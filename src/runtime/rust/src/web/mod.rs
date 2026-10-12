@@ -30,6 +30,9 @@ pub use route::*;
 pub mod console;
 #[cfg(feature = "server")]
 pub mod csrf;
+// A cookieless page request proves its Fetch Metadata before a session is minted.
+#[cfg(feature = "server")]
+mod mint_proof;
 pub mod style_inject;
 // Custom-element (`CustomElement.node`) registration glue + SRI-pinned author-JS serving.
 // The generator lives at the crate top level (`crate::widget_assets`) so the
@@ -2462,6 +2465,12 @@ fn new_sid() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// A fresh sid for a request whose mint was proved first-party.
+#[cfg(feature = "server")]
+fn minted_sid(_proof: mint_proof::MintProof) -> String {
+    new_sid()
+}
+
 /// Normalise a raw `IPE_WEB_BASE_PATH` value: trim, drop a trailing slash,
 /// ensure a single leading slash. `""` / `"/"` collapse to `""` (root-mounted —
 /// no prefix).
@@ -4127,7 +4136,27 @@ mod handlers {
     use axum::response::{IntoResponse, Response};
 
     // ── GET page (root + any path) ────────────────────────────────────
+    /// Serve a page, every response varying on the headers a mint is judged by.
     pub(super) async fn page<Model, Msg, FInit, FUpdate, FView, FSubs>(
+        state: State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+        headers: axum::http::HeaderMap,
+    ) -> Response
+    where
+        Model: Clone + PartialEq + Send + 'static,
+        Msg: Clone + Send + std::fmt::Debug + crate::stringify::IpeStringify + 'static,
+        FInit: Fn(req::WebReq) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+        FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
+        FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
+        FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
+    {
+        let mut resp = serve_page(state, method, uri, headers).await;
+        mint_proof::vary_on_mint_inputs(resp.headers_mut());
+        resp
+    }
+
+    async fn serve_page<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
@@ -4402,6 +4431,15 @@ mod handlers {
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((_, store::Rejoin::Miss)) | None => {
+                // Only a first-party arrival mints: a cross-site subresource or
+                // frame request is refused before any slot, `init` or cookie.
+                let proof = match mint_proof::MintProof::judge(
+                    &headers,
+                    mint_proof::Embedding::configured(),
+                ) {
+                    Ok(proof) => proof,
+                    Err(why) => return mint_proof::refused(why),
+                };
                 // Admission control (cookieless = brand-new session = the
                 // attack surface). Reserve a slot atomically: fetch_add-then-test
                 // avoids the load-then-add TOCTOU where N concurrent GETs all
@@ -4431,7 +4469,7 @@ mod handlers {
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
                 // Minted first so `init` and the entry run under it.
-                let scope = pubsub::SessionScope::new(new_sid());
+                let scope = pubsub::SessionScope::new(minted_sid(proof));
                 let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
                 let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, &path);
                 (
@@ -12280,6 +12318,136 @@ mod emitted_router_behavior_tests {
                     .and_then(serde_json::Value::as_array)
                     .is_some_and(|p| !p.is_empty()),
                 "a changed view pushes its patches: {json}"
+            );
+        });
+    }
+
+    /// `init` runs counted by [`counted_init`]; only the mint-gate test reads it.
+    static MINT_GATE_INITS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted_init(req: WebReq) -> (Model, IpeCmd<Msg>) {
+        MINT_GATE_INITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        init(req)
+    }
+
+    /// One cookieless `GET /` carrying `fetch_metadata`, bounded by a timeout.
+    #[allow(clippy::expect_used)] // test helper: request build / router failure / a hung handler is a test environment issue
+    async fn cookieless_get(
+        router: axum::Router,
+        fetch_metadata: [(&str, &str); 3],
+    ) -> axum::response::Response {
+        let mut b = Request::builder().method("GET").uri("/");
+        for (name, value) in fetch_metadata {
+            b = b.header(name, value);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            router.oneshot(b.body(Body::empty()).expect("build GET")),
+        )
+        .await
+        .expect("the page handler answers in time")
+        .expect("router responds")
+    }
+
+    fn vary_names(resp: &axum::response::Response) -> Vec<String> {
+        resp.headers()
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(',').map(|t| t.trim().to_ascii_lowercase()))
+            .collect()
+    }
+
+    /// Prove the refusal through the production page handler: a cross-site
+    /// subresource GET mints no session, runs no `init` and sets no cookie,
+    /// while the same request as a top-level navigation mints one; both vary on
+    /// the mint inputs.
+    #[test]
+    fn cross_site_subresource_get_mints_no_session() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let mut state = make_state(store.clone());
+            state.init = Arc::new(counted_init as fn(WebReq) -> (Model, IpeCmd<Msg>));
+            let sessions = state.session_count.clone();
+            #[allow(clippy::expect_used)] // test fixture: the test process sets no base path
+            let router = build_web_router::<
+                Model,
+                Msg,
+                fn(WebReq) -> (Model, IpeCmd<Msg>),
+                fn(Msg, Model) -> (Model, IpeCmd<Msg>),
+                fn(Model) -> Html<Msg>,
+                fn(Model) -> IpeSub<Msg>,
+            >(state, false)
+            .expect("the unset test base parses");
+            let ord = std::sync::atomic::Ordering::SeqCst;
+            let expected_vary = [
+                "sec-fetch-site",
+                "sec-fetch-mode",
+                "sec-fetch-dest",
+                "x-ipe-nav",
+            ];
+
+            let refused = cookieless_get(
+                router.clone(),
+                [
+                    ("sec-fetch-site", "cross-site"),
+                    ("sec-fetch-mode", "no-cors"),
+                    ("sec-fetch-dest", "image"),
+                ],
+            )
+            .await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+            assert!(refused.headers().get(header::SET_COOKIE).is_none());
+            let names = vary_names(&refused);
+            for name in expected_vary {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "refusal Vary lacks {name}: {names:?}"
+                );
+            }
+            assert_eq!(
+                sessions.load(ord),
+                0,
+                "a refused mint reserves no session slot"
+            );
+            assert_eq!(MINT_GATE_INITS.load(ord), 0, "a refused mint runs no init");
+
+            let admitted = cookieless_get(
+                router,
+                [
+                    ("sec-fetch-site", "cross-site"),
+                    ("sec-fetch-mode", "navigate"),
+                    ("sec-fetch-dest", "document"),
+                ],
+            )
+            .await;
+            assert_eq!(admitted.status(), StatusCode::OK);
+            let session_prefix = format!("{}=", cookie_name_for(""));
+            assert!(
+                admitted
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .any(|v| v.starts_with(&session_prefix)),
+                "a top-level navigation mints a session cookie"
+            );
+            let names = vary_names(&admitted);
+            for name in expected_vary {
+                assert!(
+                    names.iter().any(|n| n == name),
+                    "page Vary lacks {name}: {names:?}"
+                );
+            }
+            assert_eq!(
+                MINT_GATE_INITS.load(ord),
+                1,
+                "the admitted mint runs init once"
+            );
+            assert_eq!(
+                sessions.load(ord),
+                1,
+                "the admitted mint holds one session slot"
             );
         });
     }
