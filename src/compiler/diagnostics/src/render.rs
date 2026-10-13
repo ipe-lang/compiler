@@ -2137,6 +2137,9 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
             format!("this path is longer than the {cap}-byte route ceiling")
         }
         RoutePatternDefect::NotAbsolute => "this path does not start with `/`".to_string(),
+        RoutePatternDefect::TooManyParams { cap } => {
+            format!("this path holds more than {cap} `:` parameters")
+        }
         RoutePatternDefect::CatchAll { segment } => {
             format!("segment `{segment}` is a `*` catch-all, which a server route cannot hold")
         }

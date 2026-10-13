@@ -2155,12 +2155,11 @@ fn to_axum_response_with(
 
 /// The router entry serving `h` for `method` at `pattern`.
 fn method_router(
-    method: &str,
+    method: EndpointMethod,
     pattern: crate::encoding::ServerPattern,
     h: ErasedHandler,
 ) -> axum::routing::MethodRouter {
     use axum::response::IntoResponse;
-    use axum::routing::{any, delete, get, post, put};
     let pattern = Arc::new(pattern);
     let svc = move |req: axum::extract::Request| {
         let h = h.clone();
@@ -2197,12 +2196,9 @@ fn method_router(
                 .await
         }
     };
-    match method.to_uppercase().as_str() {
-        "GET" => get(svc),
-        "POST" => post(svc),
-        "PUT" => put(svc),
-        "DELETE" => delete(svc),
-        _ => any(svc),
+    match method.filter() {
+        Some(filter) => axum::routing::on(filter, svc),
+        None => axum::routing::any(svc),
     }
 }
 
@@ -2215,111 +2211,212 @@ fn strip_trailing_slash(p: &str) -> String {
     }
 }
 
-/// Server.listen : Int -> List Route -> Task Error ()  — serves via axum/tokio.
-/// Detect an unambiguous endpoint collision in the route set BEFORE the axum
-/// router is built. axum (matchit) *panics* on a conflicting insert, and that
-/// panic fires inside `server_listen`'s task future — before the
-/// `CatchPanicLayer`, which only wraps request-time handler panics — so it would
-/// crash the listener rather than surface a typed error (a soundness break).
-///
-/// This pre-check flags ONLY the always-invalid case that never coexists in
-/// axum: two handlers claiming the same path with an overlapping method (`ANY`
-/// overlaps every verb). It deliberately does NOT reason about `static` /
-/// `mountApp` prefix subtrees — a `nest`ed app coexists with sibling routes
-/// (a mount at `/` beside `Server.get "/health"` is valid), so a structural
-/// subtree rule would over-reject working programs. Those and any residual
-/// matchit ambiguity are caught by the per-insert `catch_unwind` in
-/// `server_listen`, which mirrors axum's ACTUAL behaviour and so can never
-/// over-reject. Fail closed either way: a conflicting set is refused, never bound.
-fn endpoint_conflict(routes: &[ServerRoute]) -> Option<String> {
-    // Only plain handlers carry an exact (method, path) that can duplicate.
-    let handlers: Vec<(String, &str)> = routes
-        .iter()
-        .filter(|r| matches!(r.target, RouteTarget::Handler(_)))
-        .map(|r| (r.method.to_uppercase(), r.path.as_str()))
-        .collect();
-    conflict_in(&handlers)
+/// The request methods one `Ipe.Server` handler serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointMethod {
+    Connect,
+    Delete,
+    Get,
+    Head,
+    Options,
+    Patch,
+    Post,
+    Put,
+    Trace,
+    /// Every method.
+    Any,
 }
 
-/// The pure collision core of [`endpoint_conflict`], over already-extracted
-/// `(METHOD, path)` handler entries — split out so the refusal set is
-/// unit-testable without constructing live axum handlers.
-fn conflict_in(handlers: &[(String, &str)]) -> Option<String> {
-    for (idx, (ma, pa)) in handlers.iter().enumerate() {
-        for (mb, pb) in handlers.iter().skip(idx + 1) {
-            // Same path (trailing-slash-insensitive) with an overlapping method.
-            let conflict = pa.trim_end_matches('/') == pb.trim_end_matches('/')
-                && (ma == mb || ma == "ANY" || mb == "ANY");
-            if conflict {
-                return Some(format!(
-                    "Server.listen: endpoint `{ma} {pa}` conflicts with `{mb} {pb}` — two \
-                     handlers may not claim the same path with an overlapping method; give each \
-                     endpoint a distinct path or method"
-                ));
-            }
+impl EndpointMethod {
+    /// The method a route names, `ANY` for every method, matched without
+    /// regard to case; `None` for a name that is no HTTP method.
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_uppercase().as_str() {
+            "CONNECT" => Self::Connect,
+            "DELETE" => Self::Delete,
+            "GET" => Self::Get,
+            "HEAD" => Self::Head,
+            "OPTIONS" => Self::Options,
+            "PATCH" => Self::Patch,
+            "POST" => Self::Post,
+            "PUT" => Self::Put,
+            "TRACE" => Self::Trace,
+            "ANY" => Self::Any,
+            _ => return None,
+        })
+    }
+
+    /// The router's filter for this method; `None` for `Any`.
+    const fn filter(self) -> Option<axum::routing::MethodFilter> {
+        use axum::routing::MethodFilter as F;
+        match self {
+            Self::Connect => Some(F::CONNECT),
+            Self::Delete => Some(F::DELETE),
+            Self::Get => Some(F::GET),
+            Self::Head => Some(F::HEAD),
+            Self::Options => Some(F::OPTIONS),
+            Self::Patch => Some(F::PATCH),
+            Self::Post => Some(F::POST),
+            Self::Put => Some(F::PUT),
+            Self::Trace => Some(F::TRACE),
+            Self::Any => None,
         }
     }
-    None
+
+    /// Whether some request method is served by both.
+    fn overlaps(self, other: Self) -> bool {
+        self == other || self == Self::Any || other == Self::Any
+    }
 }
 
-/// The typed error for the per-insert `catch_unwind` backstop: an axum insert
-/// panicked (a matchit route conflict) that the structural pre-check did not
-/// model. Fail closed with the offending endpoint named.
-fn conflict_at(method: &str, path: &str) -> String {
-    format!(
-        "Server.listen: endpoint `{method} {path}` conflicts with a route already registered on \
-         the server — two endpoints may not claim the same path or a path nested under another; \
-         give each endpoint a distinct path"
-    )
+/// What one parsed route serves.
+enum ParsedTarget {
+    /// A handler for the routes' requests of one method set.
+    Handler(EndpointMethod, ErasedHandler),
+    /// A static-file directory nested at the route's path.
+    Static(String),
+    /// An embedded Web app nested at the route's path.
+    #[cfg(feature = "web")]
+    MountWeb(MountCell),
 }
 
-/// An endpoint whose path is not an `Ipe.Server` route pattern
-/// ([`crate::encoding::ServerPattern`]).
+/// One `Ipe.Server` route parsed at listen, before any router insert.
+struct ParsedRoute {
+    /// The method as the program named it, for messages.
+    method: String,
+    /// The path as the program wrote it, for messages.
+    path: String,
+    pattern: crate::encoding::ServerPattern,
+    target: ParsedTarget,
+}
+
+/// Why one route was refused at listen.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EndpointPatternRefusal {
+enum RouteCause {
+    /// The path is not an `Ipe.Server` route pattern.
+    Pattern(crate::encoding::ServerPatternRefusal),
+    /// A handler's method is no HTTP method.
+    Method,
+}
+
+/// A route refused at listen, named by its method and path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EndpointRefusal {
     method: String,
     path: String,
-    refusal: crate::encoding::ServerPatternRefusal,
+    cause: RouteCause,
 }
 
 /// How many characters of a refused path a listen error quotes.
 const PATH_EXCERPT_CHARS: usize = 64;
 
-impl std::fmt::Display for EndpointPatternRefusal {
+/// `METHOD path` for a listen error: control characters scrubbed and the path
+/// cut to [`PATH_EXCERPT_CHARS`] characters.
+fn quoted_endpoint(method: &str, path: &str) -> String {
+    let mut chars = path.chars();
+    let head: String = chars.by_ref().take(PATH_EXCERPT_CHARS).collect();
+    let more = if chars.next().is_some() { "…" } else { "" };
+    format!(
+        "{} {}{more}",
+        crate::system::scrub_log_controls(method),
+        crate::system::scrub_log_controls(&head)
+    )
+}
+
+impl std::fmt::Display for EndpointRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut chars = self.path.chars();
-        let head: String = chars.by_ref().take(PATH_EXCERPT_CHARS).collect();
-        let more = if chars.next().is_some() { "…" } else { "" };
-        write!(
-            f,
-            "Server.listen: endpoint `{} {}{more}` is not a well-formed route path: {}",
-            crate::system::scrub_log_controls(&self.method),
-            crate::system::scrub_log_controls(&head),
-            self.refusal
-        )
+        let endpoint = quoted_endpoint(&self.method, &self.path);
+        match &self.cause {
+            RouteCause::Pattern(refusal) => write!(
+                f,
+                "Server.listen: endpoint `{endpoint}` is not a well-formed route path: {refusal}"
+            ),
+            RouteCause::Method => write!(
+                f,
+                "Server.listen: endpoint `{endpoint}` names no HTTP method; use GET, POST, PUT, \
+                 DELETE, PATCH, HEAD, OPTIONS, TRACE, CONNECT or ANY"
+            ),
+        }
     }
 }
 
-/// Parse every endpoint's path once, in declaration order.
+/// Parse every route once, in declaration order: its path into a
+/// [`crate::encoding::ServerPattern`] and a handler's method into an
+/// [`EndpointMethod`].
 ///
 /// # Errors
 ///
-/// The refusal of the first endpoint whose path does not parse.
-fn endpoint_patterns(
-    routes: &[ServerRoute],
-) -> Result<Vec<crate::encoding::ServerPattern>, EndpointPatternRefusal> {
+/// The refusal of the first route whose path or method does not parse.
+fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRefusal> {
     routes
-        .iter()
+        .into_iter()
         .map(|r| {
-            crate::encoding::ServerPattern::parse(&r.path).map_err(|refusal| {
-                EndpointPatternRefusal {
-                    method: r.method.to_uppercase(),
-                    path: r.path.clone(),
-                    refusal,
-                }
+            let refuse = |cause| EndpointRefusal {
+                method: r.method.to_uppercase(),
+                path: r.path.clone(),
+                cause,
+            };
+            let pattern = crate::encoding::ServerPattern::parse(&r.path)
+                .map_err(|refusal| refuse(RouteCause::Pattern(refusal)))?;
+            let target = match r.target {
+                RouteTarget::Handler(h) => ParsedTarget::Handler(
+                    EndpointMethod::parse(&r.method).ok_or_else(|| refuse(RouteCause::Method))?,
+                    h,
+                ),
+                RouteTarget::Static(dir) => ParsedTarget::Static(dir),
+                #[cfg(feature = "web")]
+                RouteTarget::MountWeb(cell) => ParsedTarget::MountWeb(cell),
+            };
+            Ok(ParsedRoute {
+                method: r.method,
+                path: r.path,
+                pattern,
+                target,
             })
         })
         .collect()
+}
+
+/// The first two handlers that claim one route with an overlapping method,
+/// as a listen error.
+///
+/// The router keys a handler by its pattern's router spelling, which two
+/// patterns share exactly when they have one shape
+/// ([`crate::encoding::ServerPattern::router_path`]); handlers of one
+/// spelling merge into one route, and only an overlapping method makes that
+/// merge a conflict. So this check refuses exactly the handler sets the
+/// router could not register, before any insert.
+fn endpoint_conflict(routes: &[ParsedRoute]) -> Option<String> {
+    let mut seen: HashMap<&str, Vec<(EndpointMethod, &ParsedRoute)>> = HashMap::new();
+    for route in routes {
+        let ParsedTarget::Handler(method, _) = route.target else {
+            continue;
+        };
+        let claims = seen.entry(route.pattern.router_path()).or_default();
+        if let Some((_, earlier)) = claims.iter().find(|(m, _)| m.overlaps(method)) {
+            return Some(format!(
+                "Server.listen: endpoint `{}` conflicts with `{}` — two handlers may not claim \
+                 the same path with an overlapping method; give each endpoint a distinct path or \
+                 method",
+                quoted_endpoint(&earlier.method.to_uppercase(), &earlier.path),
+                quoted_endpoint(&route.method.to_uppercase(), &route.path),
+            ));
+        }
+        claims.push((method, route));
+    }
+    None
+}
+
+/// The typed error for the per-insert `catch_unwind` backstop: a router
+/// insert panicked on a conflict the pre-check did not model. Fail closed
+/// with the offending endpoint named.
+fn conflict_at(method: &str, path: &str) -> String {
+    format!(
+        "Server.listen: endpoint `{}` conflicts with a route already registered on the server — \
+         two endpoints may not claim the same path or a path nested under another; give each \
+         endpoint a distinct path",
+        quoted_endpoint(method, path)
+    )
 }
 
 /// An app listener's [`ListenHost`](crate::app_config::ListenHost) whose
@@ -2546,13 +2643,13 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         // pattern the router could misread, or one no request could reach,
         // refuses the whole route set. The router sees only the rendered
         // spelling, never the author's text.
-        let patterns = match endpoint_patterns(&routes) {
-            Ok(patterns) => patterns,
+        let routes = match parse_routes(routes) {
+            Ok(routes) => routes,
             Err(refusal) => return IpeResult::Err(refusal.to_string().into()),
         };
         // Fail-closed endpoint-conflict gate (see `endpoint_conflict`): refuse an
-        // overlapping route set with a typed error before any axum insert, so a
-        // matchit conflict can never panic the listener task.
+        // overlapping handler set with a typed error before any router insert,
+        // so a router conflict can never panic the listener task.
         if let Some(msg) = endpoint_conflict(&routes) {
             return IpeResult::Err(msg.into());
         }
@@ -2598,17 +2695,18 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         // bind) rather than serve a subtly broken session/CSRF surface.
         #[cfg(feature = "web")]
         let mut web_mounted = false;
-        for (r, pattern) in routes.into_iter().zip(patterns) {
+        for r in routes {
             // Kept for the fail-closed conflict message: the arm below moves the
             // target's payload out of `r`, but leaves these scalar fields intact.
             let rmethod = r.method.clone();
             let rpath = r.path.clone();
+            let pattern = r.pattern;
             // Each axum insert is wrapped so a residual matchit conflict the
             // pre-check did not model becomes a typed error, never an escaped
             // panic (the pre-check catches the definite cases; this is the
             // independent backstop — defence in depth for a soundness invariant).
             match r.target {
-                RouteTarget::Static(dir) => {
+                ParsedTarget::Static(dir) => {
                     let path = strip_trailing_slash(&rpath);
                     let svc = strict_serve_dir(std::path::PathBuf::from(dir));
                     app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -2618,9 +2716,9 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                         Err(_) => return IpeResult::Err(conflict_at(&rmethod, &rpath).into()),
                     };
                 }
-                RouteTarget::Handler(h) => {
+                ParsedTarget::Handler(method, h) => {
                     let path = pattern.router_path().to_owned();
-                    let mr = method_router(&rmethod, pattern, h);
+                    let mr = method_router(method, pattern, h);
                     app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         app.route(&path, mr)
                     })) {
@@ -2633,7 +2731,7 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                 // listener (one port). The builder is taken once; a duplicate
                 // (a cloned route) finds `None` and is skipped — inert.
                 #[cfg(feature = "web")]
-                RouteTarget::MountWeb(cell) => {
+                ParsedTarget::MountWeb(cell) => {
                     if web_mounted {
                         return IpeResult::Err(
                             "Server.mountApp: at most one Web app may be mounted per server \
@@ -4887,33 +4985,165 @@ mod tests {
         );
     }
 
-    #[test]
-    fn distinct_handlers_never_conflict() {
-        // Happy path: sibling handlers and different verbs on one path coexist —
-        // the pre-check must not over-reject.
-        let ok = [
-            ("GET".to_string(), "/api/users"),
-            ("GET".to_string(), "/api/posts"),
-            ("POST".to_string(), "/api/users"), // same path, different verb
-            ("DELETE".to_string(), "/api/users/:id"),
-        ];
-        assert!(conflict_in(&ok).is_none());
+    fn handler_route(method: &str, path: &str) -> ServerRoute {
+        ServerRoute {
+            method: method.to_string(),
+            path: path.to_string(),
+            target: RouteTarget::Handler(name_echo()),
+        }
     }
 
-    #[test]
-    fn duplicate_method_and_path_is_refused() {
-        // Prove the refusal: the same endpoint twice (trailing slash is the same
-        // endpoint) is turned back before any axum insert.
-        let dup = [("GET".to_string(), "/api"), ("GET".to_string(), "/api/")];
-        assert!(conflict_in(&dup).is_some());
+    /// The listen-time conflict verdict on handlers `(METHOD, path)`, and
+    /// whether the router accepts every insert of the same set.
+    #[allow(clippy::expect_used)] // test: every path and method in the tables parses
+    fn conflict_and_router(set: &[(&str, &str)]) -> (Option<String>, bool) {
+        let parse = || {
+            parse_routes(set.iter().map(|(m, p)| handler_route(m, p)).collect())
+                .expect("the table's routes parse")
+        };
+        let verdict = endpoint_conflict(&parse());
+        let inserted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut app = axum::Router::new();
+            for route in parse() {
+                if let ParsedTarget::Handler(method, h) = route.target {
+                    let path = route.pattern.router_path().to_owned();
+                    app = app.route(&path, method_router(method, route.pattern, h));
+                }
+            }
+        }))
+        .is_ok();
+        (verdict, inserted)
     }
 
+    /// Prove the refusals: two handlers of one shape with an overlapping
+    /// method are refused before any insert, whatever their parameter names
+    /// or literal spellings; the router itself would refuse each such set.
     #[test]
-    fn any_verb_overlaps_every_method() {
-        // `ANY` claims every verb, so it collides with a specific-verb handler on
-        // the same path — axum would panic on the overlapping method route.
-        let any = [("ANY".to_string(), "/hook"), ("POST".to_string(), "/hook")];
-        assert!(conflict_in(&any).is_some());
+    fn handlers_of_one_shape_and_method_conflict() {
+        for set in [
+            [("GET", "/a/:x"), ("GET", "/a/:y")],
+            [("GET", "/café"), ("GET", "/caf%C3%A9")],
+            [("GET", "/api"), ("GET", "/%61pi")],
+            [("ANY", "/hook"), ("POST", "/hook")],
+            [("PATCH", "/x/:id"), ("ANY", "/x/:key")],
+            [("get", "/a"), ("GET", "/a")],
+        ] {
+            let (verdict, inserted) = conflict_and_router(&set);
+            assert!(
+                verdict
+                    .as_deref()
+                    .is_some_and(|m| m.contains("conflicts with")),
+                "{set:?}"
+            );
+            assert!(!inserted, "{set:?}: the router refuses the set too");
+        }
+    }
+
+    /// Every handler set the check accepts registers without a router
+    /// conflict: a trailing slash, a literal beside a parameter, and two
+    /// methods on one shape are all distinct.
+    #[test]
+    fn handlers_the_check_accepts_all_register() {
+        for set in [
+            vec![("GET", "/a/"), ("GET", "/a")],
+            vec![("GET", "/a/:x"), ("POST", "/a/:y")],
+            vec![("GET", "/a/b"), ("GET", "/a/:x")],
+            vec![("GET", "/a/:x"), ("GET", "/a/:y/b"), ("GET", "/a/:z/:w")],
+            vec![
+                ("GET", "/r"),
+                ("HEAD", "/r"),
+                ("PATCH", "/r"),
+                ("DELETE", "/r"),
+            ],
+            vec![
+                ("GET", "/"),
+                ("GET", "/:x"),
+                ("GET", "/a//b"),
+                ("GET", "/a%2Fb"),
+            ],
+            vec![
+                ("GET", "/api/users"),
+                ("GET", "/api/posts"),
+                ("POST", "/api/users"),
+                ("DELETE", "/api/users/:id"),
+            ],
+        ] {
+            assert_eq!(conflict_and_router(&set), (None, true), "{set:?}");
+        }
+    }
+
+    /// Prove the refusal: a handler whose method is no HTTP method is refused
+    /// at parse with the endpoint named, never served for every method.
+    #[test]
+    fn a_handler_naming_no_http_method_is_refused() {
+        for (method, path) in [("FETCH", "/x"), ("", "/x"), ("MOUNT", "/x")] {
+            let refused = parse_routes(vec![handler_route(method, path)]).err();
+            assert!(
+                refused
+                    .as_ref()
+                    .is_some_and(|r| r.cause == RouteCause::Method && r.path == path),
+                "{method:?}"
+            );
+            assert!(
+                refused.is_some_and(|r| r.to_string().contains("names no HTTP method")),
+                "{method:?}"
+            );
+        }
+        assert!(EndpointMethod::parse("patch") == Some(EndpointMethod::Patch));
+    }
+
+    /// A handler serves its own method only: a `PATCH` handler answers
+    /// `PATCH` and refuses `GET` with 405.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed routes parse and fixed requests build
+    async fn a_handler_serves_its_own_method_only() {
+        use tower::ServiceExt;
+        let mut app = axum::Router::new();
+        for route in parse_routes(vec![handler_route("PATCH", "/r")]).expect("parses") {
+            if let ParsedTarget::Handler(method, h) = route.target {
+                let path = route.pattern.router_path().to_owned();
+                app = app.route(&path, method_router(method, route.pattern, h));
+            }
+        }
+        let app = behind_listener(app);
+        for (method, status) in [
+            ("PATCH", axum::http::StatusCode::OK),
+            ("GET", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+            ("POST", axum::http::StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let wire = axum::http::Request::builder()
+                .method(method)
+                .uri("/r")
+                .body(axum::body::Body::empty())
+                .expect("test request builds");
+            let resp = match app.clone().oneshot(wire).await {
+                Ok(r) => r,
+                Err(e) => match e {},
+            };
+            assert_eq!(resp.status(), status, "{method}");
+        }
+    }
+
+    /// Prove the refusal at listen: a conflicting handler set returns its
+    /// typed error before binding.
+    #[tokio::test]
+    async fn listen_refuses_a_conflicting_handler_set_before_bind() {
+        let routes = vec![handler_route("GET", "/a/:x"), handler_route("GET", "/a/:y")];
+        let listened: IpeResult<String, ()> =
+            tokio::time::timeout(std::time::Duration::from_secs(10), server_listen(0, routes))
+                .await
+                .expect("a refused route set must return before binding, not serve");
+        let IpeResult::Err(msg) = listened else {
+            assert!(
+                matches!(listened, IpeResult::Err(_)),
+                "a conflict must refuse"
+            );
+            return;
+        };
+        assert!(
+            msg.starts_with("Server.listen: endpoint `GET /a/:x` conflicts with `GET /a/:y`"),
+            "{msg}"
+        );
     }
 
     /// A handler that answers with its `name` parameter.
@@ -4955,7 +5185,7 @@ mod tests {
         ] {
             let routes = vec![get_route("/ok"), get_route(bad)];
             assert!(
-                endpoint_patterns(&routes).is_err_and(|r| r.path == bad),
+                parse_routes(routes.clone()).is_err_and(|r| r.path == bad),
                 "{cause}: the refusal names the endpoint"
             );
             // A listener that got past the refusal would bind and serve
@@ -4980,7 +5210,7 @@ mod tests {
             assert!(msg.len() < 400, "the error quotes a bounded excerpt");
         }
         let static_dup = vec![server_static("/:id/:id".to_string(), "dir".to_string())];
-        assert!(endpoint_patterns(&static_dup).is_err());
+        assert!(parse_routes(static_dup).is_err());
     }
 
     /// An endpoint registers under its rendered spelling behind the
@@ -4994,7 +5224,10 @@ mod tests {
         for raw in ["/greet/:name", "/café", "/%61pi/"] {
             let pattern = crate::encoding::ServerPattern::parse(raw).expect("well-formed");
             let path = pattern.router_path().to_owned();
-            app = app.route(&path, method_router("GET", pattern, name_echo()));
+            app = app.route(
+                &path,
+                method_router(EndpointMethod::Get, pattern, name_echo()),
+            );
         }
         let app = behind_listener(app);
         for (uri, status) in [
@@ -5383,7 +5616,7 @@ mod tests {
     fn endpoint_router(raw: &str, h: ErasedHandler) -> axum::Router {
         let pattern = crate::encoding::ServerPattern::parse(raw).expect("well-formed");
         let path = pattern.router_path().to_owned();
-        axum::Router::new().route(&path, method_router("GET", pattern, h))
+        axum::Router::new().route(&path, method_router(EndpointMethod::Get, pattern, h))
     }
 
     /// Run `build_request` inside a router matched on `pattern`.

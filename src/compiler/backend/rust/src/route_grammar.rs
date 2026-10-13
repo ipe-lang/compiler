@@ -14,8 +14,10 @@
 //! - A `Server.*` path starts with `/` and is split like a `Web.route`
 //!   pattern; a segment led by `*` (a catch-all) is refused, a segment led by
 //!   `:` is a parameter, and any other segment holds no `:` or `*` and must
-//!   strictly percent-decode. Its router spelling, each literal re-escaped by
-//!   the runtime's one segment alphabet, is within the length ceiling.
+//!   strictly percent-decode. It holds at most `MAX_SERVER_PARAMS` parameters,
+//!   and its router spelling (each literal re-escaped by the runtime's one
+//!   segment alphabet, each parameter `:p` and its ordinal) is within the
+//!   length ceiling.
 
 use std::collections::HashSet;
 
@@ -25,6 +27,10 @@ use ipe_ir::{Callee, Expr, KernelFn, Program};
 
 /// The runtime's `MAX_URL_COMPONENT_LEN`: the longest pattern it parses.
 pub const MAX_PATH_LEN: usize = 32 * 1024 * 1024;
+
+/// The runtime's `MAX_SERVER_PARAMS`: the most parameters a `Server.*` path
+/// holds.
+pub const MAX_SERVER_PARAMS: usize = 25;
 
 /// How many characters of an offending name or segment a diagnostic quotes.
 const EXCERPT_CHARS: usize = 64;
@@ -188,7 +194,9 @@ pub fn web_route_segments(pattern: &str) -> Result<Vec<SegmentShape>, RoutePatte
 ///
 /// `TooLong` for a path over [`MAX_PATH_LEN`] bytes, `NotAbsolute` for one
 /// without a leading `/`, then the defect of the first malformed segment, then
-/// `TooLong` when the router spelling would pass the ceiling.
+/// `TooManyParams` past [`MAX_SERVER_PARAMS`] parameters, then `TooLong` when
+/// the router spelling (each parameter `:p` and its ordinal) would pass the
+/// ceiling.
 pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
     if path.len() > MAX_PATH_LEN {
         return Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN });
@@ -202,6 +210,7 @@ pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
     }
     let mut names = Names::default();
     let mut spelled: usize = 0;
+    let mut params: usize = 0;
     for raw in trimmed.split('/') {
         let seg_len = if raw.starts_with('*') {
             return Err(RoutePatternDefect::CatchAll {
@@ -209,7 +218,11 @@ pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
             });
         } else if let Some(name) = raw.strip_prefix(':') {
             names.admit(name)?;
-            raw.len()
+            // `:p` and the ordinal; a path past `MAX_SERVER_PARAMS` (two
+            // digits at most) is refused before its spelling is measured.
+            let spelled_param = if params < 10 { 3 } else { 4 };
+            params = params.saturating_add(1);
+            spelled_param
         } else if let Some(at) = raw.find([':', '*']) {
             return Err(RoutePatternDefect::MidSegmentSigil {
                 segment: excerpt(raw),
@@ -219,6 +232,11 @@ pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
             canonical_len(&literal_segment(raw)?)
         };
         spelled = spelled.saturating_add(1).saturating_add(seg_len);
+    }
+    if params > MAX_SERVER_PARAMS {
+        return Err(RoutePatternDefect::TooManyParams {
+            cap: MAX_SERVER_PARAMS,
+        });
     }
     if path.len() > 1 && path.ends_with('/') {
         spelled = spelled.saturating_add(1);
@@ -413,8 +431,8 @@ fn literal_routes(expr: &Expr) -> DResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PATH_LEN, RoutePatternDefect, excerpt, server_api_path, server_route_path,
-        web_route_pattern,
+        MAX_PATH_LEN, MAX_SERVER_PARAMS, RoutePatternDefect, excerpt, server_api_path,
+        server_route_path, web_route_pattern,
     };
 
     #[test]
@@ -560,6 +578,14 @@ mod tests {
             server_route_path("/f/:"),
             Err(RoutePatternDefect::ParamEmpty)
         );
+        let params = |n: usize| -> String { (0..n).map(|i| format!("/:v{i}")).collect() };
+        assert_eq!(server_route_path(&params(MAX_SERVER_PARAMS)), Ok(()));
+        assert_eq!(
+            server_route_path(&params(MAX_SERVER_PARAMS + 1)),
+            Err(RoutePatternDefect::TooManyParams {
+                cap: MAX_SERVER_PARAMS
+            })
+        );
     }
 
     /// A path within the parse ceiling whose router spelling grows past it is
@@ -679,8 +705,8 @@ mod agreement_tests {
     };
 
     use super::{
-        MAX_PATH_LEN, RoutePatternDefect, SegmentShape, server_api_path, server_route_path,
-        web_route_pattern, web_route_segments,
+        MAX_PATH_LEN, MAX_SERVER_PARAMS, RoutePatternDefect, SegmentShape, server_api_path,
+        server_route_path, web_route_pattern, web_route_segments,
     };
 
     /// Kind + offset of a verdict, erasing the excerpt text only this side keeps.
@@ -697,6 +723,7 @@ mod agreement_tests {
         NotAbsolute,
         CatchAll,
         MidSegmentSigil(usize),
+        TooManyParams(usize),
     }
 
     fn ours(r: Result<(), RoutePatternDefect>) -> Verdict {
@@ -712,6 +739,7 @@ mod agreement_tests {
             Err(RoutePatternDefect::NotAbsolute) => Verdict::NotAbsolute,
             Err(RoutePatternDefect::CatchAll { .. }) => Verdict::CatchAll,
             Err(RoutePatternDefect::MidSegmentSigil { at, .. }) => Verdict::MidSegmentSigil(at),
+            Err(RoutePatternDefect::TooManyParams { cap }) => Verdict::TooManyParams(cap),
         }
     }
 
@@ -749,6 +777,7 @@ mod agreement_tests {
             Err(ServerPatternRefusal::CatchAll) => Verdict::CatchAll,
             Err(ServerPatternRefusal::MidSegmentSigil { at }) => Verdict::MidSegmentSigil(at.get()),
             Err(ServerPatternRefusal::Segment(r)) => segment_verdict(r),
+            Err(ServerPatternRefusal::TooManyParams { cap }) => Verdict::TooManyParams(cap),
             Err(ServerPatternRefusal::Render(EncodeRefusal::TooLong { cap })) => {
                 Verdict::TooLong(cap.get())
             }
@@ -899,9 +928,39 @@ mod agreement_tests {
             MAX_PATH_LEN,
             ipe_runtime_rust::encoding::MAX_URL_COMPONENT_LEN.get()
         );
+        assert_eq!(
+            MAX_SERVER_PARAMS,
+            ipe_runtime_rust::encoding::MAX_SERVER_PARAMS
+        );
         let past = "a".repeat(MAX_PATH_LEN + 1);
         assert_eq!(ours(web_route_pattern(&past)), runtime_web(&past));
         assert_eq!(ours(server_route_path(&past)), runtime_server(&past));
+        let params = |n: usize| -> String { (0..n).map(|i| format!("/:v{i}")).collect() };
+        for n in [MAX_SERVER_PARAMS, MAX_SERVER_PARAMS + 1] {
+            let path = params(n);
+            assert_eq!(ours(server_route_path(&path)), runtime_server(&path), "{n}");
+        }
+        let long_name = format!("/:{}", "a".repeat(MAX_PATH_LEN - 2));
+        assert_eq!(
+            ours(server_route_path(&long_name)),
+            runtime_server(&long_name)
+        );
+        let pad = |n: usize, tail: &str| format!("/{}{tail}", "a".repeat(n));
+        for tail in ["/:x", "/:a/:b/:c/:d/:e/:f/:g/:h/:i/:j/:k"] {
+            for n in [
+                MAX_PATH_LEN - 5,
+                MAX_PATH_LEN - 4,
+                MAX_PATH_LEN - 36,
+                MAX_PATH_LEN - 37,
+            ] {
+                let grows = pad(n, tail);
+                assert_eq!(
+                    ours(server_route_path(&grows)),
+                    runtime_server(&grows),
+                    "{n} {tail}"
+                );
+            }
+        }
         for grows in [
             format!("/{}", "+".repeat(MAX_PATH_LEN / 2)),
             format!("/{}", "a".repeat(MAX_PATH_LEN - 1)),

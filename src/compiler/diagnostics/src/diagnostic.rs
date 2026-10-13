@@ -1811,6 +1811,12 @@ pub enum RoutePatternDefect {
     },
     /// A `Server.*` route path does not start with `/`.
     NotAbsolute,
+    /// A `Server.*` route path holds more `:` parameters than the server
+    /// routes.
+    TooManyParams {
+        /// The most parameters one path holds.
+        cap: usize,
+    },
     /// A `Server.*` route path has a segment led by `*`: a catch-all, which
     /// the server does not serve.
     CatchAll {
@@ -3304,6 +3310,9 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
         }
         RoutePatternDefect::TooLong { cap } => {
             format!("a route path is at most {cap} bytes — shorten it")
+        }
+        RoutePatternDefect::TooManyParams { .. } => {
+            "split the route, or carry the extra values in the query string or the body".to_string()
         }
         RoutePatternDefect::NotAbsolute => {
             "a server route path starts with `/` — write `/health`, not `health`".to_string()

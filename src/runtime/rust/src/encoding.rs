@@ -1053,13 +1053,20 @@ pub fn match_route(pattern: &RoutePattern, path: &DecodedPath) -> Option<RoutePa
 /// A literal segment is spelled by [`canonical_segment`], the same encoder
 /// every request path is rewritten through, so a router compares two outputs
 /// of one function and a raw spelling can never route apart from its
-/// canonical one. A parameter is spelled `:name`.
+/// canonical one. A parameter is spelled by its position alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerPattern {
     pattern: RoutePattern,
     trailing: TrailingSlash,
     router_path: String,
 }
+
+/// The most parameters one `Ipe.Server` route pattern holds.
+///
+/// The router names a route's parameters by one letter each and cannot name
+/// more than this many, so a longer pattern is refused at parse rather than
+/// at insert.
+pub const MAX_SERVER_PARAMS: usize = 25;
 
 /// Why an `Ipe.Server` route pattern was refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1075,6 +1082,11 @@ pub enum ServerPatternRefusal {
     },
     /// A segment is refused as in a `Web.route` pattern.
     Segment(RouteSegmentRefusal),
+    /// The pattern holds more than [`MAX_SERVER_PARAMS`] parameters.
+    TooManyParams {
+        /// The ceiling, [`MAX_SERVER_PARAMS`].
+        cap: usize,
+    },
     /// The router spelling would exceed [`MAX_URL_COMPONENT_LEN`].
     Render(EncodeRefusal),
 }
@@ -1090,6 +1102,9 @@ impl std::fmt::Display for ServerPatternRefusal {
                 at.get()
             ),
             Self::Segment(refusal) => write!(f, "{refusal}"),
+            Self::TooManyParams { cap } => {
+                write!(f, "a route path holds at most {cap} `:` parameters")
+            }
             Self::Render(refusal) => write!(f, "{refusal}"),
         }
     }
@@ -1104,7 +1119,8 @@ impl ServerPattern {
     ///
     /// `Segment` for an oversized pattern, `NotAbsolute` for one without a
     /// leading `/`, then the refusal of the first malformed segment, then
-    /// `Render` when the router spelling is oversized.
+    /// `TooManyParams` past [`MAX_SERVER_PARAMS`] parameters, then `Render`
+    /// when the router spelling is oversized.
     pub fn parse(raw: &str) -> Result<Self, ServerPatternRefusal> {
         let raws = raw_path_segments(raw).map_err(|refusal| {
             ServerPatternRefusal::Segment(RouteSegmentRefusal::Decode(refusal))
@@ -1118,6 +1134,11 @@ impl ServerPattern {
             .map(|seg| server_segment(seg, &mut names))
             .collect::<Result<Vec<_>, _>>()?;
         let pattern = RoutePattern(segments);
+        if pattern.param_names().count() > MAX_SERVER_PARAMS {
+            return Err(ServerPatternRefusal::TooManyParams {
+                cap: MAX_SERVER_PARAMS,
+            });
+        }
         let trailing = if !pattern.0.is_empty() && raw.ends_with('/') {
             TrailingSlash::Present
         } else {
@@ -1159,7 +1180,13 @@ impl ServerPattern {
     }
 
     /// The spelling the router registers: `/`, or `/seg/...` with each
-    /// literal canonical and each parameter `:name`.
+    /// literal canonical and the parameter numbered `n` in pattern order
+    /// spelled `:pn`.
+    ///
+    /// Two patterns have one spelling exactly when they have one shape: the
+    /// same trailing slash and, position by position, the same decoded
+    /// literal or a parameter each. Parameter names never reach the router,
+    /// so two patterns of one shape are one route, never a router conflict.
     #[must_use]
     pub fn router_path(&self) -> &str {
         &self.router_path
@@ -1204,13 +1231,15 @@ fn router_spelling(
         text.push_str(piece);
         Ok(())
     };
+    let mut ordinal: usize = 0;
     for seg in &pattern.0 {
         push("/")?;
         match seg {
             PatternSeg::Literal(lit) => push(&canonical_segment(lit))?,
-            PatternSeg::Param(name) => {
-                push(":")?;
-                push(name.as_str())?;
+            PatternSeg::Param(_) => {
+                push(":p")?;
+                push(&ordinal.to_string())?;
+                ordinal = ordinal.saturating_add(1);
             }
         }
     }
@@ -2319,6 +2348,83 @@ mod server_pattern_tests {
         }
     }
 
+    /// Prove the refusal: one parameter past [`MAX_SERVER_PARAMS`] is refused
+    /// at parse; the ceiling itself is served.
+    #[test]
+    fn a_pattern_past_the_parameter_ceiling_is_refused() {
+        let params = |n: usize| -> String { (0..n).map(|i| format!("/:v{i}")).collect() };
+        assert!(ServerPattern::parse(&params(MAX_SERVER_PARAMS)).is_ok());
+        assert_eq!(
+            refusal(&params(MAX_SERVER_PARAMS + 1)),
+            Some(ServerPatternRefusal::TooManyParams {
+                cap: MAX_SERVER_PARAMS
+            })
+        );
+    }
+
+    /// Two patterns spell alike exactly when they have one shape: parameter
+    /// names never matter, a trailing slash and a decoded literal always do.
+    #[test]
+    #[allow(clippy::expect_used)] // test table: every pattern is well-formed
+    fn patterns_spell_alike_exactly_when_they_share_a_shape() {
+        let spell = |raw: &str| {
+            ServerPattern::parse(raw)
+                .expect("well-formed pattern")
+                .router_path()
+                .to_owned()
+        };
+        for (a, b) in [
+            ("/a/:x", "/a/:y"),
+            ("/café", "/caf%C3%A9"),
+            ("/:a/:b", "/:c/:d"),
+            ("/%61", "/a"),
+        ] {
+            assert_eq!(spell(a), spell(b), "{a} {b}");
+        }
+        for (a, b) in [
+            ("/a/", "/a"),
+            ("/a/b", "/a/:x"),
+            ("/a/:x", "/a/:x/"),
+            ("/a%2Fb", "/a/b"),
+            ("/a//b", "/a/b"),
+            ("/:x/a", "/a/:x"),
+        ] {
+            assert_ne!(spell(a), spell(b), "{a} {b}");
+        }
+    }
+
+    /// A pattern captures a request path of its shape only: the same
+    /// trailing slash and an equal decoded literal at every literal position.
+    #[test]
+    #[allow(clippy::expect_used)] // test table: every pattern and probe is well-formed
+    fn a_pattern_captures_only_paths_of_its_shape() {
+        let captured = |pattern: &str, request: &str| {
+            ServerPattern::parse(pattern)
+                .expect("well-formed pattern")
+                .captures(&RequestPath::parse(request).expect("well-formed probe"))
+                .map(RouteParams::into_segments)
+        };
+        assert_eq!(
+            captured("/greet/:name", "/greet/caf%C3%A9"),
+            Some(vec!["café".to_owned()])
+        );
+        assert_eq!(
+            captured("/greet/:name", "/greet/a%2Fb"),
+            Some(vec!["a/b".to_owned()])
+        );
+        assert_eq!(captured("/a/", "/a/"), Some(vec![]));
+        assert_eq!(captured("/", "/"), Some(vec![]));
+        for (pattern, request) in [
+            ("/a/", "/a"),
+            ("/a", "/a/"),
+            ("/greet/:name", "/greet/a/b"),
+            ("/greet/:name", "/greet"),
+            ("/greet/:name", "/hello/bob"),
+        ] {
+            assert_eq!(captured(pattern, request), None, "{pattern} {request}");
+        }
+    }
+
     /// One byte past the parse ceiling is refused; a pattern within it whose
     /// router spelling grows past the ceiling is refused at render.
     #[test]
@@ -2353,7 +2459,8 @@ mod server_pattern_tests {
         for (raw, rendered) in [
             ("/", "/"),
             ("//", "/"),
-            ("/greet/:name", "/greet/:name"),
+            ("/greet/:name", "/greet/:p0"),
+            ("/:a/x/:b/", "/:p0/x/:p1/"),
             ("/café", "/caf%C3%A9"),
             ("/caf%C3%A9", "/caf%C3%A9"),
             ("/%61pi", "/api"),
@@ -2364,7 +2471,7 @@ mod server_pattern_tests {
             ("/a/%3Ax", "/a/%3Ax"),
             ("/a/%2A", "/a/%2A"),
             ("/a%2Fb", "/a%2Fb"),
-            ("/%2E/:_x1", "/%2E/:_x1"),
+            ("/%2E/:_x1", "/%2E/:p0"),
         ] {
             let pattern = ServerPattern::parse(raw).expect("well-formed pattern");
             assert_eq!(pattern.router_path(), rendered, "{raw:?}");
