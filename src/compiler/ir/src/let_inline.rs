@@ -112,9 +112,8 @@ pub fn pat_binds_target(pat: &Pat, target: Symbol) -> bool {
             prefix.iter().any(|p| pat_binds_target(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_target(p, target))
         }
-        // Every alternative binds the same names, so it binds `target` iff any
-        // (equivalently the first) alternative does.
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_target(p, target)),
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => false,
     }
 }
 

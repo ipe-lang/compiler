@@ -29,8 +29,9 @@ use ipe_ir::once_closure::{CaptureScope, ClosureKind, MovedCapture};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
-    ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde, is_dispatch_free, is_irrefutable,
+    RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant,
+    fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde,
+    is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
 use ipe_types::{
@@ -4200,11 +4201,13 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(a, out);
             }
         }
-        Pat::Tuple(items) | Pat::Or(items) => {
+        Pat::Tuple(items) => {
             for item in items {
                 collect_ir_pat_syms(item, out);
             }
         }
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => {}
         Pat::Record(fields) => {
             for (_, p) in fields {
                 collect_ir_pat_syms(p, out);
@@ -4817,13 +4820,8 @@ fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
                 pat_binder_syms(p, out);
             }
         }
-        // Every alternative of an or-pattern binds the same names, so walking
-        // one alternative surfaces the complete binder set.
-        Pat::Or(alts) => {
-            if let Some(first) = alts.first() {
-                pat_binder_syms(first, out);
-            }
-        }
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => {}
     }
 }
 
@@ -8253,37 +8251,6 @@ fn owned_slice_refusal(own: SliceOwnership, prefix: &[Pat], span: Span) -> DResu
     }
 }
 
-/// Refuse (IPE-L0116) a binding or-pattern over an owned list view.
-///
-/// An owned list view moves each binder out of one view shape, so every
-/// alternative would have to bind each name at the same position of the view;
-/// the owned rendering supports alternatives that bind nothing.
-fn owned_or_refusal(alts: &[Pat], span: Span) -> DResult<()> {
-    let owned = alts.iter().any(holds_owned_slice_head);
-    if owned && alts.iter().any(clone_class::pat_binds_any_name) {
-        return Err(unsupported(span, Feature::NestedCtorDiscrimination));
-    }
-    Ok(())
-}
-
-/// Is `pat` an owned-move slice head, directly or under an alias or or-pattern?
-fn holds_owned_slice_head(pat: &Pat) -> bool {
-    match pat {
-        Pat::Slice { own, .. } => *own == SliceOwnership::OwnedMove,
-        Pat::Alias(inner, _) => holds_owned_slice_head(inner),
-        Pat::Or(alts) => alts.iter().any(holds_owned_slice_head),
-        Pat::Var(_)
-        | Pat::Wildcard
-        | Pat::Int(_)
-        | Pat::Bool(_)
-        | Pat::Char(_)
-        | Pat::Str(_)
-        | Pat::Ctor { .. }
-        | Pat::Tuple(_)
-        | Pat::Record(_) => false,
-    }
-}
-
 /// Classify a single list-element / tail sub-pattern as a plain binder for the
 /// C2 desugaring: a `PVar` / `PAnything`. Any refutable sub-pattern is
 /// `None` (the whole nested list is then not desugarable).
@@ -9473,8 +9440,14 @@ fn collect_pat_ir_type_refs(pat: &Pat, enums: &mut BTreeSet<(ModPath, Symbol)>) 
                 collect_pat_ir_type_refs(p, enums);
             }
         }
-        Pat::Tuple(ps) | Pat::Or(ps) => {
+        Pat::Tuple(ps) => {
             for p in ps {
+                collect_pat_ir_type_refs(p, enums);
+            }
+        }
+        // Each constructor alternative names its enum, so every one is walked.
+        Pat::Or(alts) => {
+            for p in alts.as_slice() {
                 collect_pat_ir_type_refs(p, enums);
             }
         }
@@ -9803,7 +9776,11 @@ fn pat_matches_sqlvalue(pat: &Pat, enums: &[Symbol]) -> bool {
             (home.0.is_empty() && enums.contains(ty))
                 || args.iter().any(|p| pat_matches_sqlvalue(p, enums))
         }
-        Pat::Tuple(ps) | Pat::Or(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
+        Pat::Tuple(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
+        Pat::Or(alts) => alts
+            .as_slice()
+            .iter()
+            .any(|p| pat_matches_sqlvalue(p, enums)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_matches_sqlvalue(p, enums)),
         Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_matches_sqlvalue(p, enums))
@@ -10534,9 +10511,8 @@ fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
             prefix.iter().any(|p| pat_binds_symbol(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_symbol(p, target))
         }
-        // Every alternative of an or-pattern binds the same names, so it binds
-        // `target` iff any (equivalently, the first) alternative does.
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_symbol(p, target)),
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => false,
     }
 }
 
@@ -29806,18 +29782,14 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
                 Err(unsupported(p.span, Feature::NestedCtorDiscrimination))
             }
-            // A nested or-pattern inside a constructor payload (`Wrap (Red |
-            // Green)`) lowers each alternative through this same payload lowerer
-            // into a [`Pat::Or`]; the backend renders `Wrap(Red | Green)`, which
-            // Rust accepts. Bindings shared across the alternatives (proved in
-            // canon/types) resolve directly, with the body emitted once.
-            canon::Pattern_::POr(alts) => {
-                let lowered = alts
-                    .iter()
-                    .map(|a| self.lower_payload_pat(a))
-                    .collect::<DResult<Vec<_>>>()?;
-                Ok(Pat::Or(lowered))
-            }
+            // `or_split` lifts every nested or-pattern to whole case-arm heads
+            // before lowering, so none survives in a constructor payload.
+            canon::Pattern_::POr(_) => Err(Diagnostic::CompilerBug {
+                where_: "lower.lower_payload_pat",
+                detail: "an or-pattern survived inside a constructor payload; \
+                         or_split lifts every nested or-pattern to the arm head"
+                    .to_owned(),
+            }),
         }
     }
 
@@ -31420,10 +31392,9 @@ impl<'a> Lowerer<'a> {
                         .as_deref()
                         .is_some_and(Self::arm_has_dispatch_needing_alias)
             }
-            // An or-pattern carries a dispatch-needing alias iff any alternative
-            // does — recurse into every alternative.
-            Pat::Or(alts) => alts.iter().any(Self::arm_has_dispatch_needing_alias),
-            Pat::Var(_)
+            // A `SharedAlts` alternative holds no alias.
+            Pat::Or(_)
+            | Pat::Var(_)
             | Pat::Wildcard
             | Pat::Int(_)
             | Pat::Bool(_)
@@ -31568,19 +31539,23 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
                 self.lower_list_arm_pat(p, ty_span)
             }
-            // An or-pattern `p1 | p2 | …` lowers each alternative through this
-            // same arm lowerer into a single [`Pat::Or`]. The backend renders it
-            // as the native Rust or-pattern `p1 | p2 | …` with the arm body
-            // emitted ONCE — every alternative binds the same names (proved in
-            // canon/types), so a single body reads those binders whichever
-            // alternative matched. No body duplication.
+            // An or-pattern arm head that `or_split` kept native: binder-free
+            // constructor or Int/Char/Bool alternatives, rendered as the native
+            // Rust or-pattern `p1 | p2 | …` with the arm body emitted once.
             canon::Pattern_::POr(alts) => {
                 let lowered = alts
                     .iter()
                     .map(|a| self.lower_arm_pat(a, ty_span))
                     .collect::<DResult<Vec<_>>>()?;
-                owned_or_refusal(&lowered, p.span)?;
-                Ok(Pat::Or(lowered))
+                SharedAlts::new(lowered)
+                    .map(Pat::Or)
+                    .ok_or_else(|| Diagnostic::CompilerBug {
+                        where_: "lower.lower_arm_pat",
+                        detail: "an or-pattern arm head holds an alternative other than a \
+                                 binder-free constructor or an Int/Char/Bool literal; \
+                                 or_split splits every such arm"
+                            .to_owned(),
+                    })
             }
         }
     }
@@ -37844,47 +37819,6 @@ mod tests {
             owned_slice_refusal(SliceOwnership::BorrowClone, &aliased, span),
             Ok(())
         );
-    }
-
-    /// A binding or-pattern over an owned list view is refused with IPE-L0116; one binding nothing is accepted.
-    #[test]
-    fn owned_or_pattern_binding_fails_closed() {
-        use ipe_diagnostics::Feature;
-        use ipe_ir::{Pat, SliceOwnership};
-
-        use super::{owned_or_refusal, unsupported};
-
-        let mut fx = OwnFixture::new();
-        let x = fx.sym("x");
-        let span = Span::new(17, 23);
-        let slice = |own, prefix: Vec<Pat>| Pat::Slice {
-            prefix,
-            rest: None,
-            own,
-            elem: ipe_ir::IrType::Task(Box::new(ipe_ir::IrType::Int)),
-        };
-        let binding = [
-            slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),
-            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard, Pat::Var(x)]),
-        ];
-        assert_eq!(
-            owned_or_refusal(&binding, span),
-            Err(unsupported(span, Feature::NestedCtorDiscrimination))
-        );
-        let unbound = [
-            slice(SliceOwnership::OwnedMove, vec![]),
-            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard]),
-        ];
-        assert_eq!(owned_or_refusal(&unbound, span), Ok(()));
-        // A borrowed view copies each binder out, so a binding or-pattern stays accepted.
-        let borrowed = [
-            slice(SliceOwnership::BorrowClone, vec![Pat::Var(x)]),
-            slice(
-                SliceOwnership::BorrowClone,
-                vec![Pat::Wildcard, Pat::Var(x)],
-            ),
-        ];
-        assert_eq!(owned_or_refusal(&borrowed, span), Ok(()));
     }
 
     /// A binding nested list in a constructor payload over a non-`Clone` element is refused with IPE-L0116.

@@ -123,8 +123,9 @@ pub fn list_view<'p>(pats: impl Iterator<Item = &'p Pat> + Clone, tag: usize) ->
                 longest = longest.max(prefix.len());
             }
             Pat::Alias(inner, _) => pending.push(inner),
-            Pat::Or(alts) => pending.extend(alts),
-            Pat::Var(_)
+            // A `SharedAlts` alternative holds no slice.
+            Pat::Or(_)
+            | Pat::Var(_)
             | Pat::Wildcard
             | Pat::Int(_)
             | Pat::Bool(_)
@@ -224,8 +225,9 @@ fn borrowed_column_clone_proof<'p>(
         match pat {
             Pat::Slice { elem, .. } => elem_clone_proof(ctx, elem)?,
             Pat::Alias(inner, _) => pending.push(inner),
-            Pat::Or(alts) => pending.extend(alts),
-            Pat::Var(_)
+            // A `SharedAlts` alternative holds no slice.
+            Pat::Or(_)
+            | Pat::Var(_)
             | Pat::Wildcard
             | Pat::Int(_)
             | Pat::Bool(_)
@@ -607,12 +609,8 @@ pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResul
         | Pat::Tuple(_)
         | Pat::Record(_)
         | Pat::Slice { .. } => Ok(()),
-        // Every alternative of an or-pattern binds the same names at the same
-        // types, so rebinding via the first alternative produces the one correct
-        // set of `let` rebinds (one per name, never per-alternative).
-        Pat::Or(alts) => alts
-            .first()
-            .map_or(Ok(()), |first| collect_str_rebinds(ctx, first, out)),
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => Ok(()),
     }
 }
 
@@ -710,13 +708,8 @@ pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat, own: SliceOwnership) -> DRe
         | Pat::Ctor { .. }
         | Pat::Tuple(_)
         | Pat::Record(_) => {}
-        // Every alternative binds the same names at the same types, so the first
-        // alternative's rebinds are the whole arm's set.
-        Pat::Or(alts) => {
-            if let Some(first) = alts.first() {
-                out.push_str(&list_binder_rebinds(ctx, first, own)?);
-            }
-        }
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => {}
     }
     Ok(out)
 }
@@ -861,15 +854,10 @@ fn owned_view_shape(
                 Ok((format!("{slots} @ {inner_slots}"), tail))
             }
         }
+        // A `SharedAlts` alternative is binder-free, so it takes no slot.
         Pat::Or(alts) => {
-            if binds_any(pat) {
-                return Err(fault(
-                    "a binding or-pattern reached an owned list view; the lowerer \
-                     refuses it (IPE-L0116)",
-                ));
-            }
-            let mut parts = Vec::with_capacity(alts.len());
-            for alt in alts {
+            let mut parts = Vec::with_capacity(alts.as_slice().len());
+            for alt in alts.as_slice() {
                 parts.push(owned_view_shape(ctx, alt, width, tag, prelude)?.0);
             }
             Ok((format!("({})", parts.join(" | ")), "_".to_owned()))
@@ -911,8 +899,10 @@ fn owned_elem_fault(pat: &Pat) -> bool {
         Pat::Tuple(subs) => subs.iter().any(owned_elem_fault),
         Pat::Ctor { args, .. } => args.iter().any(owned_elem_fault),
         Pat::Record(fields) => fields.iter().any(|(_, p)| owned_elem_fault(p)),
-        Pat::Or(alts) => alts.iter().any(owned_elem_fault),
-        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) => false,
+        // A `SharedAlts` alternative holds no alias, string or list.
+        Pat::Or(_) | Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) => {
+            false
+        }
     }
 }
 
@@ -952,11 +942,8 @@ pub fn collect_elem_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResu
         | Pat::Char(_)
         | Pat::Str(_)
         | Pat::Slice { .. } => Ok(()),
-        // Every alternative binds the same names at the same types; rebind via
-        // the first alternative.
-        Pat::Or(alts) => alts
-            .first()
-            .map_or(Ok(()), |first| collect_elem_rebinds(ctx, first, out)),
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => Ok(()),
     }
 }
 
@@ -979,11 +966,8 @@ pub fn collect_list_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResu
         | Pat::Tuple(_)
         | Pat::Record(_)
         | Pat::Slice { .. } => Ok(()),
-        // Every alternative binds the same names at the same types; rebind via
-        // the first alternative.
-        Pat::Or(alts) => alts
-            .first()
-            .map_or(Ok(()), |first| collect_list_rebinds(ctx, first, out)),
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => Ok(()),
     }
 }
 
@@ -1131,8 +1115,8 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         // overlap and ordering across alternatives exactly as it does across
         // arms.
         Pat::Or(alts) => {
-            let mut parts = Vec::with_capacity(alts.len());
-            for alt in alts {
+            let mut parts = Vec::with_capacity(alts.as_slice().len());
+            for alt in alts.as_slice() {
                 parts.push(render_pat(ctx, alt)?);
             }
             Ok(parts.join(" | "))
@@ -1187,11 +1171,14 @@ pub fn pat_contains_alias_in_arm(pat: &Pat) -> bool {
             prefix.iter().any(pat_contains_alias_in_arm)
                 || rest.as_deref().is_some_and(pat_contains_alias_in_arm)
         }
-        // An or-pattern carries an alias iff any alternative does.
-        Pat::Or(alts) => alts.iter().any(pat_contains_alias_in_arm),
-        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {
-            false
-        }
+        // A `SharedAlts` alternative holds no alias.
+        Pat::Or(_)
+        | Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_) => false,
     }
 }
 
@@ -1345,7 +1332,7 @@ pub fn render_arm_pat_alias_safe(
         // this same alias-safe renderer (its clone-split prelude binds the
         // shared names) and joins with ` | `.
         Pat::Or(alts) => {
-            if alts.iter().any(pat_has_str_guard_slot) {
+            if alts.as_slice().iter().any(pat_has_str_guard_slot) {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::render_arm_pat_alias_safe",
                     detail: "a by-value string-literal leaf inside an or-pattern \
@@ -1355,8 +1342,8 @@ pub fn render_arm_pat_alias_safe(
                         .to_owned(),
                 });
             }
-            let mut parts = Vec::with_capacity(alts.len());
-            for alt in alts {
+            let mut parts = Vec::with_capacity(alts.as_slice().len());
+            for alt in alts.as_slice() {
                 parts.push(render_arm_pat_alias_safe(
                     ctx, alt, counter, prelude, guards,
                 )?);

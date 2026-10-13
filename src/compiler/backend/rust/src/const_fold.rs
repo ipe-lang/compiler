@@ -778,11 +778,13 @@ fn collect_pat_binders(pat: &Pat, out: &mut Vec<Symbol>) {
             out.push(*s);
             collect_pat_binders(inner, out);
         }
-        Pat::Ctor { args, .. } | Pat::Tuple(args) | Pat::Or(args) => {
+        Pat::Ctor { args, .. } | Pat::Tuple(args) => {
             for a in args {
                 collect_pat_binders(a, out);
             }
         }
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => {}
         Pat::Record(entries) => {
             for (_, sub) in entries {
                 collect_pat_binders(sub, out);

@@ -48,13 +48,8 @@ pub fn pat_bound_symbols(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 pat_bound_symbols(p, out);
             }
         }
-        // Every alternative of an or-pattern binds the same names, so the first
-        // alternative's binders are the whole set.
-        Pat::Or(alts) => {
-            if let Some(first) = alts.first() {
-                pat_bound_symbols(first, out);
-            }
-        }
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => {}
     }
 }
 
@@ -74,8 +69,10 @@ pub fn pat_has_str_guard_slot(pat: &Pat) -> bool {
         Pat::Tuple(elems) => elems.iter().any(pat_has_str_guard_slot),
         Pat::Ctor { args, .. } => args.iter().any(pat_has_str_guard_slot),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_has_str_guard_slot(p)),
-        Pat::Or(alts) => alts.iter().any(pat_has_str_guard_slot),
-        Pat::Var(_)
+        // A `SharedAlts` alternative is a constructor or an Int/Char/Bool literal,
+        // never a string leaf.
+        Pat::Or(_)
+        | Pat::Var(_)
         | Pat::Wildcard
         | Pat::Int(_)
         | Pat::Bool(_)

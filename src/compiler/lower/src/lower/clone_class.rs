@@ -496,7 +496,8 @@ pub(super) fn pat_binds_any_name(pat: &Pat) -> bool {
         Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(pat_binds_any_name) || rest.as_deref().is_some_and(pat_binds_any_name)
         }
-        Pat::Or(alts) => alts.iter().any(pat_binds_any_name),
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => false,
     }
 }
 
@@ -543,7 +544,8 @@ fn holds_binding_alias(pat: &Pat) -> bool {
             prefix.iter().any(holds_binding_alias)
                 || rest.as_deref().is_some_and(holds_binding_alias)
         }
-        Pat::Or(alts) => alts.iter().any(holds_binding_alias),
+        // A `SharedAlts` alternative holds no alias.
+        Pat::Or(_) => false,
     }
 }
 
@@ -589,7 +591,8 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
                     .as_deref()
                     .is_some_and(|p| pat_binds_any_in_either(p, a, b))
         }
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_any_in_either(p, a, b)),
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Or(_) => false,
     }
 }
 
