@@ -182,8 +182,19 @@ fn path_origin(
     package_name: &PackageName,
     path: &Path,
 ) -> Result<(LockedOrigin, PathBuf), CliError> {
+    path_origin_in(project_root, name, package_name, path, ipe_path_core::HOST)
+}
+
+/// [`path_origin`] with the device-element rule read under `regime`.
+fn path_origin_in(
+    project_root: &Path,
+    name: &str,
+    package_name: &PackageName,
+    path: &Path,
+    regime: ipe_path_core::Regime,
+) -> Result<(LockedOrigin, PathBuf), CliError> {
     let source = LocalSource::from_path(package_name, path)?;
-    if source.opens_a_device(ipe_path_core::HOST) {
+    if source.opens_a_device(regime) {
         return Err(crate::lockfile::LockRefusal::DeviceLocalSource {
             package: package_name.clone(),
             raw: source.as_str().to_owned(),
@@ -2967,11 +2978,41 @@ mod tests {
     }
 
     #[test]
+    fn a_device_dep_path_is_refused_before_any_open_under_windows() {
+        let proj = temp_dir("device-dep-path");
+        scaffold_project(&proj);
+        let package = pn("devicelib");
+        let path = Path::new("lib/CON");
+        // `lib/CON` does not exist: a check after `is_dir` would report it missing.
+        let origin = |regime| super::path_origin_in(&proj, "devicelib", &package, path, regime);
+        let err = origin(ipe_path_core::Regime::Windows).unwrap_err();
+        assert!(
+            matches!(&err, CliError::LockRefused(r)
+                if matches!(&**r, crate::lockfile::LockRefusal::DeviceLocalSource { raw, .. }
+                    if raw == "lib/CON")),
+            "{err:?}"
+        );
+        let missing =
+            crate::text::msg::resolve_path_dep_missing(&"devicelib", &proj.join(path).display());
+        assert!(
+            matches!(origin(ipe_path_core::Regime::Unix), Err(CliError::Resolve(msg)) if msg == missing),
+            "where `CON` opens no device the path reaches the directory check"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
     fn a_file_url_source_reaches_git_as_its_plain_path() {
         let src = git_source("file-url-origin", "module Lib\n");
         let dest = temp_dir("file-url-origin-dest").join("slot");
         let plain = src.display().to_string();
-        let url = SourceUrl::parse(&pn("p"), &format!("file://{plain}"))
+        // A Windows drive path is spelled `file:///C:\…`; a Unix one `file:///home/…`.
+        let file_url = if cfg!(windows) {
+            format!("file:///{plain}")
+        } else {
+            format!("file://{plain}")
+        };
+        let url = SourceUrl::parse(&pn("p"), &file_url)
             .expect("file URL of an absolute path is a valid source");
         let transfer = Transfer::begin(*PACKAGE_SOURCE.transfer());
         stage_origin(&pn("p"), &url, &dest, &transfer).expect("origin stages");
