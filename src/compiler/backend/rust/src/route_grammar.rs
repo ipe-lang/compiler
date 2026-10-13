@@ -578,7 +578,11 @@ mod tests {
             server_route_path("/f/:"),
             Err(RoutePatternDefect::ParamEmpty)
         );
-        let params = |n: usize| -> String { (0..n).map(|i| format!("/:v{i}")).collect() };
+        let params = |n: usize| -> String {
+            (0..n)
+                .flat_map(|i| ["/:v".to_owned(), i.to_string()])
+                .collect()
+        };
         assert_eq!(server_route_path(&params(MAX_SERVER_PARAMS)), Ok(()));
         assert_eq!(
             server_route_path(&params(MAX_SERVER_PARAMS + 1)),
@@ -935,7 +939,11 @@ mod agreement_tests {
         let past = "a".repeat(MAX_PATH_LEN + 1);
         assert_eq!(ours(web_route_pattern(&past)), runtime_web(&past));
         assert_eq!(ours(server_route_path(&past)), runtime_server(&past));
-        let params = |n: usize| -> String { (0..n).map(|i| format!("/:v{i}")).collect() };
+        let params = |n: usize| -> String {
+            (0..n)
+                .flat_map(|i| ["/:v".to_owned(), i.to_string()])
+                .collect()
+        };
         for n in [MAX_SERVER_PARAMS, MAX_SERVER_PARAMS + 1] {
             let path = params(n);
             assert_eq!(ours(server_route_path(&path)), runtime_server(&path), "{n}");

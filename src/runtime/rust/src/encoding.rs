@@ -2352,7 +2352,11 @@ mod server_pattern_tests {
     /// at parse; the ceiling itself is served.
     #[test]
     fn a_pattern_past_the_parameter_ceiling_is_refused() {
-        let params = |n: usize| -> String { (0..n).map(|i| format!("/:v{i}")).collect() };
+        let params = |n: usize| -> String {
+            (0..n)
+                .flat_map(|i| ["/:v".to_owned(), i.to_string()])
+                .collect()
+        };
         assert!(ServerPattern::parse(&params(MAX_SERVER_PARAMS)).is_ok());
         assert_eq!(
             refusal(&params(MAX_SERVER_PARAMS + 1)),
