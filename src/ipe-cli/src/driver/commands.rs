@@ -3841,21 +3841,22 @@ fn build_source_graph_from(
 /// (the same whole-tree posture package-capability inference takes); a
 /// single-file entry reads the entry plus its imported siblings.
 ///
-/// Fail-closed: any unreadable module causes an immediate `Err` so the
-/// acknowledgment gate never operates on a partial source set.
+/// Fail-closed: a discovery failure or any unreadable module causes an
+/// immediate `Err` so the acknowledgment gate never operates on a partial
+/// source set.
 ///
 /// # Errors
-/// [`CliError::Io`] when any discovered module cannot be read; for a single
-/// file, every [`loose_file_scan_sources`] error.
+/// Every [`project::discover_modules`] error, and [`CliError::Io`] when any
+/// discovered module cannot be read; for a single file, every
+/// [`loose_file_scan_sources`] error.
 pub fn user_sources_for_unsafe_scan(
     manifest: Option<&Path>,
     entry: &Path,
 ) -> Result<Vec<String>, CliError> {
     if let Some(mpath) = manifest
         && let Ok(m) = project::parse_manifest(mpath)
-        && let Ok(discovered) = project::discover_modules(&m.src_root)
     {
-        return discovered
+        return project::discover_modules(&m.src_root)?
             .iter()
             .map(|d| crate::io_bounded::read_walked_source(d.path()))
             .collect::<Result<Vec<_>, _>>();

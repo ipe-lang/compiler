@@ -3867,6 +3867,45 @@ fn unsafe_scan_manifest_project_ok_when_all_readable() {
     );
 }
 
+/// A manifest project whose module discovery fails fails both consent scans
+/// closed, never falling back to the entry's loose-file closure.
+#[test]
+fn unsafe_scan_manifest_project_fails_closed_on_discovery_failure() {
+    use std::fs;
+
+    let dir = unsafe_scan_test_dir("manifest-discovery");
+    let src = dir.join("src");
+    let entry = src.join("Main.ipe");
+    let too_deep =
+        (0..=crate::project::MAX_DISCOVERY_DEPTH).fold(src.clone(), |path, _| path.join("d"));
+    fs::create_dir_all(&too_deep).expect("create a tree past the depth ceiling");
+    fs::write(&entry, "module Main exposing (main)\n\nmain = 1\n").expect("write Main");
+    fs::write(
+        too_deep.join("Deep.ipe"),
+        "module Deep exposing (x)\n\nx = 1\n",
+    )
+    .expect("write Deep");
+    let manifest_path = dir.join("package.ipe");
+    fs::write(
+        &manifest_path,
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"test\" }\n",
+    )
+    .expect("write manifest");
+
+    let unsafe_scan = user_sources_for_unsafe_scan(Some(&manifest_path), &entry);
+    let web_scan = named_sources_for_web_scan(Some(&manifest_path), &entry);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(&unsafe_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
+        "a failed discovery fails the `.Unsafe` scan closed, got: {unsafe_scan:?}"
+    );
+    assert!(
+        matches!(&web_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
+        "a failed discovery fails the web scan closed, got: {web_scan:?}"
+    );
+}
+
 /// Single-file fallback: when `collect_entry_and_siblings` fails and the
 /// entry itself is unreadable, the result must be `Err(CliError::Io)`
 /// naming the entry path — not `Ok` with an empty list.
@@ -3939,11 +3978,11 @@ fn scan_sources_fall_back_only_on_entry_parse() {
         "an unparsable entry is web-scanned as its own text, got: {unparsable_web:?}"
     );
     assert!(
-        matches!(over_unsafe, Err(CliError::DiscoveryLimitReached { .. })),
+        matches!(&over_unsafe, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
         "a closure past its probe ceiling fails the scan closed, got: {over_unsafe:?}"
     );
     assert!(
-        matches!(over_web, Err(CliError::DiscoveryLimitReached { .. })),
+        matches!(&over_web, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
         "a closure past its probe ceiling fails the web scan closed, got: {over_web:?}"
     );
 }

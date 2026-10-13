@@ -1717,6 +1717,57 @@ mod tests {
         );
     }
 
+    /// A sibling past the per-file cap is refused by whichever cap bound its read.
+    ///
+    /// With room left for a whole capped read the per-file cap binds and the
+    /// sibling is `FileTooLarge`, exactly at the cap too; once the remaining
+    /// budget is the tighter bound, the same sibling is the closure refusal.
+    #[test]
+    fn an_oversize_sibling_is_refused_by_the_cap_that_bound_its_read() {
+        let dir = scratch_dir("binding-cap");
+        let entry = dir.join("Main.ipe");
+        let entry_text = "module Main exposing (main)\n\nimport Big\n\nmain = Big.x\n";
+        write(&entry, entry_text);
+        let cap = usize::try_from(io_bounded::SOURCE_READ_CAP).unwrap_or(usize::MAX);
+        write(&dir.join("Big.ipe"), &" ".repeat(cap.saturating_add(1)));
+        let entry_bytes = u64::try_from(entry_text.len()).unwrap_or(u64::MAX);
+        let budget = |bytes| LooseFileLimits {
+            bytes,
+            ..LooseFileLimits::DEFAULT
+        };
+        let room_for_cap = entry_bytes.saturating_add(io_bounded::SOURCE_READ_CAP);
+
+        let ample = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let at_cap = resolve_loose_file(&entry, None, budget(room_for_cap));
+        let below_cap = resolve_loose_file(&entry, None, budget(room_for_cap.saturating_sub(1)));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                ample,
+                Err(LooseFileError::Refused(CliError::FileTooLarge { max, .. }))
+                    if max == io_bounded::SOURCE_READ_CAP
+            ),
+            "an ample budget leaves the per-file cap binding, got: {ample:?}"
+        );
+        assert!(
+            matches!(
+                at_cap,
+                Err(LooseFileError::Refused(CliError::FileTooLarge { max, .. }))
+                    if max == io_bounded::SOURCE_READ_CAP
+            ),
+            "one capped read of budget left leaves the per-file cap binding, got: {at_cap:?}"
+        );
+        assert!(
+            matches!(
+                below_cap,
+                Err(LooseFileError::Refused(
+                    CliError::DiscoveryLimitReached { .. }
+                ))
+            ),
+            "a budget tighter than the per-file cap is the closure refusal, got: {below_cap:?}"
+        );
+    }
+
     /// A FIFO as the entry itself is refused at once, never blocking on a writer.
     #[cfg(unix)]
     #[test]
