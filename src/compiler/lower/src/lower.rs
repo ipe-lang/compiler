@@ -37795,7 +37795,7 @@ mod tests {
         let refused = rewrite_captured_clones(
             &BTreeSet::new(),
             &noncl,
-            &CaptureWalk::refusing(span),
+            &CaptureWalk::refusing_at(span, BTreeMap::new()),
             cons_case(ts, x, r, SliceOwnership::OwnedMove),
             CaptureScope::InRecallable,
         );
