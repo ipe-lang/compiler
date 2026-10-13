@@ -29,6 +29,7 @@ module Main exposing (main)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Db as Db exposing (Db, DbFailure(..))
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Draft, Store)
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Db.Unsafe as Unsafe
@@ -217,7 +218,7 @@ main =
     case fixtures of
         Ok fx ->
             do
-                conn <- Db.open "sqlite" "sqlite::memory:"
+                conn <- Db.open Location.memory
                 Db.withTransaction conn
                     (\tx ->
                         do

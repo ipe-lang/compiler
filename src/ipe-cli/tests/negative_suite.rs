@@ -519,9 +519,10 @@ fn security_ui_html_typed_bridge_compiles() {
 fn security_db_unsafe_exec_raw_off_plain_db_is_rejected() {
     let src = "module Main exposing (main)\n\
                import Ipe.Db as Db\n\
+               import Ipe.Db.Location as Location\n\
                import Ipe.Task as Task\n\
                main =\n\
-                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open \"sqlite\" \"sqlite::memory:\")\n";
+                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open Location.memory)\n";
     assert_rejected("security_db_unsafe_exec_raw_off_plain", src, "IPE-N0005");
 }
 
@@ -536,9 +537,10 @@ fn security_store_checked_write_kernels_are_unreachable() {
         let via_db = format!(
             "module Main exposing (main)\n\
              import Ipe.Db as Db\n\
+             import Ipe.Db.Location as Location\n\
              import Ipe.Task as Task\n\
              main =\n\
-             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open Location.memory)\n"
         );
         assert_rejected(
             &format!("security_db_{member}_unreachable"),

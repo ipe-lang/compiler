@@ -47,6 +47,7 @@ fn unsafe_exec_raw_is_the_raw_sql_entry() {
         "\
 module Main exposing (main)
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Unsafe
 import Ipe.Task
 
@@ -55,7 +56,7 @@ main =
         (\\conn ->
             Unsafe.unsafeExecRaw conn \"CREATE TABLE t (id INTEGER)\"
         )
-        (Db.open \"sqlite\" \"sqlite::memory:\")
+        (Db.open Location.memory)
 ",
     );
     let built = build(&dir, "marked");
@@ -77,6 +78,7 @@ fn unmarked_exec_raw_no_longer_compiles() {
         "\
 module Main exposing (main)
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Task
 
 main =
@@ -84,7 +86,7 @@ main =
         (\\conn ->
             Db.execRaw conn \"CREATE TABLE t (id INTEGER)\"
         )
-        (Db.open \"sqlite\" \"sqlite::memory:\")
+        (Db.open Location.memory)
 ",
     );
     let built = build(&dir, "unmarked");
@@ -106,6 +108,7 @@ fn relocated_exec_raw_off_plain_db_no_longer_compiles() {
         "\
 module Main exposing (main)
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Task
 
 main =
@@ -113,7 +116,7 @@ main =
         (\\conn ->
             Db.unsafeExecRaw conn \"CREATE TABLE t (id INTEGER)\"
         )
-        (Db.open \"sqlite\" \"sqlite::memory:\")
+        (Db.open Location.memory)
 ",
     );
     let built = build(&dir, "relocated");

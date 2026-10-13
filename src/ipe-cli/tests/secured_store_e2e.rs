@@ -47,6 +47,7 @@ const PROGRAM: &str = r#"module Main exposing (main)
 import Ipe.Auth as Auth
 import Ipe.Codec as Codec exposing (Codec)
 import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Db.Store as Store exposing (Draft, Secured, Store)
 import Ipe.Db.Unsafe as Unsafe
 import Ipe.Dict as Dict
@@ -55,6 +56,7 @@ import Ipe.Http.Server as Server
 import Ipe.Http.Server exposing (Request, Response)
 import Ipe.List as List
 import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Path as Path
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.Secret as Secret
 import Ipe.String as String
@@ -156,7 +158,10 @@ authCfg =
 
 connect : Task Error Db
 connect =
-    Db.open "sqlite" (System.getenvOr "STORE_DB" "secured-store-e2e.db")
+    Path.fromString (System.getenvOr "STORE_DB" "secured-store-e2e.db")
+        |> Result.andThen (Location.file CreateIfMissing)
+        |> Task.fromResult
+        |> Task.andThen (\location -> Db.open location)
 
 
 -- A count, or the error text, as the response body.

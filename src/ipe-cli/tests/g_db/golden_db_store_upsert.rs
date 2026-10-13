@@ -61,6 +61,7 @@ const UPSERT_TEMPLATE: &str = r#"module Main exposing (main)
 
 import Ipe.Codec as Codec
 import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Draft, Secured, Store)
 import Ipe.Error exposing (Error)
 import Ipe.Io as Io
@@ -102,7 +103,7 @@ main =
                                 (\n -> Io.println (String.fromInt n))
                                 (save conn draft (Store.public draft) secured)
                         )
-                        (Db.open "sqlite" "sqlite::memory:")
+                        (Db.open Location.memory)
 
                 Err _ ->
                     Io.println "secured failed"
