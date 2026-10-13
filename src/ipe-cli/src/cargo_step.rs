@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use ipe_backend_rust::static_build::StaticTriple;
 
 use crate::output_dir::OwnedDir;
+use crate::output_dir::held::EntryKind;
 use crate::remote_ingest::{
     GroupedChild, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal, LocalSource,
     LocalWall, METADATA_LIMITS, RunError, run_local,
@@ -164,24 +165,59 @@ pub enum CargoCrate<'a> {
 }
 
 /// Which `Cargo.lock` a blocking build replays with `--locked`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LockPolicy {
-    /// Resolve the graph once into the crate's own fresh lock, then replay it:
-    /// an emitted crate has no lock of its own.
-    Regenerate,
+#[derive(Debug, Clone, Copy)]
+enum LockPolicy<'a> {
+    /// Replay the crate's own lock when the build's toolchain proves it
+    /// current, else resolve it afresh: ipe owns the emitted crate and its lock.
+    ReplayOrResolve(&'a OwnedDir),
     /// Replay the lock the tree already commits; never rewrite it, since ipe
     /// does not own that tree.
     Committed,
 }
 
-impl CargoCrate<'_> {
+impl<'a> CargoCrate<'a> {
     /// The lock this crate's build replays.
-    const fn lock_policy(&self) -> LockPolicy {
-        match self {
-            Self::Emitted(_) => LockPolicy::Regenerate,
+    const fn lock_policy(&self) -> LockPolicy<'a> {
+        match *self {
+            Self::Emitted(dir) => LockPolicy::ReplayOrResolve(dir),
             Self::ReleaseWrapper { .. } => LockPolicy::Committed,
         }
     }
+}
+
+/// Proof that an emitted crate's `Cargo.lock` replays under `--locked` with the build's toolchain.
+///
+/// Only [`establish_lock`] constructs one.
+#[derive(Debug)]
+#[must_use]
+struct Locked(LockOrigin);
+
+impl Locked {
+    /// The line that settles the dependency-resolve stage.
+    const fn settled(&self) -> &'static str {
+        match self.0 {
+            LockOrigin::Replayed => "dependencies unchanged",
+            LockOrigin::Resolved => "dependencies resolved",
+        }
+    }
+}
+
+/// Where a [`Locked`] lock came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockOrigin {
+    /// The lock on disk passed the offline `--locked` probe; nothing was resolved.
+    Replayed,
+    /// The lock was resolved afresh by `cargo generate-lockfile`.
+    Resolved,
+}
+
+/// What the offline lock probe found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockProbe {
+    /// The lock replays as is.
+    Holds,
+    /// No regular `Cargo.lock` exists, or cargo did not exit zero: resolve.
+    Drifted,
 }
 
 /// One blocking `cargo build`: [`CargoBuild::run`] spawns it and returns once
@@ -242,8 +278,10 @@ impl CargoBuild<'_> {
     ///
     /// Every build passes `--locked`, so a transitive point release cannot
     /// change a build with no source change, and any lock-to-manifest drift
-    /// fails at `ipe` time. An emitted crate first resolves once into its own
-    /// `Cargo.lock`; the release wrapper replays the workspace's committed
+    /// fails at `ipe` time. An emitted crate keeps its own `Cargo.lock` across
+    /// runs: the pin holds while an offline `--locked` probe by the build's
+    /// toolchain proves it current, and is resolved afresh only once a resolve
+    /// input drifts. The release wrapper replays the workspace's committed
     /// lock and never rewrites it. stderr is relayed live, indented one shared
     /// column, and kept unindented (up to [`STDERR_KEEP_CAP`]) for the failure
     /// diagnostic.
@@ -255,8 +293,11 @@ impl CargoBuild<'_> {
     ///   non-zero.
     /// - [`CliError::CargoBuildTimedOut`] if the build runs past
     ///   [`CARGO_BUILD_WALL`]; every process it started is killed.
+    /// - [`CliError::LocalLimitExceeded`] if the lock probe or the resolve
+    ///   crosses a ceiling.
     /// - [`CliError::OutputRefused`] if an [`CargoCrate::Emitted`] directory
-    ///   was replaced before or while cargo ran.
+    ///   was replaced before or while cargo ran, or its `Cargo.lock` is a
+    ///   symlink or reparse point.
     pub fn run(&self) -> Result<String, CliError> {
         self.run_within(CARGO_BUILD_WALL)
     }
@@ -272,8 +313,11 @@ impl CargoBuild<'_> {
             source,
         };
         let mut cmd = self.command();
-        if self.krate.lock_policy() == LockPolicy::Regenerate {
-            lock_dependencies(&cmd, dir, self.output.verbosity())?;
+        match self.krate.lock_policy() {
+            LockPolicy::ReplayOrResolve(owned) => {
+                let _locked: Locked = establish_lock(&cmd, owned, self.output.verbosity())?;
+            }
+            LockPolicy::Committed => {}
         }
         cmd.arg("--locked");
         let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP, wall).map_err(io_err)?;
@@ -303,12 +347,17 @@ impl CargoBuild<'_> {
             return Err(io_err(e));
         }
         if !status.success() {
-            return Err(CliError::EmittedBuildFailed {
-                what: self.what,
-                code: status.code().unwrap_or(1),
-                stderr: TerminalSafe::sanitize(&drained.stderr.text),
-                runtime: self.runtime.clone(),
-            });
+            let cargo_json_stdout = match self.output {
+                CargoOutput::JsonStream(_) => drained.stdout.text.as_str(),
+                CargoOutput::Human(_) => "",
+            };
+            return Err(emitted_build_failed(
+                self.what,
+                status.code().unwrap_or(1),
+                cargo_json_stdout,
+                &drained.stderr.text,
+                self.runtime.clone(),
+            ));
         }
         if let Some(e) = drained.stdout.error {
             return Err(io_err(e));
@@ -539,15 +588,169 @@ fn wait_within(
     }
 }
 
-/// Resolve the crate's dependency graph once into its own `Cargo.lock`, with
-/// the build command's program, directory and environment, so the lock comes
-/// from the toolchain that consumes it.
+/// The refusal of a failed build of `what` that exited `code`.
 ///
-/// The resolve may fetch the registry index, so it runs under
-/// [`LOCK_FETCH_LIMITS`]. It is the one silent gap before cargo's own progress
-/// starts, so a [`Verbosity::Progress`] build covers it with a stage, settled
-/// before the relay starts. Its stderr is kept for the failure diagnostic,
-/// never relayed.
+/// Under `--message-format=json` rustc's diagnostics reach stdout as
+/// `compiler-message` records, never stderr, so their rendered text leads the
+/// kept text, then cargo's own stderr: every build mode classifies a failure
+/// (a link input the host linker cannot open, for one) from the same text.
+/// `cargo_json_stdout` is empty for a build whose stdout was not captured.
+pub fn emitted_build_failed(
+    what: &'static str,
+    code: i32,
+    cargo_json_stdout: &str,
+    stderr: &str,
+    runtime: Option<RuntimeContext>,
+) -> CliError {
+    let mut text = rendered_diagnostics(cargo_json_stdout);
+    text.push_str(stderr);
+    CliError::EmittedBuildFailed {
+        what,
+        code,
+        stderr: TerminalSafe::sanitize(&text),
+        runtime,
+    }
+}
+
+/// The `message.rendered` text of every `compiler-message` record in a JSON build's stdout, in order.
+///
+/// Kept to [`STDERR_KEEP_CAP`] bytes, whole messages only, so the diagnostic
+/// is bounded like a kept stderr.
+fn rendered_diagnostics(cargo_json_stdout: &str) -> String {
+    let mut rendered = String::new();
+    for line in cargo_json_stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(text) = value
+            .get("message")
+            .and_then(|message| message.get("rendered"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if rendered.len().saturating_add(text.len()) > STDERR_KEEP_CAP {
+            break;
+        }
+        rendered.push_str(text);
+    }
+    rendered
+}
+
+/// Prove the emitted crate's `Cargo.lock` replays, or resolve it afresh.
+///
+/// The offline probe ([`probe_lock_within`]) runs first, under
+/// [`LOCK_RESOLVE_LIMITS`]; only a lock it finds drifted is resolved again by
+/// `cargo generate-lockfile` under [`LOCK_FETCH_LIMITS`], which may fetch the
+/// registry index. Both are the one silent gap before cargo's own progress
+/// starts, so a [`Verbosity::Progress`] build covers them with one stage,
+/// settled before the relay starts.
+///
+/// # Errors
+/// - [`CliError::OutputRefused`] if `Cargo.lock` is a symlink or reparse point.
+/// - [`CliError::LocalLimitExceeded`] if the probe or the resolve crosses a ceiling.
+/// - [`CliError::Io`] if either cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process either started holds a pipe open.
+/// - [`CliError::EmittedBuildFailed`] if the resolve exits non-zero (the
+///   registry unreachable, for one).
+fn establish_lock(
+    build: &Command,
+    crate_dir: &OwnedDir,
+    verbosity: Verbosity,
+) -> Result<Locked, CliError> {
+    let stage = (verbosity == Verbosity::Progress).then(|| {
+        crate::progress::Stage::start(
+            std::io::stderr(),
+            "resolving the emitted crate's dependencies…",
+        )
+    });
+    let locked =
+        probe_lock_within(build, crate_dir, LOCK_RESOLVE_LIMITS).and_then(|probe| match probe {
+            LockProbe::Holds => Ok(Locked(LockOrigin::Replayed)),
+            LockProbe::Drifted => {
+                lock_dependencies_within(build, crate_dir.path(), LOCK_FETCH_LIMITS)
+                    .map(|()| Locked(LockOrigin::Resolved))
+            }
+        });
+    if let Some(stage) = stage {
+        match &locked {
+            Ok(locked) => stage.success(locked.settled()),
+            Err(_) => stage.failure("dependency resolution failed"),
+        }
+    }
+    locked
+}
+
+/// Whether the toolchain of `build` replays `crate_dir`'s `Cargo.lock` unchanged, offline.
+///
+/// The lock is classified first without following a link: a symlink or
+/// reparse point is refused, and an absent lock or a directory is drifted
+/// without starting a process. Otherwise the offline update
+/// `cargo update --workspace --locked --offline` runs with the build's
+/// program, directory and environment:
+/// `--locked` makes cargo exit non-zero on any change the lock would need (a
+/// manifest, a path dependency, a `[patch]` or source-replacement config, a
+/// lock format this cargo rewrites), `--workspace` keeps every non-member
+/// pin, and `--offline` keeps the probe off the network. Its exit alone is the
+/// verdict; its stderr is never parsed.
+///
+/// # Errors
+/// - [`CliError::OutputRefused`] if `Cargo.lock` is a symlink or reparse point,
+///   or a directory above it was replaced.
+/// - [`CliError::LocalLimitExceeded`] if the probe crosses a ceiling; its
+///   process group is killed.
+/// - [`CliError::Io`] if cargo cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process cargo started holds a pipe open.
+fn probe_lock_within(
+    build: &Command,
+    crate_dir: &OwnedDir,
+    ceiling: LocalCeiling,
+) -> Result<LockProbe, CliError> {
+    let lock_file = crate_dir.path_to("Cargo.lock")?;
+    match lock_file.entry_kind()? {
+        EntryKind::Absent | EntryKind::Directory => return Ok(LockProbe::Drifted),
+        EntryKind::Symlink => {
+            return Err(crate::output_dir::OutputRefusal::Symlink(lock_file.path()).into());
+        }
+        EntryKind::Other => {}
+    }
+    let dir = crate_dir.path();
+    let mut probe = Command::new(build.get_program());
+    probe
+        .args(["update", "--workspace", "--locked", "--offline"])
+        .current_dir(dir);
+    forward_build_env(build, &mut probe);
+    let captured =
+        run_local(probe, ceiling, LocalSource::LockProbe).map_err(|e| local_run_error(dir, e))?;
+    Ok(if captured.status.success() {
+        LockProbe::Holds
+    } else {
+        LockProbe::Drifted
+    })
+}
+
+/// Give `child` exactly the environment `build` sets and removes.
+///
+/// A lock step then runs under the toolchain and configuration that consume
+/// its lock.
+fn forward_build_env(build: &Command, child: &mut Command) {
+    for (key, val) in build.get_envs() {
+        match val {
+            Some(v) => child.env(key, v),
+            None => child.env_remove(key),
+        };
+    }
+}
+
+/// Resolve the crate's dependency graph afresh into its own `Cargo.lock`.
+///
+/// It runs with the build command's program, directory and environment, so
+/// the lock comes from the toolchain that consumes it, held to `ceiling`
+/// ([`LOCK_FETCH_LIMITS`] in production: the resolve may fetch the registry
+/// index). Its stderr is kept for the failure diagnostic, never relayed.
 ///
 /// # Errors
 /// - [`CliError::LocalLimitExceeded`] if the resolve crosses a ceiling.
@@ -555,32 +758,15 @@ fn wait_within(
 /// - [`CliError::ChildPipeHeld`] if a process it started holds a pipe open.
 /// - [`CliError::EmittedBuildFailed`] if it exits non-zero (the registry
 ///   unreachable, for one).
-fn lock_dependencies(build: &Command, dir: &Path, verbosity: Verbosity) -> Result<(), CliError> {
-    lock_dependencies_within(build, dir, verbosity, LOCK_FETCH_LIMITS)
-}
-
-/// [`lock_dependencies`] held to `ceiling`.
 fn lock_dependencies_within(
     build: &Command,
     dir: &Path,
-    verbosity: Verbosity,
     ceiling: LocalCeiling,
 ) -> Result<(), CliError> {
-    let stage = (verbosity == Verbosity::Progress).then(|| {
-        crate::progress::Stage::start(
-            std::io::stderr(),
-            "resolving the emitted crate's dependencies…",
-        )
-    });
     let mut lock = Command::new(build.get_program());
     lock.arg("generate-lockfile").current_dir(dir);
-    for (key, val) in build.get_envs() {
-        match val {
-            Some(v) => lock.env(key, v),
-            None => lock.env_remove(key),
-        };
-    }
-    let resolved = match run_local(lock, ceiling, LocalSource::LockFetch) {
+    forward_build_env(build, &mut lock);
+    match run_local(lock, ceiling, LocalSource::LockFetch) {
         Ok(captured) if captured.status.success() => Ok(()),
         Ok(captured) => Err(CliError::EmittedBuildFailed {
             what: "the emitted crate's dependency lockfile",
@@ -589,15 +775,7 @@ fn lock_dependencies_within(
             runtime: None,
         }),
         Err(e) => Err(local_run_error(dir, e)),
-    };
-    if let Some(stage) = stage {
-        if resolved.is_ok() {
-            stage.success("dependencies resolved");
-        } else {
-            stage.failure("dependency resolution failed");
-        }
     }
-    resolved
 }
 
 /// How an offline `cargo generate-lockfile` that ran within its ceilings ended.
@@ -1177,18 +1355,69 @@ mod tests {
         );
     }
 
+    /// The link failure a JSON-mode build reports on stdout, as cargo renders
+    /// a `compiler-message` record for it.
+    const JSON_LINK_FAILURE: &str = "error: linking with `x86_64-w64-mingw32-gcc` failed: exit code: 1
+  |
+  = note: C:\\msys64\\mingw64\\bin\\ld.exe: cannot find C:\\Users\\Jo\u{e3}o\\t\\app.o: No such file or directory
+          collect2.exe: error: ld returned 1 exit status
+
+";
+
+    #[test]
+    fn a_json_mode_link_failure_is_classified_as_the_users() {
+        let record = serde_json::json!({
+            "reason": "compiler-message",
+            "message": { "rendered": JSON_LINK_FAILURE },
+        });
+        let stdout = format!("not json\n{record}\n");
+        let refusal = super::emitted_build_failed(
+            "the watch rebuild",
+            101,
+            &stdout,
+            "error: could not compile `app`\n",
+            None,
+        );
+        assert!(matches!(refusal.fault(), crate::screen::Fault::User));
+        let unclassified = super::emitted_build_failed(
+            "the watch rebuild",
+            101,
+            "",
+            "error: could not compile `app`\n",
+            None,
+        );
+        assert!(matches!(
+            unclassified.fault(),
+            crate::screen::Fault::Internal
+        ));
+    }
+
+    #[test]
+    fn rendered_diagnostics_stop_at_the_keep_cap() {
+        let big = "e".repeat(super::STDERR_KEEP_CAP);
+        let record = serde_json::json!({
+            "reason": "compiler-message",
+            "message": { "rendered": big },
+        });
+        let stdout = format!("{record}\n{record}\n");
+        assert_eq!(
+            super::rendered_diagnostics(&stdout).len(),
+            super::STDERR_KEEP_CAP
+        );
+    }
+
     #[cfg(unix)]
     mod stubbed {
         //! Builds driven through a stub `cargo` that logs every invocation.
 
         use super::super::{
-            CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, LockOutcome, Verbosity,
-            WatchBuild, lock_dependencies_within, lock_offline, lock_offline_within,
-            target_directory, target_directory_within,
+            CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, LockOutcome, LockProbe,
+            Verbosity, WatchBuild, lock_dependencies_within, lock_offline, lock_offline_within,
+            probe_lock_within, target_directory, target_directory_within,
         };
         use super::TARGET;
         use crate::CliError;
-        use crate::output_dir::OwnedDir;
+        use crate::output_dir::{OutputRefusal, OwnedDir};
         use crate::remote_ingest::{
             IngestLimit, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalRefusal, LocalSource,
             LocalWall, METADATA_LIMITS,
@@ -1382,7 +1611,6 @@ mod tests {
             let locked = lock_dependencies_within(
                 &build,
                 &base,
-                Verbosity::Quiet,
                 LOCK_FETCH_LIMITS.with_wall(LocalWall::of_secs::<1>()),
             );
             assert!(
@@ -1426,8 +1654,10 @@ mod tests {
             assert!(built.is_ok(), "{built:?}");
             let calls = invocations(&base);
             assert!(
-                calls.iter().all(|c| !c.contains("generate-lockfile")),
-                "the wrapper's committed lock is never regenerated, got {calls:?}"
+                calls
+                    .iter()
+                    .all(|c| !c.contains("generate-lockfile") && !c.starts_with("update ")),
+                "the wrapper's committed lock is never probed nor regenerated, got {calls:?}"
             );
             assert!(
                 calls
@@ -1438,20 +1668,338 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
         }
 
-        #[test]
-        fn an_emitted_build_resolves_its_own_lock_then_replays_it() {
-            let base = scratch("emitted");
-            let cargo = stub(&base, "true");
+        /// A claimed emitted crate under `base`, holding a regular `Cargo.lock`
+        /// when `with_lock` is set.
+        fn emitted_crate(base: &Path, with_lock: bool) -> OwnedDir {
             let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            if with_lock {
+                std::fs::write(crate_dir.path().join("Cargo.lock"), "version = 4\n")
+                    .expect("write lock");
+            }
+            crate_dir
+        }
+
+        /// The logged invocations' subcommands, in order.
+        fn subcommands(base: &Path) -> Vec<String> {
+            invocations(base)
+                .iter()
+                .map(|c| c.split(' ').next().unwrap_or_default().to_owned())
+                .collect()
+        }
+
+        /// The probe's exact command line, as the stub logs it.
+        const PROBE: &str = "update --workspace --locked --offline";
+
+        #[test]
+        fn an_emitted_build_with_no_lock_resolves_then_replays() {
+            let base = scratch("no-lock");
+            let cargo = stub(&base, "true");
+            let crate_dir = emitted_crate(&base, false);
             let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
             assert!(built.is_ok(), "{built:?}");
             let calls = invocations(&base);
-            assert_eq!(calls.first().map(String::as_str), Some("generate-lockfile"));
+            assert_eq!(
+                subcommands(&base),
+                ["generate-lockfile", "build"],
+                "an absent lock is resolved without a probe, got {calls:?}"
+            );
             assert!(
-                calls
-                    .get(1)
-                    .is_some_and(|c| c.starts_with("build ") && c.contains("--locked")),
+                calls.get(1).is_some_and(|c| c.contains("--locked")),
                 "the build replays the fresh lock, got {calls:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_lock_the_probe_accepts_is_replayed_without_resolving() {
+            let base = scratch("probe-holds");
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = emitted_crate(&base, true);
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(built.is_ok(), "{built:?}");
+            let calls = invocations(&base);
+            assert_eq!(
+                calls.first().map(String::as_str),
+                Some(PROBE),
+                "the lock is probed offline under --locked, got {calls:?}"
+            );
+            assert_eq!(
+                subcommands(&base),
+                ["update", "build"],
+                "a lock the probe accepts is never resolved again, got {calls:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_lock_the_probe_rejects_is_resolved_afresh() {
+            let base = scratch("probe-drifted");
+            let cargo = stub(&base, "[ \"$1\" = update ] && exit 101\nexit 0");
+            let crate_dir = emitted_crate(&base, true);
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(built.is_ok(), "{built:?}");
+            assert_eq!(
+                subcommands(&base),
+                ["update", "generate-lockfile", "build"],
+                "a drifted lock is resolved afresh before the build"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_probe_ended_by_a_signal_resolves() {
+            let base = scratch("probe-signal");
+            let cargo = stub(&base, "[ \"$1\" = update ] && kill -9 $$\nexit 0");
+            let crate_dir = emitted_crate(&base, true);
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(built.is_ok(), "{built:?}");
+            assert_eq!(
+                subcommands(&base),
+                ["update", "generate-lockfile", "build"],
+                "a probe with no exit code never proves the lock, so it is resolved"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_probe_past_its_wall_is_refused_and_killed() {
+            let base = scratch("probe-wall");
+            let cargo = sleeping_stub(&base);
+            let crate_dir = emitted_crate(&base, true);
+            let build = std::process::Command::new(cargo.path());
+            let started = std::time::Instant::now();
+            let probed = probe_lock_within(
+                &build,
+                &crate_dir,
+                LOCK_RESOLVE_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+            );
+            assert!(
+                matches!(
+                    &probed,
+                    Err(CliError::LocalLimitExceeded(LocalRefusal {
+                        source: LocalSource::LockProbe,
+                        limit: IngestLimit::Time(_),
+                        ..
+                    }))
+                ),
+                "a probe past its wall is a typed refusal, got {probed:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the refusal lands at the wall, not at the child's exit"
+            );
+            assert!(
+                gone_soon(&base.join("pid")),
+                "the refused probe is killed and reaped"
+            );
+            assert!(
+                gone_soon(&base.join("grandchild")),
+                "a process the refused probe started is killed with its group"
+            );
+            assert_eq!(
+                subcommands(&base),
+                ["update"],
+                "a refused probe is never followed by a resolve"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_symlinked_lock_is_refused_before_cargo_runs() {
+            let base = scratch("lock-link");
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = emitted_crate(&base, false);
+            let elsewhere = base.join("elsewhere.lock");
+            std::fs::write(&elsewhere, "version = 4\n").expect("write the link target");
+            std::os::unix::fs::symlink(&elsewhere, crate_dir.path().join("Cargo.lock"))
+                .expect("plant the link");
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(
+                matches!(
+                    &built,
+                    Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+                ),
+                "a symlinked lock is refused, got {built:?}"
+            );
+            assert!(
+                invocations(&base).is_empty(),
+                "no cargo runs against a symlinked lock"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn every_build_passes_locked_whatever_the_lock_origin() {
+            for with_lock in [false, true] {
+                let base = scratch(&format!("locked-{with_lock}"));
+                let cargo = stub(&base, "exit 0");
+                let crate_dir = emitted_crate(&base, with_lock);
+                let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+                assert!(built.is_ok(), "{built:?}");
+                let calls = invocations(&base);
+                assert!(
+                    calls
+                        .iter()
+                        .filter(|c| c.starts_with("build "))
+                        .all(|c| c.contains("--locked"))
+                        && calls.iter().any(|c| c.starts_with("build ")),
+                    "the build replays the lock under --locked (lock present: {with_lock}), got {calls:?}"
+                );
+                let _ = std::fs::remove_dir_all(&base);
+            }
+        }
+
+        #[test]
+        fn the_probe_forwards_the_build_environment() {
+            let base = scratch("probe-env");
+            let env_log = base.join("env");
+            let cargo = stub(
+                &base,
+                &format!(
+                    "echo \"$1 $CARGO_TARGET_DIR\" >> '{}'\nexit 0",
+                    env_log.display()
+                ),
+            );
+            let crate_dir = emitted_crate(&base, true);
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(built.is_ok(), "{built:?}");
+            let seen = std::fs::read_to_string(&env_log).unwrap_or_default();
+            assert!(
+                seen.lines().any(|l| l == "update /t"),
+                "the probe runs with the build's CARGO_TARGET_DIR, got {seen:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Write a library package `name` at `dir` whose `[dependencies]` are `deps`.
+        fn package(dir: &Path, name: &str, deps: &str) {
+            std::fs::create_dir_all(dir.join("src")).expect("package dir");
+            std::fs::write(dir.join("src/lib.rs"), "").expect("lib.rs");
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{deps}"
+                ),
+            )
+            .expect("Cargo.toml");
+        }
+
+        #[test]
+        fn a_real_cargo_probe_holds_for_a_current_lock_and_refuses_drift() {
+            let base = scratch("real-probe");
+            let crate_dir = emitted_crate(&base, false);
+            let lock = crate_dir.path().join("Cargo.lock");
+            package(crate_dir.path(), "app", "");
+            package(&base.join("dep_a"), "dep_a", "");
+            package(&base.join("dep_b"), "dep_b", "");
+            let build = std::process::Command::new("cargo");
+            let probe = || probe_lock_within(&build, &crate_dir, LOCK_RESOLVE_LIMITS).ok();
+
+            assert_eq!(probe(), Some(LockProbe::Drifted), "no lock is drifted");
+            assert!(!lock.exists(), "the probe never writes a lock");
+
+            let resolved = std::process::Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(crate_dir.path())
+                .status()
+                .expect("run cargo generate-lockfile");
+            assert!(resolved.success(), "the test lock resolves offline");
+            let current = std::fs::read(&lock).expect("read the lock");
+            assert_eq!(probe(), Some(LockProbe::Holds), "a current lock holds");
+            assert_eq!(
+                std::fs::read(&lock).expect("read the lock"),
+                current,
+                "a probe that holds leaves the lock byte-identical"
+            );
+
+            package(crate_dir.path(), "app", "dep_a = { path = \"../dep_a\" }\n");
+            assert_eq!(
+                probe(),
+                Some(LockProbe::Drifted),
+                "a new path dependency drifts the lock"
+            );
+            assert_eq!(
+                std::fs::read(&lock).expect("read the lock"),
+                current,
+                "a drifted probe never rewrites the lock"
+            );
+
+            let resolved = std::process::Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(crate_dir.path())
+                .status()
+                .expect("run cargo generate-lockfile");
+            assert!(resolved.success(), "the path dependency resolves offline");
+            assert_eq!(probe(), Some(LockProbe::Holds), "the resolved lock holds");
+            package(
+                &base.join("dep_a"),
+                "dep_a",
+                "dep_b = { path = \"../dep_b\" }\n",
+            );
+            assert_eq!(
+                probe(),
+                Some(LockProbe::Drifted),
+                "an edit inside a path dependency's own manifest drifts the lock"
+            );
+            std::fs::remove_file(&lock).expect("delete the lock");
+            assert_eq!(
+                probe(),
+                Some(LockProbe::Drifted),
+                "a deleted lock is drifted"
+            );
+            assert!(!lock.exists(), "the probe never writes a lock");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_json_mode_verdict_classifies_the_rendered_link_failure_as_the_users() {
+            use std::os::unix::process::ExitStatusExt as _;
+            let base = scratch("json-verdict");
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = emitted_crate(&base, false);
+            let record = serde_json::json!({
+                "reason": "compiler-message",
+                "message": { "rendered": super::JSON_LINK_FAILURE },
+            });
+            let verdict_of = |stdout: String| {
+                CargoBuild {
+                    cargo: &cargo,
+                    krate: CargoCrate::Emitted(&crate_dir),
+                    profile: CargoProfile::Dev,
+                    target: CargoTarget::Wasip1,
+                    target_dir: &TARGET,
+                    output: CargoOutput::JsonStream(Verbosity::Quiet),
+                    what: "the stub build",
+                    runtime: None,
+                }
+                .verdict(super::super::Drained {
+                    waited: super::super::BuildExit::Exited(std::process::ExitStatus::from_raw(
+                        101 << 8,
+                    )),
+                    stdout: super::super::Drain {
+                        text: stdout,
+                        error: None,
+                    },
+                    stderr: super::super::Drain {
+                        text: "error: could not compile `app`\n".to_owned(),
+                        error: None,
+                    },
+                })
+            };
+            let linked = verdict_of(format!("{record}\n"));
+            assert!(
+                linked
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| matches!(e.fault(), crate::screen::Fault::User)),
+                "a JSON build's rendered link failure is the user's, got {linked:?}"
+            );
+            let bare = verdict_of(String::new());
+            assert!(
+                bare.as_ref()
+                    .err()
+                    .is_some_and(|e| matches!(e.fault(), crate::screen::Fault::Internal)),
+                "with no rendered record the failure stays unclassified, got {bare:?}"
             );
             let _ = std::fs::remove_dir_all(&base);
         }

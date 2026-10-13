@@ -1350,6 +1350,8 @@ pub enum LocalSource {
     LockResolve,
     /// A networked `cargo generate-lockfile` resolving an emitted crate's graph.
     LockFetch,
+    /// An offline `cargo update --workspace --locked` proving an emitted crate's lock replays.
+    LockProbe,
     /// A `cargo metadata --no-deps` reading a crate's target directory.
     CargoMetadata,
     /// A toolchain query: a tool's version or its installed targets.
@@ -1377,6 +1379,7 @@ impl std::fmt::Display for LocalSource {
             Self::GitQuery => "git query",
             Self::LockResolve => "offline cargo lock resolve",
             Self::LockFetch => "cargo lock resolve",
+            Self::LockProbe => "cargo lock probe",
             Self::CargoMetadata => "cargo metadata query",
             Self::ToolQuery => "toolchain query",
             Self::SupplyChainScan => "cargo-deny supply-chain scan",
