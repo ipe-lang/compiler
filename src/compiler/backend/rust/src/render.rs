@@ -4074,7 +4074,7 @@ mod p0_tests {
             op(Some(InfixOp::FloatAdd), "ddddddddddd)".into()),
             op(Some(InfixOp::FloatAdd), "eeeeeeeeeee)".into()),
             op(
-                Some("+"),
+                Some(InfixOp::FloatAdd),
                 "ffffffffffffffffffffffffffffffffffffffffffffff)".into(),
             ),
         ];
