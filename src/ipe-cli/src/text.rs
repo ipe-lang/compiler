@@ -937,6 +937,34 @@ messages! {
     cli_local_timed_out(source, limit) = "cli-local-timed-out";
     /// A `cargo build` ran past its wall and was stopped.
     cli_cargo_build_timed_out(wall) = "cli-cargo-build-timed-out";
+    /// A build directory or the toolchain sysroot the host linker cannot open.
+    cli_target_dir_unlinkable(what, path: &crate::style::TerminalSafe, linker) = "cli-target-dir-unlinkable";
+    /// An unlinkable build directory the embedding caller chose.
+    cli_target_dir_from_embedder = "cli-target-dir-from-embedder";
+    /// An unlinkable build directory `CARGO_TARGET_DIR` names.
+    cli_target_dir_from_env = "cli-target-dir-from-env";
+    /// An unlinkable build directory the `$IPE_HOME` config pins.
+    cli_target_dir_from_ipe_home = "cli-target-dir-from-ipe-home";
+    /// An unlinkable build directory a Cargo config pins.
+    cli_target_dir_from_cargo_config = "cli-target-dir-from-cargo-config";
+    /// An unlinkable crate-local build directory.
+    cli_target_dir_crate_local = "cli-target-dir-crate-local";
+    /// An unlinkable per-user build cache directory.
+    cli_target_dir_user_cache = "cli-target-dir-user-cache";
+    /// An unlinkable toolchain sysroot.
+    cli_target_dir_sysroot = "cli-target-dir-sysroot";
+    /// A host linker that opens only ASCII paths.
+    cli_host_linker_ascii_only = "cli-host-linker-ascii-only";
+    /// A host linker that opens any absolute path.
+    cli_host_linker_unicode = "cli-host-linker-unicode";
+    /// How to fix an unlinkable build directory.
+    cli_target_dir_guidance = "cli-target-dir-guidance";
+    /// How to fix an unlinkable toolchain sysroot.
+    cli_sysroot_guidance = "cli-sysroot-guidance";
+    /// The host linker could not open one of its input files.
+    cli_link_input_unopenable(linker: &crate::style::TerminalSafe, missing: &crate::style::TerminalSafe) = "cli-link-input-unopenable";
+    /// The unopenable linker input's path holds non-ASCII characters.
+    cli_link_input_non_ascii = "cli-link-input-non-ascii";
     /// A local walk met an entry it refuses by its shape.
     cli_local_tree_refused(source, shape) = "cli-local-tree-refused";
     /// A finished child's output pipe stayed open past the grace.

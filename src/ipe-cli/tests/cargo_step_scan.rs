@@ -374,3 +374,120 @@ fn a_program_not_naming_cargo_is_left_to_the_spawn_inventory() {
     let flat = flatten("Command::new(\"rustc\").arg(\"build\"); Command::new(tools.opt);");
     assert!(cargo_sites(&flat).is_empty());
 }
+
+/// What each `cargo` subcommand [`CARGO_OWNER`] runs must do with
+/// `CARGO_TARGET_DIR`, whitespace removed.
+///
+/// A build is handed the resolved build directory, and the metadata query
+/// reads the Cargo config's pin with the variable removed, so it never reads
+/// back what ipe sets. Resolving a lockfile writes no build output, so it is
+/// held to nothing.
+const TARGET_DIR_RULES: &[(&str, Option<&str>)] = &[
+    ("build", Some(".env(\"CARGO_TARGET_DIR\",target_dir)")),
+    ("metadata", Some(".env_remove(\"CARGO_TARGET_DIR\")")),
+    ("generate-lockfile", None),
+];
+
+/// The production part of a source: everything before its test module.
+fn production(source: &str) -> &str {
+    source
+        .find("#[cfg(test)]\nmod tests")
+        .and_then(|end| source.get(..end))
+        .unwrap_or(source)
+}
+
+/// Whether `line` opens a top-level function.
+fn opens_function(line: &str) -> bool {
+    [
+        "fn ",
+        "pub fn ",
+        "pub(crate) fn ",
+        "const fn ",
+        "pub const fn ",
+    ]
+    .iter()
+    .any(|head| line.starts_with(head))
+}
+
+/// The cargo sites of `source` that break [`TARGET_DIR_RULES`], one line each.
+///
+/// Each site is read from its `Command::new` to the end of the enclosing
+/// top-level function, so the statements configuring the command are seen.
+fn target_dir_drift(source: &str) -> Vec<String> {
+    let lines: Vec<&str> = production(source).lines().collect();
+    let mut drift = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if !line.contains(SPAWN_CALL) {
+            continue;
+        }
+        let rest = lines.get(at..).unwrap_or_default();
+        let end = rest
+            .iter()
+            .skip(1)
+            .position(|later| opens_function(later))
+            .map_or(rest.len(), |offset| offset.saturating_add(1));
+        let window = flatten(&rest.get(..end).unwrap_or_default().join("\n"));
+        let site = window
+            .find(SPAWN_CALL)
+            .and_then(|start| window.get(start..))
+            .unwrap_or_default();
+        let subcommand = first_subcommand(site);
+        match TARGET_DIR_RULES
+            .iter()
+            .find(|(name, _)| *name == subcommand)
+        {
+            Some((_, Some(required))) if !site.contains(required) => drift.push(format!(
+                "line {}: `cargo {subcommand}` without `{required}`",
+                at.saturating_add(1)
+            )),
+            Some(_) => {}
+            None => drift.push(format!(
+                "line {}: `cargo {subcommand}` has no CARGO_TARGET_DIR rule",
+                at.saturating_add(1)
+            )),
+        }
+    }
+    drift
+}
+
+#[test]
+fn every_cargo_child_in_cargo_step_follows_its_target_dir_rule() {
+    let path = src_root().join(CARGO_OWNER);
+    let source = std::fs::read_to_string(&path).expect("cargo_step.rs readable");
+    let sites = production(&source).matches(SPAWN_CALL).count();
+    assert!(
+        sites >= 3,
+        "the scan must see cargo_step's children, saw {sites}"
+    );
+    let drift = target_dir_drift(&source);
+    assert!(
+        drift.is_empty(),
+        "every cargo build is handed the resolved build directory and the metadata query \
+         removes the inherited one:\n{}",
+        drift.join("\n")
+    );
+}
+
+#[test]
+fn a_cargo_child_breaking_its_target_dir_rule_is_refused() {
+    let refused = [
+        "fn b(cargo: &Path) -> Command {\n    let mut cmd = Command::new(cargo);\n    \
+         cmd.arg(\"build\").current_dir(dir);\n    cmd\n}\n",
+        "fn m(cargo: &Path) {\n    let mut cmd = Command::new(cargo);\n    \
+         cmd.args([\"metadata\", \"--no-deps\"]);\n}\n",
+        "fn r(cargo: &Path) {\n    Command::new(cargo).arg(\"run\");\n}\n",
+        // The build directory set in another function is not this build's.
+        "fn b(cargo: &Path) {\n    Command::new(cargo).arg(\"build\");\n}\n\
+         fn other(cmd: &mut Command) {\n    cmd.env(\"CARGO_TARGET_DIR\", target_dir);\n}\n",
+    ];
+    for sample in refused {
+        assert!(
+            !target_dir_drift(sample).is_empty(),
+            "the target-dir rule must refuse:\n{sample}"
+        );
+    }
+    let admitted = "fn b(cargo: &Path) {\n    let mut cmd = Command::new(cargo);\n    \
+                    cmd.arg(\"build\").env(\"CARGO_TARGET_DIR\", target_dir);\n}\n\
+                    #[cfg(test)]\nmod tests {\n    fn t() { Command::new(cargo).arg(\"run\"); }\n}\n";
+    assert!(target_dir_drift(admitted).is_empty(), "{admitted}");
+}

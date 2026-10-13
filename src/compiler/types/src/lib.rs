@@ -9492,7 +9492,9 @@ mod canonicalize_tests {
             | Diagnostic::Ffi { .. }
             | Diagnostic::Sandbox { .. }
             | Diagnostic::Consent { .. }
-            | Diagnostic::RegistryUnreachable { .. } => false,
+            | Diagnostic::RegistryUnreachable { .. }
+            | Diagnostic::TargetDirUnlinkable { .. }
+            | Diagnostic::HostLinkerCannotOpenInput { .. } => false,
         }
     }
 

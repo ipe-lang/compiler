@@ -755,6 +755,18 @@ impl OwnedPath {
         }
     }
 
+    /// The final entry's kind, read through the held level above it without following a link.
+    ///
+    /// A missing level above the entry reads as [`held::EntryKind::Absent`].
+    ///
+    /// # Errors
+    /// [`CliError::OutputRefused`] for a symlink above the entry or a replaced
+    /// root; [`CliError::Io`] on a filesystem failure.
+    pub(crate) fn entry_kind(&self) -> Result<held::EntryKind, CliError> {
+        self.held_parent(false)?
+            .map_or(Ok(held::EntryKind::Absent), |(dir, name)| dir.kind_of(name))
+    }
+
     /// Create the directory itself (and every missing level above it).
     ///
     /// # Errors
@@ -3608,6 +3620,43 @@ mod tests {
                     "{op} at level {level:?} creates nothing in the link target"
                 );
             }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn entry_kind_reports_absent_file_dir_and_refuses_no_link() {
+        let base = scratch("entry_kind");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let kind = |rel: &str| out.path_to(rel).expect("path").entry_kind();
+        assert!(matches!(kind("lock"), Ok(held::EntryKind::Absent)));
+        assert!(matches!(kind("missing/lock"), Ok(held::EntryKind::Absent)));
+        std::fs::write(out.path().join("lock"), b"x").expect("write file");
+        assert!(matches!(kind("lock"), Ok(held::EntryKind::Other)));
+        std::fs::create_dir(out.path().join("sub")).expect("make dir");
+        assert!(matches!(kind("sub"), Ok(held::EntryKind::Directory)));
+        #[cfg(unix)]
+        {
+            let elsewhere = base.join("elsewhere");
+            std::fs::create_dir(&elsewhere).expect("make link target");
+            let linked = out.path_to("linked").expect("path before the link");
+            plant_link(&elsewhere, &out.path().join("linked"));
+            assert!(
+                matches!(linked.entry_kind(), Ok(held::EntryKind::Symlink)),
+                "a link to a directory is reported as the link, never followed"
+            );
+            plant_link(&elsewhere, &out.path().join("hop"));
+            let below = OwnedPath {
+                parts: vec!["hop".into(), "lock".into()],
+                ..linked
+            };
+            assert!(
+                matches!(
+                    below.entry_kind(),
+                    Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+                ),
+                "a link above the entry is refused, never walked through"
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
     }

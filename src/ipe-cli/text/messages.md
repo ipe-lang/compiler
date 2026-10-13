@@ -683,6 +683,62 @@ a signal ended the transfer — stopped; nothing was recorded
 
 cargo build did not finish within {wall} — stopped with every process it started; run `cargo build -vv` in the crate to see the step that hangs
 
+## cli-target-dir-unlinkable
+
+{what} {path} cannot be opened by {linker}
+
+## cli-target-dir-from-embedder
+
+the build directory the caller chose
+
+## cli-target-dir-from-env
+
+the build directory `CARGO_TARGET_DIR` names
+
+## cli-target-dir-from-ipe-home
+
+the build directory the `[build] target-dir` key of `$IPE_HOME/config.toml` names
+
+## cli-target-dir-from-cargo-config
+
+the build directory a Cargo config `build.target-dir` names
+
+## cli-target-dir-crate-local
+
+the project's build directory
+
+## cli-target-dir-user-cache
+
+the per-user build cache the compiler would build in instead
+
+## cli-target-dir-sysroot
+
+the Rust toolchain at
+
+## cli-host-linker-ascii-only
+
+this host's linker, which opens only ASCII paths (GNU ld on a `*-windows-gnu` host)
+
+## cli-host-linker-unicode
+
+this host's linker, which opens only absolute paths
+
+## cli-target-dir-guidance
+
+Move the project to an ASCII path, or set `CARGO_TARGET_DIR` to an ASCII directory you own under your user profile (for example `%USERPROFILE%\ipe-target`) — never a folder at the root of a drive, which other accounts can write to; or install the `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnullvm` host toolchain, whose linker opens any path.
+
+## cli-sysroot-guidance
+
+Move `RUSTUP_HOME` and `CARGO_HOME` to an ASCII directory you own under your user profile and reinstall the toolchain there, or install the `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnullvm` host toolchain, whose linker opens any path.
+
+## cli-link-input-unopenable
+
+the linker `{linker}` could not open {missing}
+
+## cli-link-input-non-ascii
+
+The path holds non-ASCII characters, which a GNU linker on a `*-windows-gnu` host cannot open.
+
 ## cli-local-tree-refused
 
 {source}: holds {shape}, which ipe does not accept — stopped; nothing was recorded
