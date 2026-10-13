@@ -220,22 +220,21 @@ impl OpenRefusal {
     }
 }
 
-/// The volume and file number of a filesystem object, its identity across lookups.
+/// The volume and object number of a filesystem object, its identity across lookups.
+///
+/// Read only from an open handle, never from a path, so an identity always
+/// names the object a handle holds rather than whatever a later lookup of a
+/// name reaches. `object` is wide enough for every platform's unique object
+/// number. On Windows it holds the 64-bit file index, which ReFS does not keep
+/// unique on a volume: a residual bounded by every write and removal going
+/// through a held handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
-    dev: u64,
-    ino: u64,
+    volume: u64,
+    object: u128,
 }
 
 impl FileId {
-    /// The identity of the object looking `path` up now reaches, following links.
-    ///
-    /// # Errors
-    /// The [`OpenRefusal`] for a `path` that cannot be looked up.
-    pub fn of_path(path: &Path) -> Result<Self, OpenRefusal> {
-        sys::id_of_path(path)
-    }
-
     /// The identity of the object the open `file` holds.
     ///
     /// # Errors

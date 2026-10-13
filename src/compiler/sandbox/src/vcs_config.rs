@@ -1233,17 +1233,55 @@ enum Zone {
     Carved,
 }
 
-/// A grant or carve directory, by path and identity.
+/// A grant or carve, by path and by the identity of the handle it is held open through.
 struct Mark {
     /// Its canonical path.
     path: PathBuf,
-    /// Its identity.
+    /// The identity of the held handle, read once from it.
     id: FileId,
     /// [`Zone::Writable`] for a grant, [`Zone::Carved`] for a carve.
     zone: Zone,
+    /// The handle `id` was read from, held for the whole scan so the object
+    /// cannot be freed and its identity reused by another directory before a
+    /// walked directory is compared against it.
+    _pinned: Pinned,
 }
 
-/// Every grant and carve of `grants`, identified now.
+/// The open handle a [`Mark`] holds.
+///
+/// A grant is a directory; a carve is a directory or a pointer file (a
+/// gitfile, a Jujutsu or Darcs file entry).
+enum Pinned {
+    /// A directory, held as a walk holds one.
+    Dir(HeldDir),
+    /// A regular file.
+    File(RegularFile),
+}
+
+impl Pinned {
+    /// Hold `path` open: as a directory, else as the regular file it is.
+    ///
+    /// `path` is canonical, so following its links is the lookup that made it.
+    fn open(path: &Path) -> Result<Self, OpenRefusal> {
+        match HeldDir::open_root(path) {
+            Ok(dir) => Ok(Self::Dir(dir)),
+            Err(OpenRefusal::NotRegular(FileKind::Regular)) => {
+                RegularFile::open_user_named(path).map(Self::File)
+            }
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    /// The identity of the object this handle holds.
+    fn id(&self) -> Result<FileId, OpenRefusal> {
+        match self {
+            Self::Dir(dir) => dir.id(),
+            Self::File(file) => file.id(),
+        }
+    }
+}
+
+/// Every grant and carve of `grants`, held open and identified from its handle.
 fn marks(grants: &Grants<'_>, kind: VcsKind) -> Result<Vec<Mark>, ConfigRefusal> {
     let writable = grants.writable.iter().map(|path| (path, Zone::Writable));
     let carved = grants.carves.iter().map(|path| (path, Zone::Carved));
@@ -1251,11 +1289,14 @@ fn marks(grants: &Grants<'_>, kind: VcsKind) -> Result<Vec<Mark>, ConfigRefusal>
         .chain(carved)
         .map(|(path, zone)| {
             let path = path.as_path();
-            FileId::of_path(path)
-                .map(|id| Mark {
-                    path: path.to_path_buf(),
-                    id,
-                    zone,
+            Pinned::open(path)
+                .and_then(|pinned| {
+                    pinned.id().map(|id| Mark {
+                        path: path.to_path_buf(),
+                        id,
+                        zone,
+                        _pinned: pinned,
+                    })
                 })
                 .map_err(|refusal| ConfigRefusal::Unreadable {
                     kind,
@@ -4360,6 +4401,52 @@ mod tests {
         };
         let result = scan(&roots, &grants, &Home::unknown(), ConfigLimits::DEFAULT);
         assert_eq!(unprovable(&result), Some(Unprovable::NoHome));
+    }
+
+    /// A grant removed before the scan holds no handle, so the scan refuses it rather than running with it unmarked.
+    #[test]
+    fn a_vanished_grant_is_unreadable() {
+        let f = fixture("vanished");
+        let tree = canonical(&f.tree);
+        let other = canonical(&f.other);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[&other]).with_carves(&[&git]);
+        std::fs::remove_dir(&f.other).expect("remove the grant");
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::Absent),
+                    ..
+                }) if path == other.as_path()
+            ),
+            "the vanished grant is unreadable, got {result:?}"
+        );
+    }
+
+    /// A carve that is a pointer file is held open as a file, so the scan runs.
+    #[test]
+    fn a_file_carve_is_held_and_scanned() {
+        let f = fixture("filecarve");
+        write(&f.tree.join("sub/.git"), "gitdir: ../.git\n");
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let pointer = canonical(&f.tree.join("sub/.git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git, &pointer]);
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+        assert_eq!(result, Ok(()), "a file carve is marked, not refused");
     }
 
     #[test]

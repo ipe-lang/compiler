@@ -1058,13 +1058,26 @@ impl HeldDir {
         }
     }
 
-    /// Whether looking `path` up now reaches this very directory.
+    /// Whether opening `path` now holds this very directory.
+    ///
+    /// `path` is opened as [`HeldDir::open`] opens it: its parent followed,
+    /// its final component never. An absent `path`, a link, or a
+    /// non-directory there holds no directory, so it is not this one.
     ///
     /// # Errors
-    /// [`CliError::Io`] when `path` cannot be stat'd or the handle cannot be.
+    /// [`CliError::Io`] when `path` cannot be opened or either handle cannot
+    /// be stat'd; [`OutputRefusal::UnnameableEntry`] for a final component
+    /// no held handle can open.
     pub fn is_at(&self, path: &Path) -> Result<bool, CliError> {
-        let found = DirId::of_path(path).map_err(|refusal| refused(path, refusal))?;
-        Ok(found == self.id()?)
+        let found = match Self::open(path) {
+            Ok(Some(found)) => found,
+            Ok(None)
+            | Err(CliError::OutputRefused(
+                OutputRefusal::Symlink(_) | OutputRefusal::NotADirectory(_),
+            )) => return Ok(false),
+            Err(other) => return Err(other),
+        };
+        Ok(found.id()? == self.id()?)
     }
 
     /// Empty the held subdirectory `child`, then remove the entry `name` it was opened as.
@@ -1818,6 +1831,56 @@ mod tests {
         HeldDir::open(path).expect("open dir").expect("dir exists")
     }
 
+    /// The identity of the file at `path`, read from a handle opened on it.
+    fn file_id_at(path: &Path) -> Option<FileId> {
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| FileId::of_file(&file).ok())
+    }
+
+    /// A link to the held directory is not the directory: `is_at` holds it false.
+    #[cfg(unix)]
+    #[test]
+    fn is_at_refuses_a_link_to_the_held_dir() {
+        let base = scratch("is_at_link");
+        let real = base.join("real");
+        std::fs::create_dir(&real).expect("make real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("plant link");
+        let dir = held_at(&real);
+        assert!(
+            matches!(dir.is_at(&real), Ok(true)),
+            "the held directory is at its own path"
+        );
+        assert!(
+            matches!(
+                HeldDir::open(&link),
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "the link is refused as a link"
+        );
+        let through_link = dir.is_at(&link);
+        assert!(
+            matches!(through_link, Ok(false)),
+            "a link to the held directory is not it, got {through_link:?}"
+        );
+        let absent = dir.is_at(&base.join("absent"));
+        assert!(
+            matches!(absent, Ok(false)),
+            "an absent path is not it, got {absent:?}"
+        );
+        let other = base.join("other");
+        std::fs::create_dir(&other).expect("make other");
+        assert!(
+            matches!(dir.is_at(&other), Ok(false)),
+            "another directory is not it"
+        );
+        std::fs::write(base.join("file"), "x").expect("make file");
+        let file = dir.is_at(&base.join("file"));
+        assert!(matches!(file, Ok(false)), "a file is not it, got {file:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Run `act` once, at the first time a claim reaches `at` on this thread.
     fn at_claim_point(at: ClaimPoint, act: impl FnOnce() + 'static) {
         let mut act = Some(act);
@@ -1927,14 +1990,14 @@ mod tests {
         at_claim_point(ClaimPoint::AfterLock, move || {
             std::fs::write(&written, MARKER_TEXT).expect("committed marker");
             std::fs::write(&filled, "built").expect("committed output");
-            seen.set(FileId::of_path(&written).ok());
+            seen.set(file_id_at(&written));
         });
         let claimed = held_at(&dir).claim();
         set_claim_hook(None);
         assert!(claimed.is_ok(), "claimed, got {claimed:?}");
         assert!(committed.get().is_some(), "the other claim committed");
         assert_eq!(
-            FileId::of_path(&marker).ok(),
+            file_id_at(&marker),
             committed.get(),
             "the committed marker is the one kept"
         );
@@ -1951,11 +2014,11 @@ mod tests {
         let dir = scratch("claim_stale_pending");
         let claim = dir.join(CLAIM_FILE);
         std::fs::write(&claim, b"").expect("stale claim file");
-        let stale = FileId::of_path(&claim).expect("stale id");
+        let stale = file_id_at(&claim).expect("stale id");
         let locked = Rc::new(Cell::new(None));
         let (seen, at) = (Rc::clone(&locked), claim.clone());
         at_claim_point(ClaimPoint::AfterLock, move || {
-            seen.set(FileId::of_path(&at).ok());
+            seen.set(file_id_at(&at));
         });
         let claimed = held_at(&dir).claim();
         set_claim_hook(None);
