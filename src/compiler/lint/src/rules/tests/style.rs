@@ -26,7 +26,8 @@ fn parses(src: &str) -> bool {
 fn findings(rule: &str, body: &str) -> Vec<Finding> {
     let m = module(body);
     assert!(parses(&m.source), "fixture must parse:\n{}", m.source);
-    run(&[m], &LintConfig::default())
+    let Ok(report) = run(&[m], &LintConfig::default(), &crate::NeverCancel);
+    report
         .findings
         .into_iter()
         .filter(|f| f.rule == rule)

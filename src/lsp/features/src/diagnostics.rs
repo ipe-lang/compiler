@@ -379,6 +379,9 @@ fn is_module_path(text: &str) -> bool {
     })
 }
 
+/// Lint findings as LSP diagnostics, one entry per owning module.
+pub type LintDiagnostics = Vec<(Vec<String>, Vec<lsp_types::Diagnostic>)>;
+
 /// Run the linter over the project's user modules and return each finding as an
 /// LSP diagnostic, keyed by owning module.
 ///
@@ -390,13 +393,19 @@ fn is_module_path(text: &str) -> bool {
 /// (injected stdlib is excluded — the linter reasons over the user's code).
 /// `config` is the resolved `lint.ipe` (or defaults). The message reuses the
 /// finding's own prose; the help lines are appended so the editor shows the same
-/// teaching the CLI does.
-#[must_use]
-pub fn collect_lint(
+/// teaching the CLI does. `probe` is polled through the lint run, so a
+/// superseded worker stops between rules instead of finishing the pass.
+///
+/// # Errors
+///
+/// Returns the probe's `Cancelled` value when the run was cut short; a partial
+/// finding set is never returned as complete.
+pub fn collect_lint<P: ipe_lint::CancelProbe>(
     user_texts: &BTreeMap<Vec<String>, String>,
     config: &ipe_lint::LintConfig,
     encoding: PositionEncoding,
-) -> Vec<(Vec<String>, Vec<lsp_types::Diagnostic>)> {
+    probe: &P,
+) -> Result<LintDiagnostics, P::Cancelled> {
     let modules: Vec<ipe_lint::SourceModule> = user_texts
         .iter()
         .map(|(module, source)| ipe_lint::SourceModule {
@@ -404,7 +413,7 @@ pub fn collect_lint(
             source: source.clone(),
         })
         .collect();
-    let report = ipe_lint::run(&modules, config);
+    let report = ipe_lint::run(&modules, config, probe)?;
 
     let mut per_module: BTreeMap<Vec<String>, Vec<lsp_types::Diagnostic>> = BTreeMap::new();
     for finding in &report.findings {
@@ -453,5 +462,5 @@ pub fn collect_lint(
                 data,
             });
     }
-    per_module.into_iter().collect()
+    Ok(per_module.into_iter().collect())
 }

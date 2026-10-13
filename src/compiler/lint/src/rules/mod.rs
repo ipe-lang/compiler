@@ -61,6 +61,7 @@ use ipe_diagnostics::{Located, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_syntax::{Expr, Expr_, Module, TypeAnnotation, Value};
 
+use crate::cancel::CancelProbe;
 use crate::finding::{Finding, Fix, SigFix};
 
 /// The read-only context every rule shares for one module: its path, its source
@@ -155,29 +156,43 @@ impl Ctx<'_> {
     }
 }
 
+/// One single-module rule: a pure function from a module's context to findings.
+pub type Rule = fn(&Ctx<'_>) -> Vec<Finding>;
+
+/// Every shipped single-module rule, in registry order.
+pub const PER_MODULE_RULES: [Rule; 19] = [
+    prim_param::check,
+    adjacent_bools::check,
+    wrapper_consistency::check,
+    unsafe_convention::check,
+    prefer_pipeline::check,
+    unused_imports::check,
+    unused_bindings::check,
+    no_silent_outline_none::check,
+    no_empty_icon_button_label::check,
+    multiline_lambda_arg::check,
+    no_bool_literal_compare::check,
+    no_redundant_bool_if::check,
+    no_simple_let_body::check,
+    simplify_double_not::check,
+    simplify_map_identity::check,
+    simplify_cons_append::check,
+    no_redundant_cons::check,
+    no_redundant_concat::check,
+    no_missing_type_annotation::check,
+];
+
 /// Run every shipped single-module rule over `ctx`, in registry order.
-pub fn run_all(ctx: &Ctx) -> Vec<Finding> {
+///
+/// `probe` is polled before each rule; once it fires the run stops and returns
+/// its `Cancelled` value, never the findings gathered so far.
+pub fn run_all<P: CancelProbe>(ctx: &Ctx<'_>, probe: &P) -> Result<Vec<Finding>, P::Cancelled> {
     let mut findings = Vec::new();
-    findings.extend(prim_param::check(ctx));
-    findings.extend(adjacent_bools::check(ctx));
-    findings.extend(wrapper_consistency::check(ctx));
-    findings.extend(unsafe_convention::check(ctx));
-    findings.extend(prefer_pipeline::check(ctx));
-    findings.extend(unused_imports::check(ctx));
-    findings.extend(unused_bindings::check(ctx));
-    findings.extend(no_silent_outline_none::check(ctx));
-    findings.extend(no_empty_icon_button_label::check(ctx));
-    findings.extend(multiline_lambda_arg::check(ctx));
-    findings.extend(no_bool_literal_compare::check(ctx));
-    findings.extend(no_redundant_bool_if::check(ctx));
-    findings.extend(no_simple_let_body::check(ctx));
-    findings.extend(simplify_double_not::check(ctx));
-    findings.extend(simplify_map_identity::check(ctx));
-    findings.extend(simplify_cons_append::check(ctx));
-    findings.extend(no_redundant_cons::check(ctx));
-    findings.extend(no_redundant_concat::check(ctx));
-    findings.extend(no_missing_type_annotation::check(ctx));
-    findings
+    for rule in PER_MODULE_RULES {
+        probe.poll()?;
+        findings.extend(rule(ctx));
+    }
+    Ok(findings)
 }
 
 /// True when `expr` is a function application the author wrote.

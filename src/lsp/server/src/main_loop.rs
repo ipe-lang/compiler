@@ -1208,7 +1208,15 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
                         &lint,
                     )
                 }))
-                .map(|demanded| lint_stage(demanded, &uri_of, encoding, &cancel, &lint))
+                .map(|demanded| {
+                    lint_stage(
+                        demanded,
+                        &uri_of,
+                        encoding,
+                        &ipe_lint::CancelFlag::new(&cancel),
+                        &lint,
+                    )
+                })
             }));
             match outcome {
                 Ok(Ok(per_uri)) => {
@@ -1383,11 +1391,11 @@ fn demand_stage(
 /// the compiler's own diagnostics for each user document (the way clippy flows
 /// through rust-analyzer). A refused `lint.ipe` runs no rule: its diagnostic is
 /// published in place of every finding.
-fn lint_stage(
+fn lint_stage<P: ipe_lint::CancelProbe>(
     demanded: Demanded,
     uri_of: &BTreeMap<Vec<String>, Url>,
     encoding: PositionEncoding,
-    cancel: &AtomicBool,
+    probe: &P,
     lint: &LintPass,
 ) -> Vec<(Url, Vec<lsp_types::Diagnostic>)> {
     let Demanded {
@@ -1398,7 +1406,7 @@ fn lint_stage(
     // A superseded worker skips the whole lint pass. The newer worker owns the
     // next publish, so dropping this one's lint work is observationally
     // identical.
-    if cancel.load(Ordering::Relaxed) {
+    if probe.poll().is_err() {
         return per_uri.into_iter().collect();
     }
     let lint_config = match lint {
@@ -1414,7 +1422,14 @@ fn lint_stage(
         }
         LintPass::Skipped => return per_uri.into_iter().collect(),
     };
-    for (module, lints) in diagnostics::collect_lint(&user_texts, lint_config, encoding) {
+    // The probe is polled again between modules and rules: a worker superseded
+    // mid-pass stops within one rule, so the main loop's join never waits out a
+    // whole lint pass.
+    let Ok(per_module) = diagnostics::collect_lint(&user_texts, lint_config, encoding, probe)
+    else {
+        return per_uri.into_iter().collect();
+    };
+    for (module, lints) in per_module {
         if let Some(uri) = uri_of.get(&module) {
             per_uri.entry(uri.clone()).or_default().extend(lints);
         }
@@ -3336,31 +3351,8 @@ mod tests {
     #[test]
     fn lint_tail_holds_no_database_clone() {
         let mut state = synced_two_module_state("/lsp-lint-tail-test");
-        let root = state.db.root().expect("a synced root");
-        let entry_module = state.entry_module().to_vec();
-        let entry_file = root
-            .files(state.db.db())
-            .get(&entry_module)
-            .copied()
-            .expect("the entry module's input");
-        let uri_of: BTreeMap<Vec<String>, Url> = state
-            .served
-            .layout()
-            .expect("a served layout")
-            .path_of_module
-            .iter()
-            .filter_map(|(module, path)| Some((module.clone(), Url::from_file_path(path).ok()?)))
-            .collect();
         let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
-        let demanded = super::demand_stage(
-            state.db.db().clone(),
-            root,
-            entry_file,
-            &uri_of,
-            &entry_module,
-            state.encoding,
-            &lint,
-        );
+        let (demanded, uri_of) = demanded_of(&state, &lint);
         assert!(
             !demanded.user_texts.is_empty(),
             "the lint stage receives owned user texts"
@@ -3385,10 +3377,93 @@ mod tests {
             demanded,
             &uri_of,
             state.encoding,
-            &AtomicBool::new(false),
+            &ipe_lint::NeverCancel,
             &lint,
         );
         assert_eq!(batch.len(), uri_of.len(), "one entry per user document");
+    }
+
+    /// A probe that fires on its `fire_at`-th poll and counts every poll.
+    struct FiresOnPoll {
+        fire_at: usize,
+        polls: std::cell::Cell<usize>,
+    }
+
+    impl ipe_lint::CancelProbe for FiresOnPoll {
+        type Cancelled = ipe_lint::LintCancelled;
+
+        fn poll(&self) -> Result<(), ipe_lint::LintCancelled> {
+            let polls = self.polls.get().saturating_add(1);
+            self.polls.set(polls);
+            if polls >= self.fire_at {
+                Err(ipe_lint::LintCancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A lint stage whose probe fires mid-pass returns before visiting the
+    /// second module and publishes no lint finding from the cut-short run.
+    ///
+    /// Checkpoint 1 is the stage's own entry check, 2 the first module's parse,
+    /// 3 the first rule over it; the second module's parse lies past every rule
+    /// over the first, so a stop at 3 never reaches it.
+    #[test]
+    fn a_lint_stage_cancelled_mid_pass_stops_before_the_second_module() {
+        let state = synced_two_module_state("/lsp-lint-cancel-mid-pass-test");
+        let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
+        let (demanded, uri_of) = demanded_of(&state, &lint);
+        assert_eq!(demanded.user_texts.len(), 2, "two user modules to lint");
+        let probe = FiresOnPoll {
+            fire_at: 3,
+            polls: std::cell::Cell::new(0),
+        };
+        let batch = super::lint_stage(demanded, &uri_of, state.encoding, &probe, &lint);
+        assert_eq!(
+            probe.polls.get(),
+            3,
+            "the stage must stop at the checkpoint that fired"
+        );
+        assert!(
+            batch
+                .iter()
+                .flat_map(|(_, diags)| diags)
+                .all(|d| d.source.as_deref() != Some("ipe-lint")),
+            "a cancelled lint pass must publish no lint finding"
+        );
+    }
+
+    /// The demand stage's output for `state`, with each user module's URI.
+    fn demanded_of(
+        state: &State,
+        lint: &super::LintPass,
+    ) -> (super::Demanded, BTreeMap<Vec<String>, Url>) {
+        let root = state.db.root().expect("a synced root");
+        let entry_module = state.entry_module().to_vec();
+        let entry_file = root
+            .files(state.db.db())
+            .get(&entry_module)
+            .copied()
+            .expect("the entry module's input");
+        let uri_of: BTreeMap<Vec<String>, Url> = state
+            .served
+            .layout()
+            .expect("a served layout")
+            .path_of_module
+            .iter()
+            .filter_map(|(module, path)| Some((module.clone(), Url::from_file_path(path).ok()?)))
+            .collect();
+        let demanded = super::demand_stage(
+            state.db.db().clone(),
+            root,
+            entry_file,
+            &uri_of,
+            &entry_module,
+            state.encoding,
+            lint,
+        );
+        (demanded, uri_of)
     }
 
     /// A sync with no paired recompute leaves the current worker's lint stage

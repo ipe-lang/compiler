@@ -17,6 +17,7 @@
 //! that AST. `lint.ipe` is likewise parsed with the front-end and its sole
 //! `lint` binding walked — never evaluated (see [`config`]).
 
+mod cancel;
 mod config;
 mod config_file;
 mod finding;
@@ -29,6 +30,7 @@ use std::collections::BTreeMap;
 
 use ipe_intern::Interner;
 
+pub use cancel::{CancelFlag, CancelProbe, LintCancelled, NeverCancel};
 pub use config::{
     ConfigError, LINT_CONFIG_FILE, LINT_CONFIG_MAX_BYTES, LintConfig, Suppressions,
     read_lint_config,
@@ -80,8 +82,20 @@ impl LintReport {
 /// The result is deterministically ordered by `(module, span, rule)`, so a
 /// report and its golden are stable regardless of module or rule evaluation
 /// order.
-#[must_use]
-pub fn run(modules: &[SourceModule], config: &LintConfig) -> LintReport {
+///
+/// `probe` is polled before each module is parsed, before each rule, and before
+/// the cross-module pass, so a superseded run stops within one rule over one
+/// module.
+///
+/// # Errors
+///
+/// Returns the probe's `Cancelled` value once it fires; a run cut short never
+/// yields a report. [`NeverCancel`] makes that branch uninhabited.
+pub fn run<P: CancelProbe>(
+    modules: &[SourceModule],
+    config: &LintConfig,
+    probe: &P,
+) -> Result<LintReport, P::Cancelled> {
     // Parse every module upfront so the per-module and cross-module passes can
     // both borrow the same owned data. Modules that fail to parse are skipped
     // (the compiler surfaces parse errors; the linter reasons only over valid
@@ -94,21 +108,22 @@ pub fn run(modules: &[SourceModule], config: &LintConfig) -> LintReport {
         suppressions: Suppressions,
     }
 
-    let parsed_modules: Vec<Parsed> = modules
-        .iter()
-        .filter_map(|m| {
-            let mut interner = Interner::new();
-            let ast = ipe_parse::parse_module(&m.source, &mut interner).ok()?;
-            let suppressions = Suppressions::scan(&m.source);
-            Some(Parsed {
-                module: m.module.clone(),
-                source: m.source.clone(),
-                interner,
-                ast,
-                suppressions,
-            })
-        })
-        .collect();
+    let mut parsed_modules: Vec<Parsed> = Vec::with_capacity(modules.len());
+    for m in modules {
+        probe.poll()?;
+        let mut interner = Interner::new();
+        let Ok(ast) = ipe_parse::parse_module(&m.source, &mut interner) else {
+            continue;
+        };
+        let suppressions = Suppressions::scan(&m.source);
+        parsed_modules.push(Parsed {
+            module: m.module.clone(),
+            source: m.source.clone(),
+            interner,
+            ast,
+            suppressions,
+        });
+    }
 
     let mut findings: Vec<Finding> = Vec::new();
 
@@ -153,7 +168,7 @@ pub fn run(modules: &[SourceModule], config: &LintConfig) -> LintReport {
             }
         }
 
-        for raw in rules::run_all(&ctx) {
+        for raw in rules::run_all(&ctx, probe)? {
             let severity = config.severity_of(raw.rule);
             if severity == Severity::Allow {
                 continue;
@@ -168,6 +183,7 @@ pub fn run(modules: &[SourceModule], config: &LintConfig) -> LintReport {
     }
 
     // ── Cross-module pass ──────────────────────────────────────────────────
+    probe.poll()?;
     // Build a slice of Ctx references valid for this function's lifetime.
     let ctxs: Vec<rules::Ctx<'_>> = parsed_modules
         .iter()
@@ -200,7 +216,7 @@ pub fn run(modules: &[SourceModule], config: &LintConfig) -> LintReport {
     }
 
     findings.sort();
-    LintReport { findings }
+    Ok(LintReport { findings })
 }
 
 /// A manual-review span emitted by `apply_sig_fixes` when a call site cannot be
@@ -274,7 +290,7 @@ struct CanonModule {
 pub fn apply_sig_fixes(modules: &[SourceModule], config: &LintConfig) -> SigFixOutcome {
     use ipe_canon::ast::Def;
 
-    let report = run(modules, config);
+    let Ok(report) = run(modules, config, &crate::NeverCancel);
 
     // Collect sig-fix intents: one entry per (rule, symbol_module, symbol_name, delta).
     // Multiple findings may target the same symbol (e.g. two adjacent-bools runs on
@@ -793,7 +809,7 @@ fn collect_call_edits(
 /// semantics-preserving and removes the finding that produced it.
 #[must_use]
 pub fn apply_fixes(modules: &[SourceModule], config: &LintConfig) -> FixOutcome {
-    let report = run(modules, config);
+    let Ok(report) = run(modules, config, &crate::NeverCancel);
     let mut edits_by_module: BTreeMap<Vec<String>, Vec<Fix>> = BTreeMap::new();
     for finding in &report.findings {
         if let Some(fix) = &finding.fix {
@@ -956,7 +972,7 @@ mod tests {
     #[test]
     fn inline_suppression_silences_one_site_bare_cr() {
         let src = "module Main exposing (render)\r\r-- ipe-lint: allow adjacent-bools\rrender : Bool -> Bool -> String\rrender a b =\r    \"x\"\r";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "bare-CR source must produce no adjacent-bools finding (parse skips it), got {:?}",
@@ -975,7 +991,7 @@ mod tests {
     #[test]
     fn bare_cr_source_without_suppression_yields_no_findings() {
         let src = "module Main exposing (render)\r\rrender : Bool -> Bool -> String\rrender a b =\r    \"x\"\r";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         // Parse fails → linter skips the module → empty report.
         assert!(
             report.findings.is_empty(),
@@ -987,7 +1003,7 @@ mod tests {
     #[test]
     fn adjacent_bools_is_found_over_a_fixture() {
         let src = "module Main exposing (render)\n\nrender : Bool -> Bool -> String\nrender a b =\n    \"x\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "expected an adjacent-bools finding, got {:?}",
@@ -1003,7 +1019,7 @@ mod tests {
             "lint.ipe",
         )
         .expect("config parses");
-        let report = run(&[module(src)], &config);
+        let Ok(report) = run(&[module(src)], &config, &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "allow should silence the rule"
@@ -1013,7 +1029,7 @@ mod tests {
     #[test]
     fn inline_suppression_silences_one_site() {
         let src = "module Main exposing (render)\n\n-- ipe-lint: allow adjacent-bools\nrender : Bool -> Bool -> String\nrender a b =\n    \"x\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "inline suppression should silence the site"
@@ -1027,7 +1043,7 @@ mod tests {
         // context-free substring match would silence the finding — a fail-OPEN
         // hole. The marker is data, not a comment, so the finding must stand.
         let src = "module Main exposing (render)\n\ndoc =\n    \"see -- ipe-lint: allow adjacent-bools \"\nrender : Bool -> Bool -> String\nrender a b =\n    \"x\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "a marker inside a string literal must NOT suppress a real finding"
@@ -1048,7 +1064,7 @@ mod tests {
         // LF-style fixture would not drift far enough to prove it). The finding
         // must stand.
         let src = "module Main exposing (render)\r\n\r\n\r\n\r\n\r\n\r\n\r\ndoc =\r\n    \"see -- ipe-lint: allow adjacent-bools \"\r\nrender : Bool -> Bool -> String\r\nrender a b =\r\n    \"x\"\r\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "a marker inside a string literal must NOT suppress on CRLF source, got {:?}",
@@ -1062,7 +1078,7 @@ mod tests {
         // endings. The offset derivation must still place the marker OUTSIDE
         // every literal span so the real directive is honoured on CRLF source.
         let src = "module Main exposing (render)\r\n\r\n-- ipe-lint: allow adjacent-bools\r\nrender : Bool -> Bool -> String\r\nrender a b =\r\n    \"x\"\r\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "a real inline suppression must silence the site on CRLF source"
@@ -1148,7 +1164,7 @@ mod tests {
     fn unknown_inline_suppression_name_is_reported() {
         // `adjasent-bools` is a deliberate typo.
         let src = "module Main exposing (render)\n\n-- ipe-lint: allow adjasent-bools\nrender : Bool -> Bool -> String\nrender a b =\n    \"x\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report
                 .findings
@@ -1170,7 +1186,7 @@ mod tests {
     #[test]
     fn correct_inline_suppression_name_is_not_flagged() {
         let src = "module Main exposing (render)\n\n-- ipe-lint: allow adjacent-bools\nrender : Bool -> Bool -> String\nrender a b =\n    \"x\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report
                 .findings
@@ -1196,7 +1212,7 @@ mod tests {
             "render a b =\n",
             "    \"x\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "suppression on a mid-annotation line must silence the finding, got {:?}",
@@ -1216,7 +1232,7 @@ mod tests {
             "render a b =\n",
             "    \"x\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "adjacent-bools"),
             "suppression on span-lo line of multi-line annotation must silence, got {:?}",
@@ -1290,7 +1306,7 @@ mod tests {
                    listen : Int -> String\n\
                    listen port =\n\
                    \x20   \"ok\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         let finding = report
             .findings
             .iter()
@@ -1329,7 +1345,7 @@ mod tests {
                    run : String -> String\n\
                    run src =\n\
                    \x20   src\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "prim-param"),
             "a source-text `src : String` param must not be mis-steered to a media \
@@ -1351,7 +1367,7 @@ mod tests {
                    render : Bool -> Bool -> String\n\
                    render a b =\n\
                    \x20   \"x\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         let finding = report
             .findings
             .iter()
@@ -1434,7 +1450,7 @@ mod tests {
                    raw : String -> String\n\
                    raw data =\n\
                    \x20   \"ok\"\n";
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         let finding = report
             .findings
             .iter()
@@ -1551,7 +1567,7 @@ mod tests {
             "import Ipe.Url\n\n",
             "main = \"hello\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report
                 .findings
@@ -1570,7 +1586,7 @@ mod tests {
             "import Ipe.Url\n\n",
             "main = Url.fromString \"http://example.com\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report
                 .findings
@@ -1591,7 +1607,7 @@ mod tests {
             "import Ipe.Url exposing (..)\n\n",
             "main = \"hello\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report
                 .findings
@@ -1604,7 +1620,8 @@ mod tests {
 
     /// The `unused-imports` findings for one `Main` module.
     fn unused_imports(src: &str) -> Vec<Finding> {
-        run(&[module(src)], &LintConfig::default())
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
+        report
             .findings
             .into_iter()
             .filter(|f| f.rule == crate::rules::unused_imports::RULE)
@@ -1732,7 +1749,7 @@ mod tests {
             "    in\n",
             "    \"hello\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "unused-bindings"),
             "an unused let binding must be flagged, got {:?}",
@@ -1751,7 +1768,7 @@ mod tests {
             "    in\n",
             "    x\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "unused-bindings"),
             "a used let binding must not be flagged, got {:?}",
@@ -1773,7 +1790,7 @@ mod tests {
             "    in\n",
             "    bumped\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "unused-bindings"),
             "a binding used as a record-update base must not be flagged, got {:?}",
@@ -1793,7 +1810,7 @@ mod tests {
             "    in\n",
             "    \"hello\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report.findings.iter().any(|f| f.rule == "unused-bindings"),
             "a `_`-prefixed let binding must not be flagged, got {:?}",
@@ -1842,7 +1859,11 @@ mod tests {
                 "    \"ok\"\n",
             ),
         );
-        let report = run(&[m_a, m_b, m_c], &LintConfig::default());
+        let Ok(report) = run(
+            &[m_a, m_b, m_c],
+            &LintConfig::default(),
+            &crate::NeverCancel,
+        );
         assert!(
             report
                 .findings
@@ -1882,7 +1903,7 @@ mod tests {
                 "    \"ok\"\n",
             ),
         );
-        let report = run(&[m_a, m_b], &LintConfig::default());
+        let Ok(report) = run(&[m_a, m_b], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             !report
                 .findings
@@ -1906,7 +1927,7 @@ mod tests {
             "send email =\n",
             "    email\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "prim-param"),
             "bare `email : String` param must be flagged, got {:?}",
@@ -1924,7 +1945,7 @@ mod tests {
             "read filepath =\n",
             "    filepath\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "prim-param"),
             "bare `filepath : String` param must be flagged, got {:?}",
@@ -1942,7 +1963,7 @@ mod tests {
             "wait timeout =\n",
             "    \"ok\"\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "prim-param"),
             "bare `timeout : Int` param must be flagged, got {:?}",
@@ -1960,7 +1981,7 @@ mod tests {
             "dispatch payload =\n",
             "    payload\n",
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report.findings.iter().any(|f| f.rule == "prim-param"),
             "bare `payload : String` param must be flagged, got {:?}",
@@ -2025,7 +2046,7 @@ mod tests {
 
     fn flags_prim_param(pname: &str, ty: &str) -> bool {
         let src = prim_param_module(pname, ty);
-        let report = run(&[module(&src)], &LintConfig::default());
+        let Ok(report) = run(&[module(&src)], &LintConfig::default(), &crate::NeverCancel);
         report.findings.iter().any(|f| f.rule == "prim-param")
     }
 
@@ -2141,7 +2162,7 @@ mod tests {
 
     /// The source text of the single `unused-imports` finding for `src`.
     fn unused_import_text(src: &str) -> Option<String> {
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         let finding = report
             .findings
             .iter()
@@ -2188,5 +2209,113 @@ mod tests {
             Some(decl),
             "a suppression outside the declaration must not silence it"
         );
+    }
+
+    /// A probe that fires on its `fire_at`-th poll and counts every poll.
+    struct FiresOnPoll {
+        fire_at: usize,
+        polls: std::cell::Cell<usize>,
+    }
+
+    impl FiresOnPoll {
+        const fn new(fire_at: usize) -> Self {
+            Self {
+                fire_at,
+                polls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl CancelProbe for FiresOnPoll {
+        type Cancelled = LintCancelled;
+
+        fn poll(&self) -> Result<(), LintCancelled> {
+            let polls = self.polls.get().saturating_add(1);
+            self.polls.set(polls);
+            if polls >= self.fire_at {
+                Err(LintCancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Two modules, each carrying an unused import the default config reports.
+    fn two_linted_modules() -> [SourceModule; 2] {
+        let named = |name: &str| SourceModule {
+            module: vec![name.to_owned()],
+            source: format!("module {name} exposing (x)\n\nimport Unused\n\nx = 1\n"),
+        };
+        [named("Alpha"), named("Beta")]
+    }
+
+    /// Every checkpoint a two-module run passes: per module, one before its
+    /// parse and one before each rule; then one before the cross-module pass.
+    const fn checkpoints_of_two_modules() -> usize {
+        2 * (1 + rules::PER_MODULE_RULES.len()) + 1
+    }
+
+    /// The probe is polled before each module's parse, before every rule over
+    /// it, and before the cross-module pass, so a superseded run stops within
+    /// one rule over one module.
+    #[test]
+    fn the_probe_is_polled_before_every_rule_over_every_module() {
+        let probe = FiresOnPoll::new(usize::MAX);
+        let report = run(&two_linted_modules(), &LintConfig::default(), &probe);
+        assert!(report.is_ok(), "a probe that never fires completes the run");
+        assert_eq!(probe.polls.get(), checkpoints_of_two_modules());
+    }
+
+    /// A probe firing at any checkpoint yields `Cancelled` and stops at once.
+    ///
+    /// No checkpoint past the firing one is reached, so a run cancelled after
+    /// the first module never visits the second, and no prefix of the findings
+    /// is ever returned as a report.
+    #[test]
+    fn a_probe_firing_at_any_checkpoint_cancels_the_run_there() {
+        let modules = two_linted_modules();
+        for fire_at in 1..=checkpoints_of_two_modules() {
+            let probe = FiresOnPoll::new(fire_at);
+            let outcome = run(&modules, &LintConfig::default(), &probe);
+            assert!(
+                matches!(outcome, Err(LintCancelled)),
+                "a probe firing at checkpoint {fire_at} must cancel the run"
+            );
+            assert_eq!(
+                probe.polls.get(),
+                fire_at,
+                "the run must stop at the checkpoint that fired"
+            );
+        }
+    }
+
+    /// A run that is never cancelled reports both modules' findings.
+    #[test]
+    fn an_uncancelled_run_reports_every_module() {
+        let Ok(report) = run(&two_linted_modules(), &LintConfig::default(), &NeverCancel);
+        for name in ["Alpha", "Beta"] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|f| f.rule == UNUSED_IMPORTS
+                        && f.module.iter().map(String::as_str).eq([name])),
+                "{name}'s unused import must be reported, got {:?}",
+                report.findings
+            );
+        }
+    }
+
+    /// A set [`CancelFlag`] cancels the run; a clear one lets it complete.
+    #[test]
+    fn a_cancel_flag_cancels_only_once_set() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let modules = two_linted_modules();
+        assert!(run(&modules, &LintConfig::default(), &CancelFlag::new(&flag)).is_ok());
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            run(&modules, &LintConfig::default(), &CancelFlag::new(&flag)),
+            Err(LintCancelled)
+        ));
     }
 }
