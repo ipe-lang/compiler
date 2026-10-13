@@ -438,13 +438,11 @@ pub fn promote_untyped_boundaries(
     Ok(schemes)
 }
 
-/// One step of the iterative [`reify_scheme`] work stack — the interface
-/// sibling of [`ZonkTask`], differing in the two places an interface must be
-/// faithful where a display read-back need not be: quantified variables map
-/// to CANONICAL tagged ids (deterministic, union-find-numbering-free), and an
-/// open record tail is PRESERVED as `RowTail::Open` (zonk presents every
-/// settled record as closed, which is fine for display but would silently
-/// close a row-polymorphic exported scheme).
+/// One step of the iterative [`reify_scheme`] work stack.
+///
+/// The interface sibling of [`ZonkTask`]: quantified variables map to
+/// CANONICAL tagged ids (deterministic, union-find-numbering-free), and an
+/// open record tail is kept as `RowTail::Open` over that canonical id.
 pub enum ReifyTask {
     Visit(VarId),
     BuildFun,
@@ -636,10 +634,13 @@ pub enum ZonkTask {
     },
     /// Pop `arity` results and push a `Tuple` over them.
     BuildTuple { arity: usize },
-    /// Pop one result per field name (in `names` order) and push a `Record`. The
-    /// `names` are visited in their `BTreeMap` order, so popping in reverse pairs
-    /// each result with its field name.
-    BuildRecord { names: Vec<Symbol> },
+    /// Pop one result per field name (in `names` order) and push a `Record` over `tail`.
+    ///
+    /// The `names` are visited in their `BTreeMap` order, so popping in reverse
+    /// pairs each result with its field name. `names` is the union of the
+    /// fields along the whole row chain and `tail` is the chain's terminal
+    /// ([`zonk_row`]).
+    BuildRecord { names: Vec<Symbol>, tail: RowTail },
     /// Record the freshly assembled result on top of the stack as the read-back
     /// of union-find representative `root`, so a later visit to any variable
     /// sharing that representative reuses the cached [`Ty`] instead of walking
@@ -657,12 +658,17 @@ pub enum ZonkTask {
 /// children's visits.
 fn zonk_visit(
     uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    reading: RowReading,
     v: VarId,
-    work: &mut Vec<ZonkTask>,
-    results: &mut Vec<Ty>,
-    memo: &mut std::collections::HashMap<VarId, Ty>,
+    walk: &mut ReadBackWalk,
     nodes_left: &mut u32,
 ) -> DResult<()> {
+    let ReadBackWalk {
+        work,
+        results,
+        memo,
+    } = walk;
     let root = uf.find(v)?;
     if let Some(cached) = memo.get(&root) {
         // A representative already read back: reuse it. Sharing does not
@@ -671,12 +677,7 @@ fn zonk_visit(
         results.push(cached.clone());
         return Ok(());
     }
-    *nodes_left = nodes_left
-        .checked_sub(1)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: STAGE,
-            detail: "type exceeded read-back node limit".to_owned(),
-        })?;
+    charge_node(nodes_left)?;
     // Borrow the descriptor: leaf arms need no owned copy, and the structural
     // arms clone only the field they genuinely move into a rebuild task (the
     // module path, the record field names) rather than the whole descriptor.
@@ -729,18 +730,15 @@ fn zonk_visit(
                 work.push(ZonkTask::Visit(*e));
             }
         }
-        Content::Structure(FlatType::Record(fields, _ext)) => {
-            // Capture the field names (BTreeMap order) for the rebuild, and visit
-            // each field var in reverse so the results land in the same order the
-            // names are popped. The extension var is intentionally not zonked
-            // here — `Ty::Record` does not carry a RowTail in its resolved form
-            // (the tail is a solver artefact consumed only by unify.rs and the
-            // `BuildRecord` path). Closed records resolve to fields only; open
-            // records show as the same (tail is transparent to diagnostics for
-            // now).
+        Content::Structure(FlatType::Record(fields, ext)) => {
+            // Merge the fields of the whole row chain and read its terminal as
+            // the tail, then visit each merged field var in reverse so the
+            // results land in the same order the names are popped.
+            let (mut fields, ext) = (fields.clone(), *ext);
+            let tail = zonk_row(uf, budget, reading, nodes_left, &mut fields, ext)?;
             let names: Vec<Symbol> = fields.keys().copied().collect();
             work.push(ZonkTask::Memoize { root });
-            work.push(ZonkTask::BuildRecord { names });
+            work.push(ZonkTask::BuildRecord { names, tail });
             for v in fields.values().rev() {
                 work.push(ZonkTask::Visit(*v));
             }
@@ -758,6 +756,100 @@ fn zonk_visit(
         }
     }
     Ok(())
+}
+
+/// Consume one of the per-call read-back nodes.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] once the [`ZONK_NODE_LIMIT`] nodes are spent.
+fn charge_node(nodes_left: &mut u32) -> DResult<()> {
+    *nodes_left = nodes_left
+        .checked_sub(1)
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: STAGE,
+            detail: "type exceeded read-back node limit".to_owned(),
+        })?;
+    Ok(())
+}
+
+/// How a read-back presents a record row that ends in a variable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowReading {
+    /// Every variable terminal is an open tail ([`zonk`]).
+    Faithful,
+    /// The record the backend emits ([`zonk_emitted`]).
+    ///
+    /// A record lowers to the struct of its known fields, so a residual
+    /// non-rigid row (a `Flex`, or a non-rigid `Super`) is its zero-extension
+    /// and reads closed. A rigid terminal is an annotation's row generic,
+    /// emitted as a generic over an unknown rest, and stays open.
+    Emitted,
+}
+
+/// Walk a record's row extension to its terminal, merging the fields along the chain.
+///
+/// The tail is [`RowTail::Closed`] exactly when the chain ends in
+/// `EmptyRecord` (or, under [`RowReading::Emitted`], in a non-rigid
+/// variable), and `RowTail::Open` over the terminal's tagged representative
+/// exactly when it ends in any other variable; `fields` gains every
+/// field of every record along the way. Each hop ticks the shared [`Budget`]
+/// and consumes one read-back node, so a chain is bounded like any other
+/// structure.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when the chain ends in a non-row type, repeats
+/// a label, or exceeds [`ZONK_NODE_LIMIT`] nodes; a step-budget error if the
+/// shared budget is exhausted.
+fn zonk_row(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    reading: RowReading,
+    nodes_left: &mut u32,
+    fields: &mut BTreeMap<Symbol, VarId>,
+    ext: VarId,
+) -> DResult<RowTail> {
+    let mut ext = ext;
+    loop {
+        budget.tick()?;
+        charge_node(nodes_left)?;
+        let tail_root = uf.find(ext)?;
+        ext = match uf.root_content(tail_root)? {
+            Content::Structure(FlatType::EmptyRecord) => return Ok(RowTail::Closed),
+            Content::Flex | Content::Super { rigid: false, .. }
+                if reading == RowReading::Emitted =>
+            {
+                return Ok(RowTail::Closed);
+            }
+            Content::Flex | Content::Rigid | Content::Super { .. } => {
+                return Ok(RowTail::Open(tag_solver_var(tail_root)));
+            }
+            Content::Structure(FlatType::Record(more, next)) => {
+                for (name, var) in more {
+                    if fields.insert(*name, *var).is_some() {
+                        return Err(row_chain_bug("duplicate record label along a row chain"));
+                    }
+                }
+                *next
+            }
+            Content::Structure(
+                FlatType::Unit | FlatType::Fun(..) | FlatType::Con { .. } | FlatType::Tuple(_),
+            ) => return Err(row_chain_bug("record row ends in a non-row type")),
+        };
+    }
+}
+
+/// A record row chain that is not a row: a label repeated along it, or a
+/// non-row terminal.
+///
+/// Reachable from input while a row variable may also stand as a whole type
+/// (`a` in `{ a | x : Int } -> a -> Int`): a caller binding it to a record
+/// that repeats a chain label, or to a non-row type, builds such a chain. The
+/// read-back refuses it, failing closed, rather than drop the clash.
+fn row_chain_bug(detail: &str) -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: STAGE,
+        detail: detail.to_owned(),
+    }
 }
 
 /// Read a settled union-find variable back into a resolved [`Ty`].
@@ -778,8 +870,38 @@ fn zonk_visit(
 /// structure has more than [`ZONK_NODE_LIMIT`] nodes; [`TypeError::StepBudgetExceeded`]
 /// if the shared budget is exhausted.
 pub fn zonk(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId) -> DResult<Ty> {
-    let mut work: Vec<ZonkTask> = vec![ZonkTask::Visit(var)];
-    let mut results: Vec<Ty> = Vec::new();
+    read_back(uf, budget, RowReading::Faithful, var)
+}
+
+/// Read a settled union-find variable back as the type the backend emits for it.
+///
+/// [`zonk`], except that a record row ending in a non-rigid variable reads
+/// [`RowTail::Closed`] ([`RowReading::Emitted`]). A post-solve obligation
+/// (equality, show) is judged on this reading: it holds of the emitted value
+/// exactly when it holds of the emitted record's fields, while a rigid row
+/// generic still reads open and satisfies none.
+///
+/// # Errors
+/// As [`zonk`].
+pub fn zonk_emitted(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId) -> DResult<Ty> {
+    read_back(uf, budget, RowReading::Emitted, var)
+}
+
+/// The stacks one [`read_back`] walk drives: pending tasks, assembled results,
+/// and the read-back cache keyed by union-find representative.
+struct ReadBackWalk {
+    work: Vec<ZonkTask>,
+    results: Vec<Ty>,
+    memo: std::collections::HashMap<VarId, Ty>,
+}
+
+/// The [`zonk`] / [`zonk_emitted`] work-stack walk under `reading`.
+fn read_back(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    reading: RowReading,
+    var: VarId,
+) -> DResult<Ty> {
     let mut nodes_left = ZONK_NODE_LIMIT;
     // Read-back cache keyed by union-find representative. The occurs check in
     // unification guarantees the structure is acyclic, so this is a DAG, not a
@@ -787,71 +909,74 @@ pub fn zonk(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId) -> DRe
     // and reusing its cached `Ty` reproduces the same type while visiting the
     // shared sub-structure only once. Without it a diamond of sharing (e.g.
     // `p = (q, q)` chained) doubles the walk per level and blows the node limit.
-    let mut memo: std::collections::HashMap<VarId, Ty> = std::collections::HashMap::new();
+    let mut walk = ReadBackWalk {
+        work: vec![ZonkTask::Visit(var)],
+        results: Vec::new(),
+        memo: std::collections::HashMap::new(),
+    };
 
-    while let Some(task) = work.pop() {
+    while let Some(task) = walk.work.pop() {
         match task {
             ZonkTask::Visit(v) => {
                 budget.tick()?;
-                zonk_visit(uf, v, &mut work, &mut results, &mut memo, &mut nodes_left)?;
+                zonk_visit(uf, budget, reading, v, &mut walk, &mut nodes_left)?;
             }
             ZonkTask::Memoize { root } => {
                 // The parent `Ty` was just assembled and sits on top of the
                 // result stack; cache it under its representative so later shared
                 // visits reuse it.
-                match results.last() {
+                match walk.results.last() {
                     Some(ty) => {
-                        memo.insert(root, ty.clone());
+                        walk.memo.insert(root, ty.clone());
                     }
                     None => return Err(zonk_underflow()),
                 }
             }
             ZonkTask::BuildFun => {
-                let (Some(b), Some(a)) = (results.pop(), results.pop()) else {
+                let (Some(b), Some(a)) = (walk.results.pop(), walk.results.pop()) else {
                     return Err(zonk_underflow());
                 };
-                results.push(Ty::Fun(Box::new(a), Box::new(b)));
+                walk.results.push(Ty::Fun(Box::new(a), Box::new(b)));
             }
             ZonkTask::BuildCon {
                 module,
                 name,
                 arity,
             } => {
-                let split = results
+                let split = walk
+                    .results
                     .len()
                     .checked_sub(arity)
                     .ok_or_else(zonk_underflow)?;
-                let args = results.split_off(split);
-                results.push(Ty::Con { module, name, args });
+                let args = walk.results.split_off(split);
+                walk.results.push(Ty::Con { module, name, args });
             }
             ZonkTask::BuildTuple { arity } => {
-                let split = results
+                let split = walk
+                    .results
                     .len()
                     .checked_sub(arity)
                     .ok_or_else(zonk_underflow)?;
-                let elems = results.split_off(split);
-                results.push(Ty::Tuple(elems));
+                let elems = walk.results.split_off(split);
+                walk.results.push(Ty::Tuple(elems));
             }
-            ZonkTask::BuildRecord { names } => {
-                let split = results
+            ZonkTask::BuildRecord { names, tail } => {
+                let split = walk
+                    .results
                     .len()
                     .checked_sub(names.len())
                     .ok_or_else(zonk_underflow)?;
-                let tys = results.split_off(split);
+                let tys = walk.results.split_off(split);
                 // `tys` is in the same order as `names` (field var visits were
                 // reversed, so the results stack restores `BTreeMap` order).
                 let fields: BTreeMap<Symbol, Ty> = names.into_iter().zip(tys).collect();
-                // Zonked records are always presented as closed — the RowTail
-                // is a solver artefact; the resolved `Ty` simply carries the
-                // settled field map without advertising openness (consistent
-                // with the the compiler reference's read-back behaviour).
-                results.push(Ty::Record(fields, RowTail::Closed));
+                walk.results.push(Ty::Record(fields, tail));
             }
         }
     }
 
-    match results.pop() {
-        Some(ty) if results.is_empty() => Ok(ty),
+    match walk.results.pop() {
+        Some(ty) if walk.results.is_empty() => Ok(ty),
         _ => Err(zonk_underflow()),
     }
 }

@@ -20,7 +20,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
 
-use crate::{EntryName, FileId, FileKind, HintedKind, OpenRefusal};
+use crate::{EntryName, FileId, FileKind, HintedKind, OpenRefusal, PlaceablePrefix};
 
 /// `FILE_FLAG_BACKUP_SEMANTICS`: allows opening a directory handle.
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -217,7 +217,10 @@ impl Dir {
     ///
     /// The canonical path is walked again from the volume root, each level
     /// opened through the held level above it without following a reparse
-    /// point, so the returned handle is the one its real path names.
+    /// point, so the returned handle is the one its real path names. The
+    /// canonical prefix must be a [`PlaceablePrefix`]: a root a reparse point
+    /// resolves onto a device or a volume-GUID namespace is refused as
+    /// [`OpenRefusal::BadName`].
     pub fn open_root(path: &Path) -> Result<Self, OpenRefusal> {
         let real = std::fs::canonicalize(path).map_err(|e| refusal_of(&e))?;
         let mut parts = real.components();
@@ -226,6 +229,7 @@ impl Dir {
         else {
             return Err(OpenRefusal::Io(io::ErrorKind::InvalidInput));
         };
+        PlaceablePrefix::parse(prefix.kind()).map_err(|_| OpenRefusal::BadName)?;
         let mut root = PathBuf::from(prefix.as_os_str());
         root.push(Component::RootDir.as_os_str());
         let mut dir = open_dir_at(root)?;

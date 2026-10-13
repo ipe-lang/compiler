@@ -58,7 +58,7 @@ pub use ty::{
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
-    promote_untyped_boundaries, reify_scheme, zonk,
+    promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
@@ -1052,8 +1052,11 @@ fn infer_core(
     // cleared a function HEAD; this catches a function NESTED inside a tuple /
     // record / enum under an equality obligation (Rust cannot compare it),
     // failing closed with IPE-T0014 instead of emitting code `cargo` rejects.
+    // The type judged is the one emitted (`zonk_emitted`): a record the deferred
+    // pass left over a residual row is its known fields, whichever operand
+    // settled it first.
     for (root, orig_bounds, span, home) in pinned {
-        let ty = lift!(zonk(&mut uf, budget, root));
+        let ty = lift!(zonk_emitted(&mut uf, budget, root));
         if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
             return Err(InferError::sited(
                 super_unsatisfied(interner, orig_bounds, &ty, span),
@@ -1565,14 +1568,7 @@ fn collect_ui_msg_and_other_vars(
     other_vars: &mut BTreeSet<Symbol>,
 ) {
     match ty {
-        Ty::Var(raw) => {
-            let sym = Symbol::from_raw(*raw);
-            if in_ui_msg {
-                ui_msg_vars.insert(sym);
-            } else {
-                other_vars.insert(sym);
-            }
-        }
+        Ty::Var(raw) => note_ui_msg_or_other_var(*raw, in_ui_msg, ui_msg_vars, other_vars),
         Ty::Fun(a, b) => {
             collect_ui_msg_and_other_vars(a, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
             collect_ui_msg_and_other_vars(b, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
@@ -1594,9 +1590,16 @@ fn collect_ui_msg_and_other_vars(
                 collect_ui_msg_and_other_vars(e, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
             }
         }
-        Ty::Record(fields, _) => {
+        Ty::Record(fields, tail) => {
             for v in fields.values() {
                 collect_ui_msg_and_other_vars(v, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
+            }
+            // A row variable is a variable in the same raw space as `Ty::Var`.
+            match tail {
+                RowTail::Open(raw) => {
+                    note_ui_msg_or_other_var(*raw, in_ui_msg, ui_msg_vars, other_vars);
+                }
+                RowTail::Closed => {}
             }
         }
         // The wildcard `any` -- a bare `Html` / `Attribute` annotation is
@@ -1604,6 +1607,21 @@ fn collect_ui_msg_and_other_vars(
         // defaulting candidate: the lowerer substitutes its concrete type from
         // the body's solved region, which defaulting to `Unit` would clobber.
         Ty::Wildcard | Ty::Unit => {}
+    }
+}
+
+/// File the variable `raw` as a ui-msg-slot variable when `in_ui_msg`, else as an other-position one.
+fn note_ui_msg_or_other_var(
+    raw: u32,
+    in_ui_msg: bool,
+    ui_msg_vars: &mut BTreeSet<Symbol>,
+    other_vars: &mut BTreeSet<Symbol>,
+) {
+    let sym = Symbol::from_raw(raw);
+    if in_ui_msg {
+        ui_msg_vars.insert(sym);
+    } else {
+        other_vars.insert(sym);
     }
 }
 
@@ -1960,7 +1978,7 @@ fn check_scheme_applications(
                     None => continue,
                 },
             };
-            let ty = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
+            let ty = zonk_emitted(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
                     super_unsatisfied(interner, *b, &ty, app.span),
@@ -2064,12 +2082,10 @@ fn check_wildcard_pins(
 
 /// Whether a resolved type is ground: no type variable and no open record row.
 ///
-/// This is the read-back form of "the type is fully known": the lowerer
-/// concretizes a wildcard parameter's region only when it holds. Inference
-/// classifies a wildcard with `solved_is_ground` instead, which also sees
-/// the open rows [`zonk`] reads back as closed; every type it admits is one
-/// this admits, so the lowerer never concretizes a wildcard inference left
-/// unpinned.
+/// This is the one "the type is fully known" judgment on a [`Ty`]: the
+/// lowerer concretizes a wildcard parameter's region only when it holds.
+/// [`zonk`] reads a row tail back faithfully, so this agrees with
+/// `solved_is_ground` on the union-find a type was read back from.
 #[must_use]
 pub fn ty_is_ground(ty: &Ty) -> bool {
     match ty {
@@ -2085,9 +2101,10 @@ pub fn ty_is_ground(ty: &Ty) -> bool {
 /// Whether every solver node reachable from `roots` is known: no type
 /// variable, and every record extension ends in the closed-row sentinel.
 ///
-/// Read on the union-find, not on a zonked [`Ty`]: [`zonk`] presents every
-/// record as closed, so an open row a field read left behind is invisible
-/// after read-back. A type this admits zonks to one [`ty_is_ground`] admits.
+/// The union-find form of [`ty_is_ground`]: inference classifies a wildcard
+/// before read-back. [`zonk`] keeps every open row tail, so a node this
+/// admits zonks to a type [`ty_is_ground`] admits, and one it refuses zonks
+/// to a type [`ty_is_ground`] refuses.
 ///
 /// # Errors
 /// A union-find invariant violation, or [`TypeError::StepBudgetExceeded`]
@@ -2475,14 +2492,15 @@ pub const MAX_SHOWN_TUPLE_ARITY: usize = 12;
 /// Whether a resolved type has a rendering: every leaf of it has a runtime
 /// show row that is not `Refused`.
 ///
-/// Refuses a bare type variable (fail-closed, like every sibling obligation), a
+/// Refuses a bare type variable and a record with an open row tail (an unknown
+/// rest of the record; fail-closed, like every sibling obligation), a
 /// function, a tuple wider than [`MAX_SHOWN_TUPLE_ARITY`], an opaque FFI
 /// handle ([`EnumEmbeds::is_opaque_handle`]), and an enum whose definition
 /// embeds a function or a handle ([`EnumEmbeds`]). A transparent FFI union is
 /// shown like any user union. Every type argument is walked.
 fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) | Ty::Record(_, RowTail::Open(_)) => false,
         Ty::Unit => true,
         Ty::Tuple(elems) => {
             elems.len() <= MAX_SHOWN_TUPLE_ARITY
@@ -2490,7 +2508,7 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
                     .iter()
                     .all(|e| ty_is_showable(interner, e, enum_embeds))
         }
-        Ty::Record(fields, _) => fields
+        Ty::Record(fields, RowTail::Closed) => fields
             .values()
             .all(|f| ty_is_showable(interner, f, enum_embeds)),
         Ty::Con { module, name, args } => {
@@ -2505,8 +2523,9 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 
 /// Whether a resolved type derives Rust's `PartialEq`: true for every fully
 /// concrete type containing no function anywhere (primitives, unit, tuples,
-/// records, and enums all derive `PartialEq`; a function never does). A bare
-/// type variable is rejected (fail-closed): an equality obligation that escaped
+/// closed records, and enums all derive `PartialEq`; a function never does). A
+/// bare type variable, and a record whose open row tail leaves the rest of the
+/// record unknown, is rejected (fail-closed): an equality obligation that escaped
 /// into an enclosing generic is not yet propagated across binding boundaries.
 /// The phantom `row` argument of an [`ipe_ir::STORE_ROW_PHANTOM_UNIONS`] union
 /// is not walked: lowering erases it, so the emitted non-generic enum's
@@ -2514,12 +2533,12 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 /// compares `IpeDbStorePred` values whatever `row` is).
 fn ty_is_equatable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) | Ty::Record(_, RowTail::Open(_)) => false,
         Ty::Unit => true,
         Ty::Tuple(elems) => elems
             .iter()
             .all(|e| ty_is_equatable(interner, e, enum_embeds)),
-        Ty::Record(fields, _) => fields
+        Ty::Record(fields, RowTail::Closed) => fields
             .values()
             .all(|f| ty_is_equatable(interner, f, enum_embeds)),
         // A `Ty::Con` head names a user enum (or a builtin like `Maybe`) whose
@@ -6769,6 +6788,57 @@ mod tests {
     }
 
     #[test]
+    fn equality_on_a_deferred_record_base_holds_nested_and_aliased() {
+        // The deferred settle leaves `a` over a residual row whatever spelling
+        // reaches it: inside a tuple, through a `let` alias, or as both
+        // operands of a generic use. Each is judged on the emitted record.
+        for body in [
+            "ok a =\n    a.x == 1 && (a, 1) == (a, 1)\n",
+            "ok a =\n    (a, 1) == (a, 1) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && (let b = a in b == b)\n",
+            "ok a =\n    (let b = a in b == b) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+            "ok a =\n    same a a && a.x == 1\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(r.is_ok(), "`{body}` must infer: {r:?}");
+        }
+    }
+
+    #[test]
+    fn equality_on_a_record_extended_by_a_function_is_refused() {
+        // The residual row reads closed only while nothing extends it: a use
+        // that adds a function field makes the compared record unequatable,
+        // in either operand order.
+        for body in [
+            "ok a =\n    a.x == 1 && a == a\n\nuse = ok { x = 1, f = \\y -> y }\n",
+            "ok a =\n    a == a && a.x == 1\n\nuse = ok { x = 1, f = \\y -> y }\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equality_on_a_rigid_row_record_is_refused() {
+        // An annotation's row variable is a generic over an unknown rest: no
+        // equality holds of it, compared directly or through a generic use.
+        for body in [
+            "ok : { r | x : Int } -> Bool\nok a =\n    a == a\n",
+            "ok : { r | x : Int } -> Bool\nok a =\n    same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
     fn pinned_super_check_sees_a_later_default() {
         // `p == p` is constrained before `n + 1` makes `n` numeric: the deep
         // equality check on `{ x = n }` must read `n` after it defaults to
@@ -8291,6 +8361,50 @@ mod tests {
         let too_wide = Ty::Tuple(vec![int_ty; MAX_SHOWN_TUPLE_ARITY + 1]);
         assert!(ty_is_showable(&i, &widest, &embeds));
         assert!(!ty_is_showable(&i, &too_wide, &embeds));
+    }
+
+    /// A record whose row tail is open has an unknown rest, so neither the
+    /// equality nor the show obligation admits it, at either site; the same
+    /// fields over a closed tail satisfy both.
+    #[test]
+    fn an_open_row_record_satisfies_no_obligation() {
+        let mut i = Interner::new();
+        let int_ty = con_ty(&mut i, &[], "Int");
+        let x = i.intern("x").expect("intern a field name");
+        let embeds = EnumEmbeds::default();
+        let record = |tail: RowTail| Ty::Record(BTreeMap::from([(x, int_ty.clone())]), tail);
+        let closed = record(RowTail::Closed);
+        let open = record(RowTail::Open(7));
+        assert!(ty_is_equatable(&i, &closed, &embeds));
+        assert!(ty_is_showable(&i, &closed, &embeds));
+        assert!(!ty_is_equatable(&i, &open, &embeds));
+        assert!(!ty_is_showable(&i, &open, &embeds));
+        let nested = Ty::Tuple(vec![int_ty, open.clone()]);
+        assert!(!ty_is_equatable(&i, &nested, &embeds));
+        assert!(!ty_is_showable(&i, &nested, &embeds));
+        for site in BOTH_SITES {
+            assert!(super_bounds_satisfied(
+                &i,
+                TyBounds::eq(),
+                &closed,
+                site,
+                &embeds
+            ));
+            assert!(!super_bounds_satisfied(
+                &i,
+                TyBounds::eq(),
+                &open,
+                site,
+                &embeds
+            ));
+            assert!(!super_bounds_satisfied(
+                &i,
+                TyBounds::show(),
+                &open,
+                site,
+                &embeds
+            ));
+        }
     }
 
     /// A one-constructor union `name` at home `Main` whose payload is `arg`.

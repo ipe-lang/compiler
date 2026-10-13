@@ -3,13 +3,15 @@
 //! Opening, classifying, and identifying a held level live in [`ipe_fs_open`];
 //! what stays here creates, renames, unlinks, and lists through its handle.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 
 use ipe_fs_open::{EntryName, HeldDir};
 use rustix::fs::{AtFlags, Mode, OFlags};
+
+use super::Listed;
 
 /// Flags for exclusively creating a new file that is never a link.
 fn new_file_flags() -> OFlags {
@@ -116,13 +118,13 @@ pub fn rmdir(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
     )?)
 }
 
-/// The names of the entries of `dir`, `.` and `..` excluded.
-pub fn names(dir: &HeldDir) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
+/// The entries of `dir`, `.` and `..` excluded, each name parsed once into a [`Listed`].
+pub fn names(dir: &HeldDir) -> io::Result<impl Iterator<Item = io::Result<Listed>>> {
     let entries = rustix::fs::Dir::read_from(dir.handle())?;
     Ok(entries.filter_map(|entry| match entry {
         Ok(entry) => {
             let name = OsStr::from_bytes(entry.file_name().to_bytes());
-            (name != "." && name != "..").then(|| Ok(name.to_os_string()))
+            (name != "." && name != "..").then(|| Ok(Listed::of(name)))
         }
         Err(e) => Some(Err(e.into())),
     }))

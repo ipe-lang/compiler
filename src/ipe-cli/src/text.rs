@@ -1638,6 +1638,10 @@ messages! {
     output_parent_traversal(path) = "output-parent-traversal";
     /// An output that names no single absolute place on every platform.
     output_unplaceable(path) = "output-unplaceable";
+    /// A relative output walked on from a working directory that names no single absolute place.
+    output_unplaceable_cwd(cwd, request) = "output-unplaceable-cwd";
+    /// A listed entry whose name no held handle can open.
+    output_unnameable_entry(path) = "output-unnameable-entry";
     /// An eject output that is not absent or empty.
     output_not_fresh(path) = "output-not-fresh";
     /// A product path with a component other than a plain name.

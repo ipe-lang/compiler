@@ -432,6 +432,16 @@ fn a_file_is_not_a_child_directory() {
     );
 }
 
+/// A device namespace is never held as a root, whatever canonicalising makes of it.
+#[cfg(windows)]
+#[test]
+fn open_root_refuses_a_device_prefix_after_canonicalising() {
+    for device in [r"\\.\pipe\", r"\\.\NUL", r"\\?\GLOBALROOT\Device\Null"] {
+        let root = HeldDir::open_root(Path::new(device));
+        assert!(root.is_err(), "{device} must not be held, got {root:?}");
+    }
+}
+
 /// Zero is not a cap: no constructor turns it into an unbounded read.
 #[test]
 fn zero_is_not_a_cap() {

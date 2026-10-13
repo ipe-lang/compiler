@@ -26,7 +26,7 @@
 //! write acts live in `unix` (descriptor-relative `*at` calls) and `windows`
 //! (handle-relative creates and deletes; path acts run under a sentinel pin).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU64;
@@ -133,6 +133,27 @@ pub enum EntryKind {
     Symlink,
     /// Anything else: a regular file, a FIFO, a socket, a device.
     Other,
+}
+
+/// One entry a directory listing yields, its name parsed once.
+///
+/// A listing hands its consumers this, never a raw name, so no consumer
+/// re-parses a name or carries one it could not act on: an `Entry` is opened
+/// handle-relative, an `Unnameable` one is reported by name and never acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Listed {
+    /// A name a held handle opens as the entry it spells.
+    Entry(EntryName),
+    /// A name no held handle can open (on Windows, one not valid Unicode or one Win32 reserves).
+    Unnameable(OsString),
+}
+
+impl Listed {
+    /// The listing entry `name`, parsed by the one entry-name rule.
+    #[must_use]
+    pub fn of(name: &OsStr) -> Self {
+        EntryName::new(name).map_or_else(|| Self::Unnameable(name.to_os_string()), Self::Entry)
+    }
 }
 
 /// An open directory handle and the path it was reached by.
@@ -317,26 +338,23 @@ impl HeldDir {
     /// The entry `name` of this directory as one plain entry name.
     ///
     /// # Errors
-    /// [`CliError::Io`] of [`io::ErrorKind::InvalidInput`] when it is not one.
-    fn entry(&self, name: &OsStr) -> Result<EntryName, CliError> {
-        EntryName::new(name).ok_or_else(|| {
-            act_err(
-                &self.path.join(name),
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a plain entry name", name.to_string_lossy()),
-                ),
-            )
-        })
+    /// [`OutputRefusal::UnnameableEntry`] when it is not one.
+    pub fn entry(&self, name: &OsStr) -> Result<EntryName, CliError> {
+        EntryName::new(name)
+            .ok_or_else(|| OutputRefusal::UnnameableEntry(self.path.join(name)).into())
+    }
+
+    /// The refusal of the listed entry `name`, which no held handle can open.
+    fn unnameable(&self, name: &OsStr) -> CliError {
+        OutputRefusal::UnnameableEntry(self.path.join(name)).into()
     }
 
     /// Classify the entry `name` without following a link.
     ///
     /// # Errors
     /// [`CliError::Io`] on a failure other than absence.
-    pub fn kind_of(&self, name: &OsStr) -> Result<EntryKind, CliError> {
-        let entry = self.entry(name)?;
-        match self.dir.kind_of(&entry) {
+    pub fn kind_of(&self, name: &EntryName) -> Result<EntryKind, CliError> {
+        match self.dir.kind_of(name) {
             Ok(None) => Ok(EntryKind::Absent),
             Ok(Some(FileKind::Dir)) => Ok(EntryKind::Directory),
             Ok(Some(FileKind::Symlink)) => Ok(EntryKind::Symlink),
@@ -347,7 +365,7 @@ impl HeldDir {
                 | FileKind::Device
                 | FileKind::Other,
             )) => Ok(EntryKind::Other),
-            Err(refusal) => Err(refused(&self.path.join(name), refusal)),
+            Err(refusal) => Err(refused(&self.path.join(name.as_os_str()), refusal)),
         }
     }
 
@@ -529,19 +547,17 @@ impl HeldDir {
     fn has_foreign_entry(&self) -> Result<bool, CliError> {
         let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
         for name in names {
-            let name = match name {
-                Ok(name) => name,
+            let entry = match name {
+                Ok(Listed::Entry(entry)) => entry,
+                Ok(Listed::Unnameable(_)) => return Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(act_err(&self.path, e)),
             };
-            let Some(entry) = EntryName::new(&name) else {
-                return Ok(true);
-            };
             let foreign = match self.dir.kind_of(&entry) {
                 Ok(None) => false,
-                Ok(Some(kind)) => tolerated_entry(&name, kind) == Tolerated::Foreign,
+                Ok(Some(kind)) => tolerated_entry(entry.as_os_str(), kind) == Tolerated::Foreign,
                 Err(OpenRefusal::Denied) => true,
-                Err(refusal) => return Err(refused(&self.path.join(&name), refusal)),
+                Err(refusal) => return Err(refused(&self.path.join(entry.as_os_str()), refusal)),
             };
             if foreign {
                 return Ok(true);
@@ -906,7 +922,7 @@ impl HeldDir {
         if Self::is_reserved(name) {
             return Err(OutputRefusal::UnsafeComponent(self.path.join(name)).into());
         }
-        if self.kind_of(name)? == EntryKind::Symlink {
+        if self.kind_of(&self.entry(name)?)? == EntryKind::Symlink {
             return Err(OutputRefusal::Symlink(self.path.join(name)).into());
         }
         let tmp = format!(".{}.ipe-tmp.{}", name.to_string_lossy(), temp_suffix());
@@ -954,7 +970,7 @@ impl HeldDir {
     /// [`OutputRefusal::Symlink`]; [`OutputRefusal::TooDeep`] for a tree nested
     /// deeper than [`MAX_REMOVE_DEPTH`]; [`CliError::Io`] on a filesystem failure.
     pub fn remove_entry(&self, name: &OsStr) -> Result<(), CliError> {
-        match self.kind_of(name)? {
+        match self.kind_of(&self.entry(name)?)? {
             EntryKind::Absent => Ok(()),
             EntryKind::Symlink => Err(OutputRefusal::Symlink(self.path.join(name)).into()),
             EntryKind::Directory => self.remove_dir(name, 0),
@@ -1012,15 +1028,17 @@ impl HeldDir {
     fn remove_contents(&self, depth: usize) -> Result<(), CliError> {
         let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
         for name in names {
-            let name = match name {
-                Ok(name) => name,
+            let entry = match name {
+                Ok(Listed::Entry(entry)) => entry,
+                Ok(Listed::Unnameable(name)) => return Err(self.unnameable(&name)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(act_err(&self.path, e)),
             };
-            match self.kind_of(&name)? {
+            let name = entry.as_os_str();
+            match self.kind_of(&entry)? {
                 EntryKind::Absent => {}
-                EntryKind::Directory => self.remove_dir(&name, depth.saturating_add(1))?,
-                EntryKind::Symlink | EntryKind::Other => self.unlink(&name)?,
+                EntryKind::Directory => self.remove_dir(name, depth.saturating_add(1))?,
+                EntryKind::Symlink | EntryKind::Other => self.unlink(name)?,
             }
         }
         Ok(())
@@ -1059,7 +1077,8 @@ impl HeldDir {
     /// [`OutputRefusal::Replaced`] when `name` no longer names `child`;
     /// [`OutputRefusal::Symlink`] for a link there; [`OutputRefusal::TooDeep`];
     /// [`OutputRefusal::InUse`] for an entry another program holds open
-    /// (Windows); [`CliError::Io`] on another filesystem failure.
+    /// (Windows); [`OutputRefusal::UnnameableEntry`] for a listed entry no
+    /// held handle can open; [`CliError::Io`] on another filesystem failure.
     pub fn remove_proven(&self, name: &OsStr, child: Self) -> Result<(), CliError> {
         self.remove_held(name, child, 0)
     }
@@ -1180,15 +1199,17 @@ impl HeldDir {
         }
         let names = sys::names(&self.dir).map_err(|e| act_err(&self.path, e))?;
         for name in names {
-            let name = match name {
-                Ok(name) => name,
+            let entry = match name {
+                Ok(Listed::Entry(entry)) => entry,
+                Ok(Listed::Unnameable(name)) => return Err(self.unnameable(&name)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(act_err(&self.path, e)),
             };
-            rel.push(&name);
-            let result = match self.kind_of(&name) {
+            let name = entry.as_os_str();
+            rel.push(name);
+            let result = match self.kind_of(&entry) {
                 Ok(EntryKind::Absent) => Ok(()),
-                Ok(EntryKind::Directory) => self.child(&name).and_then(|child| {
+                Ok(EntryKind::Directory) => self.child(name).and_then(|child| {
                     child.map_or(Ok(()), |child| {
                         level_held(child.path());
                         child.prune(rel, keep, depth.saturating_add(1), max_depth)
@@ -1198,7 +1219,7 @@ impl HeldDir {
                     if keep(rel) {
                         Ok(())
                     } else {
-                        self.unlink(&name)
+                        self.unlink(name)
                     }
                 }
                 Err(e) => Err(e),
@@ -1364,6 +1385,76 @@ mod tests {
 
     use std::cell::Cell;
     use std::rc::Rc;
+
+    /// A listed name `EntryName::new` refuses is unnameable; one it admits is the entry it spells.
+    #[test]
+    fn listed_refuses_what_entry_name_refuses() {
+        for raw in ["", ".", "..", "a/b", "a\0b"] {
+            let listed = Listed::of(OsStr::new(raw));
+            assert_eq!(
+                listed,
+                Listed::Unnameable(OsString::from(raw)),
+                "{raw:?} must be unnameable"
+            );
+        }
+        for raw in ["plain", ".ipe-output", "with space", "caf\u{e9}"] {
+            let listed = Listed::of(OsStr::new(raw));
+            assert!(
+                matches!(&listed, Listed::Entry(entry) if entry.as_os_str() == raw),
+                "{raw:?} must be listed as itself, got {listed:?}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let bytes = OsStr::from_bytes(b"not-utf8-\xff");
+            let listed = Listed::of(bytes);
+            assert!(
+                matches!(&listed, Listed::Entry(entry) if entry.as_os_str() == bytes),
+                "a Unix name of plain bytes is an entry, got {listed:?}"
+            );
+        }
+    }
+
+    /// No listing consumer takes a raw name: classification takes an `EntryName` and errors are typed.
+    #[test]
+    fn no_listing_consumer_takes_a_raw_name() {
+        let source = include_str!("held.rs");
+        for forbidden in [
+            concat!("fn kind_of(&self, name: ", "&OsStr"),
+            concat!("is not a plain ", "entry name"),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "held.rs must not hold {forbidden:?}"
+            );
+        }
+    }
+
+    /// A listed entry no held handle can open blocks a removal by name and leaves its directory intact.
+    #[cfg(windows)]
+    #[test]
+    fn a_non_unicode_entry_blocks_clean_and_is_named() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let base = scratch("non-unicode-entry");
+        let name = OsStr::new("held");
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).expect("make held");
+        let lone = OsString::from_wide(&[0x61, 0xD800]);
+        std::fs::write(dir.join(&lone), "x").expect("NTFS stores a lone surrogate name");
+        let (parent, child) = hold(&base, name);
+        let result = parent.remove_proven(name, child);
+        assert!(
+            matches!(
+                &result,
+                Err(CliError::OutputRefused(OutputRefusal::UnnameableEntry(path)))
+                    if path == &dir.join(&lone)
+            ),
+            "an unnameable entry must be named, got {result:?}"
+        );
+        assert!(dir.join(&lone).exists(), "the directory is left intact");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// A fresh, empty scratch directory unique to this test process.
     fn scratch(tag: &str) -> PathBuf {
