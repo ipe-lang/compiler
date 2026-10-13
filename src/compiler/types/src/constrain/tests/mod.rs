@@ -2640,10 +2640,11 @@ mod zonk_sharing_tests {
 #[cfg(test)]
 mod zonk_row_tail_tests {
     use super::super::{
-        BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, SolverSteps, Ty,
-        TyBounds, TypeError, UnionFind, VarId, ZONK_NODE_LIMIT, promote_untyped_boundaries,
-        tag_solver_var, zonk, zonk_emitted,
+        BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, Ty, TyBounds, TypeError,
+        UnionFind, VarId, ZONK_NODE_LIMIT, promote_untyped_boundaries, tag_solver_var, zonk,
+        zonk_emitted,
     };
+    use crate::SolverSteps;
     use ipe_intern::{Interner, Symbol};
 
     const MAIN_HDR: &str = "module Main exposing (main)\n\n";
