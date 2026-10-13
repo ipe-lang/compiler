@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::doc::{ChainOperand, Doc, LeafNorm};
+use crate::emit_expr::InfixOp;
 
 use super::RenderConfig;
 
@@ -99,7 +100,7 @@ fn render_within_spend(
         )
     });
     if spend.exhausted {
-        return (doc.plain_layout(), spend);
+        return (doc.plain_layout(indent), spend);
     }
     (out, spend)
 }
@@ -1594,7 +1595,7 @@ const ARM_PATTERN_RESERVE: usize = 5;
 /// arm's indent, so the reservation REPLACES the enclosing trailing-sibling
 /// reserve (the ` => ` text the arm concat carries) instead of stacking on it.
 fn render_or_pattern(
-    alts: &[std::borrow::Cow<'static, str>],
+    alts: &[crate::doc::Leaf],
     cfg: RenderConfig,
     col: usize,
     flat: bool,
@@ -2295,13 +2296,13 @@ fn render_if_else(
         // enclosing group could in principle break it, but the width test already
         // guaranteed it fits.
         let pieces = [
-            &Doc::text("(if "),
+            &Doc::text(leaf!("(if ")),
             cond,
-            &Doc::text(" { "),
+            &Doc::text(leaf!(" { ")),
             then_,
-            &Doc::text(" } else { "),
+            &Doc::text(leaf!(" } else { ")),
             else_,
-            &Doc::text(" })"),
+            &Doc::text(leaf!(" })")),
         ];
         render_concat(&pieces, cfg, indent, start_col, flat, out);
         return;
@@ -2310,12 +2311,19 @@ fn render_if_else(
     // Broken block form. Braces sit at the enclosing block `indent`; each branch
     // body indents to `indent + 4`. `HardLine`s force the layout unconditionally,
     // matching `rustfmt`'s block-form `if` once past the single-line threshold.
-    let head = [&Doc::text("(if "), cond, &Doc::text(" {")];
+    let head = [&Doc::text(leaf!("(if ")), cond, &Doc::text(leaf!(" {"))];
     render_concat(&head, cfg, indent, start_col, flat, out);
     render_if_branch(then_, cfg, indent, start_col, flat, out);
-    render_at(&Doc::text("} else {"), cfg, indent, start_col, flat, out);
+    render_at(
+        &Doc::text(leaf!("} else {")),
+        cfg,
+        indent,
+        start_col,
+        flat,
+        out,
+    );
     render_if_branch(else_, cfg, indent, start_col, flat, out);
-    render_at(&Doc::text("})"), cfg, indent, start_col, flat, out);
+    render_at(&Doc::text(leaf!("})")), cfg, indent, start_col, flat, out);
 }
 
 /// One branch of a broken [`Doc::IfElse`]: the branch body on its own line one
@@ -2988,7 +2996,7 @@ fn chain_flat_fits_single_line(
     let run = flat_run(
         operands.iter().enumerate().map(|(i, o)| {
             let op = if i > 0 {
-                o.leading_op.as_deref().unwrap_or("").len() + 2
+                o.leading_op.map_or("", InfixOp::spelling).len() + 2
             } else {
                 0
             };
@@ -3084,7 +3092,7 @@ fn render_chain(
         }
         // Non-first operands always carry a leading operator (the builder
         // invariant); an absent one degrades to no operator rather than panicking.
-        let op = operand.leading_op.as_deref().unwrap_or("");
+        let op = operand.leading_op.map_or("", InfixOp::spelling);
 
         if !broken {
             let cur = current_col(out);
@@ -3825,7 +3833,7 @@ fn last_head(doc: &Doc) -> &Doc {
 }
 
 /// An empty text leaf, the zero-width combining head of a non-combinable construct.
-static EMPTY_LEAF: Doc = Doc::Text(std::borrow::Cow::Borrowed(""));
+static EMPTY_LEAF: Doc = Doc::Text(crate::doc::Leaf::EMPTY);
 
 /// The flat-rendered length of a delimiter/head leaf (`f(`, `Box::new((`), used to
 /// shrink the recursive combining budget one nesting step.
@@ -3944,7 +3952,7 @@ fn delimited_expr_uncached(doc: &Doc) -> bool {
     match doc {
         Doc::CallArgs { open, elems, .. } => match open.as_ref() {
             // A tuple `(` or an array `vec![` / `[`.
-            Doc::Text(h) if h.as_ref() == "(" || h.ends_with('[') => true,
+            Doc::Text(h) if h.as_str() == "(" || h.ends_with('[') => true,
             // A `Box::new(<delimited>)` / `Some(<delimited>)` single-arg wrapper:
             // delimited iff its inner is (its own `(`-ended named head).
             Doc::Text(h) if h.ends_with('(') && !h.contains('{') && elems.len() == 1 => {
@@ -4047,7 +4055,7 @@ fn render_chain_flat(
     for (i, operand) in operands.iter().enumerate() {
         if i > 0 {
             out.push(' ');
-            out.push_str(operand.leading_op.as_deref().unwrap_or(""));
+            out.push_str(operand.leading_op.map_or("", InfixOp::spelling));
             out.push(' ');
         }
         let c = current_col(out);

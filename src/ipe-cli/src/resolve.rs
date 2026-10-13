@@ -451,7 +451,18 @@ pub(crate) fn fetch_and_verify_index_version_within(
 /// ceiling or holds a refused entry; [`CliError::Io`] on a read failure;
 /// [`CliError::Resolve`] on a malformed lockfile.
 pub fn verify_lockfile_hashes(project_root: &Path) -> Result<(), CliError> {
-    let lockfile = Lockfile::read(project_root)?;
+    verify_locked_hashes(project_root, &Lockfile::read(project_root)?)
+}
+
+/// [`verify_lockfile_hashes`] over an already-read `lockfile`.
+///
+/// The pins are those of a captured package snapshot, so the check judges the
+/// same `ipe.lock` bytes as every other audit check rather than a second read
+/// of the working tree.
+///
+/// # Errors
+/// As [`verify_lockfile_hashes`], minus the lockfile read.
+pub fn verify_locked_hashes(project_root: &Path, lockfile: &Lockfile) -> Result<(), CliError> {
     for dep in lockfile.packages() {
         let Some(cached) = dep_cache_dir(project_root, dep).filter(|dir| dir.is_dir()) else {
             // Not cached locally — nothing to re-verify here; a build re-fetches
@@ -1591,6 +1602,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&proj);
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn verify_locked_hashes_judges_the_given_pins_not_the_live_lockfile() {
+        // The pins handed in are the ones judged: a tampered cache is refused
+        // even after the working tree's `ipe.lock` is emptied, so a lockfile
+        // swapped between capture and the check cannot hide the drift.
+        let proj = temp_dir("verify-given-pins");
+        scaffold_project(&proj);
+        let src = git_source("verify-given-pins-src", "module Lib\n");
+        let dep = IpeDep::Git {
+            url: src.display().to_string(),
+            rev: None,
+        };
+        resolve_escape(&proj, "pinneddep", &dep).expect("resolve");
+        let lock = Lockfile::read(&proj).expect("lock");
+        let entry = lock
+            .packages()
+            .iter()
+            .find(|p| p.name.as_str() == "pinneddep")
+            .expect("pinneddep locked")
+            .clone();
+        let pinneddep = PackageName::parse("pinneddep").expect("valid name");
+        let cache = cache_dir(
+            &proj,
+            &pinneddep,
+            CacheSlot::Escape(entry.origin.pinned_rev().expect("a git escape pins a rev")),
+        );
+        std::fs::write(cache.join("TAMPERED"), "evil").expect("tamper");
+        std::fs::write(proj.join("ipe.lock"), "").expect("empty the live lockfile");
+
+        let result = super::verify_locked_hashes(&proj, &lock);
+        let _ = std::fs::remove_dir_all(&proj);
+        let _ = std::fs::remove_dir_all(&src);
+        assert!(
+            matches!(result, Err(crate::CliError::HashMismatch { .. })),
+            "the given pins must be judged, not the live lockfile: {result:?}"
+        );
     }
 
     #[test]
