@@ -84,7 +84,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
 | `IPE_EXHAUST_BUDGET` | 2000000 | Maximum work units the pattern-match exhaustiveness pass spends on a single `case` before giving up and emitting a budget-exceeded error. Set to `0` for no limit (escape hatch for a `case` with very many independent or-patterns). Raise when the compiler reports an exhaustiveness budget-exceeded diagnostic. | `Tunable` |
-| `IPE_SOLVER_BUDGET` | 5000000 | Maximum unification steps the type solver takes before giving up and emitting a budget-exceeded error. Set to `0` for no limit (escape hatch for programs with very large type graphs). Raise when the compiler reports a budget-exceeded diagnostic. | `Tunable` |
+| `IPE_SOLVER_BUDGET` | 5000000 | Maximum unification steps the type solver takes over the whole program before giving up and emitting a budget-exceeded error. `0` is refused with that error: the limit is always a positive step count. Each module's own solve runs under the same limit, and a program whose modules together spend more than half of it is decided by the whole-program solve. Raise when the compiler reports a budget-exceeded diagnostic. | `Tunable` |
 
 ## Compression
 
