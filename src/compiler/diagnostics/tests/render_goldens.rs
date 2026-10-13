@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use ipe_diagnostics::{
     AliasExpansionKind, Candidates, Construct, Diagnostic, EditTarget, Expected, ExpectedSet,
     Feature, LowerError, NameError, ParseError, SortedNames, Span, TokenKind, TyDoc, TypeError,
+    suggest,
 };
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,24 @@ fn goldens_dir() -> PathBuf {
     // CARGO_MANIFEST_DIR points at the crate root during tests.
     let manifest = ipe_env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| String::from("."));
     PathBuf::from(manifest).join("tests").join("render_goldens")
+}
+
+/// The hits a resolver site gets for `typo` over `names`.
+fn ranked(typo: &str, names: &[&str]) -> Box<[suggest::Hit<Box<str>>]> {
+    let Ok(query) = suggest::Query::parse(typo, suggest::Shape::Flat) else {
+        return Box::new([]);
+    };
+    let universe = names.iter().map(|name| suggest::Spelling {
+        text: name,
+        target: Box::<str>::from(*name),
+    });
+    let policy = suggest::Policy {
+        cap: suggest::Cap::MAX,
+        threshold: suggest::Threshold::Relative,
+    };
+    suggest::rank(&query, universe, policy)
+        .hits
+        .into_boxed_slice()
 }
 
 fn update_mode() -> bool {
@@ -168,7 +187,7 @@ fn golden_name_value_not_found_single_suggestion() -> Result<(), Box<dyn std::er
             name: "lenght".into(),
             suggestions: Candidates::at(
                 EditTarget::whole(Span::new(40, 46), "lenght"),
-                Box::new(["length".into()]),
+                ranked("lenght", &["length"]),
             ),
         },
     };
@@ -189,7 +208,7 @@ fn golden_name_module_not_found_multi_suggestion() -> Result<(), Box<dyn std::er
         span: Span::new(34, 39),
         msg: NameError::ModuleNotFound {
             name: "Httpp".into(),
-            suggestions: Candidates::hints(Box::new(["Http".into(), "Https".into()])),
+            suggestions: Candidates::hints(ranked("Httpp", &["Https", "Http"])),
         },
     };
     check_golden(
@@ -355,7 +374,7 @@ fn golden_name_value_not_found_tab_indented() -> Result<(), Box<dyn std::error::
             name: "lenght".into(),
             suggestions: Candidates::at(
                 EditTarget::whole(Span::new(37, 43), "lenght"),
-                Box::new(["length".into()]),
+                ranked("lenght", &["length"]),
             ),
         },
     };

@@ -385,38 +385,59 @@ mod tests {
         );
     }
 
+    /// The hits a resolver site gets for `typo` over `names`.
+    fn ranked(typo: &str, names: &[&str]) -> Box<[suggest::Hit<Box<str>>]> {
+        let Ok(query) = suggest::Query::parse(typo, suggest::Shape::Flat) else {
+            return Box::new([]);
+        };
+        let universe = names.iter().map(|name| suggest::Spelling {
+            text: name,
+            target: Box::<str>::from(*name),
+        });
+        let policy = suggest::Policy {
+            cap: suggest::Cap::MAX,
+            threshold: suggest::Threshold::Relative,
+        };
+        suggest::rank(&query, universe, policy)
+            .hits
+            .into_boxed_slice()
+    }
+
+    /// The help a `ValueNotFound` for `typo` at `0..len` gets over `names`.
+    fn value_help(typo: &str, names: &[&str]) -> Vec<HelpLine> {
+        let span = Span::new(0, u32::try_from(typo.len()).unwrap_or(u32::MAX));
+        Diagnostic::Name {
+            span,
+            msg: NameError::ValueNotFound {
+                name: typo.into(),
+                suggestions: Candidates::at(EditTarget::whole(span, typo), ranked(typo, names)),
+            },
+        }
+        .help()
+    }
+
     #[test]
     fn did_you_mean_preserves_producer_order() {
         let d = Diagnostic::Name {
             span: Span::DUMMY,
             msg: NameError::ValueNotFound {
-                name: "lenght".into(),
-                suggestions: Candidates::hints(Box::new(["length".into(), "list".into()])),
+                name: "mab".into(),
+                suggestions: Candidates::hints(ranked("mab", &["map", "mad"])),
             },
         };
         assert_eq!(
             d.help(),
             vec![
-                HelpLine::DidYouMean("length".into()),
-                HelpLine::DidYouMean("list".into()),
+                HelpLine::DidYouMean("mad".into()),
+                HelpLine::DidYouMean("map".into()),
             ]
         );
     }
 
     #[test]
-    fn single_candidate_becomes_machine_applicable_suggestion() {
-        let d = Diagnostic::Name {
-            span: Span::new(0, 6),
-            msg: NameError::ValueNotFound {
-                name: "lenght".into(),
-                suggestions: Candidates::at(
-                    EditTarget::whole(Span::new(0, 6), "lenght"),
-                    Box::new(["length".into()]),
-                ),
-            },
-        };
+    fn a_unique_single_edit_becomes_a_machine_applicable_suggestion() {
         assert_eq!(
-            d.help(),
+            value_help("lenght", &["length", "map"]),
             vec![HelpLine::Suggest(Suggestion {
                 span: Span::new(0, 6),
                 replaces: "lenght".into(),
@@ -426,7 +447,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_case_only_match_becomes_a_machine_applicable_suggestion() {
+        let help = value_help("just", &["Just"]);
+        assert!(
+            matches!(
+                help.as_slice(),
+                [HelpLine::Suggest(Suggestion {
+                    applicability: Applicability::MachineApplicable,
+                    ..
+                })]
+            ),
+            "{help:?}"
+        );
+    }
+
+    /// A sole guess two edits away could name another binding that still
+    /// type-checks: it is offered, never applied unprompted.
+    #[test]
+    fn a_plausible_sole_candidate_is_maybe_incorrect() {
+        assert_eq!(
+            value_help("lenght", &["lengths"]),
+            vec![HelpLine::Suggest(Suggestion {
+                span: Span::new(0, 6),
+                replaces: "lenght".into(),
+                replacement: "lengths".into(),
+                applicability: Applicability::MaybeIncorrect,
+            })]
+        );
+    }
+
     /// `Lsit.map` at `10..18`: the applicable edit overwrites only `Lsit`.
+    /// (`Set`, two edits away, would make the guess ambiguous.)
     #[test]
     fn unknown_module_suggestion_region_is_the_qualifier() {
         let token = Span::new(10, 18);
@@ -436,7 +488,7 @@ mod tests {
                 qualifier: "Lsit".into(),
                 suggestions: Candidates::at(
                     EditTarget::prefix(token, "Lsit"),
-                    Box::new(["List".into()]),
+                    ranked("Lsit", &["List", "Maybe"]),
                 ),
             },
         };
@@ -451,6 +503,23 @@ mod tests {
         );
     }
 
+    /// A sole shown guess with a rival two edits away that the threshold
+    /// hides is offered, never applied unprompted.
+    #[test]
+    fn a_sole_guess_with_a_hidden_rival_is_maybe_incorrect() {
+        let help = value_help("Lsit", &["List", "Set"]);
+        assert!(
+            matches!(
+                help.as_slice(),
+                [HelpLine::Suggest(Suggestion {
+                    applicability: Applicability::MaybeIncorrect,
+                    ..
+                })]
+            ),
+            "{help:?}"
+        );
+    }
+
     /// `List.mpa` at `10..18`: the applicable edit overwrites only `mpa`.
     #[test]
     fn no_such_member_region_is_the_member() {
@@ -462,7 +531,7 @@ mod tests {
                 member: "mpa".into(),
                 suggestions: Candidates::at(
                     EditTarget::suffix(token, "mpa"),
-                    Box::new(["map".into()]),
+                    ranked("mpa", &["map", "foldl"]),
                 ),
             },
         };
@@ -484,7 +553,7 @@ mod tests {
             span: Span::new(0, 30),
             msg: NameError::TypeNotFound {
                 name: "Strng".into(),
-                suggestions: Candidates::hints(Box::new(["String".into()])),
+                suggestions: Candidates::hints(ranked("Strng", &["String"])),
             },
         };
         assert_eq!(d.help(), vec![HelpLine::DidYouMean("String".into())]);

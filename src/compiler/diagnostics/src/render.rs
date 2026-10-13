@@ -2788,6 +2788,25 @@ mod tests {
     use crate::diagnostic::{
         Candidates, Diagnostic, EditTarget, Expected, ExpectedSet, ParseError, SortedNames,
     };
+    use crate::suggest;
+
+    /// The hits a resolver site gets for `typo` over `names`.
+    fn ranked(typo: &str, names: &[&str]) -> Box<[suggest::Hit<Box<str>>]> {
+        let Ok(query) = suggest::Query::parse(typo, suggest::Shape::Flat) else {
+            return Box::new([]);
+        };
+        let universe = names.iter().map(|name| suggest::Spelling {
+            text: name,
+            target: Box::<str>::from(*name),
+        });
+        let policy = suggest::Policy {
+            cap: suggest::Cap::MAX,
+            threshold: suggest::Threshold::Relative,
+        };
+        suggest::rank(&query, universe, policy)
+            .hits
+            .into_boxed_slice()
+    }
 
     /// A bidi override or zero-width character named in a diagnostic is shown
     /// by its code point, never raw where it would reorder or hide the line.
@@ -3070,18 +3089,18 @@ mod tests {
             span: Span::new(0, 6),
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Candidates::hints(Box::new(["length".into(), "list".into()])),
+                suggestions: Candidates::hints(ranked("lenght", &["lengths", "length"])),
             },
         };
         let out = render(&d, "n.ipe", "lenght\n");
         // Two-plus candidates collapse into one header; producer order of the
-        // candidate list is preserved (`length` before `list`).
+        // candidate list is preserved (`length` before `lengths`).
         assert!(
             out.contains("did you mean one of:"),
             "collapsed header:\n{out}"
         );
         let first = out.find("`length`").unwrap_or(usize::MAX);
-        let second = out.find("`list`").unwrap_or(0);
+        let second = out.find("`lengths`").unwrap_or(0);
         assert!(first < second, "producer order preserved:\n{out}");
         // Stable across runs: re-render must be byte-identical.
         assert_eq!(out, render(&d, "n.ipe", "lenght\n"));
@@ -3265,7 +3284,7 @@ mod tests {
                 name: "lenght".into(),
                 suggestions: Candidates::at(
                     EditTarget::whole(Span::new(0, 6), "lenght"),
-                    Box::new(["length".into()]),
+                    ranked("lenght", &["length"]),
                 ),
             },
         };
@@ -3289,7 +3308,7 @@ mod tests {
                 qualifier: "Lsit".into(),
                 suggestions: Candidates::at(
                     EditTarget::whole(Span::new(0, 8), "Lsit.mpa"),
-                    Box::new(["List".into()]),
+                    ranked("Lsit", &["List"]),
                 ),
             },
         };
@@ -3314,11 +3333,7 @@ mod tests {
             span: Span::new(7, 11),
             msg: NameError::ModuleNotFound {
                 name: "Fooo".into(),
-                suggestions: Candidates::hints(Box::new([
-                    "Foo".into(),
-                    "Food".into(),
-                    "Fool".into(),
-                ])),
+                suggestions: Candidates::hints(ranked("Fooo", &["Foo", "Food", "Fool"])),
             },
         };
         let out = render(&d, "n.ipe", src);
@@ -3353,7 +3368,7 @@ mod tests {
             span: Span::DUMMY,
             msg: NameError::ModuleNotFound {
                 name: "Foo".into(),
-                suggestions: Candidates::hints(Box::new(["Food".into(), "Fool".into()])),
+                suggestions: Candidates::hints(ranked("Foo", &["Food", "Fool"])),
             },
         };
         // Craft a genuine single-DidYouMean via `help()` directly: a two-plus
