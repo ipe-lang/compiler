@@ -4465,7 +4465,7 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((
@@ -4486,7 +4486,7 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((_, store::Rejoin::Miss)) | None => {
@@ -4519,7 +4519,7 @@ mod handlers {
                 // Build the request context (params from routing — empty when
                 // unrouted) and init a fresh model. The param_resolver is
                 // model-independent, breaking the init↔routing cycle.
-                let params = (st.param_resolver)(&path);
+                let params = (st.param_resolver)(path);
                 let req = req::web_req(&method, &uri, &headers, params);
                 // Session fixation guard: a store MISS means this sid is NOT a
                 // known session, so NEVER adopt the client-supplied cookie value
@@ -4527,7 +4527,7 @@ mod handlers {
                 // Minted first so `init` and the entry run under it.
                 let scope = pubsub::SessionScope::new(minted_sid(proof));
                 let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
-                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, path);
                 (
                     SessionOwner::Minted(scope.sid().to_owned()),
                     scope,
