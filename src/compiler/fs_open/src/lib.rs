@@ -226,8 +226,11 @@ impl OpenRefusal {
 /// names the object a handle holds rather than whatever a later lookup of a
 /// name reaches. `object` is wide enough for every platform's unique object
 /// number. On Windows it holds the 64-bit file index, which `ReFS` does not
-/// keep unique on a volume: a residual bounded by every write and removal
-/// going through a held handle.
+/// keep unique on a volume, so two objects there can compare equal. A write
+/// or removal an identity gates still acts through its held handle; a
+/// comparison that only classifies a held directory (the jail configuration
+/// scan matching a walked directory against a grant or carve) has no such
+/// bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
     volume: u64,

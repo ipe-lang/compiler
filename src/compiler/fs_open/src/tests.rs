@@ -524,6 +524,13 @@ fn no_file_id_from_a_path() {
             );
         }
     }
+    let unix = include_str!("unix.rs");
+    for banned in ["rustix::fs::stat(", "rustix::fs::lstat("] {
+        assert!(
+            !unix.contains(banned),
+            "unix.rs stats a path through `{banned}`, a stat no handle holds"
+        );
+    }
 }
 
 /// Two distinct directories never share an identity.

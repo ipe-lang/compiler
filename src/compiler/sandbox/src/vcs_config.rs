@@ -1261,12 +1261,21 @@ enum Pinned {
 impl Pinned {
     /// Hold `path` open: as a directory, else as the regular file it is.
     ///
-    /// `path` is canonical, so following its links is the lookup that made it.
+    /// The parent is opened following links (`path` is canonical, so that
+    /// is the lookup that made it); the final entry is opened through the
+    /// held parent and never followed, both tries naming that one entry of
+    /// that one handle. A link, a FIFO, a device, or a socket there is
+    /// refused.
     fn open(path: &Path) -> Result<Self, OpenRefusal> {
-        match HeldDir::open_root(path) {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return HeldDir::open_root(path).map(Self::Dir);
+        };
+        let name = EntryName::parse(name)?;
+        let parent = HeldDir::open_root(parent)?;
+        match parent.child_dir(&name) {
             Ok(dir) => Ok(Self::Dir(dir)),
             Err(OpenRefusal::NotRegular(FileKind::Regular)) => {
-                RegularFile::open_user_named(path).map(Self::File)
+                parent.open_regular(&name).map(Self::File)
             }
             Err(refusal) => Err(refusal),
         }
@@ -4447,6 +4456,73 @@ mod tests {
         let home = Home::known(canonical(&f.home));
         let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
         assert_eq!(result, Ok(()), "a file carve is marked, not refused");
+    }
+
+    /// Scan Git's configuration with `pointer` carved beside `.git`.
+    #[cfg(unix)]
+    fn scan_with_carve(f: &Fixture, pointer: &CanonicalPath) -> Result<(), ConfigRefusal> {
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git, pointer]);
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        scan(&roots, &grants, &home, ConfigLimits::DEFAULT)
+    }
+
+    /// A carve whose final entry became a link after it was resolved is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_carve_turned_link_is_unreadable() {
+        let f = fixture("carvelink");
+        let at = f.tree.join("sub/.git");
+        write(&at, "gitdir: ../.git\n");
+        let pointer = canonical(&at);
+        std::fs::remove_file(&at).expect("remove the pointer");
+        std::os::unix::fs::symlink(&f.other, &at).expect("plant link");
+        let result = scan_with_carve(&f, &pointer);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::Link),
+                    ..
+                }) if path == pointer.as_path()
+            ),
+            "the linked carve is unreadable, got {result:?}"
+        );
+    }
+
+    /// A carve that is a FIFO is refused without blocking on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_carve_is_unreadable() {
+        let f = fixture("carvefifo");
+        let at = f.tree.join("pipe");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &at,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("mkfifo");
+        let pointer = canonical(&at);
+        let result = scan_with_carve(&f, &pointer);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::NotRegular(FileKind::Fifo)),
+                    ..
+                }) if path == pointer.as_path()
+            ),
+            "the FIFO carve is unreadable, got {result:?}"
+        );
     }
 
     #[test]
