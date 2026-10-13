@@ -3876,8 +3876,7 @@ fn unsafe_scan_manifest_project_fails_closed_on_discovery_failure() {
     let dir = unsafe_scan_test_dir("manifest-discovery");
     let src = dir.join("src");
     let entry = src.join("Main.ipe");
-    let too_deep =
-        (0..=crate::project::MAX_DISCOVERY_DEPTH).fold(src.clone(), |path, _| path.join("d"));
+    let too_deep = (0..=crate::project::MAX_DISCOVERY_DEPTH).fold(src, |path, _| path.join("d"));
     fs::create_dir_all(&too_deep).expect("create a tree past the depth ceiling");
     fs::write(&entry, "module Main exposing (main)\n\nmain = 1\n").expect("write Main");
     fs::write(
