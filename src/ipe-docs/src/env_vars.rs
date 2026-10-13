@@ -562,10 +562,12 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_SOLVER_BUDGET",
         default: Cow::Borrowed("5000000"),
-        purpose: "Maximum unification steps the type solver takes before giving up and \
-                  emitting a budget-exceeded error. Set to `0` for no limit (escape hatch \
-                  for programs with very large type graphs). Raise when the compiler \
-                  reports a budget-exceeded diagnostic.",
+        purpose: "Maximum unification steps the type solver takes over the whole program \
+                  before giving up and emitting a budget-exceeded error. `0` is refused with \
+                  that error: the limit is always a positive step count. Each module's own \
+                  solve runs under the same limit, and a program whose modules together \
+                  spend more than half of it is decided by the whole-program solve. Raise \
+                  when the compiler reports a budget-exceeded diagnostic.",
         subsystem: Subsystem::Compiler,
         class: Class::Tunable,
     },

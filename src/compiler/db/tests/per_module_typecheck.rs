@@ -22,10 +22,12 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ipe_db::{
-    Db as _, FallbackReason, IpeDatabase, ModuleOrigin, ScopedModuleTypes, SourceFile, SourceRoot,
-    TypedBy,
+    Db as _, FallbackReason, IpeDatabase, ModuleOrigin, ScopedModuleTypes, SolveLimits, SourceFile,
+    SourceRoot, TypedBy,
 };
+use ipe_diagnostics::{Diagnostic, TypeError};
 use ipe_intern::Symbol;
+use ipe_types::{SolverSteps, SolverStepsError};
 
 /// A shared, poison-safe log of executed-query debug keys.
 #[derive(Clone, Default)]
@@ -1211,4 +1213,295 @@ fn scoped_slice_refuses_a_foreign_warning() {
         Err(FallbackReason::AssemblyConflict),
         "a dependency's warning must be refused"
     );
+}
+
+// ---------------------------------------------------------------------------
+// One solver budget: the joint program's, bounding every scoped solve too
+// ---------------------------------------------------------------------------
+
+/// The solver steps `module`'s scoped solve spent, when it took the scoped path.
+fn scoped_steps(db: &IpeDatabase, root: SourceRoot, module: SourceFile) -> Option<u64> {
+    match ipe_db::infer_module_scoped(db, root, module) {
+        ScopedModuleTypes::PerModule { steps, .. } => Some(*steps),
+        ScopedModuleTypes::InterfaceOnly { .. } | ScopedModuleTypes::WholeProgram(_) => None,
+    }
+}
+
+/// Run every solve in `db` under a step budget of `steps`.
+fn set_steps(db: &mut IpeDatabase, steps: u64) {
+    let limits = SolverSteps::new(steps).map(|steps| SolveLimits {
+        steps,
+        ..SolveLimits::DEFAULT
+    });
+    assert!(limits.is_some(), "a positive step budget");
+    if let Some(limits) = limits {
+        db.set_solve_limits(Ok(limits));
+    }
+}
+
+/// Whether `err` is the step-budget refusal for a budget of `budget`.
+const fn refuses_at_budget(err: &ipe_db::TypecheckError, budget: u64) -> bool {
+    matches!(
+        err.diagnostic(),
+        Diagnostic::Type {
+            msg: TypeError::StepBudgetExceeded { budget: refused },
+            ..
+        } if *refused == budget
+    )
+}
+
+/// The `{A, C, Entry}` program and its modules, in that order.
+fn two_dep_program(db: &IpeDatabase) -> (SourceRoot, [SourceFile; 3]) {
+    let a = file(db, &["A"], DEP_A);
+    let c = file(db, &["C"], DEP_C);
+    let entry = file(db, &["Entry"], ENTRY_WITH_TWO_DEPS);
+    let root = root_of(db, &[(&["A"], a), (&["C"], c), (&["Entry"], entry)]);
+    (root, [a, c, entry])
+}
+
+/// Scoped solves whose steps sum past half the budget are not served: the
+/// joint solve decides under the full budget. Under a budget twice their
+/// sum, the same program is served by the scoped assembly.
+#[test]
+#[allow(clippy::panic)] // a missing measurement is the test failure
+fn scoped_steps_past_half_the_budget_route_to_the_joint_solve() {
+    let (mut db, _log) = logged_db();
+    let (root, modules) = two_dep_program(&db);
+    let [_, _, entry] = modules;
+    let spent = modules.map(|module| scoped_steps(&db, root, module));
+    assert!(
+        spent.iter().all(|steps| matches!(steps, Some(n) if *n > 0)),
+        "every module solves scoped and spends steps: {spent:?}"
+    );
+    let steps: Vec<u64> = spent.into_iter().flatten().collect();
+    let Some(&most) = steps.iter().max() else {
+        panic!("a scoped solve spends steps: {steps:?}");
+    };
+    let sum = steps.iter().fold(0_u64, |sum, n| sum.saturating_add(*n));
+
+    // At the band's edge the scoped assembly is served, and the joint solve
+    // accepts the same program under the same budget.
+    set_steps(&mut db, sum.saturating_mul(2));
+    assert_eq!(
+        assert_program_oracle(&db, root, entry),
+        NonZeroUsize::new(3).map(|modules| TypedBy::Scoped { modules }),
+        "a sum of exactly half the budget is served scoped"
+    );
+
+    // Every module still fits a budget of the largest spend, but together
+    // they spend more than half of it.
+    set_steps(&mut db, most);
+    assert_eq!(
+        modules.map(|module| scoped_steps(&db, root, module)),
+        spent,
+        "each module's solve fits a budget of the largest spend"
+    );
+    let served = assert_program_oracle(&db, root, entry);
+    let refusal = ipe_db::program_types(&db, root, entry).clone().err();
+    assert!(
+        served == Some(TypedBy::Joint(FallbackReason::BudgetBand))
+            || refusal
+                .as_ref()
+                .is_some_and(|err| refuses_at_budget(err, most)),
+        "past the band the joint solve decides: {served:?} / {refusal:?}"
+    );
+}
+
+/// A module whose scoped solve runs one step past the budget falls back,
+/// naming the budget, and the program reports the joint solve's refusal; the
+/// exact budget admits the module.
+#[test]
+#[allow(clippy::panic)] // a missing measurement is the test failure
+fn module_past_the_step_budget_falls_back_to_the_joint_refusal() {
+    let (mut db, _log) = logged_db();
+    let (root, [a, c, entry]) = two_dep_program(&db);
+    let leaves = [a, c].map(|leaf| (leaf, scoped_steps(&db, root, leaf)));
+    let heaviest = leaves
+        .iter()
+        .filter_map(|(leaf, steps)| steps.map(|steps| (*leaf, steps)))
+        .max_by_key(|(_, steps)| *steps);
+    assert!(
+        matches!(heaviest, Some((_, steps)) if steps > 1),
+        "a leaf spends more than one step: {leaves:?}"
+    );
+    let Some((leaf, steps)) = heaviest else {
+        panic!("a leaf module spends steps: {leaves:?}");
+    };
+
+    set_steps(&mut db, steps - 1);
+    assert_eq!(
+        ipe_db::infer_module_scoped(&db, root, leaf),
+        &ScopedModuleTypes::WholeProgram(FallbackReason::BudgetExceeded),
+        "one step short of the module's spend refuses its scoped solve"
+    );
+    assert_eq!(assert_program_oracle(&db, root, entry), None);
+    let refusal = ipe_db::program_types(&db, root, entry).clone().err();
+    assert!(
+        refusal
+            .as_ref()
+            .is_some_and(|err| refuses_at_budget(err, steps - 1)),
+        "the program reports the joint budget refusal: {refusal:?}"
+    );
+
+    set_steps(&mut db, steps);
+    assert_eq!(
+        scoped_steps(&db, root, leaf),
+        Some(steps),
+        "the exact budget admits the module"
+    );
+}
+
+/// A module's spent steps are a function of the module and its deps'
+/// interfaces: an unrelated sibling edit and a fresh database leave them
+/// unchanged.
+#[test]
+fn scoped_steps_are_deterministic() {
+    let (mut db, _log) = logged_db();
+    let (root, [a, c, _]) = two_dep_program(&db);
+    let cold = scoped_steps(&db, root, a);
+    assert!(cold.is_some(), "A solves scoped");
+
+    assert!(ipe_db::set_text_if_changed(&mut db, c, DEP_C_BODY_EDIT));
+    assert_eq!(scoped_steps(&db, root, a), cold, "after a sibling edit");
+
+    let (fresh, _fresh_log) = logged_db();
+    let (fresh_root, [fresh_a, _, _]) = two_dep_program(&fresh);
+    assert_eq!(
+        scoped_steps(&fresh, fresh_root, fresh_a),
+        cold,
+        "in a fresh database"
+    );
+}
+
+/// The variable ceiling a database holds bounds the scoped renumbering: one
+/// id below the least ceiling that serves the program scoped, the joint solve
+/// is served for the exhausted space.
+#[test]
+#[allow(clippy::panic)] // a missing measurement is the test failure
+fn var_ceiling_bounds_the_scoped_renumbering() {
+    const GENERIC_DEP: &str = "module A exposing (ident)\n\nident : a -> a\nident x =\n    x\n";
+    const GENERIC_IMPORTER: &str = "module B exposing (b)\n\n\
+        import A exposing (ident)\n\n\
+        keep : k -> k\n\
+        keep y =\n    ident y\n\n\
+        b : Int\n\
+        b =\n    keep 1\n";
+    let (mut db, _log) = logged_db();
+    let a = file(&db, &["A"], GENERIC_DEP);
+    let b = file(&db, &["B"], GENERIC_IMPORTER);
+    let root = root_of(&db, &[(&["A"], a), (&["B"], b)]);
+    let scoped = NonZeroUsize::new(2).map(|modules| TypedBy::Scoped { modules });
+
+    let serve_at = |db: &mut IpeDatabase, n: u32| {
+        db.set_solve_limits(Ok(SolveLimits {
+            var_ceiling: ceiling(n),
+            ..SolveLimits::DEFAULT
+        }));
+        ipe_db::program_types(&*db, root, b)
+            .as_ref()
+            .ok()
+            .map(|program| program.typed_by)
+    };
+    let least = (1..=256).find(|n| serve_at(&mut db, *n) == scoped);
+    assert!(
+        matches!(least, Some(n) if n > 1),
+        "the program needs more than one variable id: {least:?}"
+    );
+    let Some(least) = least else {
+        panic!("some variable ceiling serves the scoped result");
+    };
+
+    assert_eq!(
+        serve_at(&mut db, least - 1),
+        Some(TypedBy::Joint(FallbackReason::VarSpaceExhausted)),
+        "one id short of the least ceiling exhausts the scoped space"
+    );
+    assert_eq!(
+        assert_program_oracle(&db, root, b),
+        Some(TypedBy::Joint(FallbackReason::VarSpaceExhausted)),
+        "the joint solve renumbers in the full solver space"
+    );
+}
+
+/// A zero solver budget is refused, never read as "no limit": every program
+/// reports the budget-`0` refusal from both solves, and the default setting
+/// serves the same program.
+#[test]
+fn zero_solver_budget_refuses_every_program() {
+    let (mut db, _log) = logged_db();
+    let (root, [a, _, entry]) = two_dep_program(&db);
+
+    db.set_solve_limits(Err(SolverStepsError::Zero));
+    assert_eq!(
+        ipe_db::infer_module_scoped(&db, root, a),
+        &ScopedModuleTypes::WholeProgram(FallbackReason::BudgetExceeded)
+    );
+    assert_eq!(assert_program_oracle(&db, root, entry), None);
+    let refusal = ipe_db::typecheck(&db, root, entry).clone().err();
+    assert!(
+        refusal
+            .as_ref()
+            .is_some_and(|err| refuses_at_budget(err, 0)),
+        "the joint solve refuses a zero budget: {refusal:?}"
+    );
+
+    db.set_solve_limits(Ok(SolveLimits::DEFAULT));
+    assert_eq!(
+        assert_program_oracle(&db, root, entry),
+        NonZeroUsize::new(3).map(|modules| TypedBy::Scoped { modules })
+    );
+}
+
+/// The budget band's premise: a program whose scoped solves spend `s` steps
+/// is accepted by the joint solve under a budget of `2 · s`, so the scoped
+/// assembly never serves a program the joint solve refuses for its budget.
+#[test]
+fn joint_solve_fits_twice_the_scoped_spend() {
+    const GENERIC_DEP: &str = "module A exposing (ident)\n\nident : a -> a\nident x =\n    x\n";
+    const GENERIC_IMPORTER: &str = "module B exposing (b)\n\n\
+        import A exposing (ident)\n\n\
+        keep : k -> k\n\
+        keep y =\n    ident y\n\n\
+        b : Int\n\
+        b =\n    keep 1\n";
+    let programs: [&[(&[&str], &str)]; 3] = [
+        &[
+            (&["A"], DEP_A),
+            (&["C"], DEP_C),
+            (&["Entry"], ENTRY_WITH_TWO_DEPS),
+        ],
+        &[(&["A"], DEP_A), (&["B"], IMPORTER_B)],
+        &[(&["A"], GENERIC_DEP), (&["B"], GENERIC_IMPORTER)],
+    ];
+    for program in programs {
+        let (mut db, _log) = logged_db();
+        let modules: Vec<(&[&str], SourceFile)> = program
+            .iter()
+            .map(|(path, text)| (*path, file(&db, path, text)))
+            .collect();
+        let root = root_of(&db, &modules);
+        let Some(&(entry_path, entry)) = modules.last() else {
+            continue;
+        };
+        let spent: Vec<Option<u64>> = modules
+            .iter()
+            .map(|(_, module)| scoped_steps(&db, root, *module))
+            .collect();
+        assert!(
+            spent.iter().all(|steps| matches!(steps, Some(n) if *n > 0)),
+            "{entry_path:?}: every module solves scoped: {spent:?}"
+        );
+        let sum = spent
+            .iter()
+            .flatten()
+            .try_fold(0_u64, |sum, n| sum.checked_add(*n));
+        assert!(sum.is_some(), "{entry_path:?}: the scoped sum fits a u64");
+        let Some(sum) = sum else { continue };
+        set_steps(&mut db, sum.saturating_mul(2));
+        assert_eq!(
+            assert_program_oracle(&db, root, entry),
+            NonZeroUsize::new(modules.len()).map(|modules| TypedBy::Scoped { modules }),
+            "{entry_path:?}: at twice the scoped spend both solves accept"
+        );
+    }
 }

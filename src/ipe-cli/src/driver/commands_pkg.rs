@@ -1,11 +1,11 @@
 use super::{
-    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, attribute_canon_errors,
-    attribute_post_link_error, build_loose_file_into, build_project_into, build_source_graph,
-    build_test_into, capabilities_including_served_widgets, classify_entry_shape,
-    create_source_root, default_entry, discover_manifest, emit_machine_error, emitted_bin_filename,
-    frame_infer_error, home_to_source_map, program_constructs_a_widget, resolve_runtime,
-    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, source_graph_for_target,
-    typecheck_target,
+    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
+    attribute_canon_errors, attribute_post_link_error, build_loose_file_into, build_project_into,
+    build_source_graph, build_test_into, capabilities_including_served_widgets,
+    classify_entry_shape, create_source_root, default_entry, discover_manifest, emit_machine_error,
+    emitted_bin_filename, frame_infer_error, home_to_source_map, lowering_check_query,
+    program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir, run_build,
+    runtime_context_for_message, source_graph_for_target, typecheck_target,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::contained_path::ResolvedPath;
@@ -3078,27 +3078,114 @@ fn attribute_entry_lowering_error(
 // `fix` / `--fix` — apply machine-applicable suggestions
 // ===========================================================================
 
-/// Run the front of the pipeline (parse → canon → types → lower) and return the
-/// first diagnostic it raises, or `None` when the program compiles cleanly.
-pub fn pipeline_first_diagnostic(source: &str) -> Option<Diagnostic> {
-    let mut interner = Interner::new();
-    let module = match ipe_parse::parse_module(source, &mut interner) {
-        Ok(m) => m,
-        Err(d) => return Some(d),
+/// What one build-identical check of the fix target raised.
+#[derive(Debug)]
+pub enum FixCheck {
+    /// The program compiles cleanly.
+    Clean,
+    /// The first diagnostic is owned by the fix target itself.
+    InEntry {
+        /// The source the diagnostic was framed against.
+        src: String,
+        /// The diagnostic.
+        diag: Box<Diagnostic>,
+    },
+    /// The first diagnostic is owned by another module of the build.
+    Elsewhere {
+        /// The file that owns the diagnostic.
+        file: PathBuf,
+        /// The diagnostic.
+        diag: Box<Diagnostic>,
+    },
+}
+
+/// Run [`lowering_check_query`] over `graph` and say which file owns its first diagnostic.
+///
+/// `entry_real` is the canonical path of the fix target; a diagnostic is the
+/// target's own only when its attributed file canonicalises to it.
+///
+/// # Errors
+/// Any refusal that is not a compiler diagnostic, unchanged.
+fn run_fix_check(
+    graph: &SourceGraph,
+    blame_path: &Path,
+    entry_real: &Path,
+) -> Result<FixCheck, CliError> {
+    match graph.run_attributed(blame_path, lowering_check_query) {
+        Ok(()) => Ok(FixCheck::Clean),
+        Err(CliError::Pipeline { file, src, diag }) => {
+            let owned_by_entry = fs::canonicalize(&file).is_ok_and(|real| real == entry_real);
+            Ok(if owned_by_entry {
+                FixCheck::InEntry { src, diag }
+            } else {
+                FixCheck::Elsewhere { file, diag }
+            })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Whether a patched program may replace the file it was diagnosed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchVerdict {
+    /// The answered diagnostic is gone and nothing new precedes the edit.
+    Accept,
+    /// The patched program still raises the answered diagnostic.
+    StillRaised,
+    /// The patched program no longer parses.
+    NoLongerParses,
+    /// The patched program raises a name-resolution error at or before the edit.
+    NewResolutionError,
+}
+
+/// Judge the re-check of a patched program against the diagnostic the patch answered.
+///
+/// `edited_end` is the end, in patched coordinates, of the last edit. A
+/// diagnostic is the answered one when its code and span origin match. A
+/// resolution error owned by another module is never provably unrelated to
+/// the edit, so it refuses wherever it sits.
+#[must_use]
+pub fn judge_patch(answered: &Diagnostic, edited_end: u32, after: &FixCheck) -> PatchVerdict {
+    let (diag, in_entry) = match after {
+        FixCheck::Clean => return PatchVerdict::Accept,
+        FixCheck::InEntry { diag, .. } => (diag, true),
+        FixCheck::Elsewhere { diag, .. } => (diag, false),
     };
-    let canonical = match ipe_canon::canonicalise(&module, &mut interner) {
-        Ok(c) => c,
-        Err(d) => return Some(d),
-    };
-    let types = match ipe_types::infer(&canonical, &mut interner) {
-        Ok(t) => t,
-        Err(d) => return Some(d),
-    };
-    // `--fix` diagnostic probe: single source, home is irrelevant — take just
-    // the diagnostic. Source info not available here; location falls back.
-    ipe_lower::lower(&canonical, &types, &mut interner, "", "")
-        .err()
-        .map(|(diag, _home)| diag)
+    let family = diag.code().family();
+    if matches!(family, ipe_diagnostics::Family::Parse) {
+        return PatchVerdict::NoLongerParses;
+    }
+    if in_entry
+        && diag.code() == answered.code()
+        && diag.primary_span().lo == answered.primary_span().lo
+    {
+        return PatchVerdict::StillRaised;
+    }
+    let at_or_before_edit = !in_entry || diag.primary_span().lo <= edited_end;
+    if matches!(family, ipe_diagnostics::Family::Name) && at_or_before_edit {
+        return PatchVerdict::NewResolutionError;
+    }
+    PatchVerdict::Accept
+}
+
+/// The end, in the patched text, of the right-most of the non-overlapping `edits`.
+///
+/// An offset past `u32::MAX` saturates, so a judgement against it errs toward refusal.
+#[must_use]
+pub fn patched_edit_end(edits: &[Suggestion]) -> u32 {
+    let mut ascending: Vec<&Suggestion> = edits.iter().collect();
+    ascending.sort_by_key(|s| s.span.lo);
+    let mut shift: i64 = 0;
+    let mut end: i64 = 0;
+    for s in ascending {
+        let replaced = i64::from(s.span.hi).saturating_sub(i64::from(s.span.lo));
+        let inserted = i64::try_from(s.replacement.len()).unwrap_or(i64::MAX);
+        end = i64::from(s.span.lo)
+            .saturating_add(shift)
+            .saturating_add(inserted);
+        shift = shift.saturating_add(inserted.saturating_sub(replaced));
+    }
+    u32::try_from(end).unwrap_or(u32::MAX)
 }
 
 /// Collect every [`Applicability::MachineApplicable`] suggestion a diagnostic
@@ -3183,29 +3270,42 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// The fix command/flow: read `entry`, run the pipeline, and apply the
-/// machine-applicable suggestions of the first diagnostic.
+/// The fix command/flow: diagnose `entry` with the build's own resolution and
+/// apply the machine-applicable suggestions of its first diagnostic.
+///
+/// The named file is analysed as `ipe type-check` analyses it: under the
+/// governing manifest's `src`/`tests` roots, or as the loose closure a build of
+/// the file alone compiles — never by a reduced single-module resolution, so a
+/// name the build binds through an import is never "corrected". A directory
+/// names its manifest's entry, the file a build of that directory compiles
+/// from. A diagnostic another module owns is reported, never patched.
 ///
 /// `auto` (set by `--yes` / `--fix`) is durable authorization to apply every
 /// edit without prompting; otherwise each edit is confirmed interactively on
 /// stdin. The patch is never silent: every applied or skipped edit is reported
-/// on `w`. The patched text is re-parsed before it replaces the file, and a
-/// result that no longer parses is rejected (the file is left untouched).
+/// on `w`. The patched text is re-checked by the same resolution before it
+/// replaces the file ([`judge_patch`]), and the file is replaced only while it
+/// still holds the bytes that were diagnosed.
 ///
 /// Writes go through a temp file + atomic rename.
 ///
 /// # Errors
-/// Returns [`CliError::Io`] on a filesystem failure.
+/// The refusal of a project context that cannot be built (an unreadable or
+/// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
+/// filesystem failure.
 pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
-
-    let Some(diag) = pipeline_first_diagnostic(&source) else {
-        writeln!(
-            w,
-            "fix: nothing to do — {} compiles cleanly",
-            entry.display()
-        )
-        .map_err(|e| io_err(entry, e))?;
+    let target = resolve_analysis_target(entry)?;
+    let (mut graph, blame_path) = source_graph_for_target(&target)?;
+    // A directory names its manifest's entry: every report names that file.
+    let entry = if entry.is_dir() {
+        blame_path.as_path()
+    } else {
+        entry
+    };
+    let entry_real = fs::canonicalize(&blame_path).map_err(|e| io_err(&blame_path, e))?;
+    let source = graph.entry_file.text(&graph.db).clone();
+    let first = run_fix_check(&graph, &blame_path, &entry_real)?;
+    let Some(diag) = answerable_diagnostic(first, &source, entry, w)? else {
         return Ok(());
     };
 
@@ -3221,13 +3321,103 @@ pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<
         .map_err(|e| io_err(entry, e))?;
         return Ok(());
     }
+    let chosen = choose_edits(&source, &selected, entry, auto, w)?;
+    if chosen.is_empty() {
+        writeln!(w, "fix: no edits applied").map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    }
 
+    let Some(patched) = apply_fixes(&source, &chosen) else {
+        writeln!(
+            w,
+            "fix: internal span mismatch — file left unchanged (please report)"
+        )
+        .map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    };
+
+    // Re-parse guard: refuse to keep a patch whose result no longer parses.
+    let mut guard_interner = Interner::new();
+    if ipe_parse::parse_module(&patched, &mut guard_interner).is_err() {
+        writeln!(w, "{PATCH_NO_LONGER_PARSES}").map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    }
+
+    // Second gate: the patched text, re-checked in memory by the same
+    // resolution over the same universe, must have answered its diagnostic.
+    ipe_db::set_text_if_changed(&mut graph.db, graph.entry_file, &patched);
+    let after = run_fix_check(&graph, &blame_path, &entry_real)?;
+    if let Some(refusal) = patch_refusal(&diag, &chosen, &after) {
+        writeln!(w, "{refusal}").map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    }
+
+    let IfUnchanged::Written(backup) =
+        rewrite_user_file_if_unchanged(&entry_real, &source, &patched, RewriteKind::Lossy)?
+    else {
+        writeln!(
+            w,
+            "fix: {} changed while it was being fixed — file left unchanged",
+            entry.display()
+        )
+        .map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    };
+    writeln!(
+        w,
+        "fix: applied {} edit(s) to {}",
+        chosen.len(),
+        entry.display()
+    )
+    .map_err(|e| io_err(entry, e))?;
+    if let Some(backup) = backup {
+        writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
+    }
+    Ok(())
+}
+
+/// The diagnostic `ipe fix` may answer from `check`, or `None` once it has said why there is none.
+///
+/// Only a diagnostic the fix target owns, framed against exactly the `source`
+/// that was diagnosed, is answerable.
+fn answerable_diagnostic<W: Write>(
+    check: FixCheck,
+    source: &str,
+    entry: &Path,
+    w: &mut W,
+) -> Result<Option<Box<Diagnostic>>, CliError> {
+    let refusal = match check {
+        FixCheck::InEntry { src, diag } if src == source => return Ok(Some(diag)),
+        FixCheck::Clean => format!("fix: nothing to do — {} compiles cleanly", entry.display()),
+        FixCheck::InEntry { .. } => format!(
+            "fix: the diagnosed source is not {} — file left unchanged (please report)",
+            entry.display()
+        ),
+        FixCheck::Elsewhere { file, diag } => format!(
+            "fix: the first diagnostic [{}] is in {}, not {} — no edits applied",
+            diag.code().as_str(),
+            file.display(),
+            entry.display()
+        ),
+    };
+    writeln!(w, "{refusal}").map_err(|e| io_err(entry, e))?;
+    Ok(None)
+}
+
+/// The `selected` edits to apply: all of them under `auto`, else each one the user confirms.
+fn choose_edits<W: Write>(
+    source: &str,
+    selected: &[Suggestion],
+    entry: &Path,
+    auto: bool,
+    w: &mut W,
+) -> Result<Vec<Suggestion>, CliError> {
     let mut chosen: Vec<Suggestion> = Vec::new();
-    for s in &selected {
+    for s in selected {
         let lo = usize::try_from(s.span.lo).unwrap_or(usize::MAX);
         let hi = usize::try_from(s.span.hi).unwrap_or(usize::MAX);
         let original = source.get(lo..hi).unwrap_or("");
-        let (line, col) = line_col(&source, lo);
+        let (line, col) = line_col(source, lo);
         if auto {
             writeln!(
                 w,
@@ -3251,44 +3441,35 @@ pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<
             }
         }
     }
+    Ok(chosen)
+}
 
-    if chosen.is_empty() {
-        writeln!(w, "fix: no edits applied").map_err(|e| io_err(entry, e))?;
-        return Ok(());
+/// Why the re-check `after` of a patch made of `chosen` refuses it, or `None` when it may land.
+fn patch_refusal(answered: &Diagnostic, chosen: &[Suggestion], after: &FixCheck) -> Option<String> {
+    match judge_patch(answered, patched_edit_end(chosen), after) {
+        PatchVerdict::Accept => None,
+        PatchVerdict::NoLongerParses => Some(PATCH_NO_LONGER_PARSES.to_owned()),
+        PatchVerdict::StillRaised => Some(format!(
+            "fix: the edit leaves [{}] unresolved — file left unchanged",
+            answered.code().as_str()
+        )),
+        PatchVerdict::NewResolutionError => Some(format!(
+            "fix: the edit raises a new resolution error [{}] — file left unchanged",
+            first_code(after)
+        )),
     }
+}
 
-    let Some(patched) = apply_fixes(&source, &chosen) else {
-        writeln!(
-            w,
-            "fix: internal span mismatch — file left unchanged (please report)"
-        )
-        .map_err(|e| io_err(entry, e))?;
-        return Ok(());
-    };
+/// The refusal reported for a patch whose result no longer parses.
+const PATCH_NO_LONGER_PARSES: &str =
+    "fix: patched source no longer parses — rolled back, file left unchanged";
 
-    // Re-parse guard: refuse to keep a patch whose result no longer parses.
-    let mut guard_interner = Interner::new();
-    if ipe_parse::parse_module(&patched, &mut guard_interner).is_err() {
-        writeln!(
-            w,
-            "fix: patched source no longer parses — rolled back, file left unchanged"
-        )
-        .map_err(|e| io_err(entry, e))?;
-        return Ok(());
+/// The wire code of a check's first diagnostic, or the empty string when it raised none.
+fn first_code(check: &FixCheck) -> &'static str {
+    match check {
+        FixCheck::Clean => "",
+        FixCheck::InEntry { diag, .. } | FixCheck::Elsewhere { diag, .. } => diag.code().as_str(),
     }
-
-    let backup = rewrite_user_file(entry, &patched, RewriteKind::Lossy)?;
-    writeln!(
-        w,
-        "fix: applied {} edit(s) to {}",
-        chosen.len(),
-        entry.display()
-    )
-    .map_err(|e| io_err(entry, e))?;
-    if let Some(backup) = backup {
-        writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
-    }
-    Ok(())
 }
 
 /// Read a line from stdin and interpret it as a yes/no answer. EOF or any read
@@ -3426,6 +3607,36 @@ pub fn rewrite_user_file(
 ) -> Result<Option<PathBuf>, CliError> {
     let real = fs::canonicalize(path).map_err(|e| io_err(path, e))?;
     rewrite_real_file(&real, contents, kind)
+}
+
+/// A rewrite conditioned on the file still holding the bytes it was judged by.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IfUnchanged {
+    /// The file was replaced; carries the backup path when one was made.
+    Written(Option<PathBuf>),
+    /// The file no longer holds the expected bytes and was left as it is.
+    Changed,
+}
+
+/// Rewrite the user-named file at `path` only while it still holds `expected`.
+///
+/// The file is re-read immediately before it is backed up and replaced, so an
+/// edit made to it after it was judged is never overwritten.
+///
+/// # Errors
+/// The re-read's own refusal; otherwise as [`rewrite_user_file`].
+pub fn rewrite_user_file_if_unchanged(
+    path: &Path,
+    expected: &str,
+    contents: &str,
+    kind: RewriteKind,
+) -> Result<IfUnchanged, CliError> {
+    let real = fs::canonicalize(path).map_err(|e| io_err(path, e))?;
+    let current = crate::io_bounded::read_user_named(&real, crate::io_bounded::SOURCE_CAP)?;
+    if current != expected {
+        return Ok(IfUnchanged::Changed);
+    }
+    rewrite_real_file(&real, contents, kind).map(IfUnchanged::Written)
 }
 
 /// Rewrite a user-owned file a directory walk under `root` reached.

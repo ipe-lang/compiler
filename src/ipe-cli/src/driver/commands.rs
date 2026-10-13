@@ -4156,26 +4156,48 @@ pub fn typecheck_manifest_file_via_graph(src_root: &Path, entry: &Path) -> Resul
 }
 
 /// The [`typecheck_entry_via_graph`] / [`typecheck_test_entry_via_graph`]
-/// shared core: type-check the given graph, then run the same IPE-N0040
-/// decoder-direction gate the build path runs.
+/// shared core: run [`typecheck_query`] over the given graph.
 ///
 /// # Errors
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic.
 fn typecheck_graph(graph: &SourceGraph, blame_path: &Path) -> Result<(), CliError> {
-    graph.run_attributed(blame_path, |db, root, file| {
-        // Type-check first so an ordinary type error surfaces ahead of the
-        // decoder-direction gate; then run the SAME IPE-N0040 gate the build
-        // path runs (`gate_decoder_pipelines`) over the linked module, so
-        // `ipe type-check` rejects the hand-nested decoder footgun for the
-        // earliest possible feedback rather than deferring it to `ipe dev build`.
-        let linked = ipe_db::linked_program(db, root, file)
-            .clone()
-            .map_err(|d| ipe_db::PipelineError::Lower(d, Vec::new()))?;
-        ipe_db::typecheck(db, root, file)
-            .clone()
-            .map_err(ipe_db::PipelineError::from)?;
-        gate_decoder_pipelines(&linked.module)
-    })
+    graph.run_attributed(blame_path, typecheck_query)
+}
+
+/// The type-check every analysis surface demands of a source graph: link, HM
+/// type-check, then the IPE-N0040 decoder-direction gate the build path runs.
+///
+/// Type-checking comes first so an ordinary type error surfaces ahead of the
+/// decoder-direction gate; the gate runs over the linked module, so a
+/// hand-nested decoder is refused here rather than deferred to the build.
+///
+/// # Errors
+/// The first stage's [`ipe_db::PipelineError`].
+pub fn typecheck_query(
+    db: &ipe_db::IpeDatabase,
+    root: ipe_db::SourceRoot,
+    file: ipe_db::SourceFile,
+) -> Result<(), ipe_db::PipelineError> {
+    let linked = ipe_db::linked_program(db, root, file)
+        .clone()
+        .map_err(|d| ipe_db::PipelineError::Lower(d, Vec::new()))?;
+    ipe_db::typecheck(db, root, file)
+        .clone()
+        .map_err(ipe_db::PipelineError::from)?;
+    gate_decoder_pipelines(&linked.module)
+}
+
+/// [`typecheck_query`], then lowering: the build front end short of emit.
+///
+/// # Errors
+/// The first stage's [`ipe_db::PipelineError`].
+pub fn lowering_check_query(
+    db: &ipe_db::IpeDatabase,
+    root: ipe_db::SourceRoot,
+    file: ipe_db::SourceFile,
+) -> Result<(), ipe_db::PipelineError> {
+    typecheck_query(db, root, file)?;
+    ipe_db::lower_program(db, root, file).clone().map(|_| ())
 }
 
 /// Judge one loose `.ipe` entry through the whole build front end, short of cargo.

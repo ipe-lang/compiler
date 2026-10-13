@@ -166,7 +166,7 @@ fn report_findings(
     use crate::cli_args::json;
     use cli_args::OutputFormat::{Human, Json, Plain};
 
-    let report = ipe_lint::run(modules, config);
+    let Ok(report) = ipe_lint::run(modules, config, &ipe_lint::NeverCancel);
     let source_of: BTreeMap<&[String], &str> = modules
         .iter()
         .map(|m| (m.module.as_slice(), m.source.as_str()))

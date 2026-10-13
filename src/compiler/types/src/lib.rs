@@ -50,7 +50,7 @@ pub use constrain::{Builtins, kernel_type_table, resolve_scheme};
 pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
 pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
-pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
+pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET, SolverSteps, SolverStepsError};
 pub use ty::{
     RETRY_POLICY_FIELDS, RowTail, SolverVar, Ty, TyBounds, VarCeiling, is_solver_var,
     tag_solver_var,
@@ -58,7 +58,7 @@ pub use ty::{
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
-    promote_untyped_boundaries, reify_scheme, zonk,
+    promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
@@ -454,9 +454,11 @@ pub fn canonicalize(
 /// * [`ipe_diagnostics::Diagnostic::CompilerBug`] on a violated internal
 ///   invariant (dangling union-find id, unbound local, arity mismatch — all
 ///   unreachable for well-canonicalised input).
+/// * [`ipe_diagnostics::TypeError::StepBudgetExceeded`] for a budget of `0`
+///   when [`BUDGET_ENV`] is `0`, before any solving.
 pub fn infer(m: &canon::Module, interner: &mut Interner) -> DResult<SolvedTypes> {
-    let mut budget = Budget::from_env();
-    infer_with_budget(m, interner, &mut budget)
+    let steps = SolverSteps::from_env().map_err(SolverStepsError::into_diagnostic)?;
+    infer_with_budget(m, interner, &mut Budget::new(steps))
 }
 
 /// Like [`infer`] but every error names the module that owns it.
@@ -474,8 +476,25 @@ pub fn infer_attributed(
     m: &canon::Module,
     interner: &mut Interner,
 ) -> Result<SolvedTypes, InferError> {
-    let mut budget = Budget::from_env();
-    infer_with_budget_attributed(m, interner, &mut budget)
+    let steps = SolverSteps::from_env().map_err(refused_steps)?;
+    infer_attributed_with_budget(m, interner, steps)
+}
+
+/// Like [`infer_attributed`] under an explicit step ceiling.
+///
+/// # Errors
+/// Same conditions as [`infer_attributed`].
+pub fn infer_attributed_with_budget(
+    m: &canon::Module,
+    interner: &mut Interner,
+    steps: SolverSteps,
+) -> Result<SolvedTypes, InferError> {
+    infer_with_budget_attributed(m, interner, &mut Budget::new(steps))
+}
+
+/// The whole-program refusal for a solver budget setting with no ceiling.
+fn refused_steps(refused: SolverStepsError) -> InferError {
+    InferError::unsited(refused.into_diagnostic())
 }
 
 /// One exported binding's cross-module type contract: its generalized scheme
@@ -565,6 +584,9 @@ pub struct ModuleInference {
     pub solved: SolvedTypes,
     /// The module's own typed interface, for its importers' scoped solves.
     pub interface: InterfaceStatus,
+    /// The solver steps the scoped solve spent: a pure function of the
+    /// module and its deps' interfaces.
+    pub steps: u64,
 }
 
 /// Per-binding super-type obligations, keyed `(home, name)` — the shape of
@@ -608,12 +630,28 @@ pub fn infer_module(
     deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
     interner: &mut Interner,
 ) -> Result<ModuleInference, InferError> {
-    let mut budget = Budget::from_env();
+    let steps = SolverSteps::from_env().map_err(refused_steps)?;
+    infer_module_with_budget(m, exports, deps, interner, steps)
+}
+
+/// Like [`infer_module`] under an explicit step ceiling.
+///
+/// # Errors
+/// Same conditions as [`infer_module`].
+pub fn infer_module_with_budget(
+    m: &canon::Module,
+    exports: &ModuleExports,
+    deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
+    interner: &mut Interner,
+    steps: SolverSteps,
+) -> Result<ModuleInference, InferError> {
+    let mut budget = Budget::new(steps);
     let scoped = ScopedContext { exports, deps };
     let (solved, interface) = infer_core(m, interner, &mut budget, Some(&scoped))?;
     Ok(ModuleInference {
         solved,
         interface: interface.unwrap_or(InterfaceStatus::Open),
+        steps: budget.spent(),
     })
 }
 
@@ -1014,8 +1052,11 @@ fn infer_core(
     // cleared a function HEAD; this catches a function NESTED inside a tuple /
     // record / enum under an equality obligation (Rust cannot compare it),
     // failing closed with IPE-T0014 instead of emitting code `cargo` rejects.
+    // The type judged is the one emitted (`zonk_emitted`): a record the deferred
+    // pass left over a residual row is its known fields, whichever operand
+    // settled it first.
     for (root, orig_bounds, span, home) in pinned {
-        let ty = lift!(zonk(&mut uf, budget, root));
+        let ty = lift!(zonk_emitted(&mut uf, budget, root));
         if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
             return Err(InferError::sited(
                 super_unsatisfied(interner, orig_bounds, &ty, span),
@@ -1937,7 +1978,7 @@ fn check_scheme_applications(
                     None => continue,
                 },
             };
-            let ty = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
+            let ty = zonk_emitted(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
                     super_unsatisfied(interner, *b, &ty, app.span),
@@ -4174,7 +4215,10 @@ mod tests {
         let Some((m, mut i)) = opt else { return };
         // A budget of one step cannot discharge the golden program's
         // constraints; the very first unify trips the bound.
-        let mut budget = Budget::new(1);
+        let one = SolverSteps::new(1);
+        assert!(one.is_some(), "one step is a ceiling");
+        let Some(one) = one else { return };
+        let mut budget = Budget::new(one);
         let r = infer_with_budget(&m, &mut i, &mut budget);
         assert!(matches!(
             r,
@@ -4186,12 +4230,78 @@ mod tests {
     }
 
     #[test]
-    fn disabled_budget_still_succeeds() {
+    fn default_budget_succeeds() {
         let opt = canon_golden();
         assert!(opt.is_some(), "golden");
         let Some((m, mut i)) = opt else { return };
-        let mut budget = Budget::unbounded();
+        let mut budget = Budget::new(SolverSteps::DEFAULT);
         assert!(infer_with_budget(&m, &mut i, &mut budget).is_ok());
+    }
+
+    /// A zero setting is refused, never read as "no limit"; one past zero is
+    /// the least ceiling, and an unset or malformed setting is the default.
+    #[test]
+    fn zero_solver_budget_is_refused() {
+        assert_eq!(
+            SolverSteps::from_setting(Some("0")),
+            Err(SolverStepsError::Zero)
+        );
+        assert_eq!(
+            SolverSteps::from_setting(Some(" 0 ")),
+            Err(SolverStepsError::Zero)
+        );
+        assert_eq!(
+            SolverSteps::from_setting(Some("1")).map(SolverSteps::get),
+            Ok(1)
+        );
+        assert_eq!(SolverSteps::from_setting(None), Ok(SolverSteps::DEFAULT));
+        assert_eq!(
+            SolverSteps::from_setting(Some("lots")),
+            Ok(SolverSteps::DEFAULT)
+        );
+        assert_eq!(SolverSteps::DEFAULT.get(), DEFAULT_SOLVER_BUDGET);
+        assert_eq!(SolverSteps::new(0), None);
+        assert!(matches!(
+            SolverStepsError::Zero.into_diagnostic(),
+            Diagnostic::Type {
+                msg: TypeError::StepBudgetExceeded { budget: 0 },
+                ..
+            }
+        ));
+    }
+
+    /// A scoped solve reports the steps it spent; the same ceiling one step
+    /// short of them refuses the module.
+    #[test]
+    fn scoped_solve_reports_its_steps() {
+        let opt = canon_golden();
+        assert!(opt.is_some(), "golden");
+        let Some((m, mut i)) = opt else { return };
+        let exports = ModuleExports::default();
+        let deps = BTreeMap::new();
+        let spent = infer_module_with_budget(&m, &exports, &deps, &mut i, SolverSteps::DEFAULT)
+            .map(|inference| inference.steps);
+        assert!(matches!(spent, Ok(steps) if steps > 1), "{spent:?}");
+        let Ok(steps) = spent else { return };
+        let exact = SolverSteps::new(steps).map(|ceiling| {
+            infer_module_with_budget(&m, &exports, &deps, &mut i, ceiling)
+                .map(|inference| inference.steps)
+        });
+        assert_eq!(exact, Some(Ok(steps)), "the exact ceiling admits the solve");
+        let short = SolverSteps::new(steps - 1)
+            .map(|ceiling| infer_module_with_budget(&m, &exports, &deps, &mut i, ceiling));
+        assert!(
+            matches!(
+                short
+                    .as_ref()
+                    .map(|r| r.as_ref().map_err(InferError::diagnostic)),
+                Some(Err(Diagnostic::Type {
+                    msg: TypeError::StepBudgetExceeded { .. },
+                    ..
+                }))
+            ),
+            "one step short of the spend is refused"
+        );
     }
 
     // ── rich TypeError payloads (E3) ───────────────────────────────────────
@@ -6565,7 +6675,7 @@ mod tests {
     fn min_solver_steps(src: &str) -> Option<u64> {
         let fits = |steps: u64| -> Option<bool> {
             let (m, mut i) = canon_src(src)?;
-            match infer_with_budget(&m, &mut i, &mut Budget::new(steps)) {
+            match infer_with_budget(&m, &mut i, &mut Budget::new(SolverSteps::new(steps)?)) {
                 Ok(_) => Some(true),
                 Err(Diagnostic::Type {
                     msg: TypeError::StepBudgetExceeded { .. },
@@ -6675,6 +6785,57 @@ mod tests {
             rev.is_ok(),
             "equality before field read must infer: {rev:?}"
         );
+    }
+
+    #[test]
+    fn equality_on_a_deferred_record_base_holds_nested_and_aliased() {
+        // The deferred settle leaves `a` over a residual row whatever spelling
+        // reaches it: inside a tuple, through a `let` alias, or as both
+        // operands of a generic use. Each is judged on the emitted record.
+        for body in [
+            "ok a =\n    a.x == 1 && (a, 1) == (a, 1)\n",
+            "ok a =\n    (a, 1) == (a, 1) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && (let b = a in b == b)\n",
+            "ok a =\n    (let b = a in b == b) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+            "ok a =\n    same a a && a.x == 1\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(r.is_ok(), "`{body}` must infer: {r:?}");
+        }
+    }
+
+    #[test]
+    fn equality_on_a_record_extended_by_a_function_is_refused() {
+        // The residual row reads closed only while nothing extends it: a use
+        // that adds a function field makes the compared record unequatable,
+        // in either operand order.
+        for body in [
+            "ok a =\n    a.x == 1 && a == a\n\nuse = ok { x = 1, f = \\y -> y }\n",
+            "ok a =\n    a == a && a.x == 1\n\nuse = ok { x = 1, f = \\y -> y }\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equality_on_a_rigid_row_record_is_refused() {
+        // An annotation's row variable is a generic over an unknown rest: no
+        // equality holds of it, compared directly or through a generic use.
+        for body in [
+            "ok : { r | x : Int } -> Bool\nok a =\n    a == a\n",
+            "ok : { r | x : Int } -> Bool\nok a =\n    same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
     }
 
     #[test]
@@ -7892,7 +8053,7 @@ mod tests {
         // must reproduce them byte-for-byte.
         let mut settled: Option<(Span, Option<ModuleHome>)> = None;
         for run in 0..50 {
-            let mut budget = Budget::from_env();
+            let mut budget = Budget::new(SolverSteps::DEFAULT);
             let err = infer_with_budget_attributed(&m, &mut i, &mut budget)
                 .expect_err("Wrap stamp (Int vs Stamp) must be a type error");
             let home = err.home().cloned();

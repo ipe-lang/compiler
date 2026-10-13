@@ -2330,9 +2330,7 @@ fn hint_text(hint: Hint) -> String {
         Hint::AddTypeSignature => {
             "add a top-level type signature, e.g. `f : Int -> Int`".to_string()
         }
-        Hint::RaiseSolverBudget => {
-            "raise the budget with `IPE_SOLVER_BUDGET=<n>` (0 disables the limit)".to_string()
-        }
+        Hint::RaiseSolverBudget => "raise the budget with `IPE_SOLVER_BUDGET=<n>`".to_string(),
         Hint::NestingBoundDeliberate => {
             "this limit is deliberate, to fail fast on pathologically nested input".to_string()
         }

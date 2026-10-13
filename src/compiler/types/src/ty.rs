@@ -205,7 +205,10 @@ impl VarCeiling {
 /// tagged representative exactly when it ends in a variable (`Flex`, `Rigid`
 /// or `Super`), and the record's fields are the union of the fields along the
 /// chain. Any other terminal, or a label repeated along the chain, is refused
-/// by the read-back, never a value of this type.
+/// by the read-back, never a value of this type. The emitted-type read-back
+/// ([`crate::zonk_emitted`]) differs in one place: a chain ending in
+/// a non-rigid variable reads `Closed`, the struct of its known fields the
+/// backend emits.
 ///
 /// Mirrors `Maybe String` on `TRecord (Map …) (Maybe String)` in
 /// `../ipe/src/Ipe/AST/Canonical.hs:159`.
