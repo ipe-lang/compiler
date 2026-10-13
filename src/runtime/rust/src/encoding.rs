@@ -1144,6 +1144,20 @@ impl ServerPattern {
         self.trailing
     }
 
+    /// The decoded parameter values of `path` when this pattern matches it.
+    ///
+    /// A match needs the same trailing slash and, segment by segment, an equal
+    /// decoded literal or any parameter value: the router's own rule, checked
+    /// again on decoded segments rather than on spellings.
+    #[must_use]
+    pub fn captures(&self, path: &RequestPath) -> Option<RouteParams> {
+        if self.trailing == path.trailing() {
+            match_route(&self.pattern, path.decoded())
+        } else {
+            None
+        }
+    }
+
     /// The spelling the router registers: `/`, or `/seg/...` with each
     /// literal canonical and each parameter `:name`.
     #[must_use]
