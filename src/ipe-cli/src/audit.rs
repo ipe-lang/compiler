@@ -3223,7 +3223,7 @@ mod tests {
             "control: the swapped tree carries an undeclared effect: {:?}",
             fresh
                 .as_ref()
-                .map(|set| set.len())
+                .map(BTreeSet::len)
                 .map_err(ToString::to_string)
         );
     }
