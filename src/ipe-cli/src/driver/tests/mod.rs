@@ -3867,6 +3867,45 @@ fn unsafe_scan_manifest_project_ok_when_all_readable() {
     );
 }
 
+/// A manifest project whose module discovery fails fails both consent scans
+/// closed, never falling back to the entry's loose-file closure.
+#[test]
+fn unsafe_scan_manifest_project_fails_closed_on_discovery_failure() {
+    use std::fs;
+
+    let dir = unsafe_scan_test_dir("manifest-discovery");
+    let src = dir.join("src");
+    let entry = src.join("Main.ipe");
+    let too_deep =
+        (0..=crate::project::MAX_DISCOVERY_DEPTH).fold(src.clone(), |path, _| path.join("d"));
+    fs::create_dir_all(&too_deep).expect("create a tree past the depth ceiling");
+    fs::write(&entry, "module Main exposing (main)\n\nmain = 1\n").expect("write Main");
+    fs::write(
+        too_deep.join("Deep.ipe"),
+        "module Deep exposing (x)\n\nx = 1\n",
+    )
+    .expect("write Deep");
+    let manifest_path = dir.join("package.ipe");
+    fs::write(
+        &manifest_path,
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"test\" }\n",
+    )
+    .expect("write manifest");
+
+    let unsafe_scan = user_sources_for_unsafe_scan(Some(&manifest_path), &entry);
+    let web_scan = named_sources_for_web_scan(Some(&manifest_path), &entry);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(&unsafe_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
+        "a failed discovery fails the `.Unsafe` scan closed, got: {unsafe_scan:?}"
+    );
+    assert!(
+        matches!(&web_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
+        "a failed discovery fails the web scan closed, got: {web_scan:?}"
+    );
+}
+
 /// Single-file fallback: when `collect_entry_and_siblings` fails and the
 /// entry itself is unreadable, the result must be `Err(CliError::Io)`
 /// naming the entry path — not `Ok` with an empty list.
@@ -3896,6 +3935,125 @@ fn unsafe_scan_single_file_fallback_fails_closed_on_unreadable_entry() {
                 if path == &entry
         ),
         "expected Err(CliError::SourceRefused(AccessDenied)) naming {entry:?}, got: {result:?}"
+    );
+}
+
+/// The consent scans fall back to the entry's own text only when the entry does not parse.
+///
+/// An unparsable entry is scanned as its text alone; a closure refused past
+/// its probe ceiling propagates the refusal, never the fallback.
+#[test]
+#[allow(clippy::expect_used)] // test fixture: an unwritable scratch file IS the failure
+fn scan_sources_fall_back_only_on_entry_parse() {
+    use std::fmt::Write as _;
+
+    let dir = unsafe_scan_test_dir("entry-parse-fallback");
+    let entry = dir.join("Main.ipe");
+    let broken = "module Main exposing (main)\n\nmain =\n";
+    fs::write(&entry, broken).expect("write unparsable entry");
+    let unparsable_unsafe = user_sources_for_unsafe_scan(None, &entry);
+    let unparsable_web = named_sources_for_web_scan(None, &entry);
+
+    // Every import names a module absent on disk: probing alone passes the ceiling.
+    let imports =
+        (0..crate::loose_file::MAX_LOOSE_FILE_PROBES).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "import M{i}");
+            acc
+        });
+    fs::write(
+        &entry,
+        format!("module Main exposing (main)\n\n{imports}\nmain = 1\n"),
+    )
+    .expect("write over-ceiling entry");
+    let over_unsafe = user_sources_for_unsafe_scan(None, &entry);
+    let over_web = named_sources_for_web_scan(None, &entry);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(&unparsable_unsafe, Ok(sources) if sources.iter().map(String::as_str).eq([broken])),
+        "an unparsable entry is scanned as its own text, got: {unparsable_unsafe:?}"
+    );
+    assert!(
+        matches!(&unparsable_web, Ok(named) if named.iter().map(|(_, src)| src.as_str()).eq([broken])),
+        "an unparsable entry is web-scanned as its own text, got: {unparsable_web:?}"
+    );
+    assert!(
+        matches!(&over_unsafe, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
+        "a closure past its probe ceiling fails the scan closed, got: {over_unsafe:?}"
+    );
+    assert!(
+        matches!(&over_web, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
+        "a closure past its probe ceiling fails the web scan closed, got: {over_web:?}"
+    );
+}
+
+/// The entry's parse failure renders exactly as the compiler diagnostic it always was.
+///
+/// `CliError::from` an entry-parse failure is the `Pipeline` value built from
+/// the entry, its text and its parse diagnostic: same kind, same human
+/// screen, same `--json` document.
+#[test]
+#[allow(clippy::expect_used)] // test fixture: an unwritable scratch file IS the failure
+fn entry_parse_renders_as_pipeline() {
+    let dir = unsafe_scan_test_dir("entry-parse-render");
+    let entry = dir.join("Main.ipe");
+    let broken = "module Main exposing (main)\n\nmain =\n";
+    fs::write(&entry, broken).expect("write unparsable entry");
+    let loaded = crate::loose_file::resolve_loose_file(
+        &entry,
+        None,
+        crate::loose_file::LooseFileLimits::DEFAULT,
+    );
+    let _ = fs::remove_dir_all(&dir);
+    let expected_diag = ipe_parse::parse_module(broken, &mut ipe_intern::Interner::new()).err();
+
+    assert!(
+        matches!(
+            loaded,
+            Err(crate::loose_file::LooseFileError::EntryParse(_))
+        ),
+        "an unparsable entry is the entry-parse case, got: {loaded:?}"
+    );
+    assert!(expected_diag.is_some(), "the fixture entry does not parse");
+    let (Err(failure), Some(expected_diag)) = (loaded, expected_diag) else {
+        return;
+    };
+    let expected = CliError::Pipeline {
+        file: entry.clone(),
+        src: broken.to_owned(),
+        diag: Box::new(expected_diag),
+    };
+    let actual = CliError::from(failure);
+
+    assert_eq!(actual.machine_kind(), "pipeline");
+    assert_eq!(actual.machine_kind(), expected.machine_kind());
+    assert_eq!(
+        actual.to_string(),
+        expected.to_string(),
+        "human screen parity"
+    );
+    assert!(
+        matches!(&actual, CliError::Pipeline { file, src, .. } if *file == entry && src == broken),
+        "the Pipeline names the entry and carries its text, got: {actual:?}"
+    );
+    let (
+        CliError::Pipeline { file, src, diag },
+        CliError::Pipeline {
+            diag: expected_diag,
+            ..
+        },
+    ) = (&actual, &expected)
+    else {
+        return;
+    };
+    assert_eq!(
+        diag, expected_diag,
+        "the parse diagnostic is carried unchanged"
+    );
+    assert_eq!(
+        crate::render_json(diag, &file.to_string_lossy(), src),
+        crate::render_json(expected_diag, &entry.to_string_lossy(), broken),
+        "--json parity"
     );
 }
 

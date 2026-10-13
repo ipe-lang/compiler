@@ -69,6 +69,10 @@ pub enum CliError {
     /// rustc/Elm-style report (caret snippet + help + `ipe explain` pointer)
     /// rather than a debug dump.
     ///
+    /// A loose entry's own parse failure is
+    /// [`crate::loose_file::LooseFileError::EntryParse`] until it is rendered;
+    /// its `From` conversion builds this variant.
+    ///
     /// `diag` is boxed: a bare [`Diagnostic`] is the widest field of the
     /// widest variant, and every one of the ~200 functions returning
     /// `Result<_, CliError>` pays the enum's size in its `Err` slot. Boxing

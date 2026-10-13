@@ -16,6 +16,7 @@ use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
 };
 use crate::contained_path::ResolvedPath;
+use crate::loose_file::LooseFileError;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::style::TerminalSafe;
 use crate::verb::{CommandName, DevVerb, ReleaseVerb, Umbrella, Verb};
@@ -3862,21 +3863,22 @@ fn build_source_graph_from(
 /// (the same whole-tree posture package-capability inference takes); a
 /// single-file entry reads the entry plus its imported siblings.
 ///
-/// Fail-closed: any unreadable module causes an immediate `Err` so the
-/// acknowledgment gate never operates on a partial source set.
+/// Fail-closed: a discovery failure or any unreadable module causes an
+/// immediate `Err` so the acknowledgment gate never operates on a partial
+/// source set.
 ///
 /// # Errors
-/// [`CliError::Io`] when any discovered module cannot be read; for a single
-/// file, every [`loose_file_scan_sources`] error.
+/// Every [`project::discover_modules`] error, and [`CliError::Io`] when any
+/// discovered module cannot be read; for a single file, every
+/// [`loose_file_scan_sources`] error.
 pub fn user_sources_for_unsafe_scan(
     manifest: Option<&Path>,
     entry: &Path,
 ) -> Result<Vec<String>, CliError> {
     if let Some(mpath) = manifest
         && let Ok(m) = project::parse_manifest(mpath)
-        && let Ok(discovered) = project::discover_modules(&m.src_root)
     {
-        return discovered
+        return project::discover_modules(&m.src_root)?
             .iter()
             .map(|d| crate::io_bounded::read_walked_source(d.path()))
             .collect::<Result<Vec<_>, _>>();
@@ -3895,7 +3897,7 @@ pub fn user_sources_for_unsafe_scan(
 /// source set.
 ///
 /// # Errors
-/// Every [`collect_entry_and_siblings`] error except the entry's own parse failure.
+/// Every [`LooseFileError::Refused`] error [`collect_entry_and_siblings`] returns.
 fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliError> {
     match collect_entry_and_siblings(entry) {
         Ok(collected) => Ok(collected
@@ -3903,10 +3905,10 @@ fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliErr
             .into_iter()
             .map(|(path, (_, src))| (path.join("."), src))
             .collect()),
-        Err(CliError::Pipeline { file, src, .. }) if file.as_path() == entry => {
-            Ok(vec![(entry.display().to_string(), src)])
+        Err(LooseFileError::EntryParse(failure)) => {
+            Ok(vec![(entry.display().to_string(), failure.into_src())])
         }
-        Err(other) => Err(other),
+        Err(LooseFileError::Refused(other)) => Err(other),
     }
 }
 
