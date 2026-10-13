@@ -64,18 +64,23 @@ fn render_stringify_format(
     args: &[String],
     open_col: usize,
     block_indent: usize,
-) -> String {
-    let elems: Vec<Doc> = std::iter::once(Doc::owned(fmt_literal.to_owned()))
+) -> DResult<String> {
+    let elems = std::iter::once(Doc::owned(fmt_literal.to_owned()))
         .chain(args.iter().map(|a| Doc::owned(a.clone())))
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     let call = Doc::call_args(
-        Doc::text("format!("),
+        Doc::text(leaf!("format!(")),
         elems,
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
         // A macro argument list breaks without a trailing comma.
         false,
     );
-    render_seeded(&call, RenderConfig::default(), block_indent, open_col)
+    Ok(render_seeded(
+        &call,
+        RenderConfig::default(),
+        block_indent,
+        open_col,
+    ))
 }
 
 /// `rustfmt`'s `max_width` (default 100): the widest line the formatter leaves
@@ -105,7 +110,11 @@ const FN_CALL_WIDTH: usize = 60;
 ///
 /// `arm_head` is the `            {Enum}::{Variant}(binders) => ` prefix at block
 /// indent 12; `fmt_literal` and `args` are the `format!` operands.
-fn render_stringify_enum_arm(arm_head: &str, fmt_literal: &str, args: &[String]) -> String {
+fn render_stringify_enum_arm(
+    arm_head: &str,
+    fmt_literal: &str,
+    args: &[String],
+) -> DResult<String> {
     const ARM_INDENT: usize = 12;
     let open_col = arm_head.chars().count();
 
@@ -123,18 +132,20 @@ fn render_stringify_enum_arm(arm_head: &str, fmt_literal: &str, args: &[String])
 
     if args_width <= FN_CALL_WIDTH && inline_arm_width <= MAX_WIDTH {
         // INLINE.
-        format!("{arm_head}{inline_call},")
+        Ok(format!("{arm_head}{inline_call},"))
     } else if args_width <= FN_CALL_WIDTH {
         // BLOCK-WRAP: the call fits `fn_call_width` but the inline arm overflows,
         // so `rustfmt` brace-wraps the body. The `format!` lands at arm indent + 4.
         let body_indent = " ".repeat(ARM_INDENT + 4);
         let close_indent = " ".repeat(ARM_INDENT);
-        format!("{arm_head}{{\n{body_indent}{inline_call}\n{close_indent}}}")
+        Ok(format!(
+            "{arm_head}{{\n{body_indent}{inline_call}\n{close_indent}}}"
+        ))
     } else {
         // DELIMITER-BREAK: the argument text exceeds `fn_call_width`, so the
         // `format!` breaks one argument per line after `=> `; the arm keeps `,`.
-        let call = render_stringify_format(fmt_literal, args, open_col, ARM_INDENT);
-        format!("{arm_head}{call},")
+        let call = render_stringify_format(fmt_literal, args, open_col, ARM_INDENT)?;
+        Ok(format!("{arm_head}{call},"))
     }
 }
 
@@ -1027,7 +1038,7 @@ fn emit_enum_variant_lines_and_arms(
                 &arm_head,
                 &fmt_literal,
                 &show_args,
-            ));
+            )?);
             let measured_arm = |binders: Vec<String>| {
                 let head = format!("            {name}::{vn}({}) => ", binders.join(", "));
                 let terms: Vec<String> = binders.iter().map(|b| format!(".plus({b})")).collect();
@@ -1337,7 +1348,7 @@ pub fn emit_record_struct(ctx: &EmitCtx, rec: &RecordStruct) -> DResult<String> 
     } else {
         let placeholders = vec!["{}"; rec.fields.len()].join(" ");
         let fmt_literal = format!("\"{{{{{placeholders}}}}}\"");
-        render_stringify_format(&fmt_literal, &show_args, 8, 8)
+        render_stringify_format(&fmt_literal, &show_args, 8, 8)?
     };
 
     // seal: only a fully-derivable record takes the unconditional

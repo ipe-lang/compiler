@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::doc::{ChainOperand, Doc, LeafNorm};
+use crate::emit_expr::InfixOp;
 
 mod buf;
 #[cfg(test)]
@@ -187,7 +188,7 @@ fn render_within_spend(
         )
     });
     if spend.exhausted {
-        return (doc.plain_layout(), spend);
+        return (doc.plain_layout(indent), spend);
     }
     (out.into_string(), spend)
 }
@@ -1620,7 +1621,7 @@ const ARM_PATTERN_RESERVE: usize = 5;
 /// arm's indent, so the reservation REPLACES the enclosing trailing-sibling
 /// reserve (the ` => ` text the arm concat carries) instead of stacking on it.
 fn render_or_pattern(
-    alts: &[std::borrow::Cow<'static, str>],
+    alts: &[crate::doc::Leaf],
     cfg: RenderConfig,
     col: usize,
     flat: bool,
@@ -2321,13 +2322,13 @@ fn render_if_else(
         // enclosing group could in principle break it, but the width test already
         // guaranteed it fits.
         let pieces = [
-            &Doc::text("(if "),
+            &Doc::text(leaf!("(if ")),
             cond,
-            &Doc::text(" { "),
+            &Doc::text(leaf!(" { ")),
             then_,
-            &Doc::text(" } else { "),
+            &Doc::text(leaf!(" } else { ")),
             else_,
-            &Doc::text(" })"),
+            &Doc::text(leaf!(" })")),
         ];
         render_concat(&pieces, cfg, indent, start_col, flat, out);
         return;
@@ -2336,12 +2337,19 @@ fn render_if_else(
     // Broken block form. Braces sit at the enclosing block `indent`; each branch
     // body indents to `indent + 4`. `HardLine`s force the layout unconditionally,
     // matching `rustfmt`'s block-form `if` once past the single-line threshold.
-    let head = [&Doc::text("(if "), cond, &Doc::text(" {")];
+    let head = [&Doc::text(leaf!("(if ")), cond, &Doc::text(leaf!(" {"))];
     render_concat(&head, cfg, indent, start_col, flat, out);
     render_if_branch(then_, cfg, indent, start_col, flat, out);
-    render_at(&Doc::text("} else {"), cfg, indent, start_col, flat, out);
+    render_at(
+        &Doc::text(leaf!("} else {")),
+        cfg,
+        indent,
+        start_col,
+        flat,
+        out,
+    );
     render_if_branch(else_, cfg, indent, start_col, flat, out);
-    render_at(&Doc::text("})"), cfg, indent, start_col, flat, out);
+    render_at(&Doc::text(leaf!("})")), cfg, indent, start_col, flat, out);
 }
 
 /// One branch of a broken [`Doc::IfElse`]: the branch body on its own line one
@@ -2961,7 +2969,7 @@ fn chain_flat_fits_single_line(
     let run = flat_run(
         operands.iter().enumerate().map(|(i, o)| {
             let op = if i > 0 {
-                o.leading_op.as_deref().unwrap_or("").len() + 2
+                o.leading_op.map_or("", InfixOp::spelling).len() + 2
             } else {
                 0
             };
@@ -3057,7 +3065,7 @@ fn render_chain(
         }
         // Non-first operands always carry a leading operator (the builder
         // invariant); an absent one degrades to no operator rather than panicking.
-        let op = operand.leading_op.as_deref().unwrap_or("");
+        let op = operand.leading_op.map_or("", InfixOp::spelling);
 
         if !broken {
             let cur = current_col(out);
@@ -3792,7 +3800,7 @@ fn last_head(doc: &Doc) -> &Doc {
 }
 
 /// An empty text leaf, the zero-width combining head of a non-combinable construct.
-static EMPTY_LEAF: Doc = Doc::Text(std::borrow::Cow::Borrowed(""));
+static EMPTY_LEAF: Doc = Doc::Text(crate::doc::Leaf::EMPTY);
 
 /// The flat-rendered length of a delimiter/head leaf (`f(`, `Box::new((`), used to
 /// shrink the recursive combining budget one nesting step.
@@ -3911,7 +3919,7 @@ fn delimited_expr_uncached(doc: &Doc) -> bool {
     match doc {
         Doc::CallArgs { open, elems, .. } => match open.as_ref() {
             // A tuple `(` or an array `vec![` / `[`.
-            Doc::Text(h) if h.as_ref() == "(" || h.ends_with('[') => true,
+            Doc::Text(h) if h.as_str() == "(" || h.ends_with('[') => true,
             // A `Box::new(<delimited>)` / `Some(<delimited>)` single-arg wrapper:
             // delimited iff its inner is (its own `(`-ended named head).
             Doc::Text(h) if h.ends_with('(') && !h.contains('{') && elems.len() == 1 => {
@@ -3999,7 +4007,7 @@ fn render_chain_flat(operands: &[ChainOperand], cfg: RenderConfig, indent: usize
     for (i, operand) in operands.iter().enumerate() {
         if i > 0 {
             out.push(' ');
-            out.push_str(operand.leading_op.as_deref().unwrap_or(""));
+            out.push_str(operand.leading_op.map_or("", InfixOp::spelling));
             out.push(' ');
         }
         let c = current_col(out);
@@ -4016,14 +4024,24 @@ mod p0_tests {
     //! match them, never the reverse.
 
     use super::*;
-    use crate::doc::{ChainOperand, Doc};
-    use std::borrow::Cow;
+    use crate::doc::{ChainOperand, Doc, Leaf};
+
+    /// The leaf of a test text.
+    #[allow(clippy::expect_used)] // every test text is code only; a refusal fails the test
+    fn leaf_of(text: impl Into<String>) -> Leaf {
+        Leaf::parse(text.into()).expect("a test leaf is code only")
+    }
+
+    /// A text leaf from a test text.
+    fn owned(text: impl Into<String>) -> Doc {
+        Doc::text(leaf_of(text))
+    }
 
     /// A chain operand from a plain text leaf.
-    fn op(leading: Option<&'static str>, text: String) -> ChainOperand {
+    fn op(leading: Option<InfixOp>, text: String) -> ChainOperand {
         ChainOperand {
-            leading_op: leading.map(Cow::Borrowed),
-            doc: Doc::owned(text),
+            leading_op: leading,
+            doc: owned(text),
         }
     }
 
@@ -4051,10 +4069,10 @@ mod p0_tests {
         // `+ f` each break to col 8 (block indent 4 + 4). Captured from rustfmt.
         let operands = vec![
             op(None, "(((((longfunctioncallnamehere_aaaa(x)".into()),
-            op(Some("+"), "bbbbbbbbbbb)".into()),
-            op(Some("+"), "ccccccccccc)".into()),
-            op(Some("+"), "ddddddddddd)".into()),
-            op(Some("+"), "eeeeeeeeeee)".into()),
+            op(Some(InfixOp::FloatAdd), "bbbbbbbbbbb)".into()),
+            op(Some(InfixOp::FloatAdd), "ccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "ddddddddddd)".into()),
+            op(Some(InfixOp::FloatAdd), "eeeeeeeeeee)".into()),
             op(
                 Some("+"),
                 "ffffffffffffffffffffffffffffffffffffffffffffff)".into(),
@@ -4077,11 +4095,11 @@ mod p0_tests {
                 None,
                 "(((((longfunctioncallnamehere_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa(x)".into(),
             ),
-            op(Some("+"), "bbbbbbbbbbb)".into()),
-            op(Some("+"), "ccccccccccc)".into()),
-            op(Some("+"), "ddddddddddd)".into()),
-            op(Some("+"), "eeeeeeeeeee)".into()),
-            op(Some("+"), "ff)".into()),
+            op(Some(InfixOp::FloatAdd), "bbbbbbbbbbb)".into()),
+            op(Some(InfixOp::FloatAdd), "ccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "ddddddddddd)".into()),
+            op(Some(InfixOp::FloatAdd), "eeeeeeeeeee)".into()),
+            op(Some(InfixOp::FloatAdd), "ff)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         let expected = "    let z = (((((longfunctioncallnamehere_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa(x) + bbbbbbbbbbb)\n        + ccccccccccc)\n        + ddddddddddd)\n        + eeeeeeeeeee)\n        + ff)";
@@ -4097,18 +4115,18 @@ mod p0_tests {
     /// and forces any enclosing group broken, whatever the width.
     fn block(decl: &'static str, tail: &'static str) -> Doc {
         Doc::concat(vec![
-            Doc::text("{"),
+            Doc::text(leaf!("{")),
             Doc::nest(
                 4,
                 Doc::concat(vec![
                     Doc::HardLine,
-                    Doc::text(decl),
+                    Doc::text(leaf_of(decl)),
                     Doc::HardLine,
-                    Doc::text(tail),
+                    Doc::text(leaf_of(tail)),
                 ]),
             ),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ])
     }
 
@@ -4119,13 +4137,13 @@ mod p0_tests {
         let mut inner = vec![];
         for a in args {
             inner.push(Doc::Softline);
-            inner.push(Doc::owned(format!("{a},")));
+            inner.push(owned(format!("{a},")));
         }
         Doc::group(Doc::concat(vec![
-            Doc::owned(format!("{name}(")),
+            owned(format!("{name}(")),
             Doc::nest(4, Doc::concat(inner)),
             Doc::Softline,
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         ]))
     }
 
@@ -4138,7 +4156,7 @@ mod p0_tests {
             ChainOperand {
                 leading_op: None,
                 doc: Doc::concat(vec![
-                    Doc::text("("),
+                    Doc::text(leaf!("(")),
                     call(
                         "bcall",
                         &[
@@ -4149,7 +4167,7 @@ mod p0_tests {
                     ),
                 ]),
             },
-            op(Some("+"), "cccccccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "cccccccccccccccc)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         let expected = "    let z = (bcall(\n        argument_number_one_long,\n        argument_number_two_long,\n        argument_number_three_verylong,\n    ) + cccccccccccccccc)";
@@ -4168,24 +4186,24 @@ mod p0_tests {
             ChainOperand {
                 leading_op: None,
                 doc: Doc::concat(vec![
-                    Doc::text("(((mlcall_one("),
+                    Doc::text(leaf!("(((mlcall_one(")),
                     block(
                         "let a = something_long_enough_to_force_break_here_now;",
                         "a",
                     ),
-                    Doc::text(")"),
+                    Doc::text(leaf!(")")),
                 ]),
             },
-            op(Some("+"), "slshort)".into()),
+            op(Some(InfixOp::FloatAdd), "slshort)".into()),
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
+                leading_op: Some(InfixOp::FloatAdd),
                 doc: Doc::concat(vec![
-                    Doc::text("mlcall_two("),
+                    Doc::text(leaf!("mlcall_two(")),
                     block("let b = another_thing_long_enough_to_break_it;", "b"),
-                    Doc::text("))"),
+                    Doc::text(leaf!("))")),
                 ]),
             },
-            op(Some("+"), "tail_operand_x)".into()),
+            op(Some(InfixOp::FloatAdd), "tail_operand_x)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         let expected = "    let z = (((mlcall_one({\n        let a = something_long_enough_to_force_break_here_now;\n        a\n    }) + slshort)\n        + mlcall_two({\n            let b = another_thing_long_enough_to_break_it;\n            b\n        }))\n        + tail_operand_x)";
@@ -4200,8 +4218,8 @@ mod p0_tests {
         // A short chain that fits entirely on the line: no operator breaks.
         let operands = vec![
             op(None, "((a".into()),
-            op(Some("+"), "b)".into()),
-            op(Some("+"), "c)".into()),
+            op(Some(InfixOp::FloatAdd), "b)".into()),
+            op(Some(InfixOp::FloatAdd), "c)".into()),
         ];
         let got = render_line("    let z = ", 4, &operands);
         assert_eq!(got, "    let z = ((a + b) + c)");
@@ -4217,14 +4235,14 @@ mod p0_tests {
         // The leading operand is padded past the width so the group cannot fit and
         // is forced broken — exercising the "all soft Lines break uniformly" path.
         let group = Doc::group(Doc::concat(vec![
-            Doc::owned(format!("(((mlcall_one({}) ", "x".repeat(110))),
-            Doc::text("+"),
+            owned(format!("(((mlcall_one({}) ", "x".repeat(110))),
+            Doc::text(leaf!("+")),
             Doc::Line,
-            Doc::text("slshort) +"),
+            Doc::text(leaf!("slshort) +")),
             Doc::Line,
-            Doc::text("mlcall_two({...})) +"),
+            Doc::text(leaf!("mlcall_two({...})) +")),
             Doc::Line,
-            Doc::text("tail_operand_x)"),
+            Doc::text(leaf!("tail_operand_x)")),
         ]));
         // The over-wide first operand forces the group broken.
         let mut buf = Buf::new();
@@ -4261,11 +4279,11 @@ mod p0_tests {
         // A chain doc's normalized leaves must equal its normalized rendered bytes.
         let operands = vec![
             op(None, "(((((longfunctioncallnamehere_aaaa(x)".into()),
-            op(Some("+"), "bbbbbbbbbbb)".into()),
-            op(Some("+"), "ccccccccccc)".into()),
-            op(Some("+"), "ddddddddddd)".into()),
-            op(Some("+"), "eeeeeeeeeee)".into()),
-            op(Some("+"), "ff)".into()),
+            op(Some(InfixOp::FloatAdd), "bbbbbbbbbbb)".into()),
+            op(Some(InfixOp::FloatAdd), "ccccccccccc)".into()),
+            op(Some(InfixOp::FloatAdd), "ddddddddddd)".into()),
+            op(Some(InfixOp::FloatAdd), "eeeeeeeeeee)".into()),
+            op(Some(InfixOp::FloatAdd), "ff)".into()),
         ];
         let chain = Doc::Chain { operands };
         let rendered = render(&chain, RenderConfig::default());
@@ -4281,16 +4299,16 @@ mod p0_tests {
     /// `name(a, b, c)`. Broken: one arg per line, trailing comma, closing paren
     /// dedented to the group's start column.
     fn arg_group(name: &str, args: &[&str]) -> Doc {
-        let mut inner = vec![Doc::owned(format!("{name}("))];
+        let mut inner = vec![owned(format!("{name}("))];
         let mut nested = vec![];
         for (i, a) in args.iter().enumerate() {
             if i == 0 {
                 nested.push(Doc::Softline);
             } else {
-                nested.push(Doc::text(","));
+                nested.push(Doc::text(leaf!(",")));
                 nested.push(Doc::Line);
             }
-            nested.push(Doc::owned((*a).to_owned()));
+            nested.push(owned((*a).to_owned()));
         }
         // Trailing comma appears only when broken; a `Softline`-guarded `,` would
         // vanish flat. Emit it as part of the last arg via a separate group-aware
@@ -4302,7 +4320,7 @@ mod p0_tests {
         // flatten/break decision itself.
         inner.push(Doc::nest(4, Doc::concat(nested)));
         inner.push(Doc::Softline);
-        inner.push(Doc::text(")"));
+        inner.push(Doc::text(leaf!(")")));
         Doc::group(Doc::concat(inner))
     }
 
@@ -4338,26 +4356,26 @@ mod p0_tests {
         // glues the multiline block onto the call head). Captured from `rustfmt
         // --edition 2024 --style-edition 2024`.
         let block = Doc::concat(vec![
-            Doc::text("{"),
+            Doc::text(leaf!("{")),
             Doc::nest(
                 4,
                 Doc::concat(vec![
                     Doc::HardLine,
-                    Doc::text("let x: i64 = 1;"),
+                    Doc::text(leaf!("let x: i64 = 1;")),
                     Doc::HardLine,
-                    Doc::text("x"),
+                    Doc::text(leaf!("x")),
                 ]),
             ),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ]);
         let call = Doc::call_args(
-            Doc::text("crate::main_apply_i("),
-            vec![block, Doc::text("0")],
-            Doc::text(")"),
+            Doc::text(leaf!("crate::main_apply_i(")),
+            vec![block, Doc::text(leaf!("0"))],
+            Doc::text(leaf!(")")),
             true,
         );
-        let op0 = Doc::concat(vec![Doc::text("(("), call]);
+        let op0 = Doc::concat(vec![Doc::text(leaf!("((")), call]);
         let chain = Doc::Chain {
             operands: vec![
                 ChainOperand {
@@ -4365,8 +4383,8 @@ mod p0_tests {
                     doc: op0,
                 },
                 ChainOperand {
-                    leading_op: Some(Cow::Borrowed("+")),
-                    doc: Doc::text("crate::main_apply_p(1))"),
+                    leading_op: Some(InfixOp::FloatAdd),
+                    doc: Doc::text(leaf!("crate::main_apply_p(1))")),
                 },
             ],
         };
@@ -4384,10 +4402,10 @@ mod p0_tests {
         // A tiny group whose flat width easily fits, but carrying a `HardLine`:
         // it must still break (a statement block never inlines).
         let doc = Doc::group(Doc::concat(vec![
-            Doc::text("{"),
-            Doc::nest(4, Doc::concat(vec![Doc::HardLine, Doc::text("x")])),
+            Doc::text(leaf!("{")),
+            Doc::nest(4, Doc::concat(vec![Doc::HardLine, Doc::text(leaf!("x"))])),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ]));
         assert_eq!(render(&doc, RenderConfig::default()), "{\n    x\n}");
     }
@@ -4397,8 +4415,8 @@ mod p0_tests {
         // A `BraceBody` whose body fits the width renders JUST the body — no braces
         // — matching `rustfmt`'s `move |_| rest` brace-strip on a fitting closure.
         let doc = Doc::concat(vec![
-            Doc::text("move |_| "),
-            Doc::brace_body(Doc::text("short_rest")),
+            Doc::text(leaf!("move |_| ")),
+            Doc::brace_body(Doc::text(leaf!("short_rest"))),
         ]);
         assert_eq!(render(&doc, RenderConfig::default()), "move |_| short_rest");
     }
@@ -4410,8 +4428,8 @@ mod p0_tests {
         // `rustfmt`'s block-form closure body.
         let wide = "a".repeat(110);
         let doc = Doc::concat(vec![
-            Doc::text("move |_| "),
-            Doc::brace_body(Doc::owned(wide.clone())),
+            Doc::text(leaf!("move |_| ")),
+            Doc::brace_body(owned(wide.clone())),
         ]);
         let got = render(&doc, RenderConfig::default());
         let expected = format!("move |_| {{\n    {wide}\n}}");
@@ -4425,8 +4443,12 @@ mod p0_tests {
     fn brace_body_with_hardline_body_always_braces_even_when_narrow() {
         // A statement-block body carries a `HardLine`, so it can never fit flat and
         // the `BraceBody` always braces — a block closure body is always braced.
-        let body = Doc::concat(vec![Doc::text("let y = 1;"), Doc::HardLine, Doc::text("y")]);
-        let doc = Doc::concat(vec![Doc::text("move |_| "), Doc::brace_body(body)]);
+        let body = Doc::concat(vec![
+            Doc::text(leaf!("let y = 1;")),
+            Doc::HardLine,
+            Doc::text(leaf!("y")),
+        ]);
+        let doc = Doc::concat(vec![Doc::text(leaf!("move |_| ")), Doc::brace_body(body)]);
         assert_eq!(
             render(&doc, RenderConfig::default()),
             "move |_| {\n    let y = 1;\n    y\n}"
@@ -4442,11 +4464,13 @@ mod p0_tests {
         // divergence (`move |_| (if …` instead of `move |_| { (if … } `). Pins the
         // `has_hard_break(Doc::IfElse)` block-form test against regression.
         let wide = Doc::if_else(
-            Doc::text("condition_wide_enough_to_force_block_form_layout_xxxxx"),
-            Doc::text("then_branch_value"),
-            Doc::text("else_branch_value"),
+            Doc::text(leaf!(
+                "condition_wide_enough_to_force_block_form_layout_xxxxx"
+            )),
+            Doc::text(leaf!("then_branch_value")),
+            Doc::text(leaf!("else_branch_value")),
         );
-        let doc = Doc::concat(vec![Doc::text("move |_| "), Doc::brace_body(wide)]);
+        let doc = Doc::concat(vec![Doc::text(leaf!("move |_| ")), Doc::brace_body(wide)]);
         let got = render(&doc, RenderConfig::default());
         assert!(
             got.starts_with("move |_| {\n"),
@@ -4466,22 +4490,22 @@ mod p0_tests {
         // old inline `build_if` Concat did; a width-only test would report false and
         // let `fits` (first-line-only) inline the tall branch and drop the braces.
         let block_branch = Doc::concat(vec![
-            Doc::text("({"),
+            Doc::text(leaf!("({")),
             Doc::nest(
                 4,
                 Doc::concat(vec![
                     Doc::HardLine,
-                    Doc::text("let x = 1;"),
+                    Doc::text(leaf!("let x = 1;")),
                     Doc::HardLine,
-                    Doc::text("x"),
+                    Doc::text(leaf!("x")),
                 ]),
             ),
             Doc::HardLine,
-            Doc::text("})"),
+            Doc::text(leaf!("})")),
         ]);
         // Narrow: the branch HardLines collapse to spaces in `normalized_leaves`.
-        let narrow = Doc::if_else(Doc::text("c"), block_branch, Doc::text("e"));
-        let doc = Doc::concat(vec![Doc::text("move |_| "), Doc::brace_body(narrow)]);
+        let narrow = Doc::if_else(Doc::text(leaf!("c")), block_branch, Doc::text(leaf!("e")));
+        let doc = Doc::concat(vec![Doc::text(leaf!("move |_| ")), Doc::brace_body(narrow)]);
         let got = render(&doc, RenderConfig::default());
         assert!(
             got.starts_with("move |_| {\n"),
@@ -4495,7 +4519,7 @@ mod p0_tests {
         // writes them), so the normalized leaves carry `{ body }` whether or not the
         // render drops the braces — the flat render diverges from the leaves on the
         // braces exactly as `IfBroken` diverges on the trailing comma.
-        let doc = Doc::brace_body(Doc::text("rest"));
+        let doc = Doc::brace_body(Doc::text(leaf!("rest")));
         assert_eq!(doc.normalized_leaves(), "{ rest }");
         // Flat render drops the braces (matches rustfmt), so rendered != leaves here.
         assert_eq!(render(&doc, RenderConfig::default()), "rest");
@@ -4508,9 +4532,9 @@ mod p0_tests {
         // exactly 50 columns WITHOUT the outer parens (the threshold), so it stays
         // inline whatever the enclosing indent.
         let doc = Doc::if_else(
-            Doc::text("cond1234567890"),
-            Doc::text("thenvalab"),
-            Doc::text("elsevalab"),
+            Doc::text(leaf!("cond1234567890")),
+            Doc::text(leaf!("thenvalab")),
+            Doc::text(leaf!("elsevalab")),
         );
         let seeded = Doc::nest(4, doc);
         assert_eq!(
@@ -4526,11 +4550,11 @@ mod p0_tests {
         // onto its own line at one indent step, braces dedented back to the block
         // indent — the block form, decided by the renderer from the flat leaf widths.
         let doc = Doc::if_else(
-            Doc::text("cond1234567890"),
-            Doc::text("thenvalabc"),
-            Doc::text("elsevalab"),
+            Doc::text(leaf!("cond1234567890")),
+            Doc::text(leaf!("thenvalabc")),
+            Doc::text(leaf!("elsevalab")),
         );
-        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text("let z = "), doc]));
+        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("let z = ")), doc]));
         let got = render(&stmt, RenderConfig::default());
         let expected = "let z = (if cond1234567890 {\n        thenvalabc\n    } else {\n        elsevalab\n    })";
         assert_eq!(
@@ -4544,7 +4568,11 @@ mod p0_tests {
         // The `(if … { … } else { … })` tokens ARE the SEAL leaf sequence (the string
         // emitter writes them adjacently), identical in both the inline and block
         // layouts — the block form's newlines normalize away.
-        let doc = Doc::if_else(Doc::text("c"), Doc::text("t"), Doc::text("e"));
+        let doc = Doc::if_else(
+            Doc::text(leaf!("c")),
+            Doc::text(leaf!("t")),
+            Doc::text(leaf!("e")),
+        );
         assert_eq!(doc.normalized_leaves(), "(if c { t } else { e })");
     }
 
@@ -4553,18 +4581,18 @@ mod p0_tests {
     /// `has_hard_break` once wrapped in a `CallArgs`.
     fn stmt_block() -> Doc {
         Doc::concat(vec![
-            Doc::text("{"),
+            Doc::text(leaf!("{")),
             Doc::nest(
                 4,
                 Doc::concat(vec![
                     Doc::HardLine,
-                    Doc::text("let x: i64 = 1;"),
+                    Doc::text(leaf!("let x: i64 = 1;")),
                     Doc::HardLine,
-                    Doc::text("x"),
+                    Doc::text(leaf!("x")),
                 ]),
             ),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ])
     }
 
@@ -4573,9 +4601,9 @@ mod p0_tests {
     /// so only a genuinely-single-line fit rejects gluing it flat.
     fn call_with_block_arg() -> Doc {
         Doc::call_args(
-            Doc::text("f("),
-            vec![stmt_block(), Doc::text("0")],
-            Doc::text(")"),
+            Doc::text(leaf!("f(")),
+            vec![stmt_block(), Doc::text(leaf!("0"))],
+            Doc::text(leaf!(")")),
             true,
         )
     }
@@ -4589,15 +4617,15 @@ mod p0_tests {
         // embedded newline, so the `BraceBody` braces and blocks. Prove-the-refusal
         // for the StructLit-through-BraceBody SEAL break.
         let record = Doc::struct_lit(
-            Doc::text("Rec {"),
+            Doc::text(leaf!("Rec {")),
             vec![
-                Doc::text("field_one: 111"),
-                Doc::text("field_two: 222"),
-                Doc::text("field_three: 333"),
+                Doc::text(leaf!("field_one: 111")),
+                Doc::text(leaf!("field_two: 222")),
+                Doc::text(leaf!("field_three: 333")),
             ],
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         );
-        let doc = Doc::concat(vec![Doc::text("move |_| "), Doc::brace_body(record)]);
+        let doc = Doc::concat(vec![Doc::text(leaf!("move |_| ")), Doc::brace_body(record)]);
         let got = render(&doc, RenderConfig::default());
         assert!(
             got.starts_with("move |_| {\n") && got.trim_end().ends_with('}'),
@@ -4616,7 +4644,7 @@ mod p0_tests {
         // render embeds a `\n`. A first-line-only fit sees the short head `f(` and
         // drops the closure braces; the single-line discipline keeps them.
         let doc = Doc::concat(vec![
-            Doc::text("move |_| "),
+            Doc::text(leaf!("move |_| ")),
             Doc::brace_body(call_with_block_arg()),
         ]);
         let got = render(&doc, RenderConfig::default());
@@ -4655,16 +4683,19 @@ mod p0_tests {
     #[test]
     fn match_arm_body_brace_wraps_only_when_the_opener_is_lost() {
         let arm = |head: &'static str, elems: Vec<Doc>, open: &'static str| {
-            let call = Doc::call_args(Doc::text(open), elems, Doc::text(")"), true);
+            let call = Doc::call_args(Doc::text(leaf_of(open)), elems, Doc::text(leaf!(")")), true);
             render(
-                &Doc::concat(vec![Doc::text(head), Doc::match_arm_tail(call, false)]),
+                &Doc::concat(vec![
+                    Doc::text(leaf_of(head)),
+                    Doc::match_arm_tail(call, false),
+                ]),
                 RenderConfig::default(),
             )
         };
         let moved = arm(
             "IpeDbStoreCond::Compare(op, col, value) => ",
             vec![
-                Doc::text("crate::user_ipe_db_store_live_name(view, col)"),
+                Doc::text(leaf!("crate::user_ipe_db_store_live_name(view, col)")),
                 stmt_block(),
             ],
             "ipe_result_map(",
@@ -4679,7 +4710,7 @@ mod p0_tests {
             "IpeResult::Ok(value) => ",
             vec![
                 stmt_block(),
-                Doc::text("crate::user_ipe_db_store_decode_rows(codec, rest)"),
+                Doc::text(leaf!("crate::user_ipe_db_store_decode_rows(codec, rest)")),
             ],
             "task_map(",
         );
@@ -4696,7 +4727,7 @@ mod p0_tests {
     fn render_assign_stmt(indent: usize, prefix: &'static str, rhs: Doc) -> String {
         let mut out = Buf::new();
         push_indent(indent, &mut out);
-        let doc = Doc::assign(Doc::text(prefix), rhs, 1);
+        let doc = Doc::assign(Doc::text(leaf_of(prefix)), rhs, 1);
         render_at(
             &doc,
             RenderConfig::default(),
@@ -4713,7 +4744,7 @@ mod p0_tests {
     fn assign_stays_flat_when_prefix_and_rhs_fit() {
         // `let x: T = rhs;` that fits the width stays on one line: prefix then the
         // flat RHS, no break after `=`.
-        let got = render_assign_stmt(4, "let x: i64 = ", Doc::text("Box::new(short)"));
+        let got = render_assign_stmt(4, "let x: i64 = ", Doc::text(leaf!("Box::new(short)")));
         assert_eq!(got, "    let x: i64 = Box::new(short);");
     }
 
@@ -4726,7 +4757,9 @@ mod p0_tests {
         let got = render_assign_stmt(
             4,
             "let __ipe_fn: Box<dyn Fn(i64, i64, i64) -> i64 + Send + 'static> = ",
-            Doc::text("Box::new(move |aaaa: i64, bbbb: i64, cccc: i64| -> i64 { aaaa })"),
+            Doc::text(leaf!(
+                "Box::new(move |aaaa: i64, bbbb: i64, cccc: i64| -> i64 { aaaa })"
+            )),
         );
         let expected = "    let __ipe_fn: Box<dyn Fn(i64, i64, i64) -> i64 + Send + 'static> =\n        Box::new(move |aaaa: i64, bbbb: i64, cccc: i64| -> i64 { aaaa });";
         assert_eq!(
@@ -4767,7 +4800,11 @@ mod p0_tests {
         // The break after `= ` is pure whitespace: the normalized leaves of an
         // assignment equal `prefix rhs` with a single space — exactly what the
         // string emitter writes — so the SEAL holds across the break.
-        let doc = Doc::assign(Doc::text("let x: T = "), Doc::text("value"), 1);
+        let doc = Doc::assign(
+            Doc::text(leaf!("let x: T = ")),
+            Doc::text(leaf!("value")),
+            1,
+        );
         assert_eq!(doc.normalized_leaves(), "let x: T = value");
     }
 
@@ -4796,10 +4833,10 @@ mod p0_tests {
         // group that fits lay out flat — groups decide their layout independently.
         let inner = arg_group("g", &["p", "q"]);
         let outer = Doc::group(Doc::concat(vec![
-            Doc::owned(format!("outer_{}(", "z".repeat(110))),
+            owned(format!("outer_{}(", "z".repeat(110))),
             Doc::nest(4, Doc::concat(vec![Doc::Softline, inner])),
             Doc::Softline,
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         ]));
         let got = render(&outer, RenderConfig::default());
         // Outer breaks (its leading token overflows); inner `g(p, q)` fits and
@@ -4814,9 +4851,9 @@ mod p0_tests {
     /// break-conditional trailing comma. `args` are plain text leaves.
     fn callargs(name: &'static str, args: &[&'static str]) -> Doc {
         Doc::call_args(
-            Doc::owned(format!("{name}(")),
-            args.iter().map(|a| Doc::owned((*a).to_owned())).collect(),
-            Doc::text(")"),
+            owned(format!("{name}(")),
+            args.iter().map(|a| owned((*a).to_owned())).collect(),
+            Doc::text(leaf!(")")),
             true,
         )
     }
@@ -4857,22 +4894,27 @@ mod p0_tests {
         // closing delimiters collapsing onto the final line — `rustfmt`'s combining
         // rule. Byte-golden from `rustfmt --edition 2024 --style-edition 2024`.
         let inner = Doc::call_args(
-            Doc::text("format!("),
+            Doc::text(leaf!("format!(")),
             vec![
-                Doc::text("\"{}{}\""),
-                Doc::text("\"a\".to_string()"),
-                Doc::text("\"b\".to_string()"),
+                Doc::text(leaf!("\"{}{}\"")),
+                Doc::text(leaf!("\"a\".to_string()")),
+                Doc::text(leaf!("\"b\".to_string()")),
             ],
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
             false,
         );
         let mid = Doc::call_args(
-            Doc::text("string_to_upper("),
+            Doc::text(leaf!("string_to_upper(")),
             vec![inner],
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
             true,
         );
-        let doc = Doc::call_args(Doc::text("io_println("), vec![mid], Doc::text(")"), true);
+        let doc = Doc::call_args(
+            Doc::text(leaf!("io_println(")),
+            vec![mid],
+            Doc::text(leaf!(")")),
+            true,
+        );
         let got = render(&doc, RenderConfig::default());
         let expected = "io_println(string_to_upper(format!(\n    \"{}{}\",\n    \"a\".to_string(),\n    \"b\".to_string()\n)))";
         assert_eq!(
@@ -4888,23 +4930,23 @@ mod p0_tests {
         // breaks below (`overflow_delimited_expr`). Byte-golden from `rustfmt
         // --edition 2024 --style-edition 2024`.
         let block = Doc::concat(vec![
-            Doc::text("{"),
+            Doc::text(leaf!("{")),
             Doc::nest(
                 4,
                 Doc::concat(vec![
                     Doc::HardLine,
-                    Doc::text("let __ipe_fn: i64 = 1;"),
+                    Doc::text(leaf!("let __ipe_fn: i64 = 1;")),
                     Doc::HardLine,
-                    Doc::text("__ipe_fn"),
+                    Doc::text(leaf!("__ipe_fn")),
                 ]),
             ),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ]);
         let doc = Doc::call_args(
-            Doc::text("ipe_result_map("),
-            vec![Doc::text("ok_res(2)"), block],
-            Doc::text(")"),
+            Doc::text(leaf!("ipe_result_map(")),
+            vec![Doc::text(leaf!("ok_res(2)")), block],
+            Doc::text(leaf!(")")),
             true,
         );
         let got = render(&doc, RenderConfig::default());
@@ -4958,27 +5000,27 @@ mod p0_tests {
         // `.clone()` onto its OWN line at the call's indent when the closure body
         // broke. The body here is forced multiline (a statement block).
         let body = Doc::concat(vec![
-            Doc::text("{"),
+            Doc::text(leaf!("{")),
             Doc::nest(
                 4,
                 Doc::concat(vec![
                     Doc::HardLine,
-                    Doc::text("let (a, b) = (1, 2);"),
+                    Doc::text(leaf!("let (a, b) = (1, 2);")),
                     Doc::HardLine,
-                    Doc::text("(a + b)"),
+                    Doc::text(leaf!("(a + b)")),
                 ]),
             ),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ]);
-        let closure = Doc::concat(vec![Doc::text("|| "), Doc::brace_body(body)]);
+        let closure = Doc::concat(vec![Doc::text(leaf!("|| ")), Doc::brace_body(body)]);
         let receiver = Doc::call_args(
-            Doc::text("CELL.get_or_init("),
+            Doc::text(leaf!("CELL.get_or_init(")),
             vec![closure],
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
             true,
         );
-        let doc = Doc::method_chain(receiver, Doc::text(".clone()"));
+        let doc = Doc::method_chain(receiver, Doc::text(leaf!(".clone()")));
         let got = render_seeded(&doc, RenderConfig::default(), 4, 4);
         // The closure combines onto the call head, and `.clone()` sits on its own
         // line at the call indent after the multiline receiver's `})` closing line.
@@ -5004,22 +5046,37 @@ mod p0_tests {
     /// sequence lowers to, bare and through a statement block.
     const NESTS: [(&str, Nest); 8] = [
         ("group", |d| {
-            Doc::group(Doc::concat(vec![Doc::text("g("), d, Doc::text(")")]))
+            Doc::group(Doc::concat(vec![
+                Doc::text(leaf!("g(")),
+                d,
+                Doc::text(leaf!(")")),
+            ]))
         }),
         ("call", |d| {
-            Doc::call_args(Doc::text("f("), vec![d], Doc::text(")"), true)
+            Doc::call_args(Doc::text(leaf!("f(")), vec![d], Doc::text(leaf!(")")), true)
         }),
         ("paren", |d| {
-            Doc::elidable_paren(Doc::concat(vec![d, Doc::text(" + 1")]))
+            Doc::elidable_paren(Doc::concat(vec![d, Doc::text(leaf!(" + 1"))]))
         }),
         ("if_else", |d| {
-            Doc::if_else(Doc::text("c"), d, Doc::text("y"))
+            Doc::if_else(Doc::text(leaf!("c")), d, Doc::text(leaf!("y")))
         }),
-        ("assign", |d| Doc::assign(Doc::text("let v = "), d, 1)),
+        ("assign", |d| {
+            Doc::assign(Doc::text(leaf!("let v = ")), d, 1)
+        }),
         ("mixed", |d| {
-            let arg = Doc::elidable_paren(Doc::concat(vec![d, Doc::text(" + 1")]));
-            let call = Doc::call_args(Doc::text("f("), vec![arg], Doc::text(")"), true);
-            Doc::group(Doc::if_else(Doc::text("c"), call, Doc::text("y")))
+            let arg = Doc::elidable_paren(Doc::concat(vec![d, Doc::text(leaf!(" + 1"))]));
+            let call = Doc::call_args(
+                Doc::text(leaf!("f(")),
+                vec![arg],
+                Doc::text(leaf!(")")),
+                true,
+            );
+            Doc::group(Doc::if_else(
+                Doc::text(leaf!("c")),
+                call,
+                Doc::text(leaf!("y")),
+            ))
         }),
         ("task", task_step),
         ("task_let", task_let_step),
@@ -5028,14 +5085,17 @@ mod p0_tests {
     /// One `task_and_then(first, Box::new(move |_| rest))` continuation around `d`.
     fn task_step(d: Doc) -> Doc {
         let cont = Doc::concat(vec![
-            Doc::text("Box::new(move |_| "),
+            Doc::text(leaf!("Box::new(move |_| ")),
             Doc::brace_body(d),
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         ]);
         Doc::call_args(
-            Doc::text("task_and_then("),
-            vec![Doc::text("ipe_std_log_info(String::from(\"step\"))"), cont],
-            Doc::text(")"),
+            Doc::text(leaf!("task_and_then(")),
+            vec![
+                Doc::text(leaf!("ipe_std_log_info(String::from(\"step\"))")),
+                cont,
+            ],
+            Doc::text(leaf!(")")),
             true,
         )
     }
@@ -5043,24 +5103,24 @@ mod p0_tests {
     /// A [`task_step`] whose rest is a statement block ending in `d`.
     fn task_let_step(d: Doc) -> Doc {
         let body = Doc::concat(vec![
-            Doc::text("{"),
+            Doc::text(leaf!("{")),
             Doc::nest(
                 4,
                 Doc::concat(vec![
                     Doc::HardLine,
-                    Doc::text("let v = 1;"),
+                    Doc::text(leaf!("let v = 1;")),
                     Doc::HardLine,
                     d,
                 ]),
             ),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ]);
         task_step(body)
     }
 
     fn nest(step: Nest, depth: usize) -> Doc {
-        (0..depth).fold(Doc::text("x"), |d, _| step(d))
+        (0..depth).fold(Doc::text(leaf!("x")), |d, _| step(d))
     }
 
     /// Nodes laid out afresh while rendering `doc`, and whether the render gave up
@@ -5205,13 +5265,16 @@ mod p0_tests {
             docs.push(("else_if".into(), else_if_chain(12)));
             for leaf in LEAVES {
                 for (a, first) in NESTS {
-                    docs.push((format!("{a} {leaf}"), first(Doc::text(leaf))));
+                    docs.push((format!("{a} {leaf}"), first(Doc::text(leaf_of(leaf)))));
                     for (b, second) in NESTS {
-                        docs.push((format!("{a}/{b} {leaf}"), second(first(Doc::text(leaf)))));
+                        docs.push((
+                            format!("{a}/{b} {leaf}"),
+                            second(first(Doc::text(leaf_of(leaf)))),
+                        ));
                         for (c, third) in NESTS {
                             docs.push((
                                 format!("{a}/{b}/{c} {leaf}"),
-                                third(second(first(Doc::text(leaf)))),
+                                third(second(first(Doc::text(leaf_of(leaf))))),
                             ));
                         }
                     }
@@ -5266,7 +5329,7 @@ mod p0_tests {
                 let doc = nest(step, 256);
                 let out = render(&doc, RenderConfig::default());
                 if layout_work(&doc).1 {
-                    assert_eq!(out, doc.plain_layout(), "{name}");
+                    assert_eq!(out, doc.plain_layout(0), "{name}");
                 }
                 assert_eq!(out, render(&doc, RenderConfig::default()), "{name}");
             }
@@ -5285,7 +5348,7 @@ mod p0_tests {
                 "the mixed nest must exhaust a small fuel"
             );
             let out = render_within(&doc, RenderConfig::default(), 0, 0, SMALL_FUEL);
-            assert_eq!(out, doc.plain_layout());
+            assert_eq!(out, doc.plain_layout(0));
             assert_eq!(
                 crate::doc::whitespace_normalize(&out),
                 doc.normalized_leaves()
@@ -5392,8 +5455,8 @@ mod p0_tests {
 
     /// An else-if chain of `depth` levels.
     fn else_if_chain(depth: usize) -> Doc {
-        (0..depth).fold(Doc::text("z"), |acc, _| {
-            Doc::if_else(Doc::text("c"), Doc::text("t"), acc)
+        (0..depth).fold(Doc::text(leaf!("z")), |acc, _| {
+            Doc::if_else(Doc::text(leaf!("c")), Doc::text(leaf!("t")), acc)
         })
     }
 
@@ -5469,7 +5532,13 @@ mod p0_tests {
     #[test]
     fn deep_group_nest_walks_are_charged() {
         let doc = nest(
-            |d| Doc::group(Doc::concat(vec![Doc::text("g("), d, Doc::text(")")])),
+            |d| {
+                Doc::group(Doc::concat(vec![
+                    Doc::text(leaf!("g(")),
+                    d,
+                    Doc::text(leaf!(")")),
+                ]))
+            },
             24,
         );
         let stats = render_stats(&doc, LAYOUT_FUEL, MEMO_BYTE_CEILING);
@@ -5503,9 +5572,9 @@ mod p0_tests {
     /// walk nothing and answer a default, as the output they serve is discarded.
     #[test]
     fn exhausted_fuel_stops_predicates_and_facts() {
-        let block = Doc::brace_body(Doc::text("x"));
+        let block = Doc::brace_body(Doc::text(leaf!("x")));
         let hard = Doc::HardLine;
-        let call = Doc::call_args(Doc::text("f("), vec![], Doc::text(")"), false);
+        let call = Doc::call_args(Doc::text(leaf!("f(")), vec![], Doc::text(leaf!(")")), false);
         assert!(is_glue_shape(&call));
         assert!(is_block_like(&block) && has_hard_break(&hard));
         let _scope = MemoScope::install(&block, 0);
@@ -5521,8 +5590,13 @@ mod p0_tests {
     #[test]
     fn buffer_past_its_ceiling_is_abandoned() {
         let wide = || {
-            let items = (0..64).map(|i| Doc::owned(format!("item_{i}"))).collect();
-            Doc::call_args(Doc::text("vec!["), items, Doc::text("]"), true)
+            let items = (0..64).map(|i| owned(format!("item_{i}"))).collect();
+            Doc::call_args(
+                Doc::text(leaf!("vec![")),
+                items,
+                Doc::text(leaf!("]")),
+                true,
+            )
         };
         let doc = wide();
         let _scope = MemoScope::install(&doc, LAYOUT_FUEL);
@@ -5557,50 +5631,6 @@ mod p0_tests {
         out
     }
 
-    /// The refusal: a line comment a leaf opens is closed before any byte the
-    /// layout owns, so no code lands inside it; the tokens are the SEAL's.
-    #[test]
-    fn plain_layout_never_writes_code_inside_a_line_comment() {
-        let cases = [
-            (
-                Doc::concat(vec![Doc::text("x // c"), Doc::Line, Doc::text("y")]),
-                "x // c\ny",
-            ),
-            (
-                Doc::call_args(
-                    Doc::text("f("),
-                    vec![Doc::text("a // c"), Doc::text("b")],
-                    Doc::text(")"),
-                    true,
-                ),
-                "f(a // c\n, b)",
-            ),
-            (Doc::brace_body(Doc::text("s // c")), "{ s // c\n}"),
-            (
-                Doc::concat(vec![
-                    Doc::text("a /"),
-                    Doc::text("/ c"),
-                    Doc::Line,
-                    Doc::text("y"),
-                ]),
-                "a // c\ny",
-            ),
-            (
-                Doc::concat(vec![Doc::text("// c\nz"), Doc::Line, Doc::text("y")]),
-                "// c\nz y",
-            ),
-            (
-                Doc::concat(vec![Doc::text("a // c"), Doc::HardLine, Doc::text("y")]),
-                "a // c\ny",
-            ),
-        ];
-        for (doc, want) in cases {
-            let plain = doc.plain_layout();
-            assert_eq!(plain, want);
-            assert_eq!(tokens(&plain), tokens(&seal_leaves(&doc)));
-        }
-    }
-
     /// The fallback is deterministic and address-free: the same document, or a
     /// copy of it at other addresses, always falls back to the same bytes, which
     /// carry the SEAL's tokens in order.
@@ -5616,17 +5646,17 @@ mod p0_tests {
             );
             let within = |doc: &Doc| render_within(doc, RenderConfig::default(), 0, 0, SMALL_FUEL);
             let out = within(&doc);
-            assert_eq!(out, doc.plain_layout(), "the render must fall back");
+            assert_eq!(out, doc.plain_layout(0), "the render must fall back");
             assert_eq!(out, within(&copy));
             assert_eq!(out, within(&doc));
-            assert_eq!(doc.plain_layout(), copy.plain_layout());
+            assert_eq!(doc.plain_layout(0), copy.plain_layout(0));
             assert_eq!(tokens(&out), tokens(&seal_leaves(&doc)));
         });
         for (name, step) in NESTS {
             let doc = nest(step, 24);
-            assert_eq!(doc.plain_layout(), doc.clone().plain_layout(), "{name}");
+            assert_eq!(doc.plain_layout(0), doc.clone().plain_layout(0), "{name}");
             assert_eq!(
-                tokens(&doc.plain_layout()),
+                tokens(&doc.plain_layout(0)),
                 tokens(&seal_leaves(&doc)),
                 "{name}"
             );
@@ -5658,7 +5688,7 @@ mod p0_tests {
                     let out = render_within(&doc, RenderConfig::default(), 0, 0, fuel);
                     assert_eq!(
                         out,
-                        doc.plain_layout(),
+                        doc.plain_layout(0),
                         "{name}: fuel {fuel} (spent {}, output {}) must fall back",
                         full.spent,
                         full.out.len()

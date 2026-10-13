@@ -5,6 +5,7 @@ use super::{
     render_type, tail_arm_prelude_lines,
 };
 use crate::EmitCtx;
+use crate::doc::Leaf;
 use crate::render::{LayoutSpend, render_seeded_spend};
 use core::cell::RefCell;
 use core::fmt::Write as _;
@@ -1298,23 +1299,23 @@ pub fn emit_caf_get_or_init(
     // `|| BraceBody(body)` — the single closure argument. `BraceBody` renders
     // the body WITHOUT braces when it fits flat, and WITH braces on a new line
     // when it does not, matching `rustfmt`'s closure body layout.
-    let closure_arg = Doc::concat(vec![Doc::text("|| "), Doc::brace_body(body_doc)]);
+    let closure_arg = Doc::concat(vec![Doc::text(leaf!("|| ")), Doc::brace_body(body_doc)]);
     // `CELL.get_or_init(closure)` — a single-argument function call whose sole
     // closure argument `rustfmt` combines onto the call head: `get_or_init(|| {`
     // on one line, the body broken inside, `})` at the call's indent, no trailing
     // comma.
     let receiver = Doc::call_args(
-        Doc::text("CELL.get_or_init("),
+        Doc::text(leaf!("CELL.get_or_init(")),
         vec![closure_arg],
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
         // A function-call argument list keeps a trailing comma when it breaks.
         true,
     );
     // `.clone()` glued when the receiver stays single-line, dropped onto its own
     // line at the call's indent when the receiver's closure body broke — `rustfmt`'s
     // method-chain layout after a multiline receiver.
-    let call = Doc::method_chain(receiver, Doc::text(".clone()"));
-    Ok(render_fn_body(&call))
+    let call = Doc::method_chain(receiver, Doc::text(leaf!(".clone()")));
+    render_fn_body(&call)
 }
 
 /// Render a value body expression to the exact bytes a `rustfmt`-formatted
@@ -1336,7 +1337,7 @@ pub fn emit_body_native(
     generics: GenericScope,
 ) -> DResult<String> {
     let doc = crate::emit_doc::build_doc(ctx, body_expr, 1, 0, generics)?;
-    Ok(render_fn_body(&doc))
+    render_fn_body(&doc)
 }
 
 thread_local! {
@@ -1348,14 +1349,24 @@ thread_local! {
 /// Lay a function-body `doc` out the way it lands in the emitted file: its first
 /// character at column 4, right after the fn-body indent, and every broken line
 /// nested from that 4-column block indent.
-fn render_fn_body(doc: &Doc) -> String {
+///
+/// The body is lexed whole as one [`Leaf`]: each leaf is code only, but a join
+/// between two of them can still change how they lex (`r` before `"\"//"`
+/// reads as the raw string `r"\"` and a line comment), and only the joined
+/// text shows that.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when the joined body is
+/// not code only.
+fn render_fn_body(doc: &Doc) -> DResult<String> {
     let (text, spend) = render_seeded_spend(doc, RenderConfig::default(), 4, 4);
     BODY_SPENDS.with_borrow_mut(|spends| {
         if let Some(spends) = spends {
             spends.push(spend);
         }
     });
-    text
+    Ok(Leaf::parse(text)?.into_string())
 }
 
 /// Restores the enclosing [`BODY_SPENDS`] collector when a scope ends.
@@ -1648,5 +1659,41 @@ pub fn ty_mentions_var_under_fn(ty: &IrType, sym: Symbol, under_fn: bool) -> boo
             .values()
             .any(|t| ty_mentions_var_under_fn(t, sym, under_fn)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Diagnostic, Doc, Leaf, render_fn_body};
+
+    /// The text leaf of a test text.
+    #[allow(clippy::expect_used)] // every test text is code only; a refusal fails the test
+    fn leaf_of(text: &str) -> Doc {
+        Doc::text(Leaf::parse(text.to_owned()).expect("a test leaf is code only"))
+    }
+
+    /// Two code-only leaves glued at a join whose text holds a comment: a
+    /// standalone raw-literal prefix turns the next leaf's `"\"//"` into the
+    /// raw string `r"\"` and a line comment. The body refuses the join and
+    /// names the kind and offset only.
+    #[test]
+    fn body_refuses_comment_spliced_at_a_join() {
+        let quoted = "\"\\\"//\"";
+        for (prefix, at) in [("r", 4), ("br", 5), ("cr", 5)] {
+            let doc = Doc::concat(vec![leaf_of(prefix), leaf_of(quoted)]);
+            let got = render_fn_body(&doc);
+            assert!(
+                matches!(
+                    &got,
+                    Err(Diagnostic::CompilerBug {
+                        where_: "backend.leaf_not_code",
+                        detail,
+                    }) if *detail == format!("line comment at byte {at}")
+                ),
+                "{prefix:?}: {got:?}"
+            );
+        }
+        let spaced = Doc::group(Doc::concat(vec![leaf_of("r"), Doc::Line, leaf_of(quoted)]));
+        assert_eq!(render_fn_body(&spaced).ok(), Some(format!("r {quoted}")));
     }
 }
