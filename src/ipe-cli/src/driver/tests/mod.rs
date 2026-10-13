@@ -691,7 +691,7 @@ fn ipe_fix_never_patches_a_diagnostic_another_module_owns() {
 }
 
 /// A project directory names the entry its build compiles from, so
-/// `ipe build --fix` with no path fixes the manifest's entry.
+/// `ipe dev build --fix` with no path fixes the manifest's entry.
 #[test]
 fn ipe_fix_of_a_project_directory_fixes_its_entry() {
     let dir = fix_project(
