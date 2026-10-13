@@ -18,12 +18,18 @@
 //!   and its router spelling (each literal re-escaped by the runtime's one
 //!   segment alphabet, each parameter `:p` and its ordinal) is within the
 //!   length ceiling.
+//! - A `Server.static` or `Server.mountApp` prefix is a string literal parsed
+//!   by the runtime's own `MountBase::parse`, and no two mounts of one literal
+//!   `Server.listen` list share a prefix.
 
 use std::collections::HashSet;
 
 use ipe_diagnostics::terminal::is_display_hazard;
-use ipe_diagnostics::{DResult, Diagnostic, LowerError, RoutePatternDefect, Span};
+use ipe_diagnostics::{
+    DResult, Diagnostic, LowerError, MountPrefixFault, RoutePatternDefect, Span,
+};
 use ipe_ir::{Callee, Expr, KernelFn, Program};
+use ipe_runtime_rust::encoding::{MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
 
 /// The runtime's `MAX_URL_COMPONENT_LEN`: the longest pattern it parses.
 pub const MAX_PATH_LEN: usize = 32 * 1024 * 1024;
@@ -293,6 +299,59 @@ pub fn refuse_malformed(call: &str, verdict: Result<(), RoutePatternDefect>) -> 
     })
 }
 
+/// The mount-base rule `refusal` names.
+const fn mount_fault(refusal: &MountBaseRefusal) -> MountPrefixFault {
+    match refusal {
+        MountBaseRefusal::TooLong { .. } => MountPrefixFault::TooLong {
+            cap: MAX_MOUNT_BASE_LEN,
+        },
+        MountBaseRefusal::NoLeadingSlash => MountPrefixFault::NotAbsolute,
+        MountBaseRefusal::TrailingSlash => MountPrefixFault::TrailingSlash,
+        MountBaseRefusal::EmptySegment => MountPrefixFault::EmptySegment,
+        MountBaseRefusal::DotSegment => MountPrefixFault::DotSegment,
+        MountBaseRefusal::Reserved { byte } => MountPrefixFault::Reserved { byte: *byte },
+    }
+}
+
+/// Parse a literal `Server.static` or `Server.mountApp` prefix with the
+/// runtime's mount-base parser.
+///
+/// # Errors
+///
+/// `MountPrefix` naming the rule the prefix breaks.
+pub fn mount_prefix(prefix: &str) -> Result<MountBase, RoutePatternDefect> {
+    MountBase::parse(prefix).map_err(|refusal| RoutePatternDefect::MountPrefix {
+        prefix: excerpt(prefix),
+        fault: mount_fault(&refusal),
+    })
+}
+
+/// Refuse a literal `Server.listen` route list in which two mounts serve one
+/// prefix.
+fn refuse_duplicate_mounts(routes: &[Expr]) -> DResult<()> {
+    let mut seen: HashSet<MountBase> = HashSet::new();
+    for route in routes {
+        if let Expr::Call {
+            callee: Callee::Kernel(k),
+            args,
+            ..
+        } = route
+            && matches!(route_path_of(*k), Some(RoutePath::Mount))
+            && let Some(Expr::Str(lit)) = args.first()
+            && let Ok(base) = MountBase::parse(lit)
+            && !seen.insert(base)
+        {
+            return refuse_malformed(
+                "Server.listen",
+                Err(RoutePatternDefect::MountPrefixDuplicate {
+                    prefix: excerpt(lit),
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The grammar a route kernel holds its first (path) argument to.
 #[derive(Clone, Copy)]
 enum RoutePath {
@@ -302,6 +361,8 @@ enum RoutePath {
     Server,
     /// A `Server.api` spec, whose path follows an optional method.
     ServerApi,
+    /// A `Server.static` or `Server.mountApp` prefix: a literal mount base.
+    Mount,
 }
 
 /// The path grammar of `k`'s first argument, or `None` for a kernel that
@@ -315,12 +376,11 @@ const fn route_path_of(k: KernelFn) -> Option<RoutePath> {
         | KernelFn::ServerPut
         | KernelFn::ServerDelete
         | KernelFn::ServerAny
-        | KernelFn::ServerStatic
-        | KernelFn::ServerMountApp
         | KernelFn::ServerGetAuthed
         | KernelFn::ServerPostAuthed
         | KernelFn::ServerPutAuthed
         | KernelFn::ServerDeleteAuthed => Some(RoutePath::Server),
+        KernelFn::ServerStatic | KernelFn::ServerMountApp => Some(RoutePath::Mount),
         _ => None,
     }
 }
@@ -333,8 +393,18 @@ fn refuse_literal(k: KernelFn, grammar: RoutePath, lit: &str) -> DResult<()> {
         RoutePath::Web => web_route_pattern(lit),
         RoutePath::Server => server_route_path(lit),
         RoutePath::ServerApi => server_route_path(server_api_path(lit)),
+        RoutePath::Mount => mount_prefix(lit).map(drop),
     };
     refuse_malformed(&call, verdict)
+}
+
+/// Refuse mount kernel `k` reached with a prefix that is not a string literal.
+fn refuse_unliteral_mount(k: KernelFn) -> DResult<()> {
+    let d = k.decl();
+    refuse_malformed(
+        &format!("{}.{}", d.qualifier, d.name),
+        Err(RoutePatternDefect::MountPrefixNotLiteral),
+    )
 }
 
 /// Refuse every malformed literal route path anywhere in `program`.
@@ -365,14 +435,28 @@ fn literal_routes(expr: &Expr) -> DResult<()> {
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
-        | Expr::FuncValue { .. }
         | Expr::Var(_)
         | Expr::CloneVar(_) => Ok(()),
+        Expr::FuncValue { callee, .. } => match callee {
+            Callee::Kernel(k) if matches!(route_path_of(*k), Some(RoutePath::Mount)) => {
+                refuse_unliteral_mount(*k)
+            }
+            _ => Ok(()),
+        },
         Expr::Call { callee, args, .. } => {
-            if let (Callee::Kernel(k), Some(Expr::Str(lit))) = (callee, args.first())
+            if let Callee::Kernel(k) = callee
                 && let Some(grammar) = route_path_of(*k)
             {
-                refuse_literal(*k, grammar, lit.as_str())?;
+                match (grammar, args.first()) {
+                    (_, Some(Expr::Str(lit))) => refuse_literal(*k, grammar, lit.as_str())?,
+                    (RoutePath::Mount, _) => refuse_unliteral_mount(*k)?,
+                    (RoutePath::Web | RoutePath::Server | RoutePath::ServerApi, _) => {}
+                }
+            }
+            if let Callee::Kernel(KernelFn::ServerListen) = callee
+                && let Some(Expr::List { items, .. }) = args.get(1)
+            {
+                refuse_duplicate_mounts(items)?;
             }
             args.iter().try_for_each(literal_routes)
         }
@@ -626,8 +710,9 @@ mod tests {
 /// including positions no route emission reaches.
 #[cfg(test)]
 mod walk_tests {
-    use ipe_diagnostics::{Diagnostic, LowerError, RoutePatternDefect};
+    use ipe_diagnostics::{Diagnostic, LowerError, MountPrefixFault, RoutePatternDefect};
     use ipe_ir::{CallPin, Callee, Expr, IrType, KernelFn, OnFormKind};
+    use ipe_runtime_rust::encoding::MAX_MOUNT_BASE_LEN;
 
     use super::literal_routes;
 
@@ -682,6 +767,127 @@ mod walk_tests {
                 RoutePatternDefect::ParamDuplicate { name: "id".into() }
             ))
         );
+    }
+
+    fn listen(routes: Vec<Expr>) -> Expr {
+        Expr::Call {
+            callee: Callee::Kernel(KernelFn::ServerListen),
+            args: vec![
+                Expr::Int(8000),
+                Expr::List {
+                    elem: IrType::Unit,
+                    items: routes,
+                },
+            ],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        }
+    }
+
+    /// Prove the refusals: a mount prefix that is not a mount base is refused
+    /// with the rule it breaks.
+    #[test]
+    fn a_malformed_mount_prefix_is_refused() {
+        for (prefix, fault) in [
+            ("/a?b", MountPrefixFault::Reserved { byte: b'?' }),
+            ("/a#b", MountPrefixFault::Reserved { byte: b'#' }),
+            ("/a/%zz", MountPrefixFault::Reserved { byte: b'%' }),
+            ("/a%62", MountPrefixFault::Reserved { byte: b'%' }),
+            ("/a:b", MountPrefixFault::Reserved { byte: b':' }),
+            ("/:id", MountPrefixFault::Reserved { byte: b':' }),
+            ("/files/*rest", MountPrefixFault::Reserved { byte: b'*' }),
+            ("/caf\u{e9}", MountPrefixFault::Reserved { byte: 0xC3 }),
+            ("app", MountPrefixFault::NotAbsolute),
+            ("/app/", MountPrefixFault::TrailingSlash),
+            ("/a//b", MountPrefixFault::EmptySegment),
+            ("/a/..", MountPrefixFault::DotSegment),
+        ] {
+            for k in [KernelFn::ServerStatic, KernelFn::ServerMountApp] {
+                let Some((_, defect)) = defect(&call(k, prefix)) else {
+                    assert!(defect(&call(k, prefix)).is_some(), "{prefix:?}");
+                    return;
+                };
+                assert_eq!(
+                    defect,
+                    RoutePatternDefect::MountPrefix {
+                        prefix: prefix.into(),
+                        fault
+                    },
+                    "{prefix:?}"
+                );
+            }
+        }
+        let long = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN));
+        assert!(matches!(
+            defect(&call(KernelFn::ServerStatic, &long)),
+            Some((_, RoutePatternDefect::MountPrefix { fault: MountPrefixFault::TooLong { cap }, .. }))
+                if cap == MAX_MOUNT_BASE_LEN
+        ));
+    }
+
+    /// Prove the refusals: a mount prefix computed at run time, or a mount
+    /// kernel passed as a value, is refused at compile time.
+    #[test]
+    fn a_computed_mount_prefix_is_refused() {
+        for k in [KernelFn::ServerStatic, KernelFn::ServerMountApp] {
+            let computed = Expr::Call {
+                callee: Callee::Kernel(k),
+                args: vec![Expr::Var(ipe_intern::Symbol::from_raw(1)), Expr::Unit],
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            };
+            let as_value = Expr::FuncValue {
+                callee: Callee::Kernel(k),
+                ty: IrType::Unit,
+            };
+            for expr in [computed, as_value] {
+                assert!(
+                    defect(&expr)
+                        .is_some_and(|(_, d)| d == RoutePatternDefect::MountPrefixNotLiteral),
+                    "{k:?}"
+                );
+            }
+        }
+    }
+
+    /// Prove the refusal: two mounts of one literal route list on one prefix
+    /// are refused, whatever spelling of the root they use.
+    #[test]
+    fn two_mounts_on_one_prefix_are_refused() {
+        for (a, b) in [("/a", "/a"), ("/", ""), ("/", "/"), ("/app/v2", "/app/v2")] {
+            for (ka, kb) in [
+                (KernelFn::ServerStatic, KernelFn::ServerMountApp),
+                (KernelFn::ServerMountApp, KernelFn::ServerMountApp),
+            ] {
+                let routes = listen(vec![
+                    call(ka, a),
+                    call(KernelFn::ServerGet, "/x"),
+                    call(kb, b),
+                ]);
+                assert_eq!(
+                    defect(&routes),
+                    Some((
+                        "Server.listen".into(),
+                        RoutePatternDefect::MountPrefixDuplicate { prefix: b.into() }
+                    )),
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Nested mount prefixes, a handler on a mount's prefix, and the root
+    /// beside a prefix are all accepted.
+    #[test]
+    fn distinct_mount_prefixes_pass() {
+        let routes = listen(vec![
+            call(KernelFn::ServerMountApp, "/billing"),
+            call(KernelFn::ServerMountApp, "/billing/admin"),
+            call(KernelFn::ServerGet, "/billing"),
+            call(KernelFn::ServerStatic, "/"),
+            call(KernelFn::ServerStatic, "/a-b/c.d~e_f"),
+        ]);
+        assert_eq!(literal_routes(&routes).ok(), Some(()));
     }
 
     #[test]

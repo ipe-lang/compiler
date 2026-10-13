@@ -25,9 +25,9 @@ pub use diagnostic::{
     EditTarget, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
     HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES,
     IfDefect, ImportedAs, InterceptContext, LetDefect, LowerError, MainRetName, ModelLeaf,
-    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, RoutePatternDefect,
-    RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach,
-    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
+    ModulePlacementReason, ModulePlacementRejection, MountPrefixFault, NameError, ParseError,
+    RoutePatternDefect, RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole,
+    StdlibReach, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
     TypeDeclDefect, TypeError, WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};

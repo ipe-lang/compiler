@@ -1831,6 +1831,44 @@ pub enum RoutePatternDefect {
         /// Byte offset of the sigil within the segment.
         at: usize,
     },
+    /// A `Server.static` or `Server.mountApp` prefix is not a string literal.
+    MountPrefixNotLiteral,
+    /// A `Server.static` or `Server.mountApp` prefix is not a mount base.
+    MountPrefix {
+        /// The offending prefix.
+        prefix: Box<str>,
+        /// The mount-base rule it breaks.
+        fault: MountPrefixFault,
+    },
+    /// Two mounts in one `Server.listen` list serve the same prefix.
+    MountPrefixDuplicate {
+        /// The shared prefix.
+        prefix: Box<str>,
+    },
+}
+
+/// The mount-base rule a literal `Server.static` or `Server.mountApp` prefix
+/// breaks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MountPrefixFault {
+    /// A non-root prefix that does not start with `/`.
+    NotAbsolute,
+    /// A non-root prefix that ends with `/`.
+    TrailingSlash,
+    /// Two adjacent separators.
+    EmptySegment,
+    /// A `.` or `..` segment.
+    DotSegment,
+    /// A byte outside `A-Z a-z 0-9 - . _ ~` and the `/` separator.
+    Reserved {
+        /// The offending byte.
+        byte: u8,
+    },
+    /// Longer than the mount-base ceiling.
+    TooLong {
+        /// The ceiling in bytes.
+        cap: usize,
+    },
 }
 
 /// Why a `Store.eq` / `Store.eqBy` column argument was rejected at lowering.
@@ -3330,6 +3368,21 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
         RoutePatternDefect::UnrenderableLiteral { .. } => {
             "a page's path is rendered back into a URL, and a browser drops an empty, \
              `.` or `..` segment — remove the empty segment or rename the literal"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "write the mount prefix as a string literal (`Server.static \"/assets\" dir`), so \
+             it is checked when the program compiles"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefix { .. } => {
+            "a mount prefix is `/` or `/`-separated segments of the letters, digits, `-`, `.`, \
+             `_` and `~`, with no trailing `/` — write `/assets` or `/app/v2`"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixDuplicate { .. } => {
+            "give each mount its own prefix; a longer prefix nested under another is served \
+             by the longer one"
                 .to_string()
         }
     };

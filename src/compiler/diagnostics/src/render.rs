@@ -33,10 +33,10 @@ use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
     ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, ImportedAs, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect,
-    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
-    Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
-    intercept_context_phrase,
+    Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault, NameError, ParseError,
+    RoutePatternDefect, SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect,
+    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
+    WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
 
@@ -2152,6 +2152,31 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
                 "segment `{segment}` is empty, `.` or `..`, so this route's URL cannot be rendered"
             )
         }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "this mount prefix is computed, not a string literal".to_string()
+        }
+        RoutePatternDefect::MountPrefix { prefix, fault } => {
+            format!(
+                "mount prefix `{prefix}` {}",
+                mount_prefix_fault_label(*fault)
+            )
+        }
+        RoutePatternDefect::MountPrefixDuplicate { prefix } => {
+            format!("two mounts in this list serve the prefix `{prefix}`")
+        }
+    }
+}
+
+fn mount_prefix_fault_label(fault: MountPrefixFault) -> String {
+    match fault {
+        MountPrefixFault::NotAbsolute => "does not start with `/`".to_string(),
+        MountPrefixFault::TrailingSlash => "ends with `/`".to_string(),
+        MountPrefixFault::EmptySegment => "has an empty segment (`//`)".to_string(),
+        MountPrefixFault::DotSegment => "has a `.` or `..` segment".to_string(),
+        MountPrefixFault::Reserved { byte } => {
+            format!("holds byte 0x{byte:02X}, which a mount prefix cannot hold")
+        }
+        MountPrefixFault::TooLong { cap } => format!("is longer than the {cap}-byte ceiling"),
     }
 }
 

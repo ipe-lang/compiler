@@ -12774,7 +12774,7 @@ mod emitted_router_behavior_tests {
     }
 
     /// A `Web.embed` app nested in a listener's router: a malformed URL is
-    /// refused with 400 before the nest is chosen, and a respelled mount
+    /// refused with 400 before the mount is chosen, and a respelled mount
     /// prefix enters the mount exactly as its canonical spelling does.
     #[test]
     fn embedded_app_sees_only_canonical_urls() {
@@ -12788,9 +12788,11 @@ mod emitted_router_behavior_tests {
             [0u8; 32],
         );
         block_on(async move {
-            let base = route::DecodedPath::parse("/billing").expect("the prefix parses");
-            let sub = crate::server::below_mount(builder(String::new()).await, base);
-            let app = crate::server::behind_listener(axum::Router::new().nest("/billing", sub));
+            let base = crate::encoding::MountBase::parse("/billing").expect("the prefix parses");
+            let sub = builder(String::new()).await;
+            let app = crate::server::behind_listener(
+                crate::server::MountTable::new(vec![(base, sub)]).below(axum::Router::new()),
+            );
             let status_of = |uri: &'static str| {
                 let app = app.clone();
                 async move {

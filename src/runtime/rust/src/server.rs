@@ -1601,7 +1601,7 @@ pub enum Spelling {
 /// Only [`CanonicalUrl`] builds one, so a handler that finds none was reached
 /// without the listener's parse and refuses rather than parse again. Its path
 /// is the one the router it reaches sees: a mount re-bases it below its prefix
-/// ([`below_mount`]).
+/// ([`MountTable`]).
 #[derive(Clone)]
 pub(crate) struct StrictUrl {
     #[cfg(feature = "web")]
@@ -1635,9 +1635,9 @@ impl StrictUrl {
 
     /// This parse with its path below `base`, or `None` when `base` is not a
     /// whole-segment prefix of it.
-    #[cfg(feature = "web")]
     fn below(&self, base: &crate::encoding::DecodedPath) -> Option<Self> {
         Some(Self {
+            #[cfg(feature = "web")]
             spelling: self.spelling,
             path: self.path.below(base)?,
             query: Arc::clone(&self.query),
@@ -1645,29 +1645,71 @@ impl StrictUrl {
     }
 }
 
-/// `router` nested at `prefix`, its requests' [`StrictUrl`] re-based below
-/// that prefix so its handlers read the path the router routes on.
+/// The static and Web mounts of one listener, longest prefix first.
 ///
-/// A request whose parse does not lie below `prefix` loses its parse and is
-/// refused by the handler with the fixed 500, never served the outer path.
-#[cfg(feature = "web")]
-pub(crate) fn below_mount(
-    router: axum::Router,
-    prefix: crate::encoding::DecodedPath,
-) -> axum::Router {
-    let prefix = Arc::new(prefix);
-    router.layer(axum::middleware::from_fn(
-        move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-            let rebased = req
-                .extensions_mut()
-                .remove::<StrictUrl>()
-                .and_then(|url| url.below(&prefix));
-            if let Some(url) = rebased {
-                req.extensions_mut().insert(url);
-            }
-            next.run(req)
-        },
-    ))
+/// No mount is a router insert: a request no handler route matches reaches
+/// [`MountTable::serve`], which hands it to the mount whose prefix is the
+/// longest whole-segment prefix of its decoded path. So a mount never
+/// conflicts with a route, a prefix nested under another is served by its
+/// longer mount, and a handler shadows a mount on every path it routes.
+pub(crate) struct MountTable(Vec<(crate::encoding::MountBase, axum::Router)>);
+
+impl MountTable {
+    /// The table over `mounts`, whose prefixes are distinct
+    /// ([`mount_conflict`]).
+    pub(crate) fn new(mut mounts: Vec<(crate::encoding::MountBase, axum::Router)>) -> Self {
+        mounts.sort_by_key(|(base, _)| std::cmp::Reverse(base.segments().count()));
+        Self(mounts)
+    }
+
+    /// `app` with this table serving every request no route of `app` matches.
+    pub(crate) fn below(self, app: axum::Router) -> axum::Router {
+        if self.0.is_empty() {
+            return app;
+        }
+        let table = Arc::new(self);
+        app.fallback(move |req: axum::extract::Request| {
+            let table = Arc::clone(&table);
+            async move { table.serve(req).await }
+        })
+    }
+
+    /// The mount that serves `url` and its parse below the mount's prefix.
+    fn select(&self, url: &StrictUrl) -> Option<(&axum::Router, StrictUrl)> {
+        self.0
+            .iter()
+            .find_map(|(base, router)| Some((router, url.below(base.to_decoded())?)))
+    }
+
+    /// Serve `request` by the mount [`MountTable::select`] picks, its URI path
+    /// and its [`StrictUrl`] both re-based below the mount's prefix; 404 when
+    /// no mount's prefix holds the path.
+    async fn serve(&self, mut request: axum::extract::Request) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+        let selected = match strict_url(request.extensions().get()) {
+            Ok(url) => self
+                .select(url)
+                .map(|(router, below)| (router.clone(), below)),
+            Err(rejection) => return rejection.status_and_reason().into_response(),
+        };
+        let Some((router, below)) = selected else {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        };
+        let respelled = below
+            .request_path()
+            .canonical()
+            .map_err(|_| RequestRejection::BadRequest)
+            .and_then(|path| respell_path(&mut request, &path));
+        if let Err(rejection) = respelled {
+            return rejection.status_and_reason().into_response();
+        }
+        request.extensions_mut().insert(below);
+        match router.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
 }
 
 /// The outermost URL service of every app listener: one strict parse, then
@@ -1748,17 +1790,7 @@ fn canonicalise(request: &mut axum::extract::Request) -> Result<(), RequestRejec
         Spelling::Respelled
     };
     if spelling == Spelling::Respelled {
-        let target = uri.query().map_or_else(
-            || canonical.as_str().to_owned(),
-            |query| format!("{}?{query}", canonical.as_str()),
-        );
-        let mut parts = uri.clone().into_parts();
-        parts.path_and_query = Some(
-            axum::http::uri::PathAndQuery::try_from(target)
-                .map_err(|_| RequestRejection::BadRequest)?,
-        );
-        *request.uri_mut() =
-            axum::http::Uri::from_parts(parts).map_err(|_| RequestRejection::BadRequest)?;
+        respell_path(request, &canonical)?;
     }
     request.extensions_mut().insert(StrictUrl {
         #[cfg(feature = "web")]
@@ -1766,6 +1798,30 @@ fn canonicalise(request: &mut axum::extract::Request) -> Result<(), RequestRejec
         path,
         query: Arc::new(query),
     });
+    Ok(())
+}
+
+/// Replace `request`'s URI path with `path`, keeping its query bytes.
+///
+/// # Errors
+///
+/// `BadRequest` when the respelled target is not a URI.
+fn respell_path(
+    request: &mut axum::extract::Request,
+    path: &crate::encoding::CanonicalPath,
+) -> Result<(), RequestRejection> {
+    let uri = request.uri();
+    let target = uri.query().map_or_else(
+        || path.as_str().to_owned(),
+        |query| format!("{}?{query}", path.as_str()),
+    );
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(
+        axum::http::uri::PathAndQuery::try_from(target)
+            .map_err(|_| RequestRejection::BadRequest)?,
+    );
+    *request.uri_mut() =
+        axum::http::Uri::from_parts(parts).map_err(|_| RequestRejection::BadRequest)?;
     Ok(())
 }
 
@@ -2202,15 +2258,6 @@ fn method_router(
     }
 }
 
-fn strip_trailing_slash(p: &str) -> String {
-    // strip_suffix is total — drops the trailing '/' without a raw range slice,
-    // keeping a lone "/" intact (filtering out the empty result).
-    match p.strip_suffix('/') {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => p.to_string(),
-    }
-}
-
 /// The request methods one `Ipe.Server` handler serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EndpointMethod {
@@ -2271,13 +2318,30 @@ impl EndpointMethod {
 
 /// What one parsed route serves.
 enum ParsedTarget {
-    /// A handler for the routes' requests of one method set.
-    Handler(EndpointMethod, ErasedHandler),
-    /// A static-file directory nested at the route's path.
-    Static(String),
-    /// An embedded Web app nested at the route's path.
+    /// A handler for the requests of one method set whose path its pattern
+    /// matches.
+    Handler(
+        EndpointMethod,
+        crate::encoding::ServerPattern,
+        ErasedHandler,
+    ),
+    /// A static-file directory served below a prefix.
+    Static(crate::encoding::MountBase, String),
+    /// An embedded Web app served below a prefix.
     #[cfg(feature = "web")]
-    MountWeb(MountCell),
+    MountWeb(crate::encoding::MountBase, MountCell),
+}
+
+impl ParsedTarget {
+    /// The prefix a mount serves below, or `None` for a handler.
+    const fn mount_base(&self) -> Option<&crate::encoding::MountBase> {
+        match self {
+            Self::Handler(..) => None,
+            Self::Static(base, _) => Some(base),
+            #[cfg(feature = "web")]
+            Self::MountWeb(base, _) => Some(base),
+        }
+    }
 }
 
 /// One `Ipe.Server` route parsed at listen, before any router insert.
@@ -2286,7 +2350,6 @@ struct ParsedRoute {
     method: String,
     /// The path as the program wrote it, for messages.
     path: String,
-    pattern: crate::encoding::ServerPattern,
     target: ParsedTarget,
 }
 
@@ -2295,6 +2358,8 @@ struct ParsedRoute {
 enum RouteCause {
     /// The path is not an `Ipe.Server` route pattern.
     Pattern(crate::encoding::ServerPatternRefusal),
+    /// A mount's prefix is not a mount base.
+    Prefix(crate::encoding::MountBaseRefusal),
     /// A handler's method is no HTTP method.
     Method,
 }
@@ -2331,6 +2396,10 @@ impl std::fmt::Display for EndpointRefusal {
                 f,
                 "Server.listen: endpoint `{endpoint}` is not a well-formed route path: {refusal}"
             ),
+            RouteCause::Prefix(refusal) => write!(
+                f,
+                "Server.listen: mount `{endpoint}` is not a well-formed mount prefix: {refusal}"
+            ),
             RouteCause::Method => write!(
                 f,
                 "Server.listen: endpoint `{endpoint}` names no HTTP method; use GET, POST, PUT, \
@@ -2340,9 +2409,10 @@ impl std::fmt::Display for EndpointRefusal {
     }
 }
 
-/// Parse every route once, in declaration order: its path into a
-/// [`crate::encoding::ServerPattern`] and a handler's method into an
-/// [`EndpointMethod`].
+/// Parse every route once, in declaration order: a handler's path into a
+/// [`crate::encoding::ServerPattern`] and its method into an
+/// [`EndpointMethod`], a mount's prefix into a
+/// [`crate::encoding::MountBase`].
 ///
 /// # Errors
 ///
@@ -2356,21 +2426,28 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
                 path: r.path.clone(),
                 cause,
             };
-            let pattern = crate::encoding::ServerPattern::parse(&r.path)
-                .map_err(|refusal| refuse(RouteCause::Pattern(refusal)))?;
+            let pattern = || {
+                crate::encoding::ServerPattern::parse(&r.path)
+                    .map_err(|refusal| refuse(RouteCause::Pattern(refusal)))
+            };
+            let prefix = || {
+                crate::encoding::MountBase::parse(&r.path)
+                    .map_err(|refusal| refuse(RouteCause::Prefix(refusal)))
+            };
             let target = match r.target {
-                RouteTarget::Handler(h) => ParsedTarget::Handler(
-                    EndpointMethod::parse(&r.method).ok_or_else(|| refuse(RouteCause::Method))?,
-                    h,
-                ),
-                RouteTarget::Static(dir) => ParsedTarget::Static(dir),
+                RouteTarget::Handler(h) => {
+                    let pattern = pattern()?;
+                    let method = EndpointMethod::parse(&r.method)
+                        .ok_or_else(|| refuse(RouteCause::Method))?;
+                    ParsedTarget::Handler(method, pattern, h)
+                }
+                RouteTarget::Static(dir) => ParsedTarget::Static(prefix()?, dir),
                 #[cfg(feature = "web")]
-                RouteTarget::MountWeb(cell) => ParsedTarget::MountWeb(cell),
+                RouteTarget::MountWeb(cell) => ParsedTarget::MountWeb(prefix()?, cell),
             };
             Ok(ParsedRoute {
                 method: r.method,
                 path: r.path,
-                pattern,
                 target,
             })
         })
@@ -2389,10 +2466,11 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
 fn endpoint_conflict(routes: &[ParsedRoute]) -> Option<String> {
     let mut seen: HashMap<&str, Vec<(EndpointMethod, &ParsedRoute)>> = HashMap::new();
     for route in routes {
-        let ParsedTarget::Handler(method, _) = route.target else {
+        let ParsedTarget::Handler(method, pattern, _) = &route.target else {
             continue;
         };
-        let claims = seen.entry(route.pattern.router_path()).or_default();
+        let method = *method;
+        let claims = seen.entry(pattern.router_path()).or_default();
         if let Some((_, earlier)) = claims.iter().find(|(m, _)| m.overlaps(method)) {
             return Some(format!(
                 "Server.listen: endpoint `{}` conflicts with `{}` — two handlers may not claim \
@@ -2403,6 +2481,29 @@ fn endpoint_conflict(routes: &[ParsedRoute]) -> Option<String> {
             ));
         }
         claims.push((method, route));
+    }
+    None
+}
+
+/// The first two mounts that serve one prefix, as a listen error.
+///
+/// Mounts are matched by longest prefix ([`MountTable`]), which picks one
+/// mount for every path only when no two prefixes are equal.
+fn mount_conflict(routes: &[ParsedRoute]) -> Option<String> {
+    let mut seen: HashMap<&crate::encoding::MountBase, &ParsedRoute> = HashMap::new();
+    for route in routes {
+        let Some(base) = route.target.mount_base() else {
+            continue;
+        };
+        if let Some(earlier) = seen.insert(base, route) {
+            return Some(format!(
+                "Server.listen: mount `{}` and mount `{}` serve one prefix — two mounts may not \
+                 share a prefix; give each mount its own prefix (a prefix nested under another \
+                 is served by the longer one)",
+                quoted_endpoint(&earlier.method.to_uppercase(), &earlier.path),
+                quoted_endpoint(&route.method.to_uppercase(), &route.path),
+            ));
+        }
     }
     None
 }
@@ -2650,7 +2751,7 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         // Fail-closed endpoint-conflict gate (see `endpoint_conflict`): refuse an
         // overlapping handler set with a typed error before any router insert,
         // so a router conflict can never panic the listener task.
-        if let Some(msg) = endpoint_conflict(&routes) {
+        if let Some(msg) = endpoint_conflict(&routes).or_else(|| mount_conflict(&routes)) {
             return IpeResult::Err(msg.into());
         }
         // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
@@ -2695,43 +2796,37 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         // bind) rather than serve a subtly broken session/CSRF surface.
         #[cfg(feature = "web")]
         let mut web_mounted = false;
+        let mut mounts = Vec::new();
         for r in routes {
-            // Kept for the fail-closed conflict message: the arm below moves the
-            // target's payload out of `r`, but leaves these scalar fields intact.
-            let rmethod = r.method.clone();
-            let rpath = r.path.clone();
-            let pattern = r.pattern;
-            // Each axum insert is wrapped so a residual matchit conflict the
-            // pre-check did not model becomes a typed error, never an escaped
-            // panic (the pre-check catches the definite cases; this is the
-            // independent backstop — defence in depth for a soundness invariant).
             match r.target {
-                ParsedTarget::Static(dir) => {
-                    let path = strip_trailing_slash(&rpath);
-                    let svc = strict_serve_dir(std::path::PathBuf::from(dir));
-                    app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        app.nest_service(&path, svc)
-                    })) {
-                        Ok(next) => next,
-                        Err(_) => return IpeResult::Err(conflict_at(&rmethod, &rpath).into()),
-                    };
+                ParsedTarget::Static(base, dir) => {
+                    let files = axum::Router::new()
+                        .fallback_service(strict_serve_dir(std::path::PathBuf::from(dir)));
+                    mounts.push((base, files));
                 }
-                ParsedTarget::Handler(method, h) => {
+                // The insert is wrapped so a matchit conflict `endpoint_conflict`
+                // did not model becomes a typed error rather than an escaped panic
+                // (defence in depth; the check is total over handler sets).
+                ParsedTarget::Handler(method, pattern, h) => {
                     let path = pattern.router_path().to_owned();
                     let mr = method_router(method, pattern, h);
                     app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         app.route(&path, mr)
                     })) {
                         Ok(next) => next,
-                        Err(_) => return IpeResult::Err(conflict_at(&rmethod, &rpath).into()),
+                        Err(_) => {
+                            return IpeResult::Err(
+                                conflict_at(&r.method.to_uppercase(), &r.path).into(),
+                            );
+                        }
                     };
                 }
-                // `Server.mountApp`: build the embedded web app's router scoped
-                // to the prefix, then nest it under that prefix on this same
-                // listener (one port). The builder is taken once; a duplicate
-                // (a cloned route) finds `None` and is skipped — inert.
+                // `Server.mountApp`: build the embedded web app's router for its
+                // prefix and serve it below that prefix on this same listener
+                // (one port). The builder is taken once; a duplicate (a cloned
+                // route) finds `None` and is skipped — inert.
                 #[cfg(feature = "web")]
-                ParsedTarget::MountWeb(cell) => {
+                ParsedTarget::MountWeb(base, cell) => {
                     if web_mounted {
                         return IpeResult::Err(
                             "Server.mountApp: at most one Web app may be mounted per server \
@@ -2747,25 +2842,14 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .take();
                     if let Some(build) = builder {
-                        let prefix = strip_trailing_slash(&rpath);
-                        let Ok(base) = crate::encoding::DecodedPath::parse(&prefix) else {
-                            return IpeResult::Err(
-                                format!("Server.mountApp: mount prefix `{prefix}` is not a well-formed path")
-                                    .into(),
-                            );
-                        };
-                        let sub = below_mount(build(prefix.clone()).await, base);
-                        app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            move || app.nest(&prefix, sub),
-                        )) {
-                            Ok(next) => next,
-                            Err(_) => return IpeResult::Err(conflict_at(&rmethod, &rpath).into()),
-                        };
+                        let sub = build(base.prefix().to_owned()).await;
+                        mounts.push((base, sub));
                         web_mounted = true;
                     }
                 }
             }
         }
+        let app = MountTable::new(mounts).below(app);
         // Ipê doctrine: a panicking handler returns 500, never crashes the
         // process. The custom
         // responder classifies + logs the panic SERVER-SIDE (errId) and returns a
@@ -5005,9 +5089,9 @@ mod tests {
         let inserted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut app = axum::Router::new();
             for route in parse() {
-                if let ParsedTarget::Handler(method, h) = route.target {
-                    let path = route.pattern.router_path().to_owned();
-                    app = app.route(&path, method_router(method, route.pattern, h));
+                if let ParsedTarget::Handler(method, pattern, h) = route.target {
+                    let path = pattern.router_path().to_owned();
+                    app = app.route(&path, method_router(method, pattern, h));
                 }
             }
         }))
@@ -5100,9 +5184,9 @@ mod tests {
         use tower::ServiceExt;
         let mut app = axum::Router::new();
         for route in parse_routes(vec![handler_route("PATCH", "/r")]).expect("parses") {
-            if let ParsedTarget::Handler(method, h) = route.target {
-                let path = route.pattern.router_path().to_owned();
-                app = app.route(&path, method_router(method, route.pattern, h));
+            if let ParsedTarget::Handler(method, pattern, h) = route.target {
+                let path = pattern.router_path().to_owned();
+                app = app.route(&path, method_router(method, pattern, h));
             }
         }
         let app = behind_listener(app);
@@ -5209,8 +5293,68 @@ mod tests {
             );
             assert!(msg.len() < 400, "the error quotes a bounded excerpt");
         }
-        let static_dup = vec![server_static("/:id/:id".to_string(), "dir".to_string())];
-        assert!(parse_routes(static_dup).is_err());
+    }
+
+    /// Prove the refusals: a mount prefix that is not a mount base is refused
+    /// at listen, before any bind, naming the mount.
+    #[test]
+    fn a_malformed_mount_prefix_is_refused_at_listen() {
+        for prefix in [
+            "/a?b",
+            "/a#b",
+            "/a/%zz",
+            "/a%62",
+            "/a:b",
+            "/:id/:id",
+            "/f/*rest",
+            "/caf\u{e9}",
+            "/static/",
+            "static",
+            "/a//b",
+            "/a/..",
+        ] {
+            let refused = parse_routes(vec![server_static(prefix.to_owned(), "dir".to_owned())]);
+            let Err(refusal) = refused else {
+                assert!(refused.is_err(), "{prefix:?} must be refused");
+                return;
+            };
+            let msg = refusal.to_string();
+            assert!(
+                msg.starts_with("Server.listen: mount `")
+                    && msg.contains("is not a well-formed mount prefix"),
+                "{msg}"
+            );
+        }
+        for prefix in ["", "/", "/assets", "/a-b/c.d~e_f"] {
+            assert!(
+                parse_routes(vec![server_static(prefix.to_owned(), "dir".to_owned())]).is_ok(),
+                "{prefix:?}"
+            );
+        }
+    }
+
+    /// Prove the refusal: two mounts on one prefix, whatever spelling of the
+    /// root they use, are refused; a prefix nested under another is not.
+    #[test]
+    #[allow(clippy::expect_used)] // test: every fixed prefix parses
+    fn two_mounts_on_one_prefix_are_refused_at_listen() {
+        let mounts = |prefixes: &[&str]| {
+            parse_routes(
+                prefixes
+                    .iter()
+                    .map(|p| server_static((*p).to_owned(), "dir".to_owned()))
+                    .collect(),
+            )
+            .expect("the prefixes parse")
+        };
+        for pair in [["/a", "/a"], ["/", ""], ["", ""]] {
+            let msg = mount_conflict(&mounts(&pair)).unwrap_or_default();
+            assert!(msg.contains("serve one prefix"), "{pair:?}: {msg}");
+        }
+        assert_eq!(
+            mount_conflict(&mounts(&["/", "/billing", "/billing/admin"])),
+            None
+        );
     }
 
     /// An endpoint registers under its rendered spelling behind the
@@ -6146,36 +6290,48 @@ mod tests {
         }
     }
 
-    /// A mount re-bases the listener's parse below its prefix, so its
-    /// handlers read the path its router routes on; a parse that does not lie
-    /// below the mount's base reaches the handler as no parse at all.
-    #[cfg(feature = "web")]
+    /// A request no handler matches reaches the mount whose prefix is the
+    /// longest whole-segment prefix of its decoded path, its URI and its
+    /// listener parse re-based below that prefix; a handler under a mount's
+    /// prefix shadows the mount on its own path.
     #[tokio::test]
-    async fn a_mount_reads_the_listener_parse_below_its_prefix() {
+    #[allow(clippy::expect_used)] // test: fixed prefixes parse and fixed requests build
+    async fn a_mount_serves_by_longest_prefix_below_its_prefix() {
         use tower::ServiceExt;
-        let echo = || {
-            axum::Router::new().fallback(|strict: Option<axum::Extension<StrictUrl>>| async move {
-                strict.map_or_else(
-                    || "unparsed".to_owned(),
-                    |url| {
-                        url.path
-                            .canonical()
-                            .map_or_else(|_| "too long".to_owned(), |c| c.as_str().to_owned())
-                    },
-                )
-            })
+        let echo = |name: &'static str| {
+            axum::Router::new().fallback(
+                move |strict: Option<axum::Extension<StrictUrl>>, uri: axum::http::Uri| async move {
+                    let parse = strict.map_or_else(
+                        || "unparsed".to_owned(),
+                        |url| {
+                            url.path
+                                .canonical()
+                                .map_or_else(|_| "too long".to_owned(), |c| c.as_str().to_owned())
+                        },
+                    );
+                    format!("{name} {parse} {uri}")
+                },
+            )
         };
-        let base = |raw: &str| crate::encoding::DecodedPath::parse(raw).expect("base parses");
-        let app = behind_listener(
-            axum::Router::new()
-                .nest("/billing", below_mount(echo(), base("/billing")))
-                .nest("/stray", below_mount(echo(), base("/elsewhere"))),
-        );
+        let base = |raw: &str| crate::encoding::MountBase::parse(raw).expect("base parses");
+        let table = MountTable::new(vec![
+            (base(""), echo("root")),
+            (base("/billing"), echo("billing")),
+            (base("/billing/admin"), echo("admin")),
+        ]);
+        let app = behind_listener(table.below(
+            axum::Router::new().route("/billing/health", axum::routing::get(|| async { "health" })),
+        ));
         for (uri, want) in [
-            ("/billing", "/"),
-            ("/billing/x/", "/x/"),
-            ("/%62illing/%61/b", "/a/b"),
-            ("/stray/x", "unparsed"),
+            ("/billing", "billing / /"),
+            ("/billing/", "billing / /"),
+            ("/billing/x/", "billing /x/ /x/"),
+            ("/%62illing/%61/b", "billing /a/b /a/b"),
+            ("/billing/admin/x?q=%7a", "admin /x /x?q=%7a"),
+            ("/billing/adminx", "billing /adminx /adminx"),
+            ("/billingx", "root /billingx /billingx"),
+            ("/", "root / /"),
+            ("/billing/health", "health"),
         ] {
             let resp = app
                 .clone()
@@ -6188,6 +6344,30 @@ mod tests {
                 .await
                 .expect("router responds");
             assert_eq!(axum_body_string(resp).await, want, "{uri}");
+        }
+    }
+
+    /// A request no handler matches and no mount's prefix holds is a 404.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed prefixes parse and fixed requests build
+    async fn a_path_below_no_mount_is_not_found() {
+        use tower::ServiceExt;
+        let base = crate::encoding::MountBase::parse("/billing").expect("base parses");
+        let mounted = axum::Router::new().fallback(|| async { "billing" });
+        let app =
+            behind_listener(MountTable::new(vec![(base, mounted)]).below(axum::Router::new()));
+        for uri in ["/", "/billingx", "/other/billing"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("test request builds"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "{uri}");
         }
     }
 
