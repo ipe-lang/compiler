@@ -229,11 +229,17 @@ pub fn encode_path_segment(text: &str) -> Result<EncodedSegment, EncodeRefusal> 
         _ if text.len() > MAX_URL_COMPONENT_LEN.get() => return Err(too_long),
         _ => {}
     }
-    let encoded = utf8_percent_encode(text, QUERY).to_string();
+    let encoded = escape_segment(text);
     if encoded.len() > MAX_URL_COMPONENT_LEN.get() {
         return Err(too_long);
     }
     Ok(EncodedSegment(encoded))
+}
+
+/// The one path-segment alphabet: the unreserved bytes stay plain, every other
+/// byte of the UTF-8 text becomes an uppercase `%HH`.
+fn escape_segment(text: &str) -> String {
+    utf8_percent_encode(text, QUERY).to_string()
 }
 
 /// A raw query string proven safe to copy byte-for-byte into a `Location`.
@@ -369,6 +375,136 @@ impl DecodedPath {
             .strip_prefix(base.0.as_slice())
             .map(|rest| Self(rest.to_vec()))
     }
+}
+
+/// Whether a request path ends with a `/` after its last segment.
+///
+/// The root path has no last segment, so it is always `Absent`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrailingSlash {
+    /// The path ends with its last segment (`/a`).
+    Absent,
+    /// The path ends with a `/` after its last segment (`/a/`).
+    Present,
+}
+
+/// A request path parsed once: its decoded segments and its trailing slash.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RequestPath {
+    decoded: DecodedPath,
+    trailing: TrailingSlash,
+}
+
+impl RequestPath {
+    /// Decode every segment of `raw` and record whether it ends with `/`.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of [`DecodedPath::parse`].
+    pub fn parse(raw: &str) -> Result<Self, DecodeRefusal> {
+        let decoded = DecodedPath::parse(raw)?;
+        let trailing = if !decoded.is_root() && raw.ends_with('/') {
+            TrailingSlash::Present
+        } else {
+            TrailingSlash::Absent
+        };
+        Ok(Self { decoded, trailing })
+    }
+
+    /// The decoded segments.
+    #[must_use]
+    pub const fn decoded(&self) -> &DecodedPath {
+        &self.decoded
+    }
+
+    /// Whether the path ends with `/` after its last segment.
+    #[must_use]
+    pub const fn trailing(&self) -> TrailingSlash {
+        self.trailing
+    }
+
+    /// The one canonical spelling of this path ([`canonical_path`]).
+    ///
+    /// # Errors
+    ///
+    /// `TooLong` when the spelling exceeds `MAX_URL_COMPONENT_LEN`.
+    pub fn canonical(&self) -> Result<CanonicalPath, EncodeRefusal> {
+        canonical_path(&self.decoded, self.trailing)
+    }
+}
+
+/// The canonical text of a request path; only [`canonical_path`] builds one.
+///
+/// Every route matcher compares two values of this type, so a raw spelling
+/// and a canonical spelling of one path can never route apart.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CanonicalPath(String);
+
+impl CanonicalPath {
+    /// The canonical text: `/`, or `/seg/...` with each segment escaped.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One decoded segment spelled in the one segment alphabet, total over text.
+///
+/// The empty segment stays empty, and `.` and `..` become `%2E` and `%2E%2E`,
+/// so the spelling reads back as the same segment and is never normalized
+/// away by a client or a file service.
+#[must_use]
+pub fn canonical_segment(text: &str) -> String {
+    match text {
+        "." => "%2E".to_owned(),
+        ".." => "%2E%2E".to_owned(),
+        _ => escape_segment(text),
+    }
+}
+
+/// The one encoder from decoded segments back to request-path text.
+///
+/// Each segment is spelled by [`canonical_segment`] and joined with `/`; the
+/// root is `/`, empty inner segments are kept, and `trailing` adds a final
+/// `/` after the last segment. It is injective and the left inverse of
+/// [`RequestPath::parse`]: a `:`, `*`, `{` or `/` inside a segment is
+/// escaped, so no decoded text can read as a separator or a router sigil.
+///
+/// # Errors
+///
+/// `TooLong` when the text would exceed `MAX_URL_COMPONENT_LEN`; each decoded
+/// byte spells at most three bytes, and the growth is checked per segment.
+pub fn canonical_path(
+    path: &DecodedPath,
+    trailing: TrailingSlash,
+) -> Result<CanonicalPath, EncodeRefusal> {
+    let too_long = EncodeRefusal::TooLong {
+        cap: MAX_URL_COMPONENT_LEN,
+    };
+    if path.is_root() {
+        return Ok(CanonicalPath("/".to_owned()));
+    }
+    let mut text = String::new();
+    for segment in path.segments() {
+        let spelled = canonical_segment(segment);
+        let grown = text
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_add(spelled.len()))
+            .ok_or(too_long)?;
+        if grown > MAX_URL_COMPONENT_LEN.get() {
+            return Err(too_long);
+        }
+        text.push('/');
+        text.push_str(&spelled);
+    }
+    if trailing == TrailingSlash::Present {
+        if text.len() >= MAX_URL_COMPONENT_LEN.get() {
+            return Err(too_long);
+        }
+        text.push('/');
+    }
+    Ok(CanonicalPath(text))
 }
 
 /// The longest text [`MountBase::parse`] admits, in bytes.
@@ -1095,6 +1231,109 @@ mod tests {
             prop_assert_eq!(decode_path_segment(&encoded), Ok(s));
             prop_assert!(encoded.bytes().all(|b| b.is_ascii_alphanumeric()
                 || matches!(b, b'-' | b'.' | b'_' | b'~' | b'%')));
+        }
+    }
+
+    /// The canonical spelling of the decoded path with `segments` and `trailing`.
+    fn canonical_of(segments: &[&str], trailing: TrailingSlash) -> String {
+        let path = DecodedPath(segments.iter().map(|s| (*s).to_owned()).collect());
+        canonical_path(&path, trailing).map_or_else(|_| String::new(), |c| c.as_str().to_owned())
+    }
+
+    /// Prove the refusals: every byte a router or a client could read as
+    /// structure is escaped inside a segment, and nothing is dropped.
+    #[test]
+    fn canonical_path_escapes_every_structural_byte() {
+        for (segment, want) in [
+            ("a/b", "/a%2Fb"),
+            ("a:b", "/a%3Ab"),
+            (":id", "/%3Aid"),
+            ("*rest", "/%2Arest"),
+            ("100%", "/100%25"),
+            ("a?b", "/a%3Fb"),
+            ("a#b", "/a%23b"),
+            ("{x}", "/%7Bx%7D"),
+            ("a b", "/a%20b"),
+            ("a\0b", "/a%00b"),
+            ("caf\u{e9}", "/caf%C3%A9"),
+            (".", "/%2E"),
+            ("..", "/%2E%2E"),
+            ("A-z_0.9~", "/A-z_0.9~"),
+        ] {
+            assert_eq!(
+                canonical_of(&[segment], TrailingSlash::Absent),
+                want,
+                "{segment:?}"
+            );
+        }
+        assert_eq!(canonical_of(&[], TrailingSlash::Absent), "/");
+        assert_eq!(canonical_of(&[], TrailingSlash::Present), "/");
+        assert_eq!(
+            canonical_of(&["a", "", "b"], TrailingSlash::Absent),
+            "/a//b"
+        );
+        assert_eq!(canonical_of(&["a"], TrailingSlash::Present), "/a/");
+    }
+
+    /// Prove the ceiling: a path whose spelling passes `MAX_URL_COMPONENT_LEN`
+    /// is refused, while the last legal length is spelled.
+    #[test]
+    fn canonical_path_length_is_bounded() {
+        let cap = MAX_URL_COMPONENT_LEN.get();
+        let fits = DecodedPath(vec!["a".repeat(cap - 1)]);
+        assert!(canonical_path(&fits, TrailingSlash::Absent).is_ok());
+        assert!(matches!(
+            canonical_path(&fits, TrailingSlash::Present),
+            Err(EncodeRefusal::TooLong { .. })
+        ));
+        let grows = DecodedPath(vec!["/".repeat(cap / 3)]);
+        assert!(matches!(
+            canonical_path(&grows, TrailingSlash::Absent),
+            Err(EncodeRefusal::TooLong { .. })
+        ));
+    }
+
+    /// A raw path and its trailing slash parse into one `RequestPath`; the
+    /// root never carries a trailing slash.
+    #[test]
+    fn request_path_records_the_trailing_slash() {
+        let parsed = |raw: &str| RequestPath::parse(raw).map(|p| p.trailing());
+        assert_eq!(parsed("/a"), Ok(TrailingSlash::Absent));
+        assert_eq!(parsed("/a/"), Ok(TrailingSlash::Present));
+        assert_eq!(parsed("/"), Ok(TrailingSlash::Absent));
+        assert_eq!(parsed("//"), Ok(TrailingSlash::Absent));
+        assert!(matches!(
+            RequestPath::parse("/%zz"),
+            Err(DecodeRefusal::MalformedEscape { .. })
+        ));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        // The encoder is the left inverse of the parse, idempotent through a
+        // parse, and injective over decoded paths.
+        #[test]
+        fn canonical_path_round_trips_and_is_injective(
+            a in proptest::collection::vec(".*", 0..5),
+            b in proptest::collection::vec(".*", 0..5),
+            slash_a in proptest::bool::ANY,
+            slash_b in proptest::bool::ANY,
+        ) {
+            let request = |segments: Vec<String>, slash: bool| -> Option<RequestPath> {
+                let text = format!("/{}{}", segments.iter().map(|s| canonical_segment(s)).collect::<Vec<_>>().join("/"), if slash { "/" } else { "" });
+                RequestPath::parse(&text).ok()
+            };
+            let (Some(p), Some(q)) = (request(a, slash_a), request(b, slash_b)) else {
+                return Err(TestCaseError::fail("a canonical spelling must parse"));
+            };
+            let (Ok(cp), Ok(cq)) = (p.canonical(), q.canonical()) else {
+                return Err(TestCaseError::fail("a short path must spell"));
+            };
+            prop_assert_eq!(RequestPath::parse(cp.as_str()), Ok(p.clone()));
+            let again = RequestPath::parse(cp.as_str()).ok().and_then(|r| r.canonical().ok());
+            prop_assert_eq!(again.as_ref(), Some(&cp));
+            prop_assert_eq!(p == q, cp == cq);
         }
     }
 
