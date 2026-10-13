@@ -204,8 +204,8 @@ impl VarCeiling {
 /// exactly when the record's row chain ends in `EmptyRecord`, `Open` over the
 /// tagged representative exactly when it ends in a variable (`Flex`, `Rigid`
 /// or `Super`), and the record's fields are the union of the fields along the
-/// chain. Any other terminal, or a label repeated along the chain, is a
-/// compiler bug, never a value of this type.
+/// chain. Any other terminal, or a label repeated along the chain, is refused
+/// by the read-back, never a value of this type.
 ///
 /// Mirrors `Maybe String` on `TRecord (Map …) (Maybe String)` in
 /// `../ipe/src/Ipe/AST/Canonical.hs:159`.

@@ -368,15 +368,20 @@ pub(super) fn ty_is_int(ty: &Ty, interner: &Interner) -> bool {
 }
 
 /// Is `ty` the built-in `BackoffStrategy` — an empty-module, arg-less `Con`
-/// named `BackoffStrategy`? Used by the `RetryPolicy` shape check for the
-/// `strategy` field, or a free `Ty::Var` (solver left the field unsolved).
+/// named `BackoffStrategy` — or a bare `Ty::Var` (the solver left the field
+/// unsolved)? Used by the `RetryPolicy` shape check for the `strategy` field. A
+/// compound type that merely mentions a variable (`Maybe a`, an open-row
+/// record) is not the kernel field.
 pub(super) fn is_backoff_strategy_ty(interner: &Interner, ty: &Ty) -> bool {
-    if !ipe_types::ty_is_ground(ty) {
-        return true;
+    match ty {
+        Ty::Var(_) => true,
+        Ty::Con { module, name, args } => {
+            module.is_empty()
+                && args.is_empty()
+                && interner.resolve(*name) == Some("BackoffStrategy")
+        }
+        Ty::Wildcard | Ty::Unit | Ty::Fun(_, _) | Ty::Tuple(_) | Ty::Record(_, _) => false,
     }
-    matches!(ty, Ty::Con { module, name, args }
-        if module.is_empty() && args.is_empty()
-            && interner.resolve(*name) == Some("BackoffStrategy"))
 }
 
 /// The [`canon::Type`] twin of [`ty_is_int`].

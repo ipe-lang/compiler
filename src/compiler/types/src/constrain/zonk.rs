@@ -813,7 +813,13 @@ fn zonk_row(
     }
 }
 
-/// A record row chain broke the unifier's row invariant (never reachable from input).
+/// A record row chain that is not a row: a label repeated along it, or a
+/// non-row terminal.
+///
+/// Reachable from input while a row variable may also stand as a whole type
+/// (`a` in `{ a | x : Int } -> a -> Int`): a caller binding it to a record
+/// that repeats a chain label, or to a non-row type, builds such a chain. The
+/// read-back refuses it, failing closed, rather than drop the clash.
 fn row_chain_bug(detail: &str) -> Diagnostic {
     Diagnostic::CompilerBug {
         where_: STAGE,

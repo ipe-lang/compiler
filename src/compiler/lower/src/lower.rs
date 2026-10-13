@@ -789,25 +789,28 @@ fn is_retry_policy_record(interner: &Interner, ty: &Ty) -> bool {
 }
 
 /// Is `field_ty` the `shouldRetry` arrow of the KERNEL `RetryPolicy e` record —
-/// either `Ty::Var -> _` (the solver left `e` free) or `Error -> _` (`e` unified
-/// to the built-in error type)?
+/// a bare `Ty::Var` (the solver left the field unsolved), `Ty::Var -> _` (the
+/// solver left `e` free), or `Error -> _` (`e` unified to the built-in error
+/// type)?
 ///
-/// A concrete, non-Error predicate (e.g. `Int -> Bool`) is NOT the kernel type:
-/// `shouldRetry` would be `Ty::Fun(Ty::Con{Int}, _)`, which neither case
-/// matches. Used exclusively by [`is_retry_policy_record`] — the single source
-/// for the name+type gate — so the type check lives in exactly one place.
+/// Any other type is NOT the kernel type: a concrete non-Error predicate
+/// (`Int -> Bool`), or a domain that merely mentions a variable (`Maybe a ->
+/// Bool`, `{ r | code : Int } -> Bool`), names a user record that happens to
+/// carry the four kernel field names. Used exclusively by
+/// [`is_retry_policy_record`] — the single source for the name+type gate — so
+/// the type check lives in exactly one place.
 fn is_kernel_shouldretry_ty(interner: &Interner, field_ty: &Ty) -> bool {
-    // Solver left `e` as a free variable anywhere in the field type.
-    if !ty_is_ground(field_ty) {
-        return true;
+    match field_ty {
+        Ty::Var(_) => true,
+        Ty::Fun(domain, _) => match domain.as_ref() {
+            Ty::Var(_) => true,
+            Ty::Con { name, args, .. } => {
+                args.is_empty() && interner.resolve(*name) == Some("Error")
+            }
+            Ty::Wildcard | Ty::Unit | Ty::Fun(_, _) | Ty::Tuple(_) | Ty::Record(_, _) => false,
+        },
+        Ty::Wildcard | Ty::Unit | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(_, _) => false,
     }
-    // `e` was unified to the built-in `Error` type: `field_ty = Error -> Bool`.
-    if let Ty::Fun(domain, _) = field_ty
-        && let Ty::Con { name, args, .. } = domain.as_ref()
-    {
-        return args.is_empty() && interner.resolve(*name).is_some_and(|s| s == "Error");
-    }
-    false
 }
 
 /// Build the concrete `IrType::Record` for `RetryPolicy e` with `e` fixed to
@@ -36663,6 +36666,48 @@ mod tests {
             !super::ty_fields_mention_var(&open),
             "the fields-only read must not consult the row tail"
         );
+    }
+
+    /// The kernel `RetryPolicy` field predicates admit a bare unsolved variable
+    /// and the kernel shapes only: a compound type that merely mentions a
+    /// variable or an open row is a user field, not the kernel one.
+    #[test]
+    fn kernel_retry_field_predicates_refuse_variable_mentioning_types() {
+        let mut interner = Interner::new();
+        let int_ty = builtin_con(&mut interner, "Int");
+        let bool_ty = builtin_con(&mut interner, "Bool");
+        let open = open_record(&mut interner, &[("code", int_ty.clone())]);
+        let maybe_var = Ty::Con {
+            module: Vec::new(),
+            name: interner.intern("Maybe").expect("intern Maybe"),
+            args: vec![Ty::Var(9)],
+        };
+        let var_arrow = shouldretry_var_arrow(&mut interner);
+        let error_arrow = shouldretry_error_arrow(&mut interner);
+        let strategy = backoff_strategy_ty(&mut interner);
+        let arrow = |domain: Ty, result: Ty| Ty::Fun(Box::new(domain), Box::new(result));
+
+        assert!(super::is_kernel_shouldretry_ty(&interner, &Ty::Var(5)));
+        assert!(super::is_kernel_shouldretry_ty(&interner, &var_arrow));
+        assert!(super::is_kernel_shouldretry_ty(&interner, &error_arrow));
+        for (refused, why) in [
+            (arrow(open.clone(), bool_ty.clone()), "an open-row domain"),
+            (arrow(maybe_var.clone(), bool_ty), "a `Maybe a` domain"),
+            (
+                arrow(int_ty, Ty::Var(6)),
+                "a concrete domain over a variable result",
+            ),
+        ] {
+            assert!(
+                !super::is_kernel_shouldretry_ty(&interner, &refused),
+                "shouldRetry over {why} must not be the kernel arrow"
+            );
+        }
+
+        assert!(super::is_backoff_strategy_ty(&interner, &Ty::Var(7)));
+        assert!(super::is_backoff_strategy_ty(&interner, &strategy));
+        assert!(!super::is_backoff_strategy_ty(&interner, &maybe_var));
+        assert!(!super::is_backoff_strategy_ty(&interner, &open));
     }
 
     /// A row-polymorphic record update lowers: its gate reads the base's fields, never its open tail.

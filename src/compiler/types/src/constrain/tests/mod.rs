@@ -2830,6 +2830,27 @@ mod zonk_row_tail_tests {
         );
     }
 
+    /// A signature row variable used as a whole type (`a` in
+    /// `{ a | x : Int } -> a -> Int`) lets a caller bind the row to a record
+    /// that repeats a label of the chain, or to a non-row type. Such a program
+    /// is refused, never read back as a record that silently drops the clash.
+    #[test]
+    fn a_row_variable_bound_outside_a_row_is_refused() {
+        for arg in ["{ x = 2 }", "True"] {
+            let src = format!(
+                "{MAIN_HDR}f : {{ a | x : Int }} -> a -> Int\nf r s =\n    r.x\n\ng r =\n    f r {arg}\n\nmain = 0\n"
+            );
+            let mut i = Interner::new();
+            let parsed = ipe_parse::parse_module(&src, &mut i).expect("source must parse");
+            let m = ipe_canon::canonicalise(&parsed, &mut i).expect("source must resolve");
+            let solved = crate::infer(&m, &mut i);
+            assert!(
+                solved.is_err(),
+                "binding the row variable to `{arg}` must be refused, got {solved:?}"
+            );
+        }
+    }
+
     /// Whether the solver-side and the read-back groundness judgments agree on `v`.
     fn ground_parity(uf: &mut UnionFind<Content>, v: VarId) -> Result<bool, String> {
         let mut budget = Budget::unbounded();
