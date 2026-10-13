@@ -959,7 +959,7 @@ impl RoutePattern {
     }
 
     /// The `:name`s of the parameter segments, in pattern order.
-    pub(crate) fn param_names(&self) -> impl Iterator<Item = &str> {
+    pub fn param_names(&self) -> impl Iterator<Item = &str> {
         self.0.iter().filter_map(|seg| match seg {
             PatternSeg::Param(name) => Some(name.as_str()),
             PatternSeg::Literal(_) => None,
