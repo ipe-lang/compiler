@@ -1753,7 +1753,7 @@ fn memory_store_message(ttl: Duration) -> String {
     format!("session store: memory (ttl={})", go_duration_string(ttl))
 }
 
-/// Emit the `YYYY/MM/DD HH:MM:SS [ipe.live] session store: memory (ttl=…)`
+/// Emit the `[ipe.live] YYYY/MM/DD HH:MM:SS session store: memory (ttl=…)`
 /// startup line. Shared so the in-process console sub-app mount emits the same
 /// line format.
 pub(crate) fn emit_memory_store_log(ttl: Duration) {
@@ -1808,26 +1808,25 @@ mod format_tests {
     #[test]
     fn memory_line_shape() {
         let line = crate::system::runtime_log_line(
+            crate::system::LogStream::Stderr,
             Some(&go_log_timestamp()),
             "live",
             &memory_store_message(Duration::from_secs(3600)),
         );
         let line = line.trim_start();
-        assert!(
-            line.ends_with("[ipe.live] session store: memory (ttl=1h0m0s)"),
-            "got {line:?}"
-        );
-        // Timestamp prefix `YYYY/MM/DD HH:MM:SS ` precedes it.
-        let prefix = line
-            .strip_suffix("[ipe.live] session store: memory (ttl=1h0m0s)")
-            .unwrap_or("");
+        // Tag first, then the `YYYY/MM/DD HH:MM:SS ` stamp, then the message.
+        let after_tag = line.strip_prefix("[ipe.live] ");
+        assert!(after_tag.is_some(), "the tag must lead the line: {line:?}");
+        let stamp = after_tag
+            .and_then(|rest| rest.strip_suffix("session store: memory (ttl=1h0m0s)"))
+            .unwrap_or_default();
         assert_eq!(
-            prefix.len(),
+            stamp.len(),
             20,
-            "timestamp prefix `YYYY/MM/DD HH:MM:SS ` is 20 chars: {prefix:?}"
+            "stamp `YYYY/MM/DD HH:MM:SS ` is 20 chars: {stamp:?}"
         );
-        assert_eq!(prefix.matches('/').count(), 2);
-        assert_eq!(prefix.matches(':').count(), 2);
+        assert_eq!(stamp.matches('/').count(), 2);
+        assert_eq!(stamp.matches(':').count(), 2);
     }
 }
 
