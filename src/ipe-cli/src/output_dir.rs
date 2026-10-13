@@ -198,11 +198,12 @@ pub enum OutputRefusal {
     /// on some platforms and part of a name on others. A `.` or `..` inside a
     /// verbatim path is a literal name there, not a step. The prefix must be
     /// an `ipe_fs_open::PlaceablePrefix`: a drive, or a `\\server\share` whose
-    /// server is an IPv4 address or an ASCII host name and whose share Windows
-    /// opens as spelled; a device namespace (`\\.\pipe`) or another verbatim
-    /// root (`\\?\GLOBALROOT`, `\\?\Volume{..}`) names no directory tree. And
-    /// Windows opens a name with a trailing `.` or space, a `:`, or a device
-    /// stem (`NUL`, `COM1`) as some other entry than the one spelled.
+    /// server and share Windows each opens as spelled (a host, computer,
+    /// `wsl$` or web-folder server name); a device namespace (`\\.\pipe`) or
+    /// another verbatim root (`\\?\GLOBALROOT`, `\\?\Volume{..}`) names no
+    /// directory tree. And Windows opens a name with a trailing `.` or space, a
+    /// `:`, or a device stem (`NUL`, `COM1`) as some other entry than the one
+    /// spelled.
     Unplaceable(PathBuf),
     /// The working directory a relative request is walked on from names no single absolute place.
     ///

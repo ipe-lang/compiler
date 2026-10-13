@@ -278,7 +278,7 @@ mod tests {
         let bad = [
             Prefix::UNC(OsStr::new("srv"), OsStr::new("con")),
             Prefix::UNC(OsStr::new("srv"), OsStr::new("")),
-            Prefix::UNC(OsStr::new("-srv"), OsStr::new("share")),
+            Prefix::UNC(OsStr::new("srv."), OsStr::new("share")),
             Prefix::VerbatimUNC(OsStr::new(".."), OsStr::new("x")),
             Prefix::DeviceNS(OsStr::new("pipe")),
             Prefix::Verbatim(OsStr::new("Volume{00000000-0000-0000-0000-000000000000}")),

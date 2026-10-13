@@ -8,20 +8,17 @@
 //! [`Prefix`] values, so it is decided, and tested, identically on every
 //! platform.
 //!
-//! The runtime's `path_core::Volume` is a second grammar for program input in
-//! a crate graph this one does not reach; its UNC refusal cases are mirrored
-//! by this module's tests, and this module's by its.
+//! The runtime's `path_core::Volume` parses a volume of program input in a
+//! crate graph this one does not reach. It decides where a path is anchored,
+//! not whether output may live there, so it holds no server or share rule.
 
 use std::ffi::OsStr;
-use std::net::Ipv4Addr;
 use std::path::Prefix;
 
 use crate::win32_name::opens_as_spelled;
 
-/// The most bytes a server host name may hold.
-const MAX_HOST_BYTES: usize = 253;
-/// The most bytes one label of a server host name may hold.
-const MAX_LABEL_BYTES: usize = 63;
+/// The most bytes a server name may hold: one Win32 path component.
+const MAX_SERVER_BYTES: usize = 255;
 
 /// A Windows path prefix proven to name a place on a disk or a share.
 ///
@@ -63,7 +60,13 @@ impl DriveLetter {
     }
 }
 
-/// A share's server: a dotted IPv4 address or an ASCII host name.
+/// A share's server: one ASCII name that Win32 opens as spelled.
+///
+/// The name holds only ASCII letters, digits, and `-`, `.`, `_`, `$`, `@`.
+/// That set covers a DNS host name or IPv4 address (`srv-01.corp.example`,
+/// `10.0.0.1`, `fe80--1.ipv6-literal.net`), a Windows computer name (`build_pc`),
+/// a network-provider name (`wsl$`, `wsl.localhost`), and a web-folder
+/// server (`srv@SSL@8443`).
 #[derive(Debug, Clone)]
 pub struct ServerName(Box<str>);
 
@@ -98,7 +101,7 @@ pub enum PrefixRefusal {
     BadDrive,
     /// A share prefix with an empty share name.
     EmptyShare,
-    /// A server that is neither a dotted IPv4 address nor an ASCII host name.
+    /// A server that is not one ASCII name Win32 opens as spelled (see [`ServerName`]).
     BadServer,
     /// A share name Win32 would open as another name or a device.
     BadShare,
@@ -127,29 +130,29 @@ impl PlaceablePrefix {
     }
 }
 
-/// The server `raw`, when it is a dotted IPv4 address or an ASCII host name.
+/// The server `raw`, when it is one ASCII name Win32 opens as spelled.
+///
+/// Refused: an empty or over-long name, `.` and `..`, a byte outside the
+/// [`ServerName`] set (a `:` of a raw IPv6 literal, a space, `?`, any
+/// non-ASCII text), and every name [`opens_as_spelled`] refuses (a trailing
+/// `.`, a reserved device name).
 fn server_name(raw: &OsStr) -> Result<ServerName, PrefixRefusal> {
     let text = raw.to_str().ok_or(PrefixRefusal::NotUnicode)?;
-    if text.parse::<Ipv4Addr>().is_ok() || is_host_name(text) {
+    let admitted = (1..=MAX_SERVER_BYTES).contains(&text.len())
+        && text != "."
+        && text != ".."
+        && text.bytes().all(is_server_byte)
+        && opens_as_spelled(text);
+    if admitted {
         Ok(ServerName(text.into()))
     } else {
         Err(PrefixRefusal::BadServer)
     }
 }
 
-/// Whether `text` is a host name: dot-separated labels of ASCII letters, digits, and inner hyphens.
-fn is_host_name(text: &str) -> bool {
-    (1..=MAX_HOST_BYTES).contains(&text.len()) && text.split('.').all(is_host_label)
-}
-
-/// Whether `label` is one host-name label.
-fn is_host_label(label: &str) -> bool {
-    (1..=MAX_LABEL_BYTES).contains(&label.len())
-        && label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && !label.starts_with('-')
-        && !label.ends_with('-')
+/// Whether `byte` may appear in a [`ServerName`].
+const fn is_server_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'$' | b'@')
 }
 
 /// The share `raw`, when Win32 opens it as exactly the share it spells.
@@ -167,8 +170,6 @@ fn share_name(raw: &OsStr) -> Result<ShareName, PrefixRefusal> {
 
 #[cfg(test)]
 mod tests {
-    //! The UNC cases mirror the runtime's `path_core` volume tests, which mirror these.
-
     use std::ffi::OsStr;
     use std::path::Prefix;
 
@@ -239,25 +240,24 @@ mod tests {
 
     #[test]
     fn a_bad_server_is_refused() {
-        let long_label = "a".repeat(64);
-        let long_host = ["a"; 128].join(".");
+        let long = "a".repeat(256);
         for server in [
             "",
             ".",
             "..",
             "?",
-            "-a",
-            "a-",
-            "a..b",
             "srv.",
-            "a_b",
+            "srv ",
             "a b",
-            "wsl$",
-            "srv@SSL",
+            "a*b",
+            "a%b",
+            "a:b",
             "::1",
+            "[::1]",
+            "con",
+            "NUL",
             "h\u{e9}llo",
-            long_label.as_str(),
-            long_host.as_str(),
+            long.as_str(),
         ] {
             let result = unc(server, "share");
             assert_eq!(
@@ -265,6 +265,30 @@ mod tests {
                 Some(PrefixRefusal::BadServer),
                 "server {server:?} must be refused, got {result:?}"
             );
+        }
+    }
+
+    /// A provider, computer-name, or web-folder server spelling Windows hands out is placeable.
+    #[test]
+    fn a_provider_computer_or_web_folder_server_is_placeable() {
+        let longest = "a".repeat(255);
+        for server in [
+            "wsl$",
+            "wsl.localhost",
+            "build_pc",
+            "srv@SSL",
+            "srv@SSL@8443",
+            "-srv",
+            "a..b",
+            longest.as_str(),
+        ] {
+            for result in [unc(server, "Ubuntu"), verbatim_unc(server, "Ubuntu")] {
+                let kept = matches!(
+                    &result,
+                    Ok(PlaceablePrefix::Share { server: s, .. }) if s.as_str() == server
+                );
+                assert!(kept, "server {server:?} must be placeable, got {result:?}");
+            }
         }
     }
 
@@ -296,13 +320,6 @@ mod tests {
     /// A share Win32 opens as spelled, on a well-formed server, is placeable.
     #[test]
     fn a_well_formed_share_is_placeable() {
-        let max_label = "a".repeat(63);
-        let max_host = ["a"; 127].join(".");
-        assert_eq!(
-            max_host.len(),
-            253,
-            "the host fixture sits at the byte ceiling"
-        );
         for (result, server, share) in [
             (unc("localhost", "C$"), "localhost", "C$"),
             (unc("10.0.0.1", "build"), "10.0.0.1", "build"),
@@ -317,8 +334,6 @@ mod tests {
                 "fe80--1.ipv6-literal.net",
                 "share",
             ),
-            (unc(&max_label, "s"), max_label.as_str(), "s"),
-            (unc(&max_host, "s"), max_host.as_str(), "s"),
             (unc("srv", "caf\u{e9}"), "srv", "caf\u{e9}"),
         ] {
             assert!(

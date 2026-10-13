@@ -1064,7 +1064,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-unplaceable
 
-{path} does not name one absolute place on every platform: its prefix or one of its names is refused (a drive-relative path, a device or volume path such as `\\.\pipe` or `\\?\Volume{..}`, a share whose server is not an IPv4 address or host name or whose share name Windows rewrites, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full drive or `\\server\share` path
+{path} does not name one absolute place on every platform: its prefix or one of its names is refused (a drive-relative path, a device or volume path such as `\\.\pipe` or `\\?\Volume{..}`, a share whose server or share name Windows would read as another, such as one with a trailing `.`, a `:` or a space in the server, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full drive or `\\server\share` path
 
 ## output-unplaceable-cwd
 
