@@ -417,23 +417,28 @@ impl<'a> BundleAssembler<'a> {
         // A `release web desktop` bundle carries an optimised binary and its
         // consented floor; the `build` dev bundle carries a plain debug one and
         // the development marker.
+        let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+            cargo_bin.path(),
+            crate_dir.path(),
+            None,
+        )?;
         FlooredBuild {
             cargo: &cargo_bin,
             crate_dir: &crate_dir,
             finish,
             target: CargoTarget::Host,
+            target_dir: &target_dir,
             output: CargoOutput::Human(Verbosity::Progress),
             what: "the desktop app",
             runtime: None,
         }
         .run()?;
 
-        // Locate the compiled binary via cargo metadata (the target dir may be
-        // a global CARGO_TARGET_DIR), then materialise (Linux) or describe
-        // (macOS/Windows).
-        let target_dir = crate::cargo_step::target_directory(&cargo_bin, crate_dir.path())?;
+        // Read the compiled binary back from the build directory the build was
+        // handed, then materialise (Linux) or describe (macOS/Windows).
         let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = target_dir
+            .path()
             .join(self.profile.target_subdir())
             .join(&bin_name);
         if !binary.is_file() {
@@ -1621,22 +1626,26 @@ pub fn build_and_run_test_entry(
     };
 
     // Compile the emitted Rust project.
+    let target_dir =
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), crate_dir.path(), None)?;
     FlooredBuild {
         cargo: cargo_bin,
         crate_dir: &crate_dir,
         finish: NativeFinish::Dev,
         target: CargoTarget::Host,
+        target_dir: &target_dir,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
         runtime: runtime_context_for_message(),
     }
     .run()?;
 
-    // Locate the compiled binary via `cargo metadata` so a user-level
-    // `CARGO_TARGET_DIR` pin or workspace override is respected. The binary
-    // name matches the emitted crate's package name (read from `Cargo.toml`).
+    // Read the compiled binary back from the build directory the build was
+    // handed, so a `CARGO_TARGET_DIR` or `[build] target-dir` pin is the one
+    // the build used. The binary name matches the emitted crate's package name
+    // (read from `Cargo.toml`).
     let test_bin_name = emitted_bin_filename(out_dir)?;
-    let mut bin = crate::cargo_step::target_directory(cargo_bin, out_dir)?;
+    let mut bin = target_dir.path().to_path_buf();
     bin.push("debug");
     bin.push(&test_bin_name);
 
@@ -3531,7 +3540,9 @@ pub const fn diag_span(d: &Diagnostic) -> ipe_diagnostics::Span {
         | Diagnostic::Ffi { .. }
         | Diagnostic::Sandbox { .. }
         | Diagnostic::Consent { .. }
-        | Diagnostic::RegistryUnreachable { .. } => ipe_diagnostics::Span::DUMMY,
+        | Diagnostic::RegistryUnreachable { .. }
+        | Diagnostic::TargetDirUnlinkable { .. }
+        | Diagnostic::HostLinkerCannotOpenInput { .. } => ipe_diagnostics::Span::DUMMY,
     }
 }
 

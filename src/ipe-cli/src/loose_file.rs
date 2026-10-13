@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use ipe_intern::{Interner, Symbol};
 
-use crate::{CliError, io_bounded, project};
+use crate::{CliError, Diagnostic, io_bounded, project};
 
 /// Upper bound on the user modules a loose-file load follows through imports.
 pub const MAX_LOOSE_FILE_MODULES: usize = 256;
@@ -117,6 +117,72 @@ pub struct LooseFileSources {
     pub loaded_files: Vec<PathBuf>,
 }
 
+/// Why a loose file did not resolve to its module set.
+///
+/// The entry's own parse failure is its own variant, so a consumer that
+/// falls back to the entry's text on a parse failure matches exactly that
+/// case; every other failure is [`LooseFileError::Refused`].
+#[derive(Debug)]
+pub enum LooseFileError {
+    /// The entry does not parse, so it has no import closure to follow.
+    EntryParse(EntryParseFailure),
+    /// The entry or a module its closure reaches was refused or could not be read.
+    Refused(CliError),
+}
+
+/// The entry's parse failure: the entry, the text it was parsed from, and the diagnostic.
+#[derive(Debug)]
+pub struct EntryParseFailure {
+    file: PathBuf,
+    src: String,
+    diag: Box<Diagnostic>,
+}
+
+impl EntryParseFailure {
+    /// The entry that failed to parse.
+    #[must_use]
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    /// The entry text the parser rejected (the open buffer when one shadows the disk).
+    #[must_use]
+    pub fn src(&self) -> &str {
+        &self.src
+    }
+
+    /// The parser's diagnostic.
+    #[must_use]
+    pub fn diag(&self) -> &Diagnostic {
+        &self.diag
+    }
+
+    /// The entry text, consuming the failure.
+    #[must_use]
+    pub fn into_src(self) -> String {
+        self.src
+    }
+}
+
+impl From<CliError> for LooseFileError {
+    fn from(err: CliError) -> Self {
+        Self::Refused(err)
+    }
+}
+
+impl From<LooseFileError> for CliError {
+    /// The entry's parse failure renders as the compiler diagnostic
+    /// ([`CliError::Pipeline`]); a refusal is passed through unchanged.
+    fn from(err: LooseFileError) -> Self {
+        match err {
+            LooseFileError::EntryParse(EntryParseFailure { file, src, diag }) => {
+                Self::Pipeline { file, src, diag }
+            }
+            LooseFileError::Refused(err) => err,
+        }
+    }
+}
+
 /// The outcome of reading one vetted sibling: its path and text.
 type SiblingRead = Result<(PathBuf, String), CliError>;
 
@@ -139,7 +205,8 @@ type SiblingRead = Result<(PathBuf, String), CliError>;
 /// `entry_text` shadows the entry's disk bytes (an unsaved editor buffer).
 ///
 /// # Errors
-/// [`CliError::Pipeline`] when the entry does not parse;
+/// [`LooseFileError::EntryParse`] when the entry does not parse; otherwise
+/// [`LooseFileError::Refused`] carrying
 /// [`CliError::SourceRefused`] when the entry or a probed module is a FIFO,
 /// device, socket or other non-regular file, a probed module or a directory
 /// on its way is a symlink, or it lies where the process may not look (an
@@ -154,11 +221,11 @@ pub fn resolve_loose_file(
     entry: &Path,
     entry_text: Option<&str>,
     limits: LooseFileLimits,
-) -> Result<LooseFileSources, CliError> {
+) -> Result<LooseFileSources, LooseFileError> {
     let source_dir = SourceDir::open(entry_directory(entry));
     let entry_source = match entry_text {
         Some(text) if source_bytes(text) > limits.bytes => {
-            return Err(bytes_past_budget(entry, limits));
+            return Err(bytes_past_budget(entry, limits).into());
         }
         Some(text) => text.to_owned(),
         None => charge_budget(
@@ -170,11 +237,11 @@ pub fn resolve_loose_file(
     };
     let mut interner = Interner::new();
     let parsed = ipe_parse::parse_module(&entry_source, &mut interner).map_err(|diag| {
-        CliError::Pipeline {
+        LooseFileError::EntryParse(EntryParseFailure {
             file: entry.to_path_buf(),
             src: entry_source.clone(),
             diag: Box::new(diag),
-        }
+        })
     })?;
     let entry_module = module_segments(&parsed.name.value, &interner);
     let mut pending = imported_modules(&parsed, &interner);
@@ -194,12 +261,13 @@ pub fn resolve_loose_file(
             return Err(closure_too_large(
                 entry,
                 &format!("more than {} distinct modules", limits.probes),
-            ));
+            )
+            .into());
         }
         probed.insert(module.clone());
         if let project::ModulePathShape::DeviceNamed(segment) = project::module_path_shape(&module)
         {
-            return Err(device_named_import(entry, &module, segment));
+            return Err(device_named_import(entry, &module, segment).into());
         }
         let Some(relative) = module_file(&module) else {
             continue;
@@ -212,14 +280,15 @@ pub fn resolve_loose_file(
             return Err(closure_too_large(
                 entry,
                 &format!("more than {} sibling modules", limits.modules),
-            ));
+            )
+            .into());
         }
         let remaining = limits.bytes.saturating_sub(total_bytes);
         let read = sibling.read(budget_cap(remaining));
         let (path, source) = charge_budget(read, entry, remaining, limits)?;
         total_bytes = total_bytes.saturating_add(source_bytes(&source));
         if total_bytes > limits.bytes {
-            return Err(bytes_past_budget(entry, limits));
+            return Err(bytes_past_budget(entry, limits).into());
         }
         if let Ok(parsed) = ipe_parse::parse_module(&source, &mut interner) {
             pending.extend(imported_modules(&parsed, &interner));
@@ -926,8 +995,9 @@ mod tests {
     #[cfg(unix)]
     use super::HeldDir;
     use super::{
-        CliError, DescendFailure, EntryKind, LooseFileLimits, LooseFileSources, ProjectRoot,
-        SourceDir, Spelling, WalkDir, io_bounded, resolve_loose_file, swap_ascii_case, walk,
+        CliError, DescendFailure, EntryKind, LooseFileError, LooseFileLimits, LooseFileSources,
+        ProjectRoot, SourceDir, Spelling, WalkDir, io_bounded, resolve_loose_file, swap_ascii_case,
+        walk,
     };
 
     /// A fresh, canonical scratch directory unique to `name` and this process.
@@ -1006,7 +1076,8 @@ mod tests {
                 .expect("lock the unrelated directory");
         }
 
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
 
         #[cfg(unix)]
         {
@@ -1041,7 +1112,8 @@ mod tests {
             "module Unused exposing (z)\n\nz = 3\n",
         );
 
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         let loaded = loaded.expect("imported siblings resolve");
         assert_eq!(
@@ -1088,7 +1160,8 @@ mod tests {
         );
         let buffer = "module Main exposing (main)\n\nimport Helper\n\nmain = Helper.x\n";
 
-        let loaded = resolve_loose_file(&entry, Some(buffer), LooseFileLimits::DEFAULT);
+        let loaded = resolve_loose_file(&entry, Some(buffer), LooseFileLimits::DEFAULT)
+            .map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         let loaded = loaded.expect("overlay entry loads");
         assert_eq!(
@@ -1118,8 +1191,8 @@ mod tests {
         );
         write(&dir.join("B.ipe"), "module B exposing (b)\n\nb = 1\n");
 
-        let at_limit = resolve_loose_file(&entry, None, modules_only(3));
-        let past_limit = resolve_loose_file(&entry, None, modules_only(2));
+        let at_limit = resolve_loose_file(&entry, None, modules_only(3)).map_err(CliError::from);
+        let past_limit = resolve_loose_file(&entry, None, modules_only(2)).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(at_limit.is_ok(), "three modules fit a limit of three");
         assert!(
@@ -1142,8 +1215,8 @@ mod tests {
             ..LooseFileLimits::DEFAULT
         };
 
-        let at_limit = resolve_loose_file(&entry, None, probes(3));
-        let past_limit = resolve_loose_file(&entry, None, probes(2));
+        let at_limit = resolve_loose_file(&entry, None, probes(3)).map_err(CliError::from);
+        let past_limit = resolve_loose_file(&entry, None, probes(2)).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(at_limit.is_ok(), "Main, A and B fit a probe limit of three");
         assert!(
@@ -1179,9 +1252,12 @@ mod tests {
             "module Control exposing (main)\n\nimport Auxiliary\n\nmain = Auxiliary.a\n",
         );
 
-        let bare_result = resolve_loose_file(&bare, None, LooseFileLimits::DEFAULT);
-        let nested_result = resolve_loose_file(&nested, None, LooseFileLimits::DEFAULT);
-        let control_result = resolve_loose_file(&control, None, LooseFileLimits::DEFAULT);
+        let bare_result =
+            resolve_loose_file(&bare, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
+        let nested_result =
+            resolve_loose_file(&nested, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
+        let control_result =
+            resolve_loose_file(&control, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(device_segment(&bare_result), Some("Aux"));
         assert_eq!(device_segment(&nested_result), Some("Com1"));
@@ -1201,7 +1277,8 @@ mod tests {
         );
         write(&dir.join("Nul.ipe"), "module Nul exposing (a)\n\na = 1\n");
 
-        let result = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let result =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(device_segment(&result), Some("Nul"));
     }
@@ -1224,7 +1301,8 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("Secret.ipe"), dir.join("Secret.ipe"))
             .expect("plant symlink");
 
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&outside);
         assert!(
@@ -1250,7 +1328,8 @@ mod tests {
         );
         std::os::unix::fs::symlink(&outside, dir.join("Lib")).expect("plant symlink");
 
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&outside);
         assert!(
@@ -1281,7 +1360,8 @@ mod tests {
             fs::symlink_metadata(&probed).is_ok_and(|meta| meta.file_type().is_file());
         let passes_containment =
             fs::canonicalize(&probed).is_ok_and(|canonical| canonical.starts_with(&dir));
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(
             passes_regular_file_check && passes_containment,
@@ -1335,8 +1415,10 @@ mod tests {
             ..LooseFileLimits::DEFAULT
         };
 
-        let at_budget = resolve_loose_file(&entry, None, budget(closure_bytes));
-        let past_budget = resolve_loose_file(&entry, None, budget(closure_bytes - 1));
+        let at_budget =
+            resolve_loose_file(&entry, None, budget(closure_bytes)).map_err(CliError::from);
+        let past_budget =
+            resolve_loose_file(&entry, None, budget(closure_bytes - 1)).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(
             at_budget.is_ok(),
@@ -1360,8 +1442,9 @@ mod tests {
             ..LooseFileLimits::DEFAULT
         };
 
-        let from_disk = resolve_loose_file(&entry, None, budget);
-        let from_buffer = resolve_loose_file(&entry, Some(entry_text), budget);
+        let from_disk = resolve_loose_file(&entry, None, budget).map_err(CliError::from);
+        let from_buffer =
+            resolve_loose_file(&entry, Some(entry_text), budget).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(
             matches!(from_disk, Err(CliError::DiscoveryLimitReached { .. })),
@@ -1395,7 +1478,7 @@ mod tests {
         );
 
         // A limit of four fits the diamond only if `Shared` counts once.
-        let loaded = resolve_loose_file(&entry, None, modules_only(4));
+        let loaded = resolve_loose_file(&entry, None, modules_only(4)).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(
             loaded.is_ok_and(|loaded| loaded.sources.len() == 4),
@@ -1445,7 +1528,8 @@ mod tests {
 
         let passes_containment =
             fs::canonicalize(dir.join("X.ipe")).is_ok_and(|canonical| canonical.starts_with(&dir));
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(
             passes_containment,
@@ -1552,7 +1636,8 @@ mod tests {
         make_fifo(&dir.join("Pipe.ipe"));
 
         let walked = vet(&dir, &module(&["Pipe"]));
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         let not_regular = io_bounded::SourceRefusal::NotRegularFile;
         assert!(
@@ -1565,6 +1650,124 @@ mod tests {
         );
     }
 
+    /// An entry with a syntax error is the entry-parse case, naming the entry and its text.
+    #[test]
+    fn an_entry_parse_failure_is_entry_parse() {
+        let dir = scratch_dir("entry-parse");
+        let entry = dir.join("Main.ipe");
+        let text = "module Main exposing (main)\n\nmain =\n";
+        write(&entry, text);
+
+        let from_disk = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let buffer = "module Main exposing (main\n";
+        let from_buffer = resolve_loose_file(&entry, Some(buffer), LooseFileLimits::DEFAULT);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(&from_disk, Err(LooseFileError::EntryParse(failure))
+                if failure.file() == entry && failure.src() == text),
+            "an unparsable entry on disk is EntryParse naming it, got: {from_disk:?}"
+        );
+        assert!(
+            matches!(&from_buffer, Err(LooseFileError::EntryParse(failure))
+                if failure.file() == entry && failure.src() == buffer),
+            "an unparsable open buffer is EntryParse carrying the buffer, got: {from_buffer:?}"
+        );
+    }
+
+    /// A refused probe is never the entry-parse case, even though the entry parses.
+    #[test]
+    fn a_refused_probe_is_not_entry_parse() {
+        let dir = scratch_dir("refused-not-parse");
+        let entry = dir.join("Main.ipe");
+        let entry_text = "module Main exposing (main)\n\nimport Big\n\nmain = Big.x\n";
+        write(&entry, entry_text);
+        write(&dir.join("Big.ipe"), "module Big exposing (x)\n\nx = 1\n");
+        let entry_only = LooseFileLimits {
+            bytes: u64::try_from(entry_text.len()).unwrap_or(u64::MAX),
+            ..LooseFileLimits::DEFAULT
+        };
+
+        let oversize = resolve_loose_file(&entry, None, entry_only);
+        #[cfg(unix)]
+        let fifo = {
+            let _ = fs::remove_file(dir.join("Big.ipe"));
+            make_fifo(&dir.join("Big.ipe"));
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT)
+        };
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                oversize,
+                Err(LooseFileError::Refused(
+                    CliError::DiscoveryLimitReached { .. }
+                ))
+            ),
+            "a sibling past the byte budget is Refused, never EntryParse, got: {oversize:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            matches!(
+                fifo,
+                Err(LooseFileError::Refused(CliError::SourceRefused {
+                    reason: io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                }))
+            ),
+            "an imported FIFO is Refused, never EntryParse, got: {fifo:?}"
+        );
+    }
+
+    /// A sibling past the per-file cap is refused by whichever cap bound its read.
+    ///
+    /// With room left for a whole capped read the per-file cap binds and the
+    /// sibling is `FileTooLarge`, exactly at the cap too; once the remaining
+    /// budget is the tighter bound, the same sibling is the closure refusal.
+    #[test]
+    fn an_oversize_sibling_is_refused_by_the_cap_that_bound_its_read() {
+        let dir = scratch_dir("binding-cap");
+        let entry = dir.join("Main.ipe");
+        let entry_text = "module Main exposing (main)\n\nimport Big\n\nmain = Big.x\n";
+        write(&entry, entry_text);
+        let cap = usize::try_from(io_bounded::SOURCE_READ_CAP).unwrap_or(usize::MAX);
+        write(&dir.join("Big.ipe"), &" ".repeat(cap.saturating_add(1)));
+        let entry_bytes = u64::try_from(entry_text.len()).unwrap_or(u64::MAX);
+        let budget = |bytes| LooseFileLimits {
+            bytes,
+            ..LooseFileLimits::DEFAULT
+        };
+        let room_for_cap = entry_bytes.saturating_add(io_bounded::SOURCE_READ_CAP);
+
+        let ample = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let at_cap = resolve_loose_file(&entry, None, budget(room_for_cap));
+        let below_cap = resolve_loose_file(&entry, None, budget(room_for_cap.saturating_sub(1)));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                ample,
+                Err(LooseFileError::Refused(CliError::FileTooLarge { max, .. }))
+                    if max == io_bounded::SOURCE_READ_CAP
+            ),
+            "an ample budget leaves the per-file cap binding, got: {ample:?}"
+        );
+        assert!(
+            matches!(
+                at_cap,
+                Err(LooseFileError::Refused(CliError::FileTooLarge { max, .. }))
+                    if max == io_bounded::SOURCE_READ_CAP
+            ),
+            "one capped read of budget left leaves the per-file cap binding, got: {at_cap:?}"
+        );
+        assert!(
+            matches!(
+                below_cap,
+                Err(LooseFileError::Refused(
+                    CliError::DiscoveryLimitReached { .. }
+                ))
+            ),
+            "a budget tighter than the per-file cap is the closure refusal, got: {below_cap:?}"
+        );
+    }
+
     /// A FIFO as the entry itself is refused at once, never blocking on a writer.
     #[cfg(unix)]
     #[test]
@@ -1572,7 +1775,8 @@ mod tests {
         let dir = scratch_dir("entry-fifo");
         let entry = dir.join("Main.ipe");
         make_fifo(&entry);
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         assert!(
             is_refused(&loaded, io_bounded::SourceRefusal::NotRegularFile),
@@ -1602,7 +1806,8 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
             .expect("lock the directory");
         let privileged = fs::read_dir(&locked).is_ok();
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o755));
         let _ = fs::remove_dir_all(&dir);
         if privileged {
@@ -1635,7 +1840,8 @@ mod tests {
         );
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o311)).expect("drop the read bit");
         let privileged = fs::read_dir(&dir).is_ok();
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
         let _ = fs::remove_dir_all(&dir);
         if privileged {
@@ -1667,7 +1873,8 @@ mod tests {
         );
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o311)).expect("drop the read bit");
         let privileged = fs::read_dir(&dir).is_ok();
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
         let _ = fs::remove_dir_all(&dir);
         if privileged {
@@ -1693,7 +1900,8 @@ mod tests {
         make_fifo(&entry);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o311)).expect("drop the read bit");
         let privileged = fs::read_dir(&dir).is_ok();
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
         let _ = fs::remove_dir_all(&dir);
         if privileged {
@@ -1724,7 +1932,8 @@ mod tests {
         std::os::unix::fs::symlink(real.join("Main.ipe"), &entry).expect("plant the entry link");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o311)).expect("drop the read bit");
         let privileged = fs::read_dir(&dir).is_ok();
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o755));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&real);
@@ -1764,7 +1973,8 @@ mod tests {
             "module Lib.Util exposing (u)\n\nu = 1\n",
         );
 
-        let loaded = resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT);
+        let loaded =
+            resolve_loose_file(&entry, None, LooseFileLimits::DEFAULT).map_err(CliError::from);
         let _ = fs::remove_dir_all(&dir);
         let loaded = loaded.expect("the entry loads");
         assert_eq!(

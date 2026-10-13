@@ -110,6 +110,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::RuntimeVersionMismatch { .. }
         | CliError::EmittedBuildFailed { .. }
         | CliError::CargoBuildTimedOut { .. }
+        | CliError::TargetDirUnlinkable { .. }
         | CliError::UnknownCode { .. }
         | CliError::DocNotFound { .. }
         | CliError::StaticRefusal(_)

@@ -438,6 +438,24 @@ pub fn sanitize_cargo_name(name: &str) -> String {
 /// a single shared target dir ever holds, while keeping the emitted name short.
 const CRATE_IDENTITY_HEX_LEN: usize = 8;
 
+/// The lowercase-hex SHA-256 of `canonical_dir`'s bytes: the one digest naming a project.
+///
+/// [`crate_identity`] suffixes the crate name with its prefix, and the CLI keys
+/// a project's relocated build directory by it, so both name one project alike.
+#[must_use]
+pub fn identity_hex(canonical_dir: &std::path::Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(canonical_dir.as_os_str().as_encoded_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // `{byte:02x}` is exactly two lowercase-hex chars per byte, all Cargo-valid.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Derive the emitted crate's unique identity from its sanitized friendly name
 /// and the canonical project directory.
 ///
@@ -462,19 +480,8 @@ const CRATE_IDENTITY_HEX_LEN: usize = 8;
 /// the suffix.
 #[must_use]
 pub fn crate_identity(base: &str, canonical_dir: &std::path::Path) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_dir.as_os_str().as_encoded_bytes());
-    let digest = hasher.finalize();
-
-    let mut hex = String::with_capacity(CRATE_IDENTITY_HEX_LEN);
-    for byte in digest.iter().take(CRATE_IDENTITY_HEX_LEN / 2) {
-        // `{byte:02x}` is exactly two lowercase-hex chars per byte — total width
-        // is `CRATE_IDENTITY_HEX_LEN`, both Cargo-valid.
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
+    let digest = identity_hex(canonical_dir);
+    let hex = digest.get(..CRATE_IDENTITY_HEX_LEN).unwrap_or(&digest);
 
     // Reserve room for `_<hex>` under the 64-char ceiling so the join never
     // produces an over-long (Cargo-rejected) name; trim the base, never the hash.
