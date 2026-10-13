@@ -257,6 +257,9 @@ const TAG_SESSION_HANDLE: u8 = 85;
 // `Url.Relative` — non-serde opaque same-origin reference, never a Model field;
 // present for exhaustiveness.
 const TAG_URL_RELATIVE: u8 = 86;
+// `DbLocation` — non-serde opaque database location, never a Model field;
+// present for exhaustiveness.
+const TAG_DB_LOCATION: u8 = 87;
 /// Fuel exhaustion marker — distinct from every variant tag.
 const TAG_FUEL_EXHAUSTED: u8 = 0xFF;
 
@@ -329,6 +332,7 @@ fn hash_ty(ctx: &EmitCtx, ty: &IrType, h: &mut Sha256, fuel: u32) -> DResult<()>
         IrType::UrlRelative => h.update([TAG_URL_RELATIVE]),
         // `Dsn` — non-serde opaque descriptor; present for exhaustiveness.
         IrType::Dsn => h.update([TAG_DSN]),
+        IrType::DbLocation => h.update([TAG_DB_LOCATION]),
         // External `Connection` + phantom access-mode markers — non-serde opaque
         // handles; present for exhaustiveness.
         IrType::Connection => h.update([TAG_CONNECTION]),
@@ -927,14 +931,14 @@ mod tests {
             TAG_AUTH_CONFIG, TAG_BACKOFF_STRATEGY, TAG_BOOL, TAG_BYTES, TAG_CACHE_CFG,
             TAG_CACHE_STATS, TAG_CHAR, TAG_CLI_APP, TAG_CMD, TAG_CONN_READONLY, TAG_CONN_READWRITE,
             TAG_CONNECTION, TAG_CRYPTO_KEY, TAG_CRYPTO_MAC, TAG_CSV_DOC, TAG_CUSTOM_ELEMENT,
-            TAG_DB, TAG_DECIMAL, TAG_DECODER, TAG_DICT, TAG_DSN, TAG_EMAIL_ADDRESS,
-            TAG_EMAIL_ATTACHMENT, TAG_EMAIL_MESSAGE, TAG_EMAIL_PROVIDER, TAG_EMAIL_SES_CONFIG,
-            TAG_EMAIL_SMTP_CONFIG, TAG_ENUM, TAG_ERROR, TAG_ERROR_DETAILS, TAG_ERROR_INFO,
-            TAG_ERROR_KIND, TAG_FLOAT, TAG_FN_ONCE_CHAIN, TAG_FUEL_EXHAUSTED, TAG_FUN, TAG_GENERIC,
-            TAG_HTTP_METHOD, TAG_HTTP_REQUEST, TAG_INT, TAG_JSON, TAG_LIST, TAG_LIVE_REQ,
-            TAG_LIVE_ROUTE, TAG_LOCALE, TAG_MAYBE, TAG_ORDER, TAG_PANIC_INFO, TAG_PATH,
-            TAG_PRINCIPAL, TAG_PROCESS_RUN_IN_PTY_CFG, TAG_PROCESS_RUN_WITH_CFG, TAG_RECORD,
-            TAG_REGEX, TAG_RESULT, TAG_ROW_GENERIC, TAG_SECRET, TAG_SERVER_COOKIE,
+            TAG_DB, TAG_DB_LOCATION, TAG_DECIMAL, TAG_DECODER, TAG_DICT, TAG_DSN,
+            TAG_EMAIL_ADDRESS, TAG_EMAIL_ATTACHMENT, TAG_EMAIL_MESSAGE, TAG_EMAIL_PROVIDER,
+            TAG_EMAIL_SES_CONFIG, TAG_EMAIL_SMTP_CONFIG, TAG_ENUM, TAG_ERROR, TAG_ERROR_DETAILS,
+            TAG_ERROR_INFO, TAG_ERROR_KIND, TAG_FLOAT, TAG_FN_ONCE_CHAIN, TAG_FUEL_EXHAUSTED,
+            TAG_FUN, TAG_GENERIC, TAG_HTTP_METHOD, TAG_HTTP_REQUEST, TAG_INT, TAG_JSON, TAG_LIST,
+            TAG_LIVE_REQ, TAG_LIVE_ROUTE, TAG_LOCALE, TAG_MAYBE, TAG_ORDER, TAG_PANIC_INFO,
+            TAG_PATH, TAG_PRINCIPAL, TAG_PROCESS_RUN_IN_PTY_CFG, TAG_PROCESS_RUN_WITH_CFG,
+            TAG_RECORD, TAG_REGEX, TAG_RESULT, TAG_ROW_GENERIC, TAG_SECRET, TAG_SERVER_COOKIE,
             TAG_SERVER_REQUEST, TAG_SERVER_RESPONSE, TAG_SERVER_ROUTE, TAG_SET, TAG_SETTING,
             TAG_SHAPE_TERMINAL, TAG_SHAPE_WEB, TAG_SHAPE_WEBVIEW, TAG_SHARED_FUN, TAG_SQL_FRAGMENT,
             TAG_STR, TAG_STREAM_WRITER, TAG_SUB, TAG_TASK, TAG_TOKEN_SOURCE, TAG_TUI_APP,
@@ -1009,6 +1013,7 @@ mod tests {
             ("TAG_LOCALE", TAG_LOCALE),
             ("TAG_ROW_GENERIC", TAG_ROW_GENERIC),
             ("TAG_DSN", TAG_DSN),
+            ("TAG_DB_LOCATION", TAG_DB_LOCATION),
             ("TAG_CONNECTION", TAG_CONNECTION),
             ("TAG_CONN_READONLY", TAG_CONN_READONLY),
             ("TAG_CONN_READWRITE", TAG_CONN_READWRITE),

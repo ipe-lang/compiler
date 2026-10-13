@@ -61,6 +61,7 @@ pub(super) fn ir_type_mentions(ty: &IrType, leaf: &impl Fn(&IrType) -> bool) -> 
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite

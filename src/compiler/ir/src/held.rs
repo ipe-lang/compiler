@@ -244,6 +244,7 @@ impl<F: Fn(&IrType) -> bool> HeldWalk<'_, F> {
             | IrType::Url
             | IrType::UrlRelative
             | IrType::Dsn
+            | IrType::DbLocation
             | IrType::Connection
             | IrType::ConnReadOnly
             | IrType::ConnReadWrite

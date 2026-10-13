@@ -129,6 +129,7 @@ impl Builtins {
             BuiltinTag::Url => self.url,
             BuiltinTag::UrlRelative => self.url_relative,
             BuiltinTag::Dsn => self.dsn,
+            BuiltinTag::DbLocation => self.db_location,
             BuiltinTag::Connection => self.connection,
             BuiltinTag::ConnReadOnly => self.conn_read_only,
             BuiltinTag::ConnReadWrite => self.conn_read_write,

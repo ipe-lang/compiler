@@ -518,7 +518,9 @@ pub fn emit_expr_at(
             // channel (`dsn_parse<E: From<String>>(...) -> IpeResult<E, Dsn>`) and
             // are called in a PURE `Result Error Dsn` context whose `Err` arm is
             // often discarded, leaving `E` unconstrained (E0283). Anchor `E` to
-            // `IpeError`, exactly like the Csv parse kernels above.
+            // `IpeError`, exactly like the Csv parse kernels above. The
+            // `Ipe.Db.Location.file` parse kernel
+            // (`db_location_file<E: From<IpeError>>`) is anchored the same way.
             let turbofish: &str = if pin_turbofish.is_empty()
                 && matches!(
                     callee,
@@ -527,6 +529,7 @@ pub fn emit_expr_at(
                             | KernelFn::CsvParseWithDelimiter
                             | KernelFn::DsnParse
                             | KernelFn::DsnBuild
+                            | KernelFn::DbLocationFile
                             | KernelFn::UrlRelativeParse
                     )
                 ) {

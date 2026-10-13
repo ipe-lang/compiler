@@ -108,6 +108,7 @@ pub(super) fn collect_ir_generic_syms(ty: &IrType, out: &mut BTreeSet<Symbol>) {
         | IrType::UrlRelative
         // `Dsn` is non-parametric — no generic syms.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
         | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
         // Process-run-with cfg + Cache config / stats + Csv document are
@@ -251,6 +252,7 @@ pub(super) fn default_generics_to_unit(ty: IrType, targets: &BTreeSet<Symbol>) -
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite

@@ -3349,6 +3349,7 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
         | IrType::UrlRelative
         // `Dsn` is non-parametric — mentions no type var.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -3518,6 +3519,7 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -3637,6 +3639,7 @@ fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -10495,6 +10498,7 @@ const fn ir_type_label(ty: &IrType) -> &'static str {
         IrType::Url => "Url",
         IrType::UrlRelative => "Url.Relative",
         IrType::Dsn => "Dsn",
+        IrType::DbLocation => "DbLocation",
         IrType::Connection => "Connection",
         IrType::ConnReadOnly => "ReadOnly",
         IrType::ConnReadWrite => "ReadWrite",
@@ -13504,6 +13508,7 @@ impl<'a> Lowerer<'a> {
             | IrType::Url
             | IrType::UrlRelative
             | IrType::Dsn
+            | IrType::DbLocation
             | IrType::Connection
             | IrType::ConnReadOnly
             | IrType::ConnReadWrite
@@ -18192,6 +18197,9 @@ impl<'a> Lowerer<'a> {
                 // `Dsn` is `Ipe.Db.Dsn`'s opaque validated connection descriptor.
                 // Backed by `ipe_runtime::dsn::Dsn`.
                 "Dsn" => Ok(IrType::Dsn),
+                // `DbLocation` is `Ipe.Db.Location`'s opaque typed location.
+                // Backed by `ipe_runtime::db::DbLocation`.
+                "DbLocation" => Ok(IrType::DbLocation),
                 // `Connection mode` is `Ipe.Db`'s external-connection handle. The
                 // phantom access mode is erased here — the argument is dropped, so
                 // both `Connection ReadOnly` and `Connection ReadWrite` lower to the
@@ -19914,6 +19922,9 @@ impl<'a> Lowerer<'a> {
                 // `Dsn` is `Ipe.Db.Dsn`'s opaque validated connection descriptor.
                 // Backed by `ipe_runtime::dsn::Dsn`.
                 "Dsn" => Ok(IrType::Dsn),
+                // `DbLocation` is `Ipe.Db.Location`'s opaque typed location.
+                // Backed by `ipe_runtime::db::DbLocation`.
+                "DbLocation" => Ok(IrType::DbLocation),
                 // `Connection mode` is `Ipe.Db`'s external-connection handle. The
                 // phantom access mode is erased here — the argument is dropped, so
                 // both `Connection ReadOnly` and `Connection ReadWrite` lower to the
@@ -25869,6 +25880,8 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::MathNan
                 | KernelFn::DictEmpty
                 | KernelFn::SetEmpty
+                // ── `Ipe.Db.Location.memory : DbLocation` — arity 0 ─────────
+                | KernelFn::DbLocationMemory
                 // ── Bytes arity-0 ────────────────────────────────────────────
                 | KernelFn::BytesEmpty
                 // ── JsonEnc arity-0 ────────────────────────────────────
@@ -26152,6 +26165,10 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::DbConnect
                 // `DbClose : Db -> Task Error ()` — takes the pool handle
                 | KernelFn::DbClose
+                // `DbOpen : DbLocation -> Task Error Db`
+                | KernelFn::DbOpen
+                // `Ipe.Db.Location.dsn : Dsn -> DbLocation`
+                | KernelFn::DbLocationDsn
                 // `DbDefaultMigration : String -> Migration` — pure record builder
                 | KernelFn::DbDefaultMigration
                 // ── Ipe.Db.Dsn arity-1 ───────────────────────────────
@@ -26491,8 +26508,9 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::HttpWithUrl
                 | KernelFn::HttpWithRedirects
                 // ── Db arity-2 ───────────────────────────────────────
-                // `DbOpen : String -> String -> Task Error Db`
-                | KernelFn::DbOpen
+                // `Ipe.Db.Location.file`'s kernel : `Int -> Path -> Result
+                //   Error DbLocation` (mode tag, path)
+                | KernelFn::DbLocationFile
                 // `DbExecRaw : Db -> String -> Task Error Int`
                 | KernelFn::DbExecRaw
                 // `unsafeExecRawOn : Connection ReadWrite -> String
@@ -28926,6 +28944,10 @@ impl<'a> Lowerer<'a> {
                     ("Db.Dsn", "user") => Ok(Callee::Kernel(KernelFn::DsnUser)),
                     ("Db.Dsn", "tlsTag") => Ok(Callee::Kernel(KernelFn::DsnTlsTag)),
                     ("Db.Dsn", "redacted") => Ok(Callee::Kernel(KernelFn::DsnRedacted)),
+                    // Ipe.Db.Location — the typed location `Db.open` takes.
+                    ("Db.Location", "file") => Ok(Callee::Kernel(KernelFn::DbLocationFile)),
+                    ("Db.Location", "memory") => Ok(Callee::Kernel(KernelFn::DbLocationMemory)),
+                    ("Db.Location", "dsn") => Ok(Callee::Kernel(KernelFn::DbLocationDsn)),
                     // External Connection — connect a parsed `Dsn`, close it, and
                     // the `Ipe.Db.Unsafe`-homed raw exec hatch.
                     ("Db.Dsn", "open") => Ok(Callee::Kernel(KernelFn::DbConnOpen)),
@@ -36350,6 +36372,7 @@ mod tests {
             | ipe_ir::IrType::Url
             | ipe_ir::IrType::UrlRelative
             | ipe_ir::IrType::Dsn
+            | ipe_ir::IrType::DbLocation
             | ipe_ir::IrType::Connection
             | ipe_ir::IrType::ConnReadOnly
             | ipe_ir::IrType::ConnReadWrite

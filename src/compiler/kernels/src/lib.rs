@@ -358,6 +358,9 @@ pub enum BuiltinTag {
     UrlRelative,
     /// `Dsn` — the nullary opaque validated database-connection descriptor.
     Dsn,
+    /// `DbLocation` — the nullary opaque typed database location `Db.open`
+    /// takes.
+    DbLocation,
     /// `Connection` — the external-database connection handle constructor
     /// `Connection mode`, applied to its phantom access-mode tag
     /// ([`Self::ConnReadOnly`] / [`Self::ConnReadWrite`]). Distinct from the app's
@@ -2270,8 +2273,19 @@ pub enum StdlibKernel {
     HttpMethodToString,
     // ── Db ──────────────────────────────────────────────────────────────────
     DbConnect,
+    /// `Db.open : DbLocation -> Task Error Db` — open the app pool at a typed
+    /// location; the engine is the one `package.ipe` fixed.
     DbOpen,
     DbClose,
+    // ── Ipe.Db.Location — the typed database location `Db.open` takes ──
+    /// `Ipe.Db.Location.file`, lowered to `Int(modeTag) -> Path -> Result Error
+    /// DbLocation`; the `Mode` ADT is marshalled to a tag by the wrapper.
+    DbLocationFile,
+    /// `Ipe.Db.Location.memory : DbLocation` — a private in-memory database.
+    DbLocationMemory,
+    /// `Ipe.Db.Location.dsn : Dsn -> DbLocation` — the database a parsed `Dsn`
+    /// names.
+    DbLocationDsn,
     // ── Ipe.Db.Dsn — the typed, opaque connection descriptor (parse surface) ──
     // Each returns/consumes primitives (`Int`/`String`/`Secret`) plus the opaque
     // `Dsn`; the `Driver`/`TlsMode` ADTs are marshalled to/from small-integer tags
@@ -5199,8 +5213,19 @@ impl StdlibKernel {
             ),
             // ── Db ──────────────────────────────────────────────────────────
             Self::DbConnect => d("Db", "connect", 1, Db, "db_connect", IpeOrder),
-            Self::DbOpen => d("Db", "open", 2, Db, "db_open", IpeOrder),
+            Self::DbOpen => d("Db", "open", 1, Db, "db_open", IpeOrder),
             Self::DbClose => d("Db", "close", 1, Db, "db_close", IpeOrder),
+            // ── Ipe.Db.Location — typed database location kernels ──
+            Self::DbLocationFile => d("Db.Location", "file", 2, Db, "db_location_file", IpeOrder),
+            Self::DbLocationMemory => d(
+                "Db.Location",
+                "memory",
+                0,
+                Db,
+                "db_location_memory",
+                IpeOrder,
+            ),
+            Self::DbLocationDsn => d("Db.Location", "dsn", 1, Db, "db_location_dsn", IpeOrder),
             // ── Ipe.Db.Dsn — parse-don't-validate descriptor kernels ──
             Self::DsnParse => d("Db.Dsn", "parse", 1, Db, "dsn_parse", IpeOrder),
             Self::DsnBuild => d("Db.Dsn", "build", 7, Db, "dsn_build", IpeOrder),
@@ -8107,6 +8132,9 @@ impl StdlibKernel {
         Self::DbConnect,
         Self::DbOpen,
         Self::DbClose,
+        Self::DbLocationFile,
+        Self::DbLocationMemory,
+        Self::DbLocationDsn,
         Self::DsnParse,
         Self::DsnBuild,
         Self::DsnDriverTag,
@@ -9612,6 +9640,7 @@ impl StdlibKernel {
         const REGEX: TyShape = TyShape::Con(BuiltinTag::Regex, &[]);
         const URL: TyShape = TyShape::Con(BuiltinTag::Url, &[]);
         const DSN: TyShape = TyShape::Con(BuiltinTag::Dsn, &[]);
+        const DB_LOCATION: TyShape = TyShape::Con(BuiltinTag::DbLocation, &[]);
         const LOCALE: TyShape = TyShape::Con(BuiltinTag::Locale, &[]);
         const HTTP_METHOD: TyShape = TyShape::Con(BuiltinTag::HttpMethod, &[]);
         const CRYPTO_KEY: TyShape = TyShape::Con(BuiltinTag::CryptoKey, &[]);
@@ -10524,9 +10553,17 @@ impl StdlibKernel {
         // `Db.connect : () -> Task Db`.
         const TASK_DB: TyShape = TyShape::Con(BuiltinTag::Task, &[DB]);
         const UNIT_TO_TASK_DB: TyShape = TyShape::Fun(&UNIT, &TASK_DB);
-        // `Db.open : String -> String -> Task Db`.
-        const STRING_TO_TASK_DB: TyShape = TyShape::Fun(&STRING, &TASK_DB);
-        const STRING_TO_STRING_TO_TASK_DB: TyShape = TyShape::Fun(&STRING, &STRING_TO_TASK_DB);
+        // `Db.open : DbLocation -> Task Db`.
+        const DB_LOCATION_TO_TASK_DB: TyShape = TyShape::Fun(&DB_LOCATION, &TASK_DB);
+        // `Ipe.Db.Location.file : Int -> Path -> Result Error DbLocation` (modeTag, path).
+        const RESULT_ERR_DB_LOCATION: TyShape =
+            TyShape::Con(BuiltinTag::Result, &[ERROR, DB_LOCATION]);
+        const PATH_TO_RESULT_ERR_DB_LOCATION: TyShape =
+            TyShape::Fun(&PATH, &RESULT_ERR_DB_LOCATION);
+        const INT_TO_PATH_TO_RESULT_ERR_DB_LOCATION: TyShape =
+            TyShape::Fun(&INT, &PATH_TO_RESULT_ERR_DB_LOCATION);
+        // `Ipe.Db.Location.dsn : Dsn -> DbLocation`.
+        const DSN_TO_DB_LOCATION: TyShape = TyShape::Fun(&DSN, &DB_LOCATION);
         // `Db.close : Db -> Task ()`.
         const DB_TO_TASK_UNIT: TyShape = TyShape::Fun(&DB, &TASK_UNIT);
         // `Db.execRaw : Db -> String -> Task Int`.
@@ -12491,7 +12528,10 @@ impl StdlibKernel {
             // ── Db (opaque Db handle + Dict rows; the record-shaped Migration
             //    arms keep their table entry — S4). ──
             Self::DbConnect => Some(&UNIT_TO_TASK_DB),
-            Self::DbOpen => Some(&STRING_TO_STRING_TO_TASK_DB),
+            Self::DbOpen => Some(&DB_LOCATION_TO_TASK_DB),
+            Self::DbLocationFile => Some(&INT_TO_PATH_TO_RESULT_ERR_DB_LOCATION),
+            Self::DbLocationMemory => Some(&DB_LOCATION),
+            Self::DbLocationDsn => Some(&DSN_TO_DB_LOCATION),
             Self::DbClose => Some(&DB_TO_TASK_UNIT),
             Self::DbExecRaw => Some(&DB_EXEC_RAW),
             Self::DbExec => Some(&DB_EXEC),
@@ -14541,6 +14581,11 @@ impl StdlibKernel {
             | Self::DsnUser
             | Self::DsnTlsTag
             | Self::DsnRedacted
+            // `Ipe.Db.Location.*` — naming a location is PURE: the path is parsed,
+            // never touched; the `database` disclosure belongs to `Db.open`.
+            | Self::DbLocationFile
+            | Self::DbLocationMemory
+            | Self::DbLocationDsn
             | Self::RegexCompile
             | Self::RegexMatch
             | Self::RegexFind
@@ -18010,7 +18055,7 @@ mod tests {
     ///
     /// The oracle is an INDEPENDENT restatement, not a copy of the predicate:
     /// the Db-class kernels live under the qualifiers `Db` / `Db.Decode` /
-    /// `Db.Dsn` / `Sql`, with the `class = Pure` exceptions `Db.url`
+    /// `Db.Dsn` / `Db.Location` / `Sql`, with the `class = Pure` exceptions `Db.url`
     /// (`DbUrlSetting`, a setting reader emitting `ipe_setting_db_url`) and
     /// `Db.defaultMigration` (`DbDefaultMigration`, a record builder emitted
     /// inline as a `Migration` struct literal) — neither emits a db-runtime
@@ -18023,11 +18068,13 @@ mod tests {
         use super::KernelClass;
         for k in StdlibKernel::ALL {
             let qualifier = k.decl().qualifier;
-            let expected = matches!(qualifier, "Db" | "Db.Decode" | "Db.Dsn" | "Sql")
-                && !matches!(
-                    k,
-                    StdlibKernel::DbUrlSetting | StdlibKernel::DbDefaultMigration
-                );
+            let expected = matches!(
+                qualifier,
+                "Db" | "Db.Decode" | "Db.Dsn" | "Db.Location" | "Sql"
+            ) && !matches!(
+                k,
+                StdlibKernel::DbUrlSetting | StdlibKernel::DbDefaultMigration
+            );
             assert_eq!(
                 k.is_db(),
                 expected,
