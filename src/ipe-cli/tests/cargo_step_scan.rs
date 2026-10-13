@@ -380,12 +380,13 @@ fn a_program_not_naming_cargo_is_left_to_the_spawn_inventory() {
 ///
 /// A build is handed the resolved build directory, and the metadata query
 /// reads the Cargo config's pin with the variable removed, so it never reads
-/// back what ipe sets. Resolving a lockfile writes no build output, so it is
-/// held to nothing.
+/// back what ipe sets. Resolving or replaying a lockfile writes no build output, so
+/// neither is held to anything.
 const TARGET_DIR_RULES: &[(&str, Option<&str>)] = &[
     ("build", Some(".env(\"CARGO_TARGET_DIR\",target_dir)")),
     ("metadata", Some(".env_remove(\"CARGO_TARGET_DIR\")")),
     ("generate-lockfile", None),
+    ("update", None),
 ];
 
 /// The production part of a source: everything before its test module.

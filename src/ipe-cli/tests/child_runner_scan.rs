@@ -151,7 +151,7 @@ const SITES: &[SiteRow] = &[
     (
         "cargo_step.rs",
         "target_directory_within",
-        "cargo.path()",
+        "cargo",
         Runner::Local("METADATA_LIMITS"),
         1,
     ),

@@ -4470,7 +4470,7 @@ mod held_crate_tests {
             base,
             "cargo",
             &format!(
-                "[ \"$1\" = generate-lockfile ] && exit 0\n{during}\n\
+                "case \"$1\" in generate-lockfile|update) exit 0 ;; esac\n{during}\n\
                  echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"/x\"}}'"
             ),
         )
@@ -4769,7 +4769,7 @@ mod held_crate_tests {
             &base,
             "cargo",
             &format!(
-                "[ \"$1\" = generate-lockfile ] && exit 0\ncat '{}' > '{}'\n\
+                "case \"$1\" in generate-lockfile|update) exit 0 ;; esac\ncat '{}' > '{}'\n\
                  echo \"$@\" > '{}'\nexit 1",
                 src.join("main.rs").display(),
                 seen.display(),

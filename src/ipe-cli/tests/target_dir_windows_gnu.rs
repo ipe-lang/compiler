@@ -91,7 +91,7 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
                      printf '%s %s\\n' \"$1\" \"${{CARGO_TARGET_DIR:-unset}}\" >> \"$here/calls.log\"\n\
                      case \"$1\" in\n\
                      metadata) printf '{{\"target_directory\":\"%s/target\"}}\\n' \"$PWD\"; exit 0 ;;\n\
-                     generate-lockfile) exit 0 ;;\n\
+                     generate-lockfile|update) exit 0 ;;\n\
                      *) cat \"$here/{build_stderr}\" 1>&2; exit 101 ;;\n\
                      esac\n"
                 ),
@@ -107,7 +107,15 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
                 .arg(&entry)
                 .arg("--out")
                 .arg(self.project.join("out"))
-                .env("PATH", &self.bin)
+                .env(
+                    "PATH",
+                    std::env::join_paths([
+                        self.bin.as_path(),
+                        Path::new("/usr/bin"),
+                        Path::new("/bin"),
+                    ])
+                    .expect("join PATH"),
+                )
                 .env("IPE_RUNTIME_DIR", &runtime_dir)
                 .env("IPE_HOME", &self.home)
                 .env("XDG_CACHE_HOME", &self.cache)
