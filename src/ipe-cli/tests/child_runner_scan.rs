@@ -263,6 +263,13 @@ const SITES: &[SiteRow] = &[
     ("terminate.rs", "ps_masks", "\"/bin/ps\"", Runner::Probe, 1),
     (
         "toolchain.rs",
+        "RustcSysroot::active",
+        "\"rustc\"",
+        Runner::Local("RUSTC_QUERY_LIMITS"),
+        1,
+    ),
+    (
+        "toolchain.rs",
         "RustcVersion::active",
         "\"rustc\"",
         Runner::Local("RUSTC_QUERY_LIMITS"),

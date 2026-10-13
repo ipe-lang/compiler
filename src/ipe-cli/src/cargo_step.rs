@@ -35,6 +35,7 @@ use crate::remote_ingest::{
     LocalWall, METADATA_LIMITS, RunError, run_local,
 };
 use crate::style::TerminalSafe;
+use crate::target_dir::LinkableTargetDir;
 use crate::toolchain::CargoBin;
 use crate::watch::{BuildAccel, apply_build_accel_env};
 use crate::{CliError, RuntimeContext, text};
@@ -195,6 +196,8 @@ pub struct CargoBuild<'a> {
     pub profile: CargoProfile,
     /// The compile target.
     pub target: CargoTarget,
+    /// The build directory, set as the child's `CARGO_TARGET_DIR`.
+    pub target_dir: &'a LinkableTargetDir,
     /// Where stdout goes, and how much progress shows.
     pub output: CargoOutput,
     /// What is built, named in the failure diagnostic.
@@ -217,6 +220,7 @@ impl CargoBuild<'_> {
         let mut cmd = build_command(
             self.cargo.path(),
             self.dir(),
+            self.target_dir.path(),
             self.profile,
             self.target,
             self.output,
@@ -313,11 +317,13 @@ impl CargoBuild<'_> {
     }
 }
 
-/// The directory cargo writes `crate_dir`'s build output to, read from
-/// `cargo metadata --no-deps` (it honours `CARGO_TARGET_DIR` and any config
-/// relocation).
+/// The directory a Cargo config makes cargo write `crate_dir`'s build output to,
+/// read from `cargo metadata --no-deps` with `CARGO_TARGET_DIR` removed.
 ///
-/// The child runs under [`METADATA_LIMITS`] with stdin closed.
+/// The environment variable is read separately, by
+/// [`crate::target_dir::TargetDirSources::gather`], so this reports only what
+/// the crate's Cargo config pins (its own `target` when nothing does). The
+/// child runs under [`METADATA_LIMITS`] with stdin closed.
 ///
 /// # Errors
 /// - [`CliError::LocalLimitExceeded`] if cargo crosses a ceiling (its document
@@ -326,18 +332,19 @@ impl CargoBuild<'_> {
 /// - [`CliError::ChildPipeHeld`] if a process cargo started holds a pipe open.
 /// - [`CliError::Usage`] if it exits non-zero or its document is not JSON or
 ///   carries no target directory.
-pub fn target_directory(cargo: &CargoBin, crate_dir: &Path) -> Result<PathBuf, CliError> {
+pub fn target_directory(cargo: &Path, crate_dir: &Path) -> Result<PathBuf, CliError> {
     target_directory_within(cargo, crate_dir, METADATA_LIMITS)
 }
 
 /// [`target_directory`] held to `ceiling`.
 fn target_directory_within(
-    cargo: &CargoBin,
+    cargo: &Path,
     crate_dir: &Path,
     ceiling: LocalCeiling,
 ) -> Result<PathBuf, CliError> {
-    let mut cmd = Command::new(cargo.path());
+    let mut cmd = Command::new(cargo);
     cmd.args(["metadata", "--format-version", "1", "--no-deps"])
+        .env_remove("CARGO_TARGET_DIR")
         .current_dir(crate_dir);
     let captured = run_local(cmd, ceiling, LocalSource::CargoMetadata)
         .map_err(|e| local_run_error(crate_dir, e))?;
@@ -368,8 +375,8 @@ pub struct WatchBuild<'a> {
     /// The emitted crate, proven to carry the development marker; cargo runs
     /// with it as its working directory.
     pub krate: crate::DevMarkedCrate<'a>,
-    /// A target directory overriding the inherited `CARGO_TARGET_DIR`.
-    pub target_dir: Option<&'a Path>,
+    /// The session's build directory, set as the child's `CARGO_TARGET_DIR`.
+    pub target_dir: &'a LinkableTargetDir,
     /// The compiler acceleration for this rebuild.
     pub accel: &'a BuildAccel,
     /// How much of cargo's progress shows.
@@ -382,13 +389,11 @@ impl WatchBuild<'_> {
         let mut cmd = build_command(
             self.cargo,
             self.krate.path(),
+            self.target_dir.path(),
             CargoProfile::Dev,
             CargoTarget::Host,
             CargoOutput::JsonStream(self.verbosity),
         );
-        if let Some(target) = self.target_dir {
-            cmd.env("CARGO_TARGET_DIR", target);
-        }
         apply_build_accel_env(&mut cmd, self.accel);
         cmd
     }
@@ -408,10 +413,15 @@ impl WatchBuild<'_> {
 }
 
 /// The `cargo build` every build kind shares: program, subcommand, working
-/// directory, profile, target, output mode and terminal UI.
+/// directory, build directory, profile, target, output mode and terminal UI.
+///
+/// `target_dir` is always set as `CARGO_TARGET_DIR`, so the directory cargo
+/// writes to is the one the caller resolved and reads artifacts back from,
+/// never one an inherited variable or a Cargo config picks.
 fn build_command(
     cargo: &Path,
     dir: &Path,
+    target_dir: &Path,
     profile: CargoProfile,
     target: CargoTarget,
     output: CargoOutput,
@@ -419,7 +429,10 @@ fn build_command(
     let mut cmd = Command::new(cargo);
     // Outside the terminal's foreground group a terminal read would stop the
     // build, so stdin is the null device.
-    cmd.arg("build").current_dir(dir).stdin(Stdio::null());
+    cmd.arg("build")
+        .current_dir(dir)
+        .env("CARGO_TARGET_DIR", target_dir)
+        .stdin(Stdio::null());
     if profile == CargoProfile::Release {
         cmd.arg("--release");
     }
@@ -874,6 +887,7 @@ mod tests {
         CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
         WatchBuild,
     };
+    use crate::target_dir::LinkableTargetDir;
     use crate::toolchain::CargoBin;
     use crate::watch::BuildAccel;
     use crate::wrapper_source::WrapperSource;
@@ -885,6 +899,10 @@ mod tests {
 
     /// A `cargo` the command-shape tests never spawn.
     static CARGO: LazyLock<CargoBin> = LazyLock::new(|| CargoBin::stub(PathBuf::from("cargo")));
+
+    /// The build directory every test build is handed.
+    static TARGET: LazyLock<LinkableTargetDir> =
+        LazyLock::new(|| LinkableTargetDir::assume(Path::new("/t")));
 
     /// The arguments of `cmd`, as text.
     fn args(cmd: &Command) -> Vec<String> {
@@ -918,6 +936,7 @@ mod tests {
             krate: CargoCrate::ReleaseWrapper { source, embed },
             profile: CargoProfile::Release,
             target: CargoTarget::Static(StaticTriple::X8664LinuxMusl),
+            target_dir: &TARGET,
             output: CargoOutput::Human(Verbosity::Quiet),
             what: "the release wrapper",
             runtime: None,
@@ -935,7 +954,7 @@ mod tests {
         let watch = WatchBuild {
             cargo: Path::new("cargo"),
             krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
-            target_dir: None,
+            target_dir: &TARGET,
             accel: &accel,
             verbosity: Verbosity::Progress,
         }
@@ -986,6 +1005,7 @@ mod tests {
         let wasi = super::build_command(
             Path::new("cargo"),
             Path::new("/c"),
+            Path::new("/t"),
             CargoProfile::Release,
             CargoTarget::Wasip1,
             CargoOutput::JsonStream(Verbosity::Quiet),
@@ -998,6 +1018,7 @@ mod tests {
             let other = super::build_command(
                 Path::new("cargo"),
                 Path::new("/c"),
+                Path::new("/t"),
                 CargoProfile::Dev,
                 target,
                 CargoOutput::Human(Verbosity::Quiet),
@@ -1007,10 +1028,37 @@ mod tests {
     }
 
     #[test]
+    fn every_build_pins_its_resolved_build_directory() {
+        let source = WrapperSource::unverified_for_test(Path::new("/ws"));
+        let cmd = wrapper(&source, None).command();
+        assert_eq!(env(&cmd, "CARGO_TARGET_DIR"), Env::Set(OsStr::new("/t")));
+        for target in [
+            CargoTarget::Host,
+            CargoTarget::WasmBrowser,
+            CargoTarget::Wasip1,
+        ] {
+            let built = super::build_command(
+                Path::new("cargo"),
+                Path::new("/c"),
+                Path::new("/elsewhere"),
+                CargoProfile::Dev,
+                target,
+                CargoOutput::Human(Verbosity::Quiet),
+            );
+            assert_eq!(
+                env(&built, "CARGO_TARGET_DIR"),
+                Env::Set(OsStr::new("/elsewhere")),
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_host_dev_build_carries_no_target_and_no_release_flag() {
         let cmd = super::build_command(
             Path::new("cargo"),
             Path::new("/c"),
+            Path::new("/t"),
             CargoProfile::Dev,
             CargoTarget::Host,
             CargoOutput::Human(Verbosity::Quiet),
@@ -1024,7 +1072,7 @@ mod tests {
         let cmd = WatchBuild {
             cargo: Path::new("cargo"),
             krate: crate::DevMarkedCrate::assume(Path::new("/crate")),
-            target_dir: Some(Path::new("/t")),
+            target_dir: &TARGET,
             accel: &accel,
             verbosity: Verbosity::Quiet,
         }
@@ -1138,6 +1186,7 @@ mod tests {
             WatchBuild, lock_dependencies_within, lock_offline, lock_offline_within,
             target_directory, target_directory_within,
         };
+        use super::TARGET;
         use crate::CliError;
         use crate::output_dir::OwnedDir;
         use crate::remote_ingest::{
@@ -1188,6 +1237,7 @@ mod tests {
                 krate,
                 profile: CargoProfile::Dev,
                 target: CargoTarget::Host,
+                target_dir: &TARGET,
                 output: CargoOutput::JsonStream(Verbosity::Quiet),
                 what: "the stub build",
                 runtime: None,
@@ -1472,7 +1522,7 @@ mod tests {
             let watch = WatchBuild {
                 cargo: cargo.path(),
                 krate: crate::DevMarkedCrate::assume(&crate_dir),
-                target_dir: None,
+                target_dir: &TARGET,
                 accel: &accel,
                 verbosity: Verbosity::Quiet,
             };
@@ -1517,6 +1567,7 @@ mod tests {
                 krate: CargoCrate::Emitted(&crate_dir),
                 profile: CargoProfile::Dev,
                 target: CargoTarget::Host,
+                target_dir: &TARGET,
                 output: CargoOutput::JsonStream(Verbosity::Quiet),
                 what: "the stub build",
                 runtime: None,
@@ -1554,6 +1605,7 @@ mod tests {
                 krate,
                 profile: CargoProfile::Dev,
                 target: CargoTarget::Host,
+                target_dir: &TARGET,
                 output: CargoOutput::JsonStream(Verbosity::Quiet),
                 what: "the stub build",
                 runtime: None,
@@ -1657,7 +1709,7 @@ mod tests {
         fn the_target_directory_is_read_from_cargo_metadata() {
             let base = scratch("metadata");
             let cargo = stub(&base, "echo '{\"target_directory\":\"/t\"}'");
-            let dir = target_directory(&cargo, &base);
+            let dir = target_directory(cargo.path(), &base);
             assert_eq!(dir.ok(), Some(PathBuf::from("/t")));
             let calls = invocations(&base);
             assert_eq!(
@@ -1671,7 +1723,7 @@ mod tests {
         fn a_failing_cargo_metadata_is_refused() {
             let base = scratch("metadata-fail");
             let cargo = stub(&base, "echo boom >&2; exit 3");
-            let dir = target_directory(&cargo, &base);
+            let dir = target_directory(cargo.path(), &base);
             assert!(matches!(dir, Err(CliError::Usage(_))), "{dir:?}");
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -1680,7 +1732,7 @@ mod tests {
         fn a_metadata_document_past_its_ceiling_is_refused() {
             let base = scratch("metadata-cap");
             let cargo = stub(&base, "head -c 16777217 /dev/zero");
-            let dir = target_directory(&cargo, &base);
+            let dir = target_directory(cargo.path(), &base);
             assert!(
                 matches!(
                     &dir,
@@ -1701,7 +1753,7 @@ mod tests {
             let cargo = sleeping_stub(&base);
             let started = std::time::Instant::now();
             let dir = target_directory_within(
-                &cargo,
+                cargo.path(),
                 &base,
                 METADATA_LIMITS.with_wall(LocalWall::of_secs::<1>()),
             );

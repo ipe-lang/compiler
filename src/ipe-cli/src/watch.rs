@@ -90,6 +90,7 @@ use std::time::{Duration, Instant};
 
 use crate::output_dir::{EmitTarget, OutputRefusal, OwnedDir, ProjectPaths};
 use crate::project;
+use crate::target_dir::LinkableTargetDir;
 use crate::text;
 use crate::threads::{self, ThreadRole};
 use crate::{CliError, write_emitted_project};
@@ -205,11 +206,13 @@ pub struct WatchOptions {
     /// once from the environment (see [`crate::hot_appearance_enabled`]).
     pub hot_appearance: bool,
     /// Optional cargo target directory the rebuild's `cargo build` is pinned to.
-    /// `None` (the CLI default) leaves the build to honour an inherited
-    /// `CARGO_TARGET_DIR`, exactly as before. An embedder sets it to pin the
-    /// build to a specific — typically warm — target so a rebuild links against
-    /// a pre-compiled dependency tree instead of cold-building it; the E2E watch
-    /// suite uses it to forward the CI shard's warm shared target.
+    /// `None` (the CLI default) lets the session resolve it as every build does
+    /// (an inherited `CARGO_TARGET_DIR`, a pin, or the crate's own). An embedder
+    /// sets it to pin the build to a specific — typically warm — target so a
+    /// rebuild links against a pre-compiled dependency tree instead of
+    /// cold-building it; the E2E watch suite uses it to forward the CI shard's
+    /// warm shared target. Either way it is parsed for the host linker once per
+    /// session, before the first rebuild.
     pub target_dir: Option<PathBuf>,
     /// The proven target `out_dir` names, when the caller holds one.
     ///
@@ -874,8 +877,31 @@ enum CompileOutcome {
 
 enum CargoOutcome {
     Green(PathBuf),
-    Red(String),
+    Red(CargoRed),
     Killed,
+}
+
+/// Why a watch rebuild is red.
+enum CargoRed {
+    /// `cargo` was stopped at its wall, its artifact stream was refused, or it
+    /// exited non-zero: the same typed error a one-shot build reports.
+    Refused(CliError),
+    /// The child's exit could not be observed.
+    ExitUnobserved,
+    /// `cargo` succeeded but named no executable artifact.
+    NoExecutable,
+}
+
+impl std::fmt::Display for CargoRed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) => write!(f, "{e}"),
+            Self::ExitUnobserved => f.write_str("cargo build: could not observe exit status"),
+            Self::NoExecutable => {
+                f.write_str("cargo build succeeded but produced no executable artifact")
+            }
+        }
+    }
 }
 
 /// An in-flight `cargo build` child plus whether the orchestrator killed it.
@@ -1136,6 +1162,9 @@ fn run_inner(
     let mut cargo_child: Option<Arc<std::sync::Mutex<CargoChild>>> = None;
     // The crate the in-flight cargo build compiles, proven again once it exits.
     let mut building: Option<OwnedDir> = None;
+    // The session's build directory, parsed for the host linker before the
+    // first rebuild and handed unchanged to every later one.
+    let mut session_target: Option<LinkableTargetDir> = None;
     // Set at `CompileDone` (Green), consumed at `CargoDone` (Green) — the
     // readiness strategy is a property of the SOURCE (does it call
     // `Web.tea`?), decided once per generation right after emit, not
@@ -1687,10 +1716,32 @@ fn run_inner(
                         ) {
                             post_watch_recompiling(app_port, tok);
                         }
+                        if session_target.is_none() {
+                            match LinkableTargetDir::for_crate(
+                                &opts.cargo_path,
+                                marked.path(),
+                                opts.target_dir.as_deref(),
+                            ) {
+                                Ok(resolved) => session_target = Some(resolved),
+                                Err(e) => {
+                                    emit_watch_line(
+                                        &crate::style::TerminalSafe::sanitize(&format!(
+                                            "[ipe dev watch] cannot start cargo build:\n{e}"
+                                        )),
+                                        WatchRole::Failure,
+                                    );
+                                    emit(opts, WatchEvent::CargoFailed { generation });
+                                    continue;
+                                }
+                            }
+                        }
+                        let Some(target_dir) = session_target.as_ref() else {
+                            continue;
+                        };
                         match spawn_cargo_build(
                             &opts.cargo_path,
                             marked,
-                            opts.target_dir.as_deref(),
+                            target_dir,
                             generation,
                             evt_tx.clone(),
                             opts.quiet,
@@ -1725,7 +1776,8 @@ fn run_inner(
                     CargoOutcome::Killed => {
                         emit(opts, WatchEvent::CargoKilled { generation: g });
                     }
-                    CargoOutcome::Red(msg) => {
+                    CargoOutcome::Red(red) => {
+                        let msg = red.to_string();
                         emit_watch_line(
                             &crate::style::TerminalSafe::sanitize(&format!(
                                 "[ipe dev watch] cargo build failed (last-good binary stays \
@@ -3108,24 +3160,13 @@ pub(crate) enum BuildAccel {
     WarmIncremental,
 }
 
-/// The target directory this watch build will use: an explicit
-/// [`WatchOptions::target_dir`] override wins, else an inherited
-/// `CARGO_TARGET_DIR`, else cargo's default of `<out_dir>/target`.
-fn watch_target_dir(out_dir: &Path, override_dir: Option<&Path>) -> PathBuf {
-    override_dir.map_or_else(
-        || {
-            ipe_env::var_os("CARGO_TARGET_DIR")
-                .map_or_else(|| out_dir.join("target"), PathBuf::from)
-        },
-        Path::to_path_buf,
-    )
-}
-
 /// Whether a resolved target directory already holds a compiled dependency
 /// library (a single `.rlib` under `debug/deps` — the registry crates the emitted
 /// app links). Fail-safe: any I/O error reads as no-rlib, so the worst case is one
-/// extra sccache-mode build, never a wrong-but-fast one. Pure in its argument —
-/// the ambient-env resolution lives in [`target_is_warm`].
+/// extra sccache-mode build, never a wrong-but-fast one. A target is *warm* once
+/// it holds one; a fresh (or pruned) target holds none. Pure in its argument:
+/// the directory is the session's resolved [`LinkableTargetDir`], the one the
+/// build itself is handed.
 fn dir_has_dep_rlib(target_dir: &Path) -> bool {
     let deps = target_dir.join("debug").join("deps");
     let Ok(entries) = std::fs::read_dir(&deps) else {
@@ -3134,14 +3175,6 @@ fn dir_has_dep_rlib(target_dir: &Path) -> bool {
     entries
         .flatten()
         .any(|e| e.path().extension().is_some_and(|x| x == "rlib"))
-}
-
-/// A target is *warm* once it already holds compiled dependency libraries; a
-/// fresh (or pruned) target holds none. Resolves the target directory cargo will
-/// actually use (honouring an inherited `CARGO_TARGET_DIR`, exactly as the watch
-/// build will) and checks it for a dependency `.rlib`.
-fn target_is_warm(out_dir: &Path, override_dir: Option<&Path>) -> bool {
-    dir_has_dep_rlib(&watch_target_dir(out_dir, override_dir))
 }
 
 /// Locate an `sccache` executable on `PATH`, if the machine has one. sccache is
@@ -3162,11 +3195,11 @@ fn find_sccache() -> Option<PathBuf> {
 ///
 /// The decision is computed at the call site and passed to
 /// [`apply_build_accel_env`], keeping the env-to-`Command` mapping a pure function.
-fn choose_build_accel(out_dir: &Path, override_dir: Option<&Path>, opt_out: bool) -> BuildAccel {
+fn choose_build_accel(target_dir: &Path, opt_out: bool) -> BuildAccel {
     if opt_out {
         return BuildAccel::MachineDefault;
     }
-    match (target_is_warm(out_dir, override_dir), find_sccache()) {
+    match (dir_has_dep_rlib(target_dir), find_sccache()) {
         (false, Some(sccache)) => BuildAccel::ColdSccache(sccache),
         _ => BuildAccel::WarmIncremental,
     }
@@ -3228,13 +3261,14 @@ fn env_flag_on(name: &str) -> bool {
 fn spawn_cargo_build(
     cargo_path: &Path,
     krate: crate::DevMarkedCrate<'_>,
-    target_dir: Option<&Path>,
+    target_dir: &LinkableTargetDir,
     generation: u64,
     evt_tx: mpsc::Sender<OrchestratorEvent>,
     quiet: bool,
     wall: crate::remote_ingest::LocalWall,
 ) -> std::io::Result<Arc<std::sync::Mutex<CargoChild>>> {
-    let accel = choose_build_accel(krate.path(), target_dir, env_flag_on(NO_INCREMENTAL_ENV));
+    let accel = choose_build_accel(target_dir.path(), env_flag_on(NO_INCREMENTAL_ENV));
+    let crate_path = krate.path().to_path_buf();
     let build = crate::cargo_step::WatchBuild {
         cargo: cargo_path,
         krate,
@@ -3291,24 +3325,34 @@ fn spawn_cargo_build(
         let out_buf = drained.stdout.text;
         let err_buf = drained.stderr.text;
         let outcome = match (drained.waited, drained.stdout.error) {
-            _ if timed_out => CargoOutcome::Red(CliError::CargoBuildTimedOut { wall }.to_string()),
-            (None, _) => CargoOutcome::Red("cargo build: could not observe exit status".to_owned()),
+            _ if timed_out => {
+                CargoOutcome::Red(CargoRed::Refused(CliError::CargoBuildTimedOut { wall }))
+            }
+            (None, _) => CargoOutcome::Red(CargoRed::ExitUnobserved),
             // A refused artifact stream (past its ceiling, not UTF-8, or a read
             // error) is never searched for an executable.
-            (Some((status, _)), Some(e)) if status.success() => {
-                CargoOutcome::Red(format!("cargo build: {e}"))
+            (Some((status, _)), Some(source)) if status.success() => {
+                CargoOutcome::Red(CargoRed::Refused(CliError::Io {
+                    path: crate_path.clone(),
+                    source,
+                }))
             }
-            (Some((status, _)), None) if status.success() => find_executable_path(&out_buf)
-                .map_or_else(
-                    || {
-                        CargoOutcome::Red(
-                            "cargo build succeeded but produced no executable artifact".to_owned(),
-                        )
-                    },
-                    CargoOutcome::Green,
-                ),
+            (Some((status, _)), None) if status.success() => find_executable_path(&out_buf).map_or(
+                CargoOutcome::Red(CargoRed::NoExecutable),
+                CargoOutcome::Green,
+            ),
             (Some((_, true)), _) => CargoOutcome::Killed,
-            (Some((_, false)), _) => CargoOutcome::Red(err_buf),
+            // Classified exactly as a one-shot build's failure is, so a link
+            // input the host linker cannot open reaches the screen as the
+            // environment fault it is.
+            (Some((status, false)), _) => {
+                CargoOutcome::Red(CargoRed::Refused(CliError::EmittedBuildFailed {
+                    what: "the watch rebuild",
+                    code: status.code().unwrap_or(1),
+                    stderr: crate::style::TerminalSafe::sanitize(&err_buf),
+                    runtime: None,
+                }))
+            }
         };
         let _ = evt_tx.send(OrchestratorEvent::CargoDone {
             generation,
@@ -3777,10 +3821,7 @@ mod tests {
     fn opt_out_chooses_machine_default() {
         let dir = ipe_test_temp::temp_root();
         assert!(
-            matches!(
-                choose_build_accel(&dir, None, true),
-                BuildAccel::MachineDefault
-            ),
+            matches!(choose_build_accel(&dir, true), BuildAccel::MachineDefault),
             "opt-out must choose MachineDefault"
         );
     }
@@ -4261,7 +4302,7 @@ mod tests {
         let child = super::spawn_cargo_build(
             cargo,
             crate::DevMarkedCrate::assume(out_dir),
-            Some(&out_dir.join("target")),
+            &crate::target_dir::LinkableTargetDir::assume(&out_dir.join("target")),
             1,
             tx,
             true,
@@ -4337,7 +4378,7 @@ mod tests {
         }
         .to_string();
         assert!(
-            matches!(&outcome, Some(super::CargoOutcome::Red(text)) if *text == wall_text),
+            matches!(&outcome, Some(super::CargoOutcome::Red(red)) if red.to_string() == wall_text),
             "a rebuild past its wall must report the wall's refusal"
         );
         assert!(
@@ -4369,7 +4410,7 @@ mod tests {
         let spawned = super::spawn_cargo_build(
             &cargo,
             crate::DevMarkedCrate::assume(out_dir),
-            Some(&out_dir.join("target")),
+            &crate::target_dir::LinkableTargetDir::assume(&out_dir.join("target")),
             1,
             tx,
             true,
