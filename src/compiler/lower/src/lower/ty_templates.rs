@@ -66,7 +66,7 @@ pub(super) fn ty_has_fun_in_derive_carrier(interner: &Interner, ty: &Ty) -> bool
         Ty::Tuple(elems) => elems.iter().any(ty_contains_fun),
         // An opaque boxed wrapper stores its payload behind a trait object and
         // derives nothing over it — a function there is legitimate.
-        Ty::Con { name, .. } if is_opaque_boxed_wrapper(interner, *name) => false,
+        Ty::Con { module, name, .. } if is_opaque_boxed_wrapper(interner, module, *name) => false,
         // Every other constructor head (a user enum, a builtin collection) is a
         // derive carrier over its type arguments.
         Ty::Con { args, .. } => args.iter().any(ty_contains_fun),
@@ -98,7 +98,7 @@ pub(super) fn generic_binding_breaks_clone(interner: &Interner, ty: &Ty) -> bool
         // An opaque boxed wrapper renders to a `Clone` handle over its payload
         // (the payload lives behind a trait object), so a function under it does
         // not break the parameter's `Clone` bound.
-        Ty::Con { name, .. } if is_opaque_boxed_wrapper(interner, *name) => false,
+        Ty::Con { module, name, .. } if is_opaque_boxed_wrapper(interner, module, *name) => false,
         Ty::Con { args, .. } => args
             .iter()
             .any(|a| generic_binding_breaks_clone(interner, a)),

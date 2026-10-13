@@ -620,14 +620,16 @@ fn clear_let_bound_task_fail_pins(expr: Expr) -> Expr {
 /// the payload `T` is opaque to any derive, and the emitter already lowers
 /// `decode_succeed(curryN(f))`.
 ///
-/// Matched by name only — consistent with [`Lowerer::ir_type_from_ty`], and
-/// sound because these are kernel-implicit Prelude type constructors the
-/// canonicaliser forbids a user program from redefining.
-fn is_opaque_boxed_wrapper(interner: &Interner, name: Symbol) -> bool {
+/// The head must be the builtin of its name under the type checker's
+/// head-identity rule ([`ipe_types::con_heads_compatible`] against the empty
+/// builtin home), the rule [`Lowerer::is_distinct_program_union`] applies, so a
+/// program union that is its own head is judged as the derive carrier its own
+/// enum is, never exempted as an opaque wrapper.
+fn is_opaque_boxed_wrapper(interner: &Interner, module: &[Symbol], name: Symbol) -> bool {
     matches!(
         interner.resolve(name),
         Some("Decoder" | "Task" | "Cmd" | "Sub")
-    )
+    ) && ipe_types::con_heads_compatible(module, name, &[], name, interner)
 }
 
 /// The built-in COLLECTION type constructors (`List`/`Dict`/`Set`), whose Rust
@@ -637,8 +639,12 @@ fn is_opaque_boxed_wrapper(interner: &Interner, name: Symbol) -> bool {
 /// a real gap). A function type argument here is NOT the sound
 /// enum-constructor-payload shape [`is_enum_like_con_head`] exempts — kept
 /// gated (`ty_contains_fun`) by [`embeds_nonderivable_function`]'s fallback arm.
-fn is_builtin_collection(interner: &Interner, name: Symbol) -> bool {
+///
+/// Home-aware like [`is_opaque_boxed_wrapper`]: only the builtin head of the
+/// name is a collection.
+fn is_builtin_collection(interner: &Interner, module: &[Symbol], name: Symbol) -> bool {
     matches!(interner.resolve(name), Some("List" | "Dict" | "Set"))
+        && ipe_types::con_heads_compatible(module, name, &[], name, interner)
 }
 
 /// Does a builtin collection (`List`/`Dict`/`Set`) type embed a function in a
@@ -697,7 +703,7 @@ fn collection_embeds_nonstorable_function(interner: &Interner, name: Symbol, arg
 /// positions are already rejected by the region gate before a kernel resolves.
 fn collection_storable_element_carries_function(interner: &Interner, ty: &Ty) -> bool {
     match ty {
-        Ty::Con { name, args, .. } if is_builtin_collection(interner, *name) => {
+        Ty::Con { module, name, args } if is_builtin_collection(interner, module, *name) => {
             match interner.resolve(*name) {
                 Some("List") if args.len() == 1 => args.first().is_some_and(ty_contains_fun),
                 Some("Dict") if args.len() == 2 => args.get(1).is_some_and(ty_contains_fun),
@@ -730,8 +736,9 @@ fn collection_storable_element_carries_function(interner: &Interner, ty: &Ty) ->
 /// instantiation, and several collection kernels blanket-`.clone()` their
 /// element (`DictGet`, `emit_expr.rs`) — E0599 on a non-`Clone`
 /// `Box<dyn Fn>` element. Kept gated (Stage 2 territory).
-fn is_enum_like_con_head(interner: &Interner, name: Symbol) -> bool {
-    !is_opaque_boxed_wrapper(interner, name) && !is_builtin_collection(interner, name)
+fn is_enum_like_con_head(interner: &Interner, module: &[Symbol], name: Symbol) -> bool {
+    !is_opaque_boxed_wrapper(interner, module, name)
+        && !is_builtin_collection(interner, module, name)
 }
 
 /// Does this solved [`Ty`] embed a function in a NON-derivable carrier that the
@@ -884,14 +891,14 @@ fn embeds_nonderivable_function(interner: &Interner, ty: &Ty) -> bool {
         // An opaque boxed wrapper (`Decoder (a -> b)`, `Cmd msg`, …) stores its
         // payload behind a trait object and derives nothing over it — a function
         // there is legitimate, so it is NOT a non-derivable carrier.
-        Ty::Con { name, .. } if is_opaque_boxed_wrapper(interner, *name) => false,
+        Ty::Con { module, name, .. } if is_opaque_boxed_wrapper(interner, module, *name) => false,
         // an ENUM-LIKE head (built-in `Maybe`/`Result` or a user union) —
         // the runtime/derive machinery already tolerates a function argument
         // directly under it (see `is_enum_like_con_head`); only recurse for a
         // NESTED non-derivable carrier under the argument (e.g. a `List (a->b)`
         // buried inside `Maybe (List (Int -> Int))`), never flag a bare
         // function argument itself.
-        Ty::Con { name, args, .. } if is_enum_like_con_head(interner, *name) => args
+        Ty::Con { module, name, args } if is_enum_like_con_head(interner, module, *name) => args
             .iter()
             .any(|a| embeds_nonderivable_function(interner, a)),
         // A builtin COLLECTION head (`List`/`Dict`/`Set`): a function in a
@@ -903,7 +910,7 @@ fn embeds_nonderivable_function(interner: &Interner, ty: &Ty) -> bool {
         // function reached through a nested non-storable carrier under any
         // position is flagged (recursion). See
         // [`collection_embeds_nonstorable_function`].
-        Ty::Con { name, args, .. } if is_builtin_collection(interner, *name) => {
+        Ty::Con { module, name, args } if is_builtin_collection(interner, module, *name) => {
             collection_embeds_nonstorable_function(interner, *name, args)
         }
         // Any other `Ty::Con` head (should not occur — the arms above cover
@@ -954,8 +961,8 @@ fn embeds_nonderivable_function(interner: &Interner, ty: &Ty) -> bool {
 /// [`embeds_nonderivable_function`] already returns `false` for such a bare head,
 /// so this is only reached for genuine user-enum `Con`s.
 fn con_payload_carries_function(interner: &Interner, ty: &Ty) -> bool {
-    matches!(ty, Ty::Con { name, args, .. }
-        if !is_opaque_boxed_wrapper(interner, *name)
+    matches!(ty, Ty::Con { module, name, args }
+        if !is_opaque_boxed_wrapper(interner, module, *name)
             && args.iter().any(|a| ty_contains_fun(a) || embeds_nonderivable_function(interner, a)))
 }
 
@@ -37363,6 +37370,60 @@ mod tests {
             ),
             "the canon mirror refuses the Ipe.Css Color union too"
         );
+    }
+
+    /// A union named like an opaque wrapper or a collection but not its builtin
+    /// head is judged as the derive carrier its own enum is.
+    ///
+    /// The builtin `Task`/`Decoder` box their payload and the builtin `List`
+    /// stores a bare function on the `Arc` carrier, so a function under them is
+    /// legitimate; a `Main`-homed union of the same name lowers to its own enum
+    /// (see [`Lowerer::is_distinct_program_union`]) and must not inherit either
+    /// exemption, or a function payload under it would reach a derived `Clone`.
+    #[test]
+    fn a_distinct_head_named_like_a_wrapper_or_collection_gets_no_exemption() {
+        use super::{
+            collection_storable_element_carries_function, embeds_nonderivable_function,
+            generic_binding_breaks_clone, ty_has_fun_in_derive_carrier,
+        };
+        let mut interner = Interner::new();
+        #[allow(clippy::expect_used)] // a fresh interner accepts these names
+        let [main, task, decoder, list, set, int] =
+            ["Main", "Task", "Decoder", "List", "Set", "Int"]
+                .map(|name| interner.intern(name).expect("intern name"));
+        let con = |module: Vec<ipe_intern::Symbol>, name, args| Ty::Con { module, name, args };
+        let int_ty = con(vec![], int, vec![]);
+        let fun = Ty::Fun(Box::new(int_ty.clone()), Box::new(int_ty));
+        let fun_set = con(vec![], set, vec![fun.clone()]);
+        for (module, distinct) in [(vec![], false), (vec![main], true)] {
+            assert_eq!(
+                embeds_nonderivable_function(
+                    &interner,
+                    &con(module.clone(), task, vec![fun_set.clone()])
+                ),
+                distinct,
+                "a function `Set` under `Task` is exempt only under the builtin `Task`"
+            );
+            let decoder_of_fun = con(module.clone(), decoder, vec![fun.clone()]);
+            assert_eq!(
+                ty_has_fun_in_derive_carrier(&interner, &decoder_of_fun),
+                distinct,
+                "a function under `Decoder` is a derive-carrier payload only off the builtin"
+            );
+            assert_eq!(
+                generic_binding_breaks_clone(&interner, &decoder_of_fun),
+                distinct,
+                "a function under `Decoder` breaks `Clone` only off the builtin"
+            );
+            assert_eq!(
+                collection_storable_element_carries_function(
+                    &interner,
+                    &con(module, list, vec![fun.clone()])
+                ),
+                !distinct,
+                "only the builtin `List` stores a function element"
+            );
+        }
     }
 
     /// A union that is not the builtin of its name lowers to its own enum on both lowering paths.
