@@ -20,9 +20,9 @@
 //! | `owned_list_element` | `(Step k _) :: rest`, non-`Clone` element | builds + prints `2` |
 //! | `alias_in_boxed_tuple` | `ChainNode ((rest as whole), n)` | builds + prints `8` |
 //! | `or_same_boxed_binder` | `GoLeft next \| GoRight next` | builds + prints `3` |
-//! | `boxed_ctor_test` | `Node Leaf _ _` + catch-all | fail-closed at `ipe` time |
-//! | `boxed_tuple_ctor_test` | `ChainNode (ChainEnd, 0)` + catch-all | fail-closed at `ipe` time |
-//! | `or_uneven_boxed_binder` | `(Node l _ _, _) \| (_, l)` | fail-closed at `ipe` time |
+//! | `boxed_ctor_test` | `Node Leaf _ _` | fail-closed at `ipe` time |
+//! | `boxed_tuple_ctor_test` | `ChainNode (ChainEnd, 0)` | fail-closed at `ipe` time |
+//! | `or_uneven_boxed_binder` | `Just (Node l _ _, _) \| Just (_, l)` | fail-closed at `ipe` time |
 //! | `boxed_string_test` | `Pair (Plain "go") _ _` | fail-closed IPE-L0116 |
 //! | `or_shared_alias` | `Square (n as w) \| Circle (n as w)` | builds + prints `10` |
 //! | `or_diverging_alias` | `Square (n as w) \| Rect n w` | fail-closed at `ipe` time |
@@ -334,10 +334,10 @@ import Ipe.Io as Io
 import Ipe.String as String
 
 
-type Path = Tip | GoLeft Path | GoRight Path
+type Trail = Tip | GoLeft Trail | GoRight Trail
 
 
-len : Path -> Int
+len : Trail -> Int
 len p =
     case p of
         Tip ->
@@ -367,7 +367,10 @@ leftIsLeaf t =
         Node Leaf _ _ ->
             1
 
-        _ ->
+        Node (Node _ _ _) _ _ ->
+            0
+
+        Leaf ->
             0
 
 
@@ -391,7 +394,13 @@ isLast c =
         ChainNode (ChainEnd, 0) ->
             1
 
-        _ ->
+        ChainNode (ChainEnd, _) ->
+            0
+
+        ChainNode (ChainNode _, _) ->
+            0
+
+        ChainEnd ->
             0
 
 
@@ -419,15 +428,18 @@ sumTree t =
             sumTree l + n + sumTree r
 
 
-pick : ( Tree, Tree ) -> Int
+pick : Maybe ( Tree, Tree ) -> Int
 pick pair =
     case pair of
-        ( Node l _ _, _ ) | ( _, l ) ->
+        Just ( Node l _ _, _ ) | Just ( _, l ) ->
             sumTree l
+
+        Nothing ->
+            0
 
 
 main =
-    Io.println (String.fromInt (pick ( Node (Node Leaf 3 Leaf) 4 Leaf, Leaf )))
+    Io.println (String.fromInt (pick (Just ( Node (Node Leaf 3 Leaf) 4 Leaf, Leaf ))))
 ";
 
 /// A string test two levels down, at a boxed field: the lowerer's refusal.
@@ -446,7 +458,13 @@ isGo t =
         Pair (Plain "go") _ _ ->
             1
 
-        _ ->
+        Pair (Plain _) _ _ ->
+            0
+
+        Pair (Pair _ _ _) _ _ ->
+            0
+
+        Plain _ ->
             0
 
 

@@ -443,7 +443,7 @@ pub struct ArmSink {
     pub counter: usize,
     /// Statements spliced at the head of the arm body.
     pub prelude: String,
-    /// Match guards ANDed onto the arm.
+    /// Match guards joined onto the arm with a logical AND.
     pub guards: Vec<String>,
     /// Binders bound to a whole boxed field and unboxed in the prelude.
     pub unboxed: BTreeSet<Symbol>,
