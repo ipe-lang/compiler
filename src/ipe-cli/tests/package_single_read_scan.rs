@@ -469,7 +469,7 @@ fn a_planted_working_tree_read_is_refused() -> Result<(), String> {
         "fn run_audit_over() { crate::driver::read_package_modules(m); }\n",
         "fn run_audit_over() { crate::driver::build_project_into(m); }\n",
         "fn run_audit_over() { capture_package(p); }\n",
-        "fn run_audit_over() { let _ = format!(\"{:?}\", PackageSnapshot::capture(root)); }\n",
+        "fn run_audit_over() { let _ = vec![PackageSnapshot::capture(root)]; }\n",
         "fn run_audit_over() { Sha256Hex::of_tree_within(root, c); }\n",
         "use crate::project::PackageSnapshot as S;\nfn run_audit_over() { S::capture(root); }\n",
         "type S = crate::project::PackageSnapshot;\nfn run_audit_over() { S::capture(root); }\n",
