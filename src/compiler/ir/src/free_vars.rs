@@ -20,7 +20,8 @@ pub fn pat_bound_symbols(pat: &Pat, out: &mut BTreeSet<Symbol>) {
         Pat::Var(s) => {
             out.insert(*s);
         }
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
         Pat::Alias(inner, s) => {
             out.insert(*s);
             pat_bound_symbols(inner, out);
@@ -48,8 +49,6 @@ pub fn pat_bound_symbols(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 pat_bound_symbols(p, out);
             }
         }
-        // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => {}
     }
 }
 

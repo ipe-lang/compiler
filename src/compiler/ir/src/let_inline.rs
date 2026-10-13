@@ -103,7 +103,10 @@ pub fn ir_type_contains_task(ty: &IrType, payloads: &EnumPayloadTable) -> bool {
 pub fn pat_binds_target(pat: &Pat, target: Symbol) -> bool {
     match pat {
         Pat::Var(s) => *s == target,
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Alias(inner, s) => *s == target || pat_binds_target(inner, target),
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_target(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_target(p, target)),
@@ -112,8 +115,6 @@ pub fn pat_binds_target(pat: &Pat, target: Symbol) -> bool {
             prefix.iter().any(|p| pat_binds_target(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_target(p, target))
         }
-        // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => false,
     }
 }
 

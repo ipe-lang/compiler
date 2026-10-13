@@ -4206,8 +4206,6 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(item, out);
             }
         }
-        // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => {}
         Pat::Record(fields) => {
             for (_, p) in fields {
                 collect_ir_pat_syms(p, out);
@@ -4221,7 +4219,8 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(t, out);
             }
         }
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
     }
 }
 
@@ -4797,7 +4796,8 @@ fn arg_forwarded_binders(arg: &Expr, out: &mut Vec<Symbol>) {
 fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
     match pat {
         Pat::Var(s) => out.push(*s),
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
         Pat::Alias(inner, s) => {
             out.push(*s);
             pat_binder_syms(inner, out);
@@ -4820,8 +4820,6 @@ fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
                 pat_binder_syms(p, out);
             }
         }
-        // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => {}
     }
 }
 
@@ -10502,7 +10500,10 @@ const fn ir_type_label(ty: &IrType) -> &'static str {
 fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
     match pat {
         Pat::Var(s) => *s == target,
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Alias(inner, s) => *s == target || pat_binds_symbol(inner, target),
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_symbol(p, target)),
@@ -10511,8 +10512,6 @@ fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
             prefix.iter().any(|p| pat_binds_symbol(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_symbol(p, target))
         }
-        // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => false,
     }
 }
 

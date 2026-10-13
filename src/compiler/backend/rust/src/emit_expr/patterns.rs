@@ -608,9 +608,9 @@ pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResul
         | Pat::Ctor { .. }
         | Pat::Tuple(_)
         | Pat::Record(_)
-        | Pat::Slice { .. } => Ok(()),
+        | Pat::Slice { .. }
         // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => Ok(()),
+        | Pat::Or(_) => Ok(()),
     }
 }
 
@@ -707,9 +707,9 @@ pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat, own: SliceOwnership) -> DRe
         | Pat::Char(_)
         | Pat::Ctor { .. }
         | Pat::Tuple(_)
-        | Pat::Record(_) => {}
+        | Pat::Record(_)
         // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => {}
+        | Pat::Or(_) => {}
     }
     Ok(out)
 }
@@ -941,9 +941,9 @@ pub fn collect_elem_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResu
         | Pat::Bool(_)
         | Pat::Char(_)
         | Pat::Str(_)
-        | Pat::Slice { .. } => Ok(()),
+        | Pat::Slice { .. }
         // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => Ok(()),
+        | Pat::Or(_) => Ok(()),
     }
 }
 
@@ -965,9 +965,9 @@ pub fn collect_list_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResu
         | Pat::Ctor { .. }
         | Pat::Tuple(_)
         | Pat::Record(_)
-        | Pat::Slice { .. } => Ok(()),
+        | Pat::Slice { .. }
         // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => Ok(()),
+        | Pat::Or(_) => Ok(()),
     }
 }
 

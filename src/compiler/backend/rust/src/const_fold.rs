@@ -783,8 +783,6 @@ fn collect_pat_binders(pat: &Pat, out: &mut Vec<Symbol>) {
                 collect_pat_binders(a, out);
             }
         }
-        // A `SharedAlts` alternative is binder-free.
-        Pat::Or(_) => {}
         Pat::Record(entries) => {
             for (_, sub) in entries {
                 collect_pat_binders(sub, out);
@@ -798,7 +796,8 @@ fn collect_pat_binders(pat: &Pat, out: &mut Vec<Symbol>) {
                 collect_pat_binders(r, out);
             }
         }
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
     }
 }
 

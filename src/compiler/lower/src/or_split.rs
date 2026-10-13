@@ -92,7 +92,7 @@ pub fn normalize(m: &canon::Module) -> Result<Cow<'_, canon::Module>, (Diagnosti
 /// A [`canon::Pattern_::POr`]'s alternatives, or the pattern itself otherwise,
 /// so a head-keyed decision reads through the or-pattern.
 #[must_use]
-pub fn head_alternatives(pat: &canon::Pattern) -> &[canon::Pattern] {
+pub const fn head_alternatives(pat: &canon::Pattern) -> &[canon::Pattern] {
     match &pat.value {
         canon::Pattern_::POr(alts) => alts.as_slice(),
         canon::Pattern_::PAnything
