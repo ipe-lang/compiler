@@ -753,9 +753,11 @@ Routes: `get/post/put/delete/any` | groups w/ prefix | cookies (HttpOnly,
 Secure, SameSite) | extractors: `param`, `queryParam`, `header`,
 `getCookie` | responses: `text`, `json`, `html`, `withStatus`, `redirect`
 | middleware: `Handler -> Handler`.
-Path params `:name` / catch-all `*name`: `name` = `[A-Za-z_][A-Za-z0-9_]*`,
-unique per path; a literal path breaking this is refused at compile time
-(IPE-L0156).
+Path params `:name` (a whole segment; no `*name` catch-all): `name` =
+`[A-Za-z_][A-Za-z0-9_]*`, unique per path; `Server.api` methods are
+`GET`/`HEAD`/`POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS`/`CONNECT`/`TRACE`/`ANY`;
+`Server.static`/`mountApp` prefixes are literal `/[A-Za-z0-9-._~/]` paths, each
+distinct. A literal breaking this is refused at compile time (IPE-L0156).
 
 **Handler annotation.** Named handlers ascribe at head position w/
 `Handler` alias:
