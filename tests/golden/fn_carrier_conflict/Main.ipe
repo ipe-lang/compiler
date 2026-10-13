@@ -1,0 +1,41 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+-- A `case` join whose branches hold a function under a `Maybe` payload on two
+-- carriers: `List.head c.fns` is a `Maybe` of a stored read (on `Arc`), the
+-- parameter `m` a `Maybe` of a direct function (on `Box`). No conversion
+-- reaches inside the payload, so `ipe` refuses the join.
+
+
+type alias Cfg =
+    { fns : List (Int -> Bool)
+    }
+
+
+cfg : Cfg
+cfg =
+    { fns = [ \n -> n > 2 ]
+    }
+
+
+pick : Bool -> Maybe (Int -> Bool) -> Cfg -> Int
+pick flag m c =
+    let
+        chosen =
+            case flag of
+                True ->
+                    List.head c.fns
+
+                False ->
+                    m
+    in
+    List.length (List.filter (Maybe.withDefault (\n -> n > 0) chosen) [ 1, 2, 3, 4 ])
+
+
+main =
+    Io.println (String.fromInt (pick True (Just (\n -> n > 3)) cfg))

@@ -1,0 +1,160 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task
+
+
+-- A function value meets a position whose carrier another value decides: a
+-- def return, an `if`/`case` join, a piped or partial kernel call, a kernel
+-- scheme variable bound by two arguments, and a variable under a `Task`
+-- result. A stored read (`c.keep`, on `Arc`) meets a lambda or a parameter
+-- (on `Box`) at each one, and every case runs to its count.
+
+
+type alias Cfg =
+    { keep : Int -> Bool
+    , fns : List (Int -> Bool)
+    }
+
+
+cfg : Cfg
+cfg =
+    { keep = \n -> n > 1
+    , fns = [ \n -> n > 2 ]
+    }
+
+
+nums : List Int
+nums =
+    [ 1, 2, 3, 4 ]
+
+
+count : (Int -> Bool) -> Int
+count p =
+    List.length (List.filter p nums)
+
+
+project : Cfg -> (Int -> Bool)
+project c =
+    c.keep
+
+
+projectIf : Bool -> Cfg -> (Int -> Bool)
+projectIf flag c =
+    if flag then
+        c.keep
+
+    else
+        \n -> n > 0
+
+
+projectCase : Maybe Int -> Cfg -> (Int -> Bool)
+projectCase m c =
+    case m of
+        Just _ ->
+            c.keep
+
+        Nothing ->
+            \n -> n > 0
+
+
+viaIfJoin : Bool -> Cfg -> Int
+viaIfJoin flag c =
+    List.length
+        (List.filter
+            (if flag then
+                c.keep
+
+             else
+                \n -> n > 0
+            )
+            nums
+        )
+
+
+viaCaseJoin : Maybe Int -> Cfg -> Int
+viaCaseJoin m c =
+    let
+        p =
+            case m of
+                Just _ ->
+                    c.keep
+
+                Nothing ->
+                    \n -> n > 0
+    in
+    List.length (List.filter p nums)
+
+
+viaPipedHeadDefault : Cfg -> Int
+viaPipedHeadDefault c =
+    List.length (List.filter (List.head c.fns |> Maybe.withDefault c.keep) nums)
+
+
+viaParamDefault : Maybe (Int -> Bool) -> Cfg -> Int
+viaParamDefault m c =
+    List.length (List.filter (Maybe.withDefault c.keep m) nums)
+
+
+viaResultDefault : Result String (Int -> Bool) -> Cfg -> Int
+viaResultDefault r c =
+    List.length (List.filter (Result.withDefault c.keep r) nums)
+
+
+viaPartialDefault : Maybe (Int -> Bool) -> Cfg -> Int
+viaPartialDefault m c =
+    let
+        k =
+            Maybe.withDefault c.keep
+    in
+    List.length (List.filter (k m) nums)
+
+
+viaTask : Cfg -> Task Error Int
+viaTask c =
+    Task.succeed c.keep |> Task.andThen (\f -> Task.succeed (count f))
+
+
+viaTaskMap : Cfg -> Task Error Int
+viaTaskMap c =
+    Task.succeed c.keep |> Task.map (\f -> count f)
+
+
+pure : List Int
+pure =
+    [ count (project cfg)
+    , count (projectIf True cfg)
+    , count (projectIf False cfg)
+    , count (projectCase (Just 1) cfg)
+    , count (projectCase Nothing cfg)
+    , viaIfJoin True cfg
+    , viaIfJoin False cfg
+    , viaCaseJoin (Just 1) cfg
+    , viaCaseJoin Nothing cfg
+    , viaPipedHeadDefault cfg
+    , viaParamDefault (Just (\n -> n > 3)) cfg
+    , viaParamDefault Nothing cfg
+    , viaResultDefault (Ok (\n -> n > 3)) cfg
+    , viaResultDefault (Err "none") cfg
+    , viaPartialDefault (Just (\n -> n > 3)) cfg
+    , viaPartialDefault Nothing cfg
+    ]
+
+
+main =
+    viaTask cfg
+        |> Task.andThen
+            (\fromThen ->
+                viaTaskMap cfg
+                    |> Task.andThen
+                        (\fromMap ->
+                            Io.println
+                                (String.join " "
+                                    (List.map String.fromInt (pure ++ [ fromThen, fromMap ]))
+                                )
+                        )
+            )

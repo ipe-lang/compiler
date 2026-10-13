@@ -1265,11 +1265,12 @@ fn point_free_alias_instantiating_a_clone_slot_lowers_cleanly() -> DResult<()> {
 
 #[test]
 fn fn_instantiating_a_bare_generic_slot_is_rejected() -> DResult<()> {
-    // The record is incidental: the same E0277 hits any bare-variable slot.
+    // The same E0277 a record field hits applies at any bare-variable slot.
     // `always : a -> b -> a` applied to a lambda for `a` instantiates the
-    // `Clone`-bounded `T1` to `Box<dyn Fn>` just the same. Partial application
-    // (one argument to a two-arrow callee) must gate identically — the boundary
-    // gate runs before the arity reshape.
+    // `Clone`-bounded `T1` to `Box<dyn Fn>` just the same; with no record
+    // field holding `a`, the refusal names the generic-slot carrier conflict.
+    // Partial application (one argument to a two-arrow callee) must gate
+    // identically — the boundary gate runs before the arity reshape.
     let mut i = Interner::new();
     let main = i.intern("main")?;
     let always = i.intern("always")?;
@@ -1329,7 +1330,7 @@ fn fn_instantiating_a_bare_generic_slot_is_rejected() -> DResult<()> {
     regions.insert(arg_span, arrow_int);
     let callee_def = resolvable_callee_def(&mut i, always)?;
     let res = run_with_regions(Vec::new(), vec![callee_def, def], env, regions, &mut i);
-    assert_unsupported(res, Feature::FirstClassFunctions, IPE_L0107, call_span);
+    assert_unsupported(res, Feature::FnCarrierConflict, IPE_L0107, call_span);
     Ok(())
 }
 

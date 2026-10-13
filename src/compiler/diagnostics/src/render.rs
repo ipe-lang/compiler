@@ -2358,6 +2358,13 @@ const fn feature_label(f: Feature) -> &'static str {
             "storing a function value in a record field is not supported yet \
              [feature: first-class-functions]"
         }
+        Feature::FnCarrierConflict => {
+            "this function value meets functions on a different carrier where \
+             no conversion reaches: inside a `Maybe`/`Result` payload, or at a \
+             generic type parameter. Bind the function to a name and pass that, \
+             or build the value from functions of one origin \
+             [feature: fn-carrier-conflict]"
+        }
         Feature::Kernels => "this kernel function is not available yet [feature: kernels]",
         Feature::PartialOverApplication => {
             "partial application and over-application are not supported yet \
