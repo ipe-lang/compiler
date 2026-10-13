@@ -495,7 +495,7 @@ fn arm_ceiling_plus_one() {
 /// times; the optional inner 2-way split copies its 1-node body once.
 fn node_ceiling_source(past: bool) -> String {
     let product = ["A | B"; 5].join(", ");
-    let elements = ["1"; 2047].join(", ");
+    let elements = vec!["1"; 2047].join(", ");
     let fallback = if past {
         "case t of
                 ( A, _, _, _, _ ) | ( B, _, _, _, _ ) ->
