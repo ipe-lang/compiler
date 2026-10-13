@@ -33,11 +33,11 @@ src/ipe-cli/src/watch.rs 18
 src/ipe-docs/src/env_vars.rs 131
 src/ipe-wrapper/build.rs 10
 src/runtime/rust/src/app_config.rs 6
-src/runtime/rust/src/compression.rs 3
+src/runtime/rust/src/compression.rs 2
 src/runtime/rust/src/config_decode.rs 5
 src/runtime/rust/src/control.rs 3
 src/runtime/rust/src/core.rs 4
-src/runtime/rust/src/csv.rs 7
+src/runtime/rust/src/csv.rs 6
 src/runtime/rust/src/db.rs 4
 src/runtime/rust/src/debugger/record_sink.rs 1
 src/runtime/rust/src/debugger/server.rs 1
