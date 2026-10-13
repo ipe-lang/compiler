@@ -3220,6 +3220,23 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// Wait for the batch of the event just handled, so its worker's demand
+    /// runs to completion before the next event's sync supersedes it.
+    #[allow(clippy::expect_used)] // test fixture: every served event's worker sends one batch
+    fn settle(state: &State, diag_rx: &crossbeam_channel::Receiver<DiagnosticsBatch>) {
+        let batch = diag_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the event's diagnostics batch");
+        assert_eq!(
+            batch.generation, state.generation,
+            "the settled batch is the current generation's"
+        );
+    }
+
+    /// Every event is settled before the next: a reset's trigger reads the
+    /// generation's interned symbols, which only a worker that reaches its
+    /// demand grows, so an event superseded before its worker runs proves
+    /// nothing about the ceiling.
     #[test]
     #[allow(clippy::expect_used)] // test fixture: an absolute path always has a file URI
     fn buffer_churn_resets_the_generation_without_changing_diagnostics() {
@@ -3250,7 +3267,7 @@ mod tests {
         assert!(!before.is_empty(), "Lib's type error must publish");
         assert_eq!(state.db.resets(), 0);
 
-        let (diag_tx, _diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
+        let (diag_tx, diag_rx) = crossbeam_channel::unbounded::<DiagnosticsBatch>();
         for round in 0..3 {
             let path = normalize(Path::new(&format!(
                 "/lsp-long-lived-test/Scratch{round}.ipe"
@@ -3269,6 +3286,7 @@ mod tests {
             };
             let note = Notification::new(DidOpenTextDocument::METHOD.to_owned(), open);
             handle_notification(&mut state, &loader, &note, &diag_tx);
+            settle(&state, &diag_rx);
             did_change(
                 &mut state,
                 &loader,
@@ -3276,11 +3294,13 @@ mod tests {
                 &format!("{text}\nedited{round} = 1\n"),
                 &diag_tx,
             );
+            settle(&state, &diag_rx);
             let close = lsp_types::DidCloseTextDocumentParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri },
             };
             let note = Notification::new(DidCloseTextDocument::METHOD.to_owned(), close);
             handle_notification(&mut state, &loader, &note, &diag_tx);
+            settle(&state, &diag_rx);
         }
 
         assert!(state.db.resets() >= 2, "resets: {}", state.db.resets());
