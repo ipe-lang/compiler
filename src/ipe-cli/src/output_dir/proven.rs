@@ -8,7 +8,9 @@
 //! walked on from is a [`Cwd`], which only the process working directory
 //! supplies.
 
-use std::path::{Component, Path, PathBuf, Prefix, PrefixComponent};
+use std::path::{Component, Path, PathBuf, Prefix};
+
+use ipe_fs_open::PlaceablePrefix;
 
 use super::{OutputRefusal, held};
 use crate::{CliError, io_err};
@@ -95,7 +97,7 @@ impl Cwd {
 /// directory cannot be read.
 pub fn prove_parent_steps(raw: &Path) -> Result<ProvenOutPath, CliError> {
     if raw.is_absolute() {
-        return prove_walk(raw, Path::new(""));
+        return prove_walk(raw, Path::new(""), Path::new(""));
     }
     prove_parent_steps_from(raw, &Cwd::current()?)
 }
@@ -115,13 +117,14 @@ pub fn prove_parent_steps(raw: &Path) -> Result<ProvenOutPath, CliError> {
 ///
 /// # Errors
 /// [`OutputRefusal::ParentTraversal`] for an unproven `..`;
-/// [`OutputRefusal::Unplaceable`] for a path that does not name one absolute
-/// place: a Windows drive-relative `C:x`, a rooted `\x` against a working
-/// directory with no drive, a `.` or `..` inside a verbatim `\\?\` path (a
-/// literal name there, not a step), a prefix that names no place on a disk or
-/// share (`placeable_prefix`), or a component that is not one plain name
-/// opened as spelled (`ipe_fs_open::is_one_spelled_name`); [`CliError::Io`] when a level cannot be
-/// inspected.
+/// [`OutputRefusal::Unplaceable`] for a request that does not name one
+/// absolute place: a Windows drive-relative `C:x`, a `.` or `..` inside a
+/// verbatim `\\?\` path (a literal name there, not a step), a prefix that is
+/// no [`PlaceablePrefix`], or a component that is not one plain name opened as
+/// spelled (`ipe_fs_open::is_one_spelled_name`);
+/// [`OutputRefusal::UnplaceableCwd`] when the part of the walk the working
+/// directory supplies fails the same rules, or a rooted `\x` meets a working
+/// directory with no drive; [`CliError::Io`] when a level cannot be inspected.
 pub fn prove_parent_steps_from(raw: &Path, cwd: &Cwd) -> Result<ProvenOutPath, CliError> {
     let cwd = cwd.as_path();
     let base = if raw.is_absolute() {
@@ -129,11 +132,11 @@ pub fn prove_parent_steps_from(raw: &Path, cwd: &Cwd) -> Result<ProvenOutPath, C
     } else {
         match raw.components().next() {
             Some(Component::Prefix(_)) => return Err(unplaceable(raw)),
-            Some(Component::RootDir) => drive_of(cwd).ok_or_else(|| unplaceable(raw))?,
+            Some(Component::RootDir) => drive_of(cwd).ok_or_else(|| unplaceable_cwd(cwd, raw))?,
             Some(Component::CurDir | Component::ParentDir | Component::Normal(_)) | None => cwd,
         }
     };
-    prove_walk(raw, base)
+    prove_walk(raw, base, cwd)
 }
 
 /// The refusal of `raw` as naming no single place.
@@ -141,29 +144,73 @@ fn unplaceable(raw: &Path) -> CliError {
     OutputRefusal::Unplaceable(raw.to_path_buf()).into()
 }
 
+/// The refusal of `raw` because the working directory it is walked on from names no single place.
+fn unplaceable_cwd(cwd: &Path, raw: &Path) -> CliError {
+    OutputRefusal::UnplaceableCwd {
+        cwd: cwd.to_path_buf(),
+        request: raw.to_path_buf(),
+    }
+    .into()
+}
+
+/// The part of the invoker's input a walked component came from.
+#[derive(Debug, Clone, Copy)]
+enum Origin<'a> {
+    /// The request itself.
+    Request,
+    /// The working directory the request is walked on from.
+    Cwd(&'a Path),
+}
+
+impl Origin<'_> {
+    /// The refusal of `raw` for a component of this origin that names no single place.
+    fn unplaceable(self, raw: &Path) -> CliError {
+        match self {
+            Self::Request => unplaceable(raw),
+            Self::Cwd(cwd) => unplaceable_cwd(cwd, raw),
+        }
+    }
+}
+
+/// Accept `prefix` only as a [`PlaceablePrefix`], refused under the part of the input it came from.
+fn accept_prefix(prefix: Prefix<'_>, origin: Origin<'_>, raw: &Path) -> Result<(), CliError> {
+    PlaceablePrefix::parse(prefix)
+        .map(|_| ())
+        .map_err(|_| origin.unplaceable(raw))
+}
+
 /// Walk `base` then `raw` as one component sequence into a proven absolute path.
 ///
 /// `base` is the already chosen start of the walk: empty for an absolute
-/// `raw`, else the working directory or its drive.
-fn prove_walk(raw: &Path, base: &Path) -> Result<ProvenOutPath, CliError> {
+/// `raw`, else the working directory `cwd` or its drive. A refusal of a
+/// component of `base` names `cwd`, the part the invoker must change.
+fn prove_walk(raw: &Path, base: &Path, cwd: &Path) -> Result<ProvenOutPath, CliError> {
     let traversal = || -> CliError { OutputRefusal::ParentTraversal(raw.to_path_buf()).into() };
-    if has_verbatim_dot_component(base) || has_verbatim_dot_component(raw) {
+    if has_verbatim_dot_component(base) {
+        return Err(unplaceable_cwd(cwd, raw));
+    }
+    if has_verbatim_dot_component(raw) {
         return Err(unplaceable(raw));
     }
     let mut proven = PathBuf::new();
-    for component in base.components().chain(raw.components()) {
+    let walked = base
+        .components()
+        .map(|component| (component, Origin::Cwd(cwd)))
+        .chain(
+            raw.components()
+                .map(|component| (component, Origin::Request)),
+        );
+    for (component, origin) in walked {
         match component {
             Component::Prefix(prefix) => {
-                if !placeable_prefix(prefix) {
-                    return Err(unplaceable(raw));
-                }
+                accept_prefix(prefix.kind(), origin, raw)?;
                 proven.push(component);
             }
             Component::RootDir => proven.push(component),
             Component::CurDir => {}
             Component::Normal(name) => {
                 if !ipe_fs_open::is_one_spelled_name(name) {
-                    return Err(unplaceable(raw));
+                    return Err(origin.unplaceable(raw));
                 }
                 proven.push(name);
             }
@@ -215,25 +262,53 @@ fn has_verbatim_dot_component(path: &Path) -> bool {
         && components.any(|component| matches!(component, Component::CurDir | Component::ParentDir))
 }
 
-/// Whether `prefix` names a place on a disk or a share.
-///
-/// A drive (`C:`, `\\?\C:`) or a share (`\\server\share`,
-/// `\\?\UNC\server\share`) is kept. A device namespace (`\\.\pipe`,
-/// `\\.\NUL`) and any other verbatim root (`\\?\GLOBALROOT`) address the
-/// object manager rather than a directory tree, so no output lives there.
-fn placeable_prefix(prefix: PrefixComponent<'_>) -> bool {
-    matches!(
-        prefix.kind(),
-        Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(..) | Prefix::VerbatimUNC(..)
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::ffi::OsStr;
+    use std::path::{Path, Prefix};
 
-    use super::{Cwd, OutputRefusal, prove_parent_steps_from};
+    use super::{Cwd, Origin, OutputRefusal, accept_prefix, prove_parent_steps_from};
     use crate::CliError;
+
+    /// A prefix that is no `PlaceablePrefix` is refused under the part of the input it came from.
+    #[test]
+    fn prove_walk_refuses_a_bad_share() {
+        let cwd = Cwd::assumed(r"\\srv\con\x".into());
+        let request = Path::new("out");
+        let bad = [
+            Prefix::UNC(OsStr::new("srv"), OsStr::new("con")),
+            Prefix::UNC(OsStr::new("srv"), OsStr::new("")),
+            Prefix::UNC(OsStr::new("-srv"), OsStr::new("share")),
+            Prefix::VerbatimUNC(OsStr::new(".."), OsStr::new("x")),
+            Prefix::DeviceNS(OsStr::new("pipe")),
+            Prefix::Verbatim(OsStr::new("Volume{00000000-0000-0000-0000-000000000000}")),
+        ];
+        for prefix in bad {
+            let from_cwd = accept_prefix(prefix, Origin::Cwd(cwd.as_path()), request);
+            assert!(
+                matches!(
+                    &from_cwd,
+                    Err(CliError::OutputRefused(OutputRefusal::UnplaceableCwd { cwd: named, request: asked }))
+                        if named == cwd.as_path() && asked == request
+                ),
+                "{prefix:?} from the working directory must name it, got {from_cwd:?}"
+            );
+            let from_request = accept_prefix(prefix, Origin::Request, request);
+            assert!(
+                matches!(
+                    &from_request,
+                    Err(CliError::OutputRefused(OutputRefusal::Unplaceable(asked))) if asked == request
+                ),
+                "{prefix:?} in the request must name it, got {from_request:?}"
+            );
+        }
+        let share = Prefix::UNC(OsStr::new("localhost"), OsStr::new("C$"));
+        let kept = accept_prefix(share, Origin::Request, request);
+        assert!(
+            kept.is_ok(),
+            "an admin share on a host name is placeable, got {kept:?}"
+        );
+    }
 
     /// A requested name holding NUL is unplaceable, never handed to an open.
     #[test]
