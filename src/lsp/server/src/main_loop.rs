@@ -3403,35 +3403,68 @@ mod tests {
         }
     }
 
-    /// A lint stage whose probe fires mid-pass returns before visiting the
-    /// second module and publishes no lint finding from the cut-short run.
-    ///
-    /// Checkpoint 1 is the stage's own entry check, 2 the first module's parse,
-    /// 3 the first rule over it; the second module's parse lies past every rule
-    /// over the first, so a stop at 3 never reaches it.
-    #[test]
-    fn a_lint_stage_cancelled_mid_pass_stops_before_the_second_module() {
-        let state = synced_two_module_state("/lsp-lint-cancel-mid-pass-test");
+    /// The demand of a two-module state whose every user text carries an
+    /// unused import, so an uncancelled lint pass reports a finding in each.
+    fn linted_demand(dir: &str) -> (super::Demanded, BTreeMap<Vec<String>, Url>, State) {
+        let state = synced_two_module_state(dir);
         let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
-        let (demanded, uri_of) = demanded_of(&state, &lint);
+        let (mut demanded, uri_of) = demanded_of(&state, &lint);
         assert_eq!(demanded.user_texts.len(), 2, "two user modules to lint");
-        let probe = FiresOnPoll {
-            fire_at: 3,
+        for text in demanded.user_texts.values_mut() {
+            *text = text.replacen("\n\n", "\n\nimport Unused\n\n", 1);
+        }
+        (demanded, uri_of, state)
+    }
+
+    /// Whether `batch` carries any lint finding.
+    fn has_lint_finding(batch: &[(Url, Vec<lsp_types::Diagnostic>)]) -> bool {
+        batch
+            .iter()
+            .flat_map(|(_, diags)| diags)
+            .any(|d| d.source.as_deref() == Some("ipe-lint"))
+    }
+
+    /// A lint stage whose probe fires at any checkpoint stops there and
+    /// publishes no lint finding, even past the last per-module rule, when
+    /// every module's findings were already gathered.
+    ///
+    /// Checkpoint 1 is the stage's own entry check and 2 the first module's
+    /// parse, so a stop at 3 never reaches the second module's parse. The
+    /// uncancelled control pass proves the fixture does report lint findings,
+    /// so the absence asserted on each cancelled pass is not vacuous.
+    #[test]
+    fn a_lint_stage_cancelled_at_any_checkpoint_publishes_no_lint_finding() {
+        let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
+        let (demanded, uri_of, state) = linted_demand("/lsp-lint-cancel-control-test");
+        let counter = FiresOnPoll {
+            fire_at: usize::MAX,
             polls: std::cell::Cell::new(0),
         };
-        let batch = super::lint_stage(demanded, &uri_of, state.encoding, &probe, &lint);
-        assert_eq!(
-            probe.polls.get(),
-            3,
-            "the stage must stop at the checkpoint that fired"
-        );
+        let complete = super::lint_stage(demanded, &uri_of, state.encoding, &counter, &lint);
         assert!(
-            batch
-                .iter()
-                .flat_map(|(_, diags)| diags)
-                .all(|d| d.source.as_deref() != Some("ipe-lint")),
-            "a cancelled lint pass must publish no lint finding"
+            has_lint_finding(&complete),
+            "the uncancelled pass reports the injected unused imports"
         );
+        let checkpoints = counter.polls.get();
+        assert!(checkpoints > 3, "the pass polls past the second parse");
+
+        for fire_at in [3, checkpoints] {
+            let (demanded, uri_of, state) = linted_demand("/lsp-lint-cancel-mid-pass-test");
+            let probe = FiresOnPoll {
+                fire_at,
+                polls: std::cell::Cell::new(0),
+            };
+            let batch = super::lint_stage(demanded, &uri_of, state.encoding, &probe, &lint);
+            assert_eq!(
+                probe.polls.get(),
+                fire_at,
+                "the stage must stop at the checkpoint that fired"
+            );
+            assert!(
+                !has_lint_finding(&batch),
+                "a lint pass cancelled at checkpoint {fire_at} must publish no lint finding"
+            );
+        }
     }
 
     /// The demand stage's output for `state`, with each user module's URI.

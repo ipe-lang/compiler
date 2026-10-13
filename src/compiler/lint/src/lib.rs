@@ -83,9 +83,9 @@ impl LintReport {
 /// report and its golden are stable regardless of module or rule evaluation
 /// order.
 ///
-/// `probe` is polled before each module is parsed, before each rule, and before
-/// the cross-module pass, so a superseded run stops within one rule over one
-/// module.
+/// `probe` is polled before each module is parsed, before each rule over each
+/// module, and before each module the cross-module pass aggregates, so a
+/// superseded run stops within one rule over one module.
 ///
 /// # Errors
 ///
@@ -183,7 +183,6 @@ pub fn run<P: CancelProbe>(
     }
 
     // ── Cross-module pass ──────────────────────────────────────────────────
-    probe.poll()?;
     // Build a slice of Ctx references valid for this function's lifetime.
     let ctxs: Vec<rules::Ctx<'_>> = parsed_modules
         .iter()
@@ -196,7 +195,7 @@ pub fn run<P: CancelProbe>(
         .collect();
     let ctx_refs: Vec<&rules::Ctx<'_>> = ctxs.iter().collect();
 
-    for raw in rules::run_cross_module(&ctx_refs) {
+    for raw in rules::run_cross_module(&ctx_refs, probe)? {
         let severity = config.severity_of(raw.rule);
         if severity == Severity::Allow {
             continue;
@@ -2250,14 +2249,15 @@ mod tests {
     }
 
     /// Every checkpoint a two-module run passes: per module, one before its
-    /// parse and one before each rule; then one before the cross-module pass.
+    /// parse and one before each rule; then one per module the cross-module
+    /// pass aggregates.
     const fn checkpoints_of_two_modules() -> usize {
-        2 * (1 + rules::PER_MODULE_RULES.len()) + 1
+        2 * (1 + rules::PER_MODULE_RULES.len()) + 2
     }
 
     /// The probe is polled before each module's parse, before every rule over
-    /// it, and before the cross-module pass, so a superseded run stops within
-    /// one rule over one module.
+    /// it, and before each module the cross-module pass aggregates, so a
+    /// superseded run stops within one rule over one module.
     #[test]
     fn the_probe_is_polled_before_every_rule_over_every_module() {
         let probe = FiresOnPoll::new(usize::MAX);

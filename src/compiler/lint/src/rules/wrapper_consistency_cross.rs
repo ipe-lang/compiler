@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::sig_delta::ShapeDelta;
 
+use crate::cancel::CancelProbe;
 use crate::finding::{Finding, SigFix};
 use crate::rules::{self, Ctx};
 
@@ -41,11 +42,23 @@ fn is_primitive(name: &str) -> bool {
 }
 
 /// Check `wrapper-consistency-cross` across all modules.
-pub fn check_cross<'a>(ctxs: &[&'a Ctx<'a>]) -> Vec<Finding> {
+///
+/// `probe` is polled before each module's contribution is aggregated, so a
+/// superseded run stops within one module of this pass too.
+///
+/// # Errors
+///
+/// Returns the probe's `Cancelled` value once it fires; no partial finding set
+/// is returned.
+pub fn check_cross<'a, P: CancelProbe>(
+    ctxs: &[&'a Ctx<'a>],
+    probe: &P,
+) -> Result<Vec<Finding>, P::Cancelled> {
     // First pass: aggregate per-param-name usage across all modules.
     let mut by_param: BTreeMap<&'a str, CrossUsage<'a>> = BTreeMap::new();
 
     for ctx in ctxs {
+        probe.poll()?;
         // Track which param names this module wraps, to count module-level
         // wrap contributions correctly.
         let mut wrapped_in_this_module: BTreeSet<&str> = BTreeSet::new();
@@ -124,7 +137,7 @@ pub fn check_cross<'a>(ctxs: &[&'a Ctx<'a>]) -> Vec<Finding> {
             ));
         }
     }
-    findings
+    Ok(findings)
 }
 
 fn nth_param_name<'a>(
