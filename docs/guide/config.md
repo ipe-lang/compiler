@@ -94,6 +94,31 @@ not a panic, malformed config cannot make the program fall over — the
 
 [principles]: ../../PRINCIPLES.md
 
+## The YAML subset
+
+`decodeYaml` (and `loadFromFile` on a `.yaml`/`.yml` file) reads a strict,
+predictable subset of YAML, so a config value means one thing everywhere:
+
+- **One document.** A second `---` document is refused.
+- **YAML 1.2 core booleans only.** `true` and `false`, in any letter case, are
+  booleans; `yes`, `no`, `on`, `off`, `y`, and `n` stay strings.
+- **No duplicate keys and no merge keys.** A mapping that repeats a key, or uses
+  `<<` to merge another mapping in, is refused rather than silently resolved.
+- **Core tags only.** `!!str`, `!!int`, and the other core-schema tags work;
+  `!include`, local tags such as `!secret`, and any other tag are refused. No file
+  is ever read and no environment variable is ever expanded from inside a
+  document.
+- **Finite numbers only.** `.nan` and `.inf` are refused. A plain leading-zero
+  number such as `012` decodes as the number 12; quote it (`"012"`) to keep the
+  string.
+- **Bounded.** Nesting is at most 128 deep, and anchors and aliases are replayed
+  under a fixed budget. A source past one of these ceilings, or past
+  `IPE_YAML_MAX_BYTES`, is an `Err` of kind `LimitExceeded`.
+
+A refused document is an `Err` that names the class of the problem and its line
+and column, never the document's own text, so a secret in a malformed config
+does not leak into an error message or a log.
+
 ## Configuration
 
 Two env vars cap the size of config files the runtime will parse.
@@ -102,7 +127,7 @@ Use `ipe doc <VAR>` for the full entry.
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `IPE_CONFIG_MAX_BYTES` | 16777216 (16 MiB) | Maximum size of any config file loaded via `Config.load*`. |
-| `IPE_YAML_MAX_BYTES` | 16777216 (16 MiB) | Separate ceiling for YAML sources (`Config.loadYaml`). |
+| `IPE_YAML_MAX_BYTES` | 4194304 (4 MiB) | Separate ceiling for YAML sources (`Config.decodeYaml`, and a `.yaml`/`.yml` file read by `Config.loadFromFile`). |
 
 See the [**Config** subsystem](../reference/env.md#config) in the
 environment variable reference.

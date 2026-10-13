@@ -122,12 +122,9 @@ pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
-    // Defence-in-depth against YAML "billion laughs" / anchor-alias bombs:
-    //   1. Bound the SOURCE size so a huge input can't be parsed at all (this is
-    //      the cheap, behaviour-preserving guard the audit asks for).
-    //   2. serde_yaml 0.9 itself bounds alias/anchor EXPANSION — a recursive
-    //      anchor bomb trips its built-in "repetition limit exceeded" (verified),
-    //      so a small-but-exponential input cannot expand without bound.
+    // Two bounds, in order: the source byte cap refuses a huge input before any
+    // parse, then `yaml_options`' finite budget bounds what a small input can
+    // expand into (aliases, events, nodes, depth, documents).
     let cap: usize = match YAML_SOURCE_CEILING.read() {
         Ok(cap) => cap,
         Err(refusal) => return IpeResult::Err(str_err(&format!("yaml parse: {refusal}"))),
@@ -142,10 +139,272 @@ pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
             .into_error(),
         );
     }
-    run_decoder(
-        serde_yaml::from_str(&s).map_err(|e| format!("yaml parse: {}", e)),
-        decoder,
-    )
+    match yaml_to_value(&s, yaml_options()) {
+        Ok(value) => (decoder.run)(&value),
+        Err(refusal) => IpeResult::Err(refusal.into_error()),
+    }
+}
+
+/// Deepest container nesting a YAML source may reach.
+const YAML_MAX_DEPTH: usize = 128;
+
+/// Most times one anchor may be replayed through its aliases.
+const YAML_MAX_EXPANSIONS_PER_ANCHOR: usize = 10_000;
+
+/// The one parser configuration every YAML source is read under.
+///
+/// Every budget is finite. YAML 1.1 booleans (`yes`, `on`, `y`) stay strings,
+/// tags outside the core schema refuse, duplicate and merge keys refuse, a
+/// non-finite float refuses, and an error never carries an input snippet. The
+/// source byte cap (`IPE_YAML_MAX_BYTES`, 4 MiB) is below the 64 MiB scalar-byte
+/// budget, so the cap always fires first on a large scalar.
+fn yaml_options() -> serde_saphyr::Options {
+    let mut budget = serde_saphyr::Budget::default();
+    budget.max_depth = YAML_MAX_DEPTH;
+    budget.max_documents = 1;
+    let mut options = serde_saphyr::Options::default();
+    options.budget = Some(budget);
+    options.alias_limits.max_alias_expansions_per_anchor = YAML_MAX_EXPANSIONS_PER_ANCHOR;
+    options.strict_booleans = true;
+    options.reject_unsupported_tags = true;
+    options.with_snippet = false;
+    options.emit_comments = false;
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
+    options.merge_keys = serde_saphyr::MergeKeyPolicy::Error;
+    options.legacy_octal_numbers = false;
+    options.reject_non_finite_typeless_float = true;
+    options
+}
+
+/// Parse a YAML source into a JSON value under `options`.
+fn yaml_to_value(source: &str, options: serde_saphyr::Options) -> Result<JsonVal, YamlRefusal> {
+    serde_saphyr::from_str_with_options::<JsonVal>(source, options)
+        .map_err(|error| classify_yaml_error(&error))
+}
+
+/// Why a YAML source was refused, and where.
+///
+/// Rendered from these fields alone: the parser's own text, which can quote the
+/// input, never crosses the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct YamlRefusal {
+    kind: YamlRefusalKind,
+    at: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YamlRefusalKind {
+    Limit(YamlLimit),
+    Syntax,
+    MultipleDocuments,
+    DuplicateKey,
+    MergeKey,
+    UnsupportedTag,
+    NonFiniteFloat,
+    Other,
+}
+
+/// The parser ceiling a source ran past.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum YamlLimit {
+    Depth,
+    Events,
+    Aliases,
+    Anchors,
+    Nodes,
+    ScalarBytes,
+    CommentBytes,
+    MergeKeys,
+    AliasRatio,
+    InclusionDepth,
+    InputBytes,
+    AnchorEvents,
+    AnchorBytes,
+    PropertyDepth,
+    PropertyWork,
+    AliasReplay,
+    AliasExpansions,
+    AliasReplayDepth,
+}
+
+impl YamlLimit {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Depth => "nesting depth",
+            Self::Events => "event count",
+            Self::Aliases => "alias count",
+            Self::Anchors => "anchor count",
+            Self::Nodes => "node count",
+            Self::ScalarBytes => "scalar byte",
+            Self::CommentBytes => "comment byte",
+            Self::MergeKeys => "merge key count",
+            Self::AliasRatio => "alias-to-anchor ratio",
+            Self::InclusionDepth => "inclusion depth",
+            Self::InputBytes => "input byte",
+            Self::AnchorEvents => "anchor event",
+            Self::AnchorBytes => "anchor byte",
+            Self::PropertyDepth => "property expansion depth",
+            Self::PropertyWork => "property interpolation",
+            Self::AliasReplay => "alias replay",
+            Self::AliasExpansions => "alias expansion",
+            Self::AliasReplayDepth => "alias replay depth",
+        }
+    }
+}
+
+impl YamlRefusalKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Limit(limit) => limit.label(),
+            Self::Syntax => "syntax error",
+            Self::MultipleDocuments => "more than one document",
+            Self::DuplicateKey => "duplicate mapping key",
+            Self::MergeKey => "merge key not supported",
+            Self::UnsupportedTag => "unsupported tag",
+            Self::NonFiniteFloat => "non-finite float",
+            Self::Other => "unsupported content",
+        }
+    }
+}
+
+impl YamlRefusal {
+    fn message(self) -> String {
+        let what = match self.kind {
+            YamlRefusalKind::Limit(limit) => format!("{} limit exceeded", limit.label()),
+            other => other.label().to_owned(),
+        };
+        self.at.map_or_else(
+            || format!("yaml: {what}"),
+            |(line, column)| format!("yaml: {what} at line {line}, column {column}"),
+        )
+    }
+
+    /// A ceiling breach is `LimitExceeded`; every other refusal is a decode error.
+    fn into_error<E: From<String> + FromLimitExceeded>(self) -> E {
+        match self.kind {
+            YamlRefusalKind::Limit(_) => LimitRefusal::new(self.message()).into_error(),
+            YamlRefusalKind::Syntax
+            | YamlRefusalKind::MultipleDocuments
+            | YamlRefusalKind::DuplicateKey
+            | YamlRefusalKind::MergeKey
+            | YamlRefusalKind::UnsupportedTag
+            | YamlRefusalKind::NonFiniteFloat
+            | YamlRefusalKind::Other => str_err(&self.message()),
+        }
+    }
+}
+
+fn classify_budget_breach(breach: &serde_saphyr::budget::BudgetBreach) -> YamlRefusalKind {
+    use serde_saphyr::budget::BudgetBreach as B;
+    let limit = match breach {
+        B::Depth { .. } => YamlLimit::Depth,
+        B::Events { .. } => YamlLimit::Events,
+        B::Aliases { .. } => YamlLimit::Aliases,
+        B::Anchors { .. } => YamlLimit::Anchors,
+        B::Nodes { .. } => YamlLimit::Nodes,
+        B::ScalarBytes { .. } => YamlLimit::ScalarBytes,
+        B::CommentBytes { .. } => YamlLimit::CommentBytes,
+        B::MergeKeys { .. } => YamlLimit::MergeKeys,
+        B::AliasAnchorRatio { .. } => YamlLimit::AliasRatio,
+        B::InclusionDepth { .. } => YamlLimit::InclusionDepth,
+        B::InputBytes { .. } => YamlLimit::InputBytes,
+        B::RecordedAnchorEvents { .. } => YamlLimit::AnchorEvents,
+        B::RecordedAnchorBytes { .. } => YamlLimit::AnchorBytes,
+        B::PropertyExpansionDepth { .. } => YamlLimit::PropertyDepth,
+        B::PropertyInterpolationWork { .. } => YamlLimit::PropertyWork,
+        // The one-document budget is how a second document is refused.
+        B::Documents { .. } => return YamlRefusalKind::MultipleDocuments,
+        B::SequenceUnbalanced => return YamlRefusalKind::Syntax,
+        // non_exhaustive foreign enum: unknown variants refuse as Other
+        _ => return YamlRefusalKind::Other,
+    };
+    YamlRefusalKind::Limit(limit)
+}
+
+/// Map a parser error to its refusal by variant, never by its text.
+#[allow(clippy::match_same_arms)] // known variants named for review; the wildcard is for future ones
+fn classify_yaml_error(error: &serde_saphyr::Error) -> YamlRefusal {
+    use serde_saphyr::Error as Y;
+    let error = error.without_snippet();
+    let kind = match error {
+        Y::Budget { breach, .. } => classify_budget_breach(breach),
+        Y::AliasReplayCounterOverflow { .. } | Y::AliasReplayLimitExceeded { .. } => {
+            YamlRefusalKind::Limit(YamlLimit::AliasReplay)
+        }
+        Y::AliasExpansionLimitExceeded { .. } => YamlRefusalKind::Limit(YamlLimit::AliasExpansions),
+        Y::AliasReplayStackDepthExceeded { .. } => {
+            YamlRefusalKind::Limit(YamlLimit::AliasReplayDepth)
+        }
+        Y::ExternalMessage { .. }
+        | Y::Eof { .. }
+        | Y::Unexpected { .. }
+        | Y::UnexpectedSequenceEnd { .. }
+        | Y::UnexpectedMappingEnd { .. }
+        | Y::UnexpectedContainerEndWhileSkippingNode { .. }
+        | Y::UnexpectedContainerEndWhileReadingKeyNode { .. }
+        | Y::ContainerEndMismatch { .. }
+        | Y::FoldedBlockScalarMustIndentContent { .. }
+        | Y::IndentationError { .. }
+        | Y::QuotingRequired { .. }
+        | Y::UnknownAnchor { .. }
+        | Y::AliasError { .. }
+        | Y::InvalidUtf8Input => YamlRefusalKind::Syntax,
+        Y::MultipleDocuments { .. } => YamlRefusalKind::MultipleDocuments,
+        Y::DuplicateMappingKey { .. } => YamlRefusalKind::DuplicateKey,
+        Y::MergeKeyNotAllowed { .. } | Y::MergeValueNotMapOrSeqOfMaps { .. } => {
+            YamlRefusalKind::MergeKey
+        }
+        Y::UnsupportedTag { .. }
+        | Y::TaggedScalarCannotDeserializeIntoString { .. }
+        | Y::CyclicInclude { .. }
+        | Y::UnsupportedIncludeForm { .. }
+        | Y::ResolverError { .. } => YamlRefusalKind::UnsupportedTag,
+        Y::NonFiniteFloat { .. } => YamlRefusalKind::NonFiniteFloat,
+        Y::Message { .. }
+        | Y::InvalidOptions { .. }
+        | Y::InvalidBinaryBase64 { .. }
+        | Y::BinaryNotUtf8 { .. }
+        | Y::InvalidBooleanStrict { .. }
+        | Y::InvalidCharNull { .. }
+        | Y::InvalidCharNotSingleScalar { .. }
+        | Y::NullIntoString { .. }
+        | Y::BytesNotSupportedMissingBinaryTag { .. }
+        | Y::UnexpectedValueForUnit { .. }
+        | Y::ExpectedEmptyMappingForUnitStruct { .. }
+        | Y::InternalSeedReusedForMapKey { .. }
+        | Y::ValueRequestedBeforeKey { .. }
+        | Y::ExpectedStringKeyForExternallyTaggedEnum { .. }
+        | Y::ExternallyTaggedEnumExpectedScalarOrMapping { .. }
+        | Y::UnexpectedValueForUnitEnumVariant { .. }
+        | Y::InternalDepthUnderflow { .. }
+        | Y::InternalRecursionStackEmpty { .. }
+        | Y::RecursiveReferencesRequireWeakTypes { .. }
+        | Y::InvalidScalar { .. }
+        | Y::SerdeInvalidType { .. }
+        | Y::SerdeInvalidValue { .. }
+        | Y::SerdeUnknownVariant { .. }
+        | Y::SerdeUnknownField { .. }
+        | Y::SerdeMissingField { .. }
+        | Y::TaggedEnumMismatch { .. }
+        | Y::SerdeVariantId { .. }
+        | Y::ExpectedMappingEndAfterEnumVariantValue { .. }
+        | Y::HookError { .. }
+        | Y::UnresolvedProperty { .. }
+        | Y::InvalidPropertyName { .. }
+        | Y::PropertyRequiredButUnset { .. }
+        | Y::PropertyRequiredButEmpty { .. }
+        | Y::IOError { .. }
+        | Y::CannotBorrowTransformedString { .. }
+        | Y::WithSnippet { .. } => YamlRefusalKind::Other,
+        // non_exhaustive foreign enum: unknown variants refuse as Other
+        _ => YamlRefusalKind::Other,
+    };
+    YamlRefusal {
+        kind,
+        at: error
+            .location()
+            .map(|location| (location.line(), location.column())),
+    }
 }
 
 // ── shared blocking-pool helper ───────────────────────────────────────
@@ -155,7 +414,7 @@ pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
 // Offload it to tokio's blocking pool so a large/slow-filesystem config read
 // can't stall the tokio worker thread polling this future. This module is
 // gated on the `config` Cargo feature (`config = ["json", "toml",
-// "serde_yaml"]`, runtime/Cargo.toml), which does NOT pull in `tokio`, so
+// "dep:serde-saphyr"]`, runtime/Cargo.toml), which does NOT pull in `tokio`, so
 // `tokio` is not guaranteed present here (see
 // `docs/adr/0003-security-render-and-data-access-invariants.md` §2.2).
 // The offload is `threads::join_blocking`: a pool that cannot start a thread is
@@ -449,6 +708,20 @@ mod yaml_tests {
         }
     }
 
+    /// The refusal class of `src` under the pinned options, or `None` when it parsed.
+    fn kind(src: &str) -> Option<YamlRefusalKind> {
+        yaml_to_value(src, yaml_options())
+            .err()
+            .map(|refusal| refusal.kind)
+    }
+
+    /// The pinned options with one setting changed, for the accepting controls.
+    fn lifted(change: impl FnOnce(&mut serde_saphyr::Options)) -> serde_saphyr::Options {
+        let mut options = yaml_options();
+        change(&mut options);
+        options
+    }
+
     fn field(src: &str) -> JsonVal {
         let decoded = yaml(src);
         assert!(
@@ -480,10 +753,24 @@ mod yaml_tests {
     fn alias_bomb(levels: usize) -> String {
         let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
         let mut src = String::from("a: &a [x, x, x, x, x, x, x, x, x]\n");
-        for pair in names.windows(2).take(levels.saturating_sub(1)) {
-            let (prev, next) = (pair[0], pair[1]);
-            let items = vec![format!("*{prev}"); 9].join(", ");
+        for (prev, next) in names
+            .iter()
+            .zip(names.iter().skip(1))
+            .take(levels.saturating_sub(1))
+        {
+            let items = std::iter::repeat_n(format!("*{prev}"), 9)
+                .collect::<Vec<_>>()
+                .join(", ");
             src.push_str(&format!("{next}: &{next} [{items}]\n"));
+        }
+        src
+    }
+
+    /// `count` distinct anchors, one per sequence item.
+    fn anchors(count: usize) -> String {
+        let mut src = String::new();
+        for n in 0..count {
+            src.push_str(&format!("- &a{n} 1\n"));
         }
         src
     }
@@ -509,9 +796,11 @@ mod yaml_tests {
         }
     }
 
+    /// Core booleans match in any letter case.
     #[test]
-    fn mixed_case_bool() {
-        assert_eq!(field("a: tRuE"), json!("tRuE"));
+    fn mixed_case_bool_decodes() {
+        assert_eq!(field("a: tRuE"), json!(true));
+        assert_eq!(field("a: \"tRuE\""), json!("tRuE"));
     }
 
     #[test]
@@ -521,9 +810,11 @@ mod yaml_tests {
         }
     }
 
+    /// A plain leading-zero number is a number; quoting keeps the string.
     #[test]
-    fn leading_zero_is_string() {
-        assert_eq!(field("a: 012"), json!("012"));
+    fn leading_zero_decodes_as_number() {
+        assert_eq!(field("a: 012").as_f64(), Some(12.0));
+        assert_eq!(field("a: \"012\""), json!("012"));
     }
 
     #[test]
@@ -534,39 +825,70 @@ mod yaml_tests {
     }
 
     #[test]
-    fn non_finite_floats_decode_as_null() {
+    fn non_finite_float_refused() {
         for word in [".nan", ".inf", "-.inf"] {
-            assert_eq!(field(&format!("a: {word}")), JsonVal::Null, "{word}");
+            assert_eq!(
+                kind(&format!("a: {word}")),
+                Some(YamlRefusalKind::NonFiniteFloat),
+                "{word}"
+            );
         }
+        assert_eq!(field("a: 1.5"), json!(1.5));
     }
 
     #[test]
-    fn duplicate_key_last_wins() {
-        assert_eq!(yaml("a: 1\na: 2"), IpeResult::Ok(json!({"a": 2})));
+    fn duplicate_key_refused() {
+        assert_eq!(kind("a: 1\na: 2"), Some(YamlRefusalKind::DuplicateKey));
+        let last_wins = lifted(|options| {
+            options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::LastWins;
+        });
+        assert_eq!(yaml_to_value("a: 1\na: 2", last_wins), Ok(json!({"a": 2})));
     }
 
     #[test]
-    fn merge_key_is_a_literal_key() {
+    fn merge_key_refused() {
+        let src = "base: &b {x: 1}\nm: {<<: *b}";
+        assert_eq!(kind(src), Some(YamlRefusalKind::MergeKey));
+        let ordinary = lifted(|options| {
+            options.merge_keys = serde_saphyr::MergeKeyPolicy::AsOrdinary;
+        });
         assert_eq!(
-            yaml("base: &b {x: 1}\nm: {<<: *b}"),
-            IpeResult::Ok(json!({"base": {"x": 1}, "m": {"<<": {"x": 1}}}))
+            yaml_to_value(src, ordinary),
+            Ok(json!({"base": {"x": 1}, "m": {"<<": {"x": 1}}}))
         );
     }
 
     #[test]
     fn multi_document_refused() {
-        assert!(refusal("--- a\n--- b").is_some());
+        assert_eq!(
+            kind("--- a\n--- b"),
+            Some(YamlRefusalKind::MultipleDocuments)
+        );
         assert_eq!(yaml("--- a"), IpeResult::Ok(json!("a")));
     }
 
     #[test]
     fn local_tag_refused() {
-        assert!(refusal("a: !foo x").is_some());
+        assert_eq!(kind("a: !foo x"), Some(YamlRefusalKind::UnsupportedTag));
+        let permissive = lifted(|options| options.reject_unsupported_tags = false);
+        assert_eq!(
+            yaml_to_value("a: !foo x", permissive),
+            Ok(json!({"a": "x"}))
+        );
     }
 
+    /// An include tag refuses without reading the file or naming it.
     #[test]
     fn include_tag_refused() {
-        assert!(refusal("a: !include /etc/passwd").is_some());
+        let src = "a: !include /etc/passwd";
+        assert_eq!(kind(src), Some(YamlRefusalKind::UnsupportedTag));
+        let refused = refusal(src);
+        assert!(refused.is_some(), "{src:?} must refuse");
+        let Some((_, message)) = refused else {
+            return;
+        };
+        assert!(!message.contains("/etc/passwd"), "{message}");
+        assert!(!message.contains("root:"), "{message}");
     }
 
     #[test]
@@ -588,25 +910,128 @@ mod yaml_tests {
     }
 
     #[test]
-    fn alias_bomb_refused() {
-        assert!(refusal(&alias_bomb(9)).is_some());
+    fn alias_bomb_is_limit_refusal() {
+        assert!(
+            matches!(kind(&alias_bomb(9)), Some(YamlRefusalKind::Limit(_))),
+            "a nine-level alias bomb must hit a parser ceiling"
+        );
+        assert!(matches!(
+            refusal(&alias_bomb(9)),
+            Some((crate::IpeErrorKind::LimitExceeded, _))
+        ));
         assert!(matches!(yaml(&alias_bomb(2)), IpeResult::Ok(_)));
     }
 
     #[test]
     fn depth_at_ceiling_accepted() {
-        assert!(matches!(yaml(&nested_flow(128)), IpeResult::Ok(_)));
-        assert!(matches!(yaml(&nested_block(128)), IpeResult::Ok(_)));
+        assert!(matches!(
+            yaml(&nested_flow(YAML_MAX_DEPTH)),
+            IpeResult::Ok(_)
+        ));
+        assert!(matches!(
+            yaml(&nested_block(YAML_MAX_DEPTH)),
+            IpeResult::Ok(_)
+        ));
     }
 
     #[test]
-    fn depth_ceiling_plus_one_refused() {
-        assert!(refusal(&nested_flow(129)).is_some());
-        assert!(refusal(&nested_block(129)).is_some());
+    fn depth_ceiling_plus_one_is_limit_refusal() {
+        let past = YAML_MAX_DEPTH + 1;
+        for src in [nested_flow(past), nested_block(past)] {
+            assert_eq!(kind(&src), Some(YamlRefusalKind::Limit(YamlLimit::Depth)));
+            assert!(matches!(
+                refusal(&src),
+                Some((crate::IpeErrorKind::LimitExceeded, _))
+            ));
+            let deeper = lifted(|options| {
+                let mut budget = serde_saphyr::Budget::default();
+                budget.max_depth = 2 * YAML_MAX_DEPTH;
+                budget.max_documents = 1;
+                options.budget = Some(budget);
+            });
+            assert!(yaml_to_value(&src, deeper).is_ok());
+        }
     }
 
     #[test]
-    fn syntax_error_refused() {
-        assert!(refusal("a: [1,").is_some());
+    fn anchor_count_is_limit_refusal() {
+        assert!(yaml_to_value(&anchors(50_000), yaml_options()).is_ok());
+        assert_eq!(
+            kind(&anchors(50_001)),
+            Some(YamlRefusalKind::Limit(YamlLimit::Anchors))
+        );
+    }
+
+    /// A syntax error renders only its class and position, never the source text.
+    #[test]
+    fn syntax_error_message_closed() {
+        let src = "zq: [17,";
+        let refused = yaml_to_value(src, yaml_options());
+        assert!(
+            matches!(
+                refused,
+                Err(YamlRefusal {
+                    kind: YamlRefusalKind::Syntax,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        let Err(syntax) = refused else {
+            return;
+        };
+        let expected = syntax.at.map_or_else(
+            || "yaml: syntax error".to_owned(),
+            |(line, column)| format!("yaml: syntax error at line {line}, column {column}"),
+        );
+        assert_eq!(syntax.message(), expected);
+        assert!(!expected.contains("zq"), "{expected}");
+        assert!(!expected.contains("17"), "{expected}");
+        assert_eq!(
+            refusal(src),
+            Some((crate::IpeErrorKind::Unexpected, expected))
+        );
+    }
+
+    #[test]
+    fn error_never_echoes_input() {
+        for src in [
+            "password: \"hunter2",
+            "password: hunter2\npassword: hunter2",
+        ] {
+            let refused = refusal(src);
+            assert!(refused.is_some(), "{src:?} must refuse");
+            let Some((_, message)) = refused else {
+                return;
+            };
+            assert!(!message.contains("hunter2"), "{message}");
+            assert!(!message.contains("password"), "{message}");
+        }
+    }
+
+    #[test]
+    fn yaml_options_are_pinned() {
+        let options = yaml_options();
+        assert!(options.strict_booleans);
+        assert!(options.reject_unsupported_tags);
+        assert!(!options.with_snippet);
+        assert!(!options.emit_comments);
+        assert!(!options.legacy_octal_numbers);
+        assert!(options.reject_non_finite_typeless_float);
+        assert!(matches!(
+            options.duplicate_keys,
+            serde_saphyr::DuplicateKeyPolicy::Error
+        ));
+        assert!(matches!(
+            options.merge_keys,
+            serde_saphyr::MergeKeyPolicy::Error
+        ));
+        assert_eq!(
+            options.alias_limits.max_alias_expansions_per_anchor,
+            YAML_MAX_EXPANSIONS_PER_ANCHOR
+        );
+        let budget = options.budget.as_ref();
+        assert_eq!(budget.map(|b| b.max_depth), Some(YAML_MAX_DEPTH));
+        assert_eq!(budget.map(|b| b.max_documents), Some(1));
     }
 }

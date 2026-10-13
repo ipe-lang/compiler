@@ -117,7 +117,7 @@ pub struct Module {
     /// Set by `ipe_lower` when any call site resolves to a
     /// `KernelFn::is_config()` variant. The backend reads this flag to decide
     /// whether to declare `pub mod config_decode; pub use config_decode::*;` in
-    /// the emitted `ipe_runtime/mod.rs` and add the `toml` + `serde_yaml`
+    /// the emitted `ipe_runtime/mod.rs` and add the TOML and YAML parser
     /// dependencies. The JSON-backed `Config.*` combinators (`string` / `field`
     /// / `map` / …) emit into the `json` module and do NOT set this
     /// flag, so a JSON-only program pulls neither crate.

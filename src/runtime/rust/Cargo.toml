@@ -39,7 +39,7 @@ flate2 = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true }
 csv = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }
-serde_yaml = { version = "0.9", optional = true }
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"], optional = true }
 axum = { version = "0.7", features = ["ws"], optional = true }
 tower-http = { version = "0.5", features = ["fs", "catch-panic", "timeout"], optional = true }
 # `tower` (limit + util) backs the server front-door DoS ceilings:
@@ -463,7 +463,7 @@ web-core = ["dep:serde_json", "json", "serde", "dep:serde_urlencoded", "encoding
 # must also enable `random` or the module is absent (same invariant as `async`).
 # The no-server floor is machine-checked by `tests/webview_dep_floor.rs`.
 webview = ["wry", "tao", "web-core", "tokio", "random"]
-config = ["json", "toml", "serde_yaml"]
+config = ["json", "toml", "dep:serde-saphyr"]
 # `tokio/net`+`tokio/sync`: axum binds a listener (`tokio::net`) and the
 # server/live loop uses `tokio::sync`.
 # `crypto-core`: `server.rs` constant-time compares session ids via `subtle`.
