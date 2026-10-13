@@ -4,7 +4,8 @@
 //! skips nothing and drops nothing: every entry is listed, descended into, or
 //! refused with a typed [`WalkError`]. A missing root, an entry that cannot be
 //! read, a symlinked directory (not followed, so its contents cannot be
-//! vouched for), and a tree past [`EntryCeiling`] or [`DirDepth`] are each a
+//! vouched for), a wanted name that is not a regular file (a FIFO or device a
+//! read would block on), and a tree past [`EntryCeiling`] or [`DirDepth`] are each a
 //! refusal, never a shorter list. The walk is iterative, so its depth costs no
 //! stack, and it counts entries as it reads them, so no directory listing is
 //! held past the ceiling.
@@ -80,16 +81,22 @@ pub enum Want {
     RustFiles,
     /// Every `.rs` file and every `Cargo.toml`.
     RustAndManifests,
+    /// Every `.rs` file and every `.sh` or `.bash` script.
+    RustAndShellScripts,
 }
 
 impl Want {
     /// Whether a file at `path` is one this walk lists.
     fn admits(self, path: &Path) -> bool {
-        let rust = path.extension().is_some_and(|ext| ext == "rs");
+        let extension = path.extension();
+        let rust = extension.is_some_and(|ext| ext == "rs");
         match self {
             Self::RustFiles => rust,
             Self::RustAndManifests => {
                 rust || path.file_name().is_some_and(|name| name == MANIFEST_FILE)
+            }
+            Self::RustAndShellScripts => {
+                rust || extension.is_some_and(|ext| ext == "sh" || ext == "bash")
             }
         }
     }
@@ -107,6 +114,8 @@ pub enum WalkError {
     },
     /// A symlink to a directory, which the walk does not follow.
     SymlinkedDirectory { path: PathBuf },
+    /// A wanted name that is not a regular file once any symlink is resolved.
+    NotAFile { path: PathBuf },
     /// The tree holds more entries than the walk reads.
     TooMany {
         root: PathBuf,
@@ -124,6 +133,11 @@ impl fmt::Display for WalkError {
             Self::SymlinkedDirectory { path } => write!(
                 f,
                 "{}: symlinked directory — the walk does not follow it, so it cannot vouch for its contents",
+                path.display()
+            ),
+            Self::NotAFile { path } => write!(
+                f,
+                "{}: not a regular file — a scan cannot read it as source",
                 path.display()
             ),
             Self::TooMany { root, ceiling } => write!(
@@ -146,6 +160,7 @@ impl std::error::Error for WalkError {
             Self::Io { source, .. } => Some(source),
             Self::Missing { .. }
             | Self::SymlinkedDirectory { .. }
+            | Self::NotAFile { .. }
             | Self::TooMany { .. }
             | Self::TooDeep { .. } => None,
         }
@@ -155,14 +170,16 @@ impl std::error::Error for WalkError {
 /// Every file under `root` that `want` admits, sorted by path.
 ///
 /// A symlinked file is listed, so a scan reads its target; a symlink whose
-/// target cannot be read is refused. Sorting by path orders each directory's
+/// target cannot be read is refused, and so is a wanted name whose resolved
+/// type is not a regular file. Sorting by path orders each directory's
 /// entries by name, ahead of the entries of any later sibling.
 ///
 /// # Errors
 ///
 /// A [`WalkError`] when the root is missing, any entry cannot be read, a
-/// symlinked directory is met, or the tree is past [`EntryCeiling::CEILING`]
-/// entries or [`DirDepth::CEILING`] levels; no partial list is returned.
+/// symlinked directory or a wanted non-regular file is met, or the tree is
+/// past [`EntryCeiling::CEILING`] entries or [`DirDepth::CEILING`] levels; no
+/// partial list is returned.
 pub fn rust_sources(root: &Path, want: Want) -> Result<Vec<PathBuf>, WalkError> {
     let root_type = std::fs::symlink_metadata(root)
         .map_err(|source| {
@@ -215,10 +232,15 @@ pub fn rust_sources(root: &Path, want: Want) -> Result<Vec<PathBuf>, WalkError> 
                 }
                 pending.push((path, below));
             } else {
-                if file_type.is_symlink() {
-                    refuse_directory_target(&path)?;
-                }
+                let regular = if file_type.is_symlink() {
+                    refuse_directory_target(&path)?.is_file()
+                } else {
+                    file_type.is_file()
+                };
                 if want.admits(&path) {
+                    if !regular {
+                        return Err(WalkError::NotAFile { path });
+                    }
                     files.push(path);
                 }
             }
@@ -228,8 +250,8 @@ pub fn rust_sources(root: &Path, want: Want) -> Result<Vec<PathBuf>, WalkError> 
     Ok(files)
 }
 
-/// Refuse the symlink at `path` when its target is a directory or cannot be read.
-fn refuse_directory_target(path: &Path) -> Result<(), WalkError> {
+/// The type of the symlink target at `path`, refused when it is a directory or cannot be read.
+fn refuse_directory_target(path: &Path) -> Result<std::fs::FileType, WalkError> {
     let target = std::fs::metadata(path).map_err(|source| WalkError::Io {
         path: path.to_path_buf(),
         source,
@@ -239,6 +261,6 @@ fn refuse_directory_target(path: &Path) -> Result<(), WalkError> {
             path: path.to_path_buf(),
         })
     } else {
-        Ok(())
+        Ok(target.file_type())
     }
 }

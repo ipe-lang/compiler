@@ -51,6 +51,8 @@ fn lists_every_wanted_file_sorted_and_skips_no_directory() {
         "a/z.rs",
         "a/Cargo.toml",
         "a/notes.txt",
+        "a/build.sh",
+        "a/run.bash",
         ".hidden/h.rs",
         "target/t.rs",
         "a.rs",
@@ -70,6 +72,11 @@ fn lists_every_wanted_file_sorted_and_skips_no_directory() {
     let with_manifests = rust_sources(&root, Want::RustAndManifests).expect("walk the tree");
     assert!(with_manifests.contains(&root.join("a/Cargo.toml")));
     assert_eq!(with_manifests.len(), rust.len() + 1, "{with_manifests:?}");
+    let with_scripts = rust_sources(&root, Want::RustAndShellScripts).expect("walk the tree");
+    let mut expected_scripts = expected.clone();
+    expected_scripts.extend([root.join("a/build.sh"), root.join("a/run.bash")]);
+    expected_scripts.sort();
+    assert_eq!(with_scripts, expected_scripts);
 }
 
 #[test]
@@ -193,4 +200,39 @@ fn a_tree_past_the_entry_ceiling_is_refused() {
             if *named == root && *limit == EntryCeiling::CEILING),
         "{walked:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_wanted_name_that_is_not_a_regular_file_is_refused() {
+    let root = scratch("naf");
+    put(&root, "lib.rs");
+    // A socket stands in for any non-regular file (a FIFO, a device) a read
+    // could block on or fail.
+    let socket = root.join("s.rs");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+    let walked = rust_sources(&root, Want::RustFiles);
+    assert!(
+        matches!(&walked, Err(WalkError::NotAFile { path }) if *path == socket),
+        "{walked:?}"
+    );
+
+    // A symlink is judged by its target: one resolving to a socket is refused too.
+    let elsewhere = scratch("naf_link");
+    put(&elsewhere, "lib.rs");
+    let link = elsewhere.join("linked.rs");
+    std::os::unix::fs::symlink(&socket, &link).expect("create socket symlink");
+    let walked = rust_sources(&elsewhere, Want::RustFiles);
+    assert!(
+        matches!(&walked, Err(WalkError::NotAFile { path }) if *path == link),
+        "{walked:?}"
+    );
+
+    // An unwanted non-regular file is no source: it stays out of the list.
+    let unwanted = scratch("naf_skip");
+    put(&unwanted, "lib.rs");
+    let _other =
+        std::os::unix::net::UnixListener::bind(unwanted.join("s.sock")).expect("bind socket");
+    let listed = rust_sources(&unwanted, Want::RustFiles).expect("walk the tree");
+    assert_eq!(listed, vec![unwanted.join("lib.rs")]);
 }

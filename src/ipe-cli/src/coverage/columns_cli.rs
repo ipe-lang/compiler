@@ -15,14 +15,14 @@
 //!   flag).
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use panic_scan::{WalkError, Want, rust_sources};
+use panic_scan::{Want, rust_sources};
 
 use crate::coverage::cli_surface::CliItem;
 use crate::coverage::contract::{AspectCheck, Cell};
+use crate::coverage::source_tree::TreeRefusal;
 
 // ── documented ────────────────────────────────────────────────────────────────
 
@@ -184,29 +184,6 @@ fn item_label(item: &CliItem) -> String {
     match item {
         CliItem::Subcommand { name, .. } => (*name).to_owned(),
         CliItem::Flag { command, flag, .. } => format!("{command} {}", bare_flag_token(flag)),
-    }
-}
-
-/// Why a source tree a column scans could not be read whole.
-#[derive(Debug)]
-enum TreeRefusal {
-    /// The walker refused to list the tree.
-    Walk(WalkError),
-    /// A listed file could not be read.
-    Read {
-        file: PathBuf,
-        error: std::io::Error,
-    },
-}
-
-impl fmt::Display for TreeRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Walk(error) => write!(f, "the source tree cannot be listed whole ({error})"),
-            Self::Read { file, error } => {
-                write!(f, "source {} is unreadable ({error})", file.display())
-            }
-        }
     }
 }
 

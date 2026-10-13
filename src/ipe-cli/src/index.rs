@@ -2184,68 +2184,51 @@ mod tests {
             .unwrap_or_else(|| text.lines().count())
     }
 
-    fn collect_ssot_violations(dir: &std::path::Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_ssot_violations(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let prod = production_line_count(&text);
-                for (i, line) in text.lines().take(prod).enumerate() {
-                    let trimmed = line.trim();
-                    // Skip pure comment lines.
-                    if trimmed.starts_with("//") {
-                        continue;
-                    }
-                    if trimmed.contains("read_entry(") && trimmed.contains(".ok()") {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
-                    if trimmed.contains("let Ok(") && trimmed.contains("read_entry(") {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
+    /// The production lines of every `.rs` file under `dir` that is not a
+    /// comment, as `(path, 1-based line number, trimmed text)`. The tree is read
+    /// whole or the guardrail fails: a skipped file is an unscanned file.
+    fn production_lines(dir: &std::path::Path) -> Vec<(std::path::PathBuf, usize, String)> {
+        let files = panic_scan::rust_sources(dir, panic_scan::Want::RustFiles)
+            .expect("the guardrail lists the whole tree");
+        let mut lines = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))
+                .expect("the guardrail reads every listed file");
+            let prod = production_line_count(&text);
+            for (i, line) in text.lines().take(prod).enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.starts_with("//") {
+                    lines.push((path.clone(), i + 1, trimmed.to_owned()));
                 }
+            }
+        }
+        lines
+    }
+
+    fn collect_ssot_violations(dir: &std::path::Path, out: &mut Vec<String>) {
+        for (path, line_no, trimmed) in production_lines(dir) {
+            if trimmed.contains("read_entry(") && trimmed.contains(".ok()") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
+            }
+            if trimmed.contains("let Ok(") && trimmed.contains("read_entry(") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
             }
         }
     }
 
     fn collect_read_to_string_ok_violations(dir: &std::path::Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_read_to_string_ok_violations(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let prod = production_line_count(&text);
-                for (i, line) in text.lines().take(prod).enumerate() {
-                    let trimmed = line.trim();
-                    // Skip pure comment lines.
-                    if trimmed.starts_with("//") {
-                        continue;
-                    }
-                    // The two banned forms that produce a fail-open unsafe scan:
-                    // 1. filter_map(|…| fs::read_to_string(…).ok()) — silently
-                    //    drops unreadable modules from the security scan.
-                    // 2. read_to_string(entry).ok().into_iter() — same defect on
-                    //    the single-file fallback path.
-                    if trimmed.contains("read_to_string") && trimmed.contains("filter_map") {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
-                    if trimmed.contains("read_to_string(") && trimmed.contains(".ok().into_iter()")
-                    {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
-                }
+        for (path, line_no, trimmed) in production_lines(dir) {
+            // The two banned forms that produce a fail-open unsafe scan:
+            // 1. filter_map(|…| fs::read_to_string(…).ok()) — silently
+            //    drops unreadable modules from the security scan.
+            // 2. read_to_string(entry).ok().into_iter() — same defect on
+            //    the single-file fallback path.
+            if trimmed.contains("read_to_string") && trimmed.contains("filter_map") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
+            }
+            if trimmed.contains("read_to_string(") && trimmed.contains(".ok().into_iter()") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
             }
         }
     }
