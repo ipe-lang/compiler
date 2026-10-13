@@ -20,6 +20,11 @@
 //! | `arm_ceiling_*` | an arm expanding to 64 / 65 alternatives | 64 runs; 65 is IPE-L0116 at the arm |
 //! | `node_ceiling_*` | splits adding exactly / one past `1 << 16` nodes | at the ceiling builds; past it is IPE-L0116 |
 //! | `let_head_non_native_or` | `let ((x, _) \| (_, x)) = pair` | IPE-L0116 at the alternative; the `case` form builds |
+//! | `lambda_param_non_native_or` | `\((x, _) \| (_, x)) -> x` | IPE-L0116 at the alternative |
+//! | `def_param_non_native_or` | `first ((x, _) \| (_, x)) = x` | IPE-L0116 at the alternative |
+//! | `p8_polymorphic_tuple_or` | `( Just x, _ ) \| ( _, Just x )` over `a` | builds; prints `4,0` |
+//! | `or_under_cons_head` | `(1 \| 2) :: _ -> 1` | builds; prints `1,0` |
+//! | `alias_over_or` | `(Red \| Green) as w` | the typed by-value alias refusal at the arm |
 //!
 //! Every source is checked at `ipe` time here; under `IPE_E2E=1` the accepted
 //! ones are also built with `cargo` and run (THE SEAL).
@@ -439,9 +444,14 @@ main =
         ran.status.success(),
         "split_body_warning_once: ipe must accept the program; stderr:\n{stderr}"
     );
+    // One diagnostic frame ends in one footer line that leads with its code
+    // (the footer also names the code again in its `ipe doc` hint).
+    let footers = stderr
+        .lines()
+        .filter(|line| line.trim_start().starts_with("IPE-T0011"))
+        .count();
     assert_eq!(
-        stderr.matches("IPE-T0011").count(),
-        1,
+        footers, 1,
         "split_body_warning_once: the body's warning must print exactly once; stderr:\n{stderr}"
     );
 }
@@ -543,10 +553,12 @@ fn node_ceiling_at_limit_builds() {
 /// One node past `OR_SPLIT_NODE_CEILING` is refused.
 #[test]
 fn node_ceiling_plus_one() {
-    let span = refused_l0116("node_ceiling_plus_one", &node_ceiling_source(true));
-    assert!(
-        span.is_some(),
-        "node_ceiling_plus_one: the refusal must come from the or-pattern normal form"
+    let body = node_ceiling_source(true);
+    let span = refused_l0116("node_ceiling_plus_one", &body);
+    assert_eq!(
+        span.map(|s| s.lo),
+        Some(offset_of(&body, "( A, _, _, _, _ ) | ( B")),
+        "node_ceiling_plus_one: the refusal must sit at the split that passes the ceiling"
     );
 }
 
@@ -589,5 +601,141 @@ main =
     Io.println (String.fromInt (first ( 1, 2 )))
 ",
         "1",
+    );
+}
+
+/// A non-native or-pattern in a lambda parameter has no sibling arm to split into.
+#[test]
+fn lambda_param_non_native_or() {
+    let body = "main =
+    Io.println (String.fromInt ((\\((x, _) | (_, x)) -> x) ( 1, 2 )))
+";
+    let span = refused_l0116("lambda_param_non_native_or", body);
+    assert_eq!(
+        span.map(|s| s.lo),
+        Some(offset_of(body, "(x, _)")),
+        "lambda_param_non_native_or: the refusal must sit at the alternative"
+    );
+}
+
+/// A non-native or-pattern in a definition parameter has no sibling arm to split into.
+#[test]
+fn def_param_non_native_or() {
+    let body = "first : ( Int, Int ) -> Int
+first ((x, _) | (_, x)) =
+    x
+
+
+main =
+    Io.println (String.fromInt (first ( 1, 2 )))
+";
+    let span = refused_l0116("def_param_non_native_or", body);
+    assert_eq!(
+        span.map(|s| s.lo),
+        Some(offset_of(body, "(x, _)")),
+        "def_param_non_native_or: the refusal must sit at the alternative"
+    );
+}
+
+/// An or-of-tuples over a polymorphic element splits into arms that each pass
+/// the tuple-case gates.
+#[test]
+fn p8_polymorphic_tuple_or() {
+    accept_and_run(
+        "p8_polymorphic_tuple_or",
+        "firstJust : a -> ( Maybe a, Maybe a ) -> a
+firstJust d pair =
+    case pair of
+        ( Just x, _ ) | ( _, Just x ) ->
+            x
+
+        _ ->
+            d
+
+
+main =
+    Io.println (String.fromInt (firstJust 0 ( Nothing, Just 4 )) ++ \",\" ++ String.fromInt (firstJust 0 ( Nothing, Nothing )))
+",
+        "4,0",
+    );
+}
+
+/// An or-pattern under a cons head splits into one arm per head literal.
+#[test]
+fn or_under_cons_head() {
+    accept_and_run(
+        "or_under_cons_head",
+        "lead : List Int -> Int
+lead xs =
+    case xs of
+        (1 | 2) :: _ ->
+            1
+
+        _ ->
+            0
+
+
+main =
+    Io.println (String.fromInt (lead [ 2, 9 ]) ++ \",\" ++ String.fromInt (lead [ 3 ]))
+",
+        "1,0",
+    );
+}
+
+/// An alias over a kept-native or-pattern stays one arm and reaches the
+/// by-value alias gate, which refuses it typed (never a compiler bug).
+#[test]
+fn alias_over_or() {
+    let body = "type Color
+    = Red
+    | Green
+    | Blue
+
+
+score : Color -> Int
+score w =
+    case w of
+        Red ->
+            1
+
+        Green ->
+            2
+
+        Blue ->
+            3
+
+
+pick : Color -> Int
+pick c =
+    case c of
+        (Red | Green) as w ->
+            score w
+
+        Blue ->
+            0
+
+
+main =
+    Io.println (String.fromInt (pick Green) ++ \",\" ++ String.fromInt (pick Blue))
+";
+    let entry = write_single("alias_over_or", body);
+    let out = out_dir("alias_over_or");
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&entry, &out, &runtime);
+    let refusal = match &built {
+        Err(CliError::Pipeline { diag, .. }) => match diag.as_ref() {
+            Diagnostic::Lower {
+                span,
+                msg: LowerError::Unsupported(Feature::AliasOverRefutablePayload),
+            } => Some(span.lo),
+            _ => None,
+        },
+        Ok(()) | Err(_) => None,
+    };
+    assert_eq!(
+        refusal,
+        Some(offset_of(body, "(Red | Green) as w")),
+        "alias_over_or: the alias over a native or-pattern must be the typed by-value \
+         alias refusal at the arm; got {built:?}"
     );
 }

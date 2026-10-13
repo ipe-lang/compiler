@@ -4892,9 +4892,9 @@ mod tests {
     #[test]
     fn shared_alts_deserialize_refuses_binder() -> Result<(), serde_json::Error> {
         let mut plain = Interner::new();
-        let Ok(x) = plain.intern("x") else {
-            return Ok(());
-        };
+        let x = plain
+            .intern("x")
+            .map_err(|_| <serde_json::Error as serde::de::Error>::custom("intern x"))?;
         let interner = std::sync::Arc::new(std::sync::Mutex::new(plain));
         let _guard = ipe_intern::SerdeInternerGuard::install(std::sync::Arc::clone(&interner));
         let var = serde_json::to_string(&Pat::Var(x))?;
