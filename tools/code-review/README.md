@@ -42,18 +42,16 @@ joining a stored path outside the repo:
 
 | Variable         | Meaning                                                       |
 |------------------|---------------------------------------------------------------|
-| `IPE_INDEX_DB`   | Path or `sqlite://` URL of the `ipe-index` DB.                |
+| `IPE_INDEX_DB`   | File path of the `ipe-index` DB.                              |
 | `IPE_INDEX_ROOT` | Repo root the index's `ipe:relative` paths join to; must be an existing directory holding the indexed files, checked at startup. |
-| `IPE_REVIEW_DB`  | Optional path or `sqlite://` URL of the review DB; defaults to `review.db`. |
+| `IPE_REVIEW_DB`  | Optional file path of the review DB; defaults to `review.db`. |
 | `IPE_REVIEW_MAC_KEY` | Optional key that signs every decision: exactly 64 hex characters (32 random bytes). Unset, the server is read-only. |
 
-A relative path in any of the three locations resolves against the working directory. A
-file path containing `?`, `#` or `%` is refused — pass such a location as a
-percent-encoded `sqlite://` URL. A `sqlite://` URL must carry no `?` query and
-must name a database: the app appends the open mode itself. A `sqlite:` or
-`file:` value without `//` is refused. A refused database location is reported
-by variable name only, never by value, since a mistyped URL can carry a
-password. Each refusal states one fix.
+A relative path in any of the three locations resolves against the working
+directory. Each database value is a file path, never a URL: any byte but `:` is
+allowed in its file name, and is read literally. A refused database location is
+reported by variable name only, never by value, since a mistyped URL can carry
+a password. Each refusal states one fix.
 
 The startup probes: the index DB is opened read-only and every column a queue
 page reads from its `units`, `files` and `change_queue` tables is selected,

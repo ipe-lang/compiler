@@ -60,7 +60,7 @@ drainCursorGoneAfterMigrateIn base =
             base ++ "/review.db"
     in
     do
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        loc <- Settings.parseReviewDb dbPath
         key <- testReviewKey
         LibDb.probe key loc
         LibDb.probe key loc
@@ -337,7 +337,7 @@ probeAfterEdits dbPath edits =
     do
         db <- migratedReviewAt dbPath
         Task.sequence (List.map (\sql -> Db.exec db sql []) edits)
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        loc <- Settings.parseReviewDb dbPath
         key <- testReviewKey
         message <- probeMessage (LibDb.probe key loc)
         removeReviewFiles dbPath
@@ -1326,7 +1326,7 @@ wrongKeyRefusesStartupIn base =
         db <- migratedReviewAt dbPath
         appendSigned db (rawRow "bound-1" "h" "approve" Nothing)
         bound <- rawKeyCheck db
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        loc <- Settings.parseReviewDb dbPath
         other <- otherMacKey
         refused <- refusedWith LibDb.keyMismatchRefusal (LibDb.probe (ReviewKey.Signing other) loc)
         kept <- rawKeyCheck db
@@ -1418,7 +1418,7 @@ legacyProbe dbPath edits key =
         Db.exec db "CREATE TRIGGER IF NOT EXISTS review_log_no_delete BEFORE DELETE ON review_log BEGIN SELECT RAISE(ABORT, 'review_log is append-only'); END" []
         Db.exec db "UPDATE review_log_head SET key_check = NULL WHERE one = 1" []
         unbound <- logVerdictOf db
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        loc <- Settings.parseReviewDb dbPath
         refusal <- probeMessage (LibDb.probe key loc)
         check <- rawKeyCheck db
         after <- logVerdictOf db
@@ -1443,7 +1443,7 @@ legacyGenesisAdoptsIn base =
     do
         db <- migratedReviewAt dbPath
         Db.exec db "UPDATE review_log_head SET key_check = NULL WHERE one = 1" []
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        loc <- Settings.parseReviewDb dbPath
         key <- testReviewKey
         refusal <- probeMessage (LibDb.probe key loc)
         check <- rawKeyCheck db
@@ -1483,7 +1483,7 @@ keyCheckMismatchMessageIsSecretFreeIn base =
     do
         db <- migratedReviewAt dbPath
         stored <- rawKeyCheck db
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" dbPath
+        loc <- Settings.parseReviewDb dbPath
         other <- otherMacKey
         startup <- probeMessage (LibDb.probe (ReviewKey.Signing other) loc)
         attested <- attestedFor "ipe-review-secret-free-index" (uid "u-a")

@@ -985,7 +985,7 @@ pageOf settings db fresh =
                 Task.succeed
                     { units = units
                     , total = snap.open
-                    , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db)
+                    , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db.path)
                     , dbBytes = snap.bytes
                     , next = nextCursor snap.rows
                     , progress = { reviewed = snap.units - snap.open, total = snap.units }

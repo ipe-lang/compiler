@@ -320,7 +320,7 @@ probe settings =
         Db.queryDecode conn "SELECT head FROM reviewed_stamp LIMIT 0" [] stampDecoder
         Task.succeed ()
     )
-        |> Task.onError (Settings.openFailure IndexDb settings.db)
+        |> Task.onError (Settings.openFailure IndexDb settings.db.path)
 
 
 -- The startup check of `IPE_INDEX_ROOT` against the index, per configured
@@ -340,7 +340,7 @@ probeRoot settings =
         anyUnit <- Db.queryDecode conn anyPathSql [] storedPathDecoder
         Task.succeed ( samples, anyUnit )
     )
-        |> Task.onError (Settings.openFailure IndexDb settings.db)
+        |> Task.onError (Settings.openFailure IndexDb settings.db.path)
         |> Task.andThen (\( samples, anyUnit ) -> rootsHold settings.roots samples anyUnit)
 
 
@@ -471,7 +471,7 @@ reviewedPairDecoder =
 -- runs, from settings the caller resolved once.
 readConnection : IndexSettings -> Task.Task Error Db.Db
 readConnection settings =
-    Db.open "sqlite" (Settings.indexReadUrl settings.db)
+    Db.open settings.db.read
 
 
 -- Where a page starts in the `(enqueued_at, uid)` order of `openColumns`: the
@@ -1096,7 +1096,7 @@ type Written
 drainUnit : IndexSettings -> Attested -> Written -> Task.Task Error Int
 drainUnit settings attested written =
     do
-        conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
+        conn <- Db.open settings.db.write
         Db.withTransaction conn
             (\tx ->
                 do
@@ -1185,7 +1185,7 @@ drainPair conn uid hash =
 rebuildReviewed : IndexSettings -> (Db.Db -> Task.Task Error ( Stamp, a )) -> Task.Task Error a
 rebuildReviewed settings refill =
     do
-        conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
+        conn <- Db.open settings.db.write
         Db.withTransaction conn
             (\tx ->
                 do

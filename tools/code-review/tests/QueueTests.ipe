@@ -6,6 +6,7 @@ import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
 import Ipe.Db.Sql as Sql
+import Ipe.Db.Location exposing (Mode(..))
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
@@ -33,7 +34,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -557,7 +558,7 @@ deletedQueueRowLeavesUnitOpenIn base =
         Task.fromResult (Path.fromString (repo ++ "/src")) |> Task.andThen File.mkdirAll
         writeFileText (repo ++ "/src/Main.ipe") fixtureMainIpe
         seedManyUnits indexDb 3
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+        conn <- openFileAt CreateIfMissing indexDb
         Db.exec conn "UPDATE change_queue SET change = 'deleted' WHERE uid = ?" [ Uid.toSql (uid "u-page-2") ]
         setIndexEnv indexDb repo
         r <- loadFirstPage
@@ -641,7 +642,7 @@ removePageFixture indexDb reviewDb repo =
 -- the `uid` tiebreak orders them.
 seedManyUnits : String -> Int -> Task.Task Error ()
 seedManyUnits indexDb n =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+    openFileAt CreateIfMissing indexDb
         |> Task.andThen
             (\conn ->
                 System.cwd ()
@@ -768,7 +769,7 @@ drainKeepsRequeuedChange =
 queueRows : String -> String -> String -> Task.Task Error Int
 queueRows indexDb label hash =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+        conn <- openFileAt ReadExisting indexDb
         rows <- Db.findWhere conn
             "change_queue"
             (Sql.and
@@ -1390,7 +1391,7 @@ refillDrainsOnlyReviewPairs =
             |> Task.sequence
         mirrorPair at.indexDb "foreign" "hf"
         copied <- resyncReviewedNow db
-        conn <- Db.open "sqlite" ("sqlite://" ++ at.indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting at.indexDb
         mirrored <- Db.queryDecode conn "SELECT uid, body_hash FROM reviewed ORDER BY uid, body_hash" [] pairDecoder
         cleanupProgressScratch at
         Task.succeed (copied == List.length pairs && mirrored == List.map (\( label, hash ) -> ( Uid.toString (uid label), hash )) pairs)
@@ -1453,7 +1454,7 @@ decisionHoldsWriteLockBeforeRead =
         seedProgressScratch at
         loc <- envReview
         holder <- LibDb.openAt loc
-        other <- Db.open "sqlite" ("sqlite://" ++ at.reviewDb ++ "?mode=rw")
+        other <- openFileAt WriteExisting at.reviewDb
         busy <- LibDb.writeTransaction holder (\_ -> writeFailsBusy other)
         free <- writeFailsBusy other
         cleanupProgressScratch at
@@ -1869,7 +1870,7 @@ resyncStopsAtCeiling =
             |> Task.map (\_ -> Nothing)
             |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         kept <- mirroredCount at.indexDb
-        conn <- Db.open "sqlite" ("sqlite://" ++ at.indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting at.indexDb
         preRows <- Db.findWhere conn "reviewed" (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql (uid "pre"))))
         copied <- resyncWithin (PageSize.toInt PageSize.pairs) 2 db
         rebuilt <- mirroredCount at.indexDb
