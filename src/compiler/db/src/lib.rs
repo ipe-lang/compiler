@@ -1638,7 +1638,7 @@ fn scoped_slices(
             ScopedModuleTypes::WholeProgram(reason) => return Err(*reason),
         }
     }
-    if !spent.is_some_and(|sum| sum <= budget.get() / 2) {
+    if spent.is_none_or(|sum| sum > budget.get() / 2) {
         return Err(FallbackReason::BudgetBand);
     }
     let mut interner = db.interner().lock();
