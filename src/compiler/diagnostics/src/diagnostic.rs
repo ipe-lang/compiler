@@ -3576,7 +3576,7 @@ mod code_family_tests {
     /// cross (the sandbox is the FFI jail) — so this table pins the exception
     /// too, not only the rule.
     fn family_representatives() -> Vec<(Diagnostic, Family)> {
-        vec![
+        [
             (
                 Diagnostic::Parse {
                     span: Span::DUMMY,
@@ -3655,24 +3655,6 @@ mod code_family_tests {
                 Family::Security,
             ),
             (
-                Diagnostic::RegistryUnreachable {
-                    detail: "test".to_owned(),
-                },
-                Family::Environment,
-            ),
-            (
-                Diagnostic::TargetDirUnlinkable {
-                    detail: "test".to_owned(),
-                },
-                Family::Environment,
-            ),
-            (
-                Diagnostic::HostLinkerCannotOpenInput {
-                    detail: "test".to_owned(),
-                },
-                Family::Environment,
-            ),
-            (
                 Diagnostic::CompilerBug {
                     where_: "ir.match.non_exhaustive",
                     detail: "test".to_owned(),
@@ -3680,6 +3662,28 @@ mod code_family_tests {
                 Family::Internal,
             ),
         ]
+        .into_iter()
+        .chain(environment_representatives())
+        .collect()
+    }
+
+    /// One representative [`Diagnostic`] for every environment fault, each
+    /// paired with [`Family::Environment`].
+    fn environment_representatives() -> Vec<(Diagnostic, Family)> {
+        [
+            Diagnostic::RegistryUnreachable {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::TargetDirUnlinkable {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::HostLinkerCannotOpenInput {
+                detail: "test".to_owned(),
+            },
+        ]
+        .into_iter()
+        .map(|diagnostic| (diagnostic, Family::Environment))
+        .collect()
     }
 
     /// Every representative diagnostic's rendered code belongs to the family it

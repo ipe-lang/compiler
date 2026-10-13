@@ -4974,6 +4974,7 @@ mod held_crate_tests {
             &consented,
             driver,
             triple,
+            &crate::target_dir::LinkableTargetDir::assume(&base.join("target")),
             Verbosity::Quiet,
         );
         assert!(built.is_err(), "the stub fails the build: {built:?}");

@@ -87,9 +87,10 @@ impl HostLinker {
     #[must_use]
     pub const fn of_triple(host: HostTriple) -> Self {
         match (host.os, host.env) {
-            (HostOs::Windows, HostEnv::Msvc | HostEnv::GnuLlvm) => Self::Unicode,
             (HostOs::Windows, HostEnv::Gnu | HostEnv::Other | HostEnv::Absent) => Self::AsciiOnly,
-            (HostOs::Other, _) => Self::Unicode,
+            (HostOs::Windows, HostEnv::Msvc | HostEnv::GnuLlvm) | (HostOs::Other, _) => {
+                Self::Unicode
+            }
         }
     }
 
@@ -403,6 +404,7 @@ impl LinkableTargetDir {
     }
 
     /// Where the build directory came from.
+    #[cfg(test)]
     #[must_use]
     pub const fn origin(&self) -> TargetDirOrigin {
         self.origin
@@ -578,7 +580,7 @@ mod tests {
             ),
             (
                 TargetDirSources {
-                    cargo_config_pin: Some(bad.clone()),
+                    cargo_config_pin: Some(bad),
                     ..sources()
                 },
                 TargetDirOrigin::CargoConfigPin,

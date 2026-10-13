@@ -9,6 +9,7 @@
 //! failure naming an input the linker could not open is IPE-E0003, an
 //! environment fault, never the IPE-I0001 compiler-bug frame.
 
+#[cfg(test)]
 #[cfg(unix)]
 mod stubbed {
     use std::fs;
