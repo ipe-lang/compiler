@@ -430,3 +430,183 @@ mod load_from_file_spawn_blocking_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod yaml_tests {
+    use super::*;
+    use crate::json::decode_value_identity;
+    use serde_json::json;
+
+    fn yaml(src: &str) -> IpeResult<crate::IpeError, JsonVal> {
+        config_decode_yaml(src.to_string(), decode_value_identity::<crate::IpeError>())
+    }
+
+    /// The `(kind, message)` of a refusal, or `None` when the source decoded.
+    fn refusal(src: &str) -> Option<(crate::IpeErrorKind, String)> {
+        match yaml(src) {
+            IpeResult::Ok(_) => None,
+            IpeResult::Err(crate::IpeError::Error(kind, info)) => Some((kind, info.message)),
+        }
+    }
+
+    fn field(src: &str) -> JsonVal {
+        let decoded = yaml(src);
+        assert!(
+            matches!(decoded, IpeResult::Ok(_)),
+            "{src:?} must decode: {decoded:?}"
+        );
+        let IpeResult::Ok(value) = decoded else {
+            return JsonVal::Null;
+        };
+        value.get("a").cloned().unwrap_or(JsonVal::Null)
+    }
+
+    fn nested_flow(depth: usize) -> String {
+        format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    fn nested_block(depth: usize) -> String {
+        let mut src = String::new();
+        for level in 0..depth {
+            src.push_str(&"  ".repeat(level));
+            src.push_str("a:\n");
+        }
+        src.push_str(&"  ".repeat(depth));
+        src.push_str("x\n");
+        src
+    }
+
+    /// `levels` anchors, each a list of nine aliases of the one before.
+    fn alias_bomb(levels: usize) -> String {
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+        let mut src = String::from("a: &a [x, x, x, x, x, x, x, x, x]\n");
+        for pair in names.windows(2).take(levels.saturating_sub(1)) {
+            let (prev, next) = (pair[0], pair[1]);
+            let items = vec![format!("*{prev}"); 9].join(", ");
+            src.push_str(&format!("{next}: &{next} [{items}]\n"));
+        }
+        src
+    }
+
+    #[test]
+    fn yaml_11_booleans_stay_strings() {
+        for word in ["yes", "no", "on", "off", "y", "n"] {
+            assert_eq!(field(&format!("a: {word}")), json!(word), "{word}");
+        }
+    }
+
+    #[test]
+    fn core_booleans_decode() {
+        for (word, value) in [
+            ("true", true),
+            ("True", true),
+            ("TRUE", true),
+            ("false", false),
+            ("False", false),
+            ("FALSE", false),
+        ] {
+            assert_eq!(field(&format!("a: {word}")), json!(value), "{word}");
+        }
+    }
+
+    #[test]
+    fn mixed_case_bool() {
+        assert_eq!(field("a: tRuE"), json!("tRuE"));
+    }
+
+    #[test]
+    fn nulls_decode() {
+        for src in ["a: null", "a: Null", "a: NULL", "a: ~", "a:"] {
+            assert_eq!(yaml(src), IpeResult::Ok(json!({"a": null})), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn leading_zero_is_string() {
+        assert_eq!(field("a: 012"), json!("012"));
+    }
+
+    #[test]
+    fn prefixed_ints() {
+        assert_eq!(field("a: 0x1F"), json!(31));
+        assert_eq!(field("a: 0o17"), json!(15));
+        assert_eq!(field("a: 0b11"), json!(3));
+    }
+
+    #[test]
+    fn non_finite_floats_decode_as_null() {
+        for word in [".nan", ".inf", "-.inf"] {
+            assert_eq!(field(&format!("a: {word}")), JsonVal::Null, "{word}");
+        }
+    }
+
+    #[test]
+    fn duplicate_key_last_wins() {
+        assert_eq!(yaml("a: 1\na: 2"), IpeResult::Ok(json!({"a": 2})));
+    }
+
+    #[test]
+    fn merge_key_is_a_literal_key() {
+        assert_eq!(
+            yaml("base: &b {x: 1}\nm: {<<: *b}"),
+            IpeResult::Ok(json!({"base": {"x": 1}, "m": {"<<": {"x": 1}}}))
+        );
+    }
+
+    #[test]
+    fn multi_document_refused() {
+        assert!(refusal("--- a\n--- b").is_some());
+        assert_eq!(yaml("--- a"), IpeResult::Ok(json!("a")));
+    }
+
+    #[test]
+    fn local_tag_refused() {
+        assert!(refusal("a: !foo x").is_some());
+    }
+
+    #[test]
+    fn include_tag_refused() {
+        assert!(refusal("a: !include /etc/passwd").is_some());
+    }
+
+    #[test]
+    fn env_interpolation_literal() {
+        assert_eq!(field("a: ${HOME}"), json!("${HOME}"));
+    }
+
+    #[test]
+    fn core_tags() {
+        assert_eq!(field("a: !!str 1"), json!("1"));
+        assert_eq!(field("a: !!int \"1\""), json!(1));
+    }
+
+    #[test]
+    fn empty_document() {
+        for src in ["", "   \n\n"] {
+            assert_eq!(yaml(src), IpeResult::Ok(JsonVal::Null), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn alias_bomb_refused() {
+        assert!(refusal(&alias_bomb(9)).is_some());
+        assert!(matches!(yaml(&alias_bomb(2)), IpeResult::Ok(_)));
+    }
+
+    #[test]
+    fn depth_at_ceiling_accepted() {
+        assert!(matches!(yaml(&nested_flow(128)), IpeResult::Ok(_)));
+        assert!(matches!(yaml(&nested_block(128)), IpeResult::Ok(_)));
+    }
+
+    #[test]
+    fn depth_ceiling_plus_one_refused() {
+        assert!(refusal(&nested_flow(129)).is_some());
+        assert!(refusal(&nested_block(129)).is_some());
+    }
+
+    #[test]
+    fn syntax_error_refused() {
+        assert!(refusal("a: [1,").is_some());
+    }
+}
