@@ -138,6 +138,14 @@ impl<F: Fn(&IrType) -> bool> HeldWalk<'_, F> {
         tys.into_iter().any(|t| self.holds(t, depth))
     }
 
+    /// Whether a yielded or sealed component holds, under `Reach::HeldOrYielded` only.
+    fn yields<'t>(&mut self, parts: impl IntoIterator<Item = &'t IrType>, depth: u16) -> bool {
+        match self.reach {
+            Reach::Held => false,
+            Reach::HeldOrYielded => self.any(parts, depth),
+        }
+    }
+
     fn payload_holds(&mut self, home: &ModPath, name: Symbol, depth: u16) -> bool {
         let key = (home.clone(), name);
         let payloads = self.payloads;
@@ -173,14 +181,8 @@ impl<F: Fn(&IrType) -> bool> HeldWalk<'_, F> {
             }
             // Effects and widget handles: their parameters describe what they
             // yield or seal, reached only when the walk asks for it.
-            IrType::Task(e) | IrType::Cmd(e) | IrType::Sub(e) => match self.reach {
-                Reach::Held => false,
-                Reach::HeldOrYielded => self.holds(e, next),
-            },
-            IrType::CustomElement { down, up } => match self.reach {
-                Reach::Held => false,
-                Reach::HeldOrYielded => self.holds(down, next) || self.holds(up, next),
-            },
+            IrType::Task(e) | IrType::Cmd(e) | IrType::Sub(e) => self.yields([&**e], next),
+            IrType::CustomElement { down, up } => self.yields([&**down, &**up], next),
             // Opaque values: their type parameters describe what they produce
             // or consume, not a component the value holds.
             IrType::Fun(_, _)
