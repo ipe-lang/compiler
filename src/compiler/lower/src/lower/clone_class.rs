@@ -606,7 +606,7 @@ pub(super) enum NonCloneCapture {
 
 /// The context one [`rewrite_captured_clones`] walk shares across its recursion.
 pub(super) struct CaptureWalk {
-    /// The closure's span, for a `Refuse` diagnostic.
+    /// The closure's span: the `Refuse` diagnostic site and the fallback for a capture with no recorded use.
     pub(super) span: Span,
     /// Each non-`Clone` capture's first use: where a refusal or a once
     /// closure's moved capture is reported.

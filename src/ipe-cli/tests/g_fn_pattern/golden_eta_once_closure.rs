@@ -171,8 +171,8 @@ fn admitted_once_positions_build_and_run() {
     );
 }
 
-/// R5a: an inner source lambda in an admitted slot of a recalled source lambda.
-const R5A: &str = r#"module Main exposing (main)
+/// An inner source lambda in an admitted slot of a recalled source lambda.
+const INNER_LAMBDA_IN_ADMITTED_SLOT: &str = r#"module Main exposing (main)
 
 import Ipe.Io as Io
 import Ipe.List as List
@@ -195,8 +195,8 @@ main =
         |> Task.andThen (\_ -> Io.println "unreachable")
 "#;
 
-/// R5b: an admitted once partial inside a recalled source lambda.
-const R5B: &str = r#"module Main exposing (main)
+/// An admitted once partial inside a recalled source lambda.
+const ONCE_PARTIAL_IN_RECALLED_LAMBDA: &str = r#"module Main exposing (main)
 
 import Ipe.Io as Io
 import Ipe.List as List
@@ -238,7 +238,7 @@ combine t n =
     t |> Task.map (\m -> m + n)
 
 
--- R5b with the outer lambda in `Task.andThen`'s continuation: it runs once.
+-- The once partial with the outer lambda in `Task.andThen`'s continuation: it runs once.
 chain : Task Error Int -> Task Error Int
 chain t =
     Task.andThen (\n -> Task.andThen (combine t) (Task.succeed n)) (Task.succeed 2)
@@ -275,14 +275,14 @@ main : Task Error ()
 main =
     do
         n <- chain (Task.succeed 40)
-        Io.println ("r5b=" ++ String.fromInt n)
+        Io.println ("partial=" ++ String.fromInt n)
         twice step
         twiceDestructured ( step, 1 )
         laterBind ( step, 2 ) step
 "#;
 
 /// The lines [`SOURCE_ADMITTED`] prints, in order.
-const SOURCE_ADMITTED_STDOUT: &str = "r5b=42\na\nx\nb\ny\nz\nz\nr\n";
+const SOURCE_ADMITTED_STDOUT: &str = "partial=42\na\nx\nb\ny\nz\nz\nr\n";
 
 /// Write `source` as a one-file program and return its entry and output dir.
 #[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
@@ -334,16 +334,24 @@ fn assert_source_refused_at_capture(name: &str, source: &str, needle: &str) {
     );
 }
 
-/// R5a: building the inner lambda moves `h` out of the `List.map` callback.
+/// Building the inner lambda moves `h` out of the `List.map` callback.
 #[test]
 fn source_lambda_building_a_capturing_lambda_is_refused_at_the_capture() {
-    assert_source_refused_at_capture("eta_once_source_r5a", R5A, "h x)");
+    assert_source_refused_at_capture(
+        "eta_once_source_inner_lambda",
+        INNER_LAMBDA_IN_ADMITTED_SLOT,
+        "h x)",
+    );
 }
 
-/// R5b: building the once partial moves `t` out of the `List.map` callback.
+/// Building the once partial moves `t` out of the `List.map` callback.
 #[test]
 fn source_lambda_building_a_once_partial_is_refused_at_the_capture() {
-    assert_source_refused_at_capture("eta_once_source_r5b", R5B, "t) s)");
+    assert_source_refused_at_capture(
+        "eta_once_source_once_partial",
+        ONCE_PARTIAL_IN_RECALLED_LAMBDA,
+        "t) s)",
+    );
 }
 
 /// Once source lambdas at once positions pass ipe.
