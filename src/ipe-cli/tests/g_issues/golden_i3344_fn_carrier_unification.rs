@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use ipe::CliError;
+use ipe_diagnostics::{Diagnostic, Feature, LowerError};
 
 use crate::support::repo_root;
 
@@ -185,6 +186,20 @@ fn payload_carrier_conflict_is_refused() {
         got,
         Some(ipe_diagnostics::IPE_L0107),
         "`{dir}` must fail closed with IPE-L0107; got build result: {built:?}"
+    );
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        msg: LowerError::Unsupported(Feature::FnCarrierConflict),
+                        ..
+                    }
+                )
+        ),
+        "`{dir}`: the refusal must come from the carrier-join gate, got {built:?}"
     );
 }
 
