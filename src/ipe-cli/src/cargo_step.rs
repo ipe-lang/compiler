@@ -1995,12 +1995,13 @@ mod tests {
                     .is_some_and(|e| matches!(e.fault(), crate::screen::Fault::User)),
                 "a JSON build's rendered link failure is the user's, got {linked:?}"
             );
-            let bare = verdict_of(String::new());
+            let unrendered = verdict_of(String::new());
             assert!(
-                bare.as_ref()
+                unrendered
+                    .as_ref()
                     .err()
                     .is_some_and(|e| matches!(e.fault(), crate::screen::Fault::Internal)),
-                "with no rendered record the failure stays unclassified, got {bare:?}"
+                "with no rendered record the failure stays unclassified, got {unrendered:?}"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
