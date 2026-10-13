@@ -6325,8 +6325,8 @@ where
             ));
         }
     };
-    // User-facing line on stdout.
-    crate::system::write_stdout_line(&format!("Ipe.Web listening on :{port}"));
+    // User-facing status line on stdout.
+    crate::system::emit_runtime_log_stdout("web", &format!("listening on :{port}"));
     // Graceful shutdown: trap SIGINT/SIGTERM,
     // print the shutdown line, drain in-flight requests, and return cleanly so
     // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
@@ -6640,8 +6640,9 @@ where
 
     // The console + metrics auth gate applies whether or not a console is
     // mounted, so its effective posture/mode/source is always logged once.
-    crate::system::write_stderr_line(
-        &crate::telemetry::ConsoleAuthResolution::from_env().startup_line(),
+    crate::system::emit_runtime_log(
+        "console",
+        &crate::telemetry::ConsoleAuthResolution::from_env().startup_message(),
     );
 
     // When `http_client` is active and the pre-built console binary is
