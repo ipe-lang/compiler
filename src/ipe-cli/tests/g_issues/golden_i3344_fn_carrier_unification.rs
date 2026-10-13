@@ -35,10 +35,14 @@ const ARC_INTO_DIRECT_SLOT: [&str; 5] = [
 ];
 
 fn fixture_entry() -> PathBuf {
+    golden_entry(FIXTURE)
+}
+
+fn golden_entry(dir: &str) -> PathBuf {
     repo_root()
         .join("tests")
         .join("golden")
-        .join(FIXTURE)
+        .join(dir)
         .join("Main.ipe")
 }
 
