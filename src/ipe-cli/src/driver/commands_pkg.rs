@@ -3,7 +3,7 @@ use super::{
     attribute_canon_errors, attribute_post_link_error, build_loose_file_into, build_project_into,
     build_source_graph, build_test_into, capabilities_including_served_widgets,
     classify_entry_shape, create_source_root, default_entry, discover_manifest, emit_machine_error,
-    emitted_bin_filename, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
+    emitted_bin_filename, frame_infer_error, home_to_source_map, lowering_check_query,
     program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir, run_build,
     runtime_context_for_message, source_graph_for_target, typecheck_target,
 };
@@ -2959,25 +2959,6 @@ fn attribute_entry_lowering_error(
 // `fix` / `--fix` — apply machine-applicable suggestions
 // ===========================================================================
 
-/// The build-identical check `ipe fix` diagnoses with and re-checks its patch by.
-///
-/// The same queries the build front end demands over the build's own source
-/// graph: link, type-check, the decoder-direction gate, and lowering.
-fn fix_check_query(
-    db: &ipe_db::IpeDatabase,
-    root: ipe_db::SourceRoot,
-    file: ipe_db::SourceFile,
-) -> Result<(), ipe_db::PipelineError> {
-    let linked = ipe_db::linked_program(db, root, file)
-        .clone()
-        .map_err(|d| ipe_db::PipelineError::Lower(d, Vec::new()))?;
-    ipe_db::typecheck(db, root, file)
-        .clone()
-        .map_err(ipe_db::PipelineError::from)?;
-    gate_decoder_pipelines(&linked.module)?;
-    ipe_db::lower_program(db, root, file).clone().map(|_| ())
-}
-
 /// What one build-identical check of the fix target raised.
 #[derive(Debug)]
 pub enum FixCheck {
@@ -2999,7 +2980,7 @@ pub enum FixCheck {
     },
 }
 
-/// Run [`fix_check_query`] over `graph` and say which file owns its first diagnostic.
+/// Run [`lowering_check_query`] over `graph` and say which file owns its first diagnostic.
 ///
 /// `entry_real` is the canonical path of the fix target; a diagnostic is the
 /// target's own only when its attributed file canonicalises to it.
@@ -3011,7 +2992,7 @@ fn run_fix_check(
     blame_path: &Path,
     entry_real: &Path,
 ) -> Result<FixCheck, CliError> {
-    match graph.run_attributed(blame_path, fix_check_query) {
+    match graph.run_attributed(blame_path, lowering_check_query) {
         Ok(()) => Ok(FixCheck::Clean),
         Err(CliError::Pipeline { file, src, diag }) => {
             let owned_by_entry = fs::canonicalize(&file).is_ok_and(|real| real == entry_real);
@@ -3176,8 +3157,9 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// The named file is analysed as `ipe type-check` analyses it: under the
 /// governing manifest's `src`/`tests` roots, or as the loose closure a build of
 /// the file alone compiles — never by a reduced single-module resolution, so a
-/// name the build binds through an import is never "corrected". A diagnostic
-/// another module owns is reported, never patched.
+/// name the build binds through an import is never "corrected". A directory
+/// names its manifest's entry, the file a build of that directory compiles
+/// from. A diagnostic another module owns is reported, never patched.
 ///
 /// `auto` (set by `--yes` / `--fix`) is durable authorization to apply every
 /// edit without prompting; otherwise each edit is confirmed interactively on
@@ -3193,8 +3175,14 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
 /// filesystem failure.
 pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let target = resolve_file_target(entry)?;
+    let target = resolve_analysis_target(entry)?;
     let (mut graph, blame_path) = source_graph_for_target(&target)?;
+    // A directory names its manifest's entry: every report names that file.
+    let entry = if entry.is_dir() {
+        blame_path.as_path()
+    } else {
+        entry
+    };
     let entry_real = fs::canonicalize(&blame_path).map_err(|e| io_err(&blame_path, e))?;
     let source = graph.entry_file.text(&graph.db).clone();
     let first = run_fix_check(&graph, &blame_path, &entry_real)?;

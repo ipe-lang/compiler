@@ -656,6 +656,66 @@ fn ipe_fix_refuses_a_project_whose_context_cannot_be_built() {
     assert_eq!(after.as_deref(), Some(MAIN_MISSPELLING_LENGTH), "{out}");
 }
 
+/// A module whose own `lenght` nothing binds.
+const HELPERS_MISSPELLING_LENGTH: &str =
+    "module Helpers exposing (x)\n\nlength : Int\nlength = 2\n\nx = lenght\n";
+
+/// An entry that compiles once its import compiles.
+const MAIN_IMPORTING_X: &str =
+    "module Main exposing (main)\n\nimport Helpers exposing (x)\n\nmain = x\n";
+
+/// A diagnostic another module owns is reported, never patched into the fix
+/// target or into the module that owns it.
+#[test]
+fn ipe_fix_never_patches_a_diagnostic_another_module_owns() {
+    let dir = fix_project(
+        "fix_elsewhere",
+        FIX_MANIFEST,
+        &[
+            ("Helpers.ipe", HELPERS_MISSPELLING_LENGTH),
+            ("Main.ipe", MAIN_IMPORTING_X),
+        ],
+    );
+    let helpers = fs::read_to_string(dir.join("src").join("Helpers.ipe")).ok();
+    let main = dir.join("src").join("Main.ipe");
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&main, true, &mut out);
+    let main_after = fs::read_to_string(&main).ok();
+    let helpers_after = fs::read_to_string(dir.join("src").join("Helpers.ipe")).ok();
+    let _ = fs::remove_dir_all(&dir);
+    let out = String::from_utf8_lossy(&out);
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(main_after.as_deref(), Some(MAIN_IMPORTING_X), "{out}");
+    assert_eq!(helpers_after, helpers, "{out}");
+    assert!(out.contains("Helpers.ipe, not"), "{out}");
+}
+
+/// A project directory names the entry its build compiles from, so
+/// `ipe build --fix` with no path fixes the manifest's entry.
+#[test]
+fn ipe_fix_of_a_project_directory_fixes_its_entry() {
+    let dir = fix_project(
+        "fix_project_dir",
+        FIX_MANIFEST,
+        &[("Main.ipe", MAIN_MISSPELLING_LENGTH)],
+    );
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&dir, true, &mut out);
+    let after = fs::read_to_string(dir.join("src").join("Main.ipe")).ok();
+    let _ = fs::remove_dir_all(&dir);
+    let out = String::from_utf8_lossy(&out);
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(
+        after.as_deref(),
+        Some("module Main exposing (main)\n\nlength : Int\nlength = 2\n\nmain = length\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Main.ipe:"),
+        "reports name the entry file: {out}"
+    );
+}
+
 /// A name-resolution diagnostic at byte `lo`.
 fn name_error_at(lo: u32) -> Diagnostic {
     Diagnostic::Name {
