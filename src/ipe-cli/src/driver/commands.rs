@@ -16,6 +16,7 @@ use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
 };
 use crate::contained_path::ResolvedPath;
+use crate::loose_file::LooseFileError;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::style::TerminalSafe;
 use crate::verb::{CommandName, DevVerb, ReleaseVerb, Umbrella, Verb};
@@ -3873,7 +3874,7 @@ pub fn user_sources_for_unsafe_scan(
 /// source set.
 ///
 /// # Errors
-/// Every [`collect_entry_and_siblings`] error except the entry's own parse failure.
+/// Every [`LooseFileError::Refused`] error [`collect_entry_and_siblings`] returns.
 fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliError> {
     match collect_entry_and_siblings(entry) {
         Ok(collected) => Ok(collected
@@ -3881,10 +3882,10 @@ fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliErr
             .into_iter()
             .map(|(path, (_, src))| (path.join("."), src))
             .collect()),
-        Err(CliError::Pipeline { file, src, .. }) if file.as_path() == entry => {
-            Ok(vec![(entry.display().to_string(), src)])
+        Err(LooseFileError::EntryParse(failure)) => {
+            Ok(vec![(entry.display().to_string(), failure.into_src())])
         }
-        Err(other) => Err(other),
+        Err(LooseFileError::Refused(other)) => Err(other),
     }
 }
 
