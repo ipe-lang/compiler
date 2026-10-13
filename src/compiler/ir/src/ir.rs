@@ -3950,13 +3950,14 @@ impl Match {
         let expected: BTreeSet<Symbol> = variants.iter().copied().collect();
 
         let mut covered: BTreeSet<Symbol> = BTreeSet::new();
-        for arm in &arms {
-            // The case-arm head is always a constructor pattern (payload binders
-            // are sub-patterns). A bare variable / wildcard whole-scrutinee arm
-            // routes through `new_flat`, so a non-ctor arm head here is an
-            // internal invariant violation, surfaced as a `CompilerBug` rather
-            // than silently skewing the coverage set.
-            let Pat::Ctor { variant, .. } = &arm.pat else {
+        for head in arms.iter().flat_map(|a| head_alternatives(&a.pat)) {
+            // Every case-arm head (each alternative of a native or-pattern
+            // head) is a constructor pattern (payload binders are sub-patterns).
+            // A bare variable / wildcard whole-scrutinee arm routes through
+            // `new_flat`, so a non-ctor head here is an internal invariant
+            // violation, surfaced as a `CompilerBug` rather than silently skewing
+            // the coverage set.
+            let Pat::Ctor { variant, .. } = head else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_ir::Match::new",
                     detail: "match arm head is not a constructor pattern".to_owned(),
@@ -4926,6 +4927,32 @@ mod tests {
             guard: None,
         }];
         assert!(Match::new_flat(Expr::Var(b), arms).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn match_new_covers_through_or_head() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let m = i.intern("m")?;
+        let Some(alts) = SharedAlts::new(vec![nullary(ty, inc), nullary(ty, dec)]) else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "test.match_new_covers_through_or_head",
+                detail: "a nullary constructor set is a sound SharedAlts".to_owned(),
+            });
+        };
+        let arms = vec![Arm {
+            pat: Pat::Or(alts),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new(Expr::Var(m), arms, &[inc, dec]).is_ok());
+        let partial = vec![Arm {
+            pat: nullary(ty, inc),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new(Expr::Var(m), partial, &[inc, dec]).is_err());
         Ok(())
     }
 

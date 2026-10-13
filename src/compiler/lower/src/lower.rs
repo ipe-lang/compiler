@@ -9908,7 +9908,7 @@ pub fn capabilities_reached_from(
 /// yet, carrying the offending node's source `span`. This is the
 /// "not supported yet" channel (`IPE-L01##`), distinct from [`bug`] ("the
 /// compiler is broken"): the input is valid Ipê the supported subset has not reached.
-const fn unsupported(span: Span, feature: Feature) -> Diagnostic {
+pub const fn unsupported(span: Span, feature: Feature) -> Diagnostic {
     Diagnostic::Lower {
         span,
         msg: LowerError::Unsupported(feature),
@@ -31204,9 +31204,12 @@ impl<'a> Lowerer<'a> {
         // fallback.
         let branches = branches.get(..live_end).unwrap_or(branches);
 
+        // A native or-pattern head discriminates on each of its alternatives,
+        // so a constructor-alternative head counts as constructor-headed.
         let all_ctor = branches
             .iter()
-            .all(|br| matches!(br.pat.value, canon::Pattern_::PCtor { .. }));
+            .flat_map(|br| crate::or_split::head_alternatives(&br.pat))
+            .all(|p| matches!(p.value, canon::Pattern_::PCtor { .. }));
 
         let arms = branches
             .iter()
@@ -31347,9 +31350,11 @@ impl<'a> Lowerer<'a> {
             // The scrutinee's enum is one this module declared (the type checker
             // pinned the constructor's union), so it is always in
             // `enum_variants` — the *true* variant set handed to `Match::new`.
-            let canon::Pattern_::PCtor {
+            let Some(canon::Pattern_::PCtor {
                 home, type_name, ..
-            } = &first.pat.value
+            }) = crate::or_split::head_alternatives(&first.pat)
+                .first()
+                .map(|p| &p.value)
             else {
                 return Err(bug(
                     "ipe_lower::lower_case",
