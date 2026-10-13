@@ -1263,6 +1263,7 @@ fn two_dep_program(db: &IpeDatabase) -> (SourceRoot, [SourceFile; 3]) {
 /// joint solve decides under the full budget. Under a budget twice their
 /// sum, the same program is served by the scoped assembly.
 #[test]
+#[allow(clippy::panic)] // a missing measurement is the test failure
 fn scoped_steps_past_half_the_budget_route_to_the_joint_solve() {
     let (mut db, _log) = logged_db();
     let (root, modules) = two_dep_program(&db);
@@ -1274,7 +1275,7 @@ fn scoped_steps_past_half_the_budget_route_to_the_joint_solve() {
     );
     let steps: Vec<u64> = spent.into_iter().flatten().collect();
     let Some(&most) = steps.iter().max() else {
-        return;
+        panic!("a scoped solve spends steps: {steps:?}");
     };
     let sum = steps.iter().fold(0_u64, |sum, n| sum.saturating_add(*n));
 
@@ -1310,6 +1311,7 @@ fn scoped_steps_past_half_the_budget_route_to_the_joint_solve() {
 /// naming the budget, and the program reports the joint solve's refusal; the
 /// exact budget admits the module.
 #[test]
+#[allow(clippy::panic)] // a missing measurement is the test failure
 fn module_past_the_step_budget_falls_back_to_the_joint_refusal() {
     let (mut db, _log) = logged_db();
     let (root, [a, c, entry]) = two_dep_program(&db);
@@ -1323,7 +1325,7 @@ fn module_past_the_step_budget_falls_back_to_the_joint_refusal() {
         "a leaf spends more than one step: {leaves:?}"
     );
     let Some((leaf, steps)) = heaviest else {
-        return;
+        panic!("a leaf module spends steps: {leaves:?}");
     };
 
     set_steps(&mut db, steps - 1);
@@ -1375,6 +1377,7 @@ fn scoped_steps_are_deterministic() {
 /// id below the least ceiling that serves the program scoped, the joint solve
 /// is served for the exhausted space.
 #[test]
+#[allow(clippy::panic)] // a missing measurement is the test failure
 fn var_ceiling_bounds_the_scoped_renumbering() {
     const GENERIC_DEP: &str = "module A exposing (ident)\n\nident : a -> a\nident x =\n    x\n";
     const GENERIC_IMPORTER: &str = "module B exposing (b)\n\n\
@@ -1405,7 +1408,7 @@ fn var_ceiling_bounds_the_scoped_renumbering() {
         "the program needs more than one variable id: {least:?}"
     );
     let Some(least) = least else {
-        return;
+        panic!("some variable ceiling serves the scoped result");
     };
 
     assert_eq!(

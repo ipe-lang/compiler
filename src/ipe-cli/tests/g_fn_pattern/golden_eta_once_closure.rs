@@ -372,7 +372,7 @@ fn admitted_once_source_lambdas_build_and_run() {
         return;
     }
     let (built, out) = build_source("eta_once_source_admitted_e2e", SOURCE_ADMITTED);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(built.is_ok(), "the build must succeed: {:?}", built.err());
     let outcome = crate::support::build_and_run_emitted("eta_once_source_admitted", &out);
     assert_eq!(
         outcome.exit_code,
@@ -486,7 +486,7 @@ fn destructure_thunk_over_a_function_param_builds_and_runs() {
         return;
     }
     let (built, out) = build_source("eta_once_thunk_promoted_e2e", THUNK_PROMOTED);
-    assert!(built.is_ok(), "ipe build must succeed: {:?}", built.err());
+    assert!(built.is_ok(), "the build must succeed: {:?}", built.err());
     let outcome = crate::support::build_and_run_emitted("eta_once_thunk_promoted", &out);
     assert_eq!(
         outcome.exit_code,
