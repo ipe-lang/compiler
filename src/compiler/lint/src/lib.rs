@@ -146,28 +146,12 @@ pub fn run<P: CancelProbe>(
         if unknown_sev != Severity::Allow {
             for (line_no, unknown_name) in &pm.suppressions.unknowns {
                 probe.poll()?;
-                // Synthesise a zero-width span at byte 0 of the offending line
-                // so the finding has a source location.
-                let line_byte =
-                    u32::try_from(line_start_byte(&pm.source, *line_no)).unwrap_or(u32::MAX);
-                let span = ipe_diagnostics::Span {
-                    lo: line_byte,
-                    hi: line_byte,
-                };
-                findings.push(Finding {
-                    rule: "unknown-suppression",
-                    module: pm.module.clone(),
-                    span,
-                    message: format!(
-                        "`{unknown_name}` is not a known lint rule — \
-                         the suppression has no effect"
-                    ),
-                    help: vec![
-                        "check for a typo; run `ipe lint --help` for the rule list".to_owned(),
-                    ],
-                    fix: None,
-                    sig_fix: None,
-                });
+                findings.push(unknown_suppression(
+                    &pm.module,
+                    &pm.source,
+                    *line_no,
+                    unknown_name,
+                ));
             }
         }
 
@@ -221,6 +205,24 @@ pub fn run<P: CancelProbe>(
 
     findings.sort();
     Ok(LintReport { findings })
+}
+
+/// The advisory finding for an inline suppression naming no known rule, at a
+/// zero-width span on byte 0 of the offending line.
+fn unknown_suppression(module: &[String], source: &str, line_no: usize, name: &str) -> Finding {
+    let line_byte = u32::try_from(line_start_byte(source, line_no)).unwrap_or(u32::MAX);
+    Finding {
+        rule: "unknown-suppression",
+        module: module.to_vec(),
+        span: ipe_diagnostics::Span {
+            lo: line_byte,
+            hi: line_byte,
+        },
+        message: format!("`{name}` is not a known lint rule — the suppression has no effect"),
+        help: vec!["check for a typo; run `ipe lint --help` for the rule list".to_owned()],
+        fix: None,
+        sig_fix: None,
+    }
 }
 
 /// A manual-review span emitted by `apply_sig_fixes` when a call site cannot be
