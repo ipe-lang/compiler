@@ -234,9 +234,10 @@ fromJson codec s =
 
 -- | The untrusted-input door: reject input longer than `maxChars` BEFORE
 -- decoding — a size guard for request bodies and webhooks — then decode. A
--- payload over the limit is a typed `Err`, never parsed. Parser nesting depth
--- is separately bounded by the JSON decoder itself, so this guard plus the
--- parser's depth bound cover both adversarial size and adversarial nesting.
+-- payload over the limit is a `LimitExceeded` error, never parsed. Parser
+-- nesting depth is separately bounded by the JSON decoder itself, so this
+-- guard plus the parser's depth bound cover both adversarial size and
+-- adversarial nesting.
 fromJsonSafe : Int -> Codec a -> String -> Result Error a
 fromJsonSafe maxChars codec s =
     case codec of
@@ -744,10 +745,10 @@ var3 tag ctor project inner1 inner2 inner3 =
 
 
 -- | Raised by `fromJsonSafe` when input exceeds the caller's size limit —
--- an invalid-input error carrying the reason, never a panic.
+-- a `LimitExceeded` error carrying the reason, never a panic.
 tooLargeError : Error
 tooLargeError =
-    Error.invalidInput "Ipe.Codec.fromJsonSafe: input exceeds the size limit"
+    Error.limitExceeded "Ipe.Codec.fromJsonSafe: input exceeds the size limit"
 
 
 unknownTagMessage : String -> String

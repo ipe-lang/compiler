@@ -37,7 +37,8 @@ run : String -> List String -> Task Error String
 
 `run cmd argv` — run `cmd` with the argument vector `argv`, no shell.
 Succeeds with the child's captured stdout (bounded to guard memory);
-fails with a typed `Error` on a non-zero exit or a spawn failure.
+fails with a typed `Error` on a non-zero exit or a spawn failure, and with a
+`LimitExceeded` error when the output passes `IPE_PROCESS_OUTPUT_MAX`.
 
 ## `runWith`
 
@@ -61,7 +62,8 @@ The `cfg` record controls every axis of the spawn:
 A non-zero exit is a NORMAL result carried in `exitCode`; only a spawn
 failure (e.g. the executable does not exist) fails the Task.
 `stdout` and `stderr` are each captured independently (no pipe-deadlock
-risk) and bounded by `IPE_PROCESS_OUTPUT_MAX` (default 16 MiB per stream).
+risk) and bounded by `IPE_PROCESS_OUTPUT_MAX` (default 16 MiB per stream);
+a stream past it fails the Task with a `LimitExceeded` error.
 
 ## `runInPty`
 
@@ -84,9 +86,10 @@ The `cfg` record:
   - `cols` / `rows` — the pty window size in columns and rows.
 
 Captured `output` is bounded (`IPE_PROCESS_OUTPUT_MAX`, default 16 MiB); a
-child that floods the pty past the ceiling fails the Task rather than
-allocating without bound. This is the same `subprocess` capability as `run`
-(the pty is an implementation detail of running a child, not a new reach).
+child that floods the pty past the ceiling fails the Task with a
+`LimitExceeded` error rather than allocating without bound. This is the same
+`subprocess` capability as `run` (the pty is an implementation detail of
+running a child, not a new reach).
 
 Unix-only: on a non-unix target the Task fails with an `unsupported` error.
 

@@ -2369,9 +2369,8 @@ fn exhaust_builtin_adt_nested_nonexhaustive() {
 }
 
 /// A TOP-level `case` over a Prelude built-in ADT (`ErrorKind`) that omits
-/// variants must ALSO be IPE-T0010 — not a `Diagnostic::CompilerBug` ("top
-/// constructors cover 2 of 11"), the shape the pre-fix lower backstop produced.
-/// Guards the second CO-TYPES-001 variant.
+/// variants is IPE-T0010 too, never a `Diagnostic::CompilerBug` from lower's
+/// constructor-coverage backstop.
 #[test]
 fn exhaust_builtin_adt_toplevel_nonexhaustive() {
     let src = format!(
@@ -2382,6 +2381,28 @@ fn exhaust_builtin_adt_toplevel_nonexhaustive() {
          main = Io.println (classify Io)\n"
     );
     assert_rejected("exhaust_builtin_toplevel", &src, "IPE-T0010");
+}
+
+/// A `case` over `ErrorKind` that covers every other kind but omits
+/// `LimitExceeded` is non-exhaustive (IPE-T0010): adding a kind breaks an
+/// exhaustive match at `ipe` time, never as a cargo E0004.
+#[test]
+fn exhaust_error_kind_missing_limit_exceeded_is_non_exhaustive() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         classify : ErrorKind -> String\n\
+         classify k =\n    case k of\n        \
+         Io -> \"a\"\n        Network -> \"b\"\n        Ffi -> \"c\"\n        \
+         Decode -> \"d\"\n        Timeout -> \"e\"\n        NotFound -> \"f\"\n        \
+         PermissionDenied -> \"g\"\n        InvalidInput -> \"h\"\n        \
+         Conflict -> \"i\"\n        Unavailable -> \"j\"\n        Unexpected -> \"k\"\n\n\
+         main = Io.println (classify Io)\n"
+    );
+    assert_rejected(
+        "exhaust_error_kind_missing_limit_exceeded",
+        &src,
+        "IPE-T0010",
+    );
 }
 
 /// A fold over the inbound `Ipe.Browser.Geolocation.Internals` `JsMsg` that omits

@@ -7688,7 +7688,7 @@ mod tests {
             Err(Diagnostic::Name {
                 span,
                 msg: ipe_diagnostics::NameError::ConstructorNotFound { name, suggestions },
-            }) => Some((&**name, suggestions.names.len(), *span)),
+            }) => Some((&**name, suggestions.names().len(), *span)),
             _ => None,
         }
     }

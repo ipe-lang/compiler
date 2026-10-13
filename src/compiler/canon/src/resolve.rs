@@ -2,8 +2,10 @@
 //! supported subset of `Ipe.Canonicalise.{Module,Expression,Pattern,Type}`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::num::NonZeroU8;
 use std::rc::Rc;
 
+use ipe_diagnostics::suggest::{Cap, Hit, Policy, Query, Shape, Spelling, Threshold, rank};
 use ipe_diagnostics::{
     AliasExpansionKind, AliasRowFault, Candidates, CmdSubShapeMismatch, CodecAutoRejection,
     DResult, Diagnostic, EditTarget, ImportedAs, Located, ModulePlacementReason,
@@ -26,15 +28,20 @@ use crate::scope::{
     TypeTarget as ScopeType, ValueIdentity,
 };
 
-/// The maximum number of `did you mean` suggestions attached to an unresolved
-/// name. Keeping it small prevents a wall of near-misses drowning the actual
-/// error; the list is `(Levenshtein, name)`-sorted so the closest comes first.
-const MAX_SUGGESTIONS: usize = 3;
+/// The most `did you mean` names attached to an unresolved name, so a wall of
+/// near-misses never drowns the actual error.
+const MAX_SUGGESTIONS: NonZeroU8 = NonZeroU8::MIN.saturating_add(2);
 
-/// The inclusive edit-distance ceiling for a suggestion. Mirrors the reference compiler
-/// reference (`Ipe.Canonicalise.Module.suggestQualifier`): beyond two edits a
-/// "did you mean" is more misleading than helpful, so silence wins.
-const SUGGESTION_MAX_DISTANCE: usize = 2;
+/// How every unresolved-name site ranks its `did you mean` list.
+///
+/// Each name within the ranker's relative per-segment threshold. The cap holds
+/// one name more than [`MAX_SUGGESTIONS`]: the typed name itself, ranked so it
+/// counts as a competitor to every guess, is dropped after ranking and must
+/// never cost a shown slot.
+const SUGGESTION_POLICY: Policy = Policy {
+    cap: Cap::new(MAX_SUGGESTIONS.saturating_add(1)),
+    threshold: Threshold::Relative,
+};
 
 /// Recursion-depth cap for [`canonicalise_type`].
 ///
@@ -677,7 +684,7 @@ pub fn canonicalise_module_in_project(
             // only — never intern on this path). An unrelated import
             // (`Rust.Firestore` against the project's own modules) is beyond the
             // edit-distance ceiling, so it yields none rather than the whole list.
-            let sugg = rank_suggestions(&name, catalog.paths());
+            let sugg = ranked_names(&name, Shape::Dotted, catalog.paths());
             Diagnostic::Name {
                 span: import.name.span,
                 msg: NameError::ModuleNotFound {
@@ -1770,7 +1777,7 @@ fn reject_unknown_ipe_import_with_candidates(
             continue;
         }
         let name = path_to_dot_string(interner, dep_path);
-        let sugg = rank_suggestions(&name, catalog.paths());
+        let sugg = ranked_names(&name, Shape::Dotted, catalog.paths());
         return Err(Diagnostic::Name {
             span: import.name.span,
             msg: NameError::ModuleNotFound {
@@ -2031,6 +2038,7 @@ fn bind_stdlib_kernel_import(
                                         EditTarget::whole(item.span, &name_s),
                                         suggestions(
                                             name,
+                                            Shape::Flat,
                                             members.iter().map(|(n, _)| *n),
                                             interner,
                                         ),
@@ -4390,7 +4398,12 @@ fn inject_dep_exports(
                         if !dep.values.contains(name) {
                             let name_s = name_str(interner, *name)?;
                             let module_s = path_to_dot_string(interner, dep_path);
-                            let sugg = suggestions(*name, dep.values.iter().copied(), interner);
+                            let sugg = suggestions(
+                                *name,
+                                Shape::Flat,
+                                dep.values.iter().copied(),
+                                interner,
+                            );
                             return Err(Diagnostic::Name {
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
@@ -4412,7 +4425,7 @@ fn inject_dep_exports(
                             let name_s = name_str(interner, *type_name)?;
                             let module_s = path_to_dot_string(interner, dep_path);
                             let all_names = dep.types.keys().chain(dep.aliases.keys()).copied();
-                            let sugg = suggestions(*type_name, all_names, interner);
+                            let sugg = suggestions(*type_name, Shape::Flat, all_names, interner);
                             return Err(Diagnostic::Name {
                                 span: item.span,
                                 msg: NameError::NameNotExposed {
@@ -5519,6 +5532,7 @@ fn value_not_found(
                 EditTarget::whole(span, &name_s),
                 suggestions(
                     name,
+                    Shape::Flat,
                     env.vars
                         .keys()
                         .copied()
@@ -5604,7 +5618,10 @@ fn ctor_pattern_not_found(
     Ok(Diagnostic::Name {
         span,
         msg: NameError::ConstructorNotFound {
-            suggestions: Candidates::at(region, suggestions(name, ctor_names, interner)),
+            suggestions: Candidates::at(
+                region,
+                suggestions(name, Shape::Flat, ctor_names, interner),
+            ),
             name: name_s,
         },
     })
@@ -5650,7 +5667,7 @@ fn unbound_qualifier(
         msg: NameError::UnknownModule {
             suggestions: Candidates::at(
                 token.and_then(|t| EditTarget::prefix(t, &qualifier_s)),
-                suggestions(qualifier, env.usable_qualifiers(), interner),
+                suggestions(qualifier, Shape::Dotted, env.usable_qualifiers(), interner),
             ),
             qualifier: qualifier_s,
         },
@@ -5881,6 +5898,7 @@ fn resolve_qual_var(
                         token.and_then(|t| EditTarget::suffix(t, &member)),
                         suggestions(
                             name,
+                            Shape::Flat,
                             members
                                 .keys()
                                 .chain(env.qual_ctors.get(&qualifier).iter().flat_map(|m| m.keys()))
@@ -6287,7 +6305,12 @@ fn type_not_found(name: Symbol, ctx: &TypeCtx) -> DResult<Diagnostic> {
         span: ctx.ann_span,
         msg: NameError::TypeNotFound {
             name: name_s.into(),
-            suggestions: Candidates::hints(suggestions(name, candidates, ctx.interner)),
+            suggestions: Candidates::hints(suggestions(
+                name,
+                Shape::Flat,
+                candidates,
+                ctx.interner,
+            )),
         },
     })
 }
@@ -7717,74 +7740,62 @@ pub fn detect_kernel_alias(
         )
 }
 
-/// Build the deterministic `did you mean` suggestion list for an unresolved
-/// `typo`, drawn from `candidates`.
+/// The ranked `did you mean` hits for an unresolved `typo` over the symbol
+/// universe `candidates`.
 ///
-/// Candidates within [`SUGGESTION_MAX_DISTANCE`] edits (and not identical) are
-/// kept, sorted by `(Levenshtein distance, name)` — a total, allocation-order-
-/// independent ordering — and truncated to [`MAX_SUGGESTIONS`]. A candidate the
-/// interner cannot resolve is skipped (it cannot be rendered) rather than
-/// faulting the whole diagnostic.
+/// A candidate the interner cannot resolve is a competitor the ranker never
+/// measured, so it voids every hit (no guess can then claim to stand alone)
+/// rather than faulting the whole diagnostic.
 fn suggestions(
     typo: Symbol,
+    shape: Shape,
     candidates: impl Iterator<Item = Symbol>,
     interner: &Interner,
-) -> Box<[Box<str>]> {
+) -> Box<[Hit<Box<str>>]> {
     let Some(typo_str) = interner.resolve(typo) else {
         return Box::new([]);
     };
-    rank_suggestions(typo_str, candidates.filter_map(|c| interner.resolve(c)))
+    let unresolved = std::cell::Cell::new(false);
+    let hits = ranked_names(
+        typo_str,
+        shape,
+        candidates.filter_map(|c| {
+            let name = interner.resolve(c);
+            if name.is_none() {
+                unresolved.set(true);
+            }
+            name
+        }),
+    );
+    if unresolved.get() {
+        return Box::new([]);
+    }
+    hits
 }
 
-/// The `(Levenshtein, name)`-ranked, edit-distance-capped, `MAX_SUGGESTIONS`-capped
-/// "did you mean" list over string candidates — the single ranking every
-/// suggestion site shares.
+/// The ranked `did you mean` hits for an unresolved `typo` over the name
+/// universe `candidates`, through the one shared ranker.
 ///
 /// Symbol-keyed sites reach it through [`suggestions`]; the IPE-N0020
-/// module-not-found site (whose candidate universe is dot-joined module-path
-/// strings that must never be interned) calls it directly. Sharing this keeps an
-/// unrelated name (`Rust.Firestore` against a project's modules) yielding few or
-/// none everywhere, rather than one site dumping the whole universe unranked.
-fn rank_suggestions<'a>(typo: &str, candidates: impl Iterator<Item = &'a str>) -> Box<[Box<str>]> {
-    let mut scored: Vec<(usize, Box<str>)> = candidates
-        .map(|name| (levenshtein(typo, name), Box::<str>::from(name)))
-        .filter(|(d, _)| *d > 0 && *d <= SUGGESTION_MAX_DISTANCE)
-        .collect();
-    // (distance, name) is a total order; `Box<str>` compares lexicographically.
-    scored.sort();
-    scored.dedup();
-    scored
+/// module-not-found site, whose universe is dot-joined module paths that are
+/// never interned, calls it directly. The typed name itself is never
+/// suggested: its exact lookup already failed.
+fn ranked_names<'a>(
+    typo: &str,
+    shape: Shape,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Box<[Hit<Box<str>>]> {
+    let Ok(query) = Query::parse(typo, shape) else {
+        return Box::new([]);
+    };
+    let universe = candidates.map(|text| Spelling { text, target: text });
+    rank(&query, universe, SUGGESTION_POLICY)
+        .hits
         .into_iter()
-        .take(MAX_SUGGESTIONS)
-        .map(|(_, name)| name)
+        .filter(|hit| *hit.target() != typo)
+        .take(usize::from(MAX_SUGGESTIONS.get()))
+        .map(|hit| hit.map_target(Box::from))
         .collect()
-}
-
-/// Iterative Levenshtein edit distance over Unicode scalar values, computed
-/// with two rolling rows and no indexing (the `indexing_slicing` lint is
-/// denied workspace-wide). Ipê identifiers are short ASCII names, so the
-/// O(n·m) cost is negligible. Mirrors the reference compiler's `levenshtein`.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let b_chars: Vec<char> = b.chars().collect();
-    // Row 0: cost of deleting every prefix of `b` (i.e. inserting into empty a).
-    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        // `curr[0]` = cost of deleting the first `i + 1` chars of `a`.
-        let mut curr: Vec<usize> = Vec::with_capacity(b_chars.len() + 1);
-        curr.push(i + 1);
-        // `diag` tracks `prev[j - 1]`; for the first column that is `prev[0]`,
-        // which always equals the row index `i`.
-        let mut diag = i;
-        for (cb, &up) in b_chars.iter().zip(prev.iter().skip(1)) {
-            let cost = usize::from(ca != *cb);
-            let left = curr.last().copied().unwrap_or(i + 1);
-            let cell = (up + 1).min(left + 1).min(diag + cost);
-            curr.push(cell);
-            diag = up;
-        }
-        prev = curr;
-    }
-    prev.last().copied().unwrap_or(0)
 }
 
 /// The interned symbol for the empty string (symbol id 0 is never guaranteed,
@@ -8414,17 +8425,25 @@ mod alias_ctor_gate_tests {
 
 #[cfg(test)]
 mod suggestion_ranking_tests {
-    //! [`rank_suggestions`] — the single ranking every did-you-mean site shares,
+    //! [`ranked_names`] — the one ranking every did-you-mean site shares,
     //! including the IPE-N0020 module-not-found candidate universe (which is why
     //! an unrelated import cannot dump every project module as a "did you mean").
 
-    use super::{MAX_SUGGESTIONS, rank_suggestions};
+    use super::{Interner, MAX_SUGGESTIONS, Shape, Symbol, ranked_names, suggestions};
+    use ipe_diagnostics::suggest::{Confidence, Hit};
+
+    fn names(typo: &str, shape: Shape, universe: &[&str]) -> Vec<String> {
+        ranked_names(typo, shape, universe.iter().copied())
+            .iter()
+            .map(|hit| hit.target().to_string())
+            .collect()
+    }
 
     #[test]
     fn unrelated_name_yields_none() {
         // A project's own modules against a wholly unrelated import: every
-        // candidate is beyond the edit-distance ceiling, so none is offered —
-        // never the whole unranked module list.
+        // candidate is beyond the threshold, so none is offered — never the
+        // whole unranked module list.
         let modules = [
             "Lib.Auth",
             "Lib.Cart",
@@ -8434,7 +8453,7 @@ mod suggestion_ranking_tests {
             "State",
             "Ui.Layout",
         ];
-        let got = rank_suggestions("Rust.Firestore", modules.into_iter());
+        let got = names("Rust.Firestore", Shape::Dotted, &modules);
         assert!(
             got.is_empty(),
             "an unrelated name must yield no suggestions, got: {got:?}"
@@ -8442,23 +8461,79 @@ mod suggestion_ranking_tests {
     }
 
     #[test]
-    fn near_misses_are_ranked_and_capped_at_max() {
-        // More close candidates than the cap: the list is capped at
-        // `MAX_SUGGESTIONS`, closest-first.
-        let modules = ["Foo", "Food", "Fool", "Foot", "Fond"];
-        let got = rank_suggestions("Foo", modules.into_iter());
-        assert!(
-            got.len() <= MAX_SUGGESTIONS,
-            "must cap at MAX_SUGGESTIONS ({MAX_SUGGESTIONS}), got {}: {got:?}",
-            got.len()
+    fn near_misses_are_ranked_and_capped() {
+        let modules = ["Foot", "Fool", "Food", "Foo", "Fond"];
+        let got = names("Fooo", Shape::Dotted, &modules);
+        assert_eq!(
+            got,
+            ["Foo", "Food", "Fool"],
+            "(distance, name) order, capped"
         );
-        assert!(!got.is_empty(), "genuine near-misses must be offered");
-        // The exact-match candidate (`Foo`, distance 0) is excluded — a
-        // suggestion identical to the typed name is noise.
-        assert!(
-            !got.iter().any(|s| s.as_ref() == "Foo"),
-            "distance-0 self must not be suggested, got: {got:?}"
+        assert_eq!(got.len(), usize::from(MAX_SUGGESTIONS.get()));
+    }
+
+    #[test]
+    fn the_typed_name_is_never_suggested_and_costs_no_slot() {
+        let got = names("Foo", Shape::Dotted, &["Foo", "Food", "Fool", "Foot"]);
+        assert_eq!(got, ["Food", "Fool", "Foot"]);
+    }
+
+    #[test]
+    fn a_transposed_module_qualifier_names_only_its_module() {
+        assert_eq!(
+            names("Ipe.Lsit", Shape::Dotted, &["Ipe.List", "Ipe.Set"]),
+            ["Ipe.List"]
         );
+    }
+
+    /// The typed name's own presence in the universe is a competitor: a second
+    /// name next to it is never a unique, unprompted fix.
+    #[test]
+    fn the_typed_name_in_the_universe_blocks_a_unique_guess() {
+        let hits = ranked_names("lenght", Shape::Flat, ["lenght", "length"].into_iter());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits.first().map(Hit::confidence),
+            Some(Confidence::Plausible)
+        );
+    }
+
+    /// The typed name's presence also blocks a case-only guess: after the
+    /// typed name is dropped the case variant stands alone, yet it was never
+    /// the one spelling of those letters.
+    #[test]
+    fn the_typed_name_in_the_universe_blocks_a_case_only_guess() {
+        let hits = ranked_names("Just", Shape::Flat, ["Just", "just"].into_iter());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits.first().map(Hit::confidence),
+            Some(Confidence::Plausible)
+        );
+    }
+
+    /// A candidate symbol the interner cannot resolve is a competitor the
+    /// ranker never measured: no guess beside it may stand alone.
+    #[test]
+    fn an_unresolvable_candidate_voids_every_guess() {
+        let mut interner = Interner::new();
+        let typo = interner.intern("lenght").expect("interning succeeds");
+        let length = interner.intern("length").expect("interning succeeds");
+        let alone = suggestions(typo, Shape::Flat, [length].into_iter(), &interner);
+        assert_eq!(
+            alone.first().map(Hit::confidence),
+            Some(Confidence::UniqueSingleEdit)
+        );
+        let unknown = Symbol::from_raw(u32::MAX);
+        assert!(interner.resolve(unknown).is_none());
+        let beside = suggestions(typo, Shape::Flat, [length, unknown].into_iter(), &interner);
+        assert!(beside.is_empty(), "got {beside:?}");
+    }
+
+    #[test]
+    fn a_hazardous_or_oversized_typo_gets_no_suggestion() {
+        assert!(names("ma\u{1b}p", Shape::Flat, &["map"]).is_empty());
+        let long = "m".repeat(10_000);
+        assert!(names(&long, Shape::Flat, &["map"]).is_empty());
     }
 }
 

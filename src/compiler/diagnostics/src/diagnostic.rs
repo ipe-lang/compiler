@@ -34,6 +34,7 @@ use crate::code::{
     IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
+use crate::suggest::{Confidence, Hit};
 use crate::terminal::TerminalSafe;
 
 // ===========================================================================
@@ -509,7 +510,7 @@ pub enum NameError {
         found: usize,
     },
     /// A local module named in an `import` cannot be found under `source_root`.
-    /// `suggestions` lists close matches by Levenshtein distance. [IPE-N0020]
+    /// `suggestions` lists close matches in the shared ranker's order. [IPE-N0020]
     ModuleNotFound {
         name: Box<str>,
         suggestions: Candidates,
@@ -2248,32 +2249,49 @@ impl EditTarget {
 
 /// Ranked did-you-mean names for an unresolved name, plus where a fix may land.
 ///
+/// Built only from the hits of [`crate::suggest::rank`], so the names keep the
+/// ranker's order and each name carries the ranker's confidence in it.
 /// `region` is `None` when the producer cannot prove the exact sub-span the
 /// replacement would overwrite (a type annotation carries one span for the
 /// whole annotation); such candidates only ever render as "did you mean"
-/// lines, never as an applicable edit.
+/// lines, never as an edit.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Candidates {
     /// The region a sole candidate replaces, when provable.
-    pub region: Option<EditTarget>,
-    /// The candidate names, best first.
-    pub names: Box<[Box<str>]>,
+    region: Option<EditTarget>,
+    /// The ranked hits, best first.
+    hits: Box<[Hit<Box<str>>]>,
 }
 
 impl Candidates {
-    /// Candidates with a proven (or absent) replace region.
+    /// Ranked hits with a proven (or absent) replace region.
     #[must_use]
-    pub const fn at(region: Option<EditTarget>, names: Box<[Box<str>]>) -> Self {
-        Self { region, names }
+    pub const fn at(region: Option<EditTarget>, hits: Box<[Hit<Box<str>>]>) -> Self {
+        Self { region, hits }
     }
 
-    /// Candidates that are hints only: no region, so never machine-applicable.
+    /// Ranked hits that are hints only: no region, so never an edit.
     #[must_use]
-    pub const fn hints(names: Box<[Box<str>]>) -> Self {
-        Self {
-            region: None,
-            names,
-        }
+    pub const fn hints(hits: Box<[Hit<Box<str>>]>) -> Self {
+        Self::at(None, hits)
+    }
+
+    /// The candidate names, best first.
+    #[must_use]
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.hits.iter().map(|hit| &**hit.target())
+    }
+}
+
+/// How sure an edit to a sole candidate the ranker rated `confidence` may be.
+///
+/// Only a case-only match or a unique single edit is unambiguous enough to
+/// apply unprompted; any other guess could rewrite the code to a different
+/// binding that still type-checks, so it needs the author's confirmation.
+const fn sole_applicability(confidence: Confidence) -> Applicability {
+    match confidence {
+        Confidence::CaseOnly | Confidence::UniqueSingleEdit => Applicability::MachineApplicable,
+        Confidence::Plausible => Applicability::MaybeIncorrect,
     }
 }
 
@@ -3512,24 +3530,24 @@ const fn consent_code(msg: &ConsentError) -> Code {
 
 // --- did_you_mean ------------------------------------------------------------
 
-/// Turns already-sorted candidates into help lines.
+/// Turns ranked candidates into help lines.
 ///
-/// A single candidate with a proven [`EditTarget`] is confident enough to offer
-/// as a [`Applicability::MachineApplicable`] suggestion over exactly that
-/// region; any other shape (several candidates, or no provable region) stays a
-/// non-committal "did you mean" line per name. The producer is responsible for
-/// the stable `(Levenshtein, name)` ordering.
+/// A single candidate with a proven [`EditTarget`] becomes a [`Suggestion`]
+/// over exactly that region, applicable unprompted only when the ranker found
+/// it unambiguous ([`sole_applicability`]); any other shape
+/// (several candidates, or no provable region) stays a non-committal "did you
+/// mean" line per name, in the ranker's order.
 fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
-    match (&*candidates.names, &candidates.region) {
+    match (&*candidates.hits, &candidates.region) {
         ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
             span: target.span,
             replaces: target.replaces.clone(),
-            replacement: only.clone(),
-            applicability: Applicability::MachineApplicable,
+            replacement: only.target().clone(),
+            applicability: sole_applicability(only.confidence()),
         })],
         (many, _) => many
             .iter()
-            .map(|s| HelpLine::DidYouMean(s.clone()))
+            .map(|hit| HelpLine::DidYouMean(hit.target().clone()))
             .collect(),
     }
 }

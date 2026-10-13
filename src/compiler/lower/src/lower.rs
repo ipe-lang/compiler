@@ -11513,7 +11513,7 @@ pub struct BuiltinCtors {
     pub gt: Symbol,
     // ── Error / ErrorKind ADTs ──────────────────────────────────
     // `Error` has one constructor also named `Error` (arity 2).
-    // `ErrorKind` has 11 nullary constructors.
+    // `ErrorKind` has 12 nullary constructors.
     pub error: Symbol,
     pub errorkind: Symbol,
     pub ek_io: Symbol,
@@ -11527,6 +11527,7 @@ pub struct BuiltinCtors {
     pub ek_conflict: Symbol,
     pub ek_unavailable: Symbol,
     pub ek_unexpected: Symbol,
+    pub ek_limit_exceeded: Symbol,
     // ── ErrorDetails ADT ──────────────────────────────
     // `ErrorDetails` has 6 constructors, each arity 1.
     pub errordetails: Symbol,
@@ -13035,7 +13036,7 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.gt), 0);
         // ── Error / ErrorKind ADTs ─────────────────────────────────
         // `Error` is a single-constructor ADT: `Error ErrorKind ErrorInfo`.
-        // `ErrorKind` has 11 nullary variants.
+        // `ErrorKind` has 12 nullary variants.
         // Both are Prelude built-ins — no user `type` declaration in Ipê source.
         // Seeding them here lets `case e of Error kind info ->` validate and lower
         // past the `Match::new` enum-cover check, following the same pattern as
@@ -13059,6 +13060,7 @@ impl<'a> Lowerer<'a> {
                 builtins.ek_conflict,
                 builtins.ek_unavailable,
                 builtins.ek_unexpected,
+                builtins.ek_limit_exceeded,
             ],
         );
         ctor_arity.insert((prelude_home.clone(), builtins.ek_io), 0);
@@ -13072,6 +13074,7 @@ impl<'a> Lowerer<'a> {
         ctor_arity.insert((prelude_home.clone(), builtins.ek_conflict), 0);
         ctor_arity.insert((prelude_home.clone(), builtins.ek_unavailable), 0);
         ctor_arity.insert((prelude_home.clone(), builtins.ek_unexpected), 0);
+        ctor_arity.insert((prelude_home.clone(), builtins.ek_limit_exceeded), 0);
         // ── ErrorDetails ADT ─────────────────────────────
         // 6-variant enrichment union carried on `ErrorInfo.details`. Same
         // registration recipe as `ErrorKind` above — seeding here lets
@@ -26221,6 +26224,7 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::ErrorDecode
                 | KernelFn::ErrorConflict
                 | KernelFn::ErrorUnavailable
+                | KernelFn::ErrorLimitExceeded
                 // `Error.toString : Error -> String`
                 | KernelFn::ErrorToString
                 // `Error.isRetryable : Error -> Bool`
@@ -28415,6 +28419,7 @@ impl<'a> Lowerer<'a> {
                     ("Error", "decode") => Ok(Callee::Kernel(KernelFn::ErrorDecode)),
                     ("Error", "conflict") => Ok(Callee::Kernel(KernelFn::ErrorConflict)),
                     ("Error", "unavailable") => Ok(Callee::Kernel(KernelFn::ErrorUnavailable)),
+                    ("Error", "limitExceeded") => Ok(Callee::Kernel(KernelFn::ErrorLimitExceeded)),
                     ("Error", "timeout") => Ok(Callee::Kernel(KernelFn::ErrorTimeout)),
                     ("Error", "notFound") => Ok(Callee::Kernel(KernelFn::ErrorNotFound)),
                     ("Error", "permissionDenied") => {
@@ -32059,6 +32064,7 @@ mod tests {
         let ek_conflict = interner.intern("Conflict").unwrap();
         let ek_unavailable = interner.intern("Unavailable").unwrap();
         let ek_unexpected = interner.intern("Unexpected").unwrap();
+        let ek_limit_exceeded = interner.intern("LimitExceeded").unwrap();
         // ── ErrorDetails ADT ─────────────────────────
         let errordetails = interner.intern("ErrorDetails").unwrap();
         let ed_ffi_panic = interner.intern("FfiPanic").unwrap();
@@ -32147,6 +32153,7 @@ mod tests {
             ek_conflict,
             ek_unavailable,
             ek_unexpected,
+            ek_limit_exceeded,
             // ── ErrorDetails ─────────────────────────
             errordetails,
             ed_ffi_panic,

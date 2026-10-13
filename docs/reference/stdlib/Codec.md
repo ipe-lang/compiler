@@ -217,9 +217,10 @@ fromJsonSafe : Int -> Codec a -> String -> Result Error a
 
 The untrusted-input door: reject input longer than `maxChars` BEFORE
 decoding — a size guard for request bodies and webhooks — then decode. A
-payload over the limit is a typed `Err`, never parsed. Parser nesting depth
-is separately bounded by the JSON decoder itself, so this guard plus the
-parser's depth bound cover both adversarial size and adversarial nesting.
+payload over the limit is a `LimitExceeded` error, never parsed. Parser
+nesting depth is separately bounded by the JSON decoder itself, so this
+guard plus the parser's depth bound cover both adversarial size and
+adversarial nesting.
 
 ## `string`
 

@@ -7,7 +7,37 @@ use crate::{
     ALL_CODES, Applicability, BTreeMap, Diagnostic, Path, PathBuf, Suggestion, cli_args, fs,
     project, style,
 };
-use ipe_diagnostics::{Candidates, EditTarget, NameError, Span};
+use ipe_diagnostics::{Candidates, EditTarget, NameError, Span, suggest};
+
+/// A value-not-found diagnostic for `typo` at `main = <typo>`, its candidates
+/// ranked by the shared ranker over `names`.
+fn value_not_found(typo: &str, names: &[&str]) -> Diagnostic {
+    let hi = u32::try_from(7 + typo.len()).unwrap_or(u32::MAX);
+    let span = Span::new(7, hi);
+    let hits = suggest::Query::parse(typo, suggest::Shape::Flat).map_or_else(
+        |_| Box::default(),
+        |query| {
+            let universe = names.iter().map(|name| suggest::Spelling {
+                text: name,
+                target: Box::<str>::from(*name),
+            });
+            let policy = suggest::Policy {
+                cap: suggest::Cap::MAX,
+                threshold: suggest::Threshold::Relative,
+            };
+            suggest::rank(&query, universe, policy)
+                .hits
+                .into_boxed_slice()
+        },
+    );
+    Diagnostic::Name {
+        span,
+        msg: NameError::ValueNotFound {
+            name: typo.into(),
+            suggestions: Candidates::at(EditTarget::whole(span, typo), hits),
+        },
+    }
+}
 
 /// An emit target at `out`, proven disjoint from a project directory beside it.
 fn emit_target(out: &Path) -> EmitTarget {
@@ -479,19 +509,13 @@ fn compiled_source_stdlib_own_imports_resolve_no_n0034() {
 #[test]
 fn machine_applicable_suggestion_is_collected_and_applied() {
     let src = "main = lenght";
-    // `lenght` occupies bytes 7..13.
-    let diag = Diagnostic::Name {
-        span: Span::new(7, 13),
-        msg: NameError::ValueNotFound {
-            name: "lenght".into(),
-            suggestions: Candidates::at(
-                EditTarget::whole(Span::new(7, 13), "lenght"),
-                Box::new(["length".into()]),
-            ),
-        },
-    };
+    let diag = value_not_found("lenght", &["length", "map"]);
     let fixes = machine_applicable_suggestions(&diag);
-    assert_eq!(fixes.len(), 1, "single candidate is machine-applicable");
+    assert_eq!(
+        fixes.len(),
+        1,
+        "a unique single-edit fix is machine-applicable"
+    );
     let selected = select_non_overlapping(fixes, src.len());
     let patched = apply_fixes(src, &selected);
     assert_eq!(patched.as_deref(), Some("main = length"));
@@ -577,11 +601,56 @@ fn apply_fixes_rejects_non_char_boundary_span() {
     assert_eq!(apply_fixes("é", &[s]), None);
 }
 
+/// A sole candidate the ranker only finds plausible is a hint, never a
+/// rewrite `ipe fix --yes` applies unprompted.
 #[test]
-fn levenshtein_is_symmetric_and_zero_on_equal() {
-    assert_eq!(levenshtein("abc", "abc"), 0);
-    assert_eq!(levenshtein("abc", "abd"), 1);
-    assert_eq!(levenshtein("abc", "abd"), levenshtein("abd", "abc"));
+fn a_plausible_sole_candidate_is_never_collected_as_a_fix() {
+    let diag = value_not_found("lenght", &["lengths"]);
+    assert!(
+        machine_applicable_suggestions(&diag).is_empty(),
+        "a two-edit guess must not be auto-applied: {diag:?}"
+    );
+}
+
+/// A sole single-edit candidate with a close runner-up is ambiguous: the
+/// runner-up is never shown, so the one shown must not be auto-applied.
+#[test]
+fn a_single_edit_with_a_close_runner_up_is_never_collected_as_a_fix() {
+    let diag = value_not_found("mab", &["map", "mad"]);
+    assert!(machine_applicable_suggestions(&diag).is_empty());
+}
+
+#[test]
+fn a_mistyped_command_names_its_nearest_command() {
+    assert_eq!(nearest_command("verfy"), Some("verify"));
+    assert_eq!(nearest_command("tset"), Some("test"));
+}
+
+#[test]
+fn a_wildly_different_command_gets_no_guess() {
+    assert_eq!(nearest_command("definitely-not-a-command"), None);
+    assert_eq!(nearest_command("zq"), None);
+}
+
+/// An attempt the ranker refuses (control character, oversized) gets no
+/// guess rather than an unbounded scan.
+#[test]
+fn a_hazardous_or_oversized_attempt_gets_no_guess() {
+    assert_eq!(nearest_command("verf\u{1b}y"), None);
+    assert_eq!(nearest_command(&"v".repeat(10_000)), None);
+    assert!(did_you_mean_codes(&"I".repeat(10_000)).is_empty());
+}
+
+#[test]
+fn a_mistyped_group_verb_names_its_nearest_member() {
+    assert_eq!(nearest_group_member("dev", "biuld"), Some("build"));
+    assert_eq!(nearest_group_member("no-such-group", "build"), None);
+}
+
+#[test]
+fn near_codes_are_ranked_and_capped() {
+    let got = did_you_mean_codes("IPE-T0099");
+    assert!(!got.is_empty() && got.len() <= 3, "got {got:?}");
 }
 
 #[test]

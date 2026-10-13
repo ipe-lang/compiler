@@ -1043,18 +1043,55 @@ where
     }
 }
 
-/// Resolve the request's session cookie to a live session, or the session-lost answer.
+/// Resolve the session a rejoin proof admits to a live session, or the session-lost answer.
 #[cfg(feature = "server")]
 async fn live_session<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
-    headers: &axum::http::HeaderMap,
+    proof: mint_proof::RejoinProof,
 ) -> Result<LiveSession<Model, Msg>, SessionLost>
 where
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    let sid = sid_from_cookie(headers).ok_or(SessionLost)?;
-    live_session_for(store, &sid).await
+    live_session_for(store, proof.into_key().as_str()).await
+}
+
+/// Why a request's session cookie admits no session.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CookieRefusal {
+    /// No cookie, or one that is not a well-formed sid: the session-lost answer.
+    Lost,
+    /// A cookie the request's Fetch Metadata does not admit: the fixed 403.
+    Refused(mint_proof::RejoinRefusal),
+}
+
+#[cfg(feature = "server")]
+impl axum::response::IntoResponse for CookieRefusal {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Lost => SessionLost.into_response(),
+            Self::Refused(why) => mint_proof::refused_rejoin(why),
+        }
+    }
+}
+
+/// The request's session cookie, admitted by its Fetch Metadata before any store read.
+///
+/// # Errors
+///
+/// The [`CookieRefusal`] naming why the cookie admits no session.
+#[cfg(feature = "server")]
+fn rejoin_from_cookie(
+    headers: &axum::http::HeaderMap,
+) -> Result<mint_proof::RejoinProof, CookieRefusal> {
+    let key = sid_from_cookie(headers)
+        .as_deref()
+        .and_then(store::SessionKey::parse)
+        .ok_or(CookieRefusal::Lost)?;
+    mint_proof::Arrival::judge(headers, mint_proof::Embedding::configured())
+        .rejoin(key)
+        .map_err(CookieRefusal::Refused)
 }
 
 /// Resolve once the session's closer reads `true`.
@@ -4268,7 +4305,19 @@ mod handlers {
         // live driver; a request behind the claim waits for the holder to
         // publish the session and then joins it live. A refused claim is the
         // 503 a busy session or a full process already answers with.
-        let cookie_key = cookie_sid.as_deref().and_then(store::SessionKey::parse);
+        // The request's Fetch Metadata is parsed once, before any session
+        // work: a cookie's key reaches the store only through a rejoin proof,
+        // and a fresh sid only through a mint proof, both judged from it. A
+        // refused rejoin answers 403 before any lookup, claim, `init` or
+        // credential re-proof.
+        let arrival = mint_proof::Arrival::judge(&headers, mint_proof::Embedding::configured());
+        let cookie_key = match cookie_sid.as_deref().and_then(store::SessionKey::parse) {
+            Some(key) if !reset_state_from_env() => match arrival.rejoin(key) {
+                Ok(proof) => Some(proof),
+                Err(why) => return mint_proof::refused_rejoin(why),
+            },
+            Some(_) | None => None,
+        };
         // Subscribed before any credential this request admits (in `init`,
         // the route entry or the first view), so a revocation landing between
         // that admission and the driver's start still wakes the driver.
@@ -4279,7 +4328,8 @@ mod handlers {
         // rather than entered with its bindings dropped.
         let mut claim_scope = None;
         let hit = match cookie_key {
-            Some(key) if !reset_state_from_env() => 'rejoin: {
+            Some(proof) => 'rejoin: {
+                let key = proof.into_key();
                 // A live session never contends for the claim table: the
                 // claim serialises only the cold-to-live transition.
                 if let Some(handle) = st.store.get(key.as_str()).await {
@@ -4307,7 +4357,7 @@ mod handlers {
                 claim_scope = Some(scope);
                 Some((sid, rejoin))
             }
-            Some(_) | None => None,
+            None => None,
         };
         // A live session joins only while its credentials re-prove; one whose
         // credentials no longer stand is closed here and this GET takes the
@@ -4433,10 +4483,7 @@ mod handlers {
             Some((_, store::Rejoin::Miss)) | None => {
                 // Only a first-party arrival mints: a cross-site subresource or
                 // frame request is refused before any slot, `init` or cookie.
-                let proof = match mint_proof::MintProof::judge(
-                    &headers,
-                    mint_proof::Embedding::configured(),
-                ) {
+                let proof = match arrival.mint() {
                     Ok(proof) => proof,
                     Err(why) => return mint_proof::refused(why),
                 };
@@ -4601,13 +4648,21 @@ mod handlers {
             Ok(route) => route.flatten(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
+        // The cookie reaches the store only through a rejoin proof judged from
+        // this request's Fetch Metadata: the `?path=` reconcile below runs a
+        // route entry, so a subresource (a cross-site `<img>` carrying a
+        // `SameSite=None` cookie) is refused before any lookup.
+        let proof = match rejoin_from_cookie(&headers) {
+            Ok(proof) => proof,
+            Err(refused) => return refused.into_response(),
+        };
         // X-Ipê-Web: 1 on the session-lost 404 lets the client distinguish a
         // genuine lost session (reload to recover) from a wedged proxy.
         let LiveSession {
             sid,
             handle: entry,
             scope: _,
-        } = match live_session(&st.store, &headers).await {
+        } = match live_session(&st.store, proof).await {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
@@ -4849,12 +4904,16 @@ mod handlers {
         // the HttpOnly session cookie by the time an event fires (the page
         // GET set it). No cookie → no session. A session whose credentials
         // no longer stand is closed by the lookup and answers session-lost.
+        // A mutating POST: the CSRF middleware's token pair is its cross-site gate.
         let _ = &parsed.session_id; // body field retained for wire-compat; not trusted for auth
+        let Some(cookie_sid) = sid_from_cookie(&headers) else {
+            return SessionLost.into_response();
+        };
         let LiveSession {
             handle: entry,
             scope,
             ..
-        } = match live_session(&st.store, &headers).await {
+        } = match live_session_for(&st.store, &cookie_sid).await {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
@@ -13357,6 +13416,250 @@ mod route_entry_cmd_tests {
         });
     }
 
+    /// The Fetch Metadata of a sibling-subdomain `<img>`, which carries a `Lax` cookie.
+    const SUBRESOURCE: [(&str, &str); 3] = [
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-mode", "no-cors"),
+        ("sec-fetch-dest", "image"),
+    ];
+
+    /// The same site's top-level navigation, the accepted control.
+    const NAVIGATION: [(&str, &str); 3] = [
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+
+    /// GET `path` with an optional session cookie and `metadata` → (status,
+    /// whether any cookie was set, body).
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_judged(
+        app: axum::Router,
+        path: &str,
+        cookie: Option<&str>,
+        metadata: &[(&str, &str)],
+    ) -> (StatusCode, bool, String) {
+        let mut b = Request::builder().method("GET").uri(path);
+        if let Some(c) = cookie {
+            b = b.header(
+                header::COOKIE,
+                format!("{}={c}", super::cookie_name_for("")),
+            );
+        }
+        for (name, value) in metadata {
+            b = b.header(*name, *value);
+        }
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.oneshot(b.body(Body::empty()).expect("build GET")),
+        )
+        .await
+        .expect("the page handler answers in time")
+        .expect("router responds");
+        let status = resp.status();
+        let set_cookie = resp.headers().get(header::SET_COOKIE).is_some();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("a UTF-8 page body");
+        (status, set_cookie, body)
+    }
+
+    /// Prove the refusal on the Live arm: a same-site subresource GET carrying
+    /// a live session's cookie is refused before the driver enters its path —
+    /// 403, no cookie, the entry Cmd never runs — while the same GET as a
+    /// navigation enters it.
+    #[test]
+    fn subresource_never_enters_a_live_session() {
+        run(false, || async {
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, body) =
+                get_judged(router(store.clone()), "/items/9", Some(&sid), &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert!(!body.contains("page-item-9"), "{body}");
+            let m = model_of(&store, &sid).await;
+            assert_eq!(m.as_ref().map(|m| m.page.clone()), Some(Page::Home));
+            assert_eq!(m.map(|m| count(&m, "enter:item-9")), Some(0));
+
+            let (status, _, body) =
+                get_judged(router(store.clone()), "/items/9", Some(&sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("page-item-9"), "{body}");
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(m.map(|m| count(&m, "enter:item-9")), Some(1));
+        });
+    }
+
+    /// Prove the refusal on the Restored arm: a subresource GET carrying a
+    /// cold session's cookie publishes no driver and takes no session slot,
+    /// while the navigation restores it.
+    #[test]
+    fn subresource_never_restores_a_cold_session() {
+        run(false, || async {
+            let cold_sid = new_sid();
+            let store: Store = Arc::new(ColdStore {
+                live: MemoryStore::new(Duration::from_secs(60)),
+                cold_sid: cold_sid.clone(),
+            });
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let app = || router_counted(store.clone(), sessions.clone());
+
+            let (status, set_cookie, _) =
+                get_judged(app(), "/items/3", Some(&cold_sid), &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert!(handle_of(&store, &cold_sid).await.is_none());
+            assert_eq!(sessions.load(Ordering::SeqCst), 0);
+
+            let (status, _, _) = get_judged(app(), "/items/3", Some(&cold_sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            let m = settled(&store, &cold_sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["persisted".to_owned(), "enter:item-3".to_owned()])
+            );
+        });
+    }
+
+    /// Prove the refusal on the Rebuilt arm: a subresource GET carrying the
+    /// cookie of a row predating an additive Model change never runs the
+    /// rebuild's lazy `init`, while the navigation rebuilds it under its sid.
+    #[cfg(feature = "web")]
+    #[test]
+    fn subresource_never_rebuilds_a_session() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) = file_store_with(
+                "rebuild-refused",
+                &sid,
+                checkpoint(OLD_TAG, r#"{"page":"Home"}"#),
+            );
+            take_init_sids();
+
+            let (status, set_cookie, _) =
+                get_judged(router(store.clone()), "/", Some(&sid), &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert!(take_init_sids().is_empty(), "a refused rejoin runs no init");
+            assert!(handle_of(&store, &sid).await.is_none());
+
+            let (status, _, _) =
+                get_judged(router(store.clone()), "/", Some(&sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(take_init_sids(), vec![sid]);
+        });
+    }
+
+    /// Prove the refusal of partial Fetch Metadata: it never rejoins a live
+    /// session, while a request with none at all (not embeddable) does.
+    #[test]
+    fn malformed_metadata_never_rejoins() {
+        run(false, || async {
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, _) = get_judged(
+                router(store.clone()),
+                "/items/4",
+                Some(&sid),
+                &[("sec-fetch-site", "same-origin")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert_eq!(
+                model_of(&store, &sid)
+                    .await
+                    .map(|m| count(&m, "enter:item-4")),
+                Some(0)
+            );
+
+            let (status, _, body) =
+                get_judged(router(store.clone()), "/items/4", Some(&sid), &[]).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("page-item-4"), "{body}");
+        });
+    }
+
+    /// The framing allowlist the embeddable child runs under.
+    const EMBEDDER: &str = "https://embedder.example";
+    /// Printed by the embeddable child once every assertion held.
+    const EMBEDDABLE_CHILD_RAN: &str = "embeddable rejoin child ran";
+
+    /// Prove the refusal of a metadata-less rejoin while the cookie is
+    /// `SameSite=None`: the check runs in a child process holding
+    /// `IPE_WEB_FRAME_ANCESTORS`, and must report that it ran.
+    #[test]
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    fn embeddable_rejoin_needs_metadata() {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, rest)| rest);
+        let filter = format!("{module}::embeddable_rejoin_child");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(crate::telemetry::FRAME_ANCESTORS_ENV, EMBEDDER)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        assert!(out.status.success(), "the child failed: {stdout}");
+        assert!(
+            stdout.contains(EMBEDDABLE_CHILD_RAN),
+            "the child test never ran: {stdout}"
+        );
+    }
+
+    /// The child half of `embeddable_rejoin_needs_metadata`; a no-op unless it
+    /// runs under the embedder allowlist.
+    #[test]
+    #[ignore = "run as a child process by embeddable_rejoin_needs_metadata"]
+    fn embeddable_rejoin_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok(EMBEDDER)
+        {
+            return;
+        }
+        run(false, || async {
+            assert_eq!(
+                mint_proof::Embedding::configured(),
+                mint_proof::Embedding::Embeddable
+            );
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, _) =
+                get_judged(router(store.clone()), "/items/5", Some(&sid), &[]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert_eq!(
+                model_of(&store, &sid)
+                    .await
+                    .map(|m| count(&m, "enter:item-5")),
+                Some(0)
+            );
+
+            let (status, _, body) =
+                get_judged(router(store.clone()), "/items/5", Some(&sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("page-item-5"), "{body}");
+        });
+        println!("{EMBEDDABLE_CHILD_RAN}");
+    }
+
     /// An undecodable row is a miss: a fresh sid, `init` evaluated exactly once under it.
     #[cfg(feature = "web")]
     #[test]
@@ -13935,6 +14238,81 @@ mod route_entry_cmd_tests {
             );
             let m = settled(&store, &sid, 3).await;
             assert_eq!(m.map(|m| count(&m, "enter:home")), Some(1));
+        });
+    }
+
+    /// The Fetch Metadata of the client's own `EventSource`, the accepted control.
+    const EVENT_SOURCE: [(&str, &str); 3] = [
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-dest", "empty"),
+    ];
+
+    /// Open the SSE stream for `sid` reporting `path` with `metadata` →
+    /// (status, whether any cookie was set, the stream up to its resync frame).
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn sse_judged(
+        store: &Store,
+        sid: &str,
+        path: &str,
+        metadata: &[(&str, &str)],
+    ) -> (StatusCode, bool, String) {
+        use futures_util::StreamExt;
+        let mut b = Request::builder()
+            .method("GET")
+            .uri(format!("/_ipe/sse?path={}", path.replace('/', "%2F")))
+            .header(header::ACCEPT, "text/event-stream")
+            .header(
+                header::COOKIE,
+                format!("{}={sid}", super::cookie_name_for("")),
+            );
+        for (name, value) in metadata {
+            b = b.header(*name, *value);
+        }
+        let resp = router(store.clone())
+            .oneshot(b.body(Body::empty()).expect("build SSE GET"))
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let set_cookie = resp.headers().get(header::SET_COOKIE).is_some();
+        let mut stream = resp.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while bytes.len() < 64 * 1024 && !utf8_prefix(&bytes).contains("event: patch") {
+                match stream.next().await {
+                    Some(Ok(chunk)) => bytes.extend_from_slice(&chunk),
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        (status, set_cookie, utf8_prefix(&bytes).to_owned())
+    }
+
+    /// Prove the refusal on the SSE reconcile: a same-site subresource open of
+    /// `/_ipe/sse?path=` carrying a live session's cookie is refused before
+    /// the lookup — 403, no cookie, the path's entry Cmd never runs — while
+    /// the client's own `EventSource` open enters it.
+    #[test]
+    fn subresource_sse_never_enters_a_route() {
+        run(false, || async {
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, _) = sse_judged(&store, &sid, "/items/8", &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let m = model_of(&store, &sid).await;
+            assert_eq!(m.as_ref().map(|m| m.page.clone()), Some(Page::Home));
+            assert_eq!(m.map(|m| count(&m, "enter:item-8")), Some(0));
+
+            let (status, _, frame) = sse_judged(&store, &sid, "/items/8", &EVENT_SOURCE).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(frame.contains("page-item-8"), "{frame}");
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(m.map(|m| count(&m, "enter:item-8")), Some(1));
         });
     }
 }

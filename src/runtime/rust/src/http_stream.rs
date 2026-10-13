@@ -845,11 +845,11 @@ where
             return IpeResult::Err(E::from(IpeError::invalid_input(format!("http: {refusal}"))));
         }
     };
-    let builder =
+    let (builder, budget) =
         match crate::http_client::ssrf_apply_with(builder, &req.url, req.redirects, policy, gate)
             .await
         {
-            Ok(b) => b,
+            Ok(applied) => applied,
             Err(refusal) => {
                 return IpeResult::Err(E::from(IpeError::invalid_input(format!(
                     "http: {refusal}"
@@ -889,8 +889,13 @@ where
         // [B8] The reqwest error `Debug`/`Display` (and `req.url`) can echo the
         // target URL / request headers / bearer / API key. Route through the
         // correlation-id redaction helper: raw detail → server log under a ref
-        // id; Ipê sees only a fixed generic message.
-        Ok(Err(e)) => return IpeResult::Err(crate::http_client::redacted_transport_error(e)),
+        // id; Ipê sees only a fixed generic message. A redirect chain past its
+        // hop maximum is the `LimitExceeded` refusal instead.
+        Ok(Err(e)) => {
+            return IpeResult::Err(E::from(crate::http_client::send_failure::<IpeError>(
+                e, &budget,
+            )));
+        }
     };
     // HTTP error statuses (4xx/5xx) still surface as a stream — the body may
     // carry the error payload the caller wants to read. Mirrors Http.get

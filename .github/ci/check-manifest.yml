@@ -73,6 +73,7 @@ checks:
         - cargo clippy -p ipe-runtime-rust --features debugger,tui --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features debugger,web --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --all-targets --features dev-posture -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --all-targets --features full,dev-posture -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features full --all-targets -- -D warnings
     guards: >-
       Every runtime feature combination the emitter can select builds clean

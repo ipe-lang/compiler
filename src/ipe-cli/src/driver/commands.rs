@@ -8,6 +8,10 @@ use super::{
     io_err, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
     runtime_dep_from_env, single_file_cargo_name_from_env,
 };
+use std::num::NonZeroU8;
+
+use ipe_diagnostics::suggest;
+
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
 };
@@ -3476,9 +3480,9 @@ pub fn code_index() -> String {
 /// Returns [`CliError::UnknownCode`] (carrying a deterministic did-you-mean
 /// list) when the string is not a taxonomy code.
 pub fn explain_lookup(input: &str) -> Result<&'static str, CliError> {
-    let canonical = input.trim().to_ascii_uppercase();
+    let canonical = input.trim();
     for &c in ALL_CODES {
-        if c.as_str() == canonical {
+        if c.as_str().eq_ignore_ascii_case(canonical) {
             // `explain_page` is `Some` for every `ALL_CODES` member; the `None`
             // arm is surfaced as a typed error rather than a panic.
             return explain_page(c).map_or_else(
@@ -3494,74 +3498,63 @@ pub fn explain_lookup(input: &str) -> Result<&'static str, CliError> {
     }
     Err(CliError::UnknownCode {
         input: input.trim().to_owned(),
-        suggestions: did_you_mean_codes(&canonical),
+        suggestions: did_you_mean_codes(canonical),
     })
 }
 
-/// The known command closest to `attempted` by Levenshtein distance, within a
-/// small edit threshold — the "maybe ...?" hint for a mistyped command. `None`
-/// when nothing is close enough, so a wildly different token gets only the help
-/// screen, not a misleading guess.
-pub fn nearest_command(attempted: &str) -> Option<&'static str> {
-    help::command_names()
+/// The names in `universe` the shared ranker finds near `attempted`, best
+/// first, at most `cap`.
+///
+/// An attempt the ranker refuses (blank, oversized, or carrying a control
+/// character) gets no guess, and neither does a name past the threshold.
+fn ranked_names(
+    attempted: &str,
+    universe: impl IntoIterator<Item = &'static str>,
+    cap: NonZeroU8,
+) -> Vec<&'static str> {
+    let Ok(query) = suggest::Query::parse(attempted, suggest::Shape::Flat) else {
+        return Vec::new();
+    };
+    let spellings = universe
         .into_iter()
-        .map(|name| (levenshtein(attempted, name), name))
-        .filter(|&(dist, _)| dist <= 3)
-        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
-        .map(|(_, name)| name)
-}
-
-/// The verb of `group` closest to `attempted` by Levenshtein distance, within a
-/// small edit threshold — the "maybe `ipe dev run`?" hint after a mistyped group
-/// verb. `None` when nothing is close enough, or when `group` is not a known
-/// group.
-pub fn nearest_group_member(group: &str, attempted: &str) -> Option<&'static str> {
-    help::group_members(group)?
-        .iter()
-        .map(|&verb| (levenshtein(attempted, verb), verb))
-        .filter(|&(dist, _)| dist <= 3)
-        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
-        .map(|(_, verb)| verb)
-}
-
-/// The closest known codes to `canonical` (already upper-cased), ranked by
-/// `(Levenshtein, code)` and filtered to a small edit distance. Deterministic.
-pub fn did_you_mean_codes(canonical: &str) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, &'static str)> = ALL_CODES
-        .iter()
-        .map(|&c| (levenshtein(canonical, c.as_str()), c.as_str()))
-        .collect();
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-    scored
+        .map(|text| suggest::Spelling { text, target: text });
+    let policy = suggest::Policy {
+        cap: suggest::Cap::new(cap),
+        threshold: suggest::Threshold::Relative,
+    };
+    suggest::rank(&query, spellings, policy)
+        .hits
         .into_iter()
-        .filter(|&(dist, _)| dist <= 3)
-        .take(3)
-        .map(|(_, name)| name)
+        .map(suggest::Hit::into_target)
         .collect()
 }
 
-/// Classic two-row Levenshtein edit distance. Uses no slice indexing (only
-/// `get`/`push`/`last`), so it cannot panic.
-pub fn levenshtein(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut cur: Vec<usize> = Vec::with_capacity(b.len().saturating_add(1));
-        cur.push(i.saturating_add(1));
-        for (j, &cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            let del = prev.get(j.saturating_add(1)).copied().unwrap_or(usize::MAX);
-            let ins = cur.get(j).copied().unwrap_or(usize::MAX);
-            let sub = prev.get(j).copied().unwrap_or(usize::MAX);
-            cur.push(
-                del.saturating_add(1)
-                    .min(ins.saturating_add(1))
-                    .min(sub.saturating_add(cost)),
-            );
-        }
-        prev = cur;
-    }
-    prev.last().copied().unwrap_or(0)
+/// The known command nearest `attempted` — the "maybe ...?" hint for a
+/// mistyped command. `None` when nothing is close enough, so a wildly
+/// different token gets only the help screen, not a misleading guess.
+pub fn nearest_command(attempted: &str) -> Option<&'static str> {
+    ranked_names(attempted, help::command_names(), NonZeroU8::MIN)
+        .into_iter()
+        .next()
+}
+
+/// The verb of `group` nearest `attempted` — the "maybe `ipe dev run`?" hint
+/// after a mistyped group verb. `None` when nothing is close enough, or when
+/// `group` is not a known group.
+pub fn nearest_group_member(group: &str, attempted: &str) -> Option<&'static str> {
+    let members = help::group_members(group)?;
+    ranked_names(attempted, members, NonZeroU8::MIN)
+        .into_iter()
+        .next()
+}
+
+/// The known codes nearest `input`, best first, at most three. Deterministic.
+pub fn did_you_mean_codes(input: &str) -> Vec<&'static str> {
+    ranked_names(
+        input,
+        ALL_CODES.iter().map(|c| c.as_str()),
+        NonZeroU8::MIN.saturating_add(2),
+    )
 }
 
 // ===========================================================================

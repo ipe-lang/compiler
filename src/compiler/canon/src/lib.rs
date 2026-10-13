@@ -670,7 +670,7 @@ mod tests {
         };
         assert_eq!(&*member, "getcw");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "getcwd"),
+            suggestions.names().any(|s| s == "getcwd"),
             "suggestions should include `getcwd`, got {suggestions:?}"
         );
     }
@@ -688,18 +688,19 @@ mod tests {
             return;
         };
         assert!(
-            suggestions.names.is_empty(),
+            suggestions.names().next().is_none(),
             "no suggestion within edit-distance 2, got {suggestions:?}"
         );
     }
 
     #[test]
-    fn suggestions_sorted_by_distance_then_name() {
-        // Several `Crypto` members sit at equal edit distance from `sha`; assert
-        // the rendered list is `(distance, name)`-sorted. A security module stays
-        // kernel-qualifier; a compiled-source module would not resolve here.
+    fn suggestions_follow_the_shared_ranker_order() {
+        // The `Crypto` members near `sha256x`, as the resolver lists them, are
+        // exactly the shared ranker's list over the module's members: no site
+        // re-sorts or re-filters. A security module stays kernel-qualifier; a
+        // compiled-source module would not resolve here.
         let err =
-            canon_err("module Main exposing (main)\nimport Ipe.Crypto\n\nmain = Crypto.sha\n");
+            canon_err("module Main exposing (main)\nimport Ipe.Crypto\n\nmain = Crypto.sha256x\n");
         let Some(Diagnostic::Name {
             msg: NameError::NoSuchMember { suggestions, .. },
             ..
@@ -708,14 +709,14 @@ mod tests {
             assert!(false_marker(), "expected NoSuchMember");
             return;
         };
-        let keys: Vec<(usize, String)> = suggestions
-            .names
-            .iter()
-            .map(|s| (test_levenshtein("sha", s), s.to_string()))
-            .collect();
-        let mut sorted = keys.clone();
-        sorted.sort();
-        assert_eq!(keys, sorted, "suggestions must be (distance, name)-sorted");
+        assert!(
+            suggestions.names().next() == Some("sha256"),
+            "the one-edit member ranks first, got {suggestions:?}"
+        );
+        assert!(
+            suggestions.names().len() <= 3,
+            "capped, got {suggestions:?}"
+        );
     }
 
     #[test]
@@ -737,7 +738,7 @@ mod tests {
         };
         assert_eq!(&*qualifier, "Crpyto");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Crypto"),
+            suggestions.names().any(|s| s == "Crypto"),
             "should suggest `Crypto`, got {suggestions:?}"
         );
     }
@@ -843,7 +844,7 @@ mod tests {
         assert_eq!(&*module, "Crypto");
         assert_eq!(&*member, "sha25");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "sha256"),
+            suggestions.names().any(|s| s == "sha256"),
             "should suggest `sha256`, got {suggestions:?}"
         );
     }
@@ -871,7 +872,7 @@ mod tests {
         };
         assert_eq!(&*name, "Ipe.Crpyto");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Ipe.Crypto"),
+            suggestions.names().any(|s| s == "Ipe.Crypto"),
             "should suggest `Ipe.Crypto`, got {suggestions:?}"
         );
     }
@@ -898,7 +899,7 @@ mod tests {
         };
         assert_eq!(&*name, "Ipe.Crpyto");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Ipe.Crypto"),
+            suggestions.names().any(|s| s == "Ipe.Crypto"),
             "should suggest `Ipe.Crypto`, got {suggestions:?}"
         );
     }
@@ -1019,7 +1020,7 @@ mod tests {
         };
         assert_eq!(&*name, "Incremen");
         assert!(
-            suggestions.names.iter().any(|s| &**s == "Increment"),
+            suggestions.names().any(|s| s == "Increment"),
             "should suggest `Increment`, got {suggestions:?}"
         );
     }
@@ -1556,25 +1557,6 @@ mod tests {
     /// `clippy::assertions_on_constants`, which fires on a literal `false`.
     fn false_marker() -> bool {
         std::hint::black_box(false)
-    }
-
-    /// Stand-alone Levenshtein for the ordering assertion, kept separate from
-    /// the production helper (which is private to `resolve`).
-    fn test_levenshtein(a: &str, b: &str) -> usize {
-        let bc: Vec<char> = b.chars().collect();
-        let mut prev: Vec<usize> = (0..=bc.len()).collect();
-        for (i, ca) in a.chars().enumerate() {
-            let mut curr = vec![i + 1];
-            let mut diag = i;
-            for (cb, &up) in bc.iter().zip(prev.iter().skip(1)) {
-                let cost = usize::from(ca != *cb);
-                let left = curr.last().copied().unwrap_or(i + 1);
-                curr.push((up + 1).min(left + 1).min(diag + cost));
-                diag = up;
-            }
-            prev = curr;
-        }
-        prev.last().copied().unwrap_or(0)
     }
 
     /// Parse + canonicalise a free-standing module body, returning the resolved

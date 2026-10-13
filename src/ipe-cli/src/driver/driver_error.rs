@@ -159,7 +159,7 @@ pub enum CliError {
     },
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     /// Carries the (trimmed) input and a deterministic did-you-mean list over
-    /// the known codes, ranked by `(Levenshtein, code)`.
+    /// the known codes, in the shared ranker's order.
     UnknownCode {
         input: String,
         suggestions: Vec<&'static str>,

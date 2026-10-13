@@ -590,6 +590,9 @@ jobs:
       # The development build intent — its posture tests compile only under
       # `dev-posture`, which no other combo turns on.
       - run: cargo clippy -p ipe-runtime-rust --all-targets --features dev-posture -- -D warnings
+      # The development intent over every gated module: dev-view renderers
+      # (`Debug.log`) live inside the module each type belongs to.
+      - run: cargo clippy -p ipe-runtime-rust --all-targets --features full,dev-posture -- -D warnings
       # Every runtime feature at once — lints that fire only when all gated
       # modules compile together (an item order, a cfg-gated dead fn).
       - run: cargo clippy -p ipe-runtime-rust --features full --all-targets -- -D warnings

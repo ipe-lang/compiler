@@ -9,4 +9,4 @@ startsWith and eq: ab
 eq and startsWith: a_b-x
 empty prefix: Unexpected: db.findWhere: Sql.startsWith: the prefix is empty
 longest prefix: 
-too-long prefix: Unexpected: db.findWhere: Sql.startsWith: the prefix is longer than 16384 bytes
+too-long prefix: LimitExceeded: db.findWhere: Sql.startsWith: the prefix is longer than 16384 bytes

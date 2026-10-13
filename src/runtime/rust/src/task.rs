@@ -731,15 +731,16 @@ const LOOP_EXHAUSTED_SUFFIX: &str = " times, its ceiling, without reaching Done"
 impl From<LoopRefusal> for IpeError {
     /// The one place a loop refusal becomes an `Error`.
     ///
-    /// Both refusals are `InvalidInput`: neither is retryable, since re-running
-    /// the same loop reaches the same outcome. The message carries only the
-    /// ceiling, never the loop state (which may hold a secret).
+    /// A ceiling below one is `InvalidInput`; a loop that spends its ceiling is
+    /// `LimitExceeded`. Neither is retryable, since re-running the same loop
+    /// reaches the same outcome. The message carries only the ceiling, never
+    /// the loop state (which may hold a secret).
     fn from(refusal: LoopRefusal) -> Self {
         match refusal {
             LoopRefusal::CeilingBelowOne(raw) => {
                 Self::invalid_input(format!("{LOOP_CEILING_BELOW_ONE}{raw})"))
             }
-            LoopRefusal::Exhausted(ceiling) => Self::invalid_input(format!(
+            LoopRefusal::Exhausted(ceiling) => Self::limit_exceeded(format!(
                 "{LOOP_EXHAUSTED_PREFIX}{}{LOOP_EXHAUSTED_SUFFIX}",
                 ceiling.get()
             )),
@@ -1725,7 +1726,7 @@ mod loop_tests {
         assert_eq!(
             refusal(result),
             Some((
-                IpeErrorKind::InvalidInput,
+                IpeErrorKind::LimitExceeded,
                 "Task.loop ran its step 6 times, its ceiling, without reaching Done".to_owned()
             ))
         );

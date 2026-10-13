@@ -26,7 +26,7 @@
 //! `network` capability and any SSRF-style host policy. `Dsn` is the syntactic
 //! parse boundary; connecting is a distinct, separately-reviewed act.
 
-use super::IpeResult;
+use super::{FromLimitExceeded, IpeResult};
 use crate::encoding::{UrlGrammar, decode_component};
 use crate::secret::{Secret, secret_from_string};
 use crate::ssrf::{ConfiguredHost, DriverParityQuery, UnambiguousUrl};
@@ -110,13 +110,15 @@ struct DsnPart(String);
 
 impl DsnPart {
     /// A part written percent-encoded in a URL, held decoded.
-    fn of_encoded(encoded: &str) -> Option<Self> {
-        Self::of_text(decode_component(encoded, UrlGrammar::Path).ok()?)
+    fn of_encoded(encoded: &str) -> Result<Self, DsnReject> {
+        decode_component(encoded, UrlGrammar::Path)
+            .map_err(|_| DsnReject::InvalidComponent)
+            .and_then(Self::of_text)
     }
 
     /// A part given as its own literal text.
-    fn of_text(text: String) -> Option<Self> {
-        text_ok(&text).then_some(Self(text))
+    fn of_text(text: String) -> Result<Self, DsnReject> {
+        clean_text(&text).map(|()| Self(text))
     }
 
     /// The text as held.
@@ -169,13 +171,14 @@ impl SqliteDb {
     ///
     /// `:memory:` names the in-memory database; a name starting `file:` is
     /// refused.
-    fn of_name(name: String) -> Option<Self> {
-        if !text_ok(&name) || name.starts_with("file:") {
-            None
+    fn of_name(name: String) -> Result<Self, DsnReject> {
+        clean_text(&name)?;
+        if name.starts_with("file:") {
+            Err(DsnReject::InvalidComponent)
         } else if name == SQLITE_MEMORY {
-            Some(Self::Memory)
+            Ok(Self::Memory)
         } else {
-            Some(Self::File(name))
+            Ok(Self::File(name))
         }
     }
 
@@ -200,12 +203,11 @@ impl SqliteDb {
             return Err(DsnReject::ConflictingParameter);
         }
         if path.len() > MAX_COMPONENT_LEN {
-            return Err(DsnReject::InvalidComponent);
+            return Err(DsnReject::ComponentTooLong);
         }
         decode_component(path, UrlGrammar::Path)
-            .ok()
+            .map_err(|_| DsnReject::InvalidComponent)
             .and_then(Self::of_name)
-            .ok_or(DsnReject::InvalidComponent)
     }
 
     /// The literal file name (`:memory:` for the in-memory database).
@@ -250,7 +252,7 @@ impl Credentials {
     /// [`MAX_COMPONENT_LEN`] bytes, or one with no user name, is refused.
     fn of_parts(user: Option<DsnPart>, password: Secret) -> Result<Option<Self>, DsnReject> {
         if password.byte_len() > MAX_COMPONENT_LEN {
-            return Err(DsnReject::InvalidComponent);
+            return Err(DsnReject::ComponentTooLong);
         }
         let password = (password.byte_len() > 0).then_some(password);
         match (user, password) {
@@ -359,9 +361,28 @@ enum DsnReject {
     AmbiguousUserinfo,
     PasswordWithoutUser,
     TooLong,
+    ComponentTooLong,
 }
 
 impl DsnReject {
+    /// Whether this rejection is a length ceiling: the whole DSN's or one
+    /// component's.
+    const fn is_ceiling(self) -> bool {
+        match self {
+            Self::TooLong | Self::ComponentTooLong => true,
+            Self::Unparseable
+            | Self::UnknownDriver
+            | Self::MissingHost
+            | Self::InvalidPort
+            | Self::TlsDisabled
+            | Self::UnknownSslMode
+            | Self::ConflictingParameter
+            | Self::InvalidComponent
+            | Self::AmbiguousUserinfo
+            | Self::PasswordWithoutUser => false,
+        }
+    }
+
     /// The value-free message. Every arm is a fixed, credential-free string; the
     /// input is never interpolated, so the rejection cannot leak a pasted secret.
     fn message(self) -> &'static str {
@@ -376,6 +397,7 @@ impl DsnReject {
             Self::InvalidComponent => "Ipe.Db.Dsn: invalid DSN component",
             Self::PasswordWithoutUser => "Ipe.Db.Dsn: a password needs a user name",
             Self::TooLong => "Ipe.Db.Dsn: DSN exceeds the length limit",
+            Self::ComponentTooLong => "Ipe.Db.Dsn: a DSN component exceeds the length limit",
             Self::AmbiguousUserinfo => {
                 "Ipe.Db.Dsn: the user name or password may run past the URL's authority: \
                  percent-encode `/`, `?`, `#`, `@` and `\\` in them, and write `@` \
@@ -385,8 +407,13 @@ impl DsnReject {
     }
 }
 
-fn reject<E: From<String>>(r: DsnReject) -> IpeResult<E, Dsn> {
-    IpeResult::Err(r.message().to_owned().into())
+fn reject<E: From<String> + FromLimitExceeded>(r: DsnReject) -> IpeResult<E, Dsn> {
+    let message = r.message().to_owned();
+    IpeResult::Err(if r.is_ceiling() {
+        E::from_limit_exceeded(message)
+    } else {
+        message.into()
+    })
 }
 
 /// A generous-but-bounded length cap for any single DSN component (host, user,
@@ -397,23 +424,32 @@ const MAX_COMPONENT_LEN: usize = 512;
 /// The length cap, in bytes, of a whole DSN string given to [`dsn_parse`].
 const MAX_DSN_LEN: usize = 4096;
 
-/// True when `s` is safe to carry as a DSN component: no control characters, no
+/// `Ok` when `s` is safe to carry as a DSN component: no control characters, no
 /// embedded null, no leading/trailing/interior whitespace, and within the length
 /// bound — checked on the PERCENT-DECODED form, so a `%0a`/`%00` that decodes to a
 /// control byte is rejected too. Rejecting whitespace and control bytes closes the
 /// injection/smuggling vector before any component is trusted. A malformed escape
 /// or decoded bytes that are not UTF-8 are rejected as well.
-fn component_ok(s: &str) -> bool {
-    s.len() <= MAX_COMPONENT_LEN
-        && decode_component(s, UrlGrammar::Path).is_ok_and(|decoded| text_ok(&decoded))
+fn clean_component(s: &str) -> Result<(), DsnReject> {
+    if s.len() > MAX_COMPONENT_LEN {
+        return Err(DsnReject::ComponentTooLong);
+    }
+    decode_component(s, UrlGrammar::Path)
+        .map_err(|_| DsnReject::InvalidComponent)
+        .and_then(|decoded| clean_text(&decoded))
 }
 
-/// True when `s`, taken literally, is non-empty, within the length bound, and
-/// free of control characters and whitespace.
-fn text_ok(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= MAX_COMPONENT_LEN
-        && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+/// `Ok` when `s`, taken literally, is non-empty, within the length bound, and
+/// free of control characters and whitespace; past the bound it is the
+/// component length ceiling.
+fn clean_text(s: &str) -> Result<(), DsnReject> {
+    if s.len() > MAX_COMPONENT_LEN {
+        Err(DsnReject::ComponentTooLong)
+    } else if s.is_empty() || s.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        Err(DsnReject::InvalidComponent)
+    } else {
+        Ok(())
+    }
 }
 
 /// True when `s` names the Postgres driver.
@@ -487,7 +523,7 @@ fn tls_from_query(url: &UnambiguousUrl) -> Result<TlsMode, DsnReject> {
 /// [`MAX_COMPONENT_LEN`] bytes, and a DSN over [`MAX_DSN_LEN`] bytes are
 /// refused.
 #[must_use]
-pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
+pub fn dsn_parse<E: From<String> + FromLimitExceeded>(s: String) -> IpeResult<E, Dsn> {
     if s.len() > MAX_DSN_LEN {
         return reject(DsnReject::TooLong);
     }
@@ -521,13 +557,14 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
             let Some(host) = DsnHost::of_url(&url) else {
                 return reject(DsnReject::MissingHost);
             };
-            if !component_ok(host.as_str()) {
-                return reject(DsnReject::InvalidComponent);
+            if let Err(r) = clean_component(host.as_str()) {
+                return reject(r);
             }
             // Postgres' well-known default; an omitted port is not an error.
             let port = parsed.port().unwrap_or(5432);
-            let Some(database) = DsnPart::of_encoded(parsed.path().trim_start_matches('/')) else {
-                return reject(DsnReject::InvalidComponent);
+            let database = match DsnPart::of_encoded(parsed.path().trim_start_matches('/')) {
+                Ok(database) => database,
+                Err(r) => return reject(r),
             };
             (host, port, DsnTarget::Postgres(database), tls)
         }
@@ -551,12 +588,10 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
     // a default role); when present it must be a clean component.
     let user = match parsed.username() {
         "" => None,
-        encoded => {
-            let Some(user) = DsnPart::of_encoded(encoded) else {
-                return reject(DsnReject::InvalidComponent);
-            };
-            Some(user)
-        }
+        encoded => match DsnPart::of_encoded(encoded) {
+            Ok(user) => Some(user),
+            Err(r) => return reject(r),
+        },
     };
 
     // Held decoded, as the user name is, so the connection URL encodes it once.
@@ -597,7 +632,7 @@ pub fn dsn_parse<E: From<String>>(s: String) -> IpeResult<E, Dsn> {
 /// is a rejection rather than a panic.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn dsn_build<E: From<String>>(
+pub fn dsn_build<E: From<String> + FromLimitExceeded>(
     driver_tag: i64,
     host: String,
     port: i64,
@@ -634,8 +669,8 @@ pub fn dsn_build<E: From<String>>(
 
     let host = match driver {
         DsnDriver::Postgres => {
-            if !component_ok(&host) {
-                return reject(DsnReject::InvalidComponent);
+            if let Err(r) = clean_component(&host) {
+                return reject(r);
             }
             let Some(host) = DsnHost::of_part(&host) else {
                 return reject(DsnReject::InvalidComponent);
@@ -654,16 +689,17 @@ pub fn dsn_build<E: From<String>>(
         DsnDriver::Postgres => DsnPart::of_text(database).map(DsnTarget::Postgres),
         DsnDriver::Sqlite => SqliteDb::of_name(database).map(DsnTarget::Sqlite),
     };
-    let Some(target) = target else {
-        return reject(DsnReject::InvalidComponent);
+    let target = match target {
+        Ok(target) => target,
+        Err(r) => return reject(r),
     };
     let user = if user.is_empty() {
         None
     } else {
-        let Some(user) = DsnPart::of_text(user) else {
-            return reject(DsnReject::InvalidComponent);
-        };
-        Some(user)
+        match DsnPart::of_text(user) {
+            Ok(user) => Some(user),
+            Err(r) => return reject(r),
+        }
     };
     let credentials = match Credentials::of_parts(user, password) {
         Ok(credentials) => credentials,
@@ -1077,7 +1113,7 @@ mod tests {
         ));
         assert!(matches!(
             build_with("p".repeat(MAX_COMPONENT_LEN + 1)),
-            IpeResult::Err(ref e) if e.contains("invalid DSN component")
+            IpeResult::Err(ref e) if e == "Ipe.Db.Dsn: a DSN component exceeds the length limit"
         ));
         let prefix = "postgres://reader@db.example/app?application_name=";
         let at_cap = format!("{prefix}{}", "a".repeat(MAX_DSN_LEN - prefix.len()));
@@ -1086,11 +1122,88 @@ mod tests {
             IpeResult::Ok(_)
         ));
         assert!(parse_err(&format!("{at_cap}a")).contains("exceeds the length limit"));
+        assert!(matches!(
+            dsn_parse::<super::super::IpeError>(at_cap.clone()),
+            IpeResult::Ok(_)
+        ));
+        assert!(matches!(
+            dsn_parse::<super::super::IpeError>(format!("{at_cap}a")),
+            IpeResult::Err(ref e)
+                if *e == super::super::IpeError::limit_exceeded(
+                    "Ipe.Db.Dsn: DSN exceeds the length limit"
+                )
+        ));
         let long_password = format!(
             "postgres://reader:{}@db.example/app",
             "p".repeat(MAX_COMPONENT_LEN + 1)
         );
-        assert!(parse_err(&long_password).contains("invalid DSN component"));
+        assert_eq!(
+            parse_err(&long_password),
+            "Ipe.Db.Dsn: a DSN component exceeds the length limit"
+        );
+    }
+
+    /// Every DSN component is bounded at `MAX_COMPONENT_LEN` bytes: at the cap
+    /// it is admitted, one byte past it is a `LimitExceeded` refusal, parsed
+    /// and built alike; a malformed component stays the plain rejection.
+    #[test]
+    fn a_component_one_byte_past_its_cap_is_limit_exceeded() {
+        use super::super::IpeError;
+        let refused =
+            IpeError::limit_exceeded("Ipe.Db.Dsn: a DSN component exceeds the length limit");
+        let at = "d".repeat(MAX_COMPONENT_LEN);
+        let past = "d".repeat(MAX_COMPONENT_LEN + 1);
+        let parsed = |s: String| dsn_parse::<IpeError>(s);
+        let shapes: [fn(&str) -> String; 4] = [
+            |c: &str| format!("postgres://{c}@db.example/app"),
+            |c: &str| format!("postgres://reader@db.example/{c}"),
+            |c: &str| format!("postgres://reader:{c}@db.example/app"),
+            |c: &str| format!("sqlite://{c}"),
+        ];
+        for shape in shapes {
+            assert!(
+                matches!(parsed(shape(&at)), IpeResult::Ok(_)),
+                "{}",
+                shape("<at cap>")
+            );
+            assert!(
+                matches!(parsed(shape(&past)), IpeResult::Err(ref e) if *e == refused),
+                "{}",
+                shape("<one past>")
+            );
+        }
+        let encoded_at_cap = format!(
+            "postgres://{}@db.example/app",
+            "%64".repeat(MAX_COMPONENT_LEN)
+        );
+        assert!(
+            matches!(parsed(encoded_at_cap), IpeResult::Ok(_)),
+            "a user name is bounded by its decoded length, not its encoding"
+        );
+        let built = |host: &str, database: &str, user: &str| {
+            dsn_build::<IpeError>(
+                0,
+                host.to_owned(),
+                5432,
+                database.to_owned(),
+                user.to_owned(),
+                secret_from_string(String::new()),
+                0,
+            )
+        };
+        assert!(matches!(built("db.example", &at, &at), IpeResult::Ok(_)));
+        assert!(
+            matches!(built("db.example", &past, "reader"), IpeResult::Err(ref e) if *e == refused)
+        );
+        assert!(
+            matches!(built("db.example", "app", &past), IpeResult::Err(ref e) if *e == refused)
+        );
+        assert!(matches!(built(&past, "app", "reader"), IpeResult::Err(ref e) if *e == refused));
+        let malformed = IpeError::unexpected("Ipe.Db.Dsn: invalid DSN component".to_owned());
+        assert!(
+            matches!(built("db.example", "app", "a b"), IpeResult::Err(ref e) if *e == malformed),
+            "a malformed component keeps its kind"
+        );
     }
 
     /// The connection URL `d` dials, read back by the `Dsn` parser and by the

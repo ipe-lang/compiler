@@ -115,7 +115,9 @@ subscribe =
 --      the raw port uses; no trust change.
 --   4. A host trap / decode-miss / timeout / unknown-or-late id → typed `Err`,
 --      never a panic or a partial value. Bounded: a ceiling caps outstanding
---      waiters; a per-waiter deadline evicts slow/missing replies.
+--      waiters, and a request past it fails at once with an `Unavailable` error
+--      (it frees as replies arrive); a per-waiter deadline evicts slow/missing
+--      replies.
 --
 -- `cmd` MUST be a seal-legal value type — the same discipline `send` enforces
 -- (IPE-N0039). `Decoder Value` is REJECTED; spell the reply type concretely.
@@ -156,7 +158,8 @@ request =
 -- (IPE-N0039); a `Secret` or reserved-sink payload is REJECTED fail-closed at
 -- compile time. `frameDecoder` fixes the inbound frame type for `sessionFrames`;
 -- `Decoder Value` is REJECTED (spell the frame type concretely). The `Task` fails
--- with `Err` when the host rejects the open or the open-session ceiling is reached.
+-- with `Err` when the host rejects the open, and with an `Unavailable` error when
+-- the open-session ceiling is reached (it frees as sessions close).
 openSession : a -> Decoder frame -> Task SessionHandle
 openSession =
     Kernel.kernel "Js_openSession"
