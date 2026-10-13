@@ -649,6 +649,7 @@ mod served {
             let refused =
                 parts(Request::get("/").header("host", HeaderValue::from_bytes(bytes).unwrap()));
             crate::system::runtime_log_line(
+                crate::system::LogStream::Stderr,
                 None,
                 "web",
                 &fresh_record(&AuthorityRefusal::Malformed, &target_text(&refused)),

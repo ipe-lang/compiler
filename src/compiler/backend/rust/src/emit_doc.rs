@@ -47,14 +47,12 @@
 //! [`emit_expr_at`] survives as the leaf builder the structured arms delegate to
 //! (and as the SEAL / byte-golden test oracle), not as the body formatter.
 
-use std::borrow::Cow;
-
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
 use ipe_intern::{Interner, Symbol, rust_str_lit};
 use ipe_ir::{BinOp, Callee, Expr, IrType, KernelFn, MAX_IR_RENDER_DEPTH, ModPath};
 
 use crate::EmitCtx;
-use crate::doc::{ChainOperand, Doc};
+use crate::doc::{ChainOperand, Doc, Leaf};
 use crate::emit_expr::{
     call_has_kernel_special_case, callee_name, clone_targets_in_expr, combine_guards,
     emit_arm_head, emit_binding_stmts, emit_expr_at, emit_match_scrutinee, free_vars, infix,
@@ -315,9 +313,9 @@ pub fn build_doc(
             // `rustfmt` collapses `(( … ))` to `( … )`. `Doc::elidable_paren` carries
             // the parens in the SEAL leaves but drops them at render in that case.
             Ok(delimited(
-                Doc::concat(vec![Doc::elidable_paren(func_doc), Doc::text("(")]),
+                Doc::concat(vec![Doc::elidable_paren(func_doc), Doc::text(leaf!("("))]),
                 docs,
-                Doc::text(")"),
+                Doc::text(leaf!(")")),
             ))
         }
 
@@ -400,8 +398,8 @@ pub fn build_doc(
         // the SEAL carries `"…".to_string()` adjacently, identical to the string
         // emitter's bytes.
         Expr::Str(s) => Ok(Doc::method_chain(
-            Doc::owned(rust_str_lit(s)),
-            Doc::text(".to_string()"),
+            Doc::owned(rust_str_lit(s))?,
+            Doc::text(leaf!(".to_string()")),
         )),
 
         // Every remaining arm carries the string emitter's exact bytes as one
@@ -425,7 +423,7 @@ fn leaf(
 ) -> DResult<Doc> {
     Ok(Doc::owned(emit_expr_at(
         ctx, expr, indent, depth, generics,
-    )?))
+    )?)?)
 }
 
 /// One divergent function body.
@@ -531,7 +529,7 @@ fn render_body_dedented(doc: &Doc) -> String {
     // Seed the render with four spaces so the body starts at column 4, and wrap the
     // doc in `Nest(4)` so every internal newline indents from the block indent —
     // exactly the `render_fn_body` test framing.
-    let seeded = Doc::nest(4, Doc::concat(vec![Doc::text("    "), doc.clone()]));
+    let seeded = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("    ")), doc.clone()]));
     let rendered = crate::render::render(&seeded, crate::render::RenderConfig::default());
     rendered
         .lines()
@@ -615,7 +613,6 @@ fn build_binop_chain(
             detail: format!("{op:?} reached build_binop_chain but `infix` returned None"),
         });
     };
-    let opstr = sym.spelling();
 
     // Walk down the left spine while it is the SAME operator, collecting the
     // right operands. `spine` ends up outermost..innermost; reverse to source
@@ -657,7 +654,7 @@ fn build_binop_chain(
     // First operand: `(` * depth_count, then the innermost left operand's doc.
     let mut first = Vec::with_capacity(depth_count + 1);
     for _ in 0..depth_count {
-        first.push(Doc::text("("));
+        first.push(Doc::text(leaf!("(")));
     }
     first.push(build_doc(ctx, left, indent, depth, generics)?);
     operands.push(ChainOperand {
@@ -669,8 +666,8 @@ fn build_binop_chain(
     for rhs_expr in spine {
         let rhs_doc = build_doc(ctx, rhs_expr, indent, depth, generics)?;
         operands.push(ChainOperand {
-            leading_op: Some(Cow::Borrowed(opstr)),
-            doc: Doc::concat(vec![rhs_doc, Doc::text(")")]),
+            leading_op: Some(sym),
+            doc: Doc::concat(vec![rhs_doc, Doc::text(leaf!(")"))]),
         });
     }
 
@@ -704,32 +701,32 @@ fn build_call_binop(
     let r = build_doc(ctx, rhs, indent, child, generics)?;
     match op {
         BinOp::Append => Ok(delimited_no_trailing_comma(
-            Doc::text("format!("),
+            Doc::text(leaf!("format!(")),
             // The format string is a fixed leaf; the two operands follow it as the
             // macro's positional arguments, exactly as the string emitter writes
             // `format!("{{}}{{}}", {l}, {r})`.
-            vec![Doc::text("\"{}{}\""), l, r],
-            Doc::text(")"),
+            vec![Doc::text(leaf!("\"{}{}\"")), l, r],
+            Doc::text(leaf!(")")),
         )),
         BinOp::IntDiv => Ok(delimited(
-            Doc::text("ipe_runtime::math::ipe_int_div("),
+            Doc::text(leaf!("ipe_runtime::math::ipe_int_div(")),
             vec![l, r],
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         )),
         BinOp::IntAdd => Ok(delimited(
-            Doc::text("ipe_runtime::math::ipe_int_add("),
+            Doc::text(leaf!("ipe_runtime::math::ipe_int_add(")),
             vec![l, r],
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         )),
         BinOp::IntSub => Ok(delimited(
-            Doc::text("ipe_runtime::math::ipe_int_sub("),
+            Doc::text(leaf!("ipe_runtime::math::ipe_int_sub(")),
             vec![l, r],
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         )),
         BinOp::IntMul => Ok(delimited(
-            Doc::text("ipe_runtime::math::ipe_int_mul("),
+            Doc::text(leaf!("ipe_runtime::math::ipe_int_mul(")),
             vec![l, r],
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         )),
         // Polymorphic `Number a` `+`/`-`/`*`: method-call form `l.ipe_wrapping_*(r)`.
         // The receiver `l` is the doc for the left operand; the trailing
@@ -742,15 +739,27 @@ fn build_call_binop(
         // mirrors the string emitter's `format!("{l}.ipe_wrapping_add({r})")` bytes.
         BinOp::Add => Ok(Doc::method_chain(
             l,
-            Doc::concat(vec![Doc::text(".ipe_wrapping_add("), r, Doc::text(")")]),
+            Doc::concat(vec![
+                Doc::text(leaf!(".ipe_wrapping_add(")),
+                r,
+                Doc::text(leaf!(")")),
+            ]),
         )),
         BinOp::Sub => Ok(Doc::method_chain(
             l,
-            Doc::concat(vec![Doc::text(".ipe_wrapping_sub("), r, Doc::text(")")]),
+            Doc::concat(vec![
+                Doc::text(leaf!(".ipe_wrapping_sub(")),
+                r,
+                Doc::text(leaf!(")")),
+            ]),
         )),
         BinOp::Mul => Ok(Doc::method_chain(
             l,
-            Doc::concat(vec![Doc::text(".ipe_wrapping_mul("), r, Doc::text(")")]),
+            Doc::concat(vec![
+                Doc::text(leaf!(".ipe_wrapping_mul(")),
+                r,
+                Doc::text(leaf!(")")),
+            ]),
         )),
         // The caller's guard restricts `op` to the call-shaped binops; any
         // other operator is a chain operator built elsewhere. Fail closed rather
@@ -772,11 +781,15 @@ fn build_call_binop(
 /// is reproduced; any other annotation stays a single leaf. The top-level `+`
 /// splits at outer-angle-bracket depth only, so a nested `Box<… + …>` inside the
 /// head keeps its own bounds.
-fn typed_let_prefix(typed: &str) -> Doc {
+fn typed_let_prefix(typed: &str) -> DResult<Doc> {
     if let Some(bound) = parse_type_bound(typed) {
-        return Doc::concat(vec![Doc::text("let __ipe_fn: "), bound, Doc::text(" = ")]);
+        return Ok(Doc::concat(vec![
+            Doc::text(leaf!("let __ipe_fn: ")),
+            bound?,
+            Doc::text(leaf!(" = ")),
+        ]));
     }
-    Doc::owned(format!("let __ipe_fn: {typed} = "))
+    Ok(Doc::owned(format!("let __ipe_fn: {typed} = "))?)
 }
 
 /// Parse a pointer-wrapped trait object `Ptr<Head + T1 + …>` into a breakable
@@ -785,7 +798,7 @@ fn typed_let_prefix(typed: &str) -> Doc {
 /// up to and including the first `<`; the inner is split into the head and the
 /// marker traits on ` + ` at the outer bracket's depth, so a nested generic's own
 /// `+` bounds are not split.
-fn parse_type_bound(typed: &str) -> Option<Doc> {
+fn parse_type_bound(typed: &str) -> Option<DResult<Doc>> {
     let open = typed.find('<')?;
     let ptr = typed.get(..=open)?;
     // `Ptr<…>` requires the matching `>`; the inner is the span between them.
@@ -824,15 +837,20 @@ fn parse_type_bound(typed: &str) -> Option<Doc> {
     if markers.is_empty() {
         return None;
     }
+    Some(type_bound_doc(ptr, head, markers))
+}
+
+/// The [`Doc::TypeBound`] of `Ptr<Head + T1 + …>` split into its parts.
+fn type_bound_doc(ptr: &str, head: &str, markers: &[&str]) -> DResult<Doc> {
     let traits = markers
         .iter()
         .map(|s| Doc::owned((*s).to_owned()))
-        .collect();
-    Some(Doc::type_bound(
-        Doc::owned(ptr.to_owned()),
-        Doc::owned((*head).to_owned()),
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Doc::type_bound(
+        Doc::owned(ptr.to_owned())?,
+        Doc::owned(head.to_owned())?,
         traits,
-        Doc::text(">"),
+        Doc::text(leaf!(">")),
     ))
 }
 
@@ -860,27 +878,27 @@ fn build_func_value(
     let name = callee_name(ctx, callee)?;
     let typed = render_type(ctx, ty, generics)?;
     let ctor = if wants_arc_ctor(ty) { "Arc" } else { "Box" };
-    let rhs = Doc::owned(format!("{ctor}::new({name})"));
+    let rhs = Doc::owned(format!("{ctor}::new({name})"))?;
     let assign = Doc::assign(
-        typed_let_prefix(&typed),
+        typed_let_prefix(&typed)?,
         rhs,
         // The statement's trailing `;`.
         1,
     );
     Ok(Doc::concat(vec![
-        Doc::text("{"),
+        Doc::text(leaf!("{")),
         Doc::nest(
             4,
             Doc::concat(vec![
                 Doc::HardLine,
                 assign,
-                Doc::text(";"),
+                Doc::text(leaf!(";")),
                 Doc::HardLine,
-                Doc::text("__ipe_fn"),
+                Doc::text(leaf!("__ipe_fn")),
             ]),
         ),
         Doc::HardLine,
-        Doc::text("}"),
+        Doc::text(leaf!("}")),
     ]))
 }
 
@@ -977,7 +995,11 @@ fn build_tuple(
     generics: GenericScope,
 ) -> DResult<Doc> {
     let docs = build_args(ctx, elems, indent, child, generics)?;
-    Ok(delimited(Doc::text("("), docs, Doc::text(")")))
+    Ok(delimited(
+        Doc::text(leaf!("(")),
+        docs,
+        Doc::text(leaf!(")")),
+    ))
 }
 
 /// Build the `Doc` for a plain non-empty list literal `vec![e0, e1, …]`. Only the
@@ -993,7 +1015,11 @@ fn build_list(
     generics: GenericScope,
 ) -> DResult<Doc> {
     let docs = build_args(ctx, items, indent, child, generics)?;
-    Ok(delimited(Doc::text("vec!["), docs, Doc::text("]")))
+    Ok(delimited(
+        Doc::text(leaf!("vec![")),
+        docs,
+        Doc::text(leaf!("]")),
+    ))
 }
 
 /// Build the `Doc` for `head :: tail`. The string emitter renders the runtime
@@ -1011,9 +1037,9 @@ fn build_cons(
     let head_doc = build_doc(ctx, head, indent, child, generics)?;
     let tail_doc = build_doc(ctx, tail, indent, child, generics)?;
     Ok(delimited(
-        Doc::text("ipe_runtime::list::ipe_list_cons("),
+        Doc::text(leaf!("ipe_runtime::list::ipe_list_cons(")),
         vec![head_doc, tail_doc],
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ))
 }
 
@@ -1082,9 +1108,9 @@ fn build_generic_call(
         docs.reverse();
     }
     Ok(delimited(
-        Doc::owned(format!("{name}{turbofish}(")),
+        Doc::owned(format!("{name}{turbofish}("))?,
         docs,
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ))
 }
 
@@ -1111,7 +1137,11 @@ fn build_call_args_task_and_then(
         && let Some((params, ret, body)) = and_then_cont(cont)
     {
         let closure = build_closure(ctx, params, ret, body, indent, child, generics)?;
-        let cont_doc = Doc::concat(vec![Doc::text("Box::new("), closure, Doc::text(")")]);
+        let cont_doc = Doc::concat(vec![
+            Doc::text(leaf!("Box::new(")),
+            closure,
+            Doc::text(leaf!(")")),
+        ]);
         let effect_doc = build_doc(ctx, effect, indent, child, generics)?;
         return Ok(vec![cont_doc, effect_doc]);
     }
@@ -1198,9 +1228,9 @@ fn build_ctor(
         let path = format!("{runtime}::{}", ctx.emit_ident(variant)?);
         let docs = build_args(ctx, args, indent, child, generics)?;
         return Ok(delimited(
-            Doc::owned(format!("{path}(")),
+            Doc::owned(format!("{path}("))?,
             docs,
-            Doc::text(")"),
+            Doc::text(leaf!(")")),
         ));
     }
 
@@ -1228,18 +1258,18 @@ fn build_ctor(
         // (`Box::new(<arg>)` breaks in place when `<arg>` overflows the budget).
         if ctx.is_cyclic_self_field(field_ty, home, ty) {
             docs.push(delimited(
-                Doc::text("Box::new("),
+                Doc::text(leaf!("Box::new(")),
                 vec![arg_doc],
-                Doc::text(")"),
+                Doc::text(leaf!(")")),
             ));
         } else {
             docs.push(arg_doc);
         }
     }
     Ok(delimited(
-        Doc::owned(format!("{path}(")),
+        Doc::owned(format!("{path}("))?,
         docs,
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ))
 }
 
@@ -1276,10 +1306,10 @@ fn build_let(
         // substituted by `value`, laid out as a soft group.
         let body_doc = build_doc(ctx, &inlined_body, indent, child, generics)?;
         return Ok(Doc::group(Doc::concat(vec![
-            Doc::text("({"),
+            Doc::text(leaf!("({")),
             Doc::nest(4, Doc::concat(vec![Doc::Line, body_doc])),
             Doc::Line,
-            Doc::text("})"),
+            Doc::text(leaf!("})")),
         ])));
     }
     let name_s = ctx.emit_ident(name)?;
@@ -1287,20 +1317,20 @@ fn build_let(
     let body_doc = build_doc(ctx, body, indent, child, generics)?;
     // One-statement block: `let name = value;` then `body`, each on its own line.
     Ok(Doc::concat(vec![
-        Doc::text("({"),
+        Doc::text(leaf!("({")),
         Doc::nest(
             4,
             Doc::concat(vec![
                 Doc::HardLine,
-                Doc::owned(format!("let {name_s} = ")),
+                Doc::owned(format!("let {name_s} = "))?,
                 value_doc,
-                Doc::text(";"),
+                Doc::text(leaf!(";")),
                 Doc::HardLine,
                 body_doc,
             ]),
         ),
         Doc::HardLine,
-        Doc::text("})"),
+        Doc::text(leaf!("})")),
     ]))
 }
 
@@ -1338,15 +1368,15 @@ fn build_destructure(
     let mut inner = Vec::with_capacity(stmts.len() * 2 + 2);
     for stmt in stmts {
         inner.push(Doc::HardLine);
-        inner.push(Doc::owned(stmt));
+        inner.push(Doc::owned(stmt)?);
     }
     inner.push(Doc::HardLine);
     inner.push(body_doc);
     Ok(Doc::concat(vec![
-        Doc::text("({"),
+        Doc::text(leaf!("({")),
         Doc::nest(4, Doc::concat(inner)),
         Doc::HardLine,
-        Doc::text("})"),
+        Doc::text(leaf!("})")),
     ]))
 }
 
@@ -1372,19 +1402,19 @@ fn build_record(
         let field_ident = ctx.emit_ident(*sym)?;
         let value_doc = build_doc(ctx, value, indent, child, generics)?;
         field_docs.push(Doc::concat(vec![
-            Doc::owned(format!("{field_ident}: ")),
+            Doc::owned(format!("{field_ident}: "))?,
             value_doc,
         ]));
     }
     if is_server_response {
         // The runtime struct's multi-`Set-Cookie` field is not part of the Ipê
         // record alias; the string emitter defaults it, so carry the same leaf.
-        field_docs.push(Doc::text("cookies: Vec::new()"));
+        field_docs.push(Doc::text(leaf!("cookies: Vec::new()")));
     }
     Ok(Doc::struct_lit(
-        Doc::owned(format!("{struct_name} {{")),
+        Doc::owned(format!("{struct_name} {{"))?,
         field_docs,
-        Doc::text("}"),
+        Doc::text(leaf!("}")),
     ))
 }
 
@@ -1433,9 +1463,9 @@ fn build_update(
         for (i, (_sym, value)) in fields.iter().enumerate() {
             let value_doc = build_doc(ctx, value, indent, child, generics)?;
             inner.push(Doc::HardLine);
-            inner.push(Doc::owned(format!("let __ipe_upd_{i} = ")));
+            inner.push(Doc::owned(format!("let __ipe_upd_{i} = "))?);
             inner.push(value_doc);
-            inner.push(Doc::text(";"));
+            inner.push(Doc::text(leaf!(";")));
         }
         // Build the setter chain as a single expression leaf.
         let base_doc = build_doc(ctx, record, indent, child, generics)?;
@@ -1443,15 +1473,18 @@ fn build_update(
         for (i, (field_sym, _value)) in fields.iter().enumerate() {
             let field_name = ctx.resolve_ident(*field_sym)?;
             let setter = crate::naming::field_setter_witness_method_name(field_name);
-            chain = Doc::concat(vec![chain, Doc::owned(format!(".{setter}(__ipe_upd_{i})"))]);
+            chain = Doc::concat(vec![
+                chain,
+                Doc::owned(format!(".{setter}(__ipe_upd_{i})"))?,
+            ]);
         }
         inner.push(Doc::HardLine);
         inner.push(chain);
         return Ok(Doc::concat(vec![
-            Doc::text("{"),
+            Doc::text(leaf!("{")),
             Doc::nest(4, Doc::concat(inner)),
             Doc::HardLine,
-            Doc::text("}"),
+            Doc::text(leaf!("}")),
         ]));
     }
 
@@ -1460,29 +1493,29 @@ fn build_update(
     for (i, (_sym, value)) in fields.iter().enumerate() {
         let value_doc = build_doc(ctx, value, indent, child, generics)?;
         inner.push(Doc::HardLine);
-        inner.push(Doc::owned(format!("let __ipe_upd_{i} = ")));
+        inner.push(Doc::owned(format!("let __ipe_upd_{i} = "))?);
         inner.push(value_doc);
-        inner.push(Doc::text(";"));
+        inner.push(Doc::text(leaf!(";")));
     }
     let base_doc = build_doc(ctx, record, indent, child, generics)?;
     inner.push(Doc::HardLine);
-    inner.push(Doc::text("let mut __ipe_rec = "));
+    inner.push(Doc::text(leaf!("let mut __ipe_rec = ")));
     inner.push(base_doc);
-    inner.push(Doc::text(";"));
+    inner.push(Doc::text(leaf!(";")));
     for (i, (sym, _value)) in fields.iter().enumerate() {
         let field_ident = ctx.emit_ident(*sym)?;
         inner.push(Doc::HardLine);
         inner.push(Doc::owned(format!(
             "__ipe_rec.{field_ident} = __ipe_upd_{i};"
-        )));
+        ))?);
     }
     inner.push(Doc::HardLine);
-    inner.push(Doc::text("__ipe_rec"));
+    inner.push(Doc::text(leaf!("__ipe_rec")));
     Ok(Doc::concat(vec![
-        Doc::text("{"),
+        Doc::text(leaf!("{")),
         Doc::nest(4, Doc::concat(inner)),
         Doc::HardLine,
-        Doc::text("}"),
+        Doc::text(leaf!("}")),
     ]))
 }
 
@@ -1522,14 +1555,14 @@ fn build_task_seq(
     // The continuation `Box::new(move |_| <brace-body>[rest])`: the closure body's
     // braces vanish when it fits flat and brace+break when it does not.
     let cont = Doc::concat(vec![
-        Doc::text("Box::new(move |_| "),
+        Doc::text(leaf!("Box::new(move |_| ")),
         Doc::brace_body(rest_doc),
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ]);
     Ok(delimited(
-        Doc::text("task_and_then("),
+        Doc::text(leaf!("task_and_then(")),
         vec![effect_doc, cont],
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ))
 }
 
@@ -1555,12 +1588,12 @@ fn build_db_with_transaction(
 ) -> DResult<Doc> {
     let conn_doc = build_doc(ctx, conn, indent, child, generics)?;
     // The string emitter appends `.clone()` to the emitted connection expression.
-    let conn_clone = Doc::concat(vec![conn_doc, Doc::text(".clone()")]);
+    let conn_clone = Doc::concat(vec![conn_doc, Doc::text(leaf!(".clone()"))]);
     let body_doc = build_doc(ctx, body, indent, child, generics)?;
     Ok(delimited(
-        Doc::text("db_with_transaction("),
+        Doc::text(leaf!("db_with_transaction(")),
         vec![conn_clone, body_doc],
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ))
 }
 
@@ -1584,7 +1617,7 @@ fn build_db_params_arg(
     let mut flat = String::new();
     params_doc.collect_leaves(&mut flat);
     if crate::doc::whitespace_normalize(&flat) == "Vec::new()" {
-        return Ok(Doc::text("Vec::<ipe_runtime::db::SqlParam>::new()"));
+        return Ok(Doc::text(leaf!("Vec::<ipe_runtime::db::SqlParam>::new()")));
     }
     Ok(build_db_project_params(params_doc))
 }
@@ -1597,12 +1630,16 @@ fn build_db_params_arg(
 /// wide (each method's receiver — the parenthesized params and each preceding
 /// `.method()` — renders multiline, so the next method drops to its own line).
 fn build_db_project_params(params_doc: Doc) -> Doc {
-    let base = Doc::concat(vec![Doc::text("("), params_doc, Doc::text(")")]);
-    let iter = Doc::method_chain(base, Doc::text(".into_iter()"));
-    let mapped = Doc::method_chain(iter, Doc::text(".map(::core::convert::Into::into)"));
+    let base = Doc::concat(vec![
+        Doc::text(leaf!("(")),
+        params_doc,
+        Doc::text(leaf!(")")),
+    ]);
+    let iter = Doc::method_chain(base, Doc::text(leaf!(".into_iter()")));
+    let mapped = Doc::method_chain(iter, Doc::text(leaf!(".map(::core::convert::Into::into)")));
     Doc::method_chain(
         mapped,
-        Doc::text(".collect::<Vec<ipe_runtime::db::SqlParam>>()"),
+        Doc::text(leaf!(".collect::<Vec<ipe_runtime::db::SqlParam>>()")),
     )
 }
 
@@ -1628,13 +1665,13 @@ fn build_db_param_call(
         // `db_exec_raw(conn.clone(), sql)` — no params projection.
         (KernelFn::DbExecRaw, [conn, sql]) => {
             let conn_doc = build_doc(ctx, conn, indent, child, generics)?;
-            docs.push(Doc::concat(vec![conn_doc, Doc::text(".clone()")]));
+            docs.push(Doc::concat(vec![conn_doc, Doc::text(leaf!(".clone()"))]));
             docs.push(build_doc(ctx, sql, indent, child, generics)?);
         }
         // `db_exec_params` / `db_query_params`: `(conn.clone(), sql, <projected params>)`.
         (KernelFn::DbExec | KernelFn::DbQuery, [conn, sql, params]) => {
             let conn_doc = build_doc(ctx, conn, indent, child, generics)?;
-            docs.push(Doc::concat(vec![conn_doc, Doc::text(".clone()")]));
+            docs.push(Doc::concat(vec![conn_doc, Doc::text(leaf!(".clone()"))]));
             docs.push(build_doc(ctx, sql, indent, child, generics)?);
             docs.push(build_db_params_arg(ctx, params, indent, child, generics)?);
         }
@@ -1652,9 +1689,9 @@ fn build_db_param_call(
         }
     }
     Ok(delimited(
-        Doc::owned(format!("{name}(")),
+        Doc::owned(format!("{name}("))?,
         docs,
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ))
 }
 
@@ -1668,10 +1705,10 @@ fn build_db_param_call(
 /// wide body breaks the block while the braces stay put.
 fn braced_block(body: Doc) -> Doc {
     Doc::group(Doc::concat(vec![
-        Doc::text("{"),
+        Doc::text(leaf!("{")),
         Doc::nest(4, Doc::concat(vec![Doc::Line, body])),
         Doc::Line,
-        Doc::text("}"),
+        Doc::text(leaf!("}")),
     ]))
 }
 
@@ -1711,7 +1748,7 @@ fn build_closure(
     let body_doc = build_doc(ctx, body, indent, child, generics);
     ctx.exit_closure();
     let body_doc = body_doc?;
-    Ok(Doc::concat(vec![Doc::owned(head), braced_block(body_doc)]))
+    Ok(Doc::concat(vec![Doc::owned(head)?, braced_block(body_doc)]))
 }
 
 /// Build the `Doc` for a boxed lambda value, mirroring
@@ -1780,31 +1817,31 @@ fn build_lambda(
     // the call one-per-line (closure at `indent + 4`) when the head itself overflows
     // — the standard single-argument combine, which `Doc::call_args` renders.
     let rhs = Doc::call_args(
-        Doc::owned(format!("{ctor}::new(")),
+        Doc::owned(format!("{ctor}::new("))?,
         vec![closure],
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
         true,
     );
     let assign = Doc::assign(
-        typed_let_prefix(&typed),
+        typed_let_prefix(&typed)?,
         rhs,
         // The statement's trailing `;`.
         1,
     );
     Ok(Doc::concat(vec![
-        Doc::text("{"),
+        Doc::text(leaf!("{")),
         Doc::nest(
             4,
             Doc::concat(vec![
                 Doc::HardLine,
                 assign,
-                Doc::text(";"),
+                Doc::text(leaf!(";")),
                 Doc::HardLine,
-                Doc::text("__ipe_fn"),
+                Doc::text(leaf!("__ipe_fn")),
             ]),
         ),
         Doc::HardLine,
-        Doc::text("}"),
+        Doc::text(leaf!("}")),
     ]))
 }
 
@@ -1842,20 +1879,20 @@ fn build_applied_lambda(
         let arg_doc = build_doc(ctx, arg, indent, child, generics)?;
         inner.push(Doc::HardLine);
         inner.push(Doc::assign(
-            Doc::owned(format!("let {p}: {t} = ")),
+            Doc::owned(format!("let {p}: {t} = "))?,
             arg_doc,
             1,
         ));
-        inner.push(Doc::text(";"));
+        inner.push(Doc::text(leaf!(";")));
     }
     let body_doc = build_doc(ctx, body, indent, child, generics)?;
     inner.push(Doc::HardLine);
     inner.push(body_doc);
     let block = Doc::concat(vec![
-        Doc::text("({"),
+        Doc::text(leaf!("({")),
         Doc::nest(4, Doc::concat(inner)),
         Doc::HardLine,
-        Doc::text("})"),
+        Doc::text(leaf!("})")),
     ]);
     if surplus_args.is_empty() {
         return Ok(block);
@@ -1865,9 +1902,9 @@ fn build_applied_lambda(
     // extra pair is elidable (rustfmt collapses `(( … ))`).
     let docs = build_args(ctx, surplus_args, indent, child, generics)?;
     Ok(delimited(
-        Doc::concat(vec![Doc::elidable_paren(block), Doc::text("(")]),
+        Doc::concat(vec![Doc::elidable_paren(block), Doc::text(leaf!("("))]),
         docs,
-        Doc::text(")"),
+        Doc::text(leaf!(")")),
     ))
 }
 
@@ -1995,8 +2032,8 @@ fn build_match(
         // The body is emitted at one indent step past the `match` (the arm indent),
         // exactly as the string emitter passes `indent + 1`.
         let body_doc = match (&hot_arm, &wired_arm) {
-            (Some(hot), _) => Doc::owned(hot.clone()),
-            (None, Some(wired)) => Doc::owned(wired.clone()),
+            (Some(hot), _) => Doc::owned(hot.clone())?,
+            (None, Some(wired)) => Doc::owned(wired.clone())?,
             (None, None) => build_doc(ctx, &arm.body, indent + 1, child, generics)?,
         };
         let ir_guard = match &arm.guard {
@@ -2009,14 +2046,18 @@ fn build_match(
         // the pattern's last line in either layout.
         let alts = split_or_alternatives(&pat);
         let pat_doc = if alts.len() > 1 {
-            Doc::or_pattern(alts.into_iter().map(Cow::Owned).collect())
+            Doc::or_pattern(
+                alts.into_iter()
+                    .map(Leaf::parse)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
         } else {
-            Doc::owned(pat)
+            Doc::owned(pat)?
         };
-        let arrow = combine_guards(synth_guard, ir_guard).map_or_else(
-            || Doc::text(" => "),
-            |guard| Doc::owned(format!(" if {guard} => ")),
-        );
+        let arrow = match combine_guards(synth_guard, ir_guard) {
+            None => Doc::text(leaf!(" => ")),
+            Some(guard) => Doc::owned(format!(" if {guard} => "))?,
+        };
         let head = Doc::concat(vec![pat_doc, arrow]);
         let tail = if prelude.is_empty() {
             // Plain body: the arm-tail token applies the brace/comma rule by the
@@ -2039,15 +2080,15 @@ fn build_match(
                     continue;
                 }
                 inner.push(Doc::HardLine);
-                inner.push(Doc::owned(stmt.to_owned()));
+                inner.push(Doc::owned(stmt.to_owned())?);
             }
             inner.push(Doc::HardLine);
             inner.push(body_doc);
             Doc::concat(vec![
-                Doc::text("{"),
+                Doc::text(leaf!("{")),
                 Doc::nest(4, Doc::concat(inner)),
                 Doc::HardLine,
-                Doc::text("}"),
+                Doc::text(leaf!("}")),
             ])
         };
         arm_docs.push(Doc::concat(vec![Doc::HardLine, head, tail]));
@@ -2059,15 +2100,15 @@ fn build_match(
     // `{` reproduces exactly that: the `Line` is a space when the head fits flat and
     // a newline-plus-indent when it does not.
     let head = Doc::group(Doc::concat(vec![
-        Doc::owned(format!("match {scrut}")),
+        Doc::owned(format!("match {scrut}"))?,
         Doc::Line,
-        Doc::text("{"),
+        Doc::text(leaf!("{")),
     ]));
     Ok(Doc::concat(vec![
         head,
         Doc::nest(4, Doc::concat(arm_docs)),
         Doc::HardLine,
-        Doc::text("}"),
+        Doc::text(leaf!("}")),
     ]))
 }
 
@@ -2078,8 +2119,6 @@ mod tests {
     //! string emitter's exact tokens) and per-builder byte-goldens through the
     //! renderer. The goldens are captured from `rustfmt --edition 2024
     //! --style-edition 2024`; the renderer is fixed to match, never the reverse.
-
-    use std::borrow::Cow;
 
     use ipe_intern::Interner;
     use ipe_ir::{
@@ -2092,7 +2131,7 @@ mod tests {
 
     use super::build_doc;
     use crate::doc::{ChainOperand, Doc, whitespace_normalize};
-    use crate::emit_expr::emit_expr_at;
+    use crate::emit_expr::{InfixOp, emit_expr_at};
     use crate::emit_types::GenericScope;
     use crate::render::{RenderConfig, render};
     use crate::{DbDriver, EmitCtx};
@@ -2897,28 +2936,29 @@ mod tests {
                 doc: Doc::owned(
                     "((((longfunctioncallnamehere_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_owned(),
-                ),
+                )
+                .expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
-                doc: Doc::owned("bbbbbbbbbbb)".to_owned()),
+                leading_op: Some(InfixOp::FloatAdd),
+                doc: Doc::owned("bbbbbbbbbbb)".to_owned()).expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
-                doc: Doc::owned("cc)".to_owned()),
+                leading_op: Some(InfixOp::FloatAdd),
+                doc: Doc::owned("cc)".to_owned()).expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
-                doc: Doc::owned("dd)".to_owned()),
+                leading_op: Some(InfixOp::FloatAdd),
+                doc: Doc::owned("dd)".to_owned()).expect("a test leaf is code only"),
             },
             ChainOperand {
-                leading_op: Some(Cow::Borrowed("+")),
-                doc: Doc::owned("ee)".to_owned()),
+                leading_op: Some(InfixOp::FloatAdd),
+                doc: Doc::owned("ee)".to_owned()).expect("a test leaf is code only"),
             },
         ];
         let doc = Doc::nest(
             4,
-            Doc::concat(vec![Doc::text("let z = "), Doc::Chain { operands }]),
+            Doc::concat(vec![Doc::text(leaf!("let z = ")), Doc::Chain { operands }]),
         );
         let out = render(&doc, RenderConfig::default());
         // Line 1 packs the maximal prefix that fits width 100: the long first
@@ -3054,7 +3094,7 @@ mod tests {
             let doc = build_doc(ctx, &expr, 4, 0, scope).expect("build_doc");
             // Rendered inside a `let z = ` statement at block indent 4, matching the
             // captured golden's origin column.
-            let stmt = Doc::nest(4, Doc::concat(vec![Doc::text("let z = "), doc]));
+            let stmt = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("let z = ")), doc]));
             let got = render(&stmt, RenderConfig::default());
             let expected = "let z = (if some_condition_variable {\n        first_branch_value\n    } else {\n        second_branch_value_here\n    })";
             assert_eq!(
@@ -3094,7 +3134,7 @@ mod tests {
     fn render_let_stmt(ctx: &EmitCtx, expr: &Expr) -> String {
         let scope = GenericScope::new(&[]);
         let doc = build_doc(ctx, expr, 4, 0, scope).expect("build_doc");
-        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text("let z = "), doc]));
+        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("let z = ")), doc]));
         render(&stmt, RenderConfig::default())
     }
 
@@ -3545,7 +3585,7 @@ mod tests {
     fn render_fn_body(ctx: &EmitCtx, expr: &Expr) -> String {
         let scope = GenericScope::new(&[]);
         let doc = build_doc(ctx, expr, 1, 0, scope).expect("build_doc");
-        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text("    "), doc]));
+        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("    ")), doc]));
         render(&stmt, RenderConfig::default())
     }
 
@@ -4059,7 +4099,7 @@ mod tests {
             rest: Box::new(Expr::Var(wide_body)),
         };
         let doc = build_doc(&ctx, &expr, 4, 0, scope).expect("build_doc");
-        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text("let z = "), doc]));
+        let stmt = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("let z = ")), doc]));
         let got = render(&stmt, RenderConfig::default());
         let expected = "let z = task_and_then(\n        short_eff,\n        Box::new(move |_| {\n            a_body_wide_enough_to_break_only_the_closure_body_padding_padding_padding_pad\n        }),\n    )";
         assert_eq!(
