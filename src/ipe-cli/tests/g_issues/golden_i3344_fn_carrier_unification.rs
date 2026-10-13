@@ -11,10 +11,12 @@
 //!
 //! The fixture `fn_carrier_frontier` meets a stored read with a direct
 //! function at every carrier frontier: a def return, an `if`/`case` join, a
-//! piped and a partial kernel call, a kernel scheme variable two arguments
-//! bind, and a variable under a `Task` result. The fixture
-//! `fn_carrier_conflict` joins two `Maybe` payloads on different carriers,
-//! which no conversion reconciles, so `ipe` refuses it.
+//! piped kernel call, a kernel scheme variable two arguments bind, and a
+//! variable under a `Task` result. The fixture `fn_carrier_conflict` joins two
+//! `Maybe` payloads on different carriers, which no conversion reconciles, so
+//! `ipe` refuses it. The fixture `fn_carrier_partial_moves_payload` applies a
+//! `let`-bound partial to a non-`Clone` `Maybe` parameter at a function slot,
+//! which `ipe` refuses with IPE-L0126 because the partial moves the payload.
 //!
 //! ```text
 //! cargo test -p ipe --test g_issues golden_i3344
@@ -24,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use ipe::CliError;
-use ipe_diagnostics::{Diagnostic, Feature, LowerError};
+use ipe_diagnostics::{Diagnostic, Feature, LowerError, Span};
 
 use crate::support::repo_root;
 
@@ -101,7 +103,7 @@ fn call_result_reaches_a_direct_fn_slot_and_runs() {
 const FRONTIER: &str = "fn_carrier_frontier";
 
 /// The frontier fixture's stdout: one count per case, then the two `Task` cases.
-const FRONTIER_STDOUT: &str = "3 3 4 3 4 3 4 3 4 2 1 3 1 3 1 3 3 3";
+const FRONTIER_STDOUT: &str = "3 3 4 3 4 3 4 3 4 2 1 3 1 3 3 3";
 
 /// Emitted `Task.succeed` calls handed a stored read on its `Arc` carrier, which the `Task a` result never holds.
 const ARC_INTO_TASK_RESULT: [&str; 2] = [
@@ -287,5 +289,62 @@ fn partial_with_fn_result_builds_and_runs() {
         outcome.stdout.trim_end(),
         PARTIAL_FN_RESULT_STDOUT,
         "{PARTIAL_FN_RESULT}: emitted crate built (SEAL held) but ran to the wrong output"
+    );
+}
+
+const PARTIAL_MOVES_PAYLOAD: &str = "fn_carrier_partial_moves_payload";
+
+/// The span of the `m` in the fixture's `k m`, the capture the partial moves.
+fn moved_payload_span() -> Span {
+    #[allow(clippy::expect_used)] // a missing fixture is a broken test, not a refusal
+    let src =
+        std::fs::read_to_string(golden_entry(PARTIAL_MOVES_PAYLOAD)).expect("fixture source reads");
+    let needle = "(k m)";
+    #[allow(clippy::expect_used)] // the needle is written into the fixture
+    let at = src.find(needle).expect("`(k m)` is in the fixture");
+    #[allow(clippy::expect_used)] // fixtures are far below 4 GiB
+    let lo = u32::try_from(at + "(k ".len()).expect("offset fits u32");
+    Span {
+        lo,
+        hi: lo.saturating_add(1),
+    }
+}
+
+/// A `let`-bound partial over a non-`Clone` parameter at a function slot is refused with IPE-L0126.
+///
+/// The partial `k = Maybe.withDefault c.keep` applied to `m : Maybe (Int -> Bool)`
+/// moves `m` into a closure `List.filter` calls once per element; the refusal
+/// sits at that `m`. This pins a limit, not a design: a shared form for a
+/// non-`Clone` supplied argument of a value partial flips it to
+/// accept-and-run, and the row then returns to `fn_carrier_frontier`.
+#[test]
+fn partial_over_a_non_clone_payload_is_refused() {
+    let out = crate::support::scratch_root().join("ipec_i3344_partial_moves_payload");
+    let _ = std::fs::remove_dir_all(&out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&golden_entry(PARTIAL_MOVES_PAYLOAD), &out, &runtime);
+    let got = match &built {
+        Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
+        _ => None,
+    };
+    assert_eq!(
+        got,
+        Some(ipe_diagnostics::IPE_L0126),
+        "`{PARTIAL_MOVES_PAYLOAD}` must fail closed with IPE-L0126; got build result: {built:?}"
+    );
+    let want = moved_payload_span();
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        span,
+                        msg: LowerError::Unsupported(Feature::RebuiltClosureMovesCapture),
+                    } if *span == want
+                )
+        ),
+        "`{PARTIAL_MOVES_PAYLOAD}`: the refusal must come from the once check at `m` ({want:?}), got {built:?}"
     );
 }

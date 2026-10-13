@@ -9,7 +9,7 @@ import Ipe.Task as Task
 
 
 -- A function value meets a position whose carrier another value decides: a
--- def return, an `if`/`case` join, a piped or partial kernel call, a kernel
+-- def return, an `if`/`case` join, a piped kernel call, a kernel
 -- scheme variable bound by two arguments, and a variable under a `Task`
 -- result. A stored read (`c.keep`, on `Arc`) meets a lambda or a parameter
 -- (on `Box`) at each one, and every case runs to its count.
@@ -105,15 +105,6 @@ viaResultDefault r c =
     List.length (List.filter (Result.withDefault c.keep r) nums)
 
 
-viaPartialDefault : Maybe (Int -> Bool) -> Cfg -> Int
-viaPartialDefault m c =
-    let
-        k =
-            Maybe.withDefault c.keep
-    in
-    List.length (List.filter (k m) nums)
-
-
 viaTask : Cfg -> Task Error Int
 viaTask c =
     Task.succeed c.keep |> Task.andThen (\f -> Task.succeed (count f))
@@ -140,8 +131,6 @@ pure =
     , viaParamDefault Nothing cfg
     , viaResultDefault (Ok (\n -> n > 3)) cfg
     , viaResultDefault (Err "none") cfg
-    , viaPartialDefault (Just (\n -> n > 3)) cfg
-    , viaPartialDefault Nothing cfg
     ]
 
 
