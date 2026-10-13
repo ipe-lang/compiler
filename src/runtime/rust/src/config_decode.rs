@@ -780,6 +780,8 @@ mod yaml_tests {
         for word in ["yes", "no", "on", "off", "y", "n"] {
             assert_eq!(field(&format!("a: {word}")), json!(word), "{word}");
         }
+        let yaml_11 = lifted(|options| options.strict_booleans = false);
+        assert_eq!(yaml_to_value("a: yes", yaml_11), Ok(json!({"a": true})));
     }
 
     #[test]
@@ -808,6 +810,13 @@ mod yaml_tests {
         for src in ["a: null", "a: Null", "a: NULL", "a: ~", "a:"] {
             assert_eq!(yaml(src), IpeResult::Ok(json!({"a": null})), "{src:?}");
         }
+    }
+
+    /// `null` matches in any letter case; quoting keeps the string.
+    #[test]
+    fn mixed_case_null_decodes() {
+        assert_eq!(yaml("a: nUlL"), IpeResult::Ok(json!({"a": null})));
+        assert_eq!(field("a: \"nUlL\""), json!("nUlL"));
     }
 
     /// A plain leading-zero number is a number; quoting keeps the string.
@@ -951,6 +960,27 @@ mod yaml_tests {
             });
             assert!(yaml_to_value(&src, deeper).is_ok());
         }
+    }
+
+    /// Depth composed through an alias counts: a 99-deep anchor replayed under
+    /// a 99-deep sequence nests past the ceiling although neither half does.
+    #[test]
+    fn alias_composed_depth_is_limit_refusal() {
+        let open = "[".repeat(99);
+        let close = "]".repeat(99);
+        let src = format!("a: &a {open}{close}\nb: {open}*a{close}\n");
+        assert_eq!(kind(&src), Some(YamlRefusalKind::Limit(YamlLimit::Depth)));
+        assert!(matches!(
+            refusal(&src),
+            Some((crate::IpeErrorKind::LimitExceeded, _))
+        ));
+        let deeper = lifted(|options| {
+            let mut budget = serde_saphyr::Budget::default();
+            budget.max_depth = 2 * YAML_MAX_DEPTH;
+            budget.max_documents = 1;
+            options.budget = Some(budget);
+        });
+        assert!(yaml_to_value(&src, deeper).is_ok());
     }
 
     #[test]

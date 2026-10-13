@@ -102,13 +102,16 @@ predictable subset of YAML, so a config value means one thing everywhere:
 - **One document.** A second `---` document is refused.
 - **YAML 1.2 core booleans only.** `true` and `false`, in any letter case, are
   booleans; `yes`, `no`, `on`, `off`, `y`, and `n` stay strings.
+- **Nulls.** `null` in any letter case, `~`, an empty value (`a:`), and an
+  empty or whitespace-only source are null.
 - **No duplicate keys and no merge keys.** A mapping that repeats a key, or uses
   `<<` to merge another mapping in, is refused rather than silently resolved.
 - **Core tags only.** `!!str`, `!!int`, and the other core-schema tags work;
   `!include`, local tags such as `!secret`, and any other tag are refused. No file
   is ever read and no environment variable is ever expanded from inside a
   document.
-- **Finite numbers only.** `.nan` and `.inf` are refused. A plain leading-zero
+- **Finite numbers only.** `.nan` and `.inf` are refused. Integers take the
+  `0x`, `0o`, and `0b` prefixes. A plain leading-zero
   number such as `012` decodes as the number 12; quote it (`"012"`) to keep the
   string.
 - **Bounded.** Nesting is at most 128 deep, and anchors and aliases are replayed

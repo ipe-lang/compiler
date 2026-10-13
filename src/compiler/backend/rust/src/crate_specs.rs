@@ -372,8 +372,16 @@ mod tests {
     }
 
     /// The quoted entries of the `features = [...]` list on one dependency line.
+    ///
+    /// The key must stand alone (after `{`, `,`, or a space), so the
+    /// `features` inside `default-features` is never taken for it.
     fn features_of(line: &str) -> Option<Vec<&str>> {
-        let after = line.get(line.find("features")? + "features".len()..)?;
+        let (start, key) = line.match_indices("features").find(|(at, _)| {
+            line.get(..*at)
+                .and_then(|before| before.chars().next_back())
+                .is_some_and(|c| c == '{' || c == ',' || c == ' ')
+        })?;
+        let after = line.get(start + key.len()..)?;
         let after = after.trim_start().strip_prefix('=')?.trim_start();
         let list = after.strip_prefix('[')?;
         let list = list.get(..list.find(']')?)?;
@@ -423,6 +431,9 @@ mod tests {
     fn yaml_parser_pin_drift_is_caught() {
         let exact = r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }"#;
         assert!(yaml_parser_pin_drift(exact, "fixture").is_empty());
+        assert_eq!(features_of(exact), Some(vec!["deserialize"]));
+        let reordered = r#"serde-saphyr = { version = "1.3", features = ["deserialize"], default-features = false }"#;
+        assert!(yaml_parser_pin_drift(reordered, "fixture").is_empty());
         for drifted in [
             r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize", "include"] }"#,
             r#"serde-saphyr = { version = "1.3", features = ["deserialize"] }"#,
