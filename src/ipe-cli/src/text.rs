@@ -1060,6 +1060,10 @@ messages! {
     lock_index_dep_local_rev(package) = "lock-index-dep-local-rev";
     /// A path dependency's `source` cannot be recorded in `ipe.lock`.
     lock_unrecordable_local_source(package, max, raw) = "lock-unrecordable-local-source";
+    /// A path dependency names a network share or device.
+    lock_local_source_remote(package, raw, kind) = "lock-local-source-remote";
+    /// A path dependency names a Windows device element.
+    lock_local_source_device(package, raw) = "lock-local-source-device";
     /// A path dependency's path is not valid UTF-8.
     lock_non_utf8_local_path(package, path) = "lock-non-utf8-local-path";
     /// A version string that is not valid semver.
@@ -1718,6 +1722,8 @@ messages! {
     publish_fresh_claim_not_covered(claimed) = "publish-fresh-claim-not-covered";
     /// An index `source` that is not an accepted URL.
     index_source_url_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-invalid";
+    /// An index `source` that names a network share or device.
+    index_source_url_remote(pkg: &crate::package_name::PackageName, kind, raw: &crate::style::TerminalSafe) = "index-source-url-remote";
     /// An index `source` on the plaintext `git://` transport.
     index_source_url_plaintext(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-plaintext";
     /// An index `rev` shaped like an injection.

@@ -172,6 +172,48 @@ pub fn resolve_escape(project_root: &Path, name: &str, dep: &IpeDep) -> Result<(
     resolve_escape_within(project_root, name, dep, &remote_ingest::PACKAGE_SOURCE)
 }
 
+/// The lockable origin and directory of a path dependency on `path`.
+///
+/// The typed location exists before the first filesystem touch: a network
+/// share or a device is refused here, never opened.
+fn path_origin(
+    project_root: &Path,
+    name: &str,
+    package_name: &PackageName,
+    path: &Path,
+) -> Result<(LockedOrigin, PathBuf), CliError> {
+    path_origin_in(project_root, name, package_name, path, ipe_path_core::HOST)
+}
+
+/// [`path_origin`] with the device-element rule read under `regime`.
+fn path_origin_in(
+    project_root: &Path,
+    name: &str,
+    package_name: &PackageName,
+    path: &Path,
+    regime: ipe_path_core::Regime,
+) -> Result<(LockedOrigin, PathBuf), CliError> {
+    let source = LocalSource::from_path(package_name, path)?;
+    if source.opens_a_device(regime) {
+        return Err(crate::lockfile::LockRefusal::DeviceLocalSource {
+            package: package_name.clone(),
+            raw: source.as_str().to_owned(),
+        }
+        .into());
+    }
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    if !resolved.is_dir() {
+        return Err(CliError::Resolve(
+            crate::text::msg::resolve_path_dep_missing(&name, &resolved.display()),
+        ));
+    }
+    Ok((LockedOrigin::Path { source }, resolved))
+}
+
 /// [`resolve_escape`] with a `git` fetch and the tree hash held to `budget`.
 fn resolve_escape_within(
     project_root: &Path,
@@ -257,19 +299,9 @@ fn resolve_escape_within(
             )
         }
         IpeDep::Path(path) => {
-            let resolved = if path.is_absolute() {
-                path.clone()
-            } else {
-                project_root.join(path)
-            };
-            if !resolved.is_dir() {
-                return Err(CliError::Resolve(
-                    crate::text::msg::resolve_path_dep_missing(&name, &resolved.display()),
-                ));
-            }
-            let source = LocalSource::from_path(&package_name, path)?;
+            let (origin, resolved) = path_origin(project_root, name, &package_name, path)?;
             // The author's own directory: never removed on a failure.
-            (LockedOrigin::Path { source }, resolved, None)
+            (origin, resolved, None)
         }
         IpeDep::Index(_) => {
             return Err(CliError::Resolve(
@@ -802,15 +834,14 @@ fn stage_origin(
         path: dest.to_path_buf(),
         source: e,
     })?;
+    // `git remote add` has no option terminator; the argument is the typed
+    // location's git spelling, re-judged at this sink (no leading `-`, no
+    // network share or device), so it is a safe trailing arg.
+    let remote = url
+        .git_remote()
+        .map_err(|refusal| refusal.into_cli(name, url.as_str()))?;
     run_git(name, &["init", "--quiet"], dest, transfer)?;
-    // `git remote add` has no option terminator; the URL is a parse-validated
-    // newtype (no leading `-`), so it is a safe trailing arg.
-    run_git(
-        name,
-        &["remote", "add", "origin", url.as_str()],
-        dest,
-        transfer,
-    )?;
+    run_git(name, &["remote", "add", "origin", remote], dest, transfer)?;
     Ok(())
 }
 
@@ -2917,5 +2948,77 @@ mod tests {
                 "IPE_INDEX_DIR={raw:?} must be refused: {root:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_remote_dep_path_is_refused_before_any_open() {
+        let proj = temp_dir("remote-dep-path");
+        scaffold_project(&proj);
+        let err =
+            resolve_escape(&proj, "remotelib", &IpeDep::Path("//h/s/lib".into())).unwrap_err();
+        assert!(
+            matches!(&err, CliError::LockRefused(r)
+            if matches!(**r, crate::lockfile::LockRefusal::RemoteLocalSource {
+                kind: index::RemotePath::Unc,
+                ..
+            })),
+            "{err:?}"
+        );
+        let missing =
+            resolve_escape(&proj, "missinglib", &IpeDep::Path("missing-dir".into())).unwrap_err();
+        let expected = crate::text::msg::resolve_path_dep_missing(
+            &"missinglib",
+            &proj.join("missing-dir").display(),
+        );
+        assert!(
+            matches!(&missing, CliError::Resolve(msg) if *msg == expected),
+            "{missing:?}"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn a_device_dep_path_is_refused_before_any_open_under_windows() {
+        let proj = temp_dir("device-dep-path");
+        scaffold_project(&proj);
+        let package = pn("devicelib");
+        let path = Path::new("lib/CON");
+        // `lib/CON` does not exist: a check after `is_dir` would report it missing.
+        let origin = |regime| super::path_origin_in(&proj, "devicelib", &package, path, regime);
+        let err = origin(ipe_path_core::Regime::Windows).unwrap_err();
+        assert!(
+            matches!(&err, CliError::LockRefused(r)
+                if matches!(&**r, crate::lockfile::LockRefusal::DeviceLocalSource { raw, .. }
+                    if raw == "lib/CON")),
+            "{err:?}"
+        );
+        let missing =
+            crate::text::msg::resolve_path_dep_missing(&"devicelib", &proj.join(path).display());
+        assert!(
+            matches!(origin(ipe_path_core::Regime::Unix), Err(CliError::Resolve(msg)) if msg == missing),
+            "where `CON` opens no device the path reaches the directory check"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn a_file_url_source_reaches_git_as_its_plain_path() {
+        let src = git_source("file-url-origin", "module Lib\n");
+        let dest = temp_dir("file-url-origin-dest").join("slot");
+        let plain = src.display().to_string();
+        // A Windows drive path is spelled `file:///C:\…`; a Unix one `file:///home/…`.
+        let file_url = if cfg!(windows) {
+            format!("file:///{plain}")
+        } else {
+            format!("file://{plain}")
+        };
+        let url = SourceUrl::parse(&pn("p"), &file_url)
+            .expect("file URL of an absolute path is a valid source");
+        let transfer = Transfer::begin(*PACKAGE_SOURCE.transfer());
+        stage_origin(&pn("p"), &url, &dest, &transfer).expect("origin stages");
+        let origin = run_fixture(&dest, &["remote", "get-url", "origin"], b"");
+        assert_eq!(String::from_utf8_lossy(&origin).trim_end(), plain);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = dest.parent().map(std::fs::remove_dir_all);
     }
 }
