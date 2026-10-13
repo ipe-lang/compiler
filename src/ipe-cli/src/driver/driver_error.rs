@@ -1413,22 +1413,27 @@ struct LinkFailure {
 
 impl LinkFailure {
     /// The first unopenable-input link failure in `stderr`, if any.
+    ///
+    /// One pass: each line is read once, so the scan stays linear in the
+    /// kept stderr however many link blocks it holds. A block is its header
+    /// line and the empty or indented lines after it; the next header or
+    /// unindented line ends it.
     fn parse(stderr: &str) -> Option<Self> {
-        let mut lines = stderr.lines();
-        while let Some(line) = lines.next() {
-            let Some(rest) = line.trim_start().strip_prefix("error: linking with `") else {
+        let mut linker: Option<&str> = None;
+        for line in stderr.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("error: linking with `") {
+                linker = rest.split_once('`').map(|(name, _)| name);
                 continue;
-            };
-            let Some((linker, _)) = rest.split_once('`') else {
+            }
+            if !(line.is_empty() || line.starts_with(char::is_whitespace)) {
+                linker = None;
                 continue;
-            };
-            let missing = lines
-                .clone()
-                .take_while(|note| note.is_empty() || note.starts_with(char::is_whitespace))
-                .find_map(unopenable_input);
-            if let Some(missing) = missing {
+            }
+            if let Some(name) = linker
+                && let Some(missing) = unopenable_input(line)
+            {
                 return Some(Self {
-                    linker: TerminalSafe::sanitize(linker),
+                    linker: TerminalSafe::sanitize(name),
                     missing: TerminalSafe::sanitize(missing),
                 });
             }
@@ -1732,6 +1737,22 @@ error[E0425]: cannot find value `x` in this scope
  --> src/main.rs:1:1
   = note: cc: cannot find /tmp/app.o";
         assert_eq!(LinkFailure::parse(stderr), None);
+    }
+
+    /// Many indented link headers ahead of the one real block are read once
+    /// each: a rescan of every later line per header would take minutes here.
+    #[test]
+    fn the_scan_is_linear_in_the_link_headers() {
+        let mut stderr = "  error: linking with `cc` failed\n".repeat(60_000);
+        stderr.push_str(UNOPENABLE);
+        let started = std::time::Instant::now();
+        let failure = LinkFailure::parse(&stderr).expect("the real block still classifies");
+        assert_eq!(failure.linker.as_str(), "x86_64-w64-mingw32-gcc");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the scan took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

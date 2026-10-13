@@ -448,9 +448,19 @@ mod tests {
 
     const GNU: HostLinker = HostLinker::AsciiOnly;
 
+    /// `rooted` as an absolute path on this host: on Windows a rooted path
+    /// without a drive is relative to the current drive, so it gains `C:`.
+    fn abs(rooted: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!("C:{rooted}"))
+        } else {
+            PathBuf::from(rooted)
+        }
+    }
+
     fn sources() -> TargetDirSources {
         TargetDirSources {
-            cache_base: Some(PathBuf::from("/home/ana/.cache")),
+            cache_base: Some(abs("/home/ana/.cache")),
             ..TargetDirSources::default()
         }
     }
@@ -520,12 +530,11 @@ mod tests {
     fn linux_unchanged() {
         let linker = HostLinker::of_triple(HostTriple::parse("x86_64-unknown-linux-gnu"));
         assert_eq!(linker, HostLinker::Unicode);
-        let resolved =
-            LinkableTargetDir::resolve(linker, Path::new("/srv/ipé/out/rust"), &sources());
+        let resolved = LinkableTargetDir::resolve(linker, &abs("/srv/ipé/out/rust"), &sources());
         assert_eq!(
             resolved.ok(),
             Some(LinkableTargetDir {
-                path: PathBuf::from("/srv/ipé/out/rust/target"),
+                path: abs("/srv/ipé/out/rust/target"),
                 origin: TargetDirOrigin::CrateLocal,
             })
         );
@@ -546,23 +555,23 @@ mod tests {
     #[test]
     fn gnu_host_non_ascii_pin_refused() {
         let pinned = TargetDirSources {
-            env: Some(OsString::from("/home/ana/ipé-t")),
+            env: Some(abs("/home/ana/ipé-t").into_os_string()),
             ..sources()
         };
-        let resolved = LinkableTargetDir::resolve(GNU, Path::new("/home/ana/p/out/rust"), &pinned);
+        let resolved = LinkableTargetDir::resolve(GNU, &abs("/home/ana/p/out/rust"), &pinned);
         assert_eq!(
             refusal(&resolved),
             Some((
                 UnlinkablePath::Target(TargetDirOrigin::Env),
-                "/home/ana/ipé-t".to_owned()
+                abs("/home/ana/ipé-t").to_string_lossy().into_owned()
             ))
         );
     }
 
     #[test]
     fn every_unlinkable_pin_is_refused_with_its_origin() {
-        let crate_dir = Path::new("/home/ana/p/out/rust");
-        let bad = PathBuf::from("/home/ana/Público/t");
+        let crate_dir = &abs("/home/ana/p/out/rust");
+        let bad = abs("/home/ana/Público/t");
         let cases = [
             (
                 TargetDirSources {
@@ -602,11 +611,11 @@ mod tests {
             env: Some(OsString::from("shared")),
             ..sources()
         };
-        let resolved = LinkableTargetDir::resolve(GNU, Path::new("/home/ana/p/out/rust"), &pinned);
+        let resolved = LinkableTargetDir::resolve(GNU, &abs("/home/ana/p/out/rust"), &pinned);
         assert_eq!(
             resolved.ok(),
             Some(LinkableTargetDir {
-                path: PathBuf::from("/home/ana/p/out/rust/shared"),
+                path: abs("/home/ana/p/out/rust/shared"),
                 origin: TargetDirOrigin::Env,
             })
         );
@@ -615,28 +624,27 @@ mod tests {
     #[test]
     fn the_embedder_outranks_the_environment() {
         let pinned = TargetDirSources {
-            embedder: Some(PathBuf::from("/w/t")),
-            env: Some(OsString::from("/e/t")),
+            embedder: Some(abs("/w/t")),
+            env: Some(abs("/e/t").into_os_string()),
             ..sources()
         };
-        let resolved = LinkableTargetDir::resolve(GNU, Path::new("/p"), &pinned);
-        assert_eq!(
-            resolved.ok().map(|dir| dir.path),
-            Some(PathBuf::from("/w/t"))
-        );
+        let resolved = LinkableTargetDir::resolve(GNU, &abs("/p"), &pinned);
+        assert_eq!(resolved.ok().map(|dir| dir.path), Some(abs("/w/t")));
     }
 
     #[test]
     fn gnu_host_non_ascii_crate_relocates_to_cache() {
-        let crate_dir = Path::new("/home/ana/Ministério Público/counter/out/rust");
-        let resolved = LinkableTargetDir::resolve(GNU, crate_dir, &sources());
-        let digest = ipe_backend_rust::identity_hex(crate_dir);
+        let crate_dir = abs("/home/ana/Ministério Público/counter/out/rust");
+        let resolved = LinkableTargetDir::resolve(GNU, &crate_dir, &sources());
+        // The key digests the absolute crate path the resolver reads.
+        let absolute = std::path::absolute(&crate_dir).expect("absolute crate dir");
+        let digest = ipe_backend_rust::identity_hex(&absolute);
         let key = digest.get(..16).unwrap_or_default();
         assert_eq!(key.len(), 16);
         assert_eq!(
             resolved.ok(),
             Some(LinkableTargetDir {
-                path: PathBuf::from("/home/ana/.cache/ipe/t").join(key),
+                path: abs("/home/ana/.cache/ipe/t").join(key),
                 origin: TargetDirOrigin::UserCache,
             })
         );
@@ -644,7 +652,7 @@ mod tests {
 
     #[test]
     fn gnu_host_ascii_crate_stays_local() {
-        let resolved = LinkableTargetDir::resolve(GNU, Path::new("/home/ana/p"), &sources());
+        let resolved = LinkableTargetDir::resolve(GNU, &abs("/home/ana/p"), &sources());
         assert_eq!(
             resolved.ok().map(|dir| dir.origin),
             Some(TargetDirOrigin::CrateLocal)
@@ -654,10 +662,10 @@ mod tests {
     #[test]
     fn gnu_host_non_ascii_cache_base_refused() {
         let homeless = TargetDirSources {
-            cache_base: Some(PathBuf::from("/home/joão/.cache")),
+            cache_base: Some(abs("/home/joão/.cache")),
             ..TargetDirSources::default()
         };
-        let resolved = LinkableTargetDir::resolve(GNU, Path::new("/home/joão/p"), &homeless);
+        let resolved = LinkableTargetDir::resolve(GNU, &abs("/home/joão/p"), &homeless);
         assert_eq!(
             refusal(&resolved).map(|(refused, _)| refused),
             Some(UnlinkablePath::Target(TargetDirOrigin::UserCache))
@@ -666,11 +674,8 @@ mod tests {
 
     #[test]
     fn gnu_host_without_a_cache_base_is_refused() {
-        let resolved = LinkableTargetDir::resolve(
-            GNU,
-            Path::new("/home/joão/p"),
-            &TargetDirSources::default(),
-        );
+        let resolved =
+            LinkableTargetDir::resolve(GNU, &abs("/home/joão/p"), &TargetDirSources::default());
         assert!(
             matches!(resolved, Err(CliError::CacheHomeUnknown)),
             "{resolved:?}"
@@ -680,10 +685,10 @@ mod tests {
     #[test]
     fn gnu_host_non_ascii_sysroot_refused() {
         let toolchain = TargetDirSources {
-            sysroot: Some(PathBuf::from("/home/joão/.rustup/toolchains/stable")),
+            sysroot: Some(abs("/home/joão/.rustup/toolchains/stable")),
             ..sources()
         };
-        let resolved = LinkableTargetDir::resolve(GNU, Path::new("/home/ana/p"), &toolchain);
+        let resolved = LinkableTargetDir::resolve(GNU, &abs("/home/ana/p"), &toolchain);
         assert_eq!(
             refusal(&resolved).map(|(refused, _)| refused),
             Some(UnlinkablePath::Sysroot)
@@ -693,11 +698,11 @@ mod tests {
     #[test]
     fn unicode_host_ignores_a_non_ascii_sysroot() {
         let toolchain = TargetDirSources {
-            sysroot: Some(PathBuf::from("/home/joão/.rustup/toolchains/stable")),
+            sysroot: Some(abs("/home/joão/.rustup/toolchains/stable")),
             ..sources()
         };
         let resolved =
-            LinkableTargetDir::resolve(HostLinker::Unicode, Path::new("/home/ana/p"), &toolchain);
+            LinkableTargetDir::resolve(HostLinker::Unicode, &abs("/home/ana/p"), &toolchain);
         assert!(resolved.is_ok(), "{resolved:?}");
     }
 

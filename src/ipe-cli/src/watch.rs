@@ -3345,14 +3345,11 @@ fn spawn_cargo_build(
             // Classified exactly as a one-shot build's failure is, so a link
             // input the host linker cannot open reaches the screen as the
             // environment fault it is.
-            (Some((status, false)), _) => {
-                CargoOutcome::Red(CargoRed::Refused(CliError::EmittedBuildFailed {
-                    what: "the watch rebuild",
-                    code: status.code().unwrap_or(1),
-                    stderr: crate::style::TerminalSafe::sanitize(&err_buf),
-                    runtime: None,
-                }))
-            }
+            (Some((status, false)), _) => CargoOutcome::Red(CargoRed::Refused(watch_build_failed(
+                status.code().unwrap_or(1),
+                &out_buf,
+                &err_buf,
+            ))),
         };
         let _ = evt_tx.send(OrchestratorEvent::CargoDone {
             generation,
@@ -3371,6 +3368,52 @@ fn spawn_cargo_build(
     }
 
     Ok(shared)
+}
+
+/// The refusal of a watch rebuild that exited `code`, from its
+/// `--message-format=json` stdout and its stderr.
+///
+/// With that format rustc's diagnostics reach stdout as `compiler-message`
+/// records and never stderr, so the rendered ones lead the classified text:
+/// a link failure is read from the same text a one-shot build classifies.
+fn watch_build_failed(code: i32, cargo_json_stdout: &str, stderr: &str) -> CliError {
+    let mut text = rendered_diagnostics(cargo_json_stdout);
+    text.push_str(stderr);
+    CliError::EmittedBuildFailed {
+        what: "the watch rebuild",
+        code,
+        stderr: crate::style::TerminalSafe::sanitize(&text),
+        runtime: None,
+    }
+}
+
+/// The `message.rendered` text of every `compiler-message` record in
+/// `cargo build --message-format=json`'s stdout, in order.
+///
+/// Kept to [`crate::cargo_step::STDERR_KEEP_CAP`] bytes, whole messages only,
+/// so the diagnostic is bounded like a one-shot build's kept stderr.
+fn rendered_diagnostics(cargo_json_stdout: &str) -> String {
+    let mut rendered = String::new();
+    for line in cargo_json_stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(text) = value
+            .get("message")
+            .and_then(|message| message.get("rendered"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if rendered.len().saturating_add(text.len()) > crate::cargo_step::STDERR_KEEP_CAP {
+            break;
+        }
+        rendered.push_str(text);
+    }
+    rendered
 }
 
 /// Parse `cargo build --message-format=json`'s stdout for the produced
@@ -3403,6 +3446,45 @@ mod tests {
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    /// The link failure a JSON-mode rebuild reports on stdout, as cargo
+    /// renders a `compiler-message` record for it.
+    const JSON_LINK_FAILURE: &str = "error: linking with `x86_64-w64-mingw32-gcc` failed: exit code: 1
+  |
+  = note: C:\\msys64\\mingw64\\bin\\ld.exe: cannot find C:\\Users\\Jo\u{e3}o\\t\\app.o: No such file or directory
+          collect2.exe: error: ld returned 1 exit status
+
+";
+
+    #[test]
+    fn a_json_mode_link_failure_is_classified_as_the_users() {
+        let record = serde_json::json!({
+            "reason": "compiler-message",
+            "message": { "rendered": JSON_LINK_FAILURE },
+        });
+        let stdout = format!("not json\n{record}\n");
+        let refusal = super::watch_build_failed(101, &stdout, "error: could not compile `app`\n");
+        assert!(matches!(refusal.fault(), crate::screen::Fault::User));
+        let unclassified = super::watch_build_failed(101, "", "error: could not compile `app`\n");
+        assert!(matches!(
+            unclassified.fault(),
+            crate::screen::Fault::Internal
+        ));
+    }
+
+    #[test]
+    fn rendered_diagnostics_stop_at_the_keep_cap() {
+        let big = "e".repeat(crate::cargo_step::STDERR_KEEP_CAP);
+        let record = serde_json::json!({
+            "reason": "compiler-message",
+            "message": { "rendered": big },
+        });
+        let stdout = format!("{record}\n{record}\n");
+        assert_eq!(
+            super::rendered_diagnostics(&stdout).len(),
+            crate::cargo_step::STDERR_KEEP_CAP
+        );
+    }
 
     /// Build an `EmittedProject` whose `src/main.rs` carries `main_rs`, so the
     /// HTTP-detection predicates can be tested on their real scan surface without

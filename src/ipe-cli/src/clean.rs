@@ -172,9 +172,23 @@ fn relocated_targets_within(root: &Path, cache_base: &Path, pins: &[PathBuf]) ->
             let target = crate::target_dir::user_cache_target(cache_base, &crate_dir);
             (crate_dir, target)
         })
-        .filter(|(crate_dir, target)| !pins.iter().any(|pin| crate_dir.join(pin) == *target))
+        .filter(|(crate_dir, target)| {
+            !pins
+                .iter()
+                .any(|pin| names_same_dir(&crate_dir.join(pin), target))
+        })
         .map(|(_, target)| target)
         .collect()
+}
+
+/// Whether `pin` and `target` name one directory: spelled alike, or resolving
+/// to one path through a link, a case-folding filesystem, or a `..` step.
+fn names_same_dir(pin: &Path, target: &Path) -> bool {
+    pin == target
+        || matches!(
+            (std::fs::canonicalize(pin), std::fs::canonicalize(target)),
+            (Ok(pin), Ok(target)) if pin == target
+        )
 }
 
 /// The name of the tag cargo writes into every build directory it creates.
@@ -675,6 +689,23 @@ mod tests {
         assert!(
             target.join(CACHEDIR_TAG).is_file(),
             "the pinned target survives"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A pin spelling the relocated path another way is still the user's.
+    #[test]
+    fn a_pin_spelled_another_way_is_never_removed() {
+        let (scratch, root, base) = relocation_fixture("ipe_clean_reloc_pin_alias");
+        let target = relocated(&root, &base);
+        std::fs::create_dir_all(&target).expect("make target");
+        std::fs::write(target.join(CACHEDIR_TAG), CARGO_CACHEDIR_TAG).expect("tag");
+        let key = target.file_name().expect("relocation key");
+        let pin = base.join("ipe").join("..").join("ipe").join("t").join(key);
+        let named = relocated_targets_within(&root, &base, std::slice::from_ref(&pin));
+        assert!(
+            !named.contains(&target),
+            "a pin through `..` is not named: {named:?}"
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }
