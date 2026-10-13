@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use ipe_db::{Db as _, IpeDatabase, ModuleOrigin, SourceFile, SourceRoot};
-use ipe_lint::LintConfig;
+use ipe_lint::{LintConfig, NeverCancel};
 use ipe_lsp_features::PositionEncoding;
 use ipe_lsp_features::code_actions::{DbView, code_actions};
 use ipe_lsp_features::diagnostics::{ModuleDiagnostics, collect, collect_lint, to_lsp};
@@ -858,7 +858,8 @@ fn lint_diag_for(module: &[&str], src: &str, rule: &str) -> lsp_types::Diagnosti
     );
     let config = LintConfig::default();
     let code = lsp_types::NumberOrString::String(format!("lint/{rule}"));
-    collect_lint(&user_texts, &config, PositionEncoding::Utf16)
+    let Ok(per_module) = collect_lint(&user_texts, &config, PositionEncoding::Utf16, &NeverCancel);
+    per_module
         .into_iter()
         .find(|(m, _)| m.iter().map(String::as_str).eq(module.iter().copied()))
         .into_iter()
@@ -1191,7 +1192,12 @@ fn unused_imports_quick_fix_removes_a_multiline_as_import() {
 fn unused_import_diagnostic(src: &str) -> lsp_types::Diagnostic {
     let mut user_texts = BTreeMap::new();
     user_texts.insert(vec!["Main".to_owned()], src.to_owned());
-    let per_module = collect_lint(&user_texts, &LintConfig::default(), PositionEncoding::Utf16);
+    let Ok(per_module) = collect_lint(
+        &user_texts,
+        &LintConfig::default(),
+        PositionEncoding::Utf16,
+        &NeverCancel,
+    );
     let (_, diags) = per_module
         .into_iter()
         .find(|(module, _)| module == &vec!["Main".to_owned()])
