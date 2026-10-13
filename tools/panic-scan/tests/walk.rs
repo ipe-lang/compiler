@@ -58,14 +58,13 @@ fn lists_every_wanted_file_sorted_and_skips_no_directory() {
         put(&root, rel);
     }
     let rust = rust_sources(&root, Want::RustFiles).expect("walk the tree");
-    let expected: Vec<PathBuf> = ["a/z.rs", "a.rs", ".hidden/h.rs", "b.rs", "target/t.rs"]
+    let mut expected: Vec<PathBuf> = ["a/z.rs", "a.rs", ".hidden/h.rs", "b.rs", "target/t.rs"]
         .iter()
         .map(|rel| root.join(rel))
         .collect();
-    let mut sorted = expected.clone();
-    sorted.sort();
+    expected.sort();
     assert_eq!(
-        rust, sorted,
+        rust, expected,
         "every `.rs` file, hidden and `target` included"
     );
     let with_manifests = rust_sources(&root, Want::RustAndManifests).expect("walk the tree");
