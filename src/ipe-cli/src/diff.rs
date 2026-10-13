@@ -444,6 +444,31 @@ pub fn check_semver_bump(
     report(&old_api, &new_api, old_version, new_version).map_err(DiffError::from)
 }
 
+/// [`check_semver_bump`] with the new side given as the captured module `new_sources` of `new_root`.
+///
+/// The new API is extracted from exactly the text a caller judged (a
+/// [`crate::project::PackageSnapshot`]'s sources), never from a re-read of
+/// `new_root`, which only names the tree in a diagnostic.
+///
+/// # Errors
+/// As [`check_semver_bump`]; [`DiffError::Empty`] when `new_sources` holds no module.
+pub fn check_semver_bump_over(
+    old_tree: &Path,
+    new_root: &Path,
+    new_sources: &crate::project::ModuleSources,
+    old_version: &Version,
+    new_version: &Version,
+) -> Result<SemverReport, DiffError> {
+    if new_sources.is_empty() {
+        return Err(DiffError::Empty {
+            path: new_root.to_path_buf(),
+        });
+    }
+    let old_api = extract_tree(old_tree)?;
+    let new_api = crate::api_surface::extract_sources(new_sources)?;
+    report(&old_api, &new_api, old_version, new_version).map_err(DiffError::from)
+}
+
 /// Build the [`SemverReport`] for two already-extracted APIs + versions.
 ///
 /// # Errors

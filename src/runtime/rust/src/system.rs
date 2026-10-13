@@ -705,8 +705,8 @@ fn home_dir_from_var(
 
 /// Render a runtime status line (e.g. the HTTP `listening on` banner, or an
 /// `[ipe.live]`/`[ipe.console]` session-store/console line) with a 4-space
-/// left gutter ONLY when stderr is an interactive terminal; a piped or
-/// redirected stderr (test harness, production log capture) stays flush-left so
+/// left gutter ONLY when its stream is an interactive terminal; a piped or
+/// redirected stream (test harness, production log capture) stays flush-left so
 /// downstream `contains(...)` matchers see the bare line. The `is_terminal`
 /// decision is a parameter so the indent rule is testable without a pty.
 ///
@@ -893,25 +893,64 @@ pub(crate) fn write_stdout_line(line: &str) {
     let _ = writeln!(std::io::stdout().lock(), "{line}");
 }
 
-/// Build a `"[<stamp> ][ipe.<tag>] <msg>"` line with `msg` scrubbed. Private:
-/// the only place the literal `"[ipe."` prefix is constructed; call sites use
-/// `emit_runtime_log` / `emit_runtime_log_stamped`.
+/// The standard stream a runtime log line is written to.
+///
+/// Each stream is judged on its own `is_terminal`, so a redirected stdout does
+/// not flush-left an interactive stderr line, nor the reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogStream {
+    /// Status and diagnostic lines.
+    Stderr,
+    /// User-facing status lines that sit beside program output.
+    #[cfg_attr(
+        not(all(feature = "web-core", feature = "server")),
+        allow(dead_code) // only the served web surface writes a status line to stdout
+    )]
+    Stdout,
+}
+
+impl LogStream {
+    fn is_terminal(self) -> bool {
+        use std::io::IsTerminal;
+        match self {
+            Self::Stderr => std::io::stderr().is_terminal(),
+            Self::Stdout => std::io::stdout().is_terminal(),
+        }
+    }
+
+    fn write_line(self, line: &str) {
+        match self {
+            Self::Stderr => write_stderr_line(line),
+            Self::Stdout => write_stdout_line(line),
+        }
+    }
+}
+
+/// Build a `"[ipe.<tag>] [<stamp> ]<msg>"` line with `msg` scrubbed.
+///
+/// Private: the only place the literal `"[ipe."` prefix is constructed. The
+/// tag leads and the optional stamp follows it, so every runtime line shares
+/// one layout; call sites use the `emit_runtime_log*` fns.
 fn format_runtime_log(stamp: Option<&str>, tag: &str, msg: &str) -> String {
     let msg = scrub_log_controls(msg);
     match stamp {
-        Some(stamp) => format!("{stamp} [ipe.{tag}] {msg}"),
+        Some(stamp) => format!("[ipe.{tag}] {stamp} {msg}"),
         None => format!("[ipe.{tag}] {msg}"),
     }
 }
 
 /// The fully rendered (scrubbed, terminal-guttered) form of a tagged runtime
-/// log line — exactly what the emitters write.
-pub(crate) fn runtime_log_line(stamp: Option<&str>, tag: &str, msg: &str) -> String {
-    use std::io::IsTerminal;
-    gutter_line(
-        &format_runtime_log(stamp, tag, msg),
-        std::io::stderr().is_terminal(),
-    )
+/// log line on `stream` — exactly what the emitters write.
+///
+/// The one composer of a runtime log line: tag, optional stamp, scrubbed
+/// message, then the gutter the stream's terminal state asks for.
+pub(crate) fn runtime_log_line(
+    stream: LogStream,
+    stamp: Option<&str>,
+    tag: &str,
+    msg: &str,
+) -> String {
+    gutter_line(&format_runtime_log(stamp, tag, msg), stream.is_terminal())
 }
 
 /// The single emitter for every `[ipe.<tag>] ...` runtime log line — session
@@ -922,14 +961,23 @@ pub(crate) fn runtime_log_line(stamp: Option<&str>, tag: &str, msg: &str) -> Str
 /// broken-pipe-tolerant write apply uniformly with no bypass path. Pinned by the
 /// source scan in `runtime_log_emitter_tests` below.
 pub(crate) fn emit_runtime_log(tag: &str, msg: &str) {
-    write_stderr_line(&runtime_log_line(None, tag, msg));
+    let stream = LogStream::Stderr;
+    stream.write_line(&runtime_log_line(stream, None, tag, msg));
 }
 
-/// `emit_runtime_log` for a line that carries a leading timestamp before its
-/// tag (the memory session-store startup line).
+/// `emit_runtime_log` for a line that carries a timestamp after its tag (the
+/// memory session-store startup line).
 #[cfg(all(feature = "web-core", feature = "server"))]
 pub(crate) fn emit_runtime_log_stamped(stamp: &str, tag: &str, msg: &str) {
-    write_stderr_line(&runtime_log_line(Some(stamp), tag, msg));
+    let stream = LogStream::Stderr;
+    stream.write_line(&runtime_log_line(stream, Some(stamp), tag, msg));
+}
+
+/// `emit_runtime_log` for a user-facing status line written to stdout.
+#[cfg(all(feature = "web-core", feature = "server"))]
+pub(crate) fn emit_runtime_log_stdout(tag: &str, msg: &str) {
+    let stream = LogStream::Stdout;
+    stream.write_line(&runtime_log_line(stream, None, tag, msg));
 }
 
 /// The port a program passed to its listener, admitted once as a
@@ -4166,7 +4214,39 @@ mod exit_hook_tests {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod gutter_line_tests {
-    use super::gutter_line;
+    use super::{format_runtime_log, gutter_line};
+
+    #[test]
+    fn every_runtime_line_leads_with_its_tag() {
+        // The stamp, where a line has one, follows the tag; a stamp-less line
+        // goes tag then text. The gutter wraps the whole composed line, so a
+        // terminal stream indents all three startup shapes identically.
+        for (stamp, tag, msg, flush_left) in [
+            (
+                Some("2026/10/12 09:30:00"),
+                "live",
+                "session store: memory (ttl=30m0s)",
+                "[ipe.live] 2026/10/12 09:30:00 session store: memory (ttl=30m0s)",
+            ),
+            (
+                None,
+                "console",
+                "auth posture=dev mode=token source=env",
+                "[ipe.console] auth posture=dev mode=token source=env",
+            ),
+            (
+                None,
+                "web",
+                "listening on :8000",
+                "[ipe.web] listening on :8000",
+            ),
+        ] {
+            let line = format_runtime_log(stamp, tag, msg);
+            assert_eq!(line, flush_left);
+            assert_eq!(gutter_line(&line, false), flush_left);
+            assert_eq!(gutter_line(&line, true), format!("    {flush_left}"));
+        }
+    }
 
     #[test]
     fn indents_only_under_a_terminal() {
@@ -4292,7 +4372,7 @@ mod runtime_log_emitter_tests {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod scrub_log_controls_tests {
-    use super::{runtime_log_line, scrub_log_controls};
+    use super::{LogStream, runtime_log_line, scrub_log_controls};
 
     #[test]
     fn escapes_newline_esc_del_and_c1() {
@@ -4486,7 +4566,12 @@ mod scrub_log_controls_tests {
 
     #[test]
     fn emitted_line_cannot_forge_a_second_record() {
-        let line = runtime_log_line(None, "http", "GET /x\r\n[ipe.http] forged\x1b[31m");
+        let line = runtime_log_line(
+            LogStream::Stderr,
+            None,
+            "http",
+            "GET /x\r\n[ipe.http] forged\x1b[31m",
+        );
         assert!(
             !line.chars().any(super::is_log_hazard),
             "control survived: {line:?}"
