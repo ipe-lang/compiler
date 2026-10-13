@@ -688,55 +688,56 @@ fn unboxed_read(access: FieldAccess, boxed: &str) -> String {
 
 /// Render an or-pattern's alternatives, each into its own sink, and fold them into `sink`.
 ///
-/// Every alternative binds the same names, so a binder unboxed from a boxed
-/// field must be unboxed by every alternative, and its unbox runs once, taken
-/// from the first. Alternatives that unbox different binders, that destructure
-/// a boxed field through a fresh temp, or that mint a fresh name beside an
-/// unbox have no single prelude serving them all, and are refused. Without an
-/// unbox, a by-value head keeps every alternative's prelude and a borrowed
-/// head keeps the first's.
-fn render_or_alternatives<F>(
-    alts: &[Pat],
-    access: FieldAccess,
-    sink: &mut ArmSink,
-    render: &mut F,
-) -> DResult<String>
+/// A Rust or-pattern binds one name set at one type in every alternative, and
+/// the arm body runs one prelude whichever alternative matched. So every
+/// alternative numbers its fresh names from the same base: alternatives that
+/// mint the same temps for the same binders render the same prelude, and that
+/// one prelude serves them all. Alternatives whose unboxed binders differ, that
+/// destructure a boxed field through a fresh temp (its type is fixed by the
+/// variant, not by the names it binds), or that mint fresh names into
+/// different preludes or guards have no single prelude, and are refused.
+/// Otherwise the first alternative's prelude and guards serve the arm: every
+/// alternative binds and rebinds the same names.
+fn render_or_alternatives<F>(alts: &[Pat], sink: &mut ArmSink, render: &mut F) -> DResult<String>
 where
     F: FnMut(&Pat, &mut ArmSink) -> DResult<String>,
 {
+    let base = sink.counter;
     let mut parts = Vec::with_capacity(alts.len());
     let mut done = Vec::with_capacity(alts.len());
-    let mut minted = false;
     for alt in alts {
-        let before = sink.counter;
         let mut alt_sink = sink.alternative();
         parts.push(render(alt, &mut alt_sink)?);
-        minted |= alt_sink.counter != before;
-        sink.counter = alt_sink.counter;
         done.push(alt_sink);
     }
-    let unboxed = done
-        .first()
-        .map_or_else(BTreeSet::new, |first| first.unboxed.clone());
-    let uneven = done.iter().any(|alt| alt.unboxed != unboxed);
-    let boxed_temp = done.iter().any(|alt| alt.boxed_temp);
-    if uneven || boxed_temp || (minted && !unboxed.is_empty()) {
+    let Some((first, rest)) = done.split_first() else {
         return Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::render_or_alternatives",
-            detail: "or-pattern alternatives read boxed fields differently (different \
-                     unboxed binders, or a fresh temp beside an unbox); no single arm \
-                     prelude serves every alternative"
+            detail: "an or-pattern reached the backend with no alternatives".to_owned(),
+        });
+    };
+    let minted = done.iter().any(|alt| alt.counter != base);
+    let uneven = rest.iter().any(|alt| alt.unboxed != first.unboxed);
+    let boxed_temp = done.iter().any(|alt| alt.boxed_temp);
+    let diverging_mints = minted
+        && rest.iter().any(|alt| {
+            alt.counter != first.counter
+                || alt.prelude != first.prelude
+                || alt.guards != first.guards
+        });
+    if uneven || boxed_temp || diverging_mints {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::render_or_alternatives",
+            detail: "or-pattern alternatives bind through different arm preludes (different \
+                     unboxed binders, a boxed field destructured through a temp, or fresh \
+                     names minted differently); no single prelude serves every alternative"
                 .to_owned(),
         });
     }
-    let keep_all = unboxed.is_empty() && access != FieldAccess::ByRef;
-    for (i, alt) in done.into_iter().enumerate() {
-        if keep_all || i == 0 {
-            sink.prelude.push_str(&alt.prelude);
-        }
-        sink.guards.extend(alt.guards);
-    }
-    sink.unboxed.extend(unboxed);
+    sink.counter = first.counter;
+    sink.prelude.push_str(&first.prelude);
+    sink.guards.extend(first.guards.iter().cloned());
+    sink.unboxed.extend(first.unboxed.iter().copied());
     Ok(parts.join(" | "))
 }
 
@@ -864,12 +865,9 @@ fn borrow_list_head(ctx: &EmitCtx, pat: &Pat, moves: bool, sink: &mut ArmSink) -
         }
         // Every alternative binds the same names at the same types, so the first
         // alternative's rebinds are the whole arm's set.
-        Pat::Or(alts) => render_or_alternatives(
-            alts,
-            FieldAccess::ByRef,
-            sink,
-            &mut |p: &Pat, s: &mut ArmSink| borrow_list_head(ctx, p, moves, s),
-        ),
+        Pat::Or(alts) => render_or_alternatives(alts, sink, &mut |p: &Pat, s: &mut ArmSink| {
+            borrow_list_head(ctx, p, moves, s)
+        }),
         // A wildcard binds nothing; other heads never reach a list `case`.
         Pat::Wildcard
         | Pat::Str(_)
@@ -1103,12 +1101,9 @@ fn owned_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> {
             let inner = owned_elem(ctx, inner, sink)?;
             Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
         }
-        Pat::Or(alts) => render_or_alternatives(
-            alts,
-            FieldAccess::ByValue,
-            sink,
-            &mut |p: &Pat, s: &mut ArmSink| owned_elem(ctx, p, s),
-        ),
+        Pat::Or(alts) => render_or_alternatives(alts, sink, &mut |p: &Pat, s: &mut ArmSink| {
+            owned_elem(ctx, p, s)
+        }),
         Pat::Var(_)
         | Pat::Wildcard
         | Pat::Int(_)
@@ -1175,12 +1170,9 @@ fn borrow_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> 
         Pat::Record(fields) => render_record_with(ctx, fields, |p| borrow_elem(ctx, p, sink)),
         // Every alternative binds the same names at the same types; the first
         // alternative's rebinds serve them all.
-        Pat::Or(alts) => render_or_alternatives(
-            alts,
-            FieldAccess::ByRef,
-            sink,
-            &mut |p: &Pat, s: &mut ArmSink| borrow_elem(ctx, p, s),
-        ),
+        Pat::Or(alts) => render_or_alternatives(alts, sink, &mut |p: &Pat, s: &mut ArmSink| {
+            borrow_elem(ctx, p, s)
+        }),
         // A wildcard / literal element binds nothing. A nested slice element is
         // gated at lowering (it never reaches the backend), so it needs no rebind.
         Pat::Wildcard
@@ -1536,12 +1528,9 @@ pub fn render_arm_pat_alias_safe(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -
                         .to_owned(),
                 });
             }
-            render_or_alternatives(
-                alts,
-                FieldAccess::ByValue,
-                sink,
-                &mut |p: &Pat, s: &mut ArmSink| render_arm_pat_alias_safe(ctx, p, s),
-            )
+            render_or_alternatives(alts, sink, &mut |p: &Pat, s: &mut ArmSink| {
+                render_arm_pat_alias_safe(ctx, p, s)
+            })
         }
         // `Pat::Str` is intercepted above (binder + guard); the remaining
         // leaves render directly.

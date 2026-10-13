@@ -24,6 +24,8 @@
 //! | `boxed_tuple_ctor_test` | `ChainNode (ChainEnd, 0)` + catch-all | fail-closed at `ipe` time |
 //! | `or_uneven_boxed_binder` | `(Node l _ _, _) \| (_, l)` | fail-closed at `ipe` time |
 //! | `boxed_string_test` | `Pair (Plain "go") _ _` | fail-closed IPE-L0116 |
+//! | `or_shared_alias` | `Square (n as w) \| Circle (n as w)` | builds + prints `10` |
+//! | `or_diverging_alias` | `Square (n as w) \| Rect n w` | fail-closed at `ipe` time |
 //!
 //! The refusals assert a typed `ipe`-time diagnostic, never a cargo failure.
 //! A test through the box is refused either by the lowerer (IPE-L0116) or, as
@@ -62,14 +64,26 @@ fn write_single(name: &str, source: &str) -> Option<PathBuf> {
     Some(entry)
 }
 
+/// The scratch output dir for `name`.
+fn out_dir_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("g3121-out")
+        .join(name)
+}
+
 /// The scratch output dir for `name`, cleared.
 fn out_dir(name: &str) -> PathBuf {
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("g3121-out")
-        .join(name);
+    let out = out_dir_path(name);
     let _ = std::fs::remove_dir_all(&out);
     out
 }
+
+/// The backend refusals these fixtures drive. An internal error raised
+/// anywhere else shares their code, so a refusal also names its site.
+const BACKEND_REFUSAL_SITES: &[&str] = &[
+    "ipe_backend_rust::render_user_ctor_args",
+    "ipe_backend_rust::render_or_alternatives",
+];
 
 /// Assert that `source` is REJECTED by `ipe` with one of `expected`, never
 /// accepted-then-cargo-failed. Runs without `IPE_E2E`: emission never happens.
@@ -79,11 +93,20 @@ fn assert_rejected(name: &str, source: &str, expected: &[ipe_diagnostics::Code])
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
     match ipe::build(&entry, &out, &runtime) {
-        Err(CliError::Pipeline { diag, .. }) => assert!(
-            expected.contains(&diag.code()),
-            "{name}: expected a fail-closed {expected:?}, got {}",
-            diag.code().as_str()
-        ),
+        Err(CliError::Pipeline { diag, .. }) => {
+            assert!(
+                expected.contains(&diag.code()),
+                "{name}: expected a fail-closed {expected:?}, got {}",
+                diag.code().as_str()
+            );
+            if let ipe_diagnostics::Diagnostic::CompilerBug { where_, detail } = &*diag {
+                assert!(
+                    BACKEND_REFUSAL_SITES.contains(where_),
+                    "{name}: an internal error outside the boxed-field refusals: \
+                     {where_}: {detail}"
+                );
+            }
+        }
         Ok(()) => assert!(
             false_marker(),
             "{name}: ipe ACCEPTED a test through a boxed field (exit 0) — the \
@@ -431,6 +454,57 @@ main =
     Io.println (String.fromInt (isGo (Pair (Plain "go") 1 (Plain "x"))))
 "#;
 
+/// Both or-pattern alternatives alias the same binder. Every alternative
+/// numbers its fresh names from one base, so both bind the same alias temp.
+/// Prints `10` (4 + 4 + 1 + 1).
+const OR_SHARED_ALIAS: &str = r"module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+type Shape = Dot | Square Int | Circle Int
+
+
+twice : Shape -> Int
+twice s =
+    case s of
+        Square (n as w) | Circle (n as w) ->
+            n + w
+
+        Dot ->
+            0
+
+
+main =
+    Io.println (String.fromInt (twice (Circle 4) + twice (Square 1)))
+";
+
+/// One alternative binds through an alias temp, the other binds directly: the
+/// two alternatives bind different Rust names, so no single prelude serves both.
+const OR_DIVERGING_ALIAS: &str = r"module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+
+type Shape = Dot | Square Int | Rect Int Int
+
+
+area : Shape -> Int
+area s =
+    case s of
+        Square (n as w) | Rect n w ->
+            n * w
+
+        Dot ->
+            0
+
+
+main =
+    Io.println (String.fromInt (area (Rect 2 3)))
+";
+
 #[test]
 fn maybe_wrapped_node_round_trips() {
     assert_accepted("maybe_wrapped_node", MAYBE_WRAPPED_NODE, "12");
@@ -490,5 +564,27 @@ fn boxed_string_test_fails_closed() {
         "boxed_string_test",
         BOXED_STRING_TEST,
         &[ipe_diagnostics::IPE_L0116],
+    );
+}
+
+#[test]
+fn or_shared_alias_round_trips() {
+    assert_accepted("or_shared_alias", OR_SHARED_ALIAS, "10");
+    let main_rs = out_dir_path("or_shared_alias").join("src").join("main.rs");
+    let emitted = std::fs::read_to_string(&main_rs).unwrap_or_default();
+    assert!(
+        emitted.contains("__ipe_arm_alias_0") && !emitted.contains("__ipe_arm_alias_1"),
+        "or_shared_alias: both alternatives must bind the one alias temp `__ipe_arm_alias_0` \
+         (a second temp is unbound in the other alternative, E0408); emitted {}:\n{emitted}",
+        main_rs.display()
+    );
+}
+
+#[test]
+fn or_diverging_alias_fails_closed() {
+    assert_rejected(
+        "or_diverging_alias",
+        OR_DIVERGING_ALIAS,
+        &[ipe_diagnostics::IPE_I0001],
     );
 }
