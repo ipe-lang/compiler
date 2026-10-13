@@ -39,7 +39,8 @@ type Mode
 -- when the file is absent; `CreateIfMissing` opens read-write and creates the
 -- file when absent. Returns `Err` with kind `InvalidInput` when `path` names no
 -- file (empty, `.`, `..`, a root, or a trailing separator), holds a `:` after
--- its drive or is drive-relative, starts with `//` or `\\`, or runs past 512
+-- its drive or is drive-relative, starts with two separators (`//`, `\\`) or
+-- with `\??\` (a network share or device), or runs past 512
 -- bytes once a relative path gains its leading `./`.
 file : Mode -> Path -> Result Error DbLocation
 file mode path =

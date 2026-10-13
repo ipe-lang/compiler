@@ -167,10 +167,11 @@ enum SqliteDb {
 impl SqliteDb {
     /// The database a literal file name opens.
     ///
-    /// `:memory:` names the in-memory database; a name starting `file:` is
+    /// `:memory:` names the in-memory database; a name starting `file:` or
+    /// naming a network share or device ([`names_network_or_device`]) is
     /// refused.
     fn of_name(name: String) -> Option<Self> {
-        if !text_ok(&name) || name.starts_with("file:") {
+        if !text_ok(&name) || name.starts_with("file:") || names_network_or_device(&name) {
             None
         } else if name == SQLITE_MEMORY {
             Some(Self::Memory)
@@ -414,6 +415,18 @@ fn text_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_COMPONENT_LEN
         && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// True when the file name `name` starts with two separators (`//`, `\\`, or a
+/// mix) or the NT object prefix `\??\` (either separator).
+///
+/// On Windows each names a network share or a device, so opening it can dial
+/// a remote host; no SQLite file name may take either form on any platform.
+pub(crate) fn names_network_or_device(name: &str) -> bool {
+    let separator = |b: &u8| matches!(b, b'/' | b'\\');
+    let bytes = name.as_bytes();
+    matches!(bytes, [a, b, ..] if separator(a) && separator(b))
+        || matches!(bytes, [a, b'?', b'?', d, ..] if separator(a) && separator(d))
 }
 
 /// True when `s` names the Postgres driver.
@@ -1288,7 +1301,7 @@ mod tests {
         "sqlite:x.db",
         "u:p@x.db",
         "/abs/p?q#r.db",
-        "//x/caf\u{e9}[1].db",
+        "x/caf\u{e9}[1].db",
     ];
 
     /// A built SQLite file name opens that very file `mode=rwc`, for the
@@ -1409,6 +1422,44 @@ mod tests {
                 "{name:?} must be refused"
             );
         }
+    }
+
+    /// A SQLite file name naming a network share or device is refused, built
+    /// or parsed (spelled out or percent-encoded); a single leading separator
+    /// is the control.
+    #[test]
+    fn sqlite_network_and_device_names_are_refused() {
+        for name in [
+            "//host/s/x.db",
+            "\\\\host\\s\\x.db",
+            "\\\\?\\C:\\x.db",
+            "\\\\.\\pipe\\x",
+            "/\\host\\s\\x.db",
+            "\\/host/s/x.db",
+            "\\??\\UNC\\host\\s\\x.db",
+            "/??/UNC/host/s/x.db",
+        ] {
+            assert!(
+                matches!(sqlite_build(name), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{name:?} must be refused"
+            );
+        }
+        for dsn in [
+            "sqlite:////host/s/x.db",
+            "sqlite://%5C%5Chost%5Cs%5Cx.db",
+            "sqlite:%5C%3F%3F%5CUNC%5Chost%5Cs%5Cx.db",
+            "sqlite:/%2Fhost/s/x.db",
+        ] {
+            assert!(
+                matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{dsn:?} must be refused"
+            );
+        }
+        assert!(matches!(sqlite_build("/host/s/x.db"), IpeResult::Ok(_)));
+        assert!(matches!(
+            dsn_parse::<String>("sqlite:///host/s/x.db".to_owned()),
+            IpeResult::Ok(_)
+        ));
     }
 
     // ── Secure defaults ──────────────────────────────────────────────────────

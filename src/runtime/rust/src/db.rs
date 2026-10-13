@@ -2139,8 +2139,9 @@ async fn build_pool<E: Send + crate::FromIpeError + 'static>(
 
 /// The identity a shared pool is cached under.
 ///
-/// A private in-memory database has no key, so it is never shared.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// A private in-memory database has no key, so it is never shared. A URL key
+/// may carry a password, so its `Debug` never prints the URL.
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum PoolKey {
     /// A sealed file name opened under one mode; two modes are two pools.
     File {
@@ -2151,6 +2152,20 @@ enum PoolKey {
     Dsn(String),
     /// The operator `Db.connect` URL.
     Operator(String),
+}
+
+impl std::fmt::Debug for PoolKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File { name, mode } => f
+                .debug_struct("File")
+                .field("name", name)
+                .field("mode", mode)
+                .finish(),
+            Self::Dsn(_) => f.write_str("Dsn(<redacted>)"),
+            Self::Operator(_) => f.write_str("Operator(<redacted>)"),
+        }
+    }
 }
 
 /// Connect `db_url`, returning a clone of the pool cached under `key` on a hit.
@@ -2337,7 +2352,8 @@ enum DbLocationRefusal {
     /// A `:` after the volume, or a drive-relative path, which SQLite could
     /// read as a URI or a special name.
     Colon,
-    /// A leading `//` or `\\`: a network share or device path.
+    /// A leading `//`, `\\` (or a mix) or `\??\`: a network share or device
+    /// path.
     NetworkPath,
     /// The anchored file name runs past [`SQLITE_FILE_NAME_MAX`].
     TooLong {
@@ -2363,8 +2379,8 @@ impl std::fmt::Display for DbLocationRefusal {
                  drive-relative",
             ),
             Self::NetworkPath => f.write_str(
-                "db location: a path starting `//` or `\\\\` names a network share or device, \
-                 which is refused",
+                "db location: a path starting `//`, `\\\\` or `\\??\\` names a network share \
+                 or device, which is refused",
             ),
             Self::TooLong { len } => write!(
                 f,
@@ -2418,7 +2434,7 @@ impl SqliteFileName {
     ) -> Result<Self, DbLocationRefusal> {
         use super::path_core::{is_sep, volume_name_len};
         let separator = |c: char| u8::try_from(c).is_ok_and(|b| is_sep(b, regime));
-        if text.starts_with("//") || text.starts_with("\\\\") {
+        if crate::dsn::names_network_or_device(text) {
             return Err(DbLocationRefusal::NetworkPath);
         }
         let (volume, rest) = text
@@ -13218,7 +13234,16 @@ mod tests {
             crate::path_core::Regime::Unix,
             crate::path_core::Regime::Windows,
         ] {
-            for text in ["//host/s/x.db", "\\\\host\\s\\x.db", "\\\\?\\C:\\x.db"] {
+            for text in [
+                "//host/s/x.db",
+                "\\\\host\\s\\x.db",
+                "\\\\?\\C:\\x.db",
+                "/\\host\\s\\x.db",
+                "\\/host/s/x.db",
+                "\\??\\UNC\\host\\s\\x.db",
+                "/??/UNC/host/s/x.db",
+                "\\??\\C:\\x.db",
+            ] {
                 assert_eq!(
                     seal_name(text, regime),
                     Err(DbLocationRefusal::NetworkPath),
@@ -13228,6 +13253,10 @@ mod tests {
             assert_eq!(
                 seal_name("/host/s/x.db", regime),
                 Ok("/host/s/x.db".to_owned())
+            );
+            assert_eq!(
+                seal_name("/??x/s/x.db", regime),
+                Ok("/??x/s/x.db".to_owned())
             );
         }
     }
@@ -13405,6 +13434,27 @@ mod tests {
         assert!(matches!(file, IpeResult::Ok(_)), "{file:?}");
         let IpeResult::Ok(file) = file else { return };
         let shown = format!("{file:?}");
+        assert!(shown.contains("x.db"), "{shown}");
+    }
+
+    /// A pool key never prints a URL's password; a file key prints its name.
+    #[test]
+    fn a_pool_key_debug_never_prints_a_password() {
+        let url = "postgres://u:hunter2@h/d".to_owned();
+        for key in [PoolKey::Dsn(url.clone()), PoolKey::Operator(url)] {
+            let shown = format!("{key:?}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+        }
+        let name = SqliteFileName::parse_under("x.db", crate::path_core::Regime::Unix);
+        assert!(name.is_ok(), "{name:?}");
+        let Ok(name) = name else { return };
+        let shown = format!(
+            "{:?}",
+            PoolKey::File {
+                name,
+                mode: FileMode::ReadExisting
+            }
+        );
         assert!(shown.contains("x.db"), "{shown}");
     }
 }
