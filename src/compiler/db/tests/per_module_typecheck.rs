@@ -1278,14 +1278,11 @@ fn scoped_steps_past_half_the_budget_route_to_the_joint_solve() {
     };
     let sum = steps.iter().fold(0_u64, |sum, n| sum.saturating_add(*n));
 
-    // The band's edge alone: the joint solve's own spend under this budget
-    // is the parity tripwire's claim, not this test's.
+    // At the band's edge the scoped assembly is served, and the joint solve
+    // accepts the same program under the same budget.
     set_steps(&mut db, sum.saturating_mul(2));
     assert_eq!(
-        ipe_db::program_types(&db, root, entry)
-            .as_ref()
-            .ok()
-            .map(|program| program.typed_by),
+        assert_program_oracle(&db, root, entry),
         NonZeroUsize::new(3).map(|modules| TypedBy::Scoped { modules }),
         "a sum of exactly half the budget is served scoped"
     );
@@ -1450,4 +1447,58 @@ fn zero_solver_budget_refuses_every_program() {
         assert_program_oracle(&db, root, entry),
         NonZeroUsize::new(3).map(|modules| TypedBy::Scoped { modules })
     );
+}
+
+/// The budget band's premise: a program whose scoped solves spend `s` steps
+/// is accepted by the joint solve under a budget of `2 · s`, so the scoped
+/// assembly never serves a program the joint solve refuses for its budget.
+#[test]
+fn joint_solve_fits_twice_the_scoped_spend() {
+    const GENERIC_DEP: &str = "module A exposing (ident)\n\nident : a -> a\nident x =\n    x\n";
+    const GENERIC_IMPORTER: &str = "module B exposing (b)\n\n\
+        import A exposing (ident)\n\n\
+        keep : k -> k\n\
+        keep y =\n    ident y\n\n\
+        b : Int\n\
+        b =\n    keep 1\n";
+    let programs: [&[(&[&str], &str)]; 3] = [
+        &[
+            (&["A"], DEP_A),
+            (&["C"], DEP_C),
+            (&["Entry"], ENTRY_WITH_TWO_DEPS),
+        ],
+        &[(&["A"], DEP_A), (&["B"], IMPORTER_B)],
+        &[(&["A"], GENERIC_DEP), (&["B"], GENERIC_IMPORTER)],
+    ];
+    for program in programs {
+        let (mut db, _log) = logged_db();
+        let modules: Vec<(&[&str], SourceFile)> = program
+            .iter()
+            .map(|(path, text)| (*path, file(&db, path, text)))
+            .collect();
+        let root = root_of(&db, &modules);
+        let Some(&(entry_path, entry)) = modules.last() else {
+            continue;
+        };
+        let spent: Vec<Option<u64>> = modules
+            .iter()
+            .map(|(_, module)| scoped_steps(&db, root, *module))
+            .collect();
+        assert!(
+            spent.iter().all(|steps| matches!(steps, Some(n) if *n > 0)),
+            "{entry_path:?}: every module solves scoped: {spent:?}"
+        );
+        let sum = spent
+            .iter()
+            .flatten()
+            .try_fold(0_u64, |sum, n| sum.checked_add(*n));
+        assert!(sum.is_some(), "{entry_path:?}: the scoped sum fits a u64");
+        let Some(sum) = sum else { continue };
+        set_steps(&mut db, sum.saturating_mul(2));
+        assert_eq!(
+            assert_program_oracle(&db, root, entry),
+            NonZeroUsize::new(modules.len()).map(|modules| TypedBy::Scoped { modules }),
+            "{entry_path:?}: at twice the scoped spend both solves accept"
+        );
+    }
 }
