@@ -1608,14 +1608,132 @@ pub(crate) async fn refuse_malformed_url(
     }
 }
 
-/// The listener-wide strict URL gate: no route, mount or fallback of `app`
-/// sees a malformed path or query.
+/// How a request spelled its path against the one canonical spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spelling {
+    /// The request sent the canonical spelling byte for byte.
+    Canonical,
+    /// The request sent another spelling of the same decoded path.
+    Respelled,
+}
+
+/// The listener's parse of one request URL, carried as a request extension.
 ///
-/// Each entry point also gates itself (`build_request`, the Web router and
-/// page handler, `strict_serve_dir`), so this is the independent second
-/// boundary.
-fn gate_listener(app: axum::Router) -> axum::Router {
-    app.layer(axum::middleware::from_fn(refuse_malformed_url))
+/// Only [`CanonicalUrl`] builds one, so a handler that finds none was reached
+/// without the listener's parse and refuses rather than parse again.
+#[derive(Clone)]
+pub(crate) struct StrictUrl {
+    spelling: Spelling,
+}
+
+impl StrictUrl {
+    /// Whether the client sent the canonical spelling of its path.
+    pub(crate) const fn spelling(&self) -> Spelling {
+        self.spelling
+    }
+}
+
+/// The outermost URL service of every app listener: one strict parse, then
+/// the canonical respelling of the path, before any router sees the request.
+///
+/// A malformed path or query is answered with the fixed 400 before routing, so
+/// an unrouted path and the fallback are refused alike. Every other request
+/// reaches the inner service with its path respelled by
+/// [`crate::encoding::canonical_path`] (the query bytes kept) and a
+/// [`StrictUrl`] extension, so matchit, every nest prefix and every file
+/// service compare canonical text only and two spellings of one decoded path
+/// can never route apart. It wraps the router as a service, never through
+/// `Router::layer` (which runs after routing).
+#[derive(Clone)]
+pub(crate) struct CanonicalUrl<S> {
+    inner: S,
+}
+
+impl<S> CanonicalUrl<S> {
+    /// The canonical-URL service in front of `inner`.
+    pub(crate) const fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+/// The future of [`CanonicalUrl`]: the refusal, or the inner call.
+type CanonicalFuture<F> = futures_util::future::Either<
+    std::future::Ready<Result<axum::response::Response, std::convert::Infallible>>,
+    F,
+>;
+
+impl<S> tower::Service<axum::extract::Request> for CanonicalUrl<S>
+where
+    S: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        >,
+{
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = CanonicalFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: axum::extract::Request) -> Self::Future {
+        use axum::response::IntoResponse;
+        match canonicalise(&mut request) {
+            Ok(()) => futures_util::future::Either::Right(self.inner.call(request)),
+            Err(rejection) => futures_util::future::Either::Left(std::future::ready(Ok(rejection
+                .status_and_reason()
+                .into_response()))),
+        }
+    }
+}
+
+/// Parse `request`'s URL once, respell its path canonically and record the
+/// parse as its [`StrictUrl`] extension.
+///
+/// # Errors
+///
+/// `BadRequest` for a malformed path or query, or a path whose canonical
+/// spelling exceeds the URL component ceiling.
+fn canonicalise(request: &mut axum::extract::Request) -> Result<(), RequestRejection> {
+    let uri = request.uri();
+    let path = crate::encoding::RequestPath::parse(uri.path())
+        .map_err(|_| RequestRejection::BadRequest)?;
+    parse_query(uri.query()).map_err(|_| RequestRejection::BadRequest)?;
+    let canonical = path.canonical().map_err(|_| RequestRejection::BadRequest)?;
+    let spelling = if canonical.as_str() == uri.path() {
+        Spelling::Canonical
+    } else {
+        Spelling::Respelled
+    };
+    if spelling == Spelling::Respelled {
+        let target = uri.query().map_or_else(
+            || canonical.as_str().to_owned(),
+            |query| format!("{}?{query}", canonical.as_str()),
+        );
+        let mut parts = uri.clone().into_parts();
+        parts.path_and_query = Some(
+            axum::http::uri::PathAndQuery::try_from(target)
+                .map_err(|_| RequestRejection::BadRequest)?,
+        );
+        *request.uri_mut() =
+            axum::http::Uri::from_parts(parts).map_err(|_| RequestRejection::BadRequest)?;
+    }
+    request.extensions_mut().insert(StrictUrl { spelling });
+    Ok(())
+}
+
+/// `router` behind the listener's [`CanonicalUrl`], still an `axum::Router`.
+///
+/// A test drives a router the way a listener serves it: an outer router with
+/// no route hands every request, untouched, to its fallback service.
+#[cfg(test)]
+pub(crate) fn behind_listener(router: axum::Router) -> axum::Router {
+    axum::Router::new().fallback_service(CanonicalUrl::new(router))
 }
 
 /// What a static-file mount may serve for one request path.
@@ -2234,7 +2352,8 @@ pub(crate) async fn serve_app(
         admission,
         tag,
     } = app;
-    let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag).layer(router);
+    let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
+        .layer(CanonicalUrl::new(router));
     axum::serve(
         listener,
         svc.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -2484,7 +2603,6 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                 }
             }
         }
-        let app = gate_listener(app);
         // Ipê doctrine: a panicking handler returns 500, never crashes the
         // process. The custom
         // responder classifies + logs the panic SERVER-SIDE (errId) and returns a
@@ -5531,34 +5649,34 @@ mod tests {
         assert_eq!(body, "hi");
     }
 
-    /// Serve `uri` through `gate_listener` over a raw axum route and fallback
-    /// that do no URL check of their own. Returns the status, the body and how
-    /// many times either inner handler ran.
+    /// Serve `uri` through `CanonicalUrl` over raw axum routes and a fallback
+    /// that do no URL check of their own, each answering with the target it
+    /// saw. Returns the status, the body and how many times an inner handler ran.
     async fn serve_gated(uri: &str) -> (axum::http::StatusCode, String, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tower::ServiceExt;
         let runs = Arc::new(AtomicUsize::new(0));
-        let on_route = Arc::clone(&runs);
-        let on_fallback = Arc::clone(&runs);
+        let seen = |name: &'static str, runs: Arc<AtomicUsize>| {
+            move |uri: axum::http::Uri, strict: Option<axum::Extension<StrictUrl>>| async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let spelling = strict.map(|axum::Extension(s)| s.spelling());
+                format!("{name} {uri} {spelling:?}")
+            }
+        };
         let inner = axum::Router::new()
             .route(
                 "/raw/*rest",
-                axum::routing::get(move || async move {
-                    on_route.fetch_add(1, Ordering::SeqCst);
-                    "route"
-                }),
+                axum::routing::get(seen("route", Arc::clone(&runs))),
             )
-            .fallback(move || async move {
-                on_fallback.fetch_add(1, Ordering::SeqCst);
-                "fallback"
-            });
-        let app = gate_listener(inner);
+            .route("/api", axum::routing::get(seen("api", Arc::clone(&runs))))
+            .route("/a/b", axum::routing::get(seen("a/b", Arc::clone(&runs))))
+            .fallback(seen("fallback", Arc::clone(&runs)));
         let wire = axum::http::Request::builder()
             .method("GET")
             .uri(uri)
             .body(axum::body::Body::empty())
             .expect("test request builds");
-        let resp = match app.oneshot(wire).await {
+        let resp = match CanonicalUrl::new(inner).oneshot(wire).await {
             Ok(r) => r,
             Err(e) => match e {},
         };
@@ -5568,26 +5686,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn listener_gate_refuses_a_malformed_url_before_any_route_or_fallback() {
-        // Prove the refusals of the listener-wide layer on its own: the inner
-        // route and fallback carry no URL check, so only the layer stands
-        // between them and a malformed path or query.
+    async fn canonical_url_refuses_a_malformed_url_before_any_route_or_fallback() {
+        // Prove the refusals of the listener's URL service on its own: the
+        // inner routes and fallback carry no URL check, so only the service
+        // stands between them and a malformed path or query.
+        // A path over the component ceiling never reaches this service: the
+        // request target is bounded far below it by `http`'s own URI limit,
+        // and `canonical_path` refuses its growth past the ceiling itself.
         for uri in [
             "/raw/%zz",
             "/raw/a%C3/%A9",
             "/raw/x?q=%zz",
             "/elsewhere/%C0%AF",
             "/elsewhere?%C3=1",
+            "/%zz",
+            "/%",
+            "/no/such/route/%4",
         ] {
             let (status, body, runs) = serve_gated(uri).await;
             assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri:?}");
             assert_eq!(body, "Bad Request", "{uri:?} must not echo the request");
             assert_eq!(runs, 0, "{uri:?} must never reach a route or fallback");
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_url_routes_every_spelling_of_a_path_as_its_canonical_one() {
         for (uri, want) in [
-            ("/raw/a%20b", "route"),
-            ("/raw/a%2Fb?q=a+b", "route"),
-            ("/elsewhere", "fallback"),
+            ("/raw/a%20b", "route /raw/a%20b Some(Canonical)"),
+            ("/raw/a%2Fb?q=a+b", "route /raw/a%2Fb?q=a+b Some(Canonical)"),
+            ("/elsewhere", "fallback /elsewhere Some(Canonical)"),
+            ("/api", "api /api Some(Canonical)"),
+            ("/%61pi", "api /api Some(Respelled)"),
+            ("/%61%70%69?x=%7a", "api /api?x=%7a Some(Respelled)"),
+            ("//api", "api /api Some(Respelled)"),
+            ("/caf%c3%a9", "fallback /caf%C3%A9 Some(Respelled)"),
+            ("/raw/a+b@c", "route /raw/a%2Bb%40c Some(Respelled)"),
+            ("/a/b", "a/b /a/b Some(Canonical)"),
+            ("/%61/%62", "a/b /a/b Some(Respelled)"),
+            // An escaped `/` stays inside its segment: one segment, not `/a/b`.
+            ("/a%2Fb", "fallback /a%2Fb Some(Canonical)"),
+            ("/a%2fb", "fallback /a%2Fb Some(Respelled)"),
+            // A decoded `:` or `*` is escaped, never read as a router sigil.
+            ("/raw/%3Ax", "route /raw/%3Ax Some(Canonical)"),
+            ("/raw/:x", "route /raw/%3Ax Some(Respelled)"),
         ] {
             let (status, body, runs) = serve_gated(uri).await;
             assert_eq!(status, axum::http::StatusCode::OK, "{uri:?}");
@@ -7844,6 +7986,44 @@ mod tests {
         let ip = format!("127.0.0.1:{port}");
         let resp = raw_exchange(port, &get_with_host("/", &ip)).await.unwrap();
         assert_eq!(raw_status(&resp), 200, "{resp}");
+        task.abort();
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// A real `Server.listen` refuses a malformed URL with 400 whether or not
+    /// a route would match it, and routes another spelling of `/api` to
+    /// `/api`, its handler reading the canonical path.
+    #[tokio::test]
+    async fn listen_refuses_a_malformed_url_and_routes_its_canonical_spelling() {
+        let port = free_loopback_port().unwrap();
+        crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+        crate::system::locked_remove_var(crate::env_registry::listen::SERVER_PORT.name());
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        let route = server_get::<String, _>("/api".to_owned(), |req: ServerRequest| {
+            Box::pin(ready(ok_res::<String, _>(server_text(format!(
+                "api {}",
+                req.path
+            ))))) as IpeTask<String, ServerResponse>
+        });
+        let task: tokio::task::JoinHandle<IpeResult<String, ()>> =
+            tokio::spawn(server_listen(i64::from(port), vec![route]));
+        let ip = format!("127.0.0.1:{port}");
+        for path in [
+            "/%zz",
+            "/%",
+            "/api/%zz",
+            "/no/such/route/%C0%AF",
+            "/api?q=%zz",
+        ] {
+            let resp = raw_exchange(port, &get_with_host(path, &ip)).await.unwrap();
+            assert_eq!(raw_status(&resp), 400, "{path}: {resp}");
+            assert!(!resp.contains("%zz"), "{path} must not echo the request");
+        }
+        for path in ["/api", "/%61pi", "/%61%70%69", "//api"] {
+            let resp = raw_exchange(port, &get_with_host(path, &ip)).await.unwrap();
+            assert_eq!(raw_status(&resp), 200, "{path}: {resp}");
+            assert!(resp.ends_with("api /api"), "{path}: {resp}");
+        }
         task.abort();
         crate::system::locked_remove_var("IPE_HTTP_BIND");
     }

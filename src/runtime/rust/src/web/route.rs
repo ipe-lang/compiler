@@ -589,18 +589,21 @@ pub enum Redirect {
 
 /// Decide whether a matched GET redirects to its canonical path.
 ///
-/// `raw_path` is the base-relative request path as sent, compared byte for
-/// byte with the canonical one. The redirect target is always `base` plus a
-/// [`RoutePath`] (every segment encoded, never `//`), so it stays on this
-/// origin whatever the request held.
+/// `path` is the base-relative request path the router saw, compared byte for
+/// byte with the canonical one, and `spelling` is how the client spelled the
+/// whole path, so a request the listener respelled is redirected even when
+/// its respelled text already matches. The redirect target is always `base`
+/// plus a [`RoutePath`] (every segment encoded, never `//`), so it stays on
+/// this origin whatever the request held.
 #[cfg(feature = "server")]
 pub fn canonical_redirect(
     base: &EncodedBase,
-    raw_path: &str,
+    spelling: crate::server::Spelling,
+    path: &str,
     raw_query: Option<&str>,
     canonical: &RoutePath,
 ) -> Redirect {
-    if raw_path == canonical.as_str() {
+    if spelling == crate::server::Spelling::Canonical && path == canonical.as_str() {
         return Redirect::Serve;
     }
     let mut location = String::from(base.as_str());
@@ -895,6 +898,9 @@ mod tests {
     }
 
     #[cfg(feature = "server")]
+    use crate::server::Spelling::{Canonical, Respelled};
+
+    #[cfg(feature = "server")]
     fn location_of(redirect: &Redirect) -> String {
         match redirect {
             Redirect::To(target) => match target.location().to_str() {
@@ -912,18 +918,33 @@ mod tests {
     fn canonical_redirect_targets_base_plus_canonical() {
         let canon = canonical_of("/apps/foo/");
         assert!(matches!(
-            canonical_redirect(&base("/"), "/apps/foo", None, &canon),
+            canonical_redirect(&base("/"), Canonical, "/apps/foo", None, &canon),
             Redirect::Serve
         ));
-        let to = canonical_redirect(&base("/"), "/apps/foo/", None, &canon);
+        let to = canonical_redirect(&base("/"), Canonical, "/apps/foo/", None, &canon);
         assert_eq!(location_of(&to), "/apps/foo");
-        let to = canonical_redirect(&base("/m"), "/apps/foo/", Some("x=1&y=%20"), &canon);
+        let to = canonical_redirect(
+            &base("/m"),
+            Canonical,
+            "/apps/foo/",
+            Some("x=1&y=%20"),
+            &canon,
+        );
         assert_eq!(location_of(&to), "/m/apps/foo?x=1&y=%20");
         let home = canonical_of("/");
         assert_eq!(
-            location_of(&canonical_redirect(&base("/m"), "//", None, &home)),
+            location_of(&canonical_redirect(
+                &base("/m"),
+                Canonical,
+                "//",
+                None,
+                &home
+            )),
             "/m/"
         );
+        // A respelled request is redirected though its respelled text matches.
+        let to = canonical_redirect(&base("/m"), Respelled, "/apps/foo", Some("q=1"), &canon);
+        assert_eq!(location_of(&to), "/m/apps/foo?q=1");
     }
 
     /// A redirect target redirects no further: render(parse(canonical)) is
@@ -936,7 +957,7 @@ mod tests {
             let next = canonical_of(canon.as_str());
             assert_eq!(next, canon, "{raw}: the canonical path is a fixed point");
             assert!(matches!(
-                canonical_redirect(&base("/"), canon.as_str(), None, &next),
+                canonical_redirect(&base("/"), Canonical, canon.as_str(), None, &next),
                 Redirect::Serve
             ));
         }
@@ -954,7 +975,13 @@ mod tests {
             "http://evil.com",
         ] {
             let canon = render(&Page::App(slug.into())).unwrap_or_else(|e| panic!("{slug}: {e}"));
-            let location = location_of(&canonical_redirect(&base("/"), "/other", None, &canon));
+            let location = location_of(&canonical_redirect(
+                &base("/"),
+                Canonical,
+                "/other",
+                None,
+                &canon,
+            ));
             assert!(location.starts_with("/apps/"), "{slug}: {location}");
             assert!(
                 !location.contains('\\') && !location.contains("//"),
@@ -971,7 +998,13 @@ mod tests {
                 continue;
             };
             if let Matched::Hit { canonical, .. } = resolve(&routes(), &path, render) {
-                let location = location_of(&canonical_redirect(&base("/"), raw, None, &canonical));
+                let location = location_of(&canonical_redirect(
+                    &base("/"),
+                    Canonical,
+                    raw,
+                    None,
+                    &canonical,
+                ));
                 assert!(!location.starts_with("//"), "{raw}: {location}");
                 assert!(!location.contains('\\'), "{raw}: {location}");
             }
@@ -987,7 +1020,7 @@ mod tests {
         for query in ["a#b", "a\u{1}b", "a\rb", "a b", "%zz", "%4", "é"] {
             assert!(
                 matches!(
-                    canonical_redirect(&base("/"), "/apps/foo/", Some(query), &canon),
+                    canonical_redirect(&base("/"), Canonical, "/apps/foo/", Some(query), &canon),
                     Redirect::BadQuery
                 ),
                 "{query:?} must be refused"

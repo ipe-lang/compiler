@@ -4178,6 +4178,7 @@ mod handlers {
         state: State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -4188,7 +4189,7 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        let mut resp = serve_page(state, method, uri, headers).await;
+        let mut resp = serve_page(state, method, uri, strict, headers).await;
         mint_proof::vary_on_mint_inputs(resp.headers_mut());
         resp
     }
@@ -4197,6 +4198,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -4212,9 +4214,18 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        // The router's URL gate already refused a malformed path or query;
-        // this is the second, independent boundary before any session work.
-        // The path is parsed here once; every route resolver below reads it.
+        // Only the listener's URL service hands a page its request: one that
+        // arrives without that parse is refused, never parsed afresh.
+        let Some(axum::Extension(strict)) = strict else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "500 request URL not parsed",
+            )
+                .into_response();
+        };
+        // The listener already refused a malformed path or query; this is the
+        // second, independent boundary before any session work. The path is
+        // parsed here once; every route resolver below reads it.
         let path = match crate::server::strict_url(&uri) {
             Ok(path) => path,
             Err(rejection) => return rejection.status_and_reason().into_response(),
@@ -4234,7 +4245,13 @@ mod handlers {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "500 base path unusable")
                     .into_response();
             };
-            match route::canonical_redirect(&base, uri.path(), uri.query(), canonical) {
+            match route::canonical_redirect(
+                &base,
+                strict.spelling(),
+                uri.path(),
+                uri.query(),
+                canonical,
+            ) {
                 route::Redirect::Serve => {}
                 route::Redirect::To(target) => {
                     return (
@@ -7431,9 +7448,11 @@ mod canonical_redirect_handler_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        Router::new()
-            .fallback(get(handlers::page::<Model, (), Init, Update, View, Subs>))
-            .with_state(state)
+        crate::server::behind_listener(
+            Router::new()
+                .fallback(get(handlers::page::<Model, (), Init, Update, View, Subs>))
+                .with_state(state),
+        )
     }
 
     #[allow(clippy::expect_used)] // test helper: request build and router failure are environment issues
@@ -9921,32 +9940,34 @@ mod hot_init_session_scoping_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        Router::new()
-            .route(
-                "/",
-                get(handlers::page::<
-                    Counter,
-                    (),
-                    fn(WebReq) -> (Counter, IpeCmd<()>),
-                    fn((), Counter) -> (Counter, IpeCmd<()>),
-                    fn(Counter) -> Html<()>,
-                    fn(Counter) -> IpeSub<()>,
-                >),
-            )
-            .route(
-                "/_ipe/hot-init",
-                post(
-                    handlers::hot_init_handler::<
+        crate::server::behind_listener(
+            Router::new()
+                .route(
+                    "/",
+                    get(handlers::page::<
                         Counter,
                         (),
                         fn(WebReq) -> (Counter, IpeCmd<()>),
                         fn((), Counter) -> (Counter, IpeCmd<()>),
                         fn(Counter) -> Html<()>,
                         fn(Counter) -> IpeSub<()>,
-                    >,
-                ),
-            )
-            .with_state(state)
+                    >),
+                )
+                .route(
+                    "/_ipe/hot-init",
+                    post(
+                        handlers::hot_init_handler::<
+                            Counter,
+                            (),
+                            fn(WebReq) -> (Counter, IpeCmd<()>),
+                            fn((), Counter) -> (Counter, IpeCmd<()>),
+                            fn(Counter) -> Html<()>,
+                            fn(Counter) -> IpeSub<()>,
+                        >,
+                    ),
+                )
+                .with_state(state),
+        )
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -11146,6 +11167,7 @@ mod emitted_router_behavior_tests {
             fn(Model) -> Html<Msg>,
             fn(Model) -> IpeSub<Msg>,
         >(make_state(store), false)
+        .map(crate::server::behind_listener)
         .expect("the unset test base parses")
     }
 
@@ -12438,6 +12460,7 @@ mod emitted_router_behavior_tests {
                 fn(Model) -> Html<Msg>,
                 fn(Model) -> IpeSub<Msg>,
             >(state, false)
+            .map(crate::server::behind_listener)
             .expect("the unset test base parses");
             let ord = std::sync::atomic::Ordering::SeqCst;
             let expected_vary = [
@@ -12530,6 +12553,7 @@ mod emitted_router_behavior_tests {
             fn(Model) -> Html<Msg>,
             fn(Model) -> IpeSub<Msg>,
         >(state, false)
+        .map(crate::server::behind_listener)
         .expect("the unset test base parses")
     }
 
@@ -12605,7 +12629,7 @@ mod emitted_router_behavior_tests {
     /// GET `/` against a mount, returning the status and body text.
     #[allow(clippy::expect_used)] // test helper: request build / body read failure is a test environment issue
     async fn mounted_get(router: axum::Router) -> (StatusCode, String) {
-        let resp = router
+        let resp = crate::server::behind_listener(router)
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -12752,6 +12776,52 @@ mod emitted_router_behavior_tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, FAIL_CLOSED_BODY);
         assert!(!body.contains("%zz"), "the 503 must not echo the refusal");
+    }
+
+    /// A `Web.embed` app nested in a listener's router: a malformed URL is
+    /// refused with 400 before the nest is chosen, and a respelled mount
+    /// prefix enters the mount exactly as its canonical spelling does.
+    #[test]
+    fn embedded_app_sees_only_canonical_urls() {
+        let builder = web_embed_router(
+            init,
+            update,
+            view,
+            subs,
+            "memory".to_string(),
+            String::new(),
+            [0u8; 32],
+        );
+        block_on(async move {
+            let mounted = axum::Router::new().nest("/billing", builder(String::new()).await);
+            let app = crate::server::behind_listener(mounted);
+            let status_of = |uri: &'static str| {
+                let app = app.clone();
+                async move {
+                    app.oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build GET"),
+                    )
+                    .await
+                    .expect("router responds")
+                    .status()
+                }
+            };
+            for uri in ["/billing/%zz", "/billing/%", "/%zz", "/billing?q=%zz"] {
+                assert_eq!(status_of(uri).await, StatusCode::BAD_REQUEST, "{uri}");
+            }
+            let canonical = status_of("/billing").await;
+            assert_ne!(
+                canonical,
+                StatusCode::NOT_FOUND,
+                "the mount serves its prefix"
+            );
+            assert_eq!(status_of("/%62illing").await, canonical);
+            assert_eq!(status_of("/%62%69lling").await, canonical);
+        });
     }
 
     /// A mounted app whose store config this build cannot honour answers every
@@ -13016,6 +13086,7 @@ mod route_entry_cmd_tests {
     #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
     fn router_counted(store: Store, session_count: Arc<AtomicUsize>) -> axum::Router {
         build_web_router(fixture_state(store, session_count), false)
+            .map(crate::server::behind_listener)
             .expect("the fixture route table and base are well-formed")
     }
 
@@ -13080,6 +13151,65 @@ mod route_entry_cmd_tests {
                 );
                 let resp = crate::server::raw_exchange(port, &control).await.unwrap();
                 assert_eq!(crate::server::raw_status(&resp), 200, "{resp}");
+            };
+            // The listener serves until shutdown; the checks finishing first is the pass.
+            let checked = tokio::select! {
+                _ = served => false,
+                () = checks => true,
+            };
+            assert!(checked, "serve_web returned before the checks ran");
+            crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
+    }
+
+    /// A real `serve_web` refuses a malformed URL with 400 before any route,
+    /// and serves another spelling of an internal route as that route: the
+    /// respelled event POST gets the event handler's answer, never the page
+    /// route's.
+    #[test]
+    fn web_refuses_a_malformed_url_and_routes_its_canonical_spelling() {
+        run(false, || async {
+            let port = crate::server::free_loopback_port().unwrap();
+            crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+            crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
+            crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+            crate::system::locked_set_var(
+                crate::env_registry::web::WEB_PORT.name(),
+                &port.to_string(),
+            );
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let served = serve_web::<crate::IpeError, _, _, _, _, _, _>(fixture_state(
+                memory(),
+                sessions.clone(),
+            ));
+            let checks = async {
+                let host = format!("127.0.0.1:{port}");
+                for path in ["/%zz", "/%", "/_ipe/%zz", "/no/such/page/%C0%AF", "/?q=%zz"] {
+                    let request =
+                        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+                    let resp = crate::server::raw_exchange(port, &request).await.unwrap();
+                    assert_eq!(crate::server::raw_status(&resp), 400, "{path}: {resp}");
+                    assert!(!resp.contains("%zz"), "{path} must not echo the request");
+                }
+                assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let event = |path: &str| {
+                    format!(
+                        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                };
+                let canonical = crate::server::raw_exchange(port, &event("/_ipe/event"))
+                    .await
+                    .unwrap();
+                let respelled = crate::server::raw_exchange(port, &event("/_ipe/%65vent"))
+                    .await
+                    .unwrap();
+                let status = crate::server::raw_status(&canonical);
+                assert_ne!(status, 405, "the event route answers its POST: {canonical}");
+                assert_eq!(crate::server::raw_status(&respelled), status, "{respelled}");
+                let body = |resp: &str| resp.split_once("\r\n\r\n").map(|(_, b)| b.to_owned());
+                assert_eq!(body(&respelled), body(&canonical));
             };
             // The listener serves until shutdown; the checks finishing first is the pass.
             let checked = tokio::select! {
@@ -14575,7 +14705,9 @@ mod web_revocation_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        build_web_router(state, false).expect("a router armed through the Server floor builds")
+        build_web_router(state, false)
+            .map(crate::server::behind_listener)
+            .expect("a router armed through the Server floor builds")
     }
 
     /// Arm the process through the `Server` floor, then run `body` on a
