@@ -14,7 +14,7 @@ pub mod security;
 pub mod telemetry;
 pub mod web;
 
-use crate::env_grammar::{Class, EnvRefusal, Grammar, ListenPort, judge};
+use crate::env_grammar::{Class, EnvFlag, EnvRefusal, Grammar, ListenPort, judge};
 
 /// Which runtime feature reads a variable; an entry whose feature is not
 /// compiled in is not judged.
@@ -94,6 +94,8 @@ pub enum DefaultValue {
     Count(u64),
     /// A TCP port.
     Port(u16),
+    /// A boolean switch's position.
+    Flag(EnvFlag),
 }
 
 impl std::fmt::Display for DefaultValue {
@@ -102,6 +104,8 @@ impl std::fmt::Display for DefaultValue {
             Self::Text(text) => f.write_str(text),
             Self::Count(n) => write!(f, "{n}"),
             Self::Port(port) => write!(f, "{port}"),
+            Self::Flag(EnvFlag::On) => f.write_str("on"),
+            Self::Flag(EnvFlag::Off) => f.write_str("off"),
         }
     }
 }
@@ -179,6 +183,14 @@ impl EnvEntry {
     #[must_use]
     pub const fn purpose(&self) -> &'static str {
         self.doc.purpose
+    }
+
+    /// Whether the default's kind is the grammar's.
+    ///
+    /// A flag defaults to a switch position, and only a flag does.
+    #[must_use]
+    pub const fn default_fits_grammar(&self) -> bool {
+        matches!(self.grammar, Grammar::Flag) == matches!(self.default, DefaultValue::Flag(_))
     }
 
     /// Judges the live value (overlay first) against this entry's grammar.
@@ -325,6 +337,72 @@ impl ChoiceKey {
     }
 }
 
+/// A boolean switch variable, parsed by [`EnvFlag::parse`] with a declared default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlagKey {
+    entry: EnvEntry,
+    default: EnvFlag,
+}
+
+impl FlagKey {
+    /// A switch variable named `name`, at `default` while unset.
+    #[must_use]
+    pub const fn new(name: &'static str, default: EnvFlag, doc: Doc) -> Self {
+        Self {
+            entry: EnvEntry {
+                name,
+                grammar: Grammar::Flag,
+                default: DefaultValue::Flag(default),
+                doc,
+            },
+            default,
+        }
+    }
+
+    /// The registry entry.
+    #[must_use]
+    pub const fn entry(self) -> EnvEntry {
+        self.entry
+    }
+
+    /// The variable's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.entry.name
+    }
+
+    /// The position applied while the variable is unset.
+    #[must_use]
+    pub const fn default_flag(self) -> EnvFlag {
+        self.default
+    }
+
+    /// Parses a raw lookup of this variable; the default when unset.
+    ///
+    /// # Errors
+    ///
+    /// The refusal naming the variable when the value is set but spells no switch.
+    pub fn parse(self, raw: Result<String, std::env::VarError>) -> Result<EnvFlag, EnvRefusal> {
+        judge(
+            self.entry.name,
+            Grammar::Flag,
+            self.entry.doc.class,
+            raw,
+            EnvFlag::parse,
+        )
+        .map(|flag| flag.unwrap_or(self.default))
+    }
+
+    /// Reads and parses the live value (overlay first); the default when unset.
+    ///
+    /// # Errors
+    ///
+    /// The refusal naming the variable when the value is set but spells no switch.
+    pub fn read(self) -> Result<EnvFlag, EnvRefusal> {
+        self.parse(crate::system::read_env_var(self.entry.name))
+    }
+}
+
 /// A variable holding a decimal ceiling; its name and default are the ceiling's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CeilingKey {
@@ -394,6 +472,24 @@ const SUBSYSTEMS: [&[EnvEntry]; 7] = [
     io::ENTRIES,
 ];
 
+/// Whether every entry of every subsystem has a default of its grammar's kind.
+const fn defaults_fit_grammars(mut subsystems: &[&[EnvEntry]]) -> bool {
+    while let [entries, rest @ ..] = subsystems {
+        let mut entries: &[EnvEntry] = entries;
+        while let [entry, more @ ..] = entries {
+            if !entry.default_fits_grammar() {
+                return false;
+            }
+            entries = more;
+        }
+        subsystems = rest;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a registered entry's default is not of its grammar's kind, so a switch always documents a switch position [ledger #boundary]
+const _: () = assert!(defaults_fit_grammars(&SUBSYSTEMS));
+
 /// Every registered variable, for the reference generator.
 #[doc(hidden)]
 pub fn registry() -> impl Iterator<Item = &'static EnvEntry> {
@@ -427,6 +523,8 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
         if let Err(refusal) = crate::log::startup_check() {
             refusals.push(refusal);
         }
+        #[cfg(all(feature = "web-core", feature = "server"))]
+        crate::web::csrf::fix_origin_check();
     }
     if refusals.is_empty() {
         Ok(())

@@ -1,8 +1,9 @@
-//! End-to-end refusal of a malformed operator port variable at startup.
+//! End-to-end refusal of a malformed operator variable at startup.
 //!
-//! A built program run with a set port variable that is not a TCP port must
-//! exit `1` before it listens, and its stderr must name the variable and the
-//! accepted range, so a typo never silently serves on another port.
+//! A built program run with a set port variable that is not a TCP port, or a
+//! switch that spells neither on nor off, must exit `1` before it listens, and
+//! its stderr must name the variable and the accepted form, so a typo never
+//! silently serves on another port or with a security check turned off.
 //!
 //! Gated on `IPE_E2E=1`, like every test that builds an emitted project.
 
@@ -152,18 +153,24 @@ fn run_to_exit(
 /// start that reached the listener first was not refused at startup.
 const LISTEN_TIME_PREFIXES: &[&str] = &["Server.listen:", "Web.tea:"];
 
-/// Assert a refused start: exit `1`, stderr naming `var` and the port range,
-/// written by the startup check rather than the listener, and no listening
-/// line.
-fn assert_refused(test_name: &str, var: &str, status: ExitStatus, stderr: &str) {
+/// The accepted form a refused port variable's stderr names.
+const PORT_FORM: &str = "1..=65535";
+
+/// The accepted form a refused switch variable's stderr names.
+const FLAG_FORM: &str = "one of 1, true, on, 0, false, off";
+
+/// Assert a refused start: exit `1`, stderr naming `var` and its accepted
+/// `form`, written by the startup check rather than the listener, and no
+/// listening line.
+fn assert_refused(test_name: &str, var: &str, form: &str, status: ExitStatus, stderr: &str) {
     assert_eq!(
         status.code(),
         Some(1),
         "{test_name}: a malformed {var} must exit 1\n--- stderr ---\n{stderr}"
     );
     assert!(
-        stderr.contains(var) && stderr.contains("1..=65535"),
-        "{test_name}: stderr must name {var} and the accepted range\n--- stderr ---\n{stderr}"
+        stderr.contains(var) && stderr.contains(form),
+        "{test_name}: stderr must name {var} and {form}\n--- stderr ---\n{stderr}"
     );
     assert!(
         !LISTEN_TIME_PREFIXES
@@ -191,7 +198,7 @@ fn malformed_server_port_refuses_the_start() -> Result<(), BoxError> {
     let test_name = "malformed_server_port_refuses_the_start";
     let exe = compile_and_build(test_name, SERVER_PROGRAM)?;
     let (status, stderr) = run_to_exit(test_name, &exe, &[("IPE_SERVER_PORT", "99999")])?;
-    assert_refused(test_name, "IPE_SERVER_PORT", status, &stderr);
+    assert_refused(test_name, "IPE_SERVER_PORT", PORT_FORM, status, &stderr);
     Ok(())
 }
 
@@ -208,6 +215,30 @@ fn malformed_web_port_refuses_the_start() -> Result<(), BoxError> {
     let test_name = "malformed_web_port_refuses_the_start";
     let exe = compile_and_build(test_name, WEB_PROGRAM)?;
     let (status, stderr) = run_to_exit(test_name, &exe, &[("IPE_WEB_PORT", "abc")])?;
-    assert_refused(test_name, "IPE_WEB_PORT", status, &stderr);
+    assert_refused(test_name, "IPE_WEB_PORT", PORT_FORM, status, &stderr);
+    Ok(())
+}
+
+/// A `Web.tea` app run with `IPE_WEB_CSRF_ORIGIN_CHECK=maybe` refuses to start,
+/// never reading the unknown spelling as off.
+///
+/// # Errors
+///
+/// Propagates any pipeline, build, or spawn error as a test error.
+#[test]
+fn malformed_csrf_origin_check_refuses_the_start() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "malformed_csrf_origin_check_refuses_the_start";
+    let exe = compile_and_build(test_name, WEB_PROGRAM)?;
+    let (status, stderr) = run_to_exit(test_name, &exe, &[("IPE_WEB_CSRF_ORIGIN_CHECK", "maybe")])?;
+    assert_refused(
+        test_name,
+        "IPE_WEB_CSRF_ORIGIN_CHECK",
+        FLAG_FORM,
+        status,
+        &stderr,
+    );
     Ok(())
 }
