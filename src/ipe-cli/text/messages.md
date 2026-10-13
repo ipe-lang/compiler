@@ -1064,7 +1064,15 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-unplaceable
 
-{path} does not name one absolute place on every platform (a drive-relative path, a device path such as `\\.\pipe`, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full path
+{path} does not name one absolute place on every platform: its prefix or one of its names is refused (a drive-relative path, a device or volume path such as `\\.\pipe` or `\\?\Volume{..}`, a share whose server or share name Windows would read as another, such as one with a trailing `.`, a `:` or a space in the server, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full drive or `\\server\share` path
+
+## output-unplaceable-cwd
+
+{request} is relative, but the working directory {cwd} does not name one absolute place on every platform (a device or volume path such as `\\?\Volume{..}`, or no drive for a rooted path) — run ipe from a drive or `\\server\share` path, or name the directory by its full path
+
+## output-unnameable-entry
+
+{path} has a name ipe cannot open as spelled (not valid Unicode, or a name Windows reserves), so ipe stops before acting on it — rename or remove that entry yourself
 
 ## output-not-fresh
 

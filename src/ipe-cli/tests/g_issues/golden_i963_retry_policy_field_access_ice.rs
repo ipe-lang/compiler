@@ -4,12 +4,12 @@
 //! ...) or passing a predicate lambda to `retryOn` / `withRetryOn` triggered
 //! IPE-I0001 when the solver left the type parameter `e` of `RetryPolicy e` as
 //! a free `Ty::Var`.  The root cause: `collect_records_in_ty`'s
-//! `!ty_contains_var` guard skipped the `RetryPolicy` record entirely (because
+//! `!ty_fields_mention_var` guard skipped the `RetryPolicy` record entirely (because
 //! `shouldRetry : e -> Bool` contains `e`), so no struct was registered in
 //! the synthesis table.  The backend's `record_struct_by_key` then could not
 //! find it and raised a `CompilerBug` ICE.
 //!
-//! Fix: before the `ty_contains_var` guard, detect the exact 4-field closed
+//! Fix: before the `ty_fields_mention_var` guard, detect the exact 4-field closed
 //! `RetryPolicy` shape and register its concrete IR with `e` fixed to
 //! `IrType::Error` (the only runtime instantiation).  The struct is then
 //! found by all retry-kernel paths in `emit_task_retry_call`.

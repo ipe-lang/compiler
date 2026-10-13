@@ -84,9 +84,10 @@ pub enum Ty {
     /// [`BTreeMap`] fixes iteration order (by [`Symbol`]); consumers that need a
     /// source-like order re-sort by the resolved field name.
     ///
-    /// The [`RowTail`] distinguishes closed records (most user records — field
-    /// set exact) from open records (kernel cfg records that absorb optional
-    /// extra fields via a row variable).
+    /// The [`RowTail`] distinguishes closed records (field set exact) from open
+    /// records (extra fields flow into a row variable: a row-polymorphic
+    /// signature, a record a field read or update left unpinned, a kernel cfg
+    /// record).
     Record(BTreeMap<Symbol, Self>, RowTail),
 }
 
@@ -198,6 +199,13 @@ impl VarCeiling {
 
 /// The tail of a record type's row variable — whether the record is closed
 /// (field set exact) or open (extra fields flow into a named row variable).
+///
+/// On a solver read-back ([`crate::zonk`]) the tail is faithful: `Closed`
+/// exactly when the record's row chain ends in `EmptyRecord`, `Open` over the
+/// tagged representative exactly when it ends in a variable (`Flex`, `Rigid`
+/// or `Super`), and the record's fields are the union of the fields along the
+/// chain. Any other terminal, or a label repeated along the chain, is refused
+/// by the read-back, never a value of this type.
 ///
 /// Mirrors `Maybe String` on `TRecord (Map …) (Maybe String)` in
 /// `../ipe/src/Ipe/AST/Canonical.hs:159`.

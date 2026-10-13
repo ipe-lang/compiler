@@ -196,12 +196,32 @@ pub enum OutputRefusal {
     /// A Windows drive-relative path (`C:x`) depends on a per-drive working
     /// directory, and a `/` inside a verbatim (`\\?\`) component is a separator
     /// on some platforms and part of a name on others. A `.` or `..` inside a
-    /// verbatim path is a literal name there, not a step; a device namespace
-    /// (`\\.\pipe`) or another non-disk verbatim root (`\\?\GLOBALROOT`)
-    /// names no directory tree; and Windows opens a name with a trailing `.` or
-    /// space, a `:`, or a device stem (`NUL`, `COM1`) as some other entry than
-    /// the one spelled.
+    /// verbatim path is a literal name there, not a step. The prefix must be
+    /// an `ipe_fs_open::PlaceablePrefix`: a drive, or a `\\server\share` whose
+    /// server and share Windows each opens as spelled (a host, computer,
+    /// `wsl$` or web-folder server name); a device namespace (`\\.\pipe`) or
+    /// another verbatim root (`\\?\GLOBALROOT`, `\\?\Volume{..}`) names no
+    /// directory tree. And Windows opens a name with a trailing `.` or space, a
+    /// `:`, or a device stem (`NUL`, `COM1`) as some other entry than the one
+    /// spelled.
     Unplaceable(PathBuf),
+    /// The working directory a relative request is walked on from names no single absolute place.
+    ///
+    /// The same rules as [`OutputRefusal::Unplaceable`] hold for the part of
+    /// the walk the working directory supplies; the cause is the working
+    /// directory (a `\\?\Volume{..}` path, a device namespace, a rooted `\x`
+    /// with no drive to stand on), so it is named, not the request.
+    UnplaceableCwd {
+        /// The working directory.
+        cwd: PathBuf,
+        /// The request walked on from it.
+        request: PathBuf,
+    },
+    /// A listed entry has a name no held handle can open, so ipe cannot inspect or remove it.
+    ///
+    /// On Windows a name that is not valid Unicode, or one Win32 reserves,
+    /// cannot be opened handle-relative; the directory is left untouched.
+    UnnameableEntry(PathBuf),
     /// An ejected project must go to a fresh (absent or empty) directory.
     ///
     /// The result is handed to the user, so nothing already there may be replaced.
@@ -290,6 +310,10 @@ impl std::fmt::Display for OutputRefusal {
             } => text::output_inside_cache_namespace(&out.display(), &CACHE_NAMESPACE_DIR),
             Self::ParentTraversal(p) => text::output_parent_traversal(&p.display()),
             Self::Unplaceable(p) => text::output_unplaceable(&p.display()),
+            Self::UnplaceableCwd { cwd, request } => {
+                text::output_unplaceable_cwd(&cwd.display(), &request.display())
+            }
+            Self::UnnameableEntry(p) => text::output_unnameable_entry(&p.display()),
             Self::NotFresh(p) => text::output_not_fresh(&p.display()),
             Self::UnsafeComponent(p) => text::output_unsafe_component(&p.display()),
             Self::OutsideProject { path, root } => {
@@ -748,7 +772,7 @@ impl OwnedPath {
     /// Check every existing level, final entry included; create nothing.
     fn check(&self) -> Result<(), CliError> {
         match self.held_parent(false)? {
-            Some((dir, name)) if dir.kind_of(name)? == held::EntryKind::Symlink => {
+            Some((dir, name)) if dir.kind_of(&dir.entry(name)?)? == held::EntryKind::Symlink => {
                 Err(OutputRefusal::Symlink(self.path()).into())
             }
             Some(_) | None => Ok(()),
@@ -805,7 +829,7 @@ impl OwnedPath {
         let Some((dir, name)) = self.held_parent(false)? else {
             return Ok(false);
         };
-        if dir.kind_of(name)? == held::EntryKind::Symlink {
+        if dir.kind_of(&dir.entry(name)?)? == held::EntryKind::Symlink {
             return Err(OutputRefusal::Symlink(self.path()).into());
         }
         Ok(dir.holds_contents(name, contents))
@@ -2315,11 +2339,73 @@ mod tests {
             );
             let result = prove_parent_steps_from(Path::new("x"), &Cwd::assumed(raw.clone()));
             assert!(
-                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                "x against {} must be refused, got {result:?}",
+                matches!(
+                    refused(&result),
+                    Some(OutputRefusal::UnplaceableCwd { cwd, request })
+                        if cwd == &raw && request == Path::new("x")
+                ),
+                "x against {} must be refused naming the working directory, got {result:?}",
                 raw.display()
             );
         }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A volume-GUID working directory has no placeable prefix, so a relative request is refused naming it.
+    #[cfg(windows)]
+    #[test]
+    fn a_volume_guid_cwd_is_named_as_the_cwd() {
+        let cwd = PathBuf::from(r"\\?\Volume{00000000-0000-0000-0000-000000000000}\x");
+        let result = prove_parent_steps_from(Path::new("out"), &Cwd::assumed(cwd.clone()));
+        assert!(
+            matches!(
+                refused(&result),
+                Some(OutputRefusal::UnplaceableCwd { cwd: named, request })
+                    if named == &cwd && request == Path::new("out")
+            ),
+            "out against {} must be refused naming the working directory, got {result:?}",
+            cwd.display()
+        );
+    }
+
+    /// An output under the local admin share `\\localhost\C$` is a share path like any other, so it is placed.
+    #[cfg(windows)]
+    #[test]
+    fn an_unc_out_under_localhost_admin_share_is_placed() {
+        use std::path::Prefix;
+        let base = scratch("localhost-share");
+        let proj = project(&base);
+        let plain = unverbatim(&base);
+        let letter = plain
+            .components()
+            .next()
+            .and_then(|first| match first {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    Prefix::Disk(letter) => Some(char::from(letter)),
+                    Prefix::VerbatimDisk(_)
+                    | Prefix::Verbatim(_)
+                    | Prefix::VerbatimUNC(..)
+                    | Prefix::DeviceNS(_)
+                    | Prefix::UNC(..) => None,
+                },
+                Component::RootDir
+                | Component::CurDir
+                | Component::ParentDir
+                | Component::Normal(_) => None,
+            })
+            .expect("scratch sits on a drive");
+        let rest = plain
+            .strip_prefix(format!(r"{letter}:\"))
+            .expect("scratch sits under its drive root");
+        let share = PathBuf::from(format!(r"\\localhost\{letter}$"))
+            .join(rest)
+            .join("out");
+        let result = OutputRoot::resolve(Some(&share.to_string_lossy()), &proj);
+        assert!(
+            result.is_ok(),
+            "--out {} must be placed, got {result:?}",
+            share.display()
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

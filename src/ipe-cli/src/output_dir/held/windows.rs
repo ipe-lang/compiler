@@ -22,7 +22,7 @@
 //! while a handle below them is open, and they are not empty, so the real path
 //! keeps naming the held directory throughout.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::os::windows::fs::MetadataExt as _;
@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
 use ipe_fs_open::{EntryName, HeldDir, OpenRefusal};
+
+use super::Listed;
 
 /// `FILE_FLAG_BACKUP_SEMANTICS`: allows opening a directory handle.
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -133,8 +135,9 @@ fn delete_options() -> OpenOptions {
 ///
 /// The prefix alone proves nothing: anyone who can write the directory can
 /// create such a name. [`is_held_pin`] decides.
-fn has_pin_prefix(name: &OsStr) -> bool {
-    name.to_str()
+fn has_pin_prefix(name: &EntryName) -> bool {
+    name.as_os_str()
+        .to_str()
         .is_some_and(|name| name.starts_with(PIN_PREFIX))
 }
 
@@ -145,23 +148,20 @@ fn has_pin_prefix(name: &OsStr) -> bool {
 /// pending deletion or gone. Any other entry carrying the prefix (a file
 /// someone created under that name) opens, or fails some other way, and is
 /// listed like any entry.
-fn is_held_pin(dir: &HeldDir, name: &OsStr) -> bool {
-    if !has_pin_prefix(name) {
+fn is_held_pin(dir: &HeldDir, entry: &EntryName) -> bool {
+    if !has_pin_prefix(entry) {
         return false;
     }
-    let Some(entry) = EntryName::new(name) else {
-        return false;
-    };
     let mut probe = OpenOptions::new();
     probe
         .write(true)
         .share_mode(SHARE_ALL)
         .custom_flags(OPEN_REPARSE_POINT);
-    match open_at(dir, &entry, &probe) {
+    match open_at(dir, entry, &probe) {
         Ok(_) => false,
         Err(e) if e.kind() == io::ErrorKind::NotFound => true,
         Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => true,
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => is_delete_pending(dir, &entry),
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => is_delete_pending(dir, entry),
         Err(_) => false,
     }
 }
@@ -360,17 +360,17 @@ fn remove_directory(dir: &HeldDir, name: &EntryName) -> io::Result<()> {
 /// The listing handle is opened under a pin; once open it enumerates the
 /// directory object it holds. Only a sentinel a pin holds when the entry is
 /// read is excluded ([`is_held_pin`]); any other entry, whatever its name, is
-/// listed.
-pub fn names(dir: &HeldDir) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
+/// listed, parsed once into a [`Listed`].
+pub fn names(dir: &HeldDir) -> io::Result<impl Iterator<Item = io::Result<Listed>>> {
     let entries = {
         let _pin = pin(dir)?;
         std::fs::read_dir(dir.real_path())?
     };
     Ok(entries.filter_map(move |entry| match entry {
-        Ok(entry) => {
-            let name = entry.file_name();
-            (!is_held_pin(dir, &name)).then_some(Ok(name))
-        }
+        Ok(entry) => match Listed::of(&entry.file_name()) {
+            Listed::Entry(name) if is_held_pin(dir, &name) => None,
+            listed => Some(Ok(listed)),
+        },
         Err(e) => Some(Err(e)),
     }))
 }
@@ -400,14 +400,14 @@ mod tests {
 
     #[test]
     fn only_a_held_pin_sentinel_is_hidden_from_listings() {
-        assert!(has_pin_prefix(OsStr::new(".ipe-pin-12-3")));
-        assert!(!has_pin_prefix(OsStr::new(".ipe-output")));
+        assert!(has_pin_prefix(&name(".ipe-pin-12-3")));
+        assert!(!has_pin_prefix(&name(".ipe-output")));
         let dir = scratch("pin_named");
         std::fs::write(dir.as_path().join(".ipe-pin-user"), b"user").unwrap();
         let held = held(dir.as_path());
         let _pin = pin(&held).unwrap();
         let listed: Vec<_> = names(&held).unwrap().map(Result::unwrap).collect();
-        assert_eq!(listed, vec![OsString::from(".ipe-pin-user")]);
+        assert_eq!(listed, vec![Listed::Entry(name(".ipe-pin-user"))]);
     }
 
     #[test]
@@ -428,12 +428,12 @@ mod tests {
         let held = held(dir.as_path());
         mkdir(&held, &name("sub")).unwrap();
         let names: Vec<_> = names(&held).unwrap().map(Result::unwrap).collect();
-        assert_eq!(names, vec![OsString::from("sub")]);
+        assert_eq!(names, vec![Listed::Entry(name("sub"))]);
         let on_disk: Vec<_> = std::fs::read_dir(dir.as_path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(on_disk, vec![OsString::from("sub")]);
+        assert_eq!(on_disk, vec![std::ffi::OsString::from("sub")]);
     }
 
     #[test]

@@ -170,7 +170,7 @@ fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String
         return Ok(Vec::new());
     };
     let os_name = std::ffi::OsStr::new(name);
-    match root_dir.kind_of(os_name)? {
+    match root_dir.kind_of(&root_dir.entry(os_name)?)? {
         EntryKind::Symlink => return Err(OutputRefusal::Symlink(candidate).into()),
         EntryKind::Absent | EntryKind::Other => return Ok(Vec::new()),
         EntryKind::Directory => {}
@@ -193,7 +193,7 @@ fn remove_generated_dir(root: &Path, generated: &Generated) -> Result<Vec<String
             let mut removed = Vec::new();
             for entry in entries {
                 let os_entry = std::ffi::OsStr::new(entry);
-                match dir.kind_of(os_entry)? {
+                match dir.kind_of(&dir.entry(os_entry)?)? {
                     EntryKind::Directory => {
                         dir.remove_entry(os_entry)?;
                         removed.push(format!("{name}/{entry}/"));
