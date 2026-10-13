@@ -4931,7 +4931,7 @@ fn config_cargo_toml(base: &str) -> DResult<String> {
     const PROFILE_ANCHOR: &str = "[profile.dev]";
     let yaml_features = crate_specs::SERDE_SAPHYR_FEATURES
         .iter()
-        .map(|feature| format!("\"{feature}\""))
+        .map(|feature| format!("{feature:?}"))
         .collect::<Vec<_>>()
         .join(", ");
     let deps = format!(
