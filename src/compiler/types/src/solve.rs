@@ -29,6 +29,20 @@ pub const DEFAULT_SOLVER_BUDGET: u64 = 5_000_000;
 /// Environment variable that overrides [`DEFAULT_SOLVER_BUDGET`].
 pub const BUDGET_ENV: &str = "IPE_SOLVER_BUDGET";
 
+/// A single constraint: the types of two solver variables must unify.
+///
+/// The [`Span`] is the source region blamed in any resulting [`TypeError`],
+/// and `home` is the module owning the expression that emitted it: a span is
+/// byte offsets with no file, so the home is the only key to its file.
+#[derive(Clone, Debug)]
+pub struct Constraint {
+    pub span: Span,
+    pub lhs: VarId,
+    pub rhs: VarId,
+    /// The module that owns the constrained expression.
+    pub home: ModuleHome,
+}
+
 /// A solver step ceiling: a positive number of steps, never "no limit".
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SolverSteps(NonZeroU64);
