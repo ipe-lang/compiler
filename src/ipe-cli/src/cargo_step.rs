@@ -595,6 +595,7 @@ fn wait_within(
 /// kept text, then cargo's own stderr: every build mode classifies a failure
 /// (a link input the host linker cannot open, for one) from the same text.
 /// `cargo_json_stdout` is empty for a build whose stdout was not captured.
+#[must_use]
 pub fn emitted_build_failed(
     what: &'static str,
     code: i32,
