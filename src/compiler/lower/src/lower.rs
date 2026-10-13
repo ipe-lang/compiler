@@ -10862,6 +10862,18 @@ fn emit_projection_operand_expr(
     }
 }
 
+/// `call` applied to the flatten pad's parameters, or `call` itself when the pad is empty.
+fn apply_pad(call: Expr, pad: &[(Symbol, IrType)]) -> Expr {
+    if pad.is_empty() {
+        call
+    } else {
+        Expr::Apply {
+            func: Box::new(call),
+            args: pad.iter().map(|&(sym, _)| Expr::Var(sym)).collect(),
+        }
+    }
+}
+
 /// Fail-closed SEAL gate for a point-free / partially-applied accessor-typed
 /// `Store.*` placeholder kernel (`Store.eq`, `Store.serial`, …). These leaves
 /// have no runtime function — the accessor-intercept rewrites the SATURATED
@@ -20329,21 +20341,16 @@ impl<'a> Lowerer<'a> {
         // after ipe exit 0 (SEAL break). Pad the closure with fresh trailing
         // parameters and apply the computed function value to them, so the
         // closure's arity equals its flattened type's for EVERY body shape,
-        // not only lambda-literal bodies.
-        let mut eta_pad: Vec<Symbol> = Vec::new();
-        while let Ty::Fun(arg, rest) = cur {
-            let sym = self.eta_sym(eta_pad.len())?;
-            let ir_ty = self.ir_type_from_ty_json(arg, span)?;
-            ir_params.push((sym, ir_ty));
-            eta_pad.push(sym);
-            cur = rest.as_ref();
-        }
-        // Reserve this lambda's pad block on the monotonic cursor BEFORE lowering
-        // the body: the pad params stay live (the trailing Apply below reads them),
-        // so an eta-lambda synthesised inside the body — a nested composed
-        // combinator such as `andThen (\x -> … andThen …)` — must draw disjoint
-        // names rather than shadow this scope's `eta_N`.
-        self.advance_eta(eta_pad.len());
+        // not only lambda-literal bodies. The pad block is reserved on the
+        // monotonic cursor BEFORE the body lowers: the pad params stay live (the
+        // trailing Apply below reads them), so an eta-lambda synthesised inside
+        // the body — a nested composed combinator such as
+        // `andThen (\x -> … andThen …)` — draws disjoint names rather than
+        // shadowing this scope's `eta_N`.
+        let (pad, tail) = self.flatten_pad(cur, span)?;
+        cur = tail;
+        let eta_pad: Vec<Symbol> = pad.iter().map(|&(sym, _)| sym).collect();
+        ir_params.extend(pad);
         // T8: use the JSON-friendly variant for the lambda return
         // type.  When the lambda's return type is a compound type containing a
         // free `Ty::Var` (e.g. `Task a` inside a polymorphic function like
@@ -26023,6 +26030,54 @@ impl<'a> Lowerer<'a> {
             .collect()
     }
 
+    /// The flatten-invariant pad of a closure whose body computes a value of solved type `cur`.
+    ///
+    /// Every function value is ONE closure whose parameter count is the
+    /// flattened arrow arity of its solved type: `ir_type_from_ty` renders one
+    /// multi-parameter `Fun`, and a value call site counts every arrow
+    /// ([`Self::ty_arrow_arity`]). A closure whose body yields a function
+    /// therefore takes one fresh trailing parameter per leading arrow of `cur`
+    /// and applies the computed function to them. Returns those parameters,
+    /// drawn from and reserved on the eta cursor, and the non-function tail
+    /// `cur` peels down to (the closure's return type).
+    fn flatten_pad<'t>(
+        &self,
+        mut cur: &'t Ty,
+        span: Span,
+    ) -> DResult<(Vec<(Symbol, IrType)>, &'t Ty)> {
+        let mut pad: Vec<(Symbol, IrType)> = Vec::new();
+        while let Ty::Fun(arg, rest) = cur {
+            let sym = self.eta_sym(pad.len())?;
+            pad.push((sym, self.ir_type_from_ty_json(arg, span)?));
+            cur = rest.as_ref();
+        }
+        self.advance_eta(pad.len());
+        Ok((pad, cur))
+    }
+
+    /// The flatten pad of a partial application's residual closure.
+    ///
+    /// A callee whose result is itself a function (`Maybe.withDefault d` at
+    /// `a = Int -> Bool`, a def returning a closure) yields a residual whose
+    /// flattened arity exceeds its `missing` slots: the residual takes every
+    /// arrow of its solved type at once ([`Self::flatten_pad`]). The pad is
+    /// drawn at this call site, so it is charged on the site's eta demand on
+    /// top of the missing block; an overrun is refused as
+    /// [`Feature::EtaSiteLimit`].
+    fn residual_pad<'t>(
+        &self,
+        ret_ty: &'t Ty,
+        missing: usize,
+        site: EtaDemand,
+        span: Span,
+    ) -> DResult<(Vec<(Symbol, IrType)>, &'t Ty)> {
+        let (pad, tail) = self.flatten_pad(ret_ty, span)?;
+        if !pad.is_empty() && site.charge(missing.saturating_add(pad.len())).is_none() {
+            return Err(unsupported(span, Feature::EtaSiteLimit));
+        }
+        Ok((pad, tail))
+    }
+
     /// The fresh binder and IR type of each missing argument slot
     /// `supplied..arity` of a partially-applied callee.
     fn eta_missing_params(
@@ -26236,9 +26291,12 @@ impl<'a> Lowerer<'a> {
                 }
             }
         }
-        let params = self.eta_missing_params(&resolved, &arg_tys, supplied, arity, call_span)?;
+        let mut params =
+            self.eta_missing_params(&resolved, &arg_tys, supplied, arity, call_span)?;
         call_args.extend(params.iter().map(|&(sym, _)| Expr::Var(sym)));
         self.advance_eta(arity.saturating_sub(supplied));
+        let (pad, ret_ty) =
+            self.residual_pad(ret_ty, arity.saturating_sub(supplied), site, call_span)?;
         // A missing mapper position is an eta parameter the residual call
         // forwards to the kernel: it binds the same stored element a supplied
         // mapper does, so it passes the same choke point (a point-free
@@ -26289,7 +26347,7 @@ impl<'a> Lowerer<'a> {
         } else {
             self.ir_type_from_ty_json(ret_ty, call_span)?
         };
-        let body = Expr::Call {
+        let call = Expr::Call {
             callee: resolved,
             args: call_args,
             // Eta-expanded partial application: the residual arrow's param/ret
@@ -26299,6 +26357,8 @@ impl<'a> Lowerer<'a> {
             // saturated) — this residual call carries no form-handler verdict.
             on_form: OnFormKind::NotForm,
         };
+        let body = apply_pad(call, &pad);
+        params.extend(pad);
         let sources: Vec<&canon::Expr> = canon_args.iter().collect();
         let lambda = self.clone_eta_body_captures(&sources, call_span, params, ret, body)?;
         // T4: wrap any hoisted let-bindings around the lambda.

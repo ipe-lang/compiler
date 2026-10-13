@@ -224,3 +224,68 @@ fn stored_read_through_a_user_generic_def_is_refused() {
         "`{dir}` must fail closed with IPE-L0107; got build result: {built:?}"
     );
 }
+
+const PARTIAL_FN_RESULT: &str = "fn_partial_fn_result";
+
+/// The partial-result fixture's stdout: one count per case.
+const PARTIAL_FN_RESULT_STDOUT: &str = "3 3 3 2";
+
+/// Lower the partial-result fixture into `out`, asserting `ipe` accepts it.
+fn build_partial_fn_result(out: &Path) {
+    let _ = std::fs::remove_dir_all(out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&golden_entry(PARTIAL_FN_RESULT), out, &runtime);
+    assert!(
+        built.is_ok(),
+        "{PARTIAL_FN_RESULT}: ipe must accept the fixture; got {built:?}"
+    );
+}
+
+/// A partial application whose result is a function (`Maybe.withDefault d`
+/// at a function type, a def returning a closure) lowers to ONE closure over
+/// every arrow of its type, never a closure returning a function: a value
+/// call site passes all the arrows at once.
+#[test]
+fn partial_with_fn_result_is_one_flat_closure() {
+    let out = crate::support::scratch_root().join("ipec_i3344_partial_emit");
+    build_partial_fn_result(&out);
+    let emitted = std::fs::read_to_string(out.join("src").join("main.rs")).unwrap_or_default();
+    let compact: String = emitted.chars().filter(|c| !c.is_whitespace()).collect();
+    let heads: Vec<&str> = compact
+        .split("move|")
+        .skip(1)
+        .filter_map(|rest| rest.split('{').next())
+        .collect();
+    assert!(
+        !heads.is_empty(),
+        "{PARTIAL_FN_RESULT}: emitted main.rs holds no closure to check"
+    );
+    for head in heads {
+        assert!(
+            !head.contains("->Box<dynFn") && !head.contains("->::std::sync::Arc<dynFn"),
+            "{PARTIAL_FN_RESULT}: a closure returns a function instead of taking its arrows: `move|{head}`"
+        );
+    }
+}
+
+/// The partial-result crate builds and runs to the expected output (THE SEAL).
+#[test]
+fn partial_with_fn_result_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let out = crate::support::scratch_root().join("ipec_i3344_partial_run");
+    build_partial_fn_result(&out);
+    let outcome = crate::support::build_and_run_emitted(PARTIAL_FN_RESULT, &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "{PARTIAL_FN_RESULT}: emitted crate must build and exit 0; stdout:\n{}",
+        outcome.stdout
+    );
+    assert_eq!(
+        outcome.stdout.trim_end(),
+        PARTIAL_FN_RESULT_STDOUT,
+        "{PARTIAL_FN_RESULT}: emitted crate built (SEAL held) but ran to the wrong output"
+    );
+}
