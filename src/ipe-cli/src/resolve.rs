@@ -454,9 +454,11 @@ pub fn verify_lockfile_hashes(project_root: &Path) -> Result<(), CliError> {
     verify_locked_hashes(project_root, &Lockfile::read(project_root)?)
 }
 
-/// [`verify_lockfile_hashes`] over an already-read `lockfile` — the pins of a
-/// captured package snapshot, so the check judges the same `ipe.lock` bytes as
-/// every other audit check rather than a second read of the working tree.
+/// [`verify_lockfile_hashes`] over an already-read `lockfile`.
+///
+/// The pins are those of a captured package snapshot, so the check judges the
+/// same `ipe.lock` bytes as every other audit check rather than a second read
+/// of the working tree.
 ///
 /// # Errors
 /// As [`verify_lockfile_hashes`], minus the lockfile read.
