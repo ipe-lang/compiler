@@ -2803,8 +2803,7 @@ mod tests {
         let source = Some("https://github.com/arthurmaciel/lib");
 
         let err = compute_entry_draft(&manifest, source, Some(older.as_str()))
-            .err()
-            .expect("an older commit than HEAD is refused");
+            .expect_err("an older commit than HEAD is refused");
         assert!(matches!(err, CliError::Usage(_)), "{err:?}");
 
         let draft = compute_entry_draft(&manifest, source, Some("HEAD"))
@@ -2813,8 +2812,7 @@ mod tests {
 
         std::fs::write(repo.join("lib.ipe"), "module Lib exposing (x)\n").expect("write");
         let err = compute_entry_draft(&manifest, source, Some("HEAD"))
-            .err()
-            .expect("a dirty tree is refused");
+            .expect_err("a dirty tree is refused");
         assert!(
             matches!(err, CliError::Publish(Refusal::DirtyTree { .. })),
             "{err:?}"
