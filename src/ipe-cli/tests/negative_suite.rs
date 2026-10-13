@@ -4200,8 +4200,8 @@ fn generic_row_model_web_embed_rejected() {
 /// A mounted `Web.embed` built inside a definition whose annotation carries a
 /// row generic the entry's model does not visibly use: the model is the
 /// concrete `Model`, and `r` is only the open tail of the `cfg` parameter the
-/// view reads a label from. Region types carry no record row tails, so whether
-/// the entry reaches `r` cannot be determined, and the entry is refused
+/// view reads a label from. The entry's region type does not mention `r`, so
+/// whether the entry reaches it cannot be determined, and the entry is refused
 /// fail-closed.
 const WEB_EMBED_ROW_IN_SCOPE: &str = r#"module Main exposing (main)
 import Ipe.Server.Http as Server

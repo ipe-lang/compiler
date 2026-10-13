@@ -10,18 +10,24 @@ use ipe_types::{ConHead, EmittedHeads, HeadIdentity, Ty, paired_ty_children};
 
 use super::is_opaque_boxed_wrapper;
 
-/// Does this solved [`Ty`] contain a free type variable anywhere? Used to keep
-/// the lowerer's record-shape collection to fully-concrete shapes — a
-/// variable-bearing (generic) record reaches the backend through a signature,
-/// where the type variable still has a source [`Symbol`] to name the generic.
-pub(super) fn ty_contains_var(ty: &Ty) -> bool {
+/// Whether a type variable appears in this solved [`Ty`], reading record fields only.
+///
+/// A record's row tail is deliberately not consulted, so this is NOT a
+/// groundness judgment (that is [`ipe_types::ty_is_ground`]). It serves the
+/// reads whose consumer itself works on fields only: record-shape collection
+/// must agree with `ir_type_from_ty`, which lowers a record's fields (a
+/// residual flexible row lowers as its zero-extension instance), and a
+/// row-polymorphic record update is emitted through its field trait whatever
+/// the tail. A variable-bearing record reaches the backend through a
+/// signature, where the variable still has a source [`Symbol`] to name it.
+pub(super) fn ty_fields_mention_var(ty: &Ty) -> bool {
     match ty {
         Ty::Var(_) | Ty::Wildcard => true,
         Ty::Unit => false,
-        Ty::Fun(a, b) => ty_contains_var(a) || ty_contains_var(b),
-        Ty::Tuple(elems) => elems.iter().any(ty_contains_var),
-        Ty::Record(fields, _) => fields.values().any(ty_contains_var),
-        Ty::Con { args, .. } => args.iter().any(ty_contains_var),
+        Ty::Fun(a, b) => ty_fields_mention_var(a) || ty_fields_mention_var(b),
+        Ty::Tuple(elems) => elems.iter().any(ty_fields_mention_var),
+        Ty::Record(fields, _) => fields.values().any(ty_fields_mention_var),
+        Ty::Con { args, .. } => args.iter().any(ty_fields_mention_var),
     }
 }
 
