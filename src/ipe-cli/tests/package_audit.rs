@@ -400,17 +400,18 @@ import Ipe.Io
     );
 }
 
+/// A committed FFI cache is publisher-supplied Rust the gate never loads, so a
+/// planted panic in it is neither judged nor shipped. The provenance scan judges
+/// the `src/ffi.rs` the build emits (refusals driven by the `first_hit_in`
+/// unit tests in `audit.rs`).
 #[test]
-fn a_panic_in_author_ffi_rust_rejects() {
+fn a_committed_ffi_cache_is_never_loaded_by_the_audit() {
     let pkg = temp_pkg("ffi-panic");
     write_package(
         &pkg,
         "module Package exposing (package)\n\n\npackage =\n    { name = \"ffi-pkg\", version = \"0.1.0\" }\n",
         PURE_MAIN,
     );
-    // Plant an author-supplied FFI wrapper (`_bindings.rs`) that panics. It has
-    // no `.consumer.json`, so the catalog loader ignores it (the build stays
-    // clean) — but the provenance scan reads it as author Rust and rejects.
     let cache = pkg.join(".ipe/cache/ffi/rust");
     std::fs::create_dir_all(&cache).expect("create ffi cache dir");
     std::fs::write(
@@ -422,20 +423,12 @@ fn a_panic_in_author_ffi_rust_rejects() {
 
     let (ok, stdout, stderr) = run_audit(&pkg, &index);
     assert!(
-        !ok,
-        "an authored panic in FFI wrapper Rust must reject; stdout:\n{stdout}\nstderr:\n{stderr}"
+        ok,
+        "a committed FFI cache is purged, not loaded; stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("provenance panic-scan"),
-        "the reject names the provenance check; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("author-supplied FFI Rust") && stderr.contains("panic!"),
-        "the diagnostic attributes the panic to author Rust and names it; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("mycrate_bindings.rs"),
-        "the diagnostic points at the offending file; got:\n{stderr}"
+        !stderr.contains("mycrate_bindings.rs") && !stderr.contains("provenance panic-scan"),
+        "the planted file is never judged; got:\n{stderr}"
     );
 }
 

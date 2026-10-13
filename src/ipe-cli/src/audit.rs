@@ -3151,7 +3151,7 @@ mod tests {
                                import Ipe.Html.Unsafe exposing (unsafeScript)\n\n\
                                leak = render (section [] [ unsafeScript \"x\" ])\n";
 
-    /// A capability-clean package directory.
+    /// A capability-clean package directory (an auditable package has a `Main` entry).
     fn clean_package(tag: &str) -> PathBuf {
         let dir = make_test_dir(tag);
         assert!(
@@ -3169,6 +3169,14 @@ mod tests {
             )
             .is_ok(),
             "write Lib.ipe"
+        );
+        assert!(
+            std::fs::write(
+                dir.join("src/Main.ipe"),
+                "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain : Task ()\nmain =\n    Io.println \"hi\"\n"
+            )
+            .is_ok(),
+            "write Main.ipe"
         );
         dir
     }
@@ -3204,7 +3212,10 @@ mod tests {
         assert!(
             matches!(&fresh, Err(CliError::PackageAudit(r)) if r.check == Check::Capability),
             "control: the swapped tree carries an undeclared effect: {:?}",
-            fresh.as_ref().ok()
+            fresh
+                .as_ref()
+                .map(|set| set.len())
+                .map_err(ToString::to_string)
         );
     }
 
