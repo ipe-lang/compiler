@@ -2640,8 +2640,9 @@ mod zonk_sharing_tests {
 #[cfg(test)]
 mod zonk_row_tail_tests {
     use super::super::{
-        BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, Ty, TypeError,
+        BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, Ty, TyBounds, TypeError,
         UnionFind, VarId, ZONK_NODE_LIMIT, promote_untyped_boundaries, tag_solver_var, zonk,
+        zonk_emitted,
     };
     use ipe_intern::{Interner, Symbol};
 
@@ -2731,6 +2732,63 @@ mod zonk_row_tail_tests {
             record_shape(&ty),
             Some((vec![label(1)], RowTail::Closed)),
             "a record ending in the empty row must read back closed"
+        );
+    }
+
+    /// The emitted read-back closes a residual non-rigid row and keeps every
+    /// other terminal as the faithful read-back reads it.
+    #[test]
+    fn zonk_emitted_closes_only_non_rigid_rows() {
+        let terminals = [
+            (Content::Flex, true),
+            (
+                Content::Super {
+                    rigid: false,
+                    bounds: TyBounds::eq(),
+                },
+                true,
+            ),
+            (Content::Rigid, false),
+            (
+                Content::Super {
+                    rigid: true,
+                    bounds: TyBounds::eq(),
+                },
+                false,
+            ),
+        ];
+        for (content, closes) in terminals {
+            let mut uf = UnionFind::<Content>::new();
+            let ext = uf.fresh(content.clone()).expect("fresh row must not fail");
+            let rec = record_over(&mut uf, &[1], ext);
+            let tail = tag_solver_var(uf.find(ext).expect("find must not fail"));
+            let emitted = zonk_emitted(&mut uf, &mut Budget::unbounded(), rec)
+                .expect("an open record must read back");
+            let expected = if closes {
+                RowTail::Closed
+            } else {
+                RowTail::Open(tail)
+            };
+            assert_eq!(
+                record_shape(&emitted),
+                Some((vec![label(1)], expected)),
+                "the emitted read-back of a row ending in {content:?}"
+            );
+            let faithful = zonk_unbounded(&mut uf, rec).expect("an open record must read back");
+            assert_eq!(
+                record_shape(&faithful),
+                Some((vec![label(1)], RowTail::Open(tail))),
+                "the faithful read-back of a row ending in {content:?} stays open"
+            );
+        }
+        let mut uf = UnionFind::<Content>::new();
+        let ext = empty_row(&mut uf);
+        let rec = record_over(&mut uf, &[1], ext);
+        let emitted = zonk_emitted(&mut uf, &mut Budget::unbounded(), rec)
+            .expect("a closed record must read back");
+        assert_eq!(
+            record_shape(&emitted),
+            Some((vec![label(1)], RowTail::Closed))
         );
     }
 

@@ -58,7 +58,7 @@ pub use ty::{
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
-    promote_untyped_boundaries, reify_scheme, zonk,
+    promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
@@ -1014,8 +1014,11 @@ fn infer_core(
     // cleared a function HEAD; this catches a function NESTED inside a tuple /
     // record / enum under an equality obligation (Rust cannot compare it),
     // failing closed with IPE-T0014 instead of emitting code `cargo` rejects.
+    // The type judged is the one emitted (`zonk_emitted`): a record the deferred
+    // pass left over a residual row is its known fields, whichever operand
+    // settled it first.
     for (root, orig_bounds, span, home) in pinned {
-        let ty = lift!(zonk(&mut uf, budget, root));
+        let ty = lift!(zonk_emitted(&mut uf, budget, root));
         if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
             return Err(InferError::sited(
                 super_unsatisfied(interner, orig_bounds, &ty, span),
@@ -1937,7 +1940,7 @@ fn check_scheme_applications(
                     None => continue,
                 },
             };
-            let ty = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
+            let ty = zonk_emitted(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
                     super_unsatisfied(interner, *b, &ty, app.span),
@@ -6675,6 +6678,57 @@ mod tests {
             rev.is_ok(),
             "equality before field read must infer: {rev:?}"
         );
+    }
+
+    #[test]
+    fn equality_on_a_deferred_record_base_holds_nested_and_aliased() {
+        // The deferred settle leaves `a` over a residual row whatever spelling
+        // reaches it: inside a tuple, through a `let` alias, or as both
+        // operands of a generic use. Each is judged on the emitted record.
+        for body in [
+            "ok a =\n    a.x == 1 && (a, 1) == (a, 1)\n",
+            "ok a =\n    (a, 1) == (a, 1) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && (let b = a in b == b)\n",
+            "ok a =\n    (let b = a in b == b) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+            "ok a =\n    same a a && a.x == 1\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(r.is_ok(), "`{body}` must infer: {r:?}");
+        }
+    }
+
+    #[test]
+    fn equality_on_a_record_extended_by_a_function_is_refused() {
+        // The residual row reads closed only while nothing extends it: a use
+        // that adds a function field makes the compared record unequatable,
+        // in either operand order.
+        for body in [
+            "ok a =\n    a.x == 1 && a == a\n\nuse = ok { x = 1, f = \\y -> y }\n",
+            "ok a =\n    a == a && a.x == 1\n\nuse = ok { x = 1, f = \\y -> y }\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equality_on_a_rigid_row_record_is_refused() {
+        // An annotation's row variable is a generic over an unknown rest: no
+        // equality holds of it, compared directly or through a generic use.
+        for body in [
+            "ok : { r | x : Int } -> Bool\nok a =\n    a == a\n",
+            "ok : { r | x : Int } -> Bool\nok a =\n    same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
     }
 
     #[test]
