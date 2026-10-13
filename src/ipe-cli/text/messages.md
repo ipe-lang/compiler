@@ -881,6 +881,14 @@ ipe.lock: package `{package}` is an index dependency but records a `local` rev �
 
 package `{package}`: a path dependency's `source` must be a non-empty path of at most {max} bytes with no control characters or `"`, got: "{raw}"
 
+## lock-local-source-remote
+
+package `{package}`: path dependency "{raw}" names a network share or device ({kind}), not a local directory — name a local directory instead
+
+## lock-local-source-device
+
+package `{package}`: path dependency "{raw}" names a Windows device (`CON`, `NUL`, `COM1`, …), not a directory — name a local directory instead
+
 ## lock-non-utf8-local-path
 
 package `{package}`: path dependency `{path}` is not valid UTF-8 and cannot be recorded in ipe.lock
@@ -2283,6 +2291,10 @@ error[IPE-P0001]: the packaged {platform} manifest declares OS permission(s) the
 ## index-source-url-invalid
 
 package `{pkg}`: `source` must be an https://, ssh://, or file:// URL (or a bare absolute path), got: {raw}
+
+## index-source-url-remote
+
+package `{pkg}`: `source` names a network share or device ({kind}), and opening it would contact another host — use the repository's https:// URL, got: {raw}
 
 ## index-source-url-plaintext
 

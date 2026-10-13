@@ -257,6 +257,16 @@ fn resolve_escape_within(
             )
         }
         IpeDep::Path(path) => {
+            // The typed location exists before the first filesystem touch: a
+            // network share or a device is refused here, never opened.
+            let source = LocalSource::from_path(&package_name, path)?;
+            if source.opens_a_device(ipe_path_core::HOST) {
+                return Err(crate::lockfile::LockRefusal::DeviceLocalSource {
+                    package: package_name,
+                    raw: source.as_str().to_owned(),
+                }
+                .into());
+            }
             let resolved = if path.is_absolute() {
                 path.clone()
             } else {
@@ -267,7 +277,6 @@ fn resolve_escape_within(
                     crate::text::msg::resolve_path_dep_missing(&name, &resolved.display()),
                 ));
             }
-            let source = LocalSource::from_path(&package_name, path)?;
             // The author's own directory: never removed on a failure.
             (LockedOrigin::Path { source }, resolved, None)
         }
@@ -802,15 +811,14 @@ fn stage_origin(
         path: dest.to_path_buf(),
         source: e,
     })?;
+    // `git remote add` has no option terminator; the argument is the typed
+    // location's git spelling, re-judged at this sink (no leading `-`, no
+    // network share or device), so it is a safe trailing arg.
+    let remote = url
+        .git_remote()
+        .map_err(|refusal| refusal.into_cli(name, url.as_str()))?;
     run_git(name, &["init", "--quiet"], dest, transfer)?;
-    // `git remote add` has no option terminator; the URL is a parse-validated
-    // newtype (no leading `-`), so it is a safe trailing arg.
-    run_git(
-        name,
-        &["remote", "add", "origin", url.as_str()],
-        dest,
-        transfer,
-    )?;
+    run_git(name, &["remote", "add", "origin", remote], dest, transfer)?;
     Ok(())
 }
 
@@ -2917,5 +2925,48 @@ mod tests {
                 "IPE_INDEX_DIR={raw:?} must be refused: {root:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_remote_dep_path_is_refused_before_any_open() {
+        let proj = temp_dir("remote-dep-path");
+        scaffold_project(&proj);
+        let err =
+            resolve_escape(&proj, "remotelib", &IpeDep::Path("//h/s/lib".into())).unwrap_err();
+        assert!(
+            matches!(&err, CliError::LockRefused(r)
+            if matches!(**r, crate::lockfile::LockRefusal::RemoteLocalSource {
+                kind: index::RemotePath::Unc,
+                ..
+            })),
+            "{err:?}"
+        );
+        let missing =
+            resolve_escape(&proj, "missinglib", &IpeDep::Path("missing-dir".into())).unwrap_err();
+        let expected = crate::text::msg::resolve_path_dep_missing(
+            &pn("missinglib"),
+            &proj.join("missing-dir").display(),
+        )
+        .to_string();
+        assert!(
+            matches!(&missing, CliError::Resolve(msg) if msg.to_string() == expected),
+            "{missing:?}"
+        );
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    #[test]
+    fn a_file_url_source_reaches_git_as_its_plain_path() {
+        let src = git_source("file-url-origin", "module Lib\n");
+        let dest = temp_dir("file-url-origin-dest").join("slot");
+        let plain = src.display().to_string();
+        let url = SourceUrl::parse(&pn("p"), &format!("file://{plain}"))
+            .expect("file URL of an absolute path is a valid source");
+        let transfer = Transfer::begin(*PACKAGE_SOURCE.transfer());
+        stage_origin(&pn("p"), &url, &dest, &transfer).expect("origin stages");
+        let origin = run_fixture(&dest, &["remote", "get-url", "origin"], b"");
+        assert_eq!(String::from_utf8_lossy(&origin).trim_end(), plain);
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = dest.parent().map(std::fs::remove_dir_all);
     }
 }
