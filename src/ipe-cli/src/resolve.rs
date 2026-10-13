@@ -172,6 +172,37 @@ pub fn resolve_escape(project_root: &Path, name: &str, dep: &IpeDep) -> Result<(
     resolve_escape_within(project_root, name, dep, &remote_ingest::PACKAGE_SOURCE)
 }
 
+/// The lockable origin and directory of a path dependency on `path`.
+///
+/// The typed location exists before the first filesystem touch: a network
+/// share or a device is refused here, never opened.
+fn path_origin(
+    project_root: &Path,
+    name: &str,
+    package_name: &PackageName,
+    path: &Path,
+) -> Result<(LockedOrigin, PathBuf), CliError> {
+    let source = LocalSource::from_path(package_name, path)?;
+    if source.opens_a_device(ipe_path_core::HOST) {
+        return Err(crate::lockfile::LockRefusal::DeviceLocalSource {
+            package: package_name.clone(),
+            raw: source.as_str().to_owned(),
+        }
+        .into());
+    }
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    if !resolved.is_dir() {
+        return Err(CliError::Resolve(
+            crate::text::msg::resolve_path_dep_missing(&name, &resolved.display()),
+        ));
+    }
+    Ok((LockedOrigin::Path { source }, resolved))
+}
+
 /// [`resolve_escape`] with a `git` fetch and the tree hash held to `budget`.
 fn resolve_escape_within(
     project_root: &Path,
@@ -257,28 +288,9 @@ fn resolve_escape_within(
             )
         }
         IpeDep::Path(path) => {
-            // The typed location exists before the first filesystem touch: a
-            // network share or a device is refused here, never opened.
-            let source = LocalSource::from_path(&package_name, path)?;
-            if source.opens_a_device(ipe_path_core::HOST) {
-                return Err(crate::lockfile::LockRefusal::DeviceLocalSource {
-                    package: package_name,
-                    raw: source.as_str().to_owned(),
-                }
-                .into());
-            }
-            let resolved = if path.is_absolute() {
-                path.clone()
-            } else {
-                project_root.join(path)
-            };
-            if !resolved.is_dir() {
-                return Err(CliError::Resolve(
-                    crate::text::msg::resolve_path_dep_missing(&name, &resolved.display()),
-                ));
-            }
+            let (origin, resolved) = path_origin(project_root, name, &package_name, path)?;
             // The author's own directory: never removed on a failure.
-            (LockedOrigin::Path { source }, resolved, None)
+            (origin, resolved, None)
         }
         IpeDep::Index(_) => {
             return Err(CliError::Resolve(
@@ -2944,12 +2956,11 @@ mod tests {
         let missing =
             resolve_escape(&proj, "missinglib", &IpeDep::Path("missing-dir".into())).unwrap_err();
         let expected = crate::text::msg::resolve_path_dep_missing(
-            &pn("missinglib"),
+            &"missinglib",
             &proj.join("missing-dir").display(),
-        )
-        .to_string();
+        );
         assert!(
-            matches!(&missing, CliError::Resolve(msg) if msg.to_string() == expected),
+            matches!(&missing, CliError::Resolve(msg) if *msg == expected),
             "{missing:?}"
         );
         let _ = std::fs::remove_dir_all(&proj);

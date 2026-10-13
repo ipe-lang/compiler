@@ -1108,10 +1108,9 @@ mod tests {
         let err = Lockfile::from_text(&indexed).unwrap_err();
         let shown = crate::style::TerminalSafe::sanitize(&format!("{:?}", "//h/s"));
         let expected =
-            crate::text::msg::index_source_url_remote(&pkg, &RemotePath::Unc.describe(), &shown)
-                .to_string();
+            crate::text::msg::index_source_url_remote(&pkg, &RemotePath::Unc.describe(), &shown);
         assert!(
-            matches!(&err, CliError::Resolve(msg) if msg.to_string() == expected),
+            matches!(&err, CliError::Resolve(msg) if *msg == expected),
             "{err:?}"
         );
     }
