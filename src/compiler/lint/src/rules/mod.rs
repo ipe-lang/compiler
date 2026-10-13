@@ -317,8 +317,14 @@ pub fn bool_literal(ctx: &Ctx, expr: &Expr) -> Option<bool> {
 
 /// Run cross-module rules that require all modules simultaneously.
 /// Called once per lint run after all per-module passes complete.
-pub fn run_cross_module<'a>(ctxs: &[&'a Ctx<'a>]) -> Vec<Finding> {
-    wrapper_consistency_cross::check_cross(ctxs)
+///
+/// `probe` is polled before each module a cross-module rule aggregates; once it
+/// fires the pass returns its `Cancelled` value, never a partial finding set.
+pub fn run_cross_module<'a, P: CancelProbe>(
+    ctxs: &[&'a Ctx<'a>],
+    probe: &P,
+) -> Result<Vec<Finding>, P::Cancelled> {
+    wrapper_consistency_cross::check_cross(ctxs, probe)
 }
 
 /// True when `name` appears in the module's `exposing (...)` list (or the list
