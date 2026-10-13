@@ -1208,16 +1208,26 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
                         &lint,
                     )
                 }))
-                .map(|demanded| lint_stage(demanded, &uri_of, encoding, &cancel, &lint))
+                .map(|demanded| {
+                    lint_stage(
+                        demanded,
+                        &uri_of,
+                        encoding,
+                        &ipe_lint::CancelFlag::new(&cancel),
+                        &lint,
+                    )
+                })
             }));
             match outcome {
-                Ok(Ok(per_uri)) => {
+                Ok(Ok(Ok(per_uri))) => {
                     let _ = tx.send(DiagnosticsBatch {
                         generation,
                         per_uri,
                     });
                 }
-                Ok(Err(_cancelled)) => {} // superseded — the newer worker owns the push
+                // Superseded in the demand or the lint stage: the newer worker
+                // owns the push, and no batch short of its lint findings exists.
+                Ok(Err(_) | Ok(Err(ipe_lint::LintCancelled))) => {}
                 Err(_panic) => {
                     eprintln!("[ipe lsp] internal error: diagnostics worker panicked");
                 }
@@ -1383,24 +1393,27 @@ fn demand_stage(
 /// the compiler's own diagnostics for each user document (the way clippy flows
 /// through rust-analyzer). A refused `lint.ipe` runs no rule: its diagnostic is
 /// published in place of every finding.
-fn lint_stage(
+///
+/// # Errors
+///
+/// Returns the probe's `Cancelled` value when the worker was superseded before
+/// or during the lint pass: its batch would lack the lint findings, so it is
+/// never built, and only a newer worker's complete batch can be published.
+fn lint_stage<P: ipe_lint::CancelProbe>(
     demanded: Demanded,
     uri_of: &BTreeMap<Vec<String>, Url>,
     encoding: PositionEncoding,
-    cancel: &AtomicBool,
+    probe: &P,
     lint: &LintPass,
-) -> Vec<(Url, Vec<lsp_types::Diagnostic>)> {
+) -> Result<Vec<(Url, Vec<lsp_types::Diagnostic>)>, P::Cancelled> {
     let Demanded {
         mut per_uri,
         entry_uri,
         user_texts,
     } = demanded;
-    // A superseded worker skips the whole lint pass. The newer worker owns the
-    // next publish, so dropping this one's lint work is observationally
-    // identical.
-    if cancel.load(Ordering::Relaxed) {
-        return per_uri.into_iter().collect();
-    }
+    // A superseded worker skips the whole lint pass; the newer worker owns the
+    // next publish.
+    probe.poll()?;
     let lint_config = match lint {
         LintPass::Run(config) => config,
         LintPass::Withheld { uri, diagnostic } => {
@@ -1410,17 +1423,21 @@ fn lint_stage(
                     .or_default()
                     .push(diagnostic.as_ref().clone());
             }
-            return per_uri.into_iter().collect();
+            return Ok(per_uri.into_iter().collect());
         }
-        LintPass::Skipped => return per_uri.into_iter().collect(),
+        LintPass::Skipped => return Ok(per_uri.into_iter().collect()),
     };
-    for (module, lints) in diagnostics::collect_lint(&user_texts, lint_config, encoding) {
+    // The probe is polled again between modules, rules and findings: a worker
+    // superseded mid-pass stops within one rule, so the main loop's join never
+    // waits out a whole lint pass.
+    let per_module = diagnostics::collect_lint(&user_texts, lint_config, encoding, probe)?;
+    for (module, lints) in per_module {
         if let Some(uri) = uri_of.get(&module) {
             per_uri.entry(uri.clone()).or_default().extend(lints);
         }
     }
 
-    per_uri.into_iter().collect()
+    Ok(per_uri.into_iter().collect())
 }
 
 /// `textDocument/formatting` — reformat the whole document.
@@ -3336,31 +3353,8 @@ mod tests {
     #[test]
     fn lint_tail_holds_no_database_clone() {
         let mut state = synced_two_module_state("/lsp-lint-tail-test");
-        let root = state.db.root().expect("a synced root");
-        let entry_module = state.entry_module().to_vec();
-        let entry_file = root
-            .files(state.db.db())
-            .get(&entry_module)
-            .copied()
-            .expect("the entry module's input");
-        let uri_of: BTreeMap<Vec<String>, Url> = state
-            .served
-            .layout()
-            .expect("a served layout")
-            .path_of_module
-            .iter()
-            .filter_map(|(module, path)| Some((module.clone(), Url::from_file_path(path).ok()?)))
-            .collect();
         let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
-        let demanded = super::demand_stage(
-            state.db.db().clone(),
-            root,
-            entry_file,
-            &uri_of,
-            &entry_module,
-            state.encoding,
-            &lint,
-        );
+        let (demanded, uri_of) = demanded_of(&state, &lint);
         assert!(
             !demanded.user_texts.is_empty(),
             "the lint stage receives owned user texts"
@@ -3381,14 +3375,130 @@ mod tests {
             "an input setter must not wait on the pending lint stage"
         );
 
-        let batch = super::lint_stage(
+        let Ok(batch) = super::lint_stage(
             demanded,
             &uri_of,
             state.encoding,
-            &AtomicBool::new(false),
+            &ipe_lint::NeverCancel,
             &lint,
         );
         assert_eq!(batch.len(), uri_of.len(), "one entry per user document");
+    }
+
+    /// A probe that fires on its `fire_at`-th poll and counts every poll.
+    struct FiresOnPoll {
+        fire_at: usize,
+        polls: std::cell::Cell<usize>,
+    }
+
+    impl ipe_lint::CancelProbe for FiresOnPoll {
+        type Cancelled = ipe_lint::LintCancelled;
+
+        fn poll(&self) -> Result<(), ipe_lint::LintCancelled> {
+            let polls = self.polls.get().saturating_add(1);
+            self.polls.set(polls);
+            if polls >= self.fire_at {
+                Err(ipe_lint::LintCancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// The demand of a two-module state whose every user text carries an
+    /// unused import, so an uncancelled lint pass reports a finding in each.
+    fn linted_demand(dir: &str) -> (super::Demanded, BTreeMap<Vec<String>, Url>, State) {
+        let state = synced_two_module_state(dir);
+        let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
+        let (mut demanded, uri_of) = demanded_of(&state, &lint);
+        assert_eq!(demanded.user_texts.len(), 2, "two user modules to lint");
+        for text in demanded.user_texts.values_mut() {
+            *text = text.replacen("\n\n", "\n\nimport Unused\n\n", 1);
+        }
+        (demanded, uri_of, state)
+    }
+
+    /// Whether `batch` carries any lint finding.
+    fn has_lint_finding(batch: &[(Url, Vec<lsp_types::Diagnostic>)]) -> bool {
+        batch
+            .iter()
+            .flat_map(|(_, diags)| diags)
+            .any(|d| d.source.as_deref() == Some("ipe-lint"))
+    }
+
+    /// A lint stage whose probe fires at any checkpoint stops there and builds
+    /// no batch at all, so a batch short of its lint findings has no
+    /// representation the worker could send, even when the probe fires after
+    /// every module's findings were gathered.
+    ///
+    /// Checkpoint 1 is the stage's own entry check and 2 the first module's
+    /// parse, so a stop at 3 never reaches the second module's parse. The
+    /// uncancelled control pass proves the fixture does report lint findings.
+    #[test]
+    fn a_lint_stage_cancelled_at_any_checkpoint_builds_no_batch() {
+        let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
+        let (demanded, uri_of, state) = linted_demand("/lsp-lint-cancel-control-test");
+        let counter = FiresOnPoll {
+            fire_at: usize::MAX,
+            polls: std::cell::Cell::new(0),
+        };
+        let complete = super::lint_stage(demanded, &uri_of, state.encoding, &counter, &lint);
+        assert!(
+            complete.as_deref().is_ok_and(has_lint_finding),
+            "the uncancelled pass reports the injected unused imports"
+        );
+        let checkpoints = counter.polls.get();
+        assert!(checkpoints > 3, "the pass polls past the second parse");
+
+        for fire_at in [1, 3, checkpoints] {
+            let (demanded, uri_of, state) = linted_demand("/lsp-lint-cancel-mid-pass-test");
+            let probe = FiresOnPoll {
+                fire_at,
+                polls: std::cell::Cell::new(0),
+            };
+            let outcome = super::lint_stage(demanded, &uri_of, state.encoding, &probe, &lint);
+            assert_eq!(
+                probe.polls.get(),
+                fire_at,
+                "the stage must stop at the checkpoint that fired"
+            );
+            assert!(
+                matches!(outcome, Err(ipe_lint::LintCancelled)),
+                "a lint stage cancelled at checkpoint {fire_at} must build no batch"
+            );
+        }
+    }
+
+    /// The demand stage's output for `state`, with each user module's URI.
+    fn demanded_of(
+        state: &State,
+        lint: &super::LintPass,
+    ) -> (super::Demanded, BTreeMap<Vec<String>, Url>) {
+        let root = state.db.root().expect("a synced root");
+        let entry_module = state.entry_module().to_vec();
+        let entry_file = root
+            .files(state.db.db())
+            .get(&entry_module)
+            .copied()
+            .expect("the entry module's input");
+        let uri_of: BTreeMap<Vec<String>, Url> = state
+            .served
+            .layout()
+            .expect("a served layout")
+            .path_of_module
+            .iter()
+            .filter_map(|(module, path)| Some((module.clone(), Url::from_file_path(path).ok()?)))
+            .collect();
+        let demanded = super::demand_stage(
+            state.db.db().clone(),
+            root,
+            entry_file,
+            &uri_of,
+            &entry_module,
+            state.encoding,
+            lint,
+        );
+        (demanded, uri_of)
     }
 
     /// A sync with no paired recompute leaves the current worker's lint stage

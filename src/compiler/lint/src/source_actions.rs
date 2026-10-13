@@ -79,7 +79,10 @@ pub fn organize_imports(module: &SourceModule, config: &LintConfig) -> Option<Bl
     let report = std::cell::OnceCell::new();
     organize_imports_dropping(module, |imp| {
         report
-            .get_or_init(|| run(std::slice::from_ref(module), config))
+            .get_or_init(|| {
+                let Ok(report) = run(std::slice::from_ref(module), config, &crate::NeverCancel);
+                report
+            })
             .findings
             .iter()
             .any(|f| {
@@ -304,7 +307,8 @@ pub fn fix_all_bounded(
 /// Findings per rule across `modules`.
 fn rule_counts(modules: &[SourceModule], config: &LintConfig) -> BTreeMap<&'static str, usize> {
     let mut counts = BTreeMap::new();
-    for finding in run(modules, config).findings {
+    let Ok(report) = run(modules, config, &crate::NeverCancel);
+    for finding in report.findings {
         *counts.entry(finding.rule).or_insert(0usize) += 1;
     }
     counts
@@ -906,7 +910,11 @@ mod tests {
         let src = "module Main exposing (main)\n\nmain =\n    max 0 (min a (n + String.concat (List.map fmt (List.filter live records))))\n";
 
         let partial = fixed(src, 1);
-        let residual = run(&[module(&partial)], &LintConfig::default());
+        let Ok(residual) = run(
+            &[module(&partial)],
+            &LintConfig::default(),
+            &crate::NeverCancel,
+        );
         assert!(
             residual
                 .findings
@@ -916,7 +924,11 @@ mod tests {
         );
 
         let full = fixed(src, FIX_ALL_MAX_ROUNDS);
-        let converged = run(&[module(&full)], &LintConfig::default());
+        let Ok(converged) = run(
+            &[module(&full)],
+            &LintConfig::default(),
+            &crate::NeverCancel,
+        );
         assert!(
             !converged
                 .findings
@@ -934,7 +946,7 @@ mod tests {
             out.is_none(),
             "unsafe-convention carries no fix, nothing changes: {out:?}"
         );
-        let report = run(&[module(src)], &LintConfig::default());
+        let Ok(report) = run(&[module(src)], &LintConfig::default(), &crate::NeverCancel);
         assert!(
             report
                 .findings
