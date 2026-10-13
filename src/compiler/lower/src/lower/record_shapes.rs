@@ -7,8 +7,6 @@ use ipe_canon::ast as canon;
 use ipe_intern::Interner;
 use ipe_types::Ty;
 
-use super::ty_contains_var;
-
 /// The expected TYPE shape of one field of the canonical `HttpRequest`
 /// record — `String` / `Bool` / `Int` / `List (String, String)` (the
 /// header-pair list). Ground truth mirrors
@@ -373,7 +371,7 @@ pub(super) fn ty_is_int(ty: &Ty, interner: &Interner) -> bool {
 /// named `BackoffStrategy`? Used by the `RetryPolicy` shape check for the
 /// `strategy` field, or a free `Ty::Var` (solver left the field unsolved).
 pub(super) fn is_backoff_strategy_ty(interner: &Interner, ty: &Ty) -> bool {
-    if ty_contains_var(ty) {
+    if !ipe_types::ty_is_ground(ty) {
         return true;
     }
     matches!(ty, Ty::Con { module, name, args }

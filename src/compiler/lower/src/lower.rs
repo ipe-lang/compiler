@@ -76,7 +76,8 @@ use record_shapes::{
 };
 use ty_templates::{
     canon_type_contains_record_key_set, generic_binding_breaks_clone, match_signature_template,
-    ty_contains_fun, ty_contains_record_key_set, ty_contains_var, ty_has_fun_in_derive_carrier,
+    ty_contains_fun, ty_contains_record_key_set, ty_fields_mention_var,
+    ty_has_fun_in_derive_carrier,
 };
 
 /// One lowered function parameter: its (possibly synthetic) binder name and its
@@ -303,21 +304,6 @@ const fn mapper_param_binds_fn_element(
 ) -> bool {
     matches!(ty, Ty::Fun(..))
         && ipe_kernels::mapper_param_binds_stored_element(shape, arity, arg, param)
-}
-
-/// Whether `t` still holds a type variable anywhere, an open record row tail included.
-///
-/// The walk is bounded by the solved type's own depth.
-fn ty_has_type_var(t: &Ty) -> bool {
-    match t {
-        Ty::Var(_) | Ty::Wildcard => true,
-        Ty::Fun(a, b) => ty_has_type_var(a) || ty_has_type_var(b),
-        Ty::Con { args, .. } | Ty::Tuple(args) => args.iter().any(ty_has_type_var),
-        Ty::Record(fields, tail) => {
-            matches!(tail, RowTail::Open(_)) || fields.values().any(ty_has_type_var)
-        }
-        Ty::Unit => false,
-    }
 }
 
 /// The qualified surface name of app entry `kernel` (`Web.embed`), as diagnostics print it.
@@ -812,7 +798,7 @@ fn is_retry_policy_record(interner: &Interner, ty: &Ty) -> bool {
 /// for the name+type gate — so the type check lives in exactly one place.
 fn is_kernel_shouldretry_ty(interner: &Interner, field_ty: &Ty) -> bool {
     // Solver left `e` as a free variable anywhere in the field type.
-    if ty_contains_var(field_ty) {
+    if !ty_is_ground(field_ty) {
         return true;
     }
     // `e` was unified to the built-in `Error` type: `field_ty = Error -> Bool`.
@@ -16676,7 +16662,7 @@ impl<'a> Lowerer<'a> {
                 // `RetryPolicy e` is the one stdlib record whose type parameter
                 // `e` may remain a free `Ty::Var` (the solver leaves it
                 // unresolved when the error channel is not further constrained).
-                // The `!ty_contains_var` guard below would skip it, but the
+                // The `!ty_fields_mention_var` guard below would skip it, but the
                 // backend MUST have a registered struct to call
                 // `record_struct_by_key` — otherwise field access and retry
                 // builders ICE (IPE-I0001). Detect this exact shape first and
@@ -16707,7 +16693,7 @@ impl<'a> Lowerer<'a> {
                 // sound: an unannotated binding can never be generic (the lowerer rejects an
                 // untyped binding with parameters), so every genuinely-generic
                 // record reaches the backend through a signature.
-                if !ty_contains_var(ty) {
+                if !ty_fields_mention_var(ty) {
                     let ir = self.ir_type_from_ty(ty, Span::DUMMY)?;
                     // G-b gate: skip records whose IR carries a function type.
                     // The `Web.tea` cfg record has function-typed fields
@@ -17137,7 +17123,7 @@ impl<'a> Lowerer<'a> {
                 // parameter from its solved type, exactly as the return does.
                 //
                 // A parameter the body does NOT thread to the return leaves its
-                // region a bare solver var (`ty_contains_var`) — those keep the
+                // region a bare solver var (not `ty_is_ground`) — those keep the
                 // generic lowering (`constFn x = "hi"`, `use x = 1`), which is
                 // sound because the parameter never flows into a concrete return.
                 // The check keys on `any_syms_minted`, so a genuine named type
@@ -17178,8 +17164,9 @@ impl<'a> Lowerer<'a> {
                         // (handled below) whose row tail is its extensibility,
                         // not an unknown, so only its fields must be ground; every
                         // other region is concretized only when ground. Inference
-                        // already refused every wildcard these predicates would
-                        // leave undetermined (`ty_is_ground`).
+                        // refuses every wildcard these predicates would leave
+                        // undetermined; this read-back check, over faithfully
+                        // read row tails, is the second gate behind it.
                         let determined = match region_ty {
                             Ty::Record(fields, _) => fields.values().all(ty_is_ground),
                             _ => ty_is_ground(region_ty),
@@ -22092,7 +22079,7 @@ impl<'a> Lowerer<'a> {
     /// whether it is generic; a monomorphic update is byte-identical to b3.
     fn lower_update(&self, base: &canon::Expr, fields: &[(Symbol, canon::Expr)]) -> DResult<Expr> {
         if let Some(base_ty) = self.region_ty(base.span)
-            && ty_contains_var(base_ty)
+            && ty_fields_mention_var(base_ty)
         {
             return Err(unsupported(base.span, Feature::BoundedRecordUpdate));
         }
@@ -27855,9 +27842,10 @@ impl<'a> Lowerer<'a> {
     /// generics in scope, a missing region type proves nothing, so it is
     /// refused (fail-closed).
     ///
-    /// A region type carries no record row tails, so it cannot show whether an
-    /// entry's model reaches one of `row_vars` (the annotation's row
-    /// generics); with any in scope the entry is refused (fail-closed).
+    /// A region type shows only the row generics its own records reach, not
+    /// whether a value the entry captures reaches one of `row_vars` (the
+    /// annotation's row generics); with any in scope the entry is refused
+    /// (fail-closed).
     ///
     /// A solved type still holding a type variable that is no generic of the
     /// definition means the program never fixes the app's model or message
@@ -27884,7 +27872,7 @@ impl<'a> Lowerer<'a> {
                 GenericAppEntryReach::Undetermined,
             ));
         }
-        if self.region_ty(span).is_some_and(ty_has_type_var) {
+        if self.region_ty(span).is_some_and(|ty| !ty_is_ground(ty)) {
             return Err(Diagnostic::Name {
                 span,
                 msg: NameError::UnpinnedAppEntry {
@@ -36649,6 +36637,119 @@ mod tests {
         assert!(
             !super::is_retry_policy_record(&interner, &ty),
             "open-row RetryPolicy must be rejected"
+        );
+    }
+
+    /// An open-tail record is not ground, though none of its fields mentions a variable.
+    #[test]
+    fn open_tail_record_is_not_ground() {
+        let mut interner = Interner::new();
+        let int_ty = builtin_con(&mut interner, "Int");
+        let open = open_record(&mut interner, &[("x", int_ty.clone())]);
+        let closed = closed_record(&mut interner, &[("x", int_ty)]);
+        assert!(
+            !ipe_types::ty_is_ground(&open),
+            "a record over an open row must not be ground"
+        );
+        assert!(
+            !ipe_types::ty_is_ground(&Ty::Tuple(vec![open.clone(), Ty::Unit])),
+            "an open row nested under another type must not be ground"
+        );
+        assert!(
+            ipe_types::ty_is_ground(&closed),
+            "a closed record of ground fields must be ground"
+        );
+        assert!(
+            !super::ty_fields_mention_var(&open),
+            "the fields-only read must not consult the row tail"
+        );
+    }
+
+    /// A row-polymorphic record update lowers: its gate reads the base's fields, never its open tail.
+    #[test]
+    fn row_poly_record_update_still_lowers() {
+        let src = "module Main exposing (setX)\n\nsetX : { a | x : Int } -> { a | x : Int }\nsetX r =\n    { r | x = 1 }\n";
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(src, &mut i).expect("source must parse");
+        let m = ipe_canon::canonicalise(&parsed, &mut i).expect("source must resolve");
+        let types = ipe_types::infer(&m, &mut i).expect("source must type-check");
+        assert!(
+            types
+                .regions
+                .values()
+                .any(|ty| matches!(ty, Ty::Record(_, ipe_types::RowTail::Open(_)))),
+            "the update's base must read back as an open record"
+        );
+        let lowered = crate::lower(&m, &types, &mut i, "", "");
+        assert!(
+            lowered.is_ok(),
+            "a row-polymorphic record update must lower, got {:?}",
+            lowered.err()
+        );
+    }
+
+    /// Classify an app-entry reference whose region type is a function over an `{ x : Int }` record ending in `tail`.
+    fn classify_app_entry_over_row(tail: ipe_types::RowTail) -> ipe_diagnostics::DResult<()> {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let x = interner.intern("x").expect("intern field name");
+        let int_ty = builtin_con(&mut interner, "Int");
+        let model = Ty::Record(BTreeMap::from([(x, int_ty)]), tail);
+        let span = Span::new(10, 20);
+        let mut types = empty_solved_types();
+        types.regions.insert(
+            (Vec::new(), span),
+            Ty::Fun(Box::new(model), Box::new(Ty::Unit)),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        lowerer.reject_generic_app_entry(KernelFn::WebEmbed, span, &BTreeSet::new())
+    }
+
+    /// An app entry whose solved type still carries an open row is refused as unpinned (IPE-N0051).
+    #[test]
+    fn app_entry_region_open_row_refused() {
+        let open =
+            classify_app_entry_over_row(ipe_types::RowTail::Open(ipe_types::tag_solver_var(3)));
+        assert!(
+            matches!(
+                open,
+                Err(ipe_diagnostics::Diagnostic::Name {
+                    msg: ipe_diagnostics::NameError::UnpinnedAppEntry { .. },
+                    ..
+                })
+            ),
+            "an app entry over an unfixed row must be refused with IPE-N0051, got {open:?}"
+        );
+        let closed = classify_app_entry_over_row(ipe_types::RowTail::Closed);
+        assert!(
+            closed.is_ok(),
+            "an app entry over a closed ground record must be accepted, got {closed:?}"
         );
     }
 
