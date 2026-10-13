@@ -15,8 +15,11 @@
 //!   flag).
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+
+use panic_scan::{WalkError, Want, rust_sources};
 
 use crate::coverage::cli_surface::CliItem;
 use crate::coverage::contract::{AspectCheck, Cell};
@@ -104,9 +107,18 @@ impl AspectCheck<CliItem> for TestedColumn {
     }
 
     fn check(&self, item: &CliItem) -> Cell {
+        let literals = match self.inner.as_ref() {
+            TestScan::Scanned(literals) => literals,
+            TestScan::Unscanned(refusal) => {
+                return Cell::Hole(format!(
+                    "`ipe {}` cannot be checked for a standing test: {refusal}",
+                    item_label(item)
+                ));
+            }
+        };
         match item {
             CliItem::Subcommand { name, .. } => {
-                if self.inner.mentions_command(name) {
+                if literals.contains(*name) {
                     Cell::Ok
                 } else {
                     Cell::Hole(format!(
@@ -118,7 +130,7 @@ impl AspectCheck<CliItem> for TestedColumn {
             CliItem::Flag { command, flag, .. } => {
                 // Extract the bare `--flag` token from the synopsis.
                 let bare = bare_flag_token(flag);
-                if self.inner.mentions_flag(command, bare) {
+                if literals.contains(bare) {
                     Cell::Ok
                 } else {
                     Cell::Warn(format!(
@@ -132,37 +144,69 @@ impl AspectCheck<CliItem> for TestedColumn {
 }
 
 /// The result of scanning the `tests/` tree for subcommand and flag mentions.
-struct TestScan {
+#[derive(Debug)]
+enum TestScan {
     /// Every string literal found in test `.rs` files, deduplicated.
-    literals: BTreeSet<String>,
+    Scanned(BTreeSet<String>),
+    /// The tree could not be read whole, so no mention can be trusted absent.
+    Unscanned(TreeRefusal),
 }
 
 impl TestScan {
     fn scan() -> Arc<Self> {
         static SCAN: OnceLock<Arc<TestScan>> = OnceLock::new();
-        SCAN.get_or_init(|| {
-            let tests_root = workspace_path("src/ipe-cli/tests");
-            let mut literals = BTreeSet::new();
-            for path in rs_files_under(&tests_root) {
-                if is_coverage_file(&path) {
-                    continue;
-                }
-                let Ok(src) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                collect_string_literals(&src, &mut literals);
+        SCAN.get_or_init(|| Arc::new(Self::scan_tree(&workspace_path("src/ipe-cli/tests"))))
+            .clone()
+    }
+
+    /// Collect the string literals of every non-coverage `.rs` file under `tests_root`.
+    fn scan_tree(tests_root: &Path) -> Self {
+        let files = match rust_sources(tests_root, Want::RustFiles) {
+            Ok(files) => files,
+            Err(error) => return Self::Unscanned(TreeRefusal::Walk(error)),
+        };
+        let mut literals = BTreeSet::new();
+        for path in files {
+            if is_coverage_file(&path) {
+                continue;
             }
-            Arc::new(Self { literals })
-        })
-        .clone()
+            match std::fs::read_to_string(&path) {
+                Ok(src) => collect_string_literals(&src, &mut literals),
+                Err(error) => return Self::Unscanned(TreeRefusal::Read { file: path, error }),
+            }
+        }
+        Self::Scanned(literals)
     }
+}
 
-    fn mentions_command(&self, cmd: &str) -> bool {
-        self.literals.contains(cmd)
+/// The `ipe …` words naming `item` in a diagnostic.
+fn item_label(item: &CliItem) -> String {
+    match item {
+        CliItem::Subcommand { name, .. } => (*name).to_owned(),
+        CliItem::Flag { command, flag, .. } => format!("{command} {}", bare_flag_token(flag)),
     }
+}
 
-    fn mentions_flag(&self, _command: &str, flag: &str) -> bool {
-        self.literals.contains(flag)
+/// Why a source tree a column scans could not be read whole.
+#[derive(Debug)]
+enum TreeRefusal {
+    /// The walker refused to list the tree.
+    Walk(WalkError),
+    /// A listed file could not be read.
+    Read {
+        file: PathBuf,
+        error: std::io::Error,
+    },
+}
+
+impl fmt::Display for TreeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Walk(error) => write!(f, "the source tree cannot be listed whole ({error})"),
+            Self::Read { file, error } => {
+                write!(f, "source {} is unreadable ({error})", file.display())
+            }
+        }
     }
 }
 
@@ -276,10 +320,9 @@ impl AspectCheck<CliItem> for NotAdvertisedUnimplementedColumn {
     fn check(&self, item: &CliItem) -> Cell {
         match item {
             CliItem::Subcommand { name, .. } => match self.stubs.as_ref() {
-                StubScan::Unreadable { file, error } => Cell::Hole(format!(
+                StubScan::Unreadable(refusal) => Cell::Hole(format!(
                     "`ipe {name}` cannot be cleared of `todo!()` / `unimplemented!()`: \
-                     production source {} is unreadable ({error})",
-                    file.display()
+                     production {refusal}"
                 )),
                 StubScan::Scanned(stubs) if stubs.contains(*name) => Cell::Hole(format!(
                     "`ipe {name}` is advertised in the help table but its handler \
@@ -306,7 +349,9 @@ impl AspectCheck<CliItem> for NotAdvertisedUnimplementedColumn {
 /// such macro in ANY production source file — test files are excluded.
 fn scan_stub_commands() -> Arc<StubScan> {
     static STUBS: OnceLock<Arc<StubScan>> = OnceLock::new();
-    STUBS.get_or_init(|| Arc::new(scan_stub_sources())).clone()
+    STUBS
+        .get_or_init(|| Arc::new(scan_stub_sources(&workspace_path("src/ipe-cli/src"))))
+        .clone()
 }
 
 /// Outcome of scanning the CLI production sources for stubbed handlers.
@@ -314,30 +359,30 @@ fn scan_stub_commands() -> Arc<StubScan> {
 enum StubScan {
     /// Every production source was read; these commands are stubs.
     Scanned(BTreeSet<String>),
-    /// A production source could not be read, so no command can be cleared.
-    Unreadable {
-        file: PathBuf,
-        error: std::io::Error,
-    },
+    /// The production sources could not be read whole, so no command can be cleared.
+    Unreadable(TreeRefusal),
 }
 
-/// Read every CLI production source once and name the stubbed commands.
-fn scan_stub_sources() -> StubScan {
-    let src_root = workspace_path("src/ipe-cli/src");
+/// Read every CLI production source under `src_root` once and name the stubbed commands.
+fn scan_stub_sources(src_root: &Path) -> StubScan {
+    let files = match rust_sources(src_root, Want::RustFiles) {
+        Ok(files) => files,
+        Err(error) => return StubScan::Unreadable(TreeRefusal::Walk(error)),
+    };
 
     // Every Rust production source file: confirmed test modules and the
     // coverage probes themselves are excluded.
     let mut sources = Vec::new();
-    for path in rs_files_under(&src_root) {
-        let excluded = path.strip_prefix(&src_root).is_ok_and(|rel| {
-            panic_scan::is_verified_test_path(&src_root, rel) || rel.starts_with("coverage")
+    for path in files {
+        let excluded = path.strip_prefix(src_root).is_ok_and(|rel| {
+            panic_scan::is_verified_test_path(src_root, rel) || rel.starts_with("coverage")
         });
         if excluded {
             continue;
         }
         match std::fs::read_to_string(&path) {
             Ok(src) => sources.push(src),
-            Err(error) => return StubScan::Unreadable { file: path, error },
+            Err(error) => return StubScan::Unreadable(TreeRefusal::Read { file: path, error }),
         }
     }
 
@@ -366,32 +411,6 @@ fn workspace_path(rel: &str) -> PathBuf {
         .join(rel)
 }
 
-/// Collect every `.rs` file under `root`, skipping hidden dirs and `target/`.
-fn rs_files_under(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if !root.exists() {
-        return out;
-    }
-    let mut stack = vec![root.to_owned()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with('.') && name != "target" {
-                    stack.push(path);
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +435,54 @@ mod tests {
         assert!(
             !found.contains("dev watch"),
             "literals split by other code must not join: {found:?}"
+        );
+    }
+
+    /// A tree the walker refuses holes every command and flag rather than reading as untested.
+    #[test]
+    fn a_missing_tests_tree_holes_every_item() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-cli-tested-missing-{}", std::process::id()));
+        let column = TestedColumn {
+            inner: Arc::new(TestScan::scan_tree(&root)),
+        };
+        let items = [
+            CliItem::Subcommand {
+                name: "build",
+                summary: "Build",
+            },
+            CliItem::Flag {
+                command: "build",
+                flag: "[--out <dir>]",
+                desc: "Output",
+            },
+        ];
+        for item in &items {
+            let cell = column.check(item);
+            assert!(
+                matches!(cell, Cell::Hole(ref why)
+                    if why.contains("cannot be listed") && why.contains(&*root.to_string_lossy())),
+                "{cell:?}"
+            );
+        }
+    }
+
+    /// Production sources the walker refuses clear no command of a stub.
+    #[test]
+    fn a_missing_production_tree_clears_no_command() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-cli-stubs-missing-{}", std::process::id()));
+        let column = NotAdvertisedUnimplementedColumn {
+            stubs: Arc::new(scan_stub_sources(&root)),
+        };
+        let cell = column.check(&CliItem::Subcommand {
+            name: "build",
+            summary: "Build",
+        });
+        assert!(
+            matches!(cell, Cell::Hole(ref why)
+                if why.contains("cannot be listed") && why.contains(&*root.to_string_lossy())),
+            "{cell:?}"
         );
     }
 }
