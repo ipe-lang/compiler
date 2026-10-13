@@ -5,6 +5,23 @@ import Ipe.Task as Task
 import Ipe.Error
 
 
+kindLabel : ErrorKind -> String
+kindLabel kind =
+    case kind of
+        Io -> "Io"
+        Network -> "Network"
+        Ffi -> "Ffi"
+        Decode -> "Decode"
+        Timeout -> "Timeout"
+        NotFound -> "NotFound"
+        PermissionDenied -> "PermissionDenied"
+        InvalidInput -> "InvalidInput"
+        Conflict -> "Conflict"
+        Unavailable -> "Unavailable"
+        Unexpected -> "Unexpected"
+        LimitExceeded -> "LimitExceeded"
+
+
 main =
     let
         e1 = Error.io "disk full"
@@ -12,27 +29,21 @@ main =
         e2 = Error.timeout
 
         e3 = Error.withMessage "custom message" e1
+
+        e4 = Error.limitExceeded "input too large"
     in
     case e1 of
         Error kind info ->
             do
-                kindName =
-                    case kind of
-                        Io -> "Io"
-                        Network -> "Network"
-                        Ffi -> "Ffi"
-                        Decode -> "Decode"
-                        Timeout -> "Timeout"
-                        NotFound -> "NotFound"
-                        PermissionDenied -> "PermissionDenied"
-                        InvalidInput -> "InvalidInput"
-                        Conflict -> "Conflict"
-                        Unavailable -> "Unavailable"
-                        Unexpected -> "Unexpected"
+                kindName = kindLabel kind
                 Io.println (Error.toString e1)
                 Io.println info.message
                 Io.println kindName
                 Io.println (if Error.isRetryable e1 then "retryable" else "not-retryable")
                 Io.println (if Error.isRetryable e2 then "retryable" else "not-retryable")
                 Io.println (Error.toString e3)
+                Io.println (Error.toString e4)
+                Io.println ("label " ++ kindLabel (Error.kind e4))
+                Io.println ("name " ++ Error.kindName (Error.kind e4))
+                Io.println (if Error.isRetryable e4 then "limit retryable" else "limit not-retryable")
                 Io.println "done"

@@ -5,8 +5,9 @@
 -- parameters — the runtime stringifies the key for the LRU map
 -- but the surface API stays parametric.
 --
--- The number of live caches is itself bounded: `new` fails once too
--- many caches are live, and `destroy` reclaims one.  A long-lived
+-- The number of live caches is itself bounded: `new` fails with a
+-- `LimitExceeded` error once too many caches are live, and `destroy`
+-- reclaims one.  A long-lived
 -- server creating caches per request must `destroy` them when done.
 --
 -- Every typed record ships with a `defaultCfg` constructor + `with*`

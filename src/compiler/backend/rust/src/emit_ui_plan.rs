@@ -586,6 +586,7 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::ErrorDecode
         | KernelFn::ErrorConflict
         | KernelFn::ErrorUnavailable
+        | KernelFn::ErrorLimitExceeded
         | KernelFn::ErrorTimeout
         | KernelFn::ErrorNotFound
         | KernelFn::ErrorPermissionDenied

@@ -81,6 +81,10 @@ fn error_adt_roundtrip_runs_and_prints_expected_output() {
         "not-retryable",      // Error.isRetryable e1 (Io) -- false
         "retryable",          // Error.isRetryable e2 (Timeout) -- true
         "Io: custom message", // Error.withMessage keeps the kind, replaces the message
+        "LimitExceeded: input too large", // Error.limitExceeded classifies its own kind
+        "label LimitExceeded", // the exhaustive `case kind of` reaches the new arm
+        "name LimitExceeded", // Error.kindName renders the variant name
+        "limit not-retryable", // LimitExceeded is not retryable
         "done",
     ];
     for line in expected {

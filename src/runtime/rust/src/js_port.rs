@@ -47,6 +47,21 @@
 use crate::seal_codec::{SealLimits, seal_encode};
 use crate::tea::{IpeCmd, IpeSub};
 
+/// The error a reply or terminal frame that fails its seal decode surfaces
+/// as: `LimitExceeded` when the byte or depth budget turned it back,
+/// `Unexpected` otherwise. Both carry `message`.
+#[cfg(any(not(target_arch = "wasm32"), feature = "wasm-client"))]
+fn seal_refusal_error(
+    refused: &crate::seal_codec::SealDecodeError,
+    message: &str,
+) -> crate::error::IpeError {
+    if refused.is_ceiling() {
+        crate::error::IpeError::limit_exceeded(message)
+    } else {
+        crate::error::IpeError::unexpected(message.to_owned())
+    }
+}
+
 // ─── SessionId newtype ──────────────────────────────────────────────────────
 
 /// A validated session identifier: a non-empty, all-lowercase-hex string
@@ -618,11 +633,9 @@ mod native {
                 if let Some(ports) = owner_sid.as_ref().and_then(|s| g.get_mut(&s.0))
                     && ports.pending.len() >= MAX_OUTSTANDING
                 {
-                    return crate::core::IpeResult::Err(
-                        "js_request: outstanding waiter ceiling reached"
-                            .to_string()
-                            .into(),
-                    );
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_request: outstanding waiter ceiling reached".to_owned(),
+                    ));
                 }
             }
 
@@ -673,9 +686,10 @@ mod native {
                     // Decode the reply fail-closed through the seal gate.
                     match seal_decode(&reply_value.to_string(), &decoder, SealLimits::default()) {
                         Ok(v) => crate::core::IpeResult::Ok(v),
-                        Err(_) => crate::core::IpeResult::Err(
-                            "js_request: reply failed seal decode".to_string().into(),
-                        ),
+                        Err(refused) => crate::core::IpeResult::Err(seal_refusal_error(
+                            &refused,
+                            "js_request: reply failed seal decode",
+                        )),
                     }
                 }
                 Ok(Err(_)) => {
@@ -731,11 +745,9 @@ mod native {
                 let mut g = lock_sessions();
                 let ports = g.entry(sid.0.clone()).or_insert_with(SessionPorts::new);
                 if ports.streams.len() >= MAX_OPEN_SESSIONS {
-                    return crate::core::IpeResult::Err(
-                        "js_open_session: open-session ceiling reached"
-                            .to_string()
-                            .into(),
-                    );
+                    return crate::core::IpeResult::Err(IpeError::unavailable(
+                        "js_open_session: open-session ceiling reached".to_owned(),
+                    ));
                 }
                 ports.streams.insert(
                     session_id,
@@ -934,11 +946,10 @@ mod native {
                     match seal_decode(&terminal_value.to_string(), &decoder, SealLimits::default())
                     {
                         Ok(v) => crate::core::IpeResult::Ok(v),
-                        Err(_) => crate::core::IpeResult::Err(
-                            "js_close_session: terminal failed seal decode"
-                                .to_string()
-                                .into(),
-                        ),
+                        Err(refused) => crate::core::IpeResult::Err(seal_refusal_error(
+                            &refused,
+                            "js_close_session: terminal failed seal decode",
+                        )),
                     }
                 }
                 Ok(Err(_)) => crate::core::IpeResult::Err(
@@ -1199,11 +1210,9 @@ mod wasm {
             // Refuse when the ceiling is already reached.
             let at_limit = PENDING.with(|p| p.borrow().len() >= MAX_OUTSTANDING);
             if at_limit {
-                return crate::core::IpeResult::Err(
-                    "js_request: outstanding waiter ceiling reached"
-                        .to_string()
-                        .into(),
-                );
+                return crate::core::IpeResult::Err(IpeError::unavailable(
+                    "js_request: outstanding waiter ceiling reached".to_owned(),
+                ));
             }
 
             // Serialize and wrap with the correlation id.
@@ -1270,15 +1279,12 @@ mod wasm {
                     // Clean up (idempotent).
                     PENDING.with(|p| p.borrow_mut().remove(&cor_id));
                     let reply_str = reply_js.as_string().unwrap_or_default();
-                    match serde_json::from_str::<JsonVal>(&reply_str)
-                        .ok()
-                        .and_then(|v| {
-                            seal_decode(&v.to_string(), &decoder, SealLimits::default()).ok()
-                        }) {
-                        Some(v) => crate::core::IpeResult::Ok(v),
-                        None => crate::core::IpeResult::Err(
-                            "js_request: reply failed seal decode".to_string().into(),
-                        ),
+                    match seal_decode(&reply_str, &decoder, SealLimits::default()) {
+                        Ok(v) => crate::core::IpeResult::Ok(v),
+                        Err(refused) => crate::core::IpeResult::Err(seal_refusal_error(
+                            &refused,
+                            "js_request: reply failed seal decode",
+                        )),
                     }
                 }
                 Err(_) => {
@@ -1306,11 +1312,9 @@ mod wasm {
         Box::pin(async move {
             let at_limit = SESSIONS.with(|s| s.borrow().len() >= MAX_OPEN_SESSIONS);
             if at_limit {
-                return crate::core::IpeResult::Err(
-                    "js_open_session: open-session ceiling reached"
-                        .to_string()
-                        .into(),
-                );
+                return crate::core::IpeResult::Err(IpeError::unavailable(
+                    "js_open_session: open-session ceiling reached".to_owned(),
+                ));
             }
             SESSIONS.with(|s| {
                 s.borrow_mut().insert(
@@ -1461,17 +1465,12 @@ mod wasm {
             match outcome {
                 Ok(reply_js) => {
                     let reply_str = reply_js.as_string().unwrap_or_default();
-                    match serde_json::from_str::<JsonVal>(&reply_str)
-                        .ok()
-                        .and_then(|v| {
-                            seal_decode(&v.to_string(), &decoder, SealLimits::default()).ok()
-                        }) {
-                        Some(v) => crate::core::IpeResult::Ok(v),
-                        None => crate::core::IpeResult::Err(
-                            "js_close_session: terminal failed seal decode"
-                                .to_string()
-                                .into(),
-                        ),
+                    match seal_decode(&reply_str, &decoder, SealLimits::default()) {
+                        Ok(v) => crate::core::IpeResult::Ok(v),
+                        Err(refused) => crate::core::IpeResult::Err(seal_refusal_error(
+                            &refused,
+                            "js_close_session: terminal failed seal decode",
+                        )),
                     }
                 }
                 Err(_) => {
@@ -2049,8 +2048,10 @@ mod tests {
             })
             .await;
             assert!(
-                matches!(result, crate::IpeResult::Err(_)),
-                "ceiling breach must immediately return Err"
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    "js_request: outstanding waiter ceiling reached".to_owned()
+                )),
+                "a ceiling breach is refused at once as Unavailable: it frees as replies arrive"
             );
             session_close(&sid);
         }
@@ -2137,8 +2138,36 @@ mod tests {
             })
             .await;
             assert!(
-                matches!(result, crate::IpeResult::Err(_)),
-                "malformed reply must resolve Err, got {result:?}"
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unexpected(
+                    "js_request: reply failed seal decode".to_owned()
+                )),
+                "a reply of the wrong shape is no ceiling: Unexpected, got {result:?}"
+            );
+            session_close(&sid);
+        }
+
+        // A reply past the seal byte budget resolves the Task with a
+        // `LimitExceeded` error carrying the same message as a shape refusal.
+        #[tokio::test]
+        async fn oversized_reply_is_limit_exceeded() {
+            let sid = test_sid("7a8b9c0d1e2f7a8b9c0d1e2f7a8b9c0d");
+            session_open(&sid);
+            let sid_clone = sid.clone();
+            let past_budget = "a".repeat(crate::seal_codec::DEFAULT_SEAL_MAX_INPUT_BYTES);
+            let result = drive_request(&sid, move |frame| {
+                let v: serde_json::Value = serde_json::from_str(&frame).unwrap_or_default();
+                if let Some(id) = v.get("__ipe_id").and_then(|x| x.as_u64()) {
+                    // The quoted string is two bytes past the budget.
+                    let reply = format!(r#"{{"__ipe_id":{id},"payload":"{past_budget}"}}"#);
+                    deliver_inbound_for(&sid_clone, reply);
+                }
+            })
+            .await;
+            assert!(
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::limit_exceeded(
+                    "js_request: reply failed seal decode"
+                )),
+                "a reply past the byte budget is LimitExceeded, got {result:?}"
             );
             session_close(&sid);
         }
@@ -2332,8 +2361,10 @@ mod tests {
             })
             .await;
             assert!(
-                matches!(over, crate::IpeResult::Err(_)),
-                "open past the ceiling must be refused with Err"
+                matches!(&over, crate::IpeResult::Err(e) if *e == IpeError::unavailable(
+                    "js_open_session: open-session ceiling reached".to_owned()
+                )),
+                "an open past the ceiling is refused as Unavailable: it frees as sessions close"
             );
             session_close(&sid);
         }
@@ -2383,8 +2414,40 @@ mod tests {
             );
             let result = close.await.expect("close joins");
             assert!(
-                matches!(result, crate::IpeResult::Err(_)),
-                "malformed terminal must resolve Err, got {result:?}"
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::unexpected(
+                    "js_close_session: terminal failed seal decode".to_owned()
+                )),
+                "a terminal of the wrong shape is no ceiling: Unexpected, got {result:?}"
+            );
+            session_close(&sid);
+        }
+
+        // A terminal past the seal byte budget resolves the close Task with a
+        // `LimitExceeded` error.
+        #[tokio::test]
+        async fn oversized_terminal_is_limit_exceeded() {
+            let sid = test_sid("c5c6c7c8d5d6d7d8e5e6e7e8f5f6f7f8");
+            session_open(&sid);
+            let (handle, _out) = open_session_capturing(&sid).await;
+            let sid_clone = sid.clone();
+            let close = tokio::spawn(with_session(
+                &SessionScope::new(sid.to_string()),
+                move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let past_budget = "a".repeat(crate::seal_codec::DEFAULT_SEAL_MAX_INPUT_BYTES);
+            deliver_inbound_for(
+                &sid_clone,
+                format!(
+                    r#"{{"__ipe_session":{handle},"__ipe_terminal":true,"payload":"{past_budget}"}}"#
+                ),
+            );
+            let result = close.await.expect("close joins");
+            assert!(
+                matches!(&result, crate::IpeResult::Err(e) if *e == IpeError::limit_exceeded(
+                    "js_close_session: terminal failed seal decode"
+                )),
+                "a terminal past the byte budget is LimitExceeded, got {result:?}"
             );
             session_close(&sid);
         }

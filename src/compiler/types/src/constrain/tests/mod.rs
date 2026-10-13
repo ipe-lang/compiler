@@ -461,7 +461,7 @@ mod registry_phase_c_tests {
             K::CharIsAlphaNum,
             K::CharIsHexDigit,
             K::CharIsOctDigit,
-            // Error (18 — Ipe.Error real `Error ErrorKind ErrorInfo` ADT:
+            // Error (19 — Ipe.Error real `Error ErrorKind ErrorInfo` ADT:
             // constructors, modifiers, render, classification, inspectors)
             K::ErrorUnexpected,
             K::ErrorInvalidInput,
@@ -471,6 +471,7 @@ mod registry_phase_c_tests {
             K::ErrorDecode,
             K::ErrorConflict,
             K::ErrorUnavailable,
+            K::ErrorLimitExceeded,
             K::ErrorTimeout,
             K::ErrorNotFound,
             K::ErrorPermissionDenied,

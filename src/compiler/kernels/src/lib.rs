@@ -1777,10 +1777,8 @@ pub enum StdlibKernel {
     BasicsCompare,
     // ── end Basics numerics ──────────────────────────────────────────
     // ── Error (Ipe.Error — minimal `Error = String` slice) ─────────
-    // Message-carrying constructors: `String -> Error`. With `IpeError = String`
-    // the message IS the error value, so all eight collapse to one identity
-    // runtime symbol (`ipe_error_from_message`); the distinct Ipê-level names are
-    // preserved for the rich-ADT upgrade.
+    // Message-carrying constructors: `String -> Error`. Each classifies its own
+    // `ErrorKind` through its own runtime symbol (`ipe_error_<kind>`).
     ErrorUnexpected,
     ErrorInvalidInput,
     ErrorIo,
@@ -1789,6 +1787,9 @@ pub enum StdlibKernel {
     ErrorDecode,
     ErrorConflict,
     ErrorUnavailable,
+    /// `limitExceeded : String -> Error` — a declared-ceiling refusal
+    /// (`ErrorKind.LimitExceeded`).
+    ErrorLimitExceeded,
     // Nullary constructors: `Error` (a canonical message string).
     ErrorTimeout,
     ErrorNotFound,
@@ -4279,6 +4280,14 @@ impl StdlibKernel {
                 1,
                 Pure,
                 "ipe_error_unavailable",
+                IpeOrder,
+            ),
+            Self::ErrorLimitExceeded => d(
+                "Error",
+                "limitExceeded",
+                1,
+                Pure,
+                "ipe_error_limit_exceeded",
                 IpeOrder,
             ),
             Self::ErrorTimeout => d("Error", "timeout", 0, Pure, "ipe_error_timeout", IpeOrder),
@@ -7767,6 +7776,7 @@ impl StdlibKernel {
         Self::ErrorDecode,
         Self::ErrorConflict,
         Self::ErrorUnavailable,
+        Self::ErrorLimitExceeded,
         Self::ErrorTimeout,
         Self::ErrorNotFound,
         Self::ErrorPermissionDenied,
@@ -12320,7 +12330,8 @@ impl StdlibKernel {
             | Self::ErrorFfi
             | Self::ErrorDecode
             | Self::ErrorConflict
-            | Self::ErrorUnavailable => Some(&STRING_TO_ERROR),
+            | Self::ErrorUnavailable
+            | Self::ErrorLimitExceeded => Some(&STRING_TO_ERROR),
             Self::ErrorTimeout | Self::ErrorNotFound | Self::ErrorPermissionDenied => Some(&ERROR),
             Self::ErrorWithMessage => Some(&STRING_TO_ERROR_TO_ERROR),
             Self::ErrorIsRetryable => Some(&ERROR_TO_BOOL),
@@ -13818,6 +13829,7 @@ impl StdlibKernel {
             | Self::ErrorDecode
             | Self::ErrorConflict
             | Self::ErrorUnavailable
+            | Self::ErrorLimitExceeded
             | Self::ErrorTimeout
             | Self::ErrorNotFound
             | Self::ErrorPermissionDenied

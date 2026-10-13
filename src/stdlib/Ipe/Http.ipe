@@ -6,6 +6,9 @@
 -- redaction. These records are transport DTOs carried to that boundary;
 -- downstream code MUST NOT re-validate.
 --
+-- A response body past `IPE_HTTP_MAX_BODY_BYTES`, or a redirect chain past its
+-- `FollowRedirects` maximum, fails with a `LimitExceeded` error.
+--
 -- Dial rule: a URL with `\` anywhere, or `@` in its path or fragment, is
 -- refused (its credentials could run into the host) — write `@` as `%40`.
 -- An `@` in the query is allowed, but an error for that URL then withholds
@@ -42,8 +45,9 @@
 --
 -- `parseQuery` is pure: trims a leading `?`, splits on `&`/`=`, decodes each
 -- key and value under the form grammar (`+` is a space), first-key-wins, and
--- returns a `Dict String String`. A malformed escape, invalid UTF-8, or too
--- many pairs refuses the whole query with an `Err`.
+-- returns a `Dict String String`. A malformed escape or invalid UTF-8 refuses
+-- the whole query with an `InvalidInput` error; more than 1024 pairs, with a
+-- `LimitExceeded` error.
 --
 -- Builders (`defaultRequest` / `with*`) are pure Ipe. `withHeader`
 -- cons-prepends `(k, v)` onto `req.headers`, so the most-recently-added
@@ -147,9 +151,9 @@ request =
 -- | Decode a form-encoded query string into its key/value pairs.
 --
 -- A leading `?` is dropped and a repeated key keeps its first value. Returns
--- `Err` when any key or value holds a malformed percent-escape or decodes to
--- invalid UTF-8, or when the query carries too many pairs — there is no
--- partial result.
+-- an `InvalidInput` error when any key or value holds a malformed
+-- percent-escape or decodes to invalid UTF-8, and a `LimitExceeded` error when
+-- the query carries more than 1024 pairs — there is no partial result.
 parseQuery : String -> Result Error (Dict String String)
 parseQuery =
     Kernel.kernel "Http_parseQuery"
@@ -279,7 +283,8 @@ withUrl url req =
 
 -- | Set the redirect policy for a request.  `withRedirects NoRedirects`
 -- prevents all redirects; `withRedirects (FollowRedirects n)` follows up to
--- `n` hops.
+-- `n` hops, and the hop past them fails the request with a `LimitExceeded`
+-- error.
 withRedirects : RedirectPolicy -> HttpRequest -> HttpRequest
 withRedirects p req =
     { req | redirects = p }

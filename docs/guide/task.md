@@ -113,9 +113,10 @@ step:
   the loop with its error unchanged. `Step` comes from
   `import Ipe.Task as Task exposing (Step(..))`.
 - **The ceiling is required.** `Task.loop limit init step` runs the step at most
-  `limit` times. A loop that needs one more step fails with an `InvalidInput`
+  `limit` times. A loop that needs one more step fails with a `LimitExceeded`
   error naming the ceiling, so a runaway loop stops with a typed error rather
-  than spinning forever.
+  than spinning forever. `Error.isRetryable` is `False` for it: the same loop
+  spends the same ceiling again, so raise the ceiling instead of retrying.
 
 Four shapes come up often enough to walk through.
 
@@ -245,7 +246,7 @@ countTo limit target =
 
 `countTo 150000 150000` succeeds with `150000`, running at the same stack depth
 whether it takes 10 steps or 150,000. `countTo 5 150000` fails fast with
-`InvalidInput: Task.loop ran its step 5 times, its ceiling, without reaching
+`LimitExceeded: Task.loop ran its step 5 times, its ceiling, without reaching
 Done` — a typed error naming the ceiling, not a stack overflow. `Task.loop`
 turns "how many times might this run" from a guess about the stack into a
 number you write and the runtime enforces.

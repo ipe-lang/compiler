@@ -1,6 +1,6 @@
 //! Ipe.Error: the rich, typed `Error` ADT.
 //!
-//! `Error = Error ErrorKind ErrorInfo`, an 11-variant `ErrorKind`
+//! `Error = Error ErrorKind ErrorInfo`, a 12-variant `ErrorKind`
 //! classification, message-carrying `ErrorInfo`, and the 6-variant
 //! `ErrorDetails` union (`FfiPanic`/`TypeMismatch`/`HttpStatus`/`JsonDecode`/
 //! `Custom`/`Database`) carried optionally on `ErrorInfo.details : Maybe ErrorDetails`.
@@ -28,10 +28,13 @@ use std::fmt;
 
 use crate::core::IpeMaybe;
 
-/// Ipê's `ErrorKind` — 11 nullary variants. Repr(u8) for a compact, sound,
-/// exhaustively-matched runtime type (mirrors `IpeOrder`'s convention).
-/// Variant order matches canon's registration (`crates/ipe_canon/src/env.rs`,
-/// "E-12") — do not reorder without updating that table.
+/// Ipê's `ErrorKind` — 12 nullary variants.
+///
+/// Repr(u8) for a compact, sound, exhaustively-matched runtime type (mirrors
+/// `IpeOrder`'s convention). The order is append-only: each discriminant is
+/// stable across serde and the JS port. Canon's `BuiltinUnion` ctor table
+/// (`src/compiler/canon/src/builtins.rs`) mirrors it, and
+/// `src/ipe-cli/tests/error_kind_agreement.rs` pins the two equal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
@@ -47,11 +50,30 @@ pub enum IpeErrorKind {
     Conflict = 8,
     Unavailable = 9,
     Unexpected = 10,
+    /// A declared ceiling (a size, count or depth bound on one input) turned
+    /// the input back; a larger bound would accept the same input.
+    LimitExceeded = 11,
 }
 
 crate::stringify::show_row!("ErrorKind", Value, [] IpeErrorKind, |k| k.label().to_owned());
 
 impl IpeErrorKind {
+    /// Every kind, in discriminant order.
+    pub const ALL: [Self; 12] = [
+        Self::Io,
+        Self::Network,
+        Self::Ffi,
+        Self::Decode,
+        Self::Timeout,
+        Self::NotFound,
+        Self::PermissionDenied,
+        Self::InvalidInput,
+        Self::Conflict,
+        Self::Unavailable,
+        Self::Unexpected,
+        Self::LimitExceeded,
+    ];
+
     /// Renders the reference design's `"<Kind>: "` prefix (`Error.toString`,
     /// `"<Kind>: <message>"`).
     pub(crate) const fn label(self) -> &'static str {
@@ -67,6 +89,7 @@ impl IpeErrorKind {
             Self::Conflict => "Conflict",
             Self::Unavailable => "Unavailable",
             Self::Unexpected => "Unexpected",
+            Self::LimitExceeded => "LimitExceeded",
         }
     }
 }
@@ -421,6 +444,11 @@ impl IpeError {
     pub fn unexpected(message: String) -> Self {
         Self::with(IpeErrorKind::Unexpected, message)
     }
+    /// A declared ceiling turned the input back (`ErrorKind.LimitExceeded`).
+    #[must_use]
+    pub fn limit_exceeded(message: impl Into<String>) -> Self {
+        Self::with(IpeErrorKind::LimitExceeded, message.into())
+    }
     /// Nullary in the Ipê surface — pre-built, fixed message.
     #[must_use]
     pub fn timeout() -> Self {
@@ -467,8 +495,12 @@ impl IpeError {
         format!("{}: {}", kind.label(), info.message)
     }
 
-    /// Ipê `Error.isRetryable : Error -> Bool` — `True` only for the three
-    /// kinds a caller can reasonably back off and retry.
+    /// Ipê `Error.isRetryable : Error -> Bool` — `True` only for `Timeout`,
+    /// `Network` and `Unavailable`.
+    ///
+    /// Those three are the kinds a caller can reasonably back off and retry.
+    /// The other nine fail again on the same input: `LimitExceeded` in
+    /// particular is a deterministic refusal of that input by its bound.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         let Self::Error(kind, _) = self;
@@ -504,7 +536,7 @@ impl fmt::Display for IpeError {
 
 // ── Ipe.Error kernels ────────────────────────────────
 // Each message constructor classifies its own `ErrorKind` at construction,
-// rather than sharing one string-identity runtime symbol across all eight.
+// rather than sharing one string-identity runtime symbol across all nine.
 
 #[must_use]
 pub fn ipe_error_unexpected(msg: String) -> IpeError {
@@ -537,6 +569,11 @@ pub fn ipe_error_conflict(msg: String) -> IpeError {
 #[must_use]
 pub fn ipe_error_unavailable(msg: String) -> IpeError {
     IpeError::unavailable(msg)
+}
+/// `Error.limitExceeded : String -> Error` — a declared-ceiling refusal.
+#[must_use]
+pub fn ipe_error_limit_exceeded(msg: String) -> IpeError {
+    IpeError::limit_exceeded(msg)
 }
 /// `Error.timeout : Error` — canonical timeout error.
 #[must_use]
@@ -655,6 +692,136 @@ impl FromIpeError for String {
     }
 }
 
+/// A generic `E: From<String>` error sink that can classify a refusal as
+/// `LimitExceeded`.
+///
+/// The blanket `From<String>` bridge yields `Unexpected`; a declared-ceiling
+/// refusal reaching such a sink goes through this trait instead, so it keeps
+/// its kind. Implemented for `IpeError`, as `FromUnavailable` is (unit tests
+/// add the bare `String` sink below).
+pub trait FromLimitExceeded {
+    fn from_limit_exceeded(message: String) -> Self;
+}
+
+impl FromLimitExceeded for IpeError {
+    fn from_limit_exceeded(message: String) -> Self {
+        Self::limit_exceeded(message)
+    }
+}
+
+/// A unit test's bare-`String` error sink keeps only the message.
+///
+/// Kind assertions in tests use an `IpeError` sink, so a `String` sink can
+/// never be mistaken for one that proves the `LimitExceeded` kind.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl FromLimitExceeded for String {
+    fn from_limit_exceeded(message: String) -> Self {
+        message
+    }
+}
+
+/// A declared ceiling turned the input back.
+///
+/// The message names the ceiling and, when one exists, the setting that
+/// raises it. The value reaches an error sink only as `LimitExceeded`: it has
+/// no conversion into `String`, so it cannot fall into the `From<String>`
+/// bridge that yields `Unexpected`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LimitRefusal(String);
+
+impl LimitRefusal {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+
+    /// Prefixes the message with the refusing operation, keeping the kind.
+    #[must_use]
+    pub fn context(self, operation: &str) -> Self {
+        Self(format!("{operation}: {}", self.0))
+    }
+
+    /// The refusal in a generic error sink, kinded `LimitExceeded`.
+    #[must_use]
+    pub fn into_error<E: FromLimitExceeded>(self) -> E {
+        E::from_limit_exceeded(self.0)
+    }
+}
+
+impl From<LimitRefusal> for IpeError {
+    fn from(refusal: LimitRefusal) -> Self {
+        Self::limit_exceeded(refusal.0)
+    }
+}
+
+/// A kernel failure whose kind is decided where it is built.
+///
+/// A bare `String` converts into `Unexpected`, so a `?` on an OS or library
+/// error keeps that classification; a ceiling refusal is built as
+/// `LimitExceeded` and keeps that kind through `into_error`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelFailure {
+    /// An unclassified failure (an OS or library error).
+    Unexpected(String),
+    /// A declared ceiling turned the input back.
+    LimitExceeded(LimitRefusal),
+    /// The blocking pool could not start a thread for the operation.
+    Unavailable(String),
+}
+
+impl KernelFailure {
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unexpected(message) | Self::Unavailable(message) => message,
+            Self::LimitExceeded(refusal) => refusal.message(),
+        }
+    }
+
+    /// Prefixes the message with the failing operation, keeping the kind.
+    #[must_use]
+    pub fn context(self, operation: &str) -> Self {
+        match self {
+            Self::Unexpected(message) => Self::Unexpected(format!("{operation}: {message}")),
+            Self::LimitExceeded(refusal) => Self::LimitExceeded(refusal.context(operation)),
+            Self::Unavailable(message) => Self::Unavailable(format!("{operation}: {message}")),
+        }
+    }
+
+    /// The failure in a generic error sink, each variant under its own kind.
+    #[must_use]
+    pub fn into_error<E: From<String> + FromLimitExceeded + FromUnavailable>(self) -> E {
+        match self {
+            Self::Unexpected(message) => E::from(message),
+            Self::LimitExceeded(refusal) => refusal.into_error(),
+            Self::Unavailable(message) => E::from_unavailable(message),
+        }
+    }
+}
+
+impl From<String> for KernelFailure {
+    fn from(message: String) -> Self {
+        Self::Unexpected(message)
+    }
+}
+
+impl From<LimitRefusal> for KernelFailure {
+    fn from(refusal: LimitRefusal) -> Self {
+        Self::LimitExceeded(refusal)
+    }
+}
+
+impl FromUnavailable for KernelFailure {
+    fn from_unavailable(message: String) -> Self {
+        Self::Unavailable(message)
+    }
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
@@ -682,12 +849,100 @@ mod tests {
 
     #[test]
     fn retryable_kinds_are_exactly_timeout_network_unavailable() {
-        assert!(IpeError::timeout().is_retryable());
-        assert!(IpeError::network(String::new()).is_retryable());
-        assert!(IpeError::unavailable(String::new()).is_retryable());
-        assert!(!IpeError::io(String::new()).is_retryable());
-        assert!(!IpeError::unexpected(String::new()).is_retryable());
-        assert!(!IpeError::conflict(String::new()).is_retryable());
+        for kind in IpeErrorKind::ALL {
+            let e = IpeError::with(kind, String::new());
+            let expected = matches!(
+                kind,
+                IpeErrorKind::Timeout | IpeErrorKind::Network | IpeErrorKind::Unavailable
+            );
+            assert_eq!(e.is_retryable(), expected, "{kind:?}");
+        }
+        assert!(!IpeError::limit_exceeded("x").is_retryable());
+    }
+
+    #[test]
+    fn kinds_are_append_only_with_stable_discriminants() {
+        let pinned: [(IpeErrorKind, u8, &str); 12] = [
+            (IpeErrorKind::Io, 0, "Io"),
+            (IpeErrorKind::Network, 1, "Network"),
+            (IpeErrorKind::Ffi, 2, "Ffi"),
+            (IpeErrorKind::Decode, 3, "Decode"),
+            (IpeErrorKind::Timeout, 4, "Timeout"),
+            (IpeErrorKind::NotFound, 5, "NotFound"),
+            (IpeErrorKind::PermissionDenied, 6, "PermissionDenied"),
+            (IpeErrorKind::InvalidInput, 7, "InvalidInput"),
+            (IpeErrorKind::Conflict, 8, "Conflict"),
+            (IpeErrorKind::Unavailable, 9, "Unavailable"),
+            (IpeErrorKind::Unexpected, 10, "Unexpected"),
+            (IpeErrorKind::LimitExceeded, 11, "LimitExceeded"),
+        ];
+        assert_eq!(IpeErrorKind::ALL.len(), pinned.len());
+        for (index, (kind, discriminant, label)) in pinned.into_iter().enumerate() {
+            assert_eq!(IpeErrorKind::ALL.get(index), Some(&kind));
+            assert_eq!(kind as u8, discriminant);
+            assert_eq!(kind.label(), label);
+        }
+        let mut labels: Vec<&str> = IpeErrorKind::ALL.iter().map(|k| k.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), IpeErrorKind::ALL.len(), "label is injective");
+    }
+
+    #[test]
+    fn limit_exceeded_carries_its_kind_and_prefix() {
+        let e = ipe_error_limit_exceeded("x".to_owned());
+        assert_eq!(ipe_error_kind(e.clone()), IpeErrorKind::LimitExceeded);
+        assert_eq!(e.to_ipe_string(), "LimitExceeded: x");
+        assert!(!ipe_error_is_retryable(e.clone()));
+        assert_eq!(
+            <IpeError as FromLimitExceeded>::from_limit_exceeded("x".to_owned()),
+            e
+        );
+        assert_eq!(
+            ipe_error_kind_name(IpeErrorKind::LimitExceeded),
+            "LimitExceeded"
+        );
+        let bridged = IpeError::from("file exceeds read ceiling of 4 bytes".to_owned());
+        assert_eq!(
+            ipe_error_kind(bridged),
+            IpeErrorKind::Unexpected,
+            "the bare-String bridge never classifies a ceiling"
+        );
+    }
+
+    #[test]
+    fn kernel_failure_keeps_each_kind_through_a_generic_sink() {
+        let limit = KernelFailure::from(LimitRefusal::new("over 4 bytes")).context("Op");
+        let other = KernelFailure::from("disk gone".to_owned()).context("Op");
+        let refused = KernelFailure::from_unavailable("no thread".to_owned()).context("Op");
+        assert_eq!(
+            refused.into_error::<IpeError>().to_ipe_string(),
+            "Unavailable: Op: no thread"
+        );
+        assert_eq!(limit.message(), "Op: over 4 bytes");
+        assert_eq!(
+            limit.into_error::<IpeError>().to_ipe_string(),
+            "LimitExceeded: Op: over 4 bytes"
+        );
+        assert_eq!(
+            other.into_error::<IpeError>().to_ipe_string(),
+            "Unexpected: Op: disk gone"
+        );
+        assert_eq!(
+            IpeError::from(LimitRefusal::new("x")),
+            IpeError::limit_exceeded("x")
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn kinds_round_trip_through_serde_by_variant_name() {
+        for kind in IpeErrorKind::ALL {
+            let wire = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(wire, format!("\"{}\"", kind.label()));
+            let back: IpeErrorKind = serde_json::from_str(&wire).expect("deserialize");
+            assert_eq!(back, kind);
+        }
     }
 
     #[test]
