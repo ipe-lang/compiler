@@ -1052,35 +1052,55 @@ fn audit_version(
     index_root: Option<&Path>,
     blessing: Result<&BlessedPublisher, &crate::publisher::BlessingRefusal>,
 ) -> Result<(), CliError> {
-    let checkout_str = checkout.to_string_lossy().into_owned();
-    // Pass the submitted entry's claimed publisher (named in a reject) and the
-    // attestation-backed blessing: the reserved-namespace ownership check
-    // exempts only a proven blessed publisher and rejects any other whose
-    // source tree provides a reserved-namespace (`Ipe.*`) module — the
-    // admission-time squat-proofing of the trusted namespace.
-    let mut audit_args: Vec<String> = vec![
-        checkout_str,
-        "--publisher".to_owned(),
-        submitted.publisher.as_str().to_owned(),
-    ];
-    if let Some(ir) = index_root {
-        audit_args.push("--index".to_owned());
-        audit_args.push(ir.to_string_lossy().into_owned());
+    // Audit the checkout path itself, never an argv round-trip of it: a lossy
+    // string of a non-UTF-8 path names another directory. The submitted entry's
+    // claimed publisher is named in a reject, and the attestation-backed
+    // blessing exempts only a proven blessed publisher from the
+    // reserved-namespace ownership check — the admission-time squat-proofing of
+    // the trusted namespace.
+    let options = audit::AuditOptions::for_admission(
+        submitted.publisher.clone(),
+        index_root.map(Path::to_path_buf),
+    );
+    // Typed errors propagate directly: the audit's `CliError` names the failing
+    // check, and the chatter below names the version.
+    audit::capture_package(checkout)
+        .and_then(|snapshot| audit::run_audit_over(snapshot, &options, blessing))
+        .and_then(|audited| admit_against_audit(version, submitted.name.as_str(), &audited))
+        .inspect_err(|_| {
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &format!(
+                    "audit-entry: `{}` version {} rejected",
+                    submitted.name, version.version
+                ),
+            );
+        })
+}
+
+/// Admit a submitted entry `version` only when it records what the audit of its source certified.
+///
+/// The entry's `sha256` must be the digest of the tree the audit judged, and
+/// its `capabilities` the set the audit inferred: the index records the
+/// audit's own output, never a submitted claim beside it.
+///
+/// # Errors
+/// [`CliError::HashMismatch`] when the recorded digest is not the audited one;
+/// [`CliError::PackageAudit`] when the recorded capabilities are not the audited set.
+pub fn admit_against_audit(
+    version: &index::EntryVersion,
+    package: &str,
+    audited: &audit::AuditedPackage,
+) -> Result<(), CliError> {
+    if version.sha256 != *audited.digest() {
+        return Err(CliError::HashMismatch {
+            package: package.to_owned(),
+            expected: version.sha256.as_str().to_owned(),
+            actual: audited.digest().as_str().to_owned(),
+        });
     }
-    // Propagate typed errors directly — run_audit already produces a
-    // descriptive typed CliError (PackageAudit / HashMismatch / etc.) whose
-    // Display names the failing check; the version context is clear from
-    // the eprintln below and the structured error kind.
-    audit::run_audit_as(&audit_args, blessing).inspect_err(|_| {
-        crate::screen::chatter(
-            crate::screen::Stream::Stderr,
-            crate::screen::Tone::UserError,
-            &format!(
-                "audit-entry: `{}` version {} rejected",
-                submitted.name, version.version
-            ),
-        );
-    })
+    audited.refuse_other_capabilities(&version.capabilities)
 }
 
 /// The parsed `ipe package audit-entry` invocation.
@@ -2591,52 +2611,118 @@ pub fn infer_package_capabilities(
     infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &package)
 }
 
-/// Every source a package's capability inference sees, plus its entry modules.
+/// Every source a package's build and capability inference see, plus its entry modules.
 ///
 /// Sources are the package's own modules plus the compiled-source stdlib closure
-/// and FFI interface modules the build injects.
+/// and FFI interface modules the build injects; the FFI emission inputs (the
+/// `src/ffi.rs` bindings text among them) are computed in the same step. The
+/// build ([`super::build_from_sources`]) and capability inference
+/// ([`infer_package_capabilities_in`]) consume one value of this type, so the
+/// bytes a capability verdict judges are the bytes that are emitted.
 #[derive(Clone, Debug)]
 pub struct PackageSourceSet {
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
     entries: Vec<project::DiscoveredModule>,
     injected: std::collections::BTreeSet<Vec<String>>,
     ffi_injected: std::collections::BTreeSet<Vec<String>>,
+    ffi_emit: Option<ipe_backend_rust::FfiEmit>,
 }
 
+/// The parts of a [`PackageSourceSet`] the compile core consumes.
+pub struct SourceSetParts {
+    /// Every module source, injected ones included.
+    pub sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+    /// The compiled-source stdlib module paths the driver injected.
+    pub injected: std::collections::BTreeSet<Vec<String>>,
+    /// The FFI interface module paths the driver injected.
+    pub ffi_injected: std::collections::BTreeSet<Vec<String>>,
+    /// The FFI emission inputs, when any crate is installed.
+    pub ffi_emit: Option<ipe_backend_rust::FfiEmit>,
+}
+
+/// A module-source map with the modules discovered for it.
+pub type ReadModules = (
+    BTreeMap<Vec<String>, (PathBuf, String)>,
+    Vec<project::DiscoveredModule>,
+);
+
 impl PackageSourceSet {
-    /// Read the package rooted at `manifest_path`: every discovered module's
-    /// source (read once, bounded), then the same compiled-source stdlib closure
-    /// and FFI interface injection the build performs.
+    /// Read the package rooted at `manifest_path` from disk, one bounded read per module.
+    ///
+    /// The working-tree reader for a single-shot command; a gate judges a
+    /// [`project::PackageSnapshot`] through [`PackageSourceSet::from_snapshot`].
     ///
     /// # Errors
     /// [`CliError::Io`] / manifest errors when the package cannot be read.
     pub fn read(manifest_path: &Path) -> Result<Self, CliError> {
         let manifest = project::parse_manifest(manifest_path)?;
-        let mut entries = project::discover_modules(&manifest.src_root)?;
+        let (sources, entries) = read_package_modules(&manifest)?;
+        Self::assemble(sources, entries, manifest_path)
+    }
 
-        let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-        for m in &entries {
-            let src = crate::io_bounded::read_walked_source(m.path())?;
-            sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
-        }
+    /// The source set of a captured package: its modules as the snapshot holds them, never re-read.
+    ///
+    /// # Errors
+    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    pub fn from_snapshot(snapshot: &project::PackageSnapshot) -> Result<Self, CliError> {
+        Self::assemble(
+            snapshot.sources().clone(),
+            snapshot.modules().to_vec(),
+            &snapshot_manifest_path(snapshot),
+        )
+    }
 
-        // Inject the compiled-source stdlib closure (e.g. `Ipe.Css`) just like
-        // the real build path, so a module that imports a compiled-source stdlib
-        // module lowers standalone here instead of failing name resolution
-        // (which, since a failing entry surfaces its real diagnostic, would
-        // otherwise abort build).
+    /// Inject the compiled-source stdlib closure and the FFI interface modules into `sources`.
+    ///
+    /// `blame_path` is the project manifest or entry file the FFI catalog
+    /// search walks up from.
+    ///
+    /// # Errors
+    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    pub fn assemble(
+        mut sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+        mut entries: Vec<project::DiscoveredModule>,
+        blame_path: &Path,
+    ) -> Result<Self, CliError> {
+        // `injected` is the driver's unforgeable record of which module paths
+        // are trusted stdlib source, the only inputs that earn
+        // `ModuleOrigin::EmbeddedStdlib`.
         let injected = project::inject_compiled_std_closure(&mut sources, &mut entries);
-        // Inject the FFI interface modules (installed crates + the asserted-call
-        // `Rust.Ffi` module) exactly as the build does, so an FFI-using module
-        // lowers here and its `native-ffi`/`ffi-raw` capabilities are inferred
-        // instead of the package being refused on a resolve failure.
-        let ffi_injected = ffi::prepare_ffi(&mut sources, manifest_path)?.injected;
+        // The catalog-load, nominal-unification, interface-inject and
+        // emit-assemble sequence `watch` and `lsp` share.
+        let ffi = ffi::prepare_ffi(&mut sources, blame_path)?;
         Ok(Self {
             sources,
             entries,
             injected,
-            ffi_injected,
+            ffi_injected: ffi.injected,
+            ffi_emit: ffi.emit,
         })
+    }
+
+    /// The `src/ffi.rs` text the build writes, when the package binds any crate.
+    #[must_use]
+    pub fn bindings_source(&self) -> Option<&str> {
+        self.ffi_emit
+            .as_ref()
+            .map(|emit| emit.bindings_source.as_str())
+    }
+
+    /// Whether `module_path` is one of the module sources.
+    #[must_use]
+    pub fn has_module(&self, module_path: &[String]) -> bool {
+        self.sources.contains_key(module_path)
+    }
+
+    /// The parts the compile core consumes.
+    #[must_use]
+    pub fn into_parts(self) -> SourceSetParts {
+        SourceSetParts {
+            sources: self.sources,
+            injected: self.injected,
+            ffi_injected: self.ffi_injected,
+            ffi_emit: self.ffi_emit,
+        }
     }
 
     /// The module path of every module lowered as an inference entry.
@@ -2667,8 +2753,32 @@ impl PackageSourceSet {
                 .collect(),
             injected: self.injected.clone(),
             ffi_injected: self.ffi_injected.clone(),
+            ffi_emit: self.ffi_emit.clone(),
         }
     }
+}
+
+/// The `package.ipe` path of a captured package, the FFI catalog search's start.
+#[must_use]
+pub fn snapshot_manifest_path(snapshot: &project::PackageSnapshot) -> PathBuf {
+    snapshot
+        .manifest()
+        .root
+        .join(crate::package_manifest::PACKAGE_IPE)
+}
+
+/// Read every module under `manifest`'s source root, one bounded read each.
+///
+/// # Errors
+/// [`CliError::Io`] when the source root cannot be walked or a module read.
+pub fn read_package_modules(manifest: &project::ProjectManifest) -> Result<ReadModules, CliError> {
+    let entries = project::discover_modules(&manifest.src_root)?;
+    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
+    for m in &entries {
+        let src = crate::io_bounded::read_walked_source(m.path())?;
+        sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
+    }
+    Ok((sources, entries))
 }
 
 /// [`infer_package_capabilities`] over one caller-supplied database.
@@ -4038,5 +4148,79 @@ mod test_binary_tests {
             return;
         };
         assert_eq!(path, absent);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use ipe_ir::Capability;
+    use std::collections::BTreeSet;
+
+    /// A digest literal of `fill` hex digits.
+    #[allow(clippy::expect_used)] // test fixture: the literal is a valid digest
+    fn digest(fill: &str) -> index::Sha256Hex {
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        index::Sha256Hex::parse(&package, &fill.repeat(64)).expect("valid digest")
+    }
+
+    /// An entry version recording `sha256` and `capabilities`.
+    #[allow(clippy::expect_used)] // test fixture: every literal is valid
+    fn entry(sha256: index::Sha256Hex, capabilities: BTreeSet<Capability>) -> index::EntryVersion {
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        index::EntryVersion {
+            version: crate::published_version::PublishedVersion::parse("0.1.0")
+                .expect("valid version"),
+            source: index::SourceUrl::parse(&package, "https://github.com/example/p")
+                .expect("valid source url"),
+            rev: index::PinnedRev::from_full_sha(
+                &package,
+                "9f2c7b1e0a4d5c6f8b2a1e3d4c5b6a7f8e9d0c1b",
+            )
+            .expect("valid pinned rev"),
+            sha256,
+            capabilities,
+            signature: None,
+        }
+    }
+
+    /// An entry whose recorded digest is not the audited tree's is refused.
+    #[test]
+    fn admission_refuses_a_digest_other_than_the_audited_one() {
+        let audited = audit::AuditedPackage::for_test(digest("a"), BTreeSet::new());
+        assert!(
+            admit_against_audit(&entry(digest("a"), BTreeSet::new()), "p", &audited).is_ok(),
+            "control: the audited digest and set are admitted"
+        );
+        assert!(
+            matches!(
+                admit_against_audit(&entry(digest("b"), BTreeSet::new()), "p", &audited),
+                Err(CliError::HashMismatch { .. })
+            ),
+            "a recorded digest other than the audited one is refused"
+        );
+    }
+
+    /// An entry whose recorded capabilities are not the audited set is refused.
+    #[test]
+    fn admission_refuses_capabilities_other_than_the_audited_set() {
+        let audited =
+            audit::AuditedPackage::for_test(digest("a"), BTreeSet::from([Capability::Network]));
+        assert!(
+            admit_against_audit(
+                &entry(digest("a"), BTreeSet::from([Capability::Network])),
+                "p",
+                &audited
+            )
+            .is_ok(),
+            "control: the audited set is admitted"
+        );
+        assert!(
+            matches!(
+                admit_against_audit(&entry(digest("a"), BTreeSet::new()), "p", &audited),
+                Err(CliError::PackageAudit(_))
+            ),
+            "an entry hiding an audited capability is refused"
+        );
     }
 }

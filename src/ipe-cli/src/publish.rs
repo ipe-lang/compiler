@@ -43,7 +43,7 @@ use crate::scratch::{LeafName, ScratchDir, ScratchFile};
 
 use crate::CliError;
 use crate::index::{self, CommitId, EntryVersion, IndexEntry, PinnedRev, SourceUrl};
-use crate::project::{self, ProjectManifest};
+use crate::project::ProjectManifest;
 use crate::published_version::{PublishedVersion, require_successor};
 use crate::publisher::{
     AuthenticatedPublisher, BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher,
@@ -152,14 +152,16 @@ const DEFAULT_INDEX_REPO: &str = "arthurmaciel/ipe-registry";
 pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
     let args = parse_args(rest)?;
 
-    // 1. Compute the entry version + the publisher this publish claims (the
-    //    source URL's owner — self-declared, written into the submitted entry).
-    let manifest_path = locate_manifest(&args.path)?;
-    let manifest = project::parse_manifest(&manifest_path)?;
-    let entry_version =
-        compute_entry_version(&manifest, args.source.as_deref(), args.rev.as_deref())?;
+    // 1. Capture the package once, then compute the entry's version, source and
+    //    revision + the publisher this publish claims (the source URL's owner —
+    //    self-declared, written into the submitted entry). The audit below judges
+    //    this one snapshot, and the entry records the audit's own digest and
+    //    capability set, so what is published is what was audited.
+    let snapshot = crate::audit::capture_manifest_root(&locate_manifest(&args.path)?)?;
+    let manifest = snapshot.manifest().clone();
+    let draft = compute_entry_draft(&manifest, args.source.as_deref(), args.rev.as_deref())?;
 
-    let claimed = SelfDeclaredPublisher::parse(&infer_publisher(entry_version.source.as_str()))
+    let claimed = SelfDeclaredPublisher::parse(&infer_publisher(draft.source.as_str()))
         .map_err(|refusal| CliError::Usage(text::msg::publish_source_owner_not_login(&refusal)))?;
 
     // 2. Prove the publishing identity. A real publish resolves the signing key
@@ -179,14 +181,17 @@ pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
         BlessedPublisher::from_authenticated(credentials.as_ref().map(|c| &c.identity), &claimed);
 
     // 3. Gate locally — refuse to publish a package that fails its own audit.
-    //    `run_audit_as` prints its own passing line and returns the typed reject.
-    //    It reads the previous published version from the resolver's index root
-    //    (the same checkout `merge_into_entry` reads below), so the semver check
-    //    and the duplicate-version check see one consistent index view.
-    crate::audit::run_audit_as(
-        &audit_args_for_publish(&args.path, &claimed),
+    //    The audit runs under the claimed publisher, prints its own passing line
+    //    and returns the typed reject. It reads the previous published version
+    //    from the resolver's index root (the same checkout `merge_into_entry`
+    //    reads below), so the semver check and the duplicate-version check see
+    //    one consistent index view.
+    let audited = crate::audit::run_audit_over(
+        snapshot,
+        &crate::audit::AuditOptions::for_publisher(claimed.clone()),
         blessing.as_ref(),
     )?;
+    let entry_version = entry_version_from(draft, &audited);
 
     // 4. Compute the entry file. The default appends the new version to the
     //    existing entry (refusing a duplicate); `--fresh` writes a single-version
@@ -320,23 +325,54 @@ fn locate_manifest(path: &Path) -> Result<PathBuf, CliError> {
     )))
 }
 
-/// Compute the [`EntryVersion`] for the working package: version from the
-/// manifest, source from `--source` or the git remote, rev from `--rev` or the
-/// committed HEAD, sha256 over the source tree, and the inferred capability set.
+/// The audit-independent half of an entry version: what publish pins before the gate runs.
 ///
-/// Refuses a dirty tree or an unpushed HEAD (unless an explicit `--rev` was
-/// given, which the caller is asserting is immutable) so the pin names a
-/// reproducible revision.
+/// The digest and the capability set are not here: they come from the audit
+/// of the captured snapshot ([`entry_version_from`]).
+#[derive(Debug)]
+struct EntryDraft {
+    version: PublishedVersion,
+    source: SourceUrl,
+    rev: PinnedRev,
+}
+
+/// The entry version that records `audited`'s digest and capability set over `draft`.
+///
+/// Pure: the index entry carries the audit's own output, never a second
+/// computation beside it.
+fn entry_version_from(draft: EntryDraft, audited: &crate::audit::AuditedPackage) -> EntryVersion {
+    EntryVersion {
+        version: draft.version,
+        source: draft.source,
+        rev: draft.rev,
+        sha256: audited.digest().clone(),
+        capabilities: audited.capabilities().clone(),
+        // Publish computes the entry; the keyless signature is minted by the
+        // registry's CI workflow (Fulcio/Rekor) over the statement this module
+        // emits, then attached to the entry there. The locally-authored entry is
+        // therefore always unsigned.
+        signature: None,
+    }
+}
+
+/// Compute the [`EntryDraft`] for the working package.
+///
+/// Version comes from the manifest, source from `--source` or the git remote,
+/// rev from `--rev` or the committed HEAD.
+///
+/// Refuses a dirty tree on either path, an unpushed HEAD on the default path,
+/// and a `--rev` that is not the checked-out HEAD: the audited snapshot is the
+/// working tree, so the pinned revision must be the commit that tree is.
 ///
 /// # Errors
 /// [`CliError::Publish`] on a publish precondition; [`CliError::Usage`] when
 /// the manifest declares no version; [`CliError::VersionRefused`] when it carries
 /// build metadata; resolution / IO errors otherwise.
-fn compute_entry_version(
+fn compute_entry_draft(
     manifest: &ProjectManifest,
     source_override: Option<&str>,
     rev_override: Option<&str>,
-) -> Result<EntryVersion, CliError> {
+) -> Result<EntryDraft, CliError> {
     let version = manifest_published_version(manifest)?;
 
     let source_root = &manifest.root;
@@ -361,6 +397,7 @@ fn compute_entry_version(
         let requested = CommitId::parse(&package_name, r)
             .map_err(|e| CliError::Usage(text::msg::publish_rev_refused(&e)))?;
         let raw_sha = resolve_rev_to_sha(source_root, requested.as_str())?;
+        refuse_rev_other_than_clean_head(source_root, &raw_sha)?;
         PinnedRev::from_full_sha(&package_name, &raw_sha)
             .map_err(|e| CliError::Usage(text::msg::publish_rev_not_sha(&e)))?
     } else {
@@ -369,21 +406,33 @@ fn compute_entry_version(
             .map_err(|e| CliError::Usage(text::msg::publish_head_not_sha(&e)))?
     };
 
-    let sha256 = crate::resolve::hash_source_tree(source_root)?;
-    let capabilities = crate::infer_package_capabilities(&manifest_path_of(source_root))?;
-
-    Ok(EntryVersion {
+    Ok(EntryDraft {
         version,
         source,
         rev,
-        sha256,
-        capabilities,
-        // Publish computes the entry; the keyless signature is minted by the
-        // registry's CI workflow (Fulcio/Rekor) over the statement this module
-        // emits, then attached to the entry there. The locally-authored entry is
-        // therefore always unsigned.
-        signature: None,
     })
+}
+
+/// Refuse a `--rev` whose commit is not the clean, checked-out HEAD at `source_root`.
+///
+/// # Errors
+/// [`CliError::Publish`] on a dirty tree; [`CliError::Usage`] when HEAD is
+/// another commit than `rev_sha`.
+fn refuse_rev_other_than_clean_head(source_root: &Path, rev_sha: &str) -> Result<(), CliError> {
+    if git_tree_is_dirty(source_root)? {
+        return Err(refuse(Refusal::DirtyTree {
+            source_root: source_root.to_path_buf(),
+        }));
+    }
+    let head = git_head_rev(source_root)?;
+    if head == rev_sha {
+        return Ok(());
+    }
+    Err(CliError::Usage(text::msg::publish_rev_refused(
+        &crate::style::TerminalSafe::sanitize(&format!(
+            "`--rev` names {rev_sha}, but the working tree is {head}; check out that revision so the audited tree is the pinned one"
+        )),
+    )))
 }
 
 /// The committed HEAD revision of the git repo at `source_root`, after insisting
@@ -426,11 +475,6 @@ fn resolve_rev_to_sha(root: &Path, rev: &str) -> Result<String, CliError> {
         },
     )?;
     Ok(out.trim().to_owned())
-}
-
-/// The `package.ipe` path for a project root.
-fn manifest_path_of(root: &Path) -> PathBuf {
-    root.join(crate::package_manifest::PACKAGE_IPE)
 }
 
 /// Render one [`EntryVersion`] as the `[[version]]` TOML block the index reader
@@ -1610,20 +1654,6 @@ fn infer_publisher(source: &str) -> String {
     github_owner(source).unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// The `ipe package audit` argv the local publish gate runs: the package path
-/// plus the publisher this publish claims. The blessed exemption on a
-/// reserved-namespace package needs both this claim and the authenticated
-/// blessing passed alongside it (`run_audit_as`), which covers only the claimed
-/// publisher — so a regression to a path-only argv would silently re-close the
-/// reserved namespace to its own owner, and the flag is pinned by a test.
-fn audit_args_for_publish(path: &Path, claimed: &SelfDeclaredPublisher) -> Vec<String> {
-    vec![
-        path.display().to_string(),
-        "--publisher".to_owned(),
-        claimed.as_str().to_owned(),
-    ]
-}
-
 /// The `<owner>` of a `github.com/<owner>/<repo>` URL, for either the `https://`
 /// or `git@` form. `None` when the URL is not a GitHub URL.
 fn github_owner(source: &str) -> Option<String> {
@@ -2150,23 +2180,51 @@ mod tests {
         assert_fresh_refused(&claimed, &blessing);
     }
 
-    /// The local publish gate must audit with the claimed publisher, not a
-    /// path-only argv. The authenticated blessing covers only the claimed
-    /// publisher, so threading `--publisher` is what lets the blessed first-party
-    /// publisher clear its own gate on a reserved-namespace package; a regression
-    /// to a path-only argv silently re-closes the reserved namespace to its owner
-    /// (the smoke probe stops publishing). Pin the flag + value + order.
+    /// The local publish gate must audit under the claimed publisher. The
+    /// authenticated blessing covers only the claimed publisher, so carrying the
+    /// claim is what lets the blessed first-party publisher clear its own gate on
+    /// a reserved-namespace package; an audit without it silently re-closes the
+    /// reserved namespace to its owner (the smoke probe stops publishing).
     #[test]
-    fn publish_audit_argv_carries_the_claimed_publisher() {
-        let argv = audit_args_for_publish(Path::new("/pkg"), &claim("arthurmaciel"));
+    fn publish_audit_options_carry_the_claimed_publisher() {
+        let options = crate::audit::AuditOptions::for_publisher(claim("arthurmaciel"));
         assert_eq!(
-            argv,
-            vec![
-                "/pkg".to_owned(),
-                "--publisher".to_owned(),
-                "arthurmaciel".to_owned(),
-            ],
-            "the publish gate must pass --publisher <claimed> to the audit"
+            options.claimed().map(SelfDeclaredPublisher::as_str),
+            Some("arthurmaciel"),
+            "the publish gate must audit under the claimed publisher"
+        );
+    }
+
+    /// The published entry records the audit's digest and capability set, not a second computation.
+    #[test]
+    #[allow(clippy::expect_used)] // test fixture: every literal is valid
+    fn publish_entry_pins_the_audited_digest_and_capabilities() {
+        let template = sample_version("1.2.0", caps(&[]));
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        let audited_digest =
+            index::Sha256Hex::parse(&package, &"c".repeat(64)).expect("valid digest");
+        let audited = crate::audit::AuditedPackage::for_test(
+            audited_digest.clone(),
+            caps(&[Capability::Network]),
+        );
+        let draft = EntryDraft {
+            version: template.version,
+            source: template.source,
+            rev: template.rev,
+        };
+        let entry = entry_version_from(draft, &audited);
+        assert_eq!(
+            entry.sha256, audited_digest,
+            "the entry pins the audited digest"
+        );
+        assert_eq!(
+            entry.capabilities,
+            caps(&[Capability::Network]),
+            "the entry records the audited capability set"
+        );
+        assert!(
+            entry.signature.is_none(),
+            "a locally-authored entry is unsigned"
         );
     }
 
@@ -2696,6 +2754,71 @@ mod tests {
         assert_ne!(sha, "feat", "must not record the branch name as the pin");
         assert_eq!(sha.len(), 40);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A publishable manifest rooted at `root`.
+    fn publishable_manifest(root: &Path) -> crate::project::ProjectManifest {
+        crate::project::ProjectManifest {
+            name: "lib".to_owned(),
+            version: Some("1.0.0".parse().expect("valid release")),
+            root: root.to_path_buf(),
+            src_root: root.to_path_buf(),
+            icon: None,
+            driver: ipe_backend_rust::DbDriver::default(),
+            static_request: crate::build_plan::StaticRequestLayer::default(),
+            wasm: crate::project::WasmConfig::default(),
+            dependencies: std::collections::BTreeMap::new(),
+            rust_dependencies: std::collections::BTreeMap::new(),
+            capabilities: BTreeSet::new(),
+            capabilities_accept: BTreeSet::new(),
+            control_models_accept: BTreeSet::new(),
+            has_rust_wrapper: false,
+            programs: Vec::new(),
+            exposed_modules: Vec::new(),
+            delivery: crate::project::DeliveryConfig::default(),
+        }
+    }
+
+    /// `--rev` pins only the clean, checked-out HEAD: an older commit and a
+    /// dirty tree are both refused, because the audited snapshot is the working
+    /// tree and the pin must be the commit that tree is.
+    #[test]
+    fn publish_rev_refuses_anything_but_the_clean_checked_out_head() {
+        let repo = make_git_repo("pub-rev-head", "module Lib\n");
+        let older = head_sha(&repo);
+        std::fs::write(repo.join("lib.ipe"), "module Lib exposing (..)\n").expect("write");
+        let git = |args: &[&str]| {
+            crate::remote_ingest::fixture_git(&repo)
+                .args(args)
+                .output()
+                .expect("git")
+                .status
+                .success()
+        };
+        assert!(git(&["commit", "--quiet", "-am", "next"]));
+        let head = head_sha(&repo);
+        assert_ne!(older, head);
+        let manifest = publishable_manifest(&repo);
+        let source = Some("https://github.com/arthurmaciel/lib");
+
+        let err = compute_entry_draft(&manifest, source, Some(older.as_str()))
+            .err()
+            .expect("an older commit than HEAD is refused");
+        assert!(matches!(err, CliError::Usage(_)), "{err:?}");
+
+        let draft = compute_entry_draft(&manifest, source, Some("HEAD"))
+            .expect("the clean checked-out HEAD is publishable");
+        assert_eq!(draft.rev.as_str(), head);
+
+        std::fs::write(repo.join("lib.ipe"), "module Lib exposing (x)\n").expect("write");
+        let err = compute_entry_draft(&manifest, source, Some("HEAD"))
+            .err()
+            .expect("a dirty tree is refused");
+        assert!(
+            matches!(err, CliError::Publish(Refusal::DirtyTree { .. })),
+            "{err:?}"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
