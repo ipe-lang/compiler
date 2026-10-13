@@ -1233,6 +1233,15 @@ pub enum Feature {
     UntypedFunctions,
     /// Bare function references / non-name callees. [IPE-L0107]
     FirstClassFunctions,
+    /// A function value that reaches a position on another function carrier inside a container.
+    ///
+    /// A function is emitted on a direct `Box` carrier or a shared `Arc`
+    /// carrier. Where a value meets a position planned on the other carrier
+    /// at the top level, lowering converts it; under a `Maybe`/`Result`
+    /// payload, or through a generic type argument, the conversion would
+    /// rebuild the container, so the program is refused here rather than
+    /// emitted as Rust `cargo` rejects. [IPE-L0107]
+    FnCarrierConflict,
     /// Kernel calls beyond the supported set. [IPE-L0108]
     Kernels,
     /// A call whose argument count differs from the callee's declared arity:
@@ -2691,7 +2700,7 @@ const fn feature_code(f: Feature) -> Code {
         Feature::TaskResults => IPE_L0104,
         Feature::ParamPatterns => IPE_L0105,
         Feature::UntypedFunctions => IPE_L0106,
-        Feature::FirstClassFunctions => IPE_L0107,
+        Feature::FirstClassFunctions | Feature::FnCarrierConflict => IPE_L0107,
         Feature::Kernels => IPE_L0108,
         Feature::PartialOverApplication => IPE_L0110,
         Feature::BoundedRecordUpdate => IPE_L0111,

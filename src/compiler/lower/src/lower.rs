@@ -7668,11 +7668,182 @@ enum FnCarrier {
 
 impl FnCarrier {
     /// The carrier of a value of lowered type `ty`; `None` when `ty` is no function.
-    fn of_type(ty: IrType) -> Option<Self> {
-        match ty {
-            IrType::SharedFun(params, ret) => Some(Self::Shared(params, *ret)),
-            IrType::Fun(..) | IrType::FnOnceChain(..) => Some(Self::Direct),
-            _ => None,
+    fn of_type(ty: &IrType) -> Option<Self> {
+        match carrier_shape(ty) {
+            CarrierShape::Fn(FnCarrierKind::Shared, params, ret) => {
+                Some(Self::Shared(params.to_vec(), ret.clone()))
+            }
+            CarrierShape::Fn(FnCarrierKind::Direct, ..) => Some(Self::Direct),
+            CarrierShape::Branchable(_) | CarrierShape::Fixed => None,
+        }
+    }
+}
+
+/// Which of the two function carriers a function type is emitted on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FnCarrierKind {
+    /// A `Box`/`impl Fn` closure ([`IrType::Fun`], [`IrType::FnOnceChain`]).
+    Direct,
+    /// An `Arc<dyn Fn>` value ([`IrType::SharedFun`]).
+    Shared,
+}
+
+/// What a lowered type says about the function carriers a value of it decides.
+enum CarrierShape<'a> {
+    /// A function on the given carrier, with its parameter and return types.
+    Fn(FnCarrierKind, &'a [IrType], &'a IrType),
+    /// A `Maybe`/`Result`, whose payloads are on the carrier of the value built into them.
+    Branchable(Vec<&'a IrType>),
+    /// Any other type: a leaf, or a storage container on `Arc` in every value alike.
+    Fixed,
+}
+
+/// The [`CarrierShape`] of `ty`.
+///
+/// The match is exhaustive with no wildcard arm, so an [`IrType`] variant
+/// added later must be classified here before it compiles, rather than be
+/// read as holding no function.
+#[allow(clippy::too_many_lines)] // one exhaustive `IrType` match
+fn carrier_shape(ty: &IrType) -> CarrierShape<'_> {
+    match ty {
+        IrType::Fun(params, ret) | IrType::FnOnceChain(params, ret) => {
+            CarrierShape::Fn(FnCarrierKind::Direct, params, ret)
+        }
+        IrType::SharedFun(params, ret) => CarrierShape::Fn(FnCarrierKind::Shared, params, ret),
+        IrType::Maybe(item) => CarrierShape::Branchable(vec![item.as_ref()]),
+        IrType::Result(err, ok) => CarrierShape::Branchable(vec![err.as_ref(), ok.as_ref()]),
+        IrType::Task(_)
+        | IrType::Cmd(_)
+        | IrType::Sub(_)
+        | IrType::Decoder(_)
+        | IrType::Set(_)
+        | IrType::WebRoute(_)
+        | IrType::Ui { .. }
+        | IrType::List(_)
+        | IrType::Dict(..)
+        | IrType::CustomElement { .. }
+        | IrType::Tuple(_)
+        | IrType::Record(_)
+        | IrType::Enum { .. }
+        | IrType::Int
+        | IrType::Float
+        | IrType::Bool
+        | IrType::Str
+        | IrType::Char
+        | IrType::Unit
+        | IrType::Bytes
+        | IrType::Json
+        | IrType::Db
+        | IrType::Generic(_)
+        | IrType::RowGeneric(_)
+        | IrType::BackoffStrategy
+        | IrType::Order
+        | IrType::HttpMethod
+        | IrType::Decimal
+        | IrType::ErrorKind
+        | IrType::Error
+        | IrType::ErrorDetails
+        | IrType::ErrorInfo
+        | IrType::PanicInfo
+        | IrType::TypeInfo
+        | IrType::SqlFragment
+        | IrType::Secret
+        | IrType::Path
+        | IrType::Url
+        | IrType::UrlRelative
+        | IrType::Dsn
+        | IrType::Connection
+        | IrType::ConnReadOnly
+        | IrType::ConnReadWrite
+        | IrType::Setting
+        | IrType::ShapeWeb
+        | IrType::ShapeWebView
+        | IrType::ShapeTerminal
+        | IrType::Locale
+        | IrType::Principal
+        | IrType::ProcessRunWithCfg
+        | IrType::ProcessRunInPtyCfg
+        | IrType::CacheCfg
+        | IrType::CacheStats
+        | IrType::WebSocketClientCfg
+        | IrType::CsvDoc
+        | IrType::CryptoKey
+        | IrType::CryptoMac
+        | IrType::EmailMessage
+        | IrType::EmailAttachment
+        | IrType::EmailSesConfig
+        | IrType::EmailSmtpConfig
+        | IrType::EmailProvider
+        | IrType::EmailAddress
+        | IrType::ServerRequest
+        | IrType::ServerResponse
+        | IrType::ServerRoute
+        | IrType::ServerCookie
+        | IrType::AuthConfig
+        | IrType::TokenSource
+        | IrType::StreamWriter
+        | IrType::HttpRequest
+        | IrType::WebSocketServer
+        | IrType::WebSocketServerCfg
+        | IrType::WebReq
+        | IrType::SessionHandle
+        | IrType::Regex
+        | IrType::WebApp
+        | IrType::TuiApp
+        | IrType::CliApp
+        | IrType::WorkerApp
+        | IrType::UiPlain(_) => CarrierShape::Fixed,
+    }
+}
+
+/// How a value of one lowered type converts to the function carriers of another.
+#[derive(Debug)]
+enum CarrierDiff<'a> {
+    /// Both are on the same carriers; the value is kept as is.
+    Same,
+    /// A shared function meets a direct one; rebuild it as a direct closure of this arrow.
+    ToDirect(&'a [IrType], &'a IrType),
+    /// A direct function meets a shared one; wrap it on `Arc` as a closure of this arrow.
+    ToShared(&'a [IrType], &'a IrType),
+    /// The carriers differ under a `Maybe`/`Result` payload, where no conversion reaches.
+    Nested,
+}
+
+/// The conversion a value of type `from` needs to fill a position of type `to`.
+///
+/// Only the carriers a value decides are compared: a top-level function, and
+/// a `Maybe`/`Result` payload. A storage container is on `Arc` in every value
+/// alike, and a pair of different shapes is no carrier question.
+fn carrier_diff<'a>(from: &IrType, to: &'a IrType) -> CarrierDiff<'a> {
+    match (carrier_shape(from), carrier_shape(to)) {
+        (CarrierShape::Fn(from_kind, ..), CarrierShape::Fn(to_kind, params, ret)) => {
+            match (from_kind, to_kind) {
+                (FnCarrierKind::Direct, FnCarrierKind::Direct)
+                | (FnCarrierKind::Shared, FnCarrierKind::Shared) => CarrierDiff::Same,
+                (FnCarrierKind::Shared, FnCarrierKind::Direct) => {
+                    CarrierDiff::ToDirect(params, ret)
+                }
+                (FnCarrierKind::Direct, FnCarrierKind::Shared) => {
+                    CarrierDiff::ToShared(params, ret)
+                }
+            }
+        }
+        (CarrierShape::Branchable(from_items), CarrierShape::Branchable(to_items))
+            if std::mem::discriminant(from) == std::mem::discriminant(to)
+                && from_items.len() == to_items.len() =>
+        {
+            if from_items
+                .iter()
+                .zip(&to_items)
+                .all(|(f, t)| matches!(carrier_diff(f, t), CarrierDiff::Same))
+            {
+                CarrierDiff::Same
+            } else {
+                CarrierDiff::Nested
+            }
+        }
+        (CarrierShape::Fn(..) | CarrierShape::Branchable(_) | CarrierShape::Fixed, _) => {
+            CarrierDiff::Same
         }
     }
 }
@@ -7701,11 +7872,10 @@ fn ir_holds_shared(ty: &IrType) -> bool {
 /// These are the positions a branch's own carrier decides; a storage
 /// position is on `Arc` in every branch alike.
 fn holds_shared_direct(ty: &IrType) -> bool {
-    match ty {
-        IrType::SharedFun(..) => true,
-        IrType::Maybe(item) => holds_shared_direct(item),
-        IrType::Result(err, ok) => holds_shared_direct(err) || holds_shared_direct(ok),
-        _ => false,
+    match carrier_shape(ty) {
+        CarrierShape::Fn(kind, ..) => kind == FnCarrierKind::Shared,
+        CarrierShape::Branchable(items) => items.into_iter().any(holds_shared_direct),
+        CarrierShape::Fixed => false,
     }
 }
 
@@ -7726,6 +7896,158 @@ fn join_carrier_types(branches: impl Iterator<Item = Option<IrType>>) -> Option<
         }
     }
     first
+}
+
+/// How a branch's carrier type constrains the join it is a branch of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarrierRole {
+    /// The carrier type is the one the branch is emitted on.
+    Typed,
+    /// A constructor application or an empty list, whose payload carrier is the value built into it.
+    Built,
+    /// A local whose carrier a binder promotion after its scope may still change.
+    Deferred,
+}
+
+impl CarrierRole {
+    /// The role of a join over `branches`.
+    fn of_join(branches: &[Carried]) -> Self {
+        if branches.iter().any(|b| b.role == Self::Deferred) {
+            Self::Deferred
+        } else if branches.iter().all(|b| b.role == Self::Built) {
+            Self::Built
+        } else {
+            Self::Typed
+        }
+    }
+}
+
+/// The carrier type of an expression, with its [`CarrierRole`].
+#[derive(Clone, Debug)]
+struct Carried {
+    /// The lowered type with every function on its carrier; `None` when it holds no function or is unknown.
+    ty: Option<IrType>,
+    /// How [`Self::ty`] constrains a join.
+    role: CarrierRole,
+}
+
+impl Carried {
+    /// A carrier type the value is emitted on.
+    const fn typed(ty: Option<IrType>) -> Self {
+        Self {
+            ty,
+            role: CarrierRole::Typed,
+        }
+    }
+
+    /// The type of a value whose payload carrier is the value built into it.
+    const fn built(ty: Option<IrType>) -> Self {
+        Self {
+            ty,
+            role: CarrierRole::Built,
+        }
+    }
+
+    /// The carrier type the value is emitted on, when it is known and [`CarrierRole::Typed`].
+    const fn emitted(&self) -> Option<&IrType> {
+        match self.role {
+            CarrierRole::Typed => self.ty.as_ref(),
+            CarrierRole::Built | CarrierRole::Deferred => None,
+        }
+    }
+}
+
+/// The carrier decision of one `if`/`case` join, read by its prediction and its lowering alike.
+#[derive(Debug)]
+enum JoinCarrier {
+    /// No branch converts; the join's carrier type is this one.
+    Agreed(Option<IrType>),
+    /// Every emitted branch converts to this type.
+    Converted(IrType),
+    /// The branches disagree where no conversion reaches; the join is refused.
+    Conflict,
+}
+
+impl JoinCarrier {
+    /// Refuse a [`Self::Conflict`] with IPE-L0107 [`Feature::FnCarrierConflict`] at the join's `span`.
+    const fn admit(&self, span: Span) -> DResult<()> {
+        match self {
+            Self::Conflict => Err(unsupported(span, Feature::FnCarrierConflict)),
+            Self::Agreed(_) | Self::Converted(_) => Ok(()),
+        }
+    }
+}
+
+/// Whether the callee spine `callee` is headed by a constructor.
+fn is_ctor_application(callee: &canon::Expr) -> bool {
+    let mut head = callee;
+    while let canon::Expr_::Call(inner, _) = &head.value {
+        head = inner;
+    }
+    matches!(head.value, canon::Expr_::VarCtor { .. })
+}
+
+/// The arms of a `case` that can be reached: every arm up to and including the first irrefutable one.
+///
+/// Arms after a catch-all are unreachable (IPE-T0011 warns) and are dropped
+/// before lowering, so neither the lowering nor the carrier plan reads them.
+fn live_case_branches(branches: &[canon::CaseBranch]) -> &[canon::CaseBranch] {
+    let live_end = branches
+        .iter()
+        .position(|br| br.pat.value.is_irrefutable())
+        .map_or(branches.len(), |i| i.saturating_add(1));
+    branches.get(..live_end).unwrap_or(branches)
+}
+
+/// Whether type variable `var` occurs inside a record field of the declared type `ty`.
+///
+/// It names the cause of a generic-slot refusal: a function bound to a
+/// variable a record field holds is a function stored in a record field;
+/// any other is a function meeting a generic parameter.
+fn var_in_record_field(ty: &Ty, var: u32) -> bool {
+    match ty {
+        Ty::Record(fields, _) => fields.values().any(|field| ty_mentions_var(field, var)),
+        Ty::Fun(param, ret) => var_in_record_field(param, var) || var_in_record_field(ret, var),
+        Ty::Con { args, .. } | Ty::Tuple(args) => {
+            args.iter().any(|arg| var_in_record_field(arg, var))
+        }
+        Ty::Var(_) | Ty::Wildcard | Ty::Unit => false,
+    }
+}
+
+/// Whether type variable `var` occurs anywhere in `ty`.
+fn ty_mentions_var(ty: &Ty, var: u32) -> bool {
+    match ty {
+        Ty::Var(found) => *found == var,
+        Ty::Record(fields, _) => fields.values().any(|field| ty_mentions_var(field, var)),
+        Ty::Fun(param, ret) => ty_mentions_var(param, var) || ty_mentions_var(ret, var),
+        Ty::Con { args, .. } | Ty::Tuple(args) => args.iter().any(|arg| ty_mentions_var(arg, var)),
+        Ty::Wildcard | Ty::Unit => false,
+    }
+}
+
+/// The refusal of a call that binds a variable of the declared type `declared` to a function, per `subst`.
+///
+/// `None` when no binding breaks the generic `Clone` slot. A variable a
+/// record field holds is refused as a function in a record field
+/// ([`Feature::FirstClassFunctions`]); any other as a function meeting a
+/// generic parameter ([`Feature::FnCarrierConflict`]).
+fn generic_slot_refusal(
+    interner: &Interner,
+    declared: &Ty,
+    subst: &BTreeMap<u32, Ty>,
+) -> Option<Feature> {
+    let mut broken = subst
+        .iter()
+        .filter(|(_, bound)| generic_binding_breaks_clone(interner, bound))
+        .map(|(var, _)| *var)
+        .peekable();
+    broken.peek()?;
+    if broken.any(|var| var_in_record_field(declared, var)) {
+        Some(Feature::FirstClassFunctions)
+    } else {
+        Some(Feature::FnCarrierConflict)
+    }
 }
 
 /// Whether the curried spine of `kernel` whose outer `outer_len` arguments start at slot `offset` lowers as one saturated call.
@@ -7808,17 +8130,142 @@ fn bound_carrier(bound: &[(u8, IrType)], var: u8) -> Option<IrType> {
 }
 
 /// The lowered type argument `slot` of the built-in constructor `tag`, read off `ty`.
+///
+/// Only the transparent containers are read: an effect or opaque constructor
+/// (`Task`, `Decoder`, `Cmd`, `Sub`, ...) keeps its payload at the base
+/// carrier, so a scheme variable under one is never bound through it. The
+/// match on `tag` is exhaustive, so a constructor added later is classified
+/// here before it compiles.
+#[allow(clippy::too_many_lines)] // one exhaustive `BuiltinTag` match
 fn builtin_child(tag: ipe_kernels::BuiltinTag, ty: &IrType, slot: usize) -> Option<&IrType> {
     use ipe_kernels::BuiltinTag;
-    match (tag, ty, slot) {
-        (BuiltinTag::Maybe, IrType::Maybe(item), 0)
-        | (BuiltinTag::List, IrType::List(item), 0)
-        | (BuiltinTag::Set, IrType::Set(item), 0)
-        | (BuiltinTag::Result, IrType::Result(item, _), 0)
-        | (BuiltinTag::Dict, IrType::Dict(item, _), 0)
-        | (BuiltinTag::Result, IrType::Result(_, item), 1)
-        | (BuiltinTag::Dict, IrType::Dict(_, item), 1) => Some(item),
-        _ => None,
+    match (tag, ty) {
+        (BuiltinTag::Maybe, IrType::Maybe(item))
+        | (BuiltinTag::List, IrType::List(item))
+        | (BuiltinTag::Set, IrType::Set(item)) => (slot == 0).then_some(item.as_ref()),
+        (BuiltinTag::Result, IrType::Result(first, second))
+        | (BuiltinTag::Dict, IrType::Dict(first, second)) => match slot {
+            0 => Some(first.as_ref()),
+            1 => Some(second.as_ref()),
+            _ => None,
+        },
+        (
+            BuiltinTag::Maybe
+            | BuiltinTag::List
+            | BuiltinTag::Set
+            | BuiltinTag::Result
+            | BuiltinTag::Dict
+            | BuiltinTag::Int
+            | BuiltinTag::Float
+            | BuiltinTag::Bool
+            | BuiltinTag::String
+            | BuiltinTag::Char
+            | BuiltinTag::Bytes
+            | BuiltinTag::Order
+            | BuiltinTag::Error
+            | BuiltinTag::ErrorKind
+            | BuiltinTag::ErrorDetails
+            | BuiltinTag::BackoffStrategy
+            | BuiltinTag::TaskStep
+            | BuiltinTag::Decimal
+            | BuiltinTag::Task
+            | BuiltinTag::Cmd
+            | BuiltinTag::Sub
+            | BuiltinTag::Topic
+            | BuiltinTag::Decoder
+            | BuiltinTag::Db
+            | BuiltinTag::SqlValue
+            | BuiltinTag::SqlField
+            | BuiltinTag::SqlFragment
+            | BuiltinTag::ProjectionTerm
+            | BuiltinTag::ProjectionOperand
+            | BuiltinTag::Secret
+            | BuiltinTag::Path
+            | BuiltinTag::Regex
+            | BuiltinTag::Url
+            | BuiltinTag::UrlRelative
+            | BuiltinTag::Dsn
+            | BuiltinTag::Connection
+            | BuiltinTag::ConnReadOnly
+            | BuiltinTag::ConnReadWrite
+            | BuiltinTag::Setting
+            | BuiltinTag::ShapeWeb
+            | BuiltinTag::ShapeWebView
+            | BuiltinTag::ShapeTerminal
+            | BuiltinTag::Program
+            | BuiltinTag::ProgramShapeWeb
+            | BuiltinTag::ProgramShapeTui
+            | BuiltinTag::ProgramShapeCli
+            | BuiltinTag::ProgramShapeWorker
+            | BuiltinTag::HostMode
+            | BuiltinTag::LogLevel
+            | BuiltinTag::CsrfMode
+            | BuiltinTag::RevocationMode
+            | BuiltinTag::Locale
+            | BuiltinTag::HttpMethod
+            | BuiltinTag::RedirectPolicy
+            | BuiltinTag::DbFailure
+            | BuiltinTag::AuthError
+            | BuiltinTag::Duration
+            | BuiltinTag::CryptoKey
+            | BuiltinTag::CryptoMac
+            | BuiltinTag::EmailAddress
+            | BuiltinTag::Principal
+            | BuiltinTag::Claims
+            | BuiltinTag::Algorithm
+            | BuiltinTag::JsonValue
+            | BuiltinTag::StreamId
+            | BuiltinTag::StreamWriter
+            | BuiltinTag::WsServer
+            | BuiltinTag::WsServerCfg
+            | BuiltinTag::ServerRequest
+            | BuiltinTag::ServerCookie
+            | BuiltinTag::ServerRoute
+            | BuiltinTag::AuthConfig
+            | BuiltinTag::TokenSource
+            | BuiltinTag::UiAttribute
+            | BuiltinTag::HtmlAttribute
+            | BuiltinTag::View
+            | BuiltinTag::UiElement
+            | BuiltinTag::Cells
+            | BuiltinTag::TuiAttr
+            | BuiltinTag::CliLines
+            | BuiltinTag::CliAttr
+            | BuiltinTag::Color
+            | BuiltinTag::ColorError
+            | BuiltinTag::TermProfile
+            | BuiltinTag::AnsiColor
+            | BuiltinTag::WcagLevel
+            | BuiltinTag::TextSize
+            | BuiltinTag::Deficiency
+            | BuiltinTag::CustomElement
+            | BuiltinTag::Html
+            | BuiltinTag::UiLength
+            | BuiltinTag::UiColor
+            | BuiltinTag::UiDescription
+            | BuiltinTag::UiPseudoClass
+            | BuiltinTag::InputLabel
+            | BuiltinTag::InputPlaceholder
+            | BuiltinTag::InputRadioOption
+            | BuiltinTag::WebReq
+            | BuiltinTag::SessionHandle
+            | BuiltinTag::WebRoute
+            | BuiltinTag::EmailProvider
+            | BuiltinTag::WebApp
+            | BuiltinTag::TuiApp
+            | BuiltinTag::CliApp
+            | BuiltinTag::DbStore
+            | BuiltinTag::DbDraft
+            | BuiltinTag::DbJoined
+            | BuiltinTag::DbSelect
+            | BuiltinTag::DbPolicy
+            | BuiltinTag::DbCond
+            | BuiltinTag::DbPred
+            | BuiltinTag::DbSecured
+            | BuiltinTag::DbOrder
+            | BuiltinTag::Codec,
+            _,
+        ) => None,
     }
 }
 
@@ -11654,7 +12101,11 @@ pub fn max_ctor_arity_per_module(m: &canon::Module) -> usize {
 ///   payload arity ([`max_ctor_arity_per_module`]), which is uncapped and so can
 ///   exceed the `MAX_ETA_PER_SITE` floor;
 /// * a `let` binding — up to [`MAX_ETA_PER_SITE`] for a fn-typed binder's
-///   shim / sibling-promote / rebind block.
+///   shim / sibling-promote / rebind block;
+/// * an `if` branch, an `else`, and a `case` arm — up to [`MAX_ETA_PER_SITE`]
+///   for the carrier conversion of its tail (`Lowerer::coerce_join_branch`);
+/// * a def head — up to [`MAX_ETA_PER_SITE`] for the carrier conversion of
+///   the body to the declared return type.
 ///
 /// Every charge is a ceiling, so the total is a safe over-approximation.
 /// Over-sizing is byte-neutral (the surplus tail symbols are never referenced —
@@ -11681,7 +12132,11 @@ pub fn max_live_eta_params(m: &canon::Module) -> usize {
             canon::Expr_::ForeignCall { args, .. } => args.iter().map(recur).sum::<usize>(),
             canon::Expr_::Binop { lhs, rhs, .. } => recur(lhs) + recur(rhs),
             canon::Expr_::Case(scrut, branches) => {
-                recur(scrut) + branches.iter().map(|b| recur(&b.body)).sum::<usize>()
+                recur(scrut)
+                    + branches
+                        .iter()
+                        .map(|b| MAX_ETA_PER_SITE + recur(&b.body))
+                        .sum::<usize>()
             }
             canon::Expr_::Let(bindings, body) => {
                 bindings
@@ -11693,8 +12148,9 @@ pub fn max_live_eta_params(m: &canon::Module) -> usize {
             canon::Expr_::If(branches, else_expr) => {
                 branches
                     .iter()
-                    .map(|(c, b)| recur(c) + recur(b))
+                    .map(|(c, b)| recur(c) + MAX_ETA_PER_SITE + recur(b))
                     .sum::<usize>()
+                    + MAX_ETA_PER_SITE
                     + recur(else_expr)
             }
             canon::Expr_::Tuple(elems) | canon::Expr_::List(elems) => elems.iter().map(recur).sum(),
@@ -11725,7 +12181,7 @@ pub fn max_live_eta_params(m: &canon::Module) -> usize {
         .map(|d| match d {
             canon::Def::Typed { patterns, body, .. }
             | canon::Def::Untyped { patterns, body, .. } => {
-                patterns.len() + walk_expr(body, ctor_charge)
+                patterns.len() + MAX_ETA_PER_SITE + walk_expr(body, ctor_charge)
             }
         })
         .max()
@@ -12609,6 +13065,7 @@ fn count_body_pool_sites(e: &canon::Expr, ctor_charge: usize, interner: &Interne
             acc.destructure_thunk_sites += usize::from(single_destructure_head);
             recur(scrut, &mut acc);
             for b in branches {
+                acc.eta += MAX_ETA_PER_SITE;
                 acc.nested_cons_payload_sites += direct_list_args(&b.pat.value);
                 acc.nested_strlit_payload_sites += direct_strlit_args(&b.pat.value);
                 recur(&b.body, &mut acc);
@@ -12626,9 +13083,11 @@ fn count_body_pool_sites(e: &canon::Expr, ctor_charge: usize, interner: &Interne
         }
         canon::Expr_::If(branches, else_expr) => {
             for (c, b) in branches {
+                acc.eta += MAX_ETA_PER_SITE;
                 recur(c, &mut acc);
                 recur(b, &mut acc);
             }
+            acc.eta += MAX_ETA_PER_SITE;
             recur(else_expr, &mut acc);
         }
         canon::Expr_::Tuple(elems) | canon::Expr_::List(elems) => {
@@ -12710,10 +13169,11 @@ pub fn module_symbol_pool_counts(m: &canon::Module, interner: &Interner) -> Pool
             | canon::Def::Untyped { patterns, body, .. } => (patterns, body),
         };
         let body_counts = count_body_pool_sites(body, ctor_charge, interner);
-        // Eta demand aggregates as a per-def MAX of (head arity + body sum).
+        // Eta demand aggregates as a per-def MAX of (head arity + the def
+        // return's conversion + body sum).
         counts.max_live_eta_params = counts
             .max_live_eta_params
-            .max(patterns.len() + body_counts.eta);
+            .max(patterns.len() + MAX_ETA_PER_SITE + body_counts.eta);
         // The rest sum over defs; the def head charges the destructure-param pool.
         counts.destructure_param_sites +=
             non_var_params(patterns) + body_counts.destructure_param_sites;
@@ -17110,7 +17570,7 @@ impl<'a> Lowerer<'a> {
                             self.with_binders(&param_scope, || {
                                 self.with_stored_fn_binders(
                                     patterns.iter().map(|p| (p, false)),
-                                    || self.lower_expr(body),
+                                    || self.lower_returned_body(body, &ret),
                                 )
                             })
                         });
@@ -17540,7 +18000,7 @@ impl<'a> Lowerer<'a> {
                                     self.with_binders(&param_scope, || {
                                         self.with_stored_fn_binders(
                                             patterns.iter().map(|p| (p, false)),
-                                            || self.lower_expr(body),
+                                            || self.lower_returned_body(body, &ret),
                                         )
                                     })
                                 });
@@ -17588,7 +18048,7 @@ impl<'a> Lowerer<'a> {
                         self.fn_is_async.set(matches!(ret, IrType::Task(_)));
                         let lowered_body = self
                             .reject_generic_app_entries_in(body, &BTreeSet::new())
-                            .and_then(|()| self.lower_expr(body));
+                            .and_then(|()| self.lower_returned_body(body, &ret));
                         self.fn_is_async.set(prev_async);
                         Ok((ret, lowered_body?))
                     })?;
@@ -21333,13 +21793,8 @@ impl<'a> Lowerer<'a> {
             }
             cur = rest.as_ref();
         }
-        if subst
-            .values()
-            .any(|bound| generic_binding_breaks_clone(self.interner, bound))
-        {
-            return Err(unsupported(call_span, Feature::FirstClassFunctions));
-        }
-        Ok(())
+        generic_slot_refusal(self.interner, declared, &subst)
+            .map_or(Ok(()), |feature| Err(unsupported(call_span, feature)))
     }
 
     /// The point-free twin of [`Self::reject_fn_through_generic_slot`]. A
@@ -21499,13 +21954,8 @@ impl<'a> Lowerer<'a> {
         };
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, reified, &mut subst, self.interner);
-        if subst
-            .values()
-            .any(|bound| generic_binding_breaks_clone(self.interner, bound))
-        {
-            return Err(unsupported(span, Feature::FirstClassFunctions));
-        }
-        Ok(())
+        generic_slot_refusal(self.interner, declared, &subst)
+            .map_or(Ok(()), |feature| Err(unsupported(span, feature)))
     }
 
     /// The computed-callee twin of the generic-slot gate family. A value callee
@@ -21749,10 +22199,31 @@ impl<'a> Lowerer<'a> {
                 // nested binary `If`s: `if c1 then a else if c2 then b else c`
                 // becomes `If c1 a (If c2 b c)`. Folding from the right keeps
                 // the source order of the conditions.
-                let mut acc = self.lower_expr(else_expr)?;
-                for (cond, body) in branches.iter().rev() {
+                //
+                // Every branch tail is converted to the one carrier the join
+                // plan decides ([`Self::join_plan`]).
+                let carried = self.if_branch_carriers(branches, else_expr);
+                let join = self.join_plan(e.span, &carried);
+                join.admit(e.span)?;
+                let Some((else_carried, then_carried)) = carried.split_last() else {
+                    return Err(bug(
+                        "ipe_lower::lower_expr",
+                        "`if` without an `else` branch",
+                    ));
+                };
+                let otherwise = self.lower_expr(else_expr)?;
+                let mut acc = self.coerce_join_branch(
+                    &join,
+                    else_carried,
+                    otherwise,
+                    e.span,
+                    else_expr.span,
+                )?;
+                for ((cond, body), then_carried) in branches.iter().zip(then_carried).rev() {
                     let cond = self.lower_expr(cond)?;
                     let then_ = self.lower_expr(body)?;
+                    let then_ =
+                        self.coerce_join_branch(&join, then_carried, then_, e.span, body.span)?;
                     acc = Expr::If {
                         cond: Box::new(cond),
                         then_: Box::new(then_),
@@ -21896,7 +22367,7 @@ impl<'a> Lowerer<'a> {
                 })
             }
             canon::Expr_::Update(base, fields) => self.lower_update(base, fields),
-            canon::Expr_::Case(scrut, branches) => self.lower_case(scrut, branches),
+            canon::Expr_::Case(scrut, branches) => self.lower_case(scrut, branches, e.span),
             // A top-level binding or kernel named as a bare *value* (passed,
             // returned, or let-bound) rather than directly applied. The
             // reference's solved region type fixes its shape: a function type
@@ -24235,14 +24706,20 @@ impl<'a> Lowerer<'a> {
         let IrType::Fun(params, ret) = self.ir_type_from_ty(solved, canon_arg.span)? else {
             return Ok(value);
         };
-        // Eta-expand the leaf into `Arc::new(move |eta_0, …| (leaf)(eta_0, …))`
-        // over fresh binders drawn positionally from `eta_params`. Unlike the
-        // sync-capture-kernel eta ([`eta_expand_leaf_to_shared`]), this wrapper is
-        // constructed ONCE at ctor time with no enclosing `Fn` closure, so a
-        // `Var`/`CloneVar` leaf is MOVED into the `Arc` (not cloned): the moved
-        // `Box<dyn Fn>` binding is called by shared reference inside the `Fn`
-        // wrapper, and `Box<dyn Fn>` is not `Clone`, so a clone-forward would be
-        // an E0599. Every other leaf shape is a fresh value, forwarded as-is.
+        self.shared_eta_wrapper(value, &params, &ret)
+    }
+
+    /// Wrap the function value `value` in an `Arc` closure of arrow `params -> ret` that calls it.
+    ///
+    /// ```text
+    /// Arc::new(move |eta_0, ..| (value)(eta_0, ..))
+    /// ```
+    ///
+    /// The wrapper is built once with no enclosing `Fn` closure, so a
+    /// `Var`/`CloneVar` leaf is moved into it rather than cloned: a moved
+    /// `Box<dyn Fn>` is called by shared reference inside the wrapper, and is
+    /// not `Clone`. Every other value is forwarded as is.
+    fn shared_eta_wrapper(&self, value: Expr, params: &[IrType], ret: &IrType) -> DResult<Expr> {
         let callee = match value {
             Expr::Var(s) | Expr::CloneVar(s) => Expr::Var(s),
             other => other,
@@ -24257,12 +24734,61 @@ impl<'a> Lowerer<'a> {
         self.advance_eta(params.len());
         Ok(Expr::SharedLambda {
             params: fresh_params,
-            ret: *ret,
+            ret: ret.clone(),
             body: Box::new(Expr::Apply {
                 func: Box::new(callee),
                 args: call_args,
             }),
         })
+    }
+
+    /// Convert the function value `value`, of carrier type `from`, to the carriers of `to`.
+    ///
+    /// The one adapter every carrier frontier goes through
+    /// ([`carrier_diff`]): an agreeing pair is kept as is; a shared function
+    /// meeting a direct position is rebuilt as a direct closure
+    /// ([`Self::hoist_stored_fn_read`]); a direct function meeting a shared
+    /// position is wrapped on `Arc` ([`Self::shared_eta_wrapper`]). A
+    /// mismatch under a `Maybe`/`Result` payload, and a once closure that an
+    /// `Arc` wrapper could call more than once, are refused with IPE-L0107
+    /// [`Feature::FnCarrierConflict`] at `span`. Each conversion draws its eta
+    /// names on `site`; a site past [`MAX_ETA_PER_SITE`] fails closed with
+    /// IPE-L0155.
+    fn fn_carrier_coerce(
+        &self,
+        value: Expr,
+        from: &IrType,
+        to: &IrType,
+        site: EtaDemand,
+        span: Span,
+    ) -> DResult<(Expr, EtaDemand)> {
+        match carrier_diff(from, to) {
+            CarrierDiff::Same => Ok((value, site)),
+            CarrierDiff::ToDirect(params, ret) => {
+                let site = site
+                    .charge(params.len().saturating_add(1))
+                    .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
+                Ok((self.hoist_stored_fn_read(value, params, ret)?, site))
+            }
+            CarrierDiff::ToShared(params, ret) => {
+                let value = promote_fn_field_value_carrier(value);
+                match value {
+                    Expr::SharedLambda { .. }
+                    | Expr::FuncValue {
+                        ty: IrType::SharedFun(..),
+                        ..
+                    } => Ok((value, site)),
+                    Expr::OnceLambda { .. } => Err(unsupported(span, Feature::FnCarrierConflict)),
+                    other => {
+                        let site = site
+                            .charge(params.len())
+                            .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
+                        Ok((self.shared_eta_wrapper(other, params, ret)?, site))
+                    }
+                }
+            }
+            CarrierDiff::Nested => Err(unsupported(span, Feature::FnCarrierConflict)),
+        }
     }
 
     /// The READ-frontier dual of [`Self::promote_stored_fn_carrier`]. When a
@@ -24470,7 +24996,7 @@ impl<'a> Lowerer<'a> {
         if let Some((params, ret)) = self.shared_fn_read_carrier(lowered) {
             return Some(FnCarrier::Shared(params, ret));
         }
-        FnCarrier::of_type(self.value_carrier_type(canon_arg)?)
+        FnCarrier::of_type(&self.value_carrier_type(canon_arg)?)
     }
 
     /// The use site's solved arrow of `canon_arg`, lowered, when it is one.
@@ -24513,47 +25039,68 @@ impl<'a> Lowerer<'a> {
     /// ([`Self::call_carrier_type`]). `None` when the type holds no function
     /// or cannot be lowered.
     fn value_carrier_type(&self, expr: &canon::Expr) -> Option<IrType> {
+        self.carried(expr).ty
+    }
+
+    /// The carrier type of `expr`, with how it constrains a join it is a branch of.
+    ///
+    /// The one walk behind [`Self::value_carrier_type`]. An `if` or `case`
+    /// takes the carrier its join plan decides ([`Self::join_plan`]), the
+    /// same plan its lowering converts the branches by, so the prediction and
+    /// the emitted carriers come from one decision. Each node is walked once.
+    fn carried(&self, expr: &canon::Expr) -> Carried {
         #[cfg(test)]
         self.carrier_walks
             .set(self.carrier_walks.get().saturating_add(1));
         let region = self.region_ty(expr.span);
         if region.is_some_and(|ty| !ty_holds_fun(ty)) {
-            return None;
+            return Carried::typed(None);
         }
         let lowered = || region.and_then(|ty| self.ir_type_from_ty(ty, expr.span).ok());
+        // A constructor application or an empty list that is no function
+        // value takes its payload carrier from the value built into it, which
+        // the solved type does not say.
+        let built = region.is_some_and(|ty| !matches!(ty, Ty::Fun(..)));
         match &expr.value {
             canon::Expr_::Access(record, field) => {
-                self.access_field_type(record, *field).or_else(lowered)
+                Carried::typed(self.access_field_type(record, *field).or_else(lowered))
             }
             canon::Expr_::VarLocal(sym) => {
                 let stored = self.shared_fn_reads.borrow().get(sym).cloned();
-                stored
-                    .map(|(params, ret)| IrType::SharedFun(params, Box::new(ret)))
-                    .or_else(lowered)
+                stored.map_or_else(
+                    || Carried {
+                        ty: lowered(),
+                        role: CarrierRole::Deferred,
+                    },
+                    |(params, ret)| Carried::typed(Some(IrType::SharedFun(params, Box::new(ret)))),
+                )
             }
-            canon::Expr_::If(branches, otherwise) => join_carrier_types(
-                branches
-                    .iter()
-                    .map(|(_, then)| then)
-                    .chain(std::iter::once(otherwise.as_ref()))
-                    .map(|branch| self.value_carrier_type(branch)),
-            )
-            .or_else(lowered),
-            canon::Expr_::Let(bindings, body) => self
-                .with_stored_fn_let_binders(bindings, || self.value_carrier_type(body))
-                .or_else(lowered),
+            canon::Expr_::If(branches, otherwise) => {
+                let carried = self.if_branch_carriers(branches, otherwise);
+                self.join_carried(expr.span, &carried, lowered)
+            }
+            canon::Expr_::Let(bindings, body) => {
+                let inner = self.with_stored_fn_let_binders(bindings, || self.carried(body));
+                Carried {
+                    ty: inner.ty.or_else(lowered),
+                    role: inner.role,
+                }
+            }
             canon::Expr_::Case(scrutinee, branches) => {
                 let stored = self.stored_fn_scrutinee(scrutinee, None);
-                join_carrier_types(branches.iter().map(|br| {
-                    let saved = self.shared_fn_reads.borrow().clone();
-                    self.register_stored_fn_arm_binders(&stored, &br.pat);
-                    let found = self.value_carrier_type(&br.body);
-                    *self.shared_fn_reads.borrow_mut() = saved;
-                    found
-                }))
-                .or_else(lowered)
+                let carried = self.case_branch_carriers(&stored, live_case_branches(branches));
+                self.join_carried(expr.span, &carried, lowered)
             }
-            canon::Expr_::Call(callee, args) => self.call_carrier_type(callee, args, lowered()),
+            canon::Expr_::Call(callee, args) => {
+                let ty = self.call_carrier_type(callee, args, lowered());
+                if built && is_ctor_application(callee) {
+                    Carried::built(ty)
+                } else {
+                    Carried::typed(ty)
+                }
+            }
+            canon::Expr_::VarCtor { .. } if built => Carried::built(lowered()),
+            canon::Expr_::List(items) if built && items.is_empty() => Carried::built(lowered()),
             canon::Expr_::VarTopLevel { .. }
             | canon::Expr_::VarKernel { .. }
             | canon::Expr_::VarCtor { .. }
@@ -24570,8 +25117,139 @@ impl<'a> Lowerer<'a> {
             | canon::Expr_::List(_)
             | canon::Expr_::Cons(..)
             | canon::Expr_::Record(_)
-            | canon::Expr_::Update(..) => lowered(),
+            | canon::Expr_::Update(..) => Carried::typed(lowered()),
         }
+    }
+
+    /// The carriers of the branches of an `if`, its `else` last.
+    fn if_branch_carriers(
+        &self,
+        branches: &[(canon::Expr, canon::Expr)],
+        otherwise: &canon::Expr,
+    ) -> Vec<Carried> {
+        branches
+            .iter()
+            .map(|(_, then)| then)
+            .chain(std::iter::once(otherwise))
+            .map(|branch| self.carried(branch))
+            .collect()
+    }
+
+    /// The carriers of the arm bodies of a `case` over `scrutinee`, each read with its arm's binders registered.
+    fn case_branch_carriers(
+        &self,
+        scrutinee: &StoredScrutinee,
+        branches: &[canon::CaseBranch],
+    ) -> Vec<Carried> {
+        branches
+            .iter()
+            .map(|br| {
+                let saved = self.shared_fn_reads.borrow().clone();
+                self.register_stored_fn_arm_binders(scrutinee, &br.pat);
+                let found = self.carried(&br.body);
+                *self.shared_fn_reads.borrow_mut() = saved;
+                found
+            })
+            .collect()
+    }
+
+    /// The carrier of a join at `span` whose branches carry `branches`.
+    ///
+    /// `lowered` is the join's solved type lowered, taken when the plan
+    /// leaves the carrier unknown.
+    fn join_carried(
+        &self,
+        span: Span,
+        branches: &[Carried],
+        lowered: impl FnOnce() -> Option<IrType>,
+    ) -> Carried {
+        let ty = match self.join_plan(span, branches) {
+            JoinCarrier::Agreed(ty) => ty.or_else(lowered),
+            JoinCarrier::Converted(target) => Some(target),
+            JoinCarrier::Conflict => lowered(),
+        };
+        Carried {
+            ty,
+            role: CarrierRole::of_join(branches),
+        }
+    }
+
+    /// The carrier plan of the join at `span` whose branches carry `branches`.
+    ///
+    /// Branches whose emitted carriers agree keep them, and so does a join
+    /// with a branch whose carrier a later binder promotion may still change
+    /// ([`JoinCarrier::Agreed`]). Branches that disagree on a function's
+    /// carrier convert to the join's solved type lowered
+    /// ([`JoinCarrier::Converted`]); a disagreement under a `Maybe`/`Result`
+    /// payload, where no conversion reaches, or an unknown join type, is a
+    /// [`JoinCarrier::Conflict`] the lowering refuses.
+    fn join_plan(&self, span: Span, branches: &[Carried]) -> JoinCarrier {
+        let agreed =
+            || JoinCarrier::Agreed(join_carrier_types(branches.iter().map(|b| b.ty.clone())));
+        if branches.iter().any(|b| b.role == CarrierRole::Deferred) {
+            return agreed();
+        }
+        let mut emitted = branches.iter().filter_map(Carried::emitted);
+        let Some(first) = emitted.next() else {
+            return agreed();
+        };
+        if emitted.all(|ty| matches!(carrier_diff(ty, first), CarrierDiff::Same)) {
+            return agreed();
+        }
+        let Some(target) = self
+            .region_ty(span)
+            .and_then(|ty| self.ir_type_from_ty(ty, span).ok())
+        else {
+            return JoinCarrier::Conflict;
+        };
+        if branches
+            .iter()
+            .filter_map(Carried::emitted)
+            .any(|ty| matches!(carrier_diff(ty, &target), CarrierDiff::Nested))
+        {
+            return JoinCarrier::Conflict;
+        }
+        JoinCarrier::Converted(target)
+    }
+
+    /// Convert the lowered branch `value`, which carries `branch`, to the carrier its join plan `join` decided.
+    ///
+    /// A [`JoinCarrier::Conflict`] is refused with IPE-L0107
+    /// [`Feature::FnCarrierConflict`] at the join's `join_span`; a conversion
+    /// failure is reported at the branch's `span`.
+    fn coerce_join_branch(
+        &self,
+        join: &JoinCarrier,
+        branch: &Carried,
+        value: Expr,
+        join_span: Span,
+        span: Span,
+    ) -> DResult<Expr> {
+        match (join, branch.emitted()) {
+            (JoinCarrier::Converted(target), Some(from)) => self
+                .fn_carrier_coerce(value, from, target, EtaDemand::EMPTY, span)
+                .map(|(value, _)| value),
+            (JoinCarrier::Conflict, _) => Err(unsupported(join_span, Feature::FnCarrierConflict)),
+            (JoinCarrier::Agreed(_) | JoinCarrier::Converted(_), _) => Ok(value),
+        }
+    }
+
+    /// Lower a def body whose value fills the def's declared return type `ret`.
+    ///
+    /// The def return is a carrier frontier: a body whose emitted function
+    /// carrier differs from `ret` converts through
+    /// [`Self::fn_carrier_coerce`], or is refused with IPE-L0107 when the
+    /// difference sits under a `Maybe`/`Result` payload. Only a body whose
+    /// carrier is the emitted one ([`CarrierRole::Typed`]) converts, the rule
+    /// a join branch follows too ([`Self::join_plan`]).
+    fn lower_returned_body(&self, body: &canon::Expr, ret: &IrType) -> DResult<Expr> {
+        let lowered = self.lower_expr(body)?;
+        let carried = self.carried(body);
+        let Some(from) = carried.emitted() else {
+            return Ok(lowered);
+        };
+        self.fn_carrier_coerce(lowered, from, ret, EtaDemand::EMPTY, body.span)
+            .map(|(value, _)| value)
     }
 
     /// The lowered type of the call `callee args`, with its result carrying its arguments' carriers.
@@ -31069,9 +31747,20 @@ impl<'a> Lowerer<'a> {
     // 100-line ceiling; splitting on an arbitrary boundary would obscure the
     // single linear lowering flow. The allow is narrow: only this function.
     #[allow(clippy::too_many_lines)]
-    fn lower_case(&self, scrut: &canon::Expr, branches: &[canon::CaseBranch]) -> DResult<Expr> {
+    fn lower_case(
+        &self,
+        scrut: &canon::Expr,
+        branches: &[canon::CaseBranch],
+        span: Span,
+    ) -> DResult<Expr> {
         let scrutinee = self.lower_expr(scrut)?;
         let stored_scrutinee = self.stored_fn_scrutinee(scrut, Some(&scrutinee));
+        // Every reachable arm tail is converted to the one carrier the join
+        // plan decides ([`Self::join_plan`]).
+        let live = live_case_branches(branches);
+        let carried = self.case_branch_carriers(&stored_scrutinee, live);
+        let join = self.join_plan(span, &carried);
+        join.admit(span)?;
 
         // The parser rejects a zero-branch `case` (CaseDefect::NoBranches), so
         // an empty branch list here is a violated invariant.
@@ -31150,14 +31839,11 @@ impl<'a> Lowerer<'a> {
                     // `synth_scrut_for_match` and letting the code path continue.
                     // To avoid duplicating the 80-line arm-lowering block, we use
                     // a local early-return after building the match inline here.
-                    let live_end_s = branches
-                        .iter()
-                        .position(|br| br.pat.value.is_irrefutable())
-                        .map_or(branches.len(), |i| i + 1);
-                    let branches_s = branches.get(..live_end_s).unwrap_or(branches);
+                    let branches_s = live;
                     let arms_s = branches_s
                         .iter()
-                        .map(|br| {
+                        .zip(&carried)
+                        .map(|(br, branch_carried)| {
                             let arm_pat = self.lower_arm_pat(&br.pat, scrut.span)?;
                             let arm_syms = collect_arm_pat_pvars(&br.pat.value);
                             let shared_before = self.shared_fn_reads.borrow().clone();
@@ -31176,6 +31862,13 @@ impl<'a> Lowerer<'a> {
                                         .apply_binder_move_ownership(sym, &ir_ty, arm_body, span)?;
                                 }
                             }
+                            let arm_body = self.coerce_join_branch(
+                                &join,
+                                branch_carried,
+                                arm_body,
+                                span,
+                                br.body.span,
+                            )?;
                             Ok(Arm {
                                 pat: arm_pat,
                                 body: arm_body,
@@ -31223,14 +31916,7 @@ impl<'a> Lowerer<'a> {
         // `PAlias` over an irrefutable inner (`_ as w` / `v as w`), which the
         // exhaustiveness pass treats as a catch-all, so post-alias arms
         // survived to `Match::new_flat` and ICE'd on well-typed source.
-        let live_end = branches
-            .iter()
-            .position(|br| br.pat.value.is_irrefutable())
-            .map_or(branches.len(), |i| i + 1);
-        // `live_end <= branches.len()` by construction; `get` keeps the
-        // no-panic lint satisfied with the full slice as the impossible-miss
-        // fallback.
-        let branches = branches.get(..live_end).unwrap_or(branches);
+        let branches = live;
 
         let all_ctor = branches
             .iter()
@@ -31238,7 +31924,8 @@ impl<'a> Lowerer<'a> {
 
         let arms = branches
             .iter()
-            .map(|br| {
+            .zip(&carried)
+            .map(|(br, branch_carried)| {
                 // C2: a ctor arm head nesting a supportable list / cons
                 // sub-pattern (`Just (h :: t)`) OR a string-literal sub-pattern
                 // (`Just "live"`) desugars to a fresh binder in that arg slot PLUS
@@ -31320,6 +32007,8 @@ impl<'a> Lowerer<'a> {
                         body: Box::new(arm_body),
                     };
                 }
+                let arm_body =
+                    self.coerce_join_branch(&join, branch_carried, arm_body, span, br.body.span)?;
 
                 Ok(Arm {
                     pat: arm_pat,
@@ -38055,6 +38744,107 @@ mod tests {
                 walks <= 3 * DEPTH + 1,
                 "{walks} carrier walks over a {DEPTH}-deep case scrutinee"
             );
+        });
+    }
+
+    /// The `Maybe`/`Result` payload shapes over `item`, the positions a value decides the carrier of.
+    fn branchable_containers(item: &IrType) -> Vec<(&'static str, IrType)> {
+        let boxed = || Box::new(item.clone());
+        vec![
+            ("Maybe", IrType::Maybe(boxed())),
+            ("Result err", IrType::Result(boxed(), Box::new(IrType::Int))),
+            ("Result ok", IrType::Result(Box::new(IrType::Int), boxed())),
+            (
+                "Maybe Maybe",
+                IrType::Maybe(Box::new(IrType::Maybe(boxed()))),
+            ),
+        ]
+    }
+
+    /// A carrier mismatch under a `Maybe`/`Result` payload is `Nested`; a top-level one converts.
+    #[test]
+    fn carrier_diff_marks_a_payload_mismatch_nested() {
+        use super::{CarrierDiff, carrier_diff};
+        let (shared, direct) = (shared_fn(), direct_fn());
+        assert!(matches!(
+            carrier_diff(&shared, &direct),
+            CarrierDiff::ToDirect(..)
+        ));
+        assert!(matches!(
+            carrier_diff(&direct, &shared),
+            CarrierDiff::ToShared(..)
+        ));
+        for ((shape, from), (_, to)) in branchable_containers(&shared)
+            .into_iter()
+            .zip(branchable_containers(&direct))
+        {
+            for (a, b) in [(&from, &to), (&to, &from)] {
+                let diff = carrier_diff(a, b);
+                assert!(
+                    matches!(diff, CarrierDiff::Nested),
+                    "a carrier mismatch under `{shape}` is {diff:?}, not Nested"
+                );
+            }
+            assert!(matches!(carrier_diff(&from, &from), CarrierDiff::Same));
+            assert!(matches!(carrier_diff(&to, &to), CarrierDiff::Same));
+        }
+    }
+
+    /// No container mismatch converts: every one is refused with `FnCarrierConflict`.
+    ///
+    /// Every pair of the function carriers under every container shape goes
+    /// through [`Lowerer::fn_carrier_coerce`]: an agreeing pair is kept, a
+    /// top-level pair converts, and a pair that differs under a `Maybe`/`Result`
+    /// payload is the conflict refusal, never an `Ok` the emitter would carry
+    /// to an E0308.
+    #[test]
+    fn fn_carrier_coerce_never_admits_a_payload_mismatch() {
+        use super::{CarrierDiff, Feature, carrier_diff, unsupported};
+        let span = Span::new(3, 9);
+        let carriers = [
+            shared_fn(),
+            direct_fn(),
+            IrType::FnOnceChain(vec![IrType::Int], Box::new(IrType::Bool)),
+        ];
+        with_binder_type_lowerer(|lowerer, _| {
+            for from_fn in &carriers {
+                for to_fn in &carriers {
+                    let pairs = branchable_containers(from_fn)
+                        .into_iter()
+                        .zip(branchable_containers(to_fn))
+                        .chain(
+                            every_container(from_fn)
+                                .into_iter()
+                                .zip(every_container(to_fn)),
+                        );
+                    for ((shape, from), (_, to)) in pairs {
+                        let result = lowerer.fn_carrier_coerce(
+                            Expr::Unit,
+                            &from,
+                            &to,
+                            EtaDemand::EMPTY,
+                            span,
+                        );
+                        let diff = carrier_diff(&from, &to);
+                        assert!(
+                            matches!(diff, CarrierDiff::Same | CarrierDiff::Nested),
+                            "a value under `{shape}` reaches a top-level conversion"
+                        );
+                        if matches!(diff, CarrierDiff::Same) {
+                            assert!(
+                                matches!(result, Ok((Expr::Unit, _))),
+                                "agreeing carriers under `{shape}` are not kept as is"
+                            );
+                        } else {
+                            assert_eq!(
+                                result.err(),
+                                Some(unsupported(span, Feature::FnCarrierConflict)),
+                                "a carrier mismatch under `{shape}` is not refused"
+                            );
+                        }
+                    }
+                }
+            }
         });
     }
 
