@@ -2118,7 +2118,7 @@ fn store_select_projection_label(defect: &StoreSelectProjectionDefect) -> String
 fn route_pattern_label(defect: &RoutePatternDefect) -> String {
     match defect {
         RoutePatternDefect::ParamEmpty => {
-            "a `:` or `*` segment has no parameter name after it".to_string()
+            "a `:` segment has no parameter name after it".to_string()
         }
         RoutePatternDefect::ParamNotIdentifier { name, at } => format!(
             "parameter name `{name}` is not an identifier (byte {at} is not a letter, \
@@ -2136,6 +2136,14 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
         RoutePatternDefect::TooLong { cap } => {
             format!("this path is longer than the {cap}-byte route ceiling")
         }
+        RoutePatternDefect::NotAbsolute => "this path does not start with `/`".to_string(),
+        RoutePatternDefect::CatchAll { segment } => {
+            format!("segment `{segment}` is a `*` catch-all, which a server route cannot hold")
+        }
+        RoutePatternDefect::MidSegmentSigil { segment, at } => format!(
+            "segment `{segment}` has a `:` or `*` at byte {at}, which is neither a parameter \
+             nor a literal"
+        ),
         RoutePatternDefect::UnrenderableLiteral { segment } => {
             format!(
                 "segment `{segment}` is empty, `.` or `..`, so this route's URL cannot be rendered"

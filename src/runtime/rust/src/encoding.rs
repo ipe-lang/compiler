@@ -909,6 +909,303 @@ impl ParamNames {
     }
 }
 
+/// One segment of a parsed route pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PatternSeg {
+    /// A literal segment, already decoded: it must equal the decoded request
+    /// segment.
+    Literal(String),
+    /// A `:name` segment: captures the decoded request segment as `name`.
+    Param(ParamName),
+}
+
+/// A route pattern parsed once, at registration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutePattern(Vec<PatternSeg>);
+
+impl RoutePattern {
+    /// Split `pattern` by the request-path split rule and classify each raw
+    /// segment: a leading `:` makes a parameter whose name is admitted by
+    /// [`ParamNames::admit`]; anything else is a literal decoded by the strict
+    /// path-segment decoder.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of the first malformed segment: a literal that does not
+    /// decode, a parameter name that is empty, not an identifier or a repeat,
+    /// or `TooLong` for an oversized pattern.
+    pub fn parse(pattern: &str) -> Result<Self, RouteSegmentRefusal> {
+        let mut names = ParamNames::default();
+        raw_path_segments(pattern)
+            .map_err(RouteSegmentRefusal::Decode)?
+            .into_iter()
+            .map(|raw| match raw.strip_prefix(':') {
+                Some(name) => names
+                    .admit(name)
+                    .map(PatternSeg::Param)
+                    .map_err(RouteSegmentRefusal::ParamName),
+                None => decode_path_segment(raw)
+                    .map(PatternSeg::Literal)
+                    .map_err(RouteSegmentRefusal::Decode),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
+    /// The parsed segments, in pattern order.
+    #[must_use]
+    pub fn segments(&self) -> &[PatternSeg] {
+        &self.0
+    }
+
+    /// The `:name`s of the parameter segments, in pattern order.
+    pub(crate) fn param_names(&self) -> impl Iterator<Item = &str> {
+        self.0.iter().filter_map(|seg| match seg {
+            PatternSeg::Param(name) => Some(name.as_str()),
+            PatternSeg::Literal(_) => None,
+        })
+    }
+}
+
+/// Why one segment of a route pattern was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteSegmentRefusal {
+    /// A literal segment (or the whole pattern) does not decode.
+    Decode(DecodeRefusal),
+    /// A `:name` segment's name is empty, not an identifier, or a repeat.
+    ParamName(ParamNameRefusal),
+}
+
+impl std::fmt::Display for RouteSegmentRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode(refusal) => write!(f, "{refusal}"),
+            Self::ParamName(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+/// A route pattern refused at registration: the raw pattern text and why it
+/// did not parse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutePatternRefusal {
+    /// The pattern text as registered.
+    pub pattern: String,
+    /// Why its first malformed segment was refused.
+    pub refusal: RouteSegmentRefusal,
+}
+
+impl std::fmt::Display for RoutePatternRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "route pattern `{}` is malformed: {}",
+            crate::system::scrub_log_controls(&self.pattern),
+            self.refusal
+        )
+    }
+}
+
+/// The decoded values a route pattern's `:param` segments captured, in
+/// pattern order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteParams(Vec<String>);
+
+impl RouteParams {
+    /// The `i`-th captured value, if the pattern has that many params.
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<&str> {
+        self.0.get(i).map(String::as_str)
+    }
+
+    /// The captured values, for a route builder.
+    #[must_use]
+    pub fn into_segments(self) -> Vec<String> {
+        self.0
+    }
+}
+
+/// Match a decoded `path` against a parsed `pattern`: equal segment counts; a
+/// `:name` segment captures the corresponding decoded segment; a literal
+/// segment (decoded at registration) must equal it. Returns the captured
+/// params in pattern order, or `None`.
+#[must_use]
+pub fn match_route(pattern: &RoutePattern, path: &DecodedPath) -> Option<RouteParams> {
+    let pat = pattern.segments();
+    let segs = path.segments();
+    if pat.len() != segs.len() {
+        return None;
+    }
+    let mut params = Vec::new();
+    for (ps, us) in pat.iter().zip(segs) {
+        match ps {
+            PatternSeg::Param(_) => params.push(us.clone()),
+            PatternSeg::Literal(lit) if lit == us => {}
+            PatternSeg::Literal(_) => return None,
+        }
+    }
+    Some(RouteParams(params))
+}
+
+/// An `Ipe.Server` route pattern parsed once, at listen: its segments, its
+/// trailing slash, and the one router spelling rendered from them.
+///
+/// A literal segment is spelled by [`canonical_segment`], the same encoder
+/// every request path is rewritten through, so a router compares two outputs
+/// of one function and a raw spelling can never route apart from its
+/// canonical one. A parameter is spelled `:name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerPattern {
+    pattern: RoutePattern,
+    trailing: TrailingSlash,
+    router_path: String,
+}
+
+/// Why an `Ipe.Server` route pattern was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServerPatternRefusal {
+    /// The pattern does not start with `/`.
+    NotAbsolute,
+    /// A segment is led by `*`: a catch-all, which `Ipe.Server` does not serve.
+    CatchAll,
+    /// A literal segment holds a `:` or `*` after its first byte.
+    MidSegmentSigil {
+        /// Offset of the sigil within the segment.
+        at: ByteOffset,
+    },
+    /// A segment is refused as in a `Web.route` pattern.
+    Segment(RouteSegmentRefusal),
+    /// The router spelling would exceed [`MAX_URL_COMPONENT_LEN`].
+    Render(EncodeRefusal),
+}
+
+impl std::fmt::Display for ServerPatternRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAbsolute => f.write_str("a route path starts with `/`"),
+            Self::CatchAll => f.write_str("a `*` catch-all segment is not served"),
+            Self::MidSegmentSigil { at } => write!(
+                f,
+                "a `:` or `*` at byte {} of a segment is neither a parameter nor a literal",
+                at.get()
+            ),
+            Self::Segment(refusal) => write!(f, "{refusal}"),
+            Self::Render(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+impl ServerPattern {
+    /// Parse `raw`: split by the request-path split rule, a segment led by
+    /// `:` is a parameter admitted by [`ParamNames::admit`], and any other
+    /// segment is a literal decoded by the strict path-segment decoder.
+    ///
+    /// # Errors
+    ///
+    /// `Segment` for an oversized pattern, `NotAbsolute` for one without a
+    /// leading `/`, then the refusal of the first malformed segment, then
+    /// `Render` when the router spelling is oversized.
+    pub fn parse(raw: &str) -> Result<Self, ServerPatternRefusal> {
+        let raws = raw_path_segments(raw).map_err(|refusal| {
+            ServerPatternRefusal::Segment(RouteSegmentRefusal::Decode(refusal))
+        })?;
+        if !raw.starts_with('/') {
+            return Err(ServerPatternRefusal::NotAbsolute);
+        }
+        let mut names = ParamNames::default();
+        let segments = raws
+            .into_iter()
+            .map(|seg| server_segment(seg, &mut names))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pattern = RoutePattern(segments);
+        let trailing = if !pattern.0.is_empty() && raw.ends_with('/') {
+            TrailingSlash::Present
+        } else {
+            TrailingSlash::Absent
+        };
+        let router_path =
+            router_spelling(&pattern, trailing).map_err(ServerPatternRefusal::Render)?;
+        Ok(Self {
+            pattern,
+            trailing,
+            router_path,
+        })
+    }
+
+    /// The parsed segments.
+    #[must_use]
+    pub const fn pattern(&self) -> &RoutePattern {
+        &self.pattern
+    }
+
+    /// Whether the pattern ends with `/` after its last segment.
+    #[must_use]
+    pub const fn trailing(&self) -> TrailingSlash {
+        self.trailing
+    }
+
+    /// The spelling the router registers: `/`, or `/seg/...` with each
+    /// literal canonical and each parameter `:name`.
+    #[must_use]
+    pub fn router_path(&self) -> &str {
+        &self.router_path
+    }
+}
+
+/// Classify one raw segment of an `Ipe.Server` pattern.
+fn server_segment(raw: &str, names: &mut ParamNames) -> Result<PatternSeg, ServerPatternRefusal> {
+    if raw.starts_with('*') {
+        return Err(ServerPatternRefusal::CatchAll);
+    }
+    if let Some(name) = raw.strip_prefix(':') {
+        return names.admit(name).map(PatternSeg::Param).map_err(|refusal| {
+            ServerPatternRefusal::Segment(RouteSegmentRefusal::ParamName(refusal))
+        });
+    }
+    if let Some(at) = raw.find([':', '*']) {
+        return Err(ServerPatternRefusal::MidSegmentSigil { at: ByteOffset(at) });
+    }
+    decode_path_segment(raw)
+        .map(PatternSeg::Literal)
+        .map_err(|refusal| ServerPatternRefusal::Segment(RouteSegmentRefusal::Decode(refusal)))
+}
+
+/// The router spelling of `pattern` ([`ServerPattern::router_path`]).
+fn router_spelling(
+    pattern: &RoutePattern,
+    trailing: TrailingSlash,
+) -> Result<String, EncodeRefusal> {
+    let too_long = EncodeRefusal::TooLong {
+        cap: MAX_URL_COMPONENT_LEN,
+    };
+    if pattern.0.is_empty() {
+        return Ok("/".to_owned());
+    }
+    let mut text = String::new();
+    let mut push = |piece: &str| {
+        let grown = text.len().checked_add(piece.len()).ok_or(too_long)?;
+        if grown > MAX_URL_COMPONENT_LEN.get() {
+            return Err(too_long);
+        }
+        text.push_str(piece);
+        Ok(())
+    };
+    for seg in &pattern.0 {
+        push("/")?;
+        match seg {
+            PatternSeg::Literal(lit) => push(&canonical_segment(lit))?,
+            PatternSeg::Param(name) => {
+                push(":")?;
+                push(name.as_str())?;
+            }
+        }
+    }
+    if trailing == TrailingSlash::Present {
+        push("/")?;
+    }
+    Ok(text)
+}
+
 /// `decode_component` under an explicit length cap.
 fn decode_component_within(
     raw: &str,
@@ -1957,5 +2254,132 @@ mod tests {
             request.strip_base(base.to_decoded()),
             Some(DecodedPath::parse("/pkg/app_bg.wasm").unwrap())
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod server_pattern_tests {
+    use super::*;
+
+    fn refusal(raw: &str) -> Option<ServerPatternRefusal> {
+        ServerPattern::parse(raw).err()
+    }
+
+    /// Prove the refusals: a pattern the router could misread, or one no
+    /// request could ever reach, is refused at parse with its typed cause.
+    #[test]
+    fn malformed_server_patterns_are_refused() {
+        use ParamNameRefusal as N;
+        use RouteSegmentRefusal as S;
+        use ServerPatternRefusal as R;
+        assert_eq!(refusal("/:"), Some(R::Segment(S::ParamName(N::Empty))));
+        assert!(matches!(
+            refusal("/:a/:a"),
+            Some(R::Segment(S::ParamName(N::Duplicate { .. })))
+        ));
+        assert!(matches!(
+            refusal("/:a-b"),
+            Some(R::Segment(S::ParamName(N::NotIdentifier { .. })))
+        ));
+        for catch_all in ["/*rest", "/f/*", "/a/:x/*y", "/*"] {
+            assert_eq!(refusal(catch_all), Some(R::CatchAll), "{catch_all}");
+        }
+        for (mid, at) in [("/a:b", 1), ("/v-:id", 2), ("/x/ab*", 2), ("/q/a*:b", 1)] {
+            assert_eq!(
+                refusal(mid),
+                Some(R::MidSegmentSigil { at: ByteOffset(at) }),
+                "{mid}"
+            );
+        }
+        assert!(matches!(
+            refusal("/a/%zz"),
+            Some(R::Segment(S::Decode(DecodeRefusal::MalformedEscape { .. })))
+        ));
+        assert!(matches!(
+            refusal("/ab%C0%AF"),
+            Some(R::Segment(S::Decode(DecodeRefusal::InvalidUtf8 { .. })))
+        ));
+        for relative in ["", "api", "api/:id", ":id"] {
+            assert_eq!(refusal(relative), Some(R::NotAbsolute), "{relative:?}");
+        }
+    }
+
+    /// One byte past the parse ceiling is refused; a pattern within it whose
+    /// router spelling grows past the ceiling is refused at render.
+    #[test]
+    fn over_ceiling_server_patterns_are_refused() {
+        let cap = MAX_URL_COMPONENT_LEN.get();
+        let past = format!("/{}", "a".repeat(cap));
+        assert!(matches!(
+            refusal(&past),
+            Some(ServerPatternRefusal::Segment(RouteSegmentRefusal::Decode(
+                DecodeRefusal::TooLong { .. }
+            )))
+        ));
+        let at_cap = format!("/{}", "a".repeat(cap - 1));
+        assert_eq!(
+            ServerPattern::parse(&at_cap).map(|p| p.router_path().len()),
+            Ok(cap)
+        );
+        let grows = format!("/{}", "+".repeat(cap / 2));
+        assert_eq!(
+            refusal(&grows),
+            Some(ServerPatternRefusal::Render(EncodeRefusal::TooLong {
+                cap: MAX_URL_COMPONENT_LEN
+            }))
+        );
+    }
+
+    /// A pattern registers under the canonical spelling of its literals, so
+    /// every raw spelling of one path registers alike.
+    #[test]
+    #[allow(clippy::expect_used)] // test table: every pattern is well-formed
+    fn server_patterns_render_their_canonical_spelling() {
+        for (raw, rendered) in [
+            ("/", "/"),
+            ("//", "/"),
+            ("/greet/:name", "/greet/:name"),
+            ("/café", "/caf%C3%A9"),
+            ("/caf%C3%A9", "/caf%C3%A9"),
+            ("/%61pi", "/api"),
+            ("/a/", "/a/"),
+            ("//a//", "/a/"),
+            ("/a//b", "/a//b"),
+            ("/a+b", "/a%2Bb"),
+            ("/a/%3Ax", "/a/%3Ax"),
+            ("/a/%2A", "/a/%2A"),
+            ("/a%2Fb", "/a%2Fb"),
+            ("/%2E/:_x1", "/%2E/:_x1"),
+        ] {
+            let pattern = ServerPattern::parse(raw).expect("well-formed pattern");
+            assert_eq!(pattern.router_path(), rendered, "{raw:?}");
+        }
+        let slash = ServerPattern::parse("/a/").expect("well-formed pattern");
+        assert_eq!(slash.trailing(), TrailingSlash::Present);
+        let root = ServerPattern::parse("/").expect("well-formed pattern");
+        assert_eq!(root.trailing(), TrailingSlash::Absent);
+        assert!(root.pattern().segments().is_empty());
+    }
+
+    /// The router spelling of a literal pattern is the canonical spelling of
+    /// every request path naming the same decoded segments.
+    #[test]
+    #[allow(clippy::expect_used)] // test table: every pattern and probe is well-formed
+    fn a_literal_pattern_spells_as_its_requests_do() {
+        for (pattern, request) in [
+            ("/café", "/caf%c3%a9"),
+            ("/%61pi", "/api"),
+            ("/a+b", "/a%2bb"),
+            ("/a/", "/%61/"),
+            ("/a%2Fb", "/a%2fb"),
+        ] {
+            let pattern = ServerPattern::parse(pattern).expect("well-formed pattern");
+            let request = RequestPath::parse(request).expect("well-formed probe");
+            assert_eq!(
+                Some(pattern.router_path()),
+                request.canonical().ok().as_ref().map(CanonicalPath::as_str),
+            );
+        }
     }
 }

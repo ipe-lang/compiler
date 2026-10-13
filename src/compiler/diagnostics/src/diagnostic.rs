@@ -1769,7 +1769,7 @@ pub enum LowerError {
 /// literal, never the whole literal.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RoutePatternDefect {
-    /// A `:` or `*` segment marker is followed by no name.
+    /// A `:` segment marker is followed by no name.
     ParamEmpty,
     /// A parameter name is not an identifier.
     ParamNotIdentifier {
@@ -1808,6 +1808,22 @@ pub enum RoutePatternDefect {
     UnrenderableLiteral {
         /// The offending literal segment, as written.
         segment: Box<str>,
+    },
+    /// A `Server.*` route path does not start with `/`.
+    NotAbsolute,
+    /// A `Server.*` route path has a segment led by `*`: a catch-all, which
+    /// the server does not serve.
+    CatchAll {
+        /// The offending segment.
+        segment: Box<str>,
+    },
+    /// A literal segment of a `Server.*` route path holds a `:` or `*` after
+    /// its first byte.
+    MidSegmentSigil {
+        /// The offending segment.
+        segment: Box<str>,
+        /// Byte offset of the sigil within the segment.
+        at: usize,
     },
 }
 
@@ -3265,7 +3281,7 @@ fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
 /// broke and the rewrite that satisfies it.
 fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
     let note = match defect {
-        RoutePatternDefect::ParamEmpty => "every `:` or `*` segment needs a name after it — \
+        RoutePatternDefect::ParamEmpty => "every `:` segment needs a name after it — \
              write `/posts/:id`, not `/posts/:`"
             .to_string(),
         RoutePatternDefect::ParamNotIdentifier { name, .. } => format!(
@@ -3289,8 +3305,22 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
         RoutePatternDefect::TooLong { cap } => {
             format!("a route path is at most {cap} bytes — shorten it")
         }
+        RoutePatternDefect::NotAbsolute => {
+            "a server route path starts with `/` — write `/health`, not `health`".to_string()
+        }
+        RoutePatternDefect::CatchAll { .. } => {
+            "a server route matches a fixed number of segments — name each one \
+             (`/files/:dir/:name`) instead of a `*` catch-all"
+                .to_string()
+        }
+        RoutePatternDefect::MidSegmentSigil { .. } => {
+            "a parameter is a whole segment led by `:` — split `/v-:id` into `/v/:id`, or \
+             write the literal `:` or `*` as `%3A` or `%2A`"
+                .to_string()
+        }
         RoutePatternDefect::UnrenderableLiteral { .. } => {
-            "a page's path is rendered back into a URL, and a browser drops an empty,              `.` or `..` segment — remove the empty segment or rename the literal"
+            "a page's path is rendered back into a URL, and a browser drops an empty, \
+             `.` or `..` segment — remove the empty segment or rename the literal"
                 .to_string()
         }
     };

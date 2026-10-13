@@ -3766,6 +3766,30 @@ fn lower_server_route_param_empty() {
 }
 
 #[test]
+fn lower_server_route_catch_all() {
+    let src = server_route_fixture(r#"Server.get "/files/*rest""#);
+    assert_rejected("lower_server_route_catch_all", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_mid_segment_sigil() {
+    let src = server_route_fixture(r#"Server.get "/v-:id""#);
+    assert_rejected("lower_server_route_mid_segment_sigil", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_not_absolute() {
+    let src = server_route_fixture(r#"Server.get "health""#);
+    assert_rejected("lower_server_route_not_absolute", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_malformed_escape() {
+    let src = server_route_fixture(r#"Server.get "/a/%zz""#);
+    assert_rejected("lower_server_route_malformed_escape", &src, "IPE-L0156");
+}
+
+#[test]
 fn lower_server_api_path_param_not_identifier() {
     let src = server_route_fixture(r#"Server.api "GET /v1/:a-b""#);
     assert_rejected(
@@ -4024,7 +4048,7 @@ fn well_formed_route_paths_compile() {
     );
     assert_compiles(
         "server_route_well_formed",
-        &server_route_fixture(r#"Server.get "/files/:_dir/*rest""#),
+        &server_route_fixture(r#"Server.get "/files/:_dir/:name""#),
     );
     assert_compiles(
         "server_api_well_formed",

@@ -2252,54 +2252,53 @@ fn conflict_at(method: &str, path: &str) -> String {
     )
 }
 
-/// An endpoint whose path holds a parameter name outside the runtime's one
-/// parameter-name grammar ([`crate::encoding::ParamNames`]).
+/// An endpoint whose path is not an `Ipe.Server` route pattern
+/// ([`crate::encoding::ServerPattern`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EndpointParamRefusal {
+struct EndpointPatternRefusal {
     method: String,
     path: String,
-    refusal: crate::encoding::ParamNameRefusal,
+    refusal: crate::encoding::ServerPatternRefusal,
 }
 
-impl std::fmt::Display for EndpointParamRefusal {
+/// How many characters of a refused path a listen error quotes.
+const PATH_EXCERPT_CHARS: usize = 64;
+
+impl std::fmt::Display for EndpointPatternRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut chars = self.path.chars();
+        let head: String = chars.by_ref().take(PATH_EXCERPT_CHARS).collect();
+        let more = if chars.next().is_some() { "…" } else { "" };
         write!(
             f,
-            "Server.listen: endpoint `{} {}` has a malformed path parameter: {}",
-            self.method, self.path, self.refusal
+            "Server.listen: endpoint `{} {}{more}` is not a well-formed route path: {}",
+            crate::system::scrub_log_controls(&self.method),
+            crate::system::scrub_log_controls(&head),
+            self.refusal
         )
     }
 }
 
-/// Admit every parameter name of a router path through
-/// [`crate::encoding::ParamNames`].
-///
-/// The router starts a parameter at the first `:` or `*` of a segment and runs
-/// it to the segment's end, so the text after that sigil is the name; a second
-/// sigil in the same segment is a non-identifier byte of that name.
+/// Parse every endpoint's path once, in declaration order.
 ///
 /// # Errors
 ///
-/// The first [`crate::encoding::ParamNameRefusal`] among the path's parameter
-/// names: an empty name, a non-identifier name, or a repeated name.
-pub fn path_param_names(path: &str) -> Result<(), crate::encoding::ParamNameRefusal> {
-    let mut names = crate::encoding::ParamNames::default();
-    path.split('/')
-        .filter_map(|seg| seg.split_once([':', '*']).map(|(_, name)| name))
-        .try_for_each(|name| names.admit(name).map(drop))
-}
-
-/// The first endpoint (declaration order) whose path parameters are refused.
-fn endpoint_param_refusal(routes: &[ServerRoute]) -> Option<EndpointParamRefusal> {
-    routes.iter().find_map(|r| {
-        path_param_names(&r.path)
-            .err()
-            .map(|refusal| EndpointParamRefusal {
-                method: r.method.to_uppercase(),
-                path: r.path.clone(),
-                refusal,
+/// The refusal of the first endpoint whose path does not parse.
+fn endpoint_patterns(
+    routes: &[ServerRoute],
+) -> Result<Vec<crate::encoding::ServerPattern>, EndpointPatternRefusal> {
+    routes
+        .iter()
+        .map(|r| {
+            crate::encoding::ServerPattern::parse(&r.path).map_err(|refusal| {
+                EndpointPatternRefusal {
+                    method: r.method.to_uppercase(),
+                    path: r.path.clone(),
+                    refusal,
+                }
             })
-    })
+        })
+        .collect()
 }
 
 /// An app listener's [`ListenHost`](crate::app_config::ListenHost) whose
@@ -2522,12 +2521,14 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
     routes: Vec<ServerRoute>,
 ) -> IpeTask<E, ()> {
     Box::pin(async move {
-        // Fail-closed parameter-name gate: an empty, non-identifier or repeated
-        // path parameter name would make a captured value ambiguous or
-        // unreachable, so the whole route set is refused before any insert.
-        if let Some(refusal) = endpoint_param_refusal(&routes) {
-            return IpeResult::Err(refusal.to_string().into());
-        }
+        // Every endpoint path is parsed once before any insert or bind: a
+        // pattern the router could misread, or one no request could reach,
+        // refuses the whole route set. The router sees only the rendered
+        // spelling, never the author's text.
+        let patterns = match endpoint_patterns(&routes) {
+            Ok(patterns) => patterns,
+            Err(refusal) => return IpeResult::Err(refusal.to_string().into()),
+        };
         // Fail-closed endpoint-conflict gate (see `endpoint_conflict`): refuse an
         // overlapping route set with a typed error before any axum insert, so a
         // matchit conflict can never panic the listener task.
@@ -2576,7 +2577,7 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         // bind) rather than serve a subtly broken session/CSRF surface.
         #[cfg(feature = "web")]
         let mut web_mounted = false;
-        for r in routes {
+        for (r, pattern) in routes.into_iter().zip(patterns) {
             // Kept for the fail-closed conflict message: the arm below moves the
             // target's payload out of `r`, but leaves these scalar fields intact.
             let rmethod = r.method.clone();
@@ -2598,7 +2599,7 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                 }
                 RouteTarget::Handler(h) => {
                     let mr = method_router(&rmethod, h);
-                    let path = rpath.clone();
+                    let path = pattern.router_path().to_owned();
                     app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         app.route(&path, mr)
                     })) {
@@ -4894,81 +4895,107 @@ mod tests {
         assert!(conflict_in(&any).is_some());
     }
 
-    #[test]
-    fn identifier_path_params_are_admitted() {
-        for ok in [
-            "/",
-            "/api/users",
-            "/api/users/:id",
-            "/raw/*rest",
-            "/a/:x/b/:_y",
-            "/a/:a_Z9/:Z",
-            "/a/:x/*y",
-            "/v-:id",
-        ] {
-            assert_eq!(path_param_names(ok), Ok(()), "{ok}");
+    /// A handler that answers with its `name` parameter.
+    fn name_echo() -> ErasedHandler {
+        Arc::new(|req: ServerRequest| {
+            let resp = server_text(req.params.get("name").cloned().unwrap_or_default());
+            Box::pin(async move { Ok(resp) })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<ServerResponse, String>> + Send>,
+                >
+        })
+    }
+
+    fn get_route(path: &str) -> ServerRoute {
+        ServerRoute {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            target: RouteTarget::Handler(name_echo()),
         }
     }
 
-    /// Prove the refusals: every name outside `[A-Za-z_][A-Za-z0-9_]*`, and
-    /// every repeat, is refused with its typed cause.
-    #[test]
-    fn malformed_path_params_are_refused() {
-        use crate::encoding::ParamNameRefusal as R;
-        assert_eq!(path_param_names("/:"), Err(R::Empty));
-        assert_eq!(path_param_names("/files/*"), Err(R::Empty));
-        for (bad, at) in [
-            ("/:1a", 0),
-            ("/:9", 0),
-            ("/:\u{e9}", 0),
-            ("/:a-b", 1),
-            ("/:a:b", 1),
-            ("/:a*b", 1),
-            ("/:a_Z9-", 4),
-            ("/:id.json", 2),
-        ] {
-            let refused = path_param_names(bad);
-            assert!(
-                matches!(refused, Err(R::NotIdentifier { at: off }) if off.get() == at),
-                "{bad} must break at byte {at}, got {refused:?}"
-            );
-        }
-        for dup in ["/:id/:id", "/:id/*id", "/x/:a/y/:a"] {
-            assert!(
-                matches!(path_param_names(dup), Err(R::Duplicate { .. })),
-                "{dup} must be refused as a repeat"
-            );
-        }
-    }
-
-    /// The listener refuses a route set with a malformed parameter name
-    /// before any insert or bind, naming the endpoint and the cause.
+    /// Prove the refusals at listen: every endpoint path is parsed before any
+    /// insert or bind, so a malformed one refuses the route set with the
+    /// endpoint and the cause named, and never reaches the router.
     #[tokio::test]
-    async fn listen_refuses_a_malformed_path_param_before_bind() {
-        let routes = vec![
-            server_static("/ok".to_string(), "dir".to_string()),
-            server_static("/:id/:id".to_string(), "dir".to_string()),
-        ];
-        let refusal = endpoint_param_refusal(&routes);
-        assert_eq!(refusal.as_ref().map(|r| r.path.as_str()), Some("/:id/:id"));
-        // A listener that got past the refusal would bind and serve forever;
-        // the timeout turns that regression into a failure instead of a hang.
-        let listened: IpeResult<String, ()> =
-            tokio::time::timeout(std::time::Duration::from_secs(10), server_listen(0, routes))
-                .await
-                .expect("a refused route set must return before binding, not serve");
-        assert!(
-            matches!(listened, IpeResult::Err(_)),
-            "a malformed parameter name must refuse the listener"
+    async fn listen_refuses_a_malformed_endpoint_path_before_bind() {
+        let over_cap = format!(
+            "/{}",
+            "a".repeat(crate::encoding::MAX_URL_COMPONENT_LEN.get())
         );
-        let IpeResult::Err(msg) = listened else {
-            panic!("a malformed parameter name must refuse the listener");
-        };
-        assert!(
-            msg.contains("endpoint `GET /:id/:id` has a malformed path parameter")
-                && msg.contains("parameter `id` appears twice"),
-            "{msg}"
-        );
+        for (bad, cause) in [
+            ("/:", "has no name"),
+            ("/:a/:a", "appears twice"),
+            ("/*rest", "catch-all"),
+            ("/a/%zz", "malformed percent-escape"),
+            ("/a:b", "byte 1"),
+            ("api", "starts with `/`"),
+            (over_cap.as_str(), "component longer than"),
+        ] {
+            let routes = vec![get_route("/ok"), get_route(bad)];
+            assert!(
+                endpoint_patterns(&routes).is_err_and(|r| r.path == bad),
+                "{cause}: the refusal names the endpoint"
+            );
+            // A listener that got past the refusal would bind and serve
+            // forever; the timeout turns that regression into a failure.
+            let listened: IpeResult<String, ()> =
+                tokio::time::timeout(std::time::Duration::from_secs(10), server_listen(0, routes))
+                    .await
+                    .expect("a refused route set must return before binding, not serve");
+            assert!(
+                matches!(listened, IpeResult::Err(_)),
+                "{cause}: a malformed path must refuse the listener"
+            );
+            let IpeResult::Err(msg) = listened else {
+                return;
+            };
+            assert!(
+                msg.starts_with("Server.listen: endpoint `GET ")
+                    && msg.contains("is not a well-formed route path")
+                    && msg.contains(cause),
+                "{msg:.200}"
+            );
+            assert!(msg.len() < 400, "the error quotes a bounded excerpt");
+        }
+        let static_dup = vec![server_static("/:id/:id".to_string(), "dir".to_string())];
+        assert!(endpoint_patterns(&static_dup).is_err());
+    }
+
+    /// An endpoint registers under its rendered spelling behind the
+    /// listener's canonical rewrite, so every spelling of its path reaches it
+    /// and a parameter still captures one segment.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed patterns parse and fixed requests build
+    async fn an_endpoint_routes_every_spelling_of_its_path() {
+        use tower::ServiceExt;
+        let mut app = axum::Router::new();
+        for raw in ["/greet/:name", "/café", "/%61pi/"] {
+            let pattern = crate::encoding::ServerPattern::parse(raw).expect("well-formed");
+            app = app.route(pattern.router_path(), method_router("GET", name_echo()));
+        }
+        let app = behind_listener(app);
+        for (uri, status) in [
+            ("/greet/bob", axum::http::StatusCode::OK),
+            ("/%67reet/bob", axum::http::StatusCode::OK),
+            ("/caf%C3%A9", axum::http::StatusCode::OK),
+            ("/%63af%c3%a9", axum::http::StatusCode::OK),
+            ("/api/", axum::http::StatusCode::OK),
+            ("/%61pi/", axum::http::StatusCode::OK),
+            ("/api", axum::http::StatusCode::NOT_FOUND),
+            ("/greet/a/b", axum::http::StatusCode::NOT_FOUND),
+        ] {
+            let wire = axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("test request builds");
+            let resp = match app.clone().oneshot(wire).await {
+                Ok(r) => r,
+                Err(e) => match e {},
+            };
+            assert_eq!(resp.status(), status, "{uri}");
+        }
     }
 
     /// The listener refuses an `IPE_WEB_FRAME_ANCESTORS` with no

@@ -2,7 +2,7 @@
 //! at `ipe` time.
 //!
 //! `Web.route` patterns are parsed by the runtime's `RoutePattern::parse` and
-//! `Server.*` paths by its `path_param_names`; a malformed literal would pass
+//! `Server.*` paths by its `ServerPattern::parse`; a malformed literal would pass
 //! `ipe` and then refuse to start. The compiler cannot depend on the runtime,
 //! so this module restates the same grammar, and `agreement_tests` drives one
 //! case table through both sides and asserts identical verdicts.
@@ -11,8 +11,11 @@
 //! - A `Web.route` pattern is split on raw `/` after trimming surrounding `/`;
 //!   a segment led by `:` is a parameter, any other segment must strictly
 //!   percent-decode (`%` + two hex digits, UTF-8 result, `+` literal).
-//! - A `Server.*` path gives every `/`-segment containing `:` or `*` a
-//!   parameter named by the text after the first such sigil.
+//! - A `Server.*` path starts with `/` and is split like a `Web.route`
+//!   pattern; a segment led by `*` (a catch-all) is refused, a segment led by
+//!   `:` is a parameter, and any other segment holds no `:` or `*` and must
+//!   strictly percent-decode. Its router spelling, each literal re-escaped by
+//!   the runtime's one segment alphabet, is within the length ceiling.
 
 use std::collections::HashSet;
 
@@ -178,17 +181,72 @@ pub fn web_route_segments(pattern: &str) -> Result<Vec<SegmentShape>, RoutePatte
         .collect()
 }
 
-/// Check a literal `Server.*` route path against the runtime's server
-/// parameter-name gate.
+/// Check a literal `Server.*` route path against the runtime's
+/// `ServerPattern` grammar.
 ///
 /// # Errors
 ///
-/// The defect of the first empty, non-identifier, or repeated parameter name.
+/// `TooLong` for a path over [`MAX_PATH_LEN`] bytes, `NotAbsolute` for one
+/// without a leading `/`, then the defect of the first malformed segment, then
+/// `TooLong` when the router spelling would pass the ceiling.
 pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
+    if path.len() > MAX_PATH_LEN {
+        return Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN });
+    }
+    if !path.starts_with('/') {
+        return Err(RoutePatternDefect::NotAbsolute);
+    }
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(());
+    }
     let mut names = Names::default();
-    path.split('/')
-        .filter_map(|seg| seg.split_once([':', '*']).map(|(_, name)| name))
-        .try_for_each(|name| names.admit(name))
+    let mut spelled: usize = 0;
+    for raw in trimmed.split('/') {
+        let seg_len = if raw.starts_with('*') {
+            return Err(RoutePatternDefect::CatchAll {
+                segment: excerpt(raw),
+            });
+        } else if let Some(name) = raw.strip_prefix(':') {
+            names.admit(name)?;
+            raw.len()
+        } else if let Some(at) = raw.find([':', '*']) {
+            return Err(RoutePatternDefect::MidSegmentSigil {
+                segment: excerpt(raw),
+                at,
+            });
+        } else {
+            canonical_len(&literal_segment(raw)?)
+        };
+        spelled = spelled.saturating_add(1).saturating_add(seg_len);
+    }
+    if path.len() > 1 && path.ends_with('/') {
+        spelled = spelled.saturating_add(1);
+    }
+    if spelled > MAX_PATH_LEN {
+        return Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN });
+    }
+    Ok(())
+}
+
+/// The length of the runtime's canonical spelling of one decoded segment:
+/// `.` and `..` spell as `%2E` and `%2E%2E`; an ASCII alphanumeric or one of
+/// `-` `_` `.` `~` stays one byte; every other byte is a three-byte escape.
+fn canonical_len(decoded: &str) -> usize {
+    match decoded {
+        "." => 3,
+        ".." => 6,
+        _ => decoded
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    1
+                } else {
+                    3
+                }
+            })
+            .sum(),
+    }
 }
 
 /// The path part of a literal `Server.api` spec (`"METHOD /path"`, or a bare
@@ -446,9 +504,47 @@ mod tests {
     }
 
     #[test]
-    fn server_paths_admit_names_after_either_sigil() {
-        assert_eq!(server_route_path("/u/:id/f/*rest"), Ok(()));
-        assert_eq!(server_route_path("/plain/100%zz"), Ok(()));
+    fn server_paths_the_runtime_serves_are_accepted() {
+        for ok in ["/", "//", "/u/:id/f/:name", "/caf%C3%A9", "/a/%3Ax", "/a/"] {
+            assert_eq!(server_route_path(ok), Ok(()), "{ok:?}");
+        }
+    }
+
+    /// Prove the refusals: a catch-all, a mid-segment sigil, a relative path,
+    /// a malformed escape and every malformed parameter name.
+    #[test]
+    fn malformed_server_paths_are_refused() {
+        assert_eq!(
+            server_route_path("/u/:id/f/*rest"),
+            Err(RoutePatternDefect::CatchAll {
+                segment: "*rest".into()
+            })
+        );
+        assert_eq!(
+            server_route_path("/f/*"),
+            Err(RoutePatternDefect::CatchAll {
+                segment: "*".into()
+            })
+        );
+        assert_eq!(
+            server_route_path("/v-:id"),
+            Err(RoutePatternDefect::MidSegmentSigil {
+                segment: "v-:id".into(),
+                at: 2
+            })
+        );
+        assert_eq!(
+            server_route_path("api"),
+            Err(RoutePatternDefect::NotAbsolute)
+        );
+        assert_eq!(server_route_path(""), Err(RoutePatternDefect::NotAbsolute));
+        assert_eq!(
+            server_route_path("/plain/100%zz"),
+            Err(RoutePatternDefect::MalformedEscape {
+                segment: "100%zz".into(),
+                at: 3
+            })
+        );
         assert_eq!(
             server_route_path("/x/:a-b"),
             Err(RoutePatternDefect::ParamNotIdentifier {
@@ -457,12 +553,25 @@ mod tests {
             })
         );
         assert_eq!(
-            server_route_path("/:id/*id"),
+            server_route_path("/:id/:id"),
             Err(RoutePatternDefect::ParamDuplicate { name: "id".into() })
         );
         assert_eq!(
-            server_route_path("/f/*"),
+            server_route_path("/f/:"),
             Err(RoutePatternDefect::ParamEmpty)
+        );
+    }
+
+    /// A path within the parse ceiling whose router spelling grows past it is
+    /// refused, as the runtime refuses it at listen.
+    #[test]
+    fn server_path_spelled_past_the_ceiling_is_refused() {
+        let at_cap = format!("/{}", "a".repeat(MAX_PATH_LEN - 1));
+        assert_eq!(server_route_path(&at_cap), Ok(()));
+        let grows = format!("/{}", "+".repeat(MAX_PATH_LEN / 2));
+        assert_eq!(
+            server_route_path(&grows),
+            Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN })
         );
     }
 
@@ -561,8 +670,10 @@ mod walk_tests {
 /// and a pattern it accepts is accepted here.
 #[cfg(test)]
 mod agreement_tests {
-    use ipe_runtime_rust::encoding::{DecodeRefusal, ParamNameRefusal};
-    use ipe_runtime_rust::server::{api_spec_parts, path_param_names};
+    use ipe_runtime_rust::encoding::{
+        DecodeRefusal, EncodeRefusal, ParamNameRefusal, ServerPattern, ServerPatternRefusal,
+    };
+    use ipe_runtime_rust::server::api_spec_parts;
     use ipe_runtime_rust::web::route::{
         DecodedPath, RoutePattern, RouteSegmentRefusal, match_route,
     };
@@ -583,6 +694,9 @@ mod agreement_tests {
         InvalidUtf8(usize),
         TooLong(usize),
         Unrenderable,
+        NotAbsolute,
+        CatchAll,
+        MidSegmentSigil(usize),
     }
 
     fn ours(r: Result<(), RoutePatternDefect>) -> Verdict {
@@ -595,6 +709,9 @@ mod agreement_tests {
             Err(RoutePatternDefect::InvalidUtf8 { at, .. }) => Verdict::InvalidUtf8(at),
             Err(RoutePatternDefect::TooLong { cap }) => Verdict::TooLong(cap),
             Err(RoutePatternDefect::UnrenderableLiteral { .. }) => Verdict::Unrenderable,
+            Err(RoutePatternDefect::NotAbsolute) => Verdict::NotAbsolute,
+            Err(RoutePatternDefect::CatchAll { .. }) => Verdict::CatchAll,
+            Err(RoutePatternDefect::MidSegmentSigil { at, .. }) => Verdict::MidSegmentSigil(at),
         }
     }
 
@@ -607,23 +724,38 @@ mod agreement_tests {
     }
 
     fn runtime_web(pattern: &str) -> Verdict {
-        match RoutePattern::parse(pattern) {
-            Ok(_) => Verdict::Ok,
-            Err(RouteSegmentRefusal::ParamName(r)) => name_verdict(r),
-            Err(RouteSegmentRefusal::Decode(DecodeRefusal::MalformedEscape { at })) => {
+        RoutePattern::parse(pattern).map_or_else(segment_verdict, |_| Verdict::Ok)
+    }
+
+    fn segment_verdict(r: RouteSegmentRefusal) -> Verdict {
+        match r {
+            RouteSegmentRefusal::ParamName(r) => name_verdict(r),
+            RouteSegmentRefusal::Decode(DecodeRefusal::MalformedEscape { at }) => {
                 Verdict::MalformedEscape(at.get())
             }
-            Err(RouteSegmentRefusal::Decode(DecodeRefusal::InvalidUtf8 { at })) => {
+            RouteSegmentRefusal::Decode(DecodeRefusal::InvalidUtf8 { at }) => {
                 Verdict::InvalidUtf8(at.get())
             }
-            Err(RouteSegmentRefusal::Decode(DecodeRefusal::TooLong { cap })) => {
+            RouteSegmentRefusal::Decode(DecodeRefusal::TooLong { cap }) => {
                 Verdict::TooLong(cap.get())
             }
         }
     }
 
     fn runtime_server(path: &str) -> Verdict {
-        path_param_names(path).map_or_else(name_verdict, |()| Verdict::Ok)
+        match ServerPattern::parse(path) {
+            Ok(_) => Verdict::Ok,
+            Err(ServerPatternRefusal::NotAbsolute) => Verdict::NotAbsolute,
+            Err(ServerPatternRefusal::CatchAll) => Verdict::CatchAll,
+            Err(ServerPatternRefusal::MidSegmentSigil { at }) => Verdict::MidSegmentSigil(at.get()),
+            Err(ServerPatternRefusal::Segment(r)) => segment_verdict(r),
+            Err(ServerPatternRefusal::Render(EncodeRefusal::TooLong { cap })) => {
+                Verdict::TooLong(cap.get())
+            }
+            Err(ServerPatternRefusal::Render(EncodeRefusal::Empty | EncodeRefusal::Dot)) => {
+                Verdict::Unrenderable
+            }
+        }
     }
 
     const CASES: &[&str] = &[
@@ -654,6 +786,17 @@ mod agreement_tests {
         ":lead",
         "/tail:",
         "/e/%00",
+        "api",
+        "/*",
+        "/v-:id",
+        "/x/ab*",
+        "/q/a*:b",
+        "/:a*b",
+        "/a/",
+        "//a//",
+        "/a//b",
+        "/%2E/..",
+        "/a+b~c.d_e-f",
     ];
 
     #[test]
@@ -758,5 +901,20 @@ mod agreement_tests {
         );
         let past = "a".repeat(MAX_PATH_LEN + 1);
         assert_eq!(ours(web_route_pattern(&past)), runtime_web(&past));
+        assert_eq!(ours(server_route_path(&past)), runtime_server(&past));
+        for grows in [
+            format!("/{}", "+".repeat(MAX_PATH_LEN / 2)),
+            format!("/{}", "a".repeat(MAX_PATH_LEN - 1)),
+            format!("/{}/", "a".repeat(MAX_PATH_LEN - 2)),
+            format!("/{}/", "a".repeat(MAX_PATH_LEN - 1)),
+            format!("/{}", "%2E/".repeat(MAX_PATH_LEN / 4)),
+        ] {
+            assert_eq!(
+                ours(server_route_path(&grows)),
+                runtime_server(&grows),
+                "{}",
+                grows.len()
+            );
+        }
     }
 }
