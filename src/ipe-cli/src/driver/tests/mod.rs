@@ -563,7 +563,7 @@ const HELPERS_EXPOSING_LENGHT: &str =
     "module Helpers exposing (lenght)\n\nlenght : Int\nlenght = 1\n";
 
 /// An entry whose `lenght` the build binds through its import of `Helpers`.
-const MAIN_IMPORTING_LENGHT: &str = "module Main exposing (main)\n\nimport Helpers exposing (lenght)\n\nlength : Int\nlength = 2\n\nmain = lenght\n";
+const MAIN_IMPORTING_LENGHT: &str = "module Main exposing (main)\n\nimport Helpers exposing (lenght)\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nlength : Int\nlength = 2\n\nmain : Task ()\nmain =\n    Io.println (String.fromInt lenght)\n";
 
 /// An entry whose `lenght` nothing binds: a genuine misspelling of `length`.
 const MAIN_MISSPELLING_LENGTH: &str =
