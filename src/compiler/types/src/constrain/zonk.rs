@@ -438,13 +438,11 @@ pub fn promote_untyped_boundaries(
     Ok(schemes)
 }
 
-/// One step of the iterative [`reify_scheme`] work stack — the interface
-/// sibling of [`ZonkTask`], differing in the two places an interface must be
-/// faithful where a display read-back need not be: quantified variables map
-/// to CANONICAL tagged ids (deterministic, union-find-numbering-free), and an
-/// open record tail is PRESERVED as `RowTail::Open` (zonk presents every
-/// settled record as closed, which is fine for display but would silently
-/// close a row-polymorphic exported scheme).
+/// One step of the iterative [`reify_scheme`] work stack.
+///
+/// The interface sibling of [`ZonkTask`]: quantified variables map to
+/// CANONICAL tagged ids (deterministic, union-find-numbering-free), and an
+/// open record tail is kept as `RowTail::Open` over that canonical id.
 pub enum ReifyTask {
     Visit(VarId),
     BuildFun,
@@ -636,10 +634,13 @@ pub enum ZonkTask {
     },
     /// Pop `arity` results and push a `Tuple` over them.
     BuildTuple { arity: usize },
-    /// Pop one result per field name (in `names` order) and push a `Record`. The
-    /// `names` are visited in their `BTreeMap` order, so popping in reverse pairs
-    /// each result with its field name.
-    BuildRecord { names: Vec<Symbol> },
+    /// Pop one result per field name (in `names` order) and push a `Record` over `tail`.
+    ///
+    /// The `names` are visited in their `BTreeMap` order, so popping in reverse
+    /// pairs each result with its field name. `names` is the union of the
+    /// fields along the whole row chain and `tail` is the chain's terminal
+    /// ([`zonk_row`]).
+    BuildRecord { names: Vec<Symbol>, tail: RowTail },
     /// Record the freshly assembled result on top of the stack as the read-back
     /// of union-find representative `root`, so a later visit to any variable
     /// sharing that representative reuses the cached [`Ty`] instead of walking
@@ -657,6 +658,7 @@ pub enum ZonkTask {
 /// children's visits.
 fn zonk_visit(
     uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
     v: VarId,
     work: &mut Vec<ZonkTask>,
     results: &mut Vec<Ty>,
@@ -671,12 +673,7 @@ fn zonk_visit(
         results.push(cached.clone());
         return Ok(());
     }
-    *nodes_left = nodes_left
-        .checked_sub(1)
-        .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: STAGE,
-            detail: "type exceeded read-back node limit".to_owned(),
-        })?;
+    charge_node(nodes_left)?;
     // Borrow the descriptor: leaf arms need no owned copy, and the structural
     // arms clone only the field they genuinely move into a rebuild task (the
     // module path, the record field names) rather than the whole descriptor.
@@ -729,18 +726,15 @@ fn zonk_visit(
                 work.push(ZonkTask::Visit(*e));
             }
         }
-        Content::Structure(FlatType::Record(fields, _ext)) => {
-            // Capture the field names (BTreeMap order) for the rebuild, and visit
-            // each field var in reverse so the results land in the same order the
-            // names are popped. The extension var is intentionally not zonked
-            // here — `Ty::Record` does not carry a RowTail in its resolved form
-            // (the tail is a solver artefact consumed only by unify.rs and the
-            // `BuildRecord` path). Closed records resolve to fields only; open
-            // records show as the same (tail is transparent to diagnostics for
-            // now).
+        Content::Structure(FlatType::Record(fields, ext)) => {
+            // Merge the fields of the whole row chain and read its terminal as
+            // the tail, then visit each merged field var in reverse so the
+            // results land in the same order the names are popped.
+            let (mut fields, ext) = (fields.clone(), *ext);
+            let tail = zonk_row(uf, budget, nodes_left, &mut fields, ext)?;
             let names: Vec<Symbol> = fields.keys().copied().collect();
             work.push(ZonkTask::Memoize { root });
-            work.push(ZonkTask::BuildRecord { names });
+            work.push(ZonkTask::BuildRecord { names, tail });
             for v in fields.values().rev() {
                 work.push(ZonkTask::Visit(*v));
             }
@@ -758,6 +752,73 @@ fn zonk_visit(
         }
     }
     Ok(())
+}
+
+/// Consume one of the per-call read-back nodes.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] once the [`ZONK_NODE_LIMIT`] nodes are spent.
+fn charge_node(nodes_left: &mut u32) -> DResult<()> {
+    *nodes_left = nodes_left
+        .checked_sub(1)
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: STAGE,
+            detail: "type exceeded read-back node limit".to_owned(),
+        })?;
+    Ok(())
+}
+
+/// Walk a record's row extension to its terminal, merging the fields along the chain.
+///
+/// The tail is [`RowTail::Closed`] exactly when the chain ends in
+/// `EmptyRecord`, and `RowTail::Open` over the terminal's tagged
+/// representative exactly when it ends in a variable; `fields` gains every
+/// field of every record along the way. Each hop ticks the shared [`Budget`]
+/// and consumes one read-back node, so a chain is bounded like any other
+/// structure.
+///
+/// # Errors
+/// [`Diagnostic::CompilerBug`] when the chain ends in a non-row type, repeats
+/// a label, or exceeds [`ZONK_NODE_LIMIT`] nodes; a step-budget error if the
+/// shared budget is exhausted.
+fn zonk_row(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    nodes_left: &mut u32,
+    fields: &mut BTreeMap<Symbol, VarId>,
+    ext: VarId,
+) -> DResult<RowTail> {
+    let mut ext = ext;
+    loop {
+        budget.tick()?;
+        charge_node(nodes_left)?;
+        let tail_root = uf.find(ext)?;
+        ext = match uf.root_content(tail_root)? {
+            Content::Structure(FlatType::EmptyRecord) => return Ok(RowTail::Closed),
+            Content::Flex | Content::Rigid | Content::Super { .. } => {
+                return Ok(RowTail::Open(tag_solver_var(tail_root)));
+            }
+            Content::Structure(FlatType::Record(more, next)) => {
+                for (name, var) in more {
+                    if fields.insert(*name, *var).is_some() {
+                        return Err(row_chain_bug("duplicate record label along a row chain"));
+                    }
+                }
+                *next
+            }
+            Content::Structure(
+                FlatType::Unit | FlatType::Fun(..) | FlatType::Con { .. } | FlatType::Tuple(_),
+            ) => return Err(row_chain_bug("record row ends in a non-row type")),
+        };
+    }
+}
+
+/// A record row chain broke the unifier's row invariant (never reachable from input).
+fn row_chain_bug(detail: &str) -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: STAGE,
+        detail: detail.to_owned(),
+    }
 }
 
 /// Read a settled union-find variable back into a resolved [`Ty`].
@@ -793,7 +854,15 @@ pub fn zonk(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId) -> DRe
         match task {
             ZonkTask::Visit(v) => {
                 budget.tick()?;
-                zonk_visit(uf, v, &mut work, &mut results, &mut memo, &mut nodes_left)?;
+                zonk_visit(
+                    uf,
+                    budget,
+                    v,
+                    &mut work,
+                    &mut results,
+                    &mut memo,
+                    &mut nodes_left,
+                )?;
             }
             ZonkTask::Memoize { root } => {
                 // The parent `Ty` was just assembled and sits on top of the
@@ -832,7 +901,7 @@ pub fn zonk(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId) -> DRe
                 let elems = results.split_off(split);
                 results.push(Ty::Tuple(elems));
             }
-            ZonkTask::BuildRecord { names } => {
+            ZonkTask::BuildRecord { names, tail } => {
                 let split = results
                     .len()
                     .checked_sub(names.len())
@@ -841,11 +910,7 @@ pub fn zonk(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId) -> DRe
                 // `tys` is in the same order as `names` (field var visits were
                 // reversed, so the results stack restores `BTreeMap` order).
                 let fields: BTreeMap<Symbol, Ty> = names.into_iter().zip(tys).collect();
-                // Zonked records are always presented as closed — the RowTail
-                // is a solver artefact; the resolved `Ty` simply carries the
-                // settled field map without advertising openness (consistent
-                // with the the compiler reference's read-back behaviour).
-                results.push(Ty::Record(fields, RowTail::Closed));
+                results.push(Ty::Record(fields, tail));
             }
         }
     }

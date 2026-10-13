@@ -1527,14 +1527,7 @@ fn collect_ui_msg_and_other_vars(
     other_vars: &mut BTreeSet<Symbol>,
 ) {
     match ty {
-        Ty::Var(raw) => {
-            let sym = Symbol::from_raw(*raw);
-            if in_ui_msg {
-                ui_msg_vars.insert(sym);
-            } else {
-                other_vars.insert(sym);
-            }
-        }
+        Ty::Var(raw) => note_ui_msg_or_other_var(*raw, in_ui_msg, ui_msg_vars, other_vars),
         Ty::Fun(a, b) => {
             collect_ui_msg_and_other_vars(a, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
             collect_ui_msg_and_other_vars(b, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
@@ -1556,9 +1549,16 @@ fn collect_ui_msg_and_other_vars(
                 collect_ui_msg_and_other_vars(e, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
             }
         }
-        Ty::Record(fields, _) => {
+        Ty::Record(fields, tail) => {
             for v in fields.values() {
                 collect_ui_msg_and_other_vars(v, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
+            }
+            // A row variable is a variable in the same raw space as `Ty::Var`.
+            match tail {
+                RowTail::Open(raw) => {
+                    note_ui_msg_or_other_var(*raw, in_ui_msg, ui_msg_vars, other_vars);
+                }
+                RowTail::Closed => {}
             }
         }
         // The wildcard `any` -- a bare `Html` / `Attribute` annotation is
@@ -1566,6 +1566,21 @@ fn collect_ui_msg_and_other_vars(
         // defaulting candidate: the lowerer substitutes its concrete type from
         // the body's solved region, which defaulting to `Unit` would clobber.
         Ty::Wildcard | Ty::Unit => {}
+    }
+}
+
+/// File the variable `raw` as a ui-msg-slot variable when `in_ui_msg`, else as an other-position one.
+fn note_ui_msg_or_other_var(
+    raw: u32,
+    in_ui_msg: bool,
+    ui_msg_vars: &mut BTreeSet<Symbol>,
+    other_vars: &mut BTreeSet<Symbol>,
+) {
+    let sym = Symbol::from_raw(raw);
+    if in_ui_msg {
+        ui_msg_vars.insert(sym);
+    } else {
+        other_vars.insert(sym);
     }
 }
 
@@ -2026,12 +2041,10 @@ fn check_wildcard_pins(
 
 /// Whether a resolved type is ground: no type variable and no open record row.
 ///
-/// This is the read-back form of "the type is fully known": the lowerer
-/// concretizes a wildcard parameter's region only when it holds. Inference
-/// classifies a wildcard with `solved_is_ground` instead, which also sees
-/// the open rows [`zonk`] reads back as closed; every type it admits is one
-/// this admits, so the lowerer never concretizes a wildcard inference left
-/// unpinned.
+/// This is the one "the type is fully known" judgment on a [`Ty`]: the
+/// lowerer concretizes a wildcard parameter's region only when it holds.
+/// [`zonk`] reads a row tail back faithfully, so this agrees with
+/// `solved_is_ground` on the union-find a type was read back from.
 #[must_use]
 pub fn ty_is_ground(ty: &Ty) -> bool {
     match ty {
@@ -2047,9 +2060,10 @@ pub fn ty_is_ground(ty: &Ty) -> bool {
 /// Whether every solver node reachable from `roots` is known: no type
 /// variable, and every record extension ends in the closed-row sentinel.
 ///
-/// Read on the union-find, not on a zonked [`Ty`]: [`zonk`] presents every
-/// record as closed, so an open row a field read left behind is invisible
-/// after read-back. A type this admits zonks to one [`ty_is_ground`] admits.
+/// The union-find form of [`ty_is_ground`]: inference classifies a wildcard
+/// before read-back. [`zonk`] keeps every open row tail, so a node this
+/// admits zonks to a type [`ty_is_ground`] admits, and one it refuses zonks
+/// to a type [`ty_is_ground`] refuses.
 ///
 /// # Errors
 /// A union-find invariant violation, or [`TypeError::StepBudgetExceeded`]
