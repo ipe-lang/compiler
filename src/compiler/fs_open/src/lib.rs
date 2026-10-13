@@ -225,9 +225,9 @@ impl OpenRefusal {
 /// Read only from an open handle, never from a path, so an identity always
 /// names the object a handle holds rather than whatever a later lookup of a
 /// name reaches. `object` is wide enough for every platform's unique object
-/// number. On Windows it holds the 64-bit file index, which ReFS does not keep
-/// unique on a volume: a residual bounded by every write and removal going
-/// through a held handle.
+/// number. On Windows it holds the 64-bit file index, which `ReFS` does not
+/// keep unique on a volume: a residual bounded by every write and removal
+/// going through a held handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
     volume: u64,
