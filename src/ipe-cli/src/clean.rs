@@ -218,7 +218,7 @@ fn remove_cache_target(target: &Path) -> Result<bool, CliError> {
     let Some(cache_root) = HeldDir::open(parent)? else {
         return Ok(false);
     };
-    match cache_root.kind_of(key)? {
+    match cache_root.kind_of(&cache_root.entry(key)?)? {
         EntryKind::Symlink => return Err(OutputRefusal::Symlink(target.to_path_buf()).into()),
         EntryKind::Absent | EntryKind::Other => return Ok(false),
         EntryKind::Directory => {}

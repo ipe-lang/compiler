@@ -788,7 +788,9 @@ impl OwnedPath {
     /// root; [`CliError::Io`] on a filesystem failure.
     pub(crate) fn entry_kind(&self) -> Result<held::EntryKind, CliError> {
         self.held_parent(false)?
-            .map_or(Ok(held::EntryKind::Absent), |(dir, name)| dir.kind_of(name))
+            .map_or(Ok(held::EntryKind::Absent), |(dir, name)| {
+                dir.kind_of(&dir.entry(name)?)
+            })
     }
 
     /// Create the directory itself (and every missing level above it).
