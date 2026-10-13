@@ -9,6 +9,13 @@
 //! `fn_carrier_unification_generic` passes a stored read through a user
 //! generic def, which `ipe` refuses before it can emit one.
 //!
+//! The fixture `fn_carrier_frontier` meets a stored read with a direct
+//! function at every carrier frontier: a def return, an `if`/`case` join, a
+//! piped and a partial kernel call, a kernel scheme variable two arguments
+//! bind, and a variable under a `Task` result. The fixture
+//! `fn_carrier_conflict` joins two `Maybe` payloads on different carriers,
+//! which no conversion reconciles, so `ipe` refuses it.
+//!
 //! ```text
 //! cargo test -p ipe --test g_issues golden_i3344
 //! IPE_E2E=1 cargo test -p ipe --test g_issues golden_i3344
@@ -35,11 +42,7 @@ const ARC_INTO_DIRECT_SLOT: [&str; 5] = [
 ];
 
 fn fixture_entry() -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(FIXTURE)
-        .join("Main.ipe")
+    golden_entry(FIXTURE)
 }
 
 /// Lower the fixture into `out`, asserting `ipe` accepts it.
@@ -94,17 +97,104 @@ fn call_result_reaches_a_direct_fn_slot_and_runs() {
     );
 }
 
+const FRONTIER: &str = "fn_carrier_frontier";
+
+/// The frontier fixture's stdout: one count per case, then the two `Task` cases.
+const FRONTIER_STDOUT: &str = "3 3 4 3 4 3 4 3 4 2 1 3 1 3 1 3 3 3";
+
+/// Emitted `Task.succeed` calls handed a stored read on its `Arc` carrier, which the `Task a` result never holds.
+const ARC_INTO_TASK_RESULT: [&str; 2] = [
+    "task_succeed((c).keep.clone())",
+    "task_succeed(c.keep.clone())",
+];
+
+fn golden_entry(dir: &str) -> PathBuf {
+    repo_root()
+        .join("tests")
+        .join("golden")
+        .join(dir)
+        .join("Main.ipe")
+}
+
+/// Lower the frontier fixture into `out`, asserting `ipe` accepts it.
+fn build_frontier(out: &Path) {
+    let _ = std::fs::remove_dir_all(out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&golden_entry(FRONTIER), out, &runtime);
+    assert!(
+        built.is_ok(),
+        "{FRONTIER}: ipe must accept the fixture; got {built:?}"
+    );
+}
+
+/// `ipe` accepts every frontier case, and no stored read reaches a `Task` result on `Arc`.
+#[test]
+fn every_carrier_frontier_is_accepted_on_one_carrier() {
+    let out = crate::support::scratch_root().join("ipec_i3344_frontier_emit");
+    build_frontier(&out);
+    let emitted = std::fs::read_to_string(out.join("src").join("main.rs")).unwrap_or_default();
+    let compact: String = emitted.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("task_succeed(") && compact.contains("maybe_with_default("),
+        "{FRONTIER}: emitted main.rs holds no kernel call to check"
+    );
+    for shape in ARC_INTO_TASK_RESULT {
+        assert!(
+            !compact.contains(shape),
+            "{FRONTIER}: a stored read reaches a `Task` result on `Arc` as `{shape}`"
+        );
+    }
+}
+
+/// The frontier crate builds and runs to the expected output (THE SEAL).
+#[test]
+fn every_carrier_frontier_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let out = crate::support::scratch_root().join("ipec_i3344_frontier_run");
+    build_frontier(&out);
+    let outcome = crate::support::build_and_run_emitted(FRONTIER, &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "{FRONTIER}: emitted crate must build and exit 0; stdout:\n{}",
+        outcome.stdout
+    );
+    assert_eq!(
+        outcome.stdout.trim_end(),
+        FRONTIER_STDOUT,
+        "{FRONTIER}: emitted crate built (SEAL held) but ran to the wrong output"
+    );
+}
+
+/// A join of two `Maybe` payloads on different function carriers is refused
+/// by `ipe` with IPE-L0107, never emitted as an `Arc`/`Box` mismatch.
+#[test]
+fn payload_carrier_conflict_is_refused() {
+    let dir = "fn_carrier_conflict";
+    let out = crate::support::scratch_root().join("ipec_i3344_conflict");
+    let _ = std::fs::remove_dir_all(&out);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&golden_entry(dir), &out, &runtime);
+    let got = match &built {
+        Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
+        _ => None,
+    };
+    assert_eq!(
+        got,
+        Some(ipe_diagnostics::IPE_L0107),
+        "`{dir}` must fail closed with IPE-L0107; got build result: {built:?}"
+    );
+}
+
 /// A stored function read passed through a user generic def is refused by
 /// `ipe` with IPE-L0107, never emitted with its `Arc` carrier as the def's
 /// generic result into a direct function slot.
 #[test]
 fn stored_read_through_a_user_generic_def_is_refused() {
     let dir = "fn_carrier_unification_generic";
-    let entry = repo_root()
-        .join("tests")
-        .join("golden")
-        .join(dir)
-        .join("Main.ipe");
+    let entry = golden_entry(dir);
     let out = crate::support::scratch_root().join("ipec_i3344_generic");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();

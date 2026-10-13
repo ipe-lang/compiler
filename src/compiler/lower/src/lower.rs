@@ -7858,6 +7858,25 @@ fn ty_holds_fun(ty: &Ty) -> bool {
     }
 }
 
+/// Whether the lowered type `ty` holds a function, on either carrier, anywhere.
+fn ir_holds_fn(ty: &IrType) -> bool {
+    ir_type_mentions(ty, &|t| {
+        matches!(
+            t,
+            IrType::Fun(..) | IrType::SharedFun(..) | IrType::FnOnceChain(..)
+        )
+    })
+}
+
+/// The function carrier a local binder is known to be on where it is bound.
+#[derive(Clone, Debug)]
+enum LocalFnCarrier {
+    /// A function read out of storage, on `Arc`, with its parameter and return types.
+    Stored(Vec<IrType>, IrType),
+    /// A parameter holding a function under a `Maybe`/`Result` payload, on its declared type.
+    Param(IrType),
+}
+
 /// Whether the lowered type `ty` holds an `Arc` function anywhere.
 ///
 /// Walks every type-carrying position through the exhaustive
@@ -8050,29 +8069,6 @@ fn generic_slot_refusal(
     }
 }
 
-/// Whether the curried spine of `kernel` whose outer `outer_len` arguments start at slot `offset` lowers as one saturated call.
-///
-/// True when the kernel is an accessor-intercept placeholder or a
-/// capture-cloned handler kernel, whose saturated-call gate must observe every
-/// argument, or when an outer argument `j` that is a stored function read
-/// (`stored(j)`) lands in a [`FnSlotCarrier::Direct`] slot, which only the
-/// saturated call converts.
-fn spine_saturates(
-    kernel: KernelFn,
-    offset: usize,
-    outer_len: usize,
-    stored: impl Fn(usize) -> bool,
-) -> bool {
-    kernel.is_accessor_intercept_placeholder()
-        || kernel.capture_cloned_handler_arg().is_some()
-        || (0..outer_len).any(|j| {
-            matches!(
-                kernel.fn_slot_carrier(offset.saturating_add(j)),
-                Some(FnSlotCarrier::Direct)
-            ) && stored(j)
-        })
-}
-
 /// The curried arrow `shape` past its first `count` arguments, or `None` past its spine.
 const fn spine_after(shape: &ipe_kernels::TyShape, count: usize) -> Option<&ipe_kernels::TyShape> {
     let mut cur = shape;
@@ -8087,37 +8083,28 @@ const fn spine_after(shape: &ipe_kernels::TyShape, count: usize) -> Option<&ipe_
     Some(cur)
 }
 
-/// The scheme variables a saturated call of `kernel` binds to its result's carriers.
+/// The result carrier type of a saturated call of the kernel scheme `shape` over `arg_count` arguments.
 ///
-/// Each scheme variable bound, through an argument's carrier type
-/// (`arg_types`), to a type holding an `Arc` function takes that type at every
-/// direct position of the result (a bare result variable, a `Maybe`/`Result`
-/// payload); every other position keeps `base`, the solved result type
-/// lowered, whose storage positions are already on `Arc`. A kernel with no
-/// scheme is `base`.
+/// Each scheme variable the call's plan binds ([`SchemeVarCarriers`])
+/// takes its bound type at every direct position of the result (a bare
+/// result variable, a `Maybe`/`Result` payload); every other position keeps
+/// `base`, the solved result type lowered, whose storage positions are
+/// already on `Arc`.
 fn kernel_result_carrier_type(
-    kernel: KernelFn,
-    arg_types: &[Option<IrType>],
+    shape: &ipe_kernels::TyShape,
+    bound: &[(u8, IrType)],
+    arg_count: usize,
     base: Option<IrType>,
 ) -> Option<IrType> {
-    let Some(shape) = kernel.scheme_shape() else {
-        return base;
-    };
-    let mut bound: Vec<(u8, IrType)> = Vec::new();
-    for (index, ty) in arg_types.iter().enumerate() {
-        if let (Some(arg_shape), Some(ty)) = (ipe_kernels::spine_arg(shape, index), ty) {
-            bind_shape_carriers(arg_shape, ty, &mut bound);
-        }
-    }
-    let Some(result_shape) = spine_after(shape, arg_types.len()) else {
+    let Some(result_shape) = spine_after(shape, arg_count) else {
         return base;
     };
     base.map_or_else(
         || match result_shape {
-            ipe_kernels::TyShape::Var(var) => bound_carrier(&bound, *var),
+            ipe_kernels::TyShape::Var(var) => bound_carrier(bound, *var),
             _ => None,
         },
-        |base| Some(overlay_shape_carriers(result_shape, base, &bound)),
+        |base| Some(overlay_shape_carriers(result_shape, base, bound)),
     )
 }
 
@@ -8129,163 +8116,206 @@ fn bound_carrier(bound: &[(u8, IrType)], var: u8) -> Option<IrType> {
         .map(|(_, ty)| ty.clone())
 }
 
-/// The lowered type argument `slot` of the built-in constructor `tag`, read off `ty`.
+/// How a built-in constructor carries the functions its type arguments hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagCarrier {
+    /// `Maybe`/`Result`: each payload is on the carrier of the value built into it.
+    Decided,
+    /// `List`/`Set`/`Dict`: each element is on `Arc` in every value alike.
+    Stored,
+    /// An effect or opaque constructor (`Task`, `Decoder`, `Cmd`, `Sub`, ...), whose payload stays on the base carrier.
+    Opaque,
+}
+
+/// The [`TagCarrier`] of the built-in constructor `tag`.
 ///
-/// Only the transparent containers are read: an effect or opaque constructor
-/// (`Task`, `Decoder`, `Cmd`, `Sub`, ...) keeps its payload at the base
-/// carrier, so a scheme variable under one is never bound through it. The
-/// match on `tag` is exhaustive, so a constructor added later is classified
-/// here before it compiles.
+/// The match is exhaustive with no wildcard arm, so a constructor added
+/// later is classified here before it compiles.
 #[allow(clippy::too_many_lines)] // one exhaustive `BuiltinTag` match
-fn builtin_child(tag: ipe_kernels::BuiltinTag, ty: &IrType, slot: usize) -> Option<&IrType> {
+const fn tag_carrier(tag: ipe_kernels::BuiltinTag) -> TagCarrier {
     use ipe_kernels::BuiltinTag;
-    match (tag, ty) {
-        (BuiltinTag::Maybe, IrType::Maybe(item))
-        | (BuiltinTag::List, IrType::List(item))
-        | (BuiltinTag::Set, IrType::Set(item)) => (slot == 0).then_some(item.as_ref()),
-        (BuiltinTag::Result, IrType::Result(first, second))
-        | (BuiltinTag::Dict, IrType::Dict(first, second)) => match slot {
-            0 => Some(first.as_ref()),
-            1 => Some(second.as_ref()),
-            _ => None,
-        },
-        (
-            BuiltinTag::Maybe
-            | BuiltinTag::List
-            | BuiltinTag::Set
-            | BuiltinTag::Result
-            | BuiltinTag::Dict
-            | BuiltinTag::Int
-            | BuiltinTag::Float
-            | BuiltinTag::Bool
-            | BuiltinTag::String
-            | BuiltinTag::Char
-            | BuiltinTag::Bytes
-            | BuiltinTag::Order
-            | BuiltinTag::Error
-            | BuiltinTag::ErrorKind
-            | BuiltinTag::ErrorDetails
-            | BuiltinTag::BackoffStrategy
-            | BuiltinTag::TaskStep
-            | BuiltinTag::Decimal
-            | BuiltinTag::Task
-            | BuiltinTag::Cmd
-            | BuiltinTag::Sub
-            | BuiltinTag::Topic
-            | BuiltinTag::Decoder
-            | BuiltinTag::Db
-            | BuiltinTag::SqlValue
-            | BuiltinTag::SqlField
-            | BuiltinTag::SqlFragment
-            | BuiltinTag::ProjectionTerm
-            | BuiltinTag::ProjectionOperand
-            | BuiltinTag::Secret
-            | BuiltinTag::Path
-            | BuiltinTag::Regex
-            | BuiltinTag::Url
-            | BuiltinTag::UrlRelative
-            | BuiltinTag::Dsn
-            | BuiltinTag::Connection
-            | BuiltinTag::ConnReadOnly
-            | BuiltinTag::ConnReadWrite
-            | BuiltinTag::Setting
-            | BuiltinTag::ShapeWeb
-            | BuiltinTag::ShapeWebView
-            | BuiltinTag::ShapeTerminal
-            | BuiltinTag::Program
-            | BuiltinTag::ProgramShapeWeb
-            | BuiltinTag::ProgramShapeTui
-            | BuiltinTag::ProgramShapeCli
-            | BuiltinTag::ProgramShapeWorker
-            | BuiltinTag::HostMode
-            | BuiltinTag::LogLevel
-            | BuiltinTag::CsrfMode
-            | BuiltinTag::RevocationMode
-            | BuiltinTag::Locale
-            | BuiltinTag::HttpMethod
-            | BuiltinTag::RedirectPolicy
-            | BuiltinTag::DbFailure
-            | BuiltinTag::AuthError
-            | BuiltinTag::Duration
-            | BuiltinTag::CryptoKey
-            | BuiltinTag::CryptoMac
-            | BuiltinTag::EmailAddress
-            | BuiltinTag::Principal
-            | BuiltinTag::Claims
-            | BuiltinTag::Algorithm
-            | BuiltinTag::JsonValue
-            | BuiltinTag::StreamId
-            | BuiltinTag::StreamWriter
-            | BuiltinTag::WsServer
-            | BuiltinTag::WsServerCfg
-            | BuiltinTag::ServerRequest
-            | BuiltinTag::ServerCookie
-            | BuiltinTag::ServerRoute
-            | BuiltinTag::AuthConfig
-            | BuiltinTag::TokenSource
-            | BuiltinTag::UiAttribute
-            | BuiltinTag::HtmlAttribute
-            | BuiltinTag::View
-            | BuiltinTag::UiElement
-            | BuiltinTag::Cells
-            | BuiltinTag::TuiAttr
-            | BuiltinTag::CliLines
-            | BuiltinTag::CliAttr
-            | BuiltinTag::Color
-            | BuiltinTag::ColorError
-            | BuiltinTag::TermProfile
-            | BuiltinTag::AnsiColor
-            | BuiltinTag::WcagLevel
-            | BuiltinTag::TextSize
-            | BuiltinTag::Deficiency
-            | BuiltinTag::CustomElement
-            | BuiltinTag::Html
-            | BuiltinTag::UiLength
-            | BuiltinTag::UiColor
-            | BuiltinTag::UiDescription
-            | BuiltinTag::UiPseudoClass
-            | BuiltinTag::InputLabel
-            | BuiltinTag::InputPlaceholder
-            | BuiltinTag::InputRadioOption
-            | BuiltinTag::WebReq
-            | BuiltinTag::SessionHandle
-            | BuiltinTag::WebRoute
-            | BuiltinTag::EmailProvider
-            | BuiltinTag::WebApp
-            | BuiltinTag::TuiApp
-            | BuiltinTag::CliApp
-            | BuiltinTag::DbStore
-            | BuiltinTag::DbDraft
-            | BuiltinTag::DbJoined
-            | BuiltinTag::DbSelect
-            | BuiltinTag::DbPolicy
-            | BuiltinTag::DbCond
-            | BuiltinTag::DbPred
-            | BuiltinTag::DbSecured
-            | BuiltinTag::DbOrder
-            | BuiltinTag::Codec,
-            _,
-        ) => None,
+    match tag {
+        BuiltinTag::Maybe | BuiltinTag::Result => TagCarrier::Decided,
+        BuiltinTag::List | BuiltinTag::Set | BuiltinTag::Dict => TagCarrier::Stored,
+        BuiltinTag::Int
+        | BuiltinTag::Float
+        | BuiltinTag::Bool
+        | BuiltinTag::String
+        | BuiltinTag::Char
+        | BuiltinTag::Bytes
+        | BuiltinTag::Order
+        | BuiltinTag::Error
+        | BuiltinTag::ErrorKind
+        | BuiltinTag::ErrorDetails
+        | BuiltinTag::BackoffStrategy
+        | BuiltinTag::TaskStep
+        | BuiltinTag::Decimal
+        | BuiltinTag::Task
+        | BuiltinTag::Cmd
+        | BuiltinTag::Sub
+        | BuiltinTag::Topic
+        | BuiltinTag::Decoder
+        | BuiltinTag::Db
+        | BuiltinTag::SqlValue
+        | BuiltinTag::SqlField
+        | BuiltinTag::SqlFragment
+        | BuiltinTag::ProjectionTerm
+        | BuiltinTag::ProjectionOperand
+        | BuiltinTag::Secret
+        | BuiltinTag::Path
+        | BuiltinTag::Regex
+        | BuiltinTag::Url
+        | BuiltinTag::UrlRelative
+        | BuiltinTag::Dsn
+        | BuiltinTag::Connection
+        | BuiltinTag::ConnReadOnly
+        | BuiltinTag::ConnReadWrite
+        | BuiltinTag::Setting
+        | BuiltinTag::ShapeWeb
+        | BuiltinTag::ShapeWebView
+        | BuiltinTag::ShapeTerminal
+        | BuiltinTag::Program
+        | BuiltinTag::ProgramShapeWeb
+        | BuiltinTag::ProgramShapeTui
+        | BuiltinTag::ProgramShapeCli
+        | BuiltinTag::ProgramShapeWorker
+        | BuiltinTag::HostMode
+        | BuiltinTag::LogLevel
+        | BuiltinTag::CsrfMode
+        | BuiltinTag::RevocationMode
+        | BuiltinTag::Locale
+        | BuiltinTag::HttpMethod
+        | BuiltinTag::RedirectPolicy
+        | BuiltinTag::DbFailure
+        | BuiltinTag::AuthError
+        | BuiltinTag::Duration
+        | BuiltinTag::CryptoKey
+        | BuiltinTag::CryptoMac
+        | BuiltinTag::EmailAddress
+        | BuiltinTag::Principal
+        | BuiltinTag::Claims
+        | BuiltinTag::Algorithm
+        | BuiltinTag::JsonValue
+        | BuiltinTag::StreamId
+        | BuiltinTag::StreamWriter
+        | BuiltinTag::WsServer
+        | BuiltinTag::WsServerCfg
+        | BuiltinTag::ServerRequest
+        | BuiltinTag::ServerCookie
+        | BuiltinTag::ServerRoute
+        | BuiltinTag::AuthConfig
+        | BuiltinTag::TokenSource
+        | BuiltinTag::UiAttribute
+        | BuiltinTag::HtmlAttribute
+        | BuiltinTag::View
+        | BuiltinTag::UiElement
+        | BuiltinTag::Cells
+        | BuiltinTag::TuiAttr
+        | BuiltinTag::CliLines
+        | BuiltinTag::CliAttr
+        | BuiltinTag::Color
+        | BuiltinTag::ColorError
+        | BuiltinTag::TermProfile
+        | BuiltinTag::AnsiColor
+        | BuiltinTag::WcagLevel
+        | BuiltinTag::TextSize
+        | BuiltinTag::Deficiency
+        | BuiltinTag::CustomElement
+        | BuiltinTag::Html
+        | BuiltinTag::UiLength
+        | BuiltinTag::UiColor
+        | BuiltinTag::UiDescription
+        | BuiltinTag::UiPseudoClass
+        | BuiltinTag::InputLabel
+        | BuiltinTag::InputPlaceholder
+        | BuiltinTag::InputRadioOption
+        | BuiltinTag::WebReq
+        | BuiltinTag::SessionHandle
+        | BuiltinTag::WebRoute
+        | BuiltinTag::EmailProvider
+        | BuiltinTag::WebApp
+        | BuiltinTag::TuiApp
+        | BuiltinTag::CliApp
+        | BuiltinTag::DbStore
+        | BuiltinTag::DbDraft
+        | BuiltinTag::DbJoined
+        | BuiltinTag::DbSelect
+        | BuiltinTag::DbPolicy
+        | BuiltinTag::DbCond
+        | BuiltinTag::DbPred
+        | BuiltinTag::DbSecured
+        | BuiltinTag::DbOrder
+        | BuiltinTag::Codec => TagCarrier::Opaque,
     }
 }
 
-/// Bind every scheme variable of `shape` that `ty` instantiates with a type holding an `Arc` function.
+/// The lowered type argument `slot` of the built-in constructor `tag`, read off `ty`.
 ///
-/// Walks a constructor argument and a tuple component in step with `ty`; an
-/// arrow and a record are not walked, so a variable seen only there stays
-/// unbound. The first binding of a variable is kept.
-fn bind_shape_carriers(shape: &ipe_kernels::TyShape, ty: &IrType, bound: &mut Vec<(u8, IrType)>) {
+/// Only the transparent containers are read ([`tag_carrier`]): an effect or
+/// opaque constructor keeps its payload at the base carrier, so a scheme
+/// variable under one is never bound through it.
+fn builtin_child(tag: ipe_kernels::BuiltinTag, ty: &IrType, slot: usize) -> Option<&IrType> {
+    use ipe_kernels::BuiltinTag;
+    match tag_carrier(tag) {
+        TagCarrier::Opaque => None,
+        TagCarrier::Decided | TagCarrier::Stored => match (tag, ty) {
+            (BuiltinTag::Maybe, IrType::Maybe(item))
+            | (BuiltinTag::List, IrType::List(item))
+            | (BuiltinTag::Set, IrType::Set(item)) => (slot == 0).then_some(item.as_ref()),
+            (BuiltinTag::Result, IrType::Result(first, second))
+            | (BuiltinTag::Dict, IrType::Dict(first, second)) => match slot {
+                0 => Some(first.as_ref()),
+                1 => Some(second.as_ref()),
+                _ => None,
+            },
+            // A transparent tag over a type of another shape binds nothing.
+            _ => None,
+        },
+    }
+}
+
+/// One binding of a kernel scheme variable to the carrier type of an argument position.
+#[derive(Debug)]
+struct SchemeBinding {
+    /// The scheme variable.
+    var: u8,
+    /// The carrier type the argument holds at the variable's position.
+    ty: IrType,
+    /// Whether the variable is the whole argument slot (`Var(v)`), not a position below its top.
+    bare: bool,
+    /// Whether the argument's carrier type is the one it is emitted on ([`CarrierRole::Typed`]).
+    typed: bool,
+}
+
+/// Collect a binding for every scheme variable of `shape` that `ty` instantiates with a type holding a function.
+///
+/// Walks a transparent constructor argument ([`builtin_child`]) and a
+/// tuple component in step with `ty`, in source order; an arrow and a record
+/// are not walked, so a variable seen only there is not bound. `bare` is
+/// whether `shape` is the whole argument slot.
+fn collect_shape_bindings(
+    shape: &ipe_kernels::TyShape,
+    ty: &IrType,
+    bare: bool,
+    typed: bool,
+    out: &mut Vec<SchemeBinding>,
+) {
     use ipe_kernels::TyShape;
     match shape {
         TyShape::Var(var) => {
-            if ir_holds_shared(ty) && bound_carrier(bound, *var).is_none() {
-                bound.push((*var, ty.clone()));
+            if ir_holds_fn(ty) {
+                out.push(SchemeBinding {
+                    var: *var,
+                    ty: ty.clone(),
+                    bare,
+                    typed,
+                });
             }
         }
         TyShape::Con(tag, items) => {
             for (slot, item) in items.iter().enumerate() {
                 if let Some(child) = builtin_child(*tag, ty, slot) {
-                    bind_shape_carriers(item, child, bound);
+                    collect_shape_bindings(item, child, false, typed, out);
                 }
             }
         }
@@ -8294,12 +8324,180 @@ fn bind_shape_carriers(shape: &ipe_kernels::TyShape, ty: &IrType, bound: &mut Ve
                 && items.len() == children.len()
             {
                 for (item, child) in items.iter().zip(children) {
-                    bind_shape_carriers(item, child, bound);
+                    collect_shape_bindings(item, child, false, typed, out);
                 }
             }
         }
         TyShape::Fun(..) | TyShape::Record { .. } | TyShape::Unit => {}
     }
+}
+
+/// Whether scheme variable `var` occurs in the result shape `shape` under an opaque constructor, at a position its value decides.
+///
+/// The positions are the variable directly under an opaque constructor
+/// ([`TagCarrier::Opaque`]), or under a `Maybe`/`Result` payload below one. A
+/// storage position (a collection element, a tuple component) is on `Arc`
+/// in every value alike, so it decides nothing.
+fn var_under_opaque(shape: &ipe_kernels::TyShape, var: u8, under: bool) -> bool {
+    use ipe_kernels::TyShape;
+    match shape {
+        TyShape::Var(found) => under && *found == var,
+        TyShape::Con(tag, items) => match tag_carrier(*tag) {
+            TagCarrier::Opaque => items.iter().any(|item| var_under_opaque(item, var, true)),
+            TagCarrier::Decided => items.iter().any(|item| var_under_opaque(item, var, under)),
+            TagCarrier::Stored => false,
+        },
+        TyShape::Tuple(_) | TyShape::Fun(..) | TyShape::Record { .. } | TyShape::Unit => false,
+    }
+}
+
+/// Whether two carrier types put every function a value decides on the same carrier.
+fn carriers_agree(a: &IrType, b: &IrType) -> bool {
+    matches!(carrier_diff(a, b), CarrierDiff::Same)
+}
+
+/// `ty` with every function at a position its value decides moved onto the direct carrier.
+///
+/// The positions are a top-level function and a `Maybe`/`Result` payload
+/// ([`carrier_shape`]); every other position is kept.
+fn direct_carriers(ty: &IrType) -> IrType {
+    match ty {
+        IrType::SharedFun(params, ret) => IrType::Fun(params.clone(), ret.clone()),
+        IrType::Maybe(item) => IrType::Maybe(Box::new(direct_carriers(item))),
+        IrType::Result(err, ok) => IrType::Result(
+            Box::new(direct_carriers(err)),
+            Box::new(direct_carriers(ok)),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The arguments of a kernel call bind one scheme variable to function carriers no conversion reconciles.
+#[derive(Debug, PartialEq, Eq)]
+struct CarrierConflict;
+
+/// The carrier each scheme variable of one kernel call takes, read by its prediction and its lowering alike.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SchemeVarCarriers {
+    /// The carrier type of each scheme variable bound to a function.
+    bound: Vec<(u8, IrType)>,
+    /// The scheme variables whose bare argument slots convert to their bound type.
+    converted: Vec<u8>,
+}
+
+impl SchemeVarCarriers {
+    /// The plan of a call of the kernel scheme `shape` whose argument slots carry `args`, in order.
+    ///
+    /// For each scheme variable an argument binds to a function-holding type
+    /// ([`collect_shape_bindings`]), when every binding is
+    /// [`CarrierRole::Typed`]:
+    ///
+    /// 1. the bindings below the top of a slot must agree, else the call is
+    ///    a [`CarrierConflict`];
+    /// 2. a variable the result holds under an opaque constructor
+    ///    ([`var_under_opaque`]) targets the direct carrier, and a binding
+    ///    below the top that disagrees is a [`CarrierConflict`];
+    /// 3. otherwise the target is the bindings below the top, else the
+    ///    direct carrier when the bare slots disagree.
+    ///
+    /// A variable with a target some bare slot disagrees with is converted:
+    /// every bare slot of it goes through [`Lowerer::fn_carrier_coerce`] to
+    /// the target, which is also its bound type. Every other variable, and
+    /// any with a binding of another role, is bound to its first binding
+    /// holding an `Arc` function, and no argument converts.
+    fn plan(shape: &ipe_kernels::TyShape, args: &[Carried]) -> Result<Self, CarrierConflict> {
+        let mut bindings: Vec<SchemeBinding> = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if let (Some(slot), Some(ty)) = (ipe_kernels::spine_arg(shape, index), arg.ty.as_ref())
+            {
+                let typed = arg.role == CarrierRole::Typed;
+                collect_shape_bindings(slot, ty, true, typed, &mut bindings);
+            }
+        }
+        let result = spine_after(shape, args.len());
+        let mut vars: Vec<u8> = bindings.iter().map(|binding| binding.var).collect();
+        vars.sort_unstable();
+        vars.dedup();
+        let mut plan = Self::default();
+        for var in vars {
+            let of_var: Vec<&SchemeBinding> = bindings
+                .iter()
+                .filter(|binding| binding.var == var)
+                .collect();
+            let target = if of_var.iter().all(|binding| binding.typed) {
+                let opaque = result.is_some_and(|result| var_under_opaque(result, var, false));
+                planned_target(&of_var, opaque)?
+            } else {
+                None
+            };
+            match target {
+                Some(target)
+                    if of_var
+                        .iter()
+                        .any(|binding| binding.bare && !carriers_agree(&binding.ty, &target)) =>
+                {
+                    plan.converted.push(var);
+                    plan.bound.push((var, target));
+                }
+                Some(_) | None => {
+                    if let Some(binding) =
+                        of_var.iter().find(|binding| ir_holds_shared(&binding.ty))
+                    {
+                        plan.bound.push((var, binding.ty.clone()));
+                    }
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    /// The type the bare slots of scheme variable `var` convert to, when the plan converts them.
+    fn conversion(&self, var: u8) -> Option<&IrType> {
+        if !self.converted.contains(&var) {
+            return None;
+        }
+        self.bound
+            .iter()
+            .find(|(bound_var, _)| *bound_var == var)
+            .map(|(_, ty)| ty)
+    }
+}
+
+/// The carrier type one scheme variable targets over its bindings `of_var`, per [`SchemeVarCarriers::plan`].
+///
+/// `opaque` is whether the result holds the variable under an opaque
+/// constructor. `None` when no binding decides one.
+fn planned_target(
+    of_var: &[&SchemeBinding],
+    opaque: bool,
+) -> Result<Option<IrType>, CarrierConflict> {
+    let mut nested = of_var.iter().filter(|binding| !binding.bare);
+    let first_nested = nested.next();
+    if let Some(first) = first_nested
+        && nested.any(|binding| !carriers_agree(&binding.ty, &first.ty))
+    {
+        return Err(CarrierConflict);
+    }
+    if opaque {
+        let Some(seed) = first_nested.or_else(|| of_var.first()) else {
+            return Ok(None);
+        };
+        let target = direct_carriers(&seed.ty);
+        if first_nested.is_some_and(|binding| !carriers_agree(&binding.ty, &target)) {
+            return Err(CarrierConflict);
+        }
+        return Ok(Some(target));
+    }
+    if let Some(first) = first_nested {
+        return Ok(Some(first.ty.clone()));
+    }
+    let mut bare = of_var.iter();
+    let Some(first) = bare.next() else {
+        return Ok(None);
+    };
+    Ok(bare
+        .any(|binding| !carriers_agree(&binding.ty, &first.ty))
+        .then(|| direct_carriers(&first.ty)))
 }
 
 /// `base` with every direct position `shape` names a bound scheme variable at replaced by its binding.
@@ -8308,19 +8506,22 @@ fn overlay_shape_carriers(
     base: IrType,
     bound: &[(u8, IrType)],
 ) -> IrType {
-    use ipe_kernels::{BuiltinTag, TyShape};
-    match (shape, base) {
-        (TyShape::Var(var), base) => bound_carrier(bound, *var).unwrap_or(base),
-        (TyShape::Con(BuiltinTag::Maybe, [item]), IrType::Maybe(base_item)) => {
-            IrType::Maybe(Box::new(overlay_shape_carriers(item, *base_item, bound)))
-        }
-        (TyShape::Con(BuiltinTag::Result, [err, ok]), IrType::Result(base_err, base_ok)) => {
-            IrType::Result(
+    use ipe_kernels::TyShape;
+    match shape {
+        TyShape::Var(var) => bound_carrier(bound, *var).unwrap_or(base),
+        TyShape::Con(tag, items) => match (tag_carrier(*tag), *items, base) {
+            (TagCarrier::Decided, [item], IrType::Maybe(base_item)) => {
+                IrType::Maybe(Box::new(overlay_shape_carriers(item, *base_item, bound)))
+            }
+            (TagCarrier::Decided, [err, ok], IrType::Result(base_err, base_ok)) => IrType::Result(
                 Box::new(overlay_shape_carriers(err, *base_err, bound)),
                 Box::new(overlay_shape_carriers(ok, *base_ok, bound)),
-            )
-        }
-        (_, base) => base,
+            ),
+            // A storage element is on `Arc` in `base` already; an opaque
+            // payload stays on the base carrier.
+            (TagCarrier::Decided | TagCarrier::Stored | TagCarrier::Opaque, _, base) => base,
+        },
+        TyShape::Tuple(_) | TyShape::Fun(..) | TyShape::Record { .. } | TyShape::Unit => base,
     }
 }
 
@@ -11631,19 +11832,21 @@ pub struct Lowerer<'a> {
     /// residual. Scoped save/restore per registering `let`; interior mutability so
     /// the lowering walk stays over a shared `&self`.
     local_string_literals: std::cell::RefCell<BTreeMap<Symbol, String>>,
-    /// Local binders whose value is a function read out of storage, keyed to the read's arrow.
+    /// Local binders whose function carrier is known where they are bound, keyed to that carrier.
     ///
     /// A pattern binder of an enum-constructor payload, a tuple component, a
     /// record field, or a collection element, and a `let` name bound to such a
     /// read, holds an [`IrType::SharedFun`] (`Arc<dyn Fn>`) value whatever its
-    /// own arrow says. When such a binder flows into a direct function
-    /// parameter (which an `Arc<dyn Fn>` does not satisfy) the read is
-    /// converted back onto the direct `Box<dyn Fn>` carrier at the argument
-    /// boundary ([`Self::demote_stored_fn_kernel_args`],
-    /// [`Self::demote_shared_fn_read`]). A record-field read is recovered from
-    /// its record's type, so it needs no entry. Saved and restored per scope;
+    /// own arrow says ([`LocalFnCarrier::Stored`]). When such a binder flows
+    /// into a direct function parameter (which an `Arc<dyn Fn>` does not
+    /// satisfy) the read is converted back onto the direct `Box<dyn Fn>`
+    /// carrier at the argument boundary ([`Self::coerce_kernel_fn_args`],
+    /// [`Self::demote_shared_fn_read`]). A parameter holding a function under a
+    /// `Maybe`/`Result` payload is on its declared type
+    /// ([`LocalFnCarrier::Param`]). A record-field read is recovered from its
+    /// record's type, so it needs no entry. Saved and restored per scope;
     /// interior mutability so the lowering walk stays over a shared `&self`.
-    shared_fn_reads: std::cell::RefCell<BTreeMap<Symbol, (Vec<IrType>, IrType)>>,
+    local_fn_carriers: std::cell::RefCell<BTreeMap<Symbol, LocalFnCarrier>>,
     /// The number of expressions [`Self::value_carrier_type`] has classified.
     #[cfg(test)]
     carrier_walks: std::cell::Cell<usize>,
@@ -13669,7 +13872,7 @@ impl<'a> Lowerer<'a> {
             callee_instances: std::cell::RefCell::new(Vec::new()),
             toplevel_fn_aliases: std::cell::RefCell::new(BTreeMap::new()),
             local_string_literals: std::cell::RefCell::new(BTreeMap::new()),
-            shared_fn_reads: std::cell::RefCell::new(BTreeMap::new()),
+            local_fn_carriers: std::cell::RefCell::new(BTreeMap::new()),
             #[cfg(test)]
             carrier_walks: std::cell::Cell::new(0),
             fn_row_params: std::cell::RefCell::new(BTreeMap::new()),
@@ -17568,10 +17771,9 @@ impl<'a> Lowerer<'a> {
                         .reject_generic_app_entries_in(body, &row_vars)
                         .and_then(|()| {
                             self.with_binders(&param_scope, || {
-                                self.with_stored_fn_binders(
-                                    patterns.iter().map(|p| (p, false)),
-                                    || self.lower_returned_body(body, &ret),
-                                )
+                                self.with_param_binders(&params, patterns, || {
+                                    self.lower_returned_body(body, &ret)
+                                })
                             })
                         });
                     self.fn_is_async.set(prev_async);
@@ -17998,10 +18200,9 @@ impl<'a> Lowerer<'a> {
                                 .reject_generic_app_entries_in(body, &BTreeSet::new())
                                 .and_then(|()| {
                                     self.with_binders(&param_scope, || {
-                                        self.with_stored_fn_binders(
-                                            patterns.iter().map(|p| (p, false)),
-                                            || self.lower_returned_body(body, &ret),
-                                        )
+                                        self.with_param_binders(&params, patterns, || {
+                                            self.lower_returned_body(body, &ret)
+                                        })
                                     })
                                 });
                             self.fn_is_async.set(prev_async);
@@ -20174,7 +20375,7 @@ impl<'a> Lowerer<'a> {
             all_param_pats.iter().copied(),
         );
         let mut body = self.with_binders(&param_scope, || {
-            self.with_stored_fn_binders(all_param_pats.iter().map(|p| (*p, false)), || {
+            self.with_param_binders(&ir_params, all_param_pats.iter().copied(), || {
                 self.lower_expr(cur_body)
             })
         })?;
@@ -21492,9 +21693,9 @@ impl<'a> Lowerer<'a> {
     /// `decode_succeed(curryN(...))` already produces a real `FnOnce` chain).
     ///
     /// Every other `Decoder`-wrapping type position in the compiler keeps
-    /// the ordinary, flattened `Fun` shape; [`Self::eta_expand_partial`] is
-    /// the sole caller, gated to exactly the missing-arg slot (and return
-    /// type) of these five kernels.
+    /// the ordinary, flattened `Fun` shape; [`Self::eta_param_type`] (with
+    /// [`Self::eta_expand_partial`]'s return type) is the caller, gated to
+    /// exactly the missing-arg slot (and return type) of these five kernels.
     ///
     /// Falls back to [`Self::ir_type_from_ty_json`] unchanged when `t` is
     /// not `Decoder _` at all (defensive — should not occur for these
@@ -23032,7 +23233,7 @@ impl<'a> Lowerer<'a> {
         // direct function slot (`r.step |> Task.loop n s`; the partial's eta
         // parameter is typed on the direct carrier, so the stored read must be
         // converted at the kernel call itself,
-        // [`Self::demote_stored_fn_kernel_args`]). The collapsed spine is
+        // [`Self::coerce_kernel_fn_args`]). The collapsed spine is
         // exactly the direct saturated call the programmer could have written.
         // Restricted to those spines on purpose: a GENERAL flatten reshapes
         // the call tree the downstream multi-use / last-use ownership pass reads to decide moves vs clones, mis-placing a move where
@@ -23060,14 +23261,12 @@ impl<'a> Lowerer<'a> {
     ///
     /// `callee` is the whole inner spine (`Call(Call(k, a), b)` for
     /// `k a b outer`), so the slot `outer[j]` fills is the argument count of
-    /// every spine level plus `j`. True when the head kernel is an accessor-intercept placeholder
-    /// (`Store.mask`, `Store.eq`, …) or a capture-cloned handler kernel
-    /// (`Stream.stream`), whose saturated-call gate must observe every
-    /// argument; and when an argument of `outer` is a stored function read
-    /// ([`Self::canon_stored_fn_carrier`]) landing in a
-    /// [`FnSlotCarrier::Direct`] slot of the head kernel, which only the
-    /// saturated call converts. Never a general currying reshape (which would
-    /// disturb the ownership/last-use pass).
+    /// every spine level plus `j`. The rule is [`Self::spine_level_saturates`]:
+    /// an accessor-intercept placeholder (`Store.mask`, `Store.eq`, …) or a
+    /// capture-cloned handler kernel (`Stream.stream`), whose saturated-call
+    /// gate must observe every argument, and an argument of `outer` whose
+    /// carrier only the saturated call converts. Never a general currying
+    /// reshape (which would disturb the ownership/last-use pass).
     fn spine_needs_saturated_call(&self, callee: &canon::Expr, outer: &[canon::Expr]) -> bool {
         let mut head = callee;
         let mut offset = 0_usize;
@@ -23078,10 +23277,10 @@ impl<'a> Lowerer<'a> {
         let Ok(Callee::Kernel(k)) = self.lower_callee(head) else {
             return false;
         };
-        spine_saturates(k, offset, outer.len(), |j| {
+        self.spine_level_saturates(k, head, offset, outer.len(), |j| {
             outer
                 .get(j)
-                .is_some_and(|arg| self.canon_stored_fn_carrier(arg).is_some())
+                .map_or_else(|| Carried::typed(None), |arg| self.carried(arg))
         })
     }
 
@@ -24464,11 +24663,13 @@ impl<'a> Lowerer<'a> {
                     EtaDemand::EMPTY,
                     call_span,
                 )?;
-                // A stored function read reaching a direct function slot is
-                // converted at the same choke point, so the saturated, partial,
+                // A function argument reaching a direct function slot or a
+                // scheme-variable slot is converted to the slot's planned
+                // carrier at the same choke point, so the saturated, partial,
                 // and over-applied shapes all see the converted argument.
-                let site = self.demote_stored_fn_kernel_args(
+                let site = self.coerce_kernel_fn_args(
                     &resolved,
+                    callee,
                     args,
                     &mut lowered_args,
                     site,
@@ -24900,7 +25101,7 @@ impl<'a> Lowerer<'a> {
         Ok(site)
     }
 
-    /// Convert every stored function read passed to a direct function slot of a kernel.
+    /// Convert every function argument of a kernel call to the carrier its slot takes.
     ///
     /// A function read out of storage (a record field, a user-enum payload, a
     /// tuple component, a collection element) is carried as `Arc<dyn Fn>`,
@@ -24912,15 +25113,24 @@ impl<'a> Lowerer<'a> {
     /// ([`Self::hoist_stored_fn_read`]). An [`FnSlotCarrier::AcceptsShared`]
     /// slot is re-wrapped by the backend and left as is.
     ///
+    /// A bare scheme-variable slot (`a` of `Maybe.withDefault : a -> Maybe a
+    /// -> a`) takes the carrier the call's plan decides
+    /// ([`SchemeVarCarriers::plan`], the plan [`Self::call_carrier_type`]
+    /// predicts the result by): each argument the plan converts goes through
+    /// [`Self::fn_carrier_coerce`], and a plan whose bindings conflict is
+    /// refused with IPE-L0107 [`Feature::FnCarrierConflict`] at `span`. A slot
+    /// a partial application leaves missing is planned on the type its eta
+    /// binder takes ([`Self::eta_param_type`]).
+    ///
     /// `canon_args[i]` is the source of `lowered_args[i]`; the call runs ahead
     /// of the arity split, so a saturated, partial, or over-applied call is
-    /// converted alike (an argument past the arity is no slot). A detection
-    /// that over-approximates is harmless: a direct closure re-wrapped is still
-    /// a direct closure. Each conversion draws its eta names on `site`; a site
-    /// past [`MAX_ETA_PER_SITE`] fails closed with IPE-L0155.
-    fn demote_stored_fn_kernel_args(
+    /// converted alike (an argument past the arity is no slot). Each
+    /// conversion draws its eta names on `site`; a site past
+    /// [`MAX_ETA_PER_SITE`] fails closed with IPE-L0155.
+    fn coerce_kernel_fn_args(
         &self,
         resolved: &Callee,
+        callee: &canon::Expr,
         canon_args: &[canon::Expr],
         lowered_args: &mut [Expr],
         site: EtaDemand,
@@ -24943,6 +25153,41 @@ impl<'a> Lowerer<'a> {
                 .ok_or_else(|| unsupported(span, Feature::EtaSiteLimit))?;
             let read = std::mem::replace(slot, Expr::Unit);
             *slot = self.hoist_stored_fn_read(read, &params, &ret)?;
+        }
+        let Some(shape) = kernel.scheme_shape() else {
+            return Ok(site);
+        };
+        if !canon_args
+            .iter()
+            .any(|arg| self.region_ty(arg.span).is_some_and(ty_holds_fun))
+        {
+            return Ok(site);
+        }
+        let arity = usize::from(kernel.decl().arity);
+        let carried: Vec<Carried> = (0..arity)
+            .map(|slot| {
+                canon_args.get(slot).map_or_else(
+                    || Carried::typed(self.eta_slot_type(resolved, callee.span, slot, arity)),
+                    |arg| self.carried(arg),
+                )
+            })
+            .collect();
+        let plan = SchemeVarCarriers::plan(shape, &carried)
+            .map_err(|CarrierConflict| unsupported(span, Feature::FnCarrierConflict))?;
+        for (slot, value) in lowered_args.iter_mut().enumerate().take(arity) {
+            let Some(ipe_kernels::TyShape::Var(var)) = ipe_kernels::spine_arg(shape, slot) else {
+                continue;
+            };
+            let (Some(to), Some(from)) = (
+                plan.conversion(*var),
+                carried.get(slot).and_then(|found| found.ty.as_ref()),
+            ) else {
+                continue;
+            };
+            let (converted, next) =
+                self.fn_carrier_coerce(std::mem::replace(value, Expr::Unit), from, to, site, span)?;
+            *value = converted;
+            site = next;
         }
         Ok(site)
     }
@@ -25066,14 +25311,17 @@ impl<'a> Lowerer<'a> {
                 Carried::typed(self.access_field_type(record, *field).or_else(lowered))
             }
             canon::Expr_::VarLocal(sym) => {
-                let stored = self.shared_fn_reads.borrow().get(sym).cloned();
-                stored.map_or_else(
-                    || Carried {
+                let local = self.local_fn_carriers.borrow().get(sym).cloned();
+                match local {
+                    Some(LocalFnCarrier::Stored(params, ret)) => {
+                        Carried::typed(Some(IrType::SharedFun(params, Box::new(ret))))
+                    }
+                    Some(LocalFnCarrier::Param(ty)) => Carried::typed(Some(ty)),
+                    None => Carried {
                         ty: lowered(),
                         role: CarrierRole::Deferred,
                     },
-                    |(params, ret)| Carried::typed(Some(IrType::SharedFun(params, Box::new(ret)))),
-                )
+                }
             }
             canon::Expr_::If(branches, otherwise) => {
                 let carried = self.if_branch_carriers(branches, otherwise);
@@ -25144,10 +25392,10 @@ impl<'a> Lowerer<'a> {
         branches
             .iter()
             .map(|br| {
-                let saved = self.shared_fn_reads.borrow().clone();
+                let saved = self.local_fn_carriers.borrow().clone();
                 self.register_stored_fn_arm_binders(scrutinee, &br.pat);
                 let found = self.carried(&br.body);
-                *self.shared_fn_reads.borrow_mut() = saved;
+                *self.local_fn_carriers.borrow_mut() = saved;
                 found
             })
             .collect()
@@ -25256,8 +25504,10 @@ impl<'a> Lowerer<'a> {
     ///
     /// Only a kernel call that lowers saturated passes a carrier through: its
     /// spine holds exactly the kernel's arity, and every curried level
-    /// collapses into the one direct call ([`spine_saturates`], the rule
-    /// [`Self::lower_call`] applies). A partial, over-applied, or
+    /// collapses into the one direct call ([`Self::spine_level_saturates`],
+    /// the rule [`Self::lower_call`] applies). The result takes the carriers
+    /// of the call's plan ([`SchemeVarCarriers::plan`]), the plan its lowering
+    /// converts the arguments by. A partial, over-applied, or
     /// non-collapsing spine, and a call to anything but a kernel, emits a
     /// closure or a call whose result is on the solved type's own carriers,
     /// so it is `base`. A top-level user def's result is its declared return
@@ -25284,22 +25534,72 @@ impl<'a> Lowerer<'a> {
         if spine.len() != usize::from(kernel.decl().arity) {
             return base;
         }
-        let arg_types: Vec<Option<IrType>> = spine
-            .iter()
-            .map(|arg| self.value_carrier_type(arg))
-            .collect();
-        let stored = |slot: usize| matches!(arg_types.get(slot), Some(Some(IrType::SharedFun(..))));
+        let carried: Vec<Carried> = spine.iter().map(|arg| self.carried(arg)).collect();
         let mut offset = spine.len();
         for level in levels.iter().take(levels.len().saturating_sub(1)) {
             offset = offset.saturating_sub(level.len());
             let outer_len = spine.len().saturating_sub(offset);
-            if !spine_saturates(kernel, offset, outer_len, |j| {
-                stored(offset.saturating_add(j))
+            if !self.spine_level_saturates(kernel, head, offset, outer_len, |j| {
+                carried
+                    .get(offset.saturating_add(j))
+                    .cloned()
+                    .unwrap_or_else(|| Carried::typed(None))
             }) {
                 return base;
             }
         }
-        kernel_result_carrier_type(kernel, &arg_types, base)
+        let Some(shape) = kernel.scheme_shape() else {
+            return base;
+        };
+        // A conflicting call is refused where it is lowered
+        // ([`Self::coerce_kernel_fn_args`]); its prediction keeps `base`.
+        let Ok(plan) = SchemeVarCarriers::plan(shape, &carried) else {
+            return base;
+        };
+        kernel_result_carrier_type(shape, &plan.bound, carried.len(), base)
+    }
+
+    /// Whether the curried spine of `kernel` (headed by `head`) whose outer `outer_len` arguments start at slot `offset` lowers as one saturated call.
+    ///
+    /// `carried(j)` is the carrier of outer argument `j`. True when the
+    /// kernel is an accessor-intercept placeholder or a capture-cloned
+    /// handler kernel, whose saturated-call gate must observe every argument;
+    /// when an outer argument on `Arc` lands in a [`FnSlotCarrier::Direct`]
+    /// slot; and when an outer argument in any other non-function slot is
+    /// emitted on carriers the slot's eta binder ([`Self::eta_param_type`])
+    /// would not take. Only the saturated call converts those, through the
+    /// kernel's carrier plan ([`Self::coerce_kernel_fn_args`]).
+    fn spine_level_saturates(
+        &self,
+        kernel: KernelFn,
+        head: &canon::Expr,
+        offset: usize,
+        outer_len: usize,
+        carried: impl Fn(usize) -> Carried,
+    ) -> bool {
+        if kernel.is_accessor_intercept_placeholder()
+            || kernel.capture_cloned_handler_arg().is_some()
+        {
+            return true;
+        }
+        let arity = usize::from(kernel.decl().arity);
+        let resolved = Callee::Kernel(kernel);
+        (0..outer_len).any(|j| {
+            let slot = offset.saturating_add(j);
+            match kernel.fn_slot_carrier(slot) {
+                Some(FnSlotCarrier::Direct) => {
+                    matches!(carried(j).ty, Some(IrType::SharedFun(..)))
+                }
+                Some(FnSlotCarrier::AcceptsShared) => false,
+                None => {
+                    let found = carried(j);
+                    found.emitted().is_some_and(|emitted| {
+                        self.eta_slot_type(&resolved, head.span, slot, arity)
+                            .is_some_and(|binder| !carriers_agree(emitted, &binder))
+                    })
+                }
+            }
+        })
     }
 
     /// The lowered type of field `field` of the record `record`, on its storage carrier.
@@ -25347,7 +25647,7 @@ impl<'a> Lowerer<'a> {
     ///   ([`Expr::Access`] carries the flipped `field_ty`);
     /// * a value already constructed on the `Arc` carrier ([`Expr::SharedLambda`]);
     /// * a pattern binder that projected a function out of an enum payload, tuple
-    ///   component, or collection element — recorded in [`Self::shared_fn_reads`]
+    ///   component, or collection element — recorded in [`Self::local_fn_carriers`]
     ///   at its binding site, where the scrutinee's storage carrier is known.
     ///
     /// Every other shape (a direct `Box` lambda, a top-level fn reference, a plain
@@ -25362,7 +25662,10 @@ impl<'a> Lowerer<'a> {
             Expr::SharedLambda { params, ret, .. } => {
                 Some((params.iter().map(|(_, t)| t.clone()).collect(), ret.clone()))
             }
-            Expr::Var(s) | Expr::CloneVar(s) => self.shared_fn_reads.borrow().get(s).cloned(),
+            Expr::Var(s) | Expr::CloneVar(s) => match self.local_fn_carriers.borrow().get(s) {
+                Some(LocalFnCarrier::Stored(params, ret)) => Some((params.clone(), ret.clone())),
+                Some(LocalFnCarrier::Param(_)) | None => None,
+            },
             _ => None,
         }
     }
@@ -25400,7 +25703,7 @@ impl<'a> Lowerer<'a> {
     ///
     /// `scrutinee` is the arm's `case` scrutinee, classified once
     /// ([`Self::stored_fn_scrutinee`]). The caller saves and restores
-    /// [`Self::shared_fn_reads`] around the arm so a binder never outlives
+    /// [`Self::local_fn_carriers`] around the arm so a binder never outlives
     /// its pattern scope.
     fn register_stored_fn_arm_binders(&self, scrutinee: &StoredScrutinee, pat: &canon::Pattern) {
         self.register_stored_fn_root(pat, scrutinee.value.clone(), scrutinee.builtin_payload);
@@ -25420,13 +25723,16 @@ impl<'a> Lowerer<'a> {
         builtin_payload: bool,
     ) {
         match (&pat.value, value) {
-            (canon::Pattern_::PVar(sym), Some(arrow)) => {
-                self.shared_fn_reads.borrow_mut().insert(*sym, arrow);
+            (canon::Pattern_::PVar(sym), Some((params, ret))) => {
+                self.local_fn_carriers
+                    .borrow_mut()
+                    .insert(*sym, LocalFnCarrier::Stored(params, ret));
             }
             (canon::Pattern_::PAlias(inner, name), Some(arrow)) => {
-                self.shared_fn_reads
+                let (params, ret) = arrow.clone();
+                self.local_fn_carriers
                     .borrow_mut()
-                    .insert(name.value, arrow.clone());
+                    .insert(name.value, LocalFnCarrier::Stored(params, ret));
                 self.register_stored_fn_root(inner, Some(arrow), builtin_payload);
             }
             (_, value) => self.register_stored_fn_binders(pat, value.is_some(), builtin_payload),
@@ -25443,13 +25749,41 @@ impl<'a> Lowerer<'a> {
         roots: impl IntoIterator<Item = (&'p canon::Pattern, bool)>,
         f: impl FnOnce() -> T,
     ) -> T {
-        let saved = self.shared_fn_reads.borrow().clone();
+        let saved = self.local_fn_carriers.borrow().clone();
         for (pat, here) in roots {
             self.register_stored_fn_binders(pat, here, false);
         }
         let out = f();
-        *self.shared_fn_reads.borrow_mut() = saved;
+        *self.local_fn_carriers.borrow_mut() = saved;
         out
+    }
+
+    /// Run `f` with a function's parameter binders registered, each parameter on its declared carrier.
+    ///
+    /// The binders `patterns` bind are registered as no stored read
+    /// ([`Self::with_stored_fn_binders`]), so each shadows an outer stored
+    /// binder of its name. A parameter of `params` holding a function under a
+    /// `Maybe`/`Result` payload is then recorded on its declared type
+    /// ([`LocalFnCarrier::Param`]), so a frontier it meets plans on the carrier
+    /// it is emitted on. A parameter that is itself a function is left
+    /// unrecorded: a binder promotion after its scope may still move it onto
+    /// `Arc`.
+    fn with_param_binders<'p, T>(
+        &self,
+        params: &[IrParam],
+        patterns: impl IntoIterator<Item = &'p canon::Pattern>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        self.with_stored_fn_binders(patterns.into_iter().map(|p| (p, false)), || {
+            for (sym, ty) in params {
+                if matches!(carrier_shape(ty), CarrierShape::Branchable(_)) && ir_holds_fn(ty) {
+                    self.local_fn_carriers
+                        .borrow_mut()
+                        .insert(*sym, LocalFnCarrier::Param(ty.clone()));
+                }
+            }
+            f()
+        })
     }
 
     /// Run `f` with the binders of a `let` group registered as stored function reads.
@@ -25462,13 +25796,13 @@ impl<'a> Lowerer<'a> {
         bindings: &[canon::LetBinding],
         f: impl FnOnce() -> T,
     ) -> T {
-        let saved = self.shared_fn_reads.borrow().clone();
+        let saved = self.local_fn_carriers.borrow().clone();
         for binding in bindings {
             let value = self.canon_stored_fn_carrier(&binding.body);
             self.register_stored_fn_root(&binding.pat, value, false);
         }
         let out = f();
-        *self.shared_fn_reads.borrow_mut() = saved;
+        *self.local_fn_carriers.borrow_mut() = saved;
         out
     }
 
@@ -25517,8 +25851,10 @@ impl<'a> Lowerer<'a> {
                     });
                     stored.map_or_else(
                         || self.register_stored_fn_binder(field.value, field.span, true),
-                        |arrow| {
-                            self.shared_fn_reads.borrow_mut().insert(field.value, arrow);
+                        |(params, ret)| {
+                            self.local_fn_carriers
+                                .borrow_mut()
+                                .insert(field.value, LocalFnCarrier::Stored(params, ret));
                         },
                     );
                 }
@@ -25552,12 +25888,12 @@ impl<'a> Lowerer<'a> {
         };
         match arrow {
             Some(IrType::Fun(params, ret) | IrType::SharedFun(params, ret)) => {
-                self.shared_fn_reads
+                self.local_fn_carriers
                     .borrow_mut()
-                    .insert(sym, (params, *ret));
+                    .insert(sym, LocalFnCarrier::Stored(params, *ret));
             }
             _ => {
-                self.shared_fn_reads.borrow_mut().remove(&sym);
+                self.local_fn_carriers.borrow_mut().remove(&sym);
             }
         }
     }
@@ -25703,31 +26039,73 @@ impl<'a> Lowerer<'a> {
             // eta cursor; `advance_eta` below reserves the whole block so a
             // subsequently-lowered nested eta-lambda never reuses these names.
             let sym = self.eta_sym(offset)?;
-            // Use the JSON-friendly variant so that a free `Ty::Var` in the
-            // missing-arg slot — the common case for diverging / always-failing
-            // tasks passed to `Task.andThen` or `Cmd.perform` where the result
-            // type `a` is never constrained — maps to `IrType::Json` (`JsonVal`)
-            // instead of raising IPE-L0102.  The eta-param is only a closure
-            // binder forwarded verbatim to the full kernel call; its concrete
-            // Rust type is unified by the compiler from the call site, so
-            // `JsonVal` is a sound stand-in for any unconstrained `Ty::Var`.
-            //
-            // (`f7_succeed_curried`): EXCEPT the `next_decoder` slot
-            // (the kernel's LAST argument) of the five JsonDec.Pipeline /
-            // Db.Decode curried-combinator kernels — that one slot needs the
-            // curried `FnOnce`-chain shape, never the flattened `Fun` this
-            // JSON-friendly path would otherwise produce. See
-            // `ir_type_from_ty_pipeline_decoder`'s doc comment.
-            let ir = if Self::is_pipeline_next_decoder_kernel(resolved)
-                && supplied + offset == arity - 1
-            {
-                self.ir_type_from_ty_pipeline_decoder(arg_ty, call_span)?
-            } else {
-                self.ir_type_from_ty_json(arg_ty, call_span)?
-            };
+            let ir = self.eta_param_type(
+                resolved,
+                arg_ty,
+                supplied.saturating_add(offset),
+                arity,
+                call_span,
+            )?;
             params.push((sym, ir));
         }
         Ok(params)
+    }
+
+    /// The IR type of the eta binder for argument slot `slot`, of solved type `arg_ty`, of a partial application of `resolved`.
+    ///
+    /// The one source of an eta binder's annotation: the partial's own
+    /// binders ([`Self::eta_missing_params`]) and the carrier plan of the
+    /// call they forward to ([`Self::coerce_kernel_fn_args`]) read it alike.
+    ///
+    /// The JSON-friendly lowering maps a free `Ty::Var` in the missing slot —
+    /// the common case for diverging / always-failing tasks passed to
+    /// `Task.andThen` or `Cmd.perform` where the result type `a` is never
+    /// constrained — to `IrType::Json` (`JsonVal`) instead of raising
+    /// IPE-L0102. The binder is only forwarded verbatim to the full kernel
+    /// call; its concrete Rust type is unified by the compiler from the call
+    /// site, so `JsonVal` is a sound stand-in for any unconstrained `Ty::Var`.
+    /// The `next_decoder` slot (the last argument) of the five
+    /// `JsonDec.Pipeline` / `Db.Decode` curried-combinator kernels instead
+    /// takes the curried `FnOnce`-chain shape
+    /// ([`Self::ir_type_from_ty_pipeline_decoder`]).
+    fn eta_param_type(
+        &self,
+        resolved: &Callee,
+        arg_ty: &Ty,
+        slot: usize,
+        arity: usize,
+        span: Span,
+    ) -> DResult<IrType> {
+        if Self::is_pipeline_next_decoder_kernel(resolved) && slot.saturating_add(1) == arity {
+            self.ir_type_from_ty_pipeline_decoder(arg_ty, span)
+        } else {
+            self.ir_type_from_ty_json(arg_ty, span)
+        }
+    }
+
+    /// The eta binder type of argument slot `slot` of a partial application of `resolved`, whose `arity`-arrow callee is at `callee_span`.
+    ///
+    /// `None` when the callee's solved type or the slot type does not lower.
+    fn eta_slot_type(
+        &self,
+        resolved: &Callee,
+        callee_span: Span,
+        slot: usize,
+        arity: usize,
+    ) -> Option<IrType> {
+        let (arg_tys, _) = self
+            .callee_arrow(
+                callee_span,
+                arity,
+                "ipe_lower::eta_slot_type",
+                (
+                    "no inferred type for a kernel callee",
+                    "callee type has fewer arrows than its arity",
+                ),
+            )
+            .ok()?;
+        self.eta_param_type(resolved, arg_tys.get(slot)?, slot, arity, callee_span)
+            .ok()
     }
 
     /// Eta-expand a partial application `f a0 … a_{k-1}` (with `k < arity`) into a
@@ -31781,12 +32159,12 @@ impl<'a> Lowerer<'a> {
                 // The destructured names have no carrier promotion: they shadow
                 // any outer promotable name over the arm body. A component read
                 // out of storage is registered for the arm body like any arm's.
-                let shared_before = self.shared_fn_reads.borrow().clone();
+                let shared_before = self.local_fn_carriers.borrow().clone();
                 self.register_stored_fn_arm_binders(&stored_scrutinee, &first.pat);
                 let body = self.with_binders(&shadowing_binder_scope(&first.pat), || {
                     self.lower_expr(&first.body)
                 });
-                *self.shared_fn_reads.borrow_mut() = shared_before;
+                *self.local_fn_carriers.borrow_mut() = shared_before;
                 let body = body?;
                 // Scope = the single arm body — where the destructured
                 // components are read (see pass in the thunk builder).
@@ -31846,13 +32224,13 @@ impl<'a> Lowerer<'a> {
                         .map(|(br, branch_carried)| {
                             let arm_pat = self.lower_arm_pat(&br.pat, scrut.span)?;
                             let arm_syms = collect_arm_pat_pvars(&br.pat.value);
-                            let shared_before = self.shared_fn_reads.borrow().clone();
+                            let shared_before = self.local_fn_carriers.borrow().clone();
                             self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                             let mut arm_body = self
                                 .with_binders(&arm_binder_scope(&arm_syms), || {
                                     self.lower_expr(&br.body)
                                 })?;
-                            *self.shared_fn_reads.borrow_mut() = shared_before;
+                            *self.local_fn_carriers.borrow_mut() = shared_before;
                             for sym in arm_syms {
                                 let use_span = find_first_varlocal_span(sym, &br.body);
                                 if let (Some(span), Some(ir_ty)) =
@@ -31952,11 +32330,11 @@ impl<'a> Lowerer<'a> {
                 // flip carried onto `Arc`) reads an `Arc<dyn Fn>`. Record it so a
                 // read into a direct higher-order parameter demotes to `Box`
                 // ([`Self::demote_shared_fn_read`]). Scoped to this arm.
-                let shared_before = self.shared_fn_reads.borrow().clone();
+                let shared_before = self.local_fn_carriers.borrow().clone();
                 self.register_stored_fn_arm_binders(&stored_scrutinee, &br.pat);
                 let mut arm_body =
                     self.with_binders(&arm_binder_scope(&arm_syms), || self.lower_expr(&br.body))?;
-                *self.shared_fn_reads.borrow_mut() = shared_before;
+                *self.local_fn_carriers.borrow_mut() = shared_before;
 
                 // Move-ownership discipline for arm-bound variables — each
                 // symbol the canon pattern introduces is owned in the arm body
@@ -38846,6 +39224,113 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// `Maybe a`, the payload slot the synthetic schemes below bind `a` under.
+    const MAYBE_A: ipe_kernels::TyShape = ipe_kernels::TyShape::Con(
+        ipe_kernels::BuiltinTag::Maybe,
+        &[ipe_kernels::TyShape::Var(0)],
+    );
+
+    /// `Maybe a -> Maybe a -> Maybe a`, binding `a` below the top of two slots.
+    const MAYBE_A_TWICE: ipe_kernels::TyShape =
+        ipe_kernels::TyShape::Fun(&MAYBE_A, &ipe_kernels::TyShape::Fun(&MAYBE_A, &MAYBE_A));
+
+    /// `Maybe a -> Task a`, holding `a` under an opaque result constructor.
+    const MAYBE_A_TO_TASK_A: ipe_kernels::TyShape = ipe_kernels::TyShape::Fun(
+        &MAYBE_A,
+        &ipe_kernels::TyShape::Con(
+            ipe_kernels::BuiltinTag::Task,
+            &[ipe_kernels::TyShape::Var(0)],
+        ),
+    );
+
+    /// A `Maybe` payload of `item`, on the carrier it is emitted on.
+    fn typed_maybe(item: IrType) -> super::Carried {
+        use super::Carried;
+        Carried::typed(Some(IrType::Maybe(Box::new(item))))
+    }
+
+    /// Two payload bindings of one scheme variable on different carriers have no conversion, so the call is refused.
+    #[test]
+    fn scheme_var_plan_refuses_container_conflict() {
+        use super::{CarrierConflict, SchemeVarCarriers};
+        let conflict = [typed_maybe(shared_fn()), typed_maybe(direct_fn())];
+        assert_eq!(
+            SchemeVarCarriers::plan(&MAYBE_A_TWICE, &conflict),
+            Err(CarrierConflict),
+            "payload bindings on `Arc` and `Box` are not refused"
+        );
+        let agree = [typed_maybe(shared_fn()), typed_maybe(shared_fn())];
+        let plan = SchemeVarCarriers::plan(&MAYBE_A_TWICE, &agree);
+        assert!(
+            plan.as_ref().is_ok_and(|plan| plan.conversion(0).is_none()),
+            "agreeing payload bindings are refused or converted: {plan:?}"
+        );
+    }
+
+    /// A bare slot converts to the carrier its variable's payload binding decides, in either direction.
+    #[test]
+    fn scheme_var_plan_converts_a_bare_slot_to_the_payload_carrier() {
+        use super::{Carried, SchemeVarCarriers};
+        let shape = KernelFn::MaybeWithDefault.scheme_shape();
+        for (bare, payload) in [(direct_fn(), shared_fn()), (shared_fn(), direct_fn())] {
+            let args = [
+                Carried::typed(Some(bare.clone())),
+                typed_maybe(payload.clone()),
+            ];
+            let plan = shape.map(|shape| SchemeVarCarriers::plan(shape, &args));
+            assert!(
+                matches!(&plan, Some(Ok(plan)) if plan.conversion(0) == Some(&payload)),
+                "a bare `{bare:?}` slot is not converted to the payload's `{payload:?}`: {plan:?}"
+            );
+        }
+    }
+
+    /// A variable the result holds under an opaque constructor takes the direct carrier.
+    #[test]
+    fn opaque_result_forces_direct() {
+        use super::{Carried, CarrierConflict, SchemeVarCarriers};
+        let args = [Carried::typed(Some(shared_fn()))];
+        let plan = KernelFn::TaskSucceed
+            .scheme_shape()
+            .map(|shape| SchemeVarCarriers::plan(shape, &args));
+        let direct = direct_fn();
+        assert!(
+            matches!(&plan, Some(Ok(plan)) if plan.conversion(0) == Some(&direct)),
+            "an `Arc` argument of `Task.succeed` is not converted to `Box`: {plan:?}"
+        );
+        let nested = [typed_maybe(shared_fn())];
+        assert_eq!(
+            SchemeVarCarriers::plan(&MAYBE_A_TO_TASK_A, &nested),
+            Err(CarrierConflict),
+            "an `Arc` payload bound under an opaque result is not refused"
+        );
+    }
+
+    /// A binding whose carrier is not the emitted one plans as before: no conversion, bound to its `Arc` binding.
+    #[test]
+    fn scheme_var_plan_keeps_an_undecided_binding() {
+        use super::{Carried, CarrierRole, SchemeVarCarriers};
+        let args = [
+            Carried {
+                ty: Some(shared_fn()),
+                role: CarrierRole::Deferred,
+            },
+            typed_maybe(direct_fn()),
+        ];
+        let plan = KernelFn::MaybeWithDefault
+            .scheme_shape()
+            .map(|shape| SchemeVarCarriers::plan(shape, &args));
+        let expected = SchemeVarCarriers {
+            bound: vec![(0, shared_fn())],
+            converted: Vec::new(),
+        };
+        assert_eq!(
+            plan,
+            Some(Ok(expected)),
+            "a deferred binding is converted or rebound"
+        );
     }
 
     /// An `Arc` function, the payload every container case below wraps.
