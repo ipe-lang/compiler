@@ -2640,9 +2640,9 @@ mod zonk_sharing_tests {
 #[cfg(test)]
 mod zonk_row_tail_tests {
     use super::super::{
-        BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, Ty, TyBounds, TypeError,
-        UnionFind, VarId, ZONK_NODE_LIMIT, promote_untyped_boundaries, tag_solver_var, zonk,
-        zonk_emitted,
+        BTreeMap, Budget, Builder, Content, Diagnostic, FlatType, RowTail, SolverSteps, Ty,
+        TyBounds, TypeError, UnionFind, VarId, ZONK_NODE_LIMIT, promote_untyped_boundaries,
+        tag_solver_var, zonk, zonk_emitted,
     };
     use ipe_intern::{Interner, Symbol};
 
@@ -2856,7 +2856,10 @@ mod zonk_row_tail_tests {
         for n in 0..16 {
             short = record_over(&mut uf, &[n], short);
         }
-        let result = zonk(&mut uf, &mut Budget::new(4), short);
+        let four = SolverSteps::new(4);
+        assert!(four.is_some(), "four steps is a ceiling");
+        let Some(four) = four else { return };
+        let result = zonk(&mut uf, &mut Budget::new(four), short);
         assert!(
             matches!(
                 result,
