@@ -84,8 +84,10 @@ impl LintReport {
 /// order.
 ///
 /// `probe` is polled before each module is parsed, before each rule over each
-/// module, and before each module the cross-module pass aggregates, so a
-/// superseded run stops within one rule over one module.
+/// module, before each module and each emitted site of the cross-module pass,
+/// and before each finding is filtered, so a superseded run stops within one
+/// rule over one module or one finding's line scan. Only the final sort of the
+/// gathered findings runs unpolled.
 ///
 /// # Errors
 ///
@@ -143,6 +145,7 @@ pub fn run<P: CancelProbe>(
         let unknown_sev = config.severity_of("unknown-suppression");
         if unknown_sev != Severity::Allow {
             for (line_no, unknown_name) in &pm.suppressions.unknowns {
+                probe.poll()?;
                 // Synthesise a zero-width span at byte 0 of the offending line
                 // so the finding has a source location.
                 let line_byte =
@@ -169,6 +172,7 @@ pub fn run<P: CancelProbe>(
         }
 
         for raw in rules::run_all(&ctx, probe)? {
+            probe.poll()?;
             let severity = config.severity_of(raw.rule);
             if severity == Severity::Allow {
                 continue;
@@ -196,6 +200,7 @@ pub fn run<P: CancelProbe>(
     let ctx_refs: Vec<&rules::Ctx<'_>> = ctxs.iter().collect();
 
     for raw in rules::run_cross_module(&ctx_refs, probe)? {
+        probe.poll()?;
         let severity = config.severity_of(raw.rule);
         if severity == Severity::Allow {
             continue;
@@ -2239,31 +2244,124 @@ mod tests {
         }
     }
 
-    /// Two modules, each carrying an unused import the default config reports.
+    /// Two modules, each carrying an unused import the default config reports
+    /// and nothing a default-`allow` rule would gather and filter out.
     fn two_linted_modules() -> [SourceModule; 2] {
         let named = |name: &str| SourceModule {
             module: vec![name.to_owned()],
-            source: format!("module {name} exposing (x)\n\nimport Unused\n\nx = 1\n"),
+            source: format!("module {name} exposing (x)\n\nimport Unused\n\nx : Int\nx = 1\n"),
         };
         [named("Alpha"), named("Beta")]
     }
 
-    /// Every checkpoint a two-module run passes: per module, one before its
-    /// parse and one before each rule; then one per module the cross-module
-    /// pass aggregates.
-    const fn checkpoints_of_two_modules() -> usize {
-        2 * (1 + rules::PER_MODULE_RULES.len()) + 2
+    /// An unknown inline suppression is polled before its advisory finding is
+    /// built: the one checkpoint it adds stands where the filter checkpoint of
+    /// the advisory would, so the count matches a run whose every finding was
+    /// filtered.
+    #[test]
+    fn the_probe_is_polled_before_each_unknown_suppression() {
+        let modules = [SourceModule {
+            module: vec!["Main".to_owned()],
+            source: "module Main exposing (x)\n\n-- ipe-lint: allow not-a-rule\nx : Int\nx = 1\n"
+                .to_owned(),
+        }];
+        let Ok(report) = run(&modules, &LintConfig::default(), &NeverCancel);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == "unknown-suppression"),
+            "the fixture reports its unknown suppression, got {:?}",
+            report.findings
+        );
+        let total = checkpoints(1, report.findings.len(), 0, 0);
+        let counter = FiresOnPoll::new(usize::MAX);
+        assert!(run(&modules, &LintConfig::default(), &counter).is_ok());
+        assert_eq!(counter.polls.get(), total);
+        for fire_at in 1..=total {
+            let probe = FiresOnPoll::new(fire_at);
+            let outcome = run(&modules, &LintConfig::default(), &probe);
+            assert!(matches!(outcome, Err(LintCancelled)));
+            assert_eq!(probe.polls.get(), fire_at, "the run stops where it fired");
+        }
+    }
+
+    /// Every checkpoint a run over `modules` modules passes when nothing is
+    /// filtered: per module, one before its parse and one before each rule;
+    /// one before each gathered finding is filtered; then, in the cross-module
+    /// pass, one per module aggregated, per parameter name judged, and per
+    /// bare site emitted.
+    const fn checkpoints(modules: usize, findings: usize, params: usize, sites: usize) -> usize {
+        modules * (1 + rules::PER_MODULE_RULES.len()) + findings + modules + params + sites
+    }
+
+    /// The checkpoints of a run over [`two_linted_modules`]: each carries
+    /// findings and no annotated parameter.
+    fn checkpoints_of_two_modules() -> usize {
+        let Ok(report) = run(&two_linted_modules(), &LintConfig::default(), &NeverCancel);
+        assert!(!report.findings.is_empty(), "the fixture reports findings");
+        checkpoints(2, report.findings.len(), 0, 0)
     }
 
     /// The probe is polled before each module's parse, before every rule over
-    /// it, and before each module the cross-module pass aggregates, so a
-    /// superseded run stops within one rule over one module.
+    /// it, before each finding is filtered, and before each module the
+    /// cross-module pass aggregates, so a superseded run stops within one rule
+    /// over one module.
     #[test]
     fn the_probe_is_polled_before_every_rule_over_every_module() {
         let probe = FiresOnPoll::new(usize::MAX);
         let report = run(&two_linted_modules(), &LintConfig::default(), &probe);
         assert!(report.is_ok(), "a probe that never fires completes the run");
         assert_eq!(probe.polls.get(), checkpoints_of_two_modules());
+    }
+
+    /// Two modules wrapping `payload` as `Bytes` and a third leaving it a bare
+    /// `String`: one parameter name judged, one bare site emitted, one
+    /// cross-module finding filtered.
+    fn cross_linted_modules() -> [SourceModule; 3] {
+        let named = |name: &str, binding: &str, ty: &str| SourceModule {
+            module: vec![name.to_owned()],
+            source: format!(
+                "module {name} exposing ({binding})\n\n\
+                 {binding} : {ty} -> String\n{binding} payload =\n    \"ok\"\n"
+            ),
+        };
+        [
+            named("Api", "send", "Bytes"),
+            named("Store", "persist", "Bytes"),
+            named("Cache", "put", "String"),
+        ]
+    }
+
+    /// The cross-module pass polls past its aggregation too: before each
+    /// parameter name it judges and each bare site it emits, and its findings
+    /// are polled before they are filtered, so a run superseded after the last
+    /// module was aggregated still stops within one site.
+    #[test]
+    fn the_cross_module_pass_polls_before_every_judged_name_and_emitted_site() {
+        let modules = cross_linted_modules();
+        let Ok(report) = run(&modules, &LintConfig::default(), &NeverCancel);
+        let cross = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == "wrapper-consistency-cross")
+            .count();
+        assert_eq!(cross, 1, "the fixture reports one cross-module finding");
+        let total = checkpoints(3, report.findings.len(), 1, 1);
+
+        let counter = FiresOnPoll::new(usize::MAX);
+        assert!(run(&modules, &LintConfig::default(), &counter).is_ok());
+        assert_eq!(counter.polls.get(), total);
+
+        for fire_at in 1..=total {
+            let probe = FiresOnPoll::new(fire_at);
+            let outcome = run(&modules, &LintConfig::default(), &probe);
+            assert!(
+                matches!(outcome, Err(LintCancelled)),
+                "a probe firing at checkpoint {fire_at} must cancel the run"
+            );
+            assert_eq!(probe.polls.get(), fire_at, "the run stops where it fired");
+        }
     }
 
     /// A probe firing at any checkpoint yields `Cancelled` and stops at once.

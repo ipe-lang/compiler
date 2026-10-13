@@ -27,8 +27,8 @@ use crate::rules::{self, Ctx};
 /// A usage record collected across all modules for one parameter name.
 #[derive(Default)]
 struct CrossUsage<'a> {
-    /// `(module, binding_name, span, bare_type, param_index)` — bare sites.
-    bare: Vec<(&'a [String], &'a str, ipe_diagnostics::Span, &'a str, usize)>,
+    /// `(owning module, binding_name, span, bare_type, param_index)` — bare sites.
+    bare: Vec<(&'a Ctx<'a>, &'a str, ipe_diagnostics::Span, &'a str, usize)>,
     /// Distinct wrapper names seen across all modules.
     wrapped_as: BTreeSet<&'a str>,
     /// Number of distinct modules that wrap this parameter.
@@ -43,8 +43,9 @@ fn is_primitive(name: &str) -> bool {
 
 /// Check `wrapper-consistency-cross` across all modules.
 ///
-/// `probe` is polled before each module's contribution is aggregated, so a
-/// superseded run stops within one module of this pass too.
+/// `probe` is polled before each module's contribution is aggregated, before
+/// each parameter name is judged, and before each bare site is emitted, so a
+/// superseded run stops within one module or one site of this pass too.
 ///
 /// # Errors
 ///
@@ -78,7 +79,7 @@ pub fn check_cross<'a, P: CancelProbe>(
                 };
                 let usage = by_param.entry(param_name).or_default();
                 if is_primitive(head) {
-                    usage.bare.push((ctx.module, binding, ann.span, head, idx));
+                    usage.bare.push((*ctx, binding, ann.span, head, idx));
                 } else {
                     usage.wrapped_as.insert(head);
                     usage.wrap_sites += 1;
@@ -94,6 +95,7 @@ pub fn check_cross<'a, P: CancelProbe>(
 
     let mut findings = Vec::new();
     for (param_name, usage) in &by_param {
+        probe.poll()?;
         // Cross-module guard: at least 2 modules set the convention under a
         // single wrapper name, and at least one module leaves the param bare.
         if usage.wrap_module_count < 2 || usage.wrapped_as.len() != 1 || usage.bare.is_empty() {
@@ -102,11 +104,8 @@ pub fn check_cross<'a, P: CancelProbe>(
         let wrapper = usage.wrapped_as.iter().next().copied().unwrap_or_default();
 
         // Emit one finding per bare site, attributed to the module that owns it.
-        // We need a `Ctx` to call `ctx.with_sig_fix`; find it by matching module.
-        for (module_path, binding_name, span, bare, param_idx) in &usage.bare {
-            let Some(ctx) = ctxs.iter().find(|c| c.module == *module_path) else {
-                continue;
-            };
+        for (ctx, binding_name, span, bare, param_idx) in &usage.bare {
+            probe.poll()?;
             let sig_fix = SigFix {
                 symbol_module: ctx.module.to_vec(),
                 symbol_name: (*binding_name).to_owned(),

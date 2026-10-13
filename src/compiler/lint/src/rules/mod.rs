@@ -318,8 +318,9 @@ pub fn bool_literal(ctx: &Ctx, expr: &Expr) -> Option<bool> {
 /// Run cross-module rules that require all modules simultaneously.
 /// Called once per lint run after all per-module passes complete.
 ///
-/// `probe` is polled before each module a cross-module rule aggregates; once it
-/// fires the pass returns its `Cancelled` value, never a partial finding set.
+/// `probe` is polled before each module a cross-module rule aggregates and each
+/// site it emits; once it fires the pass returns its `Cancelled` value, never a
+/// partial finding set.
 pub fn run_cross_module<'a, P: CancelProbe>(
     ctxs: &[&'a Ctx<'a>],
     probe: &P,

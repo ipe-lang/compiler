@@ -1219,13 +1219,15 @@ fn recompute(state: &mut State, diag_tx: &Sender<DiagnosticsBatch>) {
                 })
             }));
             match outcome {
-                Ok(Ok(per_uri)) => {
+                Ok(Ok(Ok(per_uri))) => {
                     let _ = tx.send(DiagnosticsBatch {
                         generation,
                         per_uri,
                     });
                 }
-                Ok(Err(_cancelled)) => {} // superseded — the newer worker owns the push
+                // Superseded in the demand or the lint stage: the newer worker
+                // owns the push, and no batch short of its lint findings exists.
+                Ok(Err(_) | Ok(Err(ipe_lint::LintCancelled))) => {}
                 Err(_panic) => {
                     eprintln!("[ipe lsp] internal error: diagnostics worker panicked");
                 }
@@ -1391,24 +1393,27 @@ fn demand_stage(
 /// the compiler's own diagnostics for each user document (the way clippy flows
 /// through rust-analyzer). A refused `lint.ipe` runs no rule: its diagnostic is
 /// published in place of every finding.
+///
+/// # Errors
+///
+/// Returns the probe's `Cancelled` value when the worker was superseded before
+/// or during the lint pass: its batch would lack the lint findings, so it is
+/// never built, and only a newer worker's complete batch can be published.
 fn lint_stage<P: ipe_lint::CancelProbe>(
     demanded: Demanded,
     uri_of: &BTreeMap<Vec<String>, Url>,
     encoding: PositionEncoding,
     probe: &P,
     lint: &LintPass,
-) -> Vec<(Url, Vec<lsp_types::Diagnostic>)> {
+) -> Result<Vec<(Url, Vec<lsp_types::Diagnostic>)>, P::Cancelled> {
     let Demanded {
         mut per_uri,
         entry_uri,
         user_texts,
     } = demanded;
-    // A superseded worker skips the whole lint pass. The newer worker owns the
-    // next publish, so dropping this one's lint work is observationally
-    // identical.
-    if probe.poll().is_err() {
-        return per_uri.into_iter().collect();
-    }
+    // A superseded worker skips the whole lint pass; the newer worker owns the
+    // next publish.
+    probe.poll()?;
     let lint_config = match lint {
         LintPass::Run(config) => config,
         LintPass::Withheld { uri, diagnostic } => {
@@ -1418,24 +1423,21 @@ fn lint_stage<P: ipe_lint::CancelProbe>(
                     .or_default()
                     .push(diagnostic.as_ref().clone());
             }
-            return per_uri.into_iter().collect();
+            return Ok(per_uri.into_iter().collect());
         }
-        LintPass::Skipped => return per_uri.into_iter().collect(),
+        LintPass::Skipped => return Ok(per_uri.into_iter().collect()),
     };
-    // The probe is polled again between modules and rules: a worker superseded
-    // mid-pass stops within one rule, so the main loop's join never waits out a
-    // whole lint pass.
-    let Ok(per_module) = diagnostics::collect_lint(&user_texts, lint_config, encoding, probe)
-    else {
-        return per_uri.into_iter().collect();
-    };
+    // The probe is polled again between modules, rules and findings: a worker
+    // superseded mid-pass stops within one rule, so the main loop's join never
+    // waits out a whole lint pass.
+    let per_module = diagnostics::collect_lint(&user_texts, lint_config, encoding, probe)?;
     for (module, lints) in per_module {
         if let Some(uri) = uri_of.get(&module) {
             per_uri.entry(uri.clone()).or_default().extend(lints);
         }
     }
 
-    per_uri.into_iter().collect()
+    Ok(per_uri.into_iter().collect())
 }
 
 /// `textDocument/formatting` — reformat the whole document.
@@ -3373,7 +3375,7 @@ mod tests {
             "an input setter must not wait on the pending lint stage"
         );
 
-        let batch = super::lint_stage(
+        let Ok(batch) = super::lint_stage(
             demanded,
             &uri_of,
             state.encoding,
@@ -3424,16 +3426,16 @@ mod tests {
             .any(|d| d.source.as_deref() == Some("ipe-lint"))
     }
 
-    /// A lint stage whose probe fires at any checkpoint stops there and
-    /// publishes no lint finding, even past the last per-module rule, when
-    /// every module's findings were already gathered.
+    /// A lint stage whose probe fires at any checkpoint stops there and builds
+    /// no batch at all, so a batch short of its lint findings has no
+    /// representation the worker could send, even when the probe fires after
+    /// every module's findings were gathered.
     ///
     /// Checkpoint 1 is the stage's own entry check and 2 the first module's
     /// parse, so a stop at 3 never reaches the second module's parse. The
-    /// uncancelled control pass proves the fixture does report lint findings,
-    /// so the absence asserted on each cancelled pass is not vacuous.
+    /// uncancelled control pass proves the fixture does report lint findings.
     #[test]
-    fn a_lint_stage_cancelled_at_any_checkpoint_publishes_no_lint_finding() {
+    fn a_lint_stage_cancelled_at_any_checkpoint_builds_no_batch() {
         let lint = super::LintPass::Run(ipe_lint::LintConfig::default());
         let (demanded, uri_of, state) = linted_demand("/lsp-lint-cancel-control-test");
         let counter = FiresOnPoll {
@@ -3442,27 +3444,27 @@ mod tests {
         };
         let complete = super::lint_stage(demanded, &uri_of, state.encoding, &counter, &lint);
         assert!(
-            has_lint_finding(&complete),
+            complete.as_deref().is_ok_and(has_lint_finding),
             "the uncancelled pass reports the injected unused imports"
         );
         let checkpoints = counter.polls.get();
         assert!(checkpoints > 3, "the pass polls past the second parse");
 
-        for fire_at in [3, checkpoints] {
+        for fire_at in [1, 3, checkpoints] {
             let (demanded, uri_of, state) = linted_demand("/lsp-lint-cancel-mid-pass-test");
             let probe = FiresOnPoll {
                 fire_at,
                 polls: std::cell::Cell::new(0),
             };
-            let batch = super::lint_stage(demanded, &uri_of, state.encoding, &probe, &lint);
+            let outcome = super::lint_stage(demanded, &uri_of, state.encoding, &probe, &lint);
             assert_eq!(
                 probe.polls.get(),
                 fire_at,
                 "the stage must stop at the checkpoint that fired"
             );
             assert!(
-                !has_lint_finding(&batch),
-                "a lint pass cancelled at checkpoint {fire_at} must publish no lint finding"
+                matches!(outcome, Err(ipe_lint::LintCancelled)),
+                "a lint stage cancelled at checkpoint {fire_at} must build no batch"
             );
         }
     }

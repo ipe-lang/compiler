@@ -1213,6 +1213,86 @@ fn unused_import_diagnostic(src: &str) -> lsp_types::Diagnostic {
         .expect("fixture must trigger lint/unused-imports")
 }
 
+/// A probe that fires on its `fire_at`-th poll and counts every poll.
+struct FiresOnPoll {
+    fire_at: usize,
+    polls: std::cell::Cell<usize>,
+}
+
+impl FiresOnPoll {
+    const fn new(fire_at: usize) -> Self {
+        Self {
+            fire_at,
+            polls: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl ipe_lint::CancelProbe for FiresOnPoll {
+    type Cancelled = ipe_lint::LintCancelled;
+
+    fn poll(&self) -> Result<(), ipe_lint::LintCancelled> {
+        let polls = self.polls.get().saturating_add(1);
+        self.polls.set(polls);
+        if polls >= self.fire_at {
+            Err(ipe_lint::LintCancelled)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The conversion of lint findings into LSP diagnostics polls the probe before
+/// each finding, so a worker superseded after the lint run finished still
+/// stops within one finding's position conversion and returns no diagnostics.
+#[test]
+fn collect_lint_polls_before_converting_each_finding() {
+    let mut user_texts = BTreeMap::new();
+    for name in ["Alpha", "Beta"] {
+        user_texts.insert(
+            vec![name.to_owned()],
+            format!("module {name} exposing (x)\n\nimport Unused\n\nx = 1\n"),
+        );
+    }
+    let config = LintConfig::default();
+    let modules: Vec<ipe_lint::SourceModule> = user_texts
+        .iter()
+        .map(|(module, source)| ipe_lint::SourceModule {
+            module: module.clone(),
+            source: source.clone(),
+        })
+        .collect();
+    let run_probe = FiresOnPoll::new(usize::MAX);
+    let finding_count = ipe_lint::run(&modules, &config, &run_probe)
+        .map(|report| report.findings.len())
+        .unwrap_or_default();
+    assert!(finding_count > 0, "the fixture reports findings");
+    let run_checkpoints = run_probe.polls.get();
+    let total = run_checkpoints + finding_count;
+
+    let counter = FiresOnPoll::new(usize::MAX);
+    assert!(collect_lint(&user_texts, &config, PositionEncoding::Utf16, &counter).is_ok());
+    assert_eq!(
+        counter.polls.get(),
+        total,
+        "one checkpoint per finding converted, past the lint run's own"
+    );
+
+    for fire_at in (run_checkpoints + 1)..=total {
+        let probe = FiresOnPoll::new(fire_at);
+        let outcome = collect_lint(&user_texts, &config, PositionEncoding::Utf16, &probe);
+        assert!(
+            matches!(outcome, Err(ipe_lint::LintCancelled)),
+            "a probe firing at conversion checkpoint {fire_at} must cancel"
+        );
+        assert_eq!(
+            probe.polls.get(),
+            fire_at,
+            "the conversion stops where it fired"
+        );
+    }
+}
+
 /// `import Foo as Bar exposing (bar)` on line 2 (0-based): unused, since
 /// neither `Bar` nor `bar` appears in `main`'s body.
 const UNUSED_IMPORT_WIDE: &str =

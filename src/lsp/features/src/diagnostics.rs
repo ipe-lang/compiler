@@ -393,8 +393,9 @@ pub type LintDiagnostics = Vec<(Vec<String>, Vec<lsp_types::Diagnostic>)>;
 /// (injected stdlib is excluded — the linter reasons over the user's code).
 /// `config` is the resolved `lint.ipe` (or defaults). The message reuses the
 /// finding's own prose; the help lines are appended so the editor shows the same
-/// teaching the CLI does. `probe` is polled through the lint run, so a
-/// superseded worker stops between rules instead of finishing the pass.
+/// teaching the CLI does. `probe` is polled through the lint run and before
+/// each finding's position conversion, so a superseded worker stops between
+/// rules or findings instead of finishing the pass.
 ///
 /// # Errors
 ///
@@ -417,6 +418,7 @@ pub fn collect_lint<P: ipe_lint::CancelProbe>(
 
     let mut per_module: BTreeMap<Vec<String>, Vec<lsp_types::Diagnostic>> = BTreeMap::new();
     for finding in &report.findings {
+        probe.poll()?;
         let Some(text) = user_texts.get(&finding.module) else {
             continue;
         };
