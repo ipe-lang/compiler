@@ -97,7 +97,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
 | `IPE_CONFIG_MAX_BYTES` | 16777216 (16 MiB) | Maximum size (bytes) of a config file loaded via `Config.load*`. Prevents memory exhaustion from unexpectedly large config files. | `Tunable` |
-| `IPE_YAML_MAX_BYTES` | 16777216 (16 MiB) | Maximum YAML source size (bytes) that `Config.loadYaml` will parse. A separate ceiling from `IPE_CONFIG_MAX_BYTES`. | `Tunable` |
+| `IPE_YAML_MAX_BYTES` | 4194304 (4 MiB) | Maximum YAML source size (bytes) that `Config.decodeYaml` will parse, including a `.yaml`/`.yml` file read by `Config.loadFromFile`. A separate ceiling from `IPE_CONFIG_MAX_BYTES`. | `Tunable` |
 
 ## CSV
 
