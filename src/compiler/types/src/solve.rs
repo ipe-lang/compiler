@@ -7,7 +7,10 @@
 //! to model, so solving reduces to: run every generated equality
 //! [`Constraint`] through
 //! the unifier, in order, sharing one [`Budget`]. The defensive solver-step
-//! bound (`IPE_SOLVER_BUDGET`) carries over verbatim in spirit.
+//! bound (`IPE_SOLVER_BUDGET`) carries over in spirit, always as a positive
+//! ceiling.
+
+use std::num::NonZeroU64;
 
 use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
 use ipe_intern::Interner;
@@ -40,52 +43,115 @@ pub struct Constraint {
     pub home: ModuleHome,
 }
 
-/// A decrementing solver-step budget.
+/// A solver step ceiling: a positive number of steps, never "no limit".
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct SolverSteps(NonZeroU64);
+
+/// Why a solver budget setting names no step ceiling.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SolverStepsError {
+    /// The setting is `0`, which admits no step at all.
+    Zero,
+}
+
+impl SolverStepsError {
+    /// The typed refusal a program meets under this setting.
+    ///
+    /// A zero setting is a ceiling of no steps, so it is the step-budget
+    /// refusal (IPE-T0003) for a budget of `0`, raised before any solving.
+    #[must_use]
+    pub const fn into_diagnostic(self) -> Diagnostic {
+        match self {
+            Self::Zero => Diagnostic::Type {
+                span: Span::DUMMY,
+                msg: TypeError::StepBudgetExceeded { budget: 0 },
+            },
+        }
+    }
+}
+
+impl SolverSteps {
+    /// The [`DEFAULT_SOLVER_BUDGET`] ceiling.
+    pub const DEFAULT: Self = match NonZeroU64::new(DEFAULT_SOLVER_BUDGET) {
+        Some(steps) => Self(steps),
+        // A zero default would admit no step: the least ceiling refuses closed.
+        None => Self(NonZeroU64::MIN),
+    };
+
+    /// The largest ceiling.
+    pub const MAX: Self = Self(NonZeroU64::MAX);
+
+    /// A ceiling of `steps`, or `None` for zero.
+    #[must_use]
+    pub const fn new(steps: u64) -> Option<Self> {
+        match NonZeroU64::new(steps) {
+            Some(steps) => Some(Self(steps)),
+            None => None,
+        }
+    }
+
+    /// The step count.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    /// The ceiling the solver budget variable ([`BUDGET_ENV`]) names.
+    ///
+    /// # Errors
+    /// [`SolverStepsError::Zero`] when the variable is `0`.
+    pub fn from_env() -> Result<Self, SolverStepsError> {
+        Self::from_setting(ipe_env::var(BUDGET_ENV).ok().as_deref())
+    }
+
+    /// The ceiling a raw setting names: unset is the default, `0` is refused.
+    ///
+    /// A malformed value falls back to the default.
+    ///
+    /// # Errors
+    /// [`SolverStepsError::Zero`] when the trimmed setting parses to `0`.
+    pub fn from_setting(raw: Option<&str>) -> Result<Self, SolverStepsError> {
+        match raw.map(|raw| raw.trim().parse::<u64>()) {
+            None | Some(Err(_)) => Ok(Self::DEFAULT),
+            Some(Ok(steps)) => Self::new(steps).ok_or(SolverStepsError::Zero),
+        }
+    }
+}
+
+/// A decrementing solver-step budget under a [`SolverSteps`] ceiling.
 ///
-/// Each unify/occurs/zonk step ticks it; reaching zero raises
-/// [`TypeError::StepBudgetExceeded`] carrying the original `limit` (so the help
-/// line can name the value to raise). A budget of `None` is disabled (the
-/// `IPE_SOLVER_BUDGET=0` escape hatch).
+/// Each unify/occurs/zonk step ticks it; the step past the ceiling raises
+/// [`TypeError::StepBudgetExceeded`] carrying the ceiling (so the help line
+/// can name the value to raise).
 pub struct Budget {
-    remaining: Option<u64>,
-    /// The step cap this budget was created with, reported in the diagnostic.
-    /// `0` for an unbounded budget (never surfaced — it cannot be exhausted).
-    limit: u64,
+    remaining: u64,
+    /// The step ceiling this budget was created with, reported in the diagnostic.
+    limit: SolverSteps,
 }
 
 impl Budget {
-    /// A budget with an explicit step cap.
+    /// A budget of `steps` steps.
     #[must_use]
-    pub const fn new(steps: u64) -> Self {
+    pub const fn new(steps: SolverSteps) -> Self {
         Self {
-            remaining: Some(steps),
+            remaining: steps.get(),
             limit: steps,
         }
     }
 
-    /// A disabled (unbounded) budget.
+    /// A budget of [`SolverSteps::MAX`] steps, which no test reaches.
+    #[cfg(test)]
     #[must_use]
     pub const fn unbounded() -> Self {
-        Self {
-            remaining: None,
-            limit: 0,
-        }
+        Self::new(SolverSteps::MAX)
     }
 
-    /// Resolve the budget from the environment, mirroring the reference compiler
-    /// three-mode resolution (unset → default; `0` → disabled; `N` → absolute).
-    /// A malformed value falls back to the default rather than failing the
-    /// build — the budget is a guard rail, not a feature.
+    /// The steps consumed so far.
+    ///
+    /// Equals the ceiling once a tick has been refused.
     #[must_use]
-    pub fn from_env() -> Self {
-        ipe_env::var(BUDGET_ENV).map_or_else(
-            |_| Self::new(DEFAULT_SOLVER_BUDGET),
-            |raw| match raw.trim().parse::<u64>() {
-                Ok(0) => Self::unbounded(),
-                Ok(n) => Self::new(n),
-                Err(_) => Self::new(DEFAULT_SOLVER_BUDGET),
-            },
-        )
+    pub const fn spent(&self) -> u64 {
+        self.limit.get().saturating_sub(self.remaining)
     }
 
     /// Consume one step.
@@ -94,18 +160,18 @@ impl Budget {
     /// [`TypeError::StepBudgetExceeded`] when the budget is exhausted, carrying
     /// the configured `limit`.
     pub const fn tick(&mut self) -> DResult<()> {
-        if let Some(remaining) = self.remaining.as_mut() {
-            match remaining.checked_sub(1) {
-                Some(next) => *remaining = next,
-                None => {
-                    return Err(Diagnostic::Type {
-                        span: Span::DUMMY,
-                        msg: TypeError::StepBudgetExceeded { budget: self.limit },
-                    });
-                }
+        match self.remaining.checked_sub(1) {
+            Some(next) => {
+                self.remaining = next;
+                Ok(())
             }
+            None => Err(Diagnostic::Type {
+                span: Span::DUMMY,
+                msg: TypeError::StepBudgetExceeded {
+                    budget: self.limit.get(),
+                },
+            }),
         }
-        Ok(())
     }
 }
 

@@ -23,11 +23,22 @@
 //! standard input or the clock). The crate's `clippy.toml` bans those APIs,
 //! and the `clippy_paths_resolve` module proves each ban fires. File reading
 //! stays in the driver, which is where inputs are set. The inference queries
-//! (`typecheck`, `infer_module_scoped`) and every query built on them call
-//! into `ipe_types`, which reads the `IPE_SOLVER_BUDGET` and
-//! `IPE_EXHAUST_BUDGET` step budgets from the process environment on each
-//! inference, so a memoised result holds for the budgets of the process that
-//! computed it.
+//! (`typecheck`, `infer_module_scoped`, `program_types`) read the solver step
+//! budget and the scoped variable ceiling from the [`SolveLimits`] input,
+//! which the database reads from `IPE_SOLVER_BUDGET` once, at construction,
+//! and tests replace through [`IpeDatabase::set_solve_limits`]. One budget is
+//! still read inside `ipe_types` on each inference: the `IPE_EXHAUST_BUDGET`
+//! exhaustiveness budget, so a memoised result holds for the exhaustiveness
+//! budget of the process that computed it.
+//!
+//! The solver step budget `P` has one meaning: the joint program's budget.
+//! Each scoped module solve runs under the ceiling `P`, and the scoped
+//! assembly is served only while the modules' steps sum to at most `P / 2`;
+//! past either bound the joint solve decides under `P`, so every budget
+//! refusal is the joint solve's. Work is at most `(n + 1) · P` for `n`
+//! modules. A program whose joint solve spends more than twice its scoped
+//! solves' sum, while that sum sits inside the band, is the one shape the
+//! band does not route to the joint solve: a deliberate bound.
 //!
 //! The interning story is the plan's Option 3a: the database owns a
 //! [`SharedInterner`] (`Arc<Mutex<ipe_intern::Interner>>`) shared with the
@@ -130,17 +141,25 @@ pub trait Db: salsa::Database {
 
 /// The concrete Ipê compiler database.
 #[salsa::db]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct IpeDatabase {
     storage: salsa::Storage<Self>,
     interner: SharedInterner,
 }
 
+impl Default for IpeDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IpeDatabase {
     /// A fresh (cold) database with a fresh interner.
+    ///
+    /// Its [`SolveLimits`] are the ones the environment names.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_storage(salsa::Storage::default())
     }
 
     /// A fresh database that forwards every salsa runtime event to
@@ -150,9 +169,30 @@ impl IpeDatabase {
     pub fn with_event_callback(
         callback: Box<dyn Fn(salsa::Event) + Send + Sync + 'static>,
     ) -> Self {
-        Self {
-            storage: salsa::Storage::new(Some(callback)),
+        Self::with_storage(salsa::Storage::new(Some(callback)))
+    }
+
+    /// A database over `storage`, holding the environment's solve limits.
+    fn with_storage(storage: salsa::Storage<Self>) -> Self {
+        let db = Self {
+            storage,
             interner: SharedInterner::new(),
+        };
+        SolveLimitsInput::new(&db, SolveLimits::from_env());
+        db
+    }
+
+    /// Replace the solve limits every inference query reads.
+    ///
+    /// A refused setting makes every program refuse with its diagnostic.
+    pub fn set_solve_limits(&mut self, setting: SolveSetting) {
+        match SolveLimitsInput::try_get(self) {
+            Some(input) => {
+                let _previous = input.set_setting(self).to(setting);
+            }
+            None => {
+                SolveLimitsInput::new(self, setting);
+            }
         }
     }
 }
@@ -170,6 +210,66 @@ impl Db for IpeDatabase {
 // ---------------------------------------------------------------------------
 // Inputs (the parse-don't-validate boundary; the driver sets these)
 // ---------------------------------------------------------------------------
+
+/// The ceilings every solve in a database runs under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SolveLimits {
+    /// The joint program's solver step budget, which is also each scoped
+    /// module solve's ceiling.
+    pub steps: ipe_types::SolverSteps,
+    /// The variable id space of a scoped renumbering (a module's slice and
+    /// the assembly); the joint solve's renumbering keeps the full solver
+    /// space.
+    pub var_ceiling: ipe_types::VarCeiling,
+}
+
+impl SolveLimits {
+    /// The default step budget over the full solver-variable space.
+    pub const DEFAULT: Self = Self {
+        steps: ipe_types::SolverSteps::DEFAULT,
+        var_ceiling: ipe_types::VarCeiling::SOLVER,
+    };
+
+    /// The limits the environment names, read once.
+    ///
+    /// # Errors
+    /// [`ipe_types::SolverStepsError::Zero`] when the solver budget is `0`.
+    pub fn from_env() -> SolveSetting {
+        ipe_types::SolverSteps::from_env().map(|steps| Self {
+            steps,
+            ..Self::DEFAULT
+        })
+    }
+}
+
+/// A database's solve limits, or the refusal of a setting that names none.
+pub type SolveSetting = Result<SolveLimits, ipe_types::SolverStepsError>;
+
+/// The solve setting as a salsa input, so every inference memo depends on it.
+#[salsa::input(singleton)]
+struct SolveLimitsInput {
+    setting: SolveSetting,
+}
+
+/// The solve limits, or the refusal every inference reports.
+///
+/// A database holding no limits is refused as a compiler bug, never solved
+/// under a guessed budget.
+fn solve_limits(db: &dyn Db) -> Result<SolveLimits, Diagnostic> {
+    SolveLimitsInput::try_get(db).map_or_else(
+        || {
+            Err(Diagnostic::CompilerBug {
+                where_: "ipe_db.solve_limits",
+                detail: "the database holds no solve limits".to_owned(),
+            })
+        },
+        |input| {
+            input
+                .setting(db)
+                .map_err(ipe_types::SolverStepsError::into_diagnostic)
+        },
+    )
+}
 
 /// One in-scope `.ipe` module: its module path (identity/diagnostic key) and
 /// full UTF-8 source text (the real input).
@@ -787,8 +887,10 @@ pub fn typecheck(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> TypecheckR
     let linked = linked_program(db, root, entry)
         .clone()
         .map_err(TypecheckError::Link)?;
+    let limits = solve_limits(db)
+        .map_err(|refused| TypecheckError::Infer(ipe_types::InferError::unsited(refused)))?;
     let mut interner = db.interner().lock();
-    ipe_types::infer_attributed(&linked.module, &mut interner)
+    ipe_types::infer_attributed_with_budget(&linked.module, &mut interner, limits.steps)
         .map(Arc::new)
         .map_err(TypecheckError::Infer)
 }
@@ -980,6 +1082,12 @@ pub enum FallbackReason {
     ImporterDependent,
     /// The module's scoped solve refused it.
     SolveError,
+    /// The module's scoped solve ran past the solver step budget, or the
+    /// budget setting names no ceiling.
+    BudgetExceeded,
+    /// The scoped solves together spent more than half the solver step
+    /// budget, so the joint solve decides acceptance under the full budget.
+    BudgetBand,
     /// A renumbering ran out of solver-variable ids below its ceiling.
     VarSpaceExhausted,
     /// Two slices claim one key, or a slice holds a key outside its own home.
@@ -1076,6 +1184,8 @@ pub enum ScopedModuleTypes {
         solved: Arc<ipe_types::CanonicalTypes>,
         /// The module's closed typed interface, for importers' scoped solves.
         interface: Arc<ipe_types::TypedInterface>,
+        /// The solver steps the module's scoped solve spent.
+        steps: u64,
     },
     /// The module's interface is closed, so its importers solve against it,
     /// but its own solved facts read its importers' use sites, so its own
@@ -1098,6 +1208,9 @@ pub enum ScopedModuleTypes {
 /// scoped solve; when the dep's interface comes out equal, `typed_interface`
 /// backdates and THIS query's memo stands without re-executing.
 ///
+/// The solve runs under the [`SolveLimits`] step budget as its ceiling and
+/// renumbers within its variable ceiling.
+///
 /// Total (never `Err`): every shortfall yields
 /// [`ScopedModuleTypes::WholeProgram`] with its [`FallbackReason`]. The cycle
 /// gate reuses [`topo_order`] with this module as the DFS root, so a cyclic
@@ -1113,6 +1226,9 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
     };
     let Ok(resolutions) = resolve_imports(db, root, module) else {
         return ScopedModuleTypes::WholeProgram(FallbackReason::ResolveError);
+    };
+    let Ok(limits) = solve_limits(db) else {
+        return ScopedModuleTypes::WholeProgram(FallbackReason::BudgetExceeded);
     };
 
     // Demand every dep interface BEFORE taking the interner lock: a cold
@@ -1140,8 +1256,13 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
         return ScopedModuleTypes::WholeProgram(FallbackReason::InternError);
     };
 
-    let inference =
-        ipe_types::infer_module(&canonical.module, &canonical.exports, &deps, &mut interner);
+    let inference = ipe_types::infer_module_with_budget(
+        &canonical.module,
+        &canonical.exports,
+        &deps,
+        &mut interner,
+        limits.steps,
+    );
     drop(interner);
     match inference {
         Ok(inference) => match inference.interface {
@@ -1151,7 +1272,7 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                         ipe_types::canonicalize(
                             slice,
                             ipe_types::VarScope::PerHome,
-                            ipe_types::VarCeiling::SOLVER,
+                            limits.var_ceiling,
                         )
                         .map_err(FallbackReason::from)
                     })
@@ -1159,6 +1280,7 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                         ScopedModuleTypes::PerModule {
                             solved: Arc::new(solved),
                             interface: Arc::new(interface),
+                            steps: inference.steps,
                         }
                     })
             }
@@ -1171,8 +1293,22 @@ pub fn infer_module_scoped(db: &dyn Db, root: SourceRoot, module: SourceFile) ->
                 ScopedModuleTypes::WholeProgram(FallbackReason::OpenInterface)
             }
         },
+        Err(err) if exceeds_step_budget(&err) => {
+            ScopedModuleTypes::WholeProgram(FallbackReason::BudgetExceeded)
+        }
         Err(_) => ScopedModuleTypes::WholeProgram(FallbackReason::SolveError),
     }
+}
+
+/// Whether a solve refusal is a step-budget exhaustion.
+const fn exceeds_step_budget(err: &ipe_types::InferError) -> bool {
+    matches!(
+        err.diagnostic(),
+        Diagnostic::Type {
+            msg: ipe_diagnostics::TypeError::StepBudgetExceeded { .. },
+            ..
+        }
+    )
 }
 
 /// Intern each segment of a module path.
@@ -1430,8 +1566,11 @@ fn linked_homes(module: &ipe_canon::ast::Module) -> BTreeSet<Vec<Symbol>> {
 /// whole program's types reads.
 ///
 /// Serves the scoped assembly only when every module in [`topo_order`] is
-/// [`ScopedModuleTypes::PerModule`] and the assembly covers every linked
-/// module ([`assemble_scoped`]). Otherwise it serves the joint [`typecheck`]
+/// [`ScopedModuleTypes::PerModule`], the modules' solver steps sum to at most
+/// half the [`SolveLimits`] step budget, and the assembly covers every linked
+/// module within the variable ceiling ([`assemble_scoped`]). Past the budget
+/// band the joint solve decides acceptance under the full budget
+/// ([`FallbackReason::BudgetBand`]). Otherwise it serves the joint [`typecheck`]
 /// renumbered under [`ipe_types::VarScope::Program`], with the joint solve's
 /// error verbatim on a red program, so every error diagnostic comes from the
 /// joint solve. [`ProgramTypes::typed_by`] records which solve was served.
@@ -1441,7 +1580,10 @@ fn linked_homes(module: &ipe_canon::ast::Module) -> BTreeSet<Vec<Symbol>> {
 /// re-solved.
 #[salsa::tracked]
 pub fn program_types(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> ProgramTypesResult {
-    let slices = match scoped_slices(db, root, entry) {
+    let Ok(limits) = solve_limits(db) else {
+        return joint_program_types(db, root, entry, FallbackReason::BudgetExceeded);
+    };
+    let slices = match scoped_slices(db, root, entry, limits.steps) {
         Ok(slices) => slices,
         Err(reason) => return joint_program_types(db, root, entry, reason),
     };
@@ -1451,12 +1593,7 @@ pub fn program_types(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> Progra
     let Some(modules) = NonZeroUsize::new(slices.len()) else {
         return joint_program_types(db, root, entry, FallbackReason::IncompleteCover);
     };
-    assemble_scoped(
-        &slices,
-        &linked_homes(&linked.module),
-        ipe_types::VarCeiling::SOLVER,
-    )
-    .map_or_else(
+    assemble_scoped(&slices, &linked_homes(&linked.module), limits.var_ceiling).map_or_else(
         |reason| joint_program_types(db, root, entry, reason),
         |types| {
             Ok(Arc::new(ProgramTypes {
@@ -1469,10 +1606,15 @@ pub fn program_types(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> Progra
 
 /// Every module's scoped slice in [`topo_order`], or the first module's reason
 /// to fall back.
+///
+/// # Errors
+/// [`FallbackReason::BudgetBand`] when the modules' solver steps sum past half
+/// of `budget`, an overflowing sum included.
 fn scoped_slices(
     db: &dyn Db,
     root: SourceRoot,
     entry: SourceFile,
+    budget: ipe_types::SolverSteps,
 ) -> Result<Vec<ModuleSlice>, FallbackReason> {
     let Ok(order) = topo_order(db, root, entry) else {
         return Err(FallbackReason::Cycle);
@@ -1480,12 +1622,14 @@ fn scoped_slices(
     let files = root.files(db);
     let mut scoped: Vec<(&[String], Arc<ipe_types::CanonicalTypes>)> =
         Vec::with_capacity(order.len());
+    let mut spent = Some(0_u64);
     for path in order.iter() {
         let Some(file) = files.get(path) else {
             return Err(FallbackReason::IncompleteCover);
         };
         match infer_module_scoped(db, root, *file) {
-            ScopedModuleTypes::PerModule { solved, .. } => {
+            ScopedModuleTypes::PerModule { solved, steps, .. } => {
+                spent = spent.and_then(|sum| sum.checked_add(*steps));
                 scoped.push((path.as_slice(), solved.clone()));
             }
             ScopedModuleTypes::InterfaceOnly { .. } => {
@@ -1493,6 +1637,9 @@ fn scoped_slices(
             }
             ScopedModuleTypes::WholeProgram(reason) => return Err(*reason),
         }
+    }
+    if spent.is_none_or(|sum| sum > budget.get() / 2) {
+        return Err(FallbackReason::BudgetBand);
     }
     let mut interner = db.interner().lock();
     scoped
@@ -1506,6 +1653,9 @@ fn scoped_slices(
 }
 
 /// The joint solve in canonical form, attributed to `reason`.
+///
+/// Renumbered within the full solver space: the joint solve's ids never
+/// exceed it.
 fn joint_program_types(
     db: &dyn Db,
     root: SourceRoot,
