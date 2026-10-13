@@ -3792,13 +3792,13 @@ fn lower_server_route_malformed_escape() {
 /// A `Server.listen` program over the literal route list `routes`.
 fn server_routes_fixture(routes: &str) -> String {
     format!(
-        r#"module Main exposing (main)
+        r"module Main exposing (main)
 import Ipe.Http.Server as Server
 import Ipe.Task
 main =
     Server.listen 8000
         [ {routes} ]
-"#
+"
     )
 }
 

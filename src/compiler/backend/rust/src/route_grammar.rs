@@ -453,7 +453,7 @@ fn literal_routes(expr: &Expr) -> DResult<()> {
                     (RoutePath::Web | RoutePath::Server | RoutePath::ServerApi, _) => {}
                 }
             }
-            if let Callee::Kernel(KernelFn::ServerListen) = callee
+            if matches!(callee, Callee::Kernel(KernelFn::ServerListen))
                 && let Some(Expr::List { items, .. }) = args.get(1)
             {
                 refuse_duplicate_mounts(items)?;
@@ -934,6 +934,8 @@ mod agreement_tests {
         CatchAll,
         MidSegmentSigil(usize),
         TooManyParams(usize),
+        /// A mount-prefix defect, which no route path parse yields.
+        Mount,
     }
 
     fn ours(r: Result<(), RoutePatternDefect>) -> Verdict {
@@ -950,6 +952,11 @@ mod agreement_tests {
             Err(RoutePatternDefect::CatchAll { .. }) => Verdict::CatchAll,
             Err(RoutePatternDefect::MidSegmentSigil { at, .. }) => Verdict::MidSegmentSigil(at),
             Err(RoutePatternDefect::TooManyParams { cap }) => Verdict::TooManyParams(cap),
+            Err(
+                RoutePatternDefect::MountPrefixNotLiteral
+                | RoutePatternDefect::MountPrefix { .. }
+                | RoutePatternDefect::MountPrefixDuplicate { .. },
+            ) => Verdict::Mount,
         }
     }
 
