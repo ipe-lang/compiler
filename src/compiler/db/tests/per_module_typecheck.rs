@@ -1240,7 +1240,7 @@ fn set_steps(db: &mut IpeDatabase, steps: u64) {
 }
 
 /// Whether `err` is the step-budget refusal for a budget of `budget`.
-fn refuses_at_budget(err: &ipe_db::TypecheckError, budget: u64) -> bool {
+const fn refuses_at_budget(err: &ipe_db::TypecheckError, budget: u64) -> bool {
     matches!(
         err.diagnostic(),
         Diagnostic::Type {
