@@ -30,7 +30,7 @@ src/ipe-cli/src/resolve.rs 2
 src/ipe-cli/src/runtime_embed.rs 5
 src/ipe-cli/src/ssh_signing_key.rs 4
 src/ipe-cli/src/watch.rs 18
-src/ipe-docs/src/env_vars.rs 131
+src/ipe-docs/src/env_vars.rs 130
 src/ipe-wrapper/build.rs 10
 src/runtime/rust/src/app_config.rs 6
 src/runtime/rust/src/compression.rs 3
@@ -57,7 +57,7 @@ src/runtime/rust/src/trace.rs 2
 src/runtime/rust/src/ui/render.rs 2
 src/runtime/rust/src/web/console.rs 13
 src/runtime/rust/src/web/console_proxy.rs 12
-src/runtime/rust/src/web/csrf.rs 4
+src/runtime/rust/src/web/csrf.rs 2
 src/runtime/rust/src/web/mod.rs 44
 src/runtime/rust/src/web/observability.rs 5
 src/runtime/rust/src/web/push_exporter.rs 9
