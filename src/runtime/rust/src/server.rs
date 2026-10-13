@@ -396,7 +396,7 @@ pub fn api_spec_parts(spec: &str) -> (String, String) {
     // split_once is total by construction — no raw `spec[..idx]` range slice
     // (the restriction-lint footgun if the delimiter ever became multi-byte).
     match spec.split_once(' ') {
-        Some((m, p)) if !m.is_empty() => (m.trim().to_uppercase(), p.trim().to_string()),
+        Some((m, p)) if !m.is_empty() => (m.trim().to_string(), p.trim().to_string()),
         _ => ("ANY".to_string(), spec.trim().to_string()),
     }
 }
@@ -1716,7 +1716,8 @@ impl MountTable {
 /// the canonical respelling of the path, before any router sees the request.
 ///
 /// A malformed path or query is answered with the fixed 400 before routing, so
-/// an unrouted path and the fallback are refused alike. Every other request
+/// an unrouted path and the fallback are refused alike; the 400 carries the
+/// response security headers every served response carries. Every other request
 /// reaches the inner service with its path respelled by
 /// [`crate::encoding::canonical_path`] (the query bytes kept) and a
 /// [`StrictUrl`] extension, so matchit, every nest prefix and every file
@@ -1764,9 +1765,12 @@ where
         use axum::response::IntoResponse;
         match canonicalise(&mut request) {
             Ok(()) => futures_util::future::Either::Right(self.inner.call(request)),
-            Err(rejection) => futures_util::future::Either::Left(std::future::ready(Ok(rejection
-                .status_and_reason()
-                .into_response()))),
+            Err(rejection) => {
+                futures_util::future::Either::Left(std::future::ready(Ok(with_security_headers(
+                    rejection.status_and_reason().into_response(),
+                    response_security_headers(),
+                ))))
+            }
         }
     }
 }
@@ -1877,6 +1881,19 @@ pub(crate) fn static_request(
 ) -> Result<StaticRequest, StaticRefusal> {
     let decoded =
         crate::encoding::DecodedPath::parse(uri_path).map_err(StaticRefusal::Malformed)?;
+    static_request_of(&decoded, root, regime)
+}
+
+/// [`static_request`] over a path already decoded.
+///
+/// # Errors
+///
+/// The [`StaticRefusal`] of the first boundary that refused the path.
+fn static_request_of(
+    decoded: &crate::encoding::DecodedPath,
+    root: &std::path::Path,
+    regime: crate::path_core::Regime,
+) -> Result<StaticRequest, StaticRefusal> {
     if decoded.is_root() {
         return Ok(StaticRequest::Root);
     }
@@ -1890,10 +1907,30 @@ pub(crate) fn static_request(
     Ok(StaticRequest::File(rel))
 }
 
+/// Whether the static gate lets `req` reach the file service beneath `root`.
+///
+/// The gate judges the listener's parse ([`StrictUrl`]), never a decode of
+/// its own, and admits only when the URI text the file service will decode
+/// names that same path: a request without the parse, a path
+/// [`static_request_of`] refuses, or a URI that reads as another path is
+/// refused.
+fn static_admits(
+    req: &axum::extract::Request,
+    root: &std::path::Path,
+    regime: crate::path_core::Regime,
+) -> bool {
+    let Ok(url) = strict_url(req.extensions().get()) else {
+        return false;
+    };
+    let parsed = url.request_path().decoded();
+    static_request_of(parsed, root, regime).is_ok()
+        && crate::encoding::DecodedPath::parse(req.uri().path()).as_ref() == Ok(parsed)
+}
+
 /// A static file service behind the strict URL gate and the static path gate.
 ///
 /// `ServeDir` percent-decodes the path itself; the gates make that decode run
-/// only on a path the strict core already accepted and [`static_request`]
+/// only on a path the listener's parse holds and [`static_request_of`]
 /// admits under the host regime.
 pub(crate) fn strict_serve_dir(
     dir: std::path::PathBuf,
@@ -1929,7 +1966,7 @@ fn strict_serve_dir_with(
     let root = dir.clone();
     let static_gate = axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
-            let admitted = static_request(req.uri().path(), &root, regime).is_ok();
+            let admitted = static_admits(&req, &root, regime);
             async move {
                 if admitted {
                     next.run(req).await
@@ -2258,41 +2295,9 @@ fn method_router(
     }
 }
 
-/// The request methods one `Ipe.Server` handler serves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EndpointMethod {
-    Connect,
-    Delete,
-    Get,
-    Head,
-    Options,
-    Patch,
-    Post,
-    Put,
-    Trace,
-    /// Every method.
-    Any,
-}
+use crate::encoding::EndpointMethod;
 
 impl EndpointMethod {
-    /// The method a route names, `ANY` for every method, matched without
-    /// regard to case; `None` for a name that is no HTTP method.
-    fn parse(name: &str) -> Option<Self> {
-        Some(match name.to_ascii_uppercase().as_str() {
-            "CONNECT" => Self::Connect,
-            "DELETE" => Self::Delete,
-            "GET" => Self::Get,
-            "HEAD" => Self::Head,
-            "OPTIONS" => Self::Options,
-            "PATCH" => Self::Patch,
-            "POST" => Self::Post,
-            "PUT" => Self::Put,
-            "TRACE" => Self::Trace,
-            "ANY" => Self::Any,
-            _ => return None,
-        })
-    }
-
     /// The router's filter for this method; `None` for `Any`.
     const fn filter(self) -> Option<axum::routing::MethodFilter> {
         use axum::routing::MethodFilter as F;
@@ -2308,11 +2313,6 @@ impl EndpointMethod {
             Self::Trace => Some(F::TRACE),
             Self::Any => None,
         }
-    }
-
-    /// Whether some request method is served by both.
-    fn overlaps(self, other: Self) -> bool {
-        self == other || self == Self::Any || other == Self::Any
     }
 }
 
@@ -5101,16 +5101,19 @@ mod tests {
 
     /// Prove the refusals: two handlers of one shape with an overlapping
     /// method are refused before any insert, whatever their parameter names
-    /// or literal spellings; the router itself would refuse each such set.
+    /// or literal spellings. The router refuses two filtered methods itself,
+    /// but registers `ANY` beside a filtered method as a method fallback, so
+    /// for those sets the check is the one gate that keeps a handler from
+    /// silently shadowing part of another.
     #[test]
     fn handlers_of_one_shape_and_method_conflict() {
-        for set in [
-            [("GET", "/a/:x"), ("GET", "/a/:y")],
-            [("GET", "/café"), ("GET", "/caf%C3%A9")],
-            [("GET", "/api"), ("GET", "/%61pi")],
-            [("ANY", "/hook"), ("POST", "/hook")],
-            [("PATCH", "/x/:id"), ("ANY", "/x/:key")],
-            [("get", "/a"), ("GET", "/a")],
+        for (set, router_refuses) in [
+            ([("GET", "/a/:x"), ("GET", "/a/:y")], true),
+            ([("GET", "/café"), ("GET", "/caf%C3%A9")], true),
+            ([("GET", "/api"), ("GET", "/%61pi")], true),
+            ([("get", "/a"), ("GET", "/a")], true),
+            ([("ANY", "/hook"), ("POST", "/hook")], false),
+            ([("PATCH", "/x/:id"), ("ANY", "/x/:key")], false),
         ] {
             let (verdict, inserted) = conflict_and_router(&set);
             assert!(
@@ -5119,7 +5122,7 @@ mod tests {
                     .is_some_and(|m| m.contains("conflicts with")),
                 "{set:?}"
             );
-            assert!(!inserted, "{set:?}: the router refuses the set too");
+            assert_eq!(inserted, !router_refuses, "{set:?}");
         }
     }
 
@@ -6042,10 +6045,10 @@ mod tests {
         uri: &str,
     ) -> (axum::http::StatusCode, String) {
         use tower::ServiceExt;
-        let app = behind_listener(
-            axum::Router::new()
-                .nest_service("/static", strict_serve_dir_with(dir.to_path_buf(), regime)),
-        );
+        let base = crate::encoding::MountBase::parse("/static").expect("the prefix parses");
+        let files =
+            axum::Router::new().fallback_service(strict_serve_dir_with(dir.to_path_buf(), regime));
+        let app = behind_listener(MountTable::new(vec![(base, files)]).below(axum::Router::new()));
         let wire = axum::http::Request::builder()
             .method("GET")
             .uri(uri)
@@ -6227,6 +6230,67 @@ mod tests {
         let (status, body) = serve_static("/static/hello.txt").await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(body, "hi");
+    }
+
+    /// Prove the refusal: a path a mount re-bases with a leading empty segment
+    /// (`/static//hello.txt`) reaches no file, though `hello.txt` exists.
+    #[tokio::test]
+    async fn static_mount_refuses_a_rest_led_by_an_empty_segment() {
+        for uri in [
+            "/static//hello.txt",
+            "/static///hello.txt",
+            "/%73tatic//hello.txt",
+        ] {
+            let (status, body) = serve_static(uri).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri:?}");
+            assert!(body.is_empty(), "{uri:?}: {body:?}");
+        }
+        let (status, body) = serve_static("/static/hello.txt").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "hi");
+    }
+
+    /// Prove the refusal: the static gate judges the listener's parse, so a
+    /// request whose URI text names a served file but whose parse names
+    /// another path reaches no file.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: fixed paths parse and fixed requests build
+    async fn static_gate_judges_the_listener_parse_not_the_uri() {
+        use tower::ServiceExt;
+        let dir = static_fixture_dir("strict-static-parse");
+        std::fs::write(dir.join("hello.txt"), "hi").expect("static fixture file");
+        let request = |parsed: &str| {
+            let mut wire = axum::http::Request::builder()
+                .method("GET")
+                .uri("/hello.txt")
+                .body(axum::body::Body::empty())
+                .expect("test request builds");
+            wire.extensions_mut().insert(StrictUrl {
+                #[cfg(feature = "web")]
+                spelling: Spelling::Canonical,
+                path: crate::encoding::RequestPath::parse(parsed).expect("the path parses"),
+                query: Arc::new(HashMap::new()),
+            });
+            wire
+        };
+        let serve = |parsed: &'static str| {
+            let files = strict_serve_dir_with(dir.clone(), crate::path_core::HOST);
+            async move {
+                match files.oneshot(request(parsed)).await {
+                    Ok(r) => r.status(),
+                    Err(e) => match e {},
+                }
+            }
+        };
+        for parsed in ["/other.txt", "/", "/hello.txt/x"] {
+            assert_eq!(
+                serve(parsed).await,
+                axum::http::StatusCode::NOT_FOUND,
+                "{parsed}"
+            );
+        }
+        assert_eq!(serve("/hello.txt").await, axum::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Serve `uri` through `CanonicalUrl` over raw axum routes and a fallback
@@ -7343,10 +7407,11 @@ mod tests {
             ("/static/missing.html", axum::http::StatusCode::NOT_FOUND),
             ("/static/%zz", axum::http::StatusCode::BAD_REQUEST),
         ] {
-            let app = behind_listener(axum::Router::new().nest_service(
-                "/static",
-                strict_serve_dir_with(dir.clone(), crate::path_core::HOST),
-            ));
+            let base = crate::encoding::MountBase::parse("/static").expect("the prefix parses");
+            let files = axum::Router::new()
+                .fallback_service(strict_serve_dir_with(dir.clone(), crate::path_core::HOST));
+            let app =
+                behind_listener(MountTable::new(vec![(base, files)]).below(axum::Router::new()));
             let wire = axum::http::Request::builder()
                 .method("GET")
                 .uri(uri)

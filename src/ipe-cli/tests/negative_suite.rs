@@ -3846,6 +3846,14 @@ fn lower_server_api_path_param_not_identifier() {
     );
 }
 
+#[test]
+fn lower_server_api_unknown_method() {
+    for spec in ["FETCH /x", "po\u{17f}t /x"] {
+        let src = server_route_fixture(&format!(r#"Server.api "{spec}""#));
+        assert_rejected("lower_server_api_unknown_method", &src, "IPE-L0156");
+    }
+}
+
 /// A routed `Web.tea` app (its Model has a `page` field) over `page_ty`,
 /// with `routes` as the table, `not_found` as `notFound`, and `extra` cfg
 /// fields appended (e.g. `, onNavigate = Navigated`).

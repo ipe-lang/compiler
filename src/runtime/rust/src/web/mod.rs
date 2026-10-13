@@ -3902,6 +3902,27 @@ fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
     parse_mount_base(&web_base_path())
 }
 
+/// The `/static` file service of a `Web` app over `dir`: a [`MountTable`]
+/// holding the one `/static` mount, so the listener's parse and the URI are
+/// re-based below the prefix as every `Server` mount re-bases them.
+///
+/// [`MountTable`]: crate::server::MountTable
+///
+/// # Errors
+///
+/// `StartupRefusal::MountBase` if `/static` were outside the mount-base
+/// grammar.
+#[cfg(feature = "server")]
+fn web_static_mount(dir: std::path::PathBuf) -> Result<axum::Router, StartupRefusal> {
+    let base = parse_mount_base(WEB_STATIC_PREFIX)?;
+    let files = axum::Router::new().fallback_service(crate::server::strict_serve_dir(dir));
+    Ok(crate::server::MountTable::new(vec![(base, files)]).below(axum::Router::new()))
+}
+
+/// The prefix a `Web` app's `[web] static` directory is served below.
+#[cfg(feature = "server")]
+const WEB_STATIC_PREFIX: &str = "/static";
+
 /// A router that answers EVERY path with `503 Service Unavailable` and the
 /// fixed [`FAIL_CLOSED_BODY`]. Used when a mounted `Web.embed` cannot start as
 /// declared (fail-closed): the mount stays reachable enough to report that it
@@ -6804,23 +6825,23 @@ where
     }
 
     // package.ipe `[web] static` (baked as IPE_WEB_STATIC_DIR) → serve files at
-    // /static/* via ServeDir. MUST be added before the `/*path` page catch-all
-    // so a /static/<file> request hits ServeDir, not the page handler (which
-    // would return HTML). `strict_serve_dir` parses each request path through
-    // `server::static_request` (decoded once, every segment a plain name under
-    // the host regime, the join re-checked) before `ServeDir` reads it. NOTE: like
-    // http.FileServer it FOLLOWS symlinks inside the dir — the dir is
-    // author-controlled (package.ipe [web] static), so that is the intended
-    // contract, NOT a confinement guarantee. Absent/empty → no static mount.
+    // /static/* via ServeDir. The nest outranks the `/*path` page catch-all, so
+    // a /static/<file> request hits ServeDir, not the page handler (which
+    // would return HTML). Inside the nest a `MountTable` re-bases the
+    // listener's parse and the URI below `/static` exactly as a `Server.static`
+    // mount does, so the static gate judges that parse: a rest the parser
+    // could never produce (`/static//x`) is a 404. `strict_serve_dir` admits
+    // only a path whose segments are plain names under the host regime, the
+    // join re-checked, before `ServeDir` reads it. NOTE: like http.FileServer
+    // it FOLLOWS symlinks inside the dir — the dir is author-controlled
+    // (package.ipe [web] static), so that is the intended contract, NOT a
+    // confinement guarantee. Absent/empty → no static mount.
     // IPE_WEB_STATIC_DIR: non-empty value mounts the named directory at /static.
     if let Some(dir) = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
         .ok()
         .filter(|d| !d.is_empty())
     {
-        router = router.nest_service(
-            "/static",
-            crate::server::strict_serve_dir(std::path::PathBuf::from(dir)),
-        );
+        router = router.nest_service("/static", web_static_mount(std::path::PathBuf::from(dir))?);
     }
 
     let app: Router = router
@@ -16404,5 +16425,51 @@ mod web_revocation_tests {
             .await;
             assert!(is_session_lost(after).await, "a revoked session is lost");
         });
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod web_static_mount_tests {
+    //! A `Web` app's `/static` mount re-bases the listener's parse as every
+    //! `Server` mount does.
+
+    use super::web_static_mount;
+
+    /// Serve `uri` through the `Web` static mount over a directory holding
+    /// `hello.txt`, behind the listener.
+    #[allow(clippy::expect_used)] // test: fixture writes and a fixed request
+    async fn serve(uri: &str) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let dir = crate::scratch_core::test_temp_root().join(format!(
+            "ipe-web-static-{}-{}",
+            std::process::id(),
+            uri.len()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp static dir");
+        std::fs::write(dir.join("hello.txt"), "hi").expect("static fixture file");
+        let mount = web_static_mount(dir.clone()).expect("`/static` is a mount base");
+        let app =
+            crate::server::behind_listener(axum::Router::new().nest_service("/static", mount));
+        let wire = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        let status = match app.oneshot(wire).await {
+            Ok(r) => r.status(),
+            Err(e) => match e {},
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        status
+    }
+
+    /// Prove the refusal: a rest led by an empty segment reaches no file,
+    /// while the file itself is served.
+    #[tokio::test]
+    async fn web_static_mount_refuses_a_rest_led_by_an_empty_segment() {
+        assert_eq!(serve("/static/hello.txt").await, axum::http::StatusCode::OK);
+        for uri in ["/static//hello.txt", "/static///hello.txt"] {
+            assert_eq!(serve(uri).await, axum::http::StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 }

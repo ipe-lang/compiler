@@ -1831,6 +1831,11 @@ pub enum RoutePatternDefect {
         /// Byte offset of the sigil within the segment.
         at: usize,
     },
+    /// A `Server.api` spec names a method the server does not serve.
+    UnknownMethod {
+        /// The method, as written.
+        method: Box<str>,
+    },
     /// A `Server.static` or `Server.mountApp` prefix is not a string literal.
     MountPrefixNotLiteral,
     /// A `Server.static` or `Server.mountApp` prefix is not a mount base.
@@ -3368,6 +3373,12 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
         RoutePatternDefect::UnrenderableLiteral { .. } => {
             "a page's path is rendered back into a URL, and a browser drops an empty, \
              `.` or `..` segment — remove the empty segment or rename the literal"
+                .to_string()
+        }
+        RoutePatternDefect::UnknownMethod { .. } => {
+            "name one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, \
+             `CONNECT`, `TRACE` or `ANY` before the path — or omit the method to serve every \
+             method"
                 .to_string()
         }
         RoutePatternDefect::MountPrefixNotLiteral => {

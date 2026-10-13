@@ -434,9 +434,17 @@ impl RequestPath {
 
     /// This path below `base` ([`DecodedPath::strip_base`]), its trailing
     /// slash kept unless nothing is left below `base`.
+    ///
+    /// `None` too when the rest starts with an empty segment (`/billing//x`
+    /// below `/billing`): no request path parses to a leading empty segment,
+    /// so its spelling (`//x`) would read back as another path (`/x`), and
+    /// the path has no place below `base`.
     #[must_use]
     pub fn below(&self, base: &DecodedPath) -> Option<Self> {
         let decoded = self.decoded.strip_base(base)?;
+        if decoded.segments().first().is_some_and(String::is_empty) {
+            return None;
+        }
         let trailing = if decoded.is_root() {
             TrailingSlash::Absent
         } else {
@@ -1061,11 +1069,61 @@ pub struct ServerPattern {
     router_path: String,
 }
 
+/// The request methods one `Ipe.Server` handler serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointMethod {
+    Connect,
+    Delete,
+    Get,
+    Head,
+    Options,
+    Patch,
+    Post,
+    Put,
+    Trace,
+    /// Every method.
+    Any,
+}
+
+impl EndpointMethod {
+    /// The method a route names, `ANY` for every method, matched without
+    /// regard to ASCII case; `None` for a name that is no HTTP method.
+    ///
+    /// This is the one method grammar: the server refuses a handler whose
+    /// method it does not name at listen, and the compiler refuses a literal
+    /// `Server.api` method it does not name.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        const NAMES: [(&str, EndpointMethod); 10] = [
+            ("CONNECT", EndpointMethod::Connect),
+            ("DELETE", EndpointMethod::Delete),
+            ("GET", EndpointMethod::Get),
+            ("HEAD", EndpointMethod::Head),
+            ("OPTIONS", EndpointMethod::Options),
+            ("PATCH", EndpointMethod::Patch),
+            ("POST", EndpointMethod::Post),
+            ("PUT", EndpointMethod::Put),
+            ("TRACE", EndpointMethod::Trace),
+            ("ANY", EndpointMethod::Any),
+        ];
+        NAMES
+            .iter()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+            .map(|(_, method)| *method)
+    }
+
+    /// Whether some request method is served by both.
+    #[must_use]
+    pub fn overlaps(self, other: Self) -> bool {
+        self == other || self == Self::Any || other == Self::Any
+    }
+}
+
 /// The most parameters one `Ipe.Server` route pattern holds.
 ///
-/// The router names a route's parameters by one letter each and cannot name
-/// more than this many, so a longer pattern is refused at parse rather than
-/// at insert.
+/// A ceiling on the parameters of one pattern, so its captures and its
+/// router spelling stay bounded whatever the pattern text holds; the compiler
+/// refuses a literal pattern past it with the same ceiling.
 pub const MAX_SERVER_PARAMS: usize = 25;
 
 /// Why an `Ipe.Server` route pattern was refused.
@@ -1639,7 +1697,7 @@ mod tests {
             canonical_path(&fits, TrailingSlash::Present),
             Err(EncodeRefusal::TooLong { .. })
         ));
-        let grows = DecodedPath(vec!["/".repeat(cap / 3)]);
+        let grows = DecodedPath(vec!["/".repeat(cap / 3 + 1)]);
         assert!(matches!(
             canonical_path(&grows, TrailingSlash::Absent),
             Err(EncodeRefusal::TooLong { .. })
@@ -1680,6 +1738,40 @@ mod tests {
         assert_eq!(below("/%62illing/x"), Some("/x".to_owned()));
         assert_eq!(below("/billings/x"), None);
         assert_eq!(below("/other"), None);
+        // A rest led by an empty segment has no spelling that reads back as
+        // itself, so it has no place below the base.
+        assert_eq!(below("/billing//x"), None);
+        assert_eq!(below("/billing//"), Some("/".to_owned()));
+        assert_eq!(below("/billing/x//y"), Some("/x//y".to_owned()));
+    }
+
+    /// Every path below a base spells as text that parses back to it: a
+    /// mount hands its router exactly the path its parse names.
+    #[test]
+    fn request_path_below_a_base_reads_back_as_itself() {
+        let base = DecodedPath::parse("/billing").expect("base parses");
+        let mut checked = 0_usize;
+        for raw in [
+            "/billing//x",
+            "/billing///x/",
+            "/billing/x//y/",
+            "/billing/%2E%2E",
+            "/billing/a%2Fb",
+            "/billing/",
+        ] {
+            let parsed = RequestPath::parse(raw).expect("the request parses");
+            let Some(below) = parsed.below(&base) else {
+                continue;
+            };
+            let spelled = below.canonical().expect("the rest spells");
+            assert_eq!(
+                RequestPath::parse(spelled.as_str()).as_ref(),
+                Ok(&below),
+                "{raw}"
+            );
+            checked = checked.saturating_add(1);
+        }
+        assert_eq!(checked, 4, "the paths with a place below the base");
     }
 
     proptest! {

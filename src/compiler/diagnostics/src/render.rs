@@ -2152,6 +2152,9 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
                 "segment `{segment}` is empty, `.` or `..`, so this route's URL cannot be rendered"
             )
         }
+        RoutePatternDefect::UnknownMethod { method } => {
+            format!("`{method}` is not a method the server serves")
+        }
         RoutePatternDefect::MountPrefixNotLiteral => {
             "this mount prefix is computed, not a string literal".to_string()
         }

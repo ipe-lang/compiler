@@ -18,6 +18,8 @@
 //!   and its router spelling (each literal re-escaped by the runtime's one
 //!   segment alphabet, each parameter `:p` and its ordinal) is within the
 //!   length ceiling.
+//! - A `Server.api` spec's method, when it names one, is a method the
+//!   runtime's own `EndpointMethod::parse` admits.
 //! - A `Server.static` or `Server.mountApp` prefix is a string literal parsed
 //!   by the runtime's own `MountBase::parse`, and no two mounts of one literal
 //!   `Server.listen` list share a prefix.
@@ -29,7 +31,7 @@ use ipe_diagnostics::{
     DResult, Diagnostic, LowerError, MountPrefixFault, RoutePatternDefect, Span,
 };
 use ipe_ir::{Callee, Expr, KernelFn, Program};
-use ipe_runtime_rust::encoding::{MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
+use ipe_runtime_rust::encoding::{EndpointMethod, MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
 
 /// The runtime's `MAX_URL_COMPONENT_LEN`: the longest pattern it parses.
 pub const MAX_PATH_LEN: usize = 32 * 1024 * 1024;
@@ -283,6 +285,34 @@ pub fn server_api_path(spec: &str) -> &str {
     }
 }
 
+/// The method of a literal `Server.api` spec, split as [`server_api_path`]
+/// splits it; `None` for a spec that names no method (every method).
+#[must_use]
+pub fn server_api_method(spec: &str) -> Option<&str> {
+    match spec.split_once(' ') {
+        Some((method, _)) if !method.is_empty() => Some(method.trim()),
+        _ => None,
+    }
+}
+
+/// Check a literal `Server.api` spec: its method against the runtime's own
+/// method grammar, then its path as a `Server.*` route path.
+///
+/// # Errors
+///
+/// `UnknownMethod` for a method the server does not serve, else the defect
+/// of [`server_route_path`].
+pub fn server_api_spec(spec: &str) -> Result<(), RoutePatternDefect> {
+    if let Some(method) = server_api_method(spec)
+        && EndpointMethod::parse(method).is_none()
+    {
+        return Err(RoutePatternDefect::UnknownMethod {
+            method: excerpt(method),
+        });
+    }
+    server_route_path(server_api_path(spec))
+}
+
 /// Turn a grammar verdict for a literal path passed to `call` into the
 /// IPE-L0156 refusal.
 ///
@@ -392,7 +422,7 @@ fn refuse_literal(k: KernelFn, grammar: RoutePath, lit: &str) -> DResult<()> {
     let verdict = match grammar {
         RoutePath::Web => web_route_pattern(lit),
         RoutePath::Server => server_route_path(lit),
-        RoutePath::ServerApi => server_route_path(server_api_path(lit)),
+        RoutePath::ServerApi => server_api_spec(lit),
         RoutePath::Mount => mount_prefix(lit).map(drop),
     };
     refuse_malformed(&call, verdict)
@@ -516,8 +546,38 @@ fn literal_routes(expr: &Expr) -> DResult<()> {
 mod tests {
     use super::{
         MAX_PATH_LEN, MAX_SERVER_PARAMS, RoutePatternDefect, excerpt, server_api_path,
-        server_route_path, web_route_pattern,
+        server_api_spec, server_route_path, web_route_pattern,
     };
+
+    /// Prove the refusal: a `Server.api` method the server does not serve is
+    /// refused at compile time, as the server refuses it at listen.
+    #[test]
+    fn a_server_api_spec_with_an_unknown_method_is_refused() {
+        for (spec, method) in [
+            ("FETCH /x", "FETCH"),
+            ("po\u{17f}t /x", "po\u{17f}t"),
+            ("G-ET /x", "G-ET"),
+        ] {
+            assert_eq!(
+                server_api_spec(spec),
+                Err(RoutePatternDefect::UnknownMethod {
+                    method: excerpt(method)
+                }),
+                "{spec:?}"
+            );
+        }
+        for spec in [
+            "GET /x",
+            "GET\t /x",
+            "patch /x",
+            "Any /x",
+            "/x",
+            " /x",
+            "TRACE  /a/:id",
+        ] {
+            assert_eq!(server_api_spec(spec), Ok(()), "{spec:?}");
+        }
+    }
 
     #[test]
     fn web_patterns_the_runtime_serves_are_accepted() {
@@ -936,6 +996,8 @@ mod agreement_tests {
         TooManyParams(usize),
         /// A mount-prefix defect, which no route path parse yields.
         Mount,
+        /// A `Server.api` method the server does not serve.
+        UnknownMethod,
     }
 
     fn ours(r: Result<(), RoutePatternDefect>) -> Verdict {
@@ -957,6 +1019,7 @@ mod agreement_tests {
                 | RoutePatternDefect::MountPrefix { .. }
                 | RoutePatternDefect::MountPrefixDuplicate { .. },
             ) => Verdict::Mount,
+            Err(RoutePatternDefect::UnknownMethod { .. }) => Verdict::UnknownMethod,
         }
     }
 
@@ -1076,6 +1139,40 @@ mod agreement_tests {
         ] {
             let (_, path) = api_spec_parts(spec);
             assert_eq!(server_api_path(spec), path, "{spec:?}");
+        }
+    }
+
+    /// The compiler admits a literal `Server.api` method exactly when the
+    /// server's listen-time parse does, whatever its case or bytes.
+    #[test]
+    fn server_api_method_matches_runtime() {
+        use ipe_runtime_rust::encoding::EndpointMethod;
+        for spec in [
+            "POST /u/:id",
+            "post /u",
+            "FETCH /u",
+            "po\u{17f}t /u",
+            "GET\t /u",
+            "\tGET /u",
+            "Any /u",
+            "/u",
+            " /u",
+            "",
+        ] {
+            let (method, _) = api_spec_parts(spec);
+            let runtime = method.is_empty() || EndpointMethod::parse(&method).is_some();
+            let ours =
+                super::server_api_method(spec).is_none_or(|m| EndpointMethod::parse(m).is_some());
+            assert_eq!(ours, runtime, "{spec:?}");
+            assert_eq!(
+                super::server_api_method(spec).unwrap_or("ANY"),
+                if method.is_empty() {
+                    "ANY"
+                } else {
+                    method.as_str()
+                },
+                "{spec:?}"
+            );
         }
     }
 
