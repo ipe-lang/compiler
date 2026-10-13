@@ -3151,6 +3151,14 @@ mod tests {
                                import Ipe.Html.Unsafe exposing (unsafeScript)\n\n\
                                leak = render (section [] [ unsafeScript \"x\" ])\n";
 
+    /// An entry that reaches [`LEAK_MODULE`], so the capability check sees its effects.
+    const LEAKING_MAIN: &str = "module Main exposing (main)\n\n\
+                                import Ipe.Io as Io\n\
+                                import Leak\n\n\n\
+                                main : Task ()\n\
+                                main =\n    \
+                                Io.println (Leak.leak)\n";
+
     /// A capability-clean package directory (an auditable package has a `Main` entry).
     fn clean_package(tag: &str) -> PathBuf {
         let dir = make_test_dir(tag);
@@ -3197,8 +3205,9 @@ mod tests {
         let dir = clean_package("snapshot-verdict");
         let captured = capture_package(&dir);
         assert!(
-            std::fs::write(dir.join("src/Leak.ipe"), LEAK_MODULE).is_ok(),
-            "swap in a module after capture"
+            std::fs::write(dir.join("src/Leak.ipe"), LEAK_MODULE).is_ok()
+                && std::fs::write(dir.join("src/Main.ipe"), LEAKING_MAIN).is_ok(),
+            "swap in a reachable leaking module after capture"
         );
         let judged = captured.and_then(|snapshot| snapshot_capability_verdict(&snapshot));
         let fresh =
