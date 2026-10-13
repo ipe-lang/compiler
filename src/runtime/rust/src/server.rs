@@ -1522,6 +1522,8 @@ pub(crate) enum RequestRejection {
     BadRequest,
     /// The request-body ceiling's environment value is malformed.
     Unavailable,
+    /// The request reached a handler without the listener's URL parse.
+    Unparsed,
 }
 
 impl RequestRejection {
@@ -1539,6 +1541,10 @@ impl RequestRejection {
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable",
             ),
+            Self::Unparsed => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+            ),
         }
     }
 }
@@ -1548,61 +1554,31 @@ fn parse_query(q: Option<&str>) -> Result<HashMap<String, String>, crate::encodi
     q.map_or_else(|| Ok(HashMap::new()), crate::encoding::decode_form_query)
 }
 
-/// Parse a request URI once, refusing it whole when its path or query is not
-/// well-formed.
+/// The listener's parse of this request's URL, read from its extensions.
 ///
-/// The path must be a well-formed RFC 3986 path: every raw segment decodes
-/// through `decode_component` under the path grammar (`DecodedPath::parse`,
-/// the parse the Ipe.Web route matcher reads its segments from, so the gate and
-/// the matcher refuse the same paths). This is also what makes the Ipe.Server
-/// path parameters sound: the router hands back each parameter already
-/// percent-decoded once by a lenient decoder, and on a path that passes this
-/// parse that decoding is byte-for-byte the strict one. The parameters are
-/// therefore used as handed back and never decoded again (a second decode
-/// would turn `%2541` into `A`).
+/// Only [`CanonicalUrl`] parses a request URL; every handler and gate behind
+/// it reads that one parse, so no entry point decodes the URL a second way.
 ///
-/// This is the one gate every HTTP entry point (Ipe.Server handlers, every
-/// Ipe.Web route, the static file mounts) passes before any handler or file
-/// service sees the URI.
+/// # Errors
 ///
-/// Returns the decoded path; the query is proven well-formed and dropped, for an
-/// entry point that matches on the path alone.
-#[cfg(feature = "web")]
-pub(crate) fn strict_url(
-    uri: &axum::http::Uri,
-) -> Result<crate::encoding::DecodedPath, RequestRejection> {
-    let path = strict_path(uri)?;
-    strict_query(uri)?;
-    Ok(path)
+/// `Unparsed` (a fixed 500) when the request carries no [`StrictUrl`]: it was
+/// reached without the listener's parse, so it is refused rather than parsed
+/// afresh.
+pub(crate) const fn strict_url(parsed: Option<&StrictUrl>) -> Result<&StrictUrl, RequestRejection> {
+    match parsed {
+        Some(url) => Ok(url),
+        None => Err(RequestRejection::Unparsed),
+    }
 }
 
-/// The strict path parse shared by every entry point.
-fn strict_path(uri: &axum::http::Uri) -> Result<crate::encoding::DecodedPath, RequestRejection> {
-    crate::encoding::DecodedPath::parse(uri.path()).map_err(|_| RequestRejection::BadRequest)
-}
-
-/// The strict query parse shared by every entry point.
-fn strict_query(uri: &axum::http::Uri) -> Result<HashMap<String, String>, RequestRejection> {
-    parse_query(uri.query()).map_err(|_| RequestRejection::BadRequest)
-}
-
-/// The decoded query of a URI whose path is also proven strict, for an entry
-/// point that never matches on the path.
-pub(crate) fn strict_url_query(
-    uri: &axum::http::Uri,
-) -> Result<HashMap<String, String>, RequestRejection> {
-    strict_path(uri)?;
-    strict_query(uri)
-}
-
-/// Middleware answering the fixed 400 `Bad Request` for a malformed request
-/// URI before the inner service runs.
-pub(crate) async fn refuse_malformed_url(
+/// Middleware refusing, with the fixed 500, a request that reaches the inner
+/// service without the listener's [`StrictUrl`].
+pub(crate) async fn refuse_unparsed_url(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match strict_url_query(req.uri()) {
+    match strict_url(req.extensions().get()) {
         Ok(_) => next.run(req).await,
         Err(rejection) => rejection.status_and_reason().into_response(),
     }
@@ -1620,17 +1596,71 @@ pub enum Spelling {
 /// The listener's parse of one request URL, carried as a request extension.
 ///
 /// Only [`CanonicalUrl`] builds one, so a handler that finds none was reached
-/// without the listener's parse and refuses rather than parse again.
+/// without the listener's parse and refuses rather than parse again. Its path
+/// is the one the router it reaches sees: a mount re-bases it below its prefix
+/// ([`below_mount`]).
 #[derive(Clone)]
 pub(crate) struct StrictUrl {
+    #[cfg(feature = "web")]
     spelling: Spelling,
+    #[cfg(feature = "web")]
+    path: crate::encoding::RequestPath,
+    query: Arc<HashMap<String, String>>,
 }
 
 impl StrictUrl {
     /// Whether the client sent the canonical spelling of its path.
+    #[cfg(feature = "web")]
     pub(crate) const fn spelling(&self) -> Spelling {
         self.spelling
     }
+
+    /// The decoded path segments.
+    #[cfg(feature = "web")]
+    pub(crate) const fn path(&self) -> &crate::encoding::DecodedPath {
+        self.path.decoded()
+    }
+
+    /// The decoded query pairs.
+    pub(crate) fn query(&self) -> &HashMap<String, String> {
+        &self.query
+    }
+
+    /// This parse with its path below `base`, or `None` when `base` is not a
+    /// whole-segment prefix of it.
+    #[cfg(feature = "web")]
+    fn below(&self, base: &crate::encoding::DecodedPath) -> Option<Self> {
+        Some(Self {
+            spelling: self.spelling,
+            path: self.path.below(base)?,
+            query: Arc::clone(&self.query),
+        })
+    }
+}
+
+/// `router` nested at `prefix`, its requests' [`StrictUrl`] re-based below
+/// that prefix so its handlers read the path the router routes on.
+///
+/// A request whose parse does not lie below `prefix` loses its parse and is
+/// refused by the handler with the fixed 500, never served the outer path.
+#[cfg(feature = "web")]
+pub(crate) fn below_mount(
+    router: axum::Router,
+    prefix: crate::encoding::DecodedPath,
+) -> axum::Router {
+    let prefix = Arc::new(prefix);
+    router.layer(axum::middleware::from_fn(
+        move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+            let rebased = req
+                .extensions_mut()
+                .remove::<StrictUrl>()
+                .and_then(|url| url.below(&prefix));
+            if let Some(url) = rebased {
+                req.extensions_mut().insert(url);
+            }
+            next.run(req)
+        },
+    ))
 }
 
 /// The outermost URL service of every app listener: one strict parse, then
@@ -1703,7 +1733,7 @@ fn canonicalise(request: &mut axum::extract::Request) -> Result<(), RequestRejec
     let uri = request.uri();
     let path = crate::encoding::RequestPath::parse(uri.path())
         .map_err(|_| RequestRejection::BadRequest)?;
-    parse_query(uri.query()).map_err(|_| RequestRejection::BadRequest)?;
+    let query = parse_query(uri.query()).map_err(|_| RequestRejection::BadRequest)?;
     let canonical = path.canonical().map_err(|_| RequestRejection::BadRequest)?;
     let spelling = if canonical.as_str() == uri.path() {
         Spelling::Canonical
@@ -1723,7 +1753,13 @@ fn canonicalise(request: &mut axum::extract::Request) -> Result<(), RequestRejec
         *request.uri_mut() =
             axum::http::Uri::from_parts(parts).map_err(|_| RequestRejection::BadRequest)?;
     }
-    request.extensions_mut().insert(StrictUrl { spelling });
+    request.extensions_mut().insert(StrictUrl {
+        #[cfg(feature = "web")]
+        spelling,
+        #[cfg(feature = "web")]
+        path,
+        query: Arc::new(query),
+    });
     Ok(())
 }
 
@@ -1762,7 +1798,7 @@ pub(crate) enum StaticRefusal {
 /// may not reach the filesystem beneath `root`.
 ///
 /// The path is decoded once by the strict core (`DecodedPath::parse`; a
-/// malformed one was already answered 400 by [`refuse_malformed_url`]), then
+/// malformed one was already answered 400 by [`CanonicalUrl`]), then
 /// parsed into a `RelPath`, so a segment that climbs, re-anchors, names a
 /// device or a stream, or aliases another entry under the regime is refused
 /// before any join. An empty segment (`/a//b`) names no entry and is refused
@@ -1849,7 +1885,7 @@ fn strict_serve_dir_with(
     tower::Layer::layer(
         &security_gate,
         tower::Layer::layer(
-            &axum::middleware::from_fn(refuse_malformed_url),
+            &axum::middleware::from_fn(refuse_unparsed_url),
             tower::Layer::layer(&static_gate, tower_http::services::ServeDir::new(dir)),
         ),
     )
@@ -1930,8 +1966,9 @@ async fn build_request(
     use axum::extract::{FromRequestParts, RawPathParams};
     let method = req.method().as_str().to_string();
     let uri = req.uri().clone();
+    // The listener respelled the path canonically: this is the encoder's text.
     let path = uri.path().to_string();
-    let query = strict_url_query(&uri)?;
+    let query = strict_url(req.extensions().get())?.query().clone();
     let mut headers = HashMap::new();
     let mut cookies = HashMap::new();
     // Read from the raw bytes of every `Cookie` header, outside the text gate
@@ -1953,7 +1990,7 @@ async fn build_request(
         }
     }
     let (mut parts, body) = req.into_parts();
-    // `strict_url` has already proved the raw path strict, so the router's
+    // The listener has already respelled the path canonically, so the router's
     // single decode of each parameter is the strict decode: used as-is. A
     // router refusal (a parameter it could not decode, or no parameter table at
     // all) is a malformed request, never an empty table.
@@ -2591,7 +2628,13 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                         .take();
                     if let Some(build) = builder {
                         let prefix = strip_trailing_slash(&rpath);
-                        let sub = build(prefix.clone()).await;
+                        let Ok(base) = crate::encoding::DecodedPath::parse(&prefix) else {
+                            return IpeResult::Err(
+                                format!("Server.mountApp: mount prefix `{prefix}` is not a well-formed path")
+                                    .into(),
+                            );
+                        };
+                        let sub = below_mount(build(prefix.clone()).await, base);
                         app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             move || app.nest(&prefix, sub),
                         )) {
@@ -5310,7 +5353,7 @@ mod tests {
                 }
             }),
         );
-        let _ = app.oneshot(wire).await;
+        let _ = behind_listener(app).oneshot(wire).await;
         slot.lock().ok().and_then(|mut s| s.take())
     }
 
@@ -5318,15 +5361,40 @@ mod tests {
     async fn build_request_without_router_params_is_bad_request() {
         // Prove the refusal: a request that never passed the router carries no
         // parameter table, and that is a malformed request, never an empty one.
-        let wire = axum::http::Request::builder()
+        let mut wire = axum::http::Request::builder()
             .method("GET")
             .uri("/")
             .body(axum::body::Body::empty())
             .expect("test request builds");
+        assert!(canonicalise(&mut wire).is_ok(), "`/` parses");
         assert!(matches!(
             build_request(wire).await,
             Err(RequestRejection::BadRequest)
         ));
+    }
+
+    /// A request that reaches a Server handler without the listener's URL
+    /// parse is refused with the fixed 500, never parsed afresh: a well-formed
+    /// URL and a malformed one are refused alike.
+    #[tokio::test]
+    async fn build_request_without_the_listener_parse_is_refused() {
+        for uri in ["/u/x?q=1", "/u/%zz"] {
+            let (status, body, runs) = serve_counted_with(uri, |app| app).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri:?}"
+            );
+            assert_eq!(body, "Internal Server Error", "{uri:?} must not echo");
+            assert_eq!(runs, 0, "{uri:?} must never reach the handler");
+        }
+        assert_eq!(
+            RequestRejection::Unparsed.status_and_reason(),
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error"
+            )
+        );
     }
 
     /// A `Cookie` header with one non-ASCII byte keeps every other cookie: the
@@ -5355,6 +5423,14 @@ mod tests {
     /// The handler answers `"{id}|{q}"` from its path parameter and query, and
     /// counts its runs. Returns the status, the body and the run count.
     async fn serve_counted(uri: &str) -> (axum::http::StatusCode, String, usize) {
+        serve_counted_with(uri, behind_listener).await
+    }
+
+    /// [`serve_counted`] with the router passed through `listener` first.
+    async fn serve_counted_with(
+        uri: &str,
+        listener: fn(axum::Router) -> axum::Router,
+    ) -> (axum::http::StatusCode, String, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tower::ServiceExt;
         let runs = Arc::new(AtomicUsize::new(0));
@@ -5369,7 +5445,7 @@ mod tests {
                     Box<dyn std::future::Future<Output = Result<ServerResponse, String>> + Send>,
                 >
         });
-        let app = axum::Router::new().route("/u/:id", method_router("GET", handler));
+        let app = listener(axum::Router::new().route("/u/:id", method_router("GET", handler)));
         let wire = axum::http::Request::builder()
             .method("GET")
             .uri(uri)
@@ -5464,8 +5540,10 @@ mod tests {
         uri: &str,
     ) -> (axum::http::StatusCode, String) {
         use tower::ServiceExt;
-        let app = axum::Router::new()
-            .nest_service("/static", strict_serve_dir_with(dir.to_path_buf(), regime));
+        let app = behind_listener(
+            axum::Router::new()
+                .nest_service("/static", strict_serve_dir_with(dir.to_path_buf(), regime)),
+        );
         let wire = axum::http::Request::builder()
             .method("GET")
             .uri(uri)
@@ -5707,6 +5785,51 @@ mod tests {
             assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{uri:?}");
             assert_eq!(body, "Bad Request", "{uri:?} must not echo the request");
             assert_eq!(runs, 0, "{uri:?} must never reach a route or fallback");
+        }
+    }
+
+    /// A mount re-bases the listener's parse below its prefix, so its
+    /// handlers read the path its router routes on; a parse that does not lie
+    /// below the mount's base reaches the handler as no parse at all.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn a_mount_reads_the_listener_parse_below_its_prefix() {
+        use tower::ServiceExt;
+        let echo = || {
+            axum::Router::new().fallback(|strict: Option<axum::Extension<StrictUrl>>| async move {
+                strict.map_or_else(
+                    || "unparsed".to_owned(),
+                    |url| {
+                        url.path
+                            .canonical()
+                            .map_or_else(|_| "too long".to_owned(), |c| c.as_str().to_owned())
+                    },
+                )
+            })
+        };
+        let base = |raw: &str| crate::encoding::DecodedPath::parse(raw).expect("base parses");
+        let app = behind_listener(
+            axum::Router::new()
+                .nest("/billing", below_mount(echo(), base("/billing")))
+                .nest("/stray", below_mount(echo(), base("/elsewhere"))),
+        );
+        for (uri, want) in [
+            ("/billing", "/"),
+            ("/billing/x/", "/x/"),
+            ("/%62illing/%61/b", "/a/b"),
+            ("/stray/x", "unparsed"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .expect("test request builds"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(axum_body_string(resp).await, want, "{uri}");
         }
     }
 
@@ -6682,10 +6805,10 @@ mod tests {
             ("/static/missing.html", axum::http::StatusCode::NOT_FOUND),
             ("/static/%zz", axum::http::StatusCode::BAD_REQUEST),
         ] {
-            let app = axum::Router::new().nest_service(
+            let app = behind_listener(axum::Router::new().nest_service(
                 "/static",
                 strict_serve_dir_with(dir.clone(), crate::path_core::HOST),
-            );
+            ));
             let wire = axum::http::Request::builder()
                 .method("GET")
                 .uri(uri)
@@ -8934,7 +9057,8 @@ mod tests {
         /// route handler is `h`, and answer the response body.
         async fn serve_public(h: ErasedHandler) -> String {
             use tower::ServiceExt;
-            let app = axum::Router::new().route("/public", method_router("GET", h));
+            let app =
+                behind_listener(axum::Router::new().route("/public", method_router("GET", h)));
             let wire = axum::http::Request::builder()
                 .method("GET")
                 .uri("/public")

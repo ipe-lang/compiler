@@ -431,6 +431,19 @@ impl RequestPath {
     pub fn canonical(&self) -> Result<CanonicalPath, EncodeRefusal> {
         canonical_path(&self.decoded, self.trailing)
     }
+
+    /// This path below `base` ([`DecodedPath::strip_base`]), its trailing
+    /// slash kept unless nothing is left below `base`.
+    #[must_use]
+    pub fn below(&self, base: &DecodedPath) -> Option<Self> {
+        let decoded = self.decoded.strip_base(base)?;
+        let trailing = if decoded.is_root() {
+            TrailingSlash::Absent
+        } else {
+            self.trailing
+        };
+        Some(Self { decoded, trailing })
+    }
 }
 
 /// The canonical text of a request path; only [`canonical_path`] builds one.
@@ -1306,6 +1319,27 @@ mod tests {
             RequestPath::parse("/%zz"),
             Err(DecodeRefusal::MalformedEscape { .. })
         ));
+    }
+
+    /// A path re-based below a mount keeps its trailing slash, except at the
+    /// mount itself; a path outside the mount has no place below it.
+    #[test]
+    fn request_path_below_a_base_is_segment_bounded() {
+        let base = DecodedPath::parse("/billing").expect("base parses");
+        let below = |raw: &str| {
+            RequestPath::parse(raw)
+                .ok()
+                .and_then(|p| p.below(&base))
+                .and_then(|p| p.canonical().ok())
+                .map(|c| c.as_str().to_owned())
+        };
+        assert_eq!(below("/billing/x/"), Some("/x/".to_owned()));
+        assert_eq!(below("/billing/x"), Some("/x".to_owned()));
+        assert_eq!(below("/billing/"), Some("/".to_owned()));
+        assert_eq!(below("/billing"), Some("/".to_owned()));
+        assert_eq!(below("/%62illing/x"), Some("/x".to_owned()));
+        assert_eq!(below("/billings/x"), None);
+        assert_eq!(below("/other"), None);
     }
 
     proptest! {

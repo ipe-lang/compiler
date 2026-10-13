@@ -4214,23 +4214,15 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        // Only the listener's URL service hands a page its request: one that
-        // arrives without that parse is refused, never parsed afresh.
-        let Some(axum::Extension(strict)) = strict else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "500 request URL not parsed",
-            )
-                .into_response();
-        };
-        // The listener already refused a malformed path or query; this is the
-        // second, independent boundary before any session work. The path is
-        // parsed here once; every route resolver below reads it.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        // The page reads the listener's one URL parse; a request reaching it
+        // without that parse is refused, never parsed afresh. Every route
+        // resolver below reads this path.
+        let strict = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let lookup = (st.route_matched)(&path);
+        let path = strict.path();
+        let lookup = (st.route_matched)(path);
         // A routed page reached by a path other than the one it renders to (a
         // trailing `/`, an escape its route decodes, `007` for an `Int` `7`) is
         // redirected there before any session work, so a session only ever
@@ -4365,7 +4357,7 @@ mod handlers {
                 let scope = pubsub::SessionScope::new(sid.clone());
                 let make_init = || {
                     pubsub::with_session(&scope, || {
-                        let params = (st.param_resolver)(&path);
+                        let params = (st.param_resolver)(path);
                         let req = req::web_req(&method, &uri, &headers, params);
                         (st.init)(req)
                     })
@@ -4637,7 +4629,7 @@ mod handlers {
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
     pub(super) async fn sse_handler<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
-        uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
         base: Arc<route::DecodedPath>,
     ) -> Response
@@ -4649,10 +4641,10 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Send + Sync + 'static,
     {
-        // The query decodes once through the strict core; the router's URL
-        // gate already refused a malformed one, this is the second boundary.
-        let qs = match crate::server::strict_url_query(&uri) {
-            Ok(qs) => qs,
+        // The query is the listener's one URL parse; a request reaching this
+        // handler without that parse is refused, never parsed afresh.
+        let qs = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.query(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         // `?path=` is parsed once into the route path it names; a malformed
@@ -5758,6 +5750,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         headers: axum::http::HeaderMap,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         method: axum::http::Method,
     ) -> axum::response::Response
     where
@@ -5782,11 +5775,11 @@ mod handlers {
         // Build a fresh init model from the current request context — the same
         // path the clean-reinit miss takes — so the reset session holds exactly
         // what a cold-start visit would have produced.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        let path = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.path(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(&path);
+        let params = (st.param_resolver)(path);
         let req = req::web_req(&method, &uri, &headers, params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
         {
@@ -5881,6 +5874,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         headers: axum::http::HeaderMap,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         method: axum::http::Method,
         body: axum::body::Bytes,
     ) -> axum::response::Response
@@ -5911,11 +5905,11 @@ mod handlers {
         // Derive the init model the same way reset_handler does: build a
         // WebReq from the current request context so route-aware apps get the
         // correct initial state.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        let path = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.path(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(&path);
+        let params = (st.param_resolver)(path);
         let req = req::web_req(&method, &uri, &headers, params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
 
@@ -6486,11 +6480,11 @@ where
     crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
     let sse_route = get(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
-              uri: axum::http::Uri,
+              strict: Option<axum::Extension<crate::server::StrictUrl>>,
               headers: axum::http::HeaderMap| {
             handlers::sse_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>(
                 st,
-                uri,
+                strict,
                 headers,
                 Arc::clone(&sse_base),
             )
@@ -6842,12 +6836,13 @@ where
         // observability::track so a rejected CSRF POST still gets counted +
         // access-logged.
         .layer(axum::middleware::from_fn(csrf::csrf_middleware))
-        // Strict URL gate over every route here (page, SSE, event, port,
-        // assets, static): a malformed path or query is answered with the
-        // fixed 400 before CSRF or any handler runs. Inner of `track`, so a
-        // refusal is still counted and access-logged.
+        // Second boundary over every route here (page, SSE, event, port,
+        // assets, static): a request that reaches this router without the
+        // listener's URL parse is answered with the fixed 500 before CSRF or
+        // any handler runs. Inner of `track`, so a refusal is still counted
+        // and access-logged.
         .layer(axum::middleware::from_fn(
-            crate::server::refuse_malformed_url,
+            crate::server::refuse_unparsed_url,
         ))
         // Per-request panic recovery: a handler or csrf-mw panic becomes a 500
         // instead of an unwound tokio task that drops the connection with no
@@ -12793,8 +12788,9 @@ mod emitted_router_behavior_tests {
             [0u8; 32],
         );
         block_on(async move {
-            let mounted = axum::Router::new().nest("/billing", builder(String::new()).await);
-            let app = crate::server::behind_listener(mounted);
+            let base = route::DecodedPath::parse("/billing").expect("the prefix parses");
+            let sub = crate::server::below_mount(builder(String::new()).await, base);
+            let app = crate::server::behind_listener(axum::Router::new().nest("/billing", sub));
             let status_of = |uri: &'static str| {
                 let app = app.clone();
                 async move {
@@ -12814,11 +12810,7 @@ mod emitted_router_behavior_tests {
                 assert_eq!(status_of(uri).await, StatusCode::BAD_REQUEST, "{uri}");
             }
             let canonical = status_of("/billing").await;
-            assert_ne!(
-                canonical,
-                StatusCode::NOT_FOUND,
-                "the mount serves its prefix"
-            );
+            assert_eq!(canonical, StatusCode::OK, "the mount serves its prefix");
             assert_eq!(status_of("/%62illing").await, canonical);
             assert_eq!(status_of("/%62%69lling").await, canonical);
         });
@@ -13110,6 +13102,46 @@ mod route_entry_cmd_tests {
 
     fn memory() -> Store {
         Arc::new(MemoryStore::<Model, Msg>::new(Duration::from_secs(60)))
+    }
+
+    /// A Web router reached without the listener's URL parse refuses every
+    /// route with the fixed 500 and starts no session: the page, the SSE
+    /// stream and the event endpoint alike, a well-formed URL and a malformed
+    /// one alike.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the fixture table builds and a fixed request always builds
+    fn web_router_without_the_listener_parse_is_refused() {
+        run(false, || async {
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let bare = build_web_router(fixture_state(memory(), sessions.clone()), false)
+                .expect("the fixture route table and base are well-formed");
+            for (method, uri) in [
+                ("GET", "/"),
+                ("GET", "/items/3"),
+                ("GET", "/%zz"),
+                ("GET", "/_ipe/sse?path=/"),
+                ("POST", "/_ipe/event"),
+            ] {
+                let resp = bare
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build request"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{method} {uri}"
+                );
+            }
+            assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(take_init_sids().is_empty());
+        });
     }
 
     /// A rebound name reaches no route of a real `serve_web`: the page GET
