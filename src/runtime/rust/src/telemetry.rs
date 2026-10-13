@@ -632,13 +632,13 @@ impl ConsoleAuthResolution {
         )
     }
 
-    /// The one startup line naming the effective posture, mode, and source.
+    /// The startup message naming the effective posture, mode, and source.
     ///
     /// Built from labels alone: never a token, its length, or any prefix.
     #[must_use]
-    pub fn startup_line(self) -> String {
+    pub fn startup_message(self) -> String {
         format!(
-            "[ipe.console] auth posture={} mode={} source={}",
+            "auth posture={} mode={} source={}",
             self.posture.label(),
             self.mode.label(),
             self.source.label()
@@ -1936,22 +1936,22 @@ mod tests {
             (
                 RawEnv::Value("token"),
                 Posture::Dev,
-                "[ipe.console] auth posture=dev mode=token source=env",
+                "auth posture=dev mode=token source=env",
             ),
             (
                 RawEnv::Absent,
                 Posture::Dev,
-                "[ipe.console] auth posture=dev mode=dev-open source=posture-default",
+                "auth posture=dev mode=dev-open source=posture-default",
             ),
             (
                 RawEnv::Absent,
                 Posture::Production,
-                "[ipe.console] auth posture=production mode=unset-prod source=posture-default",
+                "auth posture=production mode=unset-prod source=posture-default",
             ),
             (
                 RawEnv::Value("s3cret"),
                 Posture::Dev,
-                "[ipe.console] auth posture=dev mode=off source=env-invalid",
+                "auth posture=dev mode=off source=env-invalid",
             ),
         ] {
             let line = ConsoleAuthResolution::resolve(
@@ -1960,7 +1960,7 @@ mod tests {
                 posture,
                 ProcessScope::Loopback,
             )
-            .startup_line();
+            .startup_message();
             assert_eq!(line, expected);
             assert!(!line.contains("s3cret"), "startup line leaked a value");
         }
