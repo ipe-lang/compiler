@@ -3260,10 +3260,10 @@ impl<'a> Iterator for EvalOrder<'a> {
     }
 }
 
-/// A per-call-site turbofish pin for a polymorphic kernel.
+/// A per-call-site turbofish pin for a polymorphic callee.
 ///
-/// Set when the HM solver left the kernel's free result type parameter
-/// genuinely unconstrained. Each variant names the SEMANTIC default the emitter
+/// Set when the HM solver left one of the callee's type parameters genuinely
+/// unconstrained at this use. Each variant names the SEMANTIC default the emitter
 /// renders; the mapping to a concrete `::<…>` suffix lives in the backend
 /// (`emit_expr`), so this enum stays a small, typed decision — never a raw
 /// string in the IR.
@@ -3272,7 +3272,7 @@ impl<'a> Iterator for EvalOrder<'a> {
 /// parameter is a bare type variable NOT bound by an enclosing generic
 /// signature; a concrete parameter needs no pin (rustc infers it) and stays
 /// [`Self::None`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum CallPin {
     /// No turbofish — the common case (rustc infers every type parameter).
     #[default]
@@ -3293,13 +3293,20 @@ pub enum CallPin {
     /// error type — `::<IpeError>`. Used by `decimal_from_string<E: From<String>>`
     /// when the `Err` channel is discarded.
     ErrIpeError,
+    /// A USER generic function's type parameters, named by the callee
+    /// [`Func::type_params`] symbol, that occur only as UI message slots of its
+    /// signature and that this use leaves unconstrained — each pinned to `()`,
+    /// the type the use's own node type lowered that slot to. Every other
+    /// parameter renders `_`. Only a [`Callee::Func`] call carries it.
+    MsgUnit(BTreeSet<Symbol>),
 }
 
 impl CallPin {
     /// The turbofish suffix this pin renders immediately after a kernel's name
     /// (before its `(` argument list): `dict_empty::<String, i64>(…)`, etc.
     /// [`Self::None`] renders the empty string, so an unpinned call emits no
-    /// turbofish.
+    /// turbofish. [`Self::MsgUnit`] has no fixed suffix — its rendering needs
+    /// the callee's generic layout — so it is `None`.
     ///
     /// The concrete default types (`i64` / `String` / `IpeError`) mirror the
     /// polymorphic-kernel defaults: a genuinely
@@ -3308,13 +3315,14 @@ impl CallPin {
     /// inhabited default is sound — `i64` and `String` are the reference's
     /// canonical choices, `IpeError` the project's canonical error type.
     #[must_use]
-    pub const fn turbofish(self) -> &'static str {
+    pub const fn kernel_turbofish(&self) -> Option<&'static str> {
         match self {
-            Self::None => "",
-            Self::DefaultI64 => "::<i64>",
-            Self::DefaultDict => "::<String, i64>",
-            Self::DefaultResultMapErr => "::<_, _, i64>",
-            Self::ErrIpeError => "::<IpeError>",
+            Self::None => Some(""),
+            Self::DefaultI64 => Some("::<i64>"),
+            Self::DefaultDict => Some("::<String, i64>"),
+            Self::DefaultResultMapErr => Some("::<_, _, i64>"),
+            Self::ErrIpeError => Some("::<IpeError>"),
+            Self::MsgUnit(_) => None,
         }
     }
 }

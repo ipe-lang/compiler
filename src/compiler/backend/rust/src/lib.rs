@@ -73,8 +73,8 @@ use ipe_backend::{Backend, EmittedProject};
 use ipe_diagnostics::{DResult, Diagnostic, NameError, RustNameFoldKind, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
-    Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program, RuntimeBridgedEnum,
-    TypeDef,
+    CallPin, Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
+    RuntimeBridgedEnum, TypeDef,
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
@@ -1577,6 +1577,10 @@ pub(crate) struct EmitCtx<'a> {
     /// the inlined `impl Fn` fast path rather than a wasted heap allocation. A
     /// function with no such params carries no entry (the common case).
     impl_fn_params: BTreeMap<FuncId, Vec<usize>>,
+    /// Function id → the order of its explicit Rust generics, for a function
+    /// that declares any ([`GenericLayout`]). Read to render a use-site
+    /// [`ipe_ir::CallPin::MsgUnit`] turbofish against the callee's own clause.
+    generic_layouts: BTreeMap<FuncId, GenericLayout>,
     /// Every distinct record shape synthesised for the program, in emission
     /// order (sorted by field-name set).
     record_structs: Vec<RecordStruct>,
@@ -1881,6 +1885,7 @@ impl<'a> EmitCtx<'a> {
         // recover a source spelling on its own.
         let mut func_ipe_names: BTreeMap<String, String> = BTreeMap::new();
         let mut impl_fn_params: BTreeMap<FuncId, Vec<usize>> = BTreeMap::new();
+        let mut generic_layouts: BTreeMap<FuncId, GenericLayout> = BTreeMap::new();
         for module in &program.modules {
             let segs = module
                 .name
@@ -2017,6 +2022,13 @@ impl<'a> EmitCtx<'a> {
                 // ONCE here (from the same `Func`) so signature and call site can
                 // never disagree on the carrier.
                 let idxs = crate::emit_expr::impl_fn_param_indices(func);
+                let layout = GenericLayout {
+                    type_params: func.type_params.iter().map(|(sym, _)| *sym).collect(),
+                    inferred_tail: idxs.len().saturating_add(func.row_params.len()),
+                };
+                if !layout.type_params.is_empty() {
+                    generic_layouts.insert(func.id, layout);
+                }
                 if !idxs.is_empty() {
                     impl_fn_params.insert(func.id, idxs);
                 }
@@ -2513,6 +2525,7 @@ impl<'a> EmitCtx<'a> {
             enum_traits,
             func_names,
             impl_fn_params,
+            generic_layouts,
             record_structs,
             record_by_fieldset,
             cargo_name,
@@ -3881,6 +3894,64 @@ impl<'a> EmitCtx<'a> {
             .get(&id)
             .is_some_and(|idxs| idxs.contains(&idx))
     }
+
+    /// The turbofish a call to `callee` carrying `pin` renders between the
+    /// callee's name and its `(`.
+    ///
+    /// A [`CallPin::MsgUnit`] renders one entry per explicit generic of the
+    /// callee, in [`GenericLayout`] order: `()` for a type parameter the pin
+    /// names, `_` for every other one. A pin naming none of the callee's type
+    /// parameters (a message slot the callee already defaulted to `()`)
+    /// renders nothing. The pin on a non-[`Callee::Func`] callee is a lowering
+    /// bug, never a silent drop.
+    pub(crate) fn call_pin_turbofish(&self, callee: &Callee, pin: &CallPin) -> DResult<String> {
+        let syms = match pin {
+            CallPin::MsgUnit(syms) => syms,
+            CallPin::None
+            | CallPin::DefaultI64
+            | CallPin::DefaultDict
+            | CallPin::DefaultResultMapErr
+            | CallPin::ErrIpeError => {
+                return pin.kernel_turbofish().map(str::to_owned).ok_or_else(|| {
+                    Diagnostic::CompilerBug {
+                        where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
+                        detail: "a kernel pin rendered no turbofish".to_owned(),
+                    }
+                });
+            }
+        };
+        let id = match callee {
+            Callee::Func(id) => *id,
+            Callee::Kernel(_) | Callee::Ffi { .. } => {
+                return Err(Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
+                    detail: "a message-slot pin on a non-user callee".to_owned(),
+                });
+            }
+        };
+        let Some(layout) = self.generic_layouts.get(&id) else {
+            return Ok(String::new());
+        };
+        if !layout.type_params.iter().any(|sym| syms.contains(sym)) {
+            return Ok(String::new());
+        }
+        let entries: Vec<&str> = layout
+            .type_params
+            .iter()
+            .map(|sym| if syms.contains(sym) { "()" } else { "_" })
+            .chain(std::iter::repeat_n("_", layout.inferred_tail))
+            .collect();
+        Ok(format!("::<{}>", entries.join(", ")))
+    }
+}
+
+/// The explicit Rust generics of an emitted user function, in the order its
+/// clause declares them: one `T{n}` per [`ipe_ir::Func::type_params`] entry, then
+/// `inferred_tail` generics (its `FN{i}` and `R{n}` parameters) a call site
+/// always leaves to inference.
+struct GenericLayout {
+    type_params: Vec<Symbol>,
+    inferred_tail: usize,
 }
 
 /// Fold every runtime-feature requirement a type's leaves declare into `out`, via

@@ -22772,11 +22772,15 @@ impl<'a> Lowerer<'a> {
                     }
                     // A nullary top-level constant or zero-arg kernel
                     // referenced as a value is its own zero-argument call
-                    // (`x` → `x()`).
+                    // (`x` → `x()`), its message slot pinned like any call's.
+                    let pin = match &callee {
+                        Callee::Func(_) => self.user_func_msg_pin(e),
+                        Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
+                    };
                     Ok(Expr::Call {
                         callee,
                         args: Vec::new(),
-                        pin: CallPin::None,
+                        pin,
                         on_form: OnFormKind::NotForm,
                     })
                 }
@@ -23905,6 +23909,61 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The pin for a use of a user generic function `callee` whose
+    /// message-slot type parameters THIS use leaves unconstrained.
+    ///
+    /// A parameter qualifies when it occurs only in UI message slots of the
+    /// callee's declared scheme ([`ipe_types::ui_msg_only_vars`]) and the use's
+    /// solved instantiation binds it to a free variable no enclosing generic
+    /// owns ([`Self::ty_is_unbound_free`]). The use's own node type lowered
+    /// that slot to `()`, so the pin renders `()` there and the emitted call
+    /// names one concrete type instead of leaving rustc an ambiguous generic.
+    /// Phantom by construction: the parameter types no value. Any other
+    /// callee, or an instantiation the template match cannot align, pins
+    /// nothing.
+    fn user_func_msg_pin(&self, callee: &canon::Expr) -> CallPin {
+        let canon::Expr_::VarTopLevel { module, name } = &callee.value else {
+            return CallPin::None;
+        };
+        let key = (module.clone(), *name);
+        let (Some(declared), Some(inst)) = (self.types.env.get(&key), self.region_ty(callee.span))
+        else {
+            return CallPin::None;
+        };
+        let msg_only =
+            ipe_types::ui_msg_only_vars(declared, &ipe_types::ui_msg_carrier_syms(self.interner));
+        if msg_only.is_empty() {
+            return CallPin::None;
+        }
+        let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
+        match_signature_template(declared, inst, &mut subst, self.interner);
+        // An untyped callee's scheme carries solver variables, named by its
+        // `poly_var_map`; a typed callee's carries its annotation symbols.
+        let solver_names = self
+            .types
+            .untyped_type_params
+            .contains_key(&key)
+            .then(|| self.types.poly_var_map.get(&key));
+        let pinned: BTreeSet<Symbol> = msg_only
+            .into_iter()
+            .filter(|raw| subst.get(raw).is_some_and(|ty| self.ty_is_unbound_free(ty)))
+            .filter_map(|raw| {
+                solver_names.map_or_else(
+                    || Some(Symbol::from_raw(raw)),
+                    |names| {
+                        let var = ipe_types::SolverVar::from_raw(raw)?;
+                        names?.get(&var).copied()
+                    },
+                )
+            })
+            .collect();
+        if pinned.is_empty() {
+            CallPin::None
+        } else {
+            CallPin::MsgUnit(pinned)
+        }
+    }
+
     /// The turbofish pin for a polymorphic kernel whose free result type
     /// parameter the HM solver left unconstrained at THIS call site. Returns
     /// [`CallPin::None`] for every non-affected kernel and for every affected
@@ -24732,7 +24791,12 @@ impl<'a> Lowerer<'a> {
                         // the small set of ambiguous kernels AND only when the
                         // free parameter is not an enclosing generic (which would
                         // already pin it — see `kernel_turbofish_pin`).
-                        let pin = self.kernel_turbofish_pin(&resolved, args, call_span);
+                        let pin = match &resolved {
+                            Callee::Func(_) => self.user_func_msg_pin(callee),
+                            Callee::Kernel(_) | Callee::Ffi { .. } => {
+                                self.kernel_turbofish_pin(&resolved, args, call_span)
+                            }
+                        };
                         // re-align a `Result.mapError` wildcard-handler
                         // binder that defaulted to `IrType::Json` onto the
                         // value side's `IrType::Error` (`IpeError`) default,
@@ -26834,14 +26898,18 @@ impl<'a> Lowerer<'a> {
         let mut iter = lowered_args.into_iter();
         let head: Vec<Expr> = iter.by_ref().take(arity).collect();
         let rest: Vec<Expr> = iter.collect();
+        // Over-application: the base call returns a function that is further
+        // applied; the affected kernels never take this shape, so only a user
+        // callee's message slot can need a pin.
+        let pin = match &resolved {
+            Callee::Func(_) => self.user_func_msg_pin(callee),
+            Callee::Kernel(_) | Callee::Ffi { .. } => CallPin::None,
+        };
         Ok(Expr::Apply {
             func: Box::new(Expr::Call {
                 callee: resolved,
                 args: head,
-                // Over-application: the base call returns a function that is
-                // further applied; the affected kernels never take this
-                // shape, so no turbofish.
-                pin: CallPin::None,
+                pin,
                 // Over-applied kernel base call — never `onSubmit`.
                 on_form: OnFormKind::NotForm,
             }),
