@@ -179,8 +179,8 @@ fn open_dir_at(real: PathBuf) -> Result<Dir, OpenRefusal> {
 fn id_of(file: &File) -> Result<FileId, OpenRefusal> {
     let info = winapi_util::file::information(file).map_err(|e| refusal_of(&e))?;
     Ok(FileId {
-        dev: info.volume_serial_number(),
-        ino: info.file_index(),
+        volume: info.volume_serial_number(),
+        object: u128::from(info.file_index()),
     })
 }
 
@@ -194,17 +194,6 @@ pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
     winapi_util::file::information(file)
         .map(|info| info.number_of_links())
         .map_err(|e| refusal_of(&e))
-}
-
-/// The identity of the object looking `path` up now reaches, following links.
-pub fn id_of_path(path: &Path) -> Result<FileId, OpenRefusal> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(BACKUP_SEMANTICS)
-        .open(path)
-        .map_err(|e| refusal_of(&e))?;
-    id_of(&file)
 }
 
 /// Open the path the invoking user named, following links.
