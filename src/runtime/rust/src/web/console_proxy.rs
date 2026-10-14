@@ -195,8 +195,12 @@ pub(crate) fn spawn_console(
     }
 }
 
-/// Kill the tracked console child (parent shutdown), then remove the
-/// zero-config store directory. Idempotent; never panics.
+/// Kill the tracked console child, then remove the zero-config store directory.
+///
+/// Idempotent; never panics. The served app's one teardown owner is its
+/// `server::shutdown::ShutdownPlan`: `serve_web`'s plan runs this on the first
+/// signal, and `serve_web` runs it again once the app has stopped, for a child
+/// spawned after the teardown. No other signal handler stops the child.
 pub fn shutdown_console() {
     if let Ok(mut g) = CHILD.lock() {
         if let Some(child) = g.as_mut() {
@@ -209,14 +213,11 @@ pub fn shutdown_console() {
     }
 }
 
-// NOTE (shutdown ownership): the console child's teardown on parent shutdown is
-// owned by the ONE coherent graceful-shutdown path in `web::web_shutdown_signal`
-// — it calls `shutdown_console()` then returns so axum drains and the process
-// exits 0. A previous `install_shutdown_hook` here installed a SECOND tokio
-// signal handler that `std::process::exit(130)`'d; two handlers raced and the
-// 130 exit defeated the exit-0-on-clean-shutdown contract. It was removed. The
-// `PR_SET_PDEATHSIG` (Linux, via `system::spawn_hardened_tokio`) + `kill_on_drop`
-// set in `spawn_console` remain the defense-in-depth floor for NON-graceful parent death (SIGKILL / OOM / crash).
+// Shutdown ownership: the console child's graceful teardown is a hook of
+// `serve_web`'s `ShutdownPlan`, the process's one signal owner. The
+// `PR_SET_PDEATHSIG` (Linux, via `system::spawn_hardened_tokio`) and
+// `kill_on_drop` set in `spawn_console` are the floor for a non-graceful parent
+// death (SIGKILL, OOM, crash).
 
 // ─── Reverse proxy ──────────────────────────────────────────────────────────
 
@@ -531,13 +532,8 @@ pub async fn ensure_console_proxy() -> bool {
             "proxy already initialised; keeping the first mount",
         );
     }
-    // NOTE: child teardown on shutdown is now owned by the ONE coherent
-    // graceful-shutdown path in `web::web_shutdown_signal` (it calls
-    // `shutdown_console()` then lets axum drain → exit 0). We deliberately do
-    // NOT install the old `install_shutdown_hook` here — two signal handlers
-    // would race, and that hook's `std::process::exit(130)` would defeat the
-    // exit-0-on-clean-shutdown contract. The PR_SET_PDEATHSIG + kill_on_drop on
-    // the child remain the defense-in-depth floor for non-graceful parent death.
+    // No signal handler here: the child's teardown is a hook of `serve_web`'s
+    // `ShutdownPlan`, the process's one signal owner.
     crate::system::emit_runtime_log(
         "console",
         &format!("reverse-proxy ready at {CONSOLE_BASE}/* → 127.0.0.1:{port}"),

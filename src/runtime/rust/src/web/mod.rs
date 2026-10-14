@@ -1151,6 +1151,60 @@ async fn session_closed(closer: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = closer.wait_for(|closed| *closed).await;
 }
 
+/// A session's SSE body: its queued frames until the session closes or the server drains.
+///
+/// `keep` lives as long as the body. On a drain the body yields the frames
+/// already queued, at most the channel's capacity, then ends, so a frame a
+/// shutdown hook queued (the dev reload) still reaches the browser.
+#[cfg(feature = "server")]
+fn session_stream<K: Send + 'static>(
+    rx: tokio::sync::mpsc::Receiver<SsePatch>,
+    keep: K,
+    closer: tokio::sync::watch::Receiver<bool>,
+    drain: crate::server::shutdown::Drain,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send {
+    futures_util::stream::unfold(
+        (rx, keep, closer, drain, false),
+        |(mut rx, keep, mut closer, mut drain, drained)| async move {
+            if drained {
+                return None;
+            }
+            let frame = tokio::select! {
+                biased;
+                () = session_closed(&mut closer) => return None,
+                () = drain.wait() => {
+                    let queued = queued_frames(&mut rx);
+                    if queued.is_empty() {
+                        return None;
+                    }
+                    let flushed = Ok(axum::body::Bytes::from(queued));
+                    return Some((flushed, (rx, keep, closer, drain, true)));
+                },
+                frame = rx.recv() => frame,
+            };
+            frame.map(|SsePatch(s)| {
+                (
+                    Ok(axum::body::Bytes::from(s)),
+                    (rx, keep, closer, drain, false),
+                )
+            })
+        },
+    )
+}
+
+/// The frames already queued on `rx`, concatenated, at most its capacity.
+#[cfg(feature = "server")]
+fn queued_frames(rx: &mut tokio::sync::mpsc::Receiver<SsePatch>) -> String {
+    let mut queued = String::new();
+    for _ in 0..rx.max_capacity() {
+        let Ok(SsePatch(frame)) = rx.try_recv() else {
+            break;
+        };
+        queued.push_str(&frame);
+    }
+    queued
+}
+
 /// How long a session waits after a revocation before it re-proves its credentials.
 ///
 /// A burst of revocations inside one interval costs each open session at most
@@ -3269,10 +3323,6 @@ fn ttl_unavailable_response() -> axum::response::Response {
         .into_response()
 }
 
-/// Graceful-drain grace window: how long the pure axum graceful drain is allowed
-/// before we force a CLEAN exit-0. axum's `with_graceful_shutdown` WAITS for
-/// every connection to finish, so an open SSE `EventSource` (heartbeat every
-/// 15 s, otherwise idle) would hang the drain forever. This window lets ordinary
 /// Returns `true` when `IPE_WEB_RESET_STATE=1` (or any truthy value) is set in
 /// the process environment.
 ///
@@ -3295,25 +3345,6 @@ pub(crate) fn reset_state_from_env() -> bool {
 }
 
 /// Best-effort bounded flush of all active telemetry exporters (push + hub).
-/// Tunable via `IPE_WEB_SHUTDOWN_GRACE_MS` (default 1500 ms; 0 = exit at
-/// once).
-#[cfg(feature = "server")]
-const SHUTDOWN_GRACE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
-    "IPE_WEB_SHUTDOWN_GRACE_MS",
-    1500,
-    crate::system::ZeroCeiling::Accepted,
-    "decimal millisecond count",
-);
-
-/// The shutdown grace window, resolved by `serve_web` before it binds.
-#[cfg(feature = "server")]
-fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
-    SHUTDOWN_GRACE_CEILING
-        .read()
-        .map(std::time::Duration::from_millis)
-}
-
-/// Best-effort bounded flush of all active telemetry exporters (push + hub).
 ///
 /// The two flushes run concurrently, each bounded by its exporter's flush
 /// deadline (its connect timeout plus one send budget), so shutdown waits at
@@ -3328,11 +3359,9 @@ fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefu
 /// make outbound HTTP calls and are gated behind both features; a server with
 /// no outbound HTTP kernel has no exporters to flush.
 #[cfg(all(feature = "web", feature = "http_client"))]
-async fn flush_exporters() {
+pub(crate) async fn flush_exporters() {
     tokio::join!(push_exporter::flush_now(), hub_exporter::flush_now());
 }
-#[cfg(all(feature = "server", not(all(feature = "web", feature = "http_client"))))]
-async fn flush_exporters() {}
 
 /// Runs `flush_exporters` to completion from synchronous code, bounded by `push_exporter::EXIT_FLUSH_BOUND`.
 ///
@@ -3375,8 +3404,8 @@ pub(crate) fn flush_exporters_before_exit() {
 /// reconnect-wait and refetches immediately instead of waiting out the
 /// retry backoff ladder. Dev-mode only — see H23 ("dev-only reload channel
 /// ABSENT, not disabled, in production"): the production gate lives at the
-/// ONE call site chain ([`maybe_push_reload_to_web_sessions`], called from
-/// `web_shutdown_signal`), never inside this helper — a caller that
+/// ONE call site chain ([`maybe_push_reload_to_web_sessions`], a hook of
+/// `serve_web`'s shutdown plan), never inside this helper — a caller that
 /// reaches this function has already decided dev-mode applies. Delivery is
 /// best-effort, at-most-once, never retried: a full/closed channel just
 /// drops that one session's frame (the browser's own reconnect logic
@@ -3487,8 +3516,8 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
 /// The dev-only gate over [`push_reload_to_web_sessions`], over the process dev intent.
 ///
 /// Without a [`DevIntent`](crate::telemetry::DevIntent) (a release build, or a
-/// production posture) the push path is unreachable. Split from
-/// `web_shutdown_signal` so the gate is unit-testable without delivering a
+/// production posture) the push path is unreachable. A hook of `serve_web`'s
+/// shutdown plan, split out so the gate is unit-testable without delivering a
 /// real signal.
 #[cfg(feature = "server")]
 async fn maybe_push_reload_to_web_sessions<Model, Msg>(
@@ -3515,117 +3544,25 @@ async fn maybe_push_reload_with<Model, Msg>(
     }
 }
 
-/// Await the FIRST shutdown signal (SIGINT or SIGTERM), then run the graceful
-/// teardown and return so axum's `with_graceful_shutdown` drains in-flight
-/// connections and the serve future resolves `Ok(())` (→ the IpeTask is `Ok` →
-/// the generated entry exits 0).
+/// `serve_web`'s shutdown plan: the dev reload push, then the console child's stop.
 ///
-/// Two escapes guard against the drain hanging — both keep the no-panic thesis:
-///  - A bounded grace timer that force-exits 0 (CLEAN) after `grace`,
-///    so a never-idle SSE stream can't wedge the process (drops long-lived
-///    connections rather than waiting).
-///  - A SECOND signal (Ctrl-C twice) that force-exits 130 immediately.
-///
-/// Robustness: a failed SIGTERM registration must NOT crash — it degrades to
-/// SIGINT-only (`ctrl_c`). On non-unix only `ctrl_c` is available.
+/// The reload push runs before the drain, so a connected browser refetches at
+/// once instead of waiting out its reconnect backoff; it is dev-gated. The
+/// console child is tracked in a `static` whose `kill_on_drop` never runs on a
+/// process exit, so its explicit stop here is what leaves no orphan child.
 #[cfg(feature = "server")]
-async fn web_shutdown_signal<Model, Msg>(
+fn web_shutdown_plan<Model, Msg>(
     store: Arc<dyn store::SessionStore<Model, Msg>>,
-    grace: std::time::Duration,
-) where
+) -> crate::server::shutdown::ShutdownPlan
+where
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    // First press: block until SIGINT or SIGTERM arrives.
-    wait_for_term_or_int().await;
-
-    // Print to stdout. The leading newline keeps the `^C` echo on its own line.
-    crate::system::write_stdout_line("\nIpe.Web shutting down…");
-
-    // Flip readyz → draining so orchestrators stop routing new traffic while
-    // in-flight requests finish.
-    observability::mark_draining();
-
-    // Dev-only proactive `event: reload` push to every locally-live SSE
-    // session, fired once the shutdown is committed and BEFORE the bounded
-    // grace-timer drain begins — a connected browser refetches immediately
-    // instead of waiting out its reconnect backoff. Production-gated (H23).
-    maybe_push_reload_to_web_sessions(&store).await;
-
-    // Tear down the console child, if one was spawned. Idempotent no-op when
-    // none exists.
-    // Load-bearing: the child is tracked in a `static` whose `Drop`
-    // (`kill_on_drop`) never runs on `process::exit`, so this explicit
-    // `start_kill` is what prevents an orphan console child after a clean exit.
-    // Absent when `http_client` is not active: the console proxy uses reqwest.
+    let plan = crate::server::shutdown::ShutdownPlan::new("web")
+        .then(move || async move { maybe_push_reload_to_web_sessions(&store).await });
     #[cfg(all(feature = "web", feature = "http_client"))]
-    console_proxy::shutdown_console();
-
-    // Telemetry export pipelines (push/hub exporters) flush every ~2 s on a
-    // tick. The channel-close drain ONLY runs when the mpsc Sender is dropped,
-    // which requires Drop — and `process::exit` skips Drop entirely. The
-    // grace-timer and watchdog paths below end through `system::exit_process`,
-    // whose pre-exit stage sends a Flush sentinel to each active exporter and
-    // waits at most the larger exporter flush deadline; it is best-effort
-    // (telemetry only, never user data) and never hangs shutdown.
-
-    // Grace timer: force a CLEAN exit-0 after the window so a never-idle SSE
-    // connection can't hang the drain. Spawned (not awaited) so we still return
-    // immediately and let the axum drain
-    // win the race when there are no long-lived connections (the common case →
-    // sub-window exit). Exit 0 keeps the IpeTask-Ok / exit-0 contract.
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        // Defense-in-depth: kill the console child again in case it was spawned
-        // after the first teardown call (shutdown_console is idempotent).
-        #[cfg(all(feature = "web", feature = "http_client"))]
-        console_proxy::shutdown_console();
-        // The exit funnel flushes the exporters before the process ends.
-        crate::system::exit_process(0);
-    });
-
-    // Second press: a watchdog that force-exits 130 if the user hits Ctrl-C
-    // again while the drain is in progress. Spawned (not awaited).
-    tokio::spawn(async {
-        wait_for_term_or_int().await;
-        crate::system::write_stderr_line("Ipe.Web: forcing exit (second signal)");
-        #[cfg(all(feature = "web", feature = "http_client"))]
-        console_proxy::shutdown_console();
-        // 128 + SIGINT(2); the exit funnel flushes the exporters first.
-        crate::system::exit_process(130);
-    });
-    // Return → axum drains in-flight connections → serve future resolves Ok
-    // (fast path when nothing long-lived is open; otherwise the grace timer
-    // force-exits 0). The graceful return path also flushes exporters to cover
-    // the no-open-connections fast exit where process tear-down follows quickly.
-    flush_exporters().await;
-}
-
-/// Resolve when the next SIGINT or SIGTERM arrives. Total + robust: if SIGTERM
-/// can't be registered (rare), fall back to SIGINT (`ctrl_c`) only rather than
-/// panicking. On non-unix, only `ctrl_c` exists.
-#[cfg(feature = "server")]
-async fn wait_for_term_or_int() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            // SIGTERM registration failed — degrade to SIGINT only.
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    let plan = plan.then(|| async { console_proxy::shutdown_console() });
+    plan
 }
 
 /// `Ipe.Web.tea { init, update, view, subscriptions }` — serve via axum.
@@ -5202,15 +5139,19 @@ mod handlers {
             }
         }
 
+        let drain = crate::server::shutdown::drain();
         {
             let tx = tx.clone();
             let mut closer = closer.clone();
+            let mut drain = drain.clone();
             tokio::spawn(async move {
                 loop {
-                    // A closed session stops its heartbeat: the sender clone
-                    // held here must not outlive the session it keeps alive.
+                    // A closed session or a draining server stops its
+                    // heartbeat: the sender clone held here must not outlive
+                    // the stream it keeps alive.
                     tokio::select! {
                         () = session_closed(&mut closer) => break,
+                        () = drain.wait() => break,
                         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
                     }
                     if tx
@@ -5245,22 +5186,7 @@ mod handlers {
         // disconnect axum drops the body → this Arc releases.
         // The closer ends the stream when the session is closed, although
         // the driver, Cmd tasks and the heartbeat may still hold senders.
-        let body_stream = futures_util::stream::unfold(
-            (rx, SessionGauge, entry, closer),
-            |(mut rx, guard, entry, mut closer)| async move {
-                let frame = tokio::select! {
-                    biased;
-                    () = session_closed(&mut closer) => None,
-                    frame = rx.recv() => frame,
-                };
-                frame.map(|SsePatch(s)| {
-                    (
-                        Ok::<_, std::io::Error>(axum::body::Bytes::from(s)),
-                        (rx, guard, entry, closer),
-                    )
-                })
-            },
-        );
+        let body_stream = session_stream(rx, (SessionGauge, entry), closer, drain);
         match Response::builder()
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
@@ -6794,7 +6720,7 @@ where
         Ok(app) => app,
         Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
-    let grace = match shutdown_grace() {
+    let grace = match crate::server::shutdown::shutdown_grace() {
         Ok(grace) => grace,
         Err(refusal) => {
             return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
@@ -6827,6 +6753,16 @@ where
     // value resolved and recorded above, before the console gates.
     let port = resolved.port.get();
     let addr = host.addr(port);
+    // Armed before the bind, so no accepted connection precedes the owner.
+    let armed = match crate::server::shutdown::arm(web_shutdown_plan(shutdown_store), grace) {
+        Ok(armed) => armed,
+        Err(e) => {
+            return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
+                "Web.tea: shutdown signals: {}",
+                crate::system::scrub_log_controls(&e.to_string())
+            ))));
+        }
+    };
     // Logs the bind-address line (stderr), and the exposure warning if any.
     let listener = match crate::server::bind_app_listener("web", host, port).await {
         Ok(l) => l,
@@ -6838,13 +6774,13 @@ where
     };
     // User-facing status line on stdout.
     crate::system::emit_runtime_log_stdout("web", &format!("listening on :{port}"));
-    // Graceful shutdown: trap SIGINT/SIGTERM,
-    // print the shutdown line, drain in-flight requests, and return cleanly so
-    // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
-    // SECOND signal force-exits 130 via the watchdog inside web_shutdown_signal.
-    match crate::server::serve_app(listener, app, web_shutdown_signal(shutdown_store, grace)).await
-    {
-        Ok(()) => ok_res(()),
+    match crate::server::serve_app(listener, app, armed).await {
+        Ok(crate::server::shutdown::Stopped { .. }) => {
+            // A console child spawned after the plan's teardown is stopped too.
+            #[cfg(all(feature = "web", feature = "http_client"))]
+            console_proxy::shutdown_console();
+            ok_res(())
+        }
         Err(e) => IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
             "Web.tea: serve: {}",
             crate::system::scrub_log_controls(&e.to_string())
@@ -7400,9 +7336,9 @@ mod reload_push_tests {
 
     /// Without a dev intent the reload push is unreachable; with one it
     /// pushes. The env-driven gate under `ENV=dev` on the release test binary
-    /// pushes nothing. (`maybe_push_reload_to_web_sessions` is the exact call
-    /// `web_shutdown_signal` makes right after `mark_draining`, split out so no
-    /// real OS signal is needed here.)
+    /// pushes nothing. (`maybe_push_reload_to_web_sessions` is the exact hook
+    /// `serve_web`'s shutdown plan runs right after `mark_draining`, split out
+    /// so no real OS signal is needed here.)
     #[tokio::test]
     async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
@@ -8643,10 +8579,67 @@ mod admission_control_tests {
     #[test]
     fn web_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(WEB_MAX_BODY_CEILING);
-        crate::system::assert_env_ceiling_contract(SHUTDOWN_GRACE_CEILING);
         for (_, ceiling) in CLIENT_TUNING_CEILINGS {
             crate::system::assert_env_ceiling_contract(ceiling);
         }
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod sse_drain_tests {
+    use super::*;
+    use futures_util::StreamExt as _;
+
+    #[tokio::test]
+    async fn a_draining_sse_body_yields_its_queued_frames_then_ends() {
+        let (armed, signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
+        let (_closer_tx, closer) = tokio::sync::watch::channel(false);
+        let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
+        assert!(tx.send(SsePatch("live".into())).await.is_ok());
+        let first = body.next().await;
+        assert!(matches!(first, Some(Ok(ref b)) if b.as_ref() == b"live"));
+        assert!(tx.send(SsePatch("reload".into())).await.is_ok());
+        assert!(
+            signals
+                .send(crate::server::shutdown::Signal::Terminate)
+                .await
+                .is_ok()
+        );
+        let bound = std::time::Duration::from_secs(5);
+        let last = tokio::time::timeout(bound, body.next()).await;
+        assert!(
+            matches!(last, Ok(Some(Ok(ref b))) if b.as_ref() == b"reload"),
+            "the queued frame is delivered on the drain: {last:?}"
+        );
+        let end = tokio::time::timeout(bound, body.next()).await;
+        assert!(matches!(end, Ok(None)), "the body ends after the drain");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_draining_sse_body_with_nothing_queued_ends_at_once() {
+        let (armed, signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
+        let (_closer_tx, closer) = tokio::sync::watch::channel(false);
+        let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
+        assert!(
+            signals
+                .send(crate::server::shutdown::Signal::Terminate)
+                .await
+                .is_ok()
+        );
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await;
+        assert!(matches!(end, Ok(None)), "an empty drained body ends");
+        drop(tx);
     }
 }
 
