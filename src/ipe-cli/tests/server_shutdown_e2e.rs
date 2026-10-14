@@ -327,11 +327,6 @@ main =
         }
 "#;
 
-/// True when the E2E tier is off and the test must return at once.
-fn skipped() -> bool {
-    e2e_support::e2e_tier() == e2e_support::Tier::Unit
-}
-
 /// Compile `source` with the dev-loop intent, build it, and return the binary.
 ///
 /// # Errors
@@ -355,7 +350,7 @@ fn compile(test_name: &str, source: &str) -> Result<PathBuf, BoxError> {
         ..ipe::BuildOptions::from_env()
     };
     ipe::build_with_options(&entry, &out_dir, &runtime, options)
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe build failed: {e}").into() })?;
+        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;
     Ok(PathBuf::from(exe))
@@ -631,7 +626,7 @@ fn write_one_row(test_name: &str, port: u16) -> Result<(), BoxError> {
 /// file reopens intact with its row.
 #[test]
 fn sigterm_closes_the_pools_and_leaves_an_intact_database() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "sigterm_db";
@@ -716,7 +711,7 @@ fn signalled_twice(test_name: &str, signal: &str) -> Result<(Served, ExitStatus)
 /// E2: a second SIGTERM during the drain exits 143 with one forcing line.
 #[test]
 fn a_second_sigterm_forces_exit_143() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "second_sigterm";
@@ -744,7 +739,7 @@ fn a_second_sigterm_forces_exit_143() -> Result<(), BoxError> {
 /// E3: a second SIGINT during the drain exits 130.
 #[test]
 fn a_second_sigint_forces_exit_130() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "second_sigint";
@@ -772,7 +767,7 @@ fn a_second_sigint_forces_exit_130() -> Result<(), BoxError> {
 /// process ends by SIGTERM, with no shutdown line.
 #[test]
 fn a_signal_before_the_listener_takes_the_os_default() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "before_bind";
@@ -800,7 +795,7 @@ fn a_signal_before_the_listener_takes_the_os_default() -> Result<(), BoxError> {
 /// E5: a request in flight inside the grace gets its full 200, then exit 0.
 #[test]
 fn a_request_in_flight_completes_before_the_exit() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "in_flight";
@@ -845,7 +840,7 @@ fn a_request_in_flight_completes_before_the_exit() -> Result<(), BoxError> {
 /// bound: grace, settle and both pool-close stages, plus slack.
 #[test]
 fn a_stuck_request_never_holds_the_exit_past_its_bound() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "stuck";
@@ -901,7 +896,7 @@ fn session_cookie(response: &str) -> Option<String> {
 /// process exits 0 with one shutdown line.
 #[test]
 fn an_open_sse_stream_ends_cleanly_on_sigterm() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "web_sse";
@@ -1004,7 +999,7 @@ fn read_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), BoxError> {
 /// the process exits 0.
 #[test]
 fn a_websocket_client_receives_going_away_on_sigterm() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "websocket";
@@ -1064,7 +1059,7 @@ fn a_websocket_client_receives_going_away_on_sigterm() -> Result<(), BoxError> {
 /// E9: an `Http.Server`-only app builds, and SIGTERM exits 0 with one line.
 #[test]
 fn a_server_only_app_exits_zero_on_sigterm() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "server_only";
@@ -1112,7 +1107,7 @@ fn get_with_session(port: u16, path: &str, sid: &str) -> Result<String, BoxError
 /// one shutdown line, and its session file keeps no `-wal` or `-shm`.
 #[test]
 fn a_sqlite_session_store_closes_on_sigterm() -> Result<(), BoxError> {
-    if skipped() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "web_session_db";

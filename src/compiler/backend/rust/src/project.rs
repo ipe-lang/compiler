@@ -3983,7 +3983,7 @@ fn ssrf_cargo_toml(base: &str) -> DResult<String> {
 /// Build the server-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"server"` to the `default` feature list.
-/// 2. Extending the `tokio` dependency line with the `"net"` and `"sync"`
+/// 2. Extending the `tokio` dependency line with the `"net"`, `"sync"` and `"signal"`
 ///    features (required by `server.rs`'s `TcpListener` and `mpsc` usage).
 /// 3. Appending `axum`, `tower-http` (with `timeout`), and `tower` (with
 ///    `limit`) dependency lines before `[profile.dev]` — the latter two back
@@ -4013,7 +4013,7 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::TOKIO.version,
     );
     let tokio_net_sync = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"net\", \"sync\"] }}",
+        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"net\", \"sync\", \"signal\"] }}",
         crate_specs::TOKIO.name,
         crate_specs::TOKIO.version,
     );
@@ -4081,7 +4081,9 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         });
     }
 
-    // Step 2 — extend the tokio dependency line with "net" and "sync".
+    // Step 2 — extend the tokio dependency line with "net", "sync" and "signal"
+    // (the vendored `server/shutdown.rs` drains on `tokio::signal`, as the
+    // runtime's own `server` feature enables `tokio/signal`).
     let step2 = step1.replacen(&tokio_time, &tokio_net_sync, 1);
     if step2 == step1 {
         return Err(Diagnostic::CompilerBug {
@@ -4140,9 +4142,9 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     // the parent-death floor the live console-proxy relies on), so that single
     // cfg-gated declaration covers every need — adding it again would emit a
     // duplicate `rustix` key and produce invalid TOML.
-    // The `live` runtime mainline uses `tokio::signal` + `tokio::process`; the base
-    // golden emits `net`+`sync` for the HTTP server, so add the two missing features.
-    const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\"]";
+    // The `live` runtime mainline uses `tokio::process`; the server manifest emits
+    // `net`+`sync`+`signal` for the HTTP server, so add the one missing feature.
+    const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\"]";
     const TOKIO_LIVE_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\", \"process\"]";
     // `db_cargo_toml` now always emits both `"sqlite"` and `"postgres"` sqlx
     // features (since `external_conn.rs` uses `sqlx::postgres` unconditionally).
@@ -4249,8 +4251,8 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
     //
     // The tui runtime uses `tokio::sync::mpsc`; add `"sync"` when it is not
     // yet present.  The base golden has only `"time"` in the tokio feature list;
-    // server_cargo_toml adds `"net", "sync"`; web_cargo_toml extends to include
-    // `"signal", "process"`.  We gate on the SMALLEST known form that lacks
+    // server_cargo_toml adds `"net", "sync", "signal"`; web_cargo_toml extends to
+    // include `"process"`.  We gate on the SMALLEST known form that lacks
     // `"sync"` and replace it with the tui-extended form.  If `"sync"` is
     // already present (because server_cargo_toml ran first) the replacen is a
     // no-op and we do NOT error — `"sync"` is idempotent to add.
@@ -5995,10 +5997,11 @@ mod tests {
             out.contains("server = []"),
             "manifest must declare the server feature: {out}"
         );
-        // tokio net + sync features must be added.
+        // tokio net + sync + signal features must be added (the vendored
+        // `server/shutdown.rs` uses `tokio::signal`).
         assert!(
-            out.contains(r#""net""#) && out.contains(r#""sync""#),
-            "tokio must gain net + sync features: {out}"
+            out.contains(r#""net""#) && out.contains(r#""sync""#) && out.contains(r#""signal""#),
+            "tokio must gain net + sync + signal features: {out}"
         );
         // axum + tower-http + tower deps must be present. The front-door DoS
         // ceilings need `tower-http`'s `timeout` (per-request `TimeoutLayer`)
