@@ -825,7 +825,7 @@ pub(crate) const SCRUB_TRUNCATED: &str = "\\…";
 /// to its input, so a hazard in a remote request path or an ingested record
 /// shows as a visible escape and two distinct inputs never record alike.
 #[cfg_attr(
-    not(all(feature = "web-core", feature = "server")),
+    not(feature = "web"),
     allow(dead_code) // only the served request log and console ingest call it
 )]
 pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
@@ -878,13 +878,12 @@ pub(crate) fn write_stderr_line(line: &str) {
 /// (`ipe-app | head`) can never abort the process;
 /// `tests/no_panicking_print_macro.rs` refuses any production print macro.
 /// Always compiled, like its stderr sibling, so no feature combination can
-/// leave a caller without it; only `log`, `db` and the served `web` surface
-/// call it.
+/// leave a caller without it; only `log`, `db` and a served app call it.
 #[cfg_attr(
     not(any(
         feature = "log",
         feature = "db",
-        all(feature = "web-core", feature = "server")
+        feature = "server"
     )),
     allow(dead_code) // no stdout-writing module in this feature set
 )]
@@ -903,8 +902,8 @@ pub(crate) enum LogStream {
     Stderr,
     /// User-facing status lines that sit beside program output.
     #[cfg_attr(
-        not(all(feature = "web-core", feature = "server")),
-        allow(dead_code) // only the served web surface writes a status line to stdout
+        not(feature = "server"),
+        allow(dead_code) // only a served app writes a status line to stdout
     )]
     Stdout,
 }
@@ -967,14 +966,14 @@ pub(crate) fn emit_runtime_log(tag: &str, msg: &str) {
 
 /// `emit_runtime_log` for a line that carries a timestamp after its tag (the
 /// memory session-store startup line).
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 pub(crate) fn emit_runtime_log_stamped(stamp: &str, tag: &str, msg: &str) {
     let stream = LogStream::Stderr;
     stream.write_line(&runtime_log_line(stream, Some(stamp), tag, msg));
 }
 
 /// `emit_runtime_log` for a user-facing status line written to stdout.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "server")]
 pub(crate) fn emit_runtime_log_stdout(tag: &str, msg: &str) {
     let stream = LogStream::Stdout;
     stream.write_line(&runtime_log_line(stream, None, tag, msg));
@@ -3086,23 +3085,33 @@ pub fn run_exit_hook() {
     }
 }
 
+/// The teardown `process::exit` would otherwise skip, in order: the registered
+/// exit hook (terminal restore); then, in a build with the telemetry exporters,
+/// a flush of their buffered batches bounded by the exporters' flush deadline;
+/// then the stop of the console child and the removal of its store directory,
+/// after the flush that may still push to it.
+///
+/// A stage that panics is abandoned, never the exit: each stage runs under
+/// `catch_unwind`, so the process ends whatever a stage does (a tokio
+/// thread-start refusal inside the flush's `block_in_place`, a panicking
+/// hook). Without that, the panic would unwind out of the `-> !` exit and the
+/// caller (a shutdown grace timer, a second signal) would keep running.
+pub(crate) fn run_pre_exit_stages() {
+    let _ = std::panic::catch_unwind(run_exit_hook);
+    #[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
+    {
+        let _ = std::panic::catch_unwind(crate::web::flush_exporters_before_exit);
+        let _ = std::panic::catch_unwind(crate::web::console_proxy::shutdown_console);
+    }
+}
+
 /// Ends the process with `code` after every pre-exit stage has run.
 ///
 /// The one process exit in the runtime; the runtime `clippy.toml` denies
 /// `std::process::exit` everywhere else. `process::exit` skips Drop, so the
-/// stages Drop would have run happen here first: the registered exit hook
-/// (terminal restore), then, in a build with the telemetry exporters, a flush
-/// of their buffered batches bounded by the exporters' flush deadline.
-///
-/// A stage that panics is abandoned, never the exit: each stage runs under
-/// `catch_unwind`, so the process ends with `code` whatever a stage does (a
-/// tokio thread-start refusal inside the flush's `block_in_place`, a panicking
-/// hook). Without that, the panic would unwind out of this `-> !` call and the
-/// caller (a shutdown grace timer, a watchdog) would keep running.
+/// stages Drop would have run happen here first (`run_pre_exit_stages`).
 pub fn exit_process(code: i32) -> ! {
-    let _ = std::panic::catch_unwind(run_exit_hook);
-    #[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
-    let _ = std::panic::catch_unwind(crate::web::flush_exporters_before_exit);
+    run_pre_exit_stages();
     #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
     std::process::exit(code);
@@ -3458,6 +3467,149 @@ fn assert_decimal_contract(
             "{name}: a refused zero is refused"
         ),
         ZeroCeiling::Accepted => assert_eq!(parse("0"), Ok(0), "{name}: zero is accepted"),
+    }
+}
+
+/// A set of signals, bit `n - 1` standing for signal `n`.
+///
+/// The one reading of an inherited signal disposition: a served app and the
+/// `ipe` CLI both decide from it which stop signals to honour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalSet(pub u64);
+
+impl SignalSet {
+    /// Whether `signal` is in the set; a number outside `1..=64` never is.
+    #[must_use]
+    pub fn contains(self, signal: std::ffi::c_int) -> bool {
+        u32::try_from(signal)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|bit| 1u64.checked_shl(bit))
+            .is_some_and(|bit| self.0 & bit != 0)
+    }
+
+    /// The set a field of hexadecimal digits spells, at most 64 bits wide.
+    ///
+    /// Only digits are accepted: an empty field, a sign or any other byte is
+    /// refused, so no malformed mask reads as a set.
+    #[must_use]
+    pub fn from_hex(field: &str) -> Option<Self> {
+        if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(field, 16).ok().map(Self)
+    }
+}
+
+/// A signal-disposition mask line of a `/proc/<pid>/status` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusMask {
+    /// `SigIgn:`, the signals ignored.
+    Ignored,
+    /// `SigCgt:`, the signals a handler catches.
+    Caught,
+}
+
+impl StatusMask {
+    /// The line's key, colon included.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Ignored => "SigIgn:",
+            Self::Caught => "SigCgt:",
+        }
+    }
+}
+
+/// The `mask` set of a `/proc/<pid>/status` text.
+///
+/// The first line keyed by `mask` is read, its value trimmed of surrounding
+/// whitespace and parsed by [`SignalSet::from_hex`]; an absent or malformed
+/// line is `None`.
+#[must_use]
+pub fn status_mask(status: &str, mask: StatusMask) -> Option<SignalSet> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(mask.key()))
+        .and_then(|value| SignalSet::from_hex(value.trim_ascii()))
+}
+
+/// The most of `/proc/self/status` read for its signal masks.
+pub const PROC_STATUS_READ_CEILING: u64 = 64 * 1024;
+
+/// This process's `/proc/self/status`, at most [`PROC_STATUS_READ_CEILING`]
+/// bytes of it; `None` when it cannot be read.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn read_self_status() -> Option<String> {
+    use std::io::Read as _;
+    let mut status = String::new();
+    std::fs::File::open("/proc/self/status")
+        .and_then(|file| {
+            file.take(PROC_STATUS_READ_CEILING)
+                .read_to_string(&mut status)
+        })
+        .ok()
+        .map(|_| status)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod signal_mask_tests {
+    use super::{SignalSet, StatusMask, status_mask};
+
+    /// Every `SigIgn:` value shape, with the set it must read as.
+    const SIG_IGN_CASES: &[(&str, Option<u64>)] = &[
+        ("SigIgn:\t0000000000004002\n", Some(0x4002)),
+        ("SigIgn:\t1\n", Some(1)),
+        ("SigIgn:\tffffffffffffffff\n", Some(u64::MAX)),
+        ("SigIgn:\tFFFFFFFFFFFFFFFF\n", Some(u64::MAX)),
+        ("SigIgn:\tAbCd\n", Some(0xabcd)),
+        ("SigIgn: 4000 \n", Some(0x4000)),
+        ("SigIgn:\t00000000000000000000000000000001\n", Some(1)),
+        ("SigIgn:\t10000000000000000\n", None),
+        ("SigIgn:\t\n", None),
+        ("SigIgn:", None),
+        ("SigIgn:\tzz\n", None),
+        ("SigIgn:\t+1\n", None),
+        ("SigIgn:\t-1\n", None),
+        ("SigIgn:\t0x10\n", None),
+        ("SigIgn:\t1 2\n", None),
+        ("SigIgn:\t\u{661}\n", None),
+        ("sigign:\t1\n", None),
+        ("Name:\tapp\n", None),
+        ("", None),
+        ("Name:\tapp\nSigIgn:\t2\nSigIgn:\t4\n", Some(2)),
+    ];
+
+    #[test]
+    fn every_sig_ign_shape_reads_as_its_set() {
+        for &(status, expected) in SIG_IGN_CASES {
+            assert_eq!(
+                status_mask(status, StatusMask::Ignored),
+                expected.map(SignalSet),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_caught_mask_is_its_own_line() {
+        let status = "SigIgn:\t1\nSigCgt:\t4000\n";
+        assert_eq!(
+            status_mask(status, StatusMask::Caught),
+            Some(SignalSet(0x4000))
+        );
+        assert_eq!(status_mask("SigIgn:\t1\n", StatusMask::Caught), None);
+    }
+
+    #[test]
+    fn a_signal_outside_one_to_sixty_four_is_never_in_a_set() {
+        let all = SignalSet(u64::MAX);
+        assert!(all.contains(1));
+        assert!(all.contains(64));
+        assert!(!all.contains(0));
+        assert!(!all.contains(-1));
+        assert!(!all.contains(65));
+        assert!(SignalSet(0x4000).contains(15), "SIGTERM is bit 14");
     }
 }
 

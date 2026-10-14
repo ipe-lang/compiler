@@ -1272,14 +1272,14 @@ const RUNTIME_MOD_RS_TUI_APPEND: &str = "pub mod terminal_access;\n\
 /// the render core it draws through is declared by
 /// [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (which fires for `uses_web || uses_webview`
 /// and pulls in the ONE real `web` module — server items inside stay
-/// `#[cfg(feature = "server")]`, so a webview build compiles only the render core).
+/// `#[cfg(feature = "web")]`, so a webview build compiles only the render core).
 const RUNTIME_MOD_RS_WEBVIEW_APPEND: &str = "#[cfg(feature = \"webview\")]\npub mod webview;\n\
      #[cfg(feature = \"webview\")]\npub use webview::{webview_app, WebViewWindowCfg};\n";
 
 /// The server-free render core, declared for EVERY render host (`uses_web ||
 /// uses_webview`): the ONE real `web` module (which compiles to just its
-/// render-core under `web-core` alone — every axum/SSE/session item inside is
-/// `#[cfg(feature = "server")]`) plus the pure `page_shell` scaffold
+/// render-core without `web`, `server` on or off — every axum/SSE/session item inside is
+/// `#[cfg(feature = "web")]`) plus the pure `page_shell` scaffold
 /// (`web_page_core`). The native-window `webview` backend renders through
 /// `web::dispatch` / `web::style_inject` / `web::page_shell` / `web::route` over
 /// a local IPC bridge — NO axum `server`, NO SSE, NO session store. The full
@@ -1328,7 +1328,7 @@ const RUNTIME_MOD_RS_LITERAL_TABLE_APPEND: &str = "#[cfg(any(feature = \"web-cor
 /// The `web` module itself is declared by [`RUNTIME_MOD_RS_WEB_CORE_APPEND`]
 /// (shared with the webview render host). This append layers ONLY the extra
 /// crate-root modules the SERVER surface of `web/mod.rs` reaches by absolute path
-/// under `#[cfg(feature = "server")]` — `crate::widget_assets`
+/// under `#[cfg(feature = "web")]` — `crate::widget_assets`
 /// (`pub use crate::widget_assets;`), `crate::js_port_glue` (SRI-pinned Ffi.Js
 /// port asset), and `crate::js_port` (the port session/sink) — plus the server
 /// entry re-exports. In the real runtime crate the `web` feature lists
@@ -3983,7 +3983,7 @@ fn ssrf_cargo_toml(base: &str) -> DResult<String> {
 /// Build the server-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"server"` to the `default` feature list.
-/// 2. Extending the `tokio` dependency line with the `"net"` and `"sync"`
+/// 2. Extending the `tokio` dependency line with the `"net"`, `"sync"` and `"signal"`
 ///    features (required by `server.rs`'s `TcpListener` and `mpsc` usage).
 /// 3. Appending `axum`, `tower-http` (with `timeout`), and `tower` (with
 ///    `limit`) dependency lines before `[profile.dev]` — the latter two back
@@ -4013,7 +4013,7 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::TOKIO.version,
     );
     let tokio_net_sync = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"net\", \"sync\"] }}",
+        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"net\", \"sync\", \"signal\"] }}",
         crate_specs::TOKIO.name,
         crate_specs::TOKIO.version,
     );
@@ -4081,7 +4081,9 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         });
     }
 
-    // Step 2 — extend the tokio dependency line with "net" and "sync".
+    // Step 2 — extend the tokio dependency line with "net", "sync" and "signal"
+    // (the vendored `server/shutdown.rs` drains on `tokio::signal`, as the
+    // runtime's own `server` feature enables `tokio/signal`).
     let step2 = step1.replacen(&tokio_time, &tokio_net_sync, 1);
     if step2 == step1 {
         return Err(Diagnostic::CompilerBug {
@@ -4140,9 +4142,9 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     // the parent-death floor the live console-proxy relies on), so that single
     // cfg-gated declaration covers every need — adding it again would emit a
     // duplicate `rustix` key and produce invalid TOML.
-    // The `live` runtime mainline uses `tokio::signal` + `tokio::process`; the base
-    // golden emits `net`+`sync` for the HTTP server, so add the two missing features.
-    const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\"]";
+    // The `live` runtime mainline uses `tokio::process`; the server manifest emits
+    // `net`+`sync`+`signal` for the HTTP server, so add the one missing feature.
+    const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\"]";
     const TOKIO_LIVE_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\", \"process\"]";
     // `db_cargo_toml` now always emits both `"sqlite"` and `"postgres"` sqlx
     // features (since `external_conn.rs` uses `sqlx::postgres` unconditionally).
@@ -4249,8 +4251,8 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
     //
     // The tui runtime uses `tokio::sync::mpsc`; add `"sync"` when it is not
     // yet present.  The base golden has only `"time"` in the tokio feature list;
-    // server_cargo_toml adds `"net", "sync"`; web_cargo_toml extends to include
-    // `"signal", "process"`.  We gate on the SMALLEST known form that lacks
+    // server_cargo_toml adds `"net", "sync", "signal"`; web_cargo_toml extends to
+    // include `"process"`.  We gate on the SMALLEST known form that lacks
     // `"sync"` and replace it with the tui-extended form.  If `"sync"` is
     // already present (because server_cargo_toml ran first) the replacen is a
     // no-op and we do NOT error — `"sync"` is idempotent to add.
@@ -6001,10 +6003,11 @@ mod tests {
             out.contains("server = []"),
             "manifest must declare the server feature: {out}"
         );
-        // tokio net + sync features must be added.
+        // tokio net + sync + signal features must be added (the vendored
+        // `server/shutdown.rs` uses `tokio::signal`).
         assert!(
-            out.contains(r#""net""#) && out.contains(r#""sync""#),
-            "tokio must gain net + sync features: {out}"
+            out.contains(r#""net""#) && out.contains(r#""sync""#) && out.contains(r#""signal""#),
+            "tokio must gain net + sync + signal features: {out}"
         );
         // axum + tower-http + tower deps must be present. The front-door DoS
         // ceilings need `tower-http`'s `timeout` (per-request `TimeoutLayer`)
@@ -6539,7 +6542,7 @@ mod tests {
     /// `seal_modset::cmd_publish_no_live_builds`).  The `web` module itself is
     /// declared by [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (shared with the webview
     /// render host, pushed BEFORE this append); each server-only crate-root
-    /// module rides [`RUNTIME_MOD_RS_WEB_APPEND`] under `#[cfg(feature = "server")]`.
+    /// module rides [`RUNTIME_MOD_RS_WEB_APPEND`] under `#[cfg(feature = "web")]`.
     #[test]
     fn web_mod_rs_declares_widget_assets_and_js_port_closure() {
         assert!(

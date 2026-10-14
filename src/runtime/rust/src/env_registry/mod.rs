@@ -38,7 +38,7 @@ impl Feature {
             Self::Always => true,
             Self::Log => cfg!(feature = "log"),
             Self::Server => cfg!(feature = "server"),
-            Self::Web => cfg!(all(feature = "web-core", feature = "server")),
+            Self::Web => cfg!(feature = "web"),
         }
     }
 }
@@ -523,7 +523,7 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
         if let Err(refusal) = crate::log::startup_check() {
             refusals.push(refusal);
         }
-        #[cfg(all(feature = "web-core", feature = "server"))]
+        #[cfg(feature = "web")]
         crate::web::csrf::fix_origin_check();
     }
     if refusals.is_empty() {

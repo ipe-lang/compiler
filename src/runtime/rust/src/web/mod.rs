@@ -7,11 +7,11 @@ pub use crate::dom::dispatch;
 pub use diff::*;
 pub use dispatch::*;
 // `sse` is the axum Server-Sent-Events patch channel — server-only.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub mod sse;
 pub use crate::dom::form;
 pub use form::*;
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use sse::*;
 // The appearance-literal table now lives at the crate root (a pure, dev-loop
 // module shared with the loopback tui/cli hot-swap path, which links no
@@ -26,15 +26,15 @@ pub use route::*;
 // `console` (dev telemetry ingest) and `csrf` (axum CSRF middleware +
 // `crate::server` re-exports) are axum/`server`-only. `style_inject` is pure
 // render-core and stays unconditional.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub mod console;
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub mod csrf;
 // A cookieless page request proves its Fetch Metadata before a session is minted.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 mod mint_proof;
 // Every byte a session keeps resident is charged against a nested byte budget.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 mod budget;
 pub mod style_inject;
 // Custom-element (`CustomElement.node`) registration glue + SRI-pinned author-JS serving.
@@ -46,7 +46,7 @@ pub mod style_inject;
 // once at process start by the generated `main`; inert for a widget-free program.
 // Rides the `web` feature (which lists `widget-assets`); the server surface is
 // its only in-module consumer.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use crate::widget_assets;
 // Pre-built console child + reverse-proxy — spawns the bundled console
 // binary and proxies /_ipe/console/*; falls back to in-process `console` when the
@@ -57,7 +57,7 @@ pub use crate::widget_assets;
 #[cfg(all(feature = "web", feature = "http_client"))]
 pub mod console_proxy;
 // Observability middleware + noise ingest — axum request/response types, server-only.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub mod observability;
 // Observability export pipelines: federation push to a parent ingest
 // and remote-hub OTLP push. Both env-gated + inert by default.
@@ -77,20 +77,20 @@ pub use hub::*;
 // `req` builds a `WebReq` from an axum request; `store` is the axum/sqlx session
 // store — both server-only. Render hosts take their `WebReq` from the
 // target-neutral `crate::dom::req` instead.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub mod req;
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use req::*;
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub mod store;
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use store::*;
 // Additive-superset Model reconstruction: keeps a returning session's state
 // when the app's `Model` gains a new field (see the module doc). A pure,
 // self-contained decision + splice over a self-describing checkpoint body.
 pub mod additive;
 // The session-aware pub/sub broker (`crate::tea` + tokio broadcast) — server-only.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub mod pubsub;
 // Inert `update`-arm transitions: the logic counterpart of the appearance
 // `literal_table`. A data-describable `update` arm (a field record-update, a
@@ -142,7 +142,7 @@ pub use cmd_wiring::{fire_cmd_wiring, select_cmd_hot, select_effect};
 // `ipe_runtime::Event`. The broker internals (`Event`, `Broker`, `broker`,
 // `subscribe`, `publish`) are `pub(crate)` in pubsub.rs — they never leave the
 // crate, so they don't need re-exporting here.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use pubsub::{
     cmd_publish, cmd_publish_no_echo, pubsub_publish, pubsub_publish_no_echo, sub_subscribe_topic,
 };
@@ -151,10 +151,10 @@ pub use pubsub::{
 // re-export them so live submodules (diff.rs, store.rs, …) that `use super::*`
 // still see Html / Attribute / Event / render_html / html_render_. The render
 // core reaches `crate::html` directly, so the re-export rides the server surface.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use crate::html::*;
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use super::*;
 
 /// Body returned with a session-miss 404 from `/_ipe/event` and `/_ipe/sse`.
@@ -166,7 +166,7 @@ use super::*;
 /// the same string; diverging it (the old `"no session"` body) silently broke
 /// recovery after a server restart — the browser shows "Reconnecting…" forever.
 /// Guarded by `session_lost_body_tests`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const SESSION_LOST_BODY: &str = "session not found";
 
 // ─── Client assets ────────────────────────────────────────────────────────────
@@ -174,7 +174,7 @@ const SESSION_LOST_BODY: &str = "session not found";
 /// The browser-side Ipe.Web client JS asset. The 12 header `%`-verb
 /// lines are replaced with static literals; the two `%%` CSS escapes are
 /// un-escaped to `%`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const CLIENT_JS: &str = include_str!("client.js");
 
 /// Content-addressing for the client asset: computed ONCE at first access via
@@ -187,11 +187,11 @@ const CLIENT_JS: &str = include_str!("client.js");
 /// Both are derived from the same digest, computed once and interned.
 /// The `sha2` crate is unconditionally available in every generated Web project
 /// (`default` features always include `crypto` which gates `sha2`).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 static CLIENT_JS_HASH: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
 
 /// Return `(hex16, base64full)` for `CLIENT_JS`, computing once on first call.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn client_js_hashes() -> &'static (String, String) {
     CLIENT_JS_HASH.get_or_init(|| {
         use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -207,7 +207,7 @@ fn client_js_hashes() -> &'static (String, String) {
 /// `/_ipe/client.a1b2c3d4e5f6a7b8.js`. The path is stable for a given
 /// `client.js` build and changes whenever the file changes — making
 /// `Cache-Control: immutable` safe. Callers may prepend the sub-app `base`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn client_js_path() -> String {
     let (hex16, _) = client_js_hashes();
     format!("/_ipe/client.{}.js", hex16)
@@ -223,7 +223,7 @@ pub use crate::web_page_core::page_shell;
 
 /// Render `view(model)` to a full HTML page and print it — the static
 /// render path (the interactive server is `web_app`).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn web_render_static<E, Model, Msg, FView>(view: FView, model: Model) -> IpeTask<E, ()>
 where
     E: Send + 'static,
@@ -241,7 +241,7 @@ where
 }
 
 /// Static SSR page: body only, no client JS.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn render_page(body: &str) -> String {
     page_shell("", &format!("<div id=\"ipe-root\">{body}</div>"), "")
 }
@@ -264,7 +264,7 @@ pub fn render_page(body: &str) -> String {
 /// - U+0026 `&` (forecloses HTML character references)
 /// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR (JSON-legal but
 ///   line terminators to older JavaScript parsers)
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn island_escape(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
     for ch in json.chars() {
@@ -280,7 +280,7 @@ pub fn island_escape(json: &str) -> String {
     out
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod island_escape_tests {
     use super::island_escape;
 
@@ -324,7 +324,7 @@ mod island_escape_tests {
 /// The client's numeric tuning ceilings, keyed by their boot-block name.
 ///
 /// The client reads each under `cfg.tuning`; `0` passes through unchanged.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const CLIENT_TUNING_CEILINGS: [(&str, crate::system::EnvCeiling); 8] = {
     const fn tuning(name: &'static str, default: u64) -> crate::system::EnvCeiling {
         crate::system::EnvCeiling::new(
@@ -357,7 +357,7 @@ const CLIENT_TUNING_CEILINGS: [(&str, crate::system::EnvCeiling); 8] = {
 
 /// The client's numeric tuning values, keyed by their [`CLIENT_TUNING_CEILINGS`]
 /// name.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 type ClientTuning = std::collections::BTreeMap<&'static str, u64>;
 
 /// The client's numeric tuning values, resolved once per process.
@@ -365,7 +365,7 @@ type ClientTuning = std::collections::BTreeMap<&'static str, u64>;
 /// [`build_web_router`] refuses to start on a refusal here, so every page a
 /// served app renders reads the resolved `Ok`; a render that still meets a
 /// refusal refuses the page ([`BootRefusal::TuningRefused`]).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn client_tuning() -> &'static Result<ClientTuning, crate::system::EnvCeilingRefusal> {
     static TUNING: std::sync::OnceLock<Result<ClientTuning, crate::system::EnvCeilingRefusal>> =
         std::sync::OnceLock::new();
@@ -381,7 +381,7 @@ fn client_tuning() -> &'static Result<ClientTuning, crate::system::EnvCeilingRef
 ///
 /// `IPE_WEB_BANNER` set to `off`, `0` or `false` turns it off; anything else,
 /// or no value, leaves it on.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn web_banner_enabled() -> bool {
     !matches!(
         crate::system::read_env_var("IPE_WEB_BANNER")
@@ -398,7 +398,7 @@ fn web_banner_enabled() -> bool {
 /// greets a reconnect with a brief "updated ✓" toast instead of the amber
 /// "Reconnecting…" banner. Only the `ipe dev watch` blue-green path sets it; a
 /// release or `ipe dev run` server never does, so it defaults off there.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn web_swap_toast() -> bool {
     matches!(
         crate::system::read_env_var("IPE_WEB_SWAP_TOAST")
@@ -412,7 +412,7 @@ fn web_swap_toast() -> bool {
 ///
 /// Every field is required by the client: it refuses to boot on a missing or
 /// mistyped one, so there is no client-side default to drift from these.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClientConfig<'a> {
@@ -424,7 +424,7 @@ struct ClientConfig<'a> {
     msg_offline: &'a str,
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl<'a> ClientConfig<'a> {
     /// The configuration of this process, over its resolved `tuning`.
     fn from_env(tuning: &'a ClientTuning) -> Self {
@@ -440,7 +440,7 @@ impl<'a> ClientConfig<'a> {
 }
 
 /// The boot data a live page hands its client, serialized as one JSON object.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(serde::Serialize)]
 struct BootConfig<'a> {
     sid: &'a str,
@@ -451,11 +451,11 @@ struct BootConfig<'a> {
 }
 
 /// The `id` of the boot data block; `client.js` reads the element by it.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const BOOT_BLOCK_ID: &str = "ipe-boot";
 
 /// Why a live page could not be built; the page is refused with a 500.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootRefusal {
     /// A client tuning value was refused by its ceiling.
@@ -469,7 +469,7 @@ pub enum BootRefusal {
 /// `serde_json` writes the JSON and [`island_escape`] escapes it for script-data
 /// context, so no field value can end the element, open a comment, or change
 /// how the page parses. A `type="application/json"` script is never executed.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn boot_block(boot: &BootConfig<'_>) -> Result<String, BootRefusal> {
     let json = serde_json::to_string(boot).map_err(|_| BootRefusal::EncodeFailed)?;
     let escaped = island_escape(&json);
@@ -479,7 +479,7 @@ fn boot_block(boot: &BootConfig<'_>) -> Result<String, BootRefusal> {
 }
 
 /// A rendered page's boot data block, parsed as JSON.
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 fn boot_json_of(html: &str) -> Option<serde_json::Value> {
     let open = format!("<script type=\"application/json\" id=\"{BOOT_BLOCK_ID}\">");
     let rest = html.get(html.find(&open)? + open.len()..)?;
@@ -489,7 +489,7 @@ fn boot_json_of(html: &str) -> Option<serde_json::Value> {
 /// Whether the dev watch/status banner endpoint should be mounted.
 ///
 /// [`watch_banner_active_with`] over the process dev intent.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn watch_banner_active(base: &str) -> bool {
     watch_banner_active_with(base, crate::telemetry::dev_intent_from_env().as_ref())
 }
@@ -500,7 +500,7 @@ fn watch_banner_active(base: &str) -> bool {
 /// `IPE_WEB_BANNER` off/0/false), and the app is root-mounted (not a sub-app).
 /// Mirrors the conditions the banner injection already uses so no new env var
 /// is needed.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn watch_banner_active_with(base: &str, dev: Option<&crate::telemetry::DevIntent>) -> bool {
     if dev.is_none() {
         return false;
@@ -519,7 +519,7 @@ fn watch_banner_active_with(base: &str, dev: Option<&crate::telemetry::DevIntent
 /// # Errors
 ///
 /// [`BootRefusal`] when the boot data cannot be built; the page is refused.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn render_page_full(
     sid: &str,
     base: &crate::encoding::MountBase,
@@ -553,7 +553,7 @@ pub fn render_page_full(
 ///
 /// `tuning` is the process's resolved client tuning; a refused one refuses the
 /// page. `overlay` is raw HTML placed after `#ipe-root` (empty for none).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn render_live_page(
     tuning: Result<&ClientTuning, &crate::system::EnvCeilingRefusal>,
     sid: &str,
@@ -614,7 +614,7 @@ fn port_glue_script(base: &str) -> String {
 /// page carries no port `<script>` and `window.ipe` is never wired. Gated with
 /// `server` to match its callers (`render_page_full*`, server-only): the
 /// server-free `web-core` render core reaches neither the stub nor a caller.
-#[cfg(all(feature = "server", not(feature = "widget-assets")))]
+#[cfg(all(feature = "web", not(feature = "widget-assets")))]
 fn port_glue_script(_base: &str) -> String {
     String::new()
 }
@@ -624,7 +624,7 @@ fn port_glue_script(_base: &str) -> String {
 /// The overlay must carry `data-ipe-debugger` so the diff/patch engine ignores
 /// it. The shell, boot block and scripts are the ones [`render_live_page`]
 /// builds for every live page.
-#[cfg(all(feature = "server", feature = "debugger"))]
+#[cfg(all(feature = "web", feature = "debugger"))]
 fn render_page_full_with_overlay(
     sid: &str,
     base: &crate::encoding::MountBase,
@@ -648,42 +648,42 @@ fn render_page_full_with_overlay(
 /// implementation lives in the always-compiled `telemetry` module so the
 /// Ipe.Http.Server path (`server.rs`) shares the identical byte-exact banner;
 /// this is a thin re-export for the Web page renderer.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn dev_console_banner(base: &str) -> String {
     crate::telemetry::dev_console_banner(base)
 }
 
 // ─── web_app: axum mount + per-session TEA driver over SSE ─────────────────
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use crate::retained::{Bytes, RetainedBytes};
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use crate::tea::{IpeCmd, IpeSub, SubRuntime, SubSink};
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use std::sync::{Arc, Mutex, Weak};
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 /// A browser event's Msg waiting for its session's driver.
 ///
 /// It holds the Msg's bytes against the session's budget until the driver
 /// takes it, so a session's queued events count toward its byte ceiling.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub struct QueuedEvent<Msg> {
     msg: Msg,
     charge: budget::Charge,
 }
 
 /// How many browser events one session's driver queue holds.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const EVENT_QUEUE_CAP: usize = 1024;
 
 /// Per-session live state behind an `Arc<Mutex<…>>`. `rendered` is advanced by
 /// every commit; `sse_tx` is filled when the browser attaches the SSE channel;
 /// `msg_tx` and `event_tx` feed the per-session driver loop.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub struct SessionEntry<Model, Msg> {
     pub model: Model,
     /// The last committed view and the handler indexes of the retained
@@ -721,7 +721,7 @@ pub struct SessionEntry<Model, Msg> {
     pub(crate) charge: budget::Charge,
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl<Model: RetainedBytes, Msg: RetainedBytes> SessionEntry<Model, Msg> {
     /// The bytes this session keeps resident, or `None` when a part has no measure.
     fn resident_bytes(&self) -> Option<Bytes> {
@@ -745,7 +745,7 @@ impl<Model: RetainedBytes, Msg: RetainedBytes> SessionEntry<Model, Msg> {
     }
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl<Model, Msg> SessionEntry<Model, Msg> {
     /// The credential section a checkpoint of this session carries.
     ///
@@ -775,7 +775,7 @@ impl<Model, Msg> SessionEntry<Model, Msg> {
 }
 
 /// A live session's credential scope and the switch that ends its channels.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub struct SessionLiveness {
     /// The scope every call into user code on behalf of the session runs in;
     /// it carries the session's bound credentials.
@@ -788,7 +788,7 @@ pub struct SessionLiveness {
     pub rechecks: Arc<AtomicUsize>,
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl SessionLiveness {
     /// The liveness of an open session running under `scope`.
     #[must_use]
@@ -802,7 +802,7 @@ impl SessionLiveness {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 impl Default for SessionLiveness {
     fn default() -> Self {
         Self::new(pubsub::SessionScope::new(String::new()))
@@ -812,7 +812,7 @@ impl Default for SessionLiveness {
 /// Whether a session's bound credentials still stand.
 // Without `jwt` no gate exists, so nothing ever constructs `Revoked`.
 #[cfg_attr(not(feature = "jwt"), allow(dead_code))]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 enum Standing {
@@ -827,7 +827,7 @@ enum Standing {
 /// The gate is resolved at the check and never cached, so the kernel that
 /// binds and every point that enforces read one source. Unarmed, it costs one
 /// branch. A poisoned credential lock proves nothing, so it is `Revoked`.
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 fn recheck_scope(scope: &pubsub::SessionScope, at_least: Option<i64>) -> Standing {
     let Some(gate) = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
     else {
@@ -847,7 +847,7 @@ fn recheck_scope(scope: &pubsub::SessionScope, at_least: Option<i64>) -> Standin
 }
 
 /// Without `jwt` no credential is ever bound, so every session stands.
-#[cfg(all(feature = "server", not(feature = "jwt")))]
+#[cfg(all(feature = "web", not(feature = "jwt")))]
 const fn recheck_scope(_scope: &pubsub::SessionScope, _at_least: Option<i64>) -> Standing {
     Standing::Live
 }
@@ -860,7 +860,7 @@ const fn recheck_scope(_scope: &pubsub::SessionScope, _at_least: Option<i64>) ->
 /// or any credential that no longer re-proves is `Revoked`: the row is never
 /// restored unbound. `scope` holds what the lazy `init` bound, so a rebuilt
 /// row is proved over the persisted set and the new one together.
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 fn prove_persisted(section: &store::CredSection, scope: &pubsub::SessionScope) -> Standing {
     let Some(gate) = crate::revocation::ArmedGate::resolve(crate::revocation::process_mode())
     else {
@@ -884,7 +884,7 @@ fn prove_persisted(section: &store::CredSection, scope: &pubsub::SessionScope) -
 }
 
 /// Without `jwt` no gate exists, so every cold row stands.
-#[cfg(all(feature = "server", not(feature = "jwt")))]
+#[cfg(all(feature = "web", not(feature = "jwt")))]
 const fn prove_persisted(_section: &store::CredSection, _scope: &pubsub::SessionScope) -> Standing {
     Standing::Live
 }
@@ -894,7 +894,7 @@ const fn prove_persisted(_section: &store::CredSection, _scope: &pubsub::Session
 /// A refused row is deleted before its claim is released, so no later request
 /// restores it; the caller's miss path then mints a new sid and runs `init`.
 /// A live hit and a miss pass through unchanged.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn prove_rejoin<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
@@ -928,7 +928,7 @@ where
 /// [`checkpoint`] racing this close either sees it and undoes its write, or
 /// writes before the delete runs. Idempotent: a second close finds nothing
 /// left to end.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn close_session<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
@@ -948,7 +948,7 @@ async fn close_session<Model, Msg>(
 }
 
 /// Whether a [`checkpoint`] left the session in the store.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Checkpoint {
     /// The session is stored and open.
@@ -962,7 +962,7 @@ enum Checkpoint {
 /// The closer is read after the write: a [`close_session`] that flipped it
 /// before this read has its delete repeated here, and one that flips it after
 /// deletes this write itself. A closed session is never stored again.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn checkpoint<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
@@ -988,7 +988,7 @@ where
 }
 
 /// A session a request resolved whose credentials re-proved.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct LiveSession<Model, Msg> {
     /// The sid the session is stored under.
     sid: String,
@@ -997,7 +997,7 @@ struct LiveSession<Model, Msg> {
 }
 
 /// What a sid resolves to in this process.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 enum SessionLookup<Model, Msg> {
     /// The session is live and its credentials re-proved.
     Live(LiveSession<Model, Msg>),
@@ -1010,10 +1010,10 @@ enum SessionLookup<Model, Msg> {
 /// The session-lost answer: 404, `X-Ipê-Web: 1` and [`SESSION_LOST_BODY`].
 ///
 /// The client reloads on exactly this shape.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct SessionLost;
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl axum::response::IntoResponse for SessionLost {
     fn into_response(self) -> axum::response::Response {
         (
@@ -1029,7 +1029,7 @@ impl axum::response::IntoResponse for SessionLost {
 ///
 /// `None` when they no longer stand: the session is closed here and never
 /// handed to the caller.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn admit_live<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
@@ -1059,7 +1059,7 @@ where
 }
 
 /// Resolve `sid` to its live session; the one place a sid becomes a live entry.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn lookup_session<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
@@ -1077,7 +1077,7 @@ where
 }
 
 /// Resolve `sid` to a live session, or the session-lost answer.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn live_session_for<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
@@ -1093,7 +1093,7 @@ where
 }
 
 /// Resolve the session a rejoin proof admits to a live session, or the session-lost answer.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn live_session<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     proof: mint_proof::RejoinProof,
@@ -1106,7 +1106,7 @@ where
 }
 
 /// Why a request's session cookie admits no session.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CookieRefusal {
     /// No cookie, or one that is not a well-formed sid: the session-lost answer.
@@ -1115,7 +1115,7 @@ enum CookieRefusal {
     Refused(mint_proof::RejoinRefusal),
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl axum::response::IntoResponse for CookieRefusal {
     fn into_response(self) -> axum::response::Response {
         match self {
@@ -1130,7 +1130,7 @@ impl axum::response::IntoResponse for CookieRefusal {
 /// # Errors
 ///
 /// The [`CookieRefusal`] naming why the cookie admits no session.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn rejoin_from_cookie(
     headers: &axum::http::HeaderMap,
 ) -> Result<mint_proof::RejoinProof, CookieRefusal> {
@@ -1146,9 +1146,63 @@ fn rejoin_from_cookie(
 /// Resolve once the session's closer reads `true`.
 ///
 /// A dropped closer counts as closed: its session entry is gone.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn session_closed(closer: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = closer.wait_for(|closed| *closed).await;
+}
+
+/// A session's SSE body: its queued frames until the session closes or the server drains.
+///
+/// `keep` lives as long as the body. On a drain the body yields the frames
+/// already queued, at most the channel's capacity, then ends, so a frame a
+/// shutdown hook queued (the dev reload) still reaches the browser.
+#[cfg(feature = "web")]
+fn session_stream<K: Send + 'static>(
+    rx: tokio::sync::mpsc::Receiver<SsePatch>,
+    keep: K,
+    closer: tokio::sync::watch::Receiver<bool>,
+    drain: crate::server::shutdown::Drain,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send {
+    futures_util::stream::unfold(
+        (rx, keep, closer, drain, false),
+        |(mut rx, keep, mut closer, mut drain, drained)| async move {
+            if drained {
+                return None;
+            }
+            let frame = tokio::select! {
+                biased;
+                () = session_closed(&mut closer) => return None,
+                () = drain.wait() => {
+                    let queued = queued_frames(&mut rx);
+                    if queued.is_empty() {
+                        return None;
+                    }
+                    let flushed = Ok(axum::body::Bytes::from(queued));
+                    return Some((flushed, (rx, keep, closer, drain, true)));
+                },
+                frame = rx.recv() => frame,
+            };
+            frame.map(|SsePatch(s)| {
+                (
+                    Ok(axum::body::Bytes::from(s)),
+                    (rx, keep, closer, drain, false),
+                )
+            })
+        },
+    )
+}
+
+/// The frames already queued on `rx`, concatenated, at most its capacity.
+#[cfg(feature = "web")]
+fn queued_frames(rx: &mut tokio::sync::mpsc::Receiver<SsePatch>) -> String {
+    let mut queued = String::new();
+    for _ in 0..rx.max_capacity() {
+        let Ok(SsePatch(frame)) = rx.try_recv() else {
+            break;
+        };
+        queued.push_str(&frame);
+    }
+    queued
 }
 
 /// How long a session waits after a revocation before it re-proves its credentials.
@@ -1156,13 +1210,13 @@ async fn session_closed(closer: &mut tokio::sync::watch::Receiver<bool>) {
 /// A burst of revocations inside one interval costs each open session at most
 /// one recheck beyond the first, whatever the burst size, so a party that can
 /// trigger revocations cannot amplify the recheck rate.
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 const RECHECK_COALESCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Why a session driver woke to re-prove its credentials.
 // Without `jwt` the watch never wakes, so nothing constructs a variant.
 #[cfg_attr(not(feature = "jwt"), allow(dead_code))]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Wake {
     /// A revocation landed; recheck at the current time.
@@ -1178,7 +1232,7 @@ enum Wake {
 /// Subscribed before the session's first credential is admitted, so a
 /// revocation landing between that admission and the driver's start still
 /// wakes the driver.
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 struct RevocationWatch {
     generation: tokio::sync::watch::Receiver<u64>,
     /// When the last coalesced revocation recheck ran.
@@ -1191,7 +1245,7 @@ struct RevocationWatch {
     lost: bool,
 }
 
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 impl RevocationWatch {
     /// Subscribe to the revocation generation.
     fn subscribe() -> Self {
@@ -1260,14 +1314,14 @@ impl RevocationWatch {
 }
 
 /// The timer instant at Unix second `unix`; `None` past the representable range.
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 fn deadline_instant(unix: i64) -> Option<tokio::time::Instant> {
     let wait = u64::try_from(unix.saturating_sub(crate::jwt::now_unix_seconds())).unwrap_or(0);
     tokio::time::Instant::now().checked_add(std::time::Duration::from_secs(wait))
 }
 
 /// Sleep until `at`, or forever when it is `None`.
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
@@ -1276,7 +1330,7 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
 }
 
 /// The standing a [`Wake`] leaves `scope` in.
-#[cfg(all(feature = "server", feature = "jwt"))]
+#[cfg(all(feature = "web", feature = "jwt"))]
 fn standing_after(scope: &pubsub::SessionScope, wake: Wake) -> Standing {
     match wake {
         Wake::Revocation => recheck_scope(scope, None),
@@ -1293,10 +1347,10 @@ fn standing_after(scope: &pubsub::SessionScope, wake: Wake) -> Standing {
 }
 
 /// Without `jwt` there is no revocation generation; the watch never wakes.
-#[cfg(all(feature = "server", not(feature = "jwt")))]
+#[cfg(all(feature = "web", not(feature = "jwt")))]
 struct RevocationWatch;
 
-#[cfg(all(feature = "server", not(feature = "jwt")))]
+#[cfg(all(feature = "web", not(feature = "jwt")))]
 impl RevocationWatch {
     /// A watch that never wakes.
     const fn subscribe() -> Self {
@@ -1313,7 +1367,7 @@ impl RevocationWatch {
 }
 
 /// Without `jwt` every session stands.
-#[cfg(all(feature = "server", not(feature = "jwt")))]
+#[cfg(all(feature = "web", not(feature = "jwt")))]
 const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing {
     Standing::Live
 }
@@ -1327,7 +1381,7 @@ const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing 
 /// `from` / `to` are the epochs the commit moved between: the client applies
 /// the patches only onto the DOM of `from`, then adopts `to`.
 #[derive(serde::Serialize)]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct PatchEnvelope<'a> {
     #[serde(rename = "globalSeq")]
     global_seq: u64,
@@ -1338,7 +1392,7 @@ struct PatchEnvelope<'a> {
 
 /// Push one commit's `patches` frame, empty patches included, so the client's
 /// epoch always follows the server's.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn send_patches_frame(
     sse: Option<SseTx>,
     global_seq: u64,
@@ -1360,21 +1414,21 @@ async fn send_patches_frame(
 }
 
 /// A fresh render-history incarnation from the OS CSPRNG.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub(crate) fn new_incarnation() -> Incarnation {
     Incarnation::from_random_bits(uuid::Uuid::new_v4().as_u128())
 }
 
 /// The number of tabs whose last event seq a session remembers.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub const TAB_SEQ_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(15);
 
 /// The random id a browser tab mints once per page load and echoes with its events.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TabId(u128);
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl TabId {
     /// Parse exactly 32 lowercase hex characters; anything else is `None`.
     #[must_use]
@@ -1392,7 +1446,7 @@ impl TabId {
 
 /// How many seqs at and below a tab's highest dispatched seq its window
 /// remembers one by one.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub const TAB_SEQ_WINDOW: u32 = u128::BITS;
 
 /// The seqs one tab has had dispatched: its highest seq, and for each of the
@@ -1402,7 +1456,7 @@ pub const TAB_SEQ_WINDOW: u32 = u128::BITS;
 /// for the session lock, and a retried event lands after a later one. So an
 /// earlier seq is a duplicate only when that exact seq was dispatched, never
 /// merely because a later one was.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct SeqWindow {
     top: u64,
@@ -1410,7 +1464,7 @@ struct SeqWindow {
     seen: u128,
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl SeqWindow {
     const fn first(seq: u64) -> Self {
         Self { top: seq, seen: 1 }
@@ -1451,13 +1505,13 @@ impl SeqWindow {
 /// An event whose seq its tab already had dispatched is a duplicate and is
 /// acked without a dispatch. An unknown or evicted tab is accepted; the render
 /// epoch, not this map, is what keeps a replay from retargeting.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Default)]
 pub struct TabSeqs {
     recent: std::collections::VecDeque<(TabId, SeqWindow)>,
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl TabSeqs {
     /// Whether `tab` already had an event at `seq` dispatched.
     #[must_use]
@@ -1491,7 +1545,7 @@ impl TabSeqs {
 /// Only mounted when the dev banner is active (non-production, root-mounted,
 /// and `IPE_WEB_BANNER` not explicitly disabled).
 #[derive(serde::Deserialize)]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct WatchStatusBody {
     ok: bool,
     #[serde(default)]
@@ -1509,7 +1563,7 @@ struct WatchStatusBody {
 /// `/_ipe/watch/status` endpoint and replayed to new SSE connections so a
 /// browser refresh during a failed build still shows the error.
 #[derive(Clone, Debug)]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct WatchBuildStatus {
     ok: bool,
     error: Option<String>,
@@ -1522,7 +1576,7 @@ struct WatchBuildStatus {
 /// raw, and a raw newline inside the value would break the `data:` line framing.
 /// A crafted excerpt is confined to the `error` string value: it cannot inject
 /// sibling fields.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn watch_status_sse_payload(ok: bool, error: Option<&str>) -> String {
     let value = if ok {
         serde_json::json!({ "ok": true })
@@ -1538,7 +1592,7 @@ fn watch_status_sse_payload(ok: bool, error: Option<&str>) -> String {
 /// `ipe-<event>` marker. We resolve handlers server-side by ipe-id + event,
 /// so `handlerId` is the authoritative locator; `event` is derived below.
 #[derive(serde::Deserialize)]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct EventBody {
     #[serde(default)]
     #[serde(rename = "sessionId")]
@@ -1575,7 +1629,7 @@ struct EventBody {
 }
 
 /// Why `POST /_ipe/event` refuses to resolve an event.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 enum EventRefusal {
     /// The body names no render epoch.
     Missing,
@@ -1589,7 +1643,7 @@ enum EventRefusal {
 
 /// The `409` stale-render refusal: the current epoch and full render, so the
 /// client replaces its DOM and never re-sends the refused event.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn stale_render_response<Model, Msg: Clone>(
     e: &SessionEntry<Model, Msg>,
 ) -> axum::response::Response {
@@ -1616,7 +1670,7 @@ fn stale_render_response<Model, Msg: Clone>(
 ///
 /// A missing or stale epoch answers `409` with the current render; a
 /// malformed epoch or tab id answers `400`, like any other malformed body.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn event_refusal_response<Model, Msg: Clone>(
     refusal: EventRefusal,
     e: &SessionEntry<Model, Msg>,
@@ -1648,7 +1702,7 @@ fn event_refusal_response<Model, Msg: Clone>(
 /// `X-Ipe-Web: 1` marks a genuine Ipe.Web response: the client treats a `200`
 /// without it as a wedged-proxy signal. A duplicate is acked as such and was
 /// not dispatched a second time.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn event_ack(seq: u64, duplicate: bool) -> axum::response::Response {
     use axum::response::IntoResponse;
     let body = if duplicate {
@@ -1668,7 +1722,7 @@ fn event_ack(seq: u64, duplicate: bool) -> axum::response::Response {
 }
 
 /// Coerce a wire arg `Value` to the string the click/input/keydown path expects.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn value_to_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
@@ -1680,7 +1734,7 @@ fn value_to_string(v: &serde_json::Value) -> String {
 ///
 /// The only way a URL reaches a session's model; the Cmd is `#[must_use]` in
 /// [`route::Entered`] and is dispatched by whoever commits the model.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 type RouteEntry<Model, Msg> =
     Arc<dyn Fn(Model, &route::DecodedPath) -> route::Entered<Model, IpeCmd<Msg>> + Send + Sync>;
 
@@ -1691,7 +1745,7 @@ type RouteEntry<Model, Msg> =
 /// one place. Relies on one invariant: constructing an `IpeCmd` performs no
 /// effect, only `run_cmd` does, so a seed built for a session that is then
 /// discarded never fires.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn enter_session<Model, Msg>(
     route_entry: &RouteEntry<Model, Msg>,
     scope: &pubsub::SessionScope,
@@ -1704,11 +1758,11 @@ fn enter_session<Model, Msg>(
 }
 
 /// Pending URL entries a session driver holds before a new one is refused with 503.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const ENTER_QUEUE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(7);
 
 /// How long a request waits for the driver to commit its entry before answering 503.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const ENTER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether the session driver enters a queued path unconditionally or only when it is new.
@@ -1716,7 +1770,7 @@ const ENTER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// The choice is made by the driver when it commits, the one point that
 /// serialises every entry of a session, so two requests queued for one path
 /// cannot both see it as new.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnterMode {
     /// A page GET: its requester renders the reply, so the path is always entered.
@@ -1727,7 +1781,7 @@ enum EnterMode {
 }
 
 /// A URL entry for a session driver: the base-relative path, how to enter it, and where to send the rendered body.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub struct EnterRequest {
     path: route::DecodedPath,
     mode: EnterMode,
@@ -1738,7 +1792,7 @@ pub struct EnterRequest {
 ///
 /// Only the render crosses back; the entry Cmd stays with the driver, so a
 /// requester that stops waiting loses nothing.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub struct EnterReply {
     body: String,
     epoch: RenderEpoch,
@@ -1748,7 +1802,7 @@ pub struct EnterReply {
 ///
 /// `None` when the queue is full or the driver is gone; the caller refuses
 /// rather than waiting without a bound.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn queue_entry(
     enter_tx: &Sender<EnterRequest>,
     path: route::DecodedPath,
@@ -1764,7 +1818,7 @@ fn queue_entry(
 /// Wait at most [`ENTER_REPLY_TIMEOUT`] for the driver's entry reply.
 ///
 /// `None` on timeout or when the driver dropped the request unanswered.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn await_entry(reply_rx: tokio::sync::oneshot::Receiver<EnterReply>) -> Option<EnterReply> {
     tokio::time::timeout(ENTER_REPLY_TIMEOUT, reply_rx)
         .await
@@ -1773,7 +1827,7 @@ async fn await_entry(reply_rx: tokio::sync::oneshot::Receiver<EnterReply>) -> Op
 }
 
 /// What reconnect reconciliation did with the path the browser reports.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub enum ReconcileOutcome {
     /// The path is invalid, unrouted, or outside the base.
     Unchanged,
@@ -1793,7 +1847,7 @@ pub enum ReconcileOutcome {
 /// from the session's `entered_path` at commit time, so the GET that created
 /// the page, the SSE open that follows it, and concurrent reconnects at one
 /// path run the page's entry Cmd once.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn reconcile_path<Model, Msg>(
     entry: &store::SessionHandle<Model, Msg>,
     route_matched: &RouteMatched,
@@ -1816,7 +1870,7 @@ fn reconcile_path<Model, Msg>(
 }
 
 /// The 503 a request gets when its session cannot enter the URL within the bounds.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn entry_unavailable() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -1828,7 +1882,7 @@ fn entry_unavailable() -> axum::response::Response {
 }
 
 /// The 503 a request gets when the process holds as many sessions as it admits.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn at_capacity() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -1840,7 +1894,7 @@ fn at_capacity() -> axum::response::Response {
 }
 
 /// The 503 a session gets when its resident state would pass its own byte ceiling.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn over_ceiling() -> axum::response::Response {
     crate::system::emit_runtime_log(
         "web",
@@ -1850,7 +1904,7 @@ fn over_ceiling() -> axum::response::Response {
 }
 
 /// The fixed 503 body for a session refused for its resident bytes.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn too_large() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -1863,7 +1917,7 @@ fn too_large() -> axum::response::Response {
 /// Keep a debugger-edited session within its byte bound, or close it.
 ///
 /// `false` when its new state passes a byte bound; the session is then closed.
-#[cfg(all(feature = "server", feature = "debugger"))]
+#[cfg(all(feature = "web", feature = "debugger"))]
 async fn debug_resident<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
@@ -1881,7 +1935,7 @@ where
 }
 
 /// The 503 for a refused byte charge, naming the bound it would pass.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn refused_charge(why: budget::OverBudget) -> axum::response::Response {
     match why {
         budget::OverBudget::Session => over_ceiling(),
@@ -1890,7 +1944,7 @@ fn refused_charge(why: budget::OverBudget) -> axum::response::Response {
 }
 
 /// Why a page GET was refused a session.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AdmitRefusal {
     /// Every driver slot is taken.
@@ -1899,7 +1953,7 @@ enum AdmitRefusal {
     Bytes(budget::OverBudget),
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl AdmitRefusal {
     /// The 503 this refusal answers.
     fn response(self) -> axum::response::Response {
@@ -1911,7 +1965,7 @@ impl AdmitRefusal {
 }
 
 /// A page GET's driver slot and the byte charge its session holds.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct Admission {
     slot: SessionSlot,
     charge: budget::Charge,
@@ -1919,7 +1973,7 @@ struct Admission {
 
 /// Evict unconnected sessions toward `need` free bytes of `process`, waiting
 /// at most [`budget::EVICT_WAIT`] for their bytes to return.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn make_room<Model, Msg>(
     store: &dyn store::SessionStore<Model, Msg>,
     process: &budget::SessionBudget,
@@ -1949,7 +2003,7 @@ async fn make_room<Model, Msg>(
 /// # Errors
 ///
 /// The bound the charge still passes; `None` bytes pass the session's own ceiling.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn charge_up<Model, Msg>(
     store: &dyn store::SessionStore<Model, Msg>,
     charge: &mut budget::Charge,
@@ -1971,7 +2025,7 @@ async fn charge_up<Model, Msg>(
 /// # Errors
 ///
 /// The cap or the byte bound the admission would pass.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn admit<Model, Msg>(
     store: &dyn store::SessionStore<Model, Msg>,
     count: &Arc<AtomicUsize>,
@@ -1995,7 +2049,7 @@ async fn admit<Model, Msg>(
 ///
 /// `false` when its state passes a byte bound even after eviction; the caller
 /// then closes the session.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn keep_resident<Model, Msg>(
     entry: &Arc<Mutex<SessionEntry<Model, Msg>>>,
     store: &dyn store::SessionStore<Model, Msg>,
@@ -2028,7 +2082,7 @@ where
 }
 
 /// Log a live session refused for its resident bytes; always `false`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn refused_resident() -> bool {
     crate::system::emit_runtime_log(
         "web",
@@ -2039,20 +2093,20 @@ fn refused_resident() -> bool {
 
 // A claim waiter is a request queued on its session, so it waits no longer and
 // in no larger numbers than an entry queued on a live driver.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's claim waiters outnumber its enter queue [ledger #boundary]
 const _: () = assert!(store::MAX_CLAIM_WAITERS.get() <= ENTER_QUEUE_CAP.get());
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the claim wait drifts from the enter reply timeout [ledger #boundary]
 const _: () = assert!(store::CLAIM_WAIT.as_millis() == ENTER_REPLY_TIMEOUT.as_millis());
 // Every minted sid parses back as a `SessionKey`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a minted sid's length drifts from the session key's [ledger #boundary]
 const _: () = assert!(uuid::fmt::Simple::LENGTH == store::SESSION_ID_LEN);
 
 /// Build the routed entry from the route table, the `notFound` page, the
 /// app's emitted `set_page`, and its page renderer.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn routed_entry<Model, Msg, Page, FSetPage, FRender>(
     routes: Arc<Vec<route::Route<Page>>>,
     not_found: Page,
@@ -2077,7 +2131,7 @@ where
 /// The route lookup over a route table: a page that renders back is
 /// [`RouteLookup::Page`] with its canonical path; a table with no routes
 /// serves only `/`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn routed_lookup<Page, FRender>(
     routes: Arc<Vec<route::Route<Page>>>,
     render: Arc<FRender>,
@@ -2100,7 +2154,7 @@ where
 /// The three routed resolvers every routed builder installs, all over one
 /// route table and one renderer, so the entry, `req.params` and the lookup
 /// agree on which route a path resolves to.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn routed_resolvers<Model, Msg, Page, FSetPage, FRender>(
     routes: Vec<route::Route<Page>>,
     not_found: Page,
@@ -2123,10 +2177,10 @@ where
 }
 /// Boxed param resolver: a decoded GET path → the matched route's
 /// `:name`→value params.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 type ParamResolver = Arc<dyn Fn(&route::DecodedPath) -> crate::dict::IpeDict<String> + Send + Sync>;
 /// What a decoded GET path is to the page handler.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Debug)]
 enum RouteLookup {
     /// Not a page URL: browser noise, or a path no route builds a page for.
@@ -2137,7 +2191,7 @@ enum RouteLookup {
     Page(route::RoutePath),
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl RouteLookup {
     /// The lookup of an app with no route table: only `/` is a page URL.
     fn single_page(path: &route::DecodedPath) -> Self {
@@ -2157,11 +2211,11 @@ impl RouteLookup {
 /// Boxed route lookup: what a decoded GET path is to the page handler.
 /// Gates the page handler's canonical redirect, browser-noise 404 and the
 /// unrouted-GET-against-a-live-session 404 — see `page`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 type RouteMatched = Arc<dyn Fn(&route::DecodedPath) -> RouteLookup + Send + Sync>;
 
 /// Shared axum state: the session store + Arc'd TEA callbacks.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     store: Arc<dyn store::SessionStore<Model, Msg>>,
     init: Arc<FInit>,
@@ -2204,7 +2258,7 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
 }
 
 // Manual Clone — derive would demand Clone on the closures (they're behind Arc).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl<Model, Msg, FInit, FUpdate, FView, FSubs> Clone
     for WebState<Model, Msg, FInit, FUpdate, FView, FSubs>
 {
@@ -2231,7 +2285,7 @@ impl<Model, Msg, FInit, FUpdate, FView, FSubs> Clone
 /// # Errors
 ///
 /// The refusal for a value that is not a positive decimal count.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn max_sessions() -> Result<std::num::NonZeroUsize, crate::system::EnvCeilingRefusal> {
     let cap: std::num::NonZeroU64 = crate::env_registry::web::MAX_SESSIONS.ceiling().read()?;
     // A cap past the address space admits every driver the process can hold.
@@ -2241,11 +2295,11 @@ fn max_sessions() -> Result<std::num::NonZeroUsize, crate::system::EnvCeilingRef
 /// RAII admission slot: decrements `WebState::session_count` exactly once when
 /// the owning `drive_session` task exits (any path). Paired 1:1 with the
 /// `fetch_add` reservation at the session-create site — the ONLY decrement.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 struct SessionSlot {
     count: Arc<AtomicUsize>,
 }
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl SessionSlot {
     /// Reserve one driver slot under `cap`, or `None` while `cap` are held.
     fn reserve(count: &Arc<AtomicUsize>, cap: std::num::NonZeroUsize) -> Option<Self> {
@@ -2259,7 +2313,7 @@ impl SessionSlot {
             })
     }
 }
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl Drop for SessionSlot {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
@@ -2270,7 +2324,7 @@ impl Drop for SessionSlot {
 ///
 /// A rejoined session's sid is its claim's key, so the published sid and the
 /// claim it is published under cannot differ.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 enum SessionOwner {
     /// A returning session rebuilt or restored under its claim; the claim is released once the session is live.
     Rejoined(store::SidClaim),
@@ -2278,7 +2332,7 @@ enum SessionOwner {
     Minted(String),
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl SessionOwner {
     /// The sid the session is published under.
     fn sid(&self) -> &str {
@@ -2298,7 +2352,7 @@ impl SessionOwner {
 /// The session's credentials are re-proved at dispatch, with no await between
 /// the check and the effects: a revocation that returned while the caller
 /// awaited its SSE send or checkpoint write drops the whole Cmd.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, scope: &pubsub::SessionScope) {
     if recheck_scope(scope, None) == Standing::Revoked {
         return;
@@ -2307,7 +2361,7 @@ fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, scope: &pubs
 }
 
 /// Fire a `Cmd` whose session [`run_cmd`] just re-proved.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn dispatch_cmd<Msg: Send + 'static>(
     cmd: IpeCmd<Msg>,
     tx: &Sender<Msg>,
@@ -2348,7 +2402,7 @@ fn dispatch_cmd<Msg: Send + 'static>(
 /// the driver is gone; a source drops a message the full queue cannot take.
 /// Terminal input handlers in a Web session's `Sub` are dropped by
 /// [`SubRuntime::reconcile`]: a Web session has no terminal input.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl<Msg: Send + 'static> SubSink<Msg> for Sender<Msg> {
     fn deliver(&self, msg: Msg) -> impl std::future::Future<Output = bool> + Send {
         let tx = self.clone();
@@ -2360,7 +2414,7 @@ impl<Msg: Send + 'static> SubSink<Msg> for Sender<Msg> {
 }
 
 /// What the session driver did with one queued [`EnterRequest`].
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 enum EntryCommit<Model, Msg> {
     /// The path was entered and committed; the driver runs the Cmd.
     Entered(Model, IpeCmd<Msg>),
@@ -2380,7 +2434,7 @@ enum EntryCommit<Model, Msg> {
 /// that stopped waiting gets the committed page as a full resync frame over
 /// the attached SSE channel instead, so the browser never keeps a DOM the
 /// server no longer diffs against.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn commit_entry<Model, Msg, FView>(
     entry: &Weak<Mutex<SessionEntry<Model, Msg>>>,
     request: EnterRequest,
@@ -2475,7 +2529,7 @@ where
 // session scope, the revocation watch) — bundling them into a struct purely to satisfy the 7-arg heuristic
 // would add indirection without clarifying anything.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // WEAK ref: the driver must NOT keep the session alive. The strong holders are
     // the store map (until TTL evict) and any open SSE connection (pins the entry
@@ -2784,13 +2838,13 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
 /// OS CSPRNG (the approved security-randomness source per `random.rs`), and its
 /// `simple` form is exactly 32 lowercase-hex chars — same shape, no `aes-gcm`.
 /// Never panics.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn new_sid() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// A fresh sid for a request whose mint was proved first-party.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn minted_sid(_proof: mint_proof::MintProof) -> String {
     new_sid()
 }
@@ -2798,7 +2852,7 @@ fn minted_sid(_proof: mint_proof::MintProof) -> String {
 /// Normalise a raw `IPE_WEB_BASE_PATH` value: trim, drop a trailing slash,
 /// ensure a single leading slash. `""` / `"/"` collapse to `""` (root-mounted —
 /// no prefix).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn normalise_base_path(raw: &str) -> String {
     let t = raw.trim().trim_end_matches('/');
     if t.is_empty() {
@@ -2827,13 +2881,13 @@ fn normalise_base_path(raw: &str) -> String {
 /// Mirrors `csrf::csrf_cookie_name_for`. Plain-HTTP dev keeps the bare `ipe_sid`
 /// (`__Host-` requires Secure, which a browser drops over `http://`). A sub-app
 /// (Path != `/`) can never use `__Host-`, so it keeps the base-scoped name.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn cookie_name_for(base: &str) -> crate::server::CookieName {
     cookie_name_with(base, csrf::cookies_secure())
 }
 
 /// [`cookie_name_for`] under an explicit `Secure` decision.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn cookie_name_with(base: &str, secure: bool) -> crate::server::CookieName {
     use crate::server::{CookieName, RuntimeCookie};
     if base.is_empty() {
@@ -2855,7 +2909,7 @@ fn cookie_name_with(base: &str, secure: bool) -> crate::server::CookieName {
 /// Cookie `Path` for a given (normalised) base path: the base for a sub-app
 /// (scopes the cookie to `/<base>/*` so it is never sent to the parent's own
 /// routes — protecting the parent session), else `/`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn cookie_path_for(base: &str) -> String {
     if base.is_empty() {
         "/".to_string()
@@ -2871,20 +2925,20 @@ fn cookie_path_for(base: &str) -> String {
 /// `/_ipe/event` and `/_ipe/sse` paths with it. The browser reaches this child
 /// only through the parent proxy, which strips the prefix before forwarding —
 /// so the child's own router stays root-relative.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub(super) fn web_base_path() -> String {
     normalise_base_path(&crate::system::read_env_var("IPE_WEB_BASE_PATH").unwrap_or_default())
 }
 
 /// The active session cookie name (read AND write must agree, so both
 /// `page_response` and `sid_from_cookie` route through this).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn session_cookie_name() -> crate::server::CookieName {
     cookie_name_for(&web_base_path())
 }
 
 /// The active session cookie `Path`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn cookie_path() -> String {
     cookie_path_for(&web_base_path())
 }
@@ -2893,7 +2947,7 @@ fn cookie_path() -> String {
 /// the store `ttl`. `Secure` when cookies are secure or this request arrived over
 /// TLS at a trusted proxy; `SameSite=None` (always `Secure`) when the app may be
 /// framed cross-origin, else `Lax`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn session_set_cookie(
     sid: &str,
     headers: &axum::http::HeaderMap,
@@ -2924,7 +2978,7 @@ fn session_set_cookie(
 ///
 /// Snapshotted once (env is stable at process start; same rationale as
 /// `csrf::cookies_secure()` — avoids a per-request global env-lock read).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn trust_proxy_headers() -> bool {
     use std::sync::OnceLock;
     static TRUST: OnceLock<bool> = OnceLock::new();
@@ -2943,7 +2997,7 @@ fn trust_proxy_headers() -> bool {
 /// when `trust` is true — otherwise a client could forge `X-Forwarded-Proto`
 /// to fool the Secure-cookie decision (the same footgun `server.rs` already
 /// closed for `X-Forwarded-For`).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn request_is_https_with_trust(headers: &axum::http::HeaderMap, trust: bool) -> bool {
     if !trust {
         return false;
@@ -2958,14 +3012,14 @@ fn request_is_https_with_trust(headers: &axum::http::HeaderMap, trust: bool) -> 
 /// Request-scoped HTTPS detection: true when THIS request arrived over TLS at
 /// the trusted proxy (`X-Forwarded-Proto: https`). See
 /// `request_is_https_with_trust` for the testable core.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn request_is_https(headers: &axum::http::HeaderMap) -> bool {
     request_is_https_with_trust(headers, trust_proxy_headers())
 }
 
 /// Build the full-page HTTP response for a GET (initial render or reuse): the
 /// client-bearing HTML wrap + the session cookie (name/path base-path-aware).
-#[cfg(all(feature = "server", not(feature = "debugger")))]
+#[cfg(all(feature = "web", not(feature = "debugger")))]
 fn page_response(
     sid: &str,
     body: &str,
@@ -3026,7 +3080,7 @@ fn page_response(
 
 /// Same as [`page_response`] but injects `overlay` (raw HTML) after `#ipe-root`
 /// via [`render_page_full_with_overlay`]. Active only with the `debugger` feature.
-#[cfg(all(feature = "server", feature = "debugger"))]
+#[cfg(all(feature = "web", feature = "debugger"))]
 fn page_response_with_overlay(
     sid: &str,
     body: &str,
@@ -3072,7 +3126,7 @@ fn page_response_with_overlay(
 /// A cookie line or a security header with no header representation answers
 /// `500`: a page never ships without the session or CSRF cookie it was built
 /// with, nor without its framing policy.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn with_page_headers(
     resp: axum::response::Response,
     cookies: &[&crate::server::SetCookie],
@@ -3082,7 +3136,7 @@ fn with_page_headers(
 
 /// [`with_page_headers`] over the outcome of reading the security headers: a
 /// refused framing policy answers `500` with no cookie and no header set.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn with_page_headers_checked(
     resp: axum::response::Response,
     cookies: &[&crate::server::SetCookie],
@@ -3096,7 +3150,7 @@ fn with_page_headers_checked(
 }
 
 /// [`with_page_headers`] over an explicit security-header set.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn with_page_headers_from(
     mut resp: axum::response::Response,
     cookies: &[&crate::server::SetCookie],
@@ -3121,7 +3175,7 @@ fn with_page_headers_from(
 }
 
 #[cfg(test)]
-#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "web", not(target_arch = "wasm32")))]
 mod page_headers_tests {
     use super::{with_page_headers_checked, with_page_headers_from};
     use crate::server::SetCookie;
@@ -3195,7 +3249,7 @@ mod page_headers_tests {
 /// Maximum request body bytes for `/_ipe/event`: `IPE_WEB_MAX_BODY_BYTES`,
 /// default 5 MiB (5 << 20 = 5 242 880). The default covers `Event.onFile` /
 /// `Event.onImage` data-URL payloads; override for larger file uploads.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const WEB_MAX_BODY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
     "IPE_WEB_MAX_BODY_BYTES",
     5 << 20,
@@ -3204,7 +3258,7 @@ const WEB_MAX_BODY_CEILING: crate::system::EnvCeiling = crate::system::EnvCeilin
 );
 
 #[cfg(test)]
-#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "web", not(target_arch = "wasm32")))]
 mod web_max_body_bytes_tests {
     // A zero cap would 413 every /_ipe/event POST, so `0` is refused like any
     // other malformed value; the parse is driven without touching the shared
@@ -3229,7 +3283,7 @@ mod web_max_body_bytes_tests {
 
 /// The session idle-TTL the environment may set: `IPE_WEB_TTL`, whole seconds
 /// or `h` / `m` / `s` segments (`30m`, `1h30m`), at most 400 days.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
     "IPE_WEB_TTL",
     1800,
@@ -3246,7 +3300,7 @@ const WEB_TTL: crate::system::EnvDuration = crate::system::EnvDuration::new(
 /// A refusal naming `IPE_WEB_TTL` when it is present but not a positive
 /// duration within the bound, or naming `Web.sessionTtl` when that setting is
 /// not; a present value is never replaced by a default.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
     let raw = WEB_TTL.lookup();
     if matches!(raw, Err(std::env::VarError::NotPresent))
@@ -3259,7 +3313,7 @@ fn web_ttl() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
 
 /// The `503` a request answers when the session TTL or the mount base cannot
 /// be resolved.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn ttl_unavailable_response() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -3269,10 +3323,6 @@ fn ttl_unavailable_response() -> axum::response::Response {
         .into_response()
 }
 
-/// Graceful-drain grace window: how long the pure axum graceful drain is allowed
-/// before we force a CLEAN exit-0. axum's `with_graceful_shutdown` WAITS for
-/// every connection to finish, so an open SSE `EventSource` (heartbeat every
-/// 15 s, otherwise idle) would hang the drain forever. This window lets ordinary
 /// Returns `true` when `IPE_WEB_RESET_STATE=1` (or any truthy value) is set in
 /// the process environment.
 ///
@@ -3286,31 +3336,12 @@ fn ttl_unavailable_response() -> axum::response::Response {
 /// Fail-closed by design: any read failure or unrecognised value is treated as
 /// `false` (the additive algorithm runs normally), so a misconfigured env never
 /// silently corrupts state — it only fails to reset.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub(crate) fn reset_state_from_env() -> bool {
     crate::system::read_env_var("IPE_WEB_RESET_STATE")
         .ok()
         .as_deref()
         .is_some_and(|v| matches!(v, "1" | "true" | "yes" | "on"))
-}
-
-/// Best-effort bounded flush of all active telemetry exporters (push + hub).
-/// Tunable via `IPE_WEB_SHUTDOWN_GRACE_MS` (default 1500 ms; 0 = exit at
-/// once).
-#[cfg(feature = "server")]
-const SHUTDOWN_GRACE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
-    "IPE_WEB_SHUTDOWN_GRACE_MS",
-    1500,
-    crate::system::ZeroCeiling::Accepted,
-    "decimal millisecond count",
-);
-
-/// The shutdown grace window, resolved by `serve_web` before it binds.
-#[cfg(feature = "server")]
-fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefusal> {
-    SHUTDOWN_GRACE_CEILING
-        .read()
-        .map(std::time::Duration::from_millis)
 }
 
 /// Best-effort bounded flush of all active telemetry exporters (push + hub).
@@ -3328,11 +3359,9 @@ fn shutdown_grace() -> Result<std::time::Duration, crate::system::EnvCeilingRefu
 /// make outbound HTTP calls and are gated behind both features; a server with
 /// no outbound HTTP kernel has no exporters to flush.
 #[cfg(all(feature = "web", feature = "http_client"))]
-async fn flush_exporters() {
+pub(crate) async fn flush_exporters() {
     tokio::join!(push_exporter::flush_now(), hub_exporter::flush_now());
 }
-#[cfg(all(feature = "server", not(all(feature = "web", feature = "http_client"))))]
-async fn flush_exporters() {}
 
 /// Runs `flush_exporters` to completion from synchronous code, bounded by `push_exporter::EXIT_FLUSH_BOUND`.
 ///
@@ -3375,15 +3404,15 @@ pub(crate) fn flush_exporters_before_exit() {
 /// reconnect-wait and refetches immediately instead of waiting out the
 /// retry backoff ladder. Dev-mode only — see H23 ("dev-only reload channel
 /// ABSENT, not disabled, in production"): the production gate lives at the
-/// ONE call site chain ([`maybe_push_reload_to_web_sessions`], called from
-/// `web_shutdown_signal`), never inside this helper — a caller that
+/// ONE call site chain ([`maybe_push_reload_to_web_sessions`], a hook of
+/// `serve_web`'s shutdown plan), never inside this helper — a caller that
 /// reaches this function has already decided dev-mode applies. Delivery is
 /// best-effort, at-most-once, never retried: a full/closed channel just
 /// drops that one session's frame (the browser's own reconnect logic
 /// already covers the restart-detection floor; this only shaves latency),
 /// and a session that disconnects between the enumerate and the push
 /// misses a frame it can't act on anyway.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn push_reload_to_web_sessions<Model, Msg>(store: &Arc<dyn store::SessionStore<Model, Msg>>)
 where
     Model: Send + 'static,
@@ -3418,7 +3447,7 @@ where
 /// Dev-only: gated by [`literal_table::dev_overlay_active`] (flag on AND
 /// non-production). When inactive it registers nothing and pushes no frame, so
 /// no appearance patch is ever observable in a production build.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     view: &Arc<FView>,
@@ -3487,10 +3516,10 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
 /// The dev-only gate over [`push_reload_to_web_sessions`], over the process dev intent.
 ///
 /// Without a [`DevIntent`](crate::telemetry::DevIntent) (a release build, or a
-/// production posture) the push path is unreachable. Split from
-/// `web_shutdown_signal` so the gate is unit-testable without delivering a
+/// production posture) the push path is unreachable. A hook of `serve_web`'s
+/// shutdown plan, split out so the gate is unit-testable without delivering a
 /// real signal.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn maybe_push_reload_to_web_sessions<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
 ) where
@@ -3502,7 +3531,7 @@ async fn maybe_push_reload_to_web_sessions<Model, Msg>(
 }
 
 /// [`maybe_push_reload_to_web_sessions`] under an explicit dev-intent proof.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn maybe_push_reload_with<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     dev: Option<&crate::telemetry::DevIntent>,
@@ -3515,117 +3544,25 @@ async fn maybe_push_reload_with<Model, Msg>(
     }
 }
 
-/// Await the FIRST shutdown signal (SIGINT or SIGTERM), then run the graceful
-/// teardown and return so axum's `with_graceful_shutdown` drains in-flight
-/// connections and the serve future resolves `Ok(())` (→ the IpeTask is `Ok` →
-/// the generated entry exits 0).
+/// `serve_web`'s shutdown plan: the dev reload push, then the console child's stop.
 ///
-/// Two escapes guard against the drain hanging — both keep the no-panic thesis:
-///  - A bounded grace timer that force-exits 0 (CLEAN) after `grace`,
-///    so a never-idle SSE stream can't wedge the process (drops long-lived
-///    connections rather than waiting).
-///  - A SECOND signal (Ctrl-C twice) that force-exits 130 immediately.
-///
-/// Robustness: a failed SIGTERM registration must NOT crash — it degrades to
-/// SIGINT-only (`ctrl_c`). On non-unix only `ctrl_c` is available.
-#[cfg(feature = "server")]
-async fn web_shutdown_signal<Model, Msg>(
+/// The reload push runs before the drain, so a connected browser refetches at
+/// once instead of waiting out its reconnect backoff; it is dev-gated. The
+/// console child is tracked in a `static` whose `kill_on_drop` never runs on a
+/// process exit, so its explicit stop here is what leaves no orphan child.
+#[cfg(feature = "web")]
+fn web_shutdown_plan<Model, Msg>(
     store: Arc<dyn store::SessionStore<Model, Msg>>,
-    grace: std::time::Duration,
-) where
+) -> crate::server::shutdown::ShutdownPlan
+where
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    // First press: block until SIGINT or SIGTERM arrives.
-    wait_for_term_or_int().await;
-
-    // Print to stdout. The leading newline keeps the `^C` echo on its own line.
-    crate::system::write_stdout_line("\nIpe.Web shutting down…");
-
-    // Flip readyz → draining so orchestrators stop routing new traffic while
-    // in-flight requests finish.
-    observability::mark_draining();
-
-    // Dev-only proactive `event: reload` push to every locally-live SSE
-    // session, fired once the shutdown is committed and BEFORE the bounded
-    // grace-timer drain begins — a connected browser refetches immediately
-    // instead of waiting out its reconnect backoff. Production-gated (H23).
-    maybe_push_reload_to_web_sessions(&store).await;
-
-    // Tear down the console child, if one was spawned. Idempotent no-op when
-    // none exists.
-    // Load-bearing: the child is tracked in a `static` whose `Drop`
-    // (`kill_on_drop`) never runs on `process::exit`, so this explicit
-    // `start_kill` is what prevents an orphan console child after a clean exit.
-    // Absent when `http_client` is not active: the console proxy uses reqwest.
+    let plan = crate::server::shutdown::ShutdownPlan::new("web")
+        .then(move || async move { maybe_push_reload_to_web_sessions(&store).await });
     #[cfg(all(feature = "web", feature = "http_client"))]
-    console_proxy::shutdown_console();
-
-    // Telemetry export pipelines (push/hub exporters) flush every ~2 s on a
-    // tick. The channel-close drain ONLY runs when the mpsc Sender is dropped,
-    // which requires Drop — and `process::exit` skips Drop entirely. The
-    // grace-timer and watchdog paths below end through `system::exit_process`,
-    // whose pre-exit stage sends a Flush sentinel to each active exporter and
-    // waits at most the larger exporter flush deadline; it is best-effort
-    // (telemetry only, never user data) and never hangs shutdown.
-
-    // Grace timer: force a CLEAN exit-0 after the window so a never-idle SSE
-    // connection can't hang the drain. Spawned (not awaited) so we still return
-    // immediately and let the axum drain
-    // win the race when there are no long-lived connections (the common case →
-    // sub-window exit). Exit 0 keeps the IpeTask-Ok / exit-0 contract.
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        // Defense-in-depth: kill the console child again in case it was spawned
-        // after the first teardown call (shutdown_console is idempotent).
-        #[cfg(all(feature = "web", feature = "http_client"))]
-        console_proxy::shutdown_console();
-        // The exit funnel flushes the exporters before the process ends.
-        crate::system::exit_process(0);
-    });
-
-    // Second press: a watchdog that force-exits 130 if the user hits Ctrl-C
-    // again while the drain is in progress. Spawned (not awaited).
-    tokio::spawn(async {
-        wait_for_term_or_int().await;
-        crate::system::write_stderr_line("Ipe.Web: forcing exit (second signal)");
-        #[cfg(all(feature = "web", feature = "http_client"))]
-        console_proxy::shutdown_console();
-        // 128 + SIGINT(2); the exit funnel flushes the exporters first.
-        crate::system::exit_process(130);
-    });
-    // Return → axum drains in-flight connections → serve future resolves Ok
-    // (fast path when nothing long-lived is open; otherwise the grace timer
-    // force-exits 0). The graceful return path also flushes exporters to cover
-    // the no-open-connections fast exit where process tear-down follows quickly.
-    flush_exporters().await;
-}
-
-/// Resolve when the next SIGINT or SIGTERM arrives. Total + robust: if SIGTERM
-/// can't be registered (rare), fall back to SIGINT (`ctrl_c`) only rather than
-/// panicking. On non-unix, only `ctrl_c` exists.
-#[cfg(feature = "server")]
-async fn wait_for_term_or_int() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            // SIGTERM registration failed — degrade to SIGINT only.
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    let plan = plan.then(|| async { console_proxy::shutdown_console() });
+    plan
 }
 
 /// `Ipe.Web.tea { init, update, view, subscriptions }` — serve via axum.
@@ -3639,7 +3576,7 @@ async fn wait_for_term_or_int() {
 /// req-reader can bootstrap session state on first render. A non-req init is
 /// monomorphised to ignore the threaded `WebReq`.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn web_app<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     init: FInit,
     update: FUpdate,
@@ -3747,7 +3684,7 @@ where
 ///
 /// `Model`/`Msg`/the four callbacks stay concrete inside the returned closure —
 /// only the outer builder is boxed (no `dyn` over the app's handlers).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn web_embed_router<Model, Msg, FInit, FUpdate, FView, FSubs>(
     init: FInit,
     update: FUpdate,
@@ -3853,7 +3790,7 @@ where
 /// `build_web_router` / `WebState` keep the original six type params — no `dyn`
 /// over the app's handlers (§9).
 #[allow(clippy::too_many_arguments)] // mirrors web_app_routed's routed cfg (callbacks + route table + set_page + store)
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn web_embed_router_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
     init: FInit,
     update: FUpdate,
@@ -4117,7 +4054,7 @@ where
 /// Why a live web app refused to start as declared. The `Display` text is the
 /// operator detail: it goes to the runtime log (a mount) or to the local task
 /// error (a standalone app), never into a response body.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartupRefusal {
     /// The route table holds a malformed pattern.
@@ -4144,7 +4081,7 @@ pub(crate) enum StartupRefusal {
     Auth(crate::app_config::AuthStartupRefusal),
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl std::fmt::Display for StartupRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4174,7 +4111,7 @@ impl std::fmt::Display for StartupRefusal {
 
 /// Every startup refusal is a fault in the app's or the operator's
 /// configuration: typed `InvalidInput`, never the `Unexpected` catch-all.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl From<StartupRefusal> for crate::error::IpeError {
     fn from(cause: StartupRefusal) -> Self {
         Self::invalid_input(cause.to_string())
@@ -4183,7 +4120,7 @@ impl From<StartupRefusal> for crate::error::IpeError {
 
 /// The fixed public body of a fail-closed mount's 503. One constant for every
 /// [`StartupRefusal`], so a response never carries the operator detail.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub(crate) const FAIL_CLOSED_BODY: &str =
     "Service Unavailable: this app could not start. The server log names the fault.";
 
@@ -4193,7 +4130,7 @@ pub(crate) const FAIL_CLOSED_BODY: &str =
 /// # Errors
 ///
 /// [`StartupRefusal::BasePath`] for a base that is not a well-formed path.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
     route::DecodedPath::parse(base).map_err(|refusal| StartupRefusal::BasePath {
         base: base.to_string(),
@@ -4207,7 +4144,7 @@ fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
 /// # Errors
 ///
 /// [`StartupRefusal::MountBase`] for a base outside the mount-base grammar.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRefusal> {
     crate::encoding::MountBase::parse(base).map_err(|refusal| StartupRefusal::MountBase {
         base: base.to_string(),
@@ -4221,7 +4158,7 @@ fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRef
 ///
 /// [`StartupRefusal::MountBase`] for a base outside the mount-base grammar;
 /// [`build_web_router`] refuses such a base before any request is served.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
     parse_mount_base(&web_base_path())
 }
@@ -4236,7 +4173,7 @@ fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
 ///
 /// `StartupRefusal::MountBase` if `/static` were outside the mount-base
 /// grammar.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn web_static_mount(dir: std::path::PathBuf) -> Result<axum::Router, StartupRefusal> {
     let base = parse_mount_base(WEB_STATIC_PREFIX)?;
     let files = axum::Router::new().fallback_service(crate::server::strict_serve_dir(dir));
@@ -4244,7 +4181,7 @@ fn web_static_mount(dir: std::path::PathBuf) -> Result<axum::Router, StartupRefu
 }
 
 /// The prefix a `Web` app's `[web] static` directory is served below.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 const WEB_STATIC_PREFIX: &str = "/static";
 
 /// A router that answers EVERY path with `503 Service Unavailable` and the
@@ -4252,7 +4189,7 @@ const WEB_STATIC_PREFIX: &str = "/static";
 /// declared (fail-closed): the mount stays reachable enough to report that it
 /// is down, but never serves a real session on a silently-degraded store or a
 /// silently-dead route. The cause is logged once here, server-side only.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn fail_closed_router(cause: &StartupRefusal) -> axum::Router {
     crate::system::emit_runtime_log("live", &format!("mounted web app disabled: {cause}"));
     axum::Router::new().fallback(|| async {
@@ -4272,7 +4209,7 @@ fn fail_closed_router(cause: &StartupRefusal) -> axum::Router {
 /// are erased into the boxed entry, so `serve_web`/`WebState` keep the
 /// original 6 type params.
 #[allow(clippy::too_many_arguments)]
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn web_app_routed<E, Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage, FRender>(
     init: FInit,
     update: FUpdate,
@@ -4383,7 +4320,7 @@ where
 /// orphaning every handler on the page the browser is actually showing (all
 /// subsequent events, form submits included, would silently resolve to
 /// nothing).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn is_browser_noise_path(p: &str) -> bool {
     if matches!(
         p,
@@ -4417,7 +4354,7 @@ fn is_browser_noise_path(p: &str) -> bool {
 /// has no way to suppress the 404. `None` means the caller answers 404: no
 /// static dir, a request path [`noise_candidate`] refuses, or an entry that is
 /// absent, a directory or unreadable.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Response> {
     use axum::response::IntoResponse;
     // IPE_WEB_STATIC_DIR: a non-empty value mounts the named directory at /static.
@@ -4444,7 +4381,7 @@ async fn serve_noise_from_static_root(path: &str) -> Option<axum::response::Resp
 /// ([`crate::server::static_request`]): decoded once by the strict core, every
 /// segment a plain name under the regime. The candidate is the checked join
 /// ([`crate::path::join_rel`]), never a raw `Path::join`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn noise_candidate(
     dir: &str,
     uri_path: &str,
@@ -4463,7 +4400,7 @@ fn noise_candidate(
 /// Content type for a browser-noise file served from the static root. The
 /// extensions here mirror what browsers actually probe at the origin root.
 /// Anything unknown falls back to octet-stream rather than guessing.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn static_noise_mime(ext: &str) -> &'static str {
     match ext {
         "ico" => "image/x-icon",
@@ -4504,7 +4441,7 @@ fn static_noise_mime(ext: &str) -> &'static str {
 ///
 /// `RequestRejection::BadRequest` for a `path` that is not a well-formed
 /// RFC 3986 path.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn client_route_path(
     raw: &str,
     base: &route::DecodedPath,
@@ -4520,7 +4457,7 @@ fn client_route_path(
     }
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 mod handlers {
     use super::*;
     use axum::extract::State;
@@ -5202,15 +5139,19 @@ mod handlers {
             }
         }
 
+        let drain = crate::server::shutdown::drain();
         {
             let tx = tx.clone();
             let mut closer = closer.clone();
+            let mut drain = drain.clone();
             tokio::spawn(async move {
                 loop {
-                    // A closed session stops its heartbeat: the sender clone
-                    // held here must not outlive the session it keeps alive.
+                    // A closed session or a draining server stops its
+                    // heartbeat: the sender clone held here must not outlive
+                    // the stream it keeps alive.
                     tokio::select! {
                         () = session_closed(&mut closer) => break,
+                        () = drain.wait() => break,
                         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
                     }
                     if tx
@@ -5245,22 +5186,7 @@ mod handlers {
         // disconnect axum drops the body → this Arc releases.
         // The closer ends the stream when the session is closed, although
         // the driver, Cmd tasks and the heartbeat may still hold senders.
-        let body_stream = futures_util::stream::unfold(
-            (rx, SessionGauge, entry, closer),
-            |(mut rx, guard, entry, mut closer)| async move {
-                let frame = tokio::select! {
-                    biased;
-                    () = session_closed(&mut closer) => None,
-                    frame = rx.recv() => frame,
-                };
-                frame.map(|SsePatch(s)| {
-                    (
-                        Ok::<_, std::io::Error>(axum::body::Bytes::from(s)),
-                        (rx, guard, entry, closer),
-                    )
-                })
-            },
-        );
+        let body_stream = session_stream(rx, (SessionGauge, entry), closer, drain);
         match Response::builder()
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
@@ -6694,7 +6620,7 @@ mod handlers {
 ///
 /// [`StartupRefusal::Bind`] when `IPE_HTTP_BIND` is present but not an IP
 /// address.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn web_bind_host() -> Result<crate::app_config::ListenHost, StartupRefusal> {
     crate::app_config::resolve_host_bind().map_err(StartupRefusal::Bind)
 }
@@ -6702,7 +6628,7 @@ fn web_bind_host() -> Result<crate::app_config::ListenHost, StartupRefusal> {
 /// Shared server setup for `web_app` / `web_app_routed`: nested HTTP
 /// handlers (`page` / `sse_handler` / `event_handler`), router + bind/serve.
 /// The only per-entry difference (the `route_entry`) lives on `state`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 async fn serve_web<E, Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
 ) -> IpeResult<E, ()>
@@ -6794,7 +6720,7 @@ where
         Ok(app) => app,
         Err(cause) => return IpeResult::Err(E::from_ipe_error(cause.into())),
     };
-    let grace = match shutdown_grace() {
+    let grace = match crate::server::shutdown::shutdown_grace() {
         Ok(grace) => grace,
         Err(refusal) => {
             return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
@@ -6827,6 +6753,16 @@ where
     // value resolved and recorded above, before the console gates.
     let port = resolved.port.get();
     let addr = host.addr(port);
+    // Armed before the bind, so no accepted connection precedes the owner.
+    let armed = match crate::server::shutdown::arm(web_shutdown_plan(shutdown_store), grace) {
+        Ok(armed) => armed,
+        Err(e) => {
+            return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
+                "Web.tea: shutdown signals: {}",
+                crate::system::scrub_log_controls(&e.to_string())
+            ))));
+        }
+    };
     // Logs the bind-address line (stderr), and the exposure warning if any.
     let listener = match crate::server::bind_app_listener("web", host, port).await {
         Ok(l) => l,
@@ -6838,13 +6774,13 @@ where
     };
     // User-facing status line on stdout.
     crate::system::emit_runtime_log_stdout("web", &format!("listening on :{port}"));
-    // Graceful shutdown: trap SIGINT/SIGTERM,
-    // print the shutdown line, drain in-flight requests, and return cleanly so
-    // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
-    // SECOND signal force-exits 130 via the watchdog inside web_shutdown_signal.
-    match crate::server::serve_app(listener, app, web_shutdown_signal(shutdown_store, grace)).await
-    {
-        Ok(()) => ok_res(()),
+    match crate::server::serve_app(listener, app, armed).await {
+        Ok(crate::server::shutdown::Stopped { .. }) => {
+            // A console child spawned after the plan's teardown is stopped too.
+            #[cfg(all(feature = "web", feature = "http_client"))]
+            console_proxy::shutdown_console();
+            ok_res(())
+        }
         Err(e) => IpeResult::Err(E::from_ipe_error(crate::error::IpeError::io(format!(
             "Web.tea: serve: {}",
             crate::system::scrub_log_controls(&e.to_string())
@@ -6858,7 +6794,7 @@ where
 /// prefix on the shared server port. `use_console_proxy` is decided by the
 /// caller so this stays feature-clean (the caller passes `false` when
 /// `http_client` is off).
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub(crate) fn build_web_router<Model, Msg, FInit, FUpdate, FView, FSubs>(
     state: WebState<Model, Msg, FInit, FUpdate, FView, FSubs>,
     // Read only when `http_client` is active (the console-proxy arm); the
@@ -7320,14 +7256,14 @@ where
 }
 
 /// Set once a `Web` router passed its startup checks in this process; never cleared.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 static WEB_SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a `Web` app serves in this process.
 ///
 /// While it does, an armed `Auth.verifyToken` that no session or request owns
 /// is refused: the credential would bind to nothing a revocation could close.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[must_use]
 pub fn web_serving() -> bool {
     WEB_SERVING.load(std::sync::atomic::Ordering::Acquire)
@@ -7336,7 +7272,7 @@ pub fn web_serving() -> bool {
 /// Read the session cookie from request headers. Uses the base-path-aware
 /// cookie name (`session_cookie_name`) so a sub-app reads its own scoped cookie,
 /// never the parent's `ipe_sid`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 fn sid_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
     crate::server::request_cookie(headers, &session_cookie_name())
 }
@@ -7347,7 +7283,7 @@ fn sid_from_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
 // `use super::*`), so a non-Web Ipe.Html / Ipe.Ui render doesn't pull this
 // server module in.
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod reload_push_tests {
     use super::*;
     use crate::web::store::{MemoryStore, SessionHandle, SessionStore};
@@ -7400,9 +7336,9 @@ mod reload_push_tests {
 
     /// Without a dev intent the reload push is unreachable; with one it
     /// pushes. The env-driven gate under `ENV=dev` on the release test binary
-    /// pushes nothing. (`maybe_push_reload_to_web_sessions` is the exact call
-    /// `web_shutdown_signal` makes right after `mark_draining`, split out so no
-    /// real OS signal is needed here.)
+    /// pushes nothing. (`maybe_push_reload_to_web_sessions` is the exact hook
+    /// `serve_web`'s shutdown plan runs right after `mark_draining`, split out
+    /// so no real OS signal is needed here.)
     #[tokio::test]
     async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
@@ -7434,7 +7370,7 @@ mod reload_push_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod hot_appearance_push_tests {
     //! Applying an appearance patch to the running app re-renders
     //! `view(currentModel)` from the CURRENT Model (never through `update`) and
@@ -7660,7 +7596,7 @@ mod hot_appearance_push_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod dev_banner_tests {
     use super::dev_console_banner;
 
@@ -7693,7 +7629,7 @@ mod dev_banner_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod duration_parse_tests {
     use super::{WEB_TTL, web_ttl};
     use crate::system::{locked_remove_var, locked_set_var};
@@ -7762,7 +7698,7 @@ mod duration_parse_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod request_is_https_tests {
     use super::request_is_https_with_trust;
 
@@ -7794,7 +7730,7 @@ mod request_is_https_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod canonical_redirect_handler_tests {
     //! The page handler redirects a GET/HEAD for a non-canonical spelling of a
     //! routed page to its canonical path (308) before any session work: no
@@ -7991,7 +7927,7 @@ mod canonical_redirect_handler_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod base_path_tests {
     use super::{
         Html, RenderEpoch, Rendered, client_js_path, cookie_name_for, cookie_name_with,
@@ -8464,7 +8400,7 @@ mod base_path_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod session_lost_body_tests {
     //! Guards the LOAD-BEARING session-lost 404 wire contract.
     //!
@@ -8545,7 +8481,7 @@ mod session_lost_body_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod admission_control_tests {
     use super::*;
 
@@ -8643,14 +8579,71 @@ mod admission_control_tests {
     #[test]
     fn web_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(WEB_MAX_BODY_CEILING);
-        crate::system::assert_env_ceiling_contract(SHUTDOWN_GRACE_CEILING);
         for (_, ceiling) in CLIENT_TUNING_CEILINGS {
             crate::system::assert_env_ceiling_contract(ceiling);
         }
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
+mod sse_drain_tests {
+    use super::*;
+    use futures_util::StreamExt as _;
+
+    #[tokio::test]
+    async fn a_draining_sse_body_yields_its_queued_frames_then_ends() {
+        let (armed, signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
+        let (_closer_tx, closer) = tokio::sync::watch::channel(false);
+        let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
+        assert!(tx.send(SsePatch("live".into())).await.is_ok());
+        let first = body.next().await;
+        assert!(matches!(first, Some(Ok(ref b)) if b.as_ref() == b"live"));
+        assert!(tx.send(SsePatch("reload".into())).await.is_ok());
+        assert!(
+            signals
+                .send(crate::server::shutdown::Signal::Terminate)
+                .await
+                .is_ok()
+        );
+        let bound = std::time::Duration::from_secs(5);
+        let last = tokio::time::timeout(bound, body.next()).await;
+        assert!(
+            matches!(last, Ok(Some(Ok(ref b))) if b.as_ref() == b"reload"),
+            "the queued frame is delivered on the drain: {last:?}"
+        );
+        let end = tokio::time::timeout(bound, body.next()).await;
+        assert!(matches!(end, Ok(None)), "the body ends after the drain");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_draining_sse_body_with_nothing_queued_ends_at_once() {
+        let (armed, signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
+        let (_closer_tx, closer) = tokio::sync::watch::channel(false);
+        let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
+        assert!(
+            signals
+                .send(crate::server::shutdown::Signal::Terminate)
+                .await
+                .is_ok()
+        );
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await;
+        assert!(matches!(end, Ok(None)), "an empty drained body ends");
+        drop(tx);
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
 mod sse_reconnect_reconcile_tests {
     //! Drives the production reconnect reconciliation (`reconcile_path`) and
     //! the driver's entry commit (`commit_entry`):
@@ -9222,7 +9215,7 @@ mod sse_reconnect_reconcile_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod static_noise_mime_tests {
     use super::{noise_candidate, static_noise_mime};
     use crate::path_core::Regime;
@@ -9354,7 +9347,7 @@ mod recursion_session_isolation_tests {
 ///
 /// These tests mutate the runtime's env overlay (never the process `environ`;
 /// see the rationale in `system.rs`). Each test cleans up after itself.
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod security_env_tests {
 
     // ── IPE_WEB_CSRF_ORIGIN_CHECK ─────────────────────────────────────────────
@@ -9436,7 +9429,7 @@ mod security_env_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod watch_status_handler_tests {
     //! Regression-locks the `POST /_ipe/watch/status` trust boundary.
     //!
@@ -10118,7 +10111,7 @@ mod watch_status_handler_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod hot_transition_handler_tests {
     //! Regression-locks the `POST /_ipe/hot-transition` trust boundary — the
     //! dev-only leg that mutates the server-held Model from an untrusted dev
@@ -10328,7 +10321,7 @@ mod hot_transition_handler_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod hot_init_session_scoping_tests {
     //! Regression-locks the session-scoping invariant of `POST /_ipe/hot-init`:
     //! an init-datum edit is visible to FRESH sessions (those created after the
@@ -10637,7 +10630,7 @@ mod hot_init_session_scoping_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod hot_msg_handler_tests {
     //! Regression-locks the `POST /_ipe/hot-msg` trust boundary — the dev-only leg
     //! that extends the server-held `Msg` set from an untrusted dev channel. Every
@@ -10854,7 +10847,7 @@ mod hot_msg_handler_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod hot_init_handler_tests {
     //! Regression-locks the `POST /_ipe/hot-init` trust boundary — the dev-only
     //! leg that updates the server-held init datum from an untrusted dev channel.
@@ -11073,7 +11066,7 @@ mod hot_init_handler_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod hot_wiring_handler_tests {
     //! Regression-locks the `POST /_ipe/hot-wiring` trust boundary — the dev-only
     //! leg that updates the server-held Cmd wiring from an untrusted dev channel.
@@ -11297,7 +11290,7 @@ mod hot_wiring_handler_tests {
 /// The longest UTF-8 prefix of streamed body bytes. A chunk boundary may
 /// split a code point, so an unfinished tail waits for the next chunk; bytes
 /// are never replaced, so a marker past an invalid sequence is never found.
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 fn utf8_prefix(bytes: &[u8]) -> &str {
     match std::str::from_utf8(bytes) {
         Ok(text) => text,
@@ -11308,7 +11301,7 @@ fn utf8_prefix(bytes: &[u8]) -> &str {
     }
 }
 
-#[cfg(all(test, feature = "server", not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "web", not(target_arch = "wasm32")))]
 mod bind_error_tests {
     use crate::telemetry::BuildPosture;
 
@@ -11428,7 +11421,7 @@ mod bind_error_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod reset_state_tests {
     use super::reset_state_from_env;
 
@@ -11474,7 +11467,7 @@ mod reset_state_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod emitted_router_behavior_tests {
     //! In-process behavior tier for THE SEAL's live-server guarantees.
     //!
@@ -13526,7 +13519,7 @@ mod emitted_router_behavior_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod page_mount_base_tests {
     use axum::http::{HeaderMap, StatusCode};
 
@@ -13567,7 +13560,7 @@ mod page_mount_base_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod route_entry_cmd_tests {
     //! Every server path that commits a routed page from a URL runs that
     //! page's entry Cmd: the first GET (after `init`'s Cmd), a reload of a live
@@ -15324,7 +15317,7 @@ mod route_entry_cmd_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod tab_seq_window_tests {
     use super::{TAB_SEQ_CAP, TAB_SEQ_WINDOW, TabId, TabSeqs};
 
@@ -17274,7 +17267,7 @@ mod web_revocation_tests {
     }
 }
 
-#[cfg(all(test, feature = "server"))]
+#[cfg(all(test, feature = "web"))]
 mod web_static_mount_tests {
     //! A `Web` app's `/static` mount re-bases the listener's parse as every
     //! `Server` mount does.

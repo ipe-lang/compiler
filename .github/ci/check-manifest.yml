@@ -70,6 +70,8 @@ checks:
       run:
         - cargo clippy -p ipe-runtime-rust --no-default-features --features db --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features db,web --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features server --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features server,web-core --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features debugger,tui --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features debugger,web --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --all-targets --features dev-posture -- -D warnings

@@ -467,7 +467,7 @@ config = ["json", "toml", "dep:serde-saphyr"]
 # `tokio/net`+`tokio/sync`: axum binds a listener (`tokio::net`) and the
 # server/live loop uses `tokio::sync`.
 # `crypto-core`: `server.rs` constant-time compares session ids via `subtle`.
-server = ["tokio", "tokio/net", "tokio/sync", "axum", "tower-http", "tower", "futures-util", "encoding", "uuid", "random", "crypto-core"]
+server = ["tokio", "tokio/net", "tokio/sync", "tokio/signal", "axum", "tower-http", "tower", "futures-util", "encoding", "uuid", "random", "crypto-core"]
 # The reqwest-free `ssrf` module parses URLs via the `url` crate (which reqwest
 # re-exports as `reqwest::Url`); `url` is behind the `url` feature.
 # `serde`: `http_stream.rs` derives Serialize/Deserialize on its SSE event

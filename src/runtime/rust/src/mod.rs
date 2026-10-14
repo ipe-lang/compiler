@@ -692,9 +692,12 @@ pub mod web_page_core;
 // `wasm-client` sink, neither of which runs an HTTP server — the module compiles
 // to just its server-free render core (`dom` diff/dispatch/form, `style_inject`,
 // `route`, `literal_table`, `template`, the pure hot-swap datum types, and the
-// `page_shell` scaffold). The `server` feature turns the full served surface
+// `page_shell` scaffold). The `web` feature turns the full served surface
 // (axum router, SSE, session store, CSRF middleware, pub/sub broker) back on;
-// every axum/SSE/session item inside `web/` is `#[cfg(feature = "server")]`. One
+// every axum/SSE/session item inside `web/` is `#[cfg(feature = "web")]`, never
+// `server`: `server` alone carries none of the served surface's deps, so a
+// `server` + `web-core` build (a webview app that also serves `Http.Server`)
+// compiles the render core only. One
 // `pub mod web;` for both hosts — the module-set closure sees a single `web`, no
 // shell.
 #[cfg(feature = "web-core")]

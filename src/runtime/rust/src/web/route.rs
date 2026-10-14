@@ -33,7 +33,7 @@ pub use crate::encoding::{
     DecodedPath, PatternSeg, RouteParams, RoutePattern, RoutePatternRefusal, RouteSegmentRefusal,
     match_route,
 };
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 use crate::encoding::{EncodedBase, QueryText};
 
 /// A declared route: a parsed URL pattern + a builder that applies the
@@ -421,13 +421,13 @@ pub fn resolve<Page>(
 }
 
 /// A same-origin `Location` for a non-canonical page path.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Debug)]
 pub struct CanonicalRedirect {
     location: axum::http::HeaderValue,
 }
 
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 impl CanonicalRedirect {
     /// The `Location` header value: the base, the canonical path, then the
     /// request's query unchanged.
@@ -438,7 +438,7 @@ impl CanonicalRedirect {
 }
 
 /// What the page handler does with a GET before it enters the page.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 #[derive(Clone, Debug)]
 pub enum Redirect {
     /// The request path is canonical: serve it.
@@ -457,7 +457,7 @@ pub enum Redirect {
 /// its respelled text already matches. The redirect target is always `base`
 /// plus a [`RoutePath`] (every segment encoded, never `//`), so it stays on
 /// this origin whatever the request held.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub fn canonical_redirect(
     base: &EncodedBase,
     spelling: crate::server::Spelling,
@@ -751,7 +751,7 @@ mod tests {
         assert!(!match_params(&rs, &dp("/nope")).contains_key("key"));
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     fn base(path: &str) -> EncodedBase {
         match EncodedBase::encode(&dp(path)) {
             Ok(b) => b,
@@ -759,10 +759,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     use crate::server::Spelling::{Canonical, Respelled};
 
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     fn location_of(redirect: &Redirect) -> String {
         match redirect {
             Redirect::To(target) => match target.location().to_str() {
@@ -775,7 +775,7 @@ mod tests {
 
     /// A canonical request is served; any other spelling redirects to base
     /// plus the canonical path, the query carried unchanged.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_targets_base_plus_canonical() {
         let canon = canonical_of("/apps/foo/");
@@ -811,7 +811,7 @@ mod tests {
 
     /// A redirect target redirects no further: render(parse(canonical)) is
     /// the canonical path itself.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_never_loops() {
         for raw in ["/apps/foo/", "/apps/%41", "/apps/%c3%a9", "/x/1/2/"] {
@@ -826,7 +826,7 @@ mod tests {
     }
 
     /// No request path or param can steer the `Location` off this origin.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_stays_on_origin() {
         for slug in [
@@ -875,7 +875,7 @@ mod tests {
 
     /// A query that cannot be copied into a header byte for byte refuses the
     /// request instead of redirecting with a mangled or injected query.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[test]
     fn canonical_redirect_refuses_a_bad_query() {
         let canon = canonical_of("/apps/foo");

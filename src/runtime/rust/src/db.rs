@@ -2246,9 +2246,11 @@ impl std::fmt::Debug for PoolKey {
 /// Connect `db_url`, returning a clone of the pool cached under `key` on a hit.
 ///
 /// On a miss the pool is built with NO lock held (never block other tasks on
-/// connect I/O); a concurrent miss that built a redundant pool loses the
-/// `entry` race and its extra pool drops (closes), so steady state keeps one
-/// pool per key. `None` builds an uncached pool.
+/// connect I/O); a concurrent miss that built a redundant pool loses the race
+/// and its extra pool drops (closes), so steady state keeps one pool per key.
+/// A cached pool a `Db.close` closed is evicted and rebuilt, never handed out.
+/// Every pool the cache holds is an owned pool, closed at shutdown. `None`
+/// builds an uncached pool.
 async fn connect_cached<E: Send + crate::FromIpeError + 'static>(
     key: Option<PoolKey>,
     db_url: DbUrl,
@@ -2262,11 +2264,10 @@ async fn connect_cached<E: Send + crate::FromIpeError + 'static>(
             )));
         }
     };
-    if let Some(key) = &key {
-        let g = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(p) = g.get(key) {
-            return ok_res(p.clone());
-        }
+    if let Some(key) = &key
+        && let Some(open) = cached_open_pool(key)
+    {
+        return ok_res(open);
     }
     let pool = match build_pool::<E>(&db_url, journal).await {
         IpeResult::Ok(pool) => pool,
@@ -2275,17 +2276,260 @@ async fn connect_cached<E: Send + crate::FromIpeError + 'static>(
     let Some(key) = key else {
         return ok_res(pool);
     };
+    {
+        let mut g = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
+        // Another task may have inserted during the lock-free build → reuse it.
+        if let Some(existing) = g.get(&key).filter(|p| !p.is_closed()) {
+            return ok_res(existing.clone());
+        }
+        g.remove(&key);
+        // Bound the cache: at cap, return the freshly-built pool UNCACHED
+        // (functional; just not memoised) rather than growing without limit.
+        if g.len() >= max_pools {
+            return ok_res(pool);
+        }
+        g.insert(key, pool.clone());
+    }
+    own_pool(PoolRole::Cached, &pool);
+    ok_res(pool)
+}
+
+/// The open pool cached under `key`; a closed one is evicted and reads as absent.
+fn cached_open_pool(key: &PoolKey) -> Option<Db> {
     let mut g = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
-    // Another task may have inserted during the lock-free build → reuse it.
-    if let Some(existing) = g.get(&key) {
-        return ok_res(existing.clone());
+    match g.get(key).map(sqlx::Pool::is_closed) {
+        Some(false) => g.get(key).cloned(),
+        Some(true) => {
+            g.remove(key);
+            None
+        }
+        None => None,
     }
-    // Bound the cache: at cap, return the freshly-built pool UNCACHED
-    // (functional; just not memoised) rather than growing without limit.
-    if g.len() >= max_pools {
-        return ok_res(pool);
+}
+
+// ─── Owned pools: closed at shutdown ──────────────────────────────────────────
+//
+// `exit_process` runs no destructor, so a pool held in a static is never
+// dropped: SQLite never sees its last connection close and never checkpoints
+// the WAL. Every pool the runtime holds for the life of the process registers
+// here, and a served app's shutdown closes them all, each under a deadline.
+
+/// The part a runtime-held pool plays, which orders its close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolRole {
+    /// A pool `Db.connect` or `Db.open` cached.
+    Cached,
+    /// A persistent session store's pool.
+    SessionStore,
+    /// The telemetry spill pool.
+    ///
+    /// It closes after every other pool, once the last exporter flush wrote.
+    TelemetrySpill,
+}
+
+/// The future one owned-pool close runs to.
+pub type PoolClose = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// A pool the runtime holds for the life of the process.
+pub trait OwnedPool: Send + Sync {
+    /// Close the pool, waiting for its connections to finish.
+    fn close_owned(&self) -> PoolClose;
+    /// Whether the pool is already closed.
+    fn is_closed_owned(&self) -> bool;
+}
+
+impl<DB: sqlx::Database> OwnedPool for sqlx::Pool<DB> {
+    fn close_owned(&self) -> PoolClose {
+        let pool = self.clone();
+        Box::pin(async move {
+            // A connection released while the first close ran lands idle in the
+            // closed pool; each further close drains it, so the loop ends only
+            // when no connection is left open (the caller's deadline bounds it).
+            pool.close().await;
+            while pool.size() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                pool.close().await;
+            }
+        })
     }
-    ok_res(g.entry(key).or_insert(pool).clone())
+
+    fn is_closed_owned(&self) -> bool {
+        self.is_closed()
+    }
+}
+
+/// Why a pool was not registered as owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnedPoolRefusal {
+    /// The registry already holds `ceiling` open pools.
+    Full {
+        /// The most open pools the registry holds.
+        ceiling: usize,
+    },
+    /// A registrant panicked while holding the registry.
+    Unavailable,
+}
+
+impl std::fmt::Display for OwnedPoolRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full { ceiling } => {
+                write!(
+                    f,
+                    "the owned-pool registry already holds {ceiling} open pools"
+                )
+            }
+            Self::Unavailable => f.write_str("the owned-pool registry is unavailable"),
+        }
+    }
+}
+
+/// An owned pool and its role.
+type OwnedEntry = (PoolRole, Box<dyn OwnedPool>);
+
+/// How many stages [`OwnedPools::close_all`] closes in, one after another:
+/// every pool but the telemetry spill, then the spill.
+pub const CLOSE_STAGES: usize = 2;
+
+/// The pools a shutdown closes.
+pub struct OwnedPools {
+    entries: std::sync::Mutex<Vec<OwnedEntry>>,
+}
+
+impl OwnedPools {
+    /// An empty registry.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register `pool` under `role`, holding at most `ceiling` open pools.
+    ///
+    /// A pool closed since it registered no longer counts and is dropped first.
+    ///
+    /// # Errors
+    ///
+    /// [`OwnedPoolRefusal::Full`] at the ceiling, [`OwnedPoolRefusal::Unavailable`]
+    /// on a poisoned registry; the pool is not registered.
+    pub fn register(
+        &self,
+        role: PoolRole,
+        pool: Box<dyn OwnedPool>,
+        ceiling: usize,
+    ) -> Result<(), OwnedPoolRefusal> {
+        let Ok(mut entries) = self.entries.lock() else {
+            return Err(OwnedPoolRefusal::Unavailable);
+        };
+        entries.retain(|(_, held)| !held.is_closed_owned());
+        if entries.len() >= ceiling {
+            return Err(OwnedPoolRefusal::Full { ceiling });
+        }
+        entries.push((role, pool));
+        Ok(())
+    }
+
+    /// Close every registered pool, each under `deadline`; the spill pool last.
+    ///
+    /// The pools of one stage close concurrently, so a stage waits at most
+    /// `deadline` and the whole close at most [`CLOSE_STAGES`] times it. A
+    /// pool that misses its deadline is logged and left to the exit.
+    pub async fn close_all(&self, deadline: std::time::Duration) {
+        // A poisoned registry still holds whole entries; its pools close too.
+        let taken = std::mem::take(&mut *self.entries.lock().unwrap_or_else(|e| e.into_inner()));
+        let (spill, first): (Vec<OwnedEntry>, Vec<OwnedEntry>) = taken
+            .into_iter()
+            .partition(|(role, _)| *role == PoolRole::TelemetrySpill);
+        let stages: [Vec<OwnedEntry>; CLOSE_STAGES] = [first, spill];
+        for stage in stages {
+            close_within(stage, deadline).await;
+        }
+    }
+}
+
+#[cfg(test)]
+impl OwnedPools {
+    /// The open pools registered under `role`.
+    #[must_use]
+    pub fn open_in(&self, role: PoolRole) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(held, pool)| *held == role && !pool.is_closed_owned())
+            .count()
+    }
+}
+
+impl Default for OwnedPools {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Close `pools` concurrently, each under `deadline`, logging the late ones.
+async fn close_within(pools: Vec<OwnedEntry>, deadline: std::time::Duration) {
+    let mut closing = tokio::task::JoinSet::new();
+    for (_, pool) in pools {
+        let close = pool.close_owned();
+        closing.spawn(async move { tokio::time::timeout(deadline, close).await.is_ok() });
+    }
+    let mut late: usize = 0;
+    while let Some(closed) = closing.join_next().await {
+        if !matches!(closed, Ok(true)) {
+            late = late.saturating_add(1);
+        }
+    }
+    if late > 0 {
+        crate::system::emit_runtime_log(
+            "db",
+            &format!(
+                "{late} pool(s) did not close within {} ms; their connections drop at exit",
+                deadline.as_millis()
+            ),
+        );
+    }
+}
+
+/// The process's owned pools.
+static OWNED_POOLS: OwnedPools = OwnedPools::new();
+
+/// The most open pools the process registry holds: one per cached pool, two
+/// session-store backends and the spill pool.
+fn owned_pools_ceiling() -> usize {
+    let cached = DB_POOLS_CEILING.read::<usize>().unwrap_or_else(|_| {
+        usize::try_from(DB_POOLS_CEILING.default_value()).unwrap_or(usize::MAX)
+    });
+    cached.saturating_add(3)
+}
+
+/// Register `pool` with the process registry under `role`.
+///
+/// # Errors
+///
+/// The [`OwnedPoolRefusal`] of [`OwnedPools::register`].
+pub fn register_owned_pool(
+    role: PoolRole,
+    pool: Box<dyn OwnedPool>,
+) -> Result<(), OwnedPoolRefusal> {
+    OWNED_POOLS.register(role, pool, owned_pools_ceiling())
+}
+
+/// Register `pool` under `role`; a refusal is logged and the pool stays usable.
+pub fn own_pool<DB: sqlx::Database>(role: PoolRole, pool: &sqlx::Pool<DB>) {
+    if let Err(refused) = register_owned_pool(role, Box::new(pool.clone())) {
+        crate::system::emit_runtime_log(
+            "db",
+            &format!("a pool will not be closed at shutdown: {refused}"),
+        );
+    }
+}
+
+/// The process's owned-pool registry, which a served app's stop closes.
+#[must_use]
+pub fn process_pools() -> &'static OwnedPools {
+    &OWNED_POOLS
 }
 
 /// Connect the operator URL `url`, pooled per URL unless it names a private
@@ -13549,6 +13793,179 @@ mod tests {
             IpeResult::Ok(pool) => Ok(pool),
             IpeResult::Err(e) => Err(e),
         }
+    }
+
+    /// The sidecar file `suffix` names next to `path`.
+    fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    }
+
+    /// Closing the owned pools checkpoints a WAL database: no `-wal` or `-shm`
+    /// file is left and the file passes its integrity check.
+    #[tokio::test]
+    async fn closing_owned_pools_leaves_no_wal_sidecar() {
+        let (pool, path) = fresh_file_db(4).await;
+        let wrote = sqlx::query("INSERT INTO todos (title) VALUES ('kept')")
+            .execute(&pool)
+            .await;
+        assert!(wrote.is_ok(), "the write lands: {wrote:?}");
+        assert!(
+            sidecar(&path, "-wal").exists(),
+            "a WAL write leaves its sidecar open"
+        );
+        let pools = OwnedPools::new();
+        assert!(
+            pools
+                .register(PoolRole::Cached, Box::new(pool.clone()), 4)
+                .is_ok()
+        );
+        pools.close_all(std::time::Duration::from_secs(2)).await;
+        assert!(pool.is_closed());
+        assert!(
+            !sidecar(&path, "-wal").exists(),
+            "the close checkpoints the WAL"
+        );
+        assert!(
+            !sidecar(&path, "-shm").exists(),
+            "the close removes the shm"
+        );
+        let url = format!("sqlite://{}?mode=ro", path.display());
+        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await;
+        assert!(reopened.is_ok(), "the closed file reopens: {reopened:?}");
+        let Ok(reopened) = reopened else {
+            return;
+        };
+        let check: Result<(String,), _> = sqlx::query_as("PRAGMA integrity_check")
+            .fetch_one(&reopened)
+            .await;
+        assert!(
+            matches!(check, Ok((ref verdict,)) if verdict == "ok"),
+            "{check:?}"
+        );
+        let kept: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM todos")
+            .fetch_one(&reopened)
+            .await;
+        assert!(
+            matches!(kept, Ok((1,))),
+            "the write survives the close: {kept:?}"
+        );
+        reopened.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A checked-out connection never holds the close past its deadline.
+    #[tokio::test]
+    async fn a_checked_out_connection_never_holds_the_close_past_its_deadline() {
+        let (pool, path) = fresh_file_db(2).await;
+        let held = pool.acquire().await;
+        assert!(held.is_ok(), "a connection checks out: {held:?}");
+        let pools = OwnedPools::new();
+        assert!(
+            pools
+                .register(PoolRole::Cached, Box::new(pool.clone()), 4)
+                .is_ok()
+        );
+        let deadline = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let bound = deadline * 2 + std::time::Duration::from_secs(2);
+        let closed = tokio::time::timeout(bound, pools.close_all(deadline)).await;
+        assert!(closed.is_ok(), "the close returns within its deadline");
+        assert!(started.elapsed() < bound);
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file database closed by `Db.close` reopens to a working pool, never
+    /// the closed cached one.
+    #[tokio::test]
+    async fn a_closed_file_database_reopens_to_an_open_pool() {
+        let path = scratch_path("db_close_reopen.db");
+        let location = || match file_at(&path, FileMode::CreateIfMissing) {
+            IpeResult::Ok(location) => Some(location),
+            IpeResult::Err(_) => None,
+        };
+        let first = match location() {
+            Some(location) => open_at(location).await,
+            None => Err("the scratch path seals".to_owned()),
+        };
+        assert!(first.is_ok(), "the file opens: {first:?}");
+        let Ok(first) = first else {
+            return;
+        };
+        let closed = db_close::<String>(first.clone()).await;
+        assert!(matches!(closed, IpeResult::Ok(())));
+        assert!(first.is_closed());
+        let second = match location() {
+            Some(location) => open_at(location).await,
+            None => Err("the scratch path seals".to_owned()),
+        };
+        assert!(second.is_ok(), "the closed file reopens: {second:?}");
+        let Ok(second) = second else {
+            return;
+        };
+        assert!(
+            !second.is_closed(),
+            "a reopen never hands out the closed pool"
+        );
+        let queried = sqlx::query("SELECT 1").execute(&second).await;
+        assert!(queried.is_ok(), "the reopened pool answers: {queried:?}");
+        second.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stand-in pool whose closed flag the test sets.
+    struct FakePool(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl OwnedPool for FakePool {
+        fn close_owned(&self) -> PoolClose {
+            let closed = std::sync::Arc::clone(&self.0);
+            Box::pin(async move { closed.store(true, std::sync::atomic::Ordering::SeqCst) })
+        }
+
+        fn is_closed_owned(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The registry refuses one pool past its ceiling; a closed pool frees its slot.
+    #[tokio::test]
+    async fn the_owned_pool_registry_refuses_one_past_its_ceiling() {
+        let pools = OwnedPools::new();
+        let flags: Vec<_> = (0..3)
+            .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
+        let fake = |i: usize| -> Box<dyn OwnedPool> {
+            let flag = flags.get(i).map_or_else(
+                || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::clone,
+            );
+            Box::new(FakePool(flag))
+        };
+        assert!(pools.register(PoolRole::Cached, fake(0), 2).is_ok());
+        assert!(pools.register(PoolRole::SessionStore, fake(1), 2).is_ok());
+        assert_eq!(
+            pools.register(PoolRole::TelemetrySpill, fake(2), 2),
+            Err(OwnedPoolRefusal::Full { ceiling: 2 })
+        );
+        if let Some(first) = flags.first() {
+            first.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(
+            pools.register(PoolRole::TelemetrySpill, fake(2), 2).is_ok(),
+            "a closed pool no longer counts"
+        );
+        pools.close_all(std::time::Duration::from_secs(1)).await;
+        assert!(
+            flags
+                .iter()
+                .all(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)),
+            "close_all closes every registered pool"
+        );
     }
 
     /// A location is admitted only by a driver of the engine it names: every

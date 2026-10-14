@@ -582,6 +582,14 @@ jobs:
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features db --all-targets -- -D warnings
       # db WITH web — the pair must also stay co-buildable.
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features db,web --all-targets -- -D warnings
+      # server WITHOUT web or db — the `Http.Server`-only runtime an app with no
+      # `Ipe.Web` and no `Db` links, its shutdown owner included.
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features server --all-targets -- -D warnings
+      # server over the render core WITHOUT web — a webview app that also serves
+      # `Http.Server`. Every served-web item is keyed to `web`, never `server`, so
+      # this combo compiles the render core alone; an item gated narrower than the
+      # deps it uses fails here.
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features server,web-core --all-targets -- -D warnings
       # The dev-loop time-travel debugger over each frontend — the debugger render
       # sites live only under these combos, so CI must build them or the combo can
       # break while main stays green.

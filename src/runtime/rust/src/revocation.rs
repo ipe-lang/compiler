@@ -391,7 +391,7 @@ pub fn subject_is_revoked(subject: &str) -> Result<bool, RevocationError> {
 pub const MAX_CREDENTIAL_FIELD_BYTES: usize = 512;
 
 // The checkpoint sizes its credential section from the same two bounds.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the gate's credential bounds drift from the checkpoint section's [ledger #boundary]
 const _: () = assert!(
     MAX_CREDENTIAL_FIELD_BYTES == crate::web::store::MAX_CRED_FIELD_BYTES
@@ -1907,7 +1907,7 @@ mod tests {
     }
 
     /// The largest set the gate can admit fits the checkpoint's credential section.
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn the_largest_admitted_set_fits_the_checkpoint_section() {
         let field = |n: usize| {
