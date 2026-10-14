@@ -2192,9 +2192,7 @@ fn to_axum_response(r: ServerResponse, streams: RequestStreams) -> axum::respons
 /// [`crate::csp::Profile::Response`] policy.
 fn response_security_headers()
 -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
-    crate::telemetry::security_headers(crate::telemetry::HeaderProfile::Policy(
-        crate::csp::Profile::Response,
-    ))
+    crate::telemetry::security_headers(crate::csp::Profile::Response)
 }
 
 /// [`to_axum_response`] over the outcome of reading the security headers.

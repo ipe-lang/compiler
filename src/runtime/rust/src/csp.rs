@@ -4,13 +4,18 @@
 //! from the closed [`Directive`] and [`Source`] vocabularies, so no call site
 //! spells a directive string. A [`Profile`] names the response a policy guards;
 //! header assembly (`telemetry::security_headers`) takes it as a required
-//! parameter. An inline element a profile admits is admitted by a hash computed
-//! from the same constant the response embeds, never a copied digest.
+//! parameter, and every profile is a full policy, so no HTML response is sent
+//! without one. An inline script a profile admits is admitted by a hash computed
+//! from the same constant the response embeds, never a copied digest, and no
+//! profile's `script-src` holds `'unsafe-inline'`.
 
 use crate::telemetry::FrameAncestors;
 
 #[cfg(all(feature = "server", feature = "web-core"))]
 use crate::web::console::{CONSOLE_CSS, CONSOLE_JS};
+
+#[cfg(all(feature = "server", feature = "web-core", feature = "debugger"))]
+use crate::debugger::server::OVERLAY_JS;
 
 /// A policy directive the runtime emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +82,22 @@ impl Directive {
     }
 }
 
+/// Whether `text` holds `</` or `<!--`, either of which can end or re-mode a
+/// raw-text `<script>` or `<style>` element before its own close tag — so an
+/// inline constant admitted by its hash would serve bytes the hash does not
+/// cover. Every inline constant a policy hashes is asserted free of both at
+/// build time.
+pub const fn ends_raw_text_early(text: &str) -> bool {
+    let mut rest = text.as_bytes();
+    while let [first, tail @ ..] = rest {
+        if *first == b'<' && matches!(tail, [b'/', ..] | [b'!', b'-', b'-', ..]) {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
 /// A `'sha256-…'` source admitting one inline element by its exact text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CspHash(String);
@@ -108,7 +129,8 @@ pub enum Source<'a> {
     None,
     /// `'self'`: the response's own origin.
     SelfOrigin,
-    /// `'unsafe-inline'`; the profiles place it only in `style-src-attr`.
+    /// `'unsafe-inline'`; the profiles place it only in a `style-src*`
+    /// directive that holds no hash, never in a `script-src*` one.
     UnsafeInline,
     /// The `data:` scheme.
     Data,
@@ -162,6 +184,12 @@ profiles! {
     /// element are admitted by hash, and it is never framed cross-origin.
     #[cfg(all(feature = "server", feature = "web-core"))]
     Console,
+    /// An `Ipe.Web` page: its scripts are the same-origin, SRI-pinned client
+    /// files plus, under the debugger, the overlay script admitted by hash; its
+    /// scoped `<style>` elements are rendered per view, so style elements are
+    /// admitted inline.
+    #[cfg(all(feature = "server", feature = "web-core"))]
+    WebPage,
 }
 
 impl Profile {
@@ -173,6 +201,20 @@ impl Profile {
             Self::Response => framing,
             #[cfg(all(feature = "server", feature = "web-core"))]
             Self::Console => None,
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Self::WebPage => framing,
+        }
+    }
+
+    /// The `Cache-Control` the profile's response carries: a page holding
+    /// per-session values (the sid, the CSRF token) is never stored by a
+    /// shared or back-forward cache. `None` leaves caching to the handler.
+    #[must_use]
+    pub const fn cache_control(self) -> Option<&'static str> {
+        match self {
+            Self::Response => None,
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Self::Console | Self::WebPage => Some("no-store"),
         }
     }
 }
@@ -194,6 +236,26 @@ fn console_hashes() -> &'static ConsoleHashes {
     })
 }
 
+/// The hash of the debugger overlay script, computed once from [`OVERLAY_JS`].
+#[cfg(all(feature = "server", feature = "web-core", feature = "debugger"))]
+fn overlay_hash() -> &'static CspHash {
+    static CELL: std::sync::OnceLock<CspHash> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| CspHash::of(OVERLAY_JS))
+}
+
+/// The `script-src` sources of an `Ipe.Web` page.
+#[cfg(all(feature = "server", feature = "web-core"))]
+fn web_page_scripts<'a>() -> Vec<Source<'a>> {
+    #[cfg(feature = "debugger")]
+    {
+        vec![Source::SelfOrigin, Source::Hash(overlay_hash())]
+    }
+    #[cfg(not(feature = "debugger"))]
+    {
+        vec![Source::SelfOrigin]
+    }
+}
+
 /// A `Content-Security-Policy` value: an ordered list of directives.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContentSecurityPolicy<'a> {
@@ -211,13 +273,9 @@ impl<'a> ContentSecurityPolicy<'a> {
             Profile::Response => Self::response(ancestors),
             #[cfg(all(feature = "server", feature = "web-core"))]
             Profile::Console => Self::console(ancestors),
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Profile::WebPage => Self::web_page(ancestors),
         }
-    }
-
-    /// The policy holding only `frame-ancestors <framing>`.
-    #[must_use]
-    pub fn frame_only(framing: &'a FrameAncestors) -> Self {
-        Self::default().with(Directive::FrameAncestors, vec![Source::Embed(framing)])
     }
 
     /// The `Response` profile with `frame-ancestors` set to `ancestors`.
@@ -260,6 +318,31 @@ impl<'a> ContentSecurityPolicy<'a> {
             .with(D::ObjectSrc, vec![S::None])
             .with(D::BaseUri, vec![S::None])
             .with(D::FormAction, vec![S::None])
+            .with(D::FrameAncestors, vec![ancestors])
+    }
+
+    /// The `WebPage` profile with `frame-ancestors` set to `ancestors`.
+    #[cfg(all(feature = "server", feature = "web-core"))]
+    fn web_page(ancestors: Source<'a>) -> Self {
+        use Directive as D;
+        use Source as S;
+        Self::default()
+            .with(D::DefaultSrc, vec![S::None])
+            .with(D::ScriptSrc, web_page_scripts())
+            .with(D::ScriptSrcAttr, vec![S::None])
+            .with(D::StyleSrc, vec![S::SelfOrigin, S::UnsafeInline])
+            .with(D::StyleSrcElem, vec![S::SelfOrigin, S::UnsafeInline])
+            .with(D::StyleSrcAttr, vec![S::UnsafeInline])
+            .with(D::ImgSrc, vec![S::SelfOrigin, S::Data, S::Blob])
+            .with(D::FontSrc, vec![S::SelfOrigin, S::Data])
+            .with(D::MediaSrc, vec![S::SelfOrigin, S::Blob])
+            .with(D::ConnectSrc, vec![S::SelfOrigin])
+            .with(D::ManifestSrc, vec![S::SelfOrigin])
+            .with(D::WorkerSrc, vec![S::SelfOrigin])
+            .with(D::FrameSrc, vec![S::SelfOrigin])
+            .with(D::ObjectSrc, vec![S::None])
+            .with(D::BaseUri, vec![S::None])
+            .with(D::FormAction, vec![S::SelfOrigin])
             .with(D::FrameAncestors, vec![ancestors])
     }
 
@@ -342,7 +425,7 @@ mod tests {
             assert_eq!(Profile::ALL.iter().position(|q| q == p), Some(i), "{p:?}");
         }
         let declared = if cfg!(all(feature = "server", feature = "web-core")) {
-            2
+            3
         } else {
             1
         };
@@ -404,8 +487,27 @@ mod tests {
         }
     }
 
+    /// The directives that may hold `'unsafe-inline'` under `profile`: the
+    /// `style=""` attribute wherever one is admitted, plus `<style>` elements
+    /// on the `Ipe.Web` page alone, whose scoped elements are rendered per view.
+    fn unsafe_inline_holders(profile: Profile) -> &'static [Directive] {
+        match profile {
+            Profile::Response => &[Directive::StyleSrcAttr],
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Profile::Console => &[],
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Profile::WebPage => &[
+                Directive::StyleSrc,
+                Directive::StyleSrcElem,
+                Directive::StyleSrcAttr,
+            ],
+        }
+    }
+
+    /// `'unsafe-inline'` sits exactly in the style directives its profile
+    /// names, and never beside a hash there, where a browser would ignore it.
     #[test]
-    fn unsafe_inline_only_in_style_attr() {
+    fn unsafe_inline_only_in_the_profiles_hashless_style_directives() {
         let framing = embed();
         for (profile, policy) in every_policy(framing.as_ref()) {
             let holders: Vec<Directive> = policy
@@ -413,23 +515,151 @@ mod tests {
                 .filter(|(_, sources)| sources.contains(&Source::UnsafeInline))
                 .map(|(d, _)| d)
                 .collect();
-            let want: &[Directive] = if policy.sources(Directive::StyleSrcAttr).is_some() {
-                &[Directive::StyleSrcAttr]
-            } else {
-                &[]
-            };
-            assert_eq!(holders, want, "{profile:?}");
+            assert_eq!(holders, unsafe_inline_holders(profile), "{profile:?}");
+            for (directive, sources) in policy.directives() {
+                assert!(
+                    !(sources.contains(&Source::UnsafeInline)
+                        && sources.iter().any(|s| matches!(s, Source::Hash(_)))),
+                    "{profile:?} {directive:?} pairs a hash with 'unsafe-inline'"
+                );
+            }
             assert_eq!(
                 policy.header_value().matches("'unsafe-inline'").count(),
-                want.len(),
+                holders.len(),
                 "{profile:?}"
             );
         }
-        assert!(
-            ContentSecurityPolicy::for_profile(Profile::Response, None)
-                .sources(Directive::StyleSrcAttr)
-                .is_some_and(|s| s == [Source::UnsafeInline])
+    }
+
+    /// The exact `WebPage` header value under the same-origin default.
+    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[test]
+    fn web_page_profile_exact_header() {
+        #[cfg(feature = "debugger")]
+        let scripts = {
+            use base64::{Engine, engine::general_purpose::STANDARD};
+            use sha2::{Digest, Sha256};
+            format!(
+                "'self' 'sha256-{}'",
+                STANDARD.encode(Sha256::digest(OVERLAY_JS.as_bytes()))
+            )
+        };
+        #[cfg(not(feature = "debugger"))]
+        let scripts = "'self'";
+        let want = format!(
+            "default-src 'none'; script-src {scripts}; script-src-attr 'none'; \
+             style-src 'self' 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; \
+             style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; \
+             font-src 'self' data:; media-src 'self' blob:; connect-src 'self'; \
+             manifest-src 'self'; worker-src 'self'; frame-src 'self'; \
+             object-src 'none'; base-uri 'none'; form-action 'self'; \
+             frame-ancestors 'self'"
         );
+        assert_eq!(
+            ContentSecurityPolicy::for_profile(Profile::WebPage, None).header_value(),
+            want
+        );
+    }
+
+    /// Each `<script>` element of `html`: its open-tag attribute text and its
+    /// body, cut as a browser cuts a raw-text element.
+    #[cfg(all(feature = "server", feature = "web-core"))]
+    fn script_elements(html: &str) -> Vec<(&str, &str)> {
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(at) = rest.find("<script") {
+            let tail = rest.get(at + "<script".len()..).unwrap_or("");
+            let Some(open_end) = tail.find('>') else {
+                break;
+            };
+            let attrs = tail.get(..open_end).unwrap_or("");
+            let after = tail.get(open_end + 1..).unwrap_or("");
+            let Some(close) = after.find("</script") else {
+                break;
+            };
+            out.push((attrs, after.get(..close).unwrap_or("")));
+            rest = after.get(close..).unwrap_or("");
+        }
+        out
+    }
+
+    /// Whether `policy`'s `script-src` admits a `<script>` with `attrs` and
+    /// `body`: a same-origin path `src`, an inert JSON data block, or a body
+    /// whose hash the policy names.
+    #[cfg(all(feature = "server", feature = "web-core"))]
+    fn admits_script(policy: &ContentSecurityPolicy<'_>, attrs: &str, body: &str) -> bool {
+        let sources = policy.sources(Directive::ScriptSrc).unwrap_or(&[]);
+        if let Some((_, src)) = attrs.split_once(" src=\"") {
+            return src.starts_with('/')
+                && !src.starts_with("//")
+                && body.is_empty()
+                && sources.contains(&Source::SelfOrigin);
+        }
+        if attrs.contains("type=\"application/json\"") {
+            return true;
+        }
+        let hash = CspHash::of(body);
+        sources.contains(&Source::Hash(&hash))
+    }
+
+    /// Every script of a served `Ipe.Web` page runs under its policy, and an
+    /// injected inline script is refused by it.
+    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[test]
+    fn web_page_policy_admits_every_served_script() {
+        let epoch = crate::dom::dispatch::Rendered::first(
+            crate::web::new_incarnation(),
+            crate::html::Html::<()>::HText(String::new()),
+        )
+        .epoch();
+        let page = crate::web::render_page_full(
+            "sid",
+            &crate::encoding::MountBase::root(),
+            "<p>hi</p>",
+            &epoch,
+            "tok",
+        );
+        assert!(page.is_ok(), "{page:?}");
+        let page = page.unwrap_or_default();
+        let policy = ContentSecurityPolicy::for_profile(Profile::WebPage, None);
+        let scripts = script_elements(&page);
+        assert!(scripts.len() >= 2, "{page}");
+        for (attrs, body) in &scripts {
+            assert!(admits_script(&policy, attrs, body), "<script{attrs}>{body}");
+        }
+        let injected = "alert(1)";
+        assert!(
+            !admits_script(&policy, "", injected),
+            "an inline script without an admitted hash must be refused"
+        );
+        assert!(!admits_script(
+            &policy,
+            " src=\"https://evil.example/x.js\"",
+            ""
+        ));
+    }
+
+    /// The debugger overlay's inline script is the constant whose hash the
+    /// `WebPage` policy names, and an edited copy of it is refused.
+    #[cfg(all(feature = "server", feature = "web-core", feature = "debugger"))]
+    #[test]
+    fn debugger_overlay_script_is_hash_admitted() {
+        let policy = ContentSecurityPolicy::for_profile(Profile::WebPage, None);
+        for base in ["", "/myapp"] {
+            let overlay = crate::debugger::server::overlay_html(&["Add(1)".to_owned()], 1, base);
+            let scripts = script_elements(&overlay);
+            assert_eq!(scripts.len(), 1, "{overlay}");
+            for (attrs, body) in &scripts {
+                assert_eq!(*body, OVERLAY_JS);
+                assert!(admits_script(&policy, attrs, body), "{overlay}");
+            }
+        }
+        assert_eq!(
+            policy.sources(Directive::ScriptSrc),
+            Some([Source::SelfOrigin, Source::Hash(overlay_hash())].as_slice())
+        );
+        let edited = format!("{OVERLAY_JS} ");
+        assert!(!admits_script(&policy, "", &edited));
     }
 
     #[test]
@@ -484,11 +714,5 @@ mod tests {
         );
         assert!(value.starts_with("default-src 'none'; "), "{value}");
         assert_ne!(value, "frame-ancestors https://a.example https://b.example");
-        assert_eq!(
-            framing
-                .as_ref()
-                .map(|fa| ContentSecurityPolicy::frame_only(fa).header_value()),
-            Some("frame-ancestors https://a.example https://b.example".to_owned())
-        );
     }
 }
