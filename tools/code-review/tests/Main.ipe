@@ -2,6 +2,7 @@ module Main exposing (main)
 
 import DbTests
 import HarnessTests
+import HighlightTests
 import IndexTests
 import Ipe.ByteSize as ByteSize
 import Ipe.Char as Char
@@ -62,6 +63,7 @@ gatherChecks =
         [ HarnessTests.checks |> Task.andThen (contributesChecks "HarnessTests")
         , DbTests.checks |> Task.andThen (contributesChecks "DbTests")
         , ViewTests.checks |> Task.andThen (contributesChecks "ViewTests")
+        , HighlightTests.checks |> Task.andThen (contributesChecks "HighlightTests")
         , IndexTests.checks |> Task.andThen (contributesChecks "IndexTests")
         , QueueTests.checks |> Task.andThen (contributesChecks "QueueTests")
         , LinksTests.checks |> Task.andThen (contributesChecks "LinksTests")
