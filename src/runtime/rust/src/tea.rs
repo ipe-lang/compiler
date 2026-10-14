@@ -2081,13 +2081,7 @@ mod bounded_input_tests {
 
 // A subscription source runs inside the scopes of the loop that starts it: a
 // tracked body only while requested, a detached body past every re-evaluation.
-#[cfg(all(
-    test,
-    feature = "web-core",
-    feature = "server",
-    feature = "jwt",
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(test, feature = "web", feature = "jwt", not(target_arch = "wasm32")))]
 mod source_scope_tests {
     use super::*;
     use crate::revocation::SessionBindings;

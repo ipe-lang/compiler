@@ -1272,14 +1272,14 @@ const RUNTIME_MOD_RS_TUI_APPEND: &str = "pub mod terminal_access;\n\
 /// the render core it draws through is declared by
 /// [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (which fires for `uses_web || uses_webview`
 /// and pulls in the ONE real `web` module — server items inside stay
-/// `#[cfg(feature = "server")]`, so a webview build compiles only the render core).
+/// `#[cfg(feature = "web")]`, so a webview build compiles only the render core).
 const RUNTIME_MOD_RS_WEBVIEW_APPEND: &str = "#[cfg(feature = \"webview\")]\npub mod webview;\n\
      #[cfg(feature = \"webview\")]\npub use webview::{webview_app, WebViewWindowCfg};\n";
 
 /// The server-free render core, declared for EVERY render host (`uses_web ||
 /// uses_webview`): the ONE real `web` module (which compiles to just its
-/// render-core under `web-core` alone — every axum/SSE/session item inside is
-/// `#[cfg(feature = "server")]`) plus the pure `page_shell` scaffold
+/// render-core without `web`, `server` on or off — every axum/SSE/session item inside is
+/// `#[cfg(feature = "web")]`) plus the pure `page_shell` scaffold
 /// (`web_page_core`). The native-window `webview` backend renders through
 /// `web::dispatch` / `web::style_inject` / `web::page_shell` / `web::route` over
 /// a local IPC bridge — NO axum `server`, NO SSE, NO session store. The full
@@ -1328,7 +1328,7 @@ const RUNTIME_MOD_RS_LITERAL_TABLE_APPEND: &str = "#[cfg(any(feature = \"web-cor
 /// The `web` module itself is declared by [`RUNTIME_MOD_RS_WEB_CORE_APPEND`]
 /// (shared with the webview render host). This append layers ONLY the extra
 /// crate-root modules the SERVER surface of `web/mod.rs` reaches by absolute path
-/// under `#[cfg(feature = "server")]` — `crate::widget_assets`
+/// under `#[cfg(feature = "web")]` — `crate::widget_assets`
 /// (`pub use crate::widget_assets;`), `crate::js_port_glue` (SRI-pinned Ffi.Js
 /// port asset), and `crate::js_port` (the port session/sink) — plus the server
 /// entry re-exports. In the real runtime crate the `web` feature lists
@@ -6533,7 +6533,7 @@ mod tests {
     /// `seal_modset::cmd_publish_no_live_builds`).  The `web` module itself is
     /// declared by [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (shared with the webview
     /// render host, pushed BEFORE this append); each server-only crate-root
-    /// module rides [`RUNTIME_MOD_RS_WEB_APPEND`] under `#[cfg(feature = "server")]`.
+    /// module rides [`RUNTIME_MOD_RS_WEB_APPEND`] under `#[cfg(feature = "web")]`.
     #[test]
     fn web_mod_rs_declares_widget_assets_and_js_port_closure() {
         assert!(

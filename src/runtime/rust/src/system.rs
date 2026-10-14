@@ -825,7 +825,7 @@ pub(crate) const SCRUB_TRUNCATED: &str = "\\…";
 /// to its input, so a hazard in a remote request path or an ingested record
 /// shows as a visible escape and two distinct inputs never record alike.
 #[cfg_attr(
-    not(all(feature = "web-core", feature = "server")),
+    not(feature = "web"),
     allow(dead_code) // only the served request log and console ingest call it
 )]
 pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
@@ -966,7 +966,7 @@ pub(crate) fn emit_runtime_log(tag: &str, msg: &str) {
 
 /// `emit_runtime_log` for a line that carries a timestamp after its tag (the
 /// memory session-store startup line).
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 pub(crate) fn emit_runtime_log_stamped(stamp: &str, tag: &str, msg: &str) {
     let stream = LogStream::Stderr;
     stream.write_line(&runtime_log_line(stream, Some(stamp), tag, msg));

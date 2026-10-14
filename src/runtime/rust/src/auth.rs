@@ -745,7 +745,7 @@ pub fn auth_verify_token(
 /// Where an armed `Auth.verifyToken` binds the credential it admits.
 enum BindTarget {
     /// The credential set of the `Web` session user code runs on behalf of.
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     Session(std::sync::Arc<std::sync::Mutex<crate::revocation::SessionBindings>>),
     /// The binding set of the `Server` request being handled.
     #[cfg(feature = "server")]
@@ -753,7 +753,7 @@ enum BindTarget {
     /// No channel owner while a `Web` app serves in this process: a task the
     /// runtime spawned without its session's scope. Refused, never admitted
     /// unbound, because the session it acts for could not be closed on revoke.
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     Unscoped,
     /// No channel owner: a script, a CLI program or a background task.
     Outside,
@@ -765,13 +765,13 @@ fn bind_target() -> BindTarget {
 }
 
 /// Whether a `Web` app serves in this process.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 fn web_serving() -> bool {
     crate::web::web_serving()
 }
 
 /// Without the `Web` server no `Web` app can serve.
-#[cfg(not(all(feature = "web-core", feature = "server")))]
+#[cfg(not(feature = "web"))]
 const fn web_serving() -> bool {
     false
 }
@@ -781,7 +781,7 @@ const fn web_serving() -> bool {
 /// The `Web` session scope wins over the `Server` request: a `Web` router
 /// mounted in a `Server` sees both, and the session is the long-lived owner.
 fn bind_target_in(web_serving: bool) -> BindTarget {
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     if let Some(bindings) = crate::web::pubsub::session_bindings() {
         return BindTarget::Session(bindings);
     }
@@ -789,11 +789,11 @@ fn bind_target_in(web_serving: bool) -> BindTarget {
     if let Some(bindings) = crate::server::request_bindings() {
         return BindTarget::ServerRequest(bindings);
     }
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     if web_serving {
         return BindTarget::Unscoped;
     }
-    #[cfg(not(all(feature = "web-core", feature = "server")))]
+    #[cfg(not(feature = "web"))]
     let _ = web_serving;
     BindTarget::Outside
 }
@@ -820,7 +820,7 @@ fn verify_token_bound(
         let refuse = crate::revocation::Denial::auth_error;
         let credential = gate.admit(&claims, "sub").map_err(refuse)?;
         match target() {
-            #[cfg(all(feature = "web-core", feature = "server"))]
+            #[cfg(feature = "web")]
             BindTarget::Session(bindings) => {
                 crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
             }
@@ -828,7 +828,7 @@ fn verify_token_bound(
             BindTarget::ServerRequest(bindings) => {
                 crate::revocation::bind_shared(&bindings, credential).map_err(refuse)?;
             }
-            #[cfg(all(feature = "web-core", feature = "server"))]
+            #[cfg(feature = "web")]
             BindTarget::Unscoped => {
                 return Err(refuse(crate::revocation::Denial::Unscoped));
             }

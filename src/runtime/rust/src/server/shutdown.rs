@@ -157,12 +157,12 @@ impl ShutdownPlan {
 }
 
 /// Flip readiness to draining.
-#[cfg(feature = "web-core")]
+#[cfg(feature = "web")]
 fn mark_draining() {
     crate::web::observability::mark_draining();
 }
-/// Flip readiness to draining: no readiness probe without `web-core`.
-#[cfg(not(feature = "web-core"))]
+/// Flip readiness to draining: no readiness probe without the served `web` surface.
+#[cfg(not(feature = "web"))]
 const fn mark_draining() {}
 
 /// How the owner ends the process on a second signal.
