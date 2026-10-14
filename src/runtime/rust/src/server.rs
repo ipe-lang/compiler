@@ -5081,14 +5081,14 @@ mod tests {
     /// whether the router accepts every insert of the same set.
     #[allow(clippy::expect_used)] // test: every path and method in the tables parses
     fn conflict_and_router(set: &[(&str, &str)]) -> (Option<String>, bool) {
-        let parse = || {
+        let routes = || {
             parse_routes(set.iter().map(|(m, p)| handler_route(m, p)).collect())
                 .expect("the table's routes parse")
         };
-        let verdict = endpoint_conflict(&parse());
+        let verdict = endpoint_conflict(&routes());
         let inserted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut app = axum::Router::new();
-            for route in parse() {
+            for route in routes() {
                 if let ParsedTarget::Handler(method, pattern, h) = route.target {
                     let path = pattern.router_path().to_owned();
                     app = app.route(&path, method_router(method, pattern, h));
@@ -6365,7 +6365,7 @@ mod tests {
         let echo = |name: &'static str| {
             axum::Router::new().fallback(
                 move |strict: Option<axum::Extension<StrictUrl>>, uri: axum::http::Uri| async move {
-                    let parse = strict.map_or_else(
+                    let served = strict.map_or_else(
                         || "unparsed".to_owned(),
                         |url| {
                             url.path
@@ -6373,7 +6373,7 @@ mod tests {
                                 .map_or_else(|_| "too long".to_owned(), |c| c.as_str().to_owned())
                         },
                     );
-                    format!("{name} {parse} {uri}")
+                    format!("{name} {served} {uri}")
                 },
             )
         };
