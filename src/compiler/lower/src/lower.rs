@@ -38643,20 +38643,24 @@ mod tests {
         );
     }
 
-    /// A union named like an opaque wrapper or a collection but not its builtin
-    /// head is judged as the derive carrier its own enum is.
+    /// An opaque wrapper or collection head follows the type checker's head-identity rule.
     ///
-    /// The builtin `Task`/`Decoder` box their payload and the builtin `List`
-    /// stores a bare function on the `Arc` carrier, so a function under them is
-    /// legitimate; a `Main`-homed union of the same name lowers to its own enum
-    /// (see [`Lowerer::is_distinct_program_union`]) and must not inherit either
-    /// exemption, or a function payload under it would reach a derived `Clone`.
+    /// `Task`/`Decoder` and `List`/`Set` are reserved names no program can
+    /// declare, so under any home the head is the builtin and takes its
+    /// exemption (see [`ipe_types::con_heads_compatible`]); a head that rule
+    /// judged distinct would lose it.
     #[test]
-    fn a_distinct_head_named_like_a_wrapper_or_collection_gets_no_exemption() {
+    fn a_wrapper_or_collection_head_follows_the_head_identity_rule() {
         use super::{
             collection_storable_element_carries_function, embeds_nonderivable_function,
             generic_binding_breaks_clone, ty_has_fun_in_derive_carrier,
         };
+        for name in ["Task", "Decoder", "List", "Set"] {
+            assert!(
+                ipe_canon::is_user_type_declaration_forbidden(name),
+                "`{name}` must stay undeclarable, or its head can be a distinct union"
+            );
+        }
         let mut interner = Interner::new();
         #[allow(clippy::expect_used)] // a fresh interner accepts these names
         let [main, task, decoder, list, set, int] =
@@ -38666,33 +38670,29 @@ mod tests {
         let int_ty = con(vec![], int, vec![]);
         let fun = Ty::Fun(Box::new(int_ty.clone()), Box::new(int_ty));
         let fun_set = con(vec![], set, vec![fun.clone()]);
-        for (module, distinct) in [(vec![], false), (vec![main], true)] {
-            assert_eq!(
-                embeds_nonderivable_function(
+        for module in [vec![], vec![main]] {
+            assert!(
+                !embeds_nonderivable_function(
                     &interner,
                     &con(module.clone(), task, vec![fun_set.clone()])
                 ),
-                distinct,
-                "a function `Set` under `Task` is exempt only under the builtin `Task`"
+                "a function `Set` under the reserved `Task` is exempt under any home"
             );
             let decoder_of_fun = con(module.clone(), decoder, vec![fun.clone()]);
-            assert_eq!(
-                ty_has_fun_in_derive_carrier(&interner, &decoder_of_fun),
-                distinct,
-                "a function under `Decoder` is a derive-carrier payload only off the builtin"
+            assert!(
+                !ty_has_fun_in_derive_carrier(&interner, &decoder_of_fun),
+                "a function under the reserved `Decoder` is no derive-carrier payload"
             );
-            assert_eq!(
-                generic_binding_breaks_clone(&interner, &decoder_of_fun),
-                distinct,
-                "a function under `Decoder` breaks `Clone` only off the builtin"
+            assert!(
+                !generic_binding_breaks_clone(&interner, &decoder_of_fun),
+                "a function under the reserved `Decoder` never breaks `Clone`"
             );
-            assert_eq!(
+            assert!(
                 collection_storable_element_carries_function(
                     &interner,
                     &con(module, list, vec![fun.clone()])
                 ),
-                !distinct,
-                "only the builtin `List` stores a function element"
+                "the reserved `List` stores a function element under any home"
             );
         }
     }
