@@ -90,35 +90,178 @@ tokenSource tok =
             s
 
 
+-- One language's lexical grammar: the comment, string and escape forms its
+-- source has. The lexer reads only this record, so a delimiter opens
+-- something only in a language whose grammar names it: `/*` is plain text
+-- in shell and Ipê, `#` in Rust and Ipê, `--` in Rust and shell.
+type alias Grammar =
+    { lineComment : LineComment
+    , blockComment : Maybe BlockRule
+    , doubleQuote : DoubleQuote
+    , singleQuote : SingleQuote
+    , rawStrings : RawStrings
+    , bareEscape : BareEscape
+    , heredocs : Heredocs
+    , words : Words
+    }
+
+
+-- How a line comment opens: a two-character opener (`//`, `--`), or a `#`
+-- at the start of a shell word.
+type LineComment
+    = PairOpens Char Char
+    | HashAtWordStart
+
+
+-- A block comment's delimiters, character by character. Block comments
+-- nest; a block opened with the `doc` marker right after its opener is a
+-- doc comment, which does not nest (Ipê `{-| -}`).
+type alias BlockRule =
+    { open1 : Char
+    , open2 : Char
+    , close1 : Char
+    , close2 : Char
+    , doc : Maybe Char
+    }
+
+
+-- What a `"` opens: a string with `\` escapes that may span lines (Rust,
+-- shell), or one that ends with its line unless it is a `"""…"""` (Ipê).
+type DoubleQuote
+    = EscapedSpanningLines
+    | EscapedOneLineOrTriple
+
+
+-- What a `'` opens: a char literal (a `'` that closes none is punctuation),
+-- or a shell string with no escapes that may span lines.
+type SingleQuote
+    = CharLiteral
+    | VerbatimSpanningLines
+
+
+-- Whether `r"…"`, `r#"…"#` and their `br`/`cr` forms are raw strings.
+type RawStrings
+    = NoRawStrings
+    | HashRawStrings
+
+
+-- Whether a `\` outside any string escapes the next character (shell).
+type BareEscape
+    = NoBareEscape
+    | BackslashEscapesNext
+
+
+-- Whether a `<<` operator starts a heredoc whose body ends at its delimiter
+-- line (shell).
+type Heredocs
+    = NoHeredocs
+    | ShellHeredocs
+
+
+-- Which keyword list a language's words are checked against.
+type Words
+    = RustWords
+    | ShellWords
+    | IpeWords
+
+
+-- The grammar of each language this tokenizer reads; `Unknown` has none,
+-- so its text is one Plain token.
+grammar : Lang -> Maybe Grammar
+grammar lang =
+    case lang of
+        Rust ->
+            Just rustGrammar
+
+        Shell ->
+            Just shellGrammar
+
+        Ipe ->
+            Just ipeGrammar
+
+        Unknown ->
+            Nothing
+
+
+-- Rust: `//` line and nested `/* */` block comments, `"…"` strings with `\`
+-- escapes, `r"…"` and `r#"…"#` raw strings (`br`, `cr` too), `'c'` char
+-- literals (a `'` that closes no char literal, as in a lifetime, is
+-- punctuation).
+rustGrammar : Grammar
+rustGrammar =
+    { lineComment = PairOpens '/' '/'
+    , blockComment = Just { open1 = '/', open2 = '*', close1 = '*', close2 = '/', doc = Nothing }
+    , doubleQuote = EscapedSpanningLines
+    , singleQuote = CharLiteral
+    , rawStrings = HashRawStrings
+    , bareEscape = NoBareEscape
+    , heredocs = NoHeredocs
+    , words = RustWords
+    }
+
+
+-- Shell: a `#` at the start of a word begins a line comment, `'…'` strings
+-- without escapes, `"…"` strings with `\` escapes, a `\` escaping the next
+-- character, heredocs. Shell has no block comment.
+shellGrammar : Grammar
+shellGrammar =
+    { lineComment = HashAtWordStart
+    , blockComment = Nothing
+    , doubleQuote = EscapedSpanningLines
+    , singleQuote = VerbatimSpanningLines
+    , rawStrings = NoRawStrings
+    , bareEscape = BackslashEscapesNext
+    , heredocs = ShellHeredocs
+    , words = ShellWords
+    }
+
+
+-- Ipê: `--` line and nested `{- -}` block comments (a `{-|` doc comment
+-- does not nest), `"…"` strings with `\` escapes on one line, `"""…"""`
+-- strings, `'c'` char literals.
+ipeGrammar : Grammar
+ipeGrammar =
+    { lineComment = PairOpens '-' '-'
+    , blockComment = Just { open1 = '{', open2 = '-', close1 = '-', close2 = '}', doc = Just '|' }
+    , doubleQuote = EscapedOneLineOrTriple
+    , singleQuote = CharLiteral
+    , rawStrings = NoRawStrings
+    , bareEscape = NoBareEscape
+    , heredocs = NoHeredocs
+    , words = IpeWords
+    }
+
+
 -- Tokens a whole source snippet, newlines as `Plain "\n"`. Each line is lexed
--- by `lexLine` with the carry out of the line before it, and a lexeme still
--- open at the end of the input degrades to Plain: it claims no color the
--- source does not have. Unknown languages degrade to a single Plain token:
+-- with the carry out of the line before it, and a lexeme still open at the
+-- end of the input degrades to Plain: it claims no color the source does not
+-- have. A language with no grammar degrades to a single Plain token:
 -- readable, never panics, and no color claims the code does not have.
 tokenize : Lang -> String -> List Token
 tokenize lang text =
-    if lang == Unknown then
-        [ Plain text ]
+    case grammar lang of
+        Nothing ->
+            [ Plain text ]
 
-    else
-        case List.foldl (tokenizeStep lang) ( lineStart, [], Nothing ) (String.split "\n" text) of
-            ( carry, toks, Just last ) ->
-                toks ++ finish lang (openLine lang carry last)
+        Just g ->
+            case List.foldl (tokenizeStep g) ( lineStart, [], Nothing ) (String.split "\n" text) of
+                ( carry, toks, Just last ) ->
+                    toks ++ finish g (openLine g carry last)
 
-            ( _, toks, Nothing ) ->
-                toks
+                ( _, toks, Nothing ) ->
+                    toks
 
 
 -- ( the carry into the held line, the tokens before it, the line read last ):
 -- a line is lexed once the next one shows it is not the last.
-tokenizeStep : Lang -> String -> ( Carry, List Token, Maybe String ) -> ( Carry, List Token, Maybe String )
-tokenizeStep lang line ( carry, toks, held ) =
+tokenizeStep : Grammar -> String -> ( Carry, List Token, Maybe String ) -> ( Carry, List Token, Maybe String )
+tokenizeStep g line ( carry, toks, held ) =
     case held of
         Nothing ->
             ( carry, toks, Just line )
 
         Just previous ->
-            case lexLine lang carry previous of
+            case lexWith g carry previous of
                 ( lineToks, next ) ->
                     ( next, toks ++ lineToks ++ [ Plain "\n" ], Just line )
 
@@ -145,28 +288,34 @@ lineStart =
 -- in it (`don't`) opens nothing past its line.
 lexLine : Lang -> Carry -> String -> ( List Token, Carry )
 lexLine lang carry line =
-    if lang == Unknown then
-        ( [ Plain line ], carry )
+    case grammar lang of
+        Nothing ->
+            ( [ Plain line ], carry )
 
-    else
-        case endLine lang (openLine lang carry line) of
-            ( toks, carried ) ->
-                ( toks, carryAfter lang carry line toks carried )
+        Just g ->
+            lexWith g carry line
+
+
+lexWith : Grammar -> Carry -> String -> ( List Token, Carry )
+lexWith g carry line =
+    case endLine g (openLine g carry line) of
+        ( toks, carried ) ->
+            ( toks, carryAfter g carry line toks carried )
 
 
 -- A line read to its end, its last lexeme still open.
-openLine : Lang -> Carry -> String -> Lexer
-openLine lang carry line =
+openLine : Grammar -> Carry -> String -> Lexer
+openLine g carry line =
     case carry of
         Carry lexing ->
-            String.foldl (step lang) ( lexing, "", [] ) line
+            String.foldl (step g) ( lexing, "", [] ) line
 
         Heredoc _ _ ->
-            String.foldl (step lang) ( Start AfterSpace, "", [] ) line
+            String.foldl (step g) ( Start AfterSpace, "", [] ) line
 
 
-carryAfter : Lang -> Carry -> String -> List Token -> Lexing -> Carry
-carryAfter lang carry line toks carried =
+carryAfter : Grammar -> Carry -> String -> List Token -> Lexing -> Carry
+carryAfter g carry line toks carried =
     case carry of
         Heredoc delimiter stripTabs ->
             if closesHeredoc delimiter stripTabs line then
@@ -176,16 +325,17 @@ carryAfter lang carry line toks carried =
                 Heredoc delimiter stripTabs
 
         Carry _ ->
-            if lang == Shell then
-                case heredocOf toks of
-                    Just ( delimiter, stripTabs ) ->
-                        Heredoc delimiter stripTabs
+            case g.heredocs of
+                ShellHeredocs ->
+                    case heredocOf toks of
+                        Just ( delimiter, stripTabs ) ->
+                            Heredoc delimiter stripTabs
 
-                    Nothing ->
-                        Carry carried
+                        Nothing ->
+                            Carry carried
 
-            else
-                Carry carried
+                NoHeredocs ->
+                    Carry carried
 
 
 closesHeredoc : String -> Bool -> String -> Bool
@@ -372,6 +522,7 @@ plainIs text tok =
             False
 
 
+
 -- What came before a shell `#`: a `#` starts a comment only at the start of a
 -- word.
 type Gap
@@ -382,18 +533,8 @@ type Gap
 -- The lexeme the tokenizer is inside, from the characters read so far.
 -- One state per partial token, so each character is read exactly once and
 -- the run is linear in the source length. Which states a language reaches is
--- its rule table:
---
--- * Rust: `//` line and nested `/* */` block comments, `"…"` strings with `\`
---   escapes, `r"…"` and `r#"…"#` raw strings (`br`, `cr` too), `'c'` char
---   literals (a `'` that closes no char literal, as in a lifetime, is
---   punctuation).
--- * Ipê: `--` line and nested `{- -}` block comments (a `{-|` doc comment
---   does not nest), `"…"` strings with `\` escapes on one line, `"""…"""`
---   strings, `'c'` char literals.
--- * Shell: a `#` at the start of a word begins a line comment, `'…'` strings
---   without escapes, `"…"` strings with `\` escapes, a `\` escaping the next
---   character. A heredoc body is read by `lexLine`, never as a carried string.
+-- its `Grammar`; a block-comment state holds the rule it was opened by, so
+-- its delimiters are always that language's.
 --
 -- No string state reaches a comment state, so no string is drawn as a
 -- comment, on any of its lines.
@@ -408,12 +549,12 @@ type Lexing
     | ShellEscape
     | Pending Char
     | InLineComment
-    | BlockFresh
-    | InBlock Int
-    | BlockOpen1 Int
-    | BlockClose1 Int
-    | InDoc
-    | DocClose1
+    | BlockFresh BlockRule
+    | InBlock BlockRule Int
+    | BlockOpen1 BlockRule Int
+    | BlockClose1 BlockRule Int
+    | InDoc BlockRule
+    | DocClose1 BlockRule
     | RawHashes Int
     | InRaw Int
     | RawClosing Int Int
@@ -431,28 +572,28 @@ type alias Lexer =
     ( Lexing, String, List Token )
 
 
-step : Lang -> Char -> Lexer -> Lexer
-step lang c ( lexing, buf, toks ) =
+step : Grammar -> Char -> Lexer -> Lexer
+step g c ( lexing, buf, toks ) =
     case lexing of
         Start gap ->
-            begin lang gap c toks
+            begin g gap c toks
 
         InNum ->
             if isNumChar c then
                 ( InNum, extend buf c, toks )
 
             else
-                begin lang AfterText c (toks ++ [ Num buf ])
+                begin g AfterText c (toks ++ [ Num buf ])
 
         InWord ->
-            if lang == Rust && c == 'r' && (buf == "b" || buf == "c") then
+            if rawPrefixed g buf c then
                 ( InRawPrefix, extend buf c, toks )
 
             else if isWordChar c then
                 ( InWord, extend buf c, toks )
 
             else
-                begin lang AfterText c (toks ++ [ word lang buf ])
+                begin g AfterText c (toks ++ [ word g buf ])
 
         InRawPrefix ->
             if c == '"' then
@@ -465,7 +606,7 @@ step lang c ( lexing, buf, toks ) =
                 ( InWord, extend buf c, toks )
 
             else
-                begin lang AfterText c (toks ++ [ word lang buf ])
+                begin g AfterText c (toks ++ [ word g buf ])
 
         InStr ->
             if c == '"' then
@@ -491,55 +632,55 @@ step lang c ( lexing, buf, toks ) =
             ( Start AfterText, "", toks ++ [ Plain (extend buf c) ] )
 
         Pending first ->
-            opened lang first c buf toks
+            opened g first c buf toks
 
         InLineComment ->
             ( InLineComment, extend buf c, toks )
 
-        BlockFresh ->
-            if c == '|' then
-                ( InDoc, extend buf c, toks )
+        BlockFresh rule ->
+            if rule.doc == Just c then
+                ( InDoc rule, extend buf c, toks )
 
             else
-                inBlock lang 1 c buf toks
+                inBlock rule 1 c buf toks
 
-        InBlock depth ->
-            inBlock lang depth c buf toks
+        InBlock rule depth ->
+            inBlock rule depth c buf toks
 
-        BlockOpen1 depth ->
-            if c == (blockRule lang).open2 then
-                ( InBlock (depth + 1), extend buf c, toks )
+        BlockOpen1 rule depth ->
+            if c == rule.open2 then
+                ( InBlock rule (depth + 1), extend buf c, toks )
 
             else
-                inBlock lang depth c buf toks
+                inBlock rule depth c buf toks
 
-        BlockClose1 depth ->
-            if c == (blockRule lang).close2 then
+        BlockClose1 rule depth ->
+            if c == rule.close2 then
                 if depth <= 1 then
                     ( Start AfterText, "", toks ++ [ Comment (extend buf c) ] )
 
                 else
-                    ( InBlock (depth - 1), extend buf c, toks )
+                    ( InBlock rule (depth - 1), extend buf c, toks )
 
             else
-                inBlock lang depth c buf toks
+                inBlock rule depth c buf toks
 
-        InDoc ->
-            if c == '-' then
-                ( DocClose1, extend buf c, toks )
+        InDoc rule ->
+            if c == rule.close1 then
+                ( DocClose1 rule, extend buf c, toks )
 
             else
-                ( InDoc, extend buf c, toks )
+                ( InDoc rule, extend buf c, toks )
 
-        DocClose1 ->
-            if c == '}' then
+        DocClose1 rule ->
+            if c == rule.close2 then
                 ( Start AfterText, "", toks ++ [ Comment (extend buf c) ] )
 
-            else if c == '-' then
-                ( DocClose1, extend buf c, toks )
+            else if c == rule.close1 then
+                ( DocClose1 rule, extend buf c, toks )
 
             else
-                ( InDoc, extend buf c, toks )
+                ( InDoc rule, extend buf c, toks )
 
         RawHashes hashes ->
             if c == '#' then
@@ -549,7 +690,7 @@ step lang c ( lexing, buf, toks ) =
                 ( InRaw hashes, extend buf c, toks )
 
             else
-                begin lang AfterText c (toks ++ [ Plain buf ])
+                begin g AfterText c (toks ++ [ Plain buf ])
 
         InRaw hashes ->
             if c == '"' then
@@ -591,7 +732,7 @@ step lang c ( lexing, buf, toks ) =
                 ( InTriple 0, extend buf c, toks )
 
             else
-                begin lang AfterText c (toks ++ [ Str buf ])
+                begin g AfterText c (toks ++ [ Str buf ])
 
         InTriple quotes ->
             if c == '"' then
@@ -619,7 +760,7 @@ step lang c ( lexing, buf, toks ) =
                 ( Start AfterText, "", toks ++ [ Str (extend buf c) ] )
 
             else
-                step lang c (begin lang AfterText first (toks ++ [ Plain "'" ]))
+                step g c (begin g AfterText first (toks ++ [ Plain "'" ]))
 
         TickEscape ->
             ( TickEscaped, extend buf c, toks )
@@ -634,27 +775,27 @@ step lang c ( lexing, buf, toks ) =
 
 -- The state after reading `c` with no lexeme open; `gap` is what came
 -- before it.
-begin : Lang -> Gap -> Char -> List Token -> Lexer
-begin lang gap c toks =
+begin : Grammar -> Gap -> Char -> List Token -> Lexer
+begin g gap c toks =
     if Char.isDigit c then
         ( InNum, String.fromChar c, toks )
 
     else if c == '"' then
-        ( stringStart lang, "\"", toks )
+        ( stringStart g.doubleQuote, "\"", toks )
 
     else if c == tickChar then
-        ( tickStart lang, "'", toks )
+        ( tickStart g.singleQuote, "'", toks )
 
-    else if opensPair lang c then
+    else if opensPair g c then
         ( Pending c, String.fromChar c, toks )
 
-    else if lang == Shell && c == '#' && gap == AfterSpace then
+    else if hashComment g.lineComment gap c then
         ( InLineComment, "#", toks )
 
-    else if lang == Shell && c == backslashChar then
+    else if bareEscapes g.bareEscape c then
         ( ShellEscape, String.fromChar c, toks )
 
-    else if lang == Rust && c == 'r' then
+    else if rawOpens g.rawStrings c then
         ( InRawPrefix, "r", toks )
 
     else if isWordStart c then
@@ -664,121 +805,161 @@ begin lang gap c toks =
         ( Start (gapAfter c), "", toks ++ [ Plain (String.fromChar c) ] )
 
 
-stringStart : Lang -> Lexing
-stringStart lang =
-    case lang of
-        Ipe ->
+stringStart : DoubleQuote -> Lexing
+stringStart quote =
+    case quote of
+        EscapedOneLineOrTriple ->
             Quote1
 
-        Rust ->
-            InStr
-
-        Shell ->
-            InStr
-
-        Unknown ->
+        EscapedSpanningLines ->
             InStr
 
 
-tickStart : Lang -> Lexing
-tickStart lang =
-    case lang of
-        Shell ->
+tickStart : SingleQuote -> Lexing
+tickStart quote =
+    case quote of
+        VerbatimSpanningLines ->
             InSingle
 
-        Rust ->
-            Tick
-
-        Ipe ->
-            Tick
-
-        Unknown ->
+        CharLiteral ->
             Tick
 
 
--- The first character of a two-character comment opener: `/` in Rust, `-`
--- and `{` in Ipê. Shell has none.
-opensPair : Lang -> Char -> Bool
-opensPair lang c =
-    case lang of
-        Rust ->
-            c == '/'
+-- `c` is the first character of a two-character comment opener of the
+-- grammar: a pair line-comment opener's, or its block opener's.
+opensPair : Grammar -> Char -> Bool
+opensPair g c =
+    pairLineFirst g.lineComment c || blockFirst g.blockComment c
 
-        Ipe ->
-            c == '-' || c == '{'
 
-        Shell ->
+pairLineFirst : LineComment -> Char -> Bool
+pairLineFirst line c =
+    case line of
+        PairOpens first _ ->
+            c == first
+
+        HashAtWordStart ->
             False
 
-        Unknown ->
+
+blockFirst : Maybe BlockRule -> Char -> Bool
+blockFirst block c =
+    case block of
+        Just rule ->
+            c == rule.open1
+
+        Nothing ->
+            False
+
+
+hashComment : LineComment -> Gap -> Char -> Bool
+hashComment line gap c =
+    case line of
+        HashAtWordStart ->
+            c == '#' && gap == AfterSpace
+
+        PairOpens _ _ ->
+            False
+
+
+bareEscapes : BareEscape -> Char -> Bool
+bareEscapes escape c =
+    case escape of
+        BackslashEscapesNext ->
+            c == backslashChar
+
+        NoBareEscape ->
+            False
+
+
+rawOpens : RawStrings -> Char -> Bool
+rawOpens raw c =
+    case raw of
+        HashRawStrings ->
+            c == 'r'
+
+        NoRawStrings ->
+            False
+
+
+-- A word `b` or `c` followed by `r` begins a `br`/`cr` raw string prefix.
+rawPrefixed : Grammar -> String -> Char -> Bool
+rawPrefixed g buf c =
+    case g.rawStrings of
+        HashRawStrings ->
+            c == 'r' && (buf == "b" || buf == "c")
+
+        NoRawStrings ->
             False
 
 
 -- The lexeme a two-character opener starts, or the pending character as
--- punctuation when `c` completes no opener.
-opened : Lang -> Char -> Char -> String -> List Token -> Lexer
-opened lang first c buf toks =
-    if first == '/' && c == '/' then
+-- punctuation when `c` completes no opener of the grammar.
+opened : Grammar -> Char -> Char -> String -> List Token -> Lexer
+opened g first c buf toks =
+    if pairLineOpens g.lineComment first c then
         ( InLineComment, extend buf c, toks )
-
-    else if first == '/' && c == '*' then
-        ( InBlock 1, extend buf c, toks )
-
-    else if first == '-' && c == '-' then
-        ( InLineComment, extend buf c, toks )
-
-    else if first == '{' && c == '-' then
-        ( BlockFresh, extend buf c, toks )
 
     else
-        begin lang AfterText c (toks ++ [ Plain buf ])
+        case blockOpened g.blockComment first c of
+            Just entered ->
+                ( entered, extend buf c, toks )
+
+            Nothing ->
+                begin g AfterText c (toks ++ [ Plain buf ])
 
 
--- A language's block-comment delimiters, character by character.
-type alias BlockRule =
-    { open1 : Char
-    , open2 : Char
-    , close1 : Char
-    , close2 : Char
-    }
+pairLineOpens : LineComment -> Char -> Char -> Bool
+pairLineOpens line first c =
+    case line of
+        PairOpens one two ->
+            first == one && c == two
+
+        HashAtWordStart ->
+            False
 
 
-blockRule : Lang -> BlockRule
-blockRule lang =
-    case lang of
-        Ipe ->
-            { open1 = '{', open2 = '-', close1 = '-', close2 = '}' }
+-- The state a block opener `first c` enters: a fresh block when the rule has
+-- a doc marker that may follow, else the body one deep.
+blockOpened : Maybe BlockRule -> Char -> Char -> Maybe Lexing
+blockOpened block first c =
+    case block of
+        Just rule ->
+            if first == rule.open1 && c == rule.open2 then
+                case rule.doc of
+                    Just _ ->
+                        Just (BlockFresh rule)
 
-        Rust ->
-            { open1 = '/', open2 = '*', close1 = '*', close2 = '/' }
+                    Nothing ->
+                        Just (InBlock rule 1)
 
-        Shell ->
-            { open1 = '/', open2 = '*', close1 = '*', close2 = '/' }
+            else
+                Nothing
 
-        Unknown ->
-            { open1 = '/', open2 = '*', close1 = '*', close2 = '/' }
+        Nothing ->
+            Nothing
 
 
 -- One character inside a block comment `depth` deep: it may begin a nested
 -- opener or the closer.
-inBlock : Lang -> Int -> Char -> String -> List Token -> Lexer
-inBlock lang depth c buf toks =
-    if c == (blockRule lang).open1 then
-        ( BlockOpen1 depth, extend buf c, toks )
+inBlock : BlockRule -> Int -> Char -> String -> List Token -> Lexer
+inBlock rule depth c buf toks =
+    if c == rule.open1 then
+        ( BlockOpen1 rule depth, extend buf c, toks )
 
-    else if c == (blockRule lang).close1 then
-        ( BlockClose1 depth, extend buf c, toks )
+    else if c == rule.close1 then
+        ( BlockClose1 rule depth, extend buf c, toks )
 
     else
-        ( InBlock depth, extend buf c, toks )
+        ( InBlock rule depth, extend buf c, toks )
 
 
 -- The tokens of a line once its last character is read, and the lexing
 -- state the next line starts in. A lexeme that may span lines (a block
 -- comment, a Rust or shell string, a raw or triple-quoted string) closes as
 -- a piece of its kind and stays open; any other open lexeme closes here.
-endLine : Lang -> Lexer -> ( List Token, Lexing )
-endLine lang ( lexing, buf, toks ) =
+endLine : Grammar -> Lexer -> ( List Token, Lexing )
+endLine g ( lexing, buf, toks ) =
     case lexing of
         Start _ ->
             ( toks, Start AfterSpace )
@@ -787,16 +968,16 @@ endLine lang ( lexing, buf, toks ) =
             ( toks ++ [ Num buf ], Start AfterSpace )
 
         InWord ->
-            ( toks ++ [ word lang buf ], Start AfterSpace )
+            ( toks ++ [ word g buf ], Start AfterSpace )
 
         InRawPrefix ->
-            ( toks ++ [ word lang buf ], Start AfterSpace )
+            ( toks ++ [ word g buf ], Start AfterSpace )
 
         InStr ->
-            spanningString lang buf toks
+            spanningString g.doubleQuote buf toks
 
         InStrEscape ->
-            spanningString lang buf toks
+            spanningString g.doubleQuote buf toks
 
         InSingle ->
             ( piece (Str buf) toks, InSingle )
@@ -810,23 +991,23 @@ endLine lang ( lexing, buf, toks ) =
         InLineComment ->
             ( toks ++ [ Comment buf ], Start AfterSpace )
 
-        BlockFresh ->
-            ( piece (Comment buf) toks, InBlock 1 )
+        BlockFresh rule ->
+            ( piece (Comment buf) toks, InBlock rule 1 )
 
-        InBlock depth ->
-            ( piece (Comment buf) toks, InBlock depth )
+        InBlock rule depth ->
+            ( piece (Comment buf) toks, InBlock rule depth )
 
-        BlockOpen1 depth ->
-            ( piece (Comment buf) toks, InBlock depth )
+        BlockOpen1 rule depth ->
+            ( piece (Comment buf) toks, InBlock rule depth )
 
-        BlockClose1 depth ->
-            ( piece (Comment buf) toks, InBlock depth )
+        BlockClose1 rule depth ->
+            ( piece (Comment buf) toks, InBlock rule depth )
 
-        InDoc ->
-            ( piece (Comment buf) toks, InDoc )
+        InDoc rule ->
+            ( piece (Comment buf) toks, InDoc rule )
 
-        DocClose1 ->
-            ( piece (Comment buf) toks, InDoc )
+        DocClose1 rule ->
+            ( piece (Comment buf) toks, InDoc rule )
 
         RawHashes _ ->
             ( toks ++ [ Plain buf ], Start AfterSpace )
@@ -859,15 +1040,17 @@ endLine lang ( lexing, buf, toks ) =
             ( toks ++ [ Plain buf ], Start AfterSpace )
 
 
--- A `"` string open at a line's end: a Rust or shell string goes on to the
--- next line; an Ipê one ends with its line, unterminated, so it is Plain.
-spanningString : Lang -> String -> List Token -> ( List Token, Lexing )
-spanningString lang buf toks =
-    if lang == Ipe then
-        ( toks ++ [ Plain buf ], Start AfterSpace )
+-- A `"` string open at a line's end: one that may span lines goes on to the
+-- next line; a one-line string ends with its line, unterminated, so it is
+-- Plain.
+spanningString : DoubleQuote -> String -> List Token -> ( List Token, Lexing )
+spanningString quote buf toks =
+    case quote of
+        EscapedOneLineOrTriple ->
+            ( toks ++ [ Plain buf ], Start AfterSpace )
 
-    else
-        ( piece (Str buf) toks, InStr )
+        EscapedSpanningLines ->
+            ( piece (Str buf) toks, InStr )
 
 
 -- `tok` after `toks`, unless it holds no text (a lexeme carried into a line
@@ -883,8 +1066,8 @@ piece tok toks =
 
 -- Closes the lexeme open at end of input. An unterminated string or block
 -- comment degrades to Plain: it claims no color the source does not have.
-finish : Lang -> Lexer -> List Token
-finish lang ( lexing, buf, toks ) =
+finish : Grammar -> Lexer -> List Token
+finish g ( lexing, buf, toks ) =
     case lexing of
         Start _ ->
             toks
@@ -893,10 +1076,10 @@ finish lang ( lexing, buf, toks ) =
             toks ++ [ Num buf ]
 
         InWord ->
-            toks ++ [ word lang buf ]
+            toks ++ [ word g buf ]
 
         InRawPrefix ->
-            toks ++ [ word lang buf ]
+            toks ++ [ word g buf ]
 
         InLineComment ->
             toks ++ [ Comment buf ]
@@ -919,22 +1102,22 @@ finish lang ( lexing, buf, toks ) =
         Pending _ ->
             piece (Plain buf) toks
 
-        BlockFresh ->
+        BlockFresh _ ->
             piece (Plain buf) toks
 
-        InBlock _ ->
+        InBlock _ _ ->
             piece (Plain buf) toks
 
-        BlockOpen1 _ ->
+        BlockOpen1 _ _ ->
             piece (Plain buf) toks
 
-        BlockClose1 _ ->
+        BlockClose1 _ _ ->
             piece (Plain buf) toks
 
-        InDoc ->
+        InDoc _ ->
             piece (Plain buf) toks
 
-        DocClose1 ->
+        DocClose1 _ ->
             piece (Plain buf) toks
 
         RawHashes _ ->
@@ -965,9 +1148,9 @@ finish lang ( lexing, buf, toks ) =
             piece (Plain buf) toks
 
 
-word : Lang -> String -> Token
-word lang w =
-    if List.member w (keywords lang) then
+word : Grammar -> String -> Token
+word g w =
+    if List.member w (keywords g.words) then
         Keyword w
 
     else
@@ -1024,10 +1207,10 @@ isNumChar c =
     Char.isDigit c || c == '_' || c == '.'
 
 
-keywords : Lang -> List String
-keywords lang =
-    case lang of
-        Rust ->
+keywords : Words -> List String
+keywords words =
+    case words of
+        RustWords ->
             [ "fn"
             , "let"
             , "mut"
@@ -1066,7 +1249,7 @@ keywords lang =
             , "false"
             ]
 
-        Shell ->
+        ShellWords ->
             [ "if"
             , "then"
             , "else"
@@ -1094,7 +1277,7 @@ keywords lang =
             , "null"
             ]
 
-        Ipe ->
+        IpeWords ->
             [ "module"
             , "import"
             , "exposing"
@@ -1109,6 +1292,3 @@ keywords lang =
             , "let"
             , "in"
             ]
-
-        Unknown ->
-            []
