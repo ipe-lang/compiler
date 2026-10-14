@@ -9,6 +9,7 @@
 //! claim that admits it, and the caller spawns a fresh driver seeded with it.
 
 use super::SessionEntry;
+use crate::retained::Bytes;
 use crate::tea::IpeCmd;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -593,6 +594,88 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// opinion; a future backend without an in-process cache must make an
     /// explicit, reviewed choice, not silently inherit a possibly-wrong one.
     async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>>;
+
+    /// Evict the least recently seen live sessions no SSE channel holds until
+    /// their charges sum to `need`, returning the bytes they held.
+    ///
+    /// Only THIS process's live handles are evicted: a persisted row stays,
+    /// so a later visit restores it. No default body, as with
+    /// [`web_sessions`](SessionStore::web_sessions).
+    async fn evict_unconnected(&self, need: Bytes) -> Bytes;
+
+    /// Whether `handle` is the live session this process holds under `sid`.
+    ///
+    /// An SSE attach reads it under the session's lock, the lock an eviction
+    /// holds while it removes the session, so the attach either finds its
+    /// session evicted or keeps the eviction from taking it.
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool;
+}
+
+/// Evict from `sessions` the least recently seen entries no SSE channel holds,
+/// oldest first, until their charges sum to `need`; returns the bytes they held.
+///
+/// An entry is removed only under its own lock, while it still has no SSE
+/// channel and the map still holds that same handle: a stream attached since
+/// the snapshot keeps its session, and a session re-set meanwhile is never
+/// evicted in its place. The map lock is only ever taken inside an entry
+/// lock, never the other way round. The bytes return once the last holder of
+/// an evicted handle drops it.
+fn evict_unconnected_from<Model, Msg>(
+    sessions: &RwLock<SessionMap<Model, Msg>>,
+    need: Bytes,
+) -> Bytes {
+    let held: Vec<(String, SessionHandle<Model, Msg>, Instant)> = sessions
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|(sid, (handle, seen))| (sid.clone(), Arc::clone(handle), *seen))
+        .collect();
+    let mut idle: Vec<(String, SessionHandle<Model, Msg>, Instant)> = held
+        .into_iter()
+        .filter(|(_, handle, _)| {
+            handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .sse_tx
+                .is_none()
+        })
+        .collect();
+    idle.sort_by_key(|(_, _, seen)| *seen);
+    let mut freed = Bytes::ZERO;
+    for (sid, handle, _) in idle {
+        if freed.get() >= need.get() {
+            break;
+        }
+        let entry = handle.lock().unwrap_or_else(PoisonError::into_inner);
+        if entry.sse_tx.is_some() {
+            continue;
+        }
+        let mut map = sessions.write().unwrap_or_else(PoisonError::into_inner);
+        if let Entry::Occupied(slot) = map.entry(sid)
+            && Arc::ptr_eq(&slot.get().0, &handle)
+        {
+            slot.remove();
+            freed = freed
+                .checked_add(entry.charge.held())
+                .unwrap_or(Bytes::new(u64::MAX));
+        }
+        drop(map);
+        drop(entry);
+    }
+    freed
+}
+
+/// Whether `sessions` holds `handle` under `sid`.
+fn holds_in<Model, Msg>(
+    sessions: &RwLock<SessionMap<Model, Msg>>,
+    sid: &str,
+    handle: &SessionHandle<Model, Msg>,
+) -> bool {
+    sessions
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sid)
+        .is_some_and(|(held, _)| Arc::ptr_eq(held, handle))
 }
 
 // ─── Memory store — default; in-process, lost on restart ────────────────────
@@ -659,6 +742,12 @@ impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
             .values()
             .map(|(h, _)| h.clone())
             .collect()
+    }
+    async fn evict_unconnected(&self, need: Bytes) -> Bytes {
+        evict_unconnected_from(&self.sessions, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.sessions, sid, handle)
     }
 }
 
@@ -901,6 +990,12 @@ where
             .values()
             .map(|(h, _)| h.clone())
             .collect()
+    }
+    async fn evict_unconnected(&self, need: Bytes) -> Bytes {
+        evict_unconnected_from(&self.mem_cache, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
     }
 }
 
@@ -1226,6 +1321,12 @@ where
             .map(|(h, _)| h.clone())
             .collect()
     }
+    async fn evict_unconnected(&self, need: Bytes) -> Bytes {
+        evict_unconnected_from(&self.mem_cache, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
+    }
 }
 
 // ─── Postgres store — multi-instance deployments ─────────────────────────────
@@ -1407,6 +1508,12 @@ where
             .map(|(h, _)| h.clone())
             .collect()
     }
+    async fn evict_unconnected(&self, need: Bytes) -> Bytes {
+        evict_unconnected_from(&self.mem_cache, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
+    }
 }
 
 // ─── Redis store — multi-instance, native TTL, no sweep ─────────────────────
@@ -1585,6 +1692,12 @@ where
             .values()
             .map(|(h, _)| h.clone())
             .collect()
+    }
+    async fn evict_unconnected(&self, need: Bytes) -> Bytes {
+        evict_unconnected_from(&self.mem_cache, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
     }
 }
 
@@ -1847,6 +1960,7 @@ mod tests {
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
@@ -1854,6 +1968,7 @@ mod tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
         }))
     }
 
@@ -1879,6 +1994,53 @@ mod tests {
         }
     }
 
+    /// Evicting for `need` bytes removes unconnected sessions oldest first,
+    /// stops once `need` is freed, keeps a connected one, and gives the
+    /// evicted bytes back to the budget.
+    #[test]
+    #[allow(clippy::expect_used)] // test: each fixed charge fits the budget; a second past now is representable
+    fn evict_unconnected_oldest_first_keeps_connected() {
+        use crate::web::budget::SessionBudget;
+        let process = SessionBudget::process(Bytes::new(1000));
+        let charged = |bytes: u64| {
+            let h = handle();
+            h.lock().unwrap_or_else(PoisonError::into_inner).charge = process
+                .try_charge(Bytes::new(bytes))
+                .expect("fits the budget");
+            h
+        };
+        let base = Instant::now();
+        let at = |secs| {
+            base.checked_add(Duration::from_secs(secs))
+                .expect("a second past now is representable")
+        };
+        let (sse, _sse_rx) = channel(1);
+        let live = charged(100);
+        live.lock().unwrap_or_else(PoisonError::into_inner).sse_tx = Some(sse);
+        let map: SessionMap<(), ()> = HashMap::from([
+            ("live".to_owned(), (live, base)),
+            ("old".to_owned(), (charged(100), at(1))),
+            ("mid".to_owned(), (charged(100), at(2))),
+            ("new".to_owned(), (charged(100), at(3))),
+        ]);
+        let sessions = RwLock::new(map);
+        assert_eq!(process.used(), Bytes::new(400));
+        let freed = evict_unconnected_from(&sessions, Bytes::new(150));
+        assert_eq!(freed, Bytes::new(200));
+        let left = sessions.read().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            left.contains_key("live"),
+            "a connected session is never evicted"
+        );
+        assert!(
+            left.contains_key("new"),
+            "eviction stops once `need` is freed"
+        );
+        assert!(!left.contains_key("old") && !left.contains_key("mid"));
+        drop(left);
+        assert_eq!(process.used(), Bytes::new(200));
+    }
+
     #[tokio::test]
     async fn memory_store_get_set_delete() {
         let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
@@ -1901,6 +2063,7 @@ mod tests {
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
@@ -1911,6 +2074,7 @@ mod tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
         }))
     }
 
@@ -3258,12 +3422,14 @@ mod tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
             model,
             rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
             tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
         }))

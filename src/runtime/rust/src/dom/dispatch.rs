@@ -1,4 +1,5 @@
 use crate::html::{Attribute, Event, FormData, Html};
+use crate::retained::{Bytes, RetainedBytes, hash_table};
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
 
@@ -52,6 +53,26 @@ impl<M: Clone> HandlerIndex<M> {
             Event::OnForm(_, f) => f(fd), // f already returns Option<M> (None on decode failure)
             _ => None,
         }
+    }
+}
+
+impl<M: RetainedBytes> HandlerIndex<M> {
+    /// The bytes this index keeps resident, each handler counted as a
+    /// committed view counts it.
+    fn resident_bytes(&self) -> Option<Bytes> {
+        let table = Bytes::inline::<Self>()?
+            .checked_add(hash_table::<(String, HashMap<String, Event<M>>)>(
+                self.map.capacity(),
+            )?)?;
+        self.map.iter().try_fold(table, |acc, (id, events)| {
+            let inner = acc
+                .plus(id)?
+                .checked_add(Bytes::inline::<HashMap<String, Event<M>>>()?)?
+                .checked_add(hash_table::<(String, Event<M>)>(events.capacity())?)?;
+            events.iter().try_fold(inner, |acc, (name, event)| {
+                acc.plus(name)?.checked_add(event.handler_floor()?)
+            })
+        })
     }
 }
 
@@ -241,6 +262,21 @@ pub struct Rendered<M> {
     history: VecDeque<(NonZeroU64, HandlerIndex<M>)>,
 }
 
+impl<M: RetainedBytes> Rendered<M> {
+    /// The bytes the current view and every retained handler index keep resident.
+    #[must_use]
+    pub fn resident_bytes(&self) -> Option<Bytes> {
+        let spare = self.history.capacity().checked_sub(self.history.len())?;
+        let base = Bytes::inline::<Self>()?
+            .checked_add(Bytes::slots::<(NonZeroU64, HandlerIndex<M>)>(spare)?)?
+            .checked_add(self.last_view.view_bytes()?)?;
+        self.history.iter().try_fold(base, |acc, (_, index)| {
+            acc.checked_add(Bytes::inline::<NonZeroU64>()?)?
+                .checked_add(index.resident_bytes()?)
+        })
+    }
+}
+
 impl<M: Clone> Rendered<M> {
     /// The first render of a new history, at counter 1.
     #[must_use]
@@ -357,6 +393,46 @@ mod tests {
     enum Msg {
         Inc,
         Typed(String),
+    }
+
+    impl RetainedBytes for Msg {
+        fn retained_bytes(&self) -> Option<Bytes> {
+            let inline = Bytes::inline::<Self>()?;
+            match self {
+                Self::Inc => Some(inline),
+                Self::Typed(text) => inline.plus_count(text.capacity()),
+            }
+        }
+    }
+
+    // A view with handlers is charged, and so is each retained handler
+    // index, up to the history depth and no further.
+    #[test]
+    fn a_rendered_history_counts_its_view_and_every_index() {
+        let mut rendered = Rendered::first(INCARNATION, tree());
+        let first = rendered.resident_bytes().map(Bytes::get);
+        let view = tree().view_bytes().map(Bytes::get);
+        assert!(
+            first.zip(view).is_some_and(|(all, v)| all > v),
+            "{first:?} {view:?}"
+        );
+        let mut seen = Vec::new();
+        for _ in 0..RENDER_HISTORY_DEPTH.get() + 4 {
+            assert!(rendered.commit(tree()).is_ok());
+            seen.push(rendered.resident_bytes().map(Bytes::get));
+        }
+        let depth = RENDER_HISTORY_DEPTH.get();
+        assert!(
+            first < seen.first().copied().flatten(),
+            "{first:?} {seen:?}"
+        );
+        assert!(seen.iter().all(Option::is_some), "{seen:?}");
+        assert!(
+            seen.iter()
+                .skip(depth)
+                .all(|n| *n == seen.get(depth - 1).copied().flatten()),
+            "a full history holds steady: {seen:?}"
+        );
     }
 
     fn tree() -> Html<Msg> {
