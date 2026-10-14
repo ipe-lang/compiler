@@ -1862,30 +1862,56 @@ residualRows spans lines =
             coveredFlags (List.length lines) spans
     in
     List.map2 (\covered ( number, line ) -> ( covered, number, line )) flags numbered
-        |> List.foldl residualStep ( False, [] )
+        |> List.foldl residualStep ( NoneKept, [] )
         |> residualOf
 
 
--- ( a covered run since the last kept line, the rows kept so far, last
--- first ): consed, so the fold is linear in the lines.
-residualStep : ( Bool, Int, String ) -> ( Bool, List SourceRow ) -> ( Bool, List SourceRow )
-residualStep ( covered, number, line ) ( gap, rows ) =
+-- Where the residual fold is: before any kept line, right after a kept
+-- line, or past a covered run since the last kept line.
+type ResidualAt
+    = NoneKept
+    | AfterKept
+    | CoveredSinceKept
+
+
+-- ( where the fold is, the rows kept so far in order ): each row is added at
+-- the end, so the fold is linear in the lines.
+residualStep : ( Bool, Int, String ) -> ( ResidualAt, List SourceRow ) -> ( ResidualAt, List SourceRow )
+residualStep ( covered, number, line ) ( at, rows ) =
     if covered then
-        ( True, rows )
+        ( coveredAfter at, rows )
 
     else if String.isEmpty (String.trim line) then
-        ( gap, rows )
-
-    else if gap && not (List.isEmpty rows) then
-        ( False, Numbered number line :: Covered :: rows )
+        ( at, rows )
 
     else
-        ( False, Numbered number line :: rows )
+        case at of
+            CoveredSinceKept ->
+                ( AfterKept, rows ++ [ Covered, Numbered number line ] )
+
+            AfterKept ->
+                ( AfterKept, rows ++ [ Numbered number line ] )
+
+            NoneKept ->
+                ( AfterKept, rows ++ [ Numbered number line ] )
 
 
-residualOf : ( Bool, List SourceRow ) -> List SourceRow
+coveredAfter : ResidualAt -> ResidualAt
+coveredAfter at =
+    case at of
+        NoneKept ->
+            NoneKept
+
+        AfterKept ->
+            CoveredSinceKept
+
+        CoveredSinceKept ->
+            CoveredSinceKept
+
+
+residualOf : ( ResidualAt, List SourceRow ) -> List SourceRow
 residualOf ( _, rows ) =
-    List.reverse rows
+    rows
 
 
 -- One flag per line of a `count`-line file: whether any span covers it.
@@ -1914,9 +1940,9 @@ clampSpan count ( start, end ) =
         Nothing
 
 
--- ( the first line no earlier span reached, the flag runs so far, last
--- first ), over spans sorted by first line; consed, so the fold is linear
--- in the spans.
+-- ( the first line no earlier span reached, the flag runs so far in order ),
+-- over spans sorted by first line; each run is added at the end, so the fold
+-- is linear in the spans.
 coverRun : ( Int, Int ) -> ( Int, List (List Bool) ) -> ( Int, List (List Bool) )
 coverRun ( first, last ) ( next, runs ) =
     if last < next then
@@ -1927,9 +1953,9 @@ coverRun ( first, last ) ( next, runs ) =
             from =
                 max first next
         in
-        ( last + 1, List.repeat (last - from + 1) True :: List.repeat (from - next) False :: runs )
+        ( last + 1, runs ++ [ List.repeat (from - next) False, List.repeat (last - from + 1) True ] )
 
 
 closeRuns : Int -> ( Int, List (List Bool) ) -> List Bool
 closeRuns count ( next, runs ) =
-    List.concat (List.reverse (List.repeat (count - next + 1) False :: runs))
+    List.concat (runs ++ [ List.repeat (count - next + 1) False ])
