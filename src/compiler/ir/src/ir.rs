@@ -3606,16 +3606,91 @@ pub enum Pat {
         /// borrowing arm clones a binder out.
         elem: IrType,
     },
-    /// An or-pattern `p0 | p1 | …` — matches if ANY alternative matches. Each
-    /// alternative is an arbitrary [`Pat`] and recurses. Every alternative binds
-    /// the identical set of names at identical types (proved upstream in
-    /// canon/types), so a single copy of the arm body reads those binders
-    /// regardless of which alternative matched. The backend renders this as the
-    /// native Rust or-pattern `p0 | p1 | …`, joining the rendered sub-patterns
-    /// with ` | `, with the arm body emitted exactly once. Refutable (it
-    /// discriminates). Invariant: length ≥ 2 — the lowerer never wraps a lone
-    /// alternative.
-    Or(Vec<Self>),
+    /// An or-pattern `p0 | p1 | …` — matches if ANY alternative matches.
+    ///
+    /// The alternatives are a [`SharedAlts`]: binder-free constructor or
+    /// literal leaves that discriminate at depth 1, so no alternative carries a
+    /// binder, a string guard slot, a slice or a nested sub-pattern. It appears
+    /// only as a whole case-arm head; the lowerer splits every other or-pattern
+    /// into consecutive single-pattern arms before lowering. The backend renders
+    /// the native Rust or-pattern `p0 | p1 | …` with the arm body emitted once.
+    Or(SharedAlts),
+}
+
+/// The alternatives of an or-pattern.
+///
+/// At least two, each a constructor with every argument [`Pat::Wildcard`], or an
+/// [`Pat::Int`] / [`Pat::Char`] / [`Pat::Bool`] literal. Built only by
+/// [`SharedAlts::new`]; a decoded value passes the same proof.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize)]
+pub struct SharedAlts(Vec<Pat>);
+
+impl SharedAlts {
+    /// Prove `alts` is a binder-free depth-1 alternative set.
+    ///
+    /// `None` when fewer than two alternatives are given, or any alternative is
+    /// not a constructor whose every argument is `_`, nor an `Int` / `Char` /
+    /// `Bool` literal.
+    #[must_use]
+    pub fn new(alts: Vec<Pat>) -> Option<Self> {
+        (alts.len() >= 2 && alts.iter().all(is_shared_alternative)).then_some(Self(alts))
+    }
+
+    /// The alternatives, in source order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Pat] {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SharedAlts {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let alts = <Vec<Pat> as serde::Deserialize>::deserialize(d)?;
+        Self::new(alts).ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "an or-pattern alternative set must hold at least two binder-free \
+                 constructor or Int/Char/Bool literal alternatives",
+            )
+        })
+    }
+}
+
+/// Whether `pat` may stand as one alternative of a [`SharedAlts`].
+fn is_shared_alternative(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ctor { args, .. } => args.iter().all(|a| matches!(a, Pat::Wildcard)),
+        Pat::Int(_) | Pat::Char(_) | Pat::Bool(_) => true,
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Str(_)
+        | Pat::Alias(..)
+        | Pat::Tuple(_)
+        | Pat::Record(_)
+        | Pat::Slice { .. }
+        | Pat::Or(_) => false,
+    }
+}
+
+/// The heads an arm pattern discriminates on.
+///
+/// An [`Pat::Or`]'s alternatives, or the pattern itself otherwise, so a
+/// head-keyed decision reads through the or-pattern instead of misclassifying it.
+#[must_use]
+pub fn head_alternatives(pat: &Pat) -> &[Pat] {
+    match pat {
+        Pat::Or(alts) => alts.as_slice(),
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Alias(..)
+        | Pat::Ctor { .. }
+        | Pat::Tuple(_)
+        | Pat::Record(_)
+        | Pat::Slice { .. } => std::slice::from_ref(pat),
+    }
 }
 
 /// How a list pattern's binders take their elements.
@@ -3632,19 +3707,22 @@ pub enum SliceOwnership {
 
 /// Whether a pattern matches EVERY value of its scrutinee type.
 ///
-/// True for a wildcard, a variable binder, or an alias whose inner pattern is
-/// itself irrefutable. Used to prove a flat `match`'s trailing arm is a genuine
-/// catch-all.
+/// Used to prove a flat `match`'s trailing arm is a genuine catch-all.
+///
+/// | Pattern | Irrefutable |
+/// |---|---|
+/// | `_`, a variable | yes |
+/// | `inner as name` | when `inner` is |
+/// | `p0 \| p1 \| …` | when any alternative is (the row canon's `Pattern_::is_irrefutable` shares) |
+/// | a tuple | no: product cover is proved by [`is_product_shaped`] (canon's `PTuple` is irrefutable when its elements are) |
+/// | a literal, constructor, record or slice | no |
 #[must_use]
 pub fn is_irrefutable(pat: &Pat) -> bool {
     match pat {
         Pat::Wildcard | Pat::Var(_) => true,
         Pat::Alias(inner, _) => is_irrefutable(inner),
-        // An or-pattern is irrefutable only if every alternative is — in practice
-        // never for a well-formed `≥ 2` or-pattern (two distinct irrefutable
-        // alternatives are redundant), so it routes through the refutable
-        // `Match` path.
-        Pat::Or(alts) => alts.iter().all(is_irrefutable),
+        // An or-pattern matches whenever one alternative does.
+        Pat::Or(alts) => alts.as_slice().iter().any(is_irrefutable),
         Pat::Int(_)
         | Pat::Bool(_)
         | Pat::Char(_)
@@ -3714,9 +3792,8 @@ pub fn is_list_shaped(pat: &Pat) -> bool {
     match pat {
         Pat::Slice { .. } | Pat::Wildcard | Pat::Var(_) => true,
         Pat::Alias(inner, _) => is_list_shaped(inner),
-        // An or-pattern is list-shaped iff every alternative is (`[] | [_]`),
-        // so a list `case` written with alternatives still reads as list-shaped.
-        Pat::Or(alts) => alts.iter().all(is_list_shaped),
+        // An or-pattern is list-shaped iff every alternative is.
+        Pat::Or(alts) => alts.as_slice().iter().all(is_list_shaped),
         Pat::Int(_)
         | Pat::Bool(_)
         | Pat::Char(_)
@@ -3740,7 +3817,7 @@ pub fn is_ctor_headed(pat: &Pat) -> bool {
         // An or-pattern is constructor-headed iff every alternative is
         // (`Red | Green`), so an alternative-written enum cover reads as a
         // constructor-discrimination arm set.
-        Pat::Or(alts) => alts.iter().all(is_ctor_headed),
+        Pat::Or(alts) => alts.as_slice().iter().all(is_ctor_headed),
         Pat::Wildcard
         | Pat::Var(_)
         | Pat::Int(_)
@@ -3765,7 +3842,7 @@ pub fn is_product_shaped(pat: &Pat) -> bool {
         Pat::Tuple(_) | Pat::Wildcard | Pat::Var(_) => true,
         Pat::Alias(inner, _) => is_product_shaped(inner),
         // An or-pattern is product-shaped iff every alternative is.
-        Pat::Or(alts) => alts.iter().all(is_product_shaped),
+        Pat::Or(alts) => alts.as_slice().iter().all(is_product_shaped),
         Pat::Int(_)
         | Pat::Bool(_)
         | Pat::Char(_)
@@ -3893,13 +3970,14 @@ impl Match {
         let expected: BTreeSet<Symbol> = variants.iter().copied().collect();
 
         let mut covered: BTreeSet<Symbol> = BTreeSet::new();
-        for arm in &arms {
-            // The case-arm head is always a constructor pattern (payload binders
-            // are sub-patterns). A bare variable / wildcard whole-scrutinee arm
-            // routes through `new_flat`, so a non-ctor arm head here is an
-            // internal invariant violation, surfaced as a `CompilerBug` rather
-            // than silently skewing the coverage set.
-            let Pat::Ctor { variant, .. } = &arm.pat else {
+        for head in arms.iter().flat_map(|a| head_alternatives(&a.pat)) {
+            // Every case-arm head (each alternative of a native or-pattern
+            // head) is a constructor pattern (payload binders are sub-patterns).
+            // A bare variable / wildcard whole-scrutinee arm routes through
+            // `new_flat`, so a non-ctor head here is an internal invariant
+            // violation, surfaced as a `CompilerBug` rather than silently skewing
+            // the coverage set.
+            let Pat::Ctor { variant, .. } = head else {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_ir::Match::new",
                     detail: "match arm head is not a constructor pattern".to_owned(),
@@ -3974,9 +4052,12 @@ impl Match {
             });
         };
         let trailing_catch_all = is_irrefutable(&last.pat);
-        let bool_complete = arms.iter().all(|a| matches!(a.pat, Pat::Bool(_)))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Bool(true)))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Bool(false)));
+        // Every head-keyed witness reads the flattened heads, so an or-pattern
+        // arm counts as each of its alternatives.
+        let heads = || arms.iter().flat_map(|a| head_alternatives(&a.pat));
+        let bool_complete = heads().all(|h| matches!(h, Pat::Bool(_)))
+            && heads().any(|h| matches!(h, Pat::Bool(true)))
+            && heads().any(|h| matches!(h, Pat::Bool(false)));
         // Constructor-shaped heads (a constructor, or an alias whose inner is one)
         // mean the scrutinee is a finite enum; the upstream Maranget check proved
         // its coverage, so an alias-over-constructor discrimination set with no
@@ -3990,16 +4071,16 @@ impl Match {
         // was proven UPSTREAM by the Maranget usefulness check (IPE-T0010), so an
         // arm set in this shape with no trailing catch-all (`x :: rest` then `[]`)
         // is still sound here.
-        let all_list_shaped = arms.iter().all(|a| is_list_shaped(&a.pat))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Slice { .. }));
+        let all_list_shaped =
+            heads().all(is_list_shaped) && heads().any(|h| matches!(h, Pat::Slice { .. }));
         // A multi-arm tuple `case`: every arm is product-shaped (a tuple pattern,
         // an irrefutable whole-tuple binder, or an alias over those) and at least
         // one is a genuine tuple pattern. A product type is inhabited only by its
         // element tuples, so the upstream Maranget usefulness check (IPE-T0010)
         // already proved coverage before lowering — an arm set in this shape with
         // no trailing catch-all (`(True, _)` then `(False, _)`) is still sound.
-        let all_product_shaped = arms.iter().all(|a| is_product_shaped(&a.pat))
-            && arms.iter().any(|a| matches!(a.pat, Pat::Tuple(_)));
+        let all_product_shaped =
+            heads().all(is_product_shaped) && heads().any(|h| matches!(h, Pat::Tuple(_)));
         if !trailing_catch_all
             && !bool_complete
             && !all_ctor_headed
@@ -4725,6 +4806,189 @@ mod tests {
             Match::new_flat(Expr::Var(b), arms),
             Err(Diagnostic::CompilerBug { .. })
         ));
+        Ok(())
+    }
+
+    fn nullary(ty: Symbol, variant: Symbol) -> Pat {
+        Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant,
+            args: vec![],
+        }
+    }
+
+    #[test]
+    fn shared_alts_new_accepts_binder_free_heads() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let wild_arg = Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant: inc,
+            args: vec![Pat::Wildcard],
+        };
+        assert!(SharedAlts::new(vec![wild_arg, nullary(ty, dec)]).is_some());
+        assert!(SharedAlts::new(vec![Pat::Int(0), Pat::Int(1)]).is_some());
+        assert!(
+            SharedAlts::new(vec![Pat::Char("a".to_owned()), Pat::Char("b".to_owned())]).is_some()
+        );
+        assert!(SharedAlts::new(vec![Pat::Bool(true), Pat::Bool(false)]).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_binder() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let x = i.intern("x")?;
+        let binds = Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant: inc,
+            args: vec![Pat::Var(x)],
+        };
+        assert!(SharedAlts::new(vec![binds, nullary(ty, dec)]).is_none());
+        assert!(SharedAlts::new(vec![Pat::Var(x), Pat::Int(0)]).is_none());
+        assert!(SharedAlts::new(vec![Pat::Wildcard, Pat::Int(0)]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_str() {
+        assert!(
+            SharedAlts::new(vec![Pat::Str("a".to_owned()), Pat::Str("b".to_owned())]).is_none()
+        );
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_slice() {
+        let empty = Pat::Slice {
+            prefix: vec![],
+            rest: None,
+            own: SliceOwnership::BorrowClone,
+            elem: IrType::Int,
+        };
+        let one = Pat::Slice {
+            prefix: vec![Pat::Wildcard],
+            rest: None,
+            own: SliceOwnership::BorrowClone,
+            elem: IrType::Int,
+        };
+        assert!(SharedAlts::new(vec![empty, one]).is_none());
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_alias() -> DResult<()> {
+        let mut i = Interner::new();
+        let x = i.intern("x")?;
+        let aliased = Pat::Alias(Box::new(Pat::Int(0)), x);
+        assert!(SharedAlts::new(vec![aliased, Pat::Int(1)]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_tuple() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let nested = Pat::Ctor {
+            home: ModPath(vec![]),
+            ty,
+            variant: inc,
+            args: vec![nullary(ty, dec)],
+        };
+        assert!(SharedAlts::new(vec![nested, nullary(ty, dec)]).is_none());
+        let tuple = Pat::Tuple(vec![Pat::Int(0), Pat::Wildcard]);
+        let other = Pat::Tuple(vec![Pat::Wildcard, Pat::Int(0)]);
+        assert!(SharedAlts::new(vec![tuple, other]).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_alts_new_refuses_single() {
+        assert!(SharedAlts::new(vec![Pat::Int(0)]).is_none());
+        assert!(SharedAlts::new(vec![]).is_none());
+    }
+
+    #[test]
+    fn shared_alts_deserialize_refuses_binder() -> Result<(), serde_json::Error> {
+        let mut plain = Interner::new();
+        let x = plain
+            .intern("x")
+            .map_err(|_| <serde_json::Error as serde::de::Error>::custom("intern x"))?;
+        let interner = std::sync::Arc::new(std::sync::Mutex::new(plain));
+        let _guard = ipe_intern::SerdeInternerGuard::install(std::sync::Arc::clone(&interner));
+        let var = serde_json::to_string(&Pat::Var(x))?;
+        let int = serde_json::to_string(&Pat::Int(0))?;
+        let forged = format!("{{\"Or\":[{var},{int}]}}");
+        assert!(serde_json::from_str::<Pat>(&forged).is_err());
+        let sound = format!(
+            "{{\"Or\":[{int},{}]}}",
+            serde_json::to_string(&Pat::Int(1))?
+        );
+        let decoded = serde_json::from_str::<Pat>(&sound)?;
+        assert!(matches!(decoded, Pat::Or(alts) if alts.as_slice().len() == 2));
+        Ok(())
+    }
+
+    #[test]
+    fn new_flat_bool_or_cover() -> DResult<()> {
+        let mut i = Interner::new();
+        let b = i.intern("b")?;
+        // case b of True | False -> 1 — the or-head is a closed Bool cover.
+        let Some(alts) = SharedAlts::new(vec![Pat::Bool(true), Pat::Bool(false)]) else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "test.new_flat_bool_or_cover",
+                detail: "a Bool alternative set is a sound SharedAlts".to_owned(),
+            });
+        };
+        let arms = vec![Arm {
+            pat: Pat::Or(alts),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new_flat(Expr::Var(b), arms).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn match_new_covers_through_or_head() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let m = i.intern("m")?;
+        let Some(alts) = SharedAlts::new(vec![nullary(ty, inc), nullary(ty, dec)]) else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "test.match_new_covers_through_or_head",
+                detail: "a nullary constructor set is a sound SharedAlts".to_owned(),
+            });
+        };
+        let arms = vec![Arm {
+            pat: Pat::Or(alts),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new(Expr::Var(m), arms, &[inc, dec]).is_ok());
+        let partial = vec![Arm {
+            pat: nullary(ty, inc),
+            body: Expr::Int(1),
+            guard: None,
+        }];
+        assert!(Match::new(Expr::Var(m), partial, &[inc, dec]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn is_irrefutable_or_any() -> DResult<()> {
+        let mut i = Interner::new();
+        let (ty, inc, dec) = msg_enum(&mut i)?;
+        let Some(alts) = SharedAlts::new(vec![nullary(ty, inc), nullary(ty, dec)]) else {
+            return Err(Diagnostic::CompilerBug {
+                where_: "test.is_irrefutable_or_any",
+                detail: "a nullary constructor set is a sound SharedAlts".to_owned(),
+            });
+        };
+        assert!(!is_irrefutable(&Pat::Or(alts)));
+        assert_eq!(head_alternatives(&Pat::Int(0)), &[Pat::Int(0)]);
         Ok(())
     }
 

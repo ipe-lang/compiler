@@ -490,14 +490,16 @@ pub(super) fn slice_ownership(env: CloneEnv<'_>, elem: &IrType) -> SliceOwnershi
 pub(super) fn pat_binds_any_name(pat: &Pat) -> bool {
     match pat {
         Pat::Var(_) | Pat::Alias(_, _) => true,
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Ctor { args, .. } => args.iter().any(pat_binds_any_name),
         Pat::Tuple(elems) => elems.iter().any(pat_binds_any_name),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_any_name(p)),
         Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(pat_binds_any_name) || rest.as_deref().is_some_and(pat_binds_any_name)
         }
-        Pat::Or(alts) => alts.iter().any(pat_binds_any_name),
     }
 }
 
@@ -534,9 +536,14 @@ pub(super) fn slice_element_alias_refusal(prefix: &[Pat], span: Span) -> DResult
 fn holds_binding_alias(pat: &Pat) -> bool {
     match pat {
         Pat::Alias(inner, _) => pat_binds_any_name(inner),
-        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {
-            false
-        }
+        // A `SharedAlts` alternative holds no alias.
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Or(_) => false,
         Pat::Ctor { args, .. } => args.iter().any(holds_binding_alias),
         Pat::Tuple(elems) => elems.iter().any(holds_binding_alias),
         Pat::Record(fields) => fields.iter().any(|(_, p)| holds_binding_alias(p)),
@@ -544,7 +551,6 @@ fn holds_binding_alias(pat: &Pat) -> bool {
             prefix.iter().any(holds_binding_alias)
                 || rest.as_deref().is_some_and(holds_binding_alias)
         }
-        Pat::Or(alts) => alts.iter().any(holds_binding_alias),
     }
 }
 
@@ -579,7 +585,10 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
     let in_either = |s: &Symbol| a.contains(s) || b.contains(s);
     match pat {
         Pat::Var(s) => in_either(s),
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Alias(inner, s) => in_either(s) || pat_binds_any_in_either(inner, a, b),
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_any_in_either(p, a, b)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_any_in_either(p, a, b)),
@@ -590,7 +599,6 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
                     .as_deref()
                     .is_some_and(|p| pat_binds_any_in_either(p, a, b))
         }
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_any_in_either(p, a, b)),
     }
 }
 

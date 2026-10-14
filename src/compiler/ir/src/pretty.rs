@@ -445,6 +445,7 @@ fn pat_name_at(interner: &Interner, pat: &Pat, depth: u16) -> String {
             }
         }
         Pat::Or(alts) => alts
+            .as_slice()
             .iter()
             .map(|p| pat_name_at(interner, p, depth))
             .collect::<Vec<_>>()

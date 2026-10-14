@@ -5,8 +5,9 @@
 // standalone emit test lives here.
 
 use super::{BoxedSub, DResult, IrType, ModPath, Pat};
+use ipe_diagnostics::Diagnostic;
 use ipe_intern::Interner;
-use ipe_ir::SliceOwnership;
+use ipe_ir::{SharedAlts, SliceOwnership};
 
 #[test]
 fn every_pattern_shape_has_one_boxed_field_class() -> DResult<()> {
@@ -25,6 +26,11 @@ fn every_pattern_shape_has_one_boxed_field_class() -> DResult<()> {
     assert_eq!(BoxedSub::of(&pair), BoxedSub::Destructure(&pair));
     assert_eq!(BoxedSub::of(&record), BoxedSub::Destructure(&record));
     assert_eq!(BoxedSub::of(&alias), BoxedSub::Destructure(&alias));
+    let literal_alts =
+        SharedAlts::new(vec![Pat::Int(0), Pat::Int(1)]).ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "emit_expr::tests",
+            detail: "two Int alternatives are a valid SharedAlts".to_owned(),
+        })?;
     let dispatching = [
         Pat::Ctor {
             home: ModPath(Vec::new()),
@@ -42,7 +48,7 @@ fn every_pattern_shape_has_one_boxed_field_class() -> DResult<()> {
         Pat::Bool(true),
         Pat::Char("c".to_owned()),
         Pat::Str("s".to_owned()),
-        Pat::Or(vec![Pat::Int(0), Pat::Int(1)]),
+        Pat::Or(literal_alts),
     ];
     for pat in &dispatching {
         assert_eq!(BoxedSub::of(pat), BoxedSub::Dispatch, "{pat:?}");
