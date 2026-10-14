@@ -1,4 +1,4 @@
-module Lib.Settings exposing (AppSettings, DbRefusal(..), DbRole(..), IndexFile, IndexSettings, ReviewFile, brokenLog, dbFileName, dbRefusalOf, ipeTag, openFailure, parseIndexDb, parseIndexSettings, parseReviewDb)
+module Lib.Settings exposing (AppSettings, DbRefusal(..), DbRole(..), EnvValue(..), IndexFile, IndexSettings, ReviewFile, brokenLog, dbFileName, dbRefusalOf, envFailure, ipeTag, openFailure, parseIndexDb, parseIndexSettings, parseReviewDb, valueOr)
 
 import Ipe.Db as Db exposing (DbFailure(..))
 import Ipe.Db.Location as Location exposing (DbLocation, Mode(..))
@@ -10,6 +10,7 @@ import Ipe.Path as Path exposing (Path)
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
+import Lib.EnvLookup as EnvLookup
 import Lib.Epoch exposing (Epoch)
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
 import Lib.ReviewKey exposing (ReviewKey)
@@ -37,7 +38,8 @@ type alias ReviewFile =
     }
 
 
--- The index configuration, parsed from `IPE_INDEX_DB` and `IPE_INDEX_ROOT`.
+-- The index configuration, parsed from `IPE_INDEX_DB`, `IPE_INDEX_ROOT` and
+-- `IPE_INDEX_REPOS`.
 type alias IndexSettings =
     { db : IndexFile
     , roots : RootMap
@@ -59,29 +61,106 @@ type alias AppSettings =
 
 
 -- The repo tag `IPE_INDEX_ROOT` binds: `ipe`, the tag of ipe-index's default
--- `--repo ipe:.`. It is the only bound tag, so a unit stored under any other
--- tag is refused as `UnknownTag` rather than read from this root.
+-- `--repo ipe:.`. Every other tag is bound by an `IPE_INDEX_REPOS` entry or
+-- not at all: a unit stored under an unbound tag is refused as `UnknownTag`
+-- rather than read from this root.
 ipeTag : Result PathError Tag
 ipeTag =
     RepoPath.parseTag "ipe"
 
 
+-- An optional variable as one read finds it: not set, set to a value, or set
+-- but unreadable (not valid Unicode). Unreadable is never taken for unset, so
+-- a value the operator wrote is never silently replaced by a default.
+type EnvValue
+    = EnvUnset
+    | EnvSet String
+    | EnvUnreadable
+
+
+-- What a failed read of an optional variable means, by the failure's kind:
+-- absence is `EnvUnset`; every other failure is `EnvUnreadable`.
+envFailure : Error -> EnvValue
+envFailure failure =
+    if EnvLookup.isUnset failure then
+        EnvUnset
+
+    else
+        EnvUnreadable
+
+
+-- The value of optional variable `key`, or `fallback` when it is not set. An
+-- unreadable value is refused naming the variable, never its value.
+valueOr : String -> String -> EnvValue -> Task.Task Error String
+valueOr key fallback value =
+    case value of
+        EnvUnset ->
+            Task.succeed fallback
+
+        EnvSet raw ->
+            Task.succeed raw
+
+        EnvUnreadable ->
+            Task.fail (Error.invalidInput (key ++ " is set but could not be read from the environment (it is not valid Unicode); unset it to use " ++ fallback ++ ", or set it to a valid value"))
+
+
 -- The one boundary that turns the index environment's text into typed values.
--- `main` reads `IPE_INDEX_DB` and `IPE_INDEX_ROOT` once at startup and parses
--- them here, so a bad value stops the server before it listens. The value it
--- returns is the one every request reads: no request reads the environment or
--- checks the root again, so a request never serves a tree other than the one
--- startup validated.
-parseIndexSettings : String -> String -> Task.Task Error IndexSettings
-parseIndexSettings rawDb rawRoot =
+-- `main` reads `IPE_INDEX_DB`, `IPE_INDEX_ROOT` and `IPE_INDEX_REPOS` once at
+-- startup and parses them here, so a bad value stops the server before it
+-- listens. `IPE_INDEX_ROOT` binds `ipe`; each `IPE_INDEX_REPOS` entry binds
+-- one more tag, after it in the map. The value it returns is the one every
+-- request reads: no request reads the environment or checks a root again, so
+-- a request never serves a tree other than the one startup validated.
+parseIndexSettings : String -> String -> EnvValue -> Task.Task Error IndexSettings
+parseIndexSettings rawDb rawRoot rawRepos =
     do
         db <- parseIndexDb rawDb
         root <- RepoPath.parseRoot rawRoot
+        extra <- parseRepoRoots rawRepos
         roots <- ipeTag
-            |> Result.andThen (\tag -> RepoPath.rootMap [ ( tag, root ) ])
-            |> Result.mapError RepoPath.toError
+            |> Result.andThen (\tag -> RepoPath.rootMap (( tag, root ) :: extra))
+            |> Result.mapError rootsRefusal
             |> Task.fromResult
         Task.succeed { db = db, roots = roots }
+
+
+-- The roots `IPE_INDEX_REPOS` binds: none when it is not set; an unreadable
+-- or malformed value is refused.
+parseRepoRoots : EnvValue -> Task.Task Error (List ( Tag, RepoPath.Root ))
+parseRepoRoots value =
+    case value of
+        EnvUnset ->
+            Task.succeed []
+
+        EnvUnreadable ->
+            Task.fail (RepoPath.reposToError "" RepoPath.ReposUnreadable)
+
+        EnvSet raw ->
+            RepoPath.parseRepos raw
+                |> Task.andThen
+                    (\parsed ->
+                        case parsed of
+                            Ok roots ->
+                                Task.succeed roots
+
+                            Err e ->
+                                Task.fail (RepoPath.reposToError raw e)
+                    )
+
+
+-- A root map refused over the two variables together: a repeated name or
+-- `ipe` again, two names on one directory, or too many roots.
+rootsRefusal : PathError -> Error
+rootsRefusal err =
+    Error.invalidInput
+        (SafeText.toString
+            (SafeText.concat
+                [ SafeText.literal "IPE_INDEX_ROOT and IPE_INDEX_REPOS: "
+                , RepoPath.describe err
+                , SafeText.literal "; bind each repository once, `ipe` through IPE_INDEX_ROOT and every other through one IPE_INDEX_REPOS entry"
+                ]
+            )
+        )
 
 
 -- The index database from the raw `IPE_INDEX_DB` value.
