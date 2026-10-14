@@ -4791,8 +4791,10 @@ mod held_crate_tests {
             &base,
             "cargo",
             &format!(
-                "case \"$1\" in generate-lockfile|update) exit 0 ;; esac\ncat '{}' > '{}'\n\
-                 echo \"$@\" > '{}'\nexit 1",
+                "case \"$1\" in generate-lockfile|update) exit 0 ;;\n\
+                 metadata) echo '{{\"target_directory\":\"{}\"}}'; exit 0 ;; esac\n\
+                 cat '{}' > '{}'\necho \"$@\" > '{}'\nexit 1",
+                crate_dir.path().join("target").display(),
                 src.join("main.rs").display(),
                 seen.display(),
                 seen_args.display()
