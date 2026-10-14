@@ -33,6 +33,9 @@ pub mod csrf;
 // A cookieless page request proves its Fetch Metadata before a session is minted.
 #[cfg(feature = "server")]
 mod mint_proof;
+// Every byte a session keeps resident is charged against a nested byte budget.
+#[cfg(feature = "server")]
+mod budget;
 pub mod style_inject;
 // Custom-element (`CustomElement.node`) registration glue + SRI-pinned author-JS serving.
 // The generator lives at the crate top level (`crate::widget_assets`) so the
@@ -653,6 +656,8 @@ fn dev_console_banner(base: &str) -> String {
 // ─── web_app: axum mount + per-session TEA driver over SSE ─────────────────
 
 #[cfg(feature = "server")]
+use crate::retained::{Bytes, RetainedBytes};
+#[cfg(feature = "server")]
 use crate::tea::{IpeCmd, IpeSub, SubRuntime, SubSink};
 #[cfg(feature = "server")]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -694,6 +699,31 @@ pub struct SessionEntry<Model, Msg> {
     pub debug_cursor: Option<usize>,
     /// The session's credential scope and the switch that ends its channels.
     pub liveness: SessionLiveness,
+    /// The resident bytes this session holds against the byte budget,
+    /// returned when the entry drops.
+    pub(crate) charge: budget::Charge,
+}
+
+#[cfg(feature = "server")]
+impl<Model: RetainedBytes, Msg: RetainedBytes> SessionEntry<Model, Msg> {
+    /// The bytes this session keeps resident, or `None` when a part has no measure.
+    fn resident_bytes(&self) -> Option<Bytes> {
+        let bytes = budget::ENTRY_OVERHEAD.plus(&self.model)?;
+        #[cfg(feature = "debugger")]
+        let bytes = bytes.plus(&self.history)?;
+        Some(bytes)
+    }
+
+    /// Recharge this session to its resident bytes.
+    ///
+    /// # Errors
+    ///
+    /// The bound the bytes would pass; a part with no measure passes the
+    /// session's own ceiling.
+    fn recharge_resident(&mut self) -> Result<(), budget::OverBudget> {
+        let bytes = self.resident_bytes().ok_or(budget::OverBudget::Session)?;
+        self.charge.recharge(bytes)
+    }
 }
 
 #[cfg(feature = "server")]
@@ -1790,6 +1820,183 @@ fn at_capacity() -> axum::response::Response {
         .into_response()
 }
 
+/// The 503 a session gets when its resident state would pass its own byte ceiling.
+#[cfg(feature = "server")]
+fn over_ceiling() -> axum::response::Response {
+    crate::system::emit_runtime_log(
+        "web",
+        "session.over_ceiling: a session's resident state would pass its byte ceiling; refused",
+    );
+    too_large()
+}
+
+/// The fixed 503 body for a session refused for its resident bytes.
+#[cfg(feature = "server")]
+fn too_large() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "session state too large",
+    )
+        .into_response()
+}
+
+/// Keep a debugger-edited session within its byte bound, or close it.
+///
+/// # Errors
+///
+/// The 503 for a session its new state pushes past a byte bound; it is closed.
+#[cfg(feature = "debugger")]
+async fn debug_resident<Model, Msg>(
+    store: &Arc<dyn store::SessionStore<Model, Msg>>,
+    sid: &str,
+    handle: &store::SessionHandle<Model, Msg>,
+) -> Result<(), axum::response::Response>
+where
+    Model: RetainedBytes + Send + 'static,
+    Msg: RetainedBytes + Send + 'static,
+{
+    if keep_resident(handle, store.as_ref()).await {
+        return Ok(());
+    }
+    close_session(store, sid, Some(handle)).await;
+    Err(too_large())
+}
+
+/// The 503 for a refused byte charge, naming the bound it would pass.
+#[cfg(feature = "server")]
+fn refused_charge(why: budget::OverBudget) -> axum::response::Response {
+    match why {
+        budget::OverBudget::Session => over_ceiling(),
+        budget::OverBudget::Process => at_capacity(),
+    }
+}
+
+/// A page GET's driver slot and the byte charge its session holds.
+#[cfg(feature = "server")]
+struct Admission {
+    slot: SessionSlot,
+    charge: budget::Charge,
+}
+
+/// Evict unconnected sessions toward `need` free bytes of `process`, waiting
+/// at most [`budget::EVICT_WAIT`] for their bytes to return.
+#[cfg(feature = "server")]
+async fn make_room<Model, Msg>(
+    store: &dyn store::SessionStore<Model, Msg>,
+    process: &budget::SessionBudget,
+    need: Bytes,
+) {
+    if store.evict_unconnected(need).await.get() == 0 {
+        return;
+    }
+    let _ = tokio::time::timeout(budget::EVICT_WAIT, async {
+        loop {
+            // Enabled before the check, so a release between the two still wakes it.
+            let freed = process.freed();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if process.room().get() >= need.get() {
+                break;
+            }
+            freed.await;
+        }
+    })
+    .await;
+}
+
+/// Charge `charge` up to `bytes`, evicting unconnected sessions once when the
+/// process budget is short.
+///
+/// # Errors
+///
+/// The bound the charge still passes; `None` bytes pass the session's own ceiling.
+#[cfg(feature = "server")]
+async fn charge_up<Model, Msg>(
+    store: &dyn store::SessionStore<Model, Msg>,
+    charge: &mut budget::Charge,
+    bytes: Option<Bytes>,
+) -> Result<(), budget::OverBudget> {
+    let bytes = bytes.ok_or(budget::OverBudget::Session)?;
+    match charge.recharge(bytes) {
+        Err(budget::OverBudget::Process) => {
+            let need = Bytes::new(bytes.get().saturating_sub(charge.held().get()));
+            make_room(store, charge.budget().process_of().as_ref(), need).await;
+            charge.recharge(bytes)
+        }
+        settled => settled,
+    }
+}
+
+/// Reserve a driver slot and charge a new session's fixed bytes, before any `init`.
+///
+/// # Errors
+///
+/// The 503 for the cap or the byte bound the admission would pass.
+#[cfg(feature = "server")]
+async fn admit<Model, Msg>(
+    store: &dyn store::SessionStore<Model, Msg>,
+    count: &Arc<AtomicUsize>,
+    cap: std::num::NonZeroUsize,
+    process: &Arc<budget::SessionBudget>,
+) -> Result<Admission, axum::response::Response> {
+    let Some(slot) = SessionSlot::reserve(count, cap) else {
+        return Err(at_capacity());
+    };
+    let session = budget::SessionBudget::session(process, budget::SESSION_CEILING);
+    let mut charge = session.try_charge(Bytes::ZERO).map_err(refused_charge)?;
+    charge_up(store, &mut charge, Some(budget::ENTRY_OVERHEAD))
+        .await
+        .map_err(refused_charge)?;
+    Ok(Admission { slot, charge })
+}
+
+/// Recharge a live session to its resident bytes.
+///
+/// `false` when its state passes a byte bound even after eviction; the caller
+/// then closes the session.
+#[cfg(feature = "server")]
+async fn keep_resident<Model, Msg>(
+    entry: &Arc<Mutex<SessionEntry<Model, Msg>>>,
+    store: &dyn store::SessionStore<Model, Msg>,
+) -> bool
+where
+    Model: RetainedBytes,
+    Msg: RetainedBytes,
+{
+    let short = {
+        let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+        match e.recharge_resident() {
+            Ok(()) => return true,
+            Err(budget::OverBudget::Session) => None,
+            Err(budget::OverBudget::Process) => e.resident_bytes().map(|bytes| {
+                let need = Bytes::new(bytes.get().saturating_sub(e.charge.held().get()));
+                (need, e.charge.budget().process_of())
+            }),
+        }
+    };
+    let Some((need, process)) = short else {
+        return refused_resident();
+    };
+    make_room(store, process.as_ref(), need).await;
+    let kept = entry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .recharge_resident()
+        .is_ok();
+    kept || refused_resident()
+}
+
+/// Log a live session refused for its resident bytes; always `false`.
+#[cfg(feature = "server")]
+fn refused_resident() -> bool {
+    crate::system::emit_runtime_log(
+        "web",
+        "session.over_ceiling: a live session's state passed its byte bound; closed",
+    );
+    false
+}
+
 // A claim waiter is a request queued on its session, so it waits no longer and
 // in no larger numbers than an entry queued on a live driver.
 #[cfg(feature = "server")]
@@ -1940,11 +2147,14 @@ pub(crate) struct WebState<Model, Msg, FInit, FUpdate, FView, FSubs> {
     /// (form submits included).
     route_matched: RouteMatched,
     /// Web driver count for admission control. Each spawned `drive_session`
-    /// holds a `SessionSlot` that decrements this on exit; a cookieless GET that
-    /// would push it past `max_sessions()` is rejected (503) instead of minting
-    /// an unbounded number of sessions. Decremented ONLY via `SessionSlot::drop`,
-    /// so the leak fix (mortal driver) and this cap share one mechanism.
+    /// holds a `SessionSlot` that decrements this on exit; a GET that would
+    /// push it past `max_sessions` is answered 503 instead of spawning a
+    /// driver. Decremented ONLY via `SessionSlot::drop`.
     session_count: Arc<AtomicUsize>,
+    /// The most session drivers `session_count` admits at once.
+    max_sessions: std::num::NonZeroUsize,
+    /// The byte budget every session's resident state is charged against.
+    budget: Arc<budget::SessionBudget>,
     /// Latest build status from `ipe dev watch`. `None` until the first status
     /// POST arrives. Replayed to new SSE connections so a browser refresh
     /// during a failed build immediately shows the sticky error banner.
@@ -1969,26 +2179,23 @@ impl<Model, Msg, FInit, FUpdate, FView, FSubs> Clone
             param_resolver: self.param_resolver.clone(),
             route_matched: self.route_matched.clone(),
             session_count: self.session_count.clone(),
+            max_sessions: self.max_sessions,
+            budget: self.budget.clone(),
             watch_build_status: self.watch_build_status.clone(),
         }
     }
 }
 
-/// Max concurrent Web-session drivers (admission control). 0 = unlimited
-/// (opt-out). Default 50_000 — far above any single-instance real load, low
-/// enough to bound memory under a session-creation flood.
-/// Env `IPE_WEB_MAX_SESSIONS`.
+/// The operator's session-driver cap, judged at startup by the env registry.
+///
+/// # Errors
+///
+/// The refusal for a value that is not a positive decimal count.
 #[cfg(feature = "server")]
-const MAX_SESSIONS_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling::new(
-    "IPE_WEB_MAX_SESSIONS",
-    50_000,
-    crate::system::ZeroCeiling::Accepted,
-    "decimal session count",
-);
-
-#[cfg(feature = "server")]
-fn max_sessions() -> Result<usize, crate::system::EnvCeilingRefusal> {
-    MAX_SESSIONS_CEILING.read()
+fn max_sessions() -> Result<std::num::NonZeroUsize, crate::system::EnvCeilingRefusal> {
+    let cap: std::num::NonZeroU64 = crate::env_registry::web::MAX_SESSIONS.ceiling().read()?;
+    // A cap past the address space admits every driver the process can hold.
+    Ok(std::num::NonZeroUsize::try_from(cap).unwrap_or(std::num::NonZeroUsize::MAX))
 }
 
 /// RAII admission slot: decrements `WebState::session_count` exactly once when
@@ -1997,6 +2204,20 @@ fn max_sessions() -> Result<usize, crate::system::EnvCeilingRefusal> {
 #[cfg(feature = "server")]
 struct SessionSlot {
     count: Arc<AtomicUsize>,
+}
+#[cfg(feature = "server")]
+impl SessionSlot {
+    /// Reserve one driver slot under `cap`, or `None` while `cap` are held.
+    fn reserve(count: &Arc<AtomicUsize>, cap: std::num::NonZeroUsize) -> Option<Self> {
+        count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                (held < cap.get()).then(|| held.saturating_add(1))
+            })
+            .ok()
+            .map(|_| Self {
+                count: Arc::clone(count),
+            })
+    }
 }
 #[cfg(feature = "server")]
 impl Drop for SessionSlot {
@@ -2129,8 +2350,8 @@ async fn commit_entry<Model, Msg, FView>(
     scope: &pubsub::SessionScope,
 ) -> EntryCommit<Model, Msg>
 where
-    Model: Clone + Send + 'static,
-    Msg: Clone + Send + 'static,
+    Model: Clone + Send + RetainedBytes + 'static,
+    Msg: Clone + Send + RetainedBytes + 'static,
     FView: Fn(Model) -> Html<Msg> + ?Sized,
 {
     let Some(strong) = entry.upgrade() else {
@@ -2177,6 +2398,12 @@ where
         store.delete(sid).await;
         return EntryCommit::SessionGone;
     };
+    // The entered model is charged before any reply or Cmd: a session it
+    // pushes past its byte bound closes instead.
+    if !keep_resident(&strong, store.as_ref()).await {
+        close_session(store, sid, Some(&strong)).await;
+        return EntryCommit::SessionGone;
+    }
     if let Err(EnterReply { body, epoch }) = reply.send(EnterReply { body, epoch }) {
         let (frame, sse_tx) = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
@@ -2233,11 +2460,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
 ) where
     // PartialEq: the `noop` signal compares old vs new Model by structural
     // equality. Generated Model structs always derive PartialEq.
-    Model: Clone + PartialEq + Send + 'static,
+    Model: Clone + PartialEq + Send + RetainedBytes + 'static,
     // `Debug` is required to derive the BOUNDED Msg variant-name label for the
     // `ipe_web_msg_seconds` histogram (telemetry::variant_name). Generated Msg
     // enums always derive Debug, so this internal bound is always satisfiable.
-    Msg: Clone + Send + std::fmt::Debug + 'static,
+    Msg: Clone + Send + std::fmt::Debug + RetainedBytes + 'static,
     FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
     FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
@@ -2448,6 +2675,12 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             store.delete(&sid).await;
             break;
         };
+        // The committed model (and its history) is charged before any patch,
+        // checkpoint or Cmd: a session it pushes past its byte bound closes.
+        if !keep_resident(&strong, store.as_ref()).await {
+            close_session(&store, &sid, Some(&strong)).await;
+            break;
+        }
         // Msg counter. All
         // labels bounded: name = finite variant set, outcome = "ok" (this path
         // has no error channel), noop ∈ {true,false}. Emitted OUTSIDE the entry
@@ -3359,7 +3592,8 @@ where
     E: crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
-    Model: serde::Serialize
+    Model: RetainedBytes
+        + serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
         + PartialEq
@@ -3372,7 +3606,8 @@ where
     // IpeStringify: forwarded through serve_web → page for debugger overlay
     // labels via `ipe_show`. Generated Msg enums always satisfy this bound.
     // DeserializeOwned: forwarded to import_handler (dev-only debug route).
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + Sync
         + std::fmt::Debug
@@ -3391,6 +3626,12 @@ where
         // 1, never a silent downgrade to a different backend.
         let ttl = match web_ttl() {
             Ok(ttl) => ttl,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
+            }
+        };
+        let max_sessions = match max_sessions() {
+            Ok(cap) => cap,
             Err(refusal) => {
                 return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
             }
@@ -3423,6 +3664,8 @@ where
             // No route table: only `/` is a page URL.
             route_matched: Arc::new(RouteLookup::single_page),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions,
+            budget: budget::shared(),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         serve_web(state).await
@@ -3456,7 +3699,8 @@ pub fn web_embed_router<Model, Msg, FInit, FUpdate, FView, FSubs>(
 where
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
-    Model: serde::Serialize
+    Model: RetainedBytes
+        + serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
         + PartialEq
@@ -3464,7 +3708,8 @@ where
         + Sync
         + crate::stringify::IpeStringify
         + 'static,
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + Sync
         + std::fmt::Debug
@@ -3499,6 +3744,10 @@ where
                 Ok(ttl) => ttl,
                 Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let max_sessions = match max_sessions() {
+                Ok(cap) => cap,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
+            };
             let store =
                 match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
                     .await
@@ -3519,6 +3768,8 @@ where
                 param_resolver: Arc::new(|_path| crate::dict::dict_empty()),
                 route_matched: Arc::new(RouteLookup::single_page),
                 session_count: Arc::new(AtomicUsize::new(0)),
+                max_sessions,
+                budget: budget::shared(),
                 watch_build_status: Arc::new(Mutex::new(None)),
             };
             // The router is E-free (E only surfaces on the standalone
@@ -3556,7 +3807,8 @@ pub fn web_embed_router_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, F
     schema_tag: [u8; 32],
 ) -> crate::tea::MountBuilder
 where
-    Model: serde::Serialize
+    Model: RetainedBytes
+        + serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
         + PartialEq
@@ -3564,7 +3816,8 @@ where
         + Sync
         + crate::stringify::IpeStringify
         + 'static,
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + Sync
         + std::fmt::Debug
@@ -3602,6 +3855,10 @@ where
                 Ok(ttl) => ttl,
                 Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
             };
+            let max_sessions = match max_sessions() {
+                Ok(cap) => cap,
+                Err(refusal) => return fail_closed_router(&StartupRefusal::Ceiling(refusal)),
+            };
             let store =
                 match store::choose_store::<Model, Msg>(&store_kind, &store_path, ttl, schema_tag)
                     .await
@@ -3619,6 +3876,8 @@ where
                 param_resolver,
                 route_matched,
                 session_count: Arc::new(AtomicUsize::new(0)),
+                max_sessions,
+                budget: budget::shared(),
                 watch_build_status: Arc::new(Mutex::new(None)),
             };
             build_web_router::<Model, Msg, FInit, FUpdate, FView, FSubs>(state, false)
@@ -3645,7 +3904,8 @@ pub fn web_embed<Model, Msg, FInit, FUpdate, FView, FSubs>(
     schema_tag: [u8; 32],
 ) -> crate::tea::WebApp
 where
-    Model: serde::Serialize
+    Model: RetainedBytes
+        + serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
         + PartialEq
@@ -3653,7 +3913,8 @@ where
         + Sync
         + crate::stringify::IpeStringify
         + 'static,
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + Sync
         + std::fmt::Debug
@@ -3721,7 +3982,8 @@ pub fn web_embed_routed<Model, Msg, Page, FInit, FUpdate, FView, FSubs, FSetPage
     schema_tag: [u8; 32],
 ) -> crate::tea::WebApp
 where
-    Model: serde::Serialize
+    Model: RetainedBytes
+        + serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
         + PartialEq
@@ -3729,7 +3991,8 @@ where
         + Sync
         + crate::stringify::IpeStringify
         + 'static,
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + Sync
         + std::fmt::Debug
@@ -3966,7 +4229,8 @@ where
     E: crate::FromIpeError + Send + 'static,
     // IpeStringify: forwarded to serve_web → inspect_handler for the live-
     // datum surface. Generated Model types always satisfy this bound.
-    Model: serde::Serialize
+    Model: RetainedBytes
+        + serde::Serialize
         + serde::de::DeserializeOwned
         + Clone
         + PartialEq
@@ -3979,7 +4243,8 @@ where
     // IpeStringify: forwarded through serve_web → page for debugger overlay
     // labels via `ipe_show`. Generated Msg enums always satisfy this bound.
     // DeserializeOwned: forwarded to import_handler (dev-only debug route).
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + Sync
         + std::fmt::Debug
@@ -4011,6 +4276,12 @@ where
                 return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
             }
         };
+        let max_sessions = match max_sessions() {
+            Ok(cap) => cap,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(StartupRefusal::Ceiling(refusal).into()));
+            }
+        };
         let store = match store::choose_store::<Model, Msg>(
             &store_kind,
             &store_path,
@@ -4034,6 +4305,8 @@ where
             param_resolver,
             route_matched,
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions,
+            budget: budget::shared(),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         serve_web(state).await
@@ -4203,8 +4476,13 @@ mod handlers {
         headers: axum::http::HeaderMap,
     ) -> Response
     where
-        Model: Clone + PartialEq + Send + 'static,
-        Msg: Clone + Send + std::fmt::Debug + crate::stringify::IpeStringify + 'static,
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
+        Msg: RetainedBytes
+            + Clone
+            + Send
+            + std::fmt::Debug
+            + crate::stringify::IpeStringify
+            + 'static,
         FInit: Fn(req::WebReq) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
         FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
@@ -4223,13 +4501,18 @@ mod handlers {
         headers: axum::http::HeaderMap,
     ) -> Response
     where
-        Model: Clone + PartialEq + Send + 'static,
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
         // Debug: the GET handler creates a session and spawns drive_session,
         // which needs the bound for the ipe_web_msg_seconds{name} label.
         // IpeStringify: the debugger overlay renders message labels via
         // `ipe_show` so `Secret`-bearing fields are structurally redacted.
         // Generated Msg types always satisfy both bounds.
-        Msg: Clone + Send + std::fmt::Debug + crate::stringify::IpeStringify + 'static,
+        Msg: RetainedBytes
+            + Clone
+            + Send
+            + std::fmt::Debug
+            + crate::stringify::IpeStringify
+            + 'static,
         FInit: Fn(req::WebReq) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
         FUpdate: Fn(Msg, Model) -> (Model, IpeCmd<Msg>) + Send + Sync + 'static,
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
@@ -4357,6 +4640,9 @@ mod handlers {
         // rebuilt row always has one once proved; absent, the entry is refused
         // rather than entered with its bindings dropped.
         let mut claim_scope = None;
+        // A claimed rejoin's driver slot and fixed bytes, taken before its row
+        // is decoded or rebuilt; a rejoin that falls to a miss mints under it.
+        let mut admission: Option<Admission> = None;
         let hit = match cookie_key {
             Some(proof) => 'rejoin: {
                 let key = proof.into_key();
@@ -4373,6 +4659,17 @@ mod handlers {
                         return entry_unavailable();
                     }
                     Err(store::ClaimRefusal::Saturated) => return at_capacity(),
+                };
+                admission = match admit(
+                    st.store.as_ref(),
+                    &st.session_count,
+                    st.max_sessions,
+                    &st.budget,
+                )
+                .await
+                {
+                    Ok(admitted) => Some(admitted),
+                    Err(refused) => return refused,
                 };
                 let sid = claim.key().as_str().to_owned();
                 let scope = pubsub::SessionScope::new(sid.clone());
@@ -4437,8 +4734,10 @@ mod handlers {
             return (StatusCode::NOT_FOUND, "404 page not found").into_response();
         }
 
-        let (owner, scope, slot, model, cmd0) = match hit {
+        let (owner, scope, admitted, model, cmd0) = match hit {
             Some((sid, store::Rejoin::Live(handle))) => {
+                // The live driver already holds this session's slot and bytes.
+                drop(admission.take());
                 // sid is carried from the cookie lookup; the "hit but no sid"
                 // state is unrepresentable. The live driver enters the path,
                 // serialised with its `update`s, commits, touches the store and
@@ -4475,19 +4774,14 @@ mod handlers {
                 return page_response(&sid, &body, &epoch, &csrf_tok, &headers);
             }
             Some((_, store::Rejoin::Restored { claim, model, .. })) => {
-                // A returning user with a valid sid cookie → not new attack
-                // volume, so NOT rejected; but count its driver. The slot is
-                // taken at once, so the count is given back on every exit,
+                // A returning session drives under the admission its claim
+                // took, so its slot and bytes are given back on every exit,
                 // a cancelled request included.
-                let Some(scope) = claim_scope.take() else {
+                let (Some(scope), Some(admitted)) = (claim_scope.take(), admission.take()) else {
                     return entry_unavailable();
                 };
-                st.session_count.fetch_add(1, Ordering::SeqCst);
-                let slot = SessionSlot {
-                    count: st.session_count.clone(),
-                };
                 let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, path);
-                (SessionOwner::Rejoined(claim), scope, slot, m, c)
+                (SessionOwner::Rejoined(claim), scope, admitted, m, c)
             }
             Some((
                 _,
@@ -4498,17 +4792,13 @@ mod handlers {
                     ..
                 },
             )) => {
-                // Returning user, same slot pairing as `Restored`; the rebuilt
+                // Returning user, same admission as `Restored`; the rebuilt
                 // model's `init` Cmd runs first, exactly as on a new session.
-                let Some(scope) = claim_scope.take() else {
+                let (Some(scope), Some(admitted)) = (claim_scope.take(), admission.take()) else {
                     return entry_unavailable();
                 };
-                st.session_count.fetch_add(1, Ordering::SeqCst);
-                let slot = SessionSlot {
-                    count: st.session_count.clone(),
-                };
                 let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, path);
-                (SessionOwner::Rejoined(claim), scope, slot, m, c)
+                (SessionOwner::Rejoined(claim), scope, admitted, m, c)
             }
             Some((_, store::Rejoin::Miss)) | None => {
                 // Only a first-party arrival mints: a cross-site subresource or
@@ -4517,25 +4807,23 @@ mod handlers {
                     Ok(proof) => proof,
                     Err(why) => return mint_proof::refused(why),
                 };
-                // Admission control (cookieless = brand-new session = the
-                // attack surface). Reserve a slot atomically: fetch_add-then-test
-                // avoids the load-then-add TOCTOU where N concurrent GETs all
-                // pass at cap-1. ALWAYS reserve (so the slot built below is
-                // paired 1:1 with a decrement); only the rejection is gated on
-                // cap>0 (0 = unlimited opt-out). Over cap → roll back + 503.
-                // A malformed ceiling admits no new session (`usize::MIN` cap
-                // with the unlimited opt-out off), never the default.
-                let (cap, unlimited) = match max_sessions() {
-                    Ok(cap) => (cap, cap == 0),
-                    Err(_) => (usize::MIN, false),
-                };
-                let reserved = st.session_count.fetch_add(1, Ordering::SeqCst);
-                if !unlimited && reserved >= cap {
-                    st.session_count.fetch_sub(1, Ordering::SeqCst);
-                    return at_capacity();
-                }
-                let slot = SessionSlot {
-                    count: st.session_count.clone(),
+                // A rejoin that fell to a miss mints under its admission;
+                // otherwise the slot and the fixed bytes are taken now, before
+                // `init` builds a model. Over the cap or the byte budget the
+                // GET answers 503 and nothing is built.
+                let admitted = match admission.take() {
+                    Some(admitted) => admitted,
+                    None => match admit(
+                        st.store.as_ref(),
+                        &st.session_count,
+                        st.max_sessions,
+                        &st.budget,
+                    )
+                    .await
+                    {
+                        Ok(admitted) => admitted,
+                        Err(refused) => return refused,
+                    },
                 };
                 // Build the request context (params from routing — empty when
                 // unrouted) and init a fresh model. The param_resolver is
@@ -4552,7 +4840,7 @@ mod handlers {
                 (
                     SessionOwner::Minted(scope.sid().to_owned()),
                     scope,
-                    slot,
+                    admitted,
                     m,
                     c,
                 )
@@ -4576,7 +4864,8 @@ mod handlers {
         #[cfg(feature = "debugger")]
         let history_init =
             crate::debugger::RecordBuffer::new(model.clone(), crate::debugger::DEFAULT_HISTORY_CAP);
-        let entry = Arc::new(Mutex::new(SessionEntry {
+        let Admission { slot, charge } = admitted;
+        let mut resident = SessionEntry {
             model,
             rendered,
             tabs: TabSeqs::default(),
@@ -4590,7 +4879,15 @@ mod handlers {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: SessionLiveness::new(scope.clone()),
-        }));
+            charge,
+        };
+        // The first model is charged before the store, the driver or the
+        // cookie learn of the session: a refused one runs no Cmd.
+        let bytes = resident.resident_bytes();
+        if let Err(why) = charge_up(st.store.as_ref(), &mut resident.charge, bytes).await {
+            return refused_charge(why);
+        }
+        let entry = Arc::new(Mutex::new(resident));
 
         // Publishing the session is one task the request cannot cancel: the
         // store write, the driver spawn and the seed Cmd all run, and only
@@ -5775,8 +6072,13 @@ mod handlers {
         method: axum::http::Method,
     ) -> axum::response::Response
     where
-        Model: Clone + PartialEq + Send + 'static,
-        Msg: Clone + Send + std::fmt::Debug + crate::stringify::IpeStringify + 'static,
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
+        Msg: RetainedBytes
+            + Clone
+            + Send
+            + std::fmt::Debug
+            + crate::stringify::IpeStringify
+            + 'static,
         FInit: Fn(req::WebReq) -> (Model, crate::tea::IpeCmd<Msg>) + Send + Sync + 'static,
         FUpdate: Fn(Msg, Model) -> (Model, crate::tea::IpeCmd<Msg>) + Send + Sync + 'static,
         FView: Fn(Model) -> crate::html::Html<Msg> + Send + Sync + 'static,
@@ -5808,6 +6110,9 @@ mod handlers {
             e.model = init_model.clone();
             e.history.reset_to_init(init_model);
             e.debug_cursor = None;
+        }
+        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
+            return refused;
         }
         axum::http::StatusCode::OK.into_response()
     }
@@ -5900,8 +6205,9 @@ mod handlers {
         body: axum::body::Bytes,
     ) -> axum::response::Response
     where
-        Model: Clone + PartialEq + Send + 'static,
-        Msg: Clone
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
+        Msg: RetainedBytes
+            + Clone
             + Send
             + std::fmt::Debug
             + serde::de::DeserializeOwned
@@ -5974,6 +6280,9 @@ mod handlers {
             e.model = final_model;
             e.debug_cursor = None;
         }
+        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
+            return refused;
+        }
         axum::http::StatusCode::OK.into_response()
     }
 
@@ -5994,8 +6303,8 @@ mod handlers {
         axum::Json(body): axum::Json<serde_json::Value>,
     ) -> axum::response::Response
     where
-        Model: Clone + PartialEq + Send + 'static,
-        Msg: Clone + Send + std::fmt::Debug + 'static,
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
+        Msg: RetainedBytes + Clone + Send + std::fmt::Debug + 'static,
         FInit: Send + Sync + 'static,
         FUpdate: Fn(Msg, Model) -> (Model, crate::tea::IpeCmd<Msg>) + Send + Sync + 'static,
         FView: Fn(Model) -> crate::html::Html<Msg> + Send + Sync + 'static,
@@ -6036,6 +6345,9 @@ mod handlers {
                 }
             }
         };
+        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
+            return refused;
+        }
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
@@ -6072,8 +6384,8 @@ mod handlers {
         headers: axum::http::HeaderMap,
     ) -> axum::response::Response
     where
-        Model: Clone + PartialEq + Send + 'static,
-        Msg: Clone + Send + std::fmt::Debug + 'static,
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
+        Msg: RetainedBytes + Clone + Send + std::fmt::Debug + 'static,
         FInit: Send + Sync + 'static,
         FUpdate: Fn(Msg, Model) -> (Model, crate::tea::IpeCmd<Msg>) + Send + Sync + 'static,
         FView: Fn(Model) -> crate::html::Html<Msg> + Send + Sync + 'static,
@@ -6113,6 +6425,9 @@ mod handlers {
                 }
             }
         };
+        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
+            return refused;
+        }
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
@@ -6153,8 +6468,8 @@ mod handlers {
         headers: axum::http::HeaderMap,
     ) -> axum::response::Response
     where
-        Model: Clone + PartialEq + Send + 'static,
-        Msg: Clone + Send + std::fmt::Debug + 'static,
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
+        Msg: RetainedBytes + Clone + Send + std::fmt::Debug + 'static,
         FInit: Send + Sync + 'static,
         FUpdate: Fn(Msg, Model) -> (Model, crate::tea::IpeCmd<Msg>) + Send + Sync + 'static,
         FView: Fn(Model) -> crate::html::Html<Msg> + Send + Sync + 'static,
@@ -6194,6 +6509,9 @@ mod handlers {
                 }
             }
         };
+        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
+            return refused;
+        }
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
@@ -6291,12 +6609,13 @@ where
     E: crate::FromIpeError + Send + 'static,
     // IpeStringify: required by inspect_handler for the live-datum GET
     // (`/_ipe/debug/inspect`). Generated Model types always satisfy this bound.
-    Model: Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
+    Model: RetainedBytes + Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
     // Debug: forwarded to drive_session for the ipe_web_msg_seconds{name} label.
     // IpeStringify: forwarded to the page handler for debugger overlay labels.
     // DeserializeOwned: required by import_handler (dev-only debug import route).
     // Generated Msg types always satisfy all bounds.
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + std::fmt::Debug
         + serde::Serialize
@@ -6452,13 +6771,14 @@ pub(crate) fn build_web_router<Model, Msg, FInit, FUpdate, FView, FSubs>(
 where
     // IpeStringify: required by inspect_handler for the live-datum GET.
     // Generated Model types always satisfy this bound.
-    Model: Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
+    Model: RetainedBytes + Clone + PartialEq + Send + crate::stringify::IpeStringify + 'static,
     // `serde::Serialize` is required by `export_handler` and
     // `serde::de::DeserializeOwned` by `import_handler` (both dev-only routes
     // under the `debugger` feature). Generated Msg enums always derive both,
     // so these bounds tighten nothing for real programs; they are unconditional
     // to avoid `#[cfg(…)]` on where predicates (which is an unstable feature).
-    Msg: Clone
+    Msg: RetainedBytes
+        + Clone
         + Send
         + std::fmt::Debug
         + crate::stringify::IpeStringify
@@ -6950,6 +7270,7 @@ mod reload_push_tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
         }))
     }
 
@@ -7059,6 +7380,7 @@ mod hot_appearance_push_tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
         }))
     }
 
@@ -7393,6 +7715,11 @@ mod canonical_redirect_handler_tests {
     struct Model {
         page: u8,
     }
+    impl crate::retained::RetainedBytes for Model {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
+    }
 
     impl crate::stringify::IpeStringify for Model {
         fn ipe_show(&self) -> String {
@@ -7462,6 +7789,8 @@ mod canonical_redirect_handler_tests {
             param_resolver,
             route_matched,
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         crate::server::behind_listener(
@@ -8155,31 +8484,61 @@ mod admission_control_tests {
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
-    // max_sessions(): env override, default, the 0=unlimited opt-out, and the
-    // refusal of a malformed value.
+    /// The session cap reads the registry key: unset is the default, `0` and a
+    /// malformed value refuse, naming the variable.
     #[test]
-    fn max_sessions_parsing() {
-        crate::system::locked_remove_var("IPE_WEB_MAX_SESSIONS");
-        let absent = max_sessions();
-        crate::system::locked_set_var("IPE_WEB_MAX_SESSIONS", "7");
-        let seven = max_sessions();
-        crate::system::locked_set_var("IPE_WEB_MAX_SESSIONS", "0");
+    fn max_sessions_refuses_zero_and_malformed() {
+        let name = crate::env_registry::web::MAX_SESSIONS.entry().name();
+        crate::system::locked_remove_var(name);
+        let absent = max_sessions().map(std::num::NonZeroUsize::get);
+        crate::system::locked_set_var(name, "7");
+        let seven = max_sessions().map(std::num::NonZeroUsize::get);
+        crate::system::locked_set_var(name, "0");
         let zero = max_sessions();
-        crate::system::locked_set_var("IPE_WEB_MAX_SESSIONS", "garbage");
-        let garbage = max_sessions();
-        crate::system::locked_remove_var("IPE_WEB_MAX_SESSIONS");
+        crate::system::locked_set_var(name, "lots");
+        let lots = max_sessions();
+        crate::system::locked_remove_var(name);
         assert_eq!(absent, Ok(50_000));
         assert_eq!(seven, Ok(7));
-        assert_eq!(zero, Ok(0), "0 = unlimited opt-out");
         assert!(
-            garbage.is_err_and(|r| r.name() == "IPE_WEB_MAX_SESSIONS"),
+            zero.is_err_and(|r| r.name() == "IPE_WEB_MAX_SESSIONS"),
+            "0 is refused, never unlimited"
+        );
+        assert!(
+            lots.is_err_and(|r| r.name() == "IPE_WEB_MAX_SESSIONS"),
             "a malformed value is refused, never the default"
+        );
+    }
+
+    /// A slot reservation admits exactly `cap` drivers; the next is refused.
+    #[test]
+    fn max_sessions_reserve_stops_at_the_cap() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let cap = std::num::NonZeroUsize::MIN.saturating_add(1);
+        let first = SessionSlot::reserve(&count, cap);
+        let second = SessionSlot::reserve(&count, cap);
+        assert!(
+            first.is_some() && second.is_some(),
+            "two slots under a cap of 2"
+        );
+        assert!(
+            SessionSlot::reserve(&count, cap).is_none(),
+            "one past the cap refuses"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "a refusal reserves nothing"
+        );
+        drop(first);
+        assert!(
+            SessionSlot::reserve(&count, cap).is_some(),
+            "a freed slot readmits"
         );
     }
 
     #[test]
     fn web_ceilings_honour_the_shared_contract() {
-        crate::system::assert_env_ceiling_contract(MAX_SESSIONS_CEILING);
         crate::system::assert_env_ceiling_contract(WEB_MAX_BODY_CEILING);
         crate::system::assert_env_ceiling_contract(SHUTDOWN_GRACE_CEILING);
         for (_, ceiling) in CLIENT_TUNING_CEILINGS {
@@ -8311,6 +8670,7 @@ mod sse_reconnect_reconcile_tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
         }));
         Fixture {
             entry,
@@ -9040,6 +9400,8 @@ mod watch_status_handler_tests {
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         }
     }
@@ -9079,6 +9441,7 @@ mod watch_status_handler_tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
         }))
     }
 
@@ -9598,6 +9961,10 @@ mod watch_status_handler_tests {
                 param_resolver: Arc::new(test_param_resolver),
                 route_matched: Arc::new(test_route_matched),
                 session_count: Arc::new(AtomicUsize::new(0)),
+                max_sessions: std::num::NonZeroUsize::MAX,
+                budget: crate::web::budget::SessionBudget::process(
+                    crate::web::budget::SESSION_BUDGET,
+                ),
                 watch_build_status: wbs,
             }
         }
@@ -9704,6 +10071,8 @@ mod hot_transition_handler_tests {
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         Router::new()
@@ -9837,6 +10206,11 @@ mod hot_transition_handler_tests {
             struct Counter {
                 count: i64,
             }
+            impl crate::retained::RetainedBytes for Counter {
+                fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+                    crate::retained::Bytes::inline::<Self>()
+                }
+            }
             let next = transition::apply_transition_hot(INC1, Counter { count: 5 });
             assert_eq!(next.count, 7, "the registered +2 replacement must apply");
         });
@@ -9873,6 +10247,11 @@ mod hot_init_session_scoping_tests {
     #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
     struct Counter {
         count: i64,
+    }
+    impl crate::retained::RetainedBytes for Counter {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
     }
 
     impl crate::stringify::IpeStringify for Counter {
@@ -9954,6 +10333,8 @@ mod hot_init_session_scoping_tests {
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         crate::server::behind_listener(
@@ -10209,6 +10590,8 @@ mod hot_msg_handler_tests {
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         Router::new()
@@ -10422,6 +10805,8 @@ mod hot_init_handler_tests {
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         Router::new()
@@ -10639,6 +11024,8 @@ mod hot_wiring_handler_tests {
             param_resolver: Arc::new(test_param_resolver),
             route_matched: Arc::new(test_route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         Router::new()
@@ -11028,6 +11415,11 @@ mod emitted_router_behavior_tests {
         count: i64,
         last_username: String,
     }
+    impl crate::retained::RetainedBytes for Model {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
+    }
 
     impl crate::stringify::IpeStringify for Model {
         fn ipe_show(&self) -> String {
@@ -11043,6 +11435,11 @@ mod emitted_router_behavior_tests {
         Increment,
         Decrement,
         SignIn(Creds),
+    }
+    impl crate::retained::RetainedBytes for Msg {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
     }
 
     impl crate::stringify::IpeStringify for Msg {
@@ -11165,6 +11562,8 @@ mod emitted_router_behavior_tests {
             param_resolver: Arc::new(param_resolver),
             route_matched: Arc::new(route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         }
     }
@@ -12985,6 +13384,11 @@ mod route_entry_cmd_tests {
         page: Page,
         log: Vec<String>,
     }
+    impl crate::retained::RetainedBytes for Model {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
+    }
 
     impl crate::stringify::IpeStringify for Model {
         fn ipe_show(&self) -> String {
@@ -12995,6 +13399,11 @@ mod route_entry_cmd_tests {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     enum Msg {
         Loaded(String),
+    }
+    impl crate::retained::RetainedBytes for Msg {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
     }
 
     impl crate::stringify::IpeStringify for Msg {
@@ -13119,12 +13528,73 @@ mod route_entry_cmd_tests {
             param_resolver: Arc::new(|_path| crate::dict::dict_empty()),
             route_matched,
             session_count,
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         }
     }
 
     fn memory() -> Store {
         Arc::new(MemoryStore::<Model, Msg>::new(Duration::from_secs(60)))
+    }
+
+    /// The fixture router over `store`, charging sessions against `budget`.
+    #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
+    fn router_budgeted(
+        store: Store,
+        sessions: Arc<AtomicUsize>,
+        budget: Arc<crate::web::budget::SessionBudget>,
+    ) -> axum::Router {
+        let mut state = fixture_state(store, sessions);
+        state.budget = budget;
+        build_web_router(state, false)
+            .map(crate::server::behind_listener)
+            .expect("the fixture route table and base are well-formed")
+    }
+
+    /// A mint one byte short of its fixed charge answers 503 before `init`:
+    /// no cookie, no driver, no Cmd, and no byte left charged.
+    #[test]
+    fn over_budget_mint_runs_no_init_cmd() {
+        run(false, || async {
+            use crate::web::budget::{ENTRY_OVERHEAD, SessionBudget};
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let short = crate::retained::Bytes::new(ENTRY_OVERHEAD.get().saturating_sub(1));
+            let process = SessionBudget::process(short);
+            let app = router_budgeted(memory(), sessions.clone(), process.clone());
+            take_init_sids();
+            let (status, _, sid, _) = get_via(app, "/", None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(sid.is_empty(), "a refused mint sets no cookie");
+            assert!(take_init_sids().is_empty(), "a refused mint runs no init");
+            assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(process.used(), crate::retained::Bytes::ZERO);
+        });
+    }
+
+    /// A flood of cookieless GETs never holds more resident bytes than the
+    /// budget: each mint past it evicts an unconnected session first.
+    #[test]
+    fn budget_flood_stays_within_the_budget() {
+        run(false, || async {
+            use crate::web::budget::{ENTRY_OVERHEAD, SessionBudget};
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let limit = crate::retained::Bytes::new(ENTRY_OVERHEAD.get().saturating_mul(2));
+            let process = SessionBudget::process(limit);
+            let store = memory();
+            for _ in 0..6 {
+                let app = router_budgeted(store.clone(), sessions.clone(), process.clone());
+                let (status, _, _, _) = get_via(app, "/", None).await;
+                assert!(
+                    status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
+                    "{status}"
+                );
+                assert!(
+                    process.used().get() <= limit.get(),
+                    "resident bytes stay in budget"
+                );
+            }
+        });
     }
 
     /// A Web router reached without the listener's URL parse refuses every
@@ -13461,6 +13931,9 @@ mod route_entry_cmd_tests {
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.live.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.live.evict_unconnected(need).await
         }
     }
 
@@ -13941,6 +14414,9 @@ mod route_entry_cmd_tests {
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
         }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
     }
 
     /// Two concurrent GETs rejoining one schema-rebuilt sid evaluate `init` once; the second joins live.
@@ -14039,6 +14515,9 @@ mod route_entry_cmd_tests {
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
         }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
     }
 
     /// A handler cancelled while its rejoin is being stored still commits the session, its Cmd and its claim release.
@@ -14110,6 +14589,9 @@ mod route_entry_cmd_tests {
         }
         async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
         }
     }
 
@@ -14284,6 +14766,7 @@ mod route_entry_cmd_tests {
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
+            charge: crate::web::budget::Charge::detached(),
         }));
         store.set(&sid, entry).await;
         (sid, enter_rx)
@@ -14595,6 +15078,11 @@ mod web_revocation_tests {
         task_token: String,
         task_ok: Option<bool>,
     }
+    impl crate::retained::RetainedBytes for Model {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
+    }
 
     impl crate::stringify::IpeStringify for Model {
         fn ipe_show(&self) -> String {
@@ -14610,6 +15098,11 @@ mod web_revocation_tests {
         TaskDone(bool),
         /// Counts one step and returns [`revoked_cmd`], revoking nothing itself.
         Effect,
+    }
+    impl crate::retained::RetainedBytes for Msg {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
     }
 
     impl crate::stringify::IpeStringify for Msg {
@@ -14758,6 +15251,8 @@ mod web_revocation_tests {
             param_resolver: Arc::new(param_resolver),
             route_matched: Arc::new(route_matched),
             session_count: Arc::new(AtomicUsize::new(0)),
+            max_sessions: std::num::NonZeroUsize::MAX,
+            budget: crate::web::budget::SessionBudget::process(crate::web::budget::SESSION_BUDGET),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
         build_web_router(state, false)
@@ -15583,6 +16078,9 @@ mod web_revocation_tests {
         async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
         }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
     }
 
     /// Closing a session flips its closer before the store delete runs, so a
@@ -15661,6 +16159,9 @@ mod web_revocation_tests {
         }
         async fn web_sessions(&self) -> Vec<store::SessionHandle<Model, Msg>> {
             self.inner.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
         }
     }
 
