@@ -618,7 +618,10 @@ pub mod tests {
         let captured =
             crate::remote_ingest::run_probe(probe, super::PS_STDOUT_MAX_BYTES, super::PS_WALL)
                 .expect("the probe runs");
-        assert_eq!(super::ps_fields(&captured.stdout), Some((0, 0)));
+        assert_eq!(
+            super::ps_fields(&captured.stdout),
+            Some((super::SignalSet(0), super::SignalSet(0)))
+        );
         assert!(
             super::INSTALLED.get().is_none(),
             "the probe installed a signal owner"
