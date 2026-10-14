@@ -878,13 +878,12 @@ pub(crate) fn write_stderr_line(line: &str) {
 /// (`ipe-app | head`) can never abort the process;
 /// `tests/no_panicking_print_macro.rs` refuses any production print macro.
 /// Always compiled, like its stderr sibling, so no feature combination can
-/// leave a caller without it; only `log`, `db` and the served `web` surface
-/// call it.
+/// leave a caller without it; only `log`, `db` and a served app call it.
 #[cfg_attr(
     not(any(
         feature = "log",
         feature = "db",
-        all(feature = "web-core", feature = "server")
+        feature = "server"
     )),
     allow(dead_code) // no stdout-writing module in this feature set
 )]
@@ -903,8 +902,8 @@ pub(crate) enum LogStream {
     Stderr,
     /// User-facing status lines that sit beside program output.
     #[cfg_attr(
-        not(all(feature = "web-core", feature = "server")),
-        allow(dead_code) // only the served web surface writes a status line to stdout
+        not(feature = "server"),
+        allow(dead_code) // only a served app writes a status line to stdout
     )]
     Stdout,
 }
@@ -974,7 +973,7 @@ pub(crate) fn emit_runtime_log_stamped(stamp: &str, tag: &str, msg: &str) {
 }
 
 /// `emit_runtime_log` for a user-facing status line written to stdout.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "server")]
 pub(crate) fn emit_runtime_log_stdout(tag: &str, msg: &str) {
     let stream = LogStream::Stdout;
     stream.write_line(&runtime_log_line(stream, None, tag, msg));

@@ -145,6 +145,7 @@ async fn open_spill_pool(path: &str) -> Result<SqlitePool, sqlx::Error> {
         .busy_timeout(crate::system::SQLITE_BUSY_TIMEOUT);
     let pool = SqlitePool::connect_with(options).await?;
     let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await;
+    crate::db::own_pool(crate::db::PoolRole::TelemetrySpill, &pool);
     Ok(pool)
 }
 

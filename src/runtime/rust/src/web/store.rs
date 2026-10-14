@@ -1187,6 +1187,7 @@ impl<Model, Msg> SqliteStore<Model, Msg> {
                 &e,
             ))
         })?;
+        crate::db::own_pool(crate::db::PoolRole::SessionStore, &pool);
         Ok(SqliteStore {
             pool,
             mem_cache: RwLock::new(HashMap::new()),
@@ -1379,6 +1380,7 @@ impl<Model, Msg> PostgresStore<Model, Msg> {
                 &e,
             ))
         })?;
+        crate::db::own_pool(crate::db::PoolRole::SessionStore, &pool);
         Ok(PostgresStore {
             pool,
             mem_cache: RwLock::new(HashMap::new()),
