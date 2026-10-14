@@ -9361,6 +9361,63 @@ mod tests {
         );
     }
 
+    /// A write lock held past the busy timeout refuses `withTransaction` at its
+    /// begin as the typed `Database Busy`, never `Unexpected`.
+    ///
+    /// The body's own failure is untyped, so the test is red when the begin is
+    /// deferred and the body is first to want the lock. Once the lock is
+    /// released the same transaction commits.
+    #[tokio::test]
+    async fn lock_held_past_busy_timeout_is_typed_busy() {
+        let (seed, path) = fresh_file_db(1).await;
+        let options = format!("sqlite://{}", path.display())
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("parse file sqlite url")
+            .busy_timeout(std::time::Duration::from_millis(50));
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect short-timeout pool");
+        let insert = || {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                db_with_transaction::<IpeError, u64>(db.clone(), |c| {
+                    Box::pin(async move {
+                        let write = sqlx::query("INSERT INTO todos (title) VALUES ('after')");
+                        match exec_routed(&c, write).await {
+                            Ok(done) => IpeResult::Ok(done.rows_affected()),
+                            // Unclassified on purpose: only a refusal at the
+                            // begin carries the typed details.
+                            Err(e) => IpeResult::Err(IpeError::from(e.to_string())),
+                        }
+                    })
+                }),
+            )
+        };
+        let mut held = seed.acquire().await.expect("acquire holder");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *held)
+            .await
+            .expect("holder takes the write lock");
+        let contended = insert().await;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *held).await;
+        drop(held);
+        let released = insert().await;
+        db.close().await;
+        seed.close().await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(&contended, Ok(IpeResult::Err(IpeError::Error(_, info)))
+                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::Busy))),
+            "a held write lock did not refuse as typed busy: {contended:?}"
+        );
+        assert!(
+            matches!(released, Ok(IpeResult::Ok(1))),
+            "the transaction failed with the lock released: {released:?}"
+        );
+    }
+
     // THE REGRESSION GATE. On a MULTI-connection (5) file-backed pool, a
     // withTransaction body that INSERTs then returns Err must roll the INSERT
     // back. Against the old bare-pool code BEGIN/INSERT/ROLLBACK scattered across
