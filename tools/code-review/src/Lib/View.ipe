@@ -1,4 +1,4 @@
-module Lib.View exposing (displayOrderCss, escapeCss, view)
+module Lib.View exposing (RowLine(..), displayOrderCss, escapeCss, lineHtml, rowLines, view)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
@@ -727,7 +727,12 @@ previousLabel row =
 -- tool wrote (`escapeCss`), so no text the tool received can pass for one.
 safeText : SafeText -> Ui.Element msg
 safeText text =
-    Ui.html (Html.span [ Attr.style displayOrderCss ] (List.map segmentHtml (SafeText.segments text)))
+    Ui.html (safeTextHtml text)
+
+
+safeTextHtml : SafeText -> Html.Html msg
+safeTextHtml text =
+    Html.span [ Attr.style displayOrderCss ] (List.map segmentHtml (SafeText.segments text))
 
 
 segmentHtml : Segment -> Html.Html msg
@@ -883,7 +888,7 @@ sourceBlock loaded =
             [ Ui.width Ui.fill, Ui.spacing 2 ]
             (case loaded.view of
                 Shown shown ->
-                    List.map (sourceRow loaded.unit.lang) (Index.shownRows shown)
+                    List.map sourceRow (rowLines loaded.unit.lang (Index.shownRows shown))
 
                 Stale _ ->
                     withheldSource loaded.view
@@ -909,13 +914,13 @@ withheldSource view =
 
 -- One drawn row of a shown view: a numbered source line, or the marker for
 -- a run of lines other units cover, which those units' own pages show.
-sourceRow : Highlight.Lang -> SourceRow -> Ui.Element Msg
-sourceRow lang row =
+sourceRow : RowLine -> Ui.Element Msg
+sourceRow row =
     case row of
-        Numbered n line ->
-            numberedLine lang n line
+        TokenLine n toks ->
+            numberedLine n toks
 
-        Covered ->
+        CoveredLine ->
             Ui.el
                 [ Ui.width Ui.fill
                 , Font.family Font.monospace
@@ -925,8 +930,47 @@ sourceRow lang row =
                 (Ui.text "... lines reviewed as their own units")
 
 
-numberedLine : Highlight.Lang -> Int -> String -> Ui.Element Msg
-numberedLine lang n line =
+-- A shown row with its tokens: a numbered line, or a covered run.
+type RowLine
+    = TokenLine Int (List Token)
+    | CoveredLine
+
+
+-- The rows of a shown view with each line's tokens. A run of numbered rows
+-- is lexed as one text, a line's open lexeme (a block comment, a string that
+-- spans lines) carried into the next row, so a comment or string reads the
+-- same whatever line it starts on; a covered run starts afresh. A line's
+-- `\r` ending is the line break, not text. Linear in the rows' text.
+rowLines : Highlight.Lang -> List SourceRow -> List RowLine
+rowLines lang rows =
+    case List.foldl (rowLineStep lang) ( Highlight.lineStart, [] ) rows of
+        ( _, lines ) ->
+            lines
+
+
+rowLineStep : Highlight.Lang -> SourceRow -> ( Highlight.Carry, List RowLine ) -> ( Highlight.Carry, List RowLine )
+rowLineStep lang row ( carry, lines ) =
+    case row of
+        Numbered n line ->
+            case Highlight.lexLine lang carry (withoutLineEnd line) of
+                ( toks, next ) ->
+                    ( next, lines ++ [ TokenLine n toks ] )
+
+        Covered ->
+            ( Highlight.lineStart, lines ++ [ CoveredLine ] )
+
+
+withoutLineEnd : String -> String
+withoutLineEnd line =
+    if String.endsWith "\r" line then
+        String.dropRight 1 line
+
+    else
+        line
+
+
+numberedLine : Int -> List Token -> Ui.Element Msg
+numberedLine n toks =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 8 ]
         [ Ui.el
@@ -942,40 +986,40 @@ numberedLine lang n line =
             , Font.family Font.monospace
             , Font.size 12
             ]
-            (Ui.wrappedRow
-                [ Ui.width Ui.fill, Ui.spacing 0 ]
-                (List.map tokenEl (Highlight.tokenize lang line))
-            )
+            (Ui.html (lineHtml toks))
         ]
 
 
-tokenEl : Highlight.Token -> Ui.Element Msg
-tokenEl tok =
-    Ui.el
-        [ Font.family Font.monospace
-        , Font.size 12
-        , Font.color (tokenColor tok)
-        ]
-        (safeText (Highlight.tokenText tok))
+-- One source line as a single run of inline text, so it copies as the
+-- source spells it: each token an inline span in its color, its text drawn
+-- through the untrusted-text sink, and each tab drawn as the tab it is.
+lineHtml : List Token -> Html.Html msg
+lineHtml toks =
+    Html.span [ Attr.style "white-space:pre" ] (List.map tokenHtml toks)
 
 
-tokenColor : Highlight.Token -> Ui.Color
-tokenColor tok =
+tokenHtml : Token -> Html.Html msg
+tokenHtml tok =
+    Html.span [ Attr.style (tokenCss tok) ] (List.intersperse (Html.text "\t") (List.map safeTextHtml (Highlight.tokenRuns tok)))
+
+
+tokenCss : Token -> String
+tokenCss tok =
     case tok of
         Keyword _ ->
-            Ui.rgb 199 146 234
+            "color:#c792ea"
 
         Str _ ->
-            Ui.rgb 152 195 121
+            "color:#98c379"
 
         Comment _ ->
-            Ui.rgb 110 110 125
+            "color:#6e6e7d"
 
         Num _ ->
-            Ui.rgb 209 154 102
+            "color:#d19a66"
 
         Ident _ ->
-            Ui.rgb 205 205 215
+            "color:#cdcdd7"
 
         Plain _ ->
-            Ui.rgb 205 205 215
+            "color:#cdcdd7"

@@ -150,10 +150,10 @@ references : Lang -> String -> List Reference
 references lang source =
     case lang of
         Rust ->
-            referencesGo lang (Highlight.tokenize lang source) []
+            referencesOf lang (Highlight.tokenize lang source)
 
         Ipe ->
-            referencesGo lang (Highlight.tokenize lang source) []
+            referencesOf lang (Highlight.tokenize lang source)
 
         Shell ->
             []
@@ -162,178 +162,273 @@ references lang source =
             []
 
 
-referencesGo : Lang -> List Token -> List Reference -> List Reference
-referencesGo lang tokens acc =
-    case tokens of
-        [] ->
-            List.reverse acc
-
-        tok :: rest ->
-            case wordOf tok of
-                Just word ->
-                    let
-                        chain =
-                            chainGo lang word.text 1 rest
-                    in
-                    referencesGo lang chain.after (consReference word.reserved chain acc)
-
-                Nothing ->
-                    case rangeAt tokens of
-                        Just afterDots ->
-                            referencesGo lang afterDots acc
-
-                        Nothing ->
-                            case separatorAt lang tokens of
-                                Just afterSep ->
-                                    referencesGo lang (skipChain lang afterSep.rest) acc
-
-                                Nothing ->
-                                    case memberAt lang tokens of
-                                        Just afterDot ->
-                                            referencesGo lang (skipChain lang afterDot) acc
-
-                                        Nothing ->
-                                            referencesGo lang rest acc
+-- One left-to-right pass over the tokens: each token is read once and moves
+-- the walk on, so the pass is linear in the tokens.
+referencesOf : Lang -> List Token -> List Reference
+referencesOf lang tokens =
+    case List.foldl (walkToken lang) ( Between, [] ) tokens of
+        ( walk, refs ) ->
+            closeWalk walk refs
 
 
-type alias Chain =
-    { text : String
-    , segments : Int
-    , after : List Token
-    }
+-- What a token is to the walk: a word (identifier or keyword, `True` for a
+-- keyword), one of the two separator characters, or anything else.
+type Piece
+    = Word String Bool
+    | Dot
+    | Colon
+    | Other
 
 
-consReference : Bool -> Chain -> List Reference -> List Reference
-consReference reserved chain acc =
-    if chain.segments > 1 then
-        Path chain.text :: acc
-
-    else if reserved then
-        acc
-
-    else
-        Bare chain.text :: acc
-
-
--- Extends a chain over every `separator word` pair that follows it.
-chainGo : Lang -> String -> Int -> List Token -> Chain
-chainGo lang text segments tokens =
-    case separatorAt lang tokens of
-        Just afterSep ->
-            case afterSep.rest of
-                next :: rest ->
-                    case wordOf next of
-                        Just word ->
-                            chainGo lang (text ++ afterSep.sep ++ word.text) (segments + 1) rest
-
-                        Nothing ->
-                            { text = text, segments = segments, after = tokens }
-
-                [] ->
-                    { text = text, segments = segments, after = tokens }
-
-        Nothing ->
-            { text = text, segments = segments, after = tokens }
-
-
--- Drops the member-access chain at the head of `tokens`, the tokens after
--- a separator.
-skipChain : Lang -> List Token -> List Token
-skipChain lang tokens =
-    case tokens of
-        next :: rest ->
-            case wordOf next of
-                Just word ->
-                    (chainGo lang word.text 1 rest).after
-
-                Nothing ->
-                    tokens
-
-        [] ->
-            []
-
-
--- The path separator at the head of `tokens`, with the tokens after it:
--- `.` in Ipê, `::` in Rust. The tokenizer emits punctuation one character per
--- `Plain` token.
-separatorAt : Lang -> List Token -> Maybe { sep : String, rest : List Token }
-separatorAt lang tokens =
-    case tokens of
-        (Plain first) :: rest ->
-            if first == "." && lang == Ipe then
-                Just { sep = ".", rest = rest }
-
-            else if first == ":" && lang == Rust then
-                case rest of
-                    (Plain second) :: afterColons ->
-                        if second == ":" then
-                            Just { sep = "::", rest = afterColons }
-
-                        else
-                            Nothing
-
-                    _ ->
-                        Nothing
-
-            else
-                Nothing
-
-        _ ->
-            Nothing
-
-
--- A Rust `.` at the head of `tokens` — a field or method access on the
--- expression before it, never a path — with the tokens after it.
-memberAt : Lang -> List Token -> Maybe (List Token)
-memberAt lang tokens =
-    case tokens of
-        (Plain first) :: rest ->
-            if first == "." && lang == Rust then
-                Just rest
-
-            else
-                Nothing
-
-        _ ->
-            Nothing
-
-
--- A `..` at the head of `tokens` (a Rust range, an Ipê `exposing (..)`), with
--- the tokens after it: what follows it is no member.
-rangeAt : List Token -> Maybe (List Token)
-rangeAt tokens =
-    case tokens of
-        (Plain first) :: (Plain second) :: rest ->
-            if first == "." && second == "." then
-                Just rest
-
-            else
-                Nothing
-
-        _ ->
-            Nothing
-
-
-wordOf : Token -> Maybe { text : String, reserved : Bool }
-wordOf tok =
+pieceOf : Token -> Piece
+pieceOf tok =
     case tok of
         Ident s ->
-            Just { text = s, reserved = False }
+            Word s False
 
         Keyword s ->
-            Just { text = s, reserved = True }
+            Word s True
+
+        Plain s ->
+            if s == "." then
+                Dot
+
+            else if s == ":" then
+                Colon
+
+            else
+                Other
 
         Str _ ->
-            Nothing
+            Other
 
         Comment _ ->
-            Nothing
+            Other
 
         Num _ ->
-            Nothing
+            Other
 
-        Plain _ ->
-            Nothing
+
+-- The chain being read: one that names a reference (its text, its segment
+-- count, and whether its first word is a keyword), or a member-access chain
+-- that names nothing.
+type Head
+    = Emit String Int Bool
+    | Discard
+
+
+-- Where the walk is. `Between`: no chain open. `AfterDot`, `AfterColon`,
+-- `AfterColons`: a `.`, `:` or `::` read with no chain before it, so a word
+-- after it starts a member chain (and a second `.` makes a `..` range).
+-- `InChain`: a chain whose last word was just read. `ChainDot`, `ChainColon`,
+-- `ChainColons`: a chain followed by `.` (Ipê), `:` or `::` (Rust), which a
+-- word extends.
+type Walk
+    = Between
+    | AfterDot
+    | AfterColon
+    | AfterColons
+    | InChain Head
+    | ChainDot Head
+    | ChainColon Head
+    | ChainColons Head
+
+
+walkToken : Lang -> Token -> ( Walk, List Reference ) -> ( Walk, List Reference )
+walkToken lang tok ( walk, refs ) =
+    walkPiece lang (pieceOf tok) walk refs
+
+
+walkPiece : Lang -> Piece -> Walk -> List Reference -> ( Walk, List Reference )
+walkPiece lang piece walk refs =
+    case walk of
+        Between ->
+            startAt lang piece refs
+
+        AfterDot ->
+            case piece of
+                Dot ->
+                    ( Between, refs )
+
+                Word _ _ ->
+                    ( InChain Discard, refs )
+
+                Colon ->
+                    startAt lang Colon refs
+
+                Other ->
+                    ( Between, refs )
+
+        AfterColon ->
+            case piece of
+                Colon ->
+                    ( AfterColons, refs )
+
+                Word w reserved ->
+                    startAt lang (Word w reserved) refs
+
+                Dot ->
+                    startAt lang Dot refs
+
+                Other ->
+                    ( Between, refs )
+
+        AfterColons ->
+            case piece of
+                Word _ _ ->
+                    ( InChain Discard, refs )
+
+                Dot ->
+                    startAt lang Dot refs
+
+                Colon ->
+                    startAt lang Colon refs
+
+                Other ->
+                    ( Between, refs )
+
+        InChain head ->
+            case piece of
+                Dot ->
+                    if lang == Ipe then
+                        ( ChainDot head, refs )
+
+                    else
+                        startAt lang Dot (emit head refs)
+
+                Colon ->
+                    if lang == Rust then
+                        ( ChainColon head, refs )
+
+                    else
+                        startAt lang Colon (emit head refs)
+
+                Word w reserved ->
+                    startAt lang (Word w reserved) (emit head refs)
+
+                Other ->
+                    ( Between, emit head refs )
+
+        ChainDot head ->
+            case piece of
+                Word w _ ->
+                    ( InChain (extend head "." w), refs )
+
+                Dot ->
+                    walkPiece lang Dot AfterDot (emit head refs)
+
+                Colon ->
+                    walkPiece lang Colon AfterDot (emit head refs)
+
+                Other ->
+                    walkPiece lang Other AfterDot (emit head refs)
+
+        ChainColon head ->
+            case piece of
+                Colon ->
+                    ( ChainColons head, refs )
+
+                Word w reserved ->
+                    walkPiece lang (Word w reserved) AfterColon (emit head refs)
+
+                Dot ->
+                    walkPiece lang Dot AfterColon (emit head refs)
+
+                Other ->
+                    walkPiece lang Other AfterColon (emit head refs)
+
+        ChainColons head ->
+            case piece of
+                Word w _ ->
+                    ( InChain (extend head "::" w), refs )
+
+                Dot ->
+                    walkPiece lang Dot AfterColons (emit head refs)
+
+                Colon ->
+                    walkPiece lang Colon AfterColons (emit head refs)
+
+                Other ->
+                    walkPiece lang Other AfterColons (emit head refs)
+
+
+-- The walk after `piece` with no chain open: a word opens a chain, a `.`
+-- (or a Rust `:`) may open a separator.
+startAt : Lang -> Piece -> List Reference -> ( Walk, List Reference )
+startAt lang piece refs =
+    case piece of
+        Word w reserved ->
+            ( InChain (Emit w 1 reserved), refs )
+
+        Dot ->
+            ( AfterDot, refs )
+
+        Colon ->
+            if lang == Rust then
+                ( AfterColon, refs )
+
+            else
+                ( Between, refs )
+
+        Other ->
+            ( Between, refs )
+
+
+extend : Head -> String -> String -> Head
+extend head sep w =
+    case head of
+        Emit text segments reserved ->
+            Emit (text ++ sep ++ w) (segments + 1) reserved
+
+        Discard ->
+            Discard
+
+
+-- A closed chain's reference: a path of two or more segments, or a bare
+-- name that is no keyword.
+emit : Head -> List Reference -> List Reference
+emit head refs =
+    case head of
+        Emit text segments reserved ->
+            if segments > 1 then
+                refs ++ [ Path text ]
+
+            else if reserved then
+                refs
+
+            else
+                refs ++ [ Bare text ]
+
+        Discard ->
+            refs
+
+
+closeWalk : Walk -> List Reference -> List Reference
+closeWalk walk refs =
+    case walk of
+        InChain head ->
+            emit head refs
+
+        ChainDot head ->
+            emit head refs
+
+        ChainColon head ->
+            emit head refs
+
+        ChainColons head ->
+            emit head refs
+
+        Between ->
+            refs
+
+        AfterDot ->
+            refs
+
+        AfterColon ->
+            refs
+
+        AfterColons ->
+            refs
 
 
 -- The qualified names a page looks up for its references, under ipe-index's
@@ -365,28 +460,41 @@ candidates lang unit refs =
         base =
             moduleBase lang unit
     in
-    candidatesGo (List.map (alternatives lang unit base) (distinctReferences refs)) Set.empty { lookups = [], names = [], count = 0 }
+    case List.foldl candidateStep (Open Set.empty { lookups = [], names = [], count = 0 }) (List.map (alternatives lang unit base) (distinctReferences refs)) of
+        Open _ acc ->
+            { lookups = acc.lookups, names = acc.names, reach = Complete }
+
+        Full acc ->
+            { lookups = acc.lookups, names = acc.names, reach = Capped }
 
 
-candidatesGo : List (List String) -> Set String -> CandidateAcc -> Candidates
-candidatesGo pending seen acc =
-    case pending of
-        [] ->
-            { lookups = List.reverse acc.lookups, names = List.reverse acc.names, reach = Complete }
+-- The candidate fold: open, with the names seen so far, or full once a
+-- reference's alternatives would pass `linkCandidateCeiling`, after which
+-- every later reference is passed over unread.
+type CandidateFold
+    = Open (Set String) CandidateAcc
+    | Full CandidateAcc
 
-        alts :: rest ->
+
+candidateStep : List String -> CandidateFold -> CandidateFold
+candidateStep alts fold =
+    case fold of
+        Full acc ->
+            Full acc
+
+        Open seen acc ->
             let
                 fresh =
                     distinctNew seen alts
             in
             if acc.count + List.length fresh > linkCandidateCeiling then
-                { lookups = List.reverse acc.lookups, names = List.reverse acc.names, reach = Capped }
+                Full acc
 
             else
-                candidatesGo rest
+                Open
                     (List.foldl Set.insert seen fresh)
-                    { lookups = alts :: acc.lookups
-                    , names = List.reverse fresh ++ acc.names
+                    { lookups = acc.lookups ++ [ alts ]
+                    , names = acc.names ++ fresh
                     , count = acc.count + List.length fresh
                     }
 
@@ -408,21 +516,27 @@ distinctNew seen alts =
 
 distinctReferences : List Reference -> List Reference
 distinctReferences refs =
-    distinctReferencesGo refs Set.empty []
+    firstByKey referenceKey refs
 
 
-distinctReferencesGo : List Reference -> Set String -> List Reference -> List Reference
-distinctReferencesGo refs seen acc =
-    case refs of
-        [] ->
-            List.reverse acc
+-- The items of `xs` whose key no earlier item has, in their order. One
+-- stable sort by key puts each key's items together in input order, the
+-- first of each run is kept, and a sort by position restores the order:
+-- `O(n log n)`, and no step copies what the walk has built so far.
+firstByKey : (a -> String) -> List a -> List a
+firstByKey key xs =
+    case List.foldl keepRunHead ( Nothing, [] ) (List.sortBy (\( k, _ ) -> k) (List.indexedMap (\i x -> ( key x, ( i, x ) )) xs)) of
+        ( _, kept ) ->
+            List.map (\( _, x ) -> x) (List.sortBy (\( i, _ ) -> i) kept)
 
-        r :: rest ->
-            if Set.member (referenceKey r) seen then
-                distinctReferencesGo rest seen acc
 
-            else
-                distinctReferencesGo rest (Set.insert (referenceKey r) seen) (r :: acc)
+keepRunHead : ( String, ( Int, a ) ) -> ( Maybe String, List ( Int, a ) ) -> ( Maybe String, List ( Int, a ) )
+keepRunHead ( k, item ) ( previous, kept ) =
+    if previous == Just k then
+        ( previous, kept )
+
+    else
+        ( Just k, kept ++ [ item ] )
 
 
 referenceKey : Reference -> String
@@ -562,23 +676,41 @@ isUrl token =
     String.startsWith "http://" token || String.startsWith "https://" token
 
 
+-- One pass over the word: leading punctuation is dropped, and a run of
+-- punctuation is held back until a later character shows it is not trailing.
 trimPunct : String -> String
 trimPunct token =
-    String.fromList (List.reverse (dropPunct (List.reverse (dropPunct (String.toList token)))))
+    case String.foldl trimStep Leading token of
+        Leading ->
+            ""
+
+        Kept text _ ->
+            text
 
 
-dropPunct : List Char -> List Char
-dropPunct chars =
-    case chars of
-        c :: rest ->
+-- Where `trimPunct` is: in the leading punctuation, or past it with the text
+-- kept and the punctuation run read since.
+type Trim
+    = Leading
+    | Kept String String
+
+
+trimStep : Char -> Trim -> Trim
+trimStep c trim =
+    case trim of
+        Leading ->
             if isPunct c then
-                dropPunct rest
+                Leading
 
             else
-                chars
+                Kept (String.fromChar c) ""
 
-        [] ->
-            []
+        Kept text held ->
+            if isPunct c then
+                Kept text (String.append held (String.fromChar c))
+
+            else
+                Kept (String.append (String.append text held) (String.fromChar c)) ""
 
 
 -- Char literals for quote/backslash escapes crash the formatter (IPE-I0001
@@ -593,22 +725,11 @@ isPunct c =
     List.member c punctChars
 
 
--- First occurrence wins: one left-to-right pass keeps a link only when its
--- key is new. The seen set holds each link's comparable `linkKey`.
+-- First occurrence wins: a link is kept only when no earlier link has its
+-- comparable `linkKey`.
 dedup : List Link -> List Link
 dedup links =
-    case List.foldl keepFirst ( Set.empty, [] ) links of
-        ( _, kept ) ->
-            List.reverse kept
-
-
-keepFirst : Link -> ( Set String, List Link ) -> ( Set String, List Link )
-keepFirst link ( seen, kept ) =
-    if Set.member (linkKey link) seen then
-        ( seen, kept )
-
-    else
-        ( Set.insert (linkKey link) seen, link :: kept )
+    firstByKey linkKey links
 
 
 -- The text a link shows, never raw: an internal link's rendered name, an
