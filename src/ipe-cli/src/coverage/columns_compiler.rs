@@ -4,7 +4,9 @@
 //! three columns inspect the crate's `src/` tree directly, without building, so
 //! they run in the fast (non-E2E) path.
 
-use crate::coverage::compiler_surface::{CompilerCrate, rust_files};
+use panic_scan::{Want, rust_sources};
+
+use crate::coverage::compiler_surface::CompilerCrate;
 use crate::coverage::contract::{AspectCheck, Cell};
 
 // ── tested ────────────────────────────────────────────────────────────────────
@@ -22,13 +24,21 @@ impl AspectCheck<CompilerCrate> for TestedColumn {
     }
 
     fn check(&self, item: &CompilerCrate) -> Cell {
-        let files = rust_files(&item.crate_path);
+        let files = match rust_sources(&item.crate_path, Want::RustFiles) {
+            Ok(files) => files,
+            Err(error) => return unlisted(item, &error),
+        };
         for path in &files {
-            let Ok(src) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            if src.contains("#[test]") {
-                return Cell::Ok;
+            match std::fs::read_to_string(path) {
+                Ok(src) if src.contains("#[test]") => return Cell::Ok,
+                Ok(_) => {}
+                Err(error) => {
+                    return Cell::Hole(format!(
+                        "`{}` cannot be searched for tests: {} is unreadable ({error})",
+                        item.name,
+                        path.display()
+                    ));
+                }
             }
         }
         Cell::Hole(format!(
@@ -61,7 +71,17 @@ impl AspectCheck<CompilerCrate> for NoPanicColumn {
     }
 
     fn check(&self, item: &CompilerCrate) -> Cell {
-        let files = rust_files(&item.src_path);
+        let files = match rust_sources(&item.src_path, Want::RustFiles) {
+            Ok(files) if files.is_empty() => {
+                return Cell::Hole(format!(
+                    "`{}` has no `.rs` file under {} — nothing audited for panic-prone patterns",
+                    item.name,
+                    item.src_path.display()
+                ));
+            }
+            Ok(files) => files,
+            Err(error) => return unlisted(item, &error),
+        };
         let mut violations: Vec<String> = Vec::new();
         // An unread file is unaudited, not clean: it holes the crate.
         let mut unreadable: Vec<String> = Vec::new();
@@ -113,6 +133,14 @@ impl AspectCheck<CompilerCrate> for NoPanicColumn {
     }
 }
 
+/// The hole for a crate whose tree the walker refused to list: an unlisted file is unaudited.
+fn unlisted(item: &CompilerCrate, error: &panic_scan::WalkError) -> Cell {
+    Cell::Hole(format!(
+        "`{}` cannot be audited: its source tree cannot be listed whole ({error})",
+        item.name
+    ))
+}
+
 // ── documented ────────────────────────────────────────────────────────────────
 
 /// Column **documented**: `src/lib.rs` opens with at least one `//!` inner-doc
@@ -153,7 +181,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use super::NoPanicColumn;
+    use super::{NoPanicColumn, TestedColumn};
     use crate::coverage::compiler_surface::CompilerCrate;
     use crate::coverage::contract::{AspectCheck, Cell};
 
@@ -195,6 +223,73 @@ mod tests {
         let cell = NoPanicColumn.check(&item);
         std::fs::remove_dir_all(&root).unwrap();
         assert!(matches!(cell, Cell::Ok), "{cell:?}");
+    }
+
+    #[test]
+    fn a_missing_source_root_holes_every_walking_column() {
+        let root = ipe_test_temp::temp_root().join(format!(
+            "ipe-no-panic-column-missing-{}",
+            std::process::id()
+        ));
+        let item = CompilerCrate {
+            name: "probe",
+            dir: "probe",
+            src_path: Arc::new(root.join("src")),
+            crate_path: Arc::new(root.clone()),
+        };
+        for cell in [NoPanicColumn.check(&item), TestedColumn.check(&item)] {
+            assert!(
+                matches!(cell, Cell::Hole(ref why)
+                    if why.contains("cannot be listed") && why.contains(&*root.to_string_lossy())),
+                "{cell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_source_root_holes_the_crate() {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe-no-panic-column-empty-{}", std::process::id()));
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let item = CompilerCrate {
+            name: "probe",
+            dir: "probe",
+            src_path: Arc::new(src),
+            crate_path: Arc::new(root.clone()),
+        };
+        let cell = NoPanicColumn.check(&item);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            matches!(cell, Cell::Hole(ref why) if why.contains("nothing audited")),
+            "{cell:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_source_directory_holes_the_crate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, item) = crate_with_lib("unreadable", "pub fn f() {}\n");
+        let locked = root.join("src/locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("prod.rs"), "pub fn g() {}\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged user reads the locked directory anyway: nothing to refuse.
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let cells = [NoPanicColumn.check(&item), TestedColumn.check(&item)];
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        if readable {
+            return;
+        }
+        for cell in cells {
+            assert!(
+                matches!(cell, Cell::Hole(ref why) if why.contains("src/locked")),
+                "{cell:?}"
+            );
+        }
     }
 
     #[test]

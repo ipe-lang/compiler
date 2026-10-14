@@ -103,7 +103,7 @@ explain/IPE-L0105.md:17
 explain/IPE-L0107.md:26
 explain/IPE-L0107.md:49
 explain/IPE-L0107.md:71
-explain/IPE-L0107.md:84
+explain/IPE-L0107.md:110
 explain/IPE-L0108.md:17
 explain/IPE-L0108.md:25
 explain/IPE-L0108.md:33
@@ -399,8 +399,6 @@ explain/IPE-P0070.md:13
 explain/IPE-P0070.md:29
 explain/IPE-P0070.md:39
 explain/IPE-S0001.md:46
-explain/IPE-T0003.md:40
-explain/IPE-T0003.md:54
 explain/IPE-T0012.md:14
 explain/IPE-T0012.md:24
 explain/IPE-T0012.md:37

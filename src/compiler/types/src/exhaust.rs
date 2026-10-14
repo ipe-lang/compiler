@@ -562,10 +562,11 @@ fn check_param_irrefutable(pat: &canon::Pattern) -> DResult<()> {
 /// **parameter / binder** pattern for irrefutability (IPE-T0015).
 ///
 /// `extra_unions` supplies union definitions declared outside `module` (a
-/// scoped per-module solve passes its dependencies' interface unions;
-/// the whole-program solve passes none — the linked merge already carries
-/// every union), so a `case` over an imported ADT is analysed against the
-/// full constructor signature instead of being skipped as unknown.
+/// scoped per-module solve passes every union reachable through its dependency
+/// interfaces, transitively; the whole-program solve passes none — the linked
+/// merge already carries every union), so a `case` over an imported ADT is
+/// analysed against the full constructor signature instead of being skipped as
+/// unknown.
 ///
 /// Redundant-branch findings ([`TypeError::RedundantCaseBranch`], IPE-T0011)
 /// are pushed onto `warnings`, each paired with its owning definition's home,
@@ -1574,6 +1575,27 @@ mod tests {
                 Err(Diagnostic::CompilerBug { .. })
             ),
             "a `Lib.Order` the signatures lack is neither the builtin nor skipped"
+        );
+    }
+
+    /// A stdlib union listed as distinct from the builtin of its name keys no
+    /// builtin union.
+    ///
+    /// `Ipe.Db.Store` declares its own `Order` (`Asc | Desc`); without its own
+    /// table entry a catch-all over it must not be judged against `LT | EQ | GT`.
+    #[test]
+    fn a_stdlib_distinct_scrutinee_is_not_the_builtin_union() {
+        assert!(
+            matches!(
+                union_of_scrutinee(&["Ipe", "Db", "Store"], "Order"),
+                Err(Diagnostic::CompilerBug { .. })
+            ),
+            "`Ipe.Db.Store.Order` is never mistaken for the builtin `Order`"
+        );
+        assert!(
+            union_of_scrutinee(&["Ipe", "Basics"], "Order")
+                .is_ok_and(|union| union.is_some_and(|(home, _)| home.is_empty())),
+            "`Basics.Order` is the builtin `Order`"
         );
     }
 

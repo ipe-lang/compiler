@@ -833,7 +833,7 @@ const RUNTIME_MOD_RS_URL_APPEND: &str = "pub mod url;\npub use url::*;\n";
 /// `config_decode.rs` (the `Config.decodeToml` / `decodeYaml` / `decodeJson` /
 /// `loadFromFile` front-ends plus the `nullable` / `maybe` / `dict`
 /// combinators) is vendored into every emitted crate but declared only on
-/// demand — it is the sole consumer of the `toml` and `serde_yaml` crates,
+/// demand — it is the sole consumer of the TOML and YAML parser crates,
 /// which [`config_cargo_toml`] adds under the same condition. It is a leaf
 /// module (no other runtime surface calls into it), so it is declared exactly
 /// when the program reaches it directly, and never forced on transitively. The
@@ -3110,7 +3110,7 @@ fn assemble_project_text(
     } else {
         cargo_toml
     };
-    // Ipe.Config TOML/YAML decoders (`toml` + `serde_yaml`): pulled in only when
+    // Ipe.Config TOML/YAML decoders (the TOML and YAML parser crates): pulled in only when
     // the program reaches the `config_decode` runtime module (`Config.decodeToml`
     // / `decodeYaml` / `decodeJson` / `loadFromFile`, or `nullable` / `maybe` /
     // `dict`). Both crates are leaves — a JSON-only or non-Config program pulls
@@ -3420,6 +3420,7 @@ const fn is_non_serde_leaf(ty: &IrType) -> bool {
         // `Dsn` carries a `Secret` and is non-serde — a `Dsn` in a HydrationState
         // record is rejected (same posture as `Url`/`Secret`).
         | IrType::Dsn
+        | IrType::DbLocation
         // External `Connection` + phantom markers — opaque non-serde handles,
         // rejected in a HydrationState record just like `Dsn`.
         | IrType::Connection
@@ -4908,19 +4909,20 @@ fn url_cargo_toml(base: &str) -> DResult<String> {
     Ok(result)
 }
 
-/// Build the config-decoder-enabled `Cargo.toml` by appending the `toml` and
-/// `serde_yaml` dependencies before `[profile.dev]`.
+/// Build the config-decoder-enabled `Cargo.toml` by appending the TOML and
+/// YAML parser dependencies before `[profile.dev]`.
 ///
 /// `config_decode.rs` (the vendored `Ipe.Config` TOML/YAML front-ends) is the
 /// sole consumer of these two crates: `Config.decodeToml` parses with `toml`,
-/// `Config.decodeYaml` with `serde_yaml`, and `Config.loadFromFile` dispatches
+/// `Config.decodeYaml` with `serde-saphyr`, and `Config.loadFromFile` dispatches
 /// to either by file extension. Both are leaf dependencies (nothing else in the
 /// base manifest pulls them), so gating them here keeps a program that never
 /// touches the TOML/YAML surface — including a JSON-only `Config` program, whose
 /// combinators emit into the `json` module — free of both crates.
 ///
-/// The versions come from the [`crate_specs`] SSOT (drift-guarded against
-/// `runtime/Cargo.toml`).
+/// The versions and the YAML parser's exact feature set come from the
+/// [`crate_specs`] SSOT (drift-guarded against `runtime/Cargo.toml`); the YAML
+/// parser's default features stay off.
 ///
 /// # Errors
 ///
@@ -4928,12 +4930,17 @@ fn url_cargo_toml(base: &str) -> DResult<String> {
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn config_cargo_toml(base: &str) -> DResult<String> {
     const PROFILE_ANCHOR: &str = "[profile.dev]";
+    let yaml_features = crate_specs::SERDE_SAPHYR_FEATURES
+        .iter()
+        .map(|feature| format!("{feature:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let deps = format!(
-        "{} = \"{}\"\n{} = \"{}\"\n\n",
+        "{} = \"{}\"\n{} = {{ version = \"{}\", default-features = false, features = [{yaml_features}] }}\n\n",
         crate_specs::TOML.name,
         crate_specs::TOML.version,
-        crate_specs::SERDE_YAML.name,
-        crate_specs::SERDE_YAML.version,
+        crate_specs::SERDE_SAPHYR.name,
+        crate_specs::SERDE_SAPHYR.version,
     );
     let anchor_pos = base
         .find(PROFILE_ANCHOR)
@@ -6732,6 +6739,24 @@ mod tests {
         assert_eq!(default_line(&email), r#"default = ["json", "email"]"#);
         let config = config_cargo_toml(CARGO_TOML).expect("config_cargo_toml must succeed");
         assert_eq!(default_line(&config), r#"default = ["json", "config"]"#);
+    }
+
+    /// The YAML parser is pinned with default features off and exactly the
+    /// SSOT feature set, so neither `include` nor `properties` reaches an
+    /// emitted crate.
+    #[test]
+    fn config_toml_pins_the_yaml_parser_features() {
+        let config = config_cargo_toml(CARGO_TOML).expect("config_cargo_toml must succeed");
+        let yaml_line = config
+            .lines()
+            .find(|line| line.starts_with("serde-saphyr = "))
+            .expect("config_cargo_toml must add the YAML parser");
+        assert_eq!(
+            yaml_line,
+            r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }"#
+        );
+        assert!(!yaml_line.contains("include"), "{yaml_line}");
+        assert!(!yaml_line.contains("properties"), "{yaml_line}");
     }
 
     /// Promotion is idempotent and refuses a manifest with no default list.

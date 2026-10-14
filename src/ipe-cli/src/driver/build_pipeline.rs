@@ -1,5 +1,6 @@
 use super::{CliError, diag_span, io_err};
 use crate::env_dir::{HomeDir, HomeRefusal};
+use crate::loose_file::LooseFileError;
 #[cfg(not(unix))]
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
@@ -542,10 +543,11 @@ pub struct CollectedSources {
 /// the injection routine stays single-sourced.
 ///
 /// # Errors
-/// [`CliError::Pipeline`] when the entry does not parse; [`CliError::Io`] when
-/// the entry or an imported sibling cannot be read;
-/// [`CliError::DiscoveryLimitReached`] when the import closure is too large.
-pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, CliError> {
+/// [`LooseFileError::EntryParse`] when the entry does not parse; otherwise
+/// [`LooseFileError::Refused`] carrying [`CliError::Io`] when the entry or an
+/// imported sibling cannot be read, or [`CliError::DiscoveryLimitReached`]
+/// when the import closure is too large.
+pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, LooseFileError> {
     let loaded = crate::loose_file::resolve_loose_file(
         entry,
         None,
@@ -3297,7 +3299,12 @@ mod tests {
         let collected = collect_entry_and_siblings(&entry);
         let _ = fs::remove_dir_all(&dir);
         assert!(
-            matches!(collected, Err(CliError::DiscoveryLimitReached { .. })),
+            matches!(
+                collected,
+                Err(LooseFileError::Refused(
+                    CliError::DiscoveryLimitReached { .. }
+                ))
+            ),
             "the entry plus {count} imported siblings exceeds the ceiling"
         );
     }
@@ -3328,10 +3335,10 @@ mod tests {
         assert!(
             matches!(
                 collected,
-                Err(CliError::SourceRefused {
+                Err(LooseFileError::Refused(CliError::SourceRefused {
                     reason: crate::io_bounded::SourceRefusal::Symlink,
                     ..
-                })
+                }))
             ),
             "an imported symlink sibling is refused, never followed"
         );

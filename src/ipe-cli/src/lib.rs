@@ -79,6 +79,7 @@ pub mod secret_file;
 pub mod signing;
 pub mod ssh_signing_key;
 pub mod style;
+mod target_dir;
 #[cfg(unix)]
 mod terminate;
 pub mod text;

@@ -117,7 +117,7 @@ pub struct Module {
     /// Set by `ipe_lower` when any call site resolves to a
     /// `KernelFn::is_config()` variant. The backend reads this flag to decide
     /// whether to declare `pub mod config_decode; pub use config_decode::*;` in
-    /// the emitted `ipe_runtime/mod.rs` and add the `toml` + `serde_yaml`
+    /// the emitted `ipe_runtime/mod.rs` and add the TOML and YAML parser
     /// dependencies. The JSON-backed `Config.*` combinators (`string` / `field`
     /// / `map` / …) emit into the `json` module and do NOT set this
     /// flag, so a JSON-only program pulls neither crate.
@@ -1639,6 +1639,14 @@ pub enum IrType {
     /// (a `Dsn` in a Model field is a compile-time rejection, same posture as
     /// `Secret`/`Url`).
     Dsn,
+    // ── Ipe.Db.Location ─────────────────────────────────────────────────────
+    /// Opaque typed database location `Db.open` takes
+    /// (`ipe_runtime::db::DbLocation`).
+    ///
+    /// Minted only by `Ipe.Db.Location.file` (a fail-closed parse of a `Path`),
+    /// `memory`, and `dsn`; it may carry a `Dsn`, so it is `Clone`, `Debug` is
+    /// redacted, and it is non-serde (same posture as `Dsn`).
+    DbLocation,
     // ── Ipe.Db external Connection ──────────────────────────────────────────
     /// The external-database connection handle `Connection mode`
     /// (`ipe_runtime::external_conn::ExternalConnection`), distinct from the app's
@@ -1892,6 +1900,7 @@ pub fn ir_type_is_derivable(
         // `Dsn` derives Clone; `Debug` is hand-written (redacting) — fully
         // derivable, not serde (carries a `Secret`).
         | IrType::Dsn
+        | IrType::DbLocation
         // Cache config / stats + Csv document + process-run config runtime
         // structs derive Clone+Debug+PartialEq.
         | IrType::ProcessRunWithCfg
@@ -2168,6 +2177,7 @@ pub fn ir_type_is_serde(ty: &IrType, enum_serde: &impl Fn(&ModPath, Symbol) -> b
         // `ipe_runtime::dsn::Dsn` has no serde impl), so a Model field of type
         // `Dsn` is a compile-time IPE-L0120, same posture as `Url` / `Secret`.
         | IrType::Dsn
+        | IrType::DbLocation
         // Cache config / stats + Csv document + process-run config are
         // kernel-boundary data records — derivable (see `ir_type_is_derivable`)
         // but never persisted to a session store, so not serde.
@@ -2385,6 +2395,7 @@ pub const fn ir_type_feature_requirement(ty: &IrType) -> Option<RuntimeFeatureId
         // standalone but share `Connection`'s gate (fail-closed).
         IrType::SqlFragment
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite => Some(RuntimeFeatureId::Db),
@@ -2549,6 +2560,7 @@ pub fn carrier_leaf(ty: &IrType) -> CarrierLeaf<'_> {
         | IrType::UrlRelative
         // `Dsn` clones its String fields + `Secret` (a String clone).
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Db
         // The external connection wraps `Clone` sqlx pools; the phantom markers
         // never carry a runtime value but must stay exhaustive.
@@ -3260,10 +3272,10 @@ impl<'a> Iterator for EvalOrder<'a> {
     }
 }
 
-/// A per-call-site turbofish pin for a polymorphic kernel.
+/// A per-call-site turbofish pin for a polymorphic callee.
 ///
-/// Set when the HM solver left the kernel's free result type parameter
-/// genuinely unconstrained. Each variant names the SEMANTIC default the emitter
+/// Set when the HM solver left one of the callee's type parameters genuinely
+/// unconstrained at this use. Each variant names the SEMANTIC default the emitter
 /// renders; the mapping to a concrete `::<…>` suffix lives in the backend
 /// (`emit_expr`), so this enum stays a small, typed decision — never a raw
 /// string in the IR.
@@ -3272,7 +3284,7 @@ impl<'a> Iterator for EvalOrder<'a> {
 /// parameter is a bare type variable NOT bound by an enclosing generic
 /// signature; a concrete parameter needs no pin (rustc infers it) and stays
 /// [`Self::None`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum CallPin {
     /// No turbofish — the common case (rustc infers every type parameter).
     #[default]
@@ -3293,13 +3305,20 @@ pub enum CallPin {
     /// error type — `::<IpeError>`. Used by `decimal_from_string<E: From<String>>`
     /// when the `Err` channel is discarded.
     ErrIpeError,
+    /// A USER generic function's type parameters, named by the callee
+    /// [`Func::type_params`] symbol, that occur only as UI message slots of its
+    /// signature and that this use leaves unconstrained — each pinned to `()`,
+    /// the type the use's own node type lowered that slot to. Every other
+    /// parameter renders `_`. Only a [`Callee::Func`] call carries it.
+    MsgUnit(BTreeSet<Symbol>),
 }
 
 impl CallPin {
     /// The turbofish suffix this pin renders immediately after a kernel's name
     /// (before its `(` argument list): `dict_empty::<String, i64>(…)`, etc.
     /// [`Self::None`] renders the empty string, so an unpinned call emits no
-    /// turbofish.
+    /// turbofish. [`Self::MsgUnit`] has no fixed suffix — its rendering needs
+    /// the callee's generic layout — so it is `None`.
     ///
     /// The concrete default types (`i64` / `String` / `IpeError`) mirror the
     /// polymorphic-kernel defaults: a genuinely
@@ -3308,13 +3327,14 @@ impl CallPin {
     /// inhabited default is sound — `i64` and `String` are the reference's
     /// canonical choices, `IpeError` the project's canonical error type.
     #[must_use]
-    pub const fn turbofish(self) -> &'static str {
+    pub const fn kernel_turbofish(&self) -> Option<&'static str> {
         match self {
-            Self::None => "",
-            Self::DefaultI64 => "::<i64>",
-            Self::DefaultDict => "::<String, i64>",
-            Self::DefaultResultMapErr => "::<_, _, i64>",
-            Self::ErrIpeError => "::<IpeError>",
+            Self::None => Some(""),
+            Self::DefaultI64 => Some("::<i64>"),
+            Self::DefaultDict => Some("::<String, i64>"),
+            Self::DefaultResultMapErr => Some("::<_, _, i64>"),
+            Self::ErrIpeError => Some("::<IpeError>"),
+            Self::MsgUnit(_) => None,
         }
     }
 }
@@ -4234,6 +4254,7 @@ mod tests {
             (IrType::CryptoMac, RuntimeFeatureId::CryptoCore),
             (IrType::SqlFragment, RuntimeFeatureId::Db),
             (IrType::Dsn, RuntimeFeatureId::Db),
+            (IrType::DbLocation, RuntimeFeatureId::Db),
             (IrType::Connection, RuntimeFeatureId::Db),
             (IrType::ServerRequest, RuntimeFeatureId::Server),
             (IrType::StreamWriter, RuntimeFeatureId::Server),

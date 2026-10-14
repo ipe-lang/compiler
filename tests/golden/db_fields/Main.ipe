@@ -1,6 +1,7 @@
 module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Unsafe
 import Ipe.List
 import Ipe.String
@@ -63,4 +64,4 @@ main =
                             )
                 )
         )
-        (Db.open "sqlite" "sqlite::memory:")
+        (Db.open Location.memory)

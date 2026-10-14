@@ -36,6 +36,7 @@ module Main exposing (main)
 import Ipe.Codec as Codec exposing (Codec(..), Shape(..), ColType(..))
 import Ipe.Config as Config
 import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Location as Location
 import Ipe.Db.Sql as Sql
 import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Error as Error exposing (Error)
@@ -331,4 +332,4 @@ main =
         Ok ( store, strict ) ->
             Task.andThen
                 (\conn -> Db.withTransaction conn (\txconn -> runChecks txconn store strict))
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)

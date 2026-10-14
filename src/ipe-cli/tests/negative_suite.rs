@@ -519,9 +519,10 @@ fn security_ui_html_typed_bridge_compiles() {
 fn security_db_unsafe_exec_raw_off_plain_db_is_rejected() {
     let src = "module Main exposing (main)\n\
                import Ipe.Db as Db\n\
+               import Ipe.Db.Location as Location\n\
                import Ipe.Task as Task\n\
                main =\n\
-                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open \"sqlite\" \"sqlite::memory:\")\n";
+                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open Location.memory)\n";
     assert_rejected("security_db_unsafe_exec_raw_off_plain", src, "IPE-N0005");
 }
 
@@ -536,9 +537,10 @@ fn security_store_checked_write_kernels_are_unreachable() {
         let via_db = format!(
             "module Main exposing (main)\n\
              import Ipe.Db as Db\n\
+             import Ipe.Db.Location as Location\n\
              import Ipe.Task as Task\n\
              main =\n\
-             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open Location.memory)\n"
         );
         assert_rejected(
             &format!("security_db_{member}_unreachable"),
@@ -558,6 +560,90 @@ fn security_store_checked_write_kernels_are_unreachable() {
             "IPE-N0005",
         );
     }
+}
+
+/// A `Db.open` program whose open expression is `open`, then printing `ok`.
+fn db_open_program(open: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\
+         import Ipe.Db as Db\n\
+         import Ipe.Db.Dsn as Dsn\n\
+         import Ipe.Db.Location as Location exposing (Mode(..))\n\
+         import Ipe.Io as Io\n\
+         import Ipe.Path as Path\n\
+         import Ipe.Result as Result\n\
+         import Ipe.Task as Task\n\
+         main : Task Error ()\n\
+         main =\n\
+         \x20   {open}\n\
+         \x20       |> Task.andThen (\\_ -> Io.println \"ok\")\n"
+    )
+}
+
+/// SECURITY: `Db.open` takes one typed `DbLocation`. The driver-and-URL pair
+/// and a bare path string have no representation, so neither reaches a URL
+/// parser: each is a type error at `ipe` time.
+#[test]
+fn security_db_open_refuses_text() {
+    assert_rejected(
+        "security_db_open_driver_and_url",
+        &db_open_program("Db.open \"sqlite\" \"x.db\""),
+        "IPE-T0001",
+    );
+    assert_rejected(
+        "security_db_open_bare_path",
+        &db_open_program("Db.open \"x.db\""),
+        "IPE-T0001",
+    );
+    assert_rejected(
+        "security_db_location_dsn_text",
+        &db_open_program("Db.open (Location.dsn \"postgres://h/d\")"),
+        "IPE-T0001",
+    );
+}
+
+/// SECURITY (contrapositive): every typed location constructor opens.
+#[test]
+fn security_db_open_typed_locations_compile() {
+    assert_compiles(
+        "security_db_open_memory",
+        &db_open_program("Db.open Location.memory"),
+    );
+    assert_compiles(
+        "security_db_open_file",
+        &db_open_program(
+            "Path.fromString \"app.db\"\n\
+             \x20       |> Result.andThen (Location.file CreateIfMissing)\n\
+             \x20       |> Task.fromResult\n\
+             \x20       |> Task.andThen Db.open",
+        ),
+    );
+    assert_compiles(
+        "security_db_open_dsn",
+        &db_open_program(
+            "Dsn.parse \"sqlite:app.db\"\n\
+             \x20       |> Task.fromResult\n\
+             \x20       |> Task.andThen (\\dsn -> Db.open (Location.dsn dsn))",
+        ),
+    );
+}
+
+/// SECURITY: `DbLocation` is a reserved builtin, so a user type cannot shadow
+/// the proof `Db.open` accepts. The same declaration under another name is
+/// accepted.
+#[test]
+fn security_db_location_name_reserved() {
+    assert_rejected(
+        "security_db_location_reserved",
+        &format!("{HEAD}type DbLocation = DbLocation String\nmain = 1\n"),
+        "IPE-N0026",
+    );
+    assert_compiles(
+        "security_db_location_renamed",
+        &format!(
+            "{HEAD}import Ipe.Io as Io\ntype AppLocation = AppLocation String\nmain : Task Error ()\nmain = Io.println \"ok\"\n"
+        ),
+    );
 }
 
 /// SECURITY: the untyped row read `unsafeGetField` no longer lives on the plain
@@ -3766,6 +3852,77 @@ fn lower_server_route_param_empty() {
 }
 
 #[test]
+fn lower_server_route_catch_all() {
+    let src = server_route_fixture(r#"Server.get "/files/*rest""#);
+    assert_rejected("lower_server_route_catch_all", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_mid_segment_sigil() {
+    let src = server_route_fixture(r#"Server.get "/v-:id""#);
+    assert_rejected("lower_server_route_mid_segment_sigil", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_not_absolute() {
+    let src = server_route_fixture(r#"Server.get "health""#);
+    assert_rejected("lower_server_route_not_absolute", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_malformed_escape() {
+    let src = server_route_fixture(r#"Server.get "/a/%zz""#);
+    assert_rejected("lower_server_route_malformed_escape", &src, "IPE-L0156");
+}
+
+/// A `Server.listen` program over the literal route list `routes`.
+fn server_routes_fixture(routes: &str) -> String {
+    format!(
+        r"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+main =
+    Server.listen 8000
+        [ {routes} ]
+"
+    )
+}
+
+#[test]
+fn lower_server_static_prefix_reserved_byte() {
+    for prefix in ["/a?b", "/a#b", "/a/%zz", "/a:b", "/caf\u{e9}", "/assets/"] {
+        let src = server_routes_fixture(&format!(r#"Server.static "{prefix}" "public""#));
+        assert_rejected(
+            "lower_server_static_prefix_reserved_byte",
+            &src,
+            "IPE-L0156",
+        );
+    }
+}
+
+#[test]
+fn lower_server_static_prefix_not_literal() {
+    let src = r#"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+assets : String -> Route
+assets prefix = Server.static prefix "public"
+main =
+    Server.listen 8000
+        [ assets "/assets" ]
+"#;
+    assert_rejected("lower_server_static_prefix_not_literal", src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_static_prefix_duplicate() {
+    let src = server_routes_fixture(
+        r#"Server.static "/assets" "public", Server.static "/assets" "other""#,
+    );
+    assert_rejected("lower_server_static_prefix_duplicate", &src, "IPE-L0156");
+}
+
+#[test]
 fn lower_server_api_path_param_not_identifier() {
     let src = server_route_fixture(r#"Server.api "GET /v1/:a-b""#);
     assert_rejected(
@@ -3773,6 +3930,14 @@ fn lower_server_api_path_param_not_identifier() {
         &src,
         "IPE-L0156",
     );
+}
+
+#[test]
+fn lower_server_api_unknown_method() {
+    for spec in ["FETCH /x", "po\u{17f}t /x"] {
+        let src = server_route_fixture(&format!(r#"Server.api "{spec}""#));
+        assert_rejected("lower_server_api_unknown_method", &src, "IPE-L0156");
+    }
 }
 
 /// A routed `Web.tea` app (its Model has a `page` field) over `page_ty`,
@@ -4024,7 +4189,7 @@ fn well_formed_route_paths_compile() {
     );
     assert_compiles(
         "server_route_well_formed",
-        &server_route_fixture(r#"Server.get "/files/:_dir/*rest""#),
+        &server_route_fixture(r#"Server.get "/files/:_dir/:name""#),
     );
     assert_compiles(
         "server_api_well_formed",
@@ -4200,8 +4365,8 @@ fn generic_row_model_web_embed_rejected() {
 /// A mounted `Web.embed` built inside a definition whose annotation carries a
 /// row generic the entry's model does not visibly use: the model is the
 /// concrete `Model`, and `r` is only the open tail of the `cfg` parameter the
-/// view reads a label from. Region types carry no record row tails, so whether
-/// the entry reaches `r` cannot be determined, and the entry is refused
+/// view reads a label from. The entry's region type does not mention `r`, so
+/// whether the entry reaches it cannot be determined, and the entry is refused
 /// fail-closed.
 const WEB_EMBED_ROW_IN_SCOPE: &str = r#"module Main exposing (main)
 import Ipe.Server.Http as Server

@@ -25,9 +25,9 @@ pub use diagnostic::{
     EditTarget, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
     HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES,
     IfDefect, ImportedAs, InterceptContext, LetDefect, LowerError, MainRetName, ModelLeaf,
-    ModulePlacementReason, ModulePlacementRejection, NameError, ParseError, RoutePatternDefect,
-    RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole, StdlibReach,
-    StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
+    ModulePlacementReason, ModulePlacementRejection, MountPrefixFault, NameError, ParseError,
+    RoutePatternDefect, RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole,
+    StdlibReach, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
     TypeDeclDefect, TypeError, WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
@@ -161,6 +161,12 @@ mod tests {
             // Environment
             IPE_E0001 => Diagnostic::RegistryUnreachable {
                 detail: "cargo exited 101 while fetching crates:\nCould not resolve host: index.crates.io".into(),
+            },
+            IPE_E0002 => Diagnostic::TargetDirUnlinkable {
+                detail: "the build directory C:\\Users\\ana\\Projeto Público\\out\\rust\\target holds non-ASCII characters".into(),
+            },
+            IPE_E0003 => Diagnostic::HostLinkerCannotOpenInput {
+                detail: "the linker could not open C:\\Users\\ana\\Público\\symbols.o".into(),
             },
             // Consent
             IPE_S0001 => Diagnostic::Consent {

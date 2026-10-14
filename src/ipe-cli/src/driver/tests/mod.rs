@@ -4,8 +4,8 @@ use crate::io_bounded::SourceRefusal;
 use crate::output_dir::{EmitTarget, OutputRefusal, ProjectPaths};
 use crate::verb::Verb;
 use crate::{
-    ALL_CODES, Applicability, BTreeMap, Diagnostic, Path, PathBuf, Suggestion, cli_args, fs,
-    project, style,
+    ALL_CODES, Applicability, BTreeMap, Diagnostic, Interner, Path, PathBuf, Suggestion, cli_args,
+    fs, project, style,
 };
 use ipe_diagnostics::{Candidates, EditTarget, NameError, Span, suggest};
 
@@ -538,24 +538,323 @@ fn apply_fixes_refuses_mismatched_replaces() {
 /// after the dot survives.
 #[test]
 fn ipe_fix_never_rewrites_qualified_token_whole() {
+    let dir = session_scratch("fix_qualifier");
+    let main = dir.join("Main.ipe");
     let src =
         "module Main exposing (main)\n\nimport Ipe.Crypto\n\nmain =\n    Crpyto.sha256 \"x\"\n";
-    let diag = pipeline_first_diagnostic(src);
-    assert!(
-        diag.is_some(),
-        "a misspelt qualifier must raise a diagnostic"
-    );
-    let Some(diag) = diag else {
-        return;
-    };
-    let fixes = select_non_overlapping(machine_applicable_suggestions(&diag), src.len());
-    assert_eq!(fixes.len(), 1, "one applicable fix, got {diag:?}");
+    assert!(fs::write(&main, src).is_ok(), "write Main.ipe");
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&main, true, &mut out);
+    let after = fs::read_to_string(&main).ok();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
     assert_eq!(
-        apply_fixes(src, &fixes).as_deref(),
+        after.as_deref(),
         Some(
             "module Main exposing (main)\n\nimport Ipe.Crypto\n\nmain =\n    Crypto.sha256 \"x\"\n"
-        )
+        ),
+        "{}",
+        String::from_utf8_lossy(&out)
     );
+}
+
+/// A module that defines `lenght` and exposes it.
+const HELPERS_EXPOSING_LENGHT: &str =
+    "module Helpers exposing (lenght)\n\nlenght : Int\nlenght = 1\n";
+
+/// An entry whose `lenght` the build binds through its import of `Helpers`.
+const MAIN_IMPORTING_LENGHT: &str = "module Main exposing (main)\n\nimport Helpers exposing (lenght)\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nlength : Int\nlength = 2\n\nmain : Task ()\nmain =\n    Io.println (String.fromInt lenght)\n";
+
+/// An entry whose `lenght` nothing binds: a genuine misspelling of `length`.
+const MAIN_MISSPELLING_LENGTH: &str =
+    "module Main exposing (main)\n\nlength : Int\nlength = 2\n\nmain = lenght\n";
+
+/// A scratch `package.ipe` project named by `tag`, its manifest `manifest`, its `src/` `modules`.
+fn fix_project(tag: &str, manifest: &str, modules: &[(&str, &str)]) -> PathBuf {
+    let dir = session_scratch(tag);
+    let src = dir.join("src");
+    assert!(fs::create_dir_all(&src).is_ok(), "make src/");
+    assert!(
+        fs::write(dir.join("package.ipe"), manifest).is_ok(),
+        "write package.ipe"
+    );
+    for (name, text) in modules {
+        assert!(fs::write(src.join(name), text).is_ok(), "write {name}");
+    }
+    dir
+}
+
+/// A well-formed `package.ipe`.
+const FIX_MANIFEST: &str =
+    "module Package exposing (package)\n\n\npackage =\n    { name = \"fix\" }\n";
+
+/// Run `ipe fix --yes` on `src/Main.ipe` of `dir`, then remove `dir`.
+///
+/// Returns the command's result, its report, and `Main.ipe` as it was left.
+fn fix_main_of(dir: &Path) -> (Result<(), CliError>, String, Option<String>) {
+    let main = dir.join("src").join("Main.ipe");
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&main, true, &mut out);
+    let after = fs::read_to_string(&main).ok();
+    let _ = fs::remove_dir_all(dir);
+    (fixed, String::from_utf8_lossy(&out).into_owned(), after)
+}
+
+/// A name the build binds through a user import is never "corrected" to a
+/// nearby local binding: the program compiles, so the file is left byte-identical.
+#[test]
+fn ipe_fix_never_rewrites_a_name_the_build_binds_through_an_import() {
+    let dir = fix_project(
+        "fix_import_bound",
+        FIX_MANIFEST,
+        &[
+            ("Helpers.ipe", HELPERS_EXPOSING_LENGHT),
+            ("Main.ipe", MAIN_IMPORTING_LENGHT),
+        ],
+    );
+    let (fixed, out, after) = fix_main_of(&dir);
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(after.as_deref(), Some(MAIN_IMPORTING_LENGHT), "{out}");
+    assert!(out.contains("nothing to do"), "{out}");
+}
+
+/// Control for the import-bound refusal: the same misspelling, bound by
+/// nothing, is fixed in the same project shape.
+#[test]
+fn ipe_fix_corrects_a_misspelling_no_import_binds() {
+    let dir = fix_project(
+        "fix_unbound_typo",
+        FIX_MANIFEST,
+        &[
+            ("Helpers.ipe", HELPERS_EXPOSING_LENGHT),
+            ("Main.ipe", MAIN_MISSPELLING_LENGTH),
+        ],
+    );
+    let (fixed, out, after) = fix_main_of(&dir);
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(
+        after.as_deref(),
+        Some("module Main exposing (main)\n\nlength : Int\nlength = 2\n\nmain = length\n"),
+        "{out}"
+    );
+}
+
+/// A project whose context cannot be built is refused with the manifest's own
+/// typed error, never diagnosed by a reduced resolution: the file is untouched.
+#[test]
+fn ipe_fix_refuses_a_project_whose_context_cannot_be_built() {
+    let dir = fix_project(
+        "fix_broken_manifest",
+        "module Package exposing (package)\n\npackage = {\n",
+        &[("Main.ipe", MAIN_MISSPELLING_LENGTH)],
+    );
+    let (fixed, out, after) = fix_main_of(&dir);
+    assert!(
+        matches!(&fixed, Err(CliError::Pipeline { file, .. }) if file.ends_with("package.ipe")),
+        "the manifest's refusal must surface: {fixed:?}"
+    );
+    assert_eq!(after.as_deref(), Some(MAIN_MISSPELLING_LENGTH), "{out}");
+}
+
+/// A module whose own `lenght` nothing binds.
+const HELPERS_MISSPELLING_LENGTH: &str =
+    "module Helpers exposing (x)\n\nlength : Int\nlength = 2\n\nx = lenght\n";
+
+/// An entry that compiles once its import compiles.
+const MAIN_IMPORTING_X: &str =
+    "module Main exposing (main)\n\nimport Helpers exposing (x)\n\nmain = x\n";
+
+/// A diagnostic another module owns is reported, never patched into the fix
+/// target or into the module that owns it.
+#[test]
+fn ipe_fix_never_patches_a_diagnostic_another_module_owns() {
+    let dir = fix_project(
+        "fix_elsewhere",
+        FIX_MANIFEST,
+        &[
+            ("Helpers.ipe", HELPERS_MISSPELLING_LENGTH),
+            ("Main.ipe", MAIN_IMPORTING_X),
+        ],
+    );
+    let helpers = fs::read_to_string(dir.join("src").join("Helpers.ipe")).ok();
+    let main = dir.join("src").join("Main.ipe");
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&main, true, &mut out);
+    let main_after = fs::read_to_string(&main).ok();
+    let helpers_after = fs::read_to_string(dir.join("src").join("Helpers.ipe")).ok();
+    let _ = fs::remove_dir_all(&dir);
+    let out = String::from_utf8_lossy(&out);
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(main_after.as_deref(), Some(MAIN_IMPORTING_X), "{out}");
+    assert_eq!(helpers_after, helpers, "{out}");
+    assert!(out.contains("Helpers.ipe, not"), "{out}");
+}
+
+/// A project directory names the entry its build compiles from, so
+/// `ipe dev build --fix` with no path fixes the manifest's entry.
+#[test]
+fn ipe_fix_of_a_project_directory_fixes_its_entry() {
+    let dir = fix_project(
+        "fix_project_dir",
+        FIX_MANIFEST,
+        &[("Main.ipe", MAIN_MISSPELLING_LENGTH)],
+    );
+    let mut out = Vec::new();
+    let fixed = apply_fixes_cmd(&dir, true, &mut out);
+    let after = fs::read_to_string(dir.join("src").join("Main.ipe")).ok();
+    let _ = fs::remove_dir_all(&dir);
+    let out = String::from_utf8_lossy(&out);
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(
+        after.as_deref(),
+        Some("module Main exposing (main)\n\nlength : Int\nlength = 2\n\nmain = length\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Main.ipe:"),
+        "reports name the entry file: {out}"
+    );
+}
+
+/// A name-resolution diagnostic at byte `lo`.
+fn name_error_at(lo: u32) -> Diagnostic {
+    Diagnostic::Name {
+        span: Span::new(lo, lo.saturating_add(3)),
+        msg: NameError::ValueNotFound {
+            name: "zzz".into(),
+            suggestions: Candidates::hints(Box::default()),
+        },
+    }
+}
+
+/// The re-check of a patch, raising `diag` in the fix target.
+fn in_entry(diag: Diagnostic) -> FixCheck {
+    FixCheck::InEntry {
+        src: String::new(),
+        diag: Box::new(diag),
+    }
+}
+
+/// A patch whose re-check raises a new resolution error at or before its edit,
+/// or in another module, is refused.
+#[test]
+fn a_patch_raising_a_new_resolution_error_is_refused() {
+    let answered = value_not_found("lenght", &["length"]);
+    assert_eq!(
+        judge_patch(&answered, 13, &in_entry(name_error_at(2))),
+        PatchVerdict::NewResolutionError
+    );
+    assert_eq!(
+        judge_patch(&answered, 13, &in_entry(name_error_at(13))),
+        PatchVerdict::NewResolutionError
+    );
+    let elsewhere = FixCheck::Elsewhere {
+        file: PathBuf::from("Other.ipe"),
+        diag: Box::new(name_error_at(100)),
+    };
+    assert_eq!(
+        judge_patch(&answered, 13, &elsewhere),
+        PatchVerdict::NewResolutionError
+    );
+}
+
+/// A patch whose re-check still raises the answered diagnostic, or no longer
+/// parses, is refused.
+#[test]
+fn a_patch_that_does_not_answer_its_diagnostic_is_refused() {
+    let answered = value_not_found("lenght", &["length"]);
+    assert_eq!(
+        judge_patch(&answered, 13, &in_entry(answered.clone())),
+        PatchVerdict::StillRaised
+    );
+    let unparsable = ipe_parse::parse_module(
+        "module Main exposing (main)\nmain = (",
+        &mut Interner::new(),
+    )
+    .err();
+    assert!(unparsable.is_some(), "the fixture must not parse");
+    let Some(unparsable) = unparsable else {
+        return;
+    };
+    assert_eq!(
+        judge_patch(&answered, 13, &in_entry(unparsable)),
+        PatchVerdict::NoLongerParses
+    );
+}
+
+/// Control for the patch refusals: a clean re-check, a later resolution
+/// error, or a non-resolution error before the edit lets the patch land.
+#[test]
+fn a_patch_that_answers_its_diagnostic_is_accepted() {
+    let answered = value_not_found("lenght", &["length"]);
+    assert_eq!(
+        judge_patch(&answered, 13, &FixCheck::Clean),
+        PatchVerdict::Accept
+    );
+    assert_eq!(
+        judge_patch(&answered, 13, &in_entry(name_error_at(14))),
+        PatchVerdict::Accept
+    );
+    assert_eq!(
+        judge_patch(&answered, 13, &in_entry(redundant_red_branch_at(2))),
+        PatchVerdict::Accept
+    );
+}
+
+/// The edit end is measured in the patched text: earlier edits shift it.
+#[test]
+fn the_patched_edit_end_counts_every_earlier_edit() {
+    let edit = |lo: u32, replaces: &str, replacement: &str| Suggestion {
+        span: Span::new(
+            lo,
+            lo.saturating_add(u32::try_from(replaces.len()).unwrap_or(0)),
+        ),
+        replaces: replaces.into(),
+        replacement: replacement.into(),
+        applicability: Applicability::MachineApplicable,
+    };
+    assert_eq!(patched_edit_end(&[edit(7, "lenght", "length")]), 13);
+    assert_eq!(
+        patched_edit_end(&[edit(10, "xy", "z"), edit(2, "ab", "abcd")]),
+        13
+    );
+    assert_eq!(patched_edit_end(&[]), 0);
+}
+
+/// A file that changed after it was diagnosed is never overwritten.
+#[test]
+fn a_fix_rewrite_refuses_a_file_changed_since_it_was_read() {
+    let dir = session_scratch("fix_lost_update");
+    let file = dir.join("Main.ipe");
+    assert!(fs::write(&file, "edited meanwhile\n").is_ok(), "write file");
+    let outcome =
+        rewrite_user_file_if_unchanged(&file, "diagnosed\n", "patched\n", RewriteKind::Lossy);
+    let after = fs::read_to_string(&file).ok();
+    let backup_made = dir.join(BACKUP_DIR).exists();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(outcome, Ok(IfUnchanged::Changed)),
+        "a changed file must be refused: {outcome:?}"
+    );
+    assert_eq!(after.as_deref(), Some("edited meanwhile\n"));
+    assert!(!backup_made, "a refused rewrite makes no backup");
+}
+
+/// Control for the lost-update refusal: an unchanged file is rewritten.
+#[test]
+fn a_fix_rewrite_replaces_a_file_still_holding_the_diagnosed_bytes() {
+    let dir = session_scratch("fix_unchanged");
+    let file = dir.join("Main.ipe");
+    assert!(fs::write(&file, "diagnosed\n").is_ok(), "write file");
+    let outcome =
+        rewrite_user_file_if_unchanged(&file, "diagnosed\n", "patched\n", RewriteKind::Lossy);
+    let after = fs::read_to_string(&file).ok();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(outcome, Ok(IfUnchanged::Written(Some(_)))),
+        "an unchanged file must be rewritten with a backup: {outcome:?}"
+    );
+    assert_eq!(after.as_deref(), Some("patched\n"));
 }
 
 #[test]
@@ -3867,6 +4166,44 @@ fn unsafe_scan_manifest_project_ok_when_all_readable() {
     );
 }
 
+/// A manifest project whose module discovery fails fails both consent scans
+/// closed, never falling back to the entry's loose-file closure.
+#[test]
+fn unsafe_scan_manifest_project_fails_closed_on_discovery_failure() {
+    use std::fs;
+
+    let dir = unsafe_scan_test_dir("manifest-discovery");
+    let src = dir.join("src");
+    let entry = src.join("Main.ipe");
+    let too_deep = (0..=crate::project::MAX_DISCOVERY_DEPTH).fold(src, |path, _| path.join("d"));
+    fs::create_dir_all(&too_deep).expect("create a tree past the depth ceiling");
+    fs::write(&entry, "module Main exposing (main)\n\nmain = 1\n").expect("write Main");
+    fs::write(
+        too_deep.join("Deep.ipe"),
+        "module Deep exposing (x)\n\nx = 1\n",
+    )
+    .expect("write Deep");
+    let manifest_path = dir.join("package.ipe");
+    fs::write(
+        &manifest_path,
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"test\" }\n",
+    )
+    .expect("write manifest");
+
+    let unsafe_scan = user_sources_for_unsafe_scan(Some(&manifest_path), &entry);
+    let web_scan = named_sources_for_web_scan(Some(&manifest_path), &entry);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(&unsafe_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
+        "a failed discovery fails the `.Unsafe` scan closed, got: {unsafe_scan:?}"
+    );
+    assert!(
+        matches!(&web_scan, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("depth ceiling")),
+        "a failed discovery fails the web scan closed, got: {web_scan:?}"
+    );
+}
+
 /// Single-file fallback: when `collect_entry_and_siblings` fails and the
 /// entry itself is unreadable, the result must be `Err(CliError::Io)`
 /// naming the entry path — not `Ok` with an empty list.
@@ -3896,6 +4233,125 @@ fn unsafe_scan_single_file_fallback_fails_closed_on_unreadable_entry() {
                 if path == &entry
         ),
         "expected Err(CliError::SourceRefused(AccessDenied)) naming {entry:?}, got: {result:?}"
+    );
+}
+
+/// The consent scans fall back to the entry's own text only when the entry does not parse.
+///
+/// An unparsable entry is scanned as its text alone; a closure refused past
+/// its probe ceiling propagates the refusal, never the fallback.
+#[test]
+#[allow(clippy::expect_used)] // test fixture: an unwritable scratch file IS the failure
+fn scan_sources_fall_back_only_on_entry_parse() {
+    use std::fmt::Write as _;
+
+    let dir = unsafe_scan_test_dir("entry-parse-fallback");
+    let entry = dir.join("Main.ipe");
+    let broken = "module Main exposing (main)\n\nmain =\n";
+    fs::write(&entry, broken).expect("write unparsable entry");
+    let unparsable_unsafe = user_sources_for_unsafe_scan(None, &entry);
+    let unparsable_web = named_sources_for_web_scan(None, &entry);
+
+    // Every import names a module absent on disk: probing alone passes the ceiling.
+    let imports =
+        (0..crate::loose_file::MAX_LOOSE_FILE_PROBES).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "import M{i}");
+            acc
+        });
+    fs::write(
+        &entry,
+        format!("module Main exposing (main)\n\n{imports}\nmain = 1\n"),
+    )
+    .expect("write over-ceiling entry");
+    let over_unsafe = user_sources_for_unsafe_scan(None, &entry);
+    let over_web = named_sources_for_web_scan(None, &entry);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(&unparsable_unsafe, Ok(sources) if sources.iter().map(String::as_str).eq([broken])),
+        "an unparsable entry is scanned as its own text, got: {unparsable_unsafe:?}"
+    );
+    assert!(
+        matches!(&unparsable_web, Ok(named) if named.iter().map(|(_, src)| src.as_str()).eq([broken])),
+        "an unparsable entry is web-scanned as its own text, got: {unparsable_web:?}"
+    );
+    assert!(
+        matches!(&over_unsafe, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
+        "a closure past its probe ceiling fails the scan closed, got: {over_unsafe:?}"
+    );
+    assert!(
+        matches!(&over_web, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("distinct modules")),
+        "a closure past its probe ceiling fails the web scan closed, got: {over_web:?}"
+    );
+}
+
+/// The entry's parse failure renders exactly as the compiler diagnostic it always was.
+///
+/// `CliError::from` an entry-parse failure is the `Pipeline` value built from
+/// the entry, its text and its parse diagnostic: same kind, same human
+/// screen, same `--json` document.
+#[test]
+#[allow(clippy::expect_used)] // test fixture: an unwritable scratch file IS the failure
+fn entry_parse_renders_as_pipeline() {
+    let dir = unsafe_scan_test_dir("entry-parse-render");
+    let entry = dir.join("Main.ipe");
+    let broken = "module Main exposing (main)\n\nmain =\n";
+    fs::write(&entry, broken).expect("write unparsable entry");
+    let loaded = crate::loose_file::resolve_loose_file(
+        &entry,
+        None,
+        crate::loose_file::LooseFileLimits::DEFAULT,
+    );
+    let _ = fs::remove_dir_all(&dir);
+    let expected_diag = ipe_parse::parse_module(broken, &mut ipe_intern::Interner::new()).err();
+
+    assert!(
+        matches!(
+            loaded,
+            Err(crate::loose_file::LooseFileError::EntryParse(_))
+        ),
+        "an unparsable entry is the entry-parse case, got: {loaded:?}"
+    );
+    assert!(expected_diag.is_some(), "the fixture entry does not parse");
+    let (Err(failure), Some(expected_diag)) = (loaded, expected_diag) else {
+        return;
+    };
+    let expected = CliError::Pipeline {
+        file: entry.clone(),
+        src: broken.to_owned(),
+        diag: Box::new(expected_diag),
+    };
+    let actual = CliError::from(failure);
+
+    assert_eq!(actual.machine_kind(), "pipeline");
+    assert_eq!(actual.machine_kind(), expected.machine_kind());
+    assert_eq!(
+        actual.to_string(),
+        expected.to_string(),
+        "human screen parity"
+    );
+    assert!(
+        matches!(&actual, CliError::Pipeline { file, src, .. } if *file == entry && src == broken),
+        "the Pipeline names the entry and carries its text, got: {actual:?}"
+    );
+    let (
+        CliError::Pipeline { file, src, diag },
+        CliError::Pipeline {
+            diag: expected_diag,
+            ..
+        },
+    ) = (&actual, &expected)
+    else {
+        return;
+    };
+    assert_eq!(
+        diag, expected_diag,
+        "the parse diagnostic is carried unchanged"
+    );
+    assert_eq!(
+        crate::render_json(diag, &file.to_string_lossy(), src),
+        crate::render_json(expected_diag, &entry.to_string_lossy(), broken),
+        "--json parity"
     );
 }
 

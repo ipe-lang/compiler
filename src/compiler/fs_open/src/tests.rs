@@ -432,6 +432,16 @@ fn a_file_is_not_a_child_directory() {
     );
 }
 
+/// A device namespace is never held as a root, whatever canonicalising makes of it.
+#[cfg(windows)]
+#[test]
+fn open_root_refuses_a_device_prefix_after_canonicalising() {
+    for device in [r"\\.\pipe\", r"\\.\NUL", r"\\?\GLOBALROOT\Device\Null"] {
+        let root = HeldDir::open_root(Path::new(device));
+        assert!(root.is_err(), "{device} must not be held, got {root:?}");
+    }
+}
+
 /// Zero is not a cap: no constructor turns it into an unbounded read.
 #[test]
 fn zero_is_not_a_cap() {
@@ -459,7 +469,7 @@ fn a_file_held_open_elsewhere_is_in_use() {
     drop(other);
 }
 
-/// Every identity read of one file agrees: the proven handle, a raw handle, the path, and the no-follow entry.
+/// Every identity read of one file agrees: the proven handle, a raw handle, and the no-follow entry.
 #[test]
 fn every_identity_read_of_one_file_agrees() {
     let dir = scratch("identity");
@@ -470,7 +480,6 @@ fn every_identity_read_of_one_file_agrees() {
     assert_eq!(proven.id().unwrap(), entry);
     let raw = std::fs::File::open(dir.join("f.txt")).unwrap();
     assert_eq!(FileId::of_file(&raw).unwrap(), entry);
-    assert_eq!(FileId::of_path(&dir.join("f.txt")).unwrap(), entry);
     assert_eq!(proven.link_count().unwrap(), 1);
     std::fs::hard_link(dir.join("f.txt"), dir.join("g.txt")).unwrap();
     assert_eq!(proven.link_count().unwrap(), 2);
@@ -490,6 +499,90 @@ fn each_platform_builds_a_file_id_in_one_place() {
             "{platform} builds a FileId in more than one place"
         );
     }
+}
+
+/// No identity is read from a path: every `FileId` comes from an open handle.
+#[test]
+fn no_file_id_from_a_path() {
+    for (file, source) in [
+        ("lib.rs", include_str!("lib.rs")),
+        ("unix.rs", include_str!("unix.rs")),
+        ("windows.rs", include_str!("windows.rs")),
+        (
+            "sandbox/src/vcs_config.rs",
+            include_str!("../../sandbox/src/vcs_config.rs"),
+        ),
+    ] {
+        for banned in ["fn of_path", "fn id_of_path", "::of_path(", "id_of_path("] {
+            assert!(
+                !source.contains(banned),
+                "{file} reads an identity from a path through `{banned}`"
+            );
+        }
+    }
+    let unix = include_str!("unix.rs");
+    for banned in ["rustix::fs::stat(", "rustix::fs::lstat("] {
+        assert!(
+            !unix.contains(banned),
+            "unix.rs stats a path through `{banned}`, a stat no handle holds"
+        );
+    }
+}
+
+/// Two distinct directories never share an identity.
+#[test]
+fn two_distinct_dirs_have_distinct_ids() {
+    let dir = scratch("distinct_ids");
+    std::fs::create_dir(dir.join("a")).unwrap();
+    std::fs::create_dir(dir.join("b")).unwrap();
+    let a = held(&dir.join("a")).id().unwrap();
+    let b = held(&dir.join("b")).id().unwrap();
+    assert_ne!(a, b, "two directories compare distinct");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory opened twice has one identity.
+#[test]
+fn a_reopened_dir_has_the_same_id() {
+    let dir = scratch("reopened_id");
+    std::fs::create_dir(dir.join("a")).unwrap();
+    let first = held(&dir.join("a"));
+    let again = held(&dir.join("a"));
+    assert_eq!(first.id().unwrap(), again.id().unwrap());
+    let parent = held(&dir);
+    assert_eq!(
+        parent.child_dir(&name("a")).unwrap().id().unwrap(),
+        first.id().unwrap()
+    );
+    assert_eq!(
+        parent.entry_id(&name("a")).unwrap(),
+        Some(first.id().unwrap())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A directory renamed away and replaced by a new one at its name is a new identity.
+#[cfg(unix)]
+#[test]
+fn a_dir_replaced_at_the_same_name_has_a_new_id() {
+    let dir = scratch("replaced_id");
+    std::fs::create_dir(dir.join("a")).unwrap();
+    // Kept open so the replacement cannot reuse the held object number.
+    let original = held(&dir.join("a"));
+    std::fs::rename(dir.join("a"), dir.join("a.aside")).unwrap();
+    std::fs::create_dir(dir.join("a")).unwrap();
+    let replacement = held(&dir.join("a"));
+    assert_ne!(
+        original.id().unwrap(),
+        replacement.id().unwrap(),
+        "the directory now at the name is another object"
+    );
+    assert_eq!(
+        original.id().unwrap(),
+        held(&dir.join("a.aside")).id().unwrap(),
+        "the held directory keeps its identity under its new name"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The kind listed for `entry`, `None` when the listing lacks it.

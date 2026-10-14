@@ -1316,7 +1316,11 @@ fn write_fork_entry(clone: &Path, rel: &str, contents: &str) -> Result<(), CliEr
     for level in levels {
         dir = dir.create_child(level).map_err(plain)?.0;
     }
-    match dir.kind_of(leaf).map_err(plain)? {
+    match dir
+        .entry(leaf)
+        .and_then(|entry| dir.kind_of(&entry))
+        .map_err(plain)?
+    {
         EntryKind::Symlink | EntryKind::Directory => Err(not_plain(dir.path().join(leaf))),
         EntryKind::Absent | EntryKind::Other => dir
             .write_file(leaf, None, |file| file.write_all(contents.as_bytes()))

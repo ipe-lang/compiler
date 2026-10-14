@@ -102,10 +102,15 @@ pub const TOML: CrateSpec = CrateSpec {
     name: "toml",
     version: "0.8",
 };
-pub const SERDE_YAML: CrateSpec = CrateSpec {
-    name: "serde_yaml",
-    version: "0.9",
+pub const SERDE_SAPHYR: CrateSpec = CrateSpec {
+    name: "serde-saphyr",
+    version: "1.3",
 };
+/// The exact `serde-saphyr` feature set every manifest enables, defaults off.
+///
+/// `include` (file inclusion) and `properties` (environment interpolation)
+/// widen what a config source can reach, so neither is ever enabled.
+pub const SERDE_SAPHYR_FEATURES: &[&str] = &["deserialize"];
 pub const FLATE2: CrateSpec = CrateSpec {
     name: "flate2",
     version: "1",
@@ -206,7 +211,7 @@ pub const ALL: &[CrateSpec] = &[
     ICU_LOCALE_CORE,
     REQWEST,
     TOML,
-    SERDE_YAML,
+    SERDE_SAPHYR,
     FLATE2,
     ZSTD,
     CSV,
@@ -227,7 +232,7 @@ pub const ALL: &[CrateSpec] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::ALL;
+    use super::{ALL, SERDE_SAPHYR, SERDE_SAPHYR_FEATURES};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -340,10 +345,106 @@ mod tests {
                 ));
             }
         }
+        let jail_path = manifest.join(
+            "../../../../examples/wasm/language-playground/jail-runner/src/crate_template/Cargo.toml",
+        );
+        let jail_txt = std::fs::read_to_string(&jail_path)
+            .expect("crate_specs drift guard: cannot read the jail-runner crate template");
+        for (origin, text) in [
+            ("runtime/Cargo.toml", runtime_txt.as_str()),
+            ("jail-runner crate template", jail_txt.as_str()),
+        ] {
+            problems.extend(yaml_parser_pin_drift(text, origin));
+        }
         assert!(
             problems.is_empty(),
             "crate-version drift between the SSOT and the manifests:\n  {}",
             problems.join("\n  ")
         );
+    }
+
+    /// The `serde-saphyr` dependency line of a manifest, trimmed.
+    fn yaml_parser_line(text: &str) -> Option<&str> {
+        text.lines().map(str::trim).find(|line| {
+            line.split_once('=')
+                .is_some_and(|(name, _)| name.trim() == SERDE_SAPHYR.name)
+        })
+    }
+
+    /// The quoted entries of the `features = [...]` list on one dependency line.
+    ///
+    /// The key must stand alone (after `{`, `,`, or a space), so the
+    /// `features` inside `default-features` is never taken for it.
+    fn features_of(line: &str) -> Option<Vec<&str>> {
+        let (start, key) = line.match_indices("features").find(|(at, _)| {
+            line.get(..*at)
+                .and_then(|before| before.chars().next_back())
+                .is_some_and(|c| c == '{' || c == ',' || c == ' ')
+        })?;
+        let after = line.get(start + key.len()..)?;
+        let after = after.trim_start().strip_prefix('=')?.trim_start();
+        let list = after.strip_prefix('[')?;
+        let list = list.get(..list.find(']')?)?;
+        Some(
+            list.split(',')
+                .map(|entry| entry.trim().trim_matches('"'))
+                .filter(|entry| !entry.is_empty())
+                .collect(),
+        )
+    }
+
+    /// Every way a manifest's `serde-saphyr` pin departs from the SSOT.
+    ///
+    /// The version, `default-features = false`, and exactly
+    /// `SERDE_SAPHYR_FEATURES` — so `include` / `properties` can never be
+    /// switched on in one manifest alone.
+    fn yaml_parser_pin_drift(text: &str, origin: &str) -> Vec<String> {
+        let name = SERDE_SAPHYR.name;
+        let Some(line) = yaml_parser_line(text) else {
+            return vec![format!("{name}: absent from {origin}")];
+        };
+        let mut problems = Vec::new();
+        if version_of(line.split_once('=').map_or("", |(_, value)| value)).as_deref()
+            != Some(SERDE_SAPHYR.version)
+        {
+            problems.push(format!(
+                "{name}: SSOT = {}, {origin} = `{line}`",
+                SERDE_SAPHYR.version
+            ));
+        }
+        if !line.contains("default-features = false") {
+            problems.push(format!(
+                "{name}: {origin} must set `default-features = false`"
+            ));
+        }
+        if features_of(line).as_deref() != Some(SERDE_SAPHYR_FEATURES) {
+            problems.push(format!(
+                "{name}: {origin} features must be exactly {SERDE_SAPHYR_FEATURES:?}, got `{line}`"
+            ));
+        }
+        problems
+    }
+
+    /// A pin that turns on `include`, keeps default features, or moves the
+    /// version is drift; the exact pin is not.
+    #[test]
+    fn yaml_parser_pin_drift_is_caught() {
+        let exact = r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }"#;
+        assert!(yaml_parser_pin_drift(exact, "fixture").is_empty());
+        assert_eq!(features_of(exact), Some(vec!["deserialize"]));
+        let reordered = r#"serde-saphyr = { version = "1.3", features = ["deserialize"], default-features = false }"#;
+        assert!(yaml_parser_pin_drift(reordered, "fixture").is_empty());
+        for drifted in [
+            r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize", "include"] }"#,
+            r#"serde-saphyr = { version = "1.3", features = ["deserialize"] }"#,
+            r#"serde-saphyr = { version = "1.4", default-features = false, features = ["deserialize"] }"#,
+            r#"serde-saphyr = "1.3""#,
+            "toml = \"0.8\"",
+        ] {
+            assert!(
+                !yaml_parser_pin_drift(drifted, "fixture").is_empty(),
+                "{drifted} must be reported as drift"
+            );
+        }
     }
 }

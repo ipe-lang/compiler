@@ -560,6 +560,10 @@ pub struct Builtins {
     /// (`ipe_runtime::dsn::Dsn`). Constructed only by `Db.Dsn.parse` /
     /// `Db.Dsn.build`; zero type arguments. Lowered to `IrType::Dsn`.
     pub dsn: Symbol,
+    /// `"DbLocation"` — `Ipe.Db.Location`'s opaque typed database location
+    /// (`ipe_runtime::db::DbLocation`); zero type arguments. Lowered to
+    /// `IrType::DbLocation`.
+    pub db_location: Symbol,
     // ── Ipe.Db external Connection ──────────────────────────────────────────
     /// `"Connection"` — the external-DB connection handle constructor
     /// `Connection mode` (`ipe_runtime::external_conn::ExternalConnection`).
@@ -1027,6 +1031,7 @@ impl Builtins {
             url_relative: interner.intern("Relative")?,
             // ── Ipe.Db.Dsn ────────────────────────────────────────────────────────
             dsn: interner.intern("Dsn")?,
+            db_location: interner.intern("DbLocation")?,
             connection: interner.intern("Connection")?,
             conn_read_only: interner.intern("ReadOnly")?,
             conn_read_write: interner.intern("ReadWrite")?,

@@ -562,10 +562,12 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_SOLVER_BUDGET",
         default: Cow::Borrowed("5000000"),
-        purpose: "Maximum unification steps the type solver takes before giving up and \
-                  emitting a budget-exceeded error. Set to `0` for no limit (escape hatch \
-                  for programs with very large type graphs). Raise when the compiler \
-                  reports a budget-exceeded diagnostic.",
+        purpose: "Maximum unification steps the type solver takes over the whole program \
+                  before giving up and emitting a budget-exceeded error. `0` is refused with \
+                  that error: the limit is always a positive step count. Each module's own \
+                  solve runs under the same limit, and a program whose modules together \
+                  spend more than half of it is decided by the whole-program solve. Raise \
+                  when the compiler reports a budget-exceeded diagnostic.",
         subsystem: Subsystem::Compiler,
         class: Class::Tunable,
     },
@@ -589,8 +591,9 @@ static HAND_TABLE: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_YAML_MAX_BYTES",
-        default: Cow::Borrowed("16777216 (16 MiB)"),
-        purpose: "Maximum YAML source size (bytes) that `Config.loadYaml` will parse. \
+        default: Cow::Borrowed("4194304 (4 MiB)"),
+        purpose: "Maximum YAML source size (bytes) that `Config.decodeYaml` will parse, \
+                  including a `.yaml`/`.yml` file read by `Config.loadFromFile`. \
                   A separate ceiling from `IPE_CONFIG_MAX_BYTES`.",
         subsystem: Subsystem::Config,
         class: Class::Tunable,
@@ -1088,14 +1091,6 @@ static HAND_TABLE: &[EnvVar] = &[
         default: Cow::Borrowed("33554432 (32 MiB)"),
         purpose: "Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise \
                   for large file uploads; lower to tighten the DoS floor.",
-        subsystem: Subsystem::Web,
-        class: Class::Tunable,
-    },
-    EnvVar {
-        name: "IPE_WEB_MAX_SESSIONS",
-        default: Cow::Borrowed("50000"),
-        purpose: "Maximum concurrent web sessions before new connections are rejected. \
-                  Prevents unbounded memory growth under a session-creation flood.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

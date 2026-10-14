@@ -499,14 +499,13 @@ pub fn emit_expr_at(
                 return emit_ffi_glued_call(ctx, *ident, glue, args, indent, child, generics);
             }
             let name = callee_name(ctx, callee)?;
-            // a polymorphic-kernel turbofish the lowerer set because the
-            // solver left this call's result type parameter genuinely
-            // unconstrained (a discarded / empty / phantom position). Empty for
-            // every other call — `CallPin::None::turbofish()` is `""` — so an
-            // unpinned call emits no turbofish suffix. The
-            // suffix goes between the kernel name and its `(` argument list:
-            // `dict_empty::<String, i64>(…)`.
-            let pin_turbofish = pin.turbofish();
+            // the turbofish the lowerer pinned because the solver left one of
+            // this call's type parameters genuinely unconstrained (a discarded /
+            // empty / phantom position): a polymorphic kernel's default, or a
+            // user generic's message slot pinned to `()`. Empty for an unpinned
+            // call. The suffix goes between the callee name and its `(`
+            // argument list: `dict_empty::<String, i64>(…)`.
+            let pin_turbofish = ctx.call_pin_turbofish(callee, pin)?;
             // `Ipe.Csv` parse kernels are generic over the error channel
             // (`csv_parse<E: From<String>>(...) -> IpeResult<E, CsvDoc>`); a
             // `Result`-returning call whose `Err` arm is often discarded leaves
@@ -518,7 +517,9 @@ pub fn emit_expr_at(
             // channel (`dsn_parse<E: From<String>>(...) -> IpeResult<E, Dsn>`) and
             // are called in a PURE `Result Error Dsn` context whose `Err` arm is
             // often discarded, leaving `E` unconstrained (E0283). Anchor `E` to
-            // `IpeError`, exactly like the Csv parse kernels above.
+            // `IpeError`, exactly like the Csv parse kernels above. The
+            // `Ipe.Db.Location.file` parse kernel
+            // (`db_location_file<E: From<IpeError>>`) is anchored the same way.
             let turbofish: &str = if pin_turbofish.is_empty()
                 && matches!(
                     callee,
@@ -527,12 +528,13 @@ pub fn emit_expr_at(
                             | KernelFn::CsvParseWithDelimiter
                             | KernelFn::DsnParse
                             | KernelFn::DsnBuild
+                            | KernelFn::DbLocationFile
                             | KernelFn::UrlRelativeParse
                     )
                 ) {
                 "::<IpeError>"
             } else {
-                pin_turbofish
+                &pin_turbofish
             };
             // A container-first kernel renders its container before the
             // function closure; clone the function's captures at their container

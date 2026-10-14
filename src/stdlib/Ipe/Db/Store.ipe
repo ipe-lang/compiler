@@ -4634,7 +4634,7 @@ sortByOrdering ordering rows =
             List.sortWith (\a b -> cellCompare cellType dir col a b) rows
 
 
-cellCompare : CellType -> SortDir -> String -> RowCells -> RowCells -> Order
+cellCompare : CellType -> SortDir -> String -> RowCells -> RowCells -> Basics.Order
 cellCompare cellType dir col a b =
     let
         base =
@@ -4655,7 +4655,7 @@ sortCell col row =
 
 
 -- Compare two sort cells: `NULL` before every value, two values by `compareCells`.
-compareNullable : CellType -> Maybe String -> Maybe String -> Order
+compareNullable : CellType -> Maybe String -> Maybe String -> Basics.Order
 compareNullable cellType x y =
     case x of
         Nothing ->
@@ -4675,7 +4675,7 @@ compareNullable cellType x y =
                     compareCells cellType xs ys
 
 
-compareCells : CellType -> String -> String -> Order
+compareCells : CellType -> String -> String -> Basics.Order
 compareCells cellType x y =
     case cellType of
         NumericCell ->
@@ -4685,7 +4685,7 @@ compareCells cellType x y =
             compare x y
 
 
-compareNumeric : String -> String -> Order
+compareNumeric : String -> String -> Basics.Order
 compareNumeric x y =
     case ( String.toFloat x, String.toFloat y ) of
         ( Just fx, Just fy ) ->
@@ -4729,7 +4729,7 @@ cellTypeOf colType =
             TextCell
 
 
-flipOrder : Order -> Order
+flipOrder : Basics.Order -> Basics.Order
 flipOrder ord =
     case ord of
         LT ->

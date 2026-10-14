@@ -542,6 +542,7 @@ fn sql_param_wildcard_builds_at_two_types() {
     let src = format!(
         "{HEAD}import Ipe.Io as Io\n\
          import Ipe.Db\n\
+         import Ipe.Db.Location as Location\n\
          import Ipe.Db.Unsafe\n\
          import Ipe.Task\n\
          insertOne : Db -> any -> Task Error Int\n\
@@ -559,7 +560,7 @@ fn sql_param_wildcard_builds_at_two_types() {
          \x20                       Io.println \"ok\"\n\
          \x20               )\n\
          \x20       )\n\
-         \x20       (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+         \x20       (Db.open Location.memory)\n"
     );
     assert_accepted("wildcard_sql_param_two_types", &src, "ok\n");
 }
@@ -573,6 +574,7 @@ fn find_projection_bind_wildcard_builds_at_two_types() {
     let src = format!(
         "{HEAD}import Ipe.Io as Io\n\
          import Ipe.Db\n\
+         import Ipe.Db.Location as Location\n\
          import Ipe.Db.Sql as Sql\n\
          import Ipe.Task\n\
          projectOne : Db -> any -> Task Error ()\n\
@@ -591,7 +593,7 @@ fn find_projection_bind_wildcard_builds_at_two_types() {
          \x20               projectOne conn \"s\"\n\
          \x20               Io.println \"ok\"\n\
          \x20       )\n\
-         \x20       (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+         \x20       (Db.open Location.memory)\n"
     );
     assert_accepted("find_projection_wildcard_two_types", &src, "ok\n");
 }

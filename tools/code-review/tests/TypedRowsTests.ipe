@@ -1,6 +1,7 @@
 module TypedRowsTests exposing (checks)
 
 import Ipe.Db as Db
+import Ipe.Db.Location exposing (Mode(..))
 import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.Maybe as Maybe
@@ -13,7 +14,7 @@ import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (UnitPageState(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (appendSigned, check, codeText, countingVerifier, freshDir, rawKeyCheckFor, rawRow, uid)
+import TestSupport exposing (openFileAt, appendSigned, check, codeText, countingVerifier, freshDir, rawKeyCheckFor, rawRow, uid)
 
 
 -- ── unit ids ────────────────────────────────────────────────────────────
@@ -236,7 +237,7 @@ uncheckedReview : String -> List (List SqlValue) -> Task.Task Error Db
 uncheckedReview name rows =
     do
         base <- freshDir name
-        db <- Db.open "sqlite" ("sqlite://" ++ base ++ "/review.db?mode=rwc")
+        db <- openFileAt CreateIfMissing (base ++ "/review.db")
         Db.exec db "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" []
         Task.sequence (List.map (Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)") rows)
         Db.exec db "CREATE TABLE review_log (seq INTEGER PRIMARY KEY, uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, prev TEXT NOT NULL, mac TEXT NOT NULL)" []

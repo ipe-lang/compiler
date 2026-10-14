@@ -12,6 +12,7 @@ module Main exposing (main)
 
 import Ipe.Codec as Codec exposing (Codec(..), Shape(..), ColType(..))
 import Ipe.Db as Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
@@ -138,4 +139,4 @@ main =
                                 |> Task.andThen (\_ -> checks txconn store)
                         )
                 )
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)

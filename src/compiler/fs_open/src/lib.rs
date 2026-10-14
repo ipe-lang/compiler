@@ -28,9 +28,11 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 
 mod name;
+pub mod prefix;
 pub mod win32_name;
 
 pub use name::{EntryName, is_one_spelled_name};
+pub use prefix::{PlaceablePrefix, PrefixRefusal};
 
 #[cfg(unix)]
 mod unix;
@@ -218,22 +220,24 @@ impl OpenRefusal {
     }
 }
 
-/// The volume and file number of a filesystem object, its identity across lookups.
+/// The volume and object number of a filesystem object, its identity across lookups.
+///
+/// Read only from an open handle, never from a path, so an identity always
+/// names the object a handle holds rather than whatever a later lookup of a
+/// name reaches. `object` is wide enough for every platform's unique object
+/// number. On Windows it holds the 64-bit file index, which `ReFS` does not
+/// keep unique on a volume, so two objects there can compare equal. A write
+/// or removal an identity gates still acts through its held handle; a
+/// comparison that only classifies a held directory (the jail configuration
+/// scan matching a walked directory against a grant or carve) has no such
+/// bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
-    dev: u64,
-    ino: u64,
+    volume: u64,
+    object: u128,
 }
 
 impl FileId {
-    /// The identity of the object looking `path` up now reaches, following links.
-    ///
-    /// # Errors
-    /// The [`OpenRefusal`] for a `path` that cannot be looked up.
-    pub fn of_path(path: &Path) -> Result<Self, OpenRefusal> {
-        sys::id_of_path(path)
-    }
-
     /// The identity of the object the open `file` holds.
     ///
     /// # Errors
@@ -281,7 +285,9 @@ impl HeldDir {
     /// # Errors
     /// [`OpenRefusal::Absent`]; [`OpenRefusal::NotRegular`] for a
     /// non-directory; [`OpenRefusal::Link`] for a reparse point on the way
-    /// (Windows); another refusal on another failure.
+    /// (Windows); [`OpenRefusal::BadName`] for a root whose canonical prefix
+    /// is no [`PlaceablePrefix`] (Windows); another refusal on another
+    /// failure.
     pub fn open_root(path: &Path) -> Result<Self, OpenRefusal> {
         let target = if path.as_os_str().is_empty() {
             Path::new(".")

@@ -90,6 +90,8 @@ pins! {
     #[cfg(feature = "db")]
     "Dsn" => Redacted(Reveal): ipe_runtime_rust::dsn::Dsn;
     #[cfg(feature = "db")]
+    "DbLocation" => Redacted(Reveal): ipe_runtime_rust::db::DbLocation;
+    #[cfg(feature = "db")]
     "SqlFragment" => Redacted(Reveal): ipe_runtime_rust::db::SqlFragment;
     #[cfg(feature = "server")]
     "ServerRequest" => Redacted(Reveal): ipe_runtime_rust::server::ServerRequest;

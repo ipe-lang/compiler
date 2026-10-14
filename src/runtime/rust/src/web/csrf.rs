@@ -89,7 +89,7 @@ pub use crate::telemetry::frame_ancestors;
 /// `IPE_WEB_FRAME_ANCESTORS`: the page answers `500`.
 pub fn security_headers()
 -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
-    crate::telemetry::security_headers(crate::telemetry::HeaderProfile::WebPageFrameOnly)
+    crate::telemetry::security_headers(crate::csp::Profile::WebPage)
 }
 
 /// Whether to mark cookies `Secure`: [`cookies_secure_with`] over the process.

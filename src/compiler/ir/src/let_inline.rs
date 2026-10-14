@@ -45,44 +45,57 @@ pub fn inlined_let_body(
         .then(|| substitute_var(body.clone(), name, value))
 }
 
-/// Returns `true` if the expression produces a value that Rust will MOVE on
-/// first use (i.e., a non-`Clone` type), making a multi-use `let` binding
-/// cause E0382 "use of moved value".
+/// Does `expr` build a move-only (non-`Clone`) value whose multi-use `let` must be inlined?
 ///
-/// The primary case is `Vec<IpeTask<A>>`: a list whose element type is or
-/// contains a task.  `IpeTask<A>` is a `Pin<Box<dyn Future …>>` — it has no
-/// `Clone` impl because polling a future to completion consumes it.  Ipê's
-/// pure semantics guarantee re-evaluation is always correct, so the emitter
-/// can safely inline the value expression at every use site.
+/// Names every `Expr` variant; a new variant must decide here whether its
+/// value is inlined.
 ///
-/// The element type is walked through every held component, including tuple,
-/// record, and named-enum variant payloads (`payloads`), so a list of
-/// `(Task a, Int)` or of an enum wrapping a task is caught too.
-///
-/// Plain `Clone`/`Copy` values (integers, booleans, strings, records, enums)
-/// do NOT trigger this path — their `let` bindings are preserved so the
-/// compiler can share the computation.
-///
-/// Recurses into `Tuple`/`Record` LITERALS so a directly-constructed
-/// `(tasks, n)` or `{ tasks = ..., n = ... }` whose task-list is nested one
-/// level down is also caught — a purely structural widening of the AUD-04
-/// audit's narrower `Expr::List`-only check (#B4). A `let`-bound value that
-/// is task-typed only through its declared TYPE (e.g. a `Call` to a
-/// Task-returning helper, or a `Var` reference to an already-task-typed
-/// binding) is NOT detected here — that needs a real type-of-expression
-/// recovery pass this backend does not have; filed as a residual gap rather
-/// than guessed at (see AUD-04 follow-up in backlog.md).
+/// The value-building forms answer from their contents: a list whose element
+/// type holds an `IrType::Task` (`Vec<IpeTask<A>>` has no `Clone` impl —
+/// polling a future consumes it), walked through every held component
+/// including named-enum payloads (`payloads`), and a tuple or record literal
+/// holding such a value. Every other form answers `false`: its `let` stays a
+/// binding, and a second use of a move-only binding is refused at `ipe` time
+/// by the type-directed reuse gate (IPE-L0135). Answering `true` for an
+/// effectful form (`Call`, `Apply`, `TaskSeq`) would duplicate its effect at
+/// every use, so widening an arm needs a per-variant effect proof.
 #[must_use]
 pub fn expr_value_is_non_clone(expr: &Expr, payloads: &EnumPayloadTable) -> bool {
     match expr {
-        // A list whose element is a task (or holds one) — Vec<IpeTask<A>>
-        // is move-only.
         Expr::List { elem, .. } => ir_type_contains_task(elem, payloads),
         Expr::Tuple(items) => items.iter().any(|e| expr_value_is_non_clone(e, payloads)),
         Expr::Record { fields, .. } => fields
             .iter()
             .any(|(_, e)| expr_value_is_non_clone(e, payloads)),
-        _ => false,
+        Expr::Int(_)
+        | Expr::Bool(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::CustomElementRef { .. }
+        | Expr::Char(_)
+        | Expr::Unit
+        | Expr::Var(_)
+        | Expr::CloneVar(_)
+        | Expr::Ctor { .. }
+        | Expr::BinOp { .. }
+        | Expr::Let { .. }
+        | Expr::Destructure { .. }
+        | Expr::If { .. }
+        | Expr::Match(_)
+        | Expr::Call { .. }
+        | Expr::Cons { .. }
+        | Expr::ListIndexClone { .. }
+        | Expr::ListLenCheck { .. }
+        | Expr::Access { .. }
+        | Expr::Update { .. }
+        | Expr::Lambda { .. }
+        | Expr::SharedLambda { .. }
+        | Expr::OnceLambda { .. }
+        | Expr::Apply { .. }
+        | Expr::FuncValue { .. }
+        | Expr::TaskSeq { .. }
+        | Expr::TailLoop { .. }
+        | Expr::TailRecur { .. } => false,
     }
 }
 

@@ -216,7 +216,7 @@ pub fn build_doc(
             )?
             && !crate::emit_expr::ffi_call_has_glue(ctx, callee)? =>
         {
-            build_generic_call(ctx, callee, args, *pin, indent, child, generics)
+            build_generic_call(ctx, callee, args, pin, indent, child, generics)
         }
 
         // A named-function value `{ let __ipe_fn: <TypedFn> = <ctor>::new(<name>);
@@ -1057,7 +1057,7 @@ fn build_generic_call(
     ctx: &EmitCtx,
     callee: &Callee,
     args: &[Expr],
-    pin: ipe_ir::CallPin,
+    pin: &ipe_ir::CallPin,
     indent: usize,
     child: u16,
     generics: GenericScope,
@@ -1067,7 +1067,7 @@ fn build_generic_call(
     // substitutes when the pin is empty (`csv_parse::<IpeError>(…)`). Every
     // kernel here returns `IpeResult<E, _>` generic over the error channel, so a
     // call whose result flows into a polymorphic context needs `E` pinned.
-    let pin_turbofish = pin.turbofish();
+    let pin_turbofish = ctx.call_pin_turbofish(callee, pin)?;
     let turbofish: &str = if pin_turbofish.is_empty()
         && matches!(
             callee,
@@ -1077,7 +1077,7 @@ fn build_generic_call(
         ) {
         "::<IpeError>"
     } else {
-        pin_turbofish
+        &pin_turbofish
     };
     // A container-first kernel renders its container before the function
     // closure; clone the function's captures at their container use sites so the

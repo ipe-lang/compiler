@@ -1,0 +1,76 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+type alias Cfg =
+    { keep : Int -> Bool
+    }
+
+
+cfg : Cfg
+cfg =
+    { keep = \n -> n > 1
+    }
+
+
+nums : List Int
+nums =
+    [ 1, 2, 3, 4 ]
+
+
+above : Int -> Int -> (Int -> Bool)
+above a b =
+    \n -> n > a + b
+
+
+kernelPartialToSlot : Cfg -> Int
+kernelPartialToSlot c =
+    let
+        k =
+            Maybe.withDefault c.keep
+    in
+    List.length (List.filter (k Nothing) nums)
+
+
+kernelPartialSaturated : Cfg -> Int
+kernelPartialSaturated c =
+    let
+        k =
+            Maybe.withDefault c.keep
+    in
+    List.length (List.filter (\n -> k Nothing n) nums)
+
+
+defPartialToSlot : Int
+defPartialToSlot =
+    let
+        h =
+            above 0
+    in
+    List.length (List.filter (h 1) nums)
+
+
+defPartialSaturated : Int
+defPartialSaturated =
+    let
+        h =
+            above 1
+    in
+    List.length (List.filter (\n -> h 1 n) nums)
+
+
+main =
+    Io.println
+        (String.join " "
+            (List.map String.fromInt
+                [ kernelPartialToSlot cfg
+                , kernelPartialSaturated cfg
+                , defPartialToSlot
+                , defPartialSaturated
+                ]
+            )
+        )

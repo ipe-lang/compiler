@@ -11,7 +11,7 @@ exit: 0
     A source file, a project directory, or a package.ipe. Defaults to the current project.
 
   Options:
-    [--out <dir>]      put build output under <dir> (default: out/ in the project)
+    [--out <dir>]      put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
     [--runtime <dir>]  vendor the Ipê runtime from <dir>
     [--port <n>]       serve on port <n> (default: 8000)
     [--debugger]       compile the in-app time-travelling debugger overlay into the served app

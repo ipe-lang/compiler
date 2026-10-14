@@ -300,6 +300,8 @@ pub const BUILTIN_TYPES: &[BuiltinRow] = &[
     bare("DbFailure", LoweredBelowGuard, Opaque)
         .via(&["Db"])
         .tagged(BuiltinTag::DbFailure),
+    // `Ipe.Db.Location`'s typed database location: may carry a `Dsn` and its `Secret` password.
+    bare("DbLocation", Reserved, SecretOrSink).tagged(BuiltinTag::DbLocation),
     bare("Decimal", LoweredBelowGuard, Opaque).tagged(BuiltinTag::Decimal),
     bare("Decoder", Reserved, Opaque).tagged(BuiltinTag::Decoder),
     bare("Deficiency", Reserved, Opaque)
@@ -747,6 +749,7 @@ mod tests {
             "Regex",
             "Url",
             "Dsn",
+            "DbLocation",
             "Key",
             "Mac",
             "EmailAddress",

@@ -937,6 +937,34 @@ messages! {
     cli_local_timed_out(source, limit) = "cli-local-timed-out";
     /// A `cargo build` ran past its wall and was stopped.
     cli_cargo_build_timed_out(wall) = "cli-cargo-build-timed-out";
+    /// A build directory or the toolchain sysroot the host linker cannot open.
+    cli_target_dir_unlinkable(what, path: &crate::style::TerminalSafe, linker) = "cli-target-dir-unlinkable";
+    /// An unlinkable build directory the embedding caller chose.
+    cli_target_dir_from_embedder = "cli-target-dir-from-embedder";
+    /// An unlinkable build directory `CARGO_TARGET_DIR` names.
+    cli_target_dir_from_env = "cli-target-dir-from-env";
+    /// An unlinkable build directory the `$IPE_HOME` config pins.
+    cli_target_dir_from_ipe_home = "cli-target-dir-from-ipe-home";
+    /// An unlinkable build directory a Cargo config pins.
+    cli_target_dir_from_cargo_config = "cli-target-dir-from-cargo-config";
+    /// An unlinkable crate-local build directory.
+    cli_target_dir_crate_local = "cli-target-dir-crate-local";
+    /// An unlinkable per-user build cache directory.
+    cli_target_dir_user_cache = "cli-target-dir-user-cache";
+    /// An unlinkable toolchain sysroot.
+    cli_target_dir_sysroot = "cli-target-dir-sysroot";
+    /// A host linker that opens only ASCII paths.
+    cli_host_linker_ascii_only = "cli-host-linker-ascii-only";
+    /// A host linker that opens any absolute path.
+    cli_host_linker_unicode = "cli-host-linker-unicode";
+    /// How to fix an unlinkable build directory.
+    cli_target_dir_guidance = "cli-target-dir-guidance";
+    /// How to fix an unlinkable toolchain sysroot.
+    cli_sysroot_guidance = "cli-sysroot-guidance";
+    /// The host linker could not open one of its input files.
+    cli_link_input_unopenable(linker: &crate::style::TerminalSafe, missing: &crate::style::TerminalSafe) = "cli-link-input-unopenable";
+    /// The unopenable linker input's path holds non-ASCII characters.
+    cli_link_input_non_ascii = "cli-link-input-non-ascii";
     /// A local walk met an entry it refuses by its shape.
     cli_local_tree_refused(source, shape) = "cli-local-tree-refused";
     /// A finished child's output pipe stayed open past the grace.
@@ -1032,6 +1060,10 @@ messages! {
     lock_index_dep_local_rev(package) = "lock-index-dep-local-rev";
     /// A path dependency's `source` cannot be recorded in `ipe.lock`.
     lock_unrecordable_local_source(package, max, raw) = "lock-unrecordable-local-source";
+    /// A path dependency names a network share or device.
+    lock_local_source_remote(package, raw, kind) = "lock-local-source-remote";
+    /// A path dependency names a Windows device element.
+    lock_local_source_device(package, raw) = "lock-local-source-device";
     /// A path dependency's path is not valid UTF-8.
     lock_non_utf8_local_path(package, path) = "lock-non-utf8-local-path";
     /// A version string that is not valid semver.
@@ -1638,6 +1670,10 @@ messages! {
     output_parent_traversal(path) = "output-parent-traversal";
     /// An output that names no single absolute place on every platform.
     output_unplaceable(path) = "output-unplaceable";
+    /// A relative output walked on from a working directory that names no single absolute place.
+    output_unplaceable_cwd(cwd, request) = "output-unplaceable-cwd";
+    /// A listed entry whose name no held handle can open.
+    output_unnameable_entry(path) = "output-unnameable-entry";
     /// An eject output that is not absent or empty.
     output_not_fresh(path) = "output-not-fresh";
     /// A product path with a component other than a plain name.
@@ -1690,6 +1726,8 @@ messages! {
     publish_fresh_claim_not_covered(claimed) = "publish-fresh-claim-not-covered";
     /// An index `source` that is not an accepted URL.
     index_source_url_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-invalid";
+    /// An index `source` that names a network share or device.
+    index_source_url_remote(pkg: &crate::package_name::PackageName, kind, raw: &crate::style::TerminalSafe) = "index-source-url-remote";
     /// An index `source` on the plaintext `git://` transport.
     index_source_url_plaintext(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-plaintext";
     /// An index `rev` shaped like an injection.
@@ -2358,30 +2396,6 @@ mod tests {
         found
     }
 
-    /// Every `.rs` file under this crate's `src/`, skipping hidden directories
-    /// and `target/`.
-    fn rs_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_owned()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name.starts_with('.') && name != "target" {
-                        stack.push(path);
-                    }
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    out.push(path);
-                }
-            }
-        }
-        out
-    }
-
     /// No production code spells a user-facing message as a Rust literal.
     ///
     /// Every message sink (`CliError::Usage`, `CliError::Resolve`, and the
@@ -2392,7 +2406,8 @@ mod tests {
     #[test]
     fn no_literal_cli_error_usage_outside_the_catalog() {
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let files = rs_files_under(&src_root);
+        let files = panic_scan::rust_sources(&src_root, panic_scan::Want::RustFiles)
+            .expect("the crate's source tree is listed whole");
         assert!(!files.is_empty(), "no sources under {}", src_root.display());
         let mut offenders = Vec::new();
         for path in files {

@@ -3,8 +3,11 @@ module Main exposing (main)
 import Ipe.Error as Error
 import Ipe.Io as Io
 import Ipe.Db
+import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Db.Unsafe
 import Ipe.List
+import Ipe.Path as Path
+import Ipe.Result as Result
 import Ipe.String
 import Ipe.Task
 
@@ -60,4 +63,8 @@ main =
                         )
                     )
         )
-        (Db.open "sqlite" "/tmp/ipe_txn_golden.db")
+        (Path.fromString "/tmp/ipe_txn_golden.db"
+            |> Result.andThen (Location.file CreateIfMissing)
+            |> Task.fromResult
+            |> Task.andThen (\loc -> Db.open loc)
+        )

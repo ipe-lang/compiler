@@ -4,7 +4,7 @@ The command-line flags several `ipe` commands share, described once. A command p
 - `[--cfree]` — build without linking any C code (incompatible with allocators that require C, e.g. mimalloc)
 - `[--emit-permissions <ios|macos|android>]` — read-only: print the OS-permission declarations the app's accepted web capabilities derive on the platform, and build nothing
 - `[--json]` — emit each diagnostic as a stable JSON object (one per line) instead of the human layout
-- `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
+- `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[-q|--quiet]` — suppress progress chatter; only warnings and errors
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--static]` — produce a statically linked binary

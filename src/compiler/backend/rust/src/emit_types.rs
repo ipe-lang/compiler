@@ -470,6 +470,8 @@ pub fn render_type(ctx: &EmitCtx, ty: &IrType, generics: GenericScope) -> DResul
         // `Ipe.Db.Dsn`'s opaque validated connection descriptor — fully-qualified
         // to avoid ambiguity with any user-defined `Dsn` type.
         IrType::Dsn => "ipe_runtime::dsn::Dsn".to_owned(),
+        // `Ipe.Db.Location`'s opaque typed database location — fully-qualified.
+        IrType::DbLocation => "ipe_runtime::db::DbLocation".to_owned(),
         // `Ipe.Db`'s external-connection handle — the phantom access mode is
         // already erased at lowering, so every `Connection ReadOnly` /
         // `Connection ReadWrite` position renders to the one concrete pool type.
@@ -1783,6 +1785,7 @@ mod show_pin_agreement {
             IrType::Url,
             IrType::UrlRelative,
             IrType::Dsn,
+            IrType::DbLocation,
             IrType::Connection,
             IrType::ConnReadOnly,
             IrType::ConnReadWrite,

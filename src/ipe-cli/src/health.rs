@@ -800,12 +800,16 @@ enum LinkDriver {
 /// Classify a `rustc -vV` host triple into its [`LinkDriver`].
 ///
 /// Pure and host-independent — the triple string alone decides the driver, so
-/// this is testable on any CI host without ever spawning `rustc`.
+/// this is testable on any CI host without ever spawning `rustc`. Reads the
+/// environment component through [`crate::target_dir::HostTriple`], the one
+/// parse the linker-family classification shares.
 fn link_driver_for_host_triple(host: &str) -> LinkDriver {
-    if host.ends_with("-msvc") {
-        LinkDriver::Msvc
-    } else {
-        LinkDriver::CcDriver
+    match crate::target_dir::HostTriple::parse(host).env {
+        crate::target_dir::HostEnv::Msvc => LinkDriver::Msvc,
+        crate::target_dir::HostEnv::Gnu
+        | crate::target_dir::HostEnv::GnuLlvm
+        | crate::target_dir::HostEnv::Other
+        | crate::target_dir::HostEnv::Absent => LinkDriver::CcDriver,
     }
 }
 
@@ -1295,6 +1299,25 @@ enum HomeConfigValue {
     /// The file is there but was refused or could not be read: a link, a
     /// FIFO, a denied or oversized file.
     Unreadable(CliError),
+}
+
+/// The shared build directory `$IPE_HOME/config.toml` pins under `[build] target-dir`.
+///
+/// A relative pin is read against `$IPE_HOME`. `None` when no home resolves or
+/// the key is absent.
+///
+/// # Errors
+/// The refusal of a `config.toml` that is there but cannot be read: an
+/// unreadable pin fails closed rather than silently building elsewhere.
+pub(crate) fn shared_target_pin() -> Result<Option<PathBuf>, CliError> {
+    let Ok(home) = runtime_embed::ipe_home() else {
+        return Ok(None);
+    };
+    match home_config_value(&home, &["build", "target-dir"]) {
+        HomeConfigValue::Set(dir) if !dir.is_empty() => Ok(Some(home.join(dir))),
+        HomeConfigValue::Set(_) | HomeConfigValue::Unset => Ok(None),
+        HomeConfigValue::Unreadable(error) => Err(error),
+    }
 }
 
 /// Read a dotted string value from `$IPE_HOME/config.toml`.
@@ -2305,6 +2328,15 @@ mod tests {
         ));
         assert!(matches!(
             link_driver_for_host_triple("aarch64-apple-darwin"),
+            LinkDriver::CcDriver
+        ));
+        assert!(matches!(
+            link_driver_for_host_triple("aarch64-pc-windows-gnullvm"),
+            LinkDriver::CcDriver
+        ));
+        // Only an exact `msvc` environment component is the MSVC driver.
+        assert!(matches!(
+            link_driver_for_host_triple("x86_64-pc-windows-notmsvc"),
             LinkDriver::CcDriver
         ));
     }
