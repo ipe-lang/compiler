@@ -179,7 +179,11 @@ pub fn overlay_html(labels: &[String], total: usize, scrub_base: &str) -> String
 /// It is a constant so the Web page policy admits it by the hash of these
 /// exact bytes (`csp::Profile::WebPage`); per-page values (the endpoint URLs,
 /// the selected-row tint) are read from the panel's `data-ipe-dbg-*`
-/// attributes. The script runs in a self-calling function to avoid polluting
+/// attributes. Because injected markup can carry a copy of these bytes beside
+/// a forged panel, no attribute grants authority: an endpoint URL is posted to
+/// only when it equals the debug path under the mount base the client read
+/// from the page's boot block (`window.__IPE_BASE`), and a CSRF token is sent
+/// only when the client set it as a string. The script runs in a self-calling function to avoid polluting
 /// the page's global scope. It binds the panel as its own tag's previous
 /// sibling and reads the document only through members bound from the
 /// prototypes, so app markup carrying `data-ipe-debugger`, or an `img`/`form`
@@ -195,10 +199,12 @@ pub const OVERLAY_JS: &str = "\n\
   var own=doc.script();\n\
   var panel=own?own.previousElementSibling:null;\n\
   if(!panel||!panel.hasAttribute('data-ipe-debugger'))return;\n\
-  var scrubUrl=panel.getAttribute('data-ipe-dbg-scrub-url');\n\
-  var resetUrl=panel.getAttribute('data-ipe-dbg-reset-url');\n\
   var selectedBg=panel.getAttribute('data-ipe-dbg-selected')||'';\n\
-  if(!scrubUrl||!resetUrl)return;\n\
+  function endpoint(name,path){\n\
+    var base=window.__IPE_BASE;\n\
+    var url=panel.getAttribute(name);\n\
+    return typeof base==='string'&&url===base+path?url:null;\n\
+  }\n\
   var scrubber=panel.querySelector('input[type=range]');\n\
   var list=panel.querySelector('[data-ipe-dbg-list]');\n\
   var resetBtn=panel.querySelector('[data-ipe-dbg-reset]');\n\
@@ -210,11 +216,14 @@ pub const OVERLAY_JS: &str = "\n\
     }\n\
   }\n\
   function csrfToken(){\n\
-    return window.__IPE_CSRF_TOKEN||'';\n\
+    var t=window.__IPE_CSRF_TOKEN;\n\
+    return typeof t==='string'?t:'';\n\
   }\n\
   function post(n){\n\
+    var url=endpoint('data-ipe-dbg-scrub-url','/_ipe/debug/scrub');\n\
+    if(!url)return;\n\
     var xhr=new XMLHttpRequest();\n\
-    xhr.open('POST',scrubUrl,true);\n\
+    xhr.open('POST',url,true);\n\
     xhr.setRequestHeader('Content-Type','application/json');\n\
     var csrf=csrfToken();\n\
     if(csrf)xhr.setRequestHeader('X-Ipe-Csrf',csrf);\n\
@@ -251,8 +260,10 @@ pub const OVERLAY_JS: &str = "\n\
     }\n\
   });\n\
   if(resetBtn)resetBtn.addEventListener('click',function(){\n\
+    var url=endpoint('data-ipe-dbg-reset-url','/_ipe/debug/reset');\n\
+    if(!url)return;\n\
     var xhr=new XMLHttpRequest();\n\
-    xhr.open('POST',resetUrl,true);\n\
+    xhr.open('POST',url,true);\n\
     var csrf=csrfToken();\n\
     if(csrf)xhr.setRequestHeader('X-Ipe-Csrf',csrf);\n\
     xhr.onload=function(){\n\
@@ -386,6 +397,31 @@ mod tests {
         assert!(html.contains("data-ipe-dbg-scrub-url=\"/a&#34;&gt;&lt;script&gt;"));
         assert_eq!(html.matches("<script>").count(), 1);
         assert!(html.ends_with(&format!("<script>{OVERLAY_JS}</script>")));
+    }
+
+    /// The hash-admitted overlay script is reusable by injected markup, so its
+    /// two requests go only to the debug endpoints under the boot block's mount
+    /// base: each `open` takes the URL [`OVERLAY_JS`]'s `endpoint` check
+    /// returned, never a panel attribute read raw.
+    #[test]
+    fn overlay_script_posts_only_to_the_boot_base_debug_endpoints() {
+        let check = "return typeof base==='string'&&url===base+path?url:null;";
+        assert_eq!(OVERLAY_JS.matches(check).count(), 1, "{OVERLAY_JS}");
+        assert_eq!(OVERLAY_JS.matches("var base=window.__IPE_BASE;").count(), 1);
+        for (attr, path) in [
+            ("data-ipe-dbg-scrub-url", "/_ipe/debug/scrub"),
+            ("data-ipe-dbg-reset-url", "/_ipe/debug/reset"),
+        ] {
+            let call = format!("var url=endpoint('{attr}','{path}');\nif(!url)return;");
+            assert_eq!(OVERLAY_JS.matches(&call).count(), 1, "{attr}");
+            assert!(
+                !OVERLAY_JS.contains(&format!("getAttribute('{attr}')")),
+                "{attr}"
+            );
+        }
+        assert_eq!(OVERLAY_JS.matches(".open(").count(), 2);
+        assert_eq!(OVERLAY_JS.matches(".open('POST',url,true)").count(), 2);
+        assert!(OVERLAY_JS.contains("return typeof t==='string'?t:'';"));
     }
 
     // ── SessionHistory ─────────────────────────────────────────────────────────
