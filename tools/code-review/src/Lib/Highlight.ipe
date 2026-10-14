@@ -1,4 +1,4 @@
-module Lib.Highlight exposing (Carry, Lang(..), Token(..), langFor, lexLine, lineStart, tokenRuns, tokenText, tokenize)
+module Lib.Highlight exposing (Carry, Lang(..), Layout, LeadingMark(..), LineEnds(..), PathRule, Separator(..), Token(..), langFor, layoutOf, lexLine, lineStart, pathRule, tokenRuns, tokenText, tokenize)
 
 import Ipe.Char as Char
 import Ipe.List as List
@@ -91,9 +91,11 @@ tokenSource tok =
 
 
 -- One language's lexical grammar: the comment, string and escape forms its
--- source has. The lexer reads only this record, so a delimiter opens
--- something only in a language whose grammar names it: `/*` is plain text
--- in shell and Ipê, `#` in Rust and Ipê, `--` in Rust and shell.
+-- source has, what of its text is layout, and how it spells a name path.
+-- Every per-language fact the tool uses is a field here, read only through
+-- this record, so a delimiter opens something only in a language whose
+-- grammar names it (`/*` is plain text in shell and Ipê, `#` in Rust and
+-- Ipê, `--` in Rust and shell), and adding a language is adding one row.
 type alias Grammar =
     { lineComment : LineComment
     , blockComment : Maybe BlockRule
@@ -103,7 +105,47 @@ type alias Grammar =
     , bareEscape : BareEscape
     , heredocs : Heredocs
     , words : Words
+    , layout : Layout
+    , paths : Maybe PathRule
     }
+
+
+-- What of a language's text is layout, which a source view does not draw
+-- as text.
+type alias Layout =
+    { lineEnds : LineEnds
+    , leadingMark : LeadingMark
+    }
+
+
+-- What a `\r` right before a line's `\n` is: part of the CRLF line break
+-- (Rust, Ipê), or a character of the line (shell, where `cd dir\r` names
+-- another directory than `cd dir`).
+type LineEnds
+    = CrlfIsOneBreak
+    | CrIsText
+
+
+-- What a byte-order mark (U+FEFF) opening a file is: skipped by the
+-- language's compiler (Rust), or a character of the first line.
+type LeadingMark
+    = MarkSkipped
+    | MarkIsText
+
+
+-- How a language spells a name path: the separator its segments are joined
+-- with, and the word a path opens with to name the unit's own crate (Rust
+-- `crate`), if the language has one.
+type alias PathRule =
+    { separator : Separator
+    , ownRoot : Maybe String
+    }
+
+
+-- A path's segment separator: `.` (Ipê) or `::` (Rust).
+type Separator
+    = DotSeparator
+    | DoubleColonSeparator
 
 
 -- How a line comment opens: a two-character opener (`//`, `--`), or a `#`
@@ -183,10 +225,42 @@ grammar lang =
             Nothing
 
 
+-- The layout of a language's text. A language with no grammar has none:
+-- every `\r` and byte-order mark in it is text, drawn as the escape every
+-- other hazard is.
+layoutOf : Lang -> Layout
+layoutOf lang =
+    case grammar lang of
+        Just g ->
+            g.layout
+
+        Nothing ->
+            textLayout
+
+
+-- How a language spells a name path, or `Nothing` for one whose source
+-- names no path (shell, and a language with no grammar).
+pathRule : Lang -> Maybe PathRule
+pathRule lang =
+    case grammar lang of
+        Just g ->
+            g.paths
+
+        Nothing ->
+            Nothing
+
+
+-- Layout that hides nothing: a `\r` and a leading mark are text.
+textLayout : Layout
+textLayout =
+    { lineEnds = CrIsText, leadingMark = MarkIsText }
+
+
 -- Rust: `//` line and nested `/* */` block comments, `"…"` strings with `\`
 -- escapes, `r"…"` and `r#"…"#` raw strings (`br`, `cr` too), `'c'` char
 -- literals (a `'` that closes no char literal, as in a lifetime, is
--- punctuation).
+-- punctuation). A CRLF is one line break and a leading byte-order mark is
+-- skipped; a path is `a::b`, and `crate::` names the unit's own crate.
 rustGrammar : Grammar
 rustGrammar =
     { lineComment = PairOpens '/' '/'
@@ -197,12 +271,15 @@ rustGrammar =
     , bareEscape = NoBareEscape
     , heredocs = NoHeredocs
     , words = RustWords
+    , layout = { lineEnds = CrlfIsOneBreak, leadingMark = MarkSkipped }
+    , paths = Just { separator = DoubleColonSeparator, ownRoot = Just "crate" }
     }
 
 
 -- Shell: a `#` at the start of a word begins a line comment, `'…'` strings
 -- without escapes, `"…"` strings with `\` escapes, a `\` escaping the next
--- character, heredocs. Shell has no block comment.
+-- character, heredocs. Shell has no block comment and no name path, and
+-- every `\r` and leading byte-order mark is text the shell reads.
 shellGrammar : Grammar
 shellGrammar =
     { lineComment = HashAtWordStart
@@ -213,12 +290,15 @@ shellGrammar =
     , bareEscape = BackslashEscapesNext
     , heredocs = ShellHeredocs
     , words = ShellWords
+    , layout = textLayout
+    , paths = Nothing
     }
 
 
 -- Ipê: `--` line and nested `{- -}` block comments (a `{-|` doc comment
 -- does not nest), `"…"` strings with `\` escapes on one line, `"""…"""`
--- strings, `'c'` char literals.
+-- strings, `'c'` char literals. A CRLF is one line break; a leading
+-- byte-order mark is text. A path is `A.b`.
 ipeGrammar : Grammar
 ipeGrammar =
     { lineComment = PairOpens '-' '-'
@@ -229,6 +309,8 @@ ipeGrammar =
     , bareEscape = NoBareEscape
     , heredocs = NoHeredocs
     , words = IpeWords
+    , layout = { lineEnds = CrlfIsOneBreak, leadingMark = MarkIsText }
+    , paths = Just { separator = DotSeparator, ownRoot = Nothing }
     }
 
 

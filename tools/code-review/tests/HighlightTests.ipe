@@ -4,7 +4,7 @@ import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.String as String
 import Ipe.Task as Task
-import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Separator(..), Token(..))
 
 
 -- Each check pins one language's lexical grammar: a delimiter opens a
@@ -219,6 +219,75 @@ longLines =
         == [ Comment comment ]
 
 
+-- Each language's layout and path facts are its grammar row's: a CRLF is
+-- one line break in Rust and Ipê, only Rust skips a leading byte-order mark,
+-- and a path joins with `::` (Rust, `crate` its own root) or `.` (Ipê). A
+-- language with no grammar, and shell, hide nothing and spell no path.
+languageFacts : Bool
+languageFacts =
+    List.map factsOf [ Rust, Ipe, Shell, Unknown ]
+        == [ "crlf-break mark-skipped :: crate", "crlf-break mark-text .", "cr-text mark-text none", "cr-text mark-text none" ]
+
+
+factsOf : Lang -> String
+factsOf lang =
+    let
+        layout =
+            Highlight.layoutOf lang
+    in
+    lineEndsName layout.lineEnds ++ " " ++ leadingMarkName layout.leadingMark ++ " " ++ pathName lang
+
+
+lineEndsName : LineEnds -> String
+lineEndsName ends =
+    case ends of
+        CrlfIsOneBreak ->
+            "crlf-break"
+
+        CrIsText ->
+            "cr-text"
+
+
+leadingMarkName : LeadingMark -> String
+leadingMarkName mark =
+    case mark of
+        MarkSkipped ->
+            "mark-skipped"
+
+        MarkIsText ->
+            "mark-text"
+
+
+pathName : Lang -> String
+pathName lang =
+    case Highlight.pathRule lang of
+        Just rule ->
+            separatorName rule.separator ++ ownRootName rule.ownRoot
+
+        Nothing ->
+            "none"
+
+
+separatorName : Separator -> String
+separatorName sep =
+    case sep of
+        DotSeparator ->
+            "."
+
+        DoubleColonSeparator ->
+            "::"
+
+
+ownRootName : Maybe String -> String
+ownRootName root =
+    case root of
+        Just word ->
+            " " ++ word
+
+        Nothing ->
+            ""
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.succeed
@@ -232,4 +301,5 @@ checks =
         , ( "a language with no grammar is plain", unknownIsPlain )
         , ( "lexemes open at end of input close in one pass", unterminatedAtEof )
         , ( "a quarter-mebibyte line lexes whole in each language", longLines )
+        , ( "each language's layout and path facts are its grammar row", languageFacts )
         ]
