@@ -1225,7 +1225,7 @@ pub(crate) struct EmitCtx<'a> {
     ///
     /// * declares `pub mod config_decode; pub use config_decode::*;` in the
     ///   emitted `ipe_runtime/mod.rs`;
-    /// * adds the `toml` + `serde_yaml` dependencies to the emitted `Cargo.toml`.
+    /// * adds the TOML and YAML parser dependencies to the emitted `Cargo.toml`.
     ///
     /// The JSON-backed `Config.*` combinators (`string` / `field` / `map` / …)
     /// emit into the `json` module, so a program that only decodes
@@ -2241,7 +2241,7 @@ impl<'a> EmitCtx<'a> {
         let uses_http = program.modules.iter().any(|m| m.uses_http);
 
         // detect Ipe.Config TOML/YAML decoder usage (gates `config_decode` +
-        // `toml` + `serde_yaml`).
+        // the TOML and YAML parser crates).
         let uses_config = program.modules.iter().any(|m| m.uses_config);
 
         // detect Ipe.Compression usage (gates `compression` + `flate2` + `zstd`).
