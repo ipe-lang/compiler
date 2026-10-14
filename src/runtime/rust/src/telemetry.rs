@@ -1016,6 +1016,9 @@ fn security_headers_with(
     if profile.embed_list(framing).is_none() {
         h.push(("x-frame-options", "SAMEORIGIN".to_string()));
     }
+    if let Some(cache) = profile.cache_control() {
+        h.push(("cache-control", cache.to_string()));
+    }
     Ok(h)
 }
 
@@ -1571,6 +1574,30 @@ mod tests {
                     "{profile:?} {framing:?}: {set:?}"
                 );
                 assert!(want.starts_with("default-src 'none'; "), "{want}");
+            }
+        }
+    }
+
+    /// A page holding the session's sid and CSRF token is never stored by a
+    /// cache, under every framing; a handler response leaves caching to the
+    /// handler.
+    #[test]
+    fn session_pages_are_never_stored() {
+        use crate::csp::Profile;
+        let embed = FrameAncestors::parse("https://a.example").ok().flatten();
+        for &profile in Profile::ALL {
+            let want = match profile {
+                Profile::Response => None,
+                #[cfg(all(feature = "server", feature = "web-core"))]
+                Profile::Console | Profile::WebPage => Some("no-store"),
+            };
+            for framing in [None, embed.as_ref()] {
+                let set = security_headers_with(profile, Ok(framing));
+                assert!(
+                    set.as_ref()
+                        .is_ok_and(|h| header(h, "cache-control") == want),
+                    "{profile:?} {framing:?}: {set:?}"
+                );
             }
         }
     }

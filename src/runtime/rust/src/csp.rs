@@ -205,6 +205,18 @@ impl Profile {
             Self::WebPage => framing,
         }
     }
+
+    /// The `Cache-Control` the profile's response carries: a page holding
+    /// per-session values (the sid, the CSRF token) is never stored by a
+    /// shared or back-forward cache. `None` leaves caching to the handler.
+    #[must_use]
+    pub const fn cache_control(self) -> Option<&'static str> {
+        match self {
+            Self::Response => None,
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Self::Console | Self::WebPage => Some("no-store"),
+        }
+    }
 }
 
 /// The inline-element hashes of the console page.
