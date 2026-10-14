@@ -1,5 +1,6 @@
-module Lib.View exposing (RowLine(..), displayOrderCss, escapeCss, lineHtml, rowLines, view)
+module Lib.View exposing (LayoutNote(..), RowLine(..), codeHtml, displayOrderCss, escapeCss, gutterHtml, layoutNotes, lineHtml, rowLines, view)
 
+import Ipe.Char as Char
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
@@ -912,7 +913,7 @@ sourceBlock loaded =
             [ Ui.width Ui.fill, Ui.spacing 2 ]
             (case loaded.view of
                 Shown shown ->
-                    List.map sourceRow (rowLines loaded.unit.lang (Index.shownRows shown))
+                    shownSource loaded.unit.lang (Index.shownRows shown)
 
                 Stale _ ->
                     withheldSource loaded.view
@@ -936,15 +937,21 @@ withheldSource view =
             []
 
 
--- One drawn row of a shown view: a numbered source line, or the marker for
--- a run of lines other units cover, which those units' own pages show.
-sourceRow : RowLine -> Ui.Element Msg
-sourceRow row =
-    case row of
-        TokenLine n toks ->
-            numberedLine n toks
+-- A shown view: the notes on its file's layout, then each run of numbered
+-- lines as one block of text, and a marker for each run of lines other units
+-- cover, which those units' own pages show.
+shownSource : Highlight.Lang -> List SourceRow -> List (Ui.Element Msg)
+shownSource lang rows =
+    List.map layoutNoteEl (layoutNotes lang rows) ++ List.map sourcePart (sourceParts (rowLines lang rows))
 
-        CoveredLine ->
+
+sourcePart : SourcePart -> Ui.Element Msg
+sourcePart part =
+    case part of
+        LineRun run ->
+            lineRun run
+
+        CoveredRun ->
             Ui.el
                 [ Ui.width Ui.fill
                 , Font.family Font.monospace
@@ -952,6 +959,138 @@ sourceRow row =
                 , Font.color (Ui.rgb 120 120 135)
                 ]
                 (Ui.text "... lines reviewed as their own units")
+
+
+-- Consecutive numbered lines, or one run of covered lines.
+type SourcePart
+    = LineRun (List ( Int, List Token ))
+    | CoveredRun
+
+
+sourceParts : List RowLine -> List SourcePart
+sourceParts lines =
+    case List.foldl sourcePartStep ( [], [] ) lines of
+        ( run, parts ) ->
+            closeRun run parts
+
+
+sourcePartStep : RowLine -> ( List ( Int, List Token ), List SourcePart ) -> ( List ( Int, List Token ), List SourcePart )
+sourcePartStep line ( run, parts ) =
+    case line of
+        TokenLine n toks ->
+            ( run ++ [ ( n, toks ) ], parts )
+
+        CoveredLine ->
+            ( [], closeRun run parts ++ [ CoveredRun ] )
+
+
+closeRun : List ( Int, List Token ) -> List SourcePart -> List SourcePart
+closeRun run parts =
+    case run of
+        [] ->
+            parts
+
+        _ ->
+            parts ++ [ LineRun run ]
+
+
+-- A run of lines: the line numbers in a gutter selection and copying skip,
+-- beside the lines as one text block.
+lineRun : List ( Int, List Token ) -> Ui.Element Msg
+lineRun run =
+    Ui.row
+        [ Ui.width Ui.fill, Ui.spacing 8 ]
+        [ Ui.el
+            [ Ui.width (Ui.px 40)
+            , Font.family Font.monospace
+            , Font.size 12
+            , Font.color (Ui.rgb 120 120 135)
+            ]
+            (Ui.html (gutterHtml (List.map (\( n, _ ) -> n) run)))
+        , Ui.el
+            [ Ui.width Ui.fill
+            , Font.family Font.monospace
+            , Font.size 12
+            ]
+            (Ui.html (codeHtml (List.map (\( _, toks ) -> toks) run)))
+        ]
+
+
+-- The line numbers of a run, one per line, outside the copied text.
+gutterHtml : List Int -> Html.Html msg
+gutterHtml numbers =
+    Html.div
+        [ Attr.style "white-space:pre;text-align:right;user-select:none"
+        , Attr.attribute "aria-hidden" "true"
+        ]
+        [ Html.text (String.join "\n" (List.map String.fromInt numbers)) ]
+
+
+-- A run's lines as one block whose text is the lines joined by newlines, so
+-- copying it gives the source as written: one line element per line, its
+-- spaces and tabs kept.
+codeHtml : List (List Token) -> Html.Html msg
+codeHtml lines =
+    Html.node "code"
+        [ Attr.style "display:block;white-space:pre" ]
+        (List.intersperse (Html.text "\n") (List.map lineHtml lines))
+
+
+-- What the source view drew as layout rather than as text: a leading
+-- byte-order mark the language skips, or CRLF line ends it reads as line
+-- breaks.
+type LayoutNote
+    = ByteOrderMark
+    | CrlfLineEnds
+
+
+layoutNotes : Highlight.Lang -> List SourceRow -> List LayoutNote
+layoutNotes lang rows =
+    noteIf (List.any (leadingMarkRow lang) rows) ByteOrderMark ++ noteIf (List.any (crlfRow lang) rows) CrlfLineEnds
+
+
+noteIf : Bool -> LayoutNote -> List LayoutNote
+noteIf present note =
+    if present then
+        [ note ]
+
+    else
+        []
+
+
+leadingMarkRow : Highlight.Lang -> SourceRow -> Bool
+leadingMarkRow lang row =
+    case row of
+        Numbered n line ->
+            startsWithLayoutMark lang n line
+
+        Covered ->
+            False
+
+
+crlfRow : Highlight.Lang -> SourceRow -> Bool
+crlfRow lang row =
+    case row of
+        Numbered _ line ->
+            endsWithLayoutCr lang line
+
+        Covered ->
+            False
+
+
+layoutNoteEl : LayoutNote -> Ui.Element Msg
+layoutNoteEl note =
+    Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text (layoutNoteText note))
+
+
+layoutNoteText : LayoutNote -> String
+layoutNoteText note =
+    case note of
+        ByteOrderMark ->
+            "The file starts with a byte-order mark (U+FEFF), which the compiler skips; it is not drawn."
+
+        CrlfLineEnds ->
+            "The file's lines end in CRLF; each \\r before a line break is not drawn."
 
 
 -- A shown row with its tokens: a numbered line, or a covered run.
@@ -976,7 +1115,7 @@ rowLineStep : Highlight.Lang -> SourceRow -> ( Highlight.Carry, List RowLine ) -
 rowLineStep lang row ( carry, lines ) =
     case row of
         Numbered n line ->
-            case Highlight.lexLine lang carry (withoutLineEnd lang line) of
+            case Highlight.lexLine lang carry (layoutLine lang n line) of
                 ( toks, next ) ->
                     ( next, lines ++ [ TokenLine n toks ] )
 
@@ -984,17 +1123,64 @@ rowLineStep lang row ( carry, lines ) =
             ( Highlight.lineStart, lines ++ [ CoveredLine ] )
 
 
--- A line without the `\r` of a CRLF ending, in a language that reads CRLF
--- as one line break (Rust, Ipê). In shell and other text that `\r` is part
--- of the line (`cd dir\r` names another directory), so it stays, drawn as
--- the escape every other hazard is.
+-- A line without what its language reads as layout: the `\r` of a CRLF
+-- ending in a language that reads CRLF as one line break (Rust, Ipê), and a
+-- byte-order mark at the start of the file in a language that skips it
+-- (Rust). In shell and other text that `\r` is part of the line (`cd dir\r`
+-- names another directory) and a leading mark is a byte the shell reads, so
+-- each stays, drawn as the escape every other hazard is.
+layoutLine : Highlight.Lang -> Int -> String -> String
+layoutLine lang n line =
+    withoutLineEnd lang (withoutLeadingMark lang n line)
+
+
 withoutLineEnd : Highlight.Lang -> String -> String
 withoutLineEnd lang line =
-    if crlfIsLineBreak lang && String.endsWith "\r" line then
+    if endsWithLayoutCr lang line then
         String.dropRight 1 line
 
     else
         line
+
+
+withoutLeadingMark : Highlight.Lang -> Int -> String -> String
+withoutLeadingMark lang n line =
+    if startsWithLayoutMark lang n line then
+        String.dropLeft 1 line
+
+    else
+        line
+
+
+endsWithLayoutCr : Highlight.Lang -> String -> Bool
+endsWithLayoutCr lang line =
+    crlfIsLineBreak lang && String.endsWith "\r" line
+
+
+startsWithLayoutMark : Highlight.Lang -> Int -> String -> Bool
+startsWithLayoutMark lang n line =
+    n == 1 && skipsLeadingMark lang && String.startsWith byteOrderMark line
+
+
+byteOrderMark : String
+byteOrderMark =
+    String.fromChar (Char.fromCode 65279)
+
+
+skipsLeadingMark : Highlight.Lang -> Bool
+skipsLeadingMark lang =
+    case lang of
+        Rust ->
+            True
+
+        Ipe ->
+            False
+
+        Shell ->
+            False
+
+        Unknown ->
+            False
 
 
 crlfIsLineBreak : Highlight.Lang -> Bool
@@ -1011,27 +1197,6 @@ crlfIsLineBreak lang =
 
         Unknown ->
             False
-
-
-numberedLine : Int -> List Token -> Ui.Element Msg
-numberedLine n toks =
-    Ui.row
-        [ Ui.width Ui.fill, Ui.spacing 8 ]
-        [ Ui.el
-            [ Ui.width (Ui.px 40)
-            , Font.family Font.monospace
-            , Font.size 12
-            , Font.color (Ui.rgb 120 120 135)
-            , Ui.alignRight
-            ]
-            (Ui.text (String.fromInt n))
-        , Ui.el
-            [ Ui.width Ui.fill
-            , Font.family Font.monospace
-            , Font.size 12
-            ]
-            (Ui.html (lineHtml toks))
-        ]
 
 
 -- One source line as a single run of inline text, so it copies as the
