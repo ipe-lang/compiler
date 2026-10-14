@@ -7751,6 +7751,7 @@ fn carrier_shape(ty: &IrType) -> CarrierShape<'_> {
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -8166,6 +8167,7 @@ const fn tag_carrier(tag: ipe_kernels::BuiltinTag) -> TagCarrier {
         | BuiltinTag::Url
         | BuiltinTag::UrlRelative
         | BuiltinTag::Dsn
+        | BuiltinTag::DbLocation
         | BuiltinTag::Connection
         | BuiltinTag::ConnReadOnly
         | BuiltinTag::ConnReadWrite
