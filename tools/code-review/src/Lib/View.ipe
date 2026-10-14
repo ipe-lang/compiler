@@ -37,7 +37,7 @@ header model =
         , Border.color (Ui.rgb 60 60 72)
         , Border.widthEach { top = 0, right = 0, bottom = 1, left = 0 }
         ]
-        [ Ui.el [ Font.size 16, Font.bold, Font.color (Ui.rgb 235 235 240) ] (Ui.text "Code review")
+        [ Ui.el [ Ui.describe (Ui.descHeading 1), Font.size 16, Font.bold, Font.color (Ui.rgb 235 235 240) ] (Ui.text "Code review")
         , Ui.el [ Ui.width Ui.fill ] Ui.none
         , navButton (model.page == QueuePage) "Queue" ShowQueue
         , navButton (model.page == HistoryPage) "History" ShowHistory
@@ -127,13 +127,49 @@ view model =
         , Ui.onKeyDown KeyDown
         , Ui.htmlAttribute "tabindex" "0"
         , Ui.htmlAttribute "autofocus" ""
+        , Ui.htmlAttribute "lang" "en"
         ]
-        [ header model
+        [ Ui.html (Html.titleNode (pageTitle model))
+        , header model
         , Ui.el
-            [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.padding 24, Font.color (Ui.rgb 190 190 200) ]
+            [ Ui.describe Ui.descMain, Ui.width Ui.fill, Ui.height Ui.fill, Ui.padding 24, Font.color (Ui.rgb 190 190 200) ]
             (pageBody model)
         , urlSync model
         ]
+
+
+-- The document title: the page, then the tool. A unit page names its unit
+-- once the unit is loaded.
+pageTitle : Model -> String
+pageTitle model =
+    pageTopic model ++ " · Code review"
+
+
+pageTopic : Model -> String
+pageTopic model =
+    case model.page of
+        QueuePage ->
+            "Queue"
+
+        HistoryPage ->
+            "History"
+
+        UnitPage raw ->
+            case App.unitPageState raw model of
+                UnitLoaded loaded ->
+                    SafeText.toString loaded.unit.qualified
+
+                UnitLoading ->
+                    "Unit"
+
+                UnitNotFound ->
+                    "Unit"
+
+                UnitFailed _ ->
+                    "Unit"
+
+                UnitIdRefused ->
+                    "Unit"
 
 
 pageBody : Model -> Ui.Element Msg
@@ -394,7 +430,7 @@ historyHeading row badge bodyHash reviewedAt =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
         [ badge
-        , Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
+        , Ui.el [ Ui.describe (Ui.descHeading 2), Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (Index.shortHash bodyHash))
@@ -488,7 +524,7 @@ unitPageCard loaded =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ labelEl 14 (Queue.unitLabel Named unit)
+            [ sectionHeading (labelEl 14 (Queue.unitLabel Named unit))
             , chip unit.facing
             ]
         , Ui.el
@@ -602,7 +638,7 @@ unitCard model label q =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ labelEl 14 label
+            [ sectionHeading (labelEl 14 label)
             , changeBadge q.change
             , changedChip q
             , chip unit.facing
@@ -639,6 +675,13 @@ selectedViewStatus uid state =
 
         Nothing ->
             Ui.none
+
+
+-- A section of a page: the page's one `h1` is the tool's name in the header,
+-- and each unit card or history entry opens an `h2`.
+sectionHeading : Ui.Element Msg -> Ui.Element Msg
+sectionHeading content =
+    Ui.el [ Ui.describe (Ui.descHeading 2) ] content
 
 
 -- A unit's label: its kind, its qualified name and, when the page needs it

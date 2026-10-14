@@ -675,6 +675,14 @@ seededChecks a b =
         placeOf path =
             path ++ ":" ++ String.fromInt unit.lineStart
 
+        historyPage =
+            page (unverifiedHistory ShownProven Legacy)
+
+        documented title html =
+            has ("<title>" ++ title ++ " · Code review</title>") html
+                && has "lang=\"en\"" html
+                && List.length (String.split "<h1" html) == 2
+
         noControl html =
             not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
 
@@ -697,6 +705,18 @@ seededChecks a b =
         && has (placeOf (SafeText.toString unit.path)) twinCard
         && has (SafeText.toString unit.kind) shownCard
         && not (has (placeOf (SafeText.toString unit.path)) shownCard)
+    )
+    , ( "every page has a title naming it, a language and one h1, and each unit card or history entry opens an h2"
+    , documented "Queue" shownCard
+        && documented "Queue" (page baseModel)
+        && documented "History" historyPage
+        && documented "Lib.answer" shownPage
+        && documented "Unit" (page (addressModel "not a uid"))
+        && has "<h2" shownCard
+        && has "<h2" shownPage
+        && has "<h2" historyPage
+        && not (has "<title></title>" shownCard)
+        && not (has "<h2" (page baseModel))
     )
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
