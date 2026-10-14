@@ -25,6 +25,7 @@
 //! | `p8_polymorphic_tuple_or` | `( Just x, _ ) \| ( _, Just x )` over `a` | builds; prints `4,0` |
 //! | `or_under_cons_head` | `(1 \| 2) :: _ -> 1` | builds; prints `1,0` |
 //! | `alias_over_or` | `(Red \| Green) as w` | the typed by-value alias refusal at the arm |
+//! | `boxed_ctor_test_fails_closed` (in `golden_3121_boxed_field_nested_pat_seal`) | `Node Leaf _ _` | boxed dispatch stays fail-closed |
 //!
 //! Every source is checked at `ipe` time here; under `IPE_E2E=1` the accepted
 //! ones are also built with `cargo` and run (THE SEAL).
@@ -682,8 +683,8 @@ main =
     );
 }
 
-/// An alias over a kept-native or-pattern stays one arm and reaches the
-/// by-value alias gate, which refuses it typed (never a compiler bug).
+/// An alias over an or-pattern splits into aliased arms, each refused typed by
+/// the by-value alias gate (never a compiler bug).
 #[test]
 fn alias_over_or() {
     let body = "type Color

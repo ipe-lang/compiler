@@ -530,8 +530,8 @@ fn refutable_span(pat: &canon::Pattern) -> Option<Span> {
         | canon::Pattern_::PStr(_)
         | canon::Pattern_::PList(_)
         | canon::Pattern_::PCons(_, _)
-        // An or-pattern discriminates (it selects between alternatives), so in a
-        // binding position it is refutable and blamed as a whole (IPE-T0015).
+        // Reached only when no alternative is irrefutable: the or-pattern then
+        // discriminates, so in a binding position it is blamed as a whole (IPE-T0015).
         | canon::Pattern_::POr(_) => Some(pat.span),
     }
 }

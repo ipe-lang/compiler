@@ -22,10 +22,10 @@
 //! | `or_same_boxed_binder` | `GoLeft next \| GoRight next` | builds + prints `3` |
 //! | `boxed_ctor_test` | `Node Leaf _ _` | fail-closed at `ipe` time |
 //! | `boxed_tuple_ctor_test` | `ChainNode (ChainEnd, 0)` | fail-closed at `ipe` time |
-//! | `or_uneven_boxed_binder` | `Just (Node l _ _, _) \| Just (_, l)` | fail-closed at `ipe` time |
+//! | `or_uneven_boxed_binder` | `Just (Node l _ _, _) \| Just (_, l)` | builds + prints `3` |
 //! | `boxed_string_test` | `Pair (Plain "go") _ _` | fail-closed IPE-L0116 |
 //! | `or_shared_alias` | `Square (n as w) \| Circle (n as w)` | builds + prints `10` |
-//! | `or_diverging_alias` | `Square (n as w) \| Rect n w` | fail-closed at `ipe` time |
+//! | `or_diverging_alias` | `Square (n as w) \| Rect n w` | builds + prints `6` |
 //!
 //! The refusals assert a typed `ipe`-time diagnostic, never a cargo failure.
 //! A test through the box is refused either by the lowerer (IPE-L0116) or, as
@@ -568,12 +568,8 @@ fn boxed_tuple_ctor_test_fails_closed() {
 }
 
 #[test]
-fn or_uneven_boxed_binder_fails_closed() {
-    assert_rejected(
-        "or_uneven_boxed_binder",
-        OR_UNEVEN_BOXED_BINDER,
-        &[ipe_diagnostics::IPE_I0001],
-    );
+fn or_uneven_boxed_binder_round_trips() {
+    assert_accepted("or_uneven_boxed_binder", OR_UNEVEN_BOXED_BINDER, "3");
 }
 
 #[test]
@@ -599,10 +595,6 @@ fn or_shared_alias_round_trips() {
 }
 
 #[test]
-fn or_diverging_alias_fails_closed() {
-    assert_rejected(
-        "or_diverging_alias",
-        OR_DIVERGING_ALIAS,
-        &[ipe_diagnostics::IPE_I0001],
-    );
+fn or_diverging_alias_round_trips() {
+    assert_accepted("or_diverging_alias", OR_DIVERGING_ALIAS, "6");
 }

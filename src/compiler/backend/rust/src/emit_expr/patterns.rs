@@ -861,8 +861,7 @@ fn borrow_list_head(ctx: &EmitCtx, pat: &Pat, moves: bool, sink: &mut ArmSink) -
             let inner = borrow_list_head(ctx, inner, moves, sink)?;
             Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
         }
-        // Every alternative binds the same names at the same types, so the first
-        // alternative's rebinds are the whole arm's set.
+        // A `SharedAlts` alternative is binder-free, so it contributes no rebinds.
         Pat::Or(alts) => {
             render_or_alternatives(alts.as_slice(), sink, &mut |p: &Pat, s: &mut ArmSink| {
                 borrow_list_head(ctx, p, moves, s)
@@ -1167,8 +1166,7 @@ fn borrow_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> 
             &mut |p: &Pat, s: &mut ArmSink| borrow_elem(ctx, p, s),
         ),
         Pat::Record(fields) => render_record_with(ctx, fields, |p| borrow_elem(ctx, p, sink)),
-        // Every alternative binds the same names at the same types; the first
-        // alternative's rebinds serve them all.
+        // A `SharedAlts` alternative is binder-free, so it contributes no rebinds.
         Pat::Or(alts) => {
             render_or_alternatives(alts.as_slice(), sink, &mut |p: &Pat, s: &mut ArmSink| {
                 borrow_elem(ctx, p, s)
@@ -1513,11 +1511,8 @@ pub fn render_arm_pat_alias_safe(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -
                      arms must route through list_arm_head"
                 .to_owned(),
         }),
-        // A per-alternative match guard cannot attach to one branch of a Rust
-        // or-pattern, so a string-literal alternative is the residual
-        // guarded-alternative case — fail closed rather than emit an invalid
-        // guarded or-pattern. Every other or-pattern renders each alternative
-        // through this same renderer and joins them with ` | `.
+        // `SharedAlts` holds no string leaf; a per-alternative guard cannot attach
+        // to one branch of a Rust or-pattern, so refuse defensively.
         Pat::Or(alts) => {
             if alts.as_slice().iter().any(pat_has_str_guard_slot) {
                 return Err(Diagnostic::CompilerBug {
