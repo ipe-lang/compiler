@@ -33,6 +33,7 @@ var __ipeDoc = (function(doc) {
     root: prop("documentElement"),
     active: prop("activeElement"),
     visibility: prop("visibilityState"),
+    hasFocus: method(Document.prototype, "hasFocus"),
     readyState: prop("readyState"),
     byId: method(Document.prototype, "getElementById"),
     create: method(Document.prototype, "createElement"),
@@ -2539,6 +2540,10 @@ function __ipeWatchdog() {
 //   - A visible follower takes the lock from a leader that has been hidden
 //     for __ipeHelloTimeoutMs, or that has gone quiet: a background tab may
 //     be throttled or frozen, and must not starve the tab on screen.
+//   - A focused follower takes the lock from a leader without focus. The
+//     stream's `?path=` sets the session's route and its `port` frames run in
+//     the tab that holds it, so the tab the user works in holds it. Focus is
+//     one tab's at a time, so two tabs never take it from each other in turn.
 //   - `port` frames stay with the leader: exactly one tab runs each outbound
 //     port Cmd.
 //   - A follower applies a body-changing frame only when the leader shows the
@@ -2567,8 +2572,13 @@ var __ipeLiveRelease = null;     // releases the held lock
 var __ipeLiveChan = null;
 var __ipeLeaderAt = 0;           // ms of the last message from the leader
 var __ipeLeaderHiddenSince = 0;  // ms the leader first reported hidden; 0 while visible
+var __ipeLeaderUnfocused = false; // the leader's last beat reported no focus
 var __ipeResyncAskedAt = 0;      // follower: ms of the last resync request
 var __ipeResyncPending = false;  // leader: a resync reopen whose full render has not landed
+// Whether this document has focus; a browser without the member never claims it.
+function __ipeHasFocus() {
+  try { return __ipeDoc.hasFocus() === true; } catch (_) { return false; }
+}
 function __ipeLiveOwnsStream() {
   return __ipeLiveRole === "leader" || __ipeLiveRole === "solo";
 }
@@ -2589,6 +2599,7 @@ function __ipeLiveBeat() {
     t: "beat",
     live: __ipeHelloOk,
     visible: __ipeDoc.visibility() !== "hidden",
+    focused: __ipeHasFocus(),
     status: __ipeStatus
   });
 }
@@ -2644,9 +2655,10 @@ function __ipeLiveOnMessage(ev) {
   }
   if (m.t === "beat") {
     if (typeof m.live !== "boolean" || typeof m.visible !== "boolean") return;
-    if (typeof m.status !== "string") return;
+    if (typeof m.focused !== "boolean" || typeof m.status !== "string") return;
     var now = Date.now();
     __ipeLeaderAt = now;
+    __ipeLeaderUnfocused = !m.focused;
     if (m.visible) __ipeLeaderHiddenSince = 0;
     else if (__ipeLeaderHiddenSince === 0) __ipeLeaderHiddenSince = now;
     __ipeLiveMirror(m.live, m.status);
@@ -2699,6 +2711,7 @@ function __ipeLiveFollow() {
   __ipeLiveRole = "follower";
   __ipeLeaderAt = Date.now();
   __ipeLeaderHiddenSince = 0;
+  __ipeLeaderUnfocused = false;
   __ipeLiveRequest(false);
   __ipeLivePost({ t: "ask" });
 }
@@ -2733,7 +2746,8 @@ function __ipeLiveMaybeSteal() {
     take = quiet > 3 * __ipeHeartbeatTtlMs;
   } else {
     take = quiet > __ipeHeartbeatTtlMs ||
-        (__ipeLeaderHiddenSince > 0 && now - __ipeLeaderHiddenSince >= __ipeHelloTimeoutMs);
+        (__ipeLeaderHiddenSince > 0 && now - __ipeLeaderHiddenSince >= __ipeHelloTimeoutMs) ||
+        (__ipeLeaderUnfocused && __ipeHasFocus());
   }
   if (!take) return;
   __ipeLiveGen++;
@@ -2743,6 +2757,7 @@ function __ipeLiveMaybeSteal() {
   }
   __ipeLeaderAt = now;
   __ipeLeaderHiddenSince = 0;
+  __ipeLeaderUnfocused = false;
   __ipeLiveRequest(true);
 }
 function __ipeLiveStart() {
@@ -2762,6 +2777,7 @@ function __ipeLiveStart() {
   __ipeLiveRole = "follower";
   __ipeLeaderAt = Date.now();
   __ipeLeaderHiddenSince = 0;
+  __ipeLeaderUnfocused = false;
   __ipeLiveRequest(false);
   __ipeLivePost({ t: "ask" });
 }
@@ -2781,6 +2797,12 @@ function __ipeLiveStop() {
   __ipeLiveRole = "stopped";
 }
 window.addEventListener("pagehide", __ipeLiveStop);
+// Focus moving between tabs: the leader reports it, a follower may take over.
+window.addEventListener("focus", function() {
+  __ipeLiveBeat();
+  __ipeLiveMaybeSteal();
+});
+window.addEventListener("blur", __ipeLiveBeat);
 window.addEventListener("pageshow", function(ev) {
   if (ev.persisted && __ipeLiveRole === "stopped") __ipeLiveStart();
 });

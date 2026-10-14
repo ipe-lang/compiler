@@ -11,6 +11,10 @@
  *      holds a stream.
  *   2. Closing the tab that holds the stream hands it to another tab.
  *   3. A hidden tab holding the stream yields it to a visible one.
+ *   4. A focused tab takes the stream from a tab without focus, whatever its
+ *      path: the stream's tab sets the session's route and runs its port Cmds.
+ *   5. A browser without Web Locks, or whose lock requests are refused, keeps
+ *      one live stream per tab rather than none.
  *
  * Runs against the geo-clipboard example. Prerequisites and local run: see
  * geo-clipboard.spec.mjs.
@@ -116,3 +120,62 @@ test("a hidden tab holding the stream yields it to a visible tab", async ({ brow
   await expect(other.locator("html")).toHaveAttribute("data-ipe-live", "1", { timeout: 15000 });
   await ctx.close();
 });
+
+test("a focused tab takes the stream from a tab without focus", async ({ browser }) => {
+  test.setTimeout(90_000);
+  const ctx = await browser.newContext();
+  // Each tab reports the focus its `__ipeTestFocus` flag names.
+  await ctx.addInitScript(() => {
+    Document.prototype.hasFocus = function () {
+      return window.__ipeTestFocus === true;
+    };
+  });
+  const pages = await openTabs(ctx, 2);
+  await expect.poll(async () => (await holders(pages)).length, { timeout: 15000 }).toBe(1);
+  const [leader] = await holders(pages);
+  const other = pages.find((p) => p !== leader);
+
+  // The follower shows another path than the leader, then takes focus. The
+  // leader stays visible and keeps beating, so no other rule hands it over.
+  await other.evaluate(() => {
+    history.pushState(null, "", "/elsewhere");
+    window.__ipeTestFocus = true;
+    window.dispatchEvent(new Event("focus"));
+  });
+
+  await expect.poll(() => holdsStream(other), { timeout: 10000 }).toBe(true);
+  await expect.poll(() => holdsStream(leader), { timeout: 10000 }).toBe(false);
+  await expect(other.locator("html")).toHaveAttribute("data-ipe-live", "1", { timeout: 15000 });
+  await ctx.close();
+});
+
+for (const [name, init] of [
+  [
+    "without Web Locks",
+    () => {
+      Object.defineProperty(Navigator.prototype, "locks", {
+        configurable: true,
+        get() {
+          return undefined;
+        },
+      });
+    },
+  ],
+  [
+    "whose lock requests are refused",
+    () => {
+      LockManager.prototype.request = function () {
+        return Promise.reject(new DOMException("refused", "SecurityError"));
+      };
+    },
+  ],
+]) {
+  test(`a browser ${name} keeps one live stream per tab`, async ({ browser }) => {
+    test.setTimeout(60_000);
+    const ctx = await browser.newContext();
+    await ctx.addInitScript(init);
+    const pages = await openTabs(ctx, 2);
+    await expect.poll(async () => (await holders(pages)).length, { timeout: 15000 }).toBe(2);
+    await ctx.close();
+  });
+}
