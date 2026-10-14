@@ -12,13 +12,13 @@ import Ipe.Ui.Background as Background
 import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
-import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
+import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -214,9 +214,9 @@ queueUnits model =
                 , Ui.column
                     [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 16, Ui.scrollbars ]
                     [ hintLine (recordsDecisions model)
-                    , case selectedUnit model of
-                        Just q ->
-                            unitCard model True q
+                    , case List.head (List.drop model.selected (Queue.queueLabels (queueList model))) of
+                        Just ( q, label ) ->
+                            unitCard model label q
 
                         Nothing ->
                             Ui.none
@@ -234,11 +234,11 @@ queueRail model =
         , Ui.spacing 4
         , Ui.scrollbars
         ]
-        (List.indexedMap (railItem model) (queueList model))
+        (List.indexedMap (railItem model) (Queue.queueLabels (queueList model)))
 
 
-railItem : Model -> Int -> Queue.QueuedUnit -> Ui.Element Msg
-railItem model i q =
+railItem : Model -> Int -> ( Queue.QueuedUnit, UnitLabel ) -> Ui.Element Msg
+railItem model i ( q, label ) =
     let
         selected =
             i == model.selected
@@ -263,9 +263,7 @@ railItem model i q =
         { onPress = Just (SelectUnit i)
         , label = Ui.row
             [ Ui.width Ui.fill, Ui.spacing 6, Ui.centerY ]
-            [ Ui.el
-                [ Font.size 12, Font.bold, Font.color (Ui.rgb 220 220 230) ]
-                (safeText q.unit.qualified)
+            [ labelEl 12 label
             , changeBadge q.change
             ]
         }
@@ -489,9 +487,8 @@ unitPageCard loaded =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText unit.qualified)
+            [ labelEl 14 (Queue.unitLabel Named unit)
             , chip unit.facing
-            , chip unit.kind
             ]
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
@@ -583,8 +580,8 @@ urlSync model =
         (Html.node "div" [ Attr.attribute "data-ipe-path" (currentPath model) ] [])
 
 
-unitCard : Model -> Bool -> Queue.QueuedUnit -> Ui.Element Msg
-unitCard model selected q =
+unitCard : Model -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
+unitCard model label q =
     let
         unit =
             q.unit
@@ -599,24 +596,15 @@ unitCard model selected q =
         , Background.color (Ui.rgb 24 24 32)
         , Border.rounded 8
         , Border.solid
-        , if selected then
-            Border.width 2
-
-        else
-            Border.width 1
-        , if selected then
-            Border.color (Ui.rgb 130 170 240)
-
-        else
-            Border.color (Ui.rgb 50 50 62)
+        , Border.width 2
+        , Border.color (Ui.rgb 130 170 240)
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText unit.qualified)
+            [ labelEl 14 label
             , changeBadge q.change
             , changedChip q
             , chip unit.facing
-            , chip unit.kind
             , Ui.el [ Ui.width Ui.fill ] Ui.none
             , case loaded of
                 Just v ->
@@ -650,6 +638,42 @@ selectedViewStatus uid state =
 
         Nothing ->
             Ui.none
+
+
+-- A unit's label: its kind, its qualified name and, when the page needs it
+-- to tell the unit apart, its location.
+labelEl : Int -> UnitLabel -> Ui.Element Msg
+labelEl size label =
+    Ui.row
+        [ Ui.spacing 6, Ui.centerY ]
+        ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (safeText label.kind)
+         , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
+         ]
+            ++ placeEls size label.place
+        )
+
+
+placeEls : Int -> Place -> List (Ui.Element Msg)
+placeEls size place =
+    case place of
+        Named ->
+            []
+
+        At path line ->
+            [ placeEl size (placeText path line) ]
+
+        AtUnit path line uid ->
+            [ placeEl size (SafeText.concat [ placeText path line, SafeText.literal " · ", SafeText.renderForeign (Uid.toString uid) ]) ]
+
+
+placeEl : Int -> SafeText -> Ui.Element Msg
+placeEl size text =
+    Ui.el [ Font.size size, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ] (safeText text)
+
+
+placeText : SafeText -> Int -> SafeText
+placeText path line =
+    SafeText.concat [ path, SafeText.literal (":" ++ String.fromInt line) ]
 
 
 -- `path · lines a-b`, from the unit's rendered path.

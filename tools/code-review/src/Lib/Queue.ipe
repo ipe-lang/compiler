@@ -1,7 +1,8 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, startDecision, stateFromResult, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
+import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.List as List
 import Ipe.Maybe as Maybe
@@ -33,6 +34,90 @@ type alias QueuedUnit =
     , change : Index.Change
     , changed : Maybe LibDb.VerifiedRow
     }
+
+
+-- What a queued unit is called on screen: its kind and qualified name, plus
+-- as much of its location as tells it apart from every other unit on the
+-- same page. Kept as separate typed fields so no two parts can run together.
+type alias UnitLabel =
+    { kind : SafeText
+    , name : SafeText
+    , place : Place
+    }
+
+
+-- `Named`: no other unit on the page shares the kind and name. `At`: one
+-- does, but none also starts at the same path and line. `AtUnit`: even the
+-- path and line are shared, so the uid, unique on a page, settles it.
+type Place
+    = Named
+    | At SafeText Int
+    | AtUnit SafeText Int Uid
+
+
+-- The one label builder: every label on screen comes from a unit's typed
+-- fields, never from a raw string.
+unitLabel : Place -> Index.Unit -> UnitLabel
+unitLabel place unit =
+    { kind = unit.kind, name = unit.qualified, place = place }
+
+
+-- Each unit of a page with its label; no two labels of one page are equal.
+queueLabels : List QueuedUnit -> List ( QueuedUnit, UnitLabel )
+queueLabels units =
+    let
+        names =
+            tally nameKey units
+
+        places =
+            tally placeKey units
+    in
+    List.map (\q -> ( q, unitLabel (placeFor names places q.unit) q.unit )) units
+
+
+placeFor : Dict String Int -> Dict String Int -> Index.Unit -> Place
+placeFor names places unit =
+    if shared names (nameKey unit) then
+        if shared places (placeKey unit) then
+            AtUnit unit.path unit.lineStart unit.uid
+
+        else
+            At unit.path unit.lineStart
+
+    else
+        Named
+
+
+tally : (Index.Unit -> String) -> List QueuedUnit -> Dict String Int
+tally key units =
+    List.foldl (\q counts -> Dict.update (key q.unit) countOne counts) Dict.empty units
+
+
+countOne : Maybe Int -> Maybe Int
+countOne seen =
+    Just (Maybe.withDefault 0 seen + 1)
+
+
+shared : Dict String Int -> String -> Bool
+shared counts key =
+    Maybe.withDefault 0 (Dict.get key counts) > 1
+
+
+-- Collision keys over length-prefixed parts, so no two different part lists
+-- spell the same key.
+nameKey : Index.Unit -> String
+nameKey unit =
+    keyPart (SafeText.toString unit.kind) ++ keyPart (SafeText.toString unit.qualified)
+
+
+placeKey : Index.Unit -> String
+placeKey unit =
+    nameKey unit ++ keyPart (SafeText.toString unit.path) ++ keyPart (String.fromInt unit.lineStart)
+
+
+keyPart : String -> String
+keyPart part =
+    String.fromInt (String.length part) ++ ":" ++ part
 
 
 -- One loaded page of the queue. `total` counts the whole queue (never this

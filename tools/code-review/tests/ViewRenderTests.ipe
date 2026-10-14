@@ -666,6 +666,15 @@ seededChecks a b =
         beforeFirstCard =
             page (cardModelUnder (ShownBroken (BeforeFirst 1)) a)
 
+        twin =
+            { unit | uid = uid "u-twin", path = SafeText.renderForeign "ipe:src/twin.rs" }
+
+        twinCard =
+            page { baseModel | queueState = Loaded (queuePage [ queued a, { unit = twin, change = New, changed = Nothing } ] 2 { reviewed = 0, total = 2 }), selectedView = ViewShown a }
+
+        placeOf path =
+            path ++ ":" ++ String.fromInt unit.lineStart
+
         noControl html =
             not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
 
@@ -683,6 +692,12 @@ seededChecks a b =
     , ( "a hostile history name is escaped", escapesHostile (page hostileHistory) )
     , ( "a hostile unit name, unit path and history name each draw in byte order", hostileInByteOrder "" (page (cardModel hostileName)) && hostileInByteOrder "" (page (unitPageModel hostileName)) && hostileInByteOrder "" (page (cardModel hostilePath)) && hostileInByteOrder "" (page hostileHistory) )
     , ( "untrusted text draws in byte order, and text with no hazard draws no escape marker", has "unicode-bidi:bidi-override" View.displayOrderCss && has "direction:ltr" View.displayOrderCss && has "background-color:" View.escapeCss && has "border:" View.escapeCss && not (has "data-review-escape" shownCard) && has (byteOrderOpen ++ "Lib.answer") shownCard )
+    , ( "two units sharing a kind and name each show their place, a unit alone shows its kind and no place"
+    , has (placeOf "ipe:src/twin.rs") twinCard
+        && has (placeOf (SafeText.toString unit.path)) twinCard
+        && has (SafeText.toString unit.kind) shownCard
+        && not (has (placeOf (SafeText.toString unit.path)) shownCard)
+    )
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
