@@ -1444,6 +1444,23 @@ mod tests {
         }
     }
 
+    /// No identity is read from a path: every `FileId` comes from an open handle.
+    #[test]
+    fn no_file_id_from_a_path() {
+        let source = include_str!("held.rs");
+        for banned in [
+            concat!("fn of", "_path"),
+            concat!("fn id_of", "_path"),
+            concat!("::of", "_path("),
+            concat!("id_of", "_path("),
+        ] {
+            assert!(
+                !source.contains(banned),
+                "held.rs reads an identity from a path through {banned:?}"
+            );
+        }
+    }
+
     /// A listed entry no held handle can open blocks a removal by name and leaves its directory intact.
     #[cfg(windows)]
     #[test]

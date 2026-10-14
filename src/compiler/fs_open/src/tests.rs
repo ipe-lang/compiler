@@ -512,10 +512,6 @@ fn no_file_id_from_a_path() {
             "sandbox/src/vcs_config.rs",
             include_str!("../../sandbox/src/vcs_config.rs"),
         ),
-        (
-            "ipe-cli/src/output_dir/held.rs",
-            include_str!("../../../ipe-cli/src/output_dir/held.rs"),
-        ),
     ] {
         for banned in ["fn of_path", "fn id_of_path", "::of_path(", "id_of_path("] {
             assert!(
