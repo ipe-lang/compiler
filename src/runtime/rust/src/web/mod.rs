@@ -1863,7 +1863,7 @@ fn too_large() -> axum::response::Response {
 /// Keep a debugger-edited session within its byte bound, or close it.
 ///
 /// `false` when its new state passes a byte bound; the session is then closed.
-#[cfg(feature = "debugger")]
+#[cfg(all(feature = "server", feature = "debugger"))]
 async fn debug_resident<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
