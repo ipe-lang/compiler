@@ -1113,12 +1113,22 @@ pageHeaderText page =
         ]
 
 
+-- " unit" for one, " units" for any other count.
+unitsWord : Int -> String
+unitsWord count =
+    if count == 1 then
+        " unit"
+
+    else
+        " units"
+
+
 -- The units under a tag no configured root binds, left out of the queue
 -- and its progress, said where the queue's counts are; empty when none is.
 unboundNotice : QueuePage -> String
 unboundNotice page =
     if page.unbound > 0 then
-        " · " ++ String.fromInt page.unbound ++ " units in unbound repositories not shown"
+        " · " ++ String.fromInt page.unbound ++ unitsWord page.unbound ++ " in unbound repositories not shown"
 
     else
         ""
