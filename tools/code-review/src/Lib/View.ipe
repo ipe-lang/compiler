@@ -762,8 +762,8 @@ labelEl size label =
     Ui.row
         [ Ui.spacing 6, Ui.centerY ]
         ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (safeText label.kind)
-         , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
-         ]
+        , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
+        ]
             ++ placeEls size label.place
         )
 
@@ -1145,7 +1145,8 @@ gutterHtml numbers =
 -- spaces and tabs kept.
 codeHtml : List (List Token) -> Html.Html msg
 codeHtml lines =
-    Html.node "code"
+    Html.node
+        "code"
         [ Attr.style "display:block;white-space:pre" ]
         (List.intersperse (Html.text "\n") (List.map lineHtml lines))
 
