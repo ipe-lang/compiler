@@ -475,41 +475,48 @@ mod tests {
         }
     }
 
-    /// `'unsafe-inline'` sits only in a style directive, and never beside a
-    /// hash there, where a browser would ignore it.
+    /// The directives that may hold `'unsafe-inline'` under `profile`: the
+    /// `style=""` attribute wherever one is admitted, plus `<style>` elements
+    /// on the `Ipe.Web` page alone, whose scoped elements are rendered per view.
+    fn unsafe_inline_holders(profile: Profile) -> &'static [Directive] {
+        match profile {
+            Profile::Response => &[Directive::StyleSrcAttr],
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Profile::Console => &[],
+            #[cfg(all(feature = "server", feature = "web-core"))]
+            Profile::WebPage => &[
+                Directive::StyleSrc,
+                Directive::StyleSrcElem,
+                Directive::StyleSrcAttr,
+            ],
+        }
+    }
+
+    /// `'unsafe-inline'` sits exactly in the style directives its profile
+    /// names, and never beside a hash there, where a browser would ignore it.
     #[test]
-    fn unsafe_inline_only_in_hashless_style_directives() {
+    fn unsafe_inline_only_in_the_profiles_hashless_style_directives() {
         let framing = embed();
         for (profile, policy) in every_policy(framing.as_ref()) {
-            let mut holders = 0;
+            let holders: Vec<Directive> = policy
+                .directives()
+                .filter(|(_, sources)| sources.contains(&Source::UnsafeInline))
+                .map(|(d, _)| d)
+                .collect();
+            assert_eq!(holders, unsafe_inline_holders(profile), "{profile:?}");
             for (directive, sources) in policy.directives() {
-                if !sources.contains(&Source::UnsafeInline) {
-                    continue;
-                }
-                holders += 1;
                 assert!(
-                    matches!(
-                        directive,
-                        Directive::StyleSrc | Directive::StyleSrcElem | Directive::StyleSrcAttr
-                    ),
-                    "{profile:?} {directive:?}"
-                );
-                assert!(
-                    !sources.iter().any(|s| matches!(s, Source::Hash(_))),
+                    !(sources.contains(&Source::UnsafeInline)
+                        && sources.iter().any(|s| matches!(s, Source::Hash(_)))),
                     "{profile:?} {directive:?} pairs a hash with 'unsafe-inline'"
                 );
             }
             assert_eq!(
                 policy.header_value().matches("'unsafe-inline'").count(),
-                holders,
+                holders.len(),
                 "{profile:?}"
             );
         }
-        assert!(
-            ContentSecurityPolicy::for_profile(Profile::Response, None)
-                .sources(Directive::StyleSrcAttr)
-                .is_some_and(|s| s == [Source::UnsafeInline])
-        );
     }
 
     /// The exact `WebPage` header value under the same-origin default.
