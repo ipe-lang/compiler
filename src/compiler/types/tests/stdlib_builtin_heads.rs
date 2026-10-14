@@ -56,7 +56,7 @@ fn ipe_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 
 /// The stdlib source root.
 fn stdlib_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib")
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../stdlib")).to_path_buf()
 }
 
 /// The interned string behind `sym`.
@@ -201,11 +201,7 @@ fn is_builtin_spelling(c: &Collision) -> bool {
 /// spelling or listed as a distinct head.
 #[test]
 fn every_builtin_named_stdlib_union_is_a_spelling_or_listed_distinct() {
-    let found = collisions();
-    assert!(found.is_ok(), "the stdlib scan must succeed: {found:?}");
-    let Ok(found) = found else {
-        return;
-    };
+    let found = collisions().expect("the stdlib scan must succeed");
     let unclassified: Vec<String> = found
         .into_iter()
         .filter(|c| !is_builtin_spelling(c) && !listed_distinct(&c.home, &c.name))
@@ -223,11 +219,7 @@ fn every_builtin_named_stdlib_union_is_a_spelling_or_listed_distinct() {
 /// is not the builtin's spelling, so the table never carries a stale entry.
 #[test]
 fn every_listed_distinct_union_is_a_real_non_mirror() {
-    let found = collisions();
-    assert!(found.is_ok(), "the stdlib scan must succeed: {found:?}");
-    let Ok(found) = found else {
-        return;
-    };
+    let found = collisions().expect("the stdlib scan must succeed");
     for (home, name) in ipe_types::STDLIB_DISTINCT_UNIONS {
         let entry = found.iter().find(|c| {
             c.name == *name && home.iter().copied().eq(c.home.iter().map(String::as_str))
@@ -245,11 +237,7 @@ fn every_listed_distinct_union_is_a_real_non_mirror() {
 /// exists and is not also listed distinct.
 #[test]
 fn every_same_head_declaration_is_a_real_unlisted_union() {
-    let found = collisions();
-    assert!(found.is_ok(), "the stdlib scan must succeed: {found:?}");
-    let Ok(found) = found else {
-        return;
-    };
+    let found = collisions().expect("the stdlib scan must succeed");
     for (home, name) in SAME_HEAD_DECLARATIONS {
         let exists = found
             .iter()
@@ -274,11 +262,7 @@ fn every_same_head_declaration_is_a_real_unlisted_union() {
 /// still classify the `Ipe.Css` unions named after them.
 #[test]
 fn the_scan_sees_opaque_builtin_names() {
-    let found = collisions();
-    assert!(found.is_ok(), "the stdlib scan must succeed: {found:?}");
-    let Ok(found) = found else {
-        return;
-    };
+    let found = collisions().expect("the stdlib scan must succeed");
     for name in ["Color", "Length"] {
         assert!(
             found

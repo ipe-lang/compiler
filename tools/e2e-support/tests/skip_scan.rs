@@ -320,6 +320,11 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         "a privileged user reads a permission-locked directory",
     ),
     (
+        "tools/panic-scan/tests/walk.rs",
+        "an_unreadable_directory_is_refused",
+        "a privileged user reads a permission-locked directory",
+    ),
+    (
         "examples/wasm/language-playground/jail-runner/tests/sandbox_security.rs",
         "hello_world_runs_and_returns_stdout",
         PLAYGROUND_TIER,
