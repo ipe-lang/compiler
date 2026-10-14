@@ -26,6 +26,7 @@ export default {
     "form-controls.spec.mjs",
     "focus-across-patch.spec.mjs",
     "host-rebind.spec.mjs",
+    "csp.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,
