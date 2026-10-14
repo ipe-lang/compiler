@@ -2595,8 +2595,9 @@ pub(crate) async fn bind_app_listener(
 /// session or concurrency permit.
 ///
 /// Its only success is [`shutdown::Stopped`]: after the first signal the
-/// in-flight requests and long-lived tasks get what is left of the grace, the
-/// exporters flush, and every owned pool closes under its deadline. A signal
+/// in-flight requests and long-lived tasks get what is left of the grace, every
+/// other serve site sharing the owner drains too, the exporters flush, and
+/// every owned pool closes under its deadline. A signal
 /// that arrived before the serve skips accepting altogether.
 ///
 /// # Errors
@@ -2611,6 +2612,9 @@ pub(crate) async fn serve_app(
     use axum::ServiceExt as _;
     use tower::Layer as _;
     if !armed.is_draining() {
+        // This site counts as live while it serves, so a sibling site sharing
+        // the owner closes the shared pools only after this one has drained.
+        let serving = armed.drain().hold();
         let AppListener {
             listener,
             admission,
@@ -2637,8 +2641,9 @@ pub(crate) async fn serve_app(
                 }
             }
         }
-        armed.settle_live().await;
+        drop(serving);
     }
+    armed.settle_live().await;
     #[cfg(all(feature = "web", feature = "http_client"))]
     crate::web::flush_exporters().await;
     let closed = shutdown::close_owned_pools(&armed).await;
@@ -5047,6 +5052,70 @@ mod tests {
             .expect("a stuck request never holds the stop past its bound");
         assert!(matches!(stopped, Ok(Ok(shutdown::Stopped { .. }))));
         assert!(signalled.elapsed() < bound);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_site_that_drains_first_waits_for_its_sibling_before_closing_pools() {
+        use tokio::io::AsyncWriteExt as _;
+        let budget = std::time::Duration::from_secs(5);
+        let (idle_site, busy_site, signals) =
+            shutdown::tests::armed_pair(std::time::Duration::from_secs(30));
+        let bind = || {
+            bind_app_listener(
+                "test",
+                RecordedHost::record(crate::app_config::ListenHost::Loopback(
+                    crate::app_config::LoopbackIp::DEFAULT,
+                )),
+                0,
+            )
+        };
+        let idle_app = bind().await.expect("a loopback port binds");
+        let busy_app = bind().await.expect("a loopback port binds");
+        let port = busy_app.listener.local_addr().expect("a bound port").port();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entering, released) = (Arc::clone(&entered), Arc::clone(&release));
+        let router = axum::Router::new().route(
+            "/held",
+            axum::routing::get(move || {
+                let (entering, released) = (Arc::clone(&entering), Arc::clone(&released));
+                async move {
+                    entering.notify_one();
+                    released.notified().await;
+                    "done"
+                }
+            }),
+        );
+        let idle = tokio::spawn(serve_app(idle_app, axum::Router::new(), idle_site));
+        let busy = tokio::spawn(serve_app(busy_app, router, busy_site));
+        let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("the app accepts");
+        let request =
+            format!("GET /held HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        tokio::time::timeout(budget, entered.notified())
+            .await
+            .expect("the handler runs");
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !idle.is_finished(),
+            "an idle site closes the shared pools while a sibling still serves a request"
+        );
+        release.notify_one();
+        let busy = tokio::time::timeout(budget, busy)
+            .await
+            .expect("the busy site stops");
+        assert!(matches!(busy, Ok(Ok(shutdown::Stopped { .. }))));
+        let idle = tokio::time::timeout(budget, idle)
+            .await
+            .expect("the idle site stops");
+        assert!(matches!(idle, Ok(Ok(shutdown::Stopped { .. }))));
         drop(client);
     }
 

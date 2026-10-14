@@ -2268,6 +2268,28 @@ mod tests {
         }
     }
 
+    /// A SQLite session store registers its pool, so a served app's stop closes
+    /// it (and its WAL) before the exit.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_sqlite_session_store_registers_its_pool_for_the_stop() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_owned_{}.db", std::process::id()));
+        let p = path.to_str().expect("the temp path is UTF-8");
+        let _ = std::fs::remove_file(p);
+        let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
+            .await
+            .expect("the store opens");
+        assert!(
+            crate::db::process_pools().open_in(crate::db::PoolRole::SessionStore) >= 1,
+            "the session store's pool is never closed by the stop"
+        );
+        s.pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{p}{suffix}"));
+        }
+    }
+
     /// Restart survival: a store writes a checkpoint, a FRESH store over the same
     /// file (no mem-cache) restores it verbatim through a claimed lookup.
     #[cfg(feature = "db")]

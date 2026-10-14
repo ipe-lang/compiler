@@ -200,7 +200,8 @@ pub(crate) fn spawn_console(
 /// Idempotent; never panics. The served app's one teardown owner is its
 /// `server::shutdown::ShutdownPlan`: `serve_web`'s plan runs this on the first
 /// signal, and `serve_web` runs it again once the app has stopped, for a child
-/// spawned after the teardown. No other signal handler stops the child.
+/// spawned after the teardown. A forced exit (a second signal, `System.exit`)
+/// runs it as a pre-exit stage of `system::exit_process`.
 pub fn shutdown_console() {
     if let Ok(mut g) = CHILD.lock() {
         if let Some(child) = g.as_mut() {
@@ -559,6 +560,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forced_exit_removes_the_zero_config_console_store() {
+        crate::system::locked_remove_var("IPE_CONSOLE_DB_PATH");
+        let store = console_store_path().expect("a private scratch directory is created");
+        let dir = std::path::Path::new(&store)
+            .parent()
+            .expect("the store sits in its scratch directory")
+            .to_path_buf();
+        assert!(dir.is_dir());
+        crate::system::run_pre_exit_stages();
+        assert!(
+            !dir.exists(),
+            "the pre-exit stages leave the console store directory behind"
+        );
+    }
 
     #[test]
     fn bin_path_none_when_absent() {

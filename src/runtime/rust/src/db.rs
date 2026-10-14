@@ -2432,6 +2432,20 @@ impl OwnedPools {
     }
 }
 
+#[cfg(test)]
+impl OwnedPools {
+    /// The open pools registered under `role`.
+    #[must_use]
+    pub fn open_in(&self, role: PoolRole) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(held, pool)| *held == role && !pool.is_closed_owned())
+            .count()
+    }
+}
+
 impl Default for OwnedPools {
     fn default() -> Self {
         Self::new()

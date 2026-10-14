@@ -119,14 +119,7 @@ impl ShutdownPlan {
     /// A plan logged under `tag` whose first hook marks readiness as draining.
     #[must_use]
     pub fn new(tag: &'static str) -> Self {
-        #[cfg(feature = "web-core")]
-        {
-            Self::bare(tag).then(|| async { crate::web::observability::mark_draining() })
-        }
-        #[cfg(not(feature = "web-core"))]
-        {
-            Self::bare(tag)
-        }
+        Self::bare(tag).then(|| async { mark_draining() })
     }
 
     /// The `Server.listen` plan.
@@ -145,7 +138,6 @@ impl ShutdownPlan {
     }
 
     /// This plan with `hook` run after its other hooks.
-    #[cfg(any(test, feature = "web"))]
     #[must_use]
     pub fn then<F, Fut>(mut self, hook: F) -> Self
     where
@@ -156,6 +148,15 @@ impl ShutdownPlan {
         self
     }
 }
+
+/// Flip readiness to draining.
+#[cfg(feature = "web-core")]
+fn mark_draining() {
+    crate::web::observability::mark_draining();
+}
+/// Flip readiness to draining: no readiness probe without `web-core`.
+#[cfg(not(feature = "web-core"))]
+const fn mark_draining() {}
 
 /// How the owner ends the process on a second signal.
 type Exit = Box<dyn Fn(i32) + Send + Sync>;
@@ -637,6 +638,35 @@ pub mod tests {
         )
         .expect("an injected source arms");
         (armed, tx)
+    }
+
+    /// Two serve sites armed on one fresh owner, as two listeners of one
+    /// process share it.
+    #[allow(clippy::expect_used)] // a test helper fails its test on a broken fixture
+    #[must_use]
+    pub fn armed_pair(grace: Duration) -> (Armed, Armed, mpsc::Sender<Signal>) {
+        let slot: &'static Slot = Box::leak(Box::new(Mutex::new(None)));
+        let (tx, rx) = mpsc::channel(SIGNAL_QUEUE);
+        let pools = test_pools();
+        let first = arm_in(
+            slot,
+            ShutdownPlan::bare("first"),
+            grace,
+            move || Ok(rx),
+            Box::new(|_| {}),
+            pools,
+        )
+        .expect("an injected source arms");
+        let second = arm_in(
+            slot,
+            ShutdownPlan::bare("second"),
+            grace,
+            || Err(std::io::Error::other("a later arm never registers")),
+            Box::new(|_| {}),
+            pools,
+        )
+        .expect("a later arm joins the armed owner");
+        (first, second, tx)
     }
 
     #[cfg(feature = "db")]

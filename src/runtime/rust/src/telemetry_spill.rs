@@ -347,6 +347,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The spill pool registers itself, so a served app's stop closes it last.
+    #[tokio::test]
+    async fn the_spill_pool_registers_itself_for_the_stop() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("spill-owned-{}.db", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        let pool = open_spill_pool(&path).await.expect("open spill");
+        assert!(
+            crate::db::process_pools().open_in(crate::db::PoolRole::TelemetrySpill) >= 1,
+            "the spill pool is never closed by the stop"
+        );
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
     /// Every connection the spill pool hands out at once carries the declared
     /// busy timeout.
     #[tokio::test]

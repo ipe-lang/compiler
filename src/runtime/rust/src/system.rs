@@ -3085,23 +3085,33 @@ pub fn run_exit_hook() {
     }
 }
 
+/// The teardown `process::exit` would otherwise skip, in order: the registered
+/// exit hook (terminal restore); then, in a build with the telemetry exporters,
+/// a flush of their buffered batches bounded by the exporters' flush deadline;
+/// then the stop of the console child and the removal of its store directory,
+/// after the flush that may still push to it.
+///
+/// A stage that panics is abandoned, never the exit: each stage runs under
+/// `catch_unwind`, so the process ends whatever a stage does (a tokio
+/// thread-start refusal inside the flush's `block_in_place`, a panicking
+/// hook). Without that, the panic would unwind out of the `-> !` exit and the
+/// caller (a shutdown grace timer, a second signal) would keep running.
+pub(crate) fn run_pre_exit_stages() {
+    let _ = std::panic::catch_unwind(run_exit_hook);
+    #[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
+    {
+        let _ = std::panic::catch_unwind(crate::web::flush_exporters_before_exit);
+        let _ = std::panic::catch_unwind(crate::web::console_proxy::shutdown_console);
+    }
+}
+
 /// Ends the process with `code` after every pre-exit stage has run.
 ///
 /// The one process exit in the runtime; the runtime `clippy.toml` denies
 /// `std::process::exit` everywhere else. `process::exit` skips Drop, so the
-/// stages Drop would have run happen here first: the registered exit hook
-/// (terminal restore), then, in a build with the telemetry exporters, a flush
-/// of their buffered batches bounded by the exporters' flush deadline.
-///
-/// A stage that panics is abandoned, never the exit: each stage runs under
-/// `catch_unwind`, so the process ends with `code` whatever a stage does (a
-/// tokio thread-start refusal inside the flush's `block_in_place`, a panicking
-/// hook). Without that, the panic would unwind out of this `-> !` call and the
-/// caller (a shutdown grace timer, a watchdog) would keep running.
+/// stages Drop would have run happen here first (`run_pre_exit_stages`).
 pub fn exit_process(code: i32) -> ! {
-    let _ = std::panic::catch_unwind(run_exit_hook);
-    #[cfg(all(feature = "web", feature = "http_client", not(target_arch = "wasm32")))]
-    let _ = std::panic::catch_unwind(crate::web::flush_exporters_before_exit);
+    run_pre_exit_stages();
     #[expect(clippy::disallowed_methods)] // the one process exit; proves the ban fires
     // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — the runtime's one process-exit funnel: every exit request (`System.exit`, server shutdown, a CLI db op) ends here after the pre-exit stages [ledger #boundary]
     std::process::exit(code);
