@@ -28,6 +28,7 @@ export default {
     "focus-across-patch.spec.mjs",
     "host-rebind.spec.mjs",
     "live-tabs.spec.mjs",
+    "csp.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,
