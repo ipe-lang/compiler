@@ -1161,6 +1161,13 @@ fn a_sqlite_session_store_closes_on_sigterm() -> Result<(), BoxError> {
         served.seen
     );
     assert_eq!(served.containing(Pipe::Err, FORCING_LINE), 0);
+    // A store that failed to open degrades to memory; the file's WAL would
+    // then be the `Db.open` pool's alone, proving nothing of the store.
+    assert!(
+        served.containing(Pipe::Err, "session store: sqlite @ ") > 0,
+        "{test_name}: the SQLite session store opened; seen {:?}",
+        served.seen
+    );
     assert_no_sidecars(test_name, &db);
     Ok(())
 }

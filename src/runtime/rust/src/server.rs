@@ -8976,6 +8976,91 @@ mod tests {
         crate::system::locked_remove_var("IPE_HTTP_BIND");
     }
 
+    /// A socket whose peer never takes a frame.
+    struct StalledSocket;
+
+    impl futures_util::Stream for StalledSocket {
+        type Item = Result<axum::extract::ws::Message, axum::Error>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures_util::Sink<axum::extract::ws::Message> for StalledSocket {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: axum::extract::ws::Message,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Whether `ws_loop` over a [`StalledSocket`] ends within twice the
+    /// close deadline, under `max_connections` and `drain`.
+    async fn stalled_loop_ends(max_connections: usize, drain: shutdown::Drain) -> bool {
+        let ceilings = WsCeilings {
+            send_buffer: 16,
+            max_connections,
+            heartbeat_secs: 30,
+        };
+        let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let served = ws_loop(
+            StalledSocket,
+            ws_server_default_cfg::<String>(),
+            id,
+            ceilings,
+            ChannelCredentials::of_request(),
+            None,
+            drain,
+        );
+        tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_the_full_drain_refuses_ends_within_its_close_deadline() {
+        assert!(
+            stalled_loop_ends(usize::MAX, shutdown::tests::full_drain()).await,
+            "an uncounted socket's close frame never outlives its deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_over_the_peer_ceiling_ends_within_its_close_deadline() {
+        assert!(
+            stalled_loop_ends(0, shutdown::Drain::never()).await,
+            "a refused peer's close frame never outlives its deadline"
+        );
+    }
+
     // ── authenticated routes (fail-closed) ────────────────────────────
     #[cfg(feature = "jwt")]
     mod authed {
@@ -10232,91 +10317,6 @@ mod tests {
             assert!(matches!(closed, Ok(Some(()))), "onClose runs on the drain");
             armed.settle_live().await;
             assert_eq!(armed.live_count(), 0, "the socket's live count clears");
-        }
-
-        /// A socket whose peer never takes a frame.
-        struct StalledSocket;
-
-        impl futures_util::Stream for StalledSocket {
-            type Item = Result<axum::extract::ws::Message, axum::Error>;
-
-            fn poll_next(
-                self: Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Option<Self::Item>> {
-                std::task::Poll::Pending
-            }
-        }
-
-        impl futures_util::Sink<axum::extract::ws::Message> for StalledSocket {
-            type Error = std::convert::Infallible;
-
-            fn poll_ready(
-                self: Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Result<(), Self::Error>> {
-                std::task::Poll::Pending
-            }
-
-            fn start_send(
-                self: Pin<&mut Self>,
-                _item: axum::extract::ws::Message,
-            ) -> Result<(), Self::Error> {
-                Ok(())
-            }
-
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Result<(), Self::Error>> {
-                std::task::Poll::Pending
-            }
-
-            fn poll_close(
-                self: Pin<&mut Self>,
-                _cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Result<(), Self::Error>> {
-                std::task::Poll::Pending
-            }
-        }
-
-        /// Whether `ws_loop` over a [`StalledSocket`] ends within twice the
-        /// close deadline, under `max_connections` and `drain`.
-        async fn stalled_loop_ends(max_connections: usize, drain: shutdown::Drain) -> bool {
-            let ceilings = WsCeilings {
-                send_buffer: 16,
-                max_connections,
-                heartbeat_secs: 30,
-            };
-            let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let served = ws_loop(
-                StalledSocket,
-                ws_server_default_cfg::<String>(),
-                id,
-                ceilings,
-                ChannelCredentials::of_request(),
-                None,
-                drain,
-            );
-            tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served)
-                .await
-                .is_ok()
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_socket_the_full_drain_refuses_ends_within_its_close_deadline() {
-            assert!(
-                stalled_loop_ends(usize::MAX, shutdown::tests::full_drain()).await,
-                "an uncounted socket's close frame never outlives its deadline"
-            );
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn a_socket_over_the_peer_ceiling_ends_within_its_close_deadline() {
-            assert!(
-                stalled_loop_ends(0, shutdown::Drain::never()).await,
-                "a refused peer's close frame never outlives its deadline"
-            );
         }
 
         #[tokio::test(start_paused = true)]

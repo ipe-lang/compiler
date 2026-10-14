@@ -29,8 +29,9 @@ use tokio::time::Instant;
 pub const DB_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The longest closing every owned pool may take: one [`DB_CLOSE_DEADLINE`]
-/// per close stage, the stages running one after another.
-#[cfg(feature = "db")]
+/// per close stage, the stages running one after another. The bound the
+/// shutdown tests hold the exit to; `server_shutdown_e2e` mirrors it.
+#[cfg(all(feature = "db", test))]
 pub const POOLS_CLOSE_BOUND: Duration =
     DB_CLOSE_DEADLINE.saturating_mul(crate::db::CLOSE_STAGES as u32);
 
@@ -793,6 +794,14 @@ pub mod tests {
         assert_eq!(live.count.load(Ordering::SeqCst), 1);
         drop(held);
         assert_eq!(live.count.load(Ordering::SeqCst), 0);
+    }
+
+    /// `server_shutdown_e2e` restates this bound as a literal; a change here
+    /// must change it there.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_pools_close_bound_is_the_one_the_e2e_mirrors() {
+        assert_eq!(POOLS_CLOSE_BOUND, Duration::from_secs(4));
     }
 
     #[cfg(unix)]
