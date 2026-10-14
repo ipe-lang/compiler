@@ -33,10 +33,12 @@ See `tools/ipe-index/README.md` for that tool.
 
 ## Configuration
 
-The app reads four environment variables: two are **required** and two are
-optional. `main` parses all four at startup, then opens and probes each
+The app reads five environment variables: two are **required** and three are
+optional. `main` parses all five at startup, then opens and probes each
 location before it listens, and exits non-zero with a message naming the
-variable if any is unset or unusable. A misconfigured run fails closed rather
+variable if any is unset or unusable. An optional variable that is set but
+cannot be read (a value that is not valid Unicode) is refused too, never taken
+for unset. A misconfigured run fails closed rather
 than serving a page that later fails, opening a wrong-path database, or
 joining a stored path outside the repo:
 
@@ -44,11 +46,12 @@ joining a stored path outside the repo:
 |------------------|---------------------------------------------------------------|
 | `IPE_INDEX_DB`   | File path of the `ipe-index` DB.                              |
 | `IPE_INDEX_ROOT` | Repo root the index's `ipe:relative` paths join to; must be an existing directory holding the indexed files, checked at startup. |
+| `IPE_INDEX_REPOS` | Optional roots of the other repositories the index records: `name=/absolute/path` entries joined by `,` (e.g. `ext=/srv/ext,docs=/srv/ipe/docs`). At most 65536 bytes in all, a name of at most 128 bytes, a path of at most 4096 bytes, and 64 roots counting `IPE_INDEX_ROOT`. |
 | `IPE_REVIEW_DB`  | Optional file path of the review DB; defaults to `review.db`. |
 | `IPE_REVIEW_MAC_KEY` | Optional key that signs every decision: exactly 64 hex characters (32 random bytes). Unset, the server is read-only. |
 
-A relative path in any of the three locations resolves against the working
-directory. Each database value is a file path, never a URL: any byte but `:` is
+A relative path in `IPE_INDEX_DB`, `IPE_INDEX_ROOT` or `IPE_REVIEW_DB` resolves
+against the working directory; an `IPE_INDEX_REPOS` path must be absolute. Each database value is a file path, never a URL: any byte but `:` is
 allowed in its file name, and is read literally. A refused database location is
 reported by variable name only, never by value, since a mistyped URL can carry
 a password. Each refusal states one fix.
@@ -62,10 +65,33 @@ the variable and the resolved file, which is a plain absolute path once
 parsed.
 
 `IPE_INDEX_ROOT` binds the repo tag `ipe`, the tag of `ipe-index`'s default
-`--repo ipe:.`. A unit stored under any other tag (an index built with a second
-`--repo`) is refused rather than read from that root, so the page never shows a
-different file than the one the index recorded. A tag is the text before the
-first `:` when no `/` precedes it, matching how `ipe-index` reads it back.
+`--repo ipe:.`. Each `IPE_INDEX_REPOS` entry binds one more tag, the name before
+its first `=`, to the directory after it, for an index built with more than one
+`--repo`:
+
+```sh
+IPE_INDEX_ROOT=/srv/ipe IPE_INDEX_REPOS="ext=/srv/ext,docs=/srv/ipe/docs" ipe dev run
+```
+
+An entry is refused, naming its position, when it is empty, has no `=`, has a
+name that is not a repo tag (empty, or holding `/`, `:`, `=`, `,`, whitespace or
+a control character), or has a path that is not absolute (a single leading `/`),
+not written canonically (no `.` or `..` segment, no doubled or trailing `/`), or
+not an existing directory. Nothing is trimmed or cleaned, and Windows drive and
+UNC spellings are refused. A name bound twice (`ipe` included), two names on one
+directory, or more than 64 roots is refused too. Roots may nest: a path under a
+deeper root belongs to that root alone, so `ipe:docs/x` is refused when `docs`
+is bound to `/srv/ipe/docs`.
+
+At startup the bound tags must be exactly the repositories the index records,
+each nested under the same enclosing root as `ipe-index` recorded it from the
+files themselves: a repository the index records but no variable binds, a bound
+tag the index does not record, or a root nested otherwise than the index
+records stops startup. A tag is the text before the first `:` when no `/`
+precedes it, matching how `ipe-index` reads it back. A unit stored under a tag
+no root binds is never listed, counted in the queue or its progress, or read;
+should one appear after startup (the index rebuilt while the server runs), the
+queue header shows how many units it leaves out.
 
 Every stored `tag:relative` path is sealed with `Ipe.Path.fromString` and joined
 with `Ipe.Path.under`, so it must land strictly under its tag's root: an
