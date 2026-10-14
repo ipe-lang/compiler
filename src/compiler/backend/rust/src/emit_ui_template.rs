@@ -1457,7 +1457,7 @@ fn subst_expr(expr: &Expr, params: &[Symbol], args: &[Expr]) -> Expr {
                 .iter()
                 .map(|a| subst_expr(a, params, args))
                 .collect(),
-            pin: *pin,
+            pin: pin.clone(),
             on_form: *on_form,
         },
 

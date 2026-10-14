@@ -413,21 +413,45 @@ fn mod_rs_appends() -> Vec<(String, String)> {
     out
 }
 
-/// Every `.rs` file under `root`, as paths relative to it.
+/// Every `.rs` file under `root`, as paths relative to it, or a failed test.
+///
+/// The walk lists the tree whole: an unreadable directory, entry, or entry type
+/// fails the test, and a symlinked directory is refused rather than followed, so
+/// the scan never certifies a tree it could not read.
 fn rust_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| format!("{}: {error}", dir.display()))
+            .expect("the runtime tree is listed whole");
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("{}: {error}", dir.display()))
+                .expect("the runtime tree is listed whole");
             let path = entry.path();
-            if path.is_dir() {
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("{}: {error}", path.display()))
+                .expect("every runtime tree entry has a readable type");
+            if file_type.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && let Ok(rel) = path.strip_prefix(root)
-            {
+                continue;
+            }
+            if file_type.is_symlink() {
+                let target = std::fs::metadata(&path)
+                    .map_err(|error| format!("{}: {error}", path.display()))
+                    .expect("every runtime tree symlink resolves");
+                assert!(
+                    !target.is_dir(),
+                    "{}: symlinked directory under the runtime tree; the scan does not follow it",
+                    path.display()
+                );
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("a walked file lies under its root");
                 out.push(rel.to_path_buf());
             }
         }

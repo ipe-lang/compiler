@@ -33,6 +33,7 @@ var __ipeDoc = (function(doc) {
     root: prop("documentElement"),
     active: prop("activeElement"),
     visibility: prop("visibilityState"),
+    hasFocus: method(Document.prototype, "hasFocus"),
     readyState: prop("readyState"),
     byId: method(Document.prototype, "getElementById"),
     create: method(Document.prototype, "createElement"),
@@ -1298,7 +1299,7 @@ function __ipeOnPostSuccess() {
   // reopen the stream too — otherwise subscriptions and Cmd.perform
   // results would silently not arrive even though clicks work. Cancel
   // any pending reopen-with-backoff and bring it forward.
-  if (__ipeSSE === null) {
+  if (__ipeSSE === null && __ipeLiveOwnsStream()) {
     if (__ipeSseReopenTimer !== null) {
       clearTimeout(__ipeSseReopenTimer);
       __ipeSseReopenTimer = null;
@@ -2038,13 +2039,15 @@ function __ipeShowSwapToast() {
 // §SSE wedge detection.
 var __ipeSSE = null;
 var __ipeOpenAt = 0;          // ms timestamp of last EventSource.open
+var __ipeOpenStartedAt = 0;   // ms timestamp of the last __ipeOpenSSE
 var __ipeLastSseAt = 0;       // ms timestamp of any SSE event
 var __ipeHelloOk = false;     // server sent its handshake this connection
 var __ipeWatchdogTimer = null;
 var __ipeSseReopenTimer = null;
 var __ipeForcedClose = false; // true while we're tearing down to reopen
 // data-ipe-live on <html> is the app's deterministic readiness signal: "1"
-// exactly while the SSE handshake is live, "0" otherwise. The server binds
+// exactly while the session's SSE handshake is live (this tab's own stream, or
+// the leader tab's it follows), "0" otherwise. The server binds
 // this session's outbound Ipe.Ffi.Js port sink to the SSE connection (an
 // unbound sink drops frames fire-and-forget), so a Cmd that rides the port —
 // Geo.current, Clipboard.read — only round-trips once the handshake has
@@ -2055,7 +2058,11 @@ function __ipeSetLive(on) {
 }
 __ipeSetLive(false);
 function __ipeOpenSSE() {
+  // Only the tab that holds the session's stream opens one (see "One live
+  // stream per session" below).
+  if (!__ipeLiveOwnsStream()) return;
   __ipeSetLive(false);
+  __ipeOpenStartedAt = Date.now();
   __ipeForcedClose = false;
   __ipeHelloOk = false;
   __ipeOpenAt = 0;
@@ -2066,169 +2073,11 @@ function __ipeOpenSSE() {
   // reopening the SSE — sends the restored page's path, not the previous one.
   var ssePath = __ipeBase + "/_ipe/sse?path=" + encodeURIComponent(location.pathname);
   __ipeSSE = new EventSource(ssePath);
-  __ipeSSE.addEventListener("hello", function(e) {
-    // Handshake received — we know we hit a real Ipe.Web v2 server,
-    // not a proxy that intercepted with a generic 200. Anything
-    // before hello is suspect, so the connected-state flip happens
-    // HERE, not on EventSource.open. Remember that THIS page's
-    // server speaks v2 so future watchdog cycles can tighten the
-    // wedge-detection threshold to the fast 8s hello timeout.
-    __ipeServerSpeaksV2 = true;
-    __ipeHelloOk = true;
-    __ipeSetLive(true);
-    __ipeLastSseAt = Date.now();
-    if (__ipeStatusGraceTimer !== null) {
-      clearTimeout(__ipeStatusGraceTimer);
-      __ipeStatusGraceTimer = null;
-    }
-    // Dev blue-green: a `hello` after a prior one is a rebuild cutover. Greet it
-    // with the positive toast rather than leaving the amber banner up. Guarded
-    // on __ipeSwapToast, so a production reconnect keeps the ordinary chrome.
-    if (__ipeSwapToast && __ipeHelloEverOk) __ipeShowSwapToast();
-    __ipeHelloEverOk = true;
-    if (__ipeStatus !== "connected") {
-      __ipeSetStatus("connected", "");
-    }
-    __ipeRetryAttempts = 0;
-    __ipeReconnectSince = 0;
-    if (__ipeRetryTimer !== null) {
-      clearTimeout(__ipeRetryTimer);
-      __ipeRetryTimer = null;
-    }
-    if (__ipeEventQueue.length > 0) __ipeDrainQueue();
-  });
-  __ipeSSE.addEventListener("heartbeat", function(e) {
-    __ipeLastSseAt = Date.now();
-  });
-  __ipeSSE.addEventListener("patch", function(e) {
-    __ipeLastSseAt = Date.now();
-    // Old servers (pre-handshake) only ever send "patch" events.
-    // A real patch is itself proof we're talking to a Ipe.Web server,
-    // not a proxy-rewritten 200-OK, so treat first-patch-without-hello
-    // as an implicit handshake. This keeps a new client from trapping
-    // itself when a rolling deploy puts it in front of an old server.
-    if (!__ipeHelloOk) {
-      __ipeHelloOk = true;
-      __ipeSetLive(true);
-      if (__ipeStatusGraceTimer !== null) {
-        clearTimeout(__ipeStatusGraceTimer);
-        __ipeStatusGraceTimer = null;
-      }
-      if (__ipeStatus !== "connected") {
-        __ipeSetStatus("connected", "");
-      }
-      __ipeRetryAttempts = 0;
-      __ipeReconnectSince = 0;
-      if (__ipeRetryTimer !== null) {
-        clearTimeout(__ipeRetryTimer);
-        __ipeRetryTimer = null;
-      }
-    }
-    var frame;
-    try { frame = JSON.parse(e.data); } catch (_) {
-      // Legacy frame (pre-v0.9.3 server) — raw HTML, no seq to gate on.
-      // Open-<select> defence: an SSE-pushed full-body re-render during an
-      // open dropdown would collapse it, so the body is held until the
-      // select closes. Active user paths (ipe-nav, popstate, POST text
-      // fallback) are NOT defended — those are user-initiated and holding
-      // them would be worse UX than the dropdown collapsing.
-      var raw = e.data.replace(/\\n/g, "\n");
-      if (__ipeSelectOpen()) {
-        __ipeHoldRender(function() { __ipePatch(raw); });
-        return;
-      }
-      __ipeHeldRender = null;
-      return __ipePatch(raw);
-    }
-    if (frame && typeof frame === "object") {
-      __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
-        if (!frame.body) return;
-        var body = frame.body.replace(/\\n/g, "\n");
-        var apply = function() {
-          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
-        };
-        if (__ipeSelectOpen()) __ipeHoldRender(apply);
-        else {
-          // This render supersedes any held one and any patches it missed.
-          __ipeHeldRender = null;
-          apply();
-        }
-      }, frame.globalSeq);
-    }
-  });
-  // Cycle 3 P50b / Gap C11 — structural-patches SSE event.
-  //
-  // The producer (Cycle 3 P50a) now ships event:patches for any
-  // render whose diff against the previous tree fits in a small
-  // patch list (the typical 1-3 attribute/text node change at
-  // ~200-1000 B, vs the ~14 KB full body). The legacy event:patch
-  // handler above stays for first-renders, reconnect-resync,
-  // full-replace fallbacks, and any pre-P50a server.
-  //
-  // Shape parity with the HTTP /_ipe/event reply: frame is
-  // {seq, ackInputs, patches} — identical to writeEventJSON's
-  // envelope, so __ipeApplyPatches consumes both routes without
-  // divergence. seq-gating via __ipeHandleResponse means out-of-
-  // order frames (a stale patches frame arriving after a fresher
-  // patch frame, e.g. across a brief network blip) are dropped at
-  // the same monotonic guard the HTTP path uses.
-  //
-  // A frame that applies goes through __ipeApplyPatches, whose per-patch
-  // focus-restore + open-select skip is the canonical defence. A frame that
-  // cannot apply while a <select> is open marks the held render stale rather
-  // than resyncing, since the resync's first frame would only be held again.
-  // Focus / input-authority / dirty-input filtering all flow through
-  // the same code path as the HTTP-side patches application, so
-  // in-flight typing is preserved without server-side clientState
-  // alignment (the SSE producer passes nil clientState to diffTrees;
-  // the client's __ipeIsDirty filter takes over).
-  __ipeSSE.addEventListener("patches", function(e) {
-    __ipeLastSseAt = Date.now();
-    // Same implicit-handshake defence as the legacy patch listener:
-    // a real patches frame proves we're talking to a Ipe.Web server,
-    // so unstick the hello check even if the dedicated 'hello' event
-    // got eaten by a misbehaving proxy.
-    if (!__ipeHelloOk) {
-      __ipeHelloOk = true;
-      __ipeSetLive(true);
-      if (__ipeStatusGraceTimer !== null) {
-        clearTimeout(__ipeStatusGraceTimer);
-        __ipeStatusGraceTimer = null;
-      }
-      if (__ipeStatus !== "connected") {
-        __ipeSetStatus("connected", "");
-      }
-      __ipeRetryAttempts = 0;
-      __ipeReconnectSince = 0;
-      if (__ipeRetryTimer !== null) {
-        clearTimeout(__ipeRetryTimer);
-        __ipeRetryTimer = null;
-      }
-    }
-    var frame;
-    try { frame = JSON.parse(e.data); }
-    catch (_) {
-      // Producer guarantees JSON for event:patches; a non-JSON
-      // payload is impossible from a P50a+ server. Drop silently
-      // rather than running __ipePatch on garbage.
-      return;
-    }
-    if (!frame || typeof frame !== "object" || !frame.patches) return;
-    // The patches diff the render `from` against `to`: they apply only onto
-    // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
-    // first frame is the full current render.
-    if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
-      if (__ipeSelectOpen()) __ipeMarkHeldStale();
-      else {
-        __ipeHeldRender = null;
-        __ipeResyncRender();
-      }
-      return;
-    }
-    __ipeHandleResponse(frame.seq, frame.ackInputs, function() {
-      __ipeApplyPatches(frame.patches);
-      if (typeof frame.to === "string") __ipeEpoch = frame.to;
-    }, frame.globalSeq);
+  __ipeLiveRelayed.forEach(function(type) {
+    __ipeSSE.addEventListener(type, function(e) {
+      __ipeLiveRelay(type, e.data);
+      __ipeLiveFrames[type](e.data, false);
+    });
   });
   // Ipe.Ffi.Js outbound port frame: the server's js_send delivers the seal
   // wire string (a JSON string) for THIS session over its own SSE
@@ -2241,15 +2090,6 @@ function __ipeOpenSSE() {
     if (typeof window.ipeOnReceive === "function") {
       window.ipeOnReceive(e.data);
     }
-  });
-  // Dev-watch blue-green cutover cue. The watch server sends this right after
-  // `hello` on every open when running behind the proxy. It is redundant with
-  // the hello-based reconnect detection above (kept as an explicit, named
-  // signal), so it is likewise gated on a PRIOR hello — the first-load frame
-  // draws nothing. Never emitted by a release / `ipe dev run` server.
-  __ipeSSE.addEventListener("swapped", function() {
-    __ipeLastSseAt = Date.now();
-    if (__ipeSwapToast && __ipeHelloEverOk) __ipeShowSwapToast();
   });
   __ipeSSE.addEventListener("open", function() {
     // EventSource fired open — but we don't trust this alone, since a
@@ -2294,13 +2134,192 @@ function __ipeOpenSSE() {
       __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
     }, 500);
   });
+}
+// The handlers of the stream frames a leader relays, keyed by event type. Each
+// takes the frame text and whether it came relayed from the leader tab: a
+// relayed frame never retires this tab's input acks, which belong to the
+// tab whose typing the server acked.
+var __ipeLiveFrames = {
+  hello: function(text, relayed) {
+    // Handshake received — we know we hit a real Ipe.Web v2 server,
+    // not a proxy that intercepted with a generic 200. Anything
+    // before hello is suspect, so the connected-state flip happens
+    // HERE, not on EventSource.open. Remember that THIS page's
+    // server speaks v2 so future watchdog cycles can tighten the
+    // wedge-detection threshold to the fast 8s hello timeout.
+    __ipeServerSpeaksV2 = true;
+    __ipeHelloOk = true;
+    __ipeSetLive(true);
+    __ipeLastSseAt = Date.now();
+    if (__ipeStatusGraceTimer !== null) {
+      clearTimeout(__ipeStatusGraceTimer);
+      __ipeStatusGraceTimer = null;
+    }
+    // Dev blue-green: a `hello` after a prior one is a rebuild cutover. Greet it
+    // with the positive toast rather than leaving the amber banner up. Guarded
+    // on __ipeSwapToast, so a production reconnect keeps the ordinary chrome.
+    if (__ipeSwapToast && __ipeHelloEverOk) __ipeShowSwapToast();
+    __ipeHelloEverOk = true;
+    if (__ipeStatus !== "connected") {
+      __ipeSetStatus("connected", "");
+    }
+    __ipeRetryAttempts = 0;
+    __ipeReconnectSince = 0;
+    if (__ipeRetryTimer !== null) {
+      clearTimeout(__ipeRetryTimer);
+      __ipeRetryTimer = null;
+    }
+    if (__ipeEventQueue.length > 0) __ipeDrainQueue();
+  },
+  heartbeat: function(text, relayed) {
+    __ipeLastSseAt = Date.now();
+  },
+  patch: function(text, relayed) {
+    __ipeLastSseAt = Date.now();
+    // Old servers (pre-handshake) only ever send "patch" events.
+    // A real patch is itself proof we're talking to a Ipe.Web server,
+    // not a proxy-rewritten 200-OK, so treat first-patch-without-hello
+    // as an implicit handshake. This keeps a new client from trapping
+    // itself when a rolling deploy puts it in front of an old server.
+    if (!__ipeHelloOk) {
+      __ipeHelloOk = true;
+      __ipeSetLive(true);
+      if (__ipeStatusGraceTimer !== null) {
+        clearTimeout(__ipeStatusGraceTimer);
+        __ipeStatusGraceTimer = null;
+      }
+      if (__ipeStatus !== "connected") {
+        __ipeSetStatus("connected", "");
+      }
+      __ipeRetryAttempts = 0;
+      __ipeReconnectSince = 0;
+      if (__ipeRetryTimer !== null) {
+        clearTimeout(__ipeRetryTimer);
+        __ipeRetryTimer = null;
+      }
+    }
+    var frame;
+    try { frame = JSON.parse(text); } catch (_) {
+      // Legacy frame (pre-v0.9.3 server) — raw HTML, no seq to gate on.
+      // Open-<select> defence: an SSE-pushed full-body re-render during an
+      // open dropdown would collapse it, so the body is held until the
+      // select closes. Active user paths (ipe-nav, popstate, POST text
+      // fallback) are NOT defended — those are user-initiated and holding
+      // them would be worse UX than the dropdown collapsing.
+      var raw = text.replace(/\\n/g, "\n");
+      if (__ipeSelectOpen()) {
+        __ipeHoldRender(function() { __ipePatch(raw); });
+        return;
+      }
+      __ipeHeldRender = null;
+      return __ipePatch(raw);
+    }
+    if (frame && typeof frame === "object") {
+      __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
+        if (!frame.body) return;
+        var body = frame.body.replace(/\\n/g, "\n");
+        var apply = function() {
+          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
+        };
+        if (__ipeSelectOpen()) __ipeHoldRender(apply);
+        else {
+          // This render supersedes any held one and any patches it missed.
+          __ipeHeldRender = null;
+          apply();
+        }
+      }, frame.globalSeq);
+    }
+  },
+  // Cycle 3 P50b / Gap C11 — structural-patches SSE event.
+  //
+  // The producer (Cycle 3 P50a) now ships event:patches for any
+  // render whose diff against the previous tree fits in a small
+  // patch list (the typical 1-3 attribute/text node change at
+  // ~200-1000 B, vs the ~14 KB full body). The legacy event:patch
+  // handler above stays for first-renders, reconnect-resync,
+  // full-replace fallbacks, and any pre-P50a server.
+  //
+  // Shape parity with the HTTP /_ipe/event reply: frame is
+  // {seq, ackInputs, patches} — identical to writeEventJSON's
+  // envelope, so __ipeApplyPatches consumes both routes without
+  // divergence. seq-gating via __ipeHandleResponse means out-of-
+  // order frames (a stale patches frame arriving after a fresher
+  // patch frame, e.g. across a brief network blip) are dropped at
+  // the same monotonic guard the HTTP path uses.
+  //
+  // A frame that applies goes through __ipeApplyPatches, whose per-patch
+  // focus-restore + open-select skip is the canonical defence. A frame that
+  // cannot apply while a <select> is open marks the held render stale rather
+  // than resyncing, since the resync's first frame would only be held again.
+  // Focus / input-authority / dirty-input filtering all flow through
+  // the same code path as the HTTP-side patches application, so
+  // in-flight typing is preserved without server-side clientState
+  // alignment (the SSE producer passes nil clientState to diffTrees;
+  // the client's __ipeIsDirty filter takes over).
+  patches: function(text, relayed) {
+    __ipeLastSseAt = Date.now();
+    // Same implicit-handshake defence as the legacy patch listener:
+    // a real patches frame proves we're talking to a Ipe.Web server,
+    // so unstick the hello check even if the dedicated 'hello' event
+    // got eaten by a misbehaving proxy.
+    if (!__ipeHelloOk) {
+      __ipeHelloOk = true;
+      __ipeSetLive(true);
+      if (__ipeStatusGraceTimer !== null) {
+        clearTimeout(__ipeStatusGraceTimer);
+        __ipeStatusGraceTimer = null;
+      }
+      if (__ipeStatus !== "connected") {
+        __ipeSetStatus("connected", "");
+      }
+      __ipeRetryAttempts = 0;
+      __ipeReconnectSince = 0;
+      if (__ipeRetryTimer !== null) {
+        clearTimeout(__ipeRetryTimer);
+        __ipeRetryTimer = null;
+      }
+    }
+    var frame;
+    try { frame = JSON.parse(text); }
+    catch (_) {
+      // Producer guarantees JSON for event:patches; a non-JSON
+      // payload is impossible from a P50a+ server. Drop silently
+      // rather than running __ipePatch on garbage.
+      return;
+    }
+    if (!frame || typeof frame !== "object" || !frame.patches) return;
+    // The patches diff the render `from` against `to`: they apply only onto
+    // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
+    // first frame is the full current render.
+    if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
+      if (__ipeSelectOpen()) __ipeMarkHeldStale();
+      else {
+        __ipeHeldRender = null;
+        __ipeResyncRender();
+      }
+      return;
+    }
+    __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
+      __ipeApplyPatches(frame.patches);
+      if (typeof frame.to === "string") __ipeEpoch = frame.to;
+    }, frame.globalSeq);
+  },
+  // Dev-watch blue-green cutover cue. The watch server sends this right after
+  // `hello` on every open when running behind the proxy. It is redundant with
+  // the hello-based reconnect detection above (kept as an explicit, named
+  // signal), so it is likewise gated on a PRIOR hello — the first-load frame
+  // draws nothing. Never emitted by a release / `ipe dev run` server.
+  swapped: function(text, relayed) {
+    __ipeLastSseAt = Date.now();
+    if (__ipeSwapToast && __ipeHelloEverOk) __ipeShowSwapToast();
+  },
   // Dev-only build-status event: server pushes this when `ipe dev watch`
   // reports a compile or cargo failure, and when a subsequent build
   // succeeds. Only reachable when `ipe dev watch` is running; never
   // triggered in production (the POST endpoint is not mounted there).
-  __ipeSSE.addEventListener("ipe-build-status", function(e) {
+  "ipe-build-status": function(text, relayed) {
     var data;
-    try { data = JSON.parse(e.data); } catch(_) { return; }
+    try { data = JSON.parse(text); } catch(_) { return; }
     if (!data) return;
     if (data.phase === "recompiling") {
       // A rebuild is in flight — a multi-second silent window otherwise. Show a
@@ -2315,8 +2334,8 @@ function __ipeOpenSSE() {
       // reloads before this event lands.
       __ipeShowBuildOk();
     }
-  });
-}
+  }
+};
 
 // __ipeForceReopenSSE — close the current EventSource and queue a
 // fresh open with backoff. Each call bumps the retry counter; once
@@ -2330,7 +2349,17 @@ function __ipeOpenSSE() {
 // __ipeResyncRender — the DOM on screen is not the render a patches frame was
 // diffed from. Reopen the stream at once: its first frame is the full current
 // render with its epoch.
+// A tab that follows another's stream asks the leader to reopen instead.
 function __ipeResyncRender() {
+  if (!__ipeLiveOwnsStream()) {
+    __ipeLiveAskResync();
+    return;
+  }
+  __ipeCloseSSE();
+  __ipeOpenSSE();
+}
+// Close this tab's own stream, if any, and cancel a queued reopen.
+function __ipeCloseSSE() {
   __ipeForcedClose = true;
   try { if (__ipeSSE) __ipeSSE.close(); } catch (_) {}
   __ipeSSE = null;
@@ -2338,9 +2367,9 @@ function __ipeResyncRender() {
     clearTimeout(__ipeSseReopenTimer);
     __ipeSseReopenTimer = null;
   }
-  __ipeOpenSSE();
 }
 function __ipeForceReopenSSE() {
+  if (!__ipeLiveOwnsStream()) return;
   __ipeForcedClose = true;
   __ipeSetLive(false);
   try { if (__ipeSSE) __ipeSSE.close(); } catch (_) {}
@@ -2449,6 +2478,13 @@ function __ipeProbeSessionLost() {
 var __ipeServerSpeaksV2 = false;
 function __ipeWatchdog() {
   __ipeReleaseHeldRender(false);
+  // A follower watches the leader instead of a stream of its own.
+  if (__ipeLiveRole === "follower") {
+    __ipeLiveMaybeSteal();
+    return;
+  }
+  if (!__ipeLiveOwnsStream()) return;
+  __ipeLiveBeat();
   // If we have no live EventSource AND no reopen scheduled, the
   // 'error' handler must have missed (rare race) or some path tore
   // it down without re-arming. Drive the reopen here so the page
@@ -2491,10 +2527,290 @@ function __ipeWatchdog() {
   }
 }
 
+// ── One live stream per session ──────────────────────────────
+// A browser keeps at most 6 HTTP/1.1 connections per host, and an open
+// EventSource holds one for as long as the page lives. With one stream per
+// tab, the 7th tab of an origin waits forever for a connection to fetch its
+// page. So the tabs of one session share ONE stream: a Web Lock named after
+// the session elects the tab that opens it (the leader), and the leader
+// relays each frame over a BroadcastChannel of the same name to the other
+// tabs (the followers), whatever the tab count.
+//   - A closed or discarded tab drops its lock with it; the next tab in the
+//     lock's queue is granted it and opens the stream.
+//   - A visible follower takes the lock from a leader that has been hidden
+//     for __ipeHelloTimeoutMs, or that has gone quiet: a background tab may
+//     be throttled or frozen, and must not starve the tab on screen.
+//   - A focused follower takes the lock from a leader without focus. The
+//     stream's `?path=` sets the session's route and its `port` frames run in
+//     the tab that holds it, so the tab the user works in holds it. Focus is
+//     one tab's at a time, so two tabs never take it from each other in turn.
+//   - `port` frames stay with the leader: exactly one tab runs each outbound
+//     port Cmd.
+//   - A follower applies a body-changing frame only when the leader shows the
+//     same path, so a tab never takes another route's render.
+// A browser without Web Locks or BroadcastChannel (an insecure context) keeps
+// one stream per tab ("solo").
+var __ipeLiveRelayed = ["hello", "heartbeat", "patch", "patches", "swapped", "ipe-build-status"];
+var __ipeLiveStatuses = ["connected", "reconnecting", "offline"];
+var __ipeLiveName = typeof __ipeSid === "string" && __ipeSid !== ""
+    ? "ipe-live:" + __ipeBase + ":" + __ipeSid
+    : null;
+var __ipeLiveLocks = (function() {
+  try {
+    var locks = navigator.locks;
+    return locks && typeof locks.request === "function" ? locks : null;
+  } catch (_) { return null; }
+})();
+// "stopped" (before boot, and while the page is hidden in the back-forward
+// cache), "solo", "leader" or "follower".
+var __ipeLiveRole = "stopped";
+// Bumped on every role change: a lock callback or rejection of an older
+// request is ignored.
+var __ipeLiveGen = 0;
+var __ipeLiveQueued = null;      // AbortController of the queued lock request
+var __ipeLiveRelease = null;     // releases the held lock
+var __ipeLiveChan = null;
+var __ipeLeaderAt = 0;           // ms of the last message from the leader
+var __ipeLeaderHiddenSince = 0;  // ms the leader first reported hidden; 0 while visible
+var __ipeLeaderUnfocused = false; // the leader's last beat reported no focus
+var __ipeResyncAskedAt = 0;      // follower: ms of the last resync request
+var __ipeResyncPending = false;  // leader: a resync reopen whose full render has not landed
+// Whether this document has focus; a browser without the member never claims it.
+function __ipeHasFocus() {
+  try { return __ipeDoc.hasFocus() === true; } catch (_) { return false; }
+}
+function __ipeLiveOwnsStream() {
+  return __ipeLiveRole === "leader" || __ipeLiveRole === "solo";
+}
+function __ipeLivePost(msg) {
+  if (__ipeLiveChan === null) return;
+  try { __ipeLiveChan.postMessage(msg); } catch (_) {}
+}
+// Leader: hand a frame of its own stream to the followers.
+function __ipeLiveRelay(type, text) {
+  if (type === "patch") __ipeResyncPending = false;
+  if (__ipeLiveRole !== "leader") return;
+  __ipeLivePost({ t: "ev", type: type, data: text, path: location.pathname });
+}
+// Leader: tell the followers whether the stream is live and the tab visible.
+function __ipeLiveBeat() {
+  if (__ipeLiveRole !== "leader") return;
+  __ipeLivePost({
+    t: "beat",
+    live: __ipeHelloOk,
+    visible: __ipeDoc.visibility() !== "hidden",
+    focused: __ipeHasFocus(),
+    status: __ipeStatus
+  });
+}
+function __ipeLiveAskResync() {
+  var now = Date.now();
+  if (now - __ipeResyncAskedAt < __ipeHelloTimeoutMs) return;
+  __ipeResyncAskedAt = now;
+  __ipeLivePost({ t: "resync" });
+}
+// Follower: take the leader's liveness and connection state as its own.
+function __ipeLiveMirror(live, status) {
+  if (live && !__ipeHelloOk) {
+    __ipeHelloOk = true;
+    __ipeHelloEverOk = true;
+    __ipeSetLive(true);
+    if (__ipeEventQueue.length > 0) __ipeDrainQueue();
+  } else if (!live && __ipeHelloOk) {
+    __ipeHelloOk = false;
+    __ipeSetLive(false);
+  }
+  if (status === __ipeStatus) return;
+  if (__ipeLiveStatuses.indexOf(status) < 0 || __ipeLiveStatuses.indexOf(__ipeStatus) < 0) return;
+  if (status === "connected") __ipeSetStatus("connected", "");
+  else if (status === "reconnecting") __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
+  else __ipeSetStatus("offline", __ipeMsgOffline);
+}
+// Every message is checked for its shape: any script of the origin can post
+// on the channel.
+function __ipeLiveOnMessage(ev) {
+  var m = ev ? ev.data : null;
+  if (!m || typeof m !== "object" || typeof m.t !== "string") return;
+  if (m.t === "ask") {
+    __ipeLiveBeat();
+    return;
+  }
+  if (m.t === "resync") {
+    // A stream that is not live yet sends the full render when it opens, and
+    // one reopen answers every request until its full render lands.
+    if (__ipeLiveRole !== "leader" || !__ipeHelloOk) return;
+    if (__ipeResyncPending && Date.now() - __ipeOpenStartedAt < __ipeHelloTimeoutMs) return;
+    __ipeResyncPending = true;
+    __ipeResyncRender();
+    return;
+  }
+  if (__ipeLiveRole !== "follower") return;
+  if (m.t === "ev") {
+    if (typeof m.type !== "string" || __ipeLiveRelayed.indexOf(m.type) < 0) return;
+    if (typeof m.data !== "string" || typeof m.path !== "string") return;
+    __ipeLeaderAt = Date.now();
+    if ((m.type === "patch" || m.type === "patches") && m.path !== location.pathname) return;
+    __ipeLiveFrames[m.type](m.data, true);
+    return;
+  }
+  if (m.t === "beat") {
+    if (typeof m.live !== "boolean" || typeof m.visible !== "boolean") return;
+    if (typeof m.focused !== "boolean" || typeof m.status !== "string") return;
+    var now = Date.now();
+    __ipeLeaderAt = now;
+    __ipeLeaderUnfocused = !m.focused;
+    if (m.visible) __ipeLeaderHiddenSince = 0;
+    else if (__ipeLeaderHiddenSince === 0) __ipeLeaderHiddenSince = now;
+    __ipeLiveMirror(m.live, m.status);
+    __ipeLiveMaybeSteal();
+  }
+}
+// Queue for the session's lock, or take it from its holder (`steal`).
+function __ipeLiveRequest(steal) {
+  var gen = __ipeLiveGen;
+  var opts;
+  if (steal) {
+    opts = { steal: true };
+  } else {
+    __ipeLiveQueued = new AbortController();
+    opts = { signal: __ipeLiveQueued.signal };
+  }
+  var held;
+  try {
+    held = __ipeLiveLocks.request(__ipeLiveName, opts, function() {
+      // An outdated request releases the lock at once.
+      if (gen !== __ipeLiveGen) return undefined;
+      return new Promise(function(release) {
+        __ipeLiveRelease = release;
+        __ipeLiveLead();
+      });
+    });
+  } catch (_) {
+    __ipeLiveSolo();
+    return;
+  }
+  held.then(function() {}, function() {
+    if (gen !== __ipeLiveGen) return;
+    // The held lock was taken: hand the stream over and queue again.
+    if (__ipeLiveRole === "leader") __ipeLiveFollow();
+    // A request refused for any other reason leaves no election.
+    else if (__ipeLiveRole === "follower") __ipeLiveSolo();
+  });
+}
+function __ipeLiveLead() {
+  __ipeLiveRole = "leader";
+  __ipeLiveQueued = null;
+  __ipeResyncPending = false;
+  __ipeOpenSSE();
+  __ipeLiveBeat();
+}
+function __ipeLiveFollow() {
+  __ipeLiveGen++;
+  __ipeLiveRelease = null;
+  __ipeCloseSSE();
+  __ipeLiveRole = "follower";
+  __ipeLeaderAt = Date.now();
+  __ipeLeaderHiddenSince = 0;
+  __ipeLeaderUnfocused = false;
+  __ipeLiveRequest(false);
+  __ipeLivePost({ t: "ask" });
+}
+function __ipeLiveSolo() {
+  __ipeLiveGen++;
+  __ipeLiveDropLock();
+  if (__ipeLiveChan !== null) {
+    try { __ipeLiveChan.close(); } catch (_) {}
+    __ipeLiveChan = null;
+  }
+  __ipeLiveRole = "solo";
+  if (__ipeSSE === null) __ipeOpenSSE();
+}
+function __ipeLiveDropLock() {
+  if (__ipeLiveQueued !== null) {
+    try { __ipeLiveQueued.abort(); } catch (_) {}
+    __ipeLiveQueued = null;
+  }
+  if (__ipeLiveRelease !== null) {
+    var release = __ipeLiveRelease;
+    __ipeLiveRelease = null;
+    release();
+  }
+}
+// Follower: take the lock from a leader that is hidden or silent.
+function __ipeLiveMaybeSteal() {
+  if (__ipeLiveRole !== "follower") return;
+  var now = Date.now();
+  var quiet = now - __ipeLeaderAt;
+  var take;
+  if (__ipeDoc.visibility() === "hidden") {
+    take = quiet > 3 * __ipeHeartbeatTtlMs;
+  } else {
+    take = quiet > __ipeHeartbeatTtlMs ||
+        (__ipeLeaderHiddenSince > 0 && now - __ipeLeaderHiddenSince >= __ipeHelloTimeoutMs) ||
+        (__ipeLeaderUnfocused && __ipeHasFocus());
+  }
+  if (!take) return;
+  __ipeLiveGen++;
+  if (__ipeLiveQueued !== null) {
+    try { __ipeLiveQueued.abort(); } catch (_) {}
+    __ipeLiveQueued = null;
+  }
+  __ipeLeaderAt = now;
+  __ipeLeaderHiddenSince = 0;
+  __ipeLeaderUnfocused = false;
+  __ipeLiveRequest(true);
+}
+function __ipeLiveStart() {
+  __ipeLiveGen++;
+  if (__ipeLiveName === null || __ipeLiveLocks === null ||
+      typeof BroadcastChannel !== "function" || typeof AbortController !== "function") {
+    __ipeLiveSolo();
+    return;
+  }
+  try {
+    __ipeLiveChan = new BroadcastChannel(__ipeLiveName);
+  } catch (_) {
+    __ipeLiveSolo();
+    return;
+  }
+  __ipeLiveChan.onmessage = __ipeLiveOnMessage;
+  __ipeLiveRole = "follower";
+  __ipeLeaderAt = Date.now();
+  __ipeLeaderHiddenSince = 0;
+  __ipeLeaderUnfocused = false;
+  __ipeLiveRequest(false);
+  __ipeLivePost({ t: "ask" });
+}
+// Leaving the page (unload, or the back-forward cache) closes the stream and
+// frees the lock at once, so another tab takes over; a page restored from the
+// cache joins again.
+function __ipeLiveStop() {
+  __ipeLiveGen++;
+  __ipeLiveDropLock();
+  __ipeCloseSSE();
+  __ipeSetLive(false);
+  __ipeHelloOk = false;
+  if (__ipeLiveChan !== null) {
+    try { __ipeLiveChan.close(); } catch (_) {}
+    __ipeLiveChan = null;
+  }
+  __ipeLiveRole = "stopped";
+}
+window.addEventListener("pagehide", __ipeLiveStop);
+// Focus moving between tabs: the leader reports it, a follower may take over.
+window.addEventListener("focus", function() {
+  __ipeLiveBeat();
+  __ipeLiveMaybeSteal();
+});
+window.addEventListener("blur", __ipeLiveBeat);
+window.addEventListener("pageshow", function(ev) {
+  if (ev.persisted && __ipeLiveRole === "stopped") __ipeLiveStart();
+});
+
 // Kick off the SSE connection + watchdog. Watchdog interval is short
 // enough (5s) that a wedge is detected within 5s + helloTimeout / ttl
 // of the actual fault, and long enough to not be a measurable CPU cost.
-__ipeOpenSSE();
+__ipeLiveStart();
 __ipeWatchdogTimer = setInterval(__ipeWatchdog, 5000);
 
 // On tab visibility change, re-evaluate immediately — when a tab
@@ -2502,6 +2818,7 @@ __ipeWatchdogTimer = setInterval(__ipeWatchdog, 5000);
 // TCP, but EventSource sometimes lags in detecting it. Eager check
 // avoids the user staring at a stale UI for the full watchdog cycle.
 __ipeDoc.on("visibilitychange", function() {
+  __ipeLiveBeat();
   if (__ipeDoc.visibility() === "visible") {
     __ipeWatchdog();
   }

@@ -69,6 +69,10 @@ pub enum CliError {
     /// rustc/Elm-style report (caret snippet + help + `ipe explain` pointer)
     /// rather than a debug dump.
     ///
+    /// A loose entry's own parse failure is
+    /// [`crate::loose_file::LooseFileError::EntryParse`] until it is rendered;
+    /// its `From` conversion builds this variant.
+    ///
     /// `diag` is boxed: a bare [`Diagnostic`] is the widest field of the
     /// widest variant, and every one of the ~200 functions returning
     /// `Result<_, CliError>` pays the enum's size in its `Err` slot. Boxing
@@ -156,6 +160,18 @@ pub enum CliError {
     CargoBuildTimedOut {
         /// The wall the build ran past.
         wall: remote_ingest::LocalWall,
+    },
+    /// A build directory, or the toolchain sysroot, is a path the host linker cannot open.
+    ///
+    /// Raised before any cargo child starts, so no build runs into a link
+    /// failure the directory's location alone dictates.
+    TargetDirUnlinkable {
+        /// Which directory was refused.
+        origin: crate::target_dir::UnlinkablePath,
+        /// The refused path, as display text.
+        path: TerminalSafe,
+        /// The host linker family that cannot open it.
+        linker: crate::target_dir::HostLinker,
     },
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     /// Carries the (trimmed) input and a deterministic did-you-mean list over
@@ -679,6 +695,7 @@ impl CliError {
             Self::RuntimeVersionMismatch { .. } => "runtime-version-mismatch",
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
             Self::CargoBuildTimedOut { .. } => "cargo-build-timed-out",
+            Self::TargetDirUnlinkable { .. } => "target-dir-unlinkable",
             Self::UnknownCode { .. } => "unknown-code",
             Self::DocNotFound { .. } => "doc-not-found",
             Self::StaticRefusal(_) => "static-refusal",
@@ -747,7 +764,8 @@ impl CliError {
         match self {
             Self::EmittedBuildFailed { stderr, .. } => {
                 match EmittedBuildCause::of(stderr.as_str().trim()) {
-                    EmittedBuildCause::RegistryUnreachable => User,
+                    EmittedBuildCause::RegistryUnreachable
+                    | EmittedBuildCause::HostLinkerCannotOpenInput(_) => User,
                     EmittedBuildCause::MissingRuntimeFeature(_) | EmittedBuildCause::Miscompile => {
                         Internal
                     }
@@ -798,6 +816,7 @@ impl CliError {
             | Self::RemoteIngestExceeded(_)
             | Self::LocalLimitExceeded(_)
             | Self::CargoBuildTimedOut { .. }
+            | Self::TargetDirUnlinkable { .. }
             | Self::ChildPipeHeld(_)
             | Self::ThreadRefused { .. }
             | Self::ChildPipeUnread(..)
@@ -844,6 +863,7 @@ impl CliError {
                 | Self::UpgradeNoPrebuilt { .. }
                 | Self::ToolchainMissing(_)
                 | Self::EmittedBuildFailed { .. }
+                | Self::TargetDirUnlinkable { .. }
                 | Self::HealthCritical
                 | Self::LintGateFailed
                 | Self::EjectUnsupported { .. }
@@ -1076,6 +1096,21 @@ impl std::fmt::Display for CliError {
             Self::CargoBuildTimedOut { wall } => f.write_str(&text::cli_cargo_build_timed_out(
                 &remote_ingest::IngestLimit::Time(wall.limit()),
             )),
+            Self::TargetDirUnlinkable {
+                origin,
+                path,
+                linker,
+            } => {
+                let mut detail = String::from(text::cli_target_dir_unlinkable(
+                    &origin.describe(),
+                    path,
+                    &linker.describe(),
+                ));
+                detail.push('\n');
+                detail.push_str(origin.guidance());
+                let d = Diagnostic::TargetDirUnlinkable { detail };
+                f.write_str(&render(&d, "", ""))
+            }
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
             Self::ThreadRefused { role, source } => {
                 f.write_str(&text::cli_thread_refused(role, &source.kind()))
@@ -1240,12 +1275,15 @@ pub fn fmt_runtime_install_error(
 
 /// Render [`CliError::EmittedBuildFailed`] for `Display`.
 ///
-/// Three cases, one per [`EmittedBuildCause`]:
+/// Four cases, one per [`EmittedBuildCause`]:
 ///
 /// - **Stale runtime**: `cargo`'s stderr names a missing runtime feature — lead
 ///   with a targeted line pointing at the stale runtime crate.
 /// - **Registry unreachable**: `cargo` could not reach the crate registry — a
 ///   network problem, rendered with no bug-report invitation.
+/// - **Unopenable linker input**: the host linker could not open a file it was
+///   asked to link — the build's location, rendered with no bug-report
+///   invitation.
 /// - **Miscompile**: every other `cargo` failure after a successful Ipê
 ///   compile. The front-end gate ensures only valid programs reach emit, so a
 ///   `cargo` failure here means the emitted Rust is wrong — a miscompile in Ipê,
@@ -1294,6 +1332,23 @@ pub fn fmt_emitted_build_failed(
             let d = Diagnostic::RegistryUnreachable { detail };
             f.write_str(&render(&d, "", ""))
         }
+        // The host linker could not open an input (a path its family cannot
+        // open, a toolchain file under such a path): the machine's layout, not
+        // a miscompile, so no bug-report invitation.
+        EmittedBuildCause::HostLinkerCannotOpenInput(failure) => {
+            let mut detail = String::from(text::cli_link_input_unopenable(
+                &failure.linker,
+                &failure.missing,
+            ));
+            if !failure.missing.as_str().is_ascii() {
+                detail.push('\n');
+                detail.push_str(text::cli_link_input_non_ascii());
+            }
+            detail.push('\n');
+            detail.push_str(text::cli_target_dir_guidance());
+            let d = Diagnostic::HostLinkerCannotOpenInput { detail };
+            f.write_str(&render(&d, "", ""))
+        }
         // The front-end gate lets only valid programs reach emit, so this cargo
         // failure is a bug in ipe's own emission: a humble ICE whose detail
         // embeds the full cargo stderr, so a report carries everything needed to
@@ -1323,6 +1378,8 @@ enum EmittedBuildCause {
     MissingRuntimeFeature(String),
     /// `cargo` could not reach the crate registry: DNS, offline, or a proxy.
     RegistryUnreachable,
+    /// The host linker could not open one of its input files.
+    HostLinkerCannotOpenInput(LinkFailure),
     /// Any other failure: the emitted Rust is wrong, a miscompile in ipe.
     Miscompile,
 }
@@ -1335,12 +1392,71 @@ impl EmittedBuildCause {
                 if is_registry_unreachable(stderr) {
                     Self::RegistryUnreachable
                 } else {
-                    Self::Miscompile
+                    LinkFailure::parse(stderr)
+                        .map_or(Self::Miscompile, Self::HostLinkerCannotOpenInput)
                 }
             },
             Self::MissingRuntimeFeature,
         )
     }
+}
+
+/// A link step that failed because the host linker could not open one of its inputs.
+///
+/// Read from rustc's ``error: linking with `<linker>` failed`` block: a note
+/// line `<linker>: cannot find <file>` names an input file the linker could
+/// not open. A missing library (`cannot find -lfoo`) or entry symbol is a
+/// different failure and stays unclassified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkFailure {
+    /// The linker rustc ran, as display text.
+    linker: TerminalSafe,
+    /// The input file it could not open, as display text.
+    missing: TerminalSafe,
+}
+
+impl LinkFailure {
+    /// The first unopenable-input link failure in `stderr`, if any.
+    ///
+    /// One pass: each line is read once, so the scan stays linear in the
+    /// kept stderr however many link blocks it holds. A block is its header
+    /// line and the empty or indented lines after it; the next header or
+    /// unindented line ends it.
+    fn parse(stderr: &str) -> Option<Self> {
+        let mut linker: Option<&str> = None;
+        for line in stderr.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("error: linking with `") {
+                linker = rest.split_once('`').map(|(name, _)| name);
+                continue;
+            }
+            if !(line.is_empty() || line.starts_with(char::is_whitespace)) {
+                linker = None;
+                continue;
+            }
+            if let Some(name) = linker
+                && let Some(missing) = unopenable_input(line)
+            {
+                return Some(Self {
+                    linker: TerminalSafe::sanitize(name),
+                    missing: TerminalSafe::sanitize(missing),
+                });
+            }
+        }
+        None
+    }
+}
+
+/// The input file a linker note line says could not be opened, if it says so.
+fn unopenable_input(note: &str) -> Option<&str> {
+    let (_, rest) = note.split_once(": cannot find ")?;
+    if rest.starts_with("-l") || rest.starts_with("entry symbol") {
+        return None;
+    }
+    let missing = rest
+        .strip_suffix(": No such file or directory")
+        .unwrap_or(rest)
+        .trim();
+    (!missing.is_empty()).then_some(missing)
 }
 
 /// Detect whether cargo's stderr signals a network-level registry failure
@@ -1564,5 +1680,90 @@ mod tests {
         }
         assert_eq!(internal.machine_kind(), "usage");
         assert!(!internal.renders_own_screen());
+    }
+}
+
+#[cfg(test)]
+mod link_failure {
+    use super::{EmittedBuildCause, LinkFailure};
+
+    const UNOPENABLE: &str = "error: linking with `x86_64-w64-mingw32-gcc` failed: exit code: 1
+  |
+  = note: \"x86_64-w64-mingw32-gcc\" \"-m64\" \"C:\\Users\\Jo\u{e3}o\\out\\rust\\target\\debug\\deps\\app.o\"
+  = note: C:\\msys64\\mingw64\\bin\\ld.exe: cannot find C:\\Users\\Jo\u{e3}o\\out\\rust\\target\\debug\\deps\\app.o: No such file or directory
+          collect2.exe: error: ld returned 1 exit status
+
+error: could not compile `app` (bin \"app\") due to 1 previous error";
+
+    #[test]
+    fn unopenable_input_is_classified() {
+        let failure = LinkFailure::parse(UNOPENABLE).expect("an unopenable input");
+        assert_eq!(failure.linker.as_str(), "x86_64-w64-mingw32-gcc");
+        assert_eq!(
+            failure.missing.as_str(),
+            "C:\\Users\\Jo\u{e3}o\\out\\rust\\target\\debug\\deps\\app.o"
+        );
+        assert!(!failure.missing.as_str().is_ascii());
+        assert!(matches!(
+            EmittedBuildCause::of(UNOPENABLE),
+            EmittedBuildCause::HostLinkerCannotOpenInput(_)
+        ));
+    }
+
+    #[test]
+    fn undefined_reference_stays_ice() {
+        let stderr = "error: linking with `cc` failed: exit status: 1
+  |
+  = note: /usr/bin/ld: app.o: in function `main':
+          app.rs:(.text+0x1): undefined reference to `missing_symbol'
+          collect2: error: ld returned 1 exit status";
+        assert_eq!(LinkFailure::parse(stderr), None);
+        assert!(matches!(
+            EmittedBuildCause::of(stderr),
+            EmittedBuildCause::Miscompile
+        ));
+    }
+
+    #[test]
+    fn cannot_find_dash_l_is_not_input() {
+        let stderr = "error: linking with `cc` failed: exit status: 1
+  |
+  = note: /usr/bin/ld: cannot find -lsqlite3: No such file or directory
+  = note: /usr/bin/ld: cannot find entry symbol _start; defaulting to 401000";
+        assert_eq!(LinkFailure::parse(stderr), None);
+    }
+
+    #[test]
+    fn a_cannot_find_outside_the_link_block_is_ignored() {
+        let stderr = "error: linking with `cc` failed: exit status: 1
+
+error[E0425]: cannot find value `x` in this scope
+ --> src/main.rs:1:1
+  = note: cc: cannot find /tmp/app.o";
+        assert_eq!(LinkFailure::parse(stderr), None);
+    }
+
+    /// Many indented link headers ahead of the one real block are read once
+    /// each: a rescan of every later line per header would take minutes here.
+    #[test]
+    fn the_scan_is_linear_in_the_link_headers() {
+        let mut stderr = "  error: linking with `cc` failed\n".repeat(60_000);
+        stderr.push_str(UNOPENABLE);
+        let started = std::time::Instant::now();
+        let failure = LinkFailure::parse(&stderr).expect("the real block still classifies");
+        assert_eq!(failure.linker.as_str(), "x86_64-w64-mingw32-gcc");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the scan took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn no_link_block_is_no_link_failure() {
+        assert_eq!(
+            LinkFailure::parse("ld: cannot find /tmp/app.o: No such file or directory"),
+            None
+        );
     }
 }

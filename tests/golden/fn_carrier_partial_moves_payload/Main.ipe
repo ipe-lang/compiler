@@ -1,0 +1,50 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+
+
+-- A `let`-bound partial (`k = Maybe.withDefault c.keep`) applied to a
+-- non-`Clone` parameter (`m : Maybe (Int -> Bool)`) at a function slot. The
+-- partial moves `m` into a closure `List.filter` calls once per element, so
+-- `ipe` refuses it with IPE-L0126. The accepted spelling applies the kernel
+-- fully where it is used: `Maybe.withDefault c.keep m`.
+
+
+type alias Cfg =
+    { keep : Int -> Bool
+    }
+
+
+cfg : Cfg
+cfg =
+    { keep = \n -> n > 1
+    }
+
+
+nums : List Int
+nums =
+    [ 1, 2, 3, 4 ]
+
+
+viaPartialDefault : Maybe (Int -> Bool) -> Cfg -> Int
+viaPartialDefault m c =
+    let
+        k =
+            Maybe.withDefault c.keep
+    in
+    List.length (List.filter (k m) nums)
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join " "
+            (List.map String.fromInt
+                [ viaPartialDefault (Just (\n -> n > 3)) cfg
+                , viaPartialDefault Nothing cfg
+                ]
+            )
+        )

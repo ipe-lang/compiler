@@ -84,7 +84,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | Variable | Default | Effect | Class |
 |----------|---------|--------|-------|
 | `IPE_EXHAUST_BUDGET` | 2000000 | Maximum work units the pattern-match exhaustiveness pass spends on a single `case` before giving up and emitting a budget-exceeded error. Set to `0` for no limit (escape hatch for a `case` with very many independent or-patterns). Raise when the compiler reports an exhaustiveness budget-exceeded diagnostic. | `Tunable` |
-| `IPE_SOLVER_BUDGET` | 5000000 | Maximum unification steps the type solver takes before giving up and emitting a budget-exceeded error. Set to `0` for no limit (escape hatch for programs with very large type graphs). Raise when the compiler reports a budget-exceeded diagnostic. | `Tunable` |
+| `IPE_SOLVER_BUDGET` | 5000000 | Maximum unification steps the type solver takes over the whole program before giving up and emitting a budget-exceeded error. `0` is refused with that error: the limit is always a positive step count. Each module's own solve runs under the same limit, and a program whose modules together spend more than half of it is decided by the whole-program solve. Raise when the compiler reports a budget-exceeded diagnostic. | `Tunable` |
 
 ## Compression
 
@@ -209,7 +209,7 @@ Every `IPE_*` variable the runtime, CLI, and compiler read. The table is grouped
 | `IPE_WEB_HEARTBEAT_TTL_MS` | 35000 | SSE heartbeat interval (ms) the browser uses to detect a stale connection. | `Tunable` |
 | `IPE_WEB_HELLO_TIMEOUT_MS` | 8000 | Timeout (ms) for the initial SSE hello handshake. The browser closes and retries if this deadline passes. | `Tunable` |
 | `IPE_WEB_MAX_BODY_BYTES` | 33554432 (32 MiB) | Maximum inbound request-body size (bytes) for `/_ipe/event`. Raise for large file uploads; lower to tighten the DoS floor. | `Tunable` |
-| `IPE_WEB_MAX_SESSIONS` | 50000 | Maximum concurrent web sessions before new connections are rejected. Prevents unbounded memory growth under a session-creation flood. | `Tunable` |
+| `IPE_WEB_MAX_SESSIONS` | 50000 | Maximum concurrent web sessions; a new or returning session past it answers 503. Independently, the measured state of all sessions together (model, rendered view, render history, queued browser events) is capped at 512 MiB, and of one session at 16 MiB. Read once, at process start; a value that is not a positive decimal integer (`0` included) refuses the program before its first line, naming the variable. | `Tunable` |
 | `IPE_WEB_PORT` | 8000 | TCP port an `Ipe.Web` app listens on, in `1..=65535`. Any other value (empty, non-numeric, signed, `0`, or too large) refuses startup, naming the variable. Under `ipe dev watch` the supervisor chooses the port and a valid value has no effect, but a malformed one still refuses. | `Tunable` |
 | `IPE_WEB_QUEUE_MAX` | 50 | Maximum queued events per session before back-pressure is applied. | `Tunable` |
 | `IPE_WEB_RESET_STATE` | unset (off) | Set to `1`, `true`, `yes`, or `on` to force every returning session to a fresh `init`, bypassing the additive-superset checkpoint splice. Injected by `ipe dev watch --reset-state`; never set in production. Fail-closed: an absent or unrecognised value leaves the normal additive-preserve algorithm in place. | `Tunable` |

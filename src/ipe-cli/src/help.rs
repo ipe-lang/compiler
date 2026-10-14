@@ -983,10 +983,14 @@ mod tests {
     #[test]
     fn every_help_md_file_is_embedded() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("help");
-        let entries = std::fs::read_dir(&dir);
-        assert!(entries.is_ok(), "cannot read {}", dir.display());
-        for entry in entries.into_iter().flatten().flatten() {
-            let path = entry.path();
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))
+            .expect("help/ lists");
+        for entry in entries {
+            let path = entry
+                .map_err(|e| format!("{}: {e}", dir.display()))
+                .expect("every help/ entry lists")
+                .path();
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             assert!(
                 find_entry(stem).is_some() || is_group(stem) || stem == "index" || stem == "flags",

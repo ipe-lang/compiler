@@ -2329,9 +2329,19 @@ mod tests {
         let mut found = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
         while let Some(next) = stack.pop() {
-            for entry in fs::read_dir(&next).into_iter().flatten().flatten() {
+            let entries = fs::read_dir(&next)
+                .map_err(|e| format!("{}: {e}", next.display()))
+                .expect("every directory below the tree lists");
+            for entry in entries {
+                let entry = entry
+                    .map_err(|e| format!("{}: {e}", next.display()))
+                    .expect("every entry below the tree lists");
                 let path = entry.path();
-                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let file_type = entry
+                    .file_type()
+                    .map_err(|e| format!("{}: {e}", path.display()))
+                    .expect("every entry below the tree has a type");
+                if file_type.is_dir() {
                     stack.push(path.clone());
                 }
                 found.push(path);

@@ -1,0 +1,64 @@
+module Main exposing (main)
+
+-- SEAL repro: a generic view helper whose `msg` occurs only in message slots.
+-- A use under a generic caller (`wrap`, `framed`) keeps the helper generic;
+-- a use that renders it straight to a `String` never chooses a message type,
+-- so the emitted call must name one or rustc cannot infer the helper's
+-- generic (E0283) after ipe accepted the program:
+--
+--   * `leaf "y"`          — a saturated call;
+--   * `nav`               — a nullary helper referenced as a value;
+--   * `boxed (leaf "b")`  — the helper's `msg` in a parameter slot too;
+--   * `List.map leaf`     — the helper passed as a function value;
+--   * `Widgets.badge`     — a typed helper from another module;
+--   * `Widgets.chip`      — an untyped helper from another module.
+--
+-- Output: one line per rendering.
+
+import Ipe.Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+import Widgets
+
+
+leaf : String -> Html.Html msg
+leaf s =
+    Html.text s
+
+
+nav : Html.Html msg
+nav =
+    Html.text "nav"
+
+
+boxed : Html.Html msg -> Html.Html msg
+boxed inner =
+    Html.div [] [ inner ]
+
+
+wrap : List String -> Html.Html msg
+wrap xs =
+    Html.span [] (nav :: List.map leaf xs)
+
+
+framed : Html.Html msg -> Html.Html msg
+framed inner =
+    boxed (Html.p [] [ inner, Widgets.row [ "r" ], Widgets.chip "c" ])
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join "\n"
+            [ Html.render (leaf "y")
+            , Html.render nav
+            , Html.render (boxed (leaf "b"))
+            , Html.render (Html.div [] (List.map leaf [ "m", "n" ]))
+            , Html.render (Widgets.badge "t")
+            , Html.render (Widgets.chip "u")
+            , Html.render (framed (wrap [ "w" ]))
+            ]
+        )

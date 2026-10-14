@@ -969,36 +969,26 @@ fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>)
     parts.join(", ")
 }
 
-/// The response a security-header set is assembled for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeaderProfile {
-    /// An `Ipe.Web` page: its `Content-Security-Policy` holds only
-    /// `frame-ancestors`, sent under an operator embed list, because the page
-    /// shell's inline boot script would not run under a strict policy.
-    WebPageFrameOnly,
-    /// A response under the full default policy of a [`crate::csp::Profile`].
-    Policy(crate::csp::Profile),
-}
-
 /// Safe-by-default security response headers for `profile`.
 ///
-/// Returned as owned `(name, value)` pairs so each caller splices them into
-/// its response builder only when the header is unset (an explicit handler
-/// override wins).
+/// Every set carries the full `Content-Security-Policy` of `profile`: no
+/// profile assembles a set without one. Returned as owned `(name, value)`
+/// pairs so each caller splices them into its response builder only when the
+/// header is unset (an explicit handler override wins).
 ///
 /// # Errors
 ///
 /// The [`FrameAncestorsRefusal`] of a refused `IPE_WEB_FRAME_ANCESTORS`: the
 /// caller answers `500` rather than send a response without its framing policy.
 pub fn security_headers(
-    profile: HeaderProfile,
+    profile: crate::csp::Profile,
 ) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
     security_headers_with(profile, frame_ancestors_config())
 }
 
 /// [`security_headers`] under an explicit framing configuration.
 fn security_headers_with(
-    profile: HeaderProfile,
+    profile: crate::csp::Profile,
     framing: Result<Option<&FrameAncestors>, FrameAncestorsRefusal>,
 ) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
     use crate::csp::ContentSecurityPolicy;
@@ -1017,22 +1007,17 @@ fn security_headers_with(
         // granted use, never a widened allow.
         ("permissions-policy", permissions_policy_value()),
     ];
-    let (policy, embed) = match profile {
-        HeaderProfile::WebPageFrameOnly => {
-            (framing.map(ContentSecurityPolicy::frame_only), framing)
-        }
-        HeaderProfile::Policy(p) => (
-            Some(ContentSecurityPolicy::for_profile(p, framing)),
-            p.embed_list(framing),
-        ),
-    };
-    if let Some(policy) = policy {
-        h.push(("content-security-policy", policy.header_value()));
-    }
+    h.push((
+        "content-security-policy",
+        ContentSecurityPolicy::for_profile(profile, framing).header_value(),
+    ));
     // A response framed same-origin only also carries `X-Frame-Options` for
     // browsers without `frame-ancestors`.
-    if embed.is_none() {
+    if profile.embed_list(framing).is_none() {
         h.push(("x-frame-options", "SAMEORIGIN".to_string()));
+    }
+    if let Some(cache) = profile.cache_control() {
+        h.push(("cache-control", cache.to_string()));
     }
     Ok(h)
 }
@@ -1524,28 +1509,37 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The page set carries the parsed framing policy alone, and a refused
-    /// value yields no header set at all, so no response ships without framing.
+    /// The `Ipe.Web` page set carries its full strict policy under the
+    /// same-origin default and under an embed list alike, and a refused value
+    /// yields no header set at all, so no page ships without its policy.
+    #[cfg(all(feature = "server", feature = "web-core"))]
     #[test]
-    fn security_headers_follow_the_parsed_framing_policy() {
-        let page = HeaderProfile::WebPageFrameOnly;
+    fn web_page_headers_carry_the_strict_policy() {
+        use crate::csp::{ContentSecurityPolicy, Profile};
+        let page = Profile::WebPage;
         let embed = FrameAncestors::parse("https://a.example").ok().flatten();
         let framed = security_headers_with(page, Ok(embed.as_ref()));
         assert!(
-            framed
-                .as_ref()
-                .is_ok_and(|h| header(h, "content-security-policy")
-                    == Some("frame-ancestors https://a.example")
-                    && header(h, "x-frame-options").is_none()),
+            framed.as_ref().is_ok_and(|h| {
+                header(h, "content-security-policy").is_some_and(|v| {
+                    v.starts_with("default-src 'none'; script-src 'self'")
+                        && v.ends_with("; frame-ancestors https://a.example")
+                }) && header(h, "x-frame-options").is_none()
+            }),
             "{framed:?}"
         );
         let same_origin = security_headers_with(page, Ok(None));
+        let want = ContentSecurityPolicy::for_profile(page, None).header_value();
         assert!(
-            same_origin
-                .as_ref()
-                .is_ok_and(|h| header(h, "x-frame-options") == Some("SAMEORIGIN")
-                    && header(h, "content-security-policy").is_none()),
+            same_origin.as_ref().is_ok_and(|h| {
+                header(h, "x-frame-options") == Some("SAMEORIGIN")
+                    && header(h, "content-security-policy") == Some(want.as_str())
+            }),
             "{same_origin:?}"
+        );
+        assert!(
+            !want.contains("script-src 'self' 'unsafe-inline'"),
+            "{want}"
         );
         assert_eq!(
             security_headers_with(page, Err(FrameAncestorsRefusal::Blank)),
@@ -1561,7 +1555,7 @@ mod tests {
         let embed = FrameAncestors::parse("https://a.example").ok().flatten();
         for &profile in Profile::ALL {
             for framing in [None, embed.as_ref()] {
-                let set = security_headers_with(HeaderProfile::Policy(profile), Ok(framing));
+                let set = security_headers_with(profile, Ok(framing));
                 let want = ContentSecurityPolicy::for_profile(profile, framing).header_value();
                 let xfo = profile
                     .embed_list(framing)
@@ -1584,6 +1578,30 @@ mod tests {
         }
     }
 
+    /// A page holding the session's sid and CSRF token is never stored by a
+    /// cache, under every framing; a handler response leaves caching to the
+    /// handler.
+    #[test]
+    fn session_pages_are_never_stored() {
+        use crate::csp::Profile;
+        let embed = FrameAncestors::parse("https://a.example").ok().flatten();
+        for &profile in Profile::ALL {
+            let want = match profile {
+                Profile::Response => None,
+                #[cfg(all(feature = "server", feature = "web-core"))]
+                Profile::Console | Profile::WebPage => Some("no-store"),
+            };
+            for framing in [None, embed.as_ref()] {
+                let set = security_headers_with(profile, Ok(framing));
+                assert!(
+                    set.as_ref()
+                        .is_ok_and(|h| header(h, "cache-control") == want),
+                    "{profile:?} {framing:?}: {set:?}"
+                );
+            }
+        }
+    }
+
     /// Each refused framing class refuses every policy profile's header set,
     /// so its response answers 500 rather than ship without a framing policy.
     #[test]
@@ -1595,7 +1613,7 @@ mod tests {
             if let Err(refusal) = parsed {
                 for &profile in Profile::ALL {
                     assert_eq!(
-                        security_headers_with(HeaderProfile::Policy(profile), Err(refusal)),
+                        security_headers_with(profile, Err(refusal)),
                         Err(refusal),
                         "{raw:?} {profile:?}"
                     );

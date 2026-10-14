@@ -129,6 +129,13 @@ const SITES: &[SiteRow] = &[
     ("cargo_step.rs", "build_command", "cargo", Runner::Cargo, 1),
     (
         "cargo_step.rs",
+        "probe_lock_within",
+        "build.get_program()",
+        Runner::Local("LOCK_RESOLVE_LIMITS"),
+        1,
+    ),
+    (
+        "cargo_step.rs",
         "lock_dependencies_within",
         "build.get_program()",
         Runner::Local("LOCK_FETCH_LIMITS"),
@@ -144,7 +151,7 @@ const SITES: &[SiteRow] = &[
     (
         "cargo_step.rs",
         "target_directory_within",
-        "cargo.path()",
+        "cargo",
         Runner::Local("METADATA_LIMITS"),
         1,
     ),
@@ -261,6 +268,13 @@ const SITES: &[SiteRow] = &[
         1,
     ),
     ("terminate.rs", "ps_masks", "\"/bin/ps\"", Runner::Probe, 1),
+    (
+        "toolchain.rs",
+        "RustcSysroot::active",
+        "\"rustc\"",
+        Runner::Local("RUSTC_QUERY_LIMITS"),
+        1,
+    ),
     (
         "toolchain.rs",
         "RustcVersion::active",

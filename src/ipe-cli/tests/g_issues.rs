@@ -144,3 +144,5 @@ mod golden_swapped_effect_capture_seal;
 mod golden_unannotated_value_sync_seal;
 #[path = "g_issues/golden_untyped_app_entry_row_seal.rs"]
 mod golden_untyped_app_entry_row_seal;
+#[path = "g_issues/golden_use_site_msg_pin_seal.rs"]
+mod golden_use_site_msg_pin_seal;

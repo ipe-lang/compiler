@@ -3076,6 +3076,7 @@ dependencies = [
  "ipe_lower",
  "ipe_lsp_server",
  "ipe_parse",
+ "ipe_path_core",
  "ipe_sandbox",
  "ipe_stdlib",
  "ipe_syntax",

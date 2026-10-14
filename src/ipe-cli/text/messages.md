@@ -683,6 +683,62 @@ a signal ended the transfer — stopped; nothing was recorded
 
 cargo build did not finish within {wall} — stopped with every process it started; run `cargo build -vv` in the crate to see the step that hangs
 
+## cli-target-dir-unlinkable
+
+{what} {path} cannot be opened by {linker}
+
+## cli-target-dir-from-embedder
+
+the build directory the caller chose
+
+## cli-target-dir-from-env
+
+the build directory `CARGO_TARGET_DIR` names
+
+## cli-target-dir-from-ipe-home
+
+the build directory the `[build] target-dir` key of `$IPE_HOME/config.toml` names
+
+## cli-target-dir-from-cargo-config
+
+the build directory a Cargo config `build.target-dir` names
+
+## cli-target-dir-crate-local
+
+the project's build directory
+
+## cli-target-dir-user-cache
+
+the per-user build cache the compiler would build in instead
+
+## cli-target-dir-sysroot
+
+the Rust toolchain at
+
+## cli-host-linker-ascii-only
+
+this host's linker, which opens only ASCII paths (GNU ld on a `*-windows-gnu` host)
+
+## cli-host-linker-unicode
+
+this host's linker, which opens only absolute paths
+
+## cli-target-dir-guidance
+
+Move the project to an ASCII path, or set `CARGO_TARGET_DIR` to an ASCII directory you own under your user profile (for example `%USERPROFILE%\ipe-target`) — never a folder at the root of a drive, which other accounts can write to; or install the `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnullvm` host toolchain, whose linker opens any path.
+
+## cli-sysroot-guidance
+
+Move `RUSTUP_HOME` and `CARGO_HOME` to an ASCII directory you own under your user profile and reinstall the toolchain there, or install the `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnullvm` host toolchain, whose linker opens any path.
+
+## cli-link-input-unopenable
+
+the linker `{linker}` could not open {missing}
+
+## cli-link-input-non-ascii
+
+The path holds non-ASCII characters, which a GNU linker on a `*-windows-gnu` host cannot open.
+
 ## cli-local-tree-refused
 
 {source}: holds {shape}, which ipe does not accept — stopped; nothing was recorded
@@ -881,6 +937,14 @@ ipe.lock: package `{package}` is an index dependency but records a `local` rev �
 
 package `{package}`: a path dependency's `source` must be a non-empty path of at most {max} bytes with no control characters or `"`, got: "{raw}"
 
+## lock-local-source-remote
+
+package `{package}`: path dependency "{raw}" names a network share or device ({kind}), not a local directory — name a local directory instead
+
+## lock-local-source-device
+
+package `{package}`: path dependency "{raw}" names a Windows device (`CON`, `NUL`, `COM1`, …), not a directory — name a local directory instead
+
 ## lock-non-utf8-local-path
 
 package `{package}`: path dependency `{path}` is not valid UTF-8 and cannot be recorded in ipe.lock
@@ -1064,7 +1128,15 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-unplaceable
 
-{path} does not name one absolute place on every platform (a drive-relative path, a device path such as `\\.\pipe`, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full path
+{path} does not name one absolute place on every platform: its prefix or one of its names is refused (a drive-relative path, a device or volume path such as `\\.\pipe` or `\\?\Volume{..}`, a share whose server or share name Windows would read as another, such as one with a trailing `.`, a `:` or a space in the server, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full drive or `\\server\share` path
+
+## output-unplaceable-cwd
+
+{request} is relative, but the working directory {cwd} does not name one absolute place on every platform (a device or volume path such as `\\?\Volume{..}`, or no drive for a rooted path) — run ipe from a drive or `\\server\share` path, or name the directory by its full path
+
+## output-unnameable-entry
+
+{path} has a name ipe cannot open as spelled (not valid Unicode, or a name Windows reserves), so ipe stops before acting on it — rename or remove that entry yourself
 
 ## output-not-fresh
 
@@ -2283,6 +2355,10 @@ error[IPE-P0001]: the packaged {platform} manifest declares OS permission(s) the
 ## index-source-url-invalid
 
 package `{pkg}`: `source` must be an https://, ssh://, or file:// URL (or a bare absolute path), got: {raw}
+
+## index-source-url-remote
+
+package `{pkg}`: `source` names a network share or device ({kind}), and opening it would contact another host — use the repository's https:// URL, got: {raw}
 
 ## index-source-url-plaintext
 

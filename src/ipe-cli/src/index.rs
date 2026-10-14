@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use ipe_ir::Capability;
+use ipe_path_core::{ElementClass, Namespace, Regime, Volume};
 
 use crate::CliError;
 pub use crate::cache::TreeHashError;
@@ -41,7 +42,7 @@ pub enum Transport {
     Https,
     /// `ssh://` — SSH with host-key checking.
     Ssh,
-    /// `file://` or a bare absolute path — the local filesystem.
+    /// A local directory — a `file://` URL or a bare absolute path.
     File,
 }
 
@@ -58,89 +59,421 @@ impl Transport {
             Self::File => "file",
         }
     }
+}
 
-    /// The transport `raw` names by its prefix, if it is an accepted one.
-    fn of_url(raw: &str) -> Option<Self> {
-        if raw.starts_with("https://") {
-            Some(Self::Https)
-        } else if raw.starts_with("ssh://") {
-            Some(Self::Ssh)
-        } else if raw.starts_with("file://") || raw.starts_with('/') {
-            Some(Self::File)
-        } else {
-            None
+/// Why a text names a network or device location, never a local directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePath {
+    /// `\\server\share`, `//server/share`, `/\server`, a bare `\\server`.
+    Unc,
+    /// `\\?\UNC\server\share`.
+    VerbatimUnc,
+    /// `\\.\…` (pipes, volumes, `\\.\C:`).
+    DeviceNamespace,
+    /// `\\?\<name>` whose name is not a drive (`\\?\GLOBALROOT\…`, `\\?\Volume{…}`).
+    VerbatimNonDrive,
+    /// `\??\…` / `/??/…` — the NT object-manager prefix Win32 passes through.
+    NtObjectPath,
+    /// `file://<host>/…` with a host other than empty or `localhost`.
+    FileAuthority,
+}
+
+impl RemotePath {
+    /// The kind of location, as a refusal names it.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Unc => "a UNC network share",
+            Self::VerbatimUnc => "a verbatim UNC network share",
+            Self::DeviceNamespace => "a Win32 device-namespace path",
+            Self::VerbatimNonDrive => "a verbatim path that names no drive",
+            Self::NtObjectPath => "an NT object-manager path",
+            Self::FileAuthority => "a file:// URL naming another host",
         }
     }
 }
 
-/// A validated source-repository URL accepted by the package index.
+/// The network share or device `text` names, if any — the one classifier.
 ///
-/// The accept set is the [`Transport`] set: `https://`, `ssh://`, `file://`,
-/// and bare absolute paths (a leading `/`). A `git://` URL is refused with a
-/// diagnostic naming its `https://` fix. Any value that begins with `-`
-/// (option injection) or contains `::` (git transport helpers such as `ext::`
-/// or `fd::`, the real RCE vector) is rejected at parse time so a malicious
-/// index entry can never reach the `git` subprocess. A control character or
-/// `"` is rejected too, so a URL can never break out of the quoted,
-/// line-oriented files (`ipe.lock`, index entries) it is recorded in.
+/// The text is read under the Windows volume grammar ([`Volume::parse`] under
+/// [`Regime::Windows`]) on every host: a recorded source is shared data a
+/// Windows host may read later, and on Unix a `//`-led path is only another
+/// spelling of `/`, so refusing it there costs nothing.
+#[must_use]
+pub fn remote_path(text: &str) -> Option<RemotePath> {
+    match Volume::parse(text, Regime::Windows) {
+        Volume::Unc { .. } => Some(RemotePath::Unc),
+        Volume::VerbatimUnc { .. } => Some(RemotePath::VerbatimUnc),
+        Volume::Namespaced {
+            tag: Namespace::Device,
+            ..
+        } => Some(RemotePath::DeviceNamespace),
+        Volume::Namespaced {
+            tag: Namespace::Verbatim,
+            name,
+        } => (!name.is_some_and(is_drive_name)).then_some(RemotePath::VerbatimNonDrive),
+        Volume::Drive(_) | Volume::None => {
+            names_nt_object_root(text).then_some(RemotePath::NtObjectPath)
+        }
+    }
+}
+
+/// Is `name` a drive designator (`C:`): one UTF-16 unit, then `:`?
+fn is_drive_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(drive), Some(':'), None) if drive.len_utf16() == 1
+    )
+}
+
+/// Does `text` open with the NT object-manager root (`\??\`, `/??/`, a bare `\??`)?
+fn names_nt_object_root(text: &str) -> bool {
+    let sep = |c: &u8| matches!(c, b'/' | b'\\');
+    match text.as_bytes() {
+        [lead, b'?', b'?', rest @ ..] if sep(lead) => rest.first().is_none_or(sep),
+        _ => false,
+    }
+}
+
+/// Does `text` lead with a drive, plain (`C:`) or verbatim (`\\?\C:`)?
+fn names_a_drive(text: &str) -> bool {
+    match Volume::parse(text, Regime::Windows) {
+        Volume::Drive(_) => true,
+        Volume::Namespaced {
+            tag: Namespace::Verbatim,
+            name,
+        } => name.is_some_and(is_drive_name),
+        Volume::None
+        | Volume::Unc { .. }
+        | Volume::VerbatimUnc { .. }
+        | Volume::Namespaced {
+            tag: Namespace::Device,
+            ..
+        } => false,
+    }
+}
+
+/// Why a local source was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalRefusal {
+    /// The text names a network share or a device.
+    Remote(RemotePath),
+    /// Not an absolute local path on this host: a relative path, `C:x`
+    /// (drive-relative), or `\x` / `/x` on Windows (current-drive-relative).
+    NotAnchored,
+    /// A drive form (`C:\x`, `\\?\C:\x`) under the Unix regime, where git would
+    /// read `C:` as an scp-style host.
+    ForeignDrive,
+    /// A Windows element that opens a device (`CON`, `nul.txt`, `COM1`).
+    DeviceElement,
+    /// A `\\?\X:\…` whose remainder is not lossless as a plain path.
+    LossyVerbatim,
+    /// A `%` in a `file://` URL, which git would decode into a text nobody judged.
+    PercentInFileUrl,
+}
+
+/// A local repository location, in the plain spelling git receives.
+///
+/// Built only by reading the text under the Windows volume grammar, so no
+/// inhabitant names a network share, a device namespace, an NT object path or
+/// a non-local `file://` host, under either host regime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalRepo {
+    plain: String,
+}
+
+impl LocalRepo {
+    /// Read a bare path as an absolute local location under `regime`.
+    fn parse(text: &str, regime: Regime) -> Result<Self, LocalRefusal> {
+        if let Some(kind) = remote_path(text) {
+            return Err(LocalRefusal::Remote(kind));
+        }
+        let plain = match regime {
+            Regime::Unix => {
+                if names_a_drive(text) {
+                    return Err(LocalRefusal::ForeignDrive);
+                }
+                if !text.starts_with('/') {
+                    return Err(LocalRefusal::NotAnchored);
+                }
+                text
+            }
+            Regime::Windows => Self::windows_plain(text)?,
+        };
+        Ok(Self {
+            plain: plain.to_owned(),
+        })
+    }
+
+    /// The plain spelling of an absolute Windows location: `X:\…` / `X:/…`, or
+    /// a lossless `\\?\X:\…` with its verbatim prefix dropped.
+    fn windows_plain(text: &str) -> Result<&str, LocalRefusal> {
+        let volume = Volume::parse(text, Regime::Windows);
+        match volume {
+            Volume::Drive(_) => {
+                let rooted = text
+                    .get(volume.byte_len()..)
+                    .is_some_and(|rest| rest.starts_with(['\\', '/']));
+                if !rooted {
+                    return Err(LocalRefusal::NotAnchored);
+                }
+                if ElementClass::windows_elements(text).any(|c| c == ElementClass::DosDevice) {
+                    return Err(LocalRefusal::DeviceElement);
+                }
+                Ok(text)
+            }
+            Volume::Namespaced {
+                tag: Namespace::Verbatim,
+                name: Some(drive),
+            } if is_drive_name(drive) => Self::verbatim_plain(text, drive),
+            Volume::None
+            | Volume::Unc { .. }
+            | Volume::VerbatimUnc { .. }
+            | Volume::Namespaced { .. } => Err(LocalRefusal::NotAnchored),
+        }
+    }
+
+    /// `\\?\X:\a\b` as `X:\a\b`, when every element after the drive is a plain
+    /// name that Win32 reads unchanged without the verbatim prefix.
+    fn verbatim_plain<'a>(text: &'a str, drive: &str) -> Result<&'a str, LocalRefusal> {
+        let plain = text
+            .strip_prefix(r"\\?\")
+            .ok_or(LocalRefusal::LossyVerbatim)?;
+        let tail = plain
+            .strip_prefix(drive)
+            .and_then(|after| after.strip_prefix('\\'))
+            .ok_or(LocalRefusal::LossyVerbatim)?;
+        let lossless = !tail.contains('/')
+            && (tail.is_empty()
+                || tail
+                    .split('\\')
+                    .all(|e| ElementClass::of(e.as_bytes()) == ElementClass::Name));
+        if lossless {
+            Ok(plain)
+        } else {
+            Err(LocalRefusal::LossyVerbatim)
+        }
+    }
+
+    /// Read the text after `file://` as a local location under `regime`.
+    fn from_file_url(after_scheme: &str, regime: Regime) -> Result<Self, LocalRefusal> {
+        let path = file_url_path(after_scheme)?;
+        let path = match path.strip_prefix('/') {
+            Some(drive_path) if regime.is_windows() && names_a_drive(drive_path) => drive_path,
+            Some(_) | None => path,
+        };
+        Self::parse(path, regime)
+    }
+
+    /// The location as a filesystem path.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.plain)
+    }
+}
+
+/// The path of a `file://` URL (the text after the scheme), refusing a
+/// non-local host, a `%`, or a path naming a network share or device.
+fn file_url_path(after_scheme: &str) -> Result<&str, LocalRefusal> {
+    let (authority, path) = after_scheme
+        .find('/')
+        .map_or((after_scheme, ""), |at| after_scheme.split_at(at));
+    if !(authority.is_empty() || authority.eq_ignore_ascii_case("localhost")) {
+        return Err(LocalRefusal::Remote(RemotePath::FileAuthority));
+    }
+    if after_scheme.contains('%') {
+        return Err(LocalRefusal::PercentInFileUrl);
+    }
+    remote_path(path).map_or(Ok(path), |kind| Err(LocalRefusal::Remote(kind)))
+}
+
+/// Where a source repository lives, by transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// `https://` — TLS-authenticated HTTP.
+    Https,
+    /// `ssh://` — SSH with host-key checking.
+    Ssh,
+    /// A local directory, from a bare absolute path or a `file://` URL.
+    Local(LocalRepo),
+}
+
+/// Why a raw `source` value was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRefusal {
+    /// The plaintext, unauthenticated `git://` transport.
+    Plaintext,
+    /// An injection-shaped value: a leading `-`, a `::`, a control character or `"`.
+    Invalid,
+    /// A network share or a device.
+    Remote(RemotePath),
+    /// A local location this host cannot admit.
+    Local(LocalRefusal),
+}
+
+impl From<LocalRefusal> for SourceRefusal {
+    fn from(refusal: LocalRefusal) -> Self {
+        match refusal {
+            LocalRefusal::Remote(kind) => Self::Remote(kind),
+            LocalRefusal::NotAnchored
+            | LocalRefusal::ForeignDrive
+            | LocalRefusal::DeviceElement
+            | LocalRefusal::LossyVerbatim
+            | LocalRefusal::PercentInFileUrl => Self::Local(refusal),
+        }
+    }
+}
+
+impl SourceRefusal {
+    /// The refusal as the CLI reports it for package `pkg`'s `raw` source.
+    #[must_use]
+    pub fn into_cli(self, pkg: &PackageName, raw: &str) -> CliError {
+        let shown = crate::style::TerminalSafe::sanitize(&format!("{raw:?}"));
+        CliError::Resolve(match self {
+            Self::Plaintext => crate::text::msg::index_source_url_plaintext(pkg, &shown),
+            Self::Remote(kind) | Self::Local(LocalRefusal::Remote(kind)) => {
+                crate::text::msg::index_source_url_remote(pkg, &kind.describe(), &shown)
+            }
+            Self::Invalid
+            | Self::Local(
+                LocalRefusal::NotAnchored
+                | LocalRefusal::ForeignDrive
+                | LocalRefusal::DeviceElement
+                | LocalRefusal::LossyVerbatim
+                | LocalRefusal::PercentInFileUrl,
+            ) => crate::text::msg::index_source_url_invalid(pkg, &shown),
+        })
+    }
+}
+
+/// A validated source-repository location accepted by the package index.
+///
+/// The accept set is the [`Transport`] set: `https://`, `ssh://`, and a local
+/// directory, named by a `file://` URL whose host is empty or `localhost` or
+/// by a bare path absolute on this host (`/x` on Unix; `X:\x` or `\\?\X:\x` on
+/// Windows). A `git://` URL is refused with a diagnostic naming its `https://`
+/// fix. Any value that begins with `-` (option injection) or contains `::`
+/// (git transport helpers such as `ext::` or `fd::`, the real RCE vector) is
+/// rejected at parse time so a malicious index entry can never reach the `git`
+/// subprocess. A control character or `"` is rejected too, so a URL can never
+/// break out of the quoted, line-oriented files (`ipe.lock`, index entries) it
+/// is recorded in. A location naming a network share or a device (`//host/share`,
+/// `\\?\UNC\…`, `\\.\…`, `\??\…`, `file://host/…`) has no representation on any
+/// host, so opening a source never contacts a host the transport did not name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceUrl {
-    raw: String,
-    transport: Transport,
+    recorded: String,
+    kind: SourceKind,
 }
 
 impl SourceUrl {
-    /// Parse a raw string from the index into a [`SourceUrl`], rejecting
-    /// injection-shaped values and any transport outside [`Transport`].
+    /// Parse a raw string from the index into a [`SourceUrl`] under the host's
+    /// path regime.
     ///
-    /// Accepted: `https://`, `ssh://`, `file://`, and bare absolute paths
-    /// (starting with `/`). Rejected: `git://` (plaintext, unauthenticated), a
-    /// leading `-` (git flag injection), `::` anywhere (transport-helper
-    /// execution, the RCE vector), and any control character or `"` (a field
-    /// break-out where the URL is recorded).
+    /// Rejected: `git://` (plaintext, unauthenticated), a leading `-` (git flag
+    /// injection), `::` anywhere (transport-helper execution, the RCE vector),
+    /// any control character or `"` (a field break-out where the URL is
+    /// recorded), a network share or device location, and any local location
+    /// that is not absolute on this host.
     ///
     /// # Errors
     /// [`CliError::Resolve`] when the value is not an accepted source form.
     pub fn parse(pkg: &PackageName, raw: &str) -> Result<Self, CliError> {
-        let shown = || crate::style::TerminalSafe::sanitize(&format!("{raw:?}"));
+        Self::parse_in(raw, ipe_path_core::HOST).map_err(|refusal| refusal.into_cli(pkg, raw))
+    }
+
+    /// [`Self::parse`] under an explicit path `regime`.
+    fn parse_in(raw: &str, regime: Regime) -> Result<Self, SourceRefusal> {
         if raw.starts_with("git://") {
-            return Err(CliError::Resolve(
-                crate::text::msg::index_source_url_plaintext(pkg, &shown()),
-            ));
+            return Err(SourceRefusal::Plaintext);
         }
         // Fail closed: absent proof the transport is safe, reject.
         // `-`-leading values would be parsed as git flags; `::` introduces
         // transport helpers (e.g. `ext::`) that execute arbitrary commands.
         let breaks_out = raw.chars().any(|c| c.is_control() || c == '"');
-        let transport = Transport::of_url(raw)
-            .filter(|_| !raw.starts_with('-') && !raw.contains("::") && !breaks_out);
-        let Some(transport) = transport else {
-            return Err(CliError::Resolve(
-                crate::text::msg::index_source_url_invalid(pkg, &shown()),
-            ));
+        if raw.starts_with('-') || raw.contains("::") || breaks_out {
+            return Err(SourceRefusal::Invalid);
+        }
+        let kind = if raw.starts_with("https://") {
+            SourceKind::Https
+        } else if raw.starts_with("ssh://") {
+            SourceKind::Ssh
+        } else if let Some(after_scheme) = raw.strip_prefix("file://") {
+            SourceKind::Local(LocalRepo::from_file_url(after_scheme, regime)?)
+        } else {
+            SourceKind::Local(LocalRepo::parse(raw, regime)?)
         };
         Ok(Self {
-            raw: raw.to_owned(),
-            transport,
+            recorded: raw.to_owned(),
+            kind,
         })
     }
 
-    /// The validated URL string, safe to pass to `git clone -- <url> <dest>`.
+    /// The recorded spelling, as the lockfile, an index entry and publisher
+    /// inference hold it — never a git argument (that is [`Self::git_remote`]).
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.raw
+        &self.recorded
     }
 
-    /// The transport the URL uses.
+    /// Where the repository lives.
+    #[must_use]
+    pub const fn kind(&self) -> &SourceKind {
+        &self.kind
+    }
+
+    /// The `git remote add` argument: the recorded URL for `https`/`ssh`, the
+    /// plain path for a local repository.
+    ///
+    /// The exact text returned is judged again here, so a value built by any
+    /// path is refused at the sink when it names a network share or a device.
+    ///
+    /// # Errors
+    /// [`SourceRefusal::Remote`] when the argument names a network share or a
+    /// device; [`SourceRefusal::Invalid`] when it is injection-shaped.
+    pub fn git_remote(&self) -> Result<&str, SourceRefusal> {
+        let arg = match &self.kind {
+            SourceKind::Https | SourceKind::Ssh => self.recorded.as_str(),
+            SourceKind::Local(repo) => repo.plain.as_str(),
+        };
+        sink_check(arg)?;
+        Ok(arg)
+    }
+
+    /// The transport the location uses.
     #[must_use]
     pub const fn transport(&self) -> Transport {
-        self.transport
+        match self.kind {
+            SourceKind::Https => Transport::Https,
+            SourceKind::Ssh => Transport::Ssh,
+            SourceKind::Local(_) => Transport::File,
+        }
     }
+}
+
+/// The git-sink refusal: `arg` names no network share or device (spelled bare
+/// or as a `file://` URL) and is not injection-shaped.
+fn sink_check(arg: &str) -> Result<(), SourceRefusal> {
+    if let Some(after_scheme) = arg
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
+        .and_then(|_| arg.get(7..))
+    {
+        file_url_path(after_scheme)?;
+    }
+    if let Some(kind) = remote_path(arg) {
+        return Err(SourceRefusal::Remote(kind));
+    }
+    if arg.starts_with('-') || arg.contains("::") {
+        return Err(SourceRefusal::Invalid);
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for SourceUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.raw)
+        f.write_str(&self.recorded)
     }
 }
 
@@ -2184,69 +2517,257 @@ mod tests {
             .unwrap_or_else(|| text.lines().count())
     }
 
-    fn collect_ssot_violations(dir: &std::path::Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_ssot_violations(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let prod = production_line_count(&text);
-                for (i, line) in text.lines().take(prod).enumerate() {
-                    let trimmed = line.trim();
-                    // Skip pure comment lines.
-                    if trimmed.starts_with("//") {
-                        continue;
-                    }
-                    if trimmed.contains("read_entry(") && trimmed.contains(".ok()") {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
-                    if trimmed.contains("let Ok(") && trimmed.contains("read_entry(") {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
+    /// The production lines of every `.rs` file under `dir` that is not a
+    /// comment, as `(path, 1-based line number, trimmed text)`. The tree is read
+    /// whole or the guardrail fails: a skipped file is an unscanned file.
+    fn production_lines(dir: &std::path::Path) -> Vec<(std::path::PathBuf, usize, String)> {
+        let files = panic_scan::rust_sources(dir, panic_scan::Want::RustFiles)
+            .expect("the guardrail lists the whole tree");
+        let mut lines = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))
+                .expect("the guardrail reads every listed file");
+            let prod = production_line_count(&text);
+            for (i, line) in text.lines().take(prod).enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.starts_with("//") {
+                    lines.push((path.clone(), i + 1, trimmed.to_owned()));
                 }
+            }
+        }
+        lines
+    }
+
+    fn collect_ssot_violations(dir: &std::path::Path, out: &mut Vec<String>) {
+        for (path, line_no, trimmed) in production_lines(dir) {
+            if trimmed.contains("read_entry(") && trimmed.contains(".ok()") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
+            }
+            if trimmed.contains("let Ok(") && trimmed.contains("read_entry(") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
             }
         }
     }
 
     fn collect_read_to_string_ok_violations(dir: &std::path::Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_read_to_string_ok_violations(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let prod = production_line_count(&text);
-                for (i, line) in text.lines().take(prod).enumerate() {
-                    let trimmed = line.trim();
-                    // Skip pure comment lines.
-                    if trimmed.starts_with("//") {
-                        continue;
-                    }
-                    // The two banned forms that produce a fail-open unsafe scan:
-                    // 1. filter_map(|…| fs::read_to_string(…).ok()) — silently
-                    //    drops unreadable modules from the security scan.
-                    // 2. read_to_string(entry).ok().into_iter() — same defect on
-                    //    the single-file fallback path.
-                    if trimmed.contains("read_to_string") && trimmed.contains("filter_map") {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
-                    if trimmed.contains("read_to_string(") && trimmed.contains(".ok().into_iter()")
-                    {
-                        out.push(format!("{}:{}: {}", path.display(), i + 1, trimmed));
-                    }
+        for (path, line_no, trimmed) in production_lines(dir) {
+            // The two banned forms that produce a fail-open unsafe scan:
+            // 1. filter_map(|…| fs::read_to_string(…).ok()) — silently
+            //    drops unreadable modules from the security scan.
+            // 2. read_to_string(entry).ok().into_iter() — same defect on
+            //    the single-file fallback path.
+            if trimmed.contains("read_to_string") && trimmed.contains("filter_map") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
+            }
+            if trimmed.contains("read_to_string(") && trimmed.contains(".ok().into_iter()") {
+                out.push(format!("{}:{line_no}: {trimmed}", path.display()));
+            }
+        }
+    }
+
+    /// Source locations: the network-share and device refusals, under both regimes.
+    mod source_location {
+        use super::super::{LocalRefusal, RemotePath, SourceKind, SourceRefusal, sink_check};
+        use super::{SourceUrl, pn};
+        use ipe_path_core::Regime;
+
+        /// Every network-share and device spelling, with the kind it names.
+        const REMOTE_ROWS: [(&str, RemotePath); 17] = [
+            ("//h/s/r", RemotePath::Unc),
+            (r"\\h\s\r", RemotePath::Unc),
+            (r"/\h\s\r", RemotePath::Unc),
+            (r"\/h/s", RemotePath::Unc),
+            ("//h", RemotePath::Unc),
+            (r"\\?\UNC\h\s\r", RemotePath::VerbatimUnc),
+            ("//?/UNC/h/s", RemotePath::VerbatimUnc),
+            (r"\\.\pipe\x", RemotePath::DeviceNamespace),
+            ("//./C:/r", RemotePath::DeviceNamespace),
+            (
+                r"\\?\GLOBALROOT\Device\Mup\h\s",
+                RemotePath::VerbatimNonDrive,
+            ),
+            (r"\??\UNC\h\s", RemotePath::NtObjectPath),
+            ("/??/UNC/h/s", RemotePath::NtObjectPath),
+            ("file://h/s/r", RemotePath::FileAuthority),
+            ("file://H.example/r", RemotePath::FileAuthority),
+            ("file:////h/s/r", RemotePath::Unc),
+            (r"file:///\\h\s", RemotePath::Unc),
+            ("file://localhost//h/s", RemotePath::Unc),
+        ];
+
+        const PERCENT_ROWS: [&str; 2] = ["file:///%5C%5Ch%5Cs", "file:///home/u/r%20x"];
+        const WINDOWS_UNANCHORED_ROWS: [&str; 3] = ["C:repo", r"\repo", "/home/u/repo"];
+        const WINDOWS_DRIVE_CONTROLS: [&str; 2] = [r"C:\repo", "C:/repo"];
+        const DEVICE_ROWS: [&str; 3] = [r"C:\r\CON", r"C:\r\nul.txt\x", r"C:\COM1"];
+        const LOSSY_ROWS: [&str; 3] = [r"\\?\C:\a\..\b", r"\\?\C:\a.\b", r"\\?\C:/a"];
+        const FOREIGN_DRIVE_ROWS: [&str; 3] = [r"C:\r", "C:/r", r"\\?\C:\r"];
+
+        /// The refusal `raw` meets under `regime`, or `None` when admitted.
+        fn refusal(raw: &str, regime: Regime) -> Option<SourceRefusal> {
+            SourceUrl::parse_in(raw, regime).err()
+        }
+
+        /// The `git remote add` argument `raw` yields under `regime`.
+        #[allow(clippy::expect_used)] // every caller passes an admitted control
+        fn git_arg(raw: &str, regime: Regime) -> String {
+            let url = SourceUrl::parse_in(raw, regime).expect("control source is admitted");
+            url.git_remote()
+                .expect("admitted source reaches git")
+                .to_owned()
+        }
+
+        #[test]
+        fn a_remote_source_is_refused_under_every_regime() {
+            for regime in [Regime::Unix, Regime::Windows] {
+                for (raw, kind) in REMOTE_ROWS {
+                    assert_eq!(
+                        refusal(raw, regime),
+                        Some(SourceRefusal::Remote(kind)),
+                        "{raw:?} under {regime:?}"
+                    );
                 }
             }
+            assert_eq!(refusal("/home/u/r", Regime::Unix), None);
+            assert_eq!(refusal(r"C:\r", Regime::Windows), None);
+        }
+
+        #[test]
+        fn a_percent_in_a_file_url_is_refused() {
+            for raw in PERCENT_ROWS {
+                assert_eq!(
+                    refusal(raw, Regime::Unix),
+                    Some(SourceRefusal::Local(LocalRefusal::PercentInFileUrl)),
+                    "{raw:?}"
+                );
+            }
+            assert_eq!(refusal("file:///home/u/r", Regime::Unix), None);
+        }
+
+        #[test]
+        fn a_windows_unanchored_source_is_refused() {
+            for raw in WINDOWS_UNANCHORED_ROWS {
+                assert_eq!(
+                    refusal(raw, Regime::Windows),
+                    Some(SourceRefusal::Local(LocalRefusal::NotAnchored)),
+                    "{raw:?}"
+                );
+            }
+            for raw in WINDOWS_DRIVE_CONTROLS {
+                assert_eq!(refusal(raw, Regime::Windows), None, "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn a_windows_device_element_is_refused() {
+            for raw in DEVICE_ROWS {
+                assert_eq!(
+                    refusal(raw, Regime::Windows),
+                    Some(SourceRefusal::Local(LocalRefusal::DeviceElement)),
+                    "{raw:?}"
+                );
+            }
+            assert_eq!(refusal(r"C:\r\console", Regime::Windows), None);
+            assert_eq!(refusal("/srv/aux/r", Regime::Unix), None);
+        }
+
+        #[test]
+        fn a_lossy_verbatim_drive_is_refused() {
+            for raw in LOSSY_ROWS {
+                assert_eq!(
+                    refusal(raw, Regime::Windows),
+                    Some(SourceRefusal::Local(LocalRefusal::LossyVerbatim)),
+                    "{raw:?}"
+                );
+            }
+            assert_eq!(refusal(r"\\?\C:\a\b", Regime::Windows), None);
+        }
+
+        #[test]
+        fn a_drive_source_is_refused_under_the_unix_regime() {
+            for raw in FOREIGN_DRIVE_ROWS {
+                assert_eq!(
+                    refusal(raw, Regime::Unix),
+                    Some(SourceRefusal::Local(LocalRefusal::ForeignDrive)),
+                    "{raw:?}"
+                );
+            }
+            assert_eq!(refusal("/r", Regime::Unix), None);
+        }
+
+        #[test]
+        fn a_local_source_reaches_git_in_plain_spelling() {
+            assert_eq!(git_arg(r"\\?\C:\a\b", Regime::Windows), r"C:\a\b");
+            assert_eq!(git_arg("file:///C:/a", Regime::Windows), "C:/a");
+            assert_eq!(git_arg("file://LOCALHOST/C:/a", Regime::Windows), "C:/a");
+            assert_eq!(git_arg("file:///home/u/r", Regime::Unix), "/home/u/r");
+            for remote in ["https://h/r", "ssh://git@h/r"] {
+                assert_eq!(git_arg(remote, Regime::Unix), remote);
+            }
+            let local = SourceUrl::parse_in("file:///home/u/r", Regime::Unix);
+            assert!(
+                matches!(
+                    local.as_ref().map(SourceUrl::kind),
+                    Ok(SourceKind::Local(_))
+                ),
+                "{local:?}"
+            );
+            assert_eq!(
+                local.map(|url| url.as_str().to_owned()),
+                Ok("file:///home/u/r".to_owned()),
+                "the recorded spelling is kept for the lockfile"
+            );
+        }
+
+        #[test]
+        fn the_git_sink_refuses_a_remote_spelling() {
+            for (raw, kind) in REMOTE_ROWS {
+                assert_eq!(sink_check(raw), Err(SourceRefusal::Remote(kind)), "{raw:?}");
+            }
+            for injected in ["-uhack", "ext::sh"] {
+                assert_eq!(
+                    sink_check(injected),
+                    Err(SourceRefusal::Invalid),
+                    "{injected:?}"
+                );
+            }
+            for control in [r"C:\a\b", "C:/a", "/home/u/r", "https://h/r"] {
+                assert_eq!(sink_check(control), Ok(()), "{control:?}");
+            }
+        }
+
+        #[test]
+        fn the_host_parse_is_the_host_regime_parse() {
+            let rows = REMOTE_ROWS
+                .iter()
+                .map(|(raw, _)| *raw)
+                .chain(PERCENT_ROWS)
+                .chain(WINDOWS_UNANCHORED_ROWS)
+                .chain(WINDOWS_DRIVE_CONTROLS)
+                .chain(DEVICE_ROWS)
+                .chain(LOSSY_ROWS)
+                .chain(FOREIGN_DRIVE_ROWS)
+                .chain([
+                    "file:///home/u/r",
+                    r"C:\r\console",
+                    "/srv/aux/r",
+                    r"\\?\C:\a\b",
+                    "file:///C:/a",
+                    "file://LOCALHOST/C:/a",
+                    "https://h/r",
+                    "ssh://git@h/r",
+                ]);
+            for raw in rows {
+                assert_eq!(
+                    SourceUrl::parse(&pn("p"), raw).is_ok(),
+                    SourceUrl::parse_in(raw, ipe_path_core::HOST).is_ok(),
+                    "{raw:?}"
+                );
+            }
+            assert!(
+                SourceUrl::parse(&pn("p"), "//h/s/r").is_err(),
+                "the production entry point refuses a UNC share on this host"
+            );
         }
     }
 }

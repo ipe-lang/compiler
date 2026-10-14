@@ -342,8 +342,11 @@ impl Builtins {
             BuiltinTag::TaskStep => &self.task_home,
             // The `Ipe.Db.Store` query-algebra ADTs carry the store home so a
             // point-free reference lowers to the emitted enum, exactly as the
-            // hand-built `store` / `draft` / … helpers did.
-            BuiltinTag::DbStore
+            // hand-built `store` / `draft` / … helpers did. `DbOrder` carries it
+            // too: the store's `Asc | Desc` sort direction is a distinct head from
+            // the empty-home comparison `Order`, never the same type.
+            BuiltinTag::DbOrder
+            | BuiltinTag::DbStore
             | BuiltinTag::DbDraft
             | BuiltinTag::DbJoined
             | BuiltinTag::DbSelect

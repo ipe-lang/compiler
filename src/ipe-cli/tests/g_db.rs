@@ -30,8 +30,12 @@ mod golden_db_store_index_seal;
 mod golden_db_store_insert_returning_seal;
 #[path = "g_db/golden_db_store_join_seal.rs"]
 mod golden_db_store_join_seal;
+#[path = "g_db/golden_db_store_order_builtin_order_rejected.rs"]
+mod golden_db_store_order_builtin_order_rejected;
 #[path = "g_db/golden_db_store_order_by_seal.rs"]
 mod golden_db_store_order_by_seal;
+#[path = "g_db/golden_db_store_order_value.rs"]
+mod golden_db_store_order_value;
 #[path = "g_db/golden_db_store_placeholder_off_intercept.rs"]
 mod golden_db_store_placeholder_off_intercept;
 #[path = "g_db/golden_db_store_policy_algebra.rs"]

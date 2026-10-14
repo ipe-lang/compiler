@@ -1,0 +1,26 @@
+module Main exposing (main)
+
+-- Refusal: `wrap` keeps `empty` generic, and `main`'s `List.length empty`
+-- leaves its element type open. That variable is a value's type, not a
+-- message slot, so no default is sound and ipe refuses the program.
+
+import Ipe.Task as Task exposing (Task)
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+
+empty : List a
+empty =
+    []
+
+
+wrap : List b -> List b
+wrap xs =
+    xs ++ empty
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (List.length empty + List.length (wrap [ 1 ])))

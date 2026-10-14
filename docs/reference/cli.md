@@ -332,7 +332,7 @@ ipe dev build [<path>] [<shape>] [<runtime>] [<host>] [<target>]
 
 **Flags:**
 
-- `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
+- `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--emit-ir]` — also emit the intermediate representation
 - `[--fix]` — apply machine-applicable fixes before building
@@ -356,7 +356,7 @@ ipe dev run [<path>]
 
 **Flags:**
 
-- `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
+- `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--static]` — produce a statically linked binary
 - `[--target <wasm|wasi|triple>]` — compile for `wasm` (a browser bundle), `wasi` (a wasm32-wasip1 module), or a musl-static native <triple>; a native triple needs --static on `dev build` and `dev run`, `release build` is always static (default: x86_64-unknown-linux-musl); `dev run` cannot execute `wasm`, and `release build` does not produce `wasi`
@@ -381,7 +381,7 @@ ipe dev watch [<path>]
 
 **Flags:**
 
-- `[--out <dir>]` — put build output under <dir> (default: out/ in the project)
+- `[--out <dir>]` — put build output under <dir> (default: out/ in the project); on Windows a drive or `\\server\share` path is accepted, a device (`\\.\pipe`), object-namespace (`\\?\GLOBALROOT`), or volume-GUID (`\\?\Volume{..}`) path is not
 - `[--runtime <dir>]` — vendor the Ipê runtime from <dir>
 - `[--port <n>]` — serve on port <n> (default: 8000)
 - `[--debugger]` — compile the in-app time-travelling debugger overlay into the served app
