@@ -278,6 +278,7 @@ pub mod ffi_polyfills;
 pub mod file;
 pub mod http_header;
 pub mod http_client;
+pub mod inbound_authority;
 pub mod io;
 pub mod json;
 pub mod seal_codec;

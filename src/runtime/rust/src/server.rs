@@ -2556,25 +2556,62 @@ pub(crate) struct AppListener {
     tag: &'static str,
 }
 
+/// Why an app listener does not bind.
+#[derive(Debug)]
+pub(crate) enum AppBindError {
+    /// The declared host list is refused; no socket was opened.
+    Admission(crate::env_grammar::EnvRefusal),
+    /// The socket's own bind error.
+    Bind(std::io::Error),
+}
+
+/// The DNS names every app listener of this process admits, judged once.
+///
+/// Fixed by the first call, which [`crate::env_registry::startup_check`] makes,
+/// so a later environment write cannot widen a running app's admission.
+///
+/// # Errors
+///
+/// The refusal of a malformed `IPE_HTTP_ALLOWED_HOSTS`, naming the variable
+/// and never the value.
+pub(crate) fn declared_names()
+-> Result<&'static crate::inbound_authority::DeclaredNames, &'static crate::env_grammar::EnvRefusal>
+{
+    type Judged = Result<crate::inbound_authority::DeclaredNames, crate::env_grammar::EnvRefusal>;
+    static NAMES: std::sync::OnceLock<Judged> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| crate::env_registry::listen::ALLOWED_HOSTS.read())
+        .as_ref()
+}
+
+/// Fixes [`declared_names`] for the process.
+pub(crate) fn fix_declared_names() {
+    let _ = declared_names();
+}
+
 /// Bind an app listener on `host` and `port`, then log where it listens, which
 /// hosts it admits and, for an exposed host, who exposed it.
 ///
 /// The one app bind site: `Server.listen` and `serve_web` both bind through
-/// it, so neither keeps a `TcpListener::bind` of its own.
+/// it, so neither keeps a `TcpListener::bind` of its own, and neither admits a
+/// DNS name `IPE_HTTP_ALLOWED_HOSTS` does not declare.
 ///
 /// # Errors
 ///
-/// The bind's own error, for the caller to word.
+/// [`AppBindError::Admission`] for a refused host list, before any socket
+/// opens; [`AppBindError::Bind`] with the bind's own error, for the caller to
+/// word.
 pub(crate) async fn bind_app_listener(
     tag: &'static str,
     host: RecordedHost,
     port: u16,
-) -> std::io::Result<AppListener> {
+) -> Result<AppListener, AppBindError> {
+    let names = declared_names().map_err(|refusal| AppBindError::Admission(refusal.clone()))?;
     let addr = host.addr(port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let admission = crate::inbound_authority::HostAdmission::new(
-        crate::inbound_authority::DeclaredNames::none(),
-    );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(AppBindError::Bind)?;
+    let admission = crate::inbound_authority::HostAdmission::new(names.clone());
     for line in startup_lines(addr, host.0, admission.names()) {
         crate::system::emit_runtime_log(tag, &line);
     }
@@ -2726,11 +2763,15 @@ fn startup_lines(
 }
 
 /// The startup line naming which hosts an app listener admits; it counts the
-/// declared names and never echoes one.
+/// declared names and never echoes one, and with none names the variable that
+/// declares them.
 fn admission_line(names: &crate::inbound_authority::DeclaredNames) -> String {
     const ADMITTED: &str = "host admission: IP literals and localhost";
     if names.is_empty() {
-        ADMITTED.to_owned()
+        format!(
+            "{ADMITTED}; set {}=<name> to serve a DNS name",
+            crate::env_registry::listen::ALLOWED_HOSTS.name()
+        )
     } else {
         format!("{ADMITTED}, and {} declared name(s)", names.len())
     }
@@ -2956,7 +2997,12 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         let addr = host.addr(port);
         let listener = match bind_app_listener("http.server", host, port).await {
             Ok(l) => l,
-            Err(e) => {
+            Err(AppBindError::Admission(refusal)) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                    "Server.listen: {refusal}"
+                ))));
+            }
+            Err(AppBindError::Bind(e)) => {
                 return IpeResult::Err(E::from_ipe_error(resolved.bind_refusal(
                     "Server.listen",
                     addr,
@@ -5667,7 +5713,9 @@ mod tests {
         use crate::app_config::{ExposedBy, ListenHost, LoopbackIp};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let none = crate::inbound_authority::DeclaredNames::none();
-        let admission = "host admission: IP literals and localhost".to_owned();
+        let admission = "host admission: IP literals and localhost; set \
+                         IPE_HTTP_ALLOWED_HOSTS=<name> to serve a DNS name"
+            .to_owned();
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
         assert_eq!(
             startup_lines(loopback, ListenHost::Loopback(LoopbackIp::DEFAULT), &none),
@@ -8921,6 +8969,49 @@ mod tests {
         let resp = raw_exchange(port, &get_with_host("/", &ip)).await.unwrap();
         assert_eq!(raw_status(&resp), 200, "{resp}");
         task.abort();
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// A real `Server.listen` admits a name `IPE_HTTP_ALLOWED_HOSTS` declares,
+    /// and still refuses a name below it with 421.
+    #[tokio::test]
+    async fn dev_posture_pin_declared_name_admits_on_listen() {
+        crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "review.example.com");
+        let (port, task) = spawn_listen().unwrap();
+        let declared = format!("review.example.com:{port}");
+        let resp = raw_exchange(port, &get_with_host("/", &declared))
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&resp), 200, "{resp}");
+        let below = format!("x.review.example.com:{port}");
+        let resp = raw_exchange(port, &get_with_host("/", &below))
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&resp), 421, "{resp}");
+        assert!(resp.contains("host_not_admitted"), "{resp}");
+        task.abort();
+        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// A malformed `IPE_HTTP_ALLOWED_HOSTS` refuses `Server.listen` before its
+    /// socket opens, naming the variable and never the value.
+    #[tokio::test]
+    async fn listen_refuses_a_malformed_allowed_hosts_before_binding() {
+        crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "hidden.example:80");
+        let (port, task) = spawn_listen().unwrap();
+        let outcome = task.await.unwrap();
+        assert!(matches!(outcome, IpeResult::Err(_)), "{outcome:?}");
+        let IpeResult::Err(message) = outcome else {
+            return;
+        };
+        assert!(message.contains("IPE_HTTP_ALLOWED_HOSTS"), "{message}");
+        assert!(!message.contains("hidden"), "{message}");
+        assert!(
+            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_err(),
+            "no socket opens for a refused host list"
+        );
+        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
         crate::system::locked_remove_var("IPE_HTTP_BIND");
     }
 

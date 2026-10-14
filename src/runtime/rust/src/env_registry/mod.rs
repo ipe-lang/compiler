@@ -438,6 +438,59 @@ impl CeilingKey {
     }
 }
 
+/// A variable holding the DNS names an app listener admits besides IP literals
+/// and loopback names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostNamesKey(EnvEntry);
+
+impl HostNamesKey {
+    /// A host list variable named `name`; while it is unset no DNS name is declared.
+    #[must_use]
+    pub const fn new(name: &'static str, doc: Doc) -> Self {
+        Self(EnvEntry {
+            name,
+            grammar: Grammar::HostNames,
+            default: DefaultValue::Text("unset (IP literals and loopback names only)"),
+            doc,
+        })
+    }
+
+    /// The registry entry.
+    #[must_use]
+    pub const fn entry(self) -> EnvEntry {
+        self.0
+    }
+
+    /// The variable's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.0.name
+    }
+
+    /// Parses a raw lookup of this variable; the empty set when unset.
+    ///
+    /// # Errors
+    ///
+    /// The refusal naming the variable, never the value, when the value is set
+    /// but is not a host list.
+    pub fn parse(
+        self,
+        raw: Result<String, std::env::VarError>,
+    ) -> Result<crate::inbound_authority::DeclaredNames, EnvRefusal> {
+        crate::env_grammar::host_names(self.0.name, raw)
+    }
+
+    /// Reads and parses the live value (overlay first); the empty set when unset.
+    ///
+    /// # Errors
+    ///
+    /// The refusal naming the variable, never the value, when the value is set
+    /// but is not a host list.
+    pub fn read(self) -> Result<crate::inbound_authority::DeclaredNames, EnvRefusal> {
+        self.parse(crate::system::read_env_var(self.0.name))
+    }
+}
+
 /// A name no longer read: setting it is refused, naming its replacement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetiredKey(EnvEntry);
@@ -525,6 +578,8 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
         }
         #[cfg(feature = "web")]
         crate::web::csrf::fix_origin_check();
+        #[cfg(feature = "server")]
+        crate::server::fix_declared_names();
     }
     if refusals.is_empty() {
         Ok(())
@@ -702,5 +757,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A malformed `IPE_HTTP_ALLOWED_HOSTS` refuses startup naming the variable
+    /// and never the value; a well-formed list admits.
+    #[test]
+    fn malformed_allowed_hosts_refuses_startup() {
+        use crate::inbound_authority::HostListRefusal;
+        let key = listen::ALLOWED_HOSTS;
+        let host_refusals = |value: &str| {
+            crate::system::locked_set_var(key.name(), value);
+            let refusals = check_entries(&[key.entry()]);
+            crate::system::locked_remove_var(key.name());
+            refusals
+        };
+        let compiled = key.entry().feature().is_compiled();
+        let refused = host_refusals("a.com:80");
+        if compiled {
+            assert_eq!(
+                refused,
+                vec![EnvRefusal::HostNames {
+                    name: "IPE_HTTP_ALLOWED_HOSTS",
+                    refusal: HostListRefusal::Malformed { index: 0 },
+                }]
+            );
+            let text = refused.iter().map(ToString::to_string).collect::<String>();
+            assert!(text.contains("IPE_HTTP_ALLOWED_HOSTS"), "{text}");
+            assert!(!text.contains("a.com"), "{text}");
+            crate::system::locked_set_var(key.name(), "a.com:80");
+            let startup = startup_check();
+            crate::system::locked_remove_var(key.name());
+            assert!(
+                startup.is_err_and(|all| all.iter().any(|r| matches!(
+                    r,
+                    EnvRefusal::HostNames {
+                        name: "IPE_HTTP_ALLOWED_HOSTS",
+                        ..
+                    }
+                ))),
+                "startup must refuse a malformed host list"
+            );
+        } else {
+            assert!(refused.is_empty(), "{refused:?}");
+        }
+        assert!(host_refusals("review.example.com").is_empty());
     }
 }

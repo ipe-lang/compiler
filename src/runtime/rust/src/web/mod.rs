@@ -6766,7 +6766,12 @@ where
     // Logs the bind-address line (stderr), and the exposure warning if any.
     let listener = match crate::server::bind_app_listener("web", host, port).await {
         Ok(l) => l,
-        Err(e) => {
+        Err(crate::server::AppBindError::Admission(refusal)) => {
+            return IpeResult::Err(E::from_ipe_error(crate::error::IpeError::invalid_input(
+                format!("Web.tea: {refusal}"),
+            )));
+        }
+        Err(crate::server::AppBindError::Bind(e)) => {
             return IpeResult::Err(E::from_ipe_error(
                 resolved.bind_refusal("Web.tea", addr, &e),
             ));
@@ -14003,6 +14008,52 @@ mod route_entry_cmd_tests {
             };
             assert!(checked, "serve_web returned before the checks ran");
             crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
+    }
+
+    /// A real `serve_web` admits a name `IPE_HTTP_ALLOWED_HOSTS` declares, and
+    /// still refuses a name below it with 421.
+    #[test]
+    fn dev_posture_pin_declared_name_admits_on_web() {
+        run(false, || async {
+            let port = crate::server::free_loopback_port().unwrap();
+            crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+            crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
+            crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "review.example.com");
+            crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+            crate::system::locked_set_var(
+                crate::env_registry::web::WEB_PORT.name(),
+                &port.to_string(),
+            );
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let served = serve_web::<crate::error::IpeError, _, _, _, _, _, _>(fixture_state(
+                memory(),
+                sessions.clone(),
+            ));
+            let checks = async {
+                let page = |host: &str| {
+                    format!("GET / HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+                };
+                let resp = crate::server::raw_exchange(port, &page("review.example.com"))
+                    .await
+                    .unwrap();
+                assert_eq!(crate::server::raw_status(&resp), 200, "{resp}");
+                let resp = crate::server::raw_exchange(port, &page("x.review.example.com"))
+                    .await
+                    .unwrap();
+                assert_eq!(crate::server::raw_status(&resp), 421, "{resp}");
+                assert!(resp.contains("host_not_admitted"), "{resp}");
+            };
+            // The listener serves until shutdown; the checks finishing first is the pass.
+            let checked = tokio::select! {
+                _ = served => false,
+                () = checks => true,
+            };
+            assert!(checked, "serve_web returned before the checks ran");
+            crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
             crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
             crate::system::locked_remove_var("IPE_HTTP_BIND");
         });
