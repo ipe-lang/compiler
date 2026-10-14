@@ -264,6 +264,69 @@ main =
         }
 ";
 
+/// A `Web.tea` app whose `init` opens the session-store file through
+/// `Ipe.Db`: the `Db` use builds the store's `db` feature in, and the open
+/// switches the file to WAL, so the session store's own connections run in WAL
+/// and leave a `-wal` behind unless their pool closes.
+const WEB_SESSION_DB: &str = r#"module Main exposing (main)
+
+import Ipe.Db as Db
+import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Error exposing (Error)
+import Ipe.Path as Path
+import Ipe.Result as Result
+import Ipe.String
+import Ipe.System as System
+import Ipe.Task as Task exposing (Task)
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd
+import Ipe.Tea.Web.Sub
+import Ipe.Ui as Ui
+
+type Msg = Increment | Opened (Result Error ())
+
+type alias Model = { count : Int }
+
+openStoreFile : Task Error ()
+openStoreFile =
+    Path.fromString (System.getenvOr "IPE_WEB_STORE_PATH" "sessions.db")
+        |> Result.andThen (Location.file CreateIfMissing)
+        |> Task.fromResult
+        |> Task.andThen (\location -> Db.open location)
+        |> Task.map (\_ -> ())
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.perform openStoreFile Opened )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update msg model =
+    case msg of
+        Increment ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+        Opened _result ->
+            ( model, Cmd.none )
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+view : Model -> Element Msg
+view model =
+    Ui.el [ Ui.onClick Increment ] (Ui.text (String.fromInt model.count))
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Increment
+        }
+"#;
+
 /// True when the E2E tier is off and the test must return at once.
 fn skipped() -> bool {
     e2e_support::e2e_tier() == e2e_support::Tier::Unit
@@ -1024,5 +1087,80 @@ fn a_server_only_app_exits_zero_on_sigterm() -> Result<(), BoxError> {
         "{test_name}: one shutdown line; seen {:?}",
         served.seen
     );
+    Ok(())
+}
+
+/// `GET path` carrying the session cookie `sid`.
+///
+/// # Errors
+///
+/// The request fails.
+fn get_with_session(port: u16, path: &str, sid: &str) -> Result<String, BoxError> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.set_read_timeout(Some(CLIENT_BUDGET))?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ipe_sid={sid}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// E10: an `Ipe.Web` app over a SQLite session store exits 0 on SIGTERM with
+/// one shutdown line, and its session file keeps no `-wal` or `-shm`.
+#[test]
+fn a_sqlite_session_store_closes_on_sigterm() -> Result<(), BoxError> {
+    if skipped() {
+        return Ok(());
+    }
+    let test_name = "web_session_db";
+    let exe = compile(test_name, WEB_SESSION_DB)?;
+    let db = fresh_db(test_name);
+    let db_env = db.to_string_lossy().into_owned();
+    let port = pick_ephemeral_port()?;
+    let port_env = port.to_string();
+    let env = [
+        ("IPE_WEB_PORT", port_env.as_str()),
+        ("IPE_CSRF", "off"),
+        ("IPE_CONSOLE_EMBED", "off"),
+        ("IPE_WEB_STORE", "sqlite"),
+        ("IPE_WEB_STORE_PATH", db_env.as_str()),
+    ];
+    let mut served = Served::ready(&exe, port, &env)?;
+    let page = get(port, "/")?;
+    let sid = session_cookie(&page)
+        .ok_or_else(|| -> BoxError { format!("{test_name}: no ipe_sid cookie: {page}").into() })?;
+    let switched = Instant::now() + LINE_BUDGET;
+    while !sidecar(&db, "-wal").exists() {
+        assert!(
+            Instant::now() < switched,
+            "{test_name}: the session file never ran in WAL; seen {:?}",
+            served.seen
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let again = get_with_session(port, "/", &sid)?;
+    assert!(
+        again.starts_with("HTTP/1.1 200"),
+        "{test_name}: the session reloads: {again}"
+    );
+    served.signal("-TERM")?;
+    let status = served.wait_exit(EXIT_BUDGET)?;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{test_name}: {status}; seen {:?}",
+        served.seen
+    );
+    assert_eq!(
+        served.ending_with(Pipe::Out, SHUTDOWN_LINE),
+        1,
+        "{test_name}: one shutdown line; seen {:?}",
+        served.seen
+    );
+    assert_eq!(served.containing(Pipe::Err, FORCING_LINE), 0);
+    assert_no_sidecars(test_name, &db);
     Ok(())
 }
