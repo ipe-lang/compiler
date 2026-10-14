@@ -197,8 +197,8 @@ queueBody model =
 decisionErrorBanner : Model -> Ui.Element Msg
 decisionErrorBanner model =
     case model.decisionError of
-        Just err ->
-            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.concat [ SafeText.literal "Decision save failed: ", SafeText.renderForeign (Error.toString err) ]))
+        Just failure ->
+            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.concat [ SafeText.literal "Decision save failed: ", SafeText.render (Queue.saveFailureText failure) ]))
 
         Nothing ->
             Ui.none
