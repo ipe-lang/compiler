@@ -199,12 +199,15 @@ keyPart part =
 
 
 -- One loaded page of the queue. `total` counts the whole queue (never this
--- page's length); `next` is the cursor of the following page, Nothing on the
--- last page; `dbName` is the index file's name, rendered once; `log` is the
--- review log's verdict the page was read under.
+-- page's length); `unbound` counts the index's units under a tag no
+-- configured root binds, which are in neither the queue nor its progress;
+-- `next` is the cursor of the following page, Nothing on the last page;
+-- `dbName` is the index file's name, rendered once; `log` is the review
+-- log's verdict the page was read under.
 type alias QueuePage =
     { units : List QueuedUnit
     , total : Int
+    , unbound : Int
     , dbName : SafeText
     , dbBytes : Int
     , next : Maybe Index.Cursor
@@ -214,7 +217,8 @@ type alias QueuePage =
 
 
 -- Review progress over the index as it stands, never from a session:
--- `total` counts the index's units and `reviewed` those not open, so a unit
+-- `total` counts the index's units under a bound tag and `reviewed` those
+-- not open, so `reviewed` can reach `total` and a unit
 -- is reviewed exactly when its current (uid, body_hash) pair has a decision.
 -- Both come from the same read as the page's rows, after the `reviewed`
 -- copy is proved current against the review log's head. Deciding a unit
@@ -1084,17 +1088,17 @@ queueStatusText state =
 
         Loaded page ->
             if page.total == 0 then
-                Just "No units queued."
+                Just ("No units queued." ++ unboundNotice page)
 
             else if List.isEmpty page.units then
-                Just "No units to review on this page."
+                Just ("No units to review on this page." ++ unboundNotice page)
 
             else
                 Nothing
 
 
--- The queue header: database name, size, and how many of the open units
--- this page shows.
+-- The queue header: database name, size, how many of the open units this
+-- page shows, and how many units it leaves out as unbound.
 pageHeaderText : QueuePage -> String
 pageHeaderText page =
     String.concat
@@ -1105,7 +1109,19 @@ pageHeaderText page =
         , String.fromInt (List.length page.units)
         , " of "
         , String.fromInt page.total
+        , unboundNotice page
         ]
+
+
+-- The units under a tag no configured root binds, left out of the queue
+-- and its progress, said where the queue's counts are; empty when none is.
+unboundNotice : QueuePage -> String
+unboundNotice page =
+    if page.unbound > 0 then
+        " · " ++ String.fromInt page.unbound ++ " units in unbound repositories not shown"
+
+    else
+        ""
 
 
 -- One page of the queue at `cursor`, as the review app sees it: the open
@@ -1148,6 +1164,7 @@ pageOf settings db fresh =
                 Task.succeed
                     { units = units
                     , total = snap.open
+                    , unbound = snap.unbound
                     , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db.path)
                     , dbBytes = snap.bytes
                     , next = nextCursor snap.rows
@@ -1172,14 +1189,14 @@ freshSnapshot : AppSettings -> Db.Db -> Db.Db -> Index.Cursor -> Task.Task Error
 freshSnapshot settings conn db cursor =
     do
         state <- LibDb.logVerdict settings.key db
-        first <- Index.readSnapshot settings.key conn cursor
+        first <- Index.readSnapshot settings.key settings.index.roots conn cursor
         if LibDb.copyHolds state first then
             Task.succeed ( state, first )
 
         else
             do
                 rebuildUnder settings.index resyncBound state db
-                second <- Index.readSnapshot settings.key conn cursor
+                second <- Index.readSnapshot settings.key settings.index.roots conn cursor
                 if LibDb.copyHolds state second then
                     Task.succeed ( state, second )
 

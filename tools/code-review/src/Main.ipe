@@ -64,6 +64,16 @@ requireEnv key fix =
         (System.getenv key)
 
 
+-- Read an optional environment variable: not set, set, or set but
+-- unreadable, the last never mistaken for not set. The caller decides what
+-- each means; `key` is this tool's own text.
+optionalEnv : String -> Task Error Settings.EnvValue
+optionalEnv key =
+    Task.onError
+        (\e -> Task.succeed (Settings.envFailure e))
+        (System.getenv key |> Task.map Settings.EnvSet)
+
+
 -- The review-log key, read and parsed once: a malformed value stops startup
 -- with its own refusal, which never repeats the value; no value set starts
 -- the server read-only, with a notice saying so.
@@ -90,17 +100,20 @@ announceKey key =
 
 -- Parse every configured location, then open and probe each one before
 -- serving: the index read-only with every column a page reads, the review
--- database created and migrated with its log bound to `key`, and the root, which the parse requires to
--- be an existing directory and `Index.probeRoot` to hold the index's files.
--- A relative value resolves against the working directory. Then the index's
+-- database created and migrated with its log bound to `key`, and the roots,
+-- which the parse requires to be existing directories,
+-- `Index.probeRepos` to be exactly the repositories the index records, nested
+-- as it records them, and `Index.probeRoot` to hold the index's files. A
+-- relative `IPE_INDEX_ROOT` resolves against the working directory; an unset
+-- `IPE_REVIEW_DB` is `review.db` there, an unreadable one is refused. Then the index's
 -- `reviewed` copy is rebuilt from the review database once and stamped with
 -- the review log's head under `key`, so the first load already reads a
 -- current copy. Any failure stops startup with a message naming the
 -- variable and one fix.
 -- Last, this process's epoch is minted.
 -- Returns the settings, the one value the app serves from.
-requireSettings : ReviewKey -> String -> String -> String -> Task Error Settings.AppSettings
-requireSettings key rawDb rawRoot rawReview =
+requireSettings : ReviewKey -> String -> String -> Settings.EnvValue -> Settings.EnvValue -> Task Error Settings.AppSettings
+requireSettings key rawDb rawRoot rawRepos rawReview =
     Task.onError
         (\e ->
             do
@@ -108,10 +121,11 @@ requireSettings key rawDb rawRoot rawReview =
                 System.exit 1
         )
         (do
-            index <- Settings.parseIndexSettings rawDb rawRoot
+            index <- Settings.parseIndexSettings rawDb rawRoot rawRepos
             Index.probe index
+            Index.probeRepos index
             Index.probeRoot index
-            review <- Settings.parseReviewDb rawReview
+            review <- Settings.valueOr "IPE_REVIEW_DB" "review.db" rawReview |> Task.andThen Settings.parseReviewDb
             LibDb.probe key review
             db <- LibDb.openAt review
             Queue.resyncReviewed key index db
@@ -125,6 +139,8 @@ main =
     do
         rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the file path of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
         rawRoot <- requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
+        rawRepos <- optionalEnv "IPE_INDEX_REPOS"
+        rawReview <- optionalEnv "IPE_REVIEW_DB"
         key <- requireReviewKey
-        settings <- requireSettings key rawDb rawRoot (System.getenvOr "IPE_REVIEW_DB" "review.db")
+        settings <- requireSettings key rawDb rawRoot rawRepos rawReview
         Server.listen 8000 [ Server.mountApp "/" (reviewApp settings) ]

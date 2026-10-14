@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -60,13 +60,43 @@ type alias UnitView =
     }
 
 
--- The unit columns as they come off the DB, before the source is attached.
--- The unit page queries units directly, not through `openColumns`: a
--- decided unit is not open, but its page must still render, so it reads no
--- change.
-unitByUidSql : String
-unitByUidSql =
-    "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid = ?"
+-- The unit columns as they come off the DB, before the source is attached,
+-- for one uid under a bound tag. The unit page queries units directly, not
+-- through `openColumns`: a decided unit is not open, but its page must still
+-- render, so it reads no change. A unit under a tag `roots` does not bind is
+-- no unit here, as it is on no page.
+unitByUid : RootMap -> Uid -> ( String, List SqlValue )
+unitByUid roots uid =
+    let
+        bound =
+            boundTags roots
+    in
+    ( "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
+    , Uid.toSql uid :: bound.params
+    )
+
+
+-- The one bound-tag membership condition on a unit row `u`, with its bound
+-- parameters: the stored path's tag, the text before its first `:`, is one
+-- `roots` binds. A path with no `:` reads an empty tag, which no root binds.
+-- Every query that lists, counts or looks up units applies it, so no unit
+-- under an unbound tag is listed, counted as review work, or loaded. Tags
+-- enter only as bound parameters, compared under `BINARY`.
+type alias BoundTags =
+    { sql : String
+    , params : List SqlValue
+    }
+
+
+boundTags : RootMap -> BoundTags
+boundTags roots =
+    let
+        tags =
+            List.map (\( tag, _ ) -> SqlString (RepoPath.tagName tag)) (RepoPath.boundRoots roots)
+    in
+    { sql = " substr(u.path, 1, instr(u.path, ':') - 1) COLLATE BINARY IN (" ++ placeholders (List.length tags) ++ ")"
+    , params = tags
+    }
 
 
 -- The unit's file row, for the language ipe-index stored for it: a primary
@@ -83,7 +113,7 @@ unitFiles =
 loadView : Db.Db -> RootMap -> Uid -> Task.Task Error (Maybe UnitView)
 loadView conn roots uid =
     do
-        rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql uid ] rowDecoder
+        rows <- queryUnit conn roots uid
         case List.head rows of
             Just row ->
                 do
@@ -93,6 +123,15 @@ loadView conn roots uid =
 
             Nothing ->
                 Task.succeed Nothing
+
+
+queryUnit : Db.Db -> RootMap -> Uid -> Task.Task Error (List RowUnit)
+queryUnit conn roots uid =
+    let
+        ( sql, params ) =
+            unitByUid roots uid
+    in
+    Db.queryDecode conn sql params rowDecoder
 
 
 -- Jump links come only from a shown view; a withheld view links nothing and
@@ -315,7 +354,7 @@ probe : IndexSettings -> Task.Task Error ()
 probe settings =
     (do
         conn <- readConnection settings
-        Db.queryDecode conn (openColumns ++ " LIMIT 0") [] pendingRowDecoder
+        Db.queryDecode conn (openColumns (boundTags settings.roots) ++ " LIMIT 0") (boundTags settings.roots).params pendingRowDecoder
         Db.queryDecode conn "SELECT uid, body_hash FROM reviewed LIMIT 0" [] reviewedPairDecoder
         Db.queryDecode conn "SELECT head FROM reviewed_stamp LIMIT 0" [] stampDecoder
         Task.succeed ()
@@ -323,11 +362,175 @@ probe settings =
         |> Task.onError (Settings.openFailure IndexDb settings.db.path)
 
 
--- The startup check of `IPE_INDEX_ROOT` against the index, per configured
--- root: of the first `rootSample` distinct indexed paths under the root's
--- tag, at least one must join to a file that exists beneath it. A root
--- other than the tree the index was built from holds none of them and is
--- refused naming the variable, the first sampled path and the root; a file
+-- The startup check of the configured roots against the repositories the
+-- index records (its `repos` table), in one read: the bound tags must be
+-- exactly the recorded ones, and each bound root must nest under the same
+-- recorded outer tag at the same folded relative path, or under none, as
+-- ipe-index recorded from the files' identity. So a root bound under the
+-- wrong spelling of a nested directory, or a repository bound nowhere,
+-- stops startup instead of leaving units no reviewer can decide. An index
+-- with no units and no recorded repositories has nothing to check.
+probeRepos : IndexSettings -> Task.Task Error ()
+probeRepos settings =
+    (do
+        conn <- readConnection settings
+        Db.withTransaction conn
+            (\tx ->
+                do
+                    recorded <- Db.queryDecode tx reposSql [ SqlInt (RepoPath.maxRoots + 1) ] repoRowDecoder
+                    anyUnit <- Db.queryDecode tx anyPathSql [] storedPathDecoder
+                    Task.succeed ( recorded, anyUnit )
+            )
+    )
+        |> Task.onError (Settings.openFailure IndexDb settings.db.path)
+        |> Task.andThen
+            (\( recorded, anyUnit ) ->
+                case repoSetRefusal settings.roots recorded (not (List.isEmpty anyUnit)) of
+                    Nothing ->
+                        Task.succeed ()
+
+                    Just refusal ->
+                        Task.fail (Error.invalidInput (SafeText.toString (repoSetText refusal)))
+            )
+
+
+-- One row of the index's `repos` table: a tag, and the tag of the nearest
+-- declared root enclosing it with its relative path below that root, or
+-- neither.
+type alias RepoRow =
+    { tag : String
+    , outer : Maybe String
+    , prefix : Maybe String
+    }
+
+
+-- The recorded repositories in tag order, one past the ceiling at most, so
+-- an oversized set is seen without reading it whole.
+reposSql : String
+reposSql =
+    "SELECT tag, outer, prefix FROM repos ORDER BY tag LIMIT ?"
+
+
+repoRowDecoder : Db.Decode.Decoder RepoRow
+repoRowDecoder =
+    Db.Decode.succeed (\tag outer prefix -> { tag = tag, outer = outer, prefix = prefix })
+        |> Db.Decode.required "tag" (Db.Decode.string "tag")
+        |> Db.Decode.required "outer" (Db.Decode.nullable (Db.Decode.string "outer"))
+        |> Db.Decode.required "prefix" (Db.Decode.nullable (Db.Decode.string "prefix"))
+
+
+-- Why the configured roots disagree with the recorded repositories. A bound
+-- tag carries the setting that bound it.
+type RepoSetRefusal
+    = RepoSetTooLarge
+    | RepoSetMissing
+    | RepoNotIndexed String SafeText
+    | RepoNotBound String
+    | RepoNestingMismatch String SafeText
+
+
+-- The first disagreement, checked in order: a set past the ceiling, no
+-- set beside units, a bound tag not recorded, a recorded tag not bound, then
+-- each bound tag's nesting.
+repoSetRefusal : RootMap -> List RepoRow -> Bool -> Maybe RepoSetRefusal
+repoSetRefusal roots recorded hasUnits =
+    let
+        bound =
+            RepoPath.boundRoots roots
+
+        recordedRow tag =
+            List.find (\row -> row.tag == RepoPath.tagName tag) recorded
+
+        isBound name =
+            List.any (\( tag, _ ) -> RepoPath.tagName tag == name) bound
+
+        notIndexed =
+            List.find (\( tag, _ ) -> not (List.any (\row -> row.tag == RepoPath.tagName tag) recorded)) bound
+
+        notBound =
+            List.find (\row -> not (isBound row.tag)) recorded
+
+        misnested =
+            List.find
+                (\( tag, _ ) ->
+                    case recordedRow tag of
+                        Just row ->
+                            not (RepoPath.nestingAgrees roots tag row.outer row.prefix)
+
+                        Nothing ->
+                            True
+                )
+                bound
+    in
+    if List.length recorded > RepoPath.maxRoots then
+        Just RepoSetTooLarge
+
+    else if List.isEmpty recorded then
+        if hasUnits then
+            Just RepoSetMissing
+
+        else
+            Nothing
+
+    else
+        case notIndexed of
+            Just ( tag, root ) ->
+                Just (RepoNotIndexed (RepoPath.tagName tag) (RepoPath.rootOrigin tag root))
+
+            Nothing ->
+                case notBound of
+                    Just row ->
+                        Just (RepoNotBound row.tag)
+
+                    Nothing ->
+                        Maybe.map (\( tag, root ) -> RepoNestingMismatch (RepoPath.tagName tag) (RepoPath.rootOrigin tag root)) misnested
+
+
+-- A refusal as diagnostic text; every tag the index stored enters through
+-- `SafeText.quoted`.
+repoSetText : RepoSetRefusal -> SafeText
+repoSetText refusal =
+    case refusal of
+        RepoSetTooLarge ->
+            SafeText.concat
+                [ SafeText.literal "IPE_INDEX_DB records more than "
+                , SafeText.render (String.fromInt RepoPath.maxRoots)
+                , SafeText.literal " repositories, more than ipe-index writes; rebuild it from the repo root with `tools/scripts/ipe-index index`"
+                ]
+
+        RepoSetMissing ->
+            SafeText.literal "IPE_INDEX_DB holds units but records no repositories: it was built before ipe-index recorded them; rebuild it from the repo root with the current `tools/scripts/ipe-index index`"
+
+        RepoNotIndexed tag origin ->
+            SafeText.concat
+                [ origin
+                , SafeText.literal " binds repo tag "
+                , SafeText.quoted tag
+                , SafeText.literal ", which IPE_INDEX_DB does not record; remove the binding, or rebuild the index with that repository"
+                ]
+
+        RepoNotBound tag ->
+            SafeText.concat
+                [ SafeText.literal "IPE_INDEX_DB records repo tag "
+                , SafeText.quoted tag
+                , SafeText.literal ", which no configured root binds, so its units could never be decided; add an IPE_INDEX_REPOS entry `name=/absolute/path` for it, naming the root the index was built from"
+                ]
+
+        RepoNestingMismatch tag origin ->
+            SafeText.concat
+                [ origin
+                , SafeText.literal " nests repo tag "
+                , SafeText.quoted tag
+                , SafeText.literal " otherwise than IPE_INDEX_DB records it: a root encloses it, or sits at a path below that root, that the index does not record; set each root to the directory the index was built from"
+                ]
+
+
+-- The startup check of `IPE_INDEX_ROOT` and every `IPE_INDEX_REPOS` root
+-- against the index, per configured root: of the first `rootSample` distinct
+-- indexed paths under the root's tag, at least one must join to a file that
+-- exists beneath it. A root other than the tree the index was built from
+-- holds none of them and is refused naming the variable (the entry, for an
+-- `IPE_INDEX_REPOS` root), the first sampled path and the root; a file
 -- or two deleted since the last index run does not refuse a right root
 -- while another sampled file remains. An index holding units, none under a
 -- configured tag, is refused too: none of its units could be read. Only an
@@ -344,10 +547,13 @@ probeRoot settings =
         |> Task.andThen (\( samples, anyUnit ) -> rootsHold settings.roots samples anyUnit)
 
 
--- One configured root with the indexed paths sampled under its tag.
+-- One configured root with the indexed paths sampled under its tag, the
+-- setting that named it, and that setting's fix.
 type alias RootSample =
     { tag : Tag
     , rootDir : Path
+    , origin : SafeText
+    , fix : SafeText
     , stored : List String
     }
 
@@ -369,7 +575,7 @@ rootSampleOf conn ( tag, root ) =
             RepoPath.tagName tag ++ ":"
     in
     Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] storedPathDecoder
-        |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, stored = stored })
+        |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, origin = RepoPath.rootOrigin tag root, fix = RepoPath.rootFixFor root, stored = stored })
 
 
 -- Succeeds when the sample is empty or any sampled path joins to a file
@@ -388,7 +594,7 @@ rootHolds roots sample =
                             Task.succeed ()
 
                         else
-                            Task.fail (rootMismatch (List.length sample.stored) first sample.rootDir)
+                            Task.fail (rootMismatch sample (List.length sample.stored) first)
                     )
 
 
@@ -427,19 +633,20 @@ presentUnder roots stored =
             Task.succeed False
 
 
-rootMismatch : Int -> String -> Path -> Error
-rootMismatch sampled first rootDir =
+rootMismatch : RootSample -> Int -> String -> Error
+rootMismatch sample sampled first =
     Error.invalidInput
         (SafeText.toString
             (SafeText.concat
-                [ SafeText.literal "IPE_INDEX_ROOT holds none of the "
+                [ sample.origin
+                , SafeText.literal " holds none of the "
                 , SafeText.render (String.fromInt sampled)
                 , SafeText.literal " indexed files checked: index path "
                 , SafeText.quoted first
                 , SafeText.literal " is not found under "
-                , SafeText.quoted (Path.toString rootDir)
+                , SafeText.quoted (Path.toString sample.rootDir)
                 , SafeText.literal "; "
-                , RepoPath.rootFix
+                , sample.fix
                 , SafeText.literal ", or re-run `tools/scripts/ipe-index index` if the indexed files have moved"
                 ]
             )
@@ -553,9 +760,9 @@ changeOf change old =
 -- which says nothing about a unit that still stands; any other kind, a
 -- missing one included, reaches `changeDecoder`, which fails the read on
 -- one this reviewer does not know.
-openColumns : String
-openColumns =
-    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ ")"
+openColumns : BoundTags -> String
+openColumns bound =
+    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
 
 
 -- The membership condition on a unit row `u`: no pair of the `reviewed`
@@ -571,16 +778,16 @@ openOrder =
 
 
 -- The page query and its bound parameters for `cursor`. Every value is a
--- bound parameter; the page bound is always the last one.
-pendingPageQuery : PageSize -> Cursor -> ( String, List SqlValue )
-pendingPageQuery size cursor =
+-- bound parameter: the bound tags first, the page bound always last.
+pendingPageQuery : BoundTags -> PageSize -> Cursor -> ( String, List SqlValue )
+pendingPageQuery bound size cursor =
     case cursor of
         Start ->
-            ( openColumns ++ openOrder, [ SqlInt (PageSize.toInt size) ] )
+            ( openColumns bound ++ openOrder, bound.params ++ [ SqlInt (PageSize.toInt size) ] )
 
         After at ->
-            ( openColumns ++ " WHERE (enqueued_at, uid) > (?, ?)" ++ openOrder
-            , [ SqlInt at.enqueuedAt, Uid.toSql at.uid, SqlInt (PageSize.toInt size) ]
+            ( openColumns bound ++ " WHERE (enqueued_at, uid) > (?, ?)" ++ openOrder
+            , bound.params ++ [ SqlInt at.enqueuedAt, Uid.toSql at.uid, SqlInt (PageSize.toInt size) ]
             )
 
 
@@ -605,11 +812,11 @@ openColumnsDecoder =
 -- of metadata. No source file is read: a unit's file is read only by
 -- `loadView`, so a unit whose file is missing still lists, and only a failed
 -- query fails the page.
-loadPendingPage : Db.Db -> PageSize -> Cursor -> Task.Task Error (List PendingRow)
-loadPendingPage conn size cursor =
+loadPendingPage : Db.Db -> BoundTags -> PageSize -> Cursor -> Task.Task Error (List PendingRow)
+loadPendingPage conn bound size cursor =
     let
         ( sql, params ) =
-            pendingPageQuery size cursor
+            pendingPageQuery bound size cursor
     in
     Db.queryDecode conn sql params pendingRowDecoder
         |> Task.map (List.map (\( row, change, at ) -> { unit = withRow row, change = change, enqueuedAt = at }))
@@ -621,21 +828,60 @@ countDecoder =
         |> Db.Decode.required "total" (Db.Decode.int "total")
 
 
--- How many units are open, counted over `openMembership` without loading
--- a row. A count query that yields no row is a failed read, never a zero.
-countPending : Db.Db -> Task.Task Error Int
-countPending conn =
+-- How many units under a bound tag are open, counted over `openMembership`
+-- without loading a row. A count query that yields no row is a failed read,
+-- never a zero.
+countPending : Db.Db -> BoundTags -> Task.Task Error Int
+countPending conn bound =
     do
-        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE" ++ openMembership) [] countDecoder
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE" ++ openMembership ++ " AND" ++ bound.sql) bound.params countDecoder
         singleInt "COUNT(*) of open units" rows
 
 
--- How many units the index holds, open or decided.
-countUnits : Db.Db -> Task.Task Error Int
-countUnits conn =
+-- How many units under a bound tag the index holds, open or decided.
+countUnits : Db.Db -> BoundTags -> Task.Task Error Int
+countUnits conn bound =
+    do
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE" ++ bound.sql) bound.params countDecoder
+        singleInt "COUNT(*) over bound units" rows
+
+
+-- How many units the index holds under a tag no root binds.
+countUnbound : Db.Db -> BoundTags -> Task.Task Error Int
+countUnbound conn bound =
+    do
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE NOT (" ++ bound.sql ++ ")") bound.params countDecoder
+        singleInt "COUNT(*) over unbound units" rows
+
+
+-- How many units the index holds, bound or not.
+countAll : Db.Db -> Task.Task Error Int
+countAll conn =
     do
         rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM units" [] countDecoder
         singleInt "COUNT(*) over units" rows
+
+
+-- The bound and unbound counts of one read partition every unit: a unit
+-- in neither (a path the tag condition cannot judge) or in both fails the
+-- read rather than leave a total that hides it.
+partitioned : Int -> Int -> Int -> Task.Task Error ()
+partitioned bound unbound held =
+    if bound + unbound == held then
+        Task.succeed ()
+
+    else
+        Task.fail
+            (Error.unexpected
+                ("the index's unit counts do not add up: "
+                    ++ String.fromInt bound
+                    ++ " under bound repositories and "
+                    ++ String.fromInt unbound
+                    ++ " under unbound ones, of "
+                    ++ String.fromInt held
+                    ++ " units"
+                )
+            )
 
 
 bytesDecoder : Db.Decode.Decoder Int
@@ -664,8 +910,10 @@ singleInt what rows =
 
 
 -- Everything one queue page shows, read in one index transaction, so the
--- page rows, the open count and the unit count describe the same index
--- state and no write between two reads can make them disagree. The module
+-- page rows, the open count and the unit counts describe the same index
+-- state and no write between two reads can make them disagree. The rows,
+-- `open` and `units` count only units under a tag `roots` binds; `unbound`
+-- counts the rest, and the two must add up to every unit the index holds. The module
 -- exposes no other reader of the page, the counts or the size, so no
 -- caller can read one of them outside this transaction. `stamp` is the
 -- text stamped on the `reviewed` copy when it was last brought up to the
@@ -680,22 +928,30 @@ type alias Snapshot =
     , rows : List PendingRow
     , open : Int
     , units : Int
+    , unbound : Int
     , bytes : Int
     }
 
 
-readSnapshot : ReviewKey -> Db.Db -> Cursor -> Task.Task Error Snapshot
-readSnapshot key conn cursor =
+readSnapshot : ReviewKey -> RootMap -> Db.Db -> Cursor -> Task.Task Error Snapshot
+readSnapshot key roots conn cursor =
+    let
+        bound =
+            boundTags roots
+    in
     Db.withTransaction conn
         (\tx ->
             do
                 stamp <- readStamp tx
                 copy <- reviewedDigest key tx
-                rows <- loadPendingPage tx PageSize.queue cursor
-                open <- countPending tx
-                units <- countUnits tx
+                rows <- loadPendingPage tx bound PageSize.queue cursor
+                open <- countPending tx bound
+                units <- countUnits tx bound
+                unbound <- countUnbound tx bound
+                held <- countAll tx
+                partitioned units unbound held
                 bytes <- dbBytes tx
-                Task.succeed { stamp = stamp, copy = copy, rows = rows, open = open, units = units, bytes = bytes }
+                Task.succeed { stamp = stamp, copy = copy, rows = rows, open = open, units = units, unbound = unbound, bytes = bytes }
         )
 
 
@@ -1620,7 +1876,7 @@ reverify settings shown =
         ShownSource s ->
             do
                 conn <- readConnection settings
-                rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql s.uid ] rowDecoder
+                rows <- queryUnit conn settings.roots s.uid
                 case List.head rows of
                     Just row ->
                         viewOf conn settings.roots row
