@@ -2,7 +2,7 @@
 //! at `ipe` time.
 //!
 //! `Web.route` patterns are parsed by the runtime's `RoutePattern::parse` and
-//! `Server.*` paths by its `path_param_names`; a malformed literal would pass
+//! `Server.*` paths by its `ServerPattern::parse`; a malformed literal would pass
 //! `ipe` and then refuse to start. The compiler cannot depend on the runtime,
 //! so this module restates the same grammar, and `agreement_tests` drives one
 //! case table through both sides and asserts identical verdicts.
@@ -11,17 +11,34 @@
 //! - A `Web.route` pattern is split on raw `/` after trimming surrounding `/`;
 //!   a segment led by `:` is a parameter, any other segment must strictly
 //!   percent-decode (`%` + two hex digits, UTF-8 result, `+` literal).
-//! - A `Server.*` path gives every `/`-segment containing `:` or `*` a
-//!   parameter named by the text after the first such sigil.
+//! - A `Server.*` path starts with `/` and is split like a `Web.route`
+//!   pattern; a segment led by `*` (a catch-all) is refused, a segment led by
+//!   `:` is a parameter, and any other segment holds no `:` or `*` and must
+//!   strictly percent-decode. It holds at most `MAX_SERVER_PARAMS` parameters,
+//!   and its router spelling (each literal re-escaped by the runtime's one
+//!   segment alphabet, each parameter `:p` and its ordinal) is within the
+//!   length ceiling.
+//! - A `Server.api` spec's method, when it names one, is a method the
+//!   runtime's own `EndpointMethod::parse` admits.
+//! - A `Server.static` or `Server.mountApp` prefix is a string literal parsed
+//!   by the runtime's own `MountBase::parse`, and no two mounts of one literal
+//!   `Server.listen` list share a prefix.
 
 use std::collections::HashSet;
 
 use ipe_diagnostics::terminal::is_display_hazard;
-use ipe_diagnostics::{DResult, Diagnostic, LowerError, RoutePatternDefect, Span};
+use ipe_diagnostics::{
+    DResult, Diagnostic, LowerError, MountPrefixFault, RoutePatternDefect, Span,
+};
 use ipe_ir::{Callee, Expr, KernelFn, Program};
+use ipe_runtime_rust::encoding::{EndpointMethod, MAX_MOUNT_BASE_LEN, MountBase, MountBaseRefusal};
 
 /// The runtime's `MAX_URL_COMPONENT_LEN`: the longest pattern it parses.
 pub const MAX_PATH_LEN: usize = 32 * 1024 * 1024;
+
+/// The runtime's `MAX_SERVER_PARAMS`: the most parameters a `Server.*` path
+/// holds.
+pub const MAX_SERVER_PARAMS: usize = 25;
 
 /// How many characters of an offending name or segment a diagnostic quotes.
 const EXCERPT_CHARS: usize = 64;
@@ -178,17 +195,84 @@ pub fn web_route_segments(pattern: &str) -> Result<Vec<SegmentShape>, RoutePatte
         .collect()
 }
 
-/// Check a literal `Server.*` route path against the runtime's server
-/// parameter-name gate.
+/// Check a literal `Server.*` route path against the runtime's
+/// `ServerPattern` grammar.
 ///
 /// # Errors
 ///
-/// The defect of the first empty, non-identifier, or repeated parameter name.
+/// `TooLong` for a path over [`MAX_PATH_LEN`] bytes, `NotAbsolute` for one
+/// without a leading `/`, then the defect of the first malformed segment, then
+/// `TooManyParams` past [`MAX_SERVER_PARAMS`] parameters, then `TooLong` when
+/// the router spelling (each parameter `:p` and its ordinal) would pass the
+/// ceiling.
 pub fn server_route_path(path: &str) -> Result<(), RoutePatternDefect> {
+    if path.len() > MAX_PATH_LEN {
+        return Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN });
+    }
+    if !path.starts_with('/') {
+        return Err(RoutePatternDefect::NotAbsolute);
+    }
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(());
+    }
     let mut names = Names::default();
-    path.split('/')
-        .filter_map(|seg| seg.split_once([':', '*']).map(|(_, name)| name))
-        .try_for_each(|name| names.admit(name))
+    let mut spelled: usize = 0;
+    let mut params: usize = 0;
+    for raw in trimmed.split('/') {
+        let seg_len = if raw.starts_with('*') {
+            return Err(RoutePatternDefect::CatchAll {
+                segment: excerpt(raw),
+            });
+        } else if let Some(name) = raw.strip_prefix(':') {
+            names.admit(name)?;
+            // `:p` and the ordinal; a path past `MAX_SERVER_PARAMS` (two
+            // digits at most) is refused before its spelling is measured.
+            let spelled_param = if params < 10 { 3 } else { 4 };
+            params = params.saturating_add(1);
+            spelled_param
+        } else if let Some(at) = raw.find([':', '*']) {
+            return Err(RoutePatternDefect::MidSegmentSigil {
+                segment: excerpt(raw),
+                at,
+            });
+        } else {
+            canonical_len(&literal_segment(raw)?)
+        };
+        spelled = spelled.saturating_add(1).saturating_add(seg_len);
+    }
+    if params > MAX_SERVER_PARAMS {
+        return Err(RoutePatternDefect::TooManyParams {
+            cap: MAX_SERVER_PARAMS,
+        });
+    }
+    if path.len() > 1 && path.ends_with('/') {
+        spelled = spelled.saturating_add(1);
+    }
+    if spelled > MAX_PATH_LEN {
+        return Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN });
+    }
+    Ok(())
+}
+
+/// The length of the runtime's canonical spelling of one decoded segment:
+/// `.` and `..` spell as `%2E` and `%2E%2E`; an ASCII alphanumeric or one of
+/// `-` `_` `.` `~` stays one byte; every other byte is a three-byte escape.
+fn canonical_len(decoded: &str) -> usize {
+    match decoded {
+        "." => 3,
+        ".." => 6,
+        _ => decoded
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    1
+                } else {
+                    3
+                }
+            })
+            .sum(),
+    }
 }
 
 /// The path part of a literal `Server.api` spec (`"METHOD /path"`, or a bare
@@ -199,6 +283,34 @@ pub fn server_api_path(spec: &str) -> &str {
         Some((method, path)) if !method.is_empty() => path.trim(),
         _ => spec.trim(),
     }
+}
+
+/// The method of a literal `Server.api` spec, split as [`server_api_path`]
+/// splits it; `None` for a spec that names no method (every method).
+#[must_use]
+pub fn server_api_method(spec: &str) -> Option<&str> {
+    match spec.split_once(' ') {
+        Some((method, _)) if !method.is_empty() => Some(method.trim()),
+        _ => None,
+    }
+}
+
+/// Check a literal `Server.api` spec: its method against the runtime's own
+/// method grammar, then its path as a `Server.*` route path.
+///
+/// # Errors
+///
+/// `UnknownMethod` for a method the server does not serve, else the defect
+/// of [`server_route_path`].
+pub fn server_api_spec(spec: &str) -> Result<(), RoutePatternDefect> {
+    if let Some(method) = server_api_method(spec)
+        && EndpointMethod::parse(method).is_none()
+    {
+        return Err(RoutePatternDefect::UnknownMethod {
+            method: excerpt(method),
+        });
+    }
+    server_route_path(server_api_path(spec))
 }
 
 /// Turn a grammar verdict for a literal path passed to `call` into the
@@ -217,6 +329,59 @@ pub fn refuse_malformed(call: &str, verdict: Result<(), RoutePatternDefect>) -> 
     })
 }
 
+/// The mount-base rule `refusal` names.
+const fn mount_fault(refusal: &MountBaseRefusal) -> MountPrefixFault {
+    match refusal {
+        MountBaseRefusal::TooLong { .. } => MountPrefixFault::TooLong {
+            cap: MAX_MOUNT_BASE_LEN,
+        },
+        MountBaseRefusal::NoLeadingSlash => MountPrefixFault::NotAbsolute,
+        MountBaseRefusal::TrailingSlash => MountPrefixFault::TrailingSlash,
+        MountBaseRefusal::EmptySegment => MountPrefixFault::EmptySegment,
+        MountBaseRefusal::DotSegment => MountPrefixFault::DotSegment,
+        MountBaseRefusal::Reserved { byte } => MountPrefixFault::Reserved { byte: *byte },
+    }
+}
+
+/// Parse a literal `Server.static` or `Server.mountApp` prefix with the
+/// runtime's mount-base parser.
+///
+/// # Errors
+///
+/// `MountPrefix` naming the rule the prefix breaks.
+pub fn mount_prefix(prefix: &str) -> Result<MountBase, RoutePatternDefect> {
+    MountBase::parse(prefix).map_err(|refusal| RoutePatternDefect::MountPrefix {
+        prefix: excerpt(prefix),
+        fault: mount_fault(&refusal),
+    })
+}
+
+/// Refuse a literal `Server.listen` route list in which two mounts serve one
+/// prefix.
+fn refuse_duplicate_mounts(routes: &[Expr]) -> DResult<()> {
+    let mut seen: HashSet<MountBase> = HashSet::new();
+    for route in routes {
+        if let Expr::Call {
+            callee: Callee::Kernel(k),
+            args,
+            ..
+        } = route
+            && matches!(route_path_of(*k), Some(RoutePath::Mount))
+            && let Some(Expr::Str(lit)) = args.first()
+            && let Ok(base) = MountBase::parse(lit)
+            && !seen.insert(base)
+        {
+            return refuse_malformed(
+                "Server.listen",
+                Err(RoutePatternDefect::MountPrefixDuplicate {
+                    prefix: excerpt(lit),
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The grammar a route kernel holds its first (path) argument to.
 #[derive(Clone, Copy)]
 enum RoutePath {
@@ -226,6 +391,8 @@ enum RoutePath {
     Server,
     /// A `Server.api` spec, whose path follows an optional method.
     ServerApi,
+    /// A `Server.static` or `Server.mountApp` prefix: a literal mount base.
+    Mount,
 }
 
 /// The path grammar of `k`'s first argument, or `None` for a kernel that
@@ -239,12 +406,11 @@ const fn route_path_of(k: KernelFn) -> Option<RoutePath> {
         | KernelFn::ServerPut
         | KernelFn::ServerDelete
         | KernelFn::ServerAny
-        | KernelFn::ServerStatic
-        | KernelFn::ServerMountApp
         | KernelFn::ServerGetAuthed
         | KernelFn::ServerPostAuthed
         | KernelFn::ServerPutAuthed
         | KernelFn::ServerDeleteAuthed => Some(RoutePath::Server),
+        KernelFn::ServerStatic | KernelFn::ServerMountApp => Some(RoutePath::Mount),
         _ => None,
     }
 }
@@ -256,9 +422,19 @@ fn refuse_literal(k: KernelFn, grammar: RoutePath, lit: &str) -> DResult<()> {
     let verdict = match grammar {
         RoutePath::Web => web_route_pattern(lit),
         RoutePath::Server => server_route_path(lit),
-        RoutePath::ServerApi => server_route_path(server_api_path(lit)),
+        RoutePath::ServerApi => server_api_spec(lit),
+        RoutePath::Mount => mount_prefix(lit).map(drop),
     };
     refuse_malformed(&call, verdict)
+}
+
+/// Refuse mount kernel `k` reached with a prefix that is not a string literal.
+fn refuse_unliteral_mount(k: KernelFn) -> DResult<()> {
+    let d = k.decl();
+    refuse_malformed(
+        &format!("{}.{}", d.qualifier, d.name),
+        Err(RoutePatternDefect::MountPrefixNotLiteral),
+    )
 }
 
 /// Refuse every malformed literal route path anywhere in `program`.
@@ -289,14 +465,28 @@ fn literal_routes(expr: &Expr) -> DResult<()> {
         | Expr::CustomElementRef { .. }
         | Expr::Char(_)
         | Expr::Unit
-        | Expr::FuncValue { .. }
         | Expr::Var(_)
         | Expr::CloneVar(_) => Ok(()),
+        Expr::FuncValue { callee, .. } => match callee {
+            Callee::Kernel(k) if matches!(route_path_of(*k), Some(RoutePath::Mount)) => {
+                refuse_unliteral_mount(*k)
+            }
+            _ => Ok(()),
+        },
         Expr::Call { callee, args, .. } => {
-            if let (Callee::Kernel(k), Some(Expr::Str(lit))) = (callee, args.first())
+            if let Callee::Kernel(k) = callee
                 && let Some(grammar) = route_path_of(*k)
             {
-                refuse_literal(*k, grammar, lit.as_str())?;
+                match (grammar, args.first()) {
+                    (_, Some(Expr::Str(lit))) => refuse_literal(*k, grammar, lit.as_str())?,
+                    (RoutePath::Mount, _) => refuse_unliteral_mount(*k)?,
+                    (RoutePath::Web | RoutePath::Server | RoutePath::ServerApi, _) => {}
+                }
+            }
+            if matches!(callee, Callee::Kernel(KernelFn::ServerListen))
+                && let Some(Expr::List { items, .. }) = args.get(1)
+            {
+                refuse_duplicate_mounts(items)?;
             }
             args.iter().try_for_each(literal_routes)
         }
@@ -355,9 +545,39 @@ fn literal_routes(expr: &Expr) -> DResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PATH_LEN, RoutePatternDefect, excerpt, server_api_path, server_route_path,
-        web_route_pattern,
+        MAX_PATH_LEN, MAX_SERVER_PARAMS, RoutePatternDefect, excerpt, server_api_path,
+        server_api_spec, server_route_path, web_route_pattern,
     };
+
+    /// Prove the refusal: a `Server.api` method the server does not serve is
+    /// refused at compile time, as the server refuses it at listen.
+    #[test]
+    fn a_server_api_spec_with_an_unknown_method_is_refused() {
+        for (spec, method) in [
+            ("FETCH /x", "FETCH"),
+            ("po\u{17f}t /x", "po\u{17f}t"),
+            ("G-ET /x", "G-ET"),
+        ] {
+            assert_eq!(
+                server_api_spec(spec),
+                Err(RoutePatternDefect::UnknownMethod {
+                    method: excerpt(method)
+                }),
+                "{spec:?}"
+            );
+        }
+        for spec in [
+            "GET /x",
+            "GET\t /x",
+            "patch /x",
+            "Any /x",
+            "/x",
+            " /x",
+            "TRACE  /a/:id",
+        ] {
+            assert_eq!(server_api_spec(spec), Ok(()), "{spec:?}");
+        }
+    }
 
     #[test]
     fn web_patterns_the_runtime_serves_are_accepted() {
@@ -446,9 +666,47 @@ mod tests {
     }
 
     #[test]
-    fn server_paths_admit_names_after_either_sigil() {
-        assert_eq!(server_route_path("/u/:id/f/*rest"), Ok(()));
-        assert_eq!(server_route_path("/plain/100%zz"), Ok(()));
+    fn server_paths_the_runtime_serves_are_accepted() {
+        for ok in ["/", "//", "/u/:id/f/:name", "/caf%C3%A9", "/a/%3Ax", "/a/"] {
+            assert_eq!(server_route_path(ok), Ok(()), "{ok:?}");
+        }
+    }
+
+    /// Prove the refusals: a catch-all, a mid-segment sigil, a relative path,
+    /// a malformed escape and every malformed parameter name.
+    #[test]
+    fn malformed_server_paths_are_refused() {
+        assert_eq!(
+            server_route_path("/u/:id/f/*rest"),
+            Err(RoutePatternDefect::CatchAll {
+                segment: "*rest".into()
+            })
+        );
+        assert_eq!(
+            server_route_path("/f/*"),
+            Err(RoutePatternDefect::CatchAll {
+                segment: "*".into()
+            })
+        );
+        assert_eq!(
+            server_route_path("/v-:id"),
+            Err(RoutePatternDefect::MidSegmentSigil {
+                segment: "v-:id".into(),
+                at: 2
+            })
+        );
+        assert_eq!(
+            server_route_path("api"),
+            Err(RoutePatternDefect::NotAbsolute)
+        );
+        assert_eq!(server_route_path(""), Err(RoutePatternDefect::NotAbsolute));
+        assert_eq!(
+            server_route_path("/plain/100%zz"),
+            Err(RoutePatternDefect::MalformedEscape {
+                segment: "100%zz".into(),
+                at: 3
+            })
+        );
         assert_eq!(
             server_route_path("/x/:a-b"),
             Err(RoutePatternDefect::ParamNotIdentifier {
@@ -457,12 +715,37 @@ mod tests {
             })
         );
         assert_eq!(
-            server_route_path("/:id/*id"),
+            server_route_path("/:id/:id"),
             Err(RoutePatternDefect::ParamDuplicate { name: "id".into() })
         );
         assert_eq!(
-            server_route_path("/f/*"),
+            server_route_path("/f/:"),
             Err(RoutePatternDefect::ParamEmpty)
+        );
+        let params = |n: usize| -> String {
+            (0..n)
+                .flat_map(|i| ["/:v".to_owned(), i.to_string()])
+                .collect()
+        };
+        assert_eq!(server_route_path(&params(MAX_SERVER_PARAMS)), Ok(()));
+        assert_eq!(
+            server_route_path(&params(MAX_SERVER_PARAMS + 1)),
+            Err(RoutePatternDefect::TooManyParams {
+                cap: MAX_SERVER_PARAMS
+            })
+        );
+    }
+
+    /// A path within the parse ceiling whose router spelling grows past it is
+    /// refused, as the runtime refuses it at listen.
+    #[test]
+    fn server_path_spelled_past_the_ceiling_is_refused() {
+        let at_cap = format!("/{}", "a".repeat(MAX_PATH_LEN - 1));
+        assert_eq!(server_route_path(&at_cap), Ok(()));
+        let grows = format!("/{}", "+".repeat(MAX_PATH_LEN / 2));
+        assert_eq!(
+            server_route_path(&grows),
+            Err(RoutePatternDefect::TooLong { cap: MAX_PATH_LEN })
         );
     }
 
@@ -487,8 +770,9 @@ mod tests {
 /// including positions no route emission reaches.
 #[cfg(test)]
 mod walk_tests {
-    use ipe_diagnostics::{Diagnostic, LowerError, RoutePatternDefect};
+    use ipe_diagnostics::{Diagnostic, LowerError, MountPrefixFault, RoutePatternDefect};
     use ipe_ir::{CallPin, Callee, Expr, IrType, KernelFn, OnFormKind};
+    use ipe_runtime_rust::encoding::MAX_MOUNT_BASE_LEN;
 
     use super::literal_routes;
 
@@ -545,6 +829,127 @@ mod walk_tests {
         );
     }
 
+    fn listen(routes: Vec<Expr>) -> Expr {
+        Expr::Call {
+            callee: Callee::Kernel(KernelFn::ServerListen),
+            args: vec![
+                Expr::Int(8000),
+                Expr::List {
+                    elem: IrType::Unit,
+                    items: routes,
+                },
+            ],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        }
+    }
+
+    /// Prove the refusals: a mount prefix that is not a mount base is refused
+    /// with the rule it breaks.
+    #[test]
+    fn a_malformed_mount_prefix_is_refused() {
+        for (prefix, fault) in [
+            ("/a?b", MountPrefixFault::Reserved { byte: b'?' }),
+            ("/a#b", MountPrefixFault::Reserved { byte: b'#' }),
+            ("/a/%zz", MountPrefixFault::Reserved { byte: b'%' }),
+            ("/a%62", MountPrefixFault::Reserved { byte: b'%' }),
+            ("/a:b", MountPrefixFault::Reserved { byte: b':' }),
+            ("/:id", MountPrefixFault::Reserved { byte: b':' }),
+            ("/files/*rest", MountPrefixFault::Reserved { byte: b'*' }),
+            ("/caf\u{e9}", MountPrefixFault::Reserved { byte: 0xC3 }),
+            ("app", MountPrefixFault::NotAbsolute),
+            ("/app/", MountPrefixFault::TrailingSlash),
+            ("/a//b", MountPrefixFault::EmptySegment),
+            ("/a/..", MountPrefixFault::DotSegment),
+        ] {
+            for k in [KernelFn::ServerStatic, KernelFn::ServerMountApp] {
+                let Some((_, defect)) = defect(&call(k, prefix)) else {
+                    assert!(defect(&call(k, prefix)).is_some(), "{prefix:?}");
+                    return;
+                };
+                assert_eq!(
+                    defect,
+                    RoutePatternDefect::MountPrefix {
+                        prefix: prefix.into(),
+                        fault
+                    },
+                    "{prefix:?}"
+                );
+            }
+        }
+        let long = format!("/{}", "a".repeat(MAX_MOUNT_BASE_LEN));
+        assert!(matches!(
+            defect(&call(KernelFn::ServerStatic, &long)),
+            Some((_, RoutePatternDefect::MountPrefix { fault: MountPrefixFault::TooLong { cap }, .. }))
+                if cap == MAX_MOUNT_BASE_LEN
+        ));
+    }
+
+    /// Prove the refusals: a mount prefix computed at run time, or a mount
+    /// kernel passed as a value, is refused at compile time.
+    #[test]
+    fn a_computed_mount_prefix_is_refused() {
+        for k in [KernelFn::ServerStatic, KernelFn::ServerMountApp] {
+            let computed = Expr::Call {
+                callee: Callee::Kernel(k),
+                args: vec![Expr::Var(ipe_intern::Symbol::from_raw(1)), Expr::Unit],
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            };
+            let as_value = Expr::FuncValue {
+                callee: Callee::Kernel(k),
+                ty: IrType::Unit,
+            };
+            for expr in [computed, as_value] {
+                assert!(
+                    defect(&expr)
+                        .is_some_and(|(_, d)| d == RoutePatternDefect::MountPrefixNotLiteral),
+                    "{k:?}"
+                );
+            }
+        }
+    }
+
+    /// Prove the refusal: two mounts of one literal route list on one prefix
+    /// are refused, whatever spelling of the root they use.
+    #[test]
+    fn two_mounts_on_one_prefix_are_refused() {
+        for (a, b) in [("/a", "/a"), ("/", ""), ("/", "/"), ("/app/v2", "/app/v2")] {
+            for (ka, kb) in [
+                (KernelFn::ServerStatic, KernelFn::ServerMountApp),
+                (KernelFn::ServerMountApp, KernelFn::ServerMountApp),
+            ] {
+                let routes = listen(vec![
+                    call(ka, a),
+                    call(KernelFn::ServerGet, "/x"),
+                    call(kb, b),
+                ]);
+                assert_eq!(
+                    defect(&routes),
+                    Some((
+                        "Server.listen".into(),
+                        RoutePatternDefect::MountPrefixDuplicate { prefix: b.into() }
+                    )),
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Nested mount prefixes, a handler on a mount's prefix, and the root
+    /// beside a prefix are all accepted.
+    #[test]
+    fn distinct_mount_prefixes_pass() {
+        let routes = listen(vec![
+            call(KernelFn::ServerMountApp, "/billing"),
+            call(KernelFn::ServerMountApp, "/billing/admin"),
+            call(KernelFn::ServerGet, "/billing"),
+            call(KernelFn::ServerStatic, "/"),
+            call(KernelFn::ServerStatic, "/a-b/c.d~e_f"),
+        ]);
+        assert_eq!(literal_routes(&routes).ok(), Some(()));
+    }
+
     #[test]
     fn well_formed_routes_and_non_route_kernels_pass() {
         let ok = Expr::Tuple(vec![
@@ -561,15 +966,17 @@ mod walk_tests {
 /// and a pattern it accepts is accepted here.
 #[cfg(test)]
 mod agreement_tests {
-    use ipe_runtime_rust::encoding::{DecodeRefusal, ParamNameRefusal};
-    use ipe_runtime_rust::server::{api_spec_parts, path_param_names};
+    use ipe_runtime_rust::encoding::{
+        DecodeRefusal, EncodeRefusal, ParamNameRefusal, ServerPattern, ServerPatternRefusal,
+    };
+    use ipe_runtime_rust::server::api_spec_parts;
     use ipe_runtime_rust::web::route::{
         DecodedPath, RoutePattern, RouteSegmentRefusal, match_route,
     };
 
     use super::{
-        MAX_PATH_LEN, RoutePatternDefect, SegmentShape, server_api_path, server_route_path,
-        web_route_pattern, web_route_segments,
+        MAX_PATH_LEN, MAX_SERVER_PARAMS, RoutePatternDefect, SegmentShape, server_api_path,
+        server_route_path, web_route_pattern, web_route_segments,
     };
 
     /// Kind + offset of a verdict, erasing the excerpt text only this side keeps.
@@ -583,6 +990,14 @@ mod agreement_tests {
         InvalidUtf8(usize),
         TooLong(usize),
         Unrenderable,
+        NotAbsolute,
+        CatchAll,
+        MidSegmentSigil(usize),
+        TooManyParams(usize),
+        /// A mount-prefix defect, which no route path parse yields.
+        Mount,
+        /// A `Server.api` method the server does not serve.
+        UnknownMethod,
     }
 
     fn ours(r: Result<(), RoutePatternDefect>) -> Verdict {
@@ -595,6 +1010,16 @@ mod agreement_tests {
             Err(RoutePatternDefect::InvalidUtf8 { at, .. }) => Verdict::InvalidUtf8(at),
             Err(RoutePatternDefect::TooLong { cap }) => Verdict::TooLong(cap),
             Err(RoutePatternDefect::UnrenderableLiteral { .. }) => Verdict::Unrenderable,
+            Err(RoutePatternDefect::NotAbsolute) => Verdict::NotAbsolute,
+            Err(RoutePatternDefect::CatchAll { .. }) => Verdict::CatchAll,
+            Err(RoutePatternDefect::MidSegmentSigil { at, .. }) => Verdict::MidSegmentSigil(at),
+            Err(RoutePatternDefect::TooManyParams { cap }) => Verdict::TooManyParams(cap),
+            Err(
+                RoutePatternDefect::MountPrefixNotLiteral
+                | RoutePatternDefect::MountPrefix { .. }
+                | RoutePatternDefect::MountPrefixDuplicate { .. },
+            ) => Verdict::Mount,
+            Err(RoutePatternDefect::UnknownMethod { .. }) => Verdict::UnknownMethod,
         }
     }
 
@@ -607,23 +1032,39 @@ mod agreement_tests {
     }
 
     fn runtime_web(pattern: &str) -> Verdict {
-        match RoutePattern::parse(pattern) {
-            Ok(_) => Verdict::Ok,
-            Err(RouteSegmentRefusal::ParamName(r)) => name_verdict(r),
-            Err(RouteSegmentRefusal::Decode(DecodeRefusal::MalformedEscape { at })) => {
+        RoutePattern::parse(pattern).map_or_else(segment_verdict, |_| Verdict::Ok)
+    }
+
+    fn segment_verdict(r: RouteSegmentRefusal) -> Verdict {
+        match r {
+            RouteSegmentRefusal::ParamName(r) => name_verdict(r),
+            RouteSegmentRefusal::Decode(DecodeRefusal::MalformedEscape { at }) => {
                 Verdict::MalformedEscape(at.get())
             }
-            Err(RouteSegmentRefusal::Decode(DecodeRefusal::InvalidUtf8 { at })) => {
+            RouteSegmentRefusal::Decode(DecodeRefusal::InvalidUtf8 { at }) => {
                 Verdict::InvalidUtf8(at.get())
             }
-            Err(RouteSegmentRefusal::Decode(DecodeRefusal::TooLong { cap })) => {
+            RouteSegmentRefusal::Decode(DecodeRefusal::TooLong { cap }) => {
                 Verdict::TooLong(cap.get())
             }
         }
     }
 
     fn runtime_server(path: &str) -> Verdict {
-        path_param_names(path).map_or_else(name_verdict, |()| Verdict::Ok)
+        match ServerPattern::parse(path) {
+            Ok(_) => Verdict::Ok,
+            Err(ServerPatternRefusal::NotAbsolute) => Verdict::NotAbsolute,
+            Err(ServerPatternRefusal::CatchAll) => Verdict::CatchAll,
+            Err(ServerPatternRefusal::MidSegmentSigil { at }) => Verdict::MidSegmentSigil(at.get()),
+            Err(ServerPatternRefusal::Segment(r)) => segment_verdict(r),
+            Err(ServerPatternRefusal::TooManyParams { cap }) => Verdict::TooManyParams(cap),
+            Err(ServerPatternRefusal::Render(EncodeRefusal::TooLong { cap })) => {
+                Verdict::TooLong(cap.get())
+            }
+            Err(ServerPatternRefusal::Render(EncodeRefusal::Empty | EncodeRefusal::Dot)) => {
+                Verdict::Unrenderable
+            }
+        }
     }
 
     const CASES: &[&str] = &[
@@ -654,6 +1095,17 @@ mod agreement_tests {
         ":lead",
         "/tail:",
         "/e/%00",
+        "api",
+        "/*",
+        "/v-:id",
+        "/x/ab*",
+        "/q/a*:b",
+        "/:a*b",
+        "/a/",
+        "//a//",
+        "/a//b",
+        "/%2E/..",
+        "/a+b~c.d_e-f",
     ];
 
     #[test]
@@ -687,6 +1139,40 @@ mod agreement_tests {
         ] {
             let (_, path) = api_spec_parts(spec);
             assert_eq!(server_api_path(spec), path, "{spec:?}");
+        }
+    }
+
+    /// The compiler admits a literal `Server.api` method exactly when the
+    /// server's listen-time parse does, whatever its case or bytes.
+    #[test]
+    fn server_api_method_matches_runtime() {
+        use ipe_runtime_rust::encoding::EndpointMethod;
+        for spec in [
+            "POST /u/:id",
+            "post /u",
+            "FETCH /u",
+            "po\u{17f}t /u",
+            "GET\t /u",
+            "\tGET /u",
+            "Any /u",
+            "/u",
+            " /u",
+            "",
+        ] {
+            let (method, _) = api_spec_parts(spec);
+            let runtime = method.is_empty() || EndpointMethod::parse(&method).is_some();
+            let ours =
+                super::server_api_method(spec).is_none_or(|m| EndpointMethod::parse(m).is_some());
+            assert_eq!(ours, runtime, "{spec:?}");
+            assert_eq!(
+                super::server_api_method(spec).unwrap_or("ANY"),
+                if method.is_empty() {
+                    "ANY"
+                } else {
+                    method.as_str()
+                },
+                "{spec:?}"
+            );
         }
     }
 
@@ -756,7 +1242,56 @@ mod agreement_tests {
             MAX_PATH_LEN,
             ipe_runtime_rust::encoding::MAX_URL_COMPONENT_LEN.get()
         );
+        assert_eq!(
+            MAX_SERVER_PARAMS,
+            ipe_runtime_rust::encoding::MAX_SERVER_PARAMS
+        );
         let past = "a".repeat(MAX_PATH_LEN + 1);
         assert_eq!(ours(web_route_pattern(&past)), runtime_web(&past));
+        assert_eq!(ours(server_route_path(&past)), runtime_server(&past));
+        let params = |n: usize| -> String {
+            (0..n)
+                .flat_map(|i| ["/:v".to_owned(), i.to_string()])
+                .collect()
+        };
+        for n in [MAX_SERVER_PARAMS, MAX_SERVER_PARAMS + 1] {
+            let path = params(n);
+            assert_eq!(ours(server_route_path(&path)), runtime_server(&path), "{n}");
+        }
+        let long_name = format!("/:{}", "a".repeat(MAX_PATH_LEN - 2));
+        assert_eq!(
+            ours(server_route_path(&long_name)),
+            runtime_server(&long_name)
+        );
+        let pad = |n: usize, tail: &str| format!("/{}{tail}", "a".repeat(n));
+        for tail in ["/:x", "/:a/:b/:c/:d/:e/:f/:g/:h/:i/:j/:k"] {
+            for n in [
+                MAX_PATH_LEN - 5,
+                MAX_PATH_LEN - 4,
+                MAX_PATH_LEN - 36,
+                MAX_PATH_LEN - 37,
+            ] {
+                let grows = pad(n, tail);
+                assert_eq!(
+                    ours(server_route_path(&grows)),
+                    runtime_server(&grows),
+                    "{n} {tail}"
+                );
+            }
+        }
+        for grows in [
+            format!("/{}", "+".repeat(MAX_PATH_LEN / 2)),
+            format!("/{}", "a".repeat(MAX_PATH_LEN - 1)),
+            format!("/{}/", "a".repeat(MAX_PATH_LEN - 2)),
+            format!("/{}/", "a".repeat(MAX_PATH_LEN - 1)),
+            format!("/{}", "%2E/".repeat(MAX_PATH_LEN / 4)),
+        ] {
+            assert_eq!(
+                ours(server_route_path(&grows)),
+                runtime_server(&grows),
+                "{}",
+                grows.len()
+            );
+        }
     }
 }

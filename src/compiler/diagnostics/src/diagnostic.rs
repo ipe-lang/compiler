@@ -1778,7 +1778,7 @@ pub enum LowerError {
 /// literal, never the whole literal.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RoutePatternDefect {
-    /// A `:` or `*` segment marker is followed by no name.
+    /// A `:` segment marker is followed by no name.
     ParamEmpty,
     /// A parameter name is not an identifier.
     ParamNotIdentifier {
@@ -1817,6 +1817,71 @@ pub enum RoutePatternDefect {
     UnrenderableLiteral {
         /// The offending literal segment, as written.
         segment: Box<str>,
+    },
+    /// A `Server.*` route path does not start with `/`.
+    NotAbsolute,
+    /// A `Server.*` route path holds more `:` parameters than the server
+    /// routes.
+    TooManyParams {
+        /// The most parameters one path holds.
+        cap: usize,
+    },
+    /// A `Server.*` route path has a segment led by `*`: a catch-all, which
+    /// the server does not serve.
+    CatchAll {
+        /// The offending segment.
+        segment: Box<str>,
+    },
+    /// A literal segment of a `Server.*` route path holds a `:` or `*` after
+    /// its first byte.
+    MidSegmentSigil {
+        /// The offending segment.
+        segment: Box<str>,
+        /// Byte offset of the sigil within the segment.
+        at: usize,
+    },
+    /// A `Server.api` spec names a method the server does not serve.
+    UnknownMethod {
+        /// The method, as written.
+        method: Box<str>,
+    },
+    /// A `Server.static` or `Server.mountApp` prefix is not a string literal.
+    MountPrefixNotLiteral,
+    /// A `Server.static` or `Server.mountApp` prefix is not a mount base.
+    MountPrefix {
+        /// The offending prefix.
+        prefix: Box<str>,
+        /// The mount-base rule it breaks.
+        fault: MountPrefixFault,
+    },
+    /// Two mounts in one `Server.listen` list serve the same prefix.
+    MountPrefixDuplicate {
+        /// The shared prefix.
+        prefix: Box<str>,
+    },
+}
+
+/// The mount-base rule a literal `Server.static` or `Server.mountApp` prefix
+/// breaks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MountPrefixFault {
+    /// A non-root prefix that does not start with `/`.
+    NotAbsolute,
+    /// A non-root prefix that ends with `/`.
+    TrailingSlash,
+    /// Two adjacent separators.
+    EmptySegment,
+    /// A `.` or `..` segment.
+    DotSegment,
+    /// A byte outside `A-Z a-z 0-9 - . _ ~` and the `/` separator.
+    Reserved {
+        /// The offending byte.
+        byte: u8,
+    },
+    /// Longer than the mount-base ceiling.
+    TooLong {
+        /// The ceiling in bytes.
+        cap: usize,
     },
 }
 
@@ -3274,7 +3339,7 @@ fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
 /// broke and the rewrite that satisfies it.
 fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
     let note = match defect {
-        RoutePatternDefect::ParamEmpty => "every `:` or `*` segment needs a name after it — \
+        RoutePatternDefect::ParamEmpty => "every `:` segment needs a name after it — \
              write `/posts/:id`, not `/posts/:`"
             .to_string(),
         RoutePatternDefect::ParamNotIdentifier { name, .. } => format!(
@@ -3298,8 +3363,46 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
         RoutePatternDefect::TooLong { cap } => {
             format!("a route path is at most {cap} bytes — shorten it")
         }
+        RoutePatternDefect::TooManyParams { .. } => {
+            "split the route, or carry the extra values in the query string or the body".to_string()
+        }
+        RoutePatternDefect::NotAbsolute => {
+            "a server route path starts with `/` — write `/health`, not `health`".to_string()
+        }
+        RoutePatternDefect::CatchAll { .. } => {
+            "a server route matches a fixed number of segments — name each one \
+             (`/files/:dir/:name`) instead of a `*` catch-all"
+                .to_string()
+        }
+        RoutePatternDefect::MidSegmentSigil { .. } => {
+            "a parameter is a whole segment led by `:` — split `/v-:id` into `/v/:id`, or \
+             write the literal `:` or `*` as `%3A` or `%2A`"
+                .to_string()
+        }
         RoutePatternDefect::UnrenderableLiteral { .. } => {
-            "a page's path is rendered back into a URL, and a browser drops an empty,              `.` or `..` segment — remove the empty segment or rename the literal"
+            "a page's path is rendered back into a URL, and a browser drops an empty, \
+             `.` or `..` segment — remove the empty segment or rename the literal"
+                .to_string()
+        }
+        RoutePatternDefect::UnknownMethod { .. } => {
+            "name one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, \
+             `CONNECT`, `TRACE` or `ANY` before the path — or omit the method to serve every \
+             method"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "write the mount prefix as a string literal (`Server.static \"/assets\" dir`), so \
+             it is checked when the program compiles"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefix { .. } => {
+            "a mount prefix is `/` or `/`-separated segments of the letters, digits, `-`, `.`, \
+             `_` and `~`, with no trailing `/` — write `/assets` or `/app/v2`"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixDuplicate { .. } => {
+            "give each mount its own prefix; a longer prefix nested under another is served \
+             by the longer one"
                 .to_string()
         }
     };

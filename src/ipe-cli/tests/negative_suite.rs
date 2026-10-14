@@ -3766,6 +3766,77 @@ fn lower_server_route_param_empty() {
 }
 
 #[test]
+fn lower_server_route_catch_all() {
+    let src = server_route_fixture(r#"Server.get "/files/*rest""#);
+    assert_rejected("lower_server_route_catch_all", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_mid_segment_sigil() {
+    let src = server_route_fixture(r#"Server.get "/v-:id""#);
+    assert_rejected("lower_server_route_mid_segment_sigil", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_not_absolute() {
+    let src = server_route_fixture(r#"Server.get "health""#);
+    assert_rejected("lower_server_route_not_absolute", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_malformed_escape() {
+    let src = server_route_fixture(r#"Server.get "/a/%zz""#);
+    assert_rejected("lower_server_route_malformed_escape", &src, "IPE-L0156");
+}
+
+/// A `Server.listen` program over the literal route list `routes`.
+fn server_routes_fixture(routes: &str) -> String {
+    format!(
+        r"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+main =
+    Server.listen 8000
+        [ {routes} ]
+"
+    )
+}
+
+#[test]
+fn lower_server_static_prefix_reserved_byte() {
+    for prefix in ["/a?b", "/a#b", "/a/%zz", "/a:b", "/caf\u{e9}", "/assets/"] {
+        let src = server_routes_fixture(&format!(r#"Server.static "{prefix}" "public""#));
+        assert_rejected(
+            "lower_server_static_prefix_reserved_byte",
+            &src,
+            "IPE-L0156",
+        );
+    }
+}
+
+#[test]
+fn lower_server_static_prefix_not_literal() {
+    let src = r#"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+assets : String -> Route
+assets prefix = Server.static prefix "public"
+main =
+    Server.listen 8000
+        [ assets "/assets" ]
+"#;
+    assert_rejected("lower_server_static_prefix_not_literal", src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_static_prefix_duplicate() {
+    let src = server_routes_fixture(
+        r#"Server.static "/assets" "public", Server.static "/assets" "other""#,
+    );
+    assert_rejected("lower_server_static_prefix_duplicate", &src, "IPE-L0156");
+}
+
+#[test]
 fn lower_server_api_path_param_not_identifier() {
     let src = server_route_fixture(r#"Server.api "GET /v1/:a-b""#);
     assert_rejected(
@@ -3773,6 +3844,14 @@ fn lower_server_api_path_param_not_identifier() {
         &src,
         "IPE-L0156",
     );
+}
+
+#[test]
+fn lower_server_api_unknown_method() {
+    for spec in ["FETCH /x", "po\u{17f}t /x"] {
+        let src = server_route_fixture(&format!(r#"Server.api "{spec}""#));
+        assert_rejected("lower_server_api_unknown_method", &src, "IPE-L0156");
+    }
 }
 
 /// A routed `Web.tea` app (its Model has a `page` field) over `page_ty`,
@@ -4024,7 +4103,7 @@ fn well_formed_route_paths_compile() {
     );
     assert_compiles(
         "server_route_well_formed",
-        &server_route_fixture(r#"Server.get "/files/:_dir/*rest""#),
+        &server_route_fixture(r#"Server.get "/files/:_dir/:name""#),
     );
     assert_compiles(
         "server_api_well_formed",

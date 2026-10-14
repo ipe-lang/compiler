@@ -3902,6 +3902,27 @@ fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
     parse_mount_base(&web_base_path())
 }
 
+/// The `/static` file service of a `Web` app over `dir`: a [`MountTable`]
+/// holding the one `/static` mount, so the listener's parse and the URI are
+/// re-based below the prefix as every `Server` mount re-bases them.
+///
+/// [`MountTable`]: crate::server::MountTable
+///
+/// # Errors
+///
+/// `StartupRefusal::MountBase` if `/static` were outside the mount-base
+/// grammar.
+#[cfg(feature = "server")]
+fn web_static_mount(dir: std::path::PathBuf) -> Result<axum::Router, StartupRefusal> {
+    let base = parse_mount_base(WEB_STATIC_PREFIX)?;
+    let files = axum::Router::new().fallback_service(crate::server::strict_serve_dir(dir));
+    Ok(crate::server::MountTable::new(vec![(base, files)]).below(axum::Router::new()))
+}
+
+/// The prefix a `Web` app's `[web] static` directory is served below.
+#[cfg(feature = "server")]
+const WEB_STATIC_PREFIX: &str = "/static";
+
 /// A router that answers EVERY path with `503 Service Unavailable` and the
 /// fixed [`FAIL_CLOSED_BODY`]. Used when a mounted `Web.embed` cannot start as
 /// declared (fail-closed): the mount stays reachable enough to report that it
@@ -4178,6 +4199,7 @@ mod handlers {
         state: State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -4188,7 +4210,7 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        let mut resp = serve_page(state, method, uri, headers).await;
+        let mut resp = serve_page(state, method, uri, strict, headers).await;
         mint_proof::vary_on_mint_inputs(resp.headers_mut());
         resp
     }
@@ -4197,6 +4219,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -4212,14 +4235,15 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        // The router's URL gate already refused a malformed path or query;
-        // this is the second, independent boundary before any session work.
-        // The path is parsed here once; every route resolver below reads it.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        // The page reads the listener's one URL parse; a request reaching it
+        // without that parse is refused, never parsed afresh. Every route
+        // resolver below reads this path.
+        let strict = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let lookup = (st.route_matched)(&path);
+        let path = strict.path();
+        let lookup = (st.route_matched)(path);
         // A routed page reached by a path other than the one it renders to (a
         // trailing `/`, an escape its route decodes, `007` for an `Int` `7`) is
         // redirected there before any session work, so a session only ever
@@ -4234,7 +4258,13 @@ mod handlers {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "500 base path unusable")
                     .into_response();
             };
-            match route::canonical_redirect(&base, uri.path(), uri.query(), canonical) {
+            match route::canonical_redirect(
+                &base,
+                strict.spelling(),
+                uri.path(),
+                uri.query(),
+                canonical,
+            ) {
                 route::Redirect::Serve => {}
                 route::Redirect::To(target) => {
                     return (
@@ -4348,7 +4378,7 @@ mod handlers {
                 let scope = pubsub::SessionScope::new(sid.clone());
                 let make_init = || {
                     pubsub::with_session(&scope, || {
-                        let params = (st.param_resolver)(&path);
+                        let params = (st.param_resolver)(path);
                         let req = req::web_req(&method, &uri, &headers, params);
                         (st.init)(req)
                     })
@@ -4456,7 +4486,7 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((
@@ -4477,7 +4507,7 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((_, store::Rejoin::Miss)) | None => {
@@ -4510,7 +4540,7 @@ mod handlers {
                 // Build the request context (params from routing — empty when
                 // unrouted) and init a fresh model. The param_resolver is
                 // model-independent, breaking the init↔routing cycle.
-                let params = (st.param_resolver)(&path);
+                let params = (st.param_resolver)(path);
                 let req = req::web_req(&method, &uri, &headers, params);
                 // Session fixation guard: a store MISS means this sid is NOT a
                 // known session, so NEVER adopt the client-supplied cookie value
@@ -4518,7 +4548,7 @@ mod handlers {
                 // Minted first so `init` and the entry run under it.
                 let scope = pubsub::SessionScope::new(minted_sid(proof));
                 let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
-                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, path);
                 (
                     SessionOwner::Minted(scope.sid().to_owned()),
                     scope,
@@ -4620,7 +4650,7 @@ mod handlers {
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
     pub(super) async fn sse_handler<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
-        uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
         base: Arc<route::DecodedPath>,
     ) -> Response
@@ -4632,10 +4662,10 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Send + Sync + 'static,
     {
-        // The query decodes once through the strict core; the router's URL
-        // gate already refused a malformed one, this is the second boundary.
-        let qs = match crate::server::strict_url_query(&uri) {
-            Ok(qs) => qs,
+        // The query is the listener's one URL parse; a request reaching this
+        // handler without that parse is refused, never parsed afresh.
+        let qs = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.query(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         // `?path=` is parsed once into the route path it names; a malformed
@@ -5741,6 +5771,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         headers: axum::http::HeaderMap,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         method: axum::http::Method,
     ) -> axum::response::Response
     where
@@ -5765,11 +5796,11 @@ mod handlers {
         // Build a fresh init model from the current request context — the same
         // path the clean-reinit miss takes — so the reset session holds exactly
         // what a cold-start visit would have produced.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        let path = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.path(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(&path);
+        let params = (st.param_resolver)(path);
         let req = req::web_req(&method, &uri, &headers, params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
         {
@@ -5864,6 +5895,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         headers: axum::http::HeaderMap,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         method: axum::http::Method,
         body: axum::body::Bytes,
     ) -> axum::response::Response
@@ -5894,11 +5926,11 @@ mod handlers {
         // Derive the init model the same way reset_handler does: build a
         // WebReq from the current request context so route-aware apps get the
         // correct initial state.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        let path = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.path(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(&path);
+        let params = (st.param_resolver)(path);
         let req = req::web_req(&method, &uri, &headers, params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
 
@@ -6469,11 +6501,11 @@ where
     crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
     let sse_route = get(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
-              uri: axum::http::Uri,
+              strict: Option<axum::Extension<crate::server::StrictUrl>>,
               headers: axum::http::HeaderMap| {
             handlers::sse_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>(
                 st,
-                uri,
+                strict,
                 headers,
                 Arc::clone(&sse_base),
             )
@@ -6793,23 +6825,23 @@ where
     }
 
     // package.ipe `[web] static` (baked as IPE_WEB_STATIC_DIR) → serve files at
-    // /static/* via ServeDir. MUST be added before the `/*path` page catch-all
-    // so a /static/<file> request hits ServeDir, not the page handler (which
-    // would return HTML). `strict_serve_dir` parses each request path through
-    // `server::static_request` (decoded once, every segment a plain name under
-    // the host regime, the join re-checked) before `ServeDir` reads it. NOTE: like
-    // http.FileServer it FOLLOWS symlinks inside the dir — the dir is
-    // author-controlled (package.ipe [web] static), so that is the intended
-    // contract, NOT a confinement guarantee. Absent/empty → no static mount.
+    // /static/* via ServeDir. The nest outranks the `/*path` page catch-all, so
+    // a /static/<file> request hits ServeDir, not the page handler (which
+    // would return HTML). Inside the nest a `MountTable` re-bases the
+    // listener's parse and the URI below `/static` exactly as a `Server.static`
+    // mount does, so the static gate judges that parse: a rest the parser
+    // could never produce (`/static//x`) is a 404. `strict_serve_dir` admits
+    // only a path whose segments are plain names under the host regime, the
+    // join re-checked, before `ServeDir` reads it. NOTE: like http.FileServer
+    // it FOLLOWS symlinks inside the dir — the dir is author-controlled
+    // (package.ipe [web] static), so that is the intended contract, NOT a
+    // confinement guarantee. Absent/empty → no static mount.
     // IPE_WEB_STATIC_DIR: non-empty value mounts the named directory at /static.
     if let Some(dir) = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
         .ok()
         .filter(|d| !d.is_empty())
     {
-        router = router.nest_service(
-            "/static",
-            crate::server::strict_serve_dir(std::path::PathBuf::from(dir)),
-        );
+        router = router.nest_service("/static", web_static_mount(std::path::PathBuf::from(dir))?);
     }
 
     let app: Router = router
@@ -6825,12 +6857,13 @@ where
         // observability::track so a rejected CSRF POST still gets counted +
         // access-logged.
         .layer(axum::middleware::from_fn(csrf::csrf_middleware))
-        // Strict URL gate over every route here (page, SSE, event, port,
-        // assets, static): a malformed path or query is answered with the
-        // fixed 400 before CSRF or any handler runs. Inner of `track`, so a
-        // refusal is still counted and access-logged.
+        // Second boundary over every route here (page, SSE, event, port,
+        // assets, static): a request that reaches this router without the
+        // listener's URL parse is answered with the fixed 500 before CSRF or
+        // any handler runs. Inner of `track`, so a refusal is still counted
+        // and access-logged.
         .layer(axum::middleware::from_fn(
-            crate::server::refuse_malformed_url,
+            crate::server::refuse_unparsed_url,
         ))
         // Per-request panic recovery: a handler or csrf-mw panic becomes a 500
         // instead of an unwound tokio task that drops the connection with no
@@ -7431,9 +7464,11 @@ mod canonical_redirect_handler_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        Router::new()
-            .fallback(get(handlers::page::<Model, (), Init, Update, View, Subs>))
-            .with_state(state)
+        crate::server::behind_listener(
+            Router::new()
+                .fallback(get(handlers::page::<Model, (), Init, Update, View, Subs>))
+                .with_state(state),
+        )
     }
 
     #[allow(clippy::expect_used)] // test helper: request build and router failure are environment issues
@@ -9921,32 +9956,34 @@ mod hot_init_session_scoping_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        Router::new()
-            .route(
-                "/",
-                get(handlers::page::<
-                    Counter,
-                    (),
-                    fn(WebReq) -> (Counter, IpeCmd<()>),
-                    fn((), Counter) -> (Counter, IpeCmd<()>),
-                    fn(Counter) -> Html<()>,
-                    fn(Counter) -> IpeSub<()>,
-                >),
-            )
-            .route(
-                "/_ipe/hot-init",
-                post(
-                    handlers::hot_init_handler::<
+        crate::server::behind_listener(
+            Router::new()
+                .route(
+                    "/",
+                    get(handlers::page::<
                         Counter,
                         (),
                         fn(WebReq) -> (Counter, IpeCmd<()>),
                         fn((), Counter) -> (Counter, IpeCmd<()>),
                         fn(Counter) -> Html<()>,
                         fn(Counter) -> IpeSub<()>,
-                    >,
-                ),
-            )
-            .with_state(state)
+                    >),
+                )
+                .route(
+                    "/_ipe/hot-init",
+                    post(
+                        handlers::hot_init_handler::<
+                            Counter,
+                            (),
+                            fn(WebReq) -> (Counter, IpeCmd<()>),
+                            fn((), Counter) -> (Counter, IpeCmd<()>),
+                            fn(Counter) -> Html<()>,
+                            fn(Counter) -> IpeSub<()>,
+                        >,
+                    ),
+                )
+                .with_state(state),
+        )
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -11146,6 +11183,7 @@ mod emitted_router_behavior_tests {
             fn(Model) -> Html<Msg>,
             fn(Model) -> IpeSub<Msg>,
         >(make_state(store), false)
+        .map(crate::server::behind_listener)
         .expect("the unset test base parses")
     }
 
@@ -12438,6 +12476,7 @@ mod emitted_router_behavior_tests {
                 fn(Model) -> Html<Msg>,
                 fn(Model) -> IpeSub<Msg>,
             >(state, false)
+            .map(crate::server::behind_listener)
             .expect("the unset test base parses");
             let ord = std::sync::atomic::Ordering::SeqCst;
             let expected_vary = [
@@ -12530,6 +12569,7 @@ mod emitted_router_behavior_tests {
             fn(Model) -> Html<Msg>,
             fn(Model) -> IpeSub<Msg>,
         >(state, false)
+        .map(crate::server::behind_listener)
         .expect("the unset test base parses")
     }
 
@@ -12605,7 +12645,7 @@ mod emitted_router_behavior_tests {
     /// GET `/` against a mount, returning the status and body text.
     #[allow(clippy::expect_used)] // test helper: request build / body read failure is a test environment issue
     async fn mounted_get(router: axum::Router) -> (StatusCode, String) {
-        let resp = router
+        let resp = crate::server::behind_listener(router)
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -12752,6 +12792,51 @@ mod emitted_router_behavior_tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, FAIL_CLOSED_BODY);
         assert!(!body.contains("%zz"), "the 503 must not echo the refusal");
+    }
+
+    /// A `Web.embed` app nested in a listener's router: a malformed URL is
+    /// refused with 400 before the mount is chosen, and a respelled mount
+    /// prefix enters the mount exactly as its canonical spelling does.
+    #[test]
+    fn embedded_app_sees_only_canonical_urls() {
+        let builder = web_embed_router(
+            init,
+            update,
+            view,
+            subs,
+            "memory".to_string(),
+            String::new(),
+            [0u8; 32],
+        );
+        block_on(async move {
+            let base = crate::encoding::MountBase::parse("/billing").expect("the prefix parses");
+            let sub = builder(String::new()).await;
+            let app = crate::server::behind_listener(
+                crate::server::MountTable::new(vec![(base, sub)]).below(axum::Router::new()),
+            );
+            let status_of = |uri: &'static str| {
+                let app = app.clone();
+                async move {
+                    app.oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build GET"),
+                    )
+                    .await
+                    .expect("router responds")
+                    .status()
+                }
+            };
+            for uri in ["/billing/%zz", "/billing/%", "/%zz", "/billing?q=%zz"] {
+                assert_eq!(status_of(uri).await, StatusCode::BAD_REQUEST, "{uri}");
+            }
+            let canonical = status_of("/billing").await;
+            assert_eq!(canonical, StatusCode::OK, "the mount serves its prefix");
+            assert_eq!(status_of("/%62illing").await, canonical);
+            assert_eq!(status_of("/%62%69lling").await, canonical);
+        });
     }
 
     /// A mounted app whose store config this build cannot honour answers every
@@ -13016,6 +13101,7 @@ mod route_entry_cmd_tests {
     #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
     fn router_counted(store: Store, session_count: Arc<AtomicUsize>) -> axum::Router {
         build_web_router(fixture_state(store, session_count), false)
+            .map(crate::server::behind_listener)
             .expect("the fixture route table and base are well-formed")
     }
 
@@ -13039,6 +13125,46 @@ mod route_entry_cmd_tests {
 
     fn memory() -> Store {
         Arc::new(MemoryStore::<Model, Msg>::new(Duration::from_secs(60)))
+    }
+
+    /// A Web router reached without the listener's URL parse refuses every
+    /// route with the fixed 500 and starts no session: the page, the SSE
+    /// stream and the event endpoint alike, a well-formed URL and a malformed
+    /// one alike.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the fixture table builds and a fixed request always builds
+    fn web_router_without_the_listener_parse_is_refused() {
+        run(false, || async {
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let bare = build_web_router(fixture_state(memory(), sessions.clone()), false)
+                .expect("the fixture route table and base are well-formed");
+            for (method, uri) in [
+                ("GET", "/"),
+                ("GET", "/items/3"),
+                ("GET", "/%zz"),
+                ("GET", "/_ipe/sse?path=/"),
+                ("POST", "/_ipe/event"),
+            ] {
+                let resp = bare
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build request"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{method} {uri}"
+                );
+            }
+            assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(take_init_sids().is_empty());
+        });
     }
 
     /// A rebound name reaches no route of a real `serve_web`: the page GET
@@ -13080,6 +13206,65 @@ mod route_entry_cmd_tests {
                 );
                 let resp = crate::server::raw_exchange(port, &control).await.unwrap();
                 assert_eq!(crate::server::raw_status(&resp), 200, "{resp}");
+            };
+            // The listener serves until shutdown; the checks finishing first is the pass.
+            let checked = tokio::select! {
+                _ = served => false,
+                () = checks => true,
+            };
+            assert!(checked, "serve_web returned before the checks ran");
+            crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
+    }
+
+    /// A real `serve_web` refuses a malformed URL with 400 before any route,
+    /// and serves another spelling of an internal route as that route: the
+    /// respelled event POST gets the event handler's answer, never the page
+    /// route's.
+    #[test]
+    fn web_refuses_a_malformed_url_and_routes_its_canonical_spelling() {
+        run(false, || async {
+            let port = crate::server::free_loopback_port().unwrap();
+            crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+            crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
+            crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+            crate::system::locked_set_var(
+                crate::env_registry::web::WEB_PORT.name(),
+                &port.to_string(),
+            );
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let served = serve_web::<crate::IpeError, _, _, _, _, _, _>(fixture_state(
+                memory(),
+                sessions.clone(),
+            ));
+            let checks = async {
+                let host = format!("127.0.0.1:{port}");
+                for path in ["/%zz", "/%", "/_ipe/%zz", "/no/such/page/%C0%AF", "/?q=%zz"] {
+                    let request =
+                        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+                    let resp = crate::server::raw_exchange(port, &request).await.unwrap();
+                    assert_eq!(crate::server::raw_status(&resp), 400, "{path}: {resp}");
+                    assert!(!resp.contains("%zz"), "{path} must not echo the request");
+                }
+                assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let event = |path: &str| {
+                    format!(
+                        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                };
+                let canonical = crate::server::raw_exchange(port, &event("/_ipe/event"))
+                    .await
+                    .unwrap();
+                let respelled = crate::server::raw_exchange(port, &event("/_ipe/%65vent"))
+                    .await
+                    .unwrap();
+                let status = crate::server::raw_status(&canonical);
+                assert_ne!(status, 405, "the event route answers its POST: {canonical}");
+                assert_eq!(crate::server::raw_status(&respelled), status, "{respelled}");
+                let body = |resp: &str| resp.split_once("\r\n\r\n").map(|(_, b)| b.to_owned());
+                assert_eq!(body(&respelled), body(&canonical));
             };
             // The listener serves until shutdown; the checks finishing first is the pass.
             let checked = tokio::select! {
@@ -14575,7 +14760,9 @@ mod web_revocation_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        build_web_router(state, false).expect("a router armed through the Server floor builds")
+        build_web_router(state, false)
+            .map(crate::server::behind_listener)
+            .expect("a router armed through the Server floor builds")
     }
 
     /// Arm the process through the `Server` floor, then run `body` on a
@@ -16238,5 +16425,51 @@ mod web_revocation_tests {
             .await;
             assert!(is_session_lost(after).await, "a revoked session is lost");
         });
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod web_static_mount_tests {
+    //! A `Web` app's `/static` mount re-bases the listener's parse as every
+    //! `Server` mount does.
+
+    use super::web_static_mount;
+
+    /// Serve `uri` through the `Web` static mount over a directory holding
+    /// `hello.txt`, behind the listener.
+    #[allow(clippy::expect_used)] // test: fixture writes and a fixed request
+    async fn serve(uri: &str) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let dir = crate::scratch_core::test_temp_root().join(format!(
+            "ipe-web-static-{}-{}",
+            std::process::id(),
+            uri.len()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp static dir");
+        std::fs::write(dir.join("hello.txt"), "hi").expect("static fixture file");
+        let mount = web_static_mount(dir.clone()).expect("`/static` is a mount base");
+        let app =
+            crate::server::behind_listener(axum::Router::new().nest_service("/static", mount));
+        let wire = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        let status = match app.oneshot(wire).await {
+            Ok(r) => r.status(),
+            Err(e) => match e {},
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        status
+    }
+
+    /// Prove the refusal: a rest led by an empty segment reaches no file,
+    /// while the file itself is served.
+    #[tokio::test]
+    async fn web_static_mount_refuses_a_rest_led_by_an_empty_segment() {
+        assert_eq!(serve("/static/hello.txt").await, axum::http::StatusCode::OK);
+        for uri in ["/static//hello.txt", "/static///hello.txt"] {
+            assert_eq!(serve(uri).await, axum::http::StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 }

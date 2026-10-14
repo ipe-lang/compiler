@@ -33,10 +33,10 @@ use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
     ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, ImportedAs, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect,
-    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
-    Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
-    intercept_context_phrase,
+    Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault, NameError, ParseError,
+    RoutePatternDefect, SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect,
+    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
+    WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
 
@@ -2118,7 +2118,7 @@ fn store_select_projection_label(defect: &StoreSelectProjectionDefect) -> String
 fn route_pattern_label(defect: &RoutePatternDefect) -> String {
     match defect {
         RoutePatternDefect::ParamEmpty => {
-            "a `:` or `*` segment has no parameter name after it".to_string()
+            "a `:` segment has no parameter name after it".to_string()
         }
         RoutePatternDefect::ParamNotIdentifier { name, at } => format!(
             "parameter name `{name}` is not an identifier (byte {at} is not a letter, \
@@ -2136,11 +2136,50 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
         RoutePatternDefect::TooLong { cap } => {
             format!("this path is longer than the {cap}-byte route ceiling")
         }
+        RoutePatternDefect::NotAbsolute => "this path does not start with `/`".to_string(),
+        RoutePatternDefect::TooManyParams { cap } => {
+            format!("this path holds more than {cap} `:` parameters")
+        }
+        RoutePatternDefect::CatchAll { segment } => {
+            format!("segment `{segment}` is a `*` catch-all, which a server route cannot hold")
+        }
+        RoutePatternDefect::MidSegmentSigil { segment, at } => format!(
+            "segment `{segment}` has a `:` or `*` at byte {at}, which is neither a parameter \
+             nor a literal"
+        ),
         RoutePatternDefect::UnrenderableLiteral { segment } => {
             format!(
                 "segment `{segment}` is empty, `.` or `..`, so this route's URL cannot be rendered"
             )
         }
+        RoutePatternDefect::UnknownMethod { method } => {
+            format!("`{method}` is not a method the server serves")
+        }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "this mount prefix is computed, not a string literal".to_string()
+        }
+        RoutePatternDefect::MountPrefix { prefix, fault } => {
+            format!(
+                "mount prefix `{prefix}` {}",
+                mount_prefix_fault_label(*fault)
+            )
+        }
+        RoutePatternDefect::MountPrefixDuplicate { prefix } => {
+            format!("two mounts in this list serve the prefix `{prefix}`")
+        }
+    }
+}
+
+fn mount_prefix_fault_label(fault: MountPrefixFault) -> String {
+    match fault {
+        MountPrefixFault::NotAbsolute => "does not start with `/`".to_string(),
+        MountPrefixFault::TrailingSlash => "ends with `/`".to_string(),
+        MountPrefixFault::EmptySegment => "has an empty segment (`//`)".to_string(),
+        MountPrefixFault::DotSegment => "has a `.` or `..` segment".to_string(),
+        MountPrefixFault::Reserved { byte } => {
+            format!("holds byte 0x{byte:02X}, which a mount prefix cannot hold")
+        }
+        MountPrefixFault::TooLong { cap } => format!("is longer than the {cap}-byte ceiling"),
     }
 }
 
