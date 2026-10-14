@@ -73,6 +73,7 @@ Each module listed below links to a detail page with the full documentation and 
 - [Csv](#csv)
 - [Db.Codec](#dbcodec)
 - [Db.Dsn](#dbdsn)
+- [Db.Location](#dblocation)
 - [Db.Store](#dbstore)
 - [Db.Store.Unsafe](#dbstoreunsafe)
 - [Db.Unsafe](#dbunsafe)
@@ -1462,6 +1463,19 @@ Ipe.Db.Dsn — a typed, opaque database connection descriptor
 | `redacted` | `redacted dsn` — a credential-free, human-readable rendering. The password is |
 | `open` | `open dsn` — connect a parsed `Dsn` to a live, read-only external database. |
 | `close` | `close conn` — return the connection's pool. Total and idempotent over either |
+
+## Db.Location
+
+[Full reference](stdlib/Db.Location.md)
+
+Ipe.Db.Location — the typed location `Db.open` opens.
+
+| Export | Summary |
+|--------|----------|
+| `Mode` | How `file` opens its file. |
+| `file` | `file mode path` — the SQLite file at `path`, opened under `mode`. |
+| `memory` | `memory` — a fresh private in-memory SQLite database. Each `Db.open` of it |
+| `dsn` | `dsn descriptor` — the database a parsed `Dsn` names. |
 
 ## Db.Store
 

@@ -911,6 +911,9 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::DsnUser
         | KernelFn::DsnTlsTag
         | KernelFn::DsnRedacted
+        | KernelFn::DbLocationFile
+        | KernelFn::DbLocationMemory
+        | KernelFn::DbLocationDsn
         | KernelFn::DbConnOpen
         | KernelFn::DbConnClose
         | KernelFn::DbConnUnsafeExecRawOn

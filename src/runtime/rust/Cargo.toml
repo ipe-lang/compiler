@@ -111,10 +111,9 @@ hmac = { version = "0.12", optional = true }
 # heavy surface — optional, behind the `crypto` feature.
 sha1 = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
-# The driver features (`sqlite`/`postgres`) are activated by the `db-sqlite` /
-# `db-postgres` selectors, not enabled here — a program pulls only the driver
-# it emits. `db-postgres` also activates `sqlite` (the Live session store keeps
-# a sqlite side table even under the postgres driver — see `db_cargo_toml`).
+# The sqlx driver features (`sqlite`/`postgres`) are activated by `db`, not
+# here; the `db-sqlite` / `db-postgres` selectors pick which driver's aliases
+# the crate root compiles (see `db-postgres`).
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls"], optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 # `Ipe.Regex` regex kernels + `String.isUrl`, behind the `regex` feature. A
@@ -407,10 +406,11 @@ json = ["dep:serde_json", "serde"]
 # `tokio/net`: the `ssrf` gate resolves a Postgres host through
 # `tokio::net::lookup_host` (non-blocking, deadline-bounded).
 db = ["sqlx", "sqlx?/sqlite", "sqlx?/postgres", "tokio", "tokio/sync", "tokio/net", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
-# `db-sqlite` / `db-postgres`: config.rs alias selectors. Only the emitter ever
-# enables one, and it selects exactly one (SEAL-checked) — the standalone crate
-# links both sqlx drivers regardless (see `db`). The `compile_error!` in
-# `config.rs` guards the union as a fail-closed guard, not a user surface.
+# `db-sqlite` / `db-postgres`: driver alias selectors. `db-postgres` makes the
+# crate root compile `config_postgres.rs` as `config`; any other build compiles
+# the sqlite `config.rs`. The emitter enables exactly one, and the crate links
+# both sqlx drivers regardless (see `db`). The `compile_error!` in `mod.rs`
+# refuses the union, a fail-closed guard, not a user surface.
 db-sqlite = ["db"]
 db-postgres = ["db"]
 redis_store = ["redis", "tokio", "tokio/sync", "dep:serde_json", "json", "serde", "async-trait", "random"]
@@ -513,10 +513,11 @@ web = ["web-core", "widget-assets", "server", "dep:serde_json", "json", "serde",
 # at build time — the same code the server path calls, no second glue. `web`
 # implies it so the server keeps `ipe_runtime::web::widget_assets::*` unchanged.
 widget-assets = ["crypto-core", "encoding"]
-# `db-postgres` (not bare `db`) selects a concrete sqlx driver — it also pulls
-# `sqlite`, so both driver code paths compile. `jwt` + `url` cover the
-# JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
-full = ["async", "json", "jwt", "url", "db", "db-postgres", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time", "log", "regex", "uuid", "random", "decimal", "char-category"]
+# `full` names no driver selector, so it compiles the sqlite aliases the
+# runtime's own db tests open, and `full,db-postgres` is the every-feature
+# PostgreSQL build CI lints. `db` links both sqlx drivers. `jwt` + `url` cover
+# the JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
+full = ["async", "json", "jwt", "url", "db", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time", "log", "regex", "uuid", "random", "decimal", "char-category"]
 # Development-only time-travelling debugger core (recorder / re-fold / export /
 # import). NOT in `full` and NOT implied by `wasm-client` — the debugger is a
 # build-mode opt-in (`ipe dev build/run --debugger`), never a default. `ipe release`

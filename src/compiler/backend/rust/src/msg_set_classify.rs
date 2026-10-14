@@ -269,6 +269,7 @@ const fn aggregate_discriminant(ty: &IrType) -> &'static str {
         IrType::Url => "Url",
         IrType::UrlRelative => "UrlRelative",
         IrType::Dsn => "Dsn",
+        IrType::DbLocation => "DbLocation",
         IrType::Connection => "Connection",
         IrType::ConnReadOnly => "ConnReadOnly",
         IrType::ConnReadWrite => "ConnReadWrite",

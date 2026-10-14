@@ -1639,6 +1639,14 @@ pub enum IrType {
     /// (a `Dsn` in a Model field is a compile-time rejection, same posture as
     /// `Secret`/`Url`).
     Dsn,
+    // ── Ipe.Db.Location ─────────────────────────────────────────────────────
+    /// Opaque typed database location `Db.open` takes
+    /// (`ipe_runtime::db::DbLocation`).
+    ///
+    /// Minted only by `Ipe.Db.Location.file` (a fail-closed parse of a `Path`),
+    /// `memory`, and `dsn`; it may carry a `Dsn`, so it is `Clone`, `Debug` is
+    /// redacted, and it is non-serde (same posture as `Dsn`).
+    DbLocation,
     // ── Ipe.Db external Connection ──────────────────────────────────────────
     /// The external-database connection handle `Connection mode`
     /// (`ipe_runtime::external_conn::ExternalConnection`), distinct from the app's
@@ -1892,6 +1900,7 @@ pub fn ir_type_is_derivable(
         // `Dsn` derives Clone; `Debug` is hand-written (redacting) — fully
         // derivable, not serde (carries a `Secret`).
         | IrType::Dsn
+        | IrType::DbLocation
         // Cache config / stats + Csv document + process-run config runtime
         // structs derive Clone+Debug+PartialEq.
         | IrType::ProcessRunWithCfg
@@ -2168,6 +2177,7 @@ pub fn ir_type_is_serde(ty: &IrType, enum_serde: &impl Fn(&ModPath, Symbol) -> b
         // `ipe_runtime::dsn::Dsn` has no serde impl), so a Model field of type
         // `Dsn` is a compile-time IPE-L0120, same posture as `Url` / `Secret`.
         | IrType::Dsn
+        | IrType::DbLocation
         // Cache config / stats + Csv document + process-run config are
         // kernel-boundary data records — derivable (see `ir_type_is_derivable`)
         // but never persisted to a session store, so not serde.
@@ -2385,6 +2395,7 @@ pub const fn ir_type_feature_requirement(ty: &IrType) -> Option<RuntimeFeatureId
         // standalone but share `Connection`'s gate (fail-closed).
         IrType::SqlFragment
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite => Some(RuntimeFeatureId::Db),
@@ -2549,6 +2560,7 @@ pub fn carrier_leaf(ty: &IrType) -> CarrierLeaf<'_> {
         | IrType::UrlRelative
         // `Dsn` clones its String fields + `Secret` (a String clone).
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Db
         // The external connection wraps `Clone` sqlx pools; the phantom markers
         // never carry a runtime value but must stay exhaustive.
@@ -4161,6 +4173,7 @@ mod tests {
             (IrType::CryptoMac, RuntimeFeatureId::CryptoCore),
             (IrType::SqlFragment, RuntimeFeatureId::Db),
             (IrType::Dsn, RuntimeFeatureId::Db),
+            (IrType::DbLocation, RuntimeFeatureId::Db),
             (IrType::Connection, RuntimeFeatureId::Db),
             (IrType::ServerRequest, RuntimeFeatureId::Server),
             (IrType::StreamWriter, RuntimeFeatureId::Server),

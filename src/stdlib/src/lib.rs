@@ -231,6 +231,16 @@ const DB_UNSAFE: &str = include_str!("../Ipe/Db/Unsafe.ipe");
 /// `MODULES`); NOT in `STDLIB_MODULE_QUALIFIERS`, so the disjointness invariant
 /// holds.
 const DB_DSN: &str = include_str!("../Ipe/Db/Dsn.ipe");
+/// `Ipe.Db.Location` — the typed location `Db.open` opens, compiled-source
+/// Layer-3.
+///
+/// Defines the `Mode` ADT and wraps the `Db.Location_*` constructor kernels,
+/// marshalling `Mode` to a small-integer tag. A file location is parsed once
+/// into a sealed SQLite file name, so no caller text reaches a URL parser.
+/// Pure — constructing a location discloses no capability. Registered in
+/// [`COMPILED_STD_MODULES`] (NOT `MODULES`); NOT in
+/// `STDLIB_MODULE_QUALIFIERS`, so the disjointness invariant holds.
+const DB_LOCATION: &str = include_str!("../Ipe/Db/Location.ipe");
 /// `Ipe.Secret.Unsafe` — the raw secret-reveal escape hatch for `Ipe.Secret`,
 /// compiled-source Layer-3.
 ///
@@ -1881,6 +1891,13 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     CompiledStdModule {
         dotted: "Ipe.Db.Dsn",
         source: DB_DSN,
+    },
+    // Ipe.Db.Location — Layer-3 source; the typed location `Db.open` opens.
+    // Defines the `Mode` ADT and wraps the `Db.Location_*` constructor kernels.
+    // Pure: constructing a location performs no I/O and discloses no capability.
+    CompiledStdModule {
+        dotted: "Ipe.Db.Location",
+        source: DB_LOCATION,
     },
     // Ipe.Secret.Unsafe — Layer-3 source; the single `unsafeReveal` escape hatch
     // is a `Kernel.kernel "Secret_reveal"` alias to the unchanged `SecretReveal`

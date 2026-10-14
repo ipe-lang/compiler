@@ -208,6 +208,15 @@ mod tests {
                 .expect("a literal DSN"),
             ),
             case(
+                "DbLocation",
+                &crate::db::db_location_dsn(
+                    ok(crate::dsn::dsn_parse::<String>(
+                        "postgres://alice@db.example.com:5432/app".to_owned(),
+                    ))
+                    .expect("a literal DSN"),
+                ),
+            ),
+            case(
                 "SqlFragment",
                 &crate::db::sql_eq(
                     crate::db::sql_column("name".to_owned()),
@@ -407,6 +416,7 @@ mod tests {
             dev(&secret()),
             dev(&key),
             dev(&dsn),
+            dev(&crate::db::db_location_dsn(dsn.clone())),
             dev(&crate::email::SmtpConfig {
                 host: "smtp.example.com".to_owned(),
                 port: 587,
@@ -438,6 +448,8 @@ mod tests {
         assert_eq!(dev(&secret()), REDACTED_SHOW);
         assert_eq!(dev(&key), key.ipe_show());
         assert!(dev(&dsn).contains("alice"), "{}", dev(&dsn));
+        let location = dev(&crate::db::db_location_dsn(dsn.clone()));
+        assert!(location.contains("alice"), "{location}");
     }
 
     /// In a dev-posture build every implicit rendering stays on the shown view:

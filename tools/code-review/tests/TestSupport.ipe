@@ -100,6 +100,7 @@ module TestSupport exposing
     , rawKeyCheckFor
     , isRefusal
     , refusedWith
+    , openFileAt
     )
 
 import Ipe.ByteSize as ByteSize
@@ -109,6 +110,7 @@ import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
 import Ipe.Db.Sql as Sql
+import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
@@ -346,7 +348,7 @@ unitViewTag unit units =
 execIndex : String -> String -> List SqlValue -> Task.Task Error ()
 execIndex indexDb sql params =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting indexDb
         Db.exec conn sql params
         Task.succeed ()
 
@@ -357,7 +359,7 @@ execIndex indexDb sql params =
 execIndexUnchecked : String -> String -> List SqlValue -> Task.Task Error ()
 execIndexUnchecked indexDb sql params =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting indexDb
         Db.withTransaction conn
             (\tx ->
                 do
@@ -463,7 +465,7 @@ execIndexSchema conn statements =
 
 seedIndexDb : String -> Task.Task Error ()
 seedIndexDb indexDb =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+    openFileAt CreateIfMissing indexDb
         |> Task.andThen
             (\conn ->
                 System.cwd ()
@@ -541,7 +543,7 @@ envSettings =
 
 -- The review store location a server resolves once at startup, here parsed
 -- from the current `IPE_REVIEW_DB` the way `main` reads and parses it.
-envReview : Task.Task Error Settings.DbLocation
+envReview : Task.Task Error Settings.ReviewFile
 envReview =
     Settings.parseReviewDb (System.getenvOr "IPE_REVIEW_DB" "review.db")
 
@@ -754,7 +756,7 @@ modifiedFrom change =
 mirroredCount : String -> Task.Task Error Int
 mirroredCount indexDb =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+        conn <- openFileAt ReadExisting indexDb
         rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM reviewed" [] totalDecoder
         case rows of
             [ n ] ->
@@ -773,7 +775,7 @@ totalDecoder =
 -- The head stamped on the index's `reviewed` copy, Nothing when unstamped.
 stampOf : String -> Task.Task Error (Maybe String)
 stampOf indexDb =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+    openFileAt ReadExisting indexDb
         |> Task.andThen Index.readStamp
 
 
@@ -1197,7 +1199,7 @@ refusedFor reason refusal =
 migratedReviewAt : String -> Task.Task Error Db
 migratedReviewAt path =
     do
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" path
+        loc <- Settings.parseReviewDb path
         key <- testReviewKey
         LibDb.probe key loc
         LibDb.openAt loc
@@ -1268,12 +1270,21 @@ reverifyShown unit found =
             Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is not in the index"))
 
 
--- A test file path opened read-only through the app's read URL builder, so
--- every write on it fails without a key conflict.
+-- A test file path opened read-only through the location the app builds
+-- for the index, so every write on it fails without a key conflict.
 openReadOnlyAt : String -> Task.Task Error Db
 openReadOnlyAt path =
-    Settings.parseDbLocation "IPE_INDEX_DB" path
-        |> Task.andThen (\loc -> Db.open "sqlite" (Settings.indexReadUrl loc))
+    Settings.parseIndexDb path
+        |> Task.andThen (\loc -> Db.open loc.read)
+
+
+-- A test fixture's database file opened in `mode`.
+openFileAt : Mode -> String -> Task.Task Error Db
+openFileAt mode file =
+    Path.fromString file
+        |> Result.andThen (Location.file mode)
+        |> Task.fromResult
+        |> Task.andThen Db.open
 
 
 -- The vectors file beside this package: `tools/ipe-index/tests`, reached from

@@ -1637,6 +1637,10 @@ pub fn emit_db_call(
         | KernelFn::DsnUser
         | KernelFn::DsnTlsTag
         | KernelFn::DsnRedacted
+        // `Db.Location.*` — `Int` tag + `Path` / no arg / `Dsn` scalar args.
+        | KernelFn::DbLocationFile
+        | KernelFn::DbLocationMemory
+        | KernelFn::DbLocationDsn
         | KernelFn::DbDecString
         | KernelFn::DbDecInt
         | KernelFn::DbDecFloat

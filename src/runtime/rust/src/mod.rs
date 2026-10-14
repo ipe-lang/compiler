@@ -67,11 +67,30 @@
     )
 )]
 
+// `db-sqlite` and `db-postgres` are mutually exclusive sqlx driver selectors:
+// the emitter enables exactly one, and this guard refuses a hand-written union.
+#[cfg(all(feature = "db-sqlite", feature = "db-postgres"))]
+compile_error!(
+    "db-sqlite and db-postgres are mutually exclusive: a project selects exactly one sqlx driver"
+);
+
+// The driver aliases (`DbPool`, `DbRow`, the placeholder and auto-id helpers)
+// a dependency-model project links: `db-postgres` selects the PostgreSQL set,
+// every other build the SQLite set. A vendored project overwrites `config.rs`.
+#[cfg(not(feature = "db-postgres"))]
 pub mod config;
-// Behavioral tests for the emit-only Postgres `config_postgres.rs` placeholder
-// rewriter, which is otherwise never compiled into this crate (see that file's
-// header). Test-only, gated on `db` so the re-included sqlx-typed source
-// compiles; nothing here is emitted.
+#[cfg(feature = "db-postgres")]
+#[path = "config_postgres.rs"]
+pub mod config;
+// The selected aliases speak the feature's driver: a `config` that drifts from
+// its feature is a type error here, not a pool opened on the other engine.
+#[cfg(all(feature = "db", feature = "db-postgres"))]
+const _: fn(config::DbRow) -> sqlx::postgres::PgRow = |row| row;
+#[cfg(all(feature = "db", not(feature = "db-postgres")))]
+const _: fn(config::DbRow) -> sqlx::sqlite::SqliteRow = |row| row;
+// Behavioral tests for the Postgres `config_postgres.rs` placeholder rewriter
+// in every build, whichever driver this one selects. Test-only, gated on `db`
+// so the re-included sqlx-typed source compiles; nothing here is emitted.
 #[cfg(feature = "config")]
 pub mod config_decode;
 #[cfg(all(test, feature = "db"))]

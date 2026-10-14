@@ -299,6 +299,7 @@ fn ir_type_name_at(interner: &Interner, ty: &IrType, depth: u16) -> String {
         IrType::Url => "Url".to_owned(),
         IrType::UrlRelative => "Url.Relative".to_owned(),
         IrType::Dsn => "Dsn".to_owned(),
+        IrType::DbLocation => "DbLocation".to_owned(),
         // The phantom access mode is shown for a readable IR dump; it never
         // renders to a standalone Rust type (erased at emit).
         IrType::Connection => "Connection".to_owned(),

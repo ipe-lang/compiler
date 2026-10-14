@@ -1291,6 +1291,7 @@ const fn ir_type_display_name(ty: &IrType) -> &'static str {
         IrType::Url => "Url",
         IrType::UrlRelative => "Url.Relative",
         IrType::Dsn => "Dsn",
+        IrType::DbLocation => "DbLocation",
         IrType::Connection => "Connection",
         IrType::ConnReadOnly => "ReadOnly",
         IrType::ConnReadWrite => "ReadWrite",
