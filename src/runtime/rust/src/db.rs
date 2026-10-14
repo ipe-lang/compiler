@@ -2529,7 +2529,7 @@ impl DbUrl {
 }
 
 /// Which database a [`DbLocation`] names.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum LocationKind {
     /// A SQLite file opened under a mode.
     File {
@@ -2547,7 +2547,7 @@ enum LocationKind {
 /// Built only by `file` (a fail-closed parse of a `Path`), `memory` and `dsn`.
 /// It may carry a `Dsn`, so its `Debug` and show row never print the
 /// descriptor's credentials.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct DbLocation(LocationKind);
 
 crate::stringify::show_row!(
@@ -2618,6 +2618,18 @@ pub const fn db_location_memory() -> DbLocation {
 pub const fn db_location_dsn(dsn: crate::dsn::Dsn) -> DbLocation {
     DbLocation(LocationKind::Dsn(dsn))
 }
+
+/// The traits an emitted record derives for every field the IR classes
+/// derivable (`ipe_ir::ir_type_is_derivable`). Naming a type here makes a
+/// missing impl a build error in the runtime, not a `cargo` error in an
+/// emitted project.
+const fn is_derivable_carrier<T: Clone + std::fmt::Debug + PartialEq>() {}
+
+const _: () = {
+    is_derivable_carrier::<crate::dsn::Dsn>();
+    is_derivable_carrier::<DbLocation>();
+    is_derivable_carrier::<SqlFragment>();
+};
 
 pub fn db_exec_raw<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
@@ -13548,6 +13560,26 @@ mod tests {
         let IpeResult::Ok(file) = file else { return };
         let shown = format!("{file:?}");
         assert!(shown.contains("x.db"), "{shown}");
+    }
+
+    /// Two locations are equal exactly when they name the same database, and a
+    /// differing `Dsn` password makes them differ.
+    #[test]
+    fn locations_compare_by_the_database_they_name() {
+        let dsn_at = |url: &str| {
+            let parsed = crate::dsn::dsn_parse::<String>(url.to_owned());
+            assert!(matches!(parsed, IpeResult::Ok(_)), "{url} must parse");
+            parsed
+        };
+        let location = |url: &str| match dsn_at(url) {
+            IpeResult::Ok(dsn) => Some(db_location_dsn(dsn)),
+            IpeResult::Err(_) => None,
+        };
+        let one = location("postgres://u:pw1@h/d");
+        assert!(one.is_some() && one == location("postgres://u:pw1@h/d"));
+        assert!(one != location("postgres://u:pw2@h/d"));
+        assert!(one != Some(db_location_memory()));
+        assert!(Some(db_location_memory()) == Some(db_location_memory()));
     }
 
     /// A pool key never prints a URL's password; a file key prints its name.

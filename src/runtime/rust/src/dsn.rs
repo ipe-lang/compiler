@@ -104,9 +104,11 @@ impl DsnHost {
 /// Holds its decoded text and reaches a connection URL only percent-encoded
 /// ([`DsnPart::encoded`]), so no character in it can end the component it sits
 /// in and add URL syntax such as a `sslmode` parameter. A user name is
-/// credential-adjacent, so it has no derived (early-exit) equality.
+/// credential-adjacent, so its equality is constant-time, never derived.
 #[derive(Clone, Debug)]
 struct DsnPart(String);
+
+crate::ct_eq::impl_ct_eq!(DsnPart);
 
 impl DsnPart {
     /// A part written percent-encoded in a URL, held decoded.
@@ -246,6 +248,16 @@ struct Credentials {
     password: Option<Secret>,
 }
 
+impl PartialEq for Credentials {
+    /// Both halves are always compared, so a matching user name does not
+    /// shorten the time a differing password takes.
+    fn eq(&self, other: &Self) -> bool {
+        let same_user = self.user == other.user;
+        let same_password = self.password == other.password;
+        same_user && same_password
+    }
+}
+
 impl Credentials {
     /// The credentials of an optional user name and a literal password.
     ///
@@ -265,7 +277,7 @@ impl Credentials {
 }
 
 /// What a DSN connects to, per driver.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum DsnTarget {
     /// A PostgreSQL database name.
     Postgres(DsnPart),
@@ -280,7 +292,11 @@ enum DsnTarget {
 /// (cloning observes no plaintext — `Secret`'s own `Clone` does not reveal the
 /// payload). No `Display`/`IpeStringify` is derived: a `Dsn` is only ever
 /// rendered through its explicit redacted form.
-#[derive(Clone)]
+///
+/// `PartialEq` compares the non-secret fields, then the credentials in
+/// constant time ([`Credentials`]), so a record holding a `Dsn` derives
+/// equality like every other derivable field.
+#[derive(Clone, PartialEq)]
 pub struct Dsn {
     target: DsnTarget,
     host: DsnHost,
@@ -917,6 +933,23 @@ mod tests {
         match dsn_parse::<String>(s.to_string()) {
             IpeResult::Ok(_) => panic!("expected {s:?} to be rejected, but it parsed"),
             IpeResult::Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn equality_compares_every_part_including_credentials() {
+        let base = "postgres://alice:pw1@db.example:5432/app";
+        assert!(parse_ok(base) == parse_ok(base));
+        for other in [
+            "postgres://bob:pw1@db.example:5432/app",
+            "postgres://alice:pw2@db.example:5432/app",
+            "postgres://alice@db.example:5432/app",
+            "postgres://alice:pw1@db.example:5433/app",
+            "postgres://alice:pw1@other.example:5432/app",
+            "postgres://alice:pw1@db.example:5432/other",
+            "postgres://alice:pw1@db.example:5432/app?sslmode=prefer",
+        ] {
+            assert!(parse_ok(base) != parse_ok(other), "{other} must differ");
         }
     }
 
