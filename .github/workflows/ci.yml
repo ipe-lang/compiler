@@ -596,6 +596,11 @@ jobs:
       # Every runtime feature at once — lints that fire only when all gated
       # modules compile together (an item order, a cfg-gated dead fn).
       - run: cargo clippy -p ipe-runtime-rust --features full --all-targets -- -D warnings
+      # The PostgreSQL driver aliases (`config_postgres.rs`) a dependency-model
+      # `database = Postgres` project links, alone and over every feature. The
+      # library only: the runtime's own tests open SQLite.
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features db-postgres -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --features full,db-postgres -- -D warnings
 
   # Required context for `runtime-feature-combos-run`: the phase verdict (see the header).
   runtime-feature-combos:

@@ -24,6 +24,7 @@ module Main exposing (main)
 
 import Ipe.Analytics as Analytics exposing (ConsentState(..), PropValue(..))
 import Ipe.Db as Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store
 import Ipe.Dict as Dict
 import Ipe.Error as Error exposing (Error)
@@ -63,7 +64,7 @@ main =
         Ok store ->
             Task.andThen
                 (\conn -> run conn store)
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)
 
 
 run : Db -> Store.Store Analytics.AnalyticsEvent -> Task Error ()

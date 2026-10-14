@@ -204,6 +204,7 @@ pub fn paired_children<'a>(a: &'a IrType, b: &'a IrType) -> Option<PairedChildre
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite

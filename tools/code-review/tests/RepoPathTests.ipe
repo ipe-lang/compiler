@@ -6,6 +6,7 @@ import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
 import Ipe.Db.Sql as Sql
+import Ipe.Db.Location exposing (Mode(..))
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
@@ -31,7 +32,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
 
 
 -- ── guard the path resolver ─────────────────────────────────────────────
@@ -67,7 +68,7 @@ traversalPathsRejectedIn base =
 
 seedTraversalDb : String -> Task.Task Error ()
 seedTraversalDb base =
-    Db.open "sqlite" ("sqlite://" ++ base ++ "/index.db?mode=rwc")
+    openFileAt CreateIfMissing (base ++ "/index.db")
         |> Task.andThen
             (\conn ->
                 System.cwd ()

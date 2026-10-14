@@ -3420,6 +3420,7 @@ const fn is_non_serde_leaf(ty: &IrType) -> bool {
         // `Dsn` carries a `Secret` and is non-serde — a `Dsn` in a HydrationState
         // record is rejected (same posture as `Url`/`Secret`).
         | IrType::Dsn
+        | IrType::DbLocation
         // External `Connection` + phantom markers — opaque non-serde handles,
         // rejected in a HydrationState record just like `Dsn`.
         | IrType::Connection

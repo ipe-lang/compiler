@@ -519,9 +519,10 @@ fn security_ui_html_typed_bridge_compiles() {
 fn security_db_unsafe_exec_raw_off_plain_db_is_rejected() {
     let src = "module Main exposing (main)\n\
                import Ipe.Db as Db\n\
+               import Ipe.Db.Location as Location\n\
                import Ipe.Task as Task\n\
                main =\n\
-                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open \"sqlite\" \"sqlite::memory:\")\n";
+                   Task.andThen (\\conn -> Db.unsafeExecRaw conn \"SELECT 1\") (Db.open Location.memory)\n";
     assert_rejected("security_db_unsafe_exec_raw_off_plain", src, "IPE-N0005");
 }
 
@@ -536,9 +537,10 @@ fn security_store_checked_write_kernels_are_unreachable() {
         let via_db = format!(
             "module Main exposing (main)\n\
              import Ipe.Db as Db\n\
+             import Ipe.Db.Location as Location\n\
              import Ipe.Task as Task\n\
              main =\n\
-             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open \"sqlite\" \"sqlite::memory:\")\n"
+             \x20   Task.andThen (\\conn -> Db.{member} conn \"t\" []) (Db.open Location.memory)\n"
         );
         assert_rejected(
             &format!("security_db_{member}_unreachable"),
@@ -558,6 +560,90 @@ fn security_store_checked_write_kernels_are_unreachable() {
             "IPE-N0005",
         );
     }
+}
+
+/// A `Db.open` program whose open expression is `open`, then printing `ok`.
+fn db_open_program(open: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\
+         import Ipe.Db as Db\n\
+         import Ipe.Db.Dsn as Dsn\n\
+         import Ipe.Db.Location as Location exposing (Mode(..))\n\
+         import Ipe.Io as Io\n\
+         import Ipe.Path as Path\n\
+         import Ipe.Result as Result\n\
+         import Ipe.Task as Task\n\
+         main : Task Error ()\n\
+         main =\n\
+         \x20   {open}\n\
+         \x20       |> Task.andThen (\\_ -> Io.println \"ok\")\n"
+    )
+}
+
+/// SECURITY: `Db.open` takes one typed `DbLocation`. The driver-and-URL pair
+/// and a bare path string have no representation, so neither reaches a URL
+/// parser: each is a type error at `ipe` time.
+#[test]
+fn security_db_open_refuses_text() {
+    assert_rejected(
+        "security_db_open_driver_and_url",
+        &db_open_program("Db.open \"sqlite\" \"x.db\""),
+        "IPE-T0001",
+    );
+    assert_rejected(
+        "security_db_open_bare_path",
+        &db_open_program("Db.open \"x.db\""),
+        "IPE-T0001",
+    );
+    assert_rejected(
+        "security_db_location_dsn_text",
+        &db_open_program("Db.open (Location.dsn \"postgres://h/d\")"),
+        "IPE-T0001",
+    );
+}
+
+/// SECURITY (contrapositive): every typed location constructor opens.
+#[test]
+fn security_db_open_typed_locations_compile() {
+    assert_compiles(
+        "security_db_open_memory",
+        &db_open_program("Db.open Location.memory"),
+    );
+    assert_compiles(
+        "security_db_open_file",
+        &db_open_program(
+            "Path.fromString \"app.db\"\n\
+             \x20       |> Result.andThen (Location.file CreateIfMissing)\n\
+             \x20       |> Task.fromResult\n\
+             \x20       |> Task.andThen Db.open",
+        ),
+    );
+    assert_compiles(
+        "security_db_open_dsn",
+        &db_open_program(
+            "Dsn.parse \"sqlite:app.db\"\n\
+             \x20       |> Task.fromResult\n\
+             \x20       |> Task.andThen (\\dsn -> Db.open (Location.dsn dsn))",
+        ),
+    );
+}
+
+/// SECURITY: `DbLocation` is a reserved builtin, so a user type cannot shadow
+/// the proof `Db.open` accepts. The same declaration under another name is
+/// accepted.
+#[test]
+fn security_db_location_name_reserved() {
+    assert_rejected(
+        "security_db_location_reserved",
+        &format!("{HEAD}type DbLocation = DbLocation String\nmain = 1\n"),
+        "IPE-N0026",
+    );
+    assert_compiles(
+        "security_db_location_renamed",
+        &format!(
+            "{HEAD}import Ipe.Io as Io\ntype AppLocation = AppLocation String\nmain : Task Error ()\nmain = Io.println \"ok\"\n"
+        ),
+    );
 }
 
 /// SECURITY: the untyped row read `unsafeGetField` no longer lives on the plain

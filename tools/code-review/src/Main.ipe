@@ -123,7 +123,7 @@ requireSettings key rawDb rawRoot rawReview =
 main : Task Error ()
 main =
     do
-        rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the path or sqlite:// URL of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
+        rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the file path of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
         rawRoot <- requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
         key <- requireReviewKey
         settings <- requireSettings key rawDb rawRoot (System.getenvOr "IPE_REVIEW_DB" "review.db")

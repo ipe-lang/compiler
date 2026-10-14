@@ -2,6 +2,7 @@ module Main exposing (main)
 
 import Ipe.Io as Io
 import Ipe.Db as Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Dict as Dict
@@ -108,7 +109,7 @@ main =
                     Db.withTransaction conn
                         (\txconn -> runChecks txconn store)
                 )
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)
 
 
 runChecks : Db -> Store Store.Row -> Task Error ()

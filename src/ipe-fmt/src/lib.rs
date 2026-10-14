@@ -3544,7 +3544,7 @@ mod tests {
                     "        v{i} <- Queue.resyncReviewedWithin {{ pageSize = 5, pageCeiling = {i} }} \"db\"\n            |> Task.map (\\_ -> Nothing)\n            |> Task.onError (\\e -> Task.succeed (Just (Error.toString e)))\n"
                 ),
                 2 => format!("        v{i} <- Index.loadProgress\n"),
-                3 => format!("        v{i} <- Db.open \"sqlite\" \"sqlite://z\"\n"),
+                3 => format!("        v{i} <- Db.open Location.memory\n"),
                 _ => format!(
                     "        v{i} <- Db.findWhere \"conn\" \"reviewed\" (Sql.eq (Sql.column \"uid\") (Sql.string \"pre\"))\n"
                 ),

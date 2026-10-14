@@ -1439,6 +1439,10 @@ mod registry_phase_c_tests {
             K::ColorDeuteranopia,
             K::ColorTritanopia,
             K::ColorSimulate,
+            // Ipe.Db.Location — the typed location `Db.open` takes (Ipê-new).
+            K::DbLocationFile,
+            K::DbLocationMemory,
+            K::DbLocationDsn,
         ]
     };
 

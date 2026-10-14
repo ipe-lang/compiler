@@ -212,9 +212,10 @@ fn ipe_err<E: crate::FromIpeError>(engine: DbEngine, e: &sqlx::Error) -> E {
 /// The Ipê `Error` for a refused connect.
 ///
 /// A driver failure keeps its classification; the dial-target ceiling is a
-/// `LimitExceeded` refusal; every other refusal is a configuration or policy
-/// refusal and keeps its plain message. `context` prefixes the message.
-pub(crate) fn connect_refusal<E: From<String> + crate::FromIpeError>(
+/// `LimitExceeded` refusal; a malformed or mismatched location is
+/// `InvalidInput`, a dial policy refusal `PermissionDenied`, and a missing
+/// relay `Unavailable`. `context` prefixes the message.
+pub(crate) fn connect_refusal<E: crate::FromIpeError>(
     context: &str,
     engine: DbEngine,
     refused: &DbConnectError,
@@ -237,9 +238,15 @@ pub(crate) fn connect_refusal<E: From<String> + crate::FromIpeError>(
         | DbConnectError::MisplacedUserinfo
         | DbConnectError::UnsupportedScheme
         | DbConnectError::EngineMismatch { .. }
-        | DbConnectError::HostRefused(_)
-        | DbConnectError::RelayUnavailable
-        | DbConnectError::EngineRefused(_) => str_err(&format!("{context}{refused}")),
+        | DbConnectError::EngineRefused(_) => {
+            E::from_ipe_error(IpeError::invalid_input(format!("{context}{refused}")))
+        }
+        DbConnectError::HostRefused(_) => E::from_ipe_error(
+            IpeError::permission_denied().with_message(format!("{context}{refused}")),
+        ),
+        DbConnectError::RelayUnavailable => {
+            E::from_ipe_error(IpeError::unavailable(format!("{context}{refused}")))
+        }
     }
 }
 
@@ -1165,9 +1172,9 @@ pub fn db_decode_optional<
 // well-typed Ipê program). So `Db.connect <url>` resolves to ONE bounded,
 // shared pool per URL — independent of how often the user calls it.
 
-/// Process-global pool registry keyed by connection URL.
-fn pool_cache() -> &'static std::sync::Mutex<HashMap<String, Db>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Db>>> =
+/// Process-global pool registry keyed by [`PoolKey`].
+fn pool_cache() -> &'static std::sync::Mutex<HashMap<PoolKey, Db>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<PoolKey, Db>>> =
         std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
@@ -2154,101 +2161,582 @@ fn keep_outside_transaction<C: sqlx::Connection>(
     })
 }
 
-/// Build one configured pool. SQLite (file, not `:memory:`) gets WAL — concurrent
-/// readers alongside a single writer. Without WAL a shared pool serialises every
-/// statement on the rollback-journal lock. The PRAGMA runs only when the parsed
-/// URL selects a shared SQLite file, the same value that chose the driver's gate.
+/// What a fresh pool does to the SQLite journal before it is handed out.
+///
+/// WAL lets readers run alongside a single writer; without it a shared pool
+/// serialises every statement on the rollback-journal lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Journal {
+    /// Leave the journal as the database has it (a read-only file, a private
+    /// in-memory database).
+    Unchanged,
+    /// Switch to WAL; a failed switch fails the open.
+    Wal,
+    /// Switch to WAL when the parsed URL names a shared SQLite file, best
+    /// effort (the operator `Db.connect` URL and a `Dsn`).
+    WalIfShared,
+}
+
+/// Build one configured pool for `db_url`, then set its journal per `journal`.
+///
 /// Lock contention waits for [`SQLITE_BUSY_TIMEOUT`], which every connection
 /// carries from its connect options.
-async fn build_pool<E: Send + From<String> + crate::FromIpeError + 'static>(
-    url: &str,
+async fn build_pool<E: Send + crate::FromIpeError + 'static>(
+    db_url: &DbUrl,
+    journal: Journal,
 ) -> IpeResult<E, Db> {
-    let db_url = match DbUrl::parse(url) {
-        Ok(db_url) => db_url,
-        Err(refused) => return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
-    };
     let max_connections: u32 = match DB_CONNECTIONS_CEILING.read() {
         Ok(cap) => cap,
-        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
+        Err(refused) => {
+            return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(
+                refused.to_string(),
+            )));
+        }
     };
-    let pool: Db = match VettedPool::<DbDatabase>::connect(&db_url, max_connections).await {
+    let pool: Db = match VettedPool::<DbDatabase>::connect(db_url, max_connections).await {
         Ok(vetted) => vetted.into_pool(),
         Err(refused) => return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
     };
-    if db_url.is_shared_sqlite_file() {
-        let _ = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
+    let wal = match journal {
+        Journal::Unchanged => false,
+        Journal::Wal => true,
+        Journal::WalIfShared => db_url.is_shared_sqlite_file(),
+    };
+    if wal {
+        let switched = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
+        if let (Journal::Wal, Err(e)) = (journal, switched) {
+            pool.close().await;
+            return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e));
+        }
     }
     ok_res(pool)
 }
 
-/// Connect to `url`, returning a clone of the cached pool on a hit. On a miss the
-/// pool is built with NO lock held (never block other tasks on connect I/O); a
-/// concurrent miss that built a redundant pool loses the `entry` race and its
-/// extra pool drops (closes) — steady state keeps exactly one pool per URL.
-async fn connect_cached<E: Send + From<String> + crate::FromIpeError + 'static>(
-    url: String,
+/// The identity a shared pool is cached under.
+///
+/// A private in-memory database has no key, so it is never shared. A URL key
+/// may carry a password, so its `Debug` never prints the URL.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PoolKey {
+    /// A sealed file name opened under one mode; two modes are two pools.
+    File {
+        name: SqliteFileName,
+        mode: FileMode,
+    },
+    /// The connection URL of a parsed `Dsn`.
+    Dsn(String),
+    /// The operator `Db.connect` URL.
+    Operator(String),
+}
+
+impl std::fmt::Debug for PoolKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File { name, mode } => f
+                .debug_struct("File")
+                .field("name", name)
+                .field("mode", mode)
+                .finish(),
+            Self::Dsn(_) => f.write_str("Dsn(<redacted>)"),
+            Self::Operator(_) => f.write_str("Operator(<redacted>)"),
+        }
+    }
+}
+
+/// Connect `db_url`, returning a clone of the pool cached under `key` on a hit.
+///
+/// On a miss the pool is built with NO lock held (never block other tasks on
+/// connect I/O); a concurrent miss that built a redundant pool loses the
+/// `entry` race and its extra pool drops (closes), so steady state keeps one
+/// pool per key. `None` builds an uncached pool.
+async fn connect_cached<E: Send + crate::FromIpeError + 'static>(
+    key: Option<PoolKey>,
+    db_url: DbUrl,
+    journal: Journal,
 ) -> IpeResult<E, Db> {
     let max_pools: usize = match DB_POOLS_CEILING.read() {
         Ok(cap) => cap,
-        Err(refused) => return IpeResult::Err(str_err(&refused.to_string())),
+        Err(refused) => {
+            return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(
+                refused.to_string(),
+            )));
+        }
     };
-    if url_is_cacheable(&url) {
+    if let Some(key) = &key {
         let g = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(p) = g.get(&url) {
+        if let Some(p) = g.get(key) {
             return ok_res(p.clone());
         }
     }
-    match build_pool::<E>(&url).await {
-        IpeResult::Ok(pool) => {
-            if url_is_cacheable(&url) {
-                let mut g = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
-                // Another task may have inserted during the lock-free build → reuse it.
-                if let Some(existing) = g.get(&url) {
-                    return ok_res(existing.clone());
-                }
-                // Bound the cache: at cap, return the freshly-built pool UNCACHED
-                // (functional; just not memoised) rather than growing without limit.
-                if g.len() >= max_pools {
-                    return ok_res(pool);
-                }
-                ok_res(g.entry(url).or_insert(pool).clone())
-            } else {
-                ok_res(pool)
-            }
-        }
-        IpeResult::Err(e) => IpeResult::Err(e),
+    let pool = match build_pool::<E>(&db_url, journal).await {
+        IpeResult::Ok(pool) => pool,
+        IpeResult::Err(e) => return IpeResult::Err(e),
+    };
+    let Some(key) = key else {
+        return ok_res(pool);
+    };
+    let mut g = pool_cache().lock().unwrap_or_else(|e| e.into_inner());
+    // Another task may have inserted during the lock-free build → reuse it.
+    if let Some(existing) = g.get(&key) {
+        return ok_res(existing.clone());
     }
+    // Bound the cache: at cap, return the freshly-built pool UNCACHED
+    // (functional; just not memoised) rather than growing without limit.
+    if g.len() >= max_pools {
+        return ok_res(pool);
+    }
+    ok_res(g.entry(key).or_insert(pool).clone())
+}
+
+/// Connect the operator URL `url`, pooled per URL unless it names a private
+/// in-memory database.
+async fn connect_operator<E: Send + crate::FromIpeError + 'static>(
+    url: String,
+) -> IpeResult<E, Db> {
+    let db_url = match DbUrl::parse(&url) {
+        Ok(db_url) => db_url,
+        Err(refused) => return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
+    };
+    let key = url_is_cacheable(&url).then_some(PoolKey::Operator(url));
+    connect_cached(key, db_url, Journal::WalIfShared).await
 }
 
 pub fn db_connect<E: Send + From<String> + crate::FromIpeError + 'static>(
     _unit: (),
 ) -> IpeTask<E, Db> {
-    Box::pin(connect_cached(ipe_db_url()))
+    Box::pin(connect_operator(ipe_db_url()))
 }
 
-/// `Db.open : String -> String -> Task Error Db` (driver, path). The compiled
-/// `DbPool` type is already fixed by the `package.ipe` driver, so `driver` is
-/// informational; we connect using `path`. For sqlite a bare file path needs a
-/// `sqlite://…?mode=rwc` URL (create-if-missing); other drivers pass `path`
-/// through as the connection string. (Was wrongly `(_unit: ())` → ignored both
-/// args → E0061 at every `Db.open "sqlite" "x.db"` call site.)
+/// The parsed URL a [`crate::dsn::Dsn`] names, its host vetted for a
+/// PostgreSQL target.
+///
+/// Defence in depth: the host the `Dsn` parse boundary extracted is gated
+/// here, and [`VettedPool::connect`] independently gates every host its own
+/// parse of the URL finds. A `DsnHost` is proven not to be part of the DSN's
+/// credentials, so the refusal may name it.
+///
+/// # Errors
+///
+/// The [`DbConnectError`] of the URL parse, or [`DbConnectError::HostRefused`].
+pub(crate) async fn dsn_db_url(dsn: &crate::dsn::Dsn) -> Result<DbUrl, DbConnectError> {
+    let url = DbUrl::parse(&dsn.connection_url())?;
+    match dsn.driver() {
+        crate::dsn::DsnDriver::Postgres => {
+            VettedDial::for_configured_host(dsn.host().configured(), dsn.port())
+                .await
+                .map_err(DbConnectError::HostRefused)?;
+        }
+        crate::dsn::DsnDriver::Sqlite => {}
+    }
+    Ok(url)
+}
+
+/// `Db.open : DbLocation -> Task Error Db` — open the app pool at `location`.
+///
+/// The pool's engine is the one `package.ipe` fixed; a location for the other
+/// engine is a typed `InvalidInput` engine mismatch. A file location reaches
+/// the driver as a file name, never as URL text.
+///
+/// Defence in depth: the mismatch is refused here, before any URL is built or
+/// host resolved, and again by the driver's [`GatedDial`] gate.
 pub fn db_open<E: Send + From<String> + crate::FromIpeError + 'static>(
-    driver: String,
-    path: String,
+    location: DbLocation,
 ) -> IpeTask<E, Db> {
-    let url = if driver == "sqlite" && !path.contains(':') {
-        format!("sqlite://{}?mode=rwc", path)
-    } else {
-        path
-    };
-    Box::pin(connect_cached(url))
+    Box::pin(async move {
+        if let Err(refused) = location.admit_engine(KERNEL_ENGINE) {
+            return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused));
+        }
+        match location.0 {
+            LocationKind::File { name, mode } => {
+                let db_url = match DbUrl::sqlite_file(&name, mode) {
+                    Ok(db_url) => db_url,
+                    Err(refused) => {
+                        return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused));
+                    }
+                };
+                let journal = match mode {
+                    FileMode::ReadExisting => Journal::Unchanged,
+                    FileMode::WriteExisting | FileMode::CreateIfMissing => Journal::Wal,
+                };
+                connect_cached(Some(PoolKey::File { name, mode }), db_url, journal).await
+            }
+            LocationKind::Memory => match DbUrl::sqlite_memory() {
+                Ok(db_url) => connect_cached(None, db_url, Journal::Unchanged).await,
+                Err(refused) => IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
+            },
+            LocationKind::Dsn(dsn) => match dsn_db_url(&dsn).await {
+                Ok(db_url) => {
+                    let shared =
+                        matches!(db_url, DbUrl::Postgres(_)) || db_url.is_shared_sqlite_file();
+                    let key = shared.then(|| PoolKey::Dsn(dsn.connection_url()));
+                    connect_cached(key, db_url, Journal::WalIfShared).await
+                }
+                Err(refused) => IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
+            },
+        }
+    })
 }
 
-pub fn db_open_with_path<E: Send + From<String> + crate::FromIpeError + 'static>(
-    path: String,
-) -> IpeTask<E, Db> {
-    Box::pin(connect_cached(path))
+// ─── Ipe.Db.Location — the typed location `Db.open` takes ─────────────────────
+
+/// The most bytes a SQLite file name may hold, in the anchored form the driver
+/// receives (SQLite's unix `MAX_PATHNAME`).
+const SQLITE_FILE_NAME_MAX: usize = 512;
+
+/// The runtime-authored URL of a private in-memory database.
+///
+/// Each parse names a fresh database that every connection of one pool shares.
+const SQLITE_MEMORY_URL: &str = "sqlite::memory:";
+
+/// How a file location opens its file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FileMode {
+    /// Read-only; the file must exist.
+    ReadExisting,
+    /// Read-write; the file must exist.
+    WriteExisting,
+    /// Read-write; the file is created when absent.
+    CreateIfMissing,
 }
+
+impl FileMode {
+    /// The mode `Ipe.Db.Location`'s `modeTag` marshalled to `tag`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbLocationRefusal::UnknownMode`] for a tag no mode carries.
+    const fn from_tag(tag: i64) -> Result<Self, DbLocationRefusal> {
+        match tag {
+            0 => Ok(Self::ReadExisting),
+            1 => Ok(Self::WriteExisting),
+            2 => Ok(Self::CreateIfMissing),
+            _ => Err(DbLocationRefusal::UnknownMode { tag }),
+        }
+    }
+
+    /// The constructor name `Ipe.Db.Location` gives the mode.
+    #[cfg(feature = "dev-posture")]
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ReadExisting => "ReadExisting",
+            Self::WriteExisting => "WriteExisting",
+            Self::CreateIfMissing => "CreateIfMissing",
+        }
+    }
+}
+
+/// Why a database location was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DbLocationRefusal {
+    /// The path names no file: empty, `.`, `..`, a root, or a trailing separator.
+    NoFileName,
+    /// A `:` after the volume, or a drive-relative path, which SQLite could
+    /// read as a URI or a special name.
+    Colon,
+    /// A leading `//`, `\\` (or a mix) or `\??\`: a network share or device
+    /// path.
+    NetworkPath,
+    /// The anchored file name runs past [`SQLITE_FILE_NAME_MAX`].
+    TooLong {
+        /// The anchored byte length.
+        len: usize,
+    },
+    /// A mode tag no [`FileMode`] carries.
+    UnknownMode {
+        /// The refused tag.
+        tag: i64,
+    },
+}
+
+impl std::fmt::Display for DbLocationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoFileName => f.write_str(
+                "db location: the path names no file (it is empty, `.`, `..`, a root, or ends \
+                 in a separator)",
+            ),
+            Self::Colon => f.write_str(
+                "db location: a file name may not hold `:` after its drive, nor be \
+                 drive-relative",
+            ),
+            Self::NetworkPath => f.write_str(
+                "db location: a path starting `//`, `\\\\` or `\\??\\` names a network share \
+                 or device, which is refused",
+            ),
+            Self::TooLong { len } => write!(
+                f,
+                "db location: the file name is {len} bytes, past the {SQLITE_FILE_NAME_MAX}-byte \
+                 limit"
+            ),
+            Self::UnknownMode { tag } => write!(f, "db location: unknown file mode tag {tag}"),
+        }
+    }
+}
+
+impl DbLocationRefusal {
+    /// The refusal as the caller's input error.
+    ///
+    /// The error kinds have no limit kind, so the length ceiling is
+    /// `InvalidInput`, as every other location refusal is.
+    fn into_error(self) -> IpeError {
+        let message = self.to_string();
+        match self {
+            Self::NoFileName
+            | Self::Colon
+            | Self::NetworkPath
+            | Self::TooLong { .. }
+            | Self::UnknownMode { .. } => IpeError::invalid_input(message),
+        }
+    }
+}
+
+/// A SQLite file name in the form the driver hands to `sqlite3_open_v2`.
+///
+/// Built only by [`SqliteFileName::parse`]: never empty, never `:memory:`,
+/// never a `file:` URI, never a network path, and at most
+/// [`SQLITE_FILE_NAME_MAX`] bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SqliteFileName(String);
+
+impl SqliteFileName {
+    /// Seal `path` under the build target's separator rules.
+    fn parse(path: &Path) -> Result<Self, DbLocationRefusal> {
+        Self::parse_under(path.as_str(), super::path_core::HOST)
+    }
+
+    /// Seal `text` under `regime`'s separator and volume rules.
+    ///
+    /// A relative path is anchored with `./`, so SQLite reads the name as a
+    /// file and never as a URI or a special name; an absolute path keeps its
+    /// spelling.
+    fn parse_under(
+        text: &str,
+        regime: super::path_core::Regime,
+    ) -> Result<Self, DbLocationRefusal> {
+        use super::path_core::{is_sep, volume_name_len};
+        let separator = |c: char| u8::try_from(c).is_ok_and(|b| is_sep(b, regime));
+        if crate::dsn::names_network_or_device(text) {
+            return Err(DbLocationRefusal::NetworkPath);
+        }
+        let (volume, rest) = text
+            .split_at_checked(volume_name_len(text, regime))
+            .ok_or(DbLocationRefusal::Colon)?;
+        if rest.contains(':') {
+            return Err(DbLocationRefusal::Colon);
+        }
+        let rooted = rest.starts_with(separator);
+        if !volume.is_empty() && !rooted {
+            return Err(DbLocationRefusal::Colon);
+        }
+        let last = rest.rsplit(separator).next().unwrap_or_default();
+        if matches!(last, "" | "." | "..") {
+            return Err(DbLocationRefusal::NoFileName);
+        }
+        let dot_anchored =
+            text.starts_with("./") || (regime.is_windows() && text.starts_with(".\\"));
+        let anchored = if rooted || dot_anchored {
+            text.to_owned()
+        } else {
+            format!("./{text}")
+        };
+        if anchored.len() > SQLITE_FILE_NAME_MAX {
+            return Err(DbLocationRefusal::TooLong {
+                len: anchored.len(),
+            });
+        }
+        Ok(Self(anchored))
+    }
+
+    /// The anchored file name.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The re-check where a file name reaches the driver: not empty, not a
+/// `file:` URI, not `:memory:`.
+///
+/// # Errors
+///
+/// [`DbConnectError::InvalidUrl`] when `name` breaches any of the three.
+fn assert_sqlite_sink(name: &str) -> Result<(), DbConnectError> {
+    if name.is_empty() || name.starts_with("file:") || name == ":memory:" {
+        return Err(DbConnectError::InvalidUrl);
+    }
+    Ok(())
+}
+
+impl DbUrl {
+    /// The SQLite options that open the file `name` under `mode`.
+    ///
+    /// The only producer of a file [`SqliteUrl`] from a typed location: the
+    /// name is handed to the driver as a file name, never parsed as a URL.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::InvalidUrl`] when the sink re-check refuses `name`.
+    fn sqlite_file(name: &SqliteFileName, mode: FileMode) -> Result<Self, DbConnectError> {
+        assert_sqlite_sink(name.as_str())?;
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(name.as_str())
+            .read_only(matches!(mode, FileMode::ReadExisting))
+            .create_if_missing(matches!(mode, FileMode::CreateIfMissing))
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
+        Ok(Self::Sqlite(SqliteUrl {
+            options,
+            shared_file: true,
+        }))
+    }
+
+    /// The SQLite options that open a fresh private in-memory database.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::InvalidUrl`] if the driver cannot read
+    /// [`SQLITE_MEMORY_URL`].
+    fn sqlite_memory() -> Result<Self, DbConnectError> {
+        let options = SQLITE_MEMORY_URL
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .map_err(|_| DbConnectError::InvalidUrl)?
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
+        Ok(Self::Sqlite(SqliteUrl {
+            options,
+            shared_file: false,
+        }))
+    }
+}
+
+/// Which database a [`DbLocation`] names.
+#[derive(Clone, PartialEq)]
+enum LocationKind {
+    /// A SQLite file opened under a mode.
+    File {
+        name: SqliteFileName,
+        mode: FileMode,
+    },
+    /// A private in-memory SQLite database.
+    Memory,
+    /// The database a parsed `Dsn` names.
+    Dsn(crate::dsn::Dsn),
+}
+
+/// `Ipe.Db.Location`'s opaque typed database location.
+///
+/// Built only by `file` (a fail-closed parse of a `Path`), `memory` and `dsn`.
+/// It may carry a `Dsn`, so its `Debug` and show row never print the
+/// descriptor's credentials.
+#[derive(Clone, PartialEq)]
+pub struct DbLocation(LocationKind);
+
+crate::stringify::show_row!(
+    "DbLocation",
+    Redacted(Reveal),
+    [] DbLocation,
+    shown: |_| crate::stringify::REDACTED_SHOW.to_owned(),
+    dev: |location, view| location.dev(view),
+);
+
+impl DbLocation {
+    /// The engine this location names: a file or memory location is SQLite,
+    /// a `Dsn` the engine its driver names.
+    const fn engine(&self) -> DbEngine {
+        match &self.0 {
+            LocationKind::File { .. } | LocationKind::Memory => DbEngine::Sqlite,
+            LocationKind::Dsn(dsn) => match dsn.driver() {
+                crate::dsn::DsnDriver::Sqlite => DbEngine::Sqlite,
+                crate::dsn::DsnDriver::Postgres => DbEngine::Postgres,
+            },
+        }
+    }
+
+    /// Admit this location for a pool whose driver speaks `driver`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::EngineMismatch`] when the location names another engine.
+    fn admit_engine(&self, driver: DbEngine) -> Result<(), DbConnectError> {
+        let url = self.engine();
+        match (url, driver) {
+            (DbEngine::Sqlite, DbEngine::Sqlite) | (DbEngine::Postgres, DbEngine::Postgres) => {
+                Ok(())
+            }
+            (DbEngine::Sqlite, DbEngine::Postgres) | (DbEngine::Postgres, DbEngine::Sqlite) => {
+                Err(DbConnectError::EngineMismatch { url, driver })
+            }
+        }
+    }
+
+    /// The location as `Debug.log` prints it in a dev-posture build.
+    ///
+    /// A `Dsn` renders through its own show row, which redacts its password.
+    #[cfg(feature = "dev-posture")]
+    fn dev(&self, view: crate::stringify::View) -> String {
+        use crate::stringify::IpeStringify;
+        match &self.0 {
+            LocationKind::File { name, mode } => format!("File {} {}", mode.name(), name.as_str()),
+            LocationKind::Memory => "Memory".to_owned(),
+            LocationKind::Dsn(dsn) => format!("Dsn {}", dsn.ipe_render(view)),
+        }
+    }
+}
+
+impl std::fmt::Debug for DbLocation {
+    /// A file shows its name and mode; a `Dsn` shows only the marker.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            LocationKind::File { name, mode } => f
+                .debug_struct("File")
+                .field("name", &name.as_str())
+                .field("mode", mode)
+                .finish(),
+            LocationKind::Memory => f.write_str("Memory"),
+            LocationKind::Dsn(_) => f
+                .debug_tuple("Dsn")
+                .field(&crate::stringify::REDACTED_SHOW)
+                .finish(),
+        }
+    }
+}
+
+/// `Ipe.Db.Location.file`'s kernel — the location of the file `path` opened
+/// under the mode `tag` names.
+///
+/// # Errors
+///
+/// `InvalidInput` for an unknown mode tag or a path SQLite could read as
+/// anything but a plain file name.
+pub fn db_location_file<E: From<IpeError>>(tag: i64, path: Path) -> IpeResult<E, DbLocation> {
+    match FileMode::from_tag(tag)
+        .and_then(|mode| SqliteFileName::parse(&path).map(|name| (name, mode)))
+    {
+        Ok((name, mode)) => IpeResult::Ok(DbLocation(LocationKind::File { name, mode })),
+        Err(refused) => IpeResult::Err(refused.into_error().into()),
+    }
+}
+
+/// `Ipe.Db.Location.memory : DbLocation` — a private in-memory database.
+#[must_use]
+pub const fn db_location_memory() -> DbLocation {
+    DbLocation(LocationKind::Memory)
+}
+
+/// `Ipe.Db.Location.dsn : Dsn -> DbLocation` — the database `dsn` names.
+#[must_use]
+pub const fn db_location_dsn(dsn: crate::dsn::Dsn) -> DbLocation {
+    DbLocation(LocationKind::Dsn(dsn))
+}
+
+/// The traits an emitted record derives for every field the IR classes
+/// derivable (`ipe_ir::ir_type_is_derivable`). Naming a type here makes a
+/// missing impl a build error in the runtime, not a `cargo` error in an
+/// emitted project.
+const fn is_derivable_carrier<T: Clone + std::fmt::Debug + PartialEq>() {}
+
+const _: () = {
+    is_derivable_carrier::<crate::dsn::Dsn>();
+    is_derivable_carrier::<DbLocation>();
+    is_derivable_carrier::<SqlFragment>();
+};
 
 pub fn db_exec_raw<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
@@ -6855,8 +7343,10 @@ mod tests {
     /// The first failure of opening `path` and reading it: the open, else the
     /// first query.
     async fn first_failure(path: &std::path::Path) -> Option<IpeError> {
-        let opened: IpeResult<IpeError, Db> =
-            db_open("sqlite".to_owned(), path.display().to_string()).await;
+        let opened: IpeResult<IpeError, Db> = match file_at(path, FileMode::CreateIfMissing) {
+            IpeResult::Ok(location) => db_open(location).await,
+            IpeResult::Err(e) => IpeResult::Err(e),
+        };
         match opened {
             IpeResult::Err(e) => Some(e),
             IpeResult::Ok(pool) => {
@@ -7093,8 +7583,8 @@ mod tests {
         );
         assert_eq!(
             connect_refusal::<IpeError>("", DbEngine::Postgres, &DbConnectError::InvalidUrl),
-            IpeError::unexpected("db: invalid connection URL".to_owned()),
-            "a refusal that is no ceiling keeps its plain kind"
+            IpeError::invalid_input("db: invalid connection URL".to_owned()),
+            "a malformed location is an invalid-input refusal, no ceiling"
         );
     }
 
@@ -7106,7 +7596,7 @@ mod tests {
             .map(|i| format!("host=h{i}.example"))
             .collect();
         let url = format!("postgres://db.example/app?{}", hosts.join("&"));
-        let refused = match build_pool::<IpeError>(&url).await {
+        let refused = match connect_operator::<IpeError>(url).await {
             IpeResult::Err(e) => Some(e),
             IpeResult::Ok(_) => None,
         };
@@ -11129,7 +11619,7 @@ mod tests {
         assert_eq!(url, "postgres://ci-host/testdb_aud07");
     }
 
-    // AUD-07 (c): two sequential connect_cached calls with the same file URL
+    // AUD-07 (c): two sequential operator connects with the same file URL
     // observe the same database — data written via one pool is visible via the
     // other. Proves the old sqlite::memory: per-call-fresh-db bug is closed.
     #[tokio::test]
@@ -11142,8 +11632,8 @@ mod tests {
         let resolved = crate::config::ipe_db_url();
         locked_remove_var("DATABASE_URL");
 
-        let conn1 = connect_cached::<String>(resolved.clone()).await;
-        let conn2 = connect_cached::<String>(resolved).await;
+        let conn1 = connect_operator::<String>(resolved.clone()).await;
+        let conn2 = connect_operator::<String>(resolved).await;
         let pool1 = match conn1 {
             IpeResult::Ok(p) => p,
             IpeResult::Err(e) => panic!("connect1 failed: {e}"),
@@ -12134,10 +12624,10 @@ mod tests {
         );
     }
 
-    /// `build_pool` refuses an unsupported scheme and a URL for the other
-    /// engine, with the typed reason and no credential.
+    /// An operator connect refuses an unsupported scheme and a URL for the
+    /// other engine as `InvalidInput`, with the typed reason and no credential.
     #[tokio::test]
-    async fn build_pool_refuses_urls_the_build_cannot_open() {
+    async fn operator_connect_refuses_urls_the_build_cannot_open() {
         for (url, expected) in [
             (
                 "mysql://admin:s3cr3t-pw@db.example/app",
@@ -12151,11 +12641,15 @@ mod tests {
                 },
             ),
         ] {
-            let refused = match build_pool::<String>(url).await {
+            let refused = match connect_operator::<String>(url.to_owned()).await {
                 IpeResult::Err(e) => Some(e),
                 IpeResult::Ok(_) => None,
             };
-            assert_eq!(refused, Some(expected.to_string()), "{url:?}");
+            assert_eq!(
+                refused,
+                Some(format!("InvalidInput: {expected}")),
+                "{url:?}"
+            );
         }
     }
 
@@ -12179,8 +12673,11 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let url = format!("sqlite://{}?mode=rwc", path.display());
-        let pool = match build_pool::<String>(&url).await {
+        let name = SqliteFileName::parse_under(&path.display().to_string(), crate::path_core::HOST)
+            .expect("a scratch path seals");
+        let db_url =
+            DbUrl::sqlite_file(&name, FileMode::CreateIfMissing).expect("a sealed name opens");
+        let pool = match build_pool::<String>(&db_url, Journal::Wal).await {
             IpeResult::Ok(pool) => Some(pool),
             IpeResult::Err(_) => None,
         }
@@ -12942,7 +13439,10 @@ mod tests {
     /// live `sqlite_version()` and admits it.
     #[tokio::test]
     async fn engine_floor_admits_the_bundled_sqlite() {
-        let pool = build_pool::<String>("sqlite::memory:").await;
+        let db_url = DbUrl::sqlite_memory();
+        assert!(db_url.is_ok(), "{:?}", db_url.as_ref().err());
+        let Ok(db_url) = db_url else { return };
+        let pool = build_pool::<String>(&db_url, Journal::Unchanged).await;
         assert!(
             matches!(pool, IpeResult::Ok(_)),
             "bundled SQLite must clear its version floor"
@@ -13026,6 +13526,545 @@ mod tests {
                 "a comment restates the {engine} floor {rendered}; reference the const instead"
             );
         }
+    }
+
+    // ─── Ipe.Db.Location ──────────────────────────────────────────────────────
+
+    /// The location `Ipe.Db.Location.file` builds for `path` under `mode`.
+    fn file_at(path: &std::path::Path, mode: FileMode) -> IpeResult<IpeError, DbLocation> {
+        let tag = match mode {
+            FileMode::ReadExisting => 0,
+            FileMode::WriteExisting => 1,
+            FileMode::CreateIfMissing => 2,
+        };
+        match crate::path::path_from_string::<IpeError>(path.display().to_string()) {
+            IpeResult::Ok(sealed) => db_location_file(tag, sealed),
+            IpeResult::Err(e) => IpeResult::Err(e),
+        }
+    }
+
+    /// Open `location`, or the refusal as its `Kind: message` text.
+    async fn open_at(location: DbLocation) -> Result<Db, String> {
+        match db_open::<String>(location).await {
+            IpeResult::Ok(pool) => Ok(pool),
+            IpeResult::Err(e) => Err(e),
+        }
+    }
+
+    /// A location is admitted only by a driver of the engine it names: every
+    /// file, memory and sqlite `Dsn` location is refused under PostgreSQL, a
+    /// postgres `Dsn` under SQLite, before any URL is built.
+    #[test]
+    fn a_location_is_admitted_only_by_its_own_engine() {
+        let dsn = |text: &str| match crate::dsn::dsn_parse::<IpeError>(text.to_owned()) {
+            IpeResult::Ok(dsn) => Some(db_location_dsn(dsn)),
+            IpeResult::Err(_) => None,
+        };
+        let file = match file_at(
+            &scratch_path("db_location_engine.db"),
+            FileMode::CreateIfMissing,
+        ) {
+            IpeResult::Ok(location) => Some(location),
+            IpeResult::Err(_) => None,
+        };
+        let cases = [
+            (file, DbEngine::Sqlite),
+            (Some(db_location_memory()), DbEngine::Sqlite),
+            (dsn("sqlite:///srv/app.db"), DbEngine::Sqlite),
+            (
+                dsn("postgres://alice@db.example.com:5432/app"),
+                DbEngine::Postgres,
+            ),
+        ];
+        for (location, engine) in cases {
+            assert!(
+                location.is_some(),
+                "{engine:?}: the fixture location parses"
+            );
+            let Some(location) = location else { continue };
+            for driver in [DbEngine::Sqlite, DbEngine::Postgres] {
+                let admitted = location.admit_engine(driver);
+                if driver == engine {
+                    assert!(
+                        admitted.is_ok(),
+                        "{location:?} under {driver:?}: {admitted:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            admitted,
+                            Err(DbConnectError::EngineMismatch { url, driver: d })
+                                if url == engine && d == driver
+                        ),
+                        "{location:?} under {driver:?}: {admitted:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Db.open` refuses another engine's location before its host is vetted:
+    /// a postgres `Dsn` naming a loopback host (which the dial gate refuses as
+    /// `PermissionDenied`) is an `InvalidInput` engine mismatch under this
+    /// SQLite build, and the refusal never carries the password.
+    #[tokio::test]
+    async fn db_open_refuses_another_engine_before_the_host_is_vetted() {
+        let dsn = crate::dsn::dsn_parse::<String>(
+            "postgres://alice:hunter2@127.0.0.1:5432/app".to_owned(),
+        );
+        let IpeResult::Ok(dsn) = dsn else {
+            assert!(matches!(dsn, IpeResult::Ok(_)), "{dsn:?}");
+            return;
+        };
+        let refused = open_at(db_location_dsn(dsn))
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(refused.starts_with("InvalidInput: "), "{refused}");
+        assert!(
+            refused.contains("selects PostgreSQL but this build's driver is SQLite"),
+            "{refused}"
+        );
+        assert!(!refused.contains("hunter2"), "{refused}");
+    }
+
+    /// Open the file at `path` under `mode`.
+    async fn open_file(path: &std::path::Path, mode: FileMode) -> Result<Db, String> {
+        match file_at(path, mode) {
+            IpeResult::Ok(location) => open_at(location).await,
+            IpeResult::Err(e) => Err(e.to_ipe_string()),
+        }
+    }
+
+    /// The anchored name `text` seals to under `regime`.
+    fn seal_name(
+        text: &str,
+        regime: crate::path_core::Regime,
+    ) -> Result<String, DbLocationRefusal> {
+        SqliteFileName::parse_under(text, regime).map(|name| name.as_str().to_owned())
+    }
+
+    /// Each URL metacharacter in a file name is an ordinary byte: the file
+    /// created carries the literal name, and a sibling the URL reading would
+    /// name is never created. Unix only: Windows forbids `?` in a file name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn url_metacharacters_name_a_literal_file() {
+        let dir = scratch_path("db_location_literal");
+        let made = std::fs::create_dir_all(&dir);
+        assert!(made.is_ok(), "{made:?}");
+        for (literal, url_reading) in [
+            ("t.db?mode=memory", "t.db"),
+            ("a#b.db", "a"),
+            ("a.db?mode=ro&cache=shared", "a.db"),
+            ("a%3Fb.db", "a?b.db"),
+        ] {
+            let path = dir.join(literal);
+            let opened = open_file(&path, FileMode::CreateIfMissing).await;
+            assert!(opened.is_ok(), "{literal}: {opened:?}");
+            let Ok(pool) = opened else { return };
+            let wrote = sqlx::query("CREATE TABLE kept (v INTEGER NOT NULL)")
+                .execute(&pool)
+                .await;
+            assert!(wrote.is_ok(), "{literal}: {wrote:?}");
+            let inserted = sqlx::query("INSERT INTO kept VALUES (7)")
+                .execute(&pool)
+                .await;
+            assert!(inserted.is_ok(), "{literal}: {inserted:?}");
+            assert!(path.is_file(), "{literal}: no literal file");
+            assert!(
+                !dir.join(url_reading).exists(),
+                "{literal}: {url_reading} was created"
+            );
+            let reopened = open_file(&path, FileMode::WriteExisting).await;
+            assert!(reopened.is_ok(), "{literal}: {reopened:?}");
+            let Ok(reopened) = reopened else { return };
+            let kept: Result<i64, _> = sqlx::query_scalar("SELECT v FROM kept")
+                .fetch_one(&reopened)
+                .await;
+            assert!(matches!(kept, Ok(7)), "{literal}: {kept:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A NUL byte is refused by the `Path` seal before a location exists.
+    #[test]
+    fn a_nul_byte_never_reaches_a_location() {
+        let refused = crate::path::path_from_string::<IpeError>("a\0b.db".to_owned());
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, _))
+            ),
+            "{refused:?}"
+        );
+        let control = crate::path::path_from_string::<IpeError>("ab.db".to_owned());
+        assert!(matches!(control, IpeResult::Ok(_)));
+    }
+
+    /// A `:` after the volume is refused, which makes `:memory:` and every
+    /// `file:` URI unrepresentable.
+    #[test]
+    fn a_colon_in_a_file_name_is_refused() {
+        for regime in [
+            crate::path_core::Regime::Unix,
+            crate::path_core::Regime::Windows,
+        ] {
+            for text in [
+                "a:b.db",
+                ":memory:",
+                "file:x.db",
+                "file:x.db?vfs=unix-none",
+                "dir:/x.db",
+                "dir/a.db:stream",
+            ] {
+                assert_eq!(
+                    seal_name(text, regime),
+                    Err(DbLocationRefusal::Colon),
+                    "{text:?} under {regime:?}"
+                );
+            }
+            assert_eq!(seal_name("ab.db", regime), Ok("./ab.db".to_owned()));
+        }
+        assert_eq!(
+            seal_name("C:x.db", crate::path_core::Regime::Windows),
+            Err(DbLocationRefusal::Colon),
+            "a drive-relative path is refused"
+        );
+        assert_eq!(
+            seal_name("C:\\data\\x.db", crate::path_core::Regime::Windows),
+            Ok("C:\\data\\x.db".to_owned())
+        );
+        let refused = DbLocationRefusal::Colon.into_error();
+        assert!(matches!(
+            refused,
+            IpeError::Error(IpeErrorKind::InvalidInput, _)
+        ));
+    }
+
+    /// A relative name is anchored with `./` once; an absolute or anchored
+    /// name keeps its spelling.
+    #[test]
+    fn a_relative_file_name_is_anchored_once() {
+        let unix = crate::path_core::Regime::Unix;
+        assert_eq!(seal_name("x.db", unix), Ok("./x.db".to_owned()));
+        assert_eq!(seal_name("dir/x.db", unix), Ok("./dir/x.db".to_owned()));
+        assert_eq!(seal_name("/tmp/d/x.db", unix), Ok("/tmp/d/x.db".to_owned()));
+        assert_eq!(seal_name("./x.db", unix), Ok("./x.db".to_owned()));
+        let windows = crate::path_core::Regime::Windows;
+        assert_eq!(seal_name(".\\x.db", windows), Ok(".\\x.db".to_owned()));
+        assert_eq!(seal_name("\\x.db", windows), Ok("\\x.db".to_owned()));
+    }
+
+    /// A path naming no file is refused; a file under a directory is the
+    /// control.
+    #[test]
+    fn a_path_naming_no_file_is_refused() {
+        let unix = crate::path_core::Regime::Unix;
+        for text in ["", ".", "..", "/", "dir/", "dir/.", "dir/.."] {
+            assert_eq!(
+                seal_name(text, unix),
+                Err(DbLocationRefusal::NoFileName),
+                "{text:?}"
+            );
+        }
+        assert_eq!(seal_name("dir/x.db", unix), Ok("./dir/x.db".to_owned()));
+        let sealed_empty = crate::path::path_from_string::<IpeError>(String::new());
+        assert!(
+            matches!(&sealed_empty, IpeResult::Ok(_)),
+            "{sealed_empty:?}"
+        );
+        let IpeResult::Ok(sealed_empty) = sealed_empty else {
+            return;
+        };
+        let refused = db_location_file::<IpeError>(2, sealed_empty);
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, _))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// The anchored name may hold [`SQLITE_FILE_NAME_MAX`] bytes and no more.
+    #[test]
+    fn a_file_name_past_the_ceiling_is_refused() {
+        let unix = crate::path_core::Regime::Unix;
+        let at_ceiling = "a".repeat(SQLITE_FILE_NAME_MAX - 2);
+        let sealed = seal_name(&at_ceiling, unix);
+        assert!(
+            sealed
+                .as_ref()
+                .is_ok_and(|name| name.len() == SQLITE_FILE_NAME_MAX),
+            "{sealed:?}"
+        );
+        let past = "a".repeat(SQLITE_FILE_NAME_MAX - 1);
+        assert_eq!(
+            seal_name(&past, unix),
+            Err(DbLocationRefusal::TooLong {
+                len: SQLITE_FILE_NAME_MAX + 1
+            })
+        );
+        let refused = DbLocationRefusal::TooLong {
+            len: SQLITE_FILE_NAME_MAX + 1,
+        }
+        .into_error();
+        assert!(matches!(
+            refused,
+            IpeError::Error(IpeErrorKind::InvalidInput, _)
+        ));
+    }
+
+    /// A network share or device path is refused under both regimes.
+    #[test]
+    fn a_network_path_is_refused_on_every_platform() {
+        for regime in [
+            crate::path_core::Regime::Unix,
+            crate::path_core::Regime::Windows,
+        ] {
+            for text in [
+                "//host/s/x.db",
+                "\\\\host\\s\\x.db",
+                "\\\\?\\C:\\x.db",
+                "/\\host\\s\\x.db",
+                "\\/host/s/x.db",
+                "\\??\\UNC\\host\\s\\x.db",
+                "/??/UNC/host/s/x.db",
+                "\\??\\C:\\x.db",
+            ] {
+                assert_eq!(
+                    seal_name(text, regime),
+                    Err(DbLocationRefusal::NetworkPath),
+                    "{text:?} under {regime:?}"
+                );
+            }
+            assert_eq!(
+                seal_name("/host/s/x.db", regime),
+                Ok("/host/s/x.db".to_owned())
+            );
+            assert_eq!(
+                seal_name("/??x/s/x.db", regime),
+                Ok("/??x/s/x.db".to_owned())
+            );
+        }
+    }
+
+    /// The sink re-check refuses each name SQLite reads specially.
+    #[test]
+    fn the_sqlite_sink_recheck_refuses_special_names() {
+        for name in ["", "file:x", ":memory:"] {
+            assert_eq!(
+                assert_sqlite_sink(name),
+                Err(DbConnectError::InvalidUrl),
+                "{name:?}"
+            );
+        }
+        assert_eq!(assert_sqlite_sink("./x"), Ok(()));
+    }
+
+    /// Only the three tags `modeTag` produces name a mode.
+    #[test]
+    fn an_unknown_mode_tag_is_refused() {
+        for tag in [3, -1, i64::MAX] {
+            assert_eq!(
+                FileMode::from_tag(tag),
+                Err(DbLocationRefusal::UnknownMode { tag })
+            );
+        }
+        assert_eq!(FileMode::from_tag(0), Ok(FileMode::ReadExisting));
+        assert_eq!(FileMode::from_tag(1), Ok(FileMode::WriteExisting));
+        assert_eq!(FileMode::from_tag(2), Ok(FileMode::CreateIfMissing));
+        let sealed = crate::path::path_from_string::<IpeError>("x.db".to_owned());
+        let IpeResult::Ok(sealed) = sealed else {
+            return;
+        };
+        let refused = db_location_file::<IpeError>(3, sealed);
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(IpeError::Error(IpeErrorKind::InvalidInput, _))
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// `ReadExisting` and `WriteExisting` never create a file; `CreateIfMissing`
+    /// does.
+    #[tokio::test]
+    async fn only_create_if_missing_creates_the_file() {
+        for mode in [FileMode::ReadExisting, FileMode::WriteExisting] {
+            let path = scratch_path("db_location_absent");
+            let opened = open_file(&path, mode).await;
+            assert!(opened.is_err(), "{mode:?} opened a missing file");
+            assert!(!path.exists(), "{mode:?} created the file");
+        }
+        let path = scratch_path("db_location_created");
+        let created = open_file(&path, FileMode::CreateIfMissing).await;
+        assert!(created.is_ok(), "{created:?}");
+        assert!(path.is_file(), "CreateIfMissing made no file");
+        let reopened = open_file(&path, FileMode::WriteExisting).await;
+        assert!(reopened.is_ok(), "{reopened:?}");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// `ReadExisting` refuses a write; `WriteExisting` on the same file accepts it.
+    #[tokio::test]
+    async fn read_existing_refuses_a_write() {
+        let path = scratch_path("db_location_read_only");
+        let created = open_file(&path, FileMode::CreateIfMissing).await;
+        assert!(created.is_ok(), "{created:?}");
+        let Ok(created) = created else { return };
+        let made = sqlx::query("CREATE TABLE t (v INTEGER NOT NULL)")
+            .execute(&created)
+            .await;
+        assert!(made.is_ok(), "{made:?}");
+        let reader = open_file(&path, FileMode::ReadExisting).await;
+        assert!(reader.is_ok(), "{reader:?}");
+        let Ok(reader) = reader else { return };
+        let refused = sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(&reader)
+            .await;
+        assert!(refused.is_err(), "a read-only pool accepted a write");
+        let writer = open_file(&path, FileMode::WriteExisting).await;
+        assert!(writer.is_ok(), "{writer:?}");
+        let Ok(writer) = writer else { return };
+        let accepted = sqlx::query("INSERT INTO t VALUES (1)")
+            .execute(&writer)
+            .await;
+        assert!(accepted.is_ok(), "{accepted:?}");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A file location for the other engine's driver is a typed engine
+    /// mismatch, mapped to `InvalidInput`.
+    #[tokio::test]
+    async fn a_file_location_on_the_postgres_driver_is_an_engine_mismatch() {
+        let name = SqliteFileName::parse_under("x.db", crate::path_core::Regime::Unix);
+        assert!(name.is_ok(), "{name:?}");
+        let Ok(name) = name else { return };
+        let file = DbUrl::sqlite_file(&name, FileMode::CreateIfMissing);
+        assert!(file.is_ok(), "{:?}", file.as_ref().err());
+        let Ok(file) = file else { return };
+        let mismatch = <sqlx::Postgres as GatedDial>::gated_connect_options(&file, 4, &mut None)
+            .await
+            .err();
+        assert_eq!(
+            mismatch,
+            Some(DbConnectError::EngineMismatch {
+                url: DbEngine::Sqlite,
+                driver: DbEngine::Postgres,
+            })
+        );
+        let Some(mismatch) = mismatch else { return };
+        let mapped: String = connect_refusal("", KERNEL_ENGINE, &mismatch);
+        assert!(mapped.starts_with("InvalidInput: "), "{mapped}");
+        let admitted =
+            <sqlx::Sqlite as GatedDial>::gated_connect_options(&file, 4, &mut None).await;
+        assert!(admitted.is_ok(), "{:?}", admitted.err());
+    }
+
+    /// Two memory opens are two databases; a file location is shared per key.
+    #[tokio::test]
+    async fn memory_is_private_and_a_file_is_pooled_per_key() {
+        let first = open_at(db_location_memory()).await;
+        let second = open_at(db_location_memory()).await;
+        assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+        let (Ok(first), Ok(second)) = (first, second) else {
+            return;
+        };
+        let made = sqlx::query("CREATE TABLE only_first (v INTEGER NOT NULL)")
+            .execute(&first)
+            .await;
+        assert!(made.is_ok(), "{made:?}");
+        let seen = sqlx::query("SELECT v FROM only_first")
+            .fetch_all(&second)
+            .await;
+        assert!(seen.is_err(), "a second memory open saw the first's table");
+
+        let path = scratch_path("db_location_pooled");
+        let location = file_at(&path, FileMode::CreateIfMissing);
+        let IpeResult::Ok(location) = location else {
+            assert!(matches!(location, IpeResult::Ok(_)), "{location:?}");
+            return;
+        };
+        let LocationKind::File { name, .. } = location.0.clone() else {
+            return;
+        };
+        let opened = open_at(location).await;
+        assert!(opened.is_ok(), "{opened:?}");
+        let keyed = pool_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&PoolKey::File {
+                name,
+                mode: FileMode::CreateIfMissing,
+            });
+        assert!(keyed, "a file location was not pooled under its key");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A location never prints a `Dsn`'s password; a file location prints its
+    /// name.
+    #[test]
+    fn a_location_debug_never_prints_a_dsn_password() {
+        let dsn = crate::dsn::dsn_parse::<String>("postgres://u:hunter2@h/d".to_owned());
+        assert!(matches!(dsn, IpeResult::Ok(_)), "a clean DSN must parse");
+        let IpeResult::Ok(dsn) = dsn else { return };
+        let shown = format!("{:?}", db_location_dsn(dsn));
+        assert!(!shown.contains("hunter2"), "{shown}");
+        let file = file_at(std::path::Path::new("dir/x.db"), FileMode::ReadExisting);
+        assert!(matches!(file, IpeResult::Ok(_)), "{file:?}");
+        let IpeResult::Ok(file) = file else { return };
+        let shown = format!("{file:?}");
+        assert!(shown.contains("x.db"), "{shown}");
+    }
+
+    /// Two locations are equal exactly when they name the same database, and a
+    /// differing `Dsn` password makes them differ.
+    #[test]
+    fn locations_compare_by_the_database_they_name() {
+        let dsn_at = |url: &str| {
+            let parsed = crate::dsn::dsn_parse::<String>(url.to_owned());
+            assert!(matches!(parsed, IpeResult::Ok(_)), "{url} must parse");
+            parsed
+        };
+        let location = |url: &str| match dsn_at(url) {
+            IpeResult::Ok(dsn) => Some(db_location_dsn(dsn)),
+            IpeResult::Err(_) => None,
+        };
+        let one = location("postgres://u:pw1@h/d");
+        assert!(one.is_some() && one == location("postgres://u:pw1@h/d"));
+        assert!(one != location("postgres://u:pw2@h/d"));
+        assert!(one != Some(db_location_memory()));
+        assert!(Some(db_location_memory()) == Some(db_location_memory()));
+    }
+
+    /// A pool key never prints a URL's password; a file key prints its name.
+    #[test]
+    fn a_pool_key_debug_never_prints_a_password() {
+        let url = "postgres://u:hunter2@h/d".to_owned();
+        for key in [PoolKey::Dsn(url.clone()), PoolKey::Operator(url)] {
+            let shown = format!("{key:?}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+        }
+        let name = SqliteFileName::parse_under("x.db", crate::path_core::Regime::Unix);
+        assert!(name.is_ok(), "{name:?}");
+        let Ok(name) = name else { return };
+        let shown = format!(
+            "{:?}",
+            PoolKey::File {
+                name,
+                mode: FileMode::ReadExisting
+            }
+        );
+        assert!(shown.contains("x.db"), "{shown}");
     }
 }
 

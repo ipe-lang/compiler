@@ -585,7 +585,7 @@ pub fn main_report_json(res: IpeResult<ipe_runtime::error::IpeError, String>) ->
 pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     task_and_then(
-        db_open("sqlite".to_string(), "sqlite::memory:".to_string()),
+        db_open(db_location_memory()),
         Box::new(move |conn: Db| -> IpeTask<()> {
             db_with_transaction(conn.clone(), {
                 let __ipe_fn: Box<dyn Fn(Db) -> IpeTask<()> + Send + Sync + 'static> = Box::new(

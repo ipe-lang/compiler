@@ -36,6 +36,7 @@ module Main exposing (main)
 --   final:u1/g1/admin,u2/g1/member
 
 import Ipe.Db as Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Sql as Sql
 import Ipe.Db.Store as Store exposing (Draft, Store)
 import Ipe.Db.Store.Unsafe as StoreU
@@ -111,7 +112,7 @@ main =
                     Db.withTransaction conn
                         (\txconn -> runChecks txconn composite illegal)
                 )
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)
 
         ( Err e, _ ) ->
             Io.println (Error.toString e)

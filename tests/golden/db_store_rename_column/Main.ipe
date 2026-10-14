@@ -28,6 +28,7 @@ module Main exposing (main)
 
 import Ipe.Codec as Codec exposing (Codec)
 import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Store, Order(..))
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Dict as Dict
@@ -370,7 +371,7 @@ main =
             case petsStore of
                 Ok pets ->
                     do
-                        conn <- Db.open "sqlite" "sqlite::memory:"
+                        conn <- Db.open Location.memory
                         Db.withTransaction conn
                             (\tx ->
                                 do
