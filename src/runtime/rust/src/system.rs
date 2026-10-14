@@ -3552,7 +3552,7 @@ pub fn read_self_status() -> Option<String> {
         .map(|_| status)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod signal_mask_tests {
     use super::{SignalSet, StatusMask, status_mask};
 
