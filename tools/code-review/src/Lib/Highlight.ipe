@@ -522,7 +522,6 @@ plainIs text tok =
             False
 
 
-
 -- What came before a shell `#`: a `#` starts a comment only at the start of a
 -- word.
 type Gap
