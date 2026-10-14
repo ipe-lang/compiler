@@ -5043,7 +5043,7 @@ mod tests {
         let signalled = std::time::Instant::now();
         assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
         #[cfg(feature = "db")]
-        let close = shutdown::DB_CLOSE_DEADLINE;
+        let close = shutdown::POOLS_CLOSE_BOUND;
         #[cfg(not(feature = "db"))]
         let close = std::time::Duration::ZERO;
         let bound = grace + close + std::time::Duration::from_secs(2);

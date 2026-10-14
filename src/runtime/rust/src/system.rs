@@ -3470,6 +3470,149 @@ fn assert_decimal_contract(
     }
 }
 
+/// A set of signals, bit `n - 1` standing for signal `n`.
+///
+/// The one reading of an inherited signal disposition: a served app and the
+/// `ipe` CLI both decide from it which stop signals to honour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalSet(pub u64);
+
+impl SignalSet {
+    /// Whether `signal` is in the set; a number outside `1..=64` never is.
+    #[must_use]
+    pub fn contains(self, signal: std::ffi::c_int) -> bool {
+        u32::try_from(signal)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|bit| 1u64.checked_shl(bit))
+            .is_some_and(|bit| self.0 & bit != 0)
+    }
+
+    /// The set a field of hexadecimal digits spells, at most 64 bits wide.
+    ///
+    /// Only digits are accepted: an empty field, a sign or any other byte is
+    /// refused, so no malformed mask reads as a set.
+    #[must_use]
+    pub fn from_hex(field: &str) -> Option<Self> {
+        if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(field, 16).ok().map(Self)
+    }
+}
+
+/// A signal-disposition mask line of a `/proc/<pid>/status` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusMask {
+    /// `SigIgn:`, the signals ignored.
+    Ignored,
+    /// `SigCgt:`, the signals a handler catches.
+    Caught,
+}
+
+impl StatusMask {
+    /// The line's key, colon included.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Ignored => "SigIgn:",
+            Self::Caught => "SigCgt:",
+        }
+    }
+}
+
+/// The `mask` set of a `/proc/<pid>/status` text.
+///
+/// The first line keyed by `mask` is read, its value trimmed of surrounding
+/// whitespace and parsed by [`SignalSet::from_hex`]; an absent or malformed
+/// line is `None`.
+#[must_use]
+pub fn status_mask(status: &str, mask: StatusMask) -> Option<SignalSet> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(mask.key()))
+        .and_then(|value| SignalSet::from_hex(value.trim_ascii()))
+}
+
+/// The most of `/proc/self/status` read for its signal masks.
+pub const PROC_STATUS_READ_CEILING: u64 = 64 * 1024;
+
+/// This process's `/proc/self/status`, at most [`PROC_STATUS_READ_CEILING`]
+/// bytes of it; `None` when it cannot be read.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn read_self_status() -> Option<String> {
+    use std::io::Read as _;
+    let mut status = String::new();
+    std::fs::File::open("/proc/self/status")
+        .and_then(|file| {
+            file.take(PROC_STATUS_READ_CEILING)
+                .read_to_string(&mut status)
+        })
+        .ok()
+        .map(|_| status)
+}
+
+#[cfg(test)]
+mod signal_mask_tests {
+    use super::{SignalSet, StatusMask, status_mask};
+
+    /// Every `SigIgn:` value shape, with the set it must read as.
+    const SIG_IGN_CASES: &[(&str, Option<u64>)] = &[
+        ("SigIgn:\t0000000000004002\n", Some(0x4002)),
+        ("SigIgn:\t1\n", Some(1)),
+        ("SigIgn:\tffffffffffffffff\n", Some(u64::MAX)),
+        ("SigIgn:\tFFFFFFFFFFFFFFFF\n", Some(u64::MAX)),
+        ("SigIgn:\tAbCd\n", Some(0xabcd)),
+        ("SigIgn: 4000 \n", Some(0x4000)),
+        ("SigIgn:\t00000000000000000000000000000001\n", Some(1)),
+        ("SigIgn:\t10000000000000000\n", None),
+        ("SigIgn:\t\n", None),
+        ("SigIgn:", None),
+        ("SigIgn:\tzz\n", None),
+        ("SigIgn:\t+1\n", None),
+        ("SigIgn:\t-1\n", None),
+        ("SigIgn:\t0x10\n", None),
+        ("SigIgn:\t1 2\n", None),
+        ("SigIgn:\t\u{661}\n", None),
+        ("sigign:\t1\n", None),
+        ("Name:\tapp\n", None),
+        ("", None),
+        ("Name:\tapp\nSigIgn:\t2\nSigIgn:\t4\n", Some(2)),
+    ];
+
+    #[test]
+    fn every_sig_ign_shape_reads_as_its_set() {
+        for &(status, expected) in SIG_IGN_CASES {
+            assert_eq!(
+                status_mask(status, StatusMask::Ignored),
+                expected.map(SignalSet),
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_caught_mask_is_its_own_line() {
+        let status = "SigIgn:\t1\nSigCgt:\t4000\n";
+        assert_eq!(
+            status_mask(status, StatusMask::Caught),
+            Some(SignalSet(0x4000))
+        );
+        assert_eq!(status_mask("SigIgn:\t1\n", StatusMask::Caught), None);
+    }
+
+    #[test]
+    fn a_signal_outside_one_to_sixty_four_is_never_in_a_set() {
+        let all = SignalSet(u64::MAX);
+        assert!(all.contains(1));
+        assert!(all.contains(64));
+        assert!(!all.contains(0));
+        assert!(!all.contains(-1));
+        assert!(!all.contains(65));
+        assert!(SignalSet(0x4000).contains(15), "SIGTERM is bit 14");
+    }
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod env_ceiling_tests {

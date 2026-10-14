@@ -40,20 +40,9 @@ pub enum Effect {
     Continues,
 }
 
-/// A set of signals, bit `n - 1` standing for signal `n`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalSet(pub u64);
-
-impl SignalSet {
-    /// Whether `signal` is in the set; a number outside `1..=64` never is.
-    pub fn contains(self, signal: c_int) -> bool {
-        u32::try_from(signal)
-            .ok()
-            .and_then(|number| number.checked_sub(1))
-            .and_then(|bit| 1u64.checked_shl(bit))
-            .is_some_and(|bit| self.0 & bit != 0)
-    }
-}
+/// The signal-set reading a served app's runtime decides from too, so the CLI
+/// and the app can never disagree on what a mask says.
+pub use ipe_runtime_rust::system::SignalSet;
 
 /// The signal dispositions the process held before the CLI registered a handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,38 +96,31 @@ pub fn inherited() -> Inherited {
 /// The dispositions of this process, read from `/proc/self/status`.
 #[cfg(target_os = "linux")]
 fn read() -> Inherited {
-    use std::io::Read as _;
-    let mut status = String::new();
-    let opened = std::fs::File::open("/proc/self/status")
-        .and_then(|file| file.take(64 * 1024).read_to_string(&mut status));
-    if opened.is_err() {
-        return Inherited::Unknown;
-    }
-    status_masks(&status).map_or(Inherited::Unknown, |(ignored, caught)| Inherited::Known {
-        ignored: SignalSet(ignored),
-        caught: SignalSet(caught),
-    })
+    ipe_runtime_rust::system::read_self_status()
+        .and_then(|status| status_masks(&status))
+        .map_or(Inherited::Unknown, |(ignored, caught)| Inherited::Known {
+            ignored,
+            caught,
+        })
 }
 
 /// The dispositions of this process, read through `ps`.
 #[cfg(not(target_os = "linux"))]
 fn read() -> Inherited {
     ps_masks(std::process::id()).map_or(Inherited::Unknown, |(ignored, caught)| Inherited::Known {
-        ignored: SignalSet(ignored),
-        caught: SignalSet(caught),
+        ignored,
+        caught,
     })
 }
 
 /// The `SigIgn:` and `SigCgt:` masks of a `/proc/<pid>/status` text.
 #[cfg(target_os = "linux")]
-fn status_masks(status: &str) -> Option<(u64, u64)> {
-    let mask = |key: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(key))
-            .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-    };
-    Some((mask("SigIgn:")?, mask("SigCgt:")?))
+fn status_masks(status: &str) -> Option<(SignalSet, SignalSet)> {
+    use ipe_runtime_rust::system::{StatusMask, status_mask};
+    Some((
+        status_mask(status, StatusMask::Ignored)?,
+        status_mask(status, StatusMask::Caught)?,
+    ))
 }
 
 /// The most `ps` may print for one process's two masks.
@@ -156,7 +138,7 @@ const PS_WALL: crate::remote_ingest::WallBudget = crate::remote_ingest::WallBudg
 /// neither `PATH` nor the environment chooses the program; a missing or
 /// failing `ps` reads as unknown.
 #[cfg(any(not(target_os = "linux"), test))]
-fn ps_masks(pid: u32) -> Option<(u64, u64)> {
+fn ps_masks(pid: u32) -> Option<(SignalSet, SignalSet)> {
     let mut command = std::process::Command::new("/bin/ps");
     command
         .env_clear()
@@ -171,20 +153,11 @@ fn ps_masks(pid: u32) -> Option<(u64, u64)> {
 
 /// The two hexadecimal masks `ps -o sigignore= -o sigcatch=` printed, in that order.
 #[cfg(any(not(target_os = "linux"), test))]
-fn ps_fields(stdout: &[u8]) -> Option<(u64, u64)> {
+fn ps_fields(stdout: &[u8]) -> Option<(SignalSet, SignalSet)> {
     let mut fields = std::str::from_utf8(stdout).ok()?.split_ascii_whitespace();
-    let ignored = hex_field(fields.next()?)?;
-    let caught = hex_field(fields.next()?)?;
+    let ignored = SignalSet::from_hex(fields.next()?)?;
+    let caught = SignalSet::from_hex(fields.next()?)?;
     fields.next().is_none().then_some((ignored, caught))
-}
-
-/// One field of hexadecimal digits, at most 64 bits wide.
-#[cfg(any(not(target_os = "linux"), test))]
-fn hex_field(field: &str) -> Option<u64> {
-    if field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    u64::from_str_radix(field, 16).ok()
 }
 
 /// One shutdown subscriber: run once, on the first termination request.
@@ -299,7 +272,7 @@ fn respond(handling: Handling, shutdown: &mpsc::Sender<Vec<Subscriber>>) {
 
 #[cfg(test)]
 pub mod tests {
-    use super::{Effect, Handling, Inherited, SignalSet, hex_field, ps_fields};
+    use super::{Effect, Handling, Inherited, SignalSet, ps_fields};
     #[cfg(target_os = "linux")]
     use crate::remote_ingest::test_group;
     use signal_hook::consts::{SIGCONT, SIGHUP, SIGINT, SIGTERM, SIGTSTP};
@@ -407,17 +380,25 @@ pub mod tests {
     fn the_status_masks_parse_as_hex_and_need_both_lines() {
         let status =
             "Name:\tipe\nSigBlk:\t0\nSigIgn:\t0000000000000001\nSigCgt:\t0000000000004000\n";
-        assert_eq!(super::status_masks(status), Some((1, 0x4000)));
+        assert_eq!(
+            super::status_masks(status),
+            Some((SignalSet(1), SignalSet(0x4000)))
+        );
         assert_eq!(super::status_masks("Name:\tipe\nSigIgn:\t1\n"), None);
         assert_eq!(super::status_masks("SigIgn:\tzz\nSigCgt:\t0\n"), None);
+        assert_eq!(super::status_masks("SigIgn:\t+1\nSigCgt:\t0\n"), None);
+        assert_eq!(super::status_masks("SigIgn:\t1\nSigCgt:\t\n"), None);
     }
 
     #[test]
     fn the_ps_output_is_exactly_two_hex_fields() {
-        assert_eq!(ps_fields(b"00001000 0\n"), Some((0x1000, 0)));
+        assert_eq!(
+            ps_fields(b"00001000 0\n"),
+            Some((SignalSet(0x1000), SignalSet(0)))
+        );
         assert_eq!(
             ps_fields(b"  0000000000000001   4000 \n"),
-            Some((1, 0x4000))
+            Some((SignalSet(1), SignalSet(0x4000)))
         );
         assert_eq!(ps_fields(b""), None);
         assert_eq!(ps_fields(b"1\n"), None);
@@ -425,17 +406,16 @@ pub mod tests {
         assert_eq!(ps_fields(b"+1 0"), None);
         assert_eq!(ps_fields(b"SIGHUP 0"), None);
         assert_eq!(ps_fields(b"\xff 0"), None);
-        assert_eq!(hex_field("10000000000000000"), None);
-        assert_eq!(hex_field(""), None);
+        assert_eq!(ps_fields(b"10000000000000000 0"), None);
     }
 
     /// Poll `ps` for `pid` until it reports `signal` ignored, for at most 5 s.
     #[cfg(target_os = "linux")]
-    fn poll_ps(pid: u32, signal: i32) -> Option<(u64, u64)> {
+    fn poll_ps(pid: u32, signal: i32) -> Option<(SignalSet, SignalSet)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let seen = super::ps_masks(pid);
-            if seen.is_some_and(|(ignored, _)| SignalSet(ignored).contains(signal))
+            if seen.is_some_and(|(ignored, _)| ignored.contains(signal))
                 || std::time::Instant::now() >= deadline
             {
                 return seen;
@@ -459,13 +439,10 @@ pub mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let (ignored, caught) = seen.expect("ps reports both masks");
-        assert!(
-            SignalSet(ignored).contains(SIGHUP),
-            "ps misses the ignored hangup"
-        );
+        assert!(ignored.contains(SIGHUP), "ps misses the ignored hangup");
         let (proc_ignored, proc_caught) = proc_masks.expect("SigIgn and SigCgt lines");
-        assert_eq!(ignored & 0xffff_ffff, proc_ignored & 0xffff_ffff);
-        assert_eq!(caught & 0xffff_ffff, proc_caught & 0xffff_ffff);
+        assert_eq!(ignored.0 & 0xffff_ffff, proc_ignored.0 & 0xffff_ffff);
+        assert_eq!(caught.0 & 0xffff_ffff, proc_caught.0 & 0xffff_ffff);
     }
 
     /// Printed by a child test just before it raises its first termination request.

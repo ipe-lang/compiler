@@ -2378,6 +2378,10 @@ impl std::fmt::Display for OwnedPoolRefusal {
 /// An owned pool and its role.
 type OwnedEntry = (PoolRole, Box<dyn OwnedPool>);
 
+/// How many stages [`OwnedPools::close_all`] closes in, one after another:
+/// every pool but the telemetry spill, then the spill.
+pub const CLOSE_STAGES: usize = 2;
+
 /// The pools a shutdown closes.
 pub struct OwnedPools {
     entries: std::sync::Mutex<Vec<OwnedEntry>>,
@@ -2420,15 +2424,18 @@ impl OwnedPools {
     /// Close every registered pool, each under `deadline`; the spill pool last.
     ///
     /// The pools of one stage close concurrently, so a stage waits at most
-    /// `deadline`. A pool that misses it is logged and left to the exit.
+    /// `deadline` and the whole close at most [`CLOSE_STAGES`] times it. A
+    /// pool that misses its deadline is logged and left to the exit.
     pub async fn close_all(&self, deadline: std::time::Duration) {
         // A poisoned registry still holds whole entries; its pools close too.
         let taken = std::mem::take(&mut *self.entries.lock().unwrap_or_else(|e| e.into_inner()));
         let (spill, first): (Vec<OwnedEntry>, Vec<OwnedEntry>) = taken
             .into_iter()
             .partition(|(role, _)| *role == PoolRole::TelemetrySpill);
-        close_within(first, deadline).await;
-        close_within(spill, deadline).await;
+        let stages: [Vec<OwnedEntry>; CLOSE_STAGES] = [first, spill];
+        for stage in stages {
+            close_within(stage, deadline).await;
+        }
     }
 }
 

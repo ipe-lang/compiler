@@ -28,6 +28,12 @@ use tokio::time::Instant;
 #[cfg(feature = "db")]
 pub const DB_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 
+/// The longest closing every owned pool may take: one [`DB_CLOSE_DEADLINE`]
+/// per close stage, the stages running one after another.
+#[cfg(feature = "db")]
+pub const POOLS_CLOSE_BOUND: Duration =
+    DB_CLOSE_DEADLINE.saturating_mul(crate::db::CLOSE_STAGES as u32);
+
 /// How long a draining WebSocket's close frame may take to send.
 pub const WS_CLOSE_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -557,57 +563,25 @@ fn os_signals() -> std::io::Result<mpsc::Receiver<Signal>> {
 }
 
 /// A set of signals, bit `n - 1` standing for signal `n`.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SignalSet(u64);
-
-#[cfg(unix)]
-impl SignalSet {
-    /// Whether `signal` is in the set; a number outside `1..=64` never is.
-    fn contains(self, signal: std::ffi::c_int) -> bool {
-        u32::try_from(signal)
-            .ok()
-            .and_then(|number| number.checked_sub(1))
-            .and_then(|bit| 1u64.checked_shl(bit))
-            .is_some_and(|bit| self.0 & bit != 0)
-    }
-}
-
-/// The most of `/proc/self/status` read for its `SigIgn:` line.
-#[cfg(target_os = "linux")]
-const STATUS_READ_CEILING: u64 = 64 * 1024;
-
 /// The signals this process inherited as ignored, read once; none when the
-/// status cannot be read, so a stop request is never lost to a misreading.
+/// status cannot be read or parsed, so a stop request is never lost to a
+/// misreading.
 #[cfg(target_os = "linux")]
-fn inherited_ignored() -> SignalSet {
+fn inherited_ignored() -> crate::system::SignalSet {
+    use crate::system::{SignalSet, StatusMask, read_self_status, status_mask};
     static READ: OnceLock<SignalSet> = OnceLock::new();
     *READ.get_or_init(|| {
-        use std::io::Read as _;
-        let mut status = String::new();
-        let read = std::fs::File::open("/proc/self/status")
-            .and_then(|file| file.take(STATUS_READ_CEILING).read_to_string(&mut status));
-        if read.is_err() {
-            return SignalSet(0);
-        }
-        SignalSet(ignored_mask(&status).unwrap_or(0))
+        read_self_status()
+            .and_then(|status| status_mask(&status, StatusMask::Ignored))
+            .unwrap_or(SignalSet(0))
     })
 }
 
 /// The signals this process inherited as ignored: unread off Linux, so every
 /// stop signal is registered.
 #[cfg(all(unix, not(target_os = "linux")))]
-const fn inherited_ignored() -> SignalSet {
-    SignalSet(0)
-}
-
-/// The `SigIgn:` mask of a `/proc/<pid>/status` text.
-#[cfg(any(target_os = "linux", all(test, unix)))]
-fn ignored_mask(status: &str) -> Option<u64> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("SigIgn:"))
-        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+const fn inherited_ignored() -> crate::system::SignalSet {
+    crate::system::SignalSet(0)
 }
 
 #[cfg(test)]
@@ -812,15 +786,14 @@ pub mod tests {
     #[cfg(unix)]
     #[test]
     fn an_inherited_ignore_mask_is_read_per_signal() {
+        use crate::system::{StatusMask, status_mask};
+        use tokio::signal::unix::SignalKind;
         let status = "Name:\tapp\nSigIgn:\t0000000000004002\nSigCgt:\t0\n";
-        let ignored = SignalSet(ignored_mask(status).expect("the mask parses"));
-        assert!(ignored.contains(15), "SIGTERM is bit 14");
-        assert!(ignored.contains(2), "SIGINT is bit 1");
-        assert!(!ignored.contains(1));
-        assert!(!ignored.contains(0));
-        assert!(!ignored.contains(65));
-        assert_eq!(ignored_mask("SigIgn:\tnot-hex\n"), None);
-        assert_eq!(ignored_mask("Name:\tapp\n"), None);
+        let ignored = status_mask(status, StatusMask::Ignored);
+        assert!(ignored.is_some_and(|set| set.contains(SignalKind::terminate().as_raw_value())));
+        assert!(ignored.is_some_and(|set| set.contains(SignalKind::interrupt().as_raw_value())));
+        assert!(ignored.is_some_and(|set| !set.contains(SignalKind::hangup().as_raw_value())));
+        assert_eq!(status_mask("SigIgn:\tnot-hex\n", StatusMask::Ignored), None);
     }
 
     #[test]
