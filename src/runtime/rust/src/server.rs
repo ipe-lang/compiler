@@ -8995,24 +8995,31 @@ mod tests {
     }
 
     /// A malformed `IPE_HTTP_ALLOWED_HOSTS` refuses `Server.listen` before its
-    /// socket opens, naming the variable and never the value.
+    /// socket opens, naming the variable and never the value. The port is
+    /// held, so a bind attempted first would answer its own address-in-use
+    /// refusal instead of the host list's.
     #[tokio::test]
     async fn listen_refuses_a_malformed_allowed_hosts_before_binding() {
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
         crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "hidden.example:80");
-        let (port, task) = spawn_listen().unwrap();
-        let outcome = task.await.unwrap();
+        crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+        crate::system::locked_remove_var(crate::env_registry::listen::SERVER_PORT.name());
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        let route = server_get::<String, _>("/".to_owned(), |_req: ServerRequest| {
+            Box::pin(ready(ok_res::<String, _>(server_text("ok".to_owned()))))
+                as IpeTask<String, ServerResponse>
+        });
+        let outcome = server_listen::<String>(i64::from(port), vec![route]).await;
+        drop(held);
+        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
         assert!(matches!(outcome, IpeResult::Err(_)), "{outcome:?}");
         let IpeResult::Err(message) = outcome else {
             return;
         };
         assert!(message.contains("IPE_HTTP_ALLOWED_HOSTS"), "{message}");
         assert!(!message.contains("hidden"), "{message}");
-        assert!(
-            std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_err(),
-            "no socket opens for a refused host list"
-        );
-        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
-        crate::system::locked_remove_var("IPE_HTTP_BIND");
     }
 
     /// A real `Server.listen` refuses a malformed URL with 400 whether or not
