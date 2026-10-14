@@ -177,9 +177,18 @@ fn yaml_options() -> serde_saphyr::Options {
 }
 
 /// Parse a YAML source into a JSON value under `options`.
+///
+/// An error raised while an alias replays an anchor reaches the caller flattened
+/// to text, so the budget breach that caused it is read from the parser's typed
+/// budget report instead.
 fn yaml_to_value(source: &str, options: serde_saphyr::Options) -> Result<JsonVal, YamlRefusal> {
+    let breach = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let sink = std::rc::Rc::clone(&breach);
+    let options = options.with_budget_report(move |report: serde_saphyr::budget::BudgetReport| {
+        *sink.borrow_mut() = report.breached;
+    });
     serde_saphyr::from_str_with_options::<JsonVal>(source, options)
-        .map_err(|error| classify_yaml_error(&error))
+        .map_err(|error| classify_yaml_error(&error, breach.borrow().as_ref()))
 }
 
 /// Why a YAML source was refused, and where.
@@ -321,9 +330,13 @@ fn classify_budget_breach(breach: &serde_saphyr::budget::BudgetBreach) -> YamlRe
     YamlRefusalKind::Limit(limit)
 }
 
-/// Map a parser error to its refusal by variant, never by its text.
+/// Map a parser error to its refusal by variant, never by its text. `breach` is
+/// the budget breach the parser reported for the same parse, if any.
 #[allow(clippy::match_same_arms)] // known variants named for review; the wildcard is for future ones
-fn classify_yaml_error(error: &serde_saphyr::Error) -> YamlRefusal {
+fn classify_yaml_error(
+    error: &serde_saphyr::Error,
+    breach: Option<&serde_saphyr::budget::BudgetBreach>,
+) -> YamlRefusal {
     use serde_saphyr::Error as Y;
     let error = error.without_snippet();
     let kind = match error {
@@ -347,8 +360,8 @@ fn classify_yaml_error(error: &serde_saphyr::Error) -> YamlRefusal {
         | Y::IndentationError { .. }
         | Y::QuotingRequired { .. }
         | Y::UnknownAnchor { .. }
-        | Y::AliasError { .. }
         | Y::InvalidUtf8Input => YamlRefusalKind::Syntax,
+        Y::AliasError { .. } => breach.map_or(YamlRefusalKind::Syntax, classify_budget_breach),
         Y::MultipleDocuments { .. } => YamlRefusalKind::MultipleDocuments,
         Y::DuplicateMappingKey { .. } => YamlRefusalKind::DuplicateKey,
         Y::MergeKeyNotAllowed { .. } | Y::MergeValueNotMapOrSeqOfMaps { .. } => {
