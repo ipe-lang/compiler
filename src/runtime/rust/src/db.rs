@@ -9132,6 +9132,44 @@ mod tests {
         );
     }
 
+    /// No module besides `db.rs` begins a transaction in production code, so
+    /// no begin can skip `begin_write_txn`.
+    #[test]
+    fn no_other_runtime_module_begins_a_transaction() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root];
+        let mut offenders = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).expect("read a source dir") {
+                let path = entry.expect("read a dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("db.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(path.as_path()).expect("read a source file");
+                let production = source
+                    .split_once("\n#[cfg(test)]")
+                    .map_or(source.as_str(), |(head, _)| head);
+                let begins = production.lines().any(|line| {
+                    !line.trim_start().starts_with("//")
+                        && [".begin(", "::begin(", ".begin_with("]
+                            .iter()
+                            .any(|needle| line.contains(needle))
+                });
+                if begins {
+                    offenders.push(path);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a transaction begin outside db.rs can start deferred: {offenders:?}"
+        );
+    }
+
     /// A transaction that may write holds the SQLite write lock from its
     /// `BEGIN`, before its body runs a statement: a second connection asking
     /// for the write lock with no busy wait is refused.
@@ -9358,6 +9396,63 @@ mod tests {
         assert!(
             matches!(&read, Ok(IpeResult::Ok(title)) if title == "seen"),
             "a read-only transaction failed or waited on the writer: {read:?}"
+        );
+    }
+
+    /// A write lock held past the busy timeout refuses `withTransaction` at its
+    /// begin as the typed `Database Busy`, never `Unexpected`.
+    ///
+    /// The body's own failure is untyped, so the test is red when the begin is
+    /// deferred and the body is first to want the lock. Once the lock is
+    /// released the same transaction commits.
+    #[tokio::test]
+    async fn lock_held_past_busy_timeout_is_typed_busy() {
+        let (seed, path) = fresh_file_db(1).await;
+        let options = format!("sqlite://{}", path.display())
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("parse file sqlite url")
+            .busy_timeout(std::time::Duration::from_millis(50));
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect short-timeout pool");
+        let insert = || {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                db_with_transaction::<IpeError, u64>(db.clone(), |c| {
+                    Box::pin(async move {
+                        let write = sqlx::query("INSERT INTO todos (title) VALUES ('after')");
+                        match exec_routed(&c, write).await {
+                            Ok(done) => IpeResult::Ok(done.rows_affected()),
+                            // Unclassified on purpose: only a refusal at the
+                            // begin carries the typed details.
+                            Err(e) => IpeResult::Err(IpeError::from(e.to_string())),
+                        }
+                    })
+                }),
+            )
+        };
+        let mut held = seed.acquire().await.expect("acquire holder");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *held)
+            .await
+            .expect("holder takes the write lock");
+        let contended = insert().await;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *held).await;
+        drop(held);
+        let released = insert().await;
+        db.close().await;
+        seed.close().await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(&contended, Ok(IpeResult::Err(IpeError::Error(_, info)))
+                if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::Busy))),
+            "a held write lock did not refuse as typed busy: {contended:?}"
+        );
+        assert!(
+            matches!(released, Ok(IpeResult::Ok(1))),
+            "the transaction failed with the lock released: {released:?}"
         );
     }
 
