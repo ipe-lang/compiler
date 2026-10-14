@@ -319,6 +319,12 @@ candidateRule =
         == [ "helper" ]
         && namesFor Highlight.Rust { kind = "fn", name = "f", qualified = "mycrate::m::f" } [ Path "crate::util::g" ]
         == [ "mycrate::util::g" ]
+        && namesFor Highlight.Ipe { kind = "fn", name = "f", qualified = "M.f" } [ Path "crate.util.g" ]
+        == [ "crate.util.g" ]
+        && namesFor Highlight.Shell { kind = "fn", name = "f", qualified = "m::f" } [ Bare "g", Path "crate::x" ]
+        == [ "g", "crate::x" ]
+        && namesFor Highlight.Unknown { kind = "fn", name = "f", qualified = "m::f" } [ Bare "g" ]
+        == [ "g" ]
 
 
 -- A Rust `.` is a field or method access, never a path: `a.b.c` names `a`
