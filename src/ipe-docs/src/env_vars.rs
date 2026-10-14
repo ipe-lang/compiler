@@ -1153,9 +1153,10 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_SHUTDOWN_GRACE_MS",
         default: Cow::Borrowed("1500"),
-        purpose: "Grace period (ms) between receiving SIGTERM and closing active \
-                  connections. Allows in-flight requests to complete. Set to `0` for \
-                  immediate shutdown.",
+        purpose: "Grace period (ms) a served app (`Http.Server` or `Ipe.Web`) gives \
+                  in-flight requests and live streams after the first SIGTERM or \
+                  SIGINT, before it closes its connections and database pools. Set \
+                  to `0` for immediate shutdown.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

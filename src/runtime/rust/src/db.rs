@@ -13777,6 +13777,179 @@ mod tests {
         }
     }
 
+    /// The sidecar file `suffix` names next to `path`.
+    fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    }
+
+    /// Closing the owned pools checkpoints a WAL database: no `-wal` or `-shm`
+    /// file is left and the file passes its integrity check.
+    #[tokio::test]
+    async fn closing_owned_pools_leaves_no_wal_sidecar() {
+        let (pool, path) = fresh_file_db(4).await;
+        let wrote = sqlx::query("INSERT INTO todos (title) VALUES ('kept')")
+            .execute(&pool)
+            .await;
+        assert!(wrote.is_ok(), "the write lands: {wrote:?}");
+        assert!(
+            sidecar(&path, "-wal").exists(),
+            "a WAL write leaves its sidecar open"
+        );
+        let pools = OwnedPools::new();
+        assert!(
+            pools
+                .register(PoolRole::Cached, Box::new(pool.clone()), 4)
+                .is_ok()
+        );
+        pools.close_all(std::time::Duration::from_secs(2)).await;
+        assert!(pool.is_closed());
+        assert!(
+            !sidecar(&path, "-wal").exists(),
+            "the close checkpoints the WAL"
+        );
+        assert!(
+            !sidecar(&path, "-shm").exists(),
+            "the close removes the shm"
+        );
+        let url = format!("sqlite://{}?mode=ro", path.display());
+        let reopened = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await;
+        assert!(reopened.is_ok(), "the closed file reopens: {reopened:?}");
+        let Ok(reopened) = reopened else {
+            return;
+        };
+        let check: Result<(String,), _> = sqlx::query_as("PRAGMA integrity_check")
+            .fetch_one(&reopened)
+            .await;
+        assert!(
+            matches!(check, Ok((ref verdict,)) if verdict == "ok"),
+            "{check:?}"
+        );
+        let kept: Result<(i64,), _> = sqlx::query_as("SELECT COUNT(*) FROM todos")
+            .fetch_one(&reopened)
+            .await;
+        assert!(
+            matches!(kept, Ok((1,))),
+            "the write survives the close: {kept:?}"
+        );
+        reopened.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A checked-out connection never holds the close past its deadline.
+    #[tokio::test]
+    async fn a_checked_out_connection_never_holds_the_close_past_its_deadline() {
+        let (pool, path) = fresh_file_db(2).await;
+        let held = pool.acquire().await;
+        assert!(held.is_ok(), "a connection checks out: {held:?}");
+        let pools = OwnedPools::new();
+        assert!(
+            pools
+                .register(PoolRole::Cached, Box::new(pool.clone()), 4)
+                .is_ok()
+        );
+        let deadline = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let bound = deadline * 2 + std::time::Duration::from_secs(2);
+        let closed = tokio::time::timeout(bound, pools.close_all(deadline)).await;
+        assert!(closed.is_ok(), "the close returns within its deadline");
+        assert!(started.elapsed() < bound);
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file database closed by `Db.close` reopens to a working pool, never
+    /// the closed cached one.
+    #[tokio::test]
+    async fn a_closed_file_database_reopens_to_an_open_pool() {
+        let path = scratch_path("db_close_reopen.db");
+        let location = || match file_at(&path, FileMode::CreateIfMissing) {
+            IpeResult::Ok(location) => Some(location),
+            IpeResult::Err(_) => None,
+        };
+        let first = match location() {
+            Some(location) => open_at(location).await,
+            None => Err("the scratch path seals".to_owned()),
+        };
+        assert!(first.is_ok(), "the file opens: {first:?}");
+        let Ok(first) = first else {
+            return;
+        };
+        let closed = db_close::<String>(first.clone()).await;
+        assert!(matches!(closed, IpeResult::Ok(())));
+        assert!(first.is_closed());
+        let second = match location() {
+            Some(location) => open_at(location).await,
+            None => Err("the scratch path seals".to_owned()),
+        };
+        assert!(second.is_ok(), "the closed file reopens: {second:?}");
+        let Ok(second) = second else {
+            return;
+        };
+        assert!(
+            !second.is_closed(),
+            "a reopen never hands out the closed pool"
+        );
+        let queried = sqlx::query("SELECT 1").execute(&second).await;
+        assert!(queried.is_ok(), "the reopened pool answers: {queried:?}");
+        second.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stand-in pool whose closed flag the test sets.
+    struct FakePool(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl OwnedPool for FakePool {
+        fn close_owned(&self) -> PoolClose {
+            let closed = std::sync::Arc::clone(&self.0);
+            Box::pin(async move { closed.store(true, std::sync::atomic::Ordering::SeqCst) })
+        }
+
+        fn is_closed_owned(&self) -> bool {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The registry refuses one pool past its ceiling; a closed pool frees its slot.
+    #[tokio::test]
+    async fn the_owned_pool_registry_refuses_one_past_its_ceiling() {
+        let pools = OwnedPools::new();
+        let flags: Vec<_> = (0..3)
+            .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .collect();
+        let fake = |i: usize| -> Box<dyn OwnedPool> {
+            let flag = flags.get(i).map_or_else(
+                || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::clone,
+            );
+            Box::new(FakePool(flag))
+        };
+        assert!(pools.register(PoolRole::Cached, fake(0), 2).is_ok());
+        assert!(pools.register(PoolRole::SessionStore, fake(1), 2).is_ok());
+        assert_eq!(
+            pools.register(PoolRole::TelemetrySpill, fake(2), 2),
+            Err(OwnedPoolRefusal::Full { ceiling: 2 })
+        );
+        if let Some(first) = flags.first() {
+            first.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(
+            pools.register(PoolRole::TelemetrySpill, fake(2), 2).is_ok(),
+            "a closed pool no longer counts"
+        );
+        pools.close_all(std::time::Duration::from_secs(1)).await;
+        assert!(
+            flags
+                .iter()
+                .all(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)),
+            "close_all closes every registered pool"
+        );
+    }
+
     /// A location is admitted only by a driver of the engine it names: every
     /// file, memory and sqlite `Dsn` location is refused under PostgreSQL, a
     /// postgres `Dsn` under SQLite, before any URL is built.
