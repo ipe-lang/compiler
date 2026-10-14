@@ -1094,14 +1094,6 @@ static HAND_TABLE: &[EnvVar] = &[
         class: Class::Tunable,
     },
     EnvVar {
-        name: "IPE_WEB_MAX_SESSIONS",
-        default: Cow::Borrowed("50000"),
-        purpose: "Maximum concurrent web sessions before new connections are rejected. \
-                  Prevents unbounded memory growth under a session-creation flood.",
-        subsystem: Subsystem::Web,
-        class: Class::Tunable,
-    },
-    EnvVar {
         name: "IPE_WEB_QUEUE_MAX",
         default: Cow::Borrowed("50"),
         purpose: "Maximum queued events per session before back-pressure is applied.",

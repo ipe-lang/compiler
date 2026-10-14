@@ -1362,11 +1362,24 @@ crate::stringify::show_row!("HtmlEvent", Internals, [M] Event<M>, |_| "<Ipe.Html
 
 // ─── Retained measures for the Html runtime types ───────────────────────────
 
-impl<M: RetainedBytes> RetainedBytes for Html<M> {
+/// How a measure counts one event.
+type EventMeasure<M> = fn(&Event<M>) -> Option<Bytes>;
+
+impl<M: RetainedBytes> Html<M> {
+    /// The bytes a committed view keeps resident.
+    ///
+    /// As its [`RetainedBytes`] measure, except that a handler counts the
+    /// allocation of its closure and not the heap the closure's captures own,
+    /// which no `dyn Fn` exposes.
+    #[must_use]
+    pub fn view_bytes(&self) -> Option<Bytes> {
+        self.measure(Event::handler_floor)
+    }
+
     // Walked with an explicit worklist, as `Drop` is, so a deep tree is measured
     // without recursion. Each node counts its inline size once; an element adds
     // its tag, its attributes and its children list's spare slots.
-    fn retained_bytes(&self) -> Option<Bytes> {
+    fn measure(&self, event: EventMeasure<M>) -> Option<Bytes> {
         let node = Bytes::inline::<Self>()?;
         let mut total = Bytes::ZERO;
         let mut pending: Vec<&Self> = vec![self];
@@ -1375,10 +1388,15 @@ impl<M: RetainedBytes> RetainedBytes for Html<M> {
             match html {
                 Self::HElement(tag, attrs, children) => {
                     let spare = children.capacity().checked_sub(children.len())?;
+                    let attrs_spare = attrs.capacity().checked_sub(attrs.len())?;
                     total = total
                         .plus(tag)?
-                        .plus(attrs)?
+                        .checked_add(Bytes::inline::<Vec<Attribute<M>>>()?)?
+                        .checked_add(Bytes::slots::<Attribute<M>>(attrs_spare)?)?
                         .checked_add(Bytes::slots::<Self>(spare)?)?;
+                    for attr in attrs {
+                        total = total.checked_add(attr.measure(event)?)?;
+                    }
                     pending.extend(children);
                 }
                 Self::HText(text) | Self::HRaw(text) => total = total.plus(text)?,
@@ -1388,15 +1406,27 @@ impl<M: RetainedBytes> RetainedBytes for Html<M> {
     }
 }
 
-impl<M: RetainedBytes> RetainedBytes for Attribute<M> {
+impl<M: RetainedBytes> RetainedBytes for Html<M> {
     fn retained_bytes(&self) -> Option<Bytes> {
+        self.measure(<Event<M> as RetainedBytes>::retained_bytes)
+    }
+}
+
+impl<M: RetainedBytes> Attribute<M> {
+    fn measure(&self, event: EventMeasure<M>) -> Option<Bytes> {
         let inline = Bytes::inline::<Self>()?;
         match self {
             Self::Attr(key, value) => inline.plus(key)?.plus(value),
             Self::BoolAttr(key, on) => inline.plus(key)?.plus(on),
-            Self::EventAttr(event) => inline.plus(event),
+            Self::EventAttr(e) => inline.checked_add(event(e)?),
             Self::NoAttr => Some(inline),
         }
+    }
+}
+
+impl<M: RetainedBytes> RetainedBytes for Attribute<M> {
+    fn retained_bytes(&self) -> Option<Bytes> {
+        self.measure(<Event<M> as RetainedBytes>::retained_bytes)
     }
 }
 
@@ -1410,6 +1440,27 @@ impl<M: RetainedBytes> RetainedBytes for Event<M> {
             Self::OnString(..) | Self::OnBool(..) | Self::OnForm(..) | Self::OnWidget(..) => None,
         }
     }
+}
+
+impl<M: RetainedBytes> Event<M> {
+    /// This event's bytes, a handler counting its closure's allocation but
+    /// not the heap its captures own.
+    pub(crate) fn handler_floor(&self) -> Option<Bytes> {
+        let inline = Bytes::inline::<Self>()?;
+        match self {
+            Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
+            Self::OnString(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+            Self::OnWidget(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+            Self::OnBool(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+            Self::OnForm(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
+        }
+    }
+}
+
+/// The bytes the `Arc` allocation of closure `f` holds: its two reference
+/// counters and the closure itself.
+fn closure_bytes<F: ?Sized>(f: &F) -> Option<Bytes> {
+    Bytes::inline::<[usize; 2]>()?.plus_count(std::mem::size_of_val(f))
 }
 
 #[cfg(test)]
@@ -1440,6 +1491,35 @@ mod tests {
     fn a_handler_event_is_unmeasurable() {
         let attr: Attribute<String> = html_on_string_("input".into(), std::sync::Arc::new(|s| s));
         assert_eq!(attr.retained_bytes(), None);
+    }
+
+    // A committed view counts a handler by its closure, so a view the
+    // retained measure refuses is still charged, and every text byte with it.
+    #[test]
+    fn a_view_with_handlers_is_measured_by_its_closures() {
+        let text = "t".repeat(4096);
+        let view: Html<String> = Html::HElement(
+            "input".into(),
+            vec![html_on_string_("input".into(), std::sync::Arc::new(|s| s))],
+            vec![Html::HText(text)],
+        );
+        assert_eq!(view.retained_bytes(), None);
+        assert!(view.view_bytes().is_some_and(|n| n.get() >= 4096));
+    }
+
+    // A view without handlers counts the same under both measures.
+    #[test]
+    fn a_handler_free_view_measures_alike() {
+        let view: Html<String> = Html::HElement(
+            "p".into(),
+            vec![
+                Attribute::Attr("class".into(), "c".repeat(64)),
+                Attribute::EventAttr(Event::OnMsg("click".into(), "m".repeat(64))),
+            ],
+            vec![Html::HText("x".repeat(64))],
+        );
+        assert!(view.retained_bytes().is_some());
+        assert_eq!(view.view_bytes(), view.retained_bytes());
     }
 
     // A message an event carries counts toward the attribute holding it.

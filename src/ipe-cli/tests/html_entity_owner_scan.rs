@@ -58,7 +58,7 @@ const INVENTORY: &[(&str, usize, usize)] = &[
     // The compiler-side owner's byte contract.
     ("src/ipe-docs/tests/html_escape_contract.rs", 0, 3),
     // Tests of the debugger overlay's escaped label.
-    ("src/runtime/rust/src/debugger/server.rs", 0, 2),
+    ("src/runtime/rust/src/debugger/server.rs", 0, 3),
     // The runtime owner: its byte-contract doc and the escaper itself.
     ("src/runtime/rust/src/escape.rs", 2, 2),
     // Tests of the render sink's escaping.

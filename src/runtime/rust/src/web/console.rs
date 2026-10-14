@@ -8,6 +8,7 @@
 //! proxies it), the Rust console is served in-process directly off the Web
 //! router — no extra process, same data. No panic vectors.
 
+use crate::csp::ends_raw_text_early;
 use crate::telemetry::{self, ConsoleAuthMode, ConsoleAuthResolution, Posture};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -81,19 +82,6 @@ pub const CONSOLE_JS: &str = r#"
  refresh();setInterval(refresh,2000);
 "#;
 
-/// Whether `text` holds `</` or `<!--`, either of which can end or re-mode a
-/// raw-text `<script>` or `<style>` element before its own close tag.
-const fn ends_raw_text_early(text: &str) -> bool {
-    let mut rest = text.as_bytes();
-    while let [first, tail @ ..] = rest {
-        if *first == b'<' && matches!(tail, [b'/', ..] | [b'!', b'-', b'-', ..]) {
-            return true;
-        }
-        rest = tail;
-    }
-    false
-}
-
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an inline console constant could end its element early, serving bytes its policy hash does not cover [ledger #boundary]
 const _: () = assert!(!ends_raw_text_early(CONSOLE_JS) && !ends_raw_text_early(CONSOLE_CSS));
 
@@ -132,9 +120,7 @@ pub async fn console_html() -> axum::response::Response {
         .into_response();
     crate::server::with_security_headers(
         resp,
-        telemetry::security_headers(telemetry::HeaderProfile::Policy(
-            crate::csp::Profile::Console,
-        )),
+        telemetry::security_headers(crate::csp::Profile::Console),
     )
 }
 

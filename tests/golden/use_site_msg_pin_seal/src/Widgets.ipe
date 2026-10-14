@@ -1,0 +1,23 @@
+module Widgets exposing (badge, chip, row)
+
+-- Cross-module message-slot helpers. `row` uses the typed `badge` under its
+-- own generic `msg`, and `Main.framed` uses `row` and the untyped `chip` under
+-- its generic `msg`, which keeps them generic; `Main` then renders them where
+-- no message type is ever chosen.
+
+import Ipe.Html as Html
+import Ipe.List as List
+
+
+badge : String -> Html.Html msg
+badge s =
+    Html.strong [] [ Html.text s ]
+
+
+chip s =
+    Html.em [] [ Html.text s ]
+
+
+row : List String -> Html.Html msg
+row xs =
+    Html.span [] (List.map badge xs)
