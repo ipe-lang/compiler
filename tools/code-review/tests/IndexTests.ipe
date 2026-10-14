@@ -1161,8 +1161,6 @@ exposedNames source =
 -- At startup `Index.probeRepos` checks the configured roots against the
 -- repositories the index records: every bound tag recorded, every recorded
 -- tag bound, each nested as recorded, and the set within the ceiling.
-
-
 -- The `probeRepos` refusal, if any, of a seeded index after `statements`
 -- ran on it, with `IPE_INDEX_REPOS` set to `repos repo outside` (unset when
 -- empty). `repo/vendor/ext` and `outside` are existing directories.
@@ -1293,12 +1291,12 @@ unboundUnitsExcluded =
                 == List.length before.rows
                 && not (List.any (\row -> Uid.toString row.unit.uid == Uid.toString (uid "u-ext")) after.rows)
                 && (case view of
-                        Just _ ->
-                            False
+                    Just _ ->
+                        False
 
-                        Nothing ->
-                            True
-                   )
+                    Nothing ->
+                        True
+                )
             )
 
 

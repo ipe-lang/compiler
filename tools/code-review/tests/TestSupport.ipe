@@ -111,8 +111,8 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
-import Ipe.Db.Sql as Sql
 import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File

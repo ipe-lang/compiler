@@ -682,7 +682,8 @@ seededChecks a b =
         documented title html =
             has ("<title>" ++ title ++ " · Code review</title>") html
                 && has "lang=\"en\"" html
-                && List.length (String.split "<h1" html) == 2
+                && List.length (String.split "<h1" html)
+                == 2
 
         standingPage bodyHash standing =
             page { baseModel | page = UnitPage (Uid.toString a.unit.uid), selectedView = ViewShown a, standing = Queue.StandingShown a.unit.uid bodyHash standing }
@@ -755,7 +756,8 @@ seededChecks a b =
         && has "Reading review status" shownPage
     )
     , ( "a queued unit whose row for the current body does not verify says so on its card and in the rail, never as an unreviewed unit"
-    , List.length (String.split "signature does not verify" tamperedCard) == 3
+    , List.length (String.split "signature does not verify" tamperedCard)
+        == 3
         && not (has "Not reviewed" tamperedCard)
         && has "Not reviewed" shownCard
     )

@@ -5,8 +5,8 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
-import Ipe.Db.Sql as Sql
 import Ipe.Db.Location exposing (Mode(..))
+import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
@@ -919,8 +919,6 @@ relativeRootLoadsQueueIn base =
 -- `IPE_INDEX_REPOS` binds every repository besides `ipe`, one `name=/path`
 -- entry each. Every malformed value is refused at startup by its own
 -- `ReposError`, naming the entry and echoing it only quoted.
-
-
 -- The kind of a `ReposError`, one name per variant.
 reposErrorName : ReposError -> String
 reposErrorName err =
@@ -977,9 +975,9 @@ reposRefusedAs raw expected position =
                             && String.startsWith "IPE_INDEX_REPOS " text
                             && noHazard text
                             && (position
-                                    == 0
-                                    || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
-                               )
+                                == 0
+                                || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
+                            )
             )
 
 

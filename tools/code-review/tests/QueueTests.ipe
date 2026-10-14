@@ -5,8 +5,8 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
-import Ipe.Db.Sql as Sql
 import Ipe.Db.Location exposing (Mode(..))
+import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
@@ -1082,14 +1082,13 @@ labelled id kind qualified path line =
             sampleQueuedUnit.unit
     in
     { sampleQueuedUnit
-        | unit =
-            { base
-                | uid = uid id
-                , kind = SafeText.renderForeign kind
-                , qualified = SafeText.renderForeign qualified
-                , path = SafeText.renderForeign path
-                , lineStart = line
-            }
+        | unit = { base
+            | uid = uid id
+            , kind = SafeText.renderForeign kind
+            , qualified = SafeText.renderForeign qualified
+            , path = SafeText.renderForeign path
+            , lineStart = line
+        }
     }
 
 
@@ -1123,12 +1122,18 @@ standingNotCounted =
         row why =
             Just (Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
     in
-    Queue.standingOf (row Tampered) == Queue.NotCounted Tampered
-        && Queue.standingOf (row ChainBroken) == Queue.NotCounted ChainBroken
-        && Queue.standingOf (row NoKey) == Queue.NotCounted NoKey
-        && Queue.standingOf (row Legacy) == Queue.NotCounted Legacy
-        && Queue.standingOf Nothing == Queue.Undecided
-        && Queue.standingOf (row Tampered) /= Queue.Undecided
+    Queue.standingOf (row Tampered)
+        == Queue.NotCounted Tampered
+        && Queue.standingOf (row ChainBroken)
+        == Queue.NotCounted ChainBroken
+        && Queue.standingOf (row NoKey)
+        == Queue.NotCounted NoKey
+        && Queue.standingOf (row Legacy)
+        == Queue.NotCounted Legacy
+        && Queue.standingOf Nothing
+        == Queue.Undecided
+        && Queue.standingOf (row Tampered)
+        /= Queue.Undecided
 
 
 queueLabelsDistinct : Bool
@@ -1146,19 +1151,30 @@ queueLabelsDistinct =
         rs =
             SafeText.renderForeign "ipe:src/r.rs"
     in
-    List.length labels == List.length labelFixture
+    List.length labels
+        == List.length labelFixture
         && distinct
         && List.all (\( q, label ) -> label.kind == q.unit.kind && label.name == q.unit.qualified) labels
-        && placeOf "u-file-a" labels == Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1)
-        && placeOf "u-file-b9" labels == Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9)
-        && placeOf "u-regex-1" labels == Just (Queue.AtUnit rs 3 (uid "u-regex-1"))
-        && placeOf "u-regex-2" labels == Just (Queue.AtUnit rs 3 (uid "u-regex-2"))
-        && placeOf "u-tests-mod" labels == Just Queue.Named
-        && placeOf "u-tests-fn" labels == Just Queue.Named
-        && placeOf "u-split-1" labels == Just Queue.Named
-        && placeOf "u-split-2" labels == Just Queue.Named
-        && placeOf "u-main" labels == Just Queue.Named
-        && Queue.queueLabels [] == []
+        && placeOf "u-file-a" labels
+        == Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1)
+        && placeOf "u-file-b9" labels
+        == Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9)
+        && placeOf "u-regex-1" labels
+        == Just (Queue.AtUnit rs 3 (uid "u-regex-1"))
+        && placeOf "u-regex-2" labels
+        == Just (Queue.AtUnit rs 3 (uid "u-regex-2"))
+        && placeOf "u-tests-mod" labels
+        == Just Queue.Named
+        && placeOf "u-tests-fn" labels
+        == Just Queue.Named
+        && placeOf "u-split-1" labels
+        == Just Queue.Named
+        && placeOf "u-split-2" labels
+        == Just Queue.Named
+        && placeOf "u-main" labels
+        == Just Queue.Named
+        && Queue.queueLabels []
+        == []
 
 
 -- ── review progress from the databases ──────────────────────────────────
