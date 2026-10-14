@@ -25,6 +25,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::Instant;
 
 /// How long one owned pool's close may take.
+#[cfg(feature = "db")]
 pub const DB_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
 
 /// How long a draining WebSocket's close frame may take to send.
@@ -144,6 +145,7 @@ impl ShutdownPlan {
     }
 
     /// This plan with `hook` run after its other hooks.
+    #[cfg(any(test, feature = "web"))]
     #[must_use]
     pub fn then<F, Fut>(mut self, hook: F) -> Self
     where
@@ -163,7 +165,12 @@ type Exit = Box<dyn Fn(i32) + Send + Sync>;
 type PoolSet = &'static crate::db::OwnedPools;
 /// The pool registry a stop closes: none without `db`.
 #[cfg(not(feature = "db"))]
-type PoolSet = ();
+type PoolSet = NoPools;
+
+/// The empty pool registry of a build without `db`.
+#[cfg(not(feature = "db"))]
+#[derive(Clone, Copy)]
+struct NoPools;
 
 /// The process's pool registry.
 #[cfg(feature = "db")]
@@ -172,7 +179,9 @@ fn process_pools() -> PoolSet {
 }
 /// The process's pool registry: none without `db`.
 #[cfg(not(feature = "db"))]
-const fn process_pools() -> PoolSet {}
+const fn process_pools() -> PoolSet {
+    NoPools
+}
 
 /// The long-lived tasks in flight and the wake-up for their last end.
 struct Live {
@@ -370,12 +379,12 @@ fn arm_in(
     Ok(Armed { shutdown })
 }
 
-/// Close every owned pool, each under [`DB_CLOSE_DEADLINE`]; the spill pool last.
+/// Close every owned pool, each under the pool-close deadline; the spill pool last.
 pub async fn close_owned_pools(armed: &Armed) -> PoolsClosed {
     #[cfg(feature = "db")]
     armed.shutdown.pools.close_all(DB_CLOSE_DEADLINE).await;
     #[cfg(not(feature = "db"))]
-    let () = armed.shutdown.pools;
+    let NoPools = armed.shutdown.pools;
     PoolsClosed { _private: () }
 }
 
@@ -635,7 +644,9 @@ pub mod tests {
         Box::leak(Box::new(crate::db::OwnedPools::new()))
     }
     #[cfg(not(feature = "db"))]
-    const fn test_pools() -> PoolSet {}
+    const fn test_pools() -> PoolSet {
+        NoPools
+    }
 
     /// Wait until `exited` records a code, within the budget.
     #[allow(clippy::expect_used)] // a test helper fails its test on a broken fixture

@@ -221,7 +221,7 @@ main =
 "#;
 
 /// A `Web.tea` counter app; its page mints the session its SSE stream needs.
-const WEB_COUNTER: &str = r#"module Main exposing (main)
+const WEB_COUNTER: &str = r"module Main exposing (main)
 
 import Ipe.Tea.Web as Web
 import Ipe.Ui as Ui
@@ -260,7 +260,7 @@ main =
         , routes = []
         , notFound = Increment
         }
-"#;
+";
 
 /// True when the E2E tier is off and the test must return at once.
 fn skipped() -> bool {
@@ -358,8 +358,12 @@ impl Drop for Served {
 }
 
 /// Forward every line of `pipe` to `tx`.
-fn forward(pipe: impl Read + Send + 'static, tag: Pipe, tx: mpsc::Sender<(Pipe, String)>) {
-    std::thread::spawn(move || {
+fn forward(
+    pipe: impl Read + Send + 'static,
+    tag: Pipe,
+    tx: mpsc::Sender<(Pipe, String)>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new().spawn(move || {
         for line in BufReader::new(pipe).lines() {
             let Ok(line) = line else {
                 return;
@@ -368,7 +372,8 @@ fn forward(pipe: impl Read + Send + 'static, tag: Pipe, tx: mpsc::Sender<(Pipe, 
                 return;
             }
         }
-    });
+    })?;
+    Ok(())
 }
 
 impl Served {
@@ -394,10 +399,10 @@ impl Served {
         let mut child = command.spawn()?;
         let (tx, lines) = mpsc::channel();
         if let Some(out) = child.stdout.take() {
-            forward(out, Pipe::Out, tx.clone());
+            forward(out, Pipe::Out, tx.clone())?;
         }
         if let Some(err) = child.stderr.take() {
-            forward(err, Pipe::Err, tx);
+            forward(err, Pipe::Err, tx)?;
         }
         Ok(Self {
             child,
@@ -534,9 +539,12 @@ fn body(response: &str) -> &str {
 }
 
 /// `GET path` on a thread, so the caller can signal while it is in flight.
-fn get_in_flight(port: u16, path: &str) -> std::thread::JoinHandle<Result<String, String>> {
+fn get_in_flight(
+    port: u16,
+    path: &str,
+) -> std::io::Result<std::thread::JoinHandle<Result<String, String>>> {
     let path = path.to_owned();
-    std::thread::spawn(move || get(port, &path).map_err(|e| e.to_string()))
+    std::thread::Builder::new().spawn(move || get(port, &path).map_err(|e| e.to_string()))
 }
 
 /// Seed the database through the app and assert the write landed.
@@ -630,7 +638,7 @@ fn signalled_twice(test_name: &str, signal: &str) -> Result<(Served, ExitStatus)
     let port = pick_ephemeral_port()?;
     let mut served = Served::ready(&exe, port, &env)?;
     write_one_row(test_name, port)?;
-    let slow = get_in_flight(port, "/slow/30000");
+    let slow = get_in_flight(port, "/slow/30000")?;
     std::thread::sleep(Duration::from_millis(300));
     served.signal(signal)?;
     served.wait_for(SHUTDOWN_LINE, LINE_BUDGET)?;
@@ -741,7 +749,7 @@ fn a_request_in_flight_completes_before_the_exit() -> Result<(), BoxError> {
     let port = pick_ephemeral_port()?;
     let mut served = Served::ready(&exe, port, &env)?;
     write_one_row(test_name, port)?;
-    let slow = get_in_flight(port, "/slow/1000");
+    let slow = get_in_flight(port, "/slow/1000")?;
     std::thread::sleep(Duration::from_millis(300));
     served.signal("-TERM")?;
     let response = slow
@@ -786,7 +794,7 @@ fn a_stuck_request_never_holds_the_exit_past_its_bound() -> Result<(), BoxError>
     let port = pick_ephemeral_port()?;
     let mut served = Served::ready(&exe, port, &env)?;
     write_one_row(test_name, port)?;
-    let _stuck = get_in_flight(port, "/slow/120000");
+    let _stuck = get_in_flight(port, "/slow/120000")?;
     std::thread::sleep(Duration::from_millis(300));
     let signalled = Instant::now();
     served.signal("-TERM")?;

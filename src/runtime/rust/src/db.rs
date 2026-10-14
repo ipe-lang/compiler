@@ -2422,20 +2422,8 @@ impl OwnedPools {
     /// The pools of one stage close concurrently, so a stage waits at most
     /// `deadline`. A pool that misses it is logged and left to the exit.
     pub async fn close_all(&self, deadline: std::time::Duration) {
-        let taken = self
-            .entries
-            .lock()
-            .map(|mut entries| std::mem::take(&mut *entries));
-        let taken = match taken {
-            Ok(taken) => taken,
-            Err(_) => {
-                crate::system::emit_runtime_log(
-                    "db",
-                    "the owned-pool registry is unavailable; its pools were not closed",
-                );
-                return;
-            }
-        };
+        // A poisoned registry still holds whole entries; its pools close too.
+        let taken = std::mem::take(&mut *self.entries.lock().unwrap_or_else(|e| e.into_inner()));
         let (spill, first): (Vec<OwnedEntry>, Vec<OwnedEntry>) = taken
             .into_iter()
             .partition(|(role, _)| *role == PoolRole::TelemetrySpill);

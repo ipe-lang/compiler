@@ -1851,6 +1851,7 @@ pub(crate) enum StaticRequest {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum StaticRefusal {
     /// The strict core refused the path text itself.
+    #[cfg(any(test, feature = "web"))]
     Malformed(crate::encoding::DecodeRefusal),
     /// A decoded segment is not a plain name under the serving regime.
     Segment(crate::path_core::RelPathRefusal),
@@ -1874,6 +1875,7 @@ pub(crate) enum StaticRefusal {
 /// # Errors
 ///
 /// The [`StaticRefusal`] of the first boundary that refused the path.
+#[cfg(any(test, feature = "web"))]
 pub(crate) fn static_request(
     uri_path: &str,
     root: &std::path::Path,
@@ -1884,7 +1886,7 @@ pub(crate) fn static_request(
     static_request_of(&decoded, root, regime)
 }
 
-/// [`static_request`] over a path already decoded.
+/// `static_request` over a path already decoded.
 ///
 /// # Errors
 ///
@@ -1948,7 +1950,7 @@ pub(crate) fn strict_serve_dir(
 /// [`strict_serve_dir`] under an explicit `regime`, so any host proves the
 /// Windows refusals.
 ///
-/// A request path [`static_request`] refuses is answered a bare 404 that never
+/// A request path `static_request` refuses is answered a bare 404 that never
 /// echoes the path, whether or not the entry exists. Every answer carries the
 /// response security headers.
 fn strict_serve_dir_with(
@@ -5035,7 +5037,11 @@ mod tests {
             .expect("the handler runs");
         let signalled = std::time::Instant::now();
         assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
-        let bound = grace + shutdown::DB_CLOSE_DEADLINE + std::time::Duration::from_secs(2);
+        #[cfg(feature = "db")]
+        let close = shutdown::DB_CLOSE_DEADLINE;
+        #[cfg(not(feature = "db"))]
+        let close = std::time::Duration::ZERO;
+        let bound = grace + close + std::time::Duration::from_secs(2);
         let stopped = tokio::time::timeout(bound, served)
             .await
             .expect("a stuck request never holds the stop past its bound");
@@ -6424,7 +6430,11 @@ mod tests {
         let seen = |name: &'static str, runs: Arc<AtomicUsize>| {
             move |uri: axum::http::Uri, strict: Option<axum::Extension<StrictUrl>>| async move {
                 runs.fetch_add(1, Ordering::SeqCst);
+                // The spelling is a web-tier fact; a server-only build sees the parse alone.
+                #[cfg(feature = "web")]
                 let spelling = strict.map(|axum::Extension(s)| s.spelling());
+                #[cfg(not(feature = "web"))]
+                let spelling = strict.map(|_| "parsed");
                 format!("{name} {uri} {spelling:?}")
             }
         };
@@ -6556,6 +6566,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "web")]
     #[tokio::test]
     async fn canonical_url_routes_every_spelling_of_a_path_as_its_canonical_one() {
         for (uri, want) in [
