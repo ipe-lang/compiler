@@ -654,8 +654,9 @@ pub enum BuiltinTag {
     DbSecured,
     /// `Order` — the `Ipe.Db.Store.Order` nullary sort-direction ADT
     /// (`Asc | Desc`), the second argument of `orderByLeft` / `orderByRight`.
-    /// Empty-module, distinct from [`Self::Order`] (the three-way comparison
-    /// result) though both interpret to the interned name `Order`.
+    /// Homed at `Ipe.Db.Store`, which keeps it a distinct head from
+    /// [`Self::Order`] (the empty-module three-way comparison result) though
+    /// both interpret to the interned name `Order`.
     DbOrder,
     /// `Codec` — the `Ipe.Codec.Codec inner` codec ADT, the first parameter of
     /// the `*By` accessor query leaves. Homed at `Ipe.Codec`.
