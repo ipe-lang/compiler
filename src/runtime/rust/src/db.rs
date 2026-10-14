@@ -2264,10 +2264,16 @@ pub(crate) async fn dsn_db_url(dsn: &crate::dsn::Dsn) -> Result<DbUrl, DbConnect
 /// The pool's engine is the one `package.ipe` fixed; a location for the other
 /// engine is a typed `InvalidInput` engine mismatch. A file location reaches
 /// the driver as a file name, never as URL text.
+///
+/// Defence in depth: the mismatch is refused here, before any URL is built or
+/// host resolved, and again by the driver's [`GatedDial`] gate.
 pub fn db_open<E: Send + From<String> + crate::FromIpeError + 'static>(
     location: DbLocation,
 ) -> IpeTask<E, Db> {
     Box::pin(async move {
+        if let Err(refused) = location.admit_engine(KERNEL_ENGINE) {
+            return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused));
+        }
         match location.0 {
             LocationKind::File { name, mode } => {
                 let db_url = match DbUrl::sqlite_file(&name, mode) {
@@ -2559,6 +2565,35 @@ crate::stringify::show_row!(
 );
 
 impl DbLocation {
+    /// The engine this location names: a file or memory location is SQLite,
+    /// a `Dsn` the engine its driver names.
+    const fn engine(&self) -> DbEngine {
+        match &self.0 {
+            LocationKind::File { .. } | LocationKind::Memory => DbEngine::Sqlite,
+            LocationKind::Dsn(dsn) => match dsn.driver() {
+                crate::dsn::DsnDriver::Sqlite => DbEngine::Sqlite,
+                crate::dsn::DsnDriver::Postgres => DbEngine::Postgres,
+            },
+        }
+    }
+
+    /// Admit this location for a pool whose driver speaks `driver`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::EngineMismatch`] when the location names another engine.
+    fn admit_engine(&self, driver: DbEngine) -> Result<(), DbConnectError> {
+        let url = self.engine();
+        match (url, driver) {
+            (DbEngine::Sqlite, DbEngine::Sqlite) | (DbEngine::Postgres, DbEngine::Postgres) => {
+                Ok(())
+            }
+            (DbEngine::Sqlite, DbEngine::Postgres) | (DbEngine::Postgres, DbEngine::Sqlite) => {
+                Err(DbConnectError::EngineMismatch { url, driver })
+            }
+        }
+    }
+
     /// The location as `Debug.log` prints it in a dev-posture build.
     ///
     /// A `Dsn` renders through its own show row, which redacts its password.
@@ -13161,6 +13196,58 @@ mod tests {
         match db_open::<String>(location).await {
             IpeResult::Ok(pool) => Ok(pool),
             IpeResult::Err(e) => Err(e),
+        }
+    }
+
+    /// A location is admitted only by a driver of the engine it names: every
+    /// file, memory and sqlite `Dsn` location is refused under PostgreSQL, a
+    /// postgres `Dsn` under SQLite, before any URL is built.
+    #[test]
+    fn a_location_is_admitted_only_by_its_own_engine() {
+        let dsn = |text: &str| match crate::dsn::dsn_parse::<IpeError>(text.to_owned()) {
+            IpeResult::Ok(dsn) => Some(db_location_dsn(dsn)),
+            IpeResult::Err(_) => None,
+        };
+        let file = match file_at(
+            &scratch_path("db_location_engine.db"),
+            FileMode::CreateIfMissing,
+        ) {
+            IpeResult::Ok(location) => Some(location),
+            IpeResult::Err(_) => None,
+        };
+        let cases = [
+            (file, DbEngine::Sqlite),
+            (Some(db_location_memory()), DbEngine::Sqlite),
+            (dsn("sqlite:///srv/app.db"), DbEngine::Sqlite),
+            (
+                dsn("postgres://alice@db.example.com:5432/app"),
+                DbEngine::Postgres,
+            ),
+        ];
+        for (location, engine) in cases {
+            assert!(
+                location.is_some(),
+                "{engine:?}: the fixture location parses"
+            );
+            let Some(location) = location else { continue };
+            for driver in [DbEngine::Sqlite, DbEngine::Postgres] {
+                let admitted = location.admit_engine(driver);
+                if driver == engine {
+                    assert!(
+                        admitted.is_ok(),
+                        "{location:?} under {driver:?}: {admitted:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            admitted,
+                            Err(DbConnectError::EngineMismatch { url, driver: d })
+                                if url == engine && d == driver
+                        ),
+                        "{location:?} under {driver:?}: {admitted:?}"
+                    );
+                }
+            }
         }
     }
 

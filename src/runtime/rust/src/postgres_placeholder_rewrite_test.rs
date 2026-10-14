@@ -1,13 +1,10 @@
 // Behavioral regression tests for the Postgres `db_format_sql` placeholder
 // rewriter (issue #2061).
 //
-// The rewriter lives in `config_postgres.rs`, a Postgres-driver template that
-// the emitter `include_str!`s into a generated project's `ipe_runtime/config.rs`
-// (see `ipe_backend_rust::project::RUNTIME_CONFIG_RS_DB_POSTGRES`). The
-// standalone runtime crate always compiles the *sqlite* `config.rs`, whose
-// `db_format_sql` is the identity, so no in-workspace test ever exercises the
-// quote-aware `?`→`$N` rewrite. Its only prior protection was the Postgres emit
-// E2E compiling — not its behavior.
+// The rewriter lives in `config_postgres.rs`, the Postgres driver aliases the
+// crate root compiles as `config` only under `db-postgres`. The runtime's own
+// test builds select the *sqlite* `config.rs`, whose `db_format_sql` is the
+// identity, so this module drives the quote-aware `?`→`$N` rewrite directly.
 //
 // To lock the placeholder-numbering invariant without duplicating the rewriter,
 // this module `include!`s the exact template into a private inner module and
@@ -156,6 +153,21 @@ mod tests {
             rewrite("? '?' ? $$?$$ ? -- ?\n ? /* ? */ ?"),
             "$1 '?' $2 $$?$$ $3 -- ?\n $4 /* ? */ $5"
         );
+    }
+
+    #[test]
+    fn lone_trailing_delimiters_are_ordinary_text() {
+        for sql in ["?$", "?-", "?/", "? $é", "?-é", "?/é"] {
+            let expected = sql.replacen('?', "$1", 1);
+            assert_eq!(rewrite(sql), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn unterminated_quote_consumes_remainder() {
+        assert_eq!(rewrite("? 'never closes ?"), "$1 'never closes ?");
+        assert_eq!(rewrite("? \"never closes ?"), "$1 \"never closes ?");
+        assert_eq!(rewrite("'"), "'");
     }
 
     #[test]

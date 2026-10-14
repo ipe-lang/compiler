@@ -1,11 +1,10 @@
-// Postgres `ipe_runtime/config.rs` template.
+// Postgres driver aliases.
 //
-// NOT compiled into the standalone `ipe-runtime-rust` crate's default build
-// (the crate root always uses `config.rs`, the sqlite variant). This file
-// exists purely as an `include_str!` source for `ipe_backend_rust::project`
-// (see `RUNTIME_CONFIG_RS_DB_POSTGRES`), which writes it verbatim to
-// `<emitted-project>/src/ipe_runtime/config.rs` when `package.ipe`'s
-// database driver is `Package.postgres`.
+// The crate root compiles this file as `config` when the `db-postgres` feature
+// is on (a dependency-model project whose `package.ipe` database driver is
+// `Postgres`); every other build compiles `config.rs`, the sqlite variant. The
+// vendored model writes it verbatim to `<emitted-project>/src/ipe_runtime/config.rs`
+// through `ipe_backend_rust::project`'s `RUNTIME_CONFIG_RS_DB_POSTGRES`.
 //
 // Every symbol name matches `config.rs`'s sqlite variant exactly (`DbPool`,
 // `DbRow`, `ipe_db_url`, `db_last_insert_id`, `db_format_sql`,
@@ -74,165 +73,120 @@ pub fn db_format_sql(sql: String) -> String {
     //   - dollar-quoted string `$tag$…$tag$` (tag may be empty: `$$…$$`)
     //   - line comment `-- …` to end of line
     //   - block comment `/* … */` (Postgres nests these)
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len() + 8);
-    let mut n = 0u32;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match b {
-            b'?' => {
-                n += 1;
+    //
+    // Every span length is measured from ASCII delimiters, which never occur
+    // inside a multi-byte UTF-8 sequence, so each split lands on a char
+    // boundary.
+    let mut out = String::with_capacity(sql.len().saturating_add(8));
+    let mut placeholder: usize = 0;
+    let mut rest: &str = &sql;
+    while let Some(head) = rest.chars().next() {
+        let tail = rest.get(head.len_utf8()..).unwrap_or_default();
+        let span_len = match head {
+            '?' => {
+                placeholder = placeholder.saturating_add(1);
                 out.push('$');
-                out.push_str(&n.to_string());
-                i += 1;
+                out.push_str(&placeholder.to_string());
+                rest = tail;
+                continue;
             }
-            b'\'' | b'"' => {
-                let quote = b;
-                out.push(quote as char);
-                i += 1;
-                while i < bytes.len() {
-                    let c = bytes[i];
-                    if c == quote {
-                        // A doubled quote is an escaped quote inside the span,
-                        // not its terminator.
-                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
-                            out.push(quote as char);
-                            out.push(quote as char);
-                            i += 2;
-                            continue;
-                        }
-                        out.push(quote as char);
-                        i += 1;
-                        break;
-                    }
-                    push_byte(&sql, &mut out, &mut i, c);
-                }
+            '\'' => Some(quoted_len(rest.as_bytes(), b'\'')),
+            '"' => Some(quoted_len(rest.as_bytes(), b'"')),
+            '$' => dollar_quoted_len(rest.as_bytes()),
+            '-' if tail.starts_with('-') => Some(
+                rest.find('\n')
+                    .map_or(rest.len(), |nl| nl.saturating_add(1)),
+            ),
+            '/' if tail.starts_with('*') => Some(block_comment_len(rest.as_bytes())),
+            _ => None,
+        };
+        match span_len.and_then(|len| rest.get(..len).zip(rest.get(len..))) {
+            Some((span, after)) => {
+                out.push_str(span);
+                rest = after;
             }
-            b'$' => {
-                if let Some(tag_end) = dollar_tag_end(bytes, i) {
-                    // `bytes[i..tag_end]` is `$tag$`; copy the whole
-                    // dollar-quoted body verbatim up to the matching closer.
-                    let tag = &sql[i..tag_end];
-                    out.push_str(tag);
-                    i = tag_end;
-                    if let Some(close_at) = find_subslice(bytes, tag.as_bytes(), i) {
-                        out.push_str(&sql[i..close_at + tag.len()]);
-                        i = close_at + tag.len();
-                    } else {
-                        // Unterminated dollar-quote: copy the remainder as-is
-                        // (sqlx surfaces the malformed SQL as an error).
-                        out.push_str(&sql[i..]);
-                        i = bytes.len();
-                    }
-                } else {
-                    out.push('$');
-                    i += 1;
-                }
-            }
-            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                let nl = find_byte(bytes, b'\n', i);
-                let end = nl.map_or(bytes.len(), |p| p + 1);
-                out.push_str(&sql[i..end]);
-                i = end;
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                let end = block_comment_end(bytes, i);
-                out.push_str(&sql[i..end]);
-                i = end;
-            }
-            _ => {
-                push_byte(&sql, &mut out, &mut i, b);
+            None => {
+                out.push(head);
+                rest = tail;
             }
         }
     }
     out
 }
 
-// Push one UTF-8 codepoint starting at `*i` (byte `first`) to `out`, advancing
-// `*i` past its full byte length. A multi-byte character never collides with
-// the ASCII delimiters scanned above, so treating it as opaque bytes is safe.
+// Byte length of the quoted span opening at `bytes[0]` (`quote`), closer
+// included; a doubled quote is an escaped quote inside the span. An
+// unterminated span runs to the end.
 #[cfg(feature = "db")]
-fn push_byte(src: &str, out: &mut String, i: &mut usize, first: u8) {
-    let len = utf8_len(first);
-    let end = (*i + len).min(src.len());
-    out.push_str(&src[*i..end]);
-    *i = end;
-}
-
-#[cfg(feature = "db")]
-fn utf8_len(first: u8) -> usize {
-    match first {
-        b if b < 0x80 => 1,
-        b if b >> 5 == 0b110 => 2,
-        b if b >> 4 == 0b1110 => 3,
-        b if b >> 3 == 0b11110 => 4,
-        _ => 1,
-    }
-}
-
-// If `bytes[start] == b'$'` begins a dollar-quote opening tag `$tag$` (tag is
-// zero or more letters/digits/underscores, not starting with a digit), return
-// the byte index just past the closing `$` of that opening tag.
-#[cfg(feature = "db")]
-fn dollar_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut j = start + 1;
-    let mut first = true;
-    while j < bytes.len() {
-        let c = bytes[j];
-        if c == b'$' {
-            return Some(j + 1);
+fn quoted_len(bytes: &[u8], quote: u8) -> usize {
+    let mut j = 1usize;
+    while let Some(&c) = bytes.get(j) {
+        if c == quote {
+            if bytes.get(j.saturating_add(1)) == Some(&quote) {
+                j = j.saturating_add(2);
+                continue;
+            }
+            return j.saturating_add(1);
         }
-        let ok = c == b'_' || c.is_ascii_alphabetic() || (!first && c.is_ascii_digit());
+        j = j.saturating_add(1);
+    }
+    bytes.len()
+}
+
+// Byte length of the dollar-quoted string opening at `bytes[0] == b'$'`, both
+// `$tag$` delimiters included, or `None` when `bytes` does not open a
+// dollar-quote tag (zero or more letters/digits/underscores, not starting with
+// a digit). An unterminated body runs to the end (sqlx surfaces the malformed
+// SQL as an error).
+#[cfg(feature = "db")]
+fn dollar_quoted_len(bytes: &[u8]) -> Option<usize> {
+    let mut j = 1usize;
+    let tag_end = loop {
+        let c = *bytes.get(j)?;
+        if c == b'$' {
+            break j.saturating_add(1);
+        }
+        let ok = c == b'_' || c.is_ascii_alphabetic() || (j > 1 && c.is_ascii_digit());
         if !ok {
             return None;
         }
-        first = false;
-        j += 1;
-    }
-    None
+        j = j.saturating_add(1);
+    };
+    let tag = bytes.get(..tag_end)?;
+    let body = bytes.get(tag_end..).unwrap_or_default();
+    Some(
+        body.windows(tag.len())
+            .position(|w| w == tag)
+            .map_or(bytes.len(), |p| {
+                tag_end.saturating_add(p).saturating_add(tag.len())
+            }),
+    )
 }
 
+// Byte length of the block comment opening at `bytes[..2] == b"/*"`, closer
+// included. Postgres nests block comments, so track depth; an unterminated
+// comment runs to the end.
 #[cfg(feature = "db")]
-fn find_byte(bytes: &[u8], target: u8, from: usize) -> Option<usize> {
-    bytes
-        .get(from..)
-        .and_then(|s| s.iter().position(|&c| c == target).map(|p| from + p))
-}
-
-#[cfg(feature = "db")]
-fn find_subslice(bytes: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from >= bytes.len() {
-        return None;
-    }
-    bytes
-        .get(from..)
-        .and_then(|s| s.windows(needle.len()).position(|w| w == needle))
-        .map(|p| from + p)
-}
-
-// Index just past the closing `*/` of a block comment that opens at `start`
-// (`bytes[start..start+2] == b"/*"`). Postgres nests block comments, so track
-// depth; an unterminated comment consumes the remainder.
-#[cfg(feature = "db")]
-fn block_comment_end(bytes: &[u8], start: usize) -> usize {
-    let mut j = start + 2;
+fn block_comment_len(bytes: &[u8]) -> usize {
+    let mut j = 2usize;
     let mut depth = 1usize;
-    while j + 1 < bytes.len() {
-        if bytes[j] == b'/' && bytes[j + 1] == b'*' {
-            depth += 1;
-            j += 2;
-        } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
-            depth -= 1;
-            j += 2;
-            if depth == 0 {
-                return j;
+    loop {
+        match (bytes.get(j), bytes.get(j.saturating_add(1))) {
+            (Some(b'/'), Some(b'*')) => {
+                depth = depth.saturating_add(1);
+                j = j.saturating_add(2);
             }
-        } else {
-            j += 1;
+            (Some(b'*'), Some(b'/')) => {
+                depth = depth.saturating_sub(1);
+                j = j.saturating_add(2);
+                if depth == 0 {
+                    return j;
+                }
+            }
+            (Some(_), Some(_)) => j = j.saturating_add(1),
+            _ => return bytes.len(),
         }
     }
-    bytes.len()
 }
 
 // Whether INSERT must use `… RETURNING id` to recover the auto-id (Postgres
