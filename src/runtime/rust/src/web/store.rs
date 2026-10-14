@@ -602,15 +602,24 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// so a later visit restores it. No default body, as with
     /// [`web_sessions`](SessionStore::web_sessions).
     async fn evict_unconnected(&self, need: Bytes) -> Bytes;
+
+    /// Whether `handle` is the live session this process holds under `sid`.
+    ///
+    /// An SSE attach reads it under the session's lock, the lock an eviction
+    /// holds while it removes the session, so the attach either finds its
+    /// session evicted or keeps the eviction from taking it.
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool;
 }
 
 /// Evict from `sessions` the least recently seen entries no SSE channel holds,
 /// oldest first, until their charges sum to `need`; returns the bytes they held.
 ///
-/// Each entry is locked outside the map lock, and an entry is removed only
-/// while the map still holds that same handle, so a session re-set meanwhile
-/// is never evicted in its place. The bytes return once the last holder of an
-/// evicted handle drops it.
+/// An entry is removed only under its own lock, while it still has no SSE
+/// channel and the map still holds that same handle: a stream attached since
+/// the snapshot keeps its session, and a session re-set meanwhile is never
+/// evicted in its place. The map lock is only ever taken inside an entry
+/// lock, never the other way round. The bytes return once the last holder of
+/// an evicted handle drops it.
 fn evict_unconnected_from<Model, Msg>(
     sessions: &RwLock<SessionMap<Model, Msg>>,
     need: Bytes,
@@ -621,31 +630,52 @@ fn evict_unconnected_from<Model, Msg>(
         .iter()
         .map(|(sid, (handle, seen))| (sid.clone(), Arc::clone(handle), *seen))
         .collect();
-    let mut idle: Vec<(String, SessionHandle<Model, Msg>, Instant, Bytes)> = held
+    let mut idle: Vec<(String, SessionHandle<Model, Msg>, Instant)> = held
         .into_iter()
-        .filter_map(|(sid, handle, seen)| {
-            let entry = handle.lock().unwrap_or_else(PoisonError::into_inner);
-            let charged = entry.charge.held();
-            let unconnected = entry.sse_tx.is_none();
-            drop(entry);
-            unconnected.then_some((sid, handle, seen, charged))
+        .filter(|(_, handle, _)| {
+            handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .sse_tx
+                .is_none()
         })
         .collect();
-    idle.sort_by_key(|(_, _, seen, _)| *seen);
+    idle.sort_by_key(|(_, _, seen)| *seen);
     let mut freed = Bytes::ZERO;
-    for (sid, handle, _, charged) in idle {
+    for (sid, handle, _) in idle {
         if freed.get() >= need.get() {
             break;
+        }
+        let entry = handle.lock().unwrap_or_else(PoisonError::into_inner);
+        if entry.sse_tx.is_some() {
+            continue;
         }
         let mut map = sessions.write().unwrap_or_else(PoisonError::into_inner);
         if let Entry::Occupied(slot) = map.entry(sid)
             && Arc::ptr_eq(&slot.get().0, &handle)
         {
             slot.remove();
-            freed = freed.checked_add(charged).unwrap_or(Bytes::new(u64::MAX));
+            freed = freed
+                .checked_add(entry.charge.held())
+                .unwrap_or(Bytes::new(u64::MAX));
         }
+        drop(map);
+        drop(entry);
     }
     freed
+}
+
+/// Whether `sessions` holds `handle` under `sid`.
+fn holds_in<Model, Msg>(
+    sessions: &RwLock<SessionMap<Model, Msg>>,
+    sid: &str,
+    handle: &SessionHandle<Model, Msg>,
+) -> bool {
+    sessions
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sid)
+        .is_some_and(|(held, _)| Arc::ptr_eq(held, handle))
 }
 
 // ─── Memory store — default; in-process, lost on restart ────────────────────
@@ -715,6 +745,9 @@ impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
     }
     async fn evict_unconnected(&self, need: Bytes) -> Bytes {
         evict_unconnected_from(&self.sessions, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.sessions, sid, handle)
     }
 }
 
@@ -960,6 +993,9 @@ where
     }
     async fn evict_unconnected(&self, need: Bytes) -> Bytes {
         evict_unconnected_from(&self.mem_cache, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
     }
 }
 
@@ -1288,6 +1324,9 @@ where
     async fn evict_unconnected(&self, need: Bytes) -> Bytes {
         evict_unconnected_from(&self.mem_cache, need)
     }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
+    }
 }
 
 // ─── Postgres store — multi-instance deployments ─────────────────────────────
@@ -1472,6 +1511,9 @@ where
     async fn evict_unconnected(&self, need: Bytes) -> Bytes {
         evict_unconnected_from(&self.mem_cache, need)
     }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
+    }
 }
 
 // ─── Redis store — multi-instance, native TTL, no sweep ─────────────────────
@@ -1653,6 +1695,9 @@ where
     }
     async fn evict_unconnected(&self, need: Bytes) -> Bytes {
         evict_unconnected_from(&self.mem_cache, need)
+    }
+    fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+        holds_in(&self.mem_cache, sid, handle)
     }
 }
 
@@ -1915,6 +1960,7 @@ mod tests {
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
@@ -2017,6 +2063,7 @@ mod tests {
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
@@ -3382,6 +3429,7 @@ mod tests {
             seq: 0,
             sse_tx: None,
             msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
         }))

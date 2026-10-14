@@ -38,8 +38,9 @@ pub const MAX_SESSIONS: CeilingKey = CeilingKey::new(
         lifetime: Lifetime::Startup,
         subsystem: Subsystem::Web,
         purpose: "Maximum concurrent web sessions; a new or returning session past it \
-                  answers 503. Independently, all sessions together never hold more \
-                  than 512 MiB and one session never more than 16 MiB. Read once, at \
+                  answers 503. Independently, the measured state of all sessions together \
+                  (model, rendered view, render history, queued browser events) is \
+                  capped at 512 MiB, and of one session at 16 MiB. Read once, at \
                   process start; a value that is not a positive decimal integer (`0` \
                   included) refuses the program before its first line, naming the \
                   variable.",

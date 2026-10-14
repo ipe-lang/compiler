@@ -666,9 +666,23 @@ use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "server")]
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
+/// A browser event's Msg waiting for its session's driver.
+///
+/// It holds the Msg's bytes against the session's budget until the driver
+/// takes it, so a session's queued events count toward its byte ceiling.
+#[cfg(feature = "server")]
+pub struct QueuedEvent<Msg> {
+    msg: Msg,
+    charge: budget::Charge,
+}
+
+/// How many browser events one session's driver queue holds.
+#[cfg(feature = "server")]
+const EVENT_QUEUE_CAP: usize = 1024;
+
 /// Per-session live state behind an `Arc<Mutex<…>>`. `rendered` is advanced by
 /// every commit; `sse_tx` is filled when the browser attaches the SSE channel;
-/// `msg_tx` feeds the per-session driver loop.
+/// `msg_tx` and `event_tx` feed the per-session driver loop.
 #[cfg(feature = "server")]
 pub struct SessionEntry<Model, Msg> {
     pub model: Model,
@@ -680,7 +694,10 @@ pub struct SessionEntry<Model, Msg> {
     pub tabs: TabSeqs,
     pub seq: u64,
     pub sse_tx: Option<SseTx>,
+    /// Feeds the driver the Msgs a Cmd or a subscription produces.
     pub msg_tx: Sender<Msg>,
+    /// Feeds the driver the Msgs browser events resolve to, each charged.
+    pub event_tx: Sender<QueuedEvent<Msg>>,
     /// The base-relative path the session last entered, so a reconnect that
     /// reports the same path does not enter (and run its Cmd) a second time.
     pub entered_path: Option<route::DecodedPath>,
@@ -708,7 +725,9 @@ pub struct SessionEntry<Model, Msg> {
 impl<Model: RetainedBytes, Msg: RetainedBytes> SessionEntry<Model, Msg> {
     /// The bytes this session keeps resident, or `None` when a part has no measure.
     fn resident_bytes(&self) -> Option<Bytes> {
-        let bytes = budget::ENTRY_OVERHEAD.plus(&self.model)?;
+        let bytes = budget::ENTRY_OVERHEAD
+            .plus(&self.model)?
+            .checked_add(self.rendered.resident_bytes()?)?;
         #[cfg(feature = "debugger")]
         let bytes = bytes.plus(&self.history)?;
         Some(bytes)
@@ -2466,6 +2485,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     entry: Weak<Mutex<SessionEntry<Model, Msg>>>,
     mut msg_rx: Receiver<Msg>,
     msg_tx: Sender<Msg>,
+    mut event_rx: Receiver<QueuedEvent<Msg>>,
     mut enter_rx: Receiver<EnterRequest>,
     update: Arc<FUpdate>,
     view: Arc<FView>,
@@ -2551,11 +2571,21 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // lifetime to one interval past eviction.
     let mut liveness = tokio::time::interval(std::time::Duration::from_secs(30));
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The entry holds the only event sender; once it is gone the arm is
+    // disabled and the liveness tick ends the driver.
+    let mut events_open = true;
     loop {
-        let msg = tokio::select! {
+        let (msg, queued) = tokio::select! {
             maybe = msg_rx.recv() => match maybe {
-                Some(m) => m,
+                Some(m) => (m, None),
                 None => break,
+            },
+            maybe = event_rx.recv(), if events_open => match maybe {
+                Some(QueuedEvent { msg, charge }) => (msg, Some(charge)),
+                None => {
+                    events_open = false;
+                    continue;
+                }
             },
             maybe = enter_rx.recv() => {
                 let Some(request) = maybe else {
@@ -2643,6 +2673,9 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // unset and a port-using Task's outbound frame reaches no sink — the
         // request never leaves the server and the awaited reply never arrives.
         let (next, cmd) = pubsub::with_session(&scope, || update(msg, model));
+        // The event's Msg is consumed; its bytes leave the queue's charge here,
+        // before the commit charges the state it produced.
+        drop(queued);
         crate::telemetry::metric_observe(
             "ipe_web_msg_seconds",
             &[("name", &msg_name)],
@@ -3392,8 +3425,8 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
     defaults: &[String],
     patch: Vec<(usize, String)>,
 ) where
-    Model: Clone + Send + 'static,
-    Msg: Clone + Send + 'static,
+    Model: RetainedBytes + Clone + Send + 'static,
+    Msg: RetainedBytes + Clone + Send + 'static,
     FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
 {
     if !literal_table::dev_overlay_active() {
@@ -3438,9 +3471,16 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
                 Err(EpochExhausted) => None,
             }
         };
-        if let Some((patches, step, seq, sse)) = committed {
-            send_patches_frame(sse, seq, step, &patches).await;
+        let Some((patches, step, seq, sse)) = committed else {
+            continue;
+        };
+        // The re-rendered view is charged before it is pushed, as a commit
+        // the driver makes is.
+        if !keep_resident(&handle, store.as_ref()).await {
+            close_session(store, scope.sid(), Some(&handle)).await;
+            continue;
         }
+        send_patches_frame(sse, seq, step, &patches).await;
     }
 }
 
@@ -4881,6 +4921,7 @@ mod handlers {
         // On overflow events are dropped with a warn (see event_handler).
         // 1024 is far above any legitimate burst of user-driven events.
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>(1024);
+        let (event_tx, event_rx) = mpsc::channel::<QueuedEvent<Msg>>(EVENT_QUEUE_CAP);
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         #[cfg(feature = "debugger")]
         let history_init =
@@ -4893,6 +4934,7 @@ mod handlers {
             seq: 0,
             sse_tx: None,
             msg_tx: msg_tx.clone(),
+            event_tx,
             entered_path: Some(path.clone()),
             enter_tx,
             #[cfg(feature = "debugger")]
@@ -4929,6 +4971,7 @@ mod handlers {
                 Arc::downgrade(&entry),
                 msg_rx,
                 msg_tx.clone(),
+                event_rx,
                 enter_rx,
                 update,
                 view,
@@ -5039,8 +5082,13 @@ mod handlers {
         };
         // Attached and subscribed under one lock: a close that lands after
         // the lookup has already set the closer, so the stream ends at once.
+        // A session evicted since the lookup is lost: the eviction removed it
+        // under this same lock, so the store no longer holds it here.
         let closer = {
             let mut e = entry.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.store.holds(&sid, &entry) {
+                return SessionLost.into_response();
+            }
             e.sse_tx = Some(tx.clone());
             e.liveness.closer.subscribe()
         };
@@ -5235,7 +5283,7 @@ mod handlers {
     ) -> Response
     where
         Model: Clone + Send + 'static,
-        Msg: Clone + Send + 'static,
+        Msg: RetainedBytes + Clone + Send + 'static,
         FInit: Send + Sync + 'static,
         FUpdate: Send + Sync + 'static,
         FView: Send + Sync + 'static,
@@ -5329,11 +5377,27 @@ mod handlers {
         {
             return event_ack(e.seq, true);
         }
+        // The Msg is charged against the session's budget before it is
+        // queued: one that would pass a byte bound is refused with the 503 a
+        // refused charge answers, and nothing is queued.
+        let queued = match msg {
+            Some(msg) => {
+                let charged = msg
+                    .retained_bytes()
+                    .ok_or(budget::OverBudget::Session)
+                    .and_then(|bytes| e.charge.budget().try_charge(bytes));
+                match charged {
+                    Ok(charge) => Some(QueuedEvent { msg, charge }),
+                    Err(why) => return refused_charge(why),
+                }
+            }
+            None => None,
+        };
         // try_send is non-blocking; on a full queue drop the event and return
         // 429 so the client can back off. The seq is not recorded, so the
         // client's retry of the same event is not mistaken for a duplicate.
-        if let Some(m) = msg
-            && let Err(err) = e.msg_tx.try_send(m)
+        if let Some(event) = queued
+            && let Err(err) = e.event_tx.try_send(event)
         {
             crate::system::emit_runtime_log(
                 "live",
@@ -5372,8 +5436,8 @@ mod handlers {
         body: axum::body::Bytes,
     ) -> Response
     where
-        Model: Clone + Send + 'static,
-        Msg: Clone + Send + 'static,
+        Model: RetainedBytes + Clone + Send + 'static,
+        Msg: RetainedBytes + Clone + Send + 'static,
         FInit: Send + Sync + 'static,
         FUpdate: Send + Sync + 'static,
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
@@ -6018,8 +6082,8 @@ mod handlers {
         axum::Json(body): axum::Json<serde_json::Value>,
     ) -> axum::response::Response
     where
-        Model: Clone + PartialEq + Send + 'static,
-        Msg: Clone + Send + std::fmt::Debug + 'static,
+        Model: RetainedBytes + Clone + PartialEq + Send + 'static,
+        Msg: RetainedBytes + Clone + Send + std::fmt::Debug + 'static,
         FInit: Send + Sync + 'static,
         FUpdate: Fn(Msg, Model) -> (Model, crate::tea::IpeCmd<Msg>) + Send + Sync + 'static,
         FView: Fn(Model) -> crate::html::Html<Msg> + Send + Sync + 'static,
@@ -6066,6 +6130,10 @@ mod handlers {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
+        // The render it now holds is charged as well as the model it shows.
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
+        }
         let resp_json = serde_json::json!({ "body": html_body, "epoch": epoch.to_token() });
         (
             axum::http::StatusCode::OK,
@@ -6380,6 +6448,10 @@ mod handlers {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
+        // The render it now holds is charged as well as the model it shows.
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
+        }
         let resp_json = serde_json::json!({
             "body":   html_body,
             "epoch":  epoch.to_token(),
@@ -6460,6 +6532,10 @@ mod handlers {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
+        // The render it now holds is charged as well as the model it shows.
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
+        }
         let resp_json = serde_json::json!({
             "body":   html_body,
             "epoch":  epoch.to_token(),
@@ -6544,6 +6620,10 @@ mod handlers {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
+        // The render it now holds is charged as well as the model it shows.
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
+        }
         let resp_json = serde_json::json!({
             "body":   html_body,
             "epoch":  epoch.to_token(),
@@ -7284,6 +7364,7 @@ mod reload_push_tests {
             seq: 0,
             sse_tx,
             msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
@@ -7391,6 +7472,7 @@ mod hot_appearance_push_tests {
             seq: 0,
             sse_tx,
             msg_tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
@@ -8690,6 +8772,7 @@ mod sse_reconnect_reconcile_tests {
             seq: 0,
             sse_tx: None,
             msg_tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: entered_path.map(dp),
             enter_tx,
             #[cfg(feature = "debugger")]
@@ -9461,6 +9544,7 @@ mod watch_status_handler_tests {
             seq: 0,
             sse_tx,
             msg_tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
@@ -12298,12 +12382,12 @@ mod emitted_router_behavior_tests {
 
     /// Route the session's dispatches into `tx`, so a test reads exactly what
     /// `event_handler` enqueued.
-    async fn capture_dispatches(store: &Arc<Store>, sid: &str, tx: Sender<Msg>) {
+    async fn capture_dispatches(store: &Arc<Store>, sid: &str, tx: Sender<QueuedEvent<Msg>>) {
         session_of(store, sid)
             .await
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .msg_tx = tx;
+            .event_tx = tx;
     }
 
     /// `view(model)` stamped exactly as the driver stamps a committed render.
@@ -12365,14 +12449,14 @@ mod emitted_router_behavior_tests {
                 "the swap must hand the `+` hid to the `-` button"
             );
             commit_view(&store, &sid, swapped).await;
-            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
             capture_dispatches(&store, &sid, tx).await;
 
             let old = click_body(&plus, Some(&first), None);
             let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &old).await;
             assert_eq!(status, StatusCode::OK, "a retained epoch resolves");
             assert!(
-                matches!(rx.try_recv(), Ok(Msg::Increment)),
+                matches!(rx.try_recv().map(|queued| queued.msg), Ok(Msg::Increment)),
                 "the old-epoch click must dispatch the handler it was rendered with"
             );
 
@@ -12380,7 +12464,72 @@ mod emitted_router_behavior_tests {
             let now = click_body(&plus, Some(&current), None);
             let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &now).await;
             assert_eq!(status, StatusCode::OK);
-            assert!(matches!(rx.try_recv(), Ok(Msg::Decrement)));
+            assert!(matches!(
+                rx.try_recv().map(|queued| queued.msg),
+                Ok(Msg::Decrement)
+            ));
+        });
+    }
+
+    /// A queued event holds its Msg's bytes against its own session's budget.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_queued_event_is_charged_to_its_session() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let budget = Arc::clone(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .charge
+                    .budget(),
+            );
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
+            capture_dispatches(&store, &sid, tx).await;
+            let click = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &click).await;
+            assert_eq!(status, StatusCode::OK);
+            let queued = rx.try_recv().expect("the click is queued");
+            assert!(
+                Arc::ptr_eq(queued.charge.budget(), &budget),
+                "charged to its session"
+            );
+            assert_eq!(Some(queued.charge.held()), queued.msg.retained_bytes());
+        });
+    }
+
+    /// An event whose Msg would pass its session's byte ceiling is refused
+    /// with the 503 of a refused charge, and nothing is queued.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn an_event_past_the_session_ceiling_is_refused() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let budget = Arc::clone(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .charge
+                    .budget(),
+            );
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
+            capture_dispatches(&store, &sid, tx).await;
+            let full = budget
+                .try_charge(budget.room())
+                .expect("the session's room is free");
+            let click = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &click).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(rx.try_recv().is_err(), "a refused event is not queued");
+            drop(full);
         });
     }
 
@@ -12401,7 +12550,7 @@ mod emitted_router_behavior_tests {
                 };
                 commit_view(&store, &sid, stamped(view(model))).await;
             }
-            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
             capture_dispatches(&store, &sid, tx).await;
 
             let stale = click_body(&plus, Some(&first), None);
@@ -12431,7 +12580,10 @@ mod emitted_router_behavior_tests {
                     .is_some_and(|b| b.contains("data-ipe-hid")),
                 "the refusal carries the current render: {reply}"
             );
-            assert!(rx.try_recv().is_err(), "a refused event must not dispatch");
+            assert!(
+                rx.try_recv().map(|queued| queued.msg).is_err(),
+                "a refused event must not dispatch"
+            );
         });
     }
 
@@ -12444,7 +12596,7 @@ mod emitted_router_behavior_tests {
             let store = Arc::new(Store::new(Duration::from_secs(60)));
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
-            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
             capture_dispatches(&store, &sid, tx).await;
 
             let unstamped = click_body(&plus, None, None);
@@ -12453,7 +12605,7 @@ mod emitted_router_behavior_tests {
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(marker.as_deref(), Some("1"));
             assert!(
-                rx.try_recv().is_err(),
+                rx.try_recv().map(|queued| queued.msg).is_err(),
                 "an unstamped event must not dispatch"
             );
         });
@@ -12468,7 +12620,7 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
             let first = epoch_of(&body).expect("the page carries its render epoch");
-            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
             capture_dispatches(&store, &sid, tx).await;
 
             let bad_epoch = click_body(&plus, Some("not-an-epoch"), None);
@@ -12480,7 +12632,7 @@ mod emitted_router_behavior_tests {
                 assert_eq!(reply, "bad body");
             }
             assert!(
-                rx.try_recv().is_err(),
+                rx.try_recv().map(|queued| queued.msg).is_err(),
                 "a malformed event must not dispatch"
             );
         });
@@ -12498,7 +12650,7 @@ mod emitted_router_behavior_tests {
             let first = epoch_of(&body).expect("the page carries its render epoch");
             let future = future_of(&first).expect("a well-formed token");
             let foreign = foreign_of(&first).expect("a well-formed token");
-            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
             capture_dispatches(&store, &sid, tx).await;
 
             for epoch in [future, foreign] {
@@ -12508,7 +12660,10 @@ mod emitted_router_behavior_tests {
                 assert_eq!(status, StatusCode::CONFLICT, "{epoch}");
                 assert_eq!(marker.as_deref(), Some("1"));
             }
-            assert!(rx.try_recv().is_err(), "a refused event must not dispatch");
+            assert!(
+                rx.try_recv().map(|queued| queued.msg).is_err(),
+                "a refused event must not dispatch"
+            );
         });
     }
 
@@ -12522,7 +12677,7 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
             let first = epoch_of(&body).expect("the page carries its render epoch");
-            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
             capture_dispatches(&store, &sid, tx).await;
 
             let event = click_body(&plus, Some(&first), Some((TAB, 1)));
@@ -12540,13 +12695,22 @@ mod emitted_router_behavior_tests {
                 reply.contains("\"duplicate\":true"),
                 "the replay is a duplicate: {reply}"
             );
-            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
-            assert!(rx.try_recv().is_err(), "the replay must not dispatch again");
+            assert!(matches!(
+                rx.try_recv().map(|queued| queued.msg),
+                Ok(Msg::Increment)
+            ));
+            assert!(
+                rx.try_recv().map(|queued| queued.msg).is_err(),
+                "the replay must not dispatch again"
+            );
 
             let next = click_body(&plus, Some(&first), Some((TAB, 2)));
             let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &next).await;
             assert_eq!(status, StatusCode::OK);
-            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+            assert!(matches!(
+                rx.try_recv().map(|queued| queued.msg),
+                Ok(Msg::Increment)
+            ));
         });
     }
 
@@ -12561,13 +12725,16 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
             let first = epoch_of(&body).expect("the page carries its render epoch");
-            let (tx, mut rx) = mpsc::channel::<Msg>(4);
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
             capture_dispatches(&store, &sid, tx).await;
 
             let later = click_body(&plus, Some(&first), Some((TAB, 2)));
             let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &later).await;
             assert_eq!(status, StatusCode::OK);
-            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+            assert!(matches!(
+                rx.try_recv().map(|queued| queued.msg),
+                Ok(Msg::Increment)
+            ));
 
             let earlier = click_body(&plus, Some(&first), Some((TAB, 1)));
             let (status, _, reply) =
@@ -12578,7 +12745,7 @@ mod emitted_router_behavior_tests {
                 "a late earlier seq is no duplicate: {reply}"
             );
             assert!(
-                matches!(rx.try_recv(), Ok(Msg::Increment)),
+                matches!(rx.try_recv().map(|queued| queued.msg), Ok(Msg::Increment)),
                 "a late earlier seq must dispatch"
             );
 
@@ -12589,7 +12756,10 @@ mod emitted_router_behavior_tests {
                 reply.contains("\"duplicate\":true"),
                 "its replay is a duplicate: {reply}"
             );
-            assert!(rx.try_recv().is_err(), "the replay must not dispatch again");
+            assert!(
+                rx.try_recv().map(|queued| queued.msg).is_err(),
+                "the replay must not dispatch again"
+            );
         });
     }
 
@@ -12664,8 +12834,21 @@ mod emitted_router_behavior_tests {
             let (sid, body) = get(make_router(store.clone()), "/", None).await;
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
             let first = epoch_of(&body).expect("the page carries its render epoch");
-            let (tx, mut rx) = mpsc::channel::<Msg>(1);
-            tx.try_send(Msg::Decrement).expect("the one slot is free");
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(1);
+            let charge = session_of(&store, &sid)
+                .await
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .charge
+                .budget()
+                .try_charge(crate::retained::Bytes::new(0))
+                .expect("an empty charge fits");
+            tx.try_send(QueuedEvent {
+                msg: Msg::Decrement,
+                charge,
+            })
+            .map_err(|_| ())
+            .expect("the one slot is free");
             capture_dispatches(&store, &sid, tx).await;
 
             let event = click_body(&plus, Some(&first), Some((TAB, 1)));
@@ -12676,7 +12859,7 @@ mod emitted_router_behavior_tests {
                 "a full queue answers 429"
             );
             assert!(
-                matches!(rx.try_recv(), Ok(Msg::Decrement)),
+                matches!(rx.try_recv().map(|queued| queued.msg), Ok(Msg::Decrement)),
                 "drain the filler"
             );
 
@@ -12687,7 +12870,10 @@ mod emitted_router_behavior_tests {
                 !reply.contains("duplicate"),
                 "a 429 must not burn the seq: {reply}"
             );
-            assert!(matches!(rx.try_recv(), Ok(Msg::Increment)));
+            assert!(matches!(
+                rx.try_recv().map(|queued| queued.msg),
+                Ok(Msg::Increment)
+            ));
         });
     }
 
@@ -13600,7 +13786,8 @@ mod route_entry_cmd_tests {
     }
 
     /// A flood of cookieless GETs never holds more resident bytes than the
-    /// budget: each mint past it evicts an unconnected session first.
+    /// budget, and every mint is served: each one past the budget evicts the
+    /// oldest unconnected session first, so one session stays resident.
     #[test]
     fn budget_flood_stays_within_the_budget() {
         run(false, || async {
@@ -13609,18 +13796,130 @@ mod route_entry_cmd_tests {
             let limit = crate::retained::Bytes::new(ENTRY_OVERHEAD.get().saturating_mul(2));
             let process = SessionBudget::process(limit);
             let store = memory();
+            let mut minted = Vec::new();
             for _ in 0..6 {
                 let app = router_budgeted(store.clone(), sessions.clone(), process.clone());
-                let (status, _, _, _) = get_via(app, "/", None).await;
-                assert!(
-                    status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
-                    "{status}"
+                let (status, _, sid, _) = get_via(app, "/", None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "a mint past the budget evicts and is served"
                 );
                 assert!(
                     process.used().get() <= limit.get(),
                     "resident bytes stay in budget"
                 );
+                minted.push(sid);
             }
+            assert_eq!(
+                store.web_sessions().await.len(),
+                1,
+                "one session fits the budget"
+            );
+            let newest = minted.last().cloned().unwrap_or_default();
+            assert!(
+                store.get(&newest).await.is_some(),
+                "the newest session stays"
+            );
+        });
+    }
+
+    /// A session is charged for its rendered view and handler indexes, not
+    /// only its model.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the fixture page mints a session and its view measures
+    fn a_session_is_charged_for_its_rendered_view() {
+        run(false, || async {
+            use crate::web::budget::ENTRY_OVERHEAD;
+            let store = memory();
+            let (status, _, sid, _) = get_via(router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let handle = store.get(&sid).await.expect("the page stored its session");
+            let e = handle.lock().unwrap_or_else(|e| e.into_inner());
+            let view = e
+                .rendered
+                .resident_bytes()
+                .expect("the fixture view measures");
+            let floor = ENTRY_OVERHEAD
+                .checked_add(view)
+                .expect("the floor fits u64");
+            assert!(
+                e.charge.held().get() >= floor.get(),
+                "held {:?} < overhead + rendered {:?}",
+                e.charge.held(),
+                floor
+            );
+        });
+    }
+
+    /// A memory store that, once armed, drops the next session it hands out,
+    /// as an eviction landing between an SSE stream's lookup and its attach.
+    struct EvictedAfterGet(MemoryStore<Model, Msg>, std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for EvictedAfterGet {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            let handle = self.0.get(sid).await;
+            if self.1.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.0.delete(sid).await;
+            }
+            handle
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.0.admission()
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+            self.0.set(sid, handle).await;
+        }
+        async fn delete(&self, sid: &str) {
+            self.0.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.0.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.0.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool {
+            self.0.holds(sid, handle)
+        }
+    }
+
+    /// An SSE stream whose session was evicted after its lookup answers
+    /// session-lost instead of attaching to a session no request reaches.
+    #[test]
+    #[allow(clippy::expect_used)] // test: a fixed request always builds and the router responds
+    fn an_sse_attach_to_an_evicted_session_is_lost() {
+        run(false, || async {
+            let evicting = Arc::new(EvictedAfterGet(
+                MemoryStore::new(Duration::from_secs(60)),
+                std::sync::atomic::AtomicBool::new(false),
+            ));
+            let store: Store = evicting.clone();
+            let (status, _, sid, _) = get_via(router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                store.get(&sid).await.is_some(),
+                "the page stored its session"
+            );
+            evicting.1.store(true, std::sync::atomic::Ordering::SeqCst);
+            let resp = router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "the attach answers session-lost"
+            );
         });
     }
 
@@ -13961,6 +14260,9 @@ mod route_entry_cmd_tests {
         }
         async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
             self.live.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.live.holds(sid, handle)
         }
     }
 
@@ -14444,6 +14746,9 @@ mod route_entry_cmd_tests {
         async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
             self.inner.evict_unconnected(need).await
         }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
+        }
     }
 
     /// Two concurrent GETs rejoining one schema-rebuilt sid evaluate `init` once; the second joins live.
@@ -14545,6 +14850,9 @@ mod route_entry_cmd_tests {
         async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
             self.inner.evict_unconnected(need).await
         }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
+        }
     }
 
     /// A handler cancelled while its rejoin is being stored still commits the session, its Cmd and its claim release.
@@ -14619,6 +14927,9 @@ mod route_entry_cmd_tests {
         }
         async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
             self.inner.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
         }
     }
 
@@ -14783,6 +15094,7 @@ mod route_entry_cmd_tests {
             seq: 0,
             sse_tx: None,
             msg_tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
             entered_path: Some(root_path()),
             enter_tx,
             #[cfg(feature = "debugger")]
@@ -16108,6 +16420,9 @@ mod web_revocation_tests {
         async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
             self.inner.evict_unconnected(need).await
         }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
+        }
     }
 
     /// Closing a session flips its closer before the store delete runs, so a
@@ -16189,6 +16504,9 @@ mod web_revocation_tests {
         }
         async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
             self.inner.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
         }
     }
 
