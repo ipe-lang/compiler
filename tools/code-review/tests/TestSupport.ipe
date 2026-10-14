@@ -27,9 +27,11 @@ module TestSupport exposing
     , execIndexSchema
     , seedIndexDb
     , insertUnitRows
+    , insertUnboundUnit
     , setIndexEnv
     , envSettings
     , envReview
+    , optionalEnv
     , envAppSettings
     , loadFirstPage
     , indexConn
@@ -109,8 +111,8 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
-import Ipe.Db.Sql as Sql
 import Ipe.Db.Location as Location exposing (Mode(..))
+import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
@@ -478,6 +480,13 @@ seedIndexDb indexDb =
 
 insertUnitRows : Db -> Task.Task Error Int
 insertUnitRows conn =
+    Db.exec conn "INSERT INTO repos (tag, outer, prefix) VALUES ('ipe', NULL, NULL)" []
+        |> Task.andThen (\_ -> insertUnits conn)
+
+
+-- The two fixture units, both under the `ipe` repository, and their queue rows.
+insertUnits : Db -> Task.Task Error Int
+insertUnits conn =
     Db.exec conn
         "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
         [ Uid.toSql (uid "u-a")
@@ -529,6 +538,31 @@ insertUnitRows conn =
             )
 
 
+-- One open unit under the unbound tag `ext`.
+insertUnboundUnit : String -> Task.Task Error ()
+insertUnboundUnit indexDb =
+    execIndex indexDb
+        "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        [ Uid.toSql (uid "u-ext")
+        , SqlString "ext:src/Lib.rs"
+        , SqlString "fn"
+        , SqlString "answer"
+        , SqlString "Ext.answer"
+        , SqlInt 3
+        , SqlInt 6
+        , SqlString "internal"
+        , SqlNull (SqlString "")
+        , SqlString (Index.attest viewA)
+        , SqlString "shaE"
+        ]
+        |> Task.andThen
+            (\_ ->
+                execIndex indexDb
+                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
+                    [ Uid.toSql (uid "u-ext"), SqlString "new", SqlNull (SqlString ""), SqlString (Index.attest viewA), SqlString "shaE", SqlInt 4 ]
+            )
+
+
 -- The settings a server resolves once at startup, here parsed from the
 -- current `IPE_INDEX_*` environment the way `main` reads and parses it. A test
 -- that calls a request-time function resolves them once and passes them in;
@@ -538,14 +572,26 @@ envSettings =
     do
         rawDb <- System.getenv "IPE_INDEX_DB"
         rawRoot <- System.getenv "IPE_INDEX_ROOT"
-        Settings.parseIndexSettings rawDb rawRoot
+        rawRepos <- optionalEnv "IPE_INDEX_REPOS"
+        Settings.parseIndexSettings rawDb rawRoot rawRepos
 
 
 -- The review store location a server resolves once at startup, here parsed
 -- from the current `IPE_REVIEW_DB` the way `main` reads and parses it.
 envReview : Task.Task Error Settings.ReviewFile
 envReview =
-    Settings.parseReviewDb (System.getenvOr "IPE_REVIEW_DB" "review.db")
+    optionalEnv "IPE_REVIEW_DB"
+        |> Task.andThen (Settings.valueOr "IPE_REVIEW_DB" "review.db")
+        |> Task.andThen Settings.parseReviewDb
+
+
+-- An optional variable read the way `main` reads one: unset, set, or set
+-- but unreadable, never folded into one another.
+optionalEnv : String -> Task.Task Error Settings.EnvValue
+optionalEnv key =
+    Task.onError
+        (\e -> Task.succeed (Settings.envFailure e))
+        (System.getenv key |> Task.map Settings.EnvSet)
 
 
 -- Every setting a server resolves once at startup, from the current
@@ -606,6 +652,7 @@ setIndexEnv : String -> String -> Task.Task Error ()
 setIndexEnv indexDb repo =
     System.setenv "IPE_INDEX_DB" indexDb
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_ROOT" repo)
+        |> Task.andThen (\_ -> System.unsetenv "IPE_INDEX_REPOS")
 
 
 -- One first-page unit with the change the index recorded for its current
@@ -626,7 +673,7 @@ loadFirstPage =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        snap <- Index.readSnapshot ReadOnly conn Index.Start
+        snap <- Index.readSnapshot ReadOnly settings.roots conn Index.Start
         entries <- Task.sequence (List.map (pageEntry conn settings.roots) snap.rows)
         Task.succeed { units = entries, total = snap.open }
 

@@ -1,4 +1,4 @@
-module Lib.View exposing (LayoutNote(..), RowLine(..), codeHtml, displayOrderCss, escapeCss, gutterHtml, layoutNotes, lineHtml, rowLines, view)
+module Lib.View exposing (LayoutNote(..), RowLine(..), codeHtml, displayOrderCss, escapeCss, gutterHtml, layoutLine, layoutNotes, lineHtml, rowLines, view)
 
 import Ipe.Char as Char
 import Ipe.Error as Error exposing (Error)
@@ -16,7 +16,7 @@ import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
-import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Highlight as Highlight exposing (Layout, LeadingMark(..), LineEnds(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
@@ -762,8 +762,8 @@ labelEl size label =
     Ui.row
         [ Ui.spacing 6, Ui.centerY ]
         ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (safeText label.kind)
-         , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
-         ]
+        , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
+        ]
             ++ placeEls size label.place
         )
 
@@ -1145,7 +1145,8 @@ gutterHtml numbers =
 -- spaces and tabs kept.
 codeHtml : List (List Token) -> Html.Html msg
 codeHtml lines =
-    Html.node "code"
+    Html.node
+        "code"
         [ Attr.style "display:block;white-space:pre" ]
         (List.intersperse (Html.text "\n") (List.map lineHtml lines))
 
@@ -1160,7 +1161,11 @@ type LayoutNote
 
 layoutNotes : Highlight.Lang -> List SourceRow -> List LayoutNote
 layoutNotes lang rows =
-    noteIf (List.any (leadingMarkRow lang) rows) ByteOrderMark ++ noteIf (List.any (crlfRow lang) rows) CrlfLineEnds
+    let
+        layout =
+            Highlight.layoutOf lang
+    in
+    noteIf (List.any (leadingMarkRow layout) rows) ByteOrderMark ++ noteIf (List.any (crlfRow layout) rows) CrlfLineEnds
 
 
 noteIf : Bool -> LayoutNote -> List LayoutNote
@@ -1172,21 +1177,21 @@ noteIf present note =
         []
 
 
-leadingMarkRow : Highlight.Lang -> SourceRow -> Bool
-leadingMarkRow lang row =
+leadingMarkRow : Layout -> SourceRow -> Bool
+leadingMarkRow layout row =
     case row of
         Numbered n line ->
-            startsWithLayoutMark lang n line
+            startsWithLayoutMark layout n line
 
         Covered ->
             False
 
 
-crlfRow : Highlight.Lang -> SourceRow -> Bool
-crlfRow lang row =
+crlfRow : Layout -> SourceRow -> Bool
+crlfRow layout row =
     case row of
         Numbered _ line ->
-            endsWithLayoutCr lang line
+            endsWithLayoutCr layout line
 
         Covered ->
             False
@@ -1220,16 +1225,16 @@ type RowLine
 -- the rows' text.
 rowLines : Highlight.Lang -> List SourceRow -> List RowLine
 rowLines lang rows =
-    case List.foldl (rowLineStep lang) ( Highlight.lineStart, [] ) rows of
+    case List.foldl (rowLineStep lang (Highlight.layoutOf lang)) ( Highlight.lineStart, [] ) rows of
         ( _, lines ) ->
             lines
 
 
-rowLineStep : Highlight.Lang -> SourceRow -> ( Highlight.Carry, List RowLine ) -> ( Highlight.Carry, List RowLine )
-rowLineStep lang row ( carry, lines ) =
+rowLineStep : Highlight.Lang -> Layout -> SourceRow -> ( Highlight.Carry, List RowLine ) -> ( Highlight.Carry, List RowLine )
+rowLineStep lang layout row ( carry, lines ) =
     case row of
         Numbered n line ->
-            case Highlight.lexLine lang carry (layoutLine lang n line) of
+            case Highlight.lexLine lang carry (layoutLine layout n line) of
                 ( toks, next ) ->
                     ( next, lines ++ [ TokenLine n toks ] )
 
@@ -1237,43 +1242,42 @@ rowLineStep lang row ( carry, lines ) =
             ( Highlight.lineStart, lines ++ [ CoveredLine ] )
 
 
--- A line without what its language reads as layout: the `\r` of a CRLF
--- ending in a language that reads CRLF as one line break (Rust, Ipê), and a
--- byte-order mark at the start of the file in a language that skips it
--- (Rust). In shell and other text that `\r` is part of the line (`cd dir\r`
--- names another directory) and a leading mark is a byte the shell reads, so
--- each stays, drawn as the escape every other hazard is.
-layoutLine : Highlight.Lang -> Int -> String -> String
-layoutLine lang n line =
-    withoutLineEnd lang (withoutLeadingMark lang n line)
+-- Line `n` without what its language's layout says is not text: the `\r`
+-- of a CRLF ending where a CRLF is one line break, and a byte-order mark
+-- opening line 1 where the compiler skips it. Where the layout says either
+-- is text (shell, where `cd dir\r` names another directory, and a language
+-- with no grammar), it stays, drawn as the escape every other hazard is.
+layoutLine : Layout -> Int -> String -> String
+layoutLine layout n line =
+    withoutLineEnd layout (withoutLeadingMark layout n line)
 
 
-withoutLineEnd : Highlight.Lang -> String -> String
-withoutLineEnd lang line =
-    if endsWithLayoutCr lang line then
+withoutLineEnd : Layout -> String -> String
+withoutLineEnd layout line =
+    if endsWithLayoutCr layout line then
         String.dropRight 1 line
 
     else
         line
 
 
-withoutLeadingMark : Highlight.Lang -> Int -> String -> String
-withoutLeadingMark lang n line =
-    if startsWithLayoutMark lang n line then
+withoutLeadingMark : Layout -> Int -> String -> String
+withoutLeadingMark layout n line =
+    if startsWithLayoutMark layout n line then
         String.dropLeft 1 line
 
     else
         line
 
 
-endsWithLayoutCr : Highlight.Lang -> String -> Bool
-endsWithLayoutCr lang line =
-    crlfIsLineBreak lang && String.endsWith "\r" line
+endsWithLayoutCr : Layout -> String -> Bool
+endsWithLayoutCr layout line =
+    crlfIsLineBreak layout.lineEnds && String.endsWith "\r" line
 
 
-startsWithLayoutMark : Highlight.Lang -> Int -> String -> Bool
-startsWithLayoutMark lang n line =
-    n == 1 && skipsLeadingMark lang && String.startsWith byteOrderMark line
+startsWithLayoutMark : Layout -> Int -> String -> Bool
+startsWithLayoutMark layout n line =
+    n == 1 && skipsLeadingMark layout.leadingMark && String.startsWith byteOrderMark line
 
 
 byteOrderMark : String
@@ -1281,35 +1285,23 @@ byteOrderMark =
     String.fromChar (Char.fromCode 65279)
 
 
-skipsLeadingMark : Highlight.Lang -> Bool
-skipsLeadingMark lang =
-    case lang of
-        Rust ->
+skipsLeadingMark : LeadingMark -> Bool
+skipsLeadingMark mark =
+    case mark of
+        MarkSkipped ->
             True
 
-        Ipe ->
-            False
-
-        Shell ->
-            False
-
-        Unknown ->
+        MarkIsText ->
             False
 
 
-crlfIsLineBreak : Highlight.Lang -> Bool
-crlfIsLineBreak lang =
-    case lang of
-        Rust ->
+crlfIsLineBreak : LineEnds -> Bool
+crlfIsLineBreak ends =
+    case ends of
+        CrlfIsOneBreak ->
             True
 
-        Ipe ->
-            True
-
-        Shell ->
-            False
-
-        Unknown ->
+        CrIsText ->
             False
 
 

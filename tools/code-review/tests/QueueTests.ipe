@@ -5,8 +5,8 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
-import Ipe.Db.Sql as Sql
 import Ipe.Db.Location exposing (Mode(..))
+import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
@@ -34,7 +34,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf, insertUnboundUnit)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -600,7 +600,8 @@ dbSizeAndMissingDbIn base =
         setIndexEnv indexDb repo
         System.setenv "IPE_REVIEW_DB" reviewDb
         migratedReviewAt reviewDb
-        bytes <- indexConn |> Task.andThen (\conn -> Index.readSnapshot ReadOnly conn Index.Start) |> Task.map (\snap -> snap.bytes)
+        settings <- envSettings
+        bytes <- Index.readConnection settings |> Task.andThen (\conn -> Index.readSnapshot ReadOnly settings.roots conn Index.Start) |> Task.map (\snap -> snap.bytes)
         setIndexEnv (base ++ "/missing.db") repo
         result <- loadPageNow Index.Start
             |> Task.map Ok
@@ -1027,7 +1028,7 @@ queueStateTextsDistinct =
             Error.unexpected "boom"
 
         empty =
-            { units = [], total = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
 
         drained =
             { empty | total = 41000 }
@@ -1081,14 +1082,13 @@ labelled id kind qualified path line =
             sampleQueuedUnit.unit
     in
     { sampleQueuedUnit
-        | unit =
-            { base
-                | uid = uid id
-                , kind = SafeText.renderForeign kind
-                , qualified = SafeText.renderForeign qualified
-                , path = SafeText.renderForeign path
-                , lineStart = line
-            }
+        | unit = { base
+            | uid = uid id
+            , kind = SafeText.renderForeign kind
+            , qualified = SafeText.renderForeign qualified
+            , path = SafeText.renderForeign path
+            , lineStart = line
+        }
     }
 
 
@@ -1122,12 +1122,18 @@ standingNotCounted =
         row why =
             Just (Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
     in
-    Queue.standingOf (row Tampered) == Queue.NotCounted Tampered
-        && Queue.standingOf (row ChainBroken) == Queue.NotCounted ChainBroken
-        && Queue.standingOf (row NoKey) == Queue.NotCounted NoKey
-        && Queue.standingOf (row Legacy) == Queue.NotCounted Legacy
-        && Queue.standingOf Nothing == Queue.Undecided
-        && Queue.standingOf (row Tampered) /= Queue.Undecided
+    Queue.standingOf (row Tampered)
+        == Queue.NotCounted Tampered
+        && Queue.standingOf (row ChainBroken)
+        == Queue.NotCounted ChainBroken
+        && Queue.standingOf (row NoKey)
+        == Queue.NotCounted NoKey
+        && Queue.standingOf (row Legacy)
+        == Queue.NotCounted Legacy
+        && Queue.standingOf Nothing
+        == Queue.Undecided
+        && Queue.standingOf (row Tampered)
+        /= Queue.Undecided
 
 
 queueLabelsDistinct : Bool
@@ -1145,19 +1151,30 @@ queueLabelsDistinct =
         rs =
             SafeText.renderForeign "ipe:src/r.rs"
     in
-    List.length labels == List.length labelFixture
+    List.length labels
+        == List.length labelFixture
         && distinct
         && List.all (\( q, label ) -> label.kind == q.unit.kind && label.name == q.unit.qualified) labels
-        && placeOf "u-file-a" labels == Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1)
-        && placeOf "u-file-b9" labels == Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9)
-        && placeOf "u-regex-1" labels == Just (Queue.AtUnit rs 3 (uid "u-regex-1"))
-        && placeOf "u-regex-2" labels == Just (Queue.AtUnit rs 3 (uid "u-regex-2"))
-        && placeOf "u-tests-mod" labels == Just Queue.Named
-        && placeOf "u-tests-fn" labels == Just Queue.Named
-        && placeOf "u-split-1" labels == Just Queue.Named
-        && placeOf "u-split-2" labels == Just Queue.Named
-        && placeOf "u-main" labels == Just Queue.Named
-        && Queue.queueLabels [] == []
+        && placeOf "u-file-a" labels
+        == Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1)
+        && placeOf "u-file-b9" labels
+        == Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9)
+        && placeOf "u-regex-1" labels
+        == Just (Queue.AtUnit rs 3 (uid "u-regex-1"))
+        && placeOf "u-regex-2" labels
+        == Just (Queue.AtUnit rs 3 (uid "u-regex-2"))
+        && placeOf "u-tests-mod" labels
+        == Just Queue.Named
+        && placeOf "u-tests-fn" labels
+        == Just Queue.Named
+        && placeOf "u-split-1" labels
+        == Just Queue.Named
+        && placeOf "u-split-2" labels
+        == Just Queue.Named
+        && placeOf "u-main" labels
+        == Just Queue.Named
+        && Queue.queueLabels []
+        == []
 
 
 -- ── review progress from the databases ──────────────────────────────────
@@ -2508,6 +2525,65 @@ readOnlyRecordsAndCountsNothing =
             )
 
 
+-- Units under a tag no root binds are said in the header and the empty
+-- states, counted once, and absent when there are none. Red if they are
+-- dropped silently or said when there are none.
+unboundNoticeTexts : Bool
+unboundNoticeTexts =
+    let
+        empty =
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
+
+        one =
+            { empty | unbound = 1 }
+
+        many =
+            { empty | unbound = 3, total = 41000, units = [ sampleQueuedUnit ] }
+
+        drained =
+            { many | units = [] }
+    in
+    List.all identity
+        [ Queue.pageHeaderText empty == "index.db · 4.0 KB · showing 0 of 0"
+        , Queue.queueStatusText (Loaded empty) == Just "No units queued."
+        , Queue.pageHeaderText one == "index.db · 4.0 KB · showing 0 of 0 · 1 unit in unbound repositories not shown"
+        , Queue.queueStatusText (Loaded one) == Just "No units queued. · 1 unit in unbound repositories not shown"
+        , Queue.pageHeaderText many == "index.db · 4.0 KB · showing 1 of 41000 · 3 units in unbound repositories not shown"
+        , Queue.queueStatusText (Loaded drained) == Just "No units to review on this page. · 3 units in unbound repositories not shown"
+        ]
+
+
+-- A unit under an unbound tag leaves the page, its total and its progress
+-- as they were, and is counted in the page's `unbound`, so the progress the
+-- reviewer sees can still reach its total. Red if the unbound unit is
+-- queued, or counted toward the progress total no decision can reach.
+unboundUnitLeavesProgress : Task.Task Error Bool
+unboundUnitLeavesProgress =
+    do
+        at <- freshScratch "ipe-queue-unbound-progress"
+        seedProgressScratch at
+        before <- loadPageNow Index.Start
+        insertUnboundUnit at.indexDb
+        after <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (before.unbound
+                == 0
+                && after.unbound
+                == 1
+                && after.total
+                == before.total
+                && List.length after.units
+                == List.length before.units
+                && after.progress.total
+                == before.progress.total
+                && after.progress.reviewed
+                == before.progress.reviewed
+                && consistentPage after
+                && String.endsWith " · 1 unit in unbound repositories not shown" (Queue.pageHeaderText after)
+            )
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2538,6 +2614,8 @@ checks =
             , Task.succeed ( "a source read's outdated response is dropped", outdatedResponseDropped epoch )
             , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles epoch )
             , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
+            , Task.succeed ( "units under an unbound tag are said in the header and empty states", unboundNoticeTexts )
+            , check "an unbound unit leaves the page, its total and its progress as they were" unboundUnitLeavesProgress
             ]
         rest <- Task.sequence
             [ check "open units match whole decided pairs" openUnitsMatchWholePairs
