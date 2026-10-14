@@ -1,5 +1,6 @@
-module Lib.View exposing (RowLine(..), displayOrderCss, escapeCss, lineHtml, rowLines, view)
+module Lib.View exposing (LayoutNote(..), RowLine(..), codeHtml, displayOrderCss, escapeCss, gutterHtml, layoutNotes, lineHtml, rowLines, view)
 
+import Ipe.Char as Char
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
@@ -12,13 +13,13 @@ import Ipe.Ui.Background as Background
 import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
-import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
+import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -36,7 +37,7 @@ header model =
         , Border.color (Ui.rgb 60 60 72)
         , Border.widthEach { top = 0, right = 0, bottom = 1, left = 0 }
         ]
-        [ Ui.el [ Font.size 16, Font.bold, Font.color (Ui.rgb 235 235 240) ] (Ui.text "Code review")
+        [ Ui.el [ Ui.describe (Ui.descHeading 1), Font.size 16, Font.bold, Font.color (Ui.rgb 235 235 240) ] (Ui.text "Code review")
         , Ui.el [ Ui.width Ui.fill ] Ui.none
         , navButton (model.page == QueuePage) "Queue" ShowQueue
         , navButton (model.page == HistoryPage) "History" ShowHistory
@@ -126,13 +127,49 @@ view model =
         , Ui.onKeyDown KeyDown
         , Ui.htmlAttribute "tabindex" "0"
         , Ui.htmlAttribute "autofocus" ""
+        , Ui.htmlAttribute "lang" "en"
         ]
-        [ header model
+        [ Ui.html (Html.titleNode (pageTitle model))
+        , header model
         , Ui.el
-            [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.padding 24, Font.color (Ui.rgb 190 190 200) ]
+            [ Ui.describe Ui.descMain, Ui.width Ui.fill, Ui.height Ui.fill, Ui.padding 24, Font.color (Ui.rgb 190 190 200) ]
             (pageBody model)
         , urlSync model
         ]
+
+
+-- The document title: the page, then the tool. A unit page names its unit
+-- once the unit is loaded.
+pageTitle : Model -> String
+pageTitle model =
+    pageTopic model ++ " · Code review"
+
+
+pageTopic : Model -> String
+pageTopic model =
+    case model.page of
+        QueuePage ->
+            "Queue"
+
+        HistoryPage ->
+            "History"
+
+        UnitPage raw ->
+            case App.unitPageState raw model of
+                UnitLoaded loaded ->
+                    SafeText.toString loaded.unit.qualified
+
+                UnitLoading ->
+                    "Unit"
+
+                UnitNotFound ->
+                    "Unit"
+
+                UnitFailed _ ->
+                    "Unit"
+
+                UnitIdRefused ->
+                    "Unit"
 
 
 pageBody : Model -> Ui.Element Msg
@@ -145,7 +182,7 @@ pageBody model =
             historyBody model
 
         UnitPage raw ->
-            unitPageBody (App.unitPageState raw model)
+            unitPageBody model.standing (App.unitPageState raw model)
 
 
 queueBody : Model -> Ui.Element Msg
@@ -214,9 +251,9 @@ queueUnits model =
                 , Ui.column
                     [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 16, Ui.scrollbars ]
                     [ hintLine (recordsDecisions model)
-                    , case selectedUnit model of
-                        Just q ->
-                            unitCard model True q
+                    , case List.head (List.drop model.selected (Queue.queueLabels (queueList model))) of
+                        Just ( q, label ) ->
+                            unitCard model label q
 
                         Nothing ->
                             Ui.none
@@ -234,11 +271,11 @@ queueRail model =
         , Ui.spacing 4
         , Ui.scrollbars
         ]
-        (List.indexedMap (railItem model) (queueList model))
+        (List.indexedMap (railItem model) (Queue.queueLabels (queueList model)))
 
 
-railItem : Model -> Int -> Queue.QueuedUnit -> Ui.Element Msg
-railItem model i q =
+railItem : Model -> Int -> ( Queue.QueuedUnit, UnitLabel ) -> Ui.Element Msg
+railItem model i ( q, label ) =
     let
         selected =
             i == model.selected
@@ -263,10 +300,9 @@ railItem model i q =
         { onPress = Just (SelectUnit i)
         , label = Ui.row
             [ Ui.width Ui.fill, Ui.spacing 6, Ui.centerY ]
-            [ Ui.el
-                [ Font.size 12, Font.bold, Font.color (Ui.rgb 220 220 230) ]
-                (safeText q.unit.qualified)
+            [ labelEl 12 label
             , changeBadge q.change
+            , railStanding q.standing
             ]
         }
 
@@ -395,7 +431,7 @@ historyHeading row badge bodyHash reviewedAt =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
         [ badge
-        , Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
+        , Ui.el [ Ui.describe (Ui.descHeading 2), Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (Index.shortHash bodyHash))
@@ -440,13 +476,13 @@ nameOf row =
 
 -- The unit page shows the source of one unit with its resolved links —
 -- no decision buttons, no change state; the unit is read-only here.
-unitPageBody : Queue.UnitPageState -> Ui.Element Msg
-unitPageBody state =
+unitPageBody : Queue.StandingRead -> Queue.UnitPageState -> Ui.Element Msg
+unitPageBody standing state =
     case state of
         UnitLoaded loaded ->
             Ui.column
                 [ Ui.width Ui.fill, Ui.spacing 16, Ui.scrollbars ]
-                [ unitPageCard loaded ]
+                [ unitPageCard standing loaded ]
 
         UnitLoading ->
             unitPageStatus state
@@ -471,8 +507,8 @@ unitPageStatus state =
             Ui.none
 
 
-unitPageCard : Index.UnitView -> Ui.Element Msg
-unitPageCard loaded =
+unitPageCard : Queue.StandingRead -> Index.UnitView -> Ui.Element Msg
+unitPageCard standing loaded =
     let
         unit =
             loaded.unit
@@ -489,10 +525,10 @@ unitPageCard loaded =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText unit.qualified)
+            [ sectionHeading (labelEl 14 (Queue.unitLabel Named unit))
             , chip unit.facing
-            , chip unit.kind
             ]
+        , unitStanding (Queue.standingFor unit standing)
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (unitLocation unit))
@@ -554,6 +590,74 @@ linkEl link =
             safeText (Links.label link)
 
 
+-- Where a unit's current body stands in the review log: not reviewed,
+-- decided, or a row recorded for it that is not counted. Every standing
+-- draws its own badge, so a reopened unit never reads as a fresh one.
+standingBadge : Queue.Standing -> Ui.Element Msg
+standingBadge standing =
+    case standing of
+        Undecided ->
+            chip (SafeText.literal "Not reviewed")
+
+        Decided d ->
+            decisionBadge d
+
+        NotCounted why ->
+            unverifiedBadge why
+
+
+-- The rail names a standing only when a row exists for the current body;
+-- the change badge already marks a body no row names.
+railStanding : Queue.Standing -> Ui.Element Msg
+railStanding standing =
+    case standing of
+        Undecided ->
+            Ui.none
+
+        Decided _ ->
+            standingBadge standing
+
+        NotCounted _ ->
+            standingBadge standing
+
+
+-- The unit page's standing line: the badge with a refusal's reason, the
+-- failed read, or the read still running for the body shown.
+unitStanding : Maybe (Result Error Queue.Standing) -> Ui.Element Msg
+unitStanding read =
+    case read of
+        Just (Ok standing) ->
+            Ui.row
+                [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
+                [ standingBadge standing
+                , standingReason standing
+                ]
+
+        Just (Err e) ->
+            Ui.el
+                [ Font.size 12, Font.color (Ui.rgb 200 120 120) ]
+                (safeText (SafeText.concat [ SafeText.literal "Review status read failed: ", SafeText.renderForeign (Error.toString e) ]))
+
+        Nothing ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Reading review status…")
+
+
+standingReason : Queue.Standing -> Ui.Element Msg
+standingReason standing =
+    case standing of
+        Decided (StoredRefused r) ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 200 120 120) ] (safeText (LibDb.storedReasonText r))
+
+        Decided StoredApproved ->
+            Ui.none
+
+        Undecided ->
+            Ui.none
+
+        NotCounted _ ->
+            Ui.none
+
+
 decisionBadge : LibDb.StoredDecision -> Ui.Element Msg
 decisionBadge d =
     case d of
@@ -583,8 +687,8 @@ urlSync model =
         (Html.node "div" [ Attr.attribute "data-ipe-path" (currentPath model) ] [])
 
 
-unitCard : Model -> Bool -> Queue.QueuedUnit -> Ui.Element Msg
-unitCard model selected q =
+unitCard : Model -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
+unitCard model label q =
     let
         unit =
             q.unit
@@ -599,24 +703,16 @@ unitCard model selected q =
         , Background.color (Ui.rgb 24 24 32)
         , Border.rounded 8
         , Border.solid
-        , if selected then
-            Border.width 2
-
-        else
-            Border.width 1
-        , if selected then
-            Border.color (Ui.rgb 130 170 240)
-
-        else
-            Border.color (Ui.rgb 50 50 62)
+        , Border.width 2
+        , Border.color (Ui.rgb 130 170 240)
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText unit.qualified)
+            [ sectionHeading (labelEl 14 label)
             , changeBadge q.change
+            , standingBadge q.standing
             , changedChip q
             , chip unit.facing
-            , chip unit.kind
             , Ui.el [ Ui.width Ui.fill ] Ui.none
             , case loaded of
                 Just v ->
@@ -650,6 +746,49 @@ selectedViewStatus uid state =
 
         Nothing ->
             Ui.none
+
+
+-- A section of a page: the page's one `h1` is the tool's name in the header,
+-- and each unit card or history entry opens an `h2`.
+sectionHeading : Ui.Element Msg -> Ui.Element Msg
+sectionHeading content =
+    Ui.el [ Ui.describe (Ui.descHeading 2) ] content
+
+
+-- A unit's label: its kind, its qualified name and, when the page needs it
+-- to tell the unit apart, its location.
+labelEl : Int -> UnitLabel -> Ui.Element Msg
+labelEl size label =
+    Ui.row
+        [ Ui.spacing 6, Ui.centerY ]
+        ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (safeText label.kind)
+         , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
+         ]
+            ++ placeEls size label.place
+        )
+
+
+placeEls : Int -> Place -> List (Ui.Element Msg)
+placeEls size place =
+    case place of
+        Named ->
+            []
+
+        At path line ->
+            [ placeEl size (placeText path line) ]
+
+        AtUnit path line uid ->
+            [ placeEl size (SafeText.concat [ placeText path line, SafeText.literal " · ", SafeText.renderForeign (Uid.toString uid) ]) ]
+
+
+placeEl : Int -> SafeText -> Ui.Element Msg
+placeEl size text =
+    Ui.el [ Font.size size, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ] (safeText text)
+
+
+placeText : SafeText -> Int -> SafeText
+placeText path line =
+    SafeText.concat [ path, SafeText.literal (":" ++ String.fromInt line) ]
 
 
 -- `path · lines a-b`, from the unit's rendered path.
@@ -888,7 +1027,7 @@ sourceBlock loaded =
             [ Ui.width Ui.fill, Ui.spacing 2 ]
             (case loaded.view of
                 Shown shown ->
-                    List.map sourceRow (rowLines loaded.unit.lang (Index.shownRows shown))
+                    shownSource loaded.unit.lang (Index.shownRows shown)
 
                 Stale _ ->
                     withheldSource loaded.view
@@ -912,15 +1051,21 @@ withheldSource view =
             []
 
 
--- One drawn row of a shown view: a numbered source line, or the marker for
--- a run of lines other units cover, which those units' own pages show.
-sourceRow : RowLine -> Ui.Element Msg
-sourceRow row =
-    case row of
-        TokenLine n toks ->
-            numberedLine n toks
+-- A shown view: the notes on its file's layout, then each run of numbered
+-- lines as one block of text, and a marker for each run of lines other units
+-- cover, which those units' own pages show.
+shownSource : Highlight.Lang -> List SourceRow -> List (Ui.Element Msg)
+shownSource lang rows =
+    List.map layoutNoteEl (layoutNotes lang rows) ++ List.map sourcePart (sourceParts (rowLines lang rows))
 
-        CoveredLine ->
+
+sourcePart : SourcePart -> Ui.Element Msg
+sourcePart part =
+    case part of
+        LineRun run ->
+            lineRun run
+
+        CoveredRun ->
             Ui.el
                 [ Ui.width Ui.fill
                 , Font.family Font.monospace
@@ -928,6 +1073,138 @@ sourceRow row =
                 , Font.color (Ui.rgb 120 120 135)
                 ]
                 (Ui.text "... lines reviewed as their own units")
+
+
+-- Consecutive numbered lines, or one run of covered lines.
+type SourcePart
+    = LineRun (List ( Int, List Token ))
+    | CoveredRun
+
+
+sourceParts : List RowLine -> List SourcePart
+sourceParts lines =
+    case List.foldl sourcePartStep ( [], [] ) lines of
+        ( run, parts ) ->
+            closeRun run parts
+
+
+sourcePartStep : RowLine -> ( List ( Int, List Token ), List SourcePart ) -> ( List ( Int, List Token ), List SourcePart )
+sourcePartStep line ( run, parts ) =
+    case line of
+        TokenLine n toks ->
+            ( run ++ [ ( n, toks ) ], parts )
+
+        CoveredLine ->
+            ( [], closeRun run parts ++ [ CoveredRun ] )
+
+
+closeRun : List ( Int, List Token ) -> List SourcePart -> List SourcePart
+closeRun run parts =
+    case run of
+        [] ->
+            parts
+
+        _ ->
+            parts ++ [ LineRun run ]
+
+
+-- A run of lines: the line numbers in a gutter selection and copying skip,
+-- beside the lines as one text block.
+lineRun : List ( Int, List Token ) -> Ui.Element Msg
+lineRun run =
+    Ui.row
+        [ Ui.width Ui.fill, Ui.spacing 8 ]
+        [ Ui.el
+            [ Ui.width (Ui.px 40)
+            , Font.family Font.monospace
+            , Font.size 12
+            , Font.color (Ui.rgb 120 120 135)
+            ]
+            (Ui.html (gutterHtml (List.map (\( n, _ ) -> n) run)))
+        , Ui.el
+            [ Ui.width Ui.fill
+            , Font.family Font.monospace
+            , Font.size 12
+            ]
+            (Ui.html (codeHtml (List.map (\( _, toks ) -> toks) run)))
+        ]
+
+
+-- The line numbers of a run, one per line, outside the copied text.
+gutterHtml : List Int -> Html.Html msg
+gutterHtml numbers =
+    Html.div
+        [ Attr.style "white-space:pre;text-align:right;user-select:none"
+        , Attr.attribute "aria-hidden" "true"
+        ]
+        [ Html.text (String.join "\n" (List.map String.fromInt numbers)) ]
+
+
+-- A run's lines as one block whose text is the lines joined by newlines, so
+-- copying it gives the source as written: one line element per line, its
+-- spaces and tabs kept.
+codeHtml : List (List Token) -> Html.Html msg
+codeHtml lines =
+    Html.node "code"
+        [ Attr.style "display:block;white-space:pre" ]
+        (List.intersperse (Html.text "\n") (List.map lineHtml lines))
+
+
+-- What the source view drew as layout rather than as text: a leading
+-- byte-order mark the language skips, or CRLF line ends it reads as line
+-- breaks.
+type LayoutNote
+    = ByteOrderMark
+    | CrlfLineEnds
+
+
+layoutNotes : Highlight.Lang -> List SourceRow -> List LayoutNote
+layoutNotes lang rows =
+    noteIf (List.any (leadingMarkRow lang) rows) ByteOrderMark ++ noteIf (List.any (crlfRow lang) rows) CrlfLineEnds
+
+
+noteIf : Bool -> LayoutNote -> List LayoutNote
+noteIf present note =
+    if present then
+        [ note ]
+
+    else
+        []
+
+
+leadingMarkRow : Highlight.Lang -> SourceRow -> Bool
+leadingMarkRow lang row =
+    case row of
+        Numbered n line ->
+            startsWithLayoutMark lang n line
+
+        Covered ->
+            False
+
+
+crlfRow : Highlight.Lang -> SourceRow -> Bool
+crlfRow lang row =
+    case row of
+        Numbered _ line ->
+            endsWithLayoutCr lang line
+
+        Covered ->
+            False
+
+
+layoutNoteEl : LayoutNote -> Ui.Element Msg
+layoutNoteEl note =
+    Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text (layoutNoteText note))
+
+
+layoutNoteText : LayoutNote -> String
+layoutNoteText note =
+    case note of
+        ByteOrderMark ->
+            "The file starts with a byte-order mark (U+FEFF), which the compiler skips; it is not drawn."
+
+        CrlfLineEnds ->
+            "The file's lines end in CRLF; each \\r before a line break is not drawn."
 
 
 -- A shown row with its tokens: a numbered line, or a covered run.
@@ -952,7 +1229,7 @@ rowLineStep : Highlight.Lang -> SourceRow -> ( Highlight.Carry, List RowLine ) -
 rowLineStep lang row ( carry, lines ) =
     case row of
         Numbered n line ->
-            case Highlight.lexLine lang carry (withoutLineEnd lang line) of
+            case Highlight.lexLine lang carry (layoutLine lang n line) of
                 ( toks, next ) ->
                     ( next, lines ++ [ TokenLine n toks ] )
 
@@ -960,17 +1237,64 @@ rowLineStep lang row ( carry, lines ) =
             ( Highlight.lineStart, lines ++ [ CoveredLine ] )
 
 
--- A line without the `\r` of a CRLF ending, in a language that reads CRLF
--- as one line break (Rust, Ipê). In shell and other text that `\r` is part
--- of the line (`cd dir\r` names another directory), so it stays, drawn as
--- the escape every other hazard is.
+-- A line without what its language reads as layout: the `\r` of a CRLF
+-- ending in a language that reads CRLF as one line break (Rust, Ipê), and a
+-- byte-order mark at the start of the file in a language that skips it
+-- (Rust). In shell and other text that `\r` is part of the line (`cd dir\r`
+-- names another directory) and a leading mark is a byte the shell reads, so
+-- each stays, drawn as the escape every other hazard is.
+layoutLine : Highlight.Lang -> Int -> String -> String
+layoutLine lang n line =
+    withoutLineEnd lang (withoutLeadingMark lang n line)
+
+
 withoutLineEnd : Highlight.Lang -> String -> String
 withoutLineEnd lang line =
-    if crlfIsLineBreak lang && String.endsWith "\r" line then
+    if endsWithLayoutCr lang line then
         String.dropRight 1 line
 
     else
         line
+
+
+withoutLeadingMark : Highlight.Lang -> Int -> String -> String
+withoutLeadingMark lang n line =
+    if startsWithLayoutMark lang n line then
+        String.dropLeft 1 line
+
+    else
+        line
+
+
+endsWithLayoutCr : Highlight.Lang -> String -> Bool
+endsWithLayoutCr lang line =
+    crlfIsLineBreak lang && String.endsWith "\r" line
+
+
+startsWithLayoutMark : Highlight.Lang -> Int -> String -> Bool
+startsWithLayoutMark lang n line =
+    n == 1 && skipsLeadingMark lang && String.startsWith byteOrderMark line
+
+
+byteOrderMark : String
+byteOrderMark =
+    String.fromChar (Char.fromCode 65279)
+
+
+skipsLeadingMark : Highlight.Lang -> Bool
+skipsLeadingMark lang =
+    case lang of
+        Rust ->
+            True
+
+        Ipe ->
+            False
+
+        Shell ->
+            False
+
+        Unknown ->
+            False
 
 
 crlfIsLineBreak : Highlight.Lang -> Bool
@@ -987,27 +1311,6 @@ crlfIsLineBreak lang =
 
         Unknown ->
             False
-
-
-numberedLine : Int -> List Token -> Ui.Element Msg
-numberedLine n toks =
-    Ui.row
-        [ Ui.width Ui.fill, Ui.spacing 8 ]
-        [ Ui.el
-            [ Ui.width (Ui.px 40)
-            , Font.family Font.monospace
-            , Font.size 12
-            , Font.color (Ui.rgb 120 120 135)
-            , Ui.alignRight
-            ]
-            (Ui.text (String.fromInt n))
-        , Ui.el
-            [ Ui.width Ui.fill
-            , Font.family Font.monospace
-            , Font.size 12
-            ]
-            (Ui.html (lineHtml toks))
-        ]
 
 
 -- One source line as a single run of inline text, so it copies as the

@@ -31,7 +31,7 @@ import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageSt
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
-import Lib.View as View exposing (RowLine(..))
+import Lib.View as View exposing (LayoutNote(..), RowLine(..))
 import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
 
 
@@ -476,6 +476,95 @@ crlfByLanguage =
             False
 
 
+-- The text of rendered markup: every character outside a tag, in order.
+-- The fixtures it reads hold no character the markup escapes.
+markupText : String -> String
+markupText html =
+    case String.foldl markupStep ( False, "" ) html of
+        ( _, text ) ->
+            text
+
+
+markupStep : Char -> ( Bool, String ) -> ( Bool, String )
+markupStep c ( inTag, text ) =
+    if c == '<' then
+        ( True, text )
+
+    else if c == '>' then
+        ( False, text )
+
+    else if inTag then
+        ( True, text )
+
+    else
+        ( False, String.append text (String.fromChar c) )
+
+
+-- A run of lines copies as the source spells it: the code block's text is
+-- the lines joined by newlines with their spaces and tabs, one line element
+-- per line, and the line numbers sit apart in a gutter copying skips.
+sourceCopiesAsWritten : Bool
+sourceCopiesAsWritten =
+    let
+        code =
+            Html.render (View.codeHtml (List.map rowTokens (View.rowLines Rust [ Numbered 1 "fn a() {", Numbered 2 "\tlet  x = 1;", Numbered 3 "}" ])))
+
+        gutter =
+            Html.render (View.gutterHtml [ 1, 2, 3 ])
+    in
+    markupText code
+        == "fn a() {\n\tlet  x = 1;\n}"
+        && List.length (String.split "<span style=\"white-space:pre\">" code)
+        == 4
+        && String.contains "white-space:pre" code
+        && markupText gutter
+        == "1\n2\n3"
+        && String.contains "user-select:none" gutter
+        && String.contains "aria-hidden" gutter
+        && not (String.contains "user-select:none" code)
+
+
+-- A tab, a CRLF line end in Rust and a byte-order mark opening a Rust file
+-- are layout: drawn as columns or not at all, each noted for the file. Every
+-- other hazard, and each of those where its language reads it as text,
+-- draws as a marked escape and never reaches the markup as itself.
+layoutOnlyWhereLanguageReadsIt : Bool
+layoutOnlyWhereLanguageReadsIt =
+    let
+        mark =
+            codeText 65279
+
+        drawn lang rows =
+            Html.render (View.codeHtml (List.map rowTokens (View.rowLines lang rows)))
+
+        escapes raw html =
+            String.contains "data-review-escape" html && not (String.contains raw html)
+
+        layout =
+            drawn Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "\tfn y\r" ]
+    in
+    not (String.contains "data-review-escape" layout)
+        && not (String.contains mark layout)
+        && not (String.contains "\r" layout)
+        && markupText layout
+        == "fn x\n\tfn y"
+        && View.layoutNotes Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "fn y" ]
+        == [ ByteOrderMark, CrlfLineEnds ]
+        && View.layoutNotes Rust [ Numbered 1 "fn x", Numbered 2 "fn y" ]
+        == []
+        && List.all (\code -> escapes (codeText code) (drawn Rust [ Numbered 1 ("a" ++ codeText code ++ "b") ])) [ 7, 27, 127, 133, 155, 8203, 8238, 8294, 65279 ]
+        && escapes mark (drawn Rust [ Numbered 2 (mark ++ "fn x") ])
+        && escapes mark (drawn Shell [ Numbered 1 (mark ++ "echo x") ])
+        && escapes mark (drawn Ipe [ Numbered 1 (mark ++ "x = 1") ])
+        && escapes mark (drawn Unknown [ Numbered 1 (mark ++ "x") ])
+        && escapes "\r" (drawn Shell [ Numbered 1 "cd /x\r" ])
+        && escapes "\r" (drawn Rust [ Numbered 1 "a\rb" ])
+        && View.layoutNotes Shell [ Numbered 1 (mark ++ "cd /x\r") ]
+        == []
+        && View.layoutNotes Rust [ Numbered 2 (mark ++ "fn x") ]
+        == []
+
+
 -- A Rust `br"…"` or `cr"…"` is a raw string: its `\` escapes nothing, so
 -- the string closes at its quote and the next row is code.
 rawPrefixedStrings : Bool
@@ -678,6 +767,8 @@ checks =
         , Task.succeed ( "a 256 KiB token with one U+202E is three segments", hugeSegments )
         , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
         , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
+        , Task.succeed ( "a run of source lines copies as the source spells it, line numbers apart", sourceCopiesAsWritten )
+        , Task.succeed ( "only a tab, a Rust CRLF end and a Rust leading byte-order mark are layout; every other hazard draws escaped", layoutOnlyWhereLanguageReadsIt )
         , Task.succeed ( "a Rust br or cr string is raw", rawPrefixedStrings )
         , Task.succeed ( "a shell heredoc body carries no quote past its line", heredocBodies )
         ]
