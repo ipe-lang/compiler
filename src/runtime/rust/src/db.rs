@@ -9132,6 +9132,44 @@ mod tests {
         );
     }
 
+    /// No module besides `db.rs` begins a transaction in production code, so
+    /// no begin can skip `begin_write_txn`.
+    #[test]
+    fn no_other_runtime_module_begins_a_transaction() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root];
+        let mut offenders = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).expect("read a source dir") {
+                let path = entry.expect("read a dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("db.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(path.as_path()).expect("read a source file");
+                let production = source
+                    .split_once("\n#[cfg(test)]")
+                    .map_or(source.as_str(), |(head, _)| head);
+                let begins = production.lines().any(|line| {
+                    !line.trim_start().starts_with("//")
+                        && [".begin(", "::begin(", ".begin_with("]
+                            .iter()
+                            .any(|needle| line.contains(needle))
+                });
+                if begins {
+                    offenders.push(path);
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a transaction begin outside db.rs can start deferred: {offenders:?}"
+        );
+    }
+
     /// A transaction that may write holds the SQLite write lock from its
     /// `BEGIN`, before its body runs a statement: a second connection asking
     /// for the write lock with no busy wait is refused.
