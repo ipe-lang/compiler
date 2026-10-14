@@ -263,6 +263,28 @@ fn prose_band(d: &Diagnostic) -> String {
                  Check your connection and try again. Run `{DOC_HINT_CMD} IPE-E0001` for more help."
             )
         }
+        Diagnostic::TargetDirUnlinkable { detail } => {
+            format!(
+                "The compiler stopped before building your program: the host linker cannot \
+                 open a directory the build would use. This is a problem with where the project \
+                 or the toolchain lives on your machine — not a mistake in your code.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 Run `{DOC_HINT_CMD} IPE-E0002` for more help."
+            )
+        }
+        Diagnostic::HostLinkerCannotOpenInput { detail } => {
+            format!(
+                "The host linker could not open one of its input files while building your \
+                 program. This is a problem with where the build lives on your machine — not a \
+                 mistake in your code.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 Run `{DOC_HINT_CMD} IPE-E0003` for more help."
+            )
+        }
     }
 }
 
@@ -1381,7 +1403,9 @@ fn primary_label(d: &Diagnostic) -> Option<String> {
         | Diagnostic::Ffi { .. }
         | Diagnostic::Sandbox { .. }
         | Diagnostic::Consent { .. }
-        | Diagnostic::RegistryUnreachable { .. } => None,
+        | Diagnostic::RegistryUnreachable { .. }
+        | Diagnostic::TargetDirUnlinkable { .. }
+        | Diagnostic::HostLinkerCannotOpenInput { .. } => None,
     }
 }
 

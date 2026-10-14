@@ -16,6 +16,7 @@ use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
 };
 use crate::contained_path::ResolvedPath;
+use crate::loose_file::LooseFileError;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::style::TerminalSafe;
 use crate::verb::{CommandName, DevVerb, ReleaseVerb, Umbrella, Verb};
@@ -1011,6 +1012,8 @@ pub struct FlooredBuild<'a> {
     pub(crate) finish: NativeFinish<'a>,
     /// The compile target.
     pub(crate) target: CargoTarget,
+    /// The build directory cargo writes to and the artifact is read back from.
+    pub(crate) target_dir: &'a crate::target_dir::LinkableTargetDir,
     /// Where cargo's output goes.
     pub(crate) output: CargoOutput,
     /// What is built, named in the failure diagnostic.
@@ -1067,6 +1070,7 @@ impl FlooredBuild<'_> {
             krate: CargoCrate::Emitted(crate_dir),
             profile,
             target: self.target,
+            target_dir: self.target_dir,
             output: self.output,
             what: self.what,
             runtime: self.runtime,
@@ -1086,6 +1090,7 @@ fn build_pure_native_release(
     consented: &ConsentedCapabilities,
     driver: ipe_backend_rust::DbDriver,
     triple: ipe_backend_rust::static_build::StaticTriple,
+    target_dir: &crate::target_dir::LinkableTargetDir,
     verbosity: Verbosity,
 ) -> Result<String, CliError> {
     FlooredBuild {
@@ -1093,6 +1098,7 @@ fn build_pure_native_release(
         crate_dir,
         finish: NativeFinish::Release { consented, driver },
         target: CargoTarget::Static(triple),
+        target_dir,
         output: CargoOutput::Human(verbosity),
         what: "the release binary",
         runtime: None,
@@ -1151,6 +1157,8 @@ pub fn compile_and_finalize_native_build(
         Some(m) => Some(project::parse_manifest(m)?),
         None => None,
     };
+    let target_dir =
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
     FlooredBuild {
         cargo: &cargo_bin,
         crate_dir,
@@ -1158,6 +1166,7 @@ pub fn compile_and_finalize_native_build(
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
+        target_dir: &target_dir,
         output: CargoOutput::Human(Verbosity::of_quiet(quiet)),
         what: "the emitted program",
         runtime,
@@ -1168,11 +1177,12 @@ pub fn compile_and_finalize_native_build(
     // Ipê-recommended shared `CARGO_TARGET_DIR`, the artifact lands in the
     // shared cache (`<shared-target>/<profile>/<name>`), not under the project,
     // where a user cannot readily find it. The copy runs immediately after this
-    // invocation's `cargo build` returns, resolving the artifact path from
-    // `cargo metadata`; a binary missing at that path fails closed (no stale
-    // copy). Copy (never hardlink): the shared target is often a different mount.
+    // invocation's `cargo build` returns, reading the artifact from the build
+    // directory the build was handed; a binary missing at that path fails
+    // closed (no stale copy). Copy (never hardlink): the shared target is often
+    // a different mount.
     let artifact = copy_native_artifact(
-        &cargo_bin,
+        target_dir.path(),
         out_dir,
         &output.claim_area(&[OutputArea::Bin])?,
         static_plan.as_ref(),
@@ -1185,27 +1195,26 @@ pub fn compile_and_finalize_native_build(
 /// cargo target directory into `<project>/out/bin/<name>`, a stable path under
 /// the project the user can find and run regardless of `CARGO_TARGET_DIR`.
 ///
-/// The source path is resolved through `cargo metadata`'s authoritative
-/// `target_directory` (never a guess at where cargo put it) plus the `debug`
-/// profile and — under a static plan — the explicit target triple, exactly as
-/// the `release` path resolves its own artifact. Returns the destination path so
+/// The source path is `target_dir`, the build directory the build was handed
+/// (never a guess at where cargo put it), plus the `debug` profile and — under
+/// a static plan — the explicit target triple, exactly as the `release` path
+/// resolves its own artifact. Returns the destination path so
 /// the caller can report it. Copy (not hardlink): the shared target is often on
 /// a different mount.
 fn copy_native_artifact(
-    cargo_bin: &toolchain::CargoBin,
+    target_dir: &Path,
     out_dir: &Path,
     bin_dir: &OwnedDir,
     static_plan: Option<&ipe_backend_rust::static_build::StaticPlan>,
     manifest: Option<&project::ProjectManifest>,
 ) -> Result<PathBuf, CliError> {
-    let target_dir = crate::cargo_step::target_directory(cargo_bin, out_dir)?;
     // LOCATE the built binary by its emitted crate identity (the hashed
     // `<friendly>_<hash>` cargo actually produces); DELIVER it under the plain
     // friendly project name, so the user-facing artifact stays `out/bin/<name>`
     // regardless of the internal per-project identity hash.
     let bin_name = emitted_bin_filename(out_dir)?;
     let friendly = friendly_artifact_filename(manifest);
-    let mut src = target_dir;
+    let mut src = target_dir.to_path_buf();
     if let Some(plan) = static_plan {
         src.push(plan.triple.as_str());
     }
@@ -1759,16 +1768,21 @@ pub fn release_pipeline(
             options,
         )?;
 
+        let app_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+            cargo_bin.path(),
+            crate_dir.path(),
+            None,
+        )?;
         build_pure_native_release(
             &cargo_bin,
             &crate_dir,
             &consented,
             driver,
             triple,
+            &app_target_dir,
             Verbosity::Progress,
         )?;
 
-        let app_target_dir = crate::cargo_step::target_directory(&cargo_bin, &out_dir)?;
         // Cargo names the built binary after the emitted crate IDENTITY (the
         // path-uniquified `<friendly>_<hash>`), so the artifact is LOCATED by that
         // identity; it is delivered under the plain FRIENDLY name so the hash the
@@ -1776,6 +1790,7 @@ pub fn release_pipeline(
         // distributed filename.
         let bin_name = emitted_bin_filename(&out_dir)?;
         let bin_path = app_target_dir
+            .path()
             .join(triple.as_str())
             .join("release")
             .join(&bin_name);
@@ -1856,6 +1871,10 @@ pub fn release_pipeline(
         options,
     )?;
 
+    // The build directory is resolved once, before cargo runs, and the app
+    // binary is read back from that same value.
+    let app_target_dir =
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), app_dir.path(), None)?;
     FlooredBuild {
         cargo: &cargo_bin,
         crate_dir: &app_dir,
@@ -1864,18 +1883,16 @@ pub fn release_pipeline(
             driver,
         },
         target: CargoTarget::Static(triple),
+        target_dir: &app_target_dir,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the release app",
         runtime: None,
     }
     .run()?;
 
-    // Locate the compiled app binary. The target dir may be a global
-    // `CARGO_TARGET_DIR` (set by the user or the agent lane), so we resolve
-    // it via cargo metadata rather than assuming `app_out/target/`.
-    let app_target_dir = crate::cargo_step::target_directory(&cargo_bin, &app_out)?;
     let release_bin_name = emitted_bin_filename(&app_out)?;
     let app_binary = app_target_dir
+        .path()
         .join(triple.as_str())
         .join("release")
         .join(&release_bin_name);
@@ -1899,6 +1916,11 @@ pub fn release_pipeline(
         binary: &app_binary,
         profile: &profile_src,
     });
+    let wrapper_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+        cargo_bin.path(),
+        wrapper_source.root(),
+        None,
+    )?;
     CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::ReleaseWrapper {
@@ -1907,6 +1929,7 @@ pub fn release_pipeline(
         },
         profile: CargoProfile::Release,
         target: CargoTarget::Static(wrapper_static_plan.triple),
+        target_dir: &wrapper_target_dir,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the release wrapper",
         runtime: None,
@@ -1916,11 +1939,9 @@ pub fn release_pipeline(
     // Step 3: lay out the bundle.
     let bundle_dir = output.claim_area(&[OutputArea::Release, OutputArea::Bundle])?;
 
-    // Locate the wrapper binary. As with the app binary, the target dir may be
-    // a global CARGO_TARGET_DIR; resolve via cargo metadata.
-    let wrapper_target_dir =
-        crate::cargo_step::target_directory(&cargo_bin, wrapper_source.root())?;
+    // The wrapper binary is read back from the build directory its build was handed.
     let wrapper_src = wrapper_target_dir
+        .path()
         .join(wrapper_static_plan.triple.as_str())
         .join("release")
         .join(RELEASE_WRAPPER);
@@ -2207,35 +2228,22 @@ pub fn bundle_wasm(crate_dir: &OwnedDir) -> Result<(), CliError> {
     // point at the exact crate; resolution failure degrades to `None` (message
     // enrichment only, never a gate — the missing-path-dependency error cargo
     // itself raises is already fail-closed).
+    let target_dir =
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
     CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
         profile: CargoProfile::Release,
         target: CargoTarget::WasmBrowser,
+        target_dir: &target_dir,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted wasm program",
         runtime: runtime_context_for_message(),
     }
     .run()?;
 
-    // Step 2: wasm-bindgen — locate the .wasm the cargo build just produced
-    // (`CARGO_TARGET_DIR` may relocate it; probe the env var first, then the
-    // per-project fallback the emitted manifest's `[workspace]` detachment
-    // would use).
-    let wasm_path = {
-        let via_env = ipe_env::var_os("CARGO_TARGET_DIR").map(|d| {
-            std::path::PathBuf::from(d)
-                .join("wasm32-unknown-unknown")
-                .join("release")
-                .join("ipe_app.wasm")
-        });
-        let via_crate = out_dir
-            .join("target")
-            .join("wasm32-unknown-unknown")
-            .join("release")
-            .join("ipe_app.wasm");
-        via_env.filter(|p| p.is_file()).unwrap_or(via_crate)
-    };
+    // Step 2: wasm-bindgen — the .wasm the cargo build just produced.
+    let wasm_path = browser_wasm_artifact(&target_dir);
 
     bundle_wasm_pkg(
         crate_dir,
@@ -2246,6 +2254,16 @@ pub fn bundle_wasm(crate_dir: &OwnedDir) -> Result<(), CliError> {
         },
         crate::remote_ingest::WASM_TOOL_LIMITS,
     )
+}
+
+/// The `.wasm` a browser release build writes, read from the build directory
+/// the build was handed.
+fn browser_wasm_artifact(target_dir: &crate::target_dir::LinkableTargetDir) -> PathBuf {
+    target_dir
+        .path()
+        .join("wasm32-unknown-unknown")
+        .join("release")
+        .join("ipe_app.wasm")
 }
 
 /// The post-link wasm tools `bundle_wasm` runs, by program path.
@@ -2423,11 +2441,14 @@ pub fn bundle_wasi(crate_dir: &OwnedDir) -> Result<PathBuf, CliError> {
     // writes is read from the build itself, never reconstructed from a
     // target-dir guess that a toggled `CARGO_TARGET_DIR` or a relocated
     // `cargo metadata` can invalidate.
+    let target_dir =
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
     let messages = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
         profile: CargoProfile::Release,
         target: CargoTarget::Wasip1,
+        target_dir: &target_dir,
         output: CargoOutput::JsonStream(Verbosity::Progress),
         what: "the emitted wasm32-wasip1 module",
         runtime: runtime_context_for_message(),
@@ -3080,6 +3101,8 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     } else {
         None
     };
+    let target_dir =
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), crate_dir.path(), None)?;
     FlooredBuild {
         cargo: &cargo_bin,
         crate_dir: &crate_dir,
@@ -3087,6 +3110,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
+        target_dir: &target_dir,
         output: CargoOutput::Human(Verbosity::of_quiet(args.quiet)),
         what: "the emitted program",
         runtime,
@@ -3098,12 +3122,11 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // same file cargo just built from, so there is ONE source of truth and
     // no independent re-derivation can drift. A manifest that names no plain
     // package name refuses, never guessing a default another build may own.
-    // The target directory is asked of cargo itself (`cargo metadata`) — a
-    // `CARGO_TARGET_DIR` env or a user-level `[build] target-dir` pin
-    // relocates the artifact, so a hardcoded `<out>/target` would exec a
-    // missing or stale binary.
+    // The binary is read from the build directory the build was handed, so a
+    // `CARGO_TARGET_DIR` env or a `[build] target-dir` pin never sends the run
+    // to a missing or stale binary.
     let bin_name = emitted_bin_filename(&out_dir)?;
-    let mut bin = crate::cargo_step::target_directory(&cargo_bin, &out_dir)?;
+    let mut bin = target_dir.path().to_path_buf();
     if let Some(plan) = &static_plan {
         bin.push(plan.triple.as_str());
     }
@@ -3840,21 +3863,22 @@ fn build_source_graph_from(
 /// (the same whole-tree posture package-capability inference takes); a
 /// single-file entry reads the entry plus its imported siblings.
 ///
-/// Fail-closed: any unreadable module causes an immediate `Err` so the
-/// acknowledgment gate never operates on a partial source set.
+/// Fail-closed: a discovery failure or any unreadable module causes an
+/// immediate `Err` so the acknowledgment gate never operates on a partial
+/// source set.
 ///
 /// # Errors
-/// [`CliError::Io`] when any discovered module cannot be read; for a single
-/// file, every [`loose_file_scan_sources`] error.
+/// Every [`project::discover_modules`] error, and [`CliError::Io`] when any
+/// discovered module cannot be read; for a single file, every
+/// [`loose_file_scan_sources`] error.
 pub fn user_sources_for_unsafe_scan(
     manifest: Option<&Path>,
     entry: &Path,
 ) -> Result<Vec<String>, CliError> {
     if let Some(mpath) = manifest
         && let Ok(m) = project::parse_manifest(mpath)
-        && let Ok(discovered) = project::discover_modules(&m.src_root)
     {
-        return discovered
+        return project::discover_modules(&m.src_root)?
             .iter()
             .map(|d| crate::io_bounded::read_walked_source(d.path()))
             .collect::<Result<Vec<_>, _>>();
@@ -3873,7 +3897,7 @@ pub fn user_sources_for_unsafe_scan(
 /// source set.
 ///
 /// # Errors
-/// Every [`collect_entry_and_siblings`] error except the entry's own parse failure.
+/// Every [`LooseFileError::Refused`] error [`collect_entry_and_siblings`] returns.
 fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliError> {
     match collect_entry_and_siblings(entry) {
         Ok(collected) => Ok(collected
@@ -3881,10 +3905,10 @@ fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliErr
             .into_iter()
             .map(|(path, (_, src))| (path.join("."), src))
             .collect()),
-        Err(CliError::Pipeline { file, src, .. }) if file.as_path() == entry => {
-            Ok(vec![(entry.display().to_string(), src)])
+        Err(LooseFileError::EntryParse(failure)) => {
+            Ok(vec![(entry.display().to_string(), failure.into_src())])
         }
-        Err(other) => Err(other),
+        Err(LooseFileError::Refused(other)) => Err(other),
     }
 }
 
@@ -4468,7 +4492,7 @@ mod held_crate_tests {
             base,
             "cargo",
             &format!(
-                "[ \"$1\" = generate-lockfile ] && exit 0\n{during}\n\
+                "case \"$1\" in generate-lockfile|update) exit 0 ;; esac\n{during}\n\
                  echo '{{\"reason\":\"compiler-artifact\",\"executable\":\"/x\"}}'"
             ),
         )
@@ -4481,6 +4505,7 @@ mod held_crate_tests {
             krate: CargoCrate::Emitted(crate_dir),
             profile: CargoProfile::Dev,
             target: CargoTarget::Host,
+            target_dir: &crate::target_dir::LinkableTargetDir::assume(Path::new("/t")),
             output: CargoOutput::JsonStream(Verbosity::Quiet),
             what: "the emitted program",
             runtime: None,
@@ -4766,8 +4791,10 @@ mod held_crate_tests {
             &base,
             "cargo",
             &format!(
-                "[ \"$1\" = generate-lockfile ] && exit 0\ncat '{}' > '{}'\n\
-                 echo \"$@\" > '{}'\nexit 1",
+                "case \"$1\" in generate-lockfile|update) exit 0 ;;\n\
+                 metadata) echo '{{\"target_directory\":\"{}\"}}'; exit 0 ;; esac\n\
+                 cat '{}' > '{}'\necho \"$@\" > '{}'\nexit 1",
+                crate_dir.path().join("target").display(),
                 src.join("main.rs").display(),
                 seen.display(),
                 seen_args.display()
@@ -4903,6 +4930,7 @@ mod held_crate_tests {
                 driver: ipe_backend_rust::DbDriver::Sqlite,
             },
             target: CargoTarget::Static(triple),
+            target_dir: &crate::target_dir::LinkableTargetDir::assume(Path::new("/t")),
             output: CargoOutput::Human(Verbosity::Quiet),
             what: "the release app",
             runtime: None,
@@ -4965,6 +4993,7 @@ mod held_crate_tests {
             &consented,
             driver,
             triple,
+            &crate::target_dir::LinkableTargetDir::assume(&base.join("target")),
             Verbosity::Quiet,
         );
         assert!(built.is_err(), "the stub fails the build: {built:?}");
@@ -5014,6 +5043,7 @@ mod held_crate_tests {
             crate_dir: &crate_dir,
             finish: finish(&consented),
             target: CargoTarget::Host,
+            target_dir: &crate::target_dir::LinkableTargetDir::assume(Path::new("/t")),
             output: CargoOutput::Human(Verbosity::Quiet),
             what: "the emitted program",
             runtime: None,
@@ -5117,6 +5147,38 @@ mod held_crate_tests {
             }
             let _ = std::fs::remove_dir_all(&base);
         }
+    }
+}
+
+#[cfg(test)]
+mod wasm_locate_tests {
+    use crate::target_dir::{HostLinker, LinkableTargetDir, TargetDirOrigin, TargetDirSources};
+    use std::path::{Path, PathBuf};
+
+    /// A relocated build directory is where the browser artifact is read from,
+    /// never the crate's own `target`.
+    #[test]
+    fn the_browser_artifact_is_read_from_the_relocated_build_directory() {
+        let crate_dir = Path::new("/home/jos\u{e9}/app/out/rust");
+        let sources = TargetDirSources {
+            cache_base: Some(PathBuf::from("/home/cache")),
+            ..TargetDirSources::default()
+        };
+        let resolved = LinkableTargetDir::resolve(HostLinker::AsciiOnly, crate_dir, &sources)
+            .expect("an ASCII cache base relocates the build directory");
+        assert_eq!(resolved.origin(), TargetDirOrigin::UserCache);
+        let wasm = super::browser_wasm_artifact(&resolved);
+        assert!(
+            wasm.starts_with(resolved.path()),
+            "{} is under the resolved build directory",
+            wasm.display()
+        );
+        assert!(
+            !wasm.starts_with(crate_dir),
+            "{} is not under the crate's own target",
+            wasm.display()
+        );
+        assert!(wasm.ends_with("wasm32-unknown-unknown/release/ipe_app.wasm"));
     }
 }
 
