@@ -15,7 +15,7 @@ import Ipe.Ui.Input as Input
 import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Format as Format
-import Lib.Highlight as Highlight exposing (Token(..))
+import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
@@ -939,8 +939,8 @@ type RowLine
 -- The rows of a shown view with each line's tokens. A run of numbered rows
 -- is lexed as one text, a line's open lexeme (a block comment, a string that
 -- spans lines) carried into the next row, so a comment or string reads the
--- same whatever line it starts on; a covered run starts afresh. A line's
--- `\r` ending is the line break, not text. Linear in the rows' text.
+-- same whatever line it starts on; a covered run starts afresh. Linear in
+-- the rows' text.
 rowLines : Highlight.Lang -> List SourceRow -> List RowLine
 rowLines lang rows =
     case List.foldl (rowLineStep lang) ( Highlight.lineStart, [] ) rows of
@@ -952,7 +952,7 @@ rowLineStep : Highlight.Lang -> SourceRow -> ( Highlight.Carry, List RowLine ) -
 rowLineStep lang row ( carry, lines ) =
     case row of
         Numbered n line ->
-            case Highlight.lexLine lang carry (withoutLineEnd line) of
+            case Highlight.lexLine lang carry (withoutLineEnd lang line) of
                 ( toks, next ) ->
                     ( next, lines ++ [ TokenLine n toks ] )
 
@@ -960,13 +960,33 @@ rowLineStep lang row ( carry, lines ) =
             ( Highlight.lineStart, lines ++ [ CoveredLine ] )
 
 
-withoutLineEnd : String -> String
-withoutLineEnd line =
-    if String.endsWith "\r" line then
+-- A line without the `\r` of a CRLF ending, in a language that reads CRLF
+-- as one line break (Rust, Ipê). In shell and other text that `\r` is part
+-- of the line (`cd dir\r` names another directory), so it stays, drawn as
+-- the escape every other hazard is.
+withoutLineEnd : Highlight.Lang -> String -> String
+withoutLineEnd lang line =
+    if crlfIsLineBreak lang && String.endsWith "\r" line then
         String.dropRight 1 line
 
     else
         line
+
+
+crlfIsLineBreak : Highlight.Lang -> Bool
+crlfIsLineBreak lang =
+    case lang of
+        Rust ->
+            True
+
+        Ipe ->
+            True
+
+        Shell ->
+            False
+
+        Unknown ->
+            False
 
 
 numberedLine : Int -> List Token -> Ui.Element Msg

@@ -461,6 +461,81 @@ hugeResidual =
         ++ String.repeat 499999 "\n\nx"
 
 
+-- A `\r` before a line's `\n` is the CRLF line break in Rust and Ipê, and
+-- text in shell, where `cd /x\r` names another directory than `cd /x`.
+crlfByLanguage : Bool
+crlfByLanguage =
+    case ( View.rowLines Rust [ Numbered 1 "fn x\r" ], View.rowLines Shell [ Numbered 1 "cd /x\r" ] ) of
+        ( [ TokenLine 1 rust ], [ TokenLine 1 shell ] ) ->
+            rust
+                == [ Keyword "fn", Plain " ", Ident "x" ]
+                && List.member (Plain "\r") shell
+                && String.contains "data-review-escape" (Html.render (View.lineHtml shell))
+
+        _ ->
+            False
+
+
+-- A Rust `br"…"` or `cr"…"` is a raw string: its `\` escapes nothing, so
+-- the string closes at its quote and the next row is code.
+rawPrefixedStrings : Bool
+rawPrefixedStrings =
+    Highlight.tokenize Rust "br\"\\\" x"
+        == [ Str "br\"\\\"", Plain " ", Ident "x" ]
+        && Highlight.tokenize Rust "cr#\"a\"#"
+        == [ Str "cr#\"a\"#" ]
+        && Highlight.tokenize Rust "break crate"
+        == [ Keyword "break", Plain " ", Keyword "crate" ]
+        && rawRowCloses
+
+
+rawRowCloses : Bool
+rawRowCloses =
+    case View.rowLines Rust [ Numbered 1 "let s = br\"\\\";", Numbered 2 "fn x" ] of
+        [ _, TokenLine 2 second ] ->
+            second == [ Keyword "fn", Plain " ", Ident "x" ]
+
+        _ ->
+            False
+
+
+-- A shell heredoc body opens no string past its own line, so a `don't` in
+-- it leaves the code after the delimiter drawn as code; a `<<-` delimiter
+-- may follow tabs. A `<<<` here-string is no heredoc, so its quote carries.
+heredocBodies : Bool
+heredocBodies =
+    case View.rowLines Shell [ Numbered 1 "cat <<EOF", Numbered 2 "don't", Numbered 3 "EOF", Numbered 4 "rm -rf x" ] of
+        [ _, _, _, TokenLine 4 fourth ] ->
+            fourth
+                == [ Ident "rm", Plain " ", Plain "-", Ident "rf", Plain " ", Ident "x" ]
+                && heredocTabs
+                && hereStringCarries
+                && List.member (Ident "rm") (Highlight.tokenize Shell "cat <<EOF\ndon't\nEOF\nrm -rf x")
+
+        _ ->
+            False
+
+
+heredocTabs : Bool
+heredocTabs =
+    case View.rowLines Shell [ Numbered 1 "cat <<-'END'", Numbered 2 "it's", Numbered 3 "\tEND", Numbered 4 "rm x" ] of
+        [ _, _, _, TokenLine 4 fourth ] ->
+            fourth == [ Ident "rm", Plain " ", Ident "x" ]
+
+        _ ->
+            False
+
+
+hereStringCarries : Bool
+hereStringCarries =
+    case View.rowLines Shell [ Numbered 1 "cat <<<'a", Numbered 2 "b' c" ] of
+        [ _, TokenLine 2 second ] ->
+            List.take 1 second == [ Str "b'" ]
+
+        _ ->
+            False
+
+
 -- The keyboard shortcuts drive exactly the messages the buttons send: a/r
 -- act on the selected unit, j/k/g/1-5 move the selection, Enter/Escape
 -- confirm/cancel an open refuse panel, and every key is ignored while the
@@ -602,4 +677,7 @@ checks =
         , Task.succeed ( "a 256 KiB URL word and 64Ki URL words are trimmed", hugeUrls )
         , Task.succeed ( "a 256 KiB token with one U+202E is three segments", hugeSegments )
         , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
+        , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
+        , Task.succeed ( "a Rust br or cr string is raw", rawPrefixedStrings )
+        , Task.succeed ( "a shell heredoc body carries no quote past its line", heredocBodies )
         ]

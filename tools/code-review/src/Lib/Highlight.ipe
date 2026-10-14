@@ -91,43 +91,45 @@ tokenSource tok =
 
 
 -- Tokens a whole source snippet, newlines as `Plain "\n"`. Each line is lexed
--- by `lexLine`'s rules with the lexeme open at the end of the line before it
--- carried in, and a lexeme still open at the end of the input degrades to
--- Plain: it claims no color the source does not have. Unknown languages
--- degrade to a single Plain token: readable, never panics, and no color
--- claims the code does not have.
+-- by `lexLine` with the carry out of the line before it, and a lexeme still
+-- open at the end of the input degrades to Plain: it claims no color the
+-- source does not have. Unknown languages degrade to a single Plain token:
+-- readable, never panics, and no color claims the code does not have.
 tokenize : Lang -> String -> List Token
 tokenize lang text =
     if lang == Unknown then
         [ Plain text ]
 
     else
-        case List.foldl (lexInto lang) ( False, ( Start AfterSpace, "", [] ) ) (String.split "\n" text) of
-            ( _, lexer ) ->
-                finish lang lexer
+        case List.foldl (tokenizeStep lang) ( lineStart, [], Nothing ) (String.split "\n" text) of
+            ( carry, toks, Just last ) ->
+                toks ++ finish lang (openLine lang carry last)
+
+            ( _, toks, Nothing ) ->
+                toks
 
 
-lexInto : Lang -> String -> ( Bool, Lexer ) -> ( Bool, Lexer )
-lexInto lang line ( started, lexer ) =
-    if started then
-        ( True, String.foldl (step lang) (nextLine lang lexer) line )
+-- ( the carry into the held line, the tokens before it, the line read last ):
+-- a line is lexed once the next one shows it is not the last.
+tokenizeStep : Lang -> String -> ( Carry, List Token, Maybe String ) -> ( Carry, List Token, Maybe String )
+tokenizeStep lang line ( carry, toks, held ) =
+    case held of
+        Nothing ->
+            ( carry, toks, Just line )
 
-    else
-        ( True, String.foldl (step lang) lexer line )
-
-
--- Closes a line within a longer text: the line's tokens, then the newline.
-nextLine : Lang -> Lexer -> Lexer
-nextLine lang lexer =
-    case endLine lang lexer of
-        ( toks, carried ) ->
-            ( carried, "", toks ++ [ Plain "\n" ] )
+        Just previous ->
+            case lexLine lang carry previous of
+                ( lineToks, next ) ->
+                    ( next, toks ++ lineToks ++ [ Plain "\n" ], Just line )
 
 
--- The lexeme open where a source line ends, carried into the next line: a
--- block comment, a string that may span lines, or none.
+-- What a source line starts inside: the lexeme open where the line before it
+-- ended (a block comment, a string that may span lines, or none), or the
+-- body of a shell heredoc, which ends at the line that is its delimiter
+-- (after leading tabs, for `<<-`).
 type Carry
     = Carry Lexing
+    | Heredoc String Bool
 
 
 -- The carry of a first line, and of a line after a gap in the source.
@@ -138,18 +140,236 @@ lineStart =
 
 -- The tokens of one source line (no `\n` in it) and the carry into the line
 -- after it. Linear in the line: each character is read once, and a lexeme
--- open at the line's end closes as a piece of its own kind.
+-- open at the line's end closes as a piece of its own kind. A heredoc body
+-- line is lexed afresh, as the shell code such a body often is, so a quote
+-- in it (`don't`) opens nothing past its line.
 lexLine : Lang -> Carry -> String -> ( List Token, Carry )
 lexLine lang carry line =
     if lang == Unknown then
         ( [ Plain line ], carry )
 
     else
-        case carry of
-            Carry lexing ->
-                case endLine lang (String.foldl (step lang) ( lexing, "", [] ) line) of
-                    ( toks, carried ) ->
-                        ( toks, Carry carried )
+        case endLine lang (openLine lang carry line) of
+            ( toks, carried ) ->
+                ( toks, carryAfter lang carry line toks carried )
+
+
+-- A line read to its end, its last lexeme still open.
+openLine : Lang -> Carry -> String -> Lexer
+openLine lang carry line =
+    case carry of
+        Carry lexing ->
+            String.foldl (step lang) ( lexing, "", [] ) line
+
+        Heredoc _ _ ->
+            String.foldl (step lang) ( Start AfterSpace, "", [] ) line
+
+
+carryAfter : Lang -> Carry -> String -> List Token -> Lexing -> Carry
+carryAfter lang carry line toks carried =
+    case carry of
+        Heredoc delimiter stripTabs ->
+            if closesHeredoc delimiter stripTabs line then
+                lineStart
+
+            else
+                Heredoc delimiter stripTabs
+
+        Carry _ ->
+            if lang == Shell then
+                case heredocOf toks of
+                    Just ( delimiter, stripTabs ) ->
+                        Heredoc delimiter stripTabs
+
+                    Nothing ->
+                        Carry carried
+
+            else
+                Carry carried
+
+
+closesHeredoc : String -> Bool -> String -> Bool
+closesHeredoc delimiter stripTabs line =
+    line
+        == delimiter
+        || (stripTabs
+            && String.endsWith delimiter line
+            && String.all (\c -> c == tabChar) (String.dropRight (String.length delimiter) line)
+        )
+
+
+-- Where the scan of a shell line for a heredoc operator is: before one,
+-- after `<` or `<<` (`True` once `<<-`), in the blanks after the operator,
+-- in its delimiter word, or past a delimiter the word's end confirmed. The
+-- first heredoc on a line is the one read.
+type HereScan
+    = Seeking
+    | OneLt
+    | TwoLt Bool
+    | HereGap Bool
+    | HereWord String Bool
+    | HereFound String Bool
+
+
+-- What a token is to a heredoc delimiter word: text the word reads as (its
+-- quotes and `\` escapes removed), the end of the word, or a token no
+-- delimiter can hold (an unclosed or escaped quote), which drops the scan.
+type HerePiece
+    = Adds String
+    | EndsWord
+    | NoWord
+
+
+heredocOf : List Token -> Maybe ( String, Bool )
+heredocOf toks =
+    case List.foldl hereStep Seeking toks of
+        HereFound delimiter stripTabs ->
+            Just ( delimiter, stripTabs )
+
+        HereWord delimiter stripTabs ->
+            Just ( delimiter, stripTabs )
+
+        Seeking ->
+            Nothing
+
+        OneLt ->
+            Nothing
+
+        TwoLt _ ->
+            Nothing
+
+        HereGap _ ->
+            Nothing
+
+
+hereStep : Token -> HereScan -> HereScan
+hereStep tok scan =
+    case scan of
+        Seeking ->
+            if plainIs "<" tok then
+                OneLt
+
+            else
+                Seeking
+
+        OneLt ->
+            if plainIs "<" tok then
+                TwoLt False
+
+            else
+                Seeking
+
+        TwoLt stripTabs ->
+            if plainIs "<" tok then
+                Seeking
+
+            else if plainIs "-" tok && not stripTabs then
+                TwoLt True
+
+            else
+                delimiterStart stripTabs tok
+
+        HereGap stripTabs ->
+            delimiterStart stripTabs tok
+
+        HereWord delimiter stripTabs ->
+            case herePiece tok of
+                Adds more ->
+                    HereWord (String.append delimiter more) stripTabs
+
+                EndsWord ->
+                    HereFound delimiter stripTabs
+
+                NoWord ->
+                    Seeking
+
+        HereFound delimiter stripTabs ->
+            HereFound delimiter stripTabs
+
+
+delimiterStart : Bool -> Token -> HereScan
+delimiterStart stripTabs tok =
+    if plainIs " " tok || plainIs "\t" tok then
+        HereGap stripTabs
+
+    else
+        case herePiece tok of
+            Adds first ->
+                HereWord first stripTabs
+
+            EndsWord ->
+                Seeking
+
+            NoWord ->
+                Seeking
+
+
+herePiece : Token -> HerePiece
+herePiece tok =
+    case tok of
+        Ident s ->
+            Adds s
+
+        Keyword s ->
+            Adds s
+
+        Num s ->
+            Adds s
+
+        Str s ->
+            quotedPiece s
+
+        Comment _ ->
+            EndsWord
+
+        Plain s ->
+            if List.member s [ " ", "\t", ";", "|", "&", "(", ")", "<", ">" ] then
+                EndsWord
+
+            else if String.startsWith "\\" s then
+                Adds (String.dropLeft 1 s)
+
+            else
+                Adds s
+
+
+-- A closed `'…'` string reads as its inside; a closed `"…"` one too when it
+-- holds no `\`. Anything else is no delimiter.
+quotedPiece : String -> HerePiece
+quotedPiece s =
+    if String.length s < 2 then
+        NoWord
+
+    else if String.startsWith "'" s && String.endsWith "'" s then
+        Adds (String.dropRight 1 (String.dropLeft 1 s))
+
+    else if String.startsWith "\"" s && String.endsWith "\"" s && not (String.contains "\\" s) then
+        Adds (String.dropRight 1 (String.dropLeft 1 s))
+
+    else
+        NoWord
+
+
+plainIs : String -> Token -> Bool
+plainIs text tok =
+    case tok of
+        Plain s ->
+            s == text
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Comment _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
 
 
 -- What came before a shell `#`: a `#` starts a comment only at the start of a
@@ -165,14 +385,15 @@ type Gap
 -- its rule table:
 --
 -- * Rust: `//` line and nested `/* */` block comments, `"…"` strings with `\`
---   escapes, `r"…"` and `r#"…"#` raw strings, `'c'` char literals (a `'`
---   that closes no char literal, as in a lifetime, is punctuation).
+--   escapes, `r"…"` and `r#"…"#` raw strings (`br`, `cr` too), `'c'` char
+--   literals (a `'` that closes no char literal, as in a lifetime, is
+--   punctuation).
 -- * Ipê: `--` line and nested `{- -}` block comments (a `{-|` doc comment
 --   does not nest), `"…"` strings with `\` escapes on one line, `"""…"""`
 --   strings, `'c'` char literals.
 -- * Shell: a `#` at the start of a word begins a line comment, `'…'` strings
 --   without escapes, `"…"` strings with `\` escapes, a `\` escaping the next
---   character.
+--   character. A heredoc body is read by `lexLine`, never as a carried string.
 --
 -- No string state reaches a comment state, so no string is drawn as a
 -- comment, on any of its lines.
@@ -224,7 +445,10 @@ step lang c ( lexing, buf, toks ) =
                 begin lang AfterText c (toks ++ [ Num buf ])
 
         InWord ->
-            if isWordChar c then
+            if lang == Rust && c == 'r' && (buf == "b" || buf == "c") then
+                ( InRawPrefix, extend buf c, toks )
+
+            else if isWordChar c then
                 ( InWord, extend buf c, toks )
 
             else
@@ -759,7 +983,7 @@ extend buf c =
 -- characters that end a shell word leave the next `#` at a word start.
 gapAfter : Char -> Gap
 gapAfter c =
-    if List.member c [ ' ', '	', '', ';', '|', '&', '(', ')', '<', '>' ] then
+    if List.member c [ ' ', '\t', '\r', ';', '|', '&', '(', ')', '<', '>' ] then
         AfterSpace
 
     else
@@ -771,6 +995,12 @@ gapAfter c =
 backslashChar : Char
 backslashChar =
     Maybe.withDefault ' ' (List.head (String.toList "\\"))
+
+
+-- The tab character, derived from a string like `backslashChar`.
+tabChar : Char
+tabChar =
+    Maybe.withDefault ' ' (List.head (String.toList "\t"))
 
 
 -- The single-quote character, derived from a string like `backslashChar`.
