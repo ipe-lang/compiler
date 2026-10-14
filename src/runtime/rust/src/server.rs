@@ -3489,6 +3489,17 @@ fn ws_denied_close() -> axum::extract::ws::Message {
     }))
 }
 
+/// Send the close `frame`, waiting at most [`shutdown::WS_CLOSE_DEADLINE`]: a
+/// peer that stops reading never holds the socket's loop, its `onClose` or its
+/// registry slot past the deadline.
+async fn ws_send_close<S>(socket: &mut S, frame: axum::extract::ws::Message)
+where
+    S: futures_util::Sink<axum::extract::ws::Message> + Unpin,
+{
+    use futures_util::SinkExt;
+    let _ = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE, socket.send(frame)).await;
+}
+
 tokio::task_local! {
     // The axum upgrader for the in-flight request (Some only on a WS upgrade).
     static WS_UPGRADER: std::cell::Cell<Option<axum::extract::ws::WebSocketUpgrade>>;
@@ -3523,8 +3534,8 @@ fn ws_max_message_bytes(max_message_bytes: i64) -> usize {
 /// code 1008 and ends the loop.
 ///
 /// The drain counts the socket until `onClose` returns. Once it drains, the
-/// socket sends close code 1001 under [`shutdown::WS_CLOSE_DEADLINE`] and
-/// ends the loop.
+/// socket sends close code 1001 and ends the loop. Every close frame goes
+/// through [`ws_send_close`], under [`shutdown::WS_CLOSE_DEADLINE`].
 async fn ws_loop<E, S>(
     mut socket: S,
     cfg: WsServerCfg<E>,
@@ -3552,12 +3563,11 @@ async fn ws_loop<E, S>(
     // A credential revoked between the upgrade and now opens nothing: no
     // registration, no `onConnect`.
     if channel_refuses(&mut gate) {
-        let _ = socket.send(ws_denied_close()).await;
+        ws_send_close(&mut socket, ws_denied_close()).await;
         return;
     }
     let Some(_live) = drain.hold() else {
-        let _ =
-            tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE, socket.send(ws_away_close())).await;
+        ws_send_close(&mut socket, ws_away_close()).await;
         return;
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ceilings.send_buffer);
@@ -3578,7 +3588,7 @@ async fn ws_loop<E, S>(
         // guard dropped here — never held across the awaits below.
     };
     if !admitted {
-        let _ = socket.send(Message::Close(None)).await;
+        ws_send_close(&mut socket, Message::Close(None)).await;
         return;
     }
     let _ = credentials
@@ -3593,31 +3603,27 @@ async fn ws_loop<E, S>(
     heartbeat.tick().await; // consume the immediate first tick
     loop {
         if channel_unsettled(&mut gate) {
-            let _ = socket.send(ws_denied_close()).await;
+            ws_send_close(&mut socket, ws_denied_close()).await;
             break;
         }
         tokio::select! {
             biased;
             () = channel_denial(&mut gate) => {
-                let _ = socket.send(ws_denied_close()).await;
+                ws_send_close(&mut socket, ws_denied_close()).await;
                 break;
             },
             () = drain.wait() => {
-                let _ = tokio::time::timeout(
-                    shutdown::WS_CLOSE_DEADLINE,
-                    socket.send(ws_away_close()),
-                )
-                .await;
+                ws_send_close(&mut socket, ws_away_close()).await;
                 break;
             },
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Text(t))) => {
                     if t.len() > max_bytes {
-                        let _ = socket.send(Message::Close(None)).await;
+                        ws_send_close(&mut socket, Message::Close(None)).await;
                         break;
                     }
                     if channel_refuses(&mut gate) {
-                        let _ = socket.send(ws_denied_close()).await;
+                        ws_send_close(&mut socket, ws_denied_close()).await;
                         break;
                     }
                     let _ = credentials
@@ -3626,11 +3632,11 @@ async fn ws_loop<E, S>(
                 }
                 Some(Ok(Message::Binary(b))) => {
                     if b.len() > max_bytes {
-                        let _ = socket.send(Message::Close(None)).await;
+                        ws_send_close(&mut socket, Message::Close(None)).await;
                         break;
                     }
                     if channel_refuses(&mut gate) {
-                        let _ = socket.send(ws_denied_close()).await;
+                        ws_send_close(&mut socket, ws_denied_close()).await;
                         break;
                     }
                     // Convert binary frame bytes to String via UTF-8 (lossy): Ipê's
@@ -3661,12 +3667,12 @@ async fn ws_loop<E, S>(
             outgoing = rx.recv() => match outgoing {
                 Some(WsOut::Text(s)) => { if socket.send(Message::Text(s)).await.is_err() { break; } }
                 Some(WsOut::Binary(b)) => { if socket.send(Message::Binary(b)).await.is_err() { break; } }
-                Some(WsOut::Close) => { let _ = socket.send(Message::Close(None)).await; break; }
+                Some(WsOut::Close) => { ws_send_close(&mut socket, Message::Close(None)).await; break; }
                 None => break,
             },
             _ = heartbeat.tick() => {
                 if channel_refuses(&mut gate) {
-                    let _ = socket.send(ws_denied_close()).await;
+                    ws_send_close(&mut socket, ws_denied_close()).await;
                     break;
                 }
                 // Send a Ping frame; if the peer has gone away the send will
@@ -10274,11 +10280,12 @@ mod tests {
             }
         }
 
-        #[tokio::test(start_paused = true)]
-        async fn a_socket_the_full_drain_refuses_ends_within_its_close_deadline() {
+        /// Whether `ws_loop` over a [`StalledSocket`] ends within twice the
+        /// close deadline, under `max_connections` and `drain`.
+        async fn stalled_loop_ends(max_connections: usize, drain: shutdown::Drain) -> bool {
             let ceilings = WsCeilings {
                 send_buffer: 16,
-                max_connections: usize::MAX,
+                max_connections,
                 heartbeat_secs: 30,
             };
             let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -10289,12 +10296,26 @@ mod tests {
                 ceilings,
                 ChannelCredentials::of_request(),
                 None,
-                shutdown::tests::full_drain(),
+                drain,
             );
-            let ended = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served).await;
+            tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served)
+                .await
+                .is_ok()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_socket_the_full_drain_refuses_ends_within_its_close_deadline() {
             assert!(
-                ended.is_ok(),
+                stalled_loop_ends(usize::MAX, shutdown::tests::full_drain()).await,
                 "an uncounted socket's close frame never outlives its deadline"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_socket_over_the_peer_ceiling_ends_within_its_close_deadline() {
+            assert!(
+                stalled_loop_ends(0, shutdown::Drain::never()).await,
+                "a refused peer's close frame never outlives its deadline"
             );
         }
 
