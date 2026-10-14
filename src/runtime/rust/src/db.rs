@@ -2110,6 +2110,7 @@ where
         let options = DB::gated_connect_options(url, max_connections, &mut relay).await?;
         let pool = sqlx::pool::PoolOptions::<DB>::new()
             .max_connections(max_connections)
+            .after_release(keep_outside_transaction::<DB::Connection>)
             .connect_with(options)
             .await
             .map_err(|e| DbConnectError::Unreachable(DriverFailure::of(engine, &e)))?;
@@ -2128,6 +2129,29 @@ where
     pub fn into_pool(self) -> sqlx::Pool<DB> {
         self.0
     }
+}
+
+/// Whether a connection coming back to its pool may be pooled again: only
+/// when no transaction is open on it.
+///
+/// A connection can come back mid-transaction when a begin is cancelled after
+/// the engine opened the transaction but before the driver wrapped it (SQLite's
+/// `BEGIN IMMEDIATE` has that window). Pooling it would hand the next user its
+/// locks and its uncommitted work; closing it instead rolls the transaction
+/// back. A dropped transaction's rollback may still be queued on the
+/// connection, so an open transaction is judged again after a round trip has
+/// drained the queue.
+fn keep_outside_transaction<C: sqlx::Connection>(
+    conn: &mut C,
+    _meta: sqlx::pool::PoolConnectionMetadata,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, sqlx::Error>> + Send + '_>> {
+    if !conn.is_in_transaction() {
+        return Box::pin(std::future::ready(Ok(true)));
+    }
+    Box::pin(async move {
+        conn.ping().await?;
+        Ok(!conn.is_in_transaction())
+    })
 }
 
 /// Build one configured pool. SQLite (file, not `:memory:`) gets WAL — concurrent
@@ -8468,6 +8492,139 @@ mod tests {
             "second writer failed: {second:?}"
         );
         assert_eq!(total, 2, "a committed write was lost");
+    }
+
+    /// A connection that comes back to a vetted pool with a transaction still
+    /// open (a `BEGIN IMMEDIATE` cancelled after SQLite opened it, before the
+    /// driver wrapped it) is closed, not pooled: the next user gets a fresh
+    /// connection outside any transaction, and the write lock is released.
+    #[tokio::test]
+    async fn a_connection_released_inside_a_transaction_is_not_pooled_again() {
+        let (seed, path) = fresh_file_db(1).await;
+        seed.close().await;
+        let url = DbUrl::parse(&format!("sqlite://{}", path.display())).expect("parse file url");
+        let pool = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+            .await
+            .expect("vetted file pool")
+            .into_pool();
+        let mut conn = pool.acquire().await.expect("acquire");
+        {
+            // The cancelled begin's shape: the transaction is open and nothing
+            // owns its rollback.
+            let _unowned = std::mem::ManuallyDrop::new(
+                sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
+                    .await
+                    .expect("begin immediate"),
+            );
+        }
+        drop(conn);
+        let again = pool.acquire().await.expect("reacquire");
+        let inherited = sqlx::Connection::is_in_transaction(&*again);
+        drop(again);
+        let options = format!("sqlite://{}", path.display())
+            .parse::<sqlx::sqlite::SqliteConnectOptions>()
+            .expect("parse file sqlite url")
+            .busy_timeout(std::time::Duration::ZERO);
+        let other = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect probe pool");
+        let mut probe = other.acquire().await.expect("acquire probe");
+        let lock_free = sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *probe)
+            .await
+            .is_ok();
+        let _ = sqlx::query("ROLLBACK").execute(&mut *probe).await;
+        drop(probe);
+        other.close().await;
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !inherited,
+            "the pool handed out a connection inside a transaction"
+        );
+        assert!(
+            lock_free,
+            "a pooled idle connection still holds the write lock"
+        );
+    }
+
+    /// A connection whose dropped transaction's rollback is still queued comes
+    /// back to the pool and is reused once the rollback has run: the
+    /// in-memory database living on it survives.
+    #[tokio::test]
+    async fn a_connection_whose_dropped_transaction_rolled_back_is_pooled_again() {
+        let url = DbUrl::parse("sqlite::memory:").expect("parse memory url");
+        let pool = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+            .await
+            .expect("vetted memory pool")
+            .into_pool();
+        sqlx::query("CREATE TABLE kept (id INTEGER)")
+            .execute(&pool)
+            .await
+            .expect("create table");
+        let mut conn = pool.acquire().await.expect("acquire");
+        let tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE")
+            .await
+            .expect("begin immediate");
+        drop(tx);
+        drop(conn);
+        let survived = sqlx::query("SELECT COUNT(*) FROM kept")
+            .execute(&pool)
+            .await
+            .is_ok();
+        pool.close().await;
+        assert!(
+            survived,
+            "a connection whose transaction was rolled back was closed, not pooled"
+        );
+    }
+
+    /// A transaction on a read-only SQLite file still runs, and does not wait
+    /// for a writer: `BEGIN IMMEDIATE` on a read-only database is a read.
+    #[tokio::test]
+    async fn a_transaction_on_a_read_only_sqlite_file_reads_beside_a_writer() {
+        let (writer, path) = fresh_file_db(1).await;
+        sqlx::query("INSERT INTO todos (id, title, done) VALUES (1, 'seen', 0)")
+            .execute(&writer)
+            .await
+            .expect("seed row");
+        let mut held = writer.acquire().await.expect("acquire writer");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *held)
+            .await
+            .expect("writer takes the write lock");
+        let url = DbUrl::parse(&format!("sqlite://{}?mode=ro", path.display()))
+            .expect("parse read-only url");
+        let reader = VettedPool::<sqlx::Sqlite>::connect(&url, 1)
+            .await
+            .expect("vetted read-only pool")
+            .into_pool();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db_with_transaction::<String, String>(reader.clone(), |c| {
+                Box::pin(async move {
+                    let row =
+                        fetch_one_routed(&c, sqlx::query("SELECT title FROM todos WHERE id = 1"))
+                            .await;
+                    match row.and_then(|row| row.try_get::<String, _>(0_usize)) {
+                        Ok(title) => IpeResult::Ok(title),
+                        Err(e) => IpeResult::Err(e.to_string()),
+                    }
+                })
+            }),
+        )
+        .await;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *held).await;
+        drop(held);
+        reader.close().await;
+        writer.close().await;
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(&read, Ok(IpeResult::Ok(title)) if title == "seen"),
+            "a read-only transaction failed or waited on the writer: {read:?}"
+        );
     }
 
     // THE REGRESSION GATE. On a MULTI-connection (5) file-backed pool, a
