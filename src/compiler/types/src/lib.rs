@@ -1077,7 +1077,7 @@ fn infer_core(
     // instantiation is the concrete `MsgA`, so it is NOT defaulted and stays a
     // genuine generic. A variable appearing anywhere OUTSIDE a UI msg slot is
     // also excluded -- only a pure message placeholder defaults.
-    let ui_msg_cons: BTreeSet<Symbol> = ["Html", "Element", "Attribute", "Event"]
+    let ui_msg_cons: BTreeSet<Symbol> = UI_MSG_CARRIERS
         .into_iter()
         .map(|n| interner.intern(n))
         .collect::<Result<_, _>>()
@@ -1551,6 +1551,31 @@ fn infer_core(
 /// list of `SchemeApp::vars` (scheme var raw id -> instantiation) recorded at
 /// its reference sites, borrowed from `Generated::scheme_apps`.
 type SchemeAppVars<'a> = BTreeMap<(Vec<Symbol>, Symbol), Vec<&'a BTreeMap<u32, VarId>>>;
+
+/// The UI type constructors whose single argument is a message slot: a type
+/// variable there is phantom in the value it types.
+pub const UI_MSG_CARRIERS: [&str; 4] = ["Html", "Element", "Attribute", "Event"];
+
+/// The interned [`UI_MSG_CARRIERS`]. A carrier name never interned names no
+/// type in this build, so it is absent rather than minted.
+#[must_use]
+pub fn ui_msg_carrier_syms(interner: &Interner) -> BTreeSet<Symbol> {
+    UI_MSG_CARRIERS
+        .into_iter()
+        .filter_map(|n| interner.lookup(n))
+        .collect()
+}
+
+/// The type variables of `ty` that occur ONLY as a UI message slot (inside a
+/// [`UI_MSG_CARRIERS`] constructor's argument) and nowhere else, each as the
+/// raw it carries in `ty`.
+#[must_use]
+pub fn ui_msg_only_vars(ty: &Ty, carriers: &BTreeSet<Symbol>) -> BTreeSet<u32> {
+    let mut ui = BTreeSet::new();
+    let mut other = BTreeSet::new();
+    collect_ui_msg_and_other_vars(ty, carriers, false, &mut ui, &mut other);
+    ui.difference(&other).map(|s| s.as_raw()).collect()
+}
 
 /// Classify each annotation type variable of `ty` as either a **UI message
 /// slot** variable (it appears as the argument of a `Html` / `Element` /
