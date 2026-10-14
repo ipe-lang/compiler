@@ -98,7 +98,7 @@ unitAt unit =
 
 queued : Index.UnitView -> Queue.QueuedUnit
 queued loaded =
-    { unit = loaded.unit, change = New, changed = Nothing }
+    { unit = loaded.unit, change = New, changed = Nothing, standing = Queue.Undecided }
 
 
 queuePageOf : List Index.UnitView -> Queue.QueuePage

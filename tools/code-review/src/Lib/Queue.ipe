@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -29,11 +29,89 @@ import Lib.Uid as Uid exposing (Uid)
 -- recorded about its current body. `changed` is Just the previous counted
 -- review when this uid was already decided on an OLDER body hash: the author
 -- edited the code after the review, so the unit must be reviewed again.
+-- `standing` is what the review log holds for its current body: a unit
+-- reopened because its decision does not count says why.
 type alias QueuedUnit =
     { unit : Index.Unit
     , change : Index.Change
     , changed : Maybe LibDb.VerifiedRow
+    , standing : Standing
     }
+
+
+-- Where a unit's current body stands in the review log, classified as the
+-- History classifies its entries: no entry, a decision that counts, or an
+-- entry that does not count and why.
+type Standing
+    = Undecided
+    | Decided LibDb.StoredDecision
+    | NotCounted LibDb.Unverified
+
+
+standingOf : Maybe LibDb.ReviewEntry -> Standing
+standingOf entry =
+    case entry of
+        Just found ->
+            case found of
+                Verified row ->
+                    Decided (LibDb.verifiedDecision row)
+
+                Unverified row ->
+                    NotCounted row.why
+
+        Nothing ->
+            Undecided
+
+
+-- The unit page's read of its shown body's standing, keyed by the uid and
+-- body hash it was read for, so a read for another unit or an older body
+-- never stands for the one shown.
+type StandingRead
+    = StandingUnread
+    | StandingShown Uid String Standing
+    | StandingFailed Uid String Error
+
+
+-- The standing of `uid`'s body `bodyHash`, under one walk of the review log.
+loadStanding : AppSettings -> Uid -> String -> Task.Task Error Standing
+loadStanding settings uid bodyHash =
+    do
+        db <- LibDb.openAt settings.review
+        state <- LibDb.logVerdict settings.key db
+        entry <- LibDb.findDecision (LibDb.verifier state) db uid bodyHash
+        Task.succeed (standingOf entry)
+
+
+standingArrived : Uid -> String -> Result Error Standing -> StandingRead
+standingArrived uid bodyHash result =
+    case result of
+        Ok standing ->
+            StandingShown uid bodyHash standing
+
+        Err e ->
+            StandingFailed uid bodyHash e
+
+
+-- The read's result for `unit`'s current body, Nothing while none is held.
+standingFor : Index.Unit -> StandingRead -> Maybe (Result Error Standing)
+standingFor unit read =
+    case read of
+        StandingUnread ->
+            Nothing
+
+        StandingShown uid bodyHash standing ->
+            if uid == unit.uid && bodyHash == Index.storedHash unit.attested then
+                Just (Ok standing)
+
+            else
+                Nothing
+
+        StandingFailed uid bodyHash e ->
+            if uid == unit.uid && bodyHash == Index.storedHash unit.attested then
+                Just (Err e)
+
+            else
+                Nothing
 
 
 -- What a queued unit is called on screen: its kind and qualified name, plus
@@ -1154,10 +1232,12 @@ classifyUnit verify db row =
     in
     do
         latest <- LibDb.findLatestForUid verify db unit.uid
+        entry <- LibDb.findDecision verify db unit.uid current
         Task.succeed
             { unit = unit
             , change = row.change
             , changed = Maybe.andThen (previousReview current) latest
+            , standing = standingOf entry
             }
 
 

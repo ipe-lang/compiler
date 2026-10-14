@@ -1064,6 +1064,7 @@ sampleQueuedUnit =
     }
     , change = Index.New
     , changed = Nothing
+    , standing = Queue.Undecided
     }
 
 
@@ -1112,6 +1113,22 @@ placeOf id labels =
 
 -- No two labels of the page are equal, every label carries its unit's kind,
 -- and each unit gets only as much location as its collisions need.
+-- A row naming the current body that fails to verify keeps its reason; only
+-- the absence of any row is undecided.
+standingNotCounted : Bool
+standingNotCounted =
+    let
+        row why =
+            Just (Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
+    in
+    Queue.standingOf (row Tampered) == Queue.NotCounted Tampered
+        && Queue.standingOf (row ChainBroken) == Queue.NotCounted ChainBroken
+        && Queue.standingOf (row NoKey) == Queue.NotCounted NoKey
+        && Queue.standingOf (row Legacy) == Queue.NotCounted Legacy
+        && Queue.standingOf Nothing == Queue.Undecided
+        && Queue.standingOf (row Tampered) /= Queue.Undecided
+
+
 queueLabelsDistinct : Bool
 queueLabelsDistinct =
     let
@@ -2501,6 +2518,7 @@ checks =
             , check "re-queued change survives the drain" drainKeepsRequeuedChange
             , check "unit page states are distinct" unitPageStatesDistinct
             , Task.succeed ( "no two queue labels on a page are equal, each kind-qualified", queueLabelsDistinct )
+            , Task.succeed ( "a row for the current body that does not verify stands as not counted, never as undecided", standingNotCounted )
             , Task.succeed ( "a byte past the ceiling reads as the next whole KiB", byteCeilingTextRoundsUp )
             , check "queue pages bound to pageSize and cover the queue once" pagesCoverQueueOnce
             , check "a deleted queue row leaves its standing unit open, unrecorded" deletedQueueRowLeavesUnitOpen

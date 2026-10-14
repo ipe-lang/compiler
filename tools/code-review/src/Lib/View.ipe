@@ -19,7 +19,7 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), UnitLabel, UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -182,7 +182,7 @@ pageBody model =
             historyBody model
 
         UnitPage raw ->
-            unitPageBody (App.unitPageState raw model)
+            unitPageBody model.standing (App.unitPageState raw model)
 
 
 queueBody : Model -> Ui.Element Msg
@@ -302,6 +302,7 @@ railItem model i ( q, label ) =
             [ Ui.width Ui.fill, Ui.spacing 6, Ui.centerY ]
             [ labelEl 12 label
             , changeBadge q.change
+            , railStanding q.standing
             ]
         }
 
@@ -475,13 +476,13 @@ nameOf row =
 
 -- The unit page shows the source of one unit with its resolved links —
 -- no decision buttons, no change state; the unit is read-only here.
-unitPageBody : Queue.UnitPageState -> Ui.Element Msg
-unitPageBody state =
+unitPageBody : Queue.StandingRead -> Queue.UnitPageState -> Ui.Element Msg
+unitPageBody standing state =
     case state of
         UnitLoaded loaded ->
             Ui.column
                 [ Ui.width Ui.fill, Ui.spacing 16, Ui.scrollbars ]
-                [ unitPageCard loaded ]
+                [ unitPageCard standing loaded ]
 
         UnitLoading ->
             unitPageStatus state
@@ -506,8 +507,8 @@ unitPageStatus state =
             Ui.none
 
 
-unitPageCard : Index.UnitView -> Ui.Element Msg
-unitPageCard loaded =
+unitPageCard : Queue.StandingRead -> Index.UnitView -> Ui.Element Msg
+unitPageCard standing loaded =
     let
         unit =
             loaded.unit
@@ -527,6 +528,7 @@ unitPageCard loaded =
             [ sectionHeading (labelEl 14 (Queue.unitLabel Named unit))
             , chip unit.facing
             ]
+        , unitStanding (Queue.standingFor unit standing)
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (unitLocation unit))
@@ -588,6 +590,74 @@ linkEl link =
             safeText (Links.label link)
 
 
+-- Where a unit's current body stands in the review log: not reviewed,
+-- decided, or a row recorded for it that is not counted. Every standing
+-- draws its own badge, so a reopened unit never reads as a fresh one.
+standingBadge : Queue.Standing -> Ui.Element Msg
+standingBadge standing =
+    case standing of
+        Undecided ->
+            chip (SafeText.literal "Not reviewed")
+
+        Decided d ->
+            decisionBadge d
+
+        NotCounted why ->
+            unverifiedBadge why
+
+
+-- The rail names a standing only when a row exists for the current body;
+-- the change badge already marks a body no row names.
+railStanding : Queue.Standing -> Ui.Element Msg
+railStanding standing =
+    case standing of
+        Undecided ->
+            Ui.none
+
+        Decided _ ->
+            standingBadge standing
+
+        NotCounted _ ->
+            standingBadge standing
+
+
+-- The unit page's standing line: the badge with a refusal's reason, the
+-- failed read, or the read still running for the body shown.
+unitStanding : Maybe (Result Error Queue.Standing) -> Ui.Element Msg
+unitStanding read =
+    case read of
+        Just (Ok standing) ->
+            Ui.row
+                [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
+                [ standingBadge standing
+                , standingReason standing
+                ]
+
+        Just (Err e) ->
+            Ui.el
+                [ Font.size 12, Font.color (Ui.rgb 200 120 120) ]
+                (safeText (SafeText.concat [ SafeText.literal "Review status read failed: ", SafeText.renderForeign (Error.toString e) ]))
+
+        Nothing ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Reading review status…")
+
+
+standingReason : Queue.Standing -> Ui.Element Msg
+standingReason standing =
+    case standing of
+        Decided (StoredRefused r) ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 200 120 120) ] (safeText (LibDb.storedReasonText r))
+
+        Decided StoredApproved ->
+            Ui.none
+
+        Undecided ->
+            Ui.none
+
+        NotCounted _ ->
+            Ui.none
+
+
 decisionBadge : LibDb.StoredDecision -> Ui.Element Msg
 decisionBadge d =
     case d of
@@ -640,6 +710,7 @@ unitCard model label q =
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
             [ sectionHeading (labelEl 14 label)
             , changeBadge q.change
+            , standingBadge q.standing
             , changedChip q
             , chip unit.facing
             , Ui.el [ Ui.width Ui.fill ] Ui.none
