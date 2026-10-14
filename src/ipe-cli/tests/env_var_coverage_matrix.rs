@@ -195,7 +195,11 @@ fn registry_text_names_only_registered_or_excluded_variables() {
 #[test]
 fn every_excluded_name_is_read_in_the_source() {
     let reads = SourceReads::scan();
-    let unread = unread_exclusions(EXCLUDED_NAMES, reads.all_reads());
+    let all_reads = reads
+        .all_reads()
+        .map_err(ToString::to_string)
+        .expect("the source tree is read whole");
+    let unread = unread_exclusions(EXCLUDED_NAMES, all_reads);
     assert!(
         unread.is_empty(),
         "EXCLUDED_NAMES lists names no source file reads; an exclusion covers a read, so a \

@@ -1233,17 +1233,64 @@ enum Zone {
     Carved,
 }
 
-/// A grant or carve directory, by path and identity.
+/// A grant or carve, by path and by the identity of the handle it is held open through.
 struct Mark {
     /// Its canonical path.
     path: PathBuf,
-    /// Its identity.
+    /// The identity of the held handle, read once from it.
     id: FileId,
     /// [`Zone::Writable`] for a grant, [`Zone::Carved`] for a carve.
     zone: Zone,
+    /// The handle `id` was read from, held for the whole scan so the object
+    /// cannot be freed and its identity reused by another directory before a
+    /// walked directory is compared against it.
+    _pinned: Pinned,
 }
 
-/// Every grant and carve of `grants`, identified now.
+/// The open handle a [`Mark`] holds.
+///
+/// A grant is a directory; a carve is a directory or a pointer file (a
+/// gitfile, a Jujutsu or Darcs file entry).
+enum Pinned {
+    /// A directory, held as a walk holds one.
+    Dir(HeldDir),
+    /// A regular file.
+    File(RegularFile),
+}
+
+impl Pinned {
+    /// Hold `path` open: as a directory, else as the regular file it is.
+    ///
+    /// The parent is opened following links (`path` is canonical, so that
+    /// is the lookup that made it); the final entry is opened through the
+    /// held parent and never followed, both tries naming that one entry of
+    /// that one handle. A link, a FIFO, a device, or a socket there is
+    /// refused.
+    fn open(path: &Path) -> Result<Self, OpenRefusal> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return HeldDir::open_root(path).map(Self::Dir);
+        };
+        let name = EntryName::parse(name)?;
+        let parent = HeldDir::open_root(parent)?;
+        match parent.child_dir(&name) {
+            Ok(dir) => Ok(Self::Dir(dir)),
+            Err(OpenRefusal::NotRegular(FileKind::Regular)) => {
+                parent.open_regular(&name).map(Self::File)
+            }
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    /// The identity of the object this handle holds.
+    fn id(&self) -> Result<FileId, OpenRefusal> {
+        match self {
+            Self::Dir(dir) => dir.id(),
+            Self::File(file) => file.id(),
+        }
+    }
+}
+
+/// Every grant and carve of `grants`, held open and identified from its handle.
 fn marks(grants: &Grants<'_>, kind: VcsKind) -> Result<Vec<Mark>, ConfigRefusal> {
     let writable = grants.writable.iter().map(|path| (path, Zone::Writable));
     let carved = grants.carves.iter().map(|path| (path, Zone::Carved));
@@ -1251,11 +1298,14 @@ fn marks(grants: &Grants<'_>, kind: VcsKind) -> Result<Vec<Mark>, ConfigRefusal>
         .chain(carved)
         .map(|(path, zone)| {
             let path = path.as_path();
-            FileId::of_path(path)
-                .map(|id| Mark {
-                    path: path.to_path_buf(),
-                    id,
-                    zone,
+            Pinned::open(path)
+                .and_then(|pinned| {
+                    pinned.id().map(|id| Mark {
+                        path: path.to_path_buf(),
+                        id,
+                        zone,
+                        _pinned: pinned,
+                    })
                 })
                 .map_err(|refusal| ConfigRefusal::Unreadable {
                     kind,
@@ -4360,6 +4410,119 @@ mod tests {
         };
         let result = scan(&roots, &grants, &Home::unknown(), ConfigLimits::DEFAULT);
         assert_eq!(unprovable(&result), Some(Unprovable::NoHome));
+    }
+
+    /// A grant removed before the scan holds no handle, so the scan refuses it rather than running with it unmarked.
+    #[test]
+    fn a_vanished_grant_is_unreadable() {
+        let f = fixture("vanished");
+        let tree = canonical(&f.tree);
+        let other = canonical(&f.other);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[&other]).with_carves(&[&git]);
+        std::fs::remove_dir(&f.other).expect("remove the grant");
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::Absent),
+                    ..
+                }) if path == other.as_path()
+            ),
+            "the vanished grant is unreadable, got {result:?}"
+        );
+    }
+
+    /// A carve that is a pointer file is held open as a file, so the scan runs.
+    #[test]
+    fn a_file_carve_is_held_and_scanned() {
+        let f = fixture("filecarve");
+        write(&f.tree.join("sub/.git"), "gitdir: ../.git\n");
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let pointer = canonical(&f.tree.join("sub/.git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git, &pointer]);
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+        assert_eq!(result, Ok(()), "a file carve is marked, not refused");
+    }
+
+    /// Scan Git's configuration with `pointer` carved beside `.git`.
+    #[cfg(unix)]
+    fn scan_with_carve(f: &Fixture, pointer: &CanonicalPath) -> Result<(), ConfigRefusal> {
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git, pointer]);
+        let roots = ConfigRoots::Git {
+            gitdir: &f.tree.join(".git"),
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        scan(&roots, &grants, &home, ConfigLimits::DEFAULT)
+    }
+
+    /// A carve whose final entry became a link after it was resolved is refused, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_carve_turned_link_is_unreadable() {
+        let f = fixture("carvelink");
+        let at = f.tree.join("sub/.git");
+        write(&at, "gitdir: ../.git\n");
+        let pointer = canonical(&at);
+        std::fs::remove_file(&at).expect("remove the pointer");
+        std::os::unix::fs::symlink(&f.other, &at).expect("plant link");
+        let result = scan_with_carve(&f, &pointer);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::Link),
+                    ..
+                }) if path == pointer.as_path()
+            ),
+            "the linked carve is unreadable, got {result:?}"
+        );
+    }
+
+    /// A carve that is a FIFO is refused without blocking on it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_carve_is_unreadable() {
+        let f = fixture("carvefifo");
+        let at = f.tree.join("pipe");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &at,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("mkfifo");
+        let pointer = canonical(&at);
+        let result = scan_with_carve(&f, &pointer);
+        assert!(
+            matches!(
+                &result,
+                Err(ConfigRefusal::Unreadable {
+                    path,
+                    fault: ConfigFault::Open(OpenRefusal::NotRegular(FileKind::Fifo)),
+                    ..
+                }) if path == pointer.as_path()
+            ),
+            "the FIFO carve is unreadable, got {result:?}"
+        );
     }
 
     #[test]

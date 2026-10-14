@@ -36,6 +36,7 @@ use std::sync::Arc;
 use ipe_diagnostics::{ALL_CODES, Code, explain_page, title};
 
 use crate::coverage::contract::{AspectCheck, Cell, Surface};
+use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 
 // ── surface ───────────────────────────────────────────────────────────────────
 
@@ -163,7 +164,16 @@ impl AspectCheck<Code> for RefusalTestedColumn {
     }
 
     fn check(&self, code: &Code) -> Cell {
-        if self.tested.contains(code.as_str()) {
+        let found = match self.tested.contains(code.as_str()) {
+            Ok(found) => found,
+            Err(refusal) => {
+                return Cell::Hole(format!(
+                    "{} cannot be checked for a standing refusal test: {refusal}",
+                    code.as_str()
+                ));
+            }
+        };
+        if found {
             Cell::Ok
         } else {
             Cell::Hole(format!(
@@ -186,29 +196,42 @@ impl AspectCheck<Code> for RefusalTestedColumn {
 /// registry or surface authoring file.
 ///
 /// Scanned once from the `src/` and `tools/` trees; cloned cheaply via the inner
-/// [`Arc`] when columns are registered in a surface runner.
-#[derive(Clone, Debug, Default)]
+/// [`Arc`] when columns are registered in a surface runner. A tree that cannot be
+/// read whole leaves no code provably tested or untested.
+#[derive(Clone, Debug)]
 pub struct TestedCodes {
-    inner: Arc<BTreeSet<String>>,
+    inner: Arc<Result<BTreeSet<String>, TreeRefusal>>,
 }
 
 impl TestedCodes {
     /// Scan the workspace for source files referencing diagnostic codes.
     #[must_use]
     pub fn scan() -> Self {
+        Self::scan_roots(&[workspace_path("src"), workspace_path("tools")])
+    }
+
+    /// Scan every `.rs` file under `roots`, or refuse the whole scan.
+    fn scan_roots(roots: &[PathBuf]) -> Self {
         let mut found: BTreeSet<String> = BTreeSet::new();
-        for root in [workspace_path("src"), workspace_path("tools")] {
-            scan_tree(&root, &mut found);
-        }
+        let scanned = roots
+            .iter()
+            .try_for_each(|root| scan_tree(root, &mut found))
+            .map(|()| found);
         Self {
-            inner: Arc::new(found),
+            inner: Arc::new(scanned),
         }
     }
 
     /// Whether the wire string (e.g. `"IPE-N0028"`) was found in a source file.
-    #[must_use]
-    pub fn contains(&self, wire: &str) -> bool {
-        self.inner.contains(wire)
+    ///
+    /// # Errors
+    ///
+    /// The [`TreeRefusal`] that kept the scan from reading every source file.
+    pub fn contains(&self, wire: &str) -> Result<bool, &TreeRefusal> {
+        match self.inner.as_ref() {
+            Ok(found) => Ok(found.contains(wire)),
+            Err(refusal) => Err(refusal),
+        }
     }
 }
 
@@ -241,32 +264,20 @@ fn is_const_reexport_file(path: &Path) -> bool {
 }
 
 /// Walk `root`, collecting every recognised diagnostic code reference from `.rs` files.
-fn scan_tree(root: &Path, found: &mut BTreeSet<String>) {
-    let mut stack = vec![root.to_owned()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with('.') && name != "target" {
-                    stack.push(path);
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
-                && !is_authoring_file(&path)
-            {
-                let Ok(src) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                extract_wire_strings(&src, found);
-                if !is_const_reexport_file(&path) {
-                    extract_constant_idents(&src, found);
-                }
-            }
+///
+/// # Errors
+///
+/// A [`TreeRefusal`] when any file under `root` cannot be listed or read.
+fn scan_tree(root: &Path, found: &mut BTreeSet<String>) -> Result<(), TreeRefusal> {
+    for_each_source(root, panic_scan::Want::RustFiles, |path, src| {
+        if is_authoring_file(path) {
+            return;
         }
-    }
+        extract_wire_strings(src, found);
+        if !is_const_reexport_file(path) {
+            extract_constant_idents(src, found);
+        }
+    })
 }
 
 /// Extract every `"IPE-[A-Z][0-9]{4}"` quoted literal from a Rust source string.
@@ -376,6 +387,25 @@ mod tests {
         let mut found = BTreeSet::new();
         extract_constant_idents(src, &mut found);
         found
+    }
+
+    /// A tree the walker refuses holes every code with the cause, never "untested".
+    #[test]
+    fn an_unlisted_tree_holes_every_code_with_its_cause() {
+        let root = ipe_test_temp::temp_root().join(format!(
+            "ipe-diagnostic-scan-missing-{}",
+            std::process::id()
+        ));
+        let column = RefusalTestedColumn {
+            tested: TestedCodes::scan_roots(std::slice::from_ref(&root)),
+        };
+        let code = ALL_CODES.first().expect("the registry declares a code");
+        let cell = column.check(code);
+        assert!(
+            matches!(cell, Cell::Hole(ref why)
+                if why.contains("cannot be listed") && why.contains(&*root.to_string_lossy())),
+            "{cell:?}"
+        );
     }
 
     #[test]

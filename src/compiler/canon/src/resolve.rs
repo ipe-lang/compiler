@@ -320,6 +320,16 @@ const STDLIB_DEFINABLE_CARRIER_TYPES: &[&str] = &[
     "Locale",
 ];
 
+/// Whether `name` is a shared opaque carrier a trusted stdlib module
+/// re-declares as the same type the builtin of that name denotes.
+///
+/// Such a declaration (`Ipe.Config`'s `Decoder`) is the stdlib spelling of the
+/// builtin, so its `Ipe`-rooted head is identical to the empty-home builtin's.
+#[must_use]
+pub fn is_stdlib_shared_carrier_type(name: &str) -> bool {
+    STDLIB_DEFINABLE_CARRIER_TYPES.contains(&name)
+}
+
 /// Reject a `type` / `type alias` whose name shadows a reserved built-in type
 /// constructor. See [`is_user_type_declaration_forbidden`].
 ///

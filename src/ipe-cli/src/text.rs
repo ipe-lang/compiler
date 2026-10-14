@@ -2396,30 +2396,6 @@ mod tests {
         found
     }
 
-    /// Every `.rs` file under this crate's `src/`, skipping hidden directories
-    /// and `target/`.
-    fn rs_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_owned()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if !name.starts_with('.') && name != "target" {
-                        stack.push(path);
-                    }
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    out.push(path);
-                }
-            }
-        }
-        out
-    }
-
     /// No production code spells a user-facing message as a Rust literal.
     ///
     /// Every message sink (`CliError::Usage`, `CliError::Resolve`, and the
@@ -2430,7 +2406,8 @@ mod tests {
     #[test]
     fn no_literal_cli_error_usage_outside_the_catalog() {
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let files = rs_files_under(&src_root);
+        let files = panic_scan::rust_sources(&src_root, panic_scan::Want::RustFiles)
+            .expect("the crate's source tree is listed whole");
         assert!(!files.is_empty(), "no sources under {}", src_root.display());
         let mut offenders = Vec::new();
         for path in files {

@@ -112,16 +112,16 @@ fn kind_of_type(file_type: std::fs::FileType) -> FileKind {
 
 /// The identity a `stat` carries, the one place a Unix [`FileId`] is built.
 ///
-/// Every identity read (a handle, a path, a no-follow entry) goes through
-/// this one representation, so two reads of one object always compare
-/// equal. `dev_t` is signed on some Unixes; a negative device number names
-/// no object this crate compares, so it is refused.
+/// Every identity read (a handle, a no-follow entry of a held handle) goes
+/// through this one representation, so two reads of one object always
+/// compare equal. `dev_t` is signed on some Unixes; a negative device number
+/// names no object this crate compares, so it is refused. `st_ino` is
+/// zero-extended into the object number.
 fn id_of_stat(stat: &rustix::fs::Stat) -> Result<FileId, OpenRefusal> {
-    let widen =
-        |raw: i128| u64::try_from(raw).map_err(|_| OpenRefusal::Io(io::ErrorKind::InvalidData));
+    let invalid = |_| OpenRefusal::Io(io::ErrorKind::InvalidData);
     Ok(FileId {
-        dev: widen(i128::from(stat.st_dev))?,
-        ino: widen(i128::from(stat.st_ino))?,
+        volume: u64::try_from(i128::from(stat.st_dev)).map_err(invalid)?,
+        object: u128::try_from(i128::from(stat.st_ino)).map_err(invalid)?,
     })
 }
 
@@ -143,13 +143,6 @@ pub fn link_count(file: &File) -> Result<u64, OpenRefusal> {
     file.metadata()
         .map(|meta| meta.nlink())
         .map_err(|e| refusal_of(&e))
-}
-
-/// The identity of the object looking `path` up now reaches, following links.
-pub fn id_of_path(path: &Path) -> Result<FileId, OpenRefusal> {
-    rustix::fs::stat(path)
-        .map_err(refusal)
-        .and_then(|stat| id_of_stat(&stat))
 }
 
 /// Open the path the invoking user named, following links, without blocking.

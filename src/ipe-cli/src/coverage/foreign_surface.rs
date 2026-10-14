@@ -32,11 +32,12 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use ipe_kernels::{Capability, StdlibKernel};
 
 use crate::coverage::contract::{AspectCheck, Cell, Surface};
+use crate::coverage::source_tree::{TreeRefusal, for_each_source};
 
 /// One item of the foreign surface: a single capability axis from the closed
 /// [`Capability::ALL`] vocabulary, tagged with what boundary class it belongs to.
@@ -203,28 +204,24 @@ impl AspectCheck<ForeignItem> for BoundaryDisciplineWiredColumn {
 
     fn check(&self, item: &ForeignItem) -> Cell {
         match item.boundary_class {
-            BoundaryClass::JsPort => {
-                if self.inner.seal_gate_present {
-                    Cell::Ok
-                } else {
-                    Cell::Hole(
-                        "no `seal_boundary_check` or `seal_decode` call found in the \
-                         runtime source — the JS-port inbound gate is missing"
-                            .to_owned(),
-                    )
-                }
-            }
-            BoundaryClass::NativeFfi => {
-                if self.inner.jail_invocation_present {
-                    Cell::Ok
-                } else {
-                    Cell::Hole(
-                        "no `run_in_bwrap_jail` or `build_jail` invocation found in \
-                         the sandbox source — the native-FFI jail path is missing"
-                            .to_owned(),
-                    )
-                }
-            }
+            BoundaryClass::JsPort => match &self.inner.seal_gate_present {
+                Ok(true) => Cell::Ok,
+                Ok(false) => Cell::Hole(
+                    "no `seal_boundary_check` or `seal_decode` call found in the \
+                     runtime source — the JS-port inbound gate is missing"
+                        .to_owned(),
+                ),
+                Err(refusal) => unscanned("the JS-port inbound gate", refusal),
+            },
+            BoundaryClass::NativeFfi => match &self.inner.jail_invocation_present {
+                Ok(true) => Cell::Ok,
+                Ok(false) => Cell::Hole(
+                    "no `run_in_bwrap_jail` or `build_jail` invocation found in \
+                     the sandbox source — the native-FFI jail path is missing"
+                        .to_owned(),
+                ),
+                Err(refusal) => unscanned("the native-FFI jail path", refusal),
+            },
             BoundaryClass::OsResource => {
                 // At least one stdlib kernel must be tagged with this capability
                 // for the inference to be live code rather than dead tables.
@@ -259,10 +256,10 @@ impl AspectCheck<ForeignItem> for BoundaryDisciplineWiredColumn {
 struct BoundaryWireScan {
     /// Whether `seal_boundary_check` or `seal_decode` appears in the runtime
     /// source tree — the JS-port inbound fail-closed gate.
-    seal_gate_present: bool,
+    seal_gate_present: Marker,
     /// Whether a jail invocation (`run_in_bwrap_jail`, `exec_in_run_jail`,
     /// `build_windows_jailed`, `run_jail_macos`) appears in the sandbox source.
-    jail_invocation_present: bool,
+    jail_invocation_present: Marker,
 }
 
 impl BoundaryWireScan {
@@ -275,13 +272,18 @@ impl BoundaryWireScan {
         let runtime_src = workspace_path("src/runtime/rust/src");
         let sandbox_src = workspace_path("src/compiler/sandbox/src");
 
-        let seal_gate_present = source_contains(&runtime_src, "seal_boundary_check")
-            || source_contains(&runtime_src, "seal_decode");
+        let seal_gate_present =
+            source_contains(&runtime_src, &["seal_boundary_check", "seal_decode"]);
 
-        let jail_invocation_present = source_contains(&sandbox_src, "run_in_bwrap_jail")
-            || source_contains(&sandbox_src, "exec_in_run_jail")
-            || source_contains(&sandbox_src, "build_windows_jailed")
-            || source_contains(&sandbox_src, "run_jail_macos");
+        let jail_invocation_present = source_contains(
+            &sandbox_src,
+            &[
+                "run_in_bwrap_jail",
+                "exec_in_run_jail",
+                "build_windows_jailed",
+                "run_jail_macos",
+            ],
+        );
 
         Self {
             seal_gate_present,
@@ -305,7 +307,7 @@ impl BoundaryWireScan {
 ///   (clock/random are always available; unsafe/custom-element are declared-trust
 ///   disclosures). `NotApplicable` — not missing, by design.
 pub struct WithinGrantColumn {
-    grant_gate_present: bool,
+    grant_gate_present: Marker,
 }
 
 impl WithinGrantColumn {
@@ -331,15 +333,15 @@ impl AspectCheck<ForeignItem> for WithinGrantColumn {
     fn check(&self, item: &ForeignItem) -> Cell {
         match item.boundary_class {
             BoundaryClass::JsPort | BoundaryClass::NativeFfi | BoundaryClass::OsResource => {
-                if self.grant_gate_present {
-                    Cell::Ok
-                } else {
-                    Cell::Hole(format!(
+                match &self.grant_gate_present {
+                    Ok(true) => Cell::Ok,
+                    Ok(false) => Cell::Hole(format!(
                         "no `must_refuse` or `unenforceable` consent-gate invocation \
                          found in src/compiler/ffi — the grant path for {:?} is not \
                          wired",
                         item.capability
-                    ))
+                    )),
+                    Err(refusal) => unscanned("the consent-gate grant path", refusal),
                 }
             }
             BoundaryClass::Disclosure => Cell::not_applicable(
@@ -350,12 +352,14 @@ impl AspectCheck<ForeignItem> for WithinGrantColumn {
     }
 }
 
-fn scan_grant_gate_present() -> bool {
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        let ffi_src = workspace_path("src/compiler/ffi/src");
-        source_contains(&ffi_src, "must_refuse") || source_contains(&ffi_src, "unenforceable")
-    })
+fn scan_grant_gate_present() -> Marker {
+    static RESULT: OnceLock<Marker> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            let ffi_src = workspace_path("src/compiler/ffi/src");
+            source_contains(&ffi_src, &["must_refuse", "unenforceable"])
+        })
+        .clone()
 }
 
 // ── column: documented ────────────────────────────────────────────────────────
@@ -483,41 +487,37 @@ impl AspectCheck<ForeignItem> for RefusalTestedColumn {
 
     fn check(&self, item: &ForeignItem) -> Cell {
         match item.boundary_class {
-            BoundaryClass::JsPort => {
-                if self.inner.seal_reject_tested {
-                    Cell::Ok
-                } else {
-                    Cell::Hole(
-                        "no test drives the seal-decode REJECT path \
-                         (`SealDecodeError::` / `\"seal decode rejected\"` in a test \
-                         block) — the JS-port inbound gate is asserted wired but not \
-                         proven to reject"
-                            .to_owned(),
-                    )
-                }
-            }
-            BoundaryClass::NativeFfi => {
-                if self.inner.ffi_reject_tested {
-                    Cell::Ok
-                } else {
-                    Cell::Hole(
-                        "no test drives the native-FFI refuse path \
-                         (`must_refuse` / `UnknownCapability` assertion in a test) — \
-                         the FFI boundary gate is asserted wired but not proven to reject"
-                            .to_owned(),
-                    )
-                }
-            }
+            BoundaryClass::JsPort => match &self.inner.seal_reject_tested {
+                Ok(true) => Cell::Ok,
+                Ok(false) => Cell::Hole(
+                    "no test drives the seal-decode REJECT path \
+                     (`SealDecodeError::` / `\"seal decode rejected\"` in a test \
+                     block) — the JS-port inbound gate is asserted wired but not \
+                     proven to reject"
+                        .to_owned(),
+                ),
+                Err(refusal) => unscanned("a seal-decode refusal test", refusal),
+            },
+            BoundaryClass::NativeFfi => match &self.inner.ffi_reject_tested {
+                Ok(true) => Cell::Ok,
+                Ok(false) => Cell::Hole(
+                    "no test drives the native-FFI refuse path \
+                     (`must_refuse` / `UnknownCapability` assertion in a test) — \
+                     the FFI boundary gate is asserted wired but not proven to reject"
+                        .to_owned(),
+                ),
+                Err(refusal) => unscanned("a native-FFI refusal test", refusal),
+            },
             BoundaryClass::OsResource => {
                 let wire = item.capability.as_str();
-                if self.inner.os_resource_reject_tested(wire) {
-                    Cell::Ok
-                } else {
-                    Cell::Hole(format!(
+                match &self.inner.os_resource_reject_wires {
+                    Ok(wires) if wires.iter().any(|w| w == wire) => Cell::Ok,
+                    Ok(_) => Cell::Hole(format!(
                         "no test drives the rejection path for OS-resource capability \
                          `{wire}` — add a test that proves an un-granted or \
                          unenforceable `{wire}` capability is refused"
-                    ))
+                    )),
+                    Err(refusal) => unscanned(&format!("a `{wire}` refusal test"), refusal),
                 }
             }
             BoundaryClass::Disclosure => {
@@ -538,14 +538,14 @@ struct RefusalScan {
     /// Whether a test in the runtime tree asserts a seal-decode rejection via
     /// a typed variant (`SealDecodeError::`) OR a wire literal
     /// (`"seal decode rejected"`).
-    seal_reject_tested: bool,
+    seal_reject_tested: Marker,
     /// Whether a test in the FFI or capability trees asserts a native-FFI
     /// rejection (`must_refuse`, `UnknownCapability`, or
     /// `Err(Diagnostic::WireMalformed`).
-    ffi_reject_tested: bool,
+    ffi_reject_tested: Marker,
     /// Every OS-resource wire name found in a reject-assertion context in the
     /// capability or sandbox test trees.
-    os_resource_reject_wires: Vec<String>,
+    os_resource_reject_wires: Result<Vec<String>, Arc<TreeRefusal>>,
 }
 
 impl RefusalScan {
@@ -563,21 +563,26 @@ impl RefusalScan {
         let cli_tests = workspace_path("src/ipe-cli/tests");
 
         // JsPort: typed error variant OR wire string in a test block.
-        let seal_reject_tested = test_source_contains(&runtime_tests, "SealDecodeError::")
-            || test_source_contains(&runtime_tests, "seal decode rejected")
-            || test_source_contains(&cli_tests, "SealDecodeError::");
+        let seal_reject_tested = either(
+            test_source_contains(
+                &runtime_tests,
+                &["SealDecodeError::", "seal decode rejected"],
+            ),
+            test_source_contains(&cli_tests, &["SealDecodeError::"]),
+        );
 
         // NativeFfi: must_refuse / UnknownCapability / WireMalformed in a test.
-        let ffi_reject_tested = test_source_contains(&ffi_src, "must_refuse")
-            || test_source_contains(&ffi_src, "UnknownCapability")
-            || test_source_contains(&ffi_src, "WireMalformed")
-            || test_source_contains(&kernels_tests, "UnknownCapability")
-            || test_source_contains(&kernels_tests, "from_str_rejects");
+        let ffi_reject_tested = either(
+            test_source_contains(
+                &ffi_src,
+                &["must_refuse", "UnknownCapability", "WireMalformed"],
+            ),
+            test_source_contains(&kernels_tests, &["UnknownCapability", "from_str_rejects"]),
+        );
 
         // OsResource: collect capability wire names that appear in a reject
         // context (must_refuse / unenforceable / UnknownCapability) in the
         // test portion of the ffi or sandbox trees.
-        let mut os_resource_reject_wires = Vec::new();
         let os_resource_caps = [
             Capability::Network,
             Capability::Filesystem,
@@ -585,23 +590,23 @@ impl RefusalScan {
             Capability::Env,
             Capability::Subprocess,
         ];
-        for cap in os_resource_caps {
-            let wire = cap.as_str();
-            // A test that mentions BOTH the wire name and a reject marker
-            // proves the rejection path is exercised for that specific axis.
-            if scan_wire_in_reject_context(
-                wire,
-                &[
-                    ffi_src.as_path(),
-                    kernels_tests.as_path(),
-                    sandbox_src.as_path(),
-                    sandbox_tests.as_path(),
-                    cli_tests.as_path(),
-                ],
-            ) {
-                os_resource_reject_wires.push(wire.to_owned());
-            }
-        }
+        let reject_roots = [
+            ffi_src.as_path(),
+            kernels_tests.as_path(),
+            sandbox_src.as_path(),
+            sandbox_tests.as_path(),
+            cli_tests.as_path(),
+        ];
+        // A test that mentions BOTH the wire name and a reject marker proves the
+        // rejection path is exercised for that specific axis.
+        let os_resource_reject_wires = reject_context_texts(&reject_roots).map(|texts| {
+            os_resource_caps
+                .iter()
+                .map(|cap| cap.as_str())
+                .filter(|wire| texts.iter().any(|src| src.contains(wire)))
+                .map(str::to_owned)
+                .collect()
+        });
 
         Self {
             seal_reject_tested,
@@ -609,106 +614,74 @@ impl RefusalScan {
             os_resource_reject_wires,
         }
     }
+}
 
-    fn os_resource_reject_tested(&self, wire: &str) -> bool {
-        self.os_resource_reject_wires.iter().any(|w| w == wire)
+/// Whether a source scan found a marker, or the refusal that kept it from reading
+/// every file it was asked to read.
+type Marker = Result<bool, Arc<TreeRefusal>>;
+
+/// A hole naming why `what` cannot be confirmed: the scan could not read the
+/// tree whole, so the marker's absence proves nothing.
+fn unscanned(what: &str, refusal: &TreeRefusal) -> Cell {
+    Cell::Hole(format!("{what} cannot be confirmed: {refusal}"))
+}
+
+/// A marker found by either scan; a refusal only when neither found it.
+fn either(a: Marker, b: Marker) -> Marker {
+    match (a, b) {
+        (Ok(true), _) | (_, Ok(true)) => Ok(true),
+        (Err(refusal), _) | (_, Err(refusal)) => Err(refusal),
+        (Ok(false), Ok(false)) => Ok(false),
     }
 }
 
-/// Whether a capability wire name appears in the same test file as a reject
-/// marker (`must_refuse`, `unenforceable`, `UnknownCapability`, `WireMalformed`,
-/// `assert.*Err`, or `from_str_rejects`).
-fn scan_wire_in_reject_context(wire: &str, roots: &[&Path]) -> bool {
+/// The text of every test-context `.rs` file under `roots` that carries a
+/// reject marker (`must_refuse`, `unenforceable`, `UnknownCapability`,
+/// `WireMalformed`, `from_str_rejects`, or `from_str_hard_rejects`).
+fn reject_context_texts(roots: &[&Path]) -> Result<Vec<String>, Arc<TreeRefusal>> {
+    let mut texts = Vec::new();
     for root in roots {
-        for path in rust_test_files(root) {
-            let Ok(src) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if src.contains(wire)
-                && (src.contains("must_refuse")
-                    || src.contains("unenforceable")
-                    || src.contains("UnknownCapability")
-                    || src.contains("WireMalformed")
-                    || src.contains("from_str_rejects")
-                    || src.contains("from_str_hard_rejects"))
+        for_each_source(root, panic_scan::Want::RustFiles, |_, src| {
+            if src.contains("must_refuse")
+                || src.contains("unenforceable")
+                || src.contains("UnknownCapability")
+                || src.contains("WireMalformed")
+                || src.contains("from_str_rejects")
+                || src.contains("from_str_hard_rejects")
             {
-                return true;
+                texts.push(src.to_owned());
             }
-        }
+        })
+        .map_err(Arc::new)?;
     }
-    false
+    Ok(texts)
 }
 
-/// Whether any `.rs` file under `root` (recursively) contains `marker`.
+/// Whether any `.rs` file under `root` (recursively) contains one of `markers`.
 /// Scans ALL files — the marker may live outside a `#[test]` fn but still
 /// be part of a test module (`#[cfg(test)]`).
-fn source_contains(root: &Path, marker: &str) -> bool {
-    for path in rust_source_files(root) {
-        let Ok(src) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if src.contains(marker) {
-            return true;
-        }
-    }
-    false
+fn source_contains(root: &Path, markers: &[&str]) -> Marker {
+    any_source(root, |src| markers.iter().any(|m| src.contains(m)))
 }
 
-/// Whether any `.rs` file under `root` (recursively) contains `marker`
+/// Whether any `.rs` file under `root` (recursively) contains one of `markers`
 /// AND also contains `#[test]` or `#[cfg(test)]` — so the marker is in a
 /// test context rather than production code.
-fn test_source_contains(root: &Path, marker: &str) -> bool {
-    for path in rust_source_files(root) {
-        let Ok(src) = std::fs::read_to_string(&path) else {
-            continue;
-        };
+fn test_source_contains(root: &Path, markers: &[&str]) -> Marker {
+    any_source(root, |src| {
         let in_test_context = src.contains("#[test]") || src.contains("#[cfg(test)]");
-        if in_test_context && src.contains(marker) {
-            return true;
-        }
-    }
-    false
+        in_test_context && markers.iter().any(|m| src.contains(m))
+    })
 }
 
-/// Collect every `.rs` file under `root`, skipping hidden directories and
-/// `target`.
-fn rust_source_files(root: &Path) -> Vec<PathBuf> {
-    collect_files(root, &["rs"])
-}
-
-/// Collect every `.rs` file under `root` that is itself a test file (`tests/`
-/// directory or carries `#[test]` / `#[cfg(test)]`) — used by
-/// [`test_source_contains`], which applies its own in-test filter after reading.
-fn rust_test_files(root: &Path) -> Vec<PathBuf> {
-    collect_files(root, &["rs"])
-}
-
-fn collect_files(root: &Path, extensions: &[&str]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if !root.exists() {
-        return out;
-    }
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !name.starts_with('.') && name != "target" {
-                    stack.push(path);
-                }
-            } else {
-                let ext = path.extension().and_then(|e| e.to_str());
-                if ext.is_some_and(|e| extensions.contains(&e)) {
-                    out.push(path);
-                }
-            }
-        }
-    }
-    out
+/// Whether `hit` holds for any `.rs` file under `root`, read whole or refused.
+fn any_source(root: &Path, hit: impl Fn(&str) -> bool) -> Marker {
+    let mut found = false;
+    for_each_source(root, panic_scan::Want::RustFiles, |_, src| {
+        found = found || hit(src);
+    })
+    .map_err(Arc::new)?;
+    Ok(found)
 }
 
 /// Resolve a workspace-root-relative path from this crate's manifest directory.
@@ -746,3 +719,30 @@ pub fn foreign_columns() -> Vec<Box<dyn AspectCheck<ForeignItem>>> {
 /// documents every capability axis. Add an entry here (with a structural
 /// reason) only for a genuinely deferred gap, never to mask a real regression.
 pub const FOREIGN_ALLOWLIST: &[(&str, &str, &str)] = &[];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tree the scan cannot read whole is a refusal, never an absent marker, and
+    /// a refusal survives `either` unless the other scan found the marker.
+    #[test]
+    fn an_unlisted_tree_is_a_refusal_never_an_absent_marker() {
+        let missing = ipe_test_temp::temp_root().join(format!(
+            "ipe-foreign-surface-missing-{}",
+            std::process::id()
+        ));
+        let marker = source_contains(&missing, &["seal_decode"]);
+        assert!(marker.is_err(), "{marker:?}");
+        assert!(test_source_contains(&missing, &["must_refuse"]).is_err());
+        assert!(reject_context_texts(&[missing.as_path()]).is_err());
+        assert!(either(marker.clone(), Ok(false)).is_err());
+        assert!(matches!(either(marker.clone(), Ok(true)), Ok(true)));
+        let refusal = marker.expect_err("a missing tree is a refusal");
+        let cell = unscanned("the JS-port inbound gate", &refusal);
+        assert!(
+            matches!(&cell, Cell::Hole(msg) if msg.contains("cannot be listed whole")),
+            "{cell:?}"
+        );
+    }
+}

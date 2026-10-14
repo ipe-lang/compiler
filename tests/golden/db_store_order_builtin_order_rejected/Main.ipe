@@ -1,0 +1,23 @@
+module Main exposing (main)
+
+-- `Store.Order` (`Asc | Desc`, the join sort direction) and the builtin `Order`
+-- (`LT | EQ | GT`, the comparison result) share a name but are distinct types.
+-- Comparing a value of one with a value of the other is a TYPE MISMATCH, so
+-- this fixture MUST fail to build; the golden test asserts the rejection.
+
+
+import Ipe.Db.Store as Store
+import Ipe.Io as Io
+
+
+sameDirection : Bool
+sameDirection =
+    Store.Asc == LT
+
+
+main =
+    if sameDirection then
+        Io.println "unreachable"
+
+    else
+        Io.println "unreachable"

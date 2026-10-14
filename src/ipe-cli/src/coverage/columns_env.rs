@@ -83,7 +83,16 @@ impl AspectCheck<EnvItem> for ReadInCodeColumn {
                 "not a registered environment variable — this column judges registered vars only",
             );
         };
-        if self.reads.all_reads().contains(var.name) {
+        let reads = match self.reads.all_reads() {
+            Ok(reads) => reads,
+            Err(refusal) => {
+                return Cell::Hole(format!(
+                    "`{}` cannot be checked for a read in the source: {refusal}",
+                    var.name
+                ));
+            }
+        };
+        if reads.contains(var.name) {
             Cell::Ok
         } else {
             Cell::Hole(format!(
@@ -183,14 +192,14 @@ fn load_env_reference() -> Option<String> {
 /// subtly different inputs, but each is fail-closed. The cleanup is tracked; this
 /// column keeps it visible until one canonical parser subsumes the hand-rolls.
 pub struct TruthyParseColumn {
-    hand_rolled: bool,
+    reads: SourceReads,
 }
 
 impl TruthyParseColumn {
     #[must_use]
     pub fn new(reads: &SourceReads) -> Self {
         Self {
-            hand_rolled: reads.has_hand_rolled_truthy(),
+            reads: reads.clone(),
         }
     }
 }
@@ -212,7 +221,16 @@ impl AspectCheck<EnvItem> for TruthyParseColumn {
                  toggles only",
             );
         }
-        if self.hand_rolled {
+        let hand_rolled = match self.reads.has_hand_rolled_truthy() {
+            Ok(hand_rolled) => hand_rolled,
+            Err(refusal) => {
+                return Cell::Hole(format!(
+                    "`{}` cannot be checked for a hand-rolled truthy table: {refusal}",
+                    var.name
+                ));
+            }
+        };
+        if hand_rolled {
             Cell::Warn(format!(
                 "`{}` is a boolean-style var and the tree still hand-rolls a \
                  `matches!(v, \"1\" | \"true\" | …)` truthy table rather than \
