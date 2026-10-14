@@ -118,7 +118,7 @@ const CONFIG_FILE_CEILING: crate::system::EnvCeiling = crate::system::EnvCeiling
 );
 
 // Config.decodeYaml : String -> Decoder a -> Result Error a
-pub fn config_decode_yaml<E: From<String> + 'static, T>(
+pub fn config_decode_yaml<E: From<String> + FromLimitExceeded + 'static, T>(
     s: String,
     decoder: Decoder<E, T>,
 ) -> IpeResult<E, T> {
@@ -133,11 +133,14 @@ pub fn config_decode_yaml<E: From<String> + 'static, T>(
         Err(refusal) => return IpeResult::Err(str_err(&format!("yaml parse: {refusal}"))),
     };
     if s.len() > cap {
-        return IpeResult::Err(str_err(&format!(
-            "yaml parse: input is {} bytes, over the {} byte cap (IPE_YAML_MAX_BYTES)",
-            s.len(),
-            cap
-        )));
+        return IpeResult::Err(
+            LimitRefusal::new(format!(
+                "yaml parse: input is {} bytes, over the {} byte cap (IPE_YAML_MAX_BYTES)",
+                s.len(),
+                cap
+            ))
+            .into_error(),
+        );
     }
     run_decoder(
         serde_yaml::from_str(&s).map_err(|e| format!("yaml parse: {}", e)),
@@ -155,10 +158,10 @@ pub fn config_decode_yaml<E: From<String> + 'static, T>(
 // "serde_yaml"]`, runtime/Cargo.toml), which does NOT pull in `tokio`, so
 // `tokio` is not guaranteed present here (see
 // `docs/adr/0003-security-render-and-data-access-invariants.md` §2.2).
-// The offload is `threads::run_blocking`: a pool that cannot start a thread is
+// The offload is `threads::join_blocking`: a pool that cannot start a thread is
 // an `Unavailable` error, and a build without the pool reads inline.
 
-fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
+fn config_read_capped(path: &str, cap: u64) -> Result<String, KernelFailure> {
     // Open first, then enforce the cap THROUGH a capped reader rather than
     // trusting a metadata-only precheck: std::fs::metadata reports len()==0
     // for non-regular files (FIFO, /dev/zero, char devices), so a metadata
@@ -168,15 +171,16 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}", e))?;
     let meta = file.metadata().map_err(|e| format!("{}", e))?;
     if !meta.file_type().is_file() {
-        return Err(format!("config file {:?} is not a regular file", path));
+        return Err(format!("config file {:?} is not a regular file", path).into());
     }
     if meta.len() > cap {
-        return Err(format!(
+        return Err(LimitRefusal::new(format!(
             "config file {:?} is {} bytes, over the {} byte cap (IPE_CONFIG_MAX_BYTES)",
             path,
             meta.len(),
             cap
-        ));
+        ))
+        .into());
     }
     let mut contents = String::new();
     // take(cap+1): if the file grew between the metadata check and the read,
@@ -185,10 +189,11 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
         .read_to_string(&mut contents)
         .map_err(|e| format!("{}", e))?;
     if contents.len() as u64 > cap {
-        return Err(format!(
+        return Err(LimitRefusal::new(format!(
             "config file {:?} exceeds the {} byte cap (IPE_CONFIG_MAX_BYTES)",
             path, cap
-        ));
+        ))
+        .into());
     }
     Ok(contents)
 }
@@ -196,13 +201,13 @@ fn config_read_capped(path: &str, cap: u64) -> Result<String, String> {
 // Config.loadFromFile : String -> Decoder a -> Task Error a
 // Extension dispatch: .toml / .yaml|.yml / .json (default json).
 //
-// the file read is offloaded via `threads::run_blocking` (see the module-level
+// the file read is offloaded via `threads::join_blocking` (see the module-level
 // comment above) so a large/slow config read can't stall the tokio
 // worker thread. The decode dispatch itself runs back on the calling task
 // after the read completes — decoding an already-in-memory, size-capped
 // (≤16 MiB default) string is fast enough not to warrant its own offload.
 pub fn config_load_from_file<
-    E: From<String> + crate::FromUnavailable + Send + 'static,
+    E: From<String> + FromLimitExceeded + crate::FromUnavailable + Send + 'static,
     T: Send + 'static,
 >(
     path: crate::path::Path,
@@ -220,18 +225,17 @@ pub fn config_load_from_file<
             Ok(cap) => cap,
             Err(refusal) => return IpeResult::Err(str_err(&refusal.to_string())),
         };
-        let contents = match crate::threads::run_blocking::<_, E, _>(
-            "Config.loadFromFile",
-            "background config-file task panicked",
-            {
-                let path = path.clone();
-                move || config_read_capped(&path, cap)
-            },
-        )
+        let contents = match crate::threads::join_blocking("Config.loadFromFile", {
+            let path = path.clone();
+            move || config_read_capped(&path, cap)
+        })
         .await
         {
-            Ok(c) => c,
-            Err(e) => return IpeResult::Err(e),
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return IpeResult::Err(e.into_error()),
+            Err(failure) => {
+                return IpeResult::Err(failure.into_error("background config-file task panicked"));
+            }
         };
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".toml") {
@@ -265,6 +269,10 @@ mod load_from_file_tests {
 
     fn name_decoder() -> Decoder<String, String> {
         decode_field("name".to_string(), json_decode_string::<String>())
+    }
+
+    fn kinded_name_decoder() -> Decoder<crate::IpeError, String> {
+        decode_field("name".to_string(), json_decode_string::<crate::IpeError>())
     }
 
     /// Seal a test fixture path through the runtime's one constructor.
@@ -319,15 +327,35 @@ mod load_from_file_tests {
             .join(format!("ipe_cfg_over_cap_{}.json", std::process::id()));
         std::fs::write(&p, vec![b'a'; 8192]).unwrap();
         crate::system::locked_set_var("IPE_CONFIG_MAX_BYTES", "1024");
-        let res: IpeResult<String, String> = block(config_load_from_file(
+        let res: IpeResult<crate::IpeError, String> = block(config_load_from_file(
             make_path(&p.to_string_lossy()),
-            name_decoder(),
+            kinded_name_decoder(),
         ));
         crate::system::locked_remove_var("IPE_CONFIG_MAX_BYTES");
         let _ = std::fs::remove_file(&p);
         assert!(
-            matches!(res, IpeResult::Err(_)),
-            "8 KiB config file under a 1 KiB cap must Err"
+            matches!(&res, IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::LimitExceeded, info))
+                if info.message.ends_with("is 8192 bytes, over the 1024 byte cap (IPE_CONFIG_MAX_BYTES)")),
+            "8 KiB config file under a 1 KiB cap must be a LimitExceeded refusal: {res:?}"
+        );
+    }
+
+    /// A YAML source one byte over `IPE_YAML_MAX_BYTES` is a `LimitExceeded`
+    /// refusal; a source at the cap parses.
+    #[test]
+    fn yaml_source_past_the_cap_is_limit_exceeded() {
+        crate::system::locked_set_var("IPE_YAML_MAX_BYTES", "13");
+        let at_cap: IpeResult<crate::IpeError, String> =
+            config_decode_yaml("name: abcdefg".to_string(), kinded_name_decoder());
+        let past: IpeResult<crate::IpeError, String> =
+            config_decode_yaml("name: abcdefgh".to_string(), kinded_name_decoder());
+        crate::system::locked_remove_var("IPE_YAML_MAX_BYTES");
+        assert_eq!(at_cap, IpeResult::Ok("abcdefg".to_string()));
+        assert_eq!(
+            past,
+            IpeResult::Err(crate::IpeError::limit_exceeded(
+                "yaml parse: input is 14 bytes, over the 13 byte cap (IPE_YAML_MAX_BYTES)"
+            ))
         );
     }
 

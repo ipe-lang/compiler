@@ -590,6 +590,9 @@ jobs:
       # The development build intent — its posture tests compile only under
       # `dev-posture`, which no other combo turns on.
       - run: cargo clippy -p ipe-runtime-rust --all-targets --features dev-posture -- -D warnings
+      # The development intent over every gated module: dev-view renderers
+      # (`Debug.log`) live inside the module each type belongs to.
+      - run: cargo clippy -p ipe-runtime-rust --all-targets --features full,dev-posture -- -D warnings
       # Every runtime feature at once — lints that fire only when all gated
       # modules compile together (an item order, a cfg-gated dead fn).
       - run: cargo clippy -p ipe-runtime-rust --features full --all-targets -- -D warnings
@@ -837,7 +840,10 @@ jobs:
   # inside the CLI's own job, and a transfer that cannot be contained is refused
   # with its child killed and reaped. Those refusals and the job teardown of a
   # lingering grandchild exist only on Windows, so this job runs the
-  # `remote_ingest` tests of `ipe` there.
+  # `remote_ingest` tests of `ipe` there. The build directory handed to a
+  # Windows linker and the classification of a link step that cannot open an
+  # input are host-dependent too, so their `target_dir` and
+  # `driver_error::link_failure` tests run here as well.
   windows-test:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -850,9 +856,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
-      - name: Test the transfer containment on Windows
+      - name: Test the transfer containment and linkable build directory on Windows
         shell: bash
-        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::)'
+        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::) | test(target_dir::) | test(driver_error::link_failure)'
 
   # Required aggregation gate for `test`: green only when every shard, the
   # doctest job (in test-prep), the feature job `wasi-run` and the Windows job

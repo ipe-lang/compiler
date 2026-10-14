@@ -1,11 +1,11 @@
 use super::{
-    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, attribute_canon_errors,
-    attribute_post_link_error, build_loose_file_into, build_project_into, build_source_graph,
-    build_test_into, capabilities_including_served_widgets, classify_entry_shape,
-    create_source_root, default_entry, discover_manifest, emit_machine_error, emitted_bin_filename,
-    frame_infer_error, home_to_source_map, program_constructs_a_widget, resolve_runtime,
-    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, source_graph_for_target,
-    typecheck_target,
+    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
+    attribute_canon_errors, attribute_post_link_error, build_loose_file_into, build_project_into,
+    build_source_graph, build_test_into, capabilities_including_served_widgets,
+    classify_entry_shape, create_source_root, default_entry, discover_manifest, emit_machine_error,
+    emitted_bin_filename, frame_infer_error, home_to_source_map, lowering_check_query,
+    program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir, run_build,
+    runtime_context_for_message, source_graph_for_target, typecheck_target,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
 use crate::contained_path::ResolvedPath;
@@ -417,23 +417,28 @@ impl<'a> BundleAssembler<'a> {
         // A `release web desktop` bundle carries an optimised binary and its
         // consented floor; the `build` dev bundle carries a plain debug one and
         // the development marker.
+        let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+            cargo_bin.path(),
+            crate_dir.path(),
+            None,
+        )?;
         FlooredBuild {
             cargo: &cargo_bin,
             crate_dir: &crate_dir,
             finish,
             target: CargoTarget::Host,
+            target_dir: &target_dir,
             output: CargoOutput::Human(Verbosity::Progress),
             what: "the desktop app",
             runtime: None,
         }
         .run()?;
 
-        // Locate the compiled binary via cargo metadata (the target dir may be
-        // a global CARGO_TARGET_DIR), then materialise (Linux) or describe
-        // (macOS/Windows).
-        let target_dir = crate::cargo_step::target_directory(&cargo_bin, crate_dir.path())?;
+        // Read the compiled binary back from the build directory the build was
+        // handed, then materialise (Linux) or describe (macOS/Windows).
         let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = target_dir
+            .path()
             .join(self.profile.target_subdir())
             .join(&bin_name);
         if !binary.is_file() {
@@ -1052,35 +1057,55 @@ fn audit_version(
     index_root: Option<&Path>,
     blessing: Result<&BlessedPublisher, &crate::publisher::BlessingRefusal>,
 ) -> Result<(), CliError> {
-    let checkout_str = checkout.to_string_lossy().into_owned();
-    // Pass the submitted entry's claimed publisher (named in a reject) and the
-    // attestation-backed blessing: the reserved-namespace ownership check
-    // exempts only a proven blessed publisher and rejects any other whose
-    // source tree provides a reserved-namespace (`Ipe.*`) module — the
-    // admission-time squat-proofing of the trusted namespace.
-    let mut audit_args: Vec<String> = vec![
-        checkout_str,
-        "--publisher".to_owned(),
-        submitted.publisher.as_str().to_owned(),
-    ];
-    if let Some(ir) = index_root {
-        audit_args.push("--index".to_owned());
-        audit_args.push(ir.to_string_lossy().into_owned());
+    // Audit the checkout path itself, never an argv round-trip of it: a lossy
+    // string of a non-UTF-8 path names another directory. The submitted entry's
+    // claimed publisher is named in a reject, and the attestation-backed
+    // blessing exempts only a proven blessed publisher from the
+    // reserved-namespace ownership check — the admission-time squat-proofing of
+    // the trusted namespace.
+    let options = audit::AuditOptions::for_admission(
+        submitted.publisher.clone(),
+        index_root.map(Path::to_path_buf),
+    );
+    // Typed errors propagate directly: the audit's `CliError` names the failing
+    // check, and the chatter below names the version.
+    audit::capture_package(checkout)
+        .and_then(|snapshot| audit::run_audit_over(snapshot, &options, blessing))
+        .and_then(|audited| admit_against_audit(version, submitted.name.as_str(), &audited))
+        .inspect_err(|_| {
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &format!(
+                    "audit-entry: `{}` version {} rejected",
+                    submitted.name, version.version
+                ),
+            );
+        })
+}
+
+/// Admit a submitted entry `version` only when it records what the audit of its source certified.
+///
+/// The entry's `sha256` must be the digest of the tree the audit judged, and
+/// its `capabilities` the set the audit inferred: the index records the
+/// audit's own output, never a submitted claim beside it.
+///
+/// # Errors
+/// [`CliError::HashMismatch`] when the recorded digest is not the audited one;
+/// [`CliError::PackageAudit`] when the recorded capabilities are not the audited set.
+pub fn admit_against_audit(
+    version: &index::EntryVersion,
+    package: &str,
+    audited: &audit::AuditedPackage,
+) -> Result<(), CliError> {
+    if version.sha256 != *audited.digest() {
+        return Err(CliError::HashMismatch {
+            package: package.to_owned(),
+            expected: version.sha256.as_str().to_owned(),
+            actual: audited.digest().as_str().to_owned(),
+        });
     }
-    // Propagate typed errors directly — run_audit already produces a
-    // descriptive typed CliError (PackageAudit / HashMismatch / etc.) whose
-    // Display names the failing check; the version context is clear from
-    // the eprintln below and the structured error kind.
-    audit::run_audit_as(&audit_args, blessing).inspect_err(|_| {
-        crate::screen::chatter(
-            crate::screen::Stream::Stderr,
-            crate::screen::Tone::UserError,
-            &format!(
-                "audit-entry: `{}` version {} rejected",
-                submitted.name, version.version
-            ),
-        );
-    })
+    audited.refuse_other_capabilities(&version.capabilities)
 }
 
 /// The parsed `ipe package audit-entry` invocation.
@@ -1601,22 +1626,26 @@ pub fn build_and_run_test_entry(
     };
 
     // Compile the emitted Rust project.
+    let target_dir =
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), crate_dir.path(), None)?;
     FlooredBuild {
         cargo: cargo_bin,
         crate_dir: &crate_dir,
         finish: NativeFinish::Dev,
         target: CargoTarget::Host,
+        target_dir: &target_dir,
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
         runtime: runtime_context_for_message(),
     }
     .run()?;
 
-    // Locate the compiled binary via `cargo metadata` so a user-level
-    // `CARGO_TARGET_DIR` pin or workspace override is respected. The binary
-    // name matches the emitted crate's package name (read from `Cargo.toml`).
+    // Read the compiled binary back from the build directory the build was
+    // handed, so a `CARGO_TARGET_DIR` or `[build] target-dir` pin is the one
+    // the build used. The binary name matches the emitted crate's package name
+    // (read from `Cargo.toml`).
     let test_bin_name = emitted_bin_filename(out_dir)?;
-    let mut bin = crate::cargo_step::target_directory(cargo_bin, out_dir)?;
+    let mut bin = target_dir.path().to_path_buf();
     bin.push("debug");
     bin.push(&test_bin_name);
 
@@ -2591,52 +2620,118 @@ pub fn infer_package_capabilities(
     infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &package)
 }
 
-/// Every source a package's capability inference sees, plus its entry modules.
+/// Every source a package's build and capability inference see, plus its entry modules.
 ///
 /// Sources are the package's own modules plus the compiled-source stdlib closure
-/// and FFI interface modules the build injects.
+/// and FFI interface modules the build injects; the FFI emission inputs (the
+/// `src/ffi.rs` bindings text among them) are computed in the same step. The
+/// build ([`super::build_from_sources`]) and capability inference
+/// ([`infer_package_capabilities_in`]) consume one value of this type, so the
+/// bytes a capability verdict judges are the bytes that are emitted.
 #[derive(Clone, Debug)]
 pub struct PackageSourceSet {
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
     entries: Vec<project::DiscoveredModule>,
     injected: std::collections::BTreeSet<Vec<String>>,
     ffi_injected: std::collections::BTreeSet<Vec<String>>,
+    ffi_emit: Option<ipe_backend_rust::FfiEmit>,
 }
 
+/// The parts of a [`PackageSourceSet`] the compile core consumes.
+pub struct SourceSetParts {
+    /// Every module source, injected ones included.
+    pub sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+    /// The compiled-source stdlib module paths the driver injected.
+    pub injected: std::collections::BTreeSet<Vec<String>>,
+    /// The FFI interface module paths the driver injected.
+    pub ffi_injected: std::collections::BTreeSet<Vec<String>>,
+    /// The FFI emission inputs, when any crate is installed.
+    pub ffi_emit: Option<ipe_backend_rust::FfiEmit>,
+}
+
+/// A module-source map with the modules discovered for it.
+pub type ReadModules = (
+    BTreeMap<Vec<String>, (PathBuf, String)>,
+    Vec<project::DiscoveredModule>,
+);
+
 impl PackageSourceSet {
-    /// Read the package rooted at `manifest_path`: every discovered module's
-    /// source (read once, bounded), then the same compiled-source stdlib closure
-    /// and FFI interface injection the build performs.
+    /// Read the package rooted at `manifest_path` from disk, one bounded read per module.
+    ///
+    /// The working-tree reader for a single-shot command; a gate judges a
+    /// [`project::PackageSnapshot`] through [`PackageSourceSet::from_snapshot`].
     ///
     /// # Errors
     /// [`CliError::Io`] / manifest errors when the package cannot be read.
     pub fn read(manifest_path: &Path) -> Result<Self, CliError> {
         let manifest = project::parse_manifest(manifest_path)?;
-        let mut entries = project::discover_modules(&manifest.src_root)?;
+        let (sources, entries) = read_package_modules(&manifest)?;
+        Self::assemble(sources, entries, manifest_path)
+    }
 
-        let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-        for m in &entries {
-            let src = crate::io_bounded::read_walked_source(m.path())?;
-            sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
-        }
+    /// The source set of a captured package: its modules as the snapshot holds them, never re-read.
+    ///
+    /// # Errors
+    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    pub fn from_snapshot(snapshot: &project::PackageSnapshot) -> Result<Self, CliError> {
+        Self::assemble(
+            snapshot.sources().clone(),
+            snapshot.modules().to_vec(),
+            &snapshot_manifest_path(snapshot),
+        )
+    }
 
-        // Inject the compiled-source stdlib closure (e.g. `Ipe.Css`) just like
-        // the real build path, so a module that imports a compiled-source stdlib
-        // module lowers standalone here instead of failing name resolution
-        // (which, since a failing entry surfaces its real diagnostic, would
-        // otherwise abort build).
+    /// Inject the compiled-source stdlib closure and the FFI interface modules into `sources`.
+    ///
+    /// `blame_path` is the project manifest or entry file the FFI catalog
+    /// search walks up from.
+    ///
+    /// # Errors
+    /// The FFI catalog errors of [`ffi::prepare_ffi`].
+    pub fn assemble(
+        mut sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+        mut entries: Vec<project::DiscoveredModule>,
+        blame_path: &Path,
+    ) -> Result<Self, CliError> {
+        // `injected` is the driver's unforgeable record of which module paths
+        // are trusted stdlib source, the only inputs that earn
+        // `ModuleOrigin::EmbeddedStdlib`.
         let injected = project::inject_compiled_std_closure(&mut sources, &mut entries);
-        // Inject the FFI interface modules (installed crates + the asserted-call
-        // `Rust.Ffi` module) exactly as the build does, so an FFI-using module
-        // lowers here and its `native-ffi`/`ffi-raw` capabilities are inferred
-        // instead of the package being refused on a resolve failure.
-        let ffi_injected = ffi::prepare_ffi(&mut sources, manifest_path)?.injected;
+        // The catalog-load, nominal-unification, interface-inject and
+        // emit-assemble sequence `watch` and `lsp` share.
+        let ffi = ffi::prepare_ffi(&mut sources, blame_path)?;
         Ok(Self {
             sources,
             entries,
             injected,
-            ffi_injected,
+            ffi_injected: ffi.injected,
+            ffi_emit: ffi.emit,
         })
+    }
+
+    /// The `src/ffi.rs` text the build writes, when the package binds any crate.
+    #[must_use]
+    pub fn bindings_source(&self) -> Option<&str> {
+        self.ffi_emit
+            .as_ref()
+            .map(|emit| emit.bindings_source.as_str())
+    }
+
+    /// Whether `module_path` is one of the module sources.
+    #[must_use]
+    pub fn has_module(&self, module_path: &[String]) -> bool {
+        self.sources.contains_key(module_path)
+    }
+
+    /// The parts the compile core consumes.
+    #[must_use]
+    pub fn into_parts(self) -> SourceSetParts {
+        SourceSetParts {
+            sources: self.sources,
+            injected: self.injected,
+            ffi_injected: self.ffi_injected,
+            ffi_emit: self.ffi_emit,
+        }
     }
 
     /// The module path of every module lowered as an inference entry.
@@ -2667,8 +2762,32 @@ impl PackageSourceSet {
                 .collect(),
             injected: self.injected.clone(),
             ffi_injected: self.ffi_injected.clone(),
+            ffi_emit: self.ffi_emit.clone(),
         }
     }
+}
+
+/// The `package.ipe` path of a captured package, the FFI catalog search's start.
+#[must_use]
+pub fn snapshot_manifest_path(snapshot: &project::PackageSnapshot) -> PathBuf {
+    snapshot
+        .manifest()
+        .root
+        .join(crate::package_manifest::PACKAGE_IPE)
+}
+
+/// Read every module under `manifest`'s source root, one bounded read each.
+///
+/// # Errors
+/// [`CliError::Io`] when the source root cannot be walked or a module read.
+pub fn read_package_modules(manifest: &project::ProjectManifest) -> Result<ReadModules, CliError> {
+    let entries = project::discover_modules(&manifest.src_root)?;
+    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
+    for m in &entries {
+        let src = crate::io_bounded::read_walked_source(m.path())?;
+        sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
+    }
+    Ok((sources, entries))
 }
 
 /// [`infer_package_capabilities`] over one caller-supplied database.
@@ -2959,27 +3078,114 @@ fn attribute_entry_lowering_error(
 // `fix` / `--fix` — apply machine-applicable suggestions
 // ===========================================================================
 
-/// Run the front of the pipeline (parse → canon → types → lower) and return the
-/// first diagnostic it raises, or `None` when the program compiles cleanly.
-pub fn pipeline_first_diagnostic(source: &str) -> Option<Diagnostic> {
-    let mut interner = Interner::new();
-    let module = match ipe_parse::parse_module(source, &mut interner) {
-        Ok(m) => m,
-        Err(d) => return Some(d),
+/// What one build-identical check of the fix target raised.
+#[derive(Debug)]
+pub enum FixCheck {
+    /// The program compiles cleanly.
+    Clean,
+    /// The first diagnostic is owned by the fix target itself.
+    InEntry {
+        /// The source the diagnostic was framed against.
+        src: String,
+        /// The diagnostic.
+        diag: Box<Diagnostic>,
+    },
+    /// The first diagnostic is owned by another module of the build.
+    Elsewhere {
+        /// The file that owns the diagnostic.
+        file: PathBuf,
+        /// The diagnostic.
+        diag: Box<Diagnostic>,
+    },
+}
+
+/// Run [`lowering_check_query`] over `graph` and say which file owns its first diagnostic.
+///
+/// `entry_real` is the canonical path of the fix target; a diagnostic is the
+/// target's own only when its attributed file canonicalises to it.
+///
+/// # Errors
+/// Any refusal that is not a compiler diagnostic, unchanged.
+fn run_fix_check(
+    graph: &SourceGraph,
+    blame_path: &Path,
+    entry_real: &Path,
+) -> Result<FixCheck, CliError> {
+    match graph.run_attributed(blame_path, lowering_check_query) {
+        Ok(()) => Ok(FixCheck::Clean),
+        Err(CliError::Pipeline { file, src, diag }) => {
+            let owned_by_entry = fs::canonicalize(&file).is_ok_and(|real| real == entry_real);
+            Ok(if owned_by_entry {
+                FixCheck::InEntry { src, diag }
+            } else {
+                FixCheck::Elsewhere { file, diag }
+            })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Whether a patched program may replace the file it was diagnosed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchVerdict {
+    /// The answered diagnostic is gone and nothing new precedes the edit.
+    Accept,
+    /// The patched program still raises the answered diagnostic.
+    StillRaised,
+    /// The patched program no longer parses.
+    NoLongerParses,
+    /// The patched program raises a name-resolution error at or before the edit.
+    NewResolutionError,
+}
+
+/// Judge the re-check of a patched program against the diagnostic the patch answered.
+///
+/// `edited_end` is the end, in patched coordinates, of the last edit. A
+/// diagnostic is the answered one when its code and span origin match. A
+/// resolution error owned by another module is never provably unrelated to
+/// the edit, so it refuses wherever it sits.
+#[must_use]
+pub fn judge_patch(answered: &Diagnostic, edited_end: u32, after: &FixCheck) -> PatchVerdict {
+    let (diag, in_entry) = match after {
+        FixCheck::Clean => return PatchVerdict::Accept,
+        FixCheck::InEntry { diag, .. } => (diag, true),
+        FixCheck::Elsewhere { diag, .. } => (diag, false),
     };
-    let canonical = match ipe_canon::canonicalise(&module, &mut interner) {
-        Ok(c) => c,
-        Err(d) => return Some(d),
-    };
-    let types = match ipe_types::infer(&canonical, &mut interner) {
-        Ok(t) => t,
-        Err(d) => return Some(d),
-    };
-    // `--fix` diagnostic probe: single source, home is irrelevant — take just
-    // the diagnostic. Source info not available here; location falls back.
-    ipe_lower::lower(&canonical, &types, &mut interner, "", "")
-        .err()
-        .map(|(diag, _home)| diag)
+    let family = diag.code().family();
+    if matches!(family, ipe_diagnostics::Family::Parse) {
+        return PatchVerdict::NoLongerParses;
+    }
+    if in_entry
+        && diag.code() == answered.code()
+        && diag.primary_span().lo == answered.primary_span().lo
+    {
+        return PatchVerdict::StillRaised;
+    }
+    let at_or_before_edit = !in_entry || diag.primary_span().lo <= edited_end;
+    if matches!(family, ipe_diagnostics::Family::Name) && at_or_before_edit {
+        return PatchVerdict::NewResolutionError;
+    }
+    PatchVerdict::Accept
+}
+
+/// The end, in the patched text, of the right-most of the non-overlapping `edits`.
+///
+/// An offset past `u32::MAX` saturates, so a judgement against it errs toward refusal.
+#[must_use]
+pub fn patched_edit_end(edits: &[Suggestion]) -> u32 {
+    let mut ascending: Vec<&Suggestion> = edits.iter().collect();
+    ascending.sort_by_key(|s| s.span.lo);
+    let mut shift: i64 = 0;
+    let mut end: i64 = 0;
+    for s in ascending {
+        let replaced = i64::from(s.span.hi).saturating_sub(i64::from(s.span.lo));
+        let inserted = i64::try_from(s.replacement.len()).unwrap_or(i64::MAX);
+        end = i64::from(s.span.lo)
+            .saturating_add(shift)
+            .saturating_add(inserted);
+        shift = shift.saturating_add(inserted.saturating_sub(replaced));
+    }
+    u32::try_from(end).unwrap_or(u32::MAX)
 }
 
 /// Collect every [`Applicability::MachineApplicable`] suggestion a diagnostic
@@ -3064,29 +3270,42 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// The fix command/flow: read `entry`, run the pipeline, and apply the
-/// machine-applicable suggestions of the first diagnostic.
+/// The fix command/flow: diagnose `entry` with the build's own resolution and
+/// apply the machine-applicable suggestions of its first diagnostic.
+///
+/// The named file is analysed as `ipe type-check` analyses it: under the
+/// governing manifest's `src`/`tests` roots, or as the loose closure a build of
+/// the file alone compiles — never by a reduced single-module resolution, so a
+/// name the build binds through an import is never "corrected". A directory
+/// names its manifest's entry, the file a build of that directory compiles
+/// from. A diagnostic another module owns is reported, never patched.
 ///
 /// `auto` (set by `--yes` / `--fix`) is durable authorization to apply every
 /// edit without prompting; otherwise each edit is confirmed interactively on
 /// stdin. The patch is never silent: every applied or skipped edit is reported
-/// on `w`. The patched text is re-parsed before it replaces the file, and a
-/// result that no longer parses is rejected (the file is left untouched).
+/// on `w`. The patched text is re-checked by the same resolution before it
+/// replaces the file ([`judge_patch`]), and the file is replaced only while it
+/// still holds the bytes that were diagnosed.
 ///
 /// Writes go through a temp file + atomic rename.
 ///
 /// # Errors
-/// Returns [`CliError::Io`] on a filesystem failure.
+/// The refusal of a project context that cannot be built (an unreadable or
+/// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
+/// filesystem failure.
 pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let source = crate::io_bounded::read_user_named(entry, crate::io_bounded::SOURCE_CAP)?;
-
-    let Some(diag) = pipeline_first_diagnostic(&source) else {
-        writeln!(
-            w,
-            "fix: nothing to do — {} compiles cleanly",
-            entry.display()
-        )
-        .map_err(|e| io_err(entry, e))?;
+    let target = resolve_analysis_target(entry)?;
+    let (mut graph, blame_path) = source_graph_for_target(&target)?;
+    // A directory names its manifest's entry: every report names that file.
+    let entry = if entry.is_dir() {
+        blame_path.as_path()
+    } else {
+        entry
+    };
+    let entry_real = fs::canonicalize(&blame_path).map_err(|e| io_err(&blame_path, e))?;
+    let source = graph.entry_file.text(&graph.db).clone();
+    let first = run_fix_check(&graph, &blame_path, &entry_real)?;
+    let Some(diag) = answerable_diagnostic(first, &source, entry, w)? else {
         return Ok(());
     };
 
@@ -3102,13 +3321,103 @@ pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<
         .map_err(|e| io_err(entry, e))?;
         return Ok(());
     }
+    let chosen = choose_edits(&source, &selected, entry, auto, w)?;
+    if chosen.is_empty() {
+        writeln!(w, "fix: no edits applied").map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    }
 
+    let Some(patched) = apply_fixes(&source, &chosen) else {
+        writeln!(
+            w,
+            "fix: internal span mismatch — file left unchanged (please report)"
+        )
+        .map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    };
+
+    // Re-parse guard: refuse to keep a patch whose result no longer parses.
+    let mut guard_interner = Interner::new();
+    if ipe_parse::parse_module(&patched, &mut guard_interner).is_err() {
+        writeln!(w, "{PATCH_NO_LONGER_PARSES}").map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    }
+
+    // Second gate: the patched text, re-checked in memory by the same
+    // resolution over the same universe, must have answered its diagnostic.
+    ipe_db::set_text_if_changed(&mut graph.db, graph.entry_file, &patched);
+    let after = run_fix_check(&graph, &blame_path, &entry_real)?;
+    if let Some(refusal) = patch_refusal(&diag, &chosen, &after) {
+        writeln!(w, "{refusal}").map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    }
+
+    let IfUnchanged::Written(backup) =
+        rewrite_user_file_if_unchanged(&entry_real, &source, &patched, RewriteKind::Lossy)?
+    else {
+        writeln!(
+            w,
+            "fix: {} changed while it was being fixed — file left unchanged",
+            entry.display()
+        )
+        .map_err(|e| io_err(entry, e))?;
+        return Ok(());
+    };
+    writeln!(
+        w,
+        "fix: applied {} edit(s) to {}",
+        chosen.len(),
+        entry.display()
+    )
+    .map_err(|e| io_err(entry, e))?;
+    if let Some(backup) = backup {
+        writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
+    }
+    Ok(())
+}
+
+/// The diagnostic `ipe fix` may answer from `check`, or `None` once it has said why there is none.
+///
+/// Only a diagnostic the fix target owns, framed against exactly the `source`
+/// that was diagnosed, is answerable.
+fn answerable_diagnostic<W: Write>(
+    check: FixCheck,
+    source: &str,
+    entry: &Path,
+    w: &mut W,
+) -> Result<Option<Box<Diagnostic>>, CliError> {
+    let refusal = match check {
+        FixCheck::InEntry { src, diag } if src == source => return Ok(Some(diag)),
+        FixCheck::Clean => format!("fix: nothing to do — {} compiles cleanly", entry.display()),
+        FixCheck::InEntry { .. } => format!(
+            "fix: the diagnosed source is not {} — file left unchanged (please report)",
+            entry.display()
+        ),
+        FixCheck::Elsewhere { file, diag } => format!(
+            "fix: the first diagnostic [{}] is in {}, not {} — no edits applied",
+            diag.code().as_str(),
+            file.display(),
+            entry.display()
+        ),
+    };
+    writeln!(w, "{refusal}").map_err(|e| io_err(entry, e))?;
+    Ok(None)
+}
+
+/// The `selected` edits to apply: all of them under `auto`, else each one the user confirms.
+fn choose_edits<W: Write>(
+    source: &str,
+    selected: &[Suggestion],
+    entry: &Path,
+    auto: bool,
+    w: &mut W,
+) -> Result<Vec<Suggestion>, CliError> {
     let mut chosen: Vec<Suggestion> = Vec::new();
-    for s in &selected {
+    for s in selected {
         let lo = usize::try_from(s.span.lo).unwrap_or(usize::MAX);
         let hi = usize::try_from(s.span.hi).unwrap_or(usize::MAX);
         let original = source.get(lo..hi).unwrap_or("");
-        let (line, col) = line_col(&source, lo);
+        let (line, col) = line_col(source, lo);
         if auto {
             writeln!(
                 w,
@@ -3132,44 +3441,35 @@ pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<
             }
         }
     }
+    Ok(chosen)
+}
 
-    if chosen.is_empty() {
-        writeln!(w, "fix: no edits applied").map_err(|e| io_err(entry, e))?;
-        return Ok(());
+/// Why the re-check `after` of a patch made of `chosen` refuses it, or `None` when it may land.
+fn patch_refusal(answered: &Diagnostic, chosen: &[Suggestion], after: &FixCheck) -> Option<String> {
+    match judge_patch(answered, patched_edit_end(chosen), after) {
+        PatchVerdict::Accept => None,
+        PatchVerdict::NoLongerParses => Some(PATCH_NO_LONGER_PARSES.to_owned()),
+        PatchVerdict::StillRaised => Some(format!(
+            "fix: the edit leaves [{}] unresolved — file left unchanged",
+            answered.code().as_str()
+        )),
+        PatchVerdict::NewResolutionError => Some(format!(
+            "fix: the edit raises a new resolution error [{}] — file left unchanged",
+            first_code(after)
+        )),
     }
+}
 
-    let Some(patched) = apply_fixes(&source, &chosen) else {
-        writeln!(
-            w,
-            "fix: internal span mismatch — file left unchanged (please report)"
-        )
-        .map_err(|e| io_err(entry, e))?;
-        return Ok(());
-    };
+/// The refusal reported for a patch whose result no longer parses.
+const PATCH_NO_LONGER_PARSES: &str =
+    "fix: patched source no longer parses — rolled back, file left unchanged";
 
-    // Re-parse guard: refuse to keep a patch whose result no longer parses.
-    let mut guard_interner = Interner::new();
-    if ipe_parse::parse_module(&patched, &mut guard_interner).is_err() {
-        writeln!(
-            w,
-            "fix: patched source no longer parses — rolled back, file left unchanged"
-        )
-        .map_err(|e| io_err(entry, e))?;
-        return Ok(());
+/// The wire code of a check's first diagnostic, or the empty string when it raised none.
+fn first_code(check: &FixCheck) -> &'static str {
+    match check {
+        FixCheck::Clean => "",
+        FixCheck::InEntry { diag, .. } | FixCheck::Elsewhere { diag, .. } => diag.code().as_str(),
     }
-
-    let backup = rewrite_user_file(entry, &patched, RewriteKind::Lossy)?;
-    writeln!(
-        w,
-        "fix: applied {} edit(s) to {}",
-        chosen.len(),
-        entry.display()
-    )
-    .map_err(|e| io_err(entry, e))?;
-    if let Some(backup) = backup {
-        writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
-    }
-    Ok(())
 }
 
 /// Read a line from stdin and interpret it as a yes/no answer. EOF or any read
@@ -3309,6 +3609,36 @@ pub fn rewrite_user_file(
     rewrite_real_file(&real, contents, kind)
 }
 
+/// A rewrite conditioned on the file still holding the bytes it was judged by.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IfUnchanged {
+    /// The file was replaced; carries the backup path when one was made.
+    Written(Option<PathBuf>),
+    /// The file no longer holds the expected bytes and was left as it is.
+    Changed,
+}
+
+/// Rewrite the user-named file at `path` only while it still holds `expected`.
+///
+/// The file is re-read immediately before it is backed up and replaced, so an
+/// edit made to it after it was judged is never overwritten.
+///
+/// # Errors
+/// The re-read's own refusal; otherwise as [`rewrite_user_file`].
+pub fn rewrite_user_file_if_unchanged(
+    path: &Path,
+    expected: &str,
+    contents: &str,
+    kind: RewriteKind,
+) -> Result<IfUnchanged, CliError> {
+    let real = fs::canonicalize(path).map_err(|e| io_err(path, e))?;
+    let current = crate::io_bounded::read_user_named(&real, crate::io_bounded::SOURCE_CAP)?;
+    if current != expected {
+        return Ok(IfUnchanged::Changed);
+    }
+    rewrite_real_file(&real, contents, kind).map(IfUnchanged::Written)
+}
+
 /// Rewrite a user-owned file a directory walk under `root` reached.
 ///
 /// As [`rewrite_user_file`], but the file must resolve inside `root`: a
@@ -3421,7 +3751,9 @@ pub const fn diag_span(d: &Diagnostic) -> ipe_diagnostics::Span {
         | Diagnostic::Ffi { .. }
         | Diagnostic::Sandbox { .. }
         | Diagnostic::Consent { .. }
-        | Diagnostic::RegistryUnreachable { .. } => ipe_diagnostics::Span::DUMMY,
+        | Diagnostic::RegistryUnreachable { .. }
+        | Diagnostic::TargetDirUnlinkable { .. }
+        | Diagnostic::HostLinkerCannotOpenInput { .. } => ipe_diagnostics::Span::DUMMY,
     }
 }
 
@@ -4038,5 +4370,79 @@ mod test_binary_tests {
             return;
         };
         assert_eq!(path, absent);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use ipe_ir::Capability;
+    use std::collections::BTreeSet;
+
+    /// A digest literal of `fill` hex digits.
+    #[allow(clippy::expect_used)] // test fixture: the literal is a valid digest
+    fn digest(fill: &str) -> index::Sha256Hex {
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        index::Sha256Hex::parse(&package, &fill.repeat(64)).expect("valid digest")
+    }
+
+    /// An entry version recording `sha256` and `capabilities`.
+    #[allow(clippy::expect_used)] // test fixture: every literal is valid
+    fn entry(sha256: index::Sha256Hex, capabilities: BTreeSet<Capability>) -> index::EntryVersion {
+        let package = crate::package_name::PackageName::parse("p").expect("valid name");
+        index::EntryVersion {
+            version: crate::published_version::PublishedVersion::parse("0.1.0")
+                .expect("valid version"),
+            source: index::SourceUrl::parse(&package, "https://github.com/example/p")
+                .expect("valid source url"),
+            rev: index::PinnedRev::from_full_sha(
+                &package,
+                "9f2c7b1e0a4d5c6f8b2a1e3d4c5b6a7f8e9d0c1b",
+            )
+            .expect("valid pinned rev"),
+            sha256,
+            capabilities,
+            signature: None,
+        }
+    }
+
+    /// An entry whose recorded digest is not the audited tree's is refused.
+    #[test]
+    fn admission_refuses_a_digest_other_than_the_audited_one() {
+        let audited = audit::AuditedPackage::for_test(digest("a"), BTreeSet::new());
+        assert!(
+            admit_against_audit(&entry(digest("a"), BTreeSet::new()), "p", &audited).is_ok(),
+            "control: the audited digest and set are admitted"
+        );
+        assert!(
+            matches!(
+                admit_against_audit(&entry(digest("b"), BTreeSet::new()), "p", &audited),
+                Err(CliError::HashMismatch { .. })
+            ),
+            "a recorded digest other than the audited one is refused"
+        );
+    }
+
+    /// An entry whose recorded capabilities are not the audited set is refused.
+    #[test]
+    fn admission_refuses_capabilities_other_than_the_audited_set() {
+        let audited =
+            audit::AuditedPackage::for_test(digest("a"), BTreeSet::from([Capability::Network]));
+        assert!(
+            admit_against_audit(
+                &entry(digest("a"), BTreeSet::from([Capability::Network])),
+                "p",
+                &audited
+            )
+            .is_ok(),
+            "control: the audited set is admitted"
+        );
+        assert!(
+            matches!(
+                admit_against_audit(&entry(digest("a"), BTreeSet::new()), "p", &audited),
+                Err(CliError::PackageAudit(_))
+            ),
+            "an entry hiding an audited capability is refused"
+        );
     }
 }

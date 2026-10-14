@@ -202,7 +202,7 @@ mod tests {
         let m = module(source);
         let modules = [m];
         let config = crate::LintConfig::default();
-        let report = crate::run(&modules, &config);
+        let Ok(report) = crate::run(&modules, &config, &crate::NeverCancel);
         report
             .findings
             .into_iter()

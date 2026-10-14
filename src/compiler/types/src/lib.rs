@@ -50,7 +50,7 @@ pub use constrain::{Builtins, kernel_type_table, resolve_scheme};
 pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
 pub use homed::{HomedWarning, InferError, ModuleHome, ProgramDiag};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
-pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
+pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET, SolverSteps, SolverStepsError};
 pub use ty::{
     RETRY_POLICY_FIELDS, RowTail, SolverVar, Ty, TyBounds, VarCeiling, is_solver_var,
     tag_solver_var,
@@ -58,11 +58,11 @@ pub use ty::{
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
-    promote_untyped_boundaries, reify_scheme, zonk,
+    promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
-pub use unify::con_heads_compatible;
+pub use unify::{STDLIB_DISTINCT_UNIONS, con_heads_compatible};
 use unify::{occurs_guard, super_admits_record, unify_at};
 use unionfind::{UnionFind, VarId};
 
@@ -454,9 +454,11 @@ pub fn canonicalize(
 /// * [`ipe_diagnostics::Diagnostic::CompilerBug`] on a violated internal
 ///   invariant (dangling union-find id, unbound local, arity mismatch — all
 ///   unreachable for well-canonicalised input).
+/// * [`ipe_diagnostics::TypeError::StepBudgetExceeded`] for a budget of `0`
+///   when [`BUDGET_ENV`] is `0`, before any solving.
 pub fn infer(m: &canon::Module, interner: &mut Interner) -> DResult<SolvedTypes> {
-    let mut budget = Budget::from_env();
-    infer_with_budget(m, interner, &mut budget)
+    let steps = SolverSteps::from_env().map_err(SolverStepsError::into_diagnostic)?;
+    infer_with_budget(m, interner, &mut Budget::new(steps))
 }
 
 /// Like [`infer`] but every error names the module that owns it.
@@ -474,8 +476,25 @@ pub fn infer_attributed(
     m: &canon::Module,
     interner: &mut Interner,
 ) -> Result<SolvedTypes, InferError> {
-    let mut budget = Budget::from_env();
-    infer_with_budget_attributed(m, interner, &mut budget)
+    let steps = SolverSteps::from_env().map_err(refused_steps)?;
+    infer_attributed_with_budget(m, interner, steps)
+}
+
+/// Like [`infer_attributed`] under an explicit step ceiling.
+///
+/// # Errors
+/// Same conditions as [`infer_attributed`].
+pub fn infer_attributed_with_budget(
+    m: &canon::Module,
+    interner: &mut Interner,
+    steps: SolverSteps,
+) -> Result<SolvedTypes, InferError> {
+    infer_with_budget_attributed(m, interner, &mut Budget::new(steps))
+}
+
+/// The whole-program refusal for a solver budget setting with no ceiling.
+fn refused_steps(refused: SolverStepsError) -> InferError {
+    InferError::unsited(refused.into_diagnostic())
 }
 
 /// One exported binding's cross-module type contract: its generalized scheme
@@ -565,6 +584,9 @@ pub struct ModuleInference {
     pub solved: SolvedTypes,
     /// The module's own typed interface, for its importers' scoped solves.
     pub interface: InterfaceStatus,
+    /// The solver steps the scoped solve spent: a pure function of the
+    /// module and its deps' interfaces.
+    pub steps: u64,
 }
 
 /// Per-binding super-type obligations, keyed `(home, name)` — the shape of
@@ -608,12 +630,28 @@ pub fn infer_module(
     deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
     interner: &mut Interner,
 ) -> Result<ModuleInference, InferError> {
-    let mut budget = Budget::from_env();
+    let steps = SolverSteps::from_env().map_err(refused_steps)?;
+    infer_module_with_budget(m, exports, deps, interner, steps)
+}
+
+/// Like [`infer_module`] under an explicit step ceiling.
+///
+/// # Errors
+/// Same conditions as [`infer_module`].
+pub fn infer_module_with_budget(
+    m: &canon::Module,
+    exports: &ModuleExports,
+    deps: &BTreeMap<Vec<Symbol>, Arc<TypedInterface>>,
+    interner: &mut Interner,
+    steps: SolverSteps,
+) -> Result<ModuleInference, InferError> {
+    let mut budget = Budget::new(steps);
     let scoped = ScopedContext { exports, deps };
     let (solved, interface) = infer_core(m, interner, &mut budget, Some(&scoped))?;
     Ok(ModuleInference {
         solved,
         interface: interface.unwrap_or(InterfaceStatus::Open),
+        steps: budget.spent(),
     })
 }
 
@@ -1014,8 +1052,11 @@ fn infer_core(
     // cleared a function HEAD; this catches a function NESTED inside a tuple /
     // record / enum under an equality obligation (Rust cannot compare it),
     // failing closed with IPE-T0014 instead of emitting code `cargo` rejects.
+    // The type judged is the one emitted (`zonk_emitted`): a record the deferred
+    // pass left over a residual row is its known fields, whichever operand
+    // settled it first.
     for (root, orig_bounds, span, home) in pinned {
-        let ty = lift!(zonk(&mut uf, budget, root));
+        let ty = lift!(zonk_emitted(&mut uf, budget, root));
         if !concrete_super_ok(interner, orig_bounds, &ty, &enum_embeds) {
             return Err(InferError::sited(
                 super_unsatisfied(interner, orig_bounds, &ty, span),
@@ -1527,14 +1568,7 @@ fn collect_ui_msg_and_other_vars(
     other_vars: &mut BTreeSet<Symbol>,
 ) {
     match ty {
-        Ty::Var(raw) => {
-            let sym = Symbol::from_raw(*raw);
-            if in_ui_msg {
-                ui_msg_vars.insert(sym);
-            } else {
-                other_vars.insert(sym);
-            }
-        }
+        Ty::Var(raw) => note_ui_msg_or_other_var(*raw, in_ui_msg, ui_msg_vars, other_vars),
         Ty::Fun(a, b) => {
             collect_ui_msg_and_other_vars(a, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
             collect_ui_msg_and_other_vars(b, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
@@ -1556,9 +1590,16 @@ fn collect_ui_msg_and_other_vars(
                 collect_ui_msg_and_other_vars(e, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
             }
         }
-        Ty::Record(fields, _) => {
+        Ty::Record(fields, tail) => {
             for v in fields.values() {
                 collect_ui_msg_and_other_vars(v, ui_msg_cons, in_ui_msg, ui_msg_vars, other_vars);
+            }
+            // A row variable is a variable in the same raw space as `Ty::Var`.
+            match tail {
+                RowTail::Open(raw) => {
+                    note_ui_msg_or_other_var(*raw, in_ui_msg, ui_msg_vars, other_vars);
+                }
+                RowTail::Closed => {}
             }
         }
         // The wildcard `any` -- a bare `Html` / `Attribute` annotation is
@@ -1566,6 +1607,21 @@ fn collect_ui_msg_and_other_vars(
         // defaulting candidate: the lowerer substitutes its concrete type from
         // the body's solved region, which defaulting to `Unit` would clobber.
         Ty::Wildcard | Ty::Unit => {}
+    }
+}
+
+/// File the variable `raw` as a ui-msg-slot variable when `in_ui_msg`, else as an other-position one.
+fn note_ui_msg_or_other_var(
+    raw: u32,
+    in_ui_msg: bool,
+    ui_msg_vars: &mut BTreeSet<Symbol>,
+    other_vars: &mut BTreeSet<Symbol>,
+) {
+    let sym = Symbol::from_raw(raw);
+    if in_ui_msg {
+        ui_msg_vars.insert(sym);
+    } else {
+        other_vars.insert(sym);
     }
 }
 
@@ -1922,7 +1978,7 @@ fn check_scheme_applications(
                     None => continue,
                 },
             };
-            let ty = zonk(uf, budget, *fresh).map_err(InferError::unsited)?;
+            let ty = zonk_emitted(uf, budget, *fresh).map_err(InferError::unsited)?;
             if !emitted_bound_satisfied(interner, *b, &ty, enum_embeds) {
                 return Err(InferError::sited(
                     super_unsatisfied(interner, *b, &ty, app.span),
@@ -2026,12 +2082,10 @@ fn check_wildcard_pins(
 
 /// Whether a resolved type is ground: no type variable and no open record row.
 ///
-/// This is the read-back form of "the type is fully known": the lowerer
-/// concretizes a wildcard parameter's region only when it holds. Inference
-/// classifies a wildcard with `solved_is_ground` instead, which also sees
-/// the open rows [`zonk`] reads back as closed; every type it admits is one
-/// this admits, so the lowerer never concretizes a wildcard inference left
-/// unpinned.
+/// This is the one "the type is fully known" judgment on a [`Ty`]: the
+/// lowerer concretizes a wildcard parameter's region only when it holds.
+/// [`zonk`] reads a row tail back faithfully, so this agrees with
+/// `solved_is_ground` on the union-find a type was read back from.
 #[must_use]
 pub fn ty_is_ground(ty: &Ty) -> bool {
     match ty {
@@ -2047,9 +2101,10 @@ pub fn ty_is_ground(ty: &Ty) -> bool {
 /// Whether every solver node reachable from `roots` is known: no type
 /// variable, and every record extension ends in the closed-row sentinel.
 ///
-/// Read on the union-find, not on a zonked [`Ty`]: [`zonk`] presents every
-/// record as closed, so an open row a field read left behind is invisible
-/// after read-back. A type this admits zonks to one [`ty_is_ground`] admits.
+/// The union-find form of [`ty_is_ground`]: inference classifies a wildcard
+/// before read-back. [`zonk`] keeps every open row tail, so a node this
+/// admits zonks to a type [`ty_is_ground`] admits, and one it refuses zonks
+/// to a type [`ty_is_ground`] refuses.
 ///
 /// # Errors
 /// A union-find invariant violation, or [`TypeError::StepBudgetExceeded`]
@@ -2437,14 +2492,15 @@ pub const MAX_SHOWN_TUPLE_ARITY: usize = 12;
 /// Whether a resolved type has a rendering: every leaf of it has a runtime
 /// show row that is not `Refused`.
 ///
-/// Refuses a bare type variable (fail-closed, like every sibling obligation), a
+/// Refuses a bare type variable and a record with an open row tail (an unknown
+/// rest of the record; fail-closed, like every sibling obligation), a
 /// function, a tuple wider than [`MAX_SHOWN_TUPLE_ARITY`], an opaque FFI
 /// handle ([`EnumEmbeds::is_opaque_handle`]), and an enum whose definition
 /// embeds a function or a handle ([`EnumEmbeds`]). A transparent FFI union is
 /// shown like any user union. Every type argument is walked.
 fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) | Ty::Record(_, RowTail::Open(_)) => false,
         Ty::Unit => true,
         Ty::Tuple(elems) => {
             elems.len() <= MAX_SHOWN_TUPLE_ARITY
@@ -2452,7 +2508,7 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
                     .iter()
                     .all(|e| ty_is_showable(interner, e, enum_embeds))
         }
-        Ty::Record(fields, _) => fields
+        Ty::Record(fields, RowTail::Closed) => fields
             .values()
             .all(|f| ty_is_showable(interner, f, enum_embeds)),
         Ty::Con { module, name, args } => {
@@ -2467,8 +2523,9 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 
 /// Whether a resolved type derives Rust's `PartialEq`: true for every fully
 /// concrete type containing no function anywhere (primitives, unit, tuples,
-/// records, and enums all derive `PartialEq`; a function never does). A bare
-/// type variable is rejected (fail-closed): an equality obligation that escaped
+/// closed records, and enums all derive `PartialEq`; a function never does). A
+/// bare type variable, and a record whose open row tail leaves the rest of the
+/// record unknown, is rejected (fail-closed): an equality obligation that escaped
 /// into an enclosing generic is not yet propagated across binding boundaries.
 /// The phantom `row` argument of an [`ipe_ir::STORE_ROW_PHANTOM_UNIONS`] union
 /// is not walked: lowering erases it, so the emitted non-generic enum's
@@ -2476,12 +2533,12 @@ fn ty_is_showable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> boo
 /// compares `IpeDbStorePred` values whatever `row` is).
 fn ty_is_equatable(interner: &Interner, ty: &Ty, enum_embeds: &EnumEmbeds) -> bool {
     match ty {
-        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) => false,
+        Ty::Var(_) | Ty::Wildcard | Ty::Fun(_, _) | Ty::Record(_, RowTail::Open(_)) => false,
         Ty::Unit => true,
         Ty::Tuple(elems) => elems
             .iter()
             .all(|e| ty_is_equatable(interner, e, enum_embeds)),
-        Ty::Record(fields, _) => fields
+        Ty::Record(fields, RowTail::Closed) => fields
             .values()
             .all(|f| ty_is_equatable(interner, f, enum_embeds)),
         // A `Ty::Con` head names a user enum (or a builtin like `Maybe`) whose
@@ -4158,7 +4215,10 @@ mod tests {
         let Some((m, mut i)) = opt else { return };
         // A budget of one step cannot discharge the golden program's
         // constraints; the very first unify trips the bound.
-        let mut budget = Budget::new(1);
+        let one = SolverSteps::new(1);
+        assert!(one.is_some(), "one step is a ceiling");
+        let Some(one) = one else { return };
+        let mut budget = Budget::new(one);
         let r = infer_with_budget(&m, &mut i, &mut budget);
         assert!(matches!(
             r,
@@ -4170,12 +4230,78 @@ mod tests {
     }
 
     #[test]
-    fn disabled_budget_still_succeeds() {
+    fn default_budget_succeeds() {
         let opt = canon_golden();
         assert!(opt.is_some(), "golden");
         let Some((m, mut i)) = opt else { return };
-        let mut budget = Budget::unbounded();
+        let mut budget = Budget::new(SolverSteps::DEFAULT);
         assert!(infer_with_budget(&m, &mut i, &mut budget).is_ok());
+    }
+
+    /// A zero setting is refused, never read as "no limit"; one past zero is
+    /// the least ceiling, and an unset or malformed setting is the default.
+    #[test]
+    fn zero_solver_budget_is_refused() {
+        assert_eq!(
+            SolverSteps::from_setting(Some("0")),
+            Err(SolverStepsError::Zero)
+        );
+        assert_eq!(
+            SolverSteps::from_setting(Some(" 0 ")),
+            Err(SolverStepsError::Zero)
+        );
+        assert_eq!(
+            SolverSteps::from_setting(Some("1")).map(SolverSteps::get),
+            Ok(1)
+        );
+        assert_eq!(SolverSteps::from_setting(None), Ok(SolverSteps::DEFAULT));
+        assert_eq!(
+            SolverSteps::from_setting(Some("lots")),
+            Ok(SolverSteps::DEFAULT)
+        );
+        assert_eq!(SolverSteps::DEFAULT.get(), DEFAULT_SOLVER_BUDGET);
+        assert_eq!(SolverSteps::new(0), None);
+        assert!(matches!(
+            SolverStepsError::Zero.into_diagnostic(),
+            Diagnostic::Type {
+                msg: TypeError::StepBudgetExceeded { budget: 0 },
+                ..
+            }
+        ));
+    }
+
+    /// A scoped solve reports the steps it spent; the same ceiling one step
+    /// short of them refuses the module.
+    #[test]
+    fn scoped_solve_reports_its_steps() {
+        let opt = canon_golden();
+        assert!(opt.is_some(), "golden");
+        let Some((m, mut i)) = opt else { return };
+        let exports = ModuleExports::default();
+        let deps = BTreeMap::new();
+        let spent = infer_module_with_budget(&m, &exports, &deps, &mut i, SolverSteps::DEFAULT)
+            .map(|inference| inference.steps);
+        assert!(matches!(spent, Ok(steps) if steps > 1), "{spent:?}");
+        let Ok(steps) = spent else { return };
+        let exact = SolverSteps::new(steps).map(|ceiling| {
+            infer_module_with_budget(&m, &exports, &deps, &mut i, ceiling)
+                .map(|inference| inference.steps)
+        });
+        assert_eq!(exact, Some(Ok(steps)), "the exact ceiling admits the solve");
+        let short = SolverSteps::new(steps - 1)
+            .map(|ceiling| infer_module_with_budget(&m, &exports, &deps, &mut i, ceiling));
+        assert!(
+            matches!(
+                short
+                    .as_ref()
+                    .map(|r| r.as_ref().map_err(InferError::diagnostic)),
+                Some(Err(Diagnostic::Type {
+                    msg: TypeError::StepBudgetExceeded { .. },
+                    ..
+                }))
+            ),
+            "one step short of the spend is refused"
+        );
     }
 
     // ── rich TypeError payloads (E3) ───────────────────────────────────────
@@ -6549,7 +6675,7 @@ mod tests {
     fn min_solver_steps(src: &str) -> Option<u64> {
         let fits = |steps: u64| -> Option<bool> {
             let (m, mut i) = canon_src(src)?;
-            match infer_with_budget(&m, &mut i, &mut Budget::new(steps)) {
+            match infer_with_budget(&m, &mut i, &mut Budget::new(SolverSteps::new(steps)?)) {
                 Ok(_) => Some(true),
                 Err(Diagnostic::Type {
                     msg: TypeError::StepBudgetExceeded { .. },
@@ -6659,6 +6785,57 @@ mod tests {
             rev.is_ok(),
             "equality before field read must infer: {rev:?}"
         );
+    }
+
+    #[test]
+    fn equality_on_a_deferred_record_base_holds_nested_and_aliased() {
+        // The deferred settle leaves `a` over a residual row whatever spelling
+        // reaches it: inside a tuple, through a `let` alias, or as both
+        // operands of a generic use. Each is judged on the emitted record.
+        for body in [
+            "ok a =\n    a.x == 1 && (a, 1) == (a, 1)\n",
+            "ok a =\n    (a, 1) == (a, 1) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && (let b = a in b == b)\n",
+            "ok a =\n    (let b = a in b == b) && a.x == 1\n",
+            "ok a =\n    a.x == 1 && same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+            "ok a =\n    same a a && a.x == 1\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(r.is_ok(), "`{body}` must infer: {r:?}");
+        }
+    }
+
+    #[test]
+    fn equality_on_a_record_extended_by_a_function_is_refused() {
+        // The residual row reads closed only while nothing extends it: a use
+        // that adds a function field makes the compared record unequatable,
+        // in either operand order.
+        for body in [
+            "ok a =\n    a.x == 1 && a == a\n\nuse = ok { x = 1, f = \\y -> y }\n",
+            "ok a =\n    a == a && a.x == 1\n\nuse = ok { x = 1, f = \\y -> y }\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn equality_on_a_rigid_row_record_is_refused() {
+        // An annotation's row variable is a generic over an unknown rest: no
+        // equality holds of it, compared directly or through a generic use.
+        for body in [
+            "ok : { r | x : Int } -> Bool\nok a =\n    a == a\n",
+            "ok : { r | x : Int } -> Bool\nok a =\n    same a a\n\nsame : t -> t -> Bool\nsame p q =\n    p == q\n",
+        ] {
+            let r = infer_deferred(body);
+            assert!(
+                is_type_error(&r, |m| matches!(m, TypeError::SuperTypeUnsatisfied { .. })),
+                "`{body}` must be SuperTypeUnsatisfied, got {r:?}"
+            );
+        }
     }
 
     #[test]
@@ -7688,7 +7865,7 @@ mod tests {
             Err(Diagnostic::Name {
                 span,
                 msg: ipe_diagnostics::NameError::ConstructorNotFound { name, suggestions },
-            }) => Some((&**name, suggestions.names.len(), *span)),
+            }) => Some((&**name, suggestions.names().len(), *span)),
             _ => None,
         }
     }
@@ -7876,7 +8053,7 @@ mod tests {
         // must reproduce them byte-for-byte.
         let mut settled: Option<(Span, Option<ModuleHome>)> = None;
         for run in 0..50 {
-            let mut budget = Budget::from_env();
+            let mut budget = Budget::new(SolverSteps::DEFAULT);
             let err = infer_with_budget_attributed(&m, &mut i, &mut budget)
                 .expect_err("Wrap stamp (Int vs Stamp) must be a type error");
             let home = err.home().cloned();
@@ -8184,6 +8361,50 @@ mod tests {
         let too_wide = Ty::Tuple(vec![int_ty; MAX_SHOWN_TUPLE_ARITY + 1]);
         assert!(ty_is_showable(&i, &widest, &embeds));
         assert!(!ty_is_showable(&i, &too_wide, &embeds));
+    }
+
+    /// A record whose row tail is open has an unknown rest, so neither the
+    /// equality nor the show obligation admits it, at either site; the same
+    /// fields over a closed tail satisfy both.
+    #[test]
+    fn an_open_row_record_satisfies_no_obligation() {
+        let mut i = Interner::new();
+        let int_ty = con_ty(&mut i, &[], "Int");
+        let x = i.intern("x").expect("intern a field name");
+        let embeds = EnumEmbeds::default();
+        let record = |tail: RowTail| Ty::Record(BTreeMap::from([(x, int_ty.clone())]), tail);
+        let closed = record(RowTail::Closed);
+        let open = record(RowTail::Open(7));
+        assert!(ty_is_equatable(&i, &closed, &embeds));
+        assert!(ty_is_showable(&i, &closed, &embeds));
+        assert!(!ty_is_equatable(&i, &open, &embeds));
+        assert!(!ty_is_showable(&i, &open, &embeds));
+        let nested = Ty::Tuple(vec![int_ty, open.clone()]);
+        assert!(!ty_is_equatable(&i, &nested, &embeds));
+        assert!(!ty_is_showable(&i, &nested, &embeds));
+        for site in BOTH_SITES {
+            assert!(super_bounds_satisfied(
+                &i,
+                TyBounds::eq(),
+                &closed,
+                site,
+                &embeds
+            ));
+            assert!(!super_bounds_satisfied(
+                &i,
+                TyBounds::eq(),
+                &open,
+                site,
+                &embeds
+            ));
+            assert!(!super_bounds_satisfied(
+                &i,
+                TyBounds::show(),
+                &open,
+                site,
+                &embeds
+            ));
+        }
     }
 
     /// A one-constructor union `name` at home `Main` whose payload is `arg`.
@@ -9099,6 +9320,270 @@ h x =
             }
         }
     }
+
+    // ── Builtin head identity and reachable unions ─────────────────────────
+
+    /// Scoped-solve each module over its DIRECT imports' interfaces only.
+    ///
+    /// Entries are dependency-first `(dotted module path, source, direct
+    /// imports)` triples. Unlike [`infer_scoped`], a module sees only the
+    /// interfaces it imports, exactly as the driver's per-module tier offers
+    /// them, so a union declared two imports down reaches it only through an
+    /// interface's reachable closure. Returns every module's result in order,
+    /// or `None` when one fails to parse or canonicalise.
+    fn infer_scoped_direct(modules_src: &[(&str, &str, &[&str])]) -> Option<Vec<ScopedResult>> {
+        let mut i = Interner::new();
+        let mut exports_by_path: BTreeMap<Vec<Symbol>, ModuleExports> = BTreeMap::new();
+        let mut interfaces: BTreeMap<Vec<Symbol>, Arc<TypedInterface>> = BTreeMap::new();
+        let mut results = Vec::new();
+        for (path_str, src, imports) in modules_src {
+            let mut intern_path = |dotted: &str| {
+                dotted
+                    .split('.')
+                    .map(|seg| i.intern(seg))
+                    .collect::<DResult<Vec<Symbol>>>()
+                    .ok()
+            };
+            let path = intern_path(path_str)?;
+            let mut direct: BTreeMap<Vec<Symbol>, Arc<TypedInterface>> = BTreeMap::new();
+            for import in *imports {
+                let import_path = intern_path(import)?;
+                let iface = interfaces.get(&import_path)?;
+                direct.insert(import_path, Arc::clone(iface));
+            }
+            let parsed = ipe_parse::parse_module(src, &mut i).ok()?;
+            let (cm, exports) =
+                ipe_canon::canonicalise_module(&parsed, &path, &exports_by_path, &mut i).ok()?;
+            let result = infer_module(&cm, &exports, &direct, &mut i);
+            if let Ok(ModuleInference {
+                interface: InterfaceStatus::Closed(iface),
+                ..
+            }) = &result
+            {
+                interfaces.insert(path.clone(), Arc::new(iface.clone()));
+            }
+            exports_by_path.insert(path, exports);
+            results.push(result);
+        }
+        Some(results)
+    }
+
+    /// `A` declares a closed union, `B` hands out a value of it, `Main` imports
+    /// only `B`.
+    const REACHABLE_UNION_A: &str = "module A exposing (T(..))\n\ntype T\n    = X\n    | Y\n";
+    const REACHABLE_UNION_B: &str =
+        "module B exposing (wrap)\n\nimport A exposing (T(..))\n\nwrap : T\nwrap =\n    X\n";
+
+    /// A catch-all `case` over a union declared two imports down is judged
+    /// against that union's constructors (IPE-T0018), not skipped as unknown.
+    #[test]
+    fn catch_all_over_a_transitively_reached_union_is_refused() {
+        let main_src = format!(
+            "{M2C_HDR}import B\n\nmain =\n    case B.wrap of\n        _ ->\n            0\n"
+        );
+        let modules: [(&str, &str, &[&str]); 3] = [
+            ("A", REACHABLE_UNION_A, &[]),
+            ("B", REACHABLE_UNION_B, &["A"]),
+            ("Main", main_src.as_str(), &["B"]),
+        ];
+        let results = infer_scoped_direct(&modules);
+        assert!(
+            results.is_some(),
+            "the three-module fixture must canonicalise"
+        );
+        let Some(results) = results else {
+            return;
+        };
+        assert!(
+            matches!(
+                results.get(2),
+                Some(Err(InferError::Sited {
+                    diag: Diagnostic::Type {
+                        msg: TypeError::WildcardCoversKnownConstructors { .. },
+                        ..
+                    },
+                    ..
+                }))
+            ),
+            "a `_`-only case over `A.T` reached through `B` must be refused: {:?}",
+            results.get(2)
+        );
+    }
+
+    /// The reachable closure is transitive: a fourth module importing only the
+    /// third still knows the union two interfaces down.
+    #[test]
+    fn reachable_unions_close_over_every_interface_level() {
+        let c_src = "module C exposing (again)\n\nimport B\n\nagain =\n    B.wrap\n";
+        let main_src = format!(
+            "{M2C_HDR}import C\n\nmain =\n    case C.again of\n        _ ->\n            0\n"
+        );
+        let modules: [(&str, &str, &[&str]); 4] = [
+            ("A", REACHABLE_UNION_A, &[]),
+            ("B", REACHABLE_UNION_B, &["A"]),
+            ("C", c_src, &["B"]),
+            ("Main", main_src.as_str(), &["C"]),
+        ];
+        let results = infer_scoped_direct(&modules);
+        assert!(
+            results.is_some(),
+            "the four-module fixture must canonicalise"
+        );
+        let Some(results) = results else {
+            return;
+        };
+        assert!(
+            matches!(
+                results.get(3),
+                Some(Err(InferError::Sited {
+                    diag: Diagnostic::Type {
+                        msg: TypeError::WildcardCoversKnownConstructors { .. },
+                        ..
+                    },
+                    ..
+                }))
+            ),
+            "a `_`-only case over `A.T` reached through `C` and `B` must be refused: {:?}",
+            results.get(3)
+        );
+    }
+
+    /// Equality on a function-carrying union declared two imports down is
+    /// refused (IPE-T0014) exactly as on one declared next door.
+    #[test]
+    fn equality_on_a_transitively_reached_function_union_is_refused() {
+        let a_src = "module A exposing (H(..))\n\ntype H\n    = H (Int -> Int)\n";
+        let b_src = "module B exposing (mk)\n\nimport A exposing (H(..))\n\n\
+                     mk : H\nmk =\n    H (\\n -> n)\n";
+        let main_src = format!("{M2C_HDR}import B\n\nmain =\n    B.mk == B.mk\n");
+        let modules: [(&str, &str, &[&str]); 3] = [
+            ("A", a_src, &[]),
+            ("B", b_src, &["A"]),
+            ("Main", main_src.as_str(), &["B"]),
+        ];
+        let results = infer_scoped_direct(&modules);
+        assert!(
+            results.is_some(),
+            "the three-module fixture must canonicalise"
+        );
+        let Some(results) = results else {
+            return;
+        };
+        assert!(
+            matches!(
+                results.get(2),
+                Some(Err(InferError::Sited {
+                    diag: Diagnostic::Type {
+                        msg: TypeError::SuperTypeUnsatisfied { .. },
+                        ..
+                    },
+                    ..
+                }))
+            ),
+            "`==` on `A.H` reached through `B` must be refused: {:?}",
+            results.get(2)
+        );
+    }
+
+    /// Canonicalise dependency-first modules, an `Ipe.*` path as embedded stdlib.
+    ///
+    /// Returns each module's canonical form and exports in order, or `None`
+    /// when one fails to parse or canonicalise.
+    fn canon_with_stdlib_origin(
+        modules_src: &[(&str, &str)],
+        i: &mut Interner,
+    ) -> Option<Vec<(Vec<Symbol>, canon::Module, ModuleExports)>> {
+        let mut exports_by_path: BTreeMap<Vec<Symbol>, ModuleExports> = BTreeMap::new();
+        let mut out = Vec::new();
+        for (path_str, src) in modules_src {
+            let path: Vec<Symbol> = path_str
+                .split('.')
+                .map(|seg| i.intern(seg))
+                .collect::<DResult<Vec<Symbol>>>()
+                .ok()?;
+            let origin = if path_str.starts_with("Ipe.") {
+                ipe_canon::ModuleOrigin::EmbeddedStdlib
+            } else {
+                ipe_canon::ModuleOrigin::User
+            };
+            let parsed = ipe_parse::parse_module(src, i).ok()?;
+            let (cm, exports) = ipe_canon::canonicalise_module_with_origin(
+                &parsed,
+                &path,
+                &exports_by_path,
+                origin,
+                i,
+            )
+            .ok()?;
+            exports_by_path.insert(path.clone(), exports.clone());
+            out.push((path, cm, exports));
+        }
+        Some(out)
+    }
+
+    /// The `Ipe.Db.Store` sort direction shares the builtin name `Order` but not
+    /// its constructors, so `Store.Asc == LT` is a mismatch, never a comparison
+    /// of one type.
+    #[test]
+    fn store_sort_order_is_not_the_builtin_order() {
+        let store_src =
+            "module Ipe.Db.Store exposing (Order(..))\n\ntype Order\n    = Asc\n    | Desc\n";
+        let main_src =
+            format!("{M2C_HDR}import Ipe.Db.Store as Store\n\nmain =\n    Store.Asc == LT\n");
+        let modules = [("Ipe.Db.Store", store_src), ("Main", main_src.as_str())];
+
+        let mut i = Interner::new();
+        let canon = canon_with_stdlib_origin(&modules, &mut i);
+        assert!(
+            canon.is_some(),
+            "the store-shaped fixture must canonicalise"
+        );
+        let Some(canon) = canon else {
+            return;
+        };
+        let entry = canon
+            .last()
+            .map(|(path, _, _)| path.clone())
+            .unwrap_or_default();
+        let linked = ipe_canon::link::link(
+            entry,
+            canon.iter().map(|(_, cm, _)| cm.clone()).collect(),
+            &i,
+        );
+        assert!(
+            linked.is_ok(),
+            "the store-shaped fixture must link: {linked:?}"
+        );
+        let Ok(m) = linked else {
+            return;
+        };
+        let solved = infer(&m, &mut i);
+        assert!(
+            refused_as_mismatch(&solved),
+            "`Store.Asc == LT` must be a type mismatch: {solved:?}"
+        );
+
+        let mut interfaces: BTreeMap<Vec<Symbol>, Arc<TypedInterface>> = BTreeMap::new();
+        let mut results = Vec::new();
+        for (path, cm, exports) in &canon {
+            let result = infer_module(cm, exports, &interfaces, &mut i);
+            if let Ok(ModuleInference {
+                interface: InterfaceStatus::Closed(iface),
+                ..
+            }) = &result
+            {
+                interfaces.insert(path.clone(), Arc::new(iface.clone()));
+            }
+            results.push(result);
+        }
+        assert!(
+            scoped_refuses_importer(&results, |msg| matches!(
+                msg,
+                TypeError::TypeMismatch { .. }
+            )),
+            "the scoped solve must refuse `Store.Asc == LT` too: {results:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9492,7 +9977,9 @@ mod canonicalize_tests {
             | Diagnostic::Ffi { .. }
             | Diagnostic::Sandbox { .. }
             | Diagnostic::Consent { .. }
-            | Diagnostic::RegistryUnreachable { .. } => false,
+            | Diagnostic::RegistryUnreachable { .. }
+            | Diagnostic::TargetDirUnlinkable { .. }
+            | Diagnostic::HostLinkerCannotOpenInput { .. } => false,
         }
     }
 

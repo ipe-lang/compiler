@@ -11,15 +11,15 @@ Three knots.
 
 - **An `Error` classifies the failure at construction.** You build one with a
   kind-naming constructor: `Error.network msg`, `Error.invalidInput msg`,
-  `Error.timeout`, `Error.notFound`, `Error.permissionDenied`, and so on. The kind
-  is part of the value, so the reason a thing failed is data, not prose to be
+  `Error.timeout`, `Error.notFound`, `Error.permissionDenied`,
+  `Error.limitExceeded msg`, and so on. The kind is part of the value, so the reason a thing failed is data, not prose to be
   re-parsed. Message-carrying constructors take a description; canonical ones
   (`timeout`, `notFound`, `permissionDenied`) carry a fixed message.
 - **`isRetryable` reads the tag, so a policy is one query.** "Retry transient
   failures" is `Error.isRetryable err` — `True` for `timeout`, `network`, and
   `unavailable` — not a fragile substring search on the message. `Error.kind`
-  extracts the tag itself, and `Error.kindName` its stable lowercase label, for
-  richer branching or metrics.
+  extracts the tag itself, and `Error.kindName` its variant name (`"Io"`,
+  `"LimitExceeded"`, …), for richer branching or metrics.
 - **`toString` renders `"<Kind>: <message>"`.** For a log line you get a compact,
   classified string. The structured `ErrorDetails` a value may carry (attached with
   `withDetails`) stay out of that rendering, so a log line doesn't accidentally leak
@@ -75,7 +75,26 @@ Failure -> retry policy (by error kind, not message text):
 ```
 
 The transient kinds retry; the caller's mistake (`InvalidInput`) and the
-definitive `NotFound` do not.
+definitive `NotFound` do not. Neither does `LimitExceeded`, an input a declared
+ceiling turned back (too large, too long, too deep or with too many parts for
+its bound): the same input fails again against the same bound.
+
+`ErrorKind` has twelve variants:
+
+| Kind | Retryable | Meaning |
+|------|-----------|---------|
+| `Io` | no | a filesystem or stream operation failed |
+| `Network` | yes | a connection or transport failure |
+| `Ffi` | no | a foreign call failed |
+| `Decode` | no | input did not decode to the expected shape |
+| `Timeout` | yes | the operation ran out of time |
+| `NotFound` | no | the named thing does not exist |
+| `PermissionDenied` | no | the caller lacks the right |
+| `InvalidInput` | no | the caller passed a malformed value |
+| `Conflict` | no | the operation clashed with existing state |
+| `Unavailable` | yes | the service is temporarily not serving |
+| `Unexpected` | no | an internal failure with no better class |
+| `LimitExceeded` | no | a declared ceiling refused the input |
 
 ## The why
 

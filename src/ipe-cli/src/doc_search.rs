@@ -262,8 +262,11 @@ where
             threshold: Threshold::Relative,
         },
     );
-    let typo_of: BTreeMap<Peer<'a>, Distance> =
-        typos.hits.iter().map(|h| (h.target, h.distance)).collect();
+    let typo_of: BTreeMap<Peer<'a>, Distance> = typos
+        .hits
+        .iter()
+        .map(|h| (*h.target(), h.distance()))
+        .collect();
     let cut = cut || typos.truncated;
 
     let mut matched: Vec<_> = pool
@@ -290,7 +293,7 @@ where
         let mut hits: Vec<(Distance, Peer<'a>)> = nearest
             .hits
             .iter()
-            .map(|h| (h.distance, h.target))
+            .map(|h| (h.distance(), *h.target()))
             .collect();
         hits.sort_unstable();
         return Ranked {
@@ -604,7 +607,7 @@ mod tests {
         )
         .hits
         .first()
-        .map(|h| h.distance);
+        .map(suggest::Hit::distance);
         classify(e, &Folded::of(e), &q, typo).map(|(tier, _)| tier)
     }
 

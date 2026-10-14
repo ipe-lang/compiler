@@ -140,7 +140,9 @@ fn with_slot<R>(handle: i64, default: R, f: impl FnOnce(&mut Slot) -> R) -> R {
 }
 
 /// `Cache.newRaw : CacheCfg -> Task Error Int` — allocate a cache, return its handle.
-pub fn cache_new_raw<E: Send + From<String> + 'static>(cfg: CacheCfg) -> IpeTask<E, i64> {
+pub fn cache_new_raw<E: Send + From<String> + FromLimitExceeded + 'static>(
+    cfg: CacheCfg,
+) -> IpeTask<E, i64> {
     Box::pin(async move {
         // Bounded by construction (PRINCIPLES §3): the type's contract is
         // "bounded by entry count" (Ipe.Cache header). A non-positive
@@ -186,12 +188,9 @@ pub fn cache_new_raw<E: Send + From<String> + 'static>(cfg: CacheCfg) -> IpeTask
             // evicting a cache another task still holds a handle to. Reclamation
             // is caller-driven (`cache_destroy`); this is the hard backstop.
             if g.live.len() as i64 >= MAX_LIVE_CACHES {
-                return IpeResult::Err(
-                    format!(
-                        "Cache.new: live cache limit reached ({MAX_LIVE_CACHES}); destroy unused caches before creating more"
-                    )
-                    .into(),
-                );
+                return IpeResult::Err(E::from_limit_exceeded(format!(
+                    "Cache.new: live cache limit reached ({MAX_LIVE_CACHES}); destroy unused caches before creating more"
+                )));
             }
             // Saturating: monotonic handle counter — `+= 1` would debug-panic on
             // i64 overflow. (Saturating at i64::MAX is benign: reaching it needs
@@ -594,9 +593,14 @@ mod tests {
                 IpeResult::Err(_) => break,
             }
         }
-        // At (or above) the ceiling, a further allocation is refused.
-        assert!(
-            matches!(try_new(tiny_cfg()), IpeResult::Err(_)),
+        // At (or above) the ceiling, a further allocation is refused as a
+        // `LimitExceeded` error.
+        assert_eq!(
+            try_new(tiny_cfg()),
+            IpeResult::Err(IpeError::limit_exceeded(format!(
+                "Cache.new: live cache limit reached ({MAX_LIVE_CACHES}); \
+                 destroy unused caches before creating more"
+            ))),
             "cache_new_raw must fail closed at the MAX_LIVE_CACHES ceiling"
         );
         for h in ours {

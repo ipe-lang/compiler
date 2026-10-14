@@ -93,8 +93,8 @@ enum Unauditable {
         path: PathBuf,
         source: panic_scan::ScanError,
     },
-    /// A walk met a symlink to a directory, whose contents it cannot vouch for.
-    SymlinkedDirectory { path: PathBuf },
+    /// A walk could not list every file under a directory.
+    Walk(panic_scan::WalkError),
     /// A file to scan resolves outside the scanned root.
     OutsideRoot { path: PathBuf },
     /// A production file compiles in a source the scan cannot audit.
@@ -138,11 +138,7 @@ impl fmt::Display for Unauditable {
                 "{}: could not parse as Rust within the scan ceilings ({source}) — cannot audit; fail closed",
                 path.display()
             ),
-            Self::SymlinkedDirectory { path } => write!(
-                f,
-                "{}: symlinked directory — the walk does not follow it, so it cannot be audited; fail closed",
-                path.display()
-            ),
+            Self::Walk(source) => write!(f, "{source} — cannot be audited; fail closed"),
             Self::OutsideRoot { path } => write!(
                 f,
                 "{}: resolves outside the working directory — fail closed",
@@ -477,55 +473,24 @@ fn scan_file(path: &Path) -> Result<(bool, Vec<IncludedSource>), Unauditable> {
     Ok((!scan.hits.is_empty(), scan.included_sources))
 }
 
-/// Every `.rs` file and manifest under `dirs`, in sorted order.
+/// Every `.rs` file and manifest under `dirs`, each directory's in sorted order.
 ///
-/// A walk that finds no Rust file is refused: an empty scan would read as a pass.
+/// Each directory is listed by [`panic_scan::rust_sources`], which refuses any
+/// entry it cannot read and every symlinked directory. A walk that finds no
+/// Rust file is refused: an empty scan would read as a pass.
 fn walk_all(dirs: &NonEmpty<PathBuf>) -> Result<Vec<PathBuf>, Unauditable> {
     let mut files = Vec::new();
     for dir in dirs.iter() {
-        walk(dir, &mut files)?;
+        files.extend(
+            panic_scan::rust_sources(dir, panic_scan::Want::RustAndManifests)
+                .map_err(Unauditable::Walk)?,
+        );
     }
     if files.iter().any(|path| is_rust_file(path)) {
         Ok(files)
     } else {
         Err(Unauditable::EmptyWalk { dirs: dirs.clone() })
     }
-}
-
-/// Append every `.rs` file and manifest under `dir` to `files`.
-///
-/// A symlink is judged by its target: a symlinked file is listed, so the scan
-/// reads its target; a symlinked directory is refused, because the walk does
-/// not follow it and so cannot vouch for what it holds.
-fn walk(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Unauditable> {
-    let unreadable = |source: std::io::Error| Unauditable::Io {
-        path: dir.to_path_buf(),
-        source,
-    };
-    let mut entries = std::fs::read_dir(dir)
-        .map_err(unreadable)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(unreadable)?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(unreadable)?;
-        if file_type.is_symlink() {
-            let target = std::fs::metadata(&path).map_err(|source| Unauditable::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if target.is_dir() {
-                return Err(Unauditable::SymlinkedDirectory { path });
-            }
-        }
-        if file_type.is_dir() {
-            walk(&path, files)?;
-        } else if is_rust_file(&path) || is_manifest(&path) {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

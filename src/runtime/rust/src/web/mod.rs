@@ -1043,18 +1043,55 @@ where
     }
 }
 
-/// Resolve the request's session cookie to a live session, or the session-lost answer.
+/// Resolve the session a rejoin proof admits to a live session, or the session-lost answer.
 #[cfg(feature = "server")]
 async fn live_session<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
-    headers: &axum::http::HeaderMap,
+    proof: mint_proof::RejoinProof,
 ) -> Result<LiveSession<Model, Msg>, SessionLost>
 where
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    let sid = sid_from_cookie(headers).ok_or(SessionLost)?;
-    live_session_for(store, &sid).await
+    live_session_for(store, proof.into_key().as_str()).await
+}
+
+/// Why a request's session cookie admits no session.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CookieRefusal {
+    /// No cookie, or one that is not a well-formed sid: the session-lost answer.
+    Lost,
+    /// A cookie the request's Fetch Metadata does not admit: the fixed 403.
+    Refused(mint_proof::RejoinRefusal),
+}
+
+#[cfg(feature = "server")]
+impl axum::response::IntoResponse for CookieRefusal {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Lost => SessionLost.into_response(),
+            Self::Refused(why) => mint_proof::refused_rejoin(why),
+        }
+    }
+}
+
+/// The request's session cookie, admitted by its Fetch Metadata before any store read.
+///
+/// # Errors
+///
+/// The [`CookieRefusal`] naming why the cookie admits no session.
+#[cfg(feature = "server")]
+fn rejoin_from_cookie(
+    headers: &axum::http::HeaderMap,
+) -> Result<mint_proof::RejoinProof, CookieRefusal> {
+    let key = sid_from_cookie(headers)
+        .as_deref()
+        .and_then(store::SessionKey::parse)
+        .ok_or(CookieRefusal::Lost)?;
+    mint_proof::Arrival::judge(headers, mint_proof::Embedding::configured())
+        .rejoin(key)
+        .map_err(CookieRefusal::Refused)
 }
 
 /// Resolve once the session's closer reads `true`.
@@ -3865,6 +3902,27 @@ fn web_mount_base() -> Result<crate::encoding::MountBase, StartupRefusal> {
     parse_mount_base(&web_base_path())
 }
 
+/// The `/static` file service of a `Web` app over `dir`: a [`MountTable`]
+/// holding the one `/static` mount, so the listener's parse and the URI are
+/// re-based below the prefix as every `Server` mount re-bases them.
+///
+/// [`MountTable`]: crate::server::MountTable
+///
+/// # Errors
+///
+/// `StartupRefusal::MountBase` if `/static` were outside the mount-base
+/// grammar.
+#[cfg(feature = "server")]
+fn web_static_mount(dir: std::path::PathBuf) -> Result<axum::Router, StartupRefusal> {
+    let base = parse_mount_base(WEB_STATIC_PREFIX)?;
+    let files = axum::Router::new().fallback_service(crate::server::strict_serve_dir(dir));
+    Ok(crate::server::MountTable::new(vec![(base, files)]).below(axum::Router::new()))
+}
+
+/// The prefix a `Web` app's `[web] static` directory is served below.
+#[cfg(feature = "server")]
+const WEB_STATIC_PREFIX: &str = "/static";
+
 /// A router that answers EVERY path with `503 Service Unavailable` and the
 /// fixed [`FAIL_CLOSED_BODY`]. Used when a mounted `Web.embed` cannot start as
 /// declared (fail-closed): the mount stays reachable enough to report that it
@@ -4141,6 +4199,7 @@ mod handlers {
         state: State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -4151,7 +4210,7 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        let mut resp = serve_page(state, method, uri, headers).await;
+        let mut resp = serve_page(state, method, uri, strict, headers).await;
         mint_proof::vary_on_mint_inputs(resp.headers_mut());
         resp
     }
@@ -4160,6 +4219,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -4175,14 +4235,15 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        // The router's URL gate already refused a malformed path or query;
-        // this is the second, independent boundary before any session work.
-        // The path is parsed here once; every route resolver below reads it.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        // The page reads the listener's one URL parse; a request reaching it
+        // without that parse is refused, never parsed afresh. Every route
+        // resolver below reads this path.
+        let strict = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict,
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let lookup = (st.route_matched)(&path);
+        let path = strict.path();
+        let lookup = (st.route_matched)(path);
         // A routed page reached by a path other than the one it renders to (a
         // trailing `/`, an escape its route decodes, `007` for an `Int` `7`) is
         // redirected there before any session work, so a session only ever
@@ -4197,7 +4258,13 @@ mod handlers {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "500 base path unusable")
                     .into_response();
             };
-            match route::canonical_redirect(&base, uri.path(), uri.query(), canonical) {
+            match route::canonical_redirect(
+                &base,
+                strict.spelling(),
+                uri.path(),
+                uri.query(),
+                canonical,
+            ) {
                 route::Redirect::Serve => {}
                 route::Redirect::To(target) => {
                     return (
@@ -4268,7 +4335,19 @@ mod handlers {
         // live driver; a request behind the claim waits for the holder to
         // publish the session and then joins it live. A refused claim is the
         // 503 a busy session or a full process already answers with.
-        let cookie_key = cookie_sid.as_deref().and_then(store::SessionKey::parse);
+        // The request's Fetch Metadata is parsed once, before any session
+        // work: a cookie's key reaches the store only through a rejoin proof,
+        // and a fresh sid only through a mint proof, both judged from it. A
+        // refused rejoin answers 403 before any lookup, claim, `init` or
+        // credential re-proof.
+        let arrival = mint_proof::Arrival::judge(&headers, mint_proof::Embedding::configured());
+        let cookie_key = match cookie_sid.as_deref().and_then(store::SessionKey::parse) {
+            Some(key) if !reset_state_from_env() => match arrival.rejoin(key) {
+                Ok(proof) => Some(proof),
+                Err(why) => return mint_proof::refused_rejoin(why),
+            },
+            Some(_) | None => None,
+        };
         // Subscribed before any credential this request admits (in `init`,
         // the route entry or the first view), so a revocation landing between
         // that admission and the driver's start still wakes the driver.
@@ -4279,7 +4358,8 @@ mod handlers {
         // rather than entered with its bindings dropped.
         let mut claim_scope = None;
         let hit = match cookie_key {
-            Some(key) if !reset_state_from_env() => 'rejoin: {
+            Some(proof) => 'rejoin: {
+                let key = proof.into_key();
                 // A live session never contends for the claim table: the
                 // claim serialises only the cold-to-live transition.
                 if let Some(handle) = st.store.get(key.as_str()).await {
@@ -4298,7 +4378,7 @@ mod handlers {
                 let scope = pubsub::SessionScope::new(sid.clone());
                 let make_init = || {
                     pubsub::with_session(&scope, || {
-                        let params = (st.param_resolver)(&path);
+                        let params = (st.param_resolver)(path);
                         let req = req::web_req(&method, &uri, &headers, params);
                         (st.init)(req)
                     })
@@ -4307,7 +4387,7 @@ mod handlers {
                 claim_scope = Some(scope);
                 Some((sid, rejoin))
             }
-            Some(_) | None => None,
+            None => None,
         };
         // A live session joins only while its credentials re-prove; one whose
         // credentials no longer stand is closed here and this GET takes the
@@ -4406,7 +4486,7 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, model, IpeCmd::None, path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((
@@ -4427,16 +4507,13 @@ mod handlers {
                 let slot = SessionSlot {
                     count: st.session_count.clone(),
                 };
-                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, model, init_cmd, path);
                 (SessionOwner::Rejoined(claim), scope, slot, m, c)
             }
             Some((_, store::Rejoin::Miss)) | None => {
                 // Only a first-party arrival mints: a cross-site subresource or
                 // frame request is refused before any slot, `init` or cookie.
-                let proof = match mint_proof::MintProof::judge(
-                    &headers,
-                    mint_proof::Embedding::configured(),
-                ) {
+                let proof = match arrival.mint() {
                     Ok(proof) => proof,
                     Err(why) => return mint_proof::refused(why),
                 };
@@ -4463,7 +4540,7 @@ mod handlers {
                 // Build the request context (params from routing — empty when
                 // unrouted) and init a fresh model. The param_resolver is
                 // model-independent, breaking the init↔routing cycle.
-                let params = (st.param_resolver)(&path);
+                let params = (st.param_resolver)(path);
                 let req = req::web_req(&method, &uri, &headers, params);
                 // Session fixation guard: a store MISS means this sid is NOT a
                 // known session, so NEVER adopt the client-supplied cookie value
@@ -4471,7 +4548,7 @@ mod handlers {
                 // Minted first so `init` and the entry run under it.
                 let scope = pubsub::SessionScope::new(minted_sid(proof));
                 let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
-                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, &path);
+                let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, path);
                 (
                     SessionOwner::Minted(scope.sid().to_owned()),
                     scope,
@@ -4573,7 +4650,7 @@ mod handlers {
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
     pub(super) async fn sse_handler<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
-        uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         headers: axum::http::HeaderMap,
         base: Arc<route::DecodedPath>,
     ) -> Response
@@ -4585,10 +4662,10 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Send + Sync + 'static,
     {
-        // The query decodes once through the strict core; the router's URL
-        // gate already refused a malformed one, this is the second boundary.
-        let qs = match crate::server::strict_url_query(&uri) {
-            Ok(qs) => qs,
+        // The query is the listener's one URL parse; a request reaching this
+        // handler without that parse is refused, never parsed afresh.
+        let qs = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.query(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
         // `?path=` is parsed once into the route path it names; a malformed
@@ -4601,13 +4678,21 @@ mod handlers {
             Ok(route) => route.flatten(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
+        // The cookie reaches the store only through a rejoin proof judged from
+        // this request's Fetch Metadata: the `?path=` reconcile below runs a
+        // route entry, so a subresource (a cross-site `<img>` carrying a
+        // `SameSite=None` cookie) is refused before any lookup.
+        let proof = match rejoin_from_cookie(&headers) {
+            Ok(proof) => proof,
+            Err(refused) => return refused.into_response(),
+        };
         // X-Ipê-Web: 1 on the session-lost 404 lets the client distinguish a
         // genuine lost session (reload to recover) from a wedged proxy.
         let LiveSession {
             sid,
             handle: entry,
             scope: _,
-        } = match live_session(&st.store, &headers).await {
+        } = match live_session(&st.store, proof).await {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
@@ -4849,12 +4934,16 @@ mod handlers {
         // the HttpOnly session cookie by the time an event fires (the page
         // GET set it). No cookie → no session. A session whose credentials
         // no longer stand is closed by the lookup and answers session-lost.
+        // A mutating POST: the CSRF middleware's token pair is its cross-site gate.
         let _ = &parsed.session_id; // body field retained for wire-compat; not trusted for auth
+        let Some(cookie_sid) = sid_from_cookie(&headers) else {
+            return SessionLost.into_response();
+        };
         let LiveSession {
             handle: entry,
             scope,
             ..
-        } = match live_session(&st.store, &headers).await {
+        } = match live_session_for(&st.store, &cookie_sid).await {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
@@ -5682,6 +5771,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         headers: axum::http::HeaderMap,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         method: axum::http::Method,
     ) -> axum::response::Response
     where
@@ -5706,11 +5796,11 @@ mod handlers {
         // Build a fresh init model from the current request context — the same
         // path the clean-reinit miss takes — so the reset session holds exactly
         // what a cold-start visit would have produced.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        let path = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.path(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(&path);
+        let params = (st.param_resolver)(path);
         let req = req::web_req(&method, &uri, &headers, params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
         {
@@ -5805,6 +5895,7 @@ mod handlers {
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         headers: axum::http::HeaderMap,
         uri: axum::http::Uri,
+        strict: Option<axum::Extension<crate::server::StrictUrl>>,
         method: axum::http::Method,
         body: axum::body::Bytes,
     ) -> axum::response::Response
@@ -5835,11 +5926,11 @@ mod handlers {
         // Derive the init model the same way reset_handler does: build a
         // WebReq from the current request context so route-aware apps get the
         // correct initial state.
-        let path = match crate::server::strict_url(&uri) {
-            Ok(path) => path,
+        let path = match crate::server::strict_url(strict.as_deref()) {
+            Ok(strict) => strict.path(),
             Err(rejection) => return rejection.status_and_reason().into_response(),
         };
-        let params = (st.param_resolver)(&path);
+        let params = (st.param_resolver)(path);
         let req = req::web_req(&method, &uri, &headers, params);
         let (init_model, _cmd) = pubsub::with_session(&scope, || (st.init)(req));
 
@@ -6325,8 +6416,8 @@ where
             ));
         }
     };
-    // User-facing line on stdout.
-    crate::system::write_stdout_line(&format!("Ipe.Web listening on :{port}"));
+    // User-facing status line on stdout.
+    crate::system::emit_runtime_log_stdout("web", &format!("listening on :{port}"));
     // Graceful shutdown: trap SIGINT/SIGTERM,
     // print the shutdown line, drain in-flight requests, and return cleanly so
     // the IpeTask resolves Ok → the generated entry exits 0 (NOT 130). A
@@ -6410,11 +6501,11 @@ where
     crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
     let sse_route = get(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
-              uri: axum::http::Uri,
+              strict: Option<axum::Extension<crate::server::StrictUrl>>,
               headers: axum::http::HeaderMap| {
             handlers::sse_handler::<Model, Msg, FInit, FUpdate, FView, FSubs>(
                 st,
-                uri,
+                strict,
                 headers,
                 Arc::clone(&sse_base),
             )
@@ -6640,8 +6731,9 @@ where
 
     // The console + metrics auth gate applies whether or not a console is
     // mounted, so its effective posture/mode/source is always logged once.
-    crate::system::write_stderr_line(
-        &crate::telemetry::ConsoleAuthResolution::from_env().startup_line(),
+    crate::system::emit_runtime_log(
+        "console",
+        &crate::telemetry::ConsoleAuthResolution::from_env().startup_message(),
     );
 
     // When `http_client` is active and the pre-built console binary is
@@ -6733,23 +6825,23 @@ where
     }
 
     // package.ipe `[web] static` (baked as IPE_WEB_STATIC_DIR) → serve files at
-    // /static/* via ServeDir. MUST be added before the `/*path` page catch-all
-    // so a /static/<file> request hits ServeDir, not the page handler (which
-    // would return HTML). `strict_serve_dir` parses each request path through
-    // `server::static_request` (decoded once, every segment a plain name under
-    // the host regime, the join re-checked) before `ServeDir` reads it. NOTE: like
-    // http.FileServer it FOLLOWS symlinks inside the dir — the dir is
-    // author-controlled (package.ipe [web] static), so that is the intended
-    // contract, NOT a confinement guarantee. Absent/empty → no static mount.
+    // /static/* via ServeDir. The nest outranks the `/*path` page catch-all, so
+    // a /static/<file> request hits ServeDir, not the page handler (which
+    // would return HTML). Inside the nest a `MountTable` re-bases the
+    // listener's parse and the URI below `/static` exactly as a `Server.static`
+    // mount does, so the static gate judges that parse: a rest the parser
+    // could never produce (`/static//x`) is a 404. `strict_serve_dir` admits
+    // only a path whose segments are plain names under the host regime, the
+    // join re-checked, before `ServeDir` reads it. NOTE: like http.FileServer
+    // it FOLLOWS symlinks inside the dir — the dir is author-controlled
+    // (package.ipe [web] static), so that is the intended contract, NOT a
+    // confinement guarantee. Absent/empty → no static mount.
     // IPE_WEB_STATIC_DIR: non-empty value mounts the named directory at /static.
     if let Some(dir) = crate::system::read_env_var("IPE_WEB_STATIC_DIR")
         .ok()
         .filter(|d| !d.is_empty())
     {
-        router = router.nest_service(
-            "/static",
-            crate::server::strict_serve_dir(std::path::PathBuf::from(dir)),
-        );
+        router = router.nest_service("/static", web_static_mount(std::path::PathBuf::from(dir))?);
     }
 
     let app: Router = router
@@ -6765,12 +6857,13 @@ where
         // observability::track so a rejected CSRF POST still gets counted +
         // access-logged.
         .layer(axum::middleware::from_fn(csrf::csrf_middleware))
-        // Strict URL gate over every route here (page, SSE, event, port,
-        // assets, static): a malformed path or query is answered with the
-        // fixed 400 before CSRF or any handler runs. Inner of `track`, so a
-        // refusal is still counted and access-logged.
+        // Second boundary over every route here (page, SSE, event, port,
+        // assets, static): a request that reaches this router without the
+        // listener's URL parse is answered with the fixed 500 before CSRF or
+        // any handler runs. Inner of `track`, so a refusal is still counted
+        // and access-logged.
         .layer(axum::middleware::from_fn(
-            crate::server::refuse_malformed_url,
+            crate::server::refuse_unparsed_url,
         ))
         // Per-request panic recovery: a handler or csrf-mw panic becomes a 500
         // instead of an unwound tokio task that drops the connection with no
@@ -7371,9 +7464,11 @@ mod canonical_redirect_handler_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        Router::new()
-            .fallback(get(handlers::page::<Model, (), Init, Update, View, Subs>))
-            .with_state(state)
+        crate::server::behind_listener(
+            Router::new()
+                .fallback(get(handlers::page::<Model, (), Init, Update, View, Subs>))
+                .with_state(state),
+        )
     }
 
     #[allow(clippy::expect_used)] // test helper: request build and router failure are environment issues
@@ -9861,32 +9956,34 @@ mod hot_init_session_scoping_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        Router::new()
-            .route(
-                "/",
-                get(handlers::page::<
-                    Counter,
-                    (),
-                    fn(WebReq) -> (Counter, IpeCmd<()>),
-                    fn((), Counter) -> (Counter, IpeCmd<()>),
-                    fn(Counter) -> Html<()>,
-                    fn(Counter) -> IpeSub<()>,
-                >),
-            )
-            .route(
-                "/_ipe/hot-init",
-                post(
-                    handlers::hot_init_handler::<
+        crate::server::behind_listener(
+            Router::new()
+                .route(
+                    "/",
+                    get(handlers::page::<
                         Counter,
                         (),
                         fn(WebReq) -> (Counter, IpeCmd<()>),
                         fn((), Counter) -> (Counter, IpeCmd<()>),
                         fn(Counter) -> Html<()>,
                         fn(Counter) -> IpeSub<()>,
-                    >,
-                ),
-            )
-            .with_state(state)
+                    >),
+                )
+                .route(
+                    "/_ipe/hot-init",
+                    post(
+                        handlers::hot_init_handler::<
+                            Counter,
+                            (),
+                            fn(WebReq) -> (Counter, IpeCmd<()>),
+                            fn((), Counter) -> (Counter, IpeCmd<()>),
+                            fn(Counter) -> Html<()>,
+                            fn(Counter) -> IpeSub<()>,
+                        >,
+                    ),
+                )
+                .with_state(state),
+        )
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -11086,6 +11183,7 @@ mod emitted_router_behavior_tests {
             fn(Model) -> Html<Msg>,
             fn(Model) -> IpeSub<Msg>,
         >(make_state(store), false)
+        .map(crate::server::behind_listener)
         .expect("the unset test base parses")
     }
 
@@ -12378,6 +12476,7 @@ mod emitted_router_behavior_tests {
                 fn(Model) -> Html<Msg>,
                 fn(Model) -> IpeSub<Msg>,
             >(state, false)
+            .map(crate::server::behind_listener)
             .expect("the unset test base parses");
             let ord = std::sync::atomic::Ordering::SeqCst;
             let expected_vary = [
@@ -12470,6 +12569,7 @@ mod emitted_router_behavior_tests {
             fn(Model) -> Html<Msg>,
             fn(Model) -> IpeSub<Msg>,
         >(state, false)
+        .map(crate::server::behind_listener)
         .expect("the unset test base parses")
     }
 
@@ -12545,7 +12645,7 @@ mod emitted_router_behavior_tests {
     /// GET `/` against a mount, returning the status and body text.
     #[allow(clippy::expect_used)] // test helper: request build / body read failure is a test environment issue
     async fn mounted_get(router: axum::Router) -> (StatusCode, String) {
-        let resp = router
+        let resp = crate::server::behind_listener(router)
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -12692,6 +12792,51 @@ mod emitted_router_behavior_tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, FAIL_CLOSED_BODY);
         assert!(!body.contains("%zz"), "the 503 must not echo the refusal");
+    }
+
+    /// A `Web.embed` app nested in a listener's router: a malformed URL is
+    /// refused with 400 before the mount is chosen, and a respelled mount
+    /// prefix enters the mount exactly as its canonical spelling does.
+    #[test]
+    fn embedded_app_sees_only_canonical_urls() {
+        let builder = web_embed_router(
+            init,
+            update,
+            view,
+            subs,
+            "memory".to_string(),
+            String::new(),
+            [0u8; 32],
+        );
+        block_on(async move {
+            let base = crate::encoding::MountBase::parse("/billing").expect("the prefix parses");
+            let sub = builder(String::new()).await;
+            let app = crate::server::behind_listener(
+                crate::server::MountTable::new(vec![(base, sub)]).below(axum::Router::new()),
+            );
+            let status_of = |uri: &'static str| {
+                let app = app.clone();
+                async move {
+                    app.oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build GET"),
+                    )
+                    .await
+                    .expect("router responds")
+                    .status()
+                }
+            };
+            for uri in ["/billing/%zz", "/billing/%", "/%zz", "/billing?q=%zz"] {
+                assert_eq!(status_of(uri).await, StatusCode::BAD_REQUEST, "{uri}");
+            }
+            let canonical = status_of("/billing").await;
+            assert_eq!(canonical, StatusCode::OK, "the mount serves its prefix");
+            assert_eq!(status_of("/%62illing").await, canonical);
+            assert_eq!(status_of("/%62%69lling").await, canonical);
+        });
     }
 
     /// A mounted app whose store config this build cannot honour answers every
@@ -12956,6 +13101,7 @@ mod route_entry_cmd_tests {
     #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
     fn router_counted(store: Store, session_count: Arc<AtomicUsize>) -> axum::Router {
         build_web_router(fixture_state(store, session_count), false)
+            .map(crate::server::behind_listener)
             .expect("the fixture route table and base are well-formed")
     }
 
@@ -12979,6 +13125,46 @@ mod route_entry_cmd_tests {
 
     fn memory() -> Store {
         Arc::new(MemoryStore::<Model, Msg>::new(Duration::from_secs(60)))
+    }
+
+    /// A Web router reached without the listener's URL parse refuses every
+    /// route with the fixed 500 and starts no session: the page, the SSE
+    /// stream and the event endpoint alike, a well-formed URL and a malformed
+    /// one alike.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the fixture table builds and a fixed request always builds
+    fn web_router_without_the_listener_parse_is_refused() {
+        run(false, || async {
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let bare = build_web_router(fixture_state(memory(), sessions.clone()), false)
+                .expect("the fixture route table and base are well-formed");
+            for (method, uri) in [
+                ("GET", "/"),
+                ("GET", "/items/3"),
+                ("GET", "/%zz"),
+                ("GET", "/_ipe/sse?path=/"),
+                ("POST", "/_ipe/event"),
+            ] {
+                let resp = bare
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .body(Body::empty())
+                            .expect("build request"),
+                    )
+                    .await
+                    .expect("router responds");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{method} {uri}"
+                );
+            }
+            assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(take_init_sids().is_empty());
+        });
     }
 
     /// A rebound name reaches no route of a real `serve_web`: the page GET
@@ -13020,6 +13206,65 @@ mod route_entry_cmd_tests {
                 );
                 let resp = crate::server::raw_exchange(port, &control).await.unwrap();
                 assert_eq!(crate::server::raw_status(&resp), 200, "{resp}");
+            };
+            // The listener serves until shutdown; the checks finishing first is the pass.
+            let checked = tokio::select! {
+                _ = served => false,
+                () = checks => true,
+            };
+            assert!(checked, "serve_web returned before the checks ran");
+            crate::system::locked_remove_var(crate::env_registry::web::WEB_PORT.name());
+            crate::system::locked_remove_var("IPE_CONSOLE_EMBED");
+            crate::system::locked_remove_var("IPE_HTTP_BIND");
+        });
+    }
+
+    /// A real `serve_web` refuses a malformed URL with 400 before any route,
+    /// and serves another spelling of an internal route as that route: the
+    /// respelled event POST gets the event handler's answer, never the page
+    /// route's.
+    #[test]
+    fn web_refuses_a_malformed_url_and_routes_its_canonical_spelling() {
+        run(false, || async {
+            let port = crate::server::free_loopback_port().unwrap();
+            crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+            crate::system::locked_set_var("IPE_CONSOLE_EMBED", "off");
+            crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+            crate::system::locked_set_var(
+                crate::env_registry::web::WEB_PORT.name(),
+                &port.to_string(),
+            );
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let served = serve_web::<crate::IpeError, _, _, _, _, _, _>(fixture_state(
+                memory(),
+                sessions.clone(),
+            ));
+            let checks = async {
+                let host = format!("127.0.0.1:{port}");
+                for path in ["/%zz", "/%", "/_ipe/%zz", "/no/such/page/%C0%AF", "/?q=%zz"] {
+                    let request =
+                        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+                    let resp = crate::server::raw_exchange(port, &request).await.unwrap();
+                    assert_eq!(crate::server::raw_status(&resp), 400, "{path}: {resp}");
+                    assert!(!resp.contains("%zz"), "{path} must not echo the request");
+                }
+                assert_eq!(sessions.load(std::sync::atomic::Ordering::SeqCst), 0);
+                let event = |path: &str| {
+                    format!(
+                        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                };
+                let canonical = crate::server::raw_exchange(port, &event("/_ipe/event"))
+                    .await
+                    .unwrap();
+                let respelled = crate::server::raw_exchange(port, &event("/_ipe/%65vent"))
+                    .await
+                    .unwrap();
+                let status = crate::server::raw_status(&canonical);
+                assert_ne!(status, 405, "the event route answers its POST: {canonical}");
+                assert_eq!(crate::server::raw_status(&respelled), status, "{respelled}");
+                let body = |resp: &str| resp.split_once("\r\n\r\n").map(|(_, b)| b.to_owned());
+                assert_eq!(body(&respelled), body(&canonical));
             };
             // The listener serves until shutdown; the checks finishing first is the pass.
             let checked = tokio::select! {
@@ -13354,6 +13599,250 @@ mod route_entry_cmd_tests {
                 "a verbatim restore never evaluates init"
             );
         });
+    }
+
+    /// The Fetch Metadata of a sibling-subdomain `<img>`, which carries a `Lax` cookie.
+    const SUBRESOURCE: [(&str, &str); 3] = [
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-mode", "no-cors"),
+        ("sec-fetch-dest", "image"),
+    ];
+
+    /// The same site's top-level navigation, the accepted control.
+    const NAVIGATION: [(&str, &str); 3] = [
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+
+    /// GET `path` with an optional session cookie and `metadata` → (status,
+    /// whether any cookie was set, body).
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_judged(
+        app: axum::Router,
+        path: &str,
+        cookie: Option<&str>,
+        metadata: &[(&str, &str)],
+    ) -> (StatusCode, bool, String) {
+        let mut b = Request::builder().method("GET").uri(path);
+        if let Some(c) = cookie {
+            b = b.header(
+                header::COOKIE,
+                format!("{}={c}", super::cookie_name_for("")),
+            );
+        }
+        for (name, value) in metadata {
+            b = b.header(*name, *value);
+        }
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.oneshot(b.body(Body::empty()).expect("build GET")),
+        )
+        .await
+        .expect("the page handler answers in time")
+        .expect("router responds");
+        let status = resp.status();
+        let set_cookie = resp.headers().get(header::SET_COOKIE).is_some();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("a UTF-8 page body");
+        (status, set_cookie, body)
+    }
+
+    /// Prove the refusal on the Live arm: a same-site subresource GET carrying
+    /// a live session's cookie is refused before the driver enters its path —
+    /// 403, no cookie, the entry Cmd never runs — while the same GET as a
+    /// navigation enters it.
+    #[test]
+    fn subresource_never_enters_a_live_session() {
+        run(false, || async {
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, body) =
+                get_judged(router(store.clone()), "/items/9", Some(&sid), &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert!(!body.contains("page-item-9"), "{body}");
+            let m = model_of(&store, &sid).await;
+            assert_eq!(m.as_ref().map(|m| m.page.clone()), Some(Page::Home));
+            assert_eq!(m.map(|m| count(&m, "enter:item-9")), Some(0));
+
+            let (status, _, body) =
+                get_judged(router(store.clone()), "/items/9", Some(&sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("page-item-9"), "{body}");
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(m.map(|m| count(&m, "enter:item-9")), Some(1));
+        });
+    }
+
+    /// Prove the refusal on the Restored arm: a subresource GET carrying a
+    /// cold session's cookie publishes no driver and takes no session slot,
+    /// while the navigation restores it.
+    #[test]
+    fn subresource_never_restores_a_cold_session() {
+        run(false, || async {
+            let cold_sid = new_sid();
+            let store: Store = Arc::new(ColdStore {
+                live: MemoryStore::new(Duration::from_secs(60)),
+                cold_sid: cold_sid.clone(),
+            });
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let app = || router_counted(store.clone(), sessions.clone());
+
+            let (status, set_cookie, _) =
+                get_judged(app(), "/items/3", Some(&cold_sid), &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert!(handle_of(&store, &cold_sid).await.is_none());
+            assert_eq!(sessions.load(Ordering::SeqCst), 0);
+
+            let (status, _, _) = get_judged(app(), "/items/3", Some(&cold_sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            let m = settled(&store, &cold_sid, 2).await;
+            assert_eq!(
+                m.map(|m| m.log),
+                Some(vec!["persisted".to_owned(), "enter:item-3".to_owned()])
+            );
+        });
+    }
+
+    /// Prove the refusal on the Rebuilt arm: a subresource GET carrying the
+    /// cookie of a row predating an additive Model change never runs the
+    /// rebuild's lazy `init`, while the navigation rebuilds it under its sid.
+    #[cfg(feature = "web")]
+    #[test]
+    fn subresource_never_rebuilds_a_session() {
+        run(false, || async {
+            let sid = new_sid();
+            let (store, _dir) = file_store_with(
+                "rebuild-refused",
+                &sid,
+                checkpoint(OLD_TAG, r#"{"page":"Home"}"#),
+            );
+            take_init_sids();
+
+            let (status, set_cookie, _) =
+                get_judged(router(store.clone()), "/", Some(&sid), &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert!(take_init_sids().is_empty(), "a refused rejoin runs no init");
+            assert!(handle_of(&store, &sid).await.is_none());
+
+            let (status, _, _) =
+                get_judged(router(store.clone()), "/", Some(&sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(take_init_sids(), vec![sid]);
+        });
+    }
+
+    /// Prove the refusal of partial Fetch Metadata: it never rejoins a live
+    /// session, while a request with none at all (not embeddable) does.
+    #[test]
+    fn malformed_metadata_never_rejoins() {
+        run(false, || async {
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, _) = get_judged(
+                router(store.clone()),
+                "/items/4",
+                Some(&sid),
+                &[("sec-fetch-site", "same-origin")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert_eq!(
+                model_of(&store, &sid)
+                    .await
+                    .map(|m| count(&m, "enter:item-4")),
+                Some(0)
+            );
+
+            let (status, _, body) =
+                get_judged(router(store.clone()), "/items/4", Some(&sid), &[]).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("page-item-4"), "{body}");
+        });
+    }
+
+    /// The framing allowlist the embeddable child runs under.
+    const EMBEDDER: &str = "https://embedder.example";
+    /// Printed by the embeddable child once every assertion held.
+    const EMBEDDABLE_CHILD_RAN: &str = "embeddable rejoin child ran";
+
+    /// Prove the refusal of a metadata-less rejoin while the cookie is
+    /// `SameSite=None`: the check runs in a child process holding
+    /// `IPE_WEB_FRAME_ANCESTORS`, and must report that it ran.
+    #[test]
+    #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
+    fn embeddable_rejoin_needs_metadata() {
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, rest)| rest);
+        let filter = format!("{module}::embeddable_rejoin_child");
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                filter.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(crate::telemetry::FRAME_ANCESTORS_ENV, EMBEDDER)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8(out.stdout).unwrap_or_default();
+        assert!(out.status.success(), "the child failed: {stdout}");
+        assert!(
+            stdout.contains(EMBEDDABLE_CHILD_RAN),
+            "the child test never ran: {stdout}"
+        );
+    }
+
+    /// The child half of `embeddable_rejoin_needs_metadata`; a no-op unless it
+    /// runs under the embedder allowlist.
+    #[test]
+    #[ignore = "run as a child process by embeddable_rejoin_needs_metadata"]
+    fn embeddable_rejoin_child() {
+        if crate::system::read_env_var(crate::telemetry::FRAME_ANCESTORS_ENV).as_deref()
+            != Ok(EMBEDDER)
+        {
+            return;
+        }
+        run(false, || async {
+            assert_eq!(
+                mint_proof::Embedding::configured(),
+                mint_proof::Embedding::Embeddable
+            );
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, _) =
+                get_judged(router(store.clone()), "/items/5", Some(&sid), &[]).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            assert_eq!(
+                model_of(&store, &sid)
+                    .await
+                    .map(|m| count(&m, "enter:item-5")),
+                Some(0)
+            );
+
+            let (status, _, body) =
+                get_judged(router(store.clone()), "/items/5", Some(&sid), &NAVIGATION).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("page-item-5"), "{body}");
+        });
+        println!("{EMBEDDABLE_CHILD_RAN}");
     }
 
     /// An undecodable row is a miss: a fresh sid, `init` evaluated exactly once under it.
@@ -13936,6 +14425,81 @@ mod route_entry_cmd_tests {
             assert_eq!(m.map(|m| count(&m, "enter:home")), Some(1));
         });
     }
+
+    /// The Fetch Metadata of the client's own `EventSource`, the accepted control.
+    const EVENT_SOURCE: [(&str, &str); 3] = [
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-dest", "empty"),
+    ];
+
+    /// Open the SSE stream for `sid` reporting `path` with `metadata` →
+    /// (status, whether any cookie was set, the stream up to its resync frame).
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn sse_judged(
+        store: &Store,
+        sid: &str,
+        path: &str,
+        metadata: &[(&str, &str)],
+    ) -> (StatusCode, bool, String) {
+        use futures_util::StreamExt;
+        let mut b = Request::builder()
+            .method("GET")
+            .uri(format!("/_ipe/sse?path={}", path.replace('/', "%2F")))
+            .header(header::ACCEPT, "text/event-stream")
+            .header(
+                header::COOKIE,
+                format!("{}={sid}", super::cookie_name_for("")),
+            );
+        for (name, value) in metadata {
+            b = b.header(*name, *value);
+        }
+        let resp = router(store.clone())
+            .oneshot(b.body(Body::empty()).expect("build SSE GET"))
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let set_cookie = resp.headers().get(header::SET_COOKIE).is_some();
+        let mut stream = resp.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while bytes.len() < 64 * 1024 && !utf8_prefix(&bytes).contains("event: patch") {
+                match stream.next().await {
+                    Some(Ok(chunk)) => bytes.extend_from_slice(&chunk),
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        (status, set_cookie, utf8_prefix(&bytes).to_owned())
+    }
+
+    /// Prove the refusal on the SSE reconcile: a same-site subresource open of
+    /// `/_ipe/sse?path=` carrying a live session's cookie is refused before
+    /// the lookup — 403, no cookie, the path's entry Cmd never runs — while
+    /// the client's own `EventSource` open enters it.
+    #[test]
+    fn subresource_sse_never_enters_a_route() {
+        run(false, || async {
+            let store = memory();
+            let (_, _, sid, _) = get(&store, "/", None).await;
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, set_cookie, _) = sse_judged(&store, &sid, "/items/8", &SUBRESOURCE).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert!(!set_cookie, "a refused rejoin sets no cookie");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let m = model_of(&store, &sid).await;
+            assert_eq!(m.as_ref().map(|m| m.page.clone()), Some(Page::Home));
+            assert_eq!(m.map(|m| count(&m, "enter:item-8")), Some(0));
+
+            let (status, _, frame) = sse_judged(&store, &sid, "/items/8", &EVENT_SOURCE).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(frame.contains("page-item-8"), "{frame}");
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(m.map(|m| count(&m, "enter:item-8")), Some(1));
+        });
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -14196,7 +14760,9 @@ mod web_revocation_tests {
             session_count: Arc::new(AtomicUsize::new(0)),
             watch_build_status: Arc::new(Mutex::new(None)),
         };
-        build_web_router(state, false).expect("a router armed through the Server floor builds")
+        build_web_router(state, false)
+            .map(crate::server::behind_listener)
+            .expect("a router armed through the Server floor builds")
     }
 
     /// Arm the process through the `Server` floor, then run `body` on a
@@ -15859,5 +16425,51 @@ mod web_revocation_tests {
             .await;
             assert!(is_session_lost(after).await, "a revoked session is lost");
         });
+    }
+}
+
+#[cfg(all(test, feature = "server"))]
+mod web_static_mount_tests {
+    //! A `Web` app's `/static` mount re-bases the listener's parse as every
+    //! `Server` mount does.
+
+    use super::web_static_mount;
+
+    /// Serve `uri` through the `Web` static mount over a directory holding
+    /// `hello.txt`, behind the listener.
+    #[allow(clippy::expect_used)] // test: fixture writes and a fixed request
+    async fn serve(uri: &str) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let dir = crate::scratch_core::test_temp_root().join(format!(
+            "ipe-web-static-{}-{}",
+            std::process::id(),
+            uri.len()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp static dir");
+        std::fs::write(dir.join("hello.txt"), "hi").expect("static fixture file");
+        let mount = web_static_mount(dir.clone()).expect("`/static` is a mount base");
+        let app =
+            crate::server::behind_listener(axum::Router::new().nest_service("/static", mount));
+        let wire = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("test request builds");
+        let status = match app.oneshot(wire).await {
+            Ok(r) => r.status(),
+            Err(e) => match e {},
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        status
+    }
+
+    /// Prove the refusal: a rest led by an empty segment reaches no file,
+    /// while the file itself is served.
+    #[tokio::test]
+    async fn web_static_mount_refuses_a_rest_led_by_an_empty_segment() {
+        assert_eq!(serve("/static/hello.txt").await, axum::http::StatusCode::OK);
+        for uri in ["/static//hello.txt", "/static///hello.txt"] {
+            assert_eq!(serve(uri).await, axum::http::StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 }

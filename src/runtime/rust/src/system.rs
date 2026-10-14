@@ -1,6 +1,9 @@
 // System helpers — some generic over E (when returning IpeTask).
 use super::path::{OsOrigin, from_os};
-use super::{IpeError, IpeMaybe, IpeResult, IpeTask, ok_res, str_err};
+use super::{
+    FromLimitExceeded, IpeError, IpeMaybe, IpeResult, IpeTask, KernelFailure, LimitRefusal, ok_res,
+    str_err,
+};
 
 // `std::env::set_var`/`remove_var` are documented as NOT thread-safe: a mutator
 // reallocates the C `environ` block while another thread READS it — and the
@@ -702,8 +705,8 @@ fn home_dir_from_var(
 
 /// Render a runtime status line (e.g. the HTTP `listening on` banner, or an
 /// `[ipe.live]`/`[ipe.console]` session-store/console line) with a 4-space
-/// left gutter ONLY when stderr is an interactive terminal; a piped or
-/// redirected stderr (test harness, production log capture) stays flush-left so
+/// left gutter ONLY when its stream is an interactive terminal; a piped or
+/// redirected stream (test harness, production log capture) stays flush-left so
 /// downstream `contains(...)` matchers see the bare line. The `is_terminal`
 /// decision is a parameter so the indent rule is testable without a pty.
 ///
@@ -890,25 +893,64 @@ pub(crate) fn write_stdout_line(line: &str) {
     let _ = writeln!(std::io::stdout().lock(), "{line}");
 }
 
-/// Build a `"[<stamp> ][ipe.<tag>] <msg>"` line with `msg` scrubbed. Private:
-/// the only place the literal `"[ipe."` prefix is constructed; call sites use
-/// `emit_runtime_log` / `emit_runtime_log_stamped`.
+/// The standard stream a runtime log line is written to.
+///
+/// Each stream is judged on its own `is_terminal`, so a redirected stdout does
+/// not flush-left an interactive stderr line, nor the reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogStream {
+    /// Status and diagnostic lines.
+    Stderr,
+    /// User-facing status lines that sit beside program output.
+    #[cfg_attr(
+        not(all(feature = "web-core", feature = "server")),
+        allow(dead_code) // only the served web surface writes a status line to stdout
+    )]
+    Stdout,
+}
+
+impl LogStream {
+    fn is_terminal(self) -> bool {
+        use std::io::IsTerminal;
+        match self {
+            Self::Stderr => std::io::stderr().is_terminal(),
+            Self::Stdout => std::io::stdout().is_terminal(),
+        }
+    }
+
+    fn write_line(self, line: &str) {
+        match self {
+            Self::Stderr => write_stderr_line(line),
+            Self::Stdout => write_stdout_line(line),
+        }
+    }
+}
+
+/// Build a `"[ipe.<tag>] [<stamp> ]<msg>"` line with `msg` scrubbed.
+///
+/// Private: the only place the literal `"[ipe."` prefix is constructed. The
+/// tag leads and the optional stamp follows it, so every runtime line shares
+/// one layout; call sites use the `emit_runtime_log*` fns.
 fn format_runtime_log(stamp: Option<&str>, tag: &str, msg: &str) -> String {
     let msg = scrub_log_controls(msg);
     match stamp {
-        Some(stamp) => format!("{stamp} [ipe.{tag}] {msg}"),
+        Some(stamp) => format!("[ipe.{tag}] {stamp} {msg}"),
         None => format!("[ipe.{tag}] {msg}"),
     }
 }
 
 /// The fully rendered (scrubbed, terminal-guttered) form of a tagged runtime
-/// log line — exactly what the emitters write.
-pub(crate) fn runtime_log_line(stamp: Option<&str>, tag: &str, msg: &str) -> String {
-    use std::io::IsTerminal;
-    gutter_line(
-        &format_runtime_log(stamp, tag, msg),
-        std::io::stderr().is_terminal(),
-    )
+/// log line on `stream` — exactly what the emitters write.
+///
+/// The one composer of a runtime log line: tag, optional stamp, scrubbed
+/// message, then the gutter the stream's terminal state asks for.
+pub(crate) fn runtime_log_line(
+    stream: LogStream,
+    stamp: Option<&str>,
+    tag: &str,
+    msg: &str,
+) -> String {
+    gutter_line(&format_runtime_log(stamp, tag, msg), stream.is_terminal())
 }
 
 /// The single emitter for every `[ipe.<tag>] ...` runtime log line — session
@@ -919,14 +961,23 @@ pub(crate) fn runtime_log_line(stamp: Option<&str>, tag: &str, msg: &str) -> Str
 /// broken-pipe-tolerant write apply uniformly with no bypass path. Pinned by the
 /// source scan in `runtime_log_emitter_tests` below.
 pub(crate) fn emit_runtime_log(tag: &str, msg: &str) {
-    write_stderr_line(&runtime_log_line(None, tag, msg));
+    let stream = LogStream::Stderr;
+    stream.write_line(&runtime_log_line(stream, None, tag, msg));
 }
 
-/// `emit_runtime_log` for a line that carries a leading timestamp before its
-/// tag (the memory session-store startup line).
+/// `emit_runtime_log` for a line that carries a timestamp after its tag (the
+/// memory session-store startup line).
 #[cfg(all(feature = "web-core", feature = "server"))]
 pub(crate) fn emit_runtime_log_stamped(stamp: &str, tag: &str, msg: &str) {
-    write_stderr_line(&runtime_log_line(Some(stamp), tag, msg));
+    let stream = LogStream::Stderr;
+    stream.write_line(&runtime_log_line(stream, Some(stamp), tag, msg));
+}
+
+/// `emit_runtime_log` for a user-facing status line written to stdout.
+#[cfg(all(feature = "web-core", feature = "server"))]
+pub(crate) fn emit_runtime_log_stdout(tag: &str, msg: &str) {
+    let stream = LogStream::Stdout;
+    stream.write_line(&runtime_log_line(stream, None, tag, msg));
 }
 
 /// The port a program passed to its listener, admitted once as a
@@ -1307,16 +1358,20 @@ fn decode_arg_at(
 // see `docs/adr/0003-security-render-and-data-access-invariants.md`
 // §2.2 — so the fallback only matters for this crate's own narrow-feature
 // standalone builds).
-// The offload is `threads::run_blocking`: a blocking pool that cannot start a
-// thread is an `Unavailable` error, and a build without the pool (no `tokio`, or
-// wasm32) runs the closure inline.
+// The offload is `threads::join_blocking`: a blocking pool that cannot start a
+// thread is an `Unavailable` error, a capture past its ceiling is
+// `LimitExceeded`, and a build without the pool (no `tokio`, or wasm32) runs the
+// closure inline.
 async fn run_blocking<T, E, F>(f: F) -> Result<T, E>
 where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
+    F: FnOnce() -> Result<T, KernelFailure> + Send + 'static,
     T: Send + 'static,
-    E: From<String> + crate::FromUnavailable,
+    E: From<String> + FromLimitExceeded + crate::FromUnavailable,
 {
-    crate::threads::run_blocking("Process", "background process task panicked", f).await
+    match crate::threads::join_blocking("Process", f).await {
+        Ok(done) => done.map_err(KernelFailure::into_error),
+        Err(failure) => Err(failure.into_error("background process task panicked")),
+    }
 }
 
 /// The default combined-output capture ceiling (16 MiB), overridable via
@@ -2377,7 +2432,7 @@ fn still_parented_by(
     }
 }
 
-fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCapture, String> {
+fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCapture, KernelFailure> {
     use std::process::{Command, Stdio};
 
     let mut builder = Command::new(cmd);
@@ -2424,10 +2479,11 @@ fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCaptu
 
     if combined.len() as u64 > cap {
         // `guard`'s `Drop` kills + reaps the still-running child on this bail.
-        return Err(format!(
+        return Err(LimitRefusal::new(format!(
             "{cmd}: output exceeds the {cap}-byte capture ceiling \
              (raise IPE_PROCESS_OUTPUT_MAX)"
-        ));
+        ))
+        .into());
     }
 
     let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
@@ -2457,7 +2513,9 @@ fn process_run_sync(cmd: &str, args: &[String], cap: u64) -> Result<ProcessCaptu
 /// doc comment above) so a long-running subprocess can't stall the tokio worker
 /// thread polling this future.
 #[must_use]
-pub fn process_run<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn process_run<
+    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
+>(
     cmd: String,
     args: Vec<String>,
 ) -> IpeTask<E, String> {
@@ -2473,7 +2531,9 @@ pub fn process_run<E: Send + From<String> + crate::FromUnavailable + 'static>(
 /// so no test mutates the process-global environment (which would race a
 /// concurrent subprocess call reading the same var).
 #[must_use]
-fn process_run_with_cap<E: Send + From<String> + crate::FromUnavailable + 'static>(
+fn process_run_with_cap<
+    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
+>(
     cmd: String,
     args: Vec<String>,
     cap: u64,
@@ -2538,7 +2598,7 @@ fn process_run_with_sync(
     cwd: Option<&std::path::Path>,
     env_overrides: &[(String, String)],
     cap: u64,
-) -> Result<ProcessRunOutput, String> {
+) -> Result<ProcessRunOutput, KernelFailure> {
     use std::process::{Command, Stdio};
 
     let mut builder = Command::new(cmd);
@@ -2590,16 +2650,18 @@ fn process_run_with_sync(
         .map_err(|e| format!("{cmd}: {e}"))?;
 
     if stdout_bytes.len() as u64 > cap {
-        return Err(format!(
+        return Err(LimitRefusal::new(format!(
             "{cmd}: stdout exceeds the {cap}-byte capture ceiling \
              (raise IPE_PROCESS_OUTPUT_MAX)"
-        ));
+        ))
+        .into());
     }
     if stderr_bytes.len() as u64 > cap {
-        return Err(format!(
+        return Err(LimitRefusal::new(format!(
             "{cmd}: stderr exceeds the {cap}-byte capture ceiling \
              (raise IPE_PROCESS_OUTPUT_MAX)"
-        ));
+        ))
+        .into());
     }
 
     let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
@@ -2630,7 +2692,9 @@ fn process_run_with_sync(
 /// inherits its confined environment from the parent, and the overrides are
 /// applied ON TOP of that already-confined environment.
 #[must_use]
-pub fn process_run_with<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn process_run_with<
+    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
+>(
     cfg: ProcessRunWithCfg,
 ) -> IpeTask<E, ProcessRunOutput> {
     match process_output_ceiling() {
@@ -2674,7 +2738,9 @@ crate::stringify::show_row!(
 );
 
 #[must_use]
-fn process_run_with_impl<E: Send + From<String> + crate::FromUnavailable + 'static>(
+fn process_run_with_impl<
+    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
+>(
     cfg: ProcessRunWithCfg,
     cap: u64,
 ) -> IpeTask<E, ProcessRunOutput> {
@@ -2760,7 +2826,9 @@ pub struct ProcessPtyOutput {
 /// rather than a silent no-op. The blocking spawn+read+wait is offloaded via
 /// `run_blocking` so a long-running child cannot stall the tokio worker thread.
 #[must_use]
-pub fn process_run_in_pty<E: Send + From<String> + crate::FromUnavailable + 'static>(
+pub fn process_run_in_pty<
+    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
+>(
     cfg: ProcessRunInPtyCfg,
 ) -> IpeTask<E, ProcessPtyOutput> {
     match process_output_ceiling() {
@@ -2770,7 +2838,9 @@ pub fn process_run_in_pty<E: Send + From<String> + crate::FromUnavailable + 'sta
 }
 
 #[must_use]
-fn process_run_in_pty_impl<E: Send + From<String> + crate::FromUnavailable + 'static>(
+fn process_run_in_pty_impl<
+    E: Send + From<String> + FromLimitExceeded + crate::FromUnavailable + 'static,
+>(
     cfg: ProcessRunInPtyCfg,
     cap: u64,
 ) -> IpeTask<E, ProcessPtyOutput> {
@@ -2790,8 +2860,10 @@ fn process_run_in_pty_impl<E: Send + From<String> + crate::FromUnavailable + 'st
 fn process_run_in_pty_sync(
     _cfg: ProcessRunInPtyCfg,
     _cap: u64,
-) -> Result<ProcessPtyOutput, String> {
-    Err("Process.runInPty is only supported on Unix targets".to_owned())
+) -> Result<ProcessPtyOutput, KernelFailure> {
+    Err(KernelFailure::from(
+        "Process.runInPty is only supported on Unix targets".to_owned(),
+    ))
 }
 
 /// Spawn `cfg.command cfg.args` under a freshly allocated pseudo-terminal, sized
@@ -2815,7 +2887,10 @@ fn process_run_in_pty_sync(
 /// replica, so a child reading input blocks on the pty (EOF once the master is
 /// closed) rather than the parent's stdin.
 #[cfg(unix)]
-fn process_run_in_pty_sync(cfg: ProcessRunInPtyCfg, cap: u64) -> Result<ProcessPtyOutput, String> {
+fn process_run_in_pty_sync(
+    cfg: ProcessRunInPtyCfg,
+    cap: u64,
+) -> Result<ProcessPtyOutput, KernelFailure> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
 
@@ -2958,10 +3033,11 @@ fn process_run_in_pty_sync(cfg: ProcessRunInPtyCfg, cap: u64) -> Result<ProcessP
 
     if combined.len() as u64 > cap {
         // `guard`'s `Drop` kills + reaps the still-running child on this bail.
-        return Err(format!(
+        return Err(LimitRefusal::new(format!(
             "{cmd}: pty output exceeds the {cap}-byte capture ceiling \
              (raise IPE_PROCESS_OUTPUT_MAX)"
-        ));
+        ))
+        .into());
     }
 
     let status = guard.wait().map_err(|e| format!("{cmd}: {e}"))?;
@@ -4138,7 +4214,39 @@ mod exit_hook_tests {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod gutter_line_tests {
-    use super::gutter_line;
+    use super::{format_runtime_log, gutter_line};
+
+    #[test]
+    fn every_runtime_line_leads_with_its_tag() {
+        // The stamp, where a line has one, follows the tag; a stamp-less line
+        // goes tag then text. The gutter wraps the whole composed line, so a
+        // terminal stream indents all three startup shapes identically.
+        for (stamp, tag, msg, flush_left) in [
+            (
+                Some("2026/10/12 09:30:00"),
+                "live",
+                "session store: memory (ttl=30m0s)",
+                "[ipe.live] 2026/10/12 09:30:00 session store: memory (ttl=30m0s)",
+            ),
+            (
+                None,
+                "console",
+                "auth posture=dev mode=token source=env",
+                "[ipe.console] auth posture=dev mode=token source=env",
+            ),
+            (
+                None,
+                "web",
+                "listening on :8000",
+                "[ipe.web] listening on :8000",
+            ),
+        ] {
+            let line = format_runtime_log(stamp, tag, msg);
+            assert_eq!(line, flush_left);
+            assert_eq!(gutter_line(&line, false), flush_left);
+            assert_eq!(gutter_line(&line, true), format!("    {flush_left}"));
+        }
+    }
 
     #[test]
     fn indents_only_under_a_terminal() {
@@ -4264,7 +4372,7 @@ mod runtime_log_emitter_tests {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod scrub_log_controls_tests {
-    use super::{runtime_log_line, scrub_log_controls};
+    use super::{LogStream, runtime_log_line, scrub_log_controls};
 
     #[test]
     fn escapes_newline_esc_del_and_c1() {
@@ -4458,7 +4566,12 @@ mod scrub_log_controls_tests {
 
     #[test]
     fn emitted_line_cannot_forge_a_second_record() {
-        let line = runtime_log_line(None, "http", "GET /x\r\n[ipe.http] forged\x1b[31m");
+        let line = runtime_log_line(
+            LogStream::Stderr,
+            None,
+            "http",
+            "GET /x\r\n[ipe.http] forged\x1b[31m",
+        );
         assert!(
             !line.chars().any(super::is_log_hazard),
             "control survived: {line:?}"
@@ -5311,14 +5424,27 @@ mod process_run_tests {
     fn output_over_ceiling_errs() {
         // The ceiling is passed explicitly (not via a process-global env var),
         // so this runs safely in parallel with any other subprocess test.
-        let res: IpeResult<String, String> = block(process_run_with_cap::<String>(
+        let res: IpeResult<IpeError, String> = block(process_run_with_cap::<IpeError>(
             "printf".to_string(),
-            vec!["%s".to_string(), "x".repeat(64)],
+            vec!["%s".to_string(), "x".repeat(9)],
             8,
         ));
-        assert!(
-            matches!(res, IpeResult::Err(_)),
-            "64 bytes of output under an 8-byte ceiling must Err, not OOM/truncate"
+        assert_eq!(
+            res,
+            IpeResult::Err(IpeError::limit_exceeded(
+                "printf: output exceeds the 8-byte capture ceiling (raise IPE_PROCESS_OUTPUT_MAX)"
+            )),
+            "9 bytes of output under an 8-byte ceiling is a LimitExceeded refusal"
+        );
+        let at_cap: IpeResult<IpeError, String> = block(process_run_with_cap::<IpeError>(
+            "printf".to_string(),
+            vec!["%s".to_string(), "x".repeat(8)],
+            8,
+        ));
+        assert_eq!(
+            at_cap,
+            IpeResult::Ok("x".repeat(8)),
+            "output at the ceiling is kept"
         );
     }
 
@@ -5352,7 +5478,7 @@ mod process_run_tests {
         ];
         let refused = process_run_sync("sh", &args, 64);
         assert!(
-            matches!(&refused, Err(e) if e.contains("capture thread refused")),
+            matches!(&refused, Err(e) if e.message().contains("capture thread refused")),
             "{:?}",
             refused.as_ref().err()
         );
@@ -5525,18 +5651,36 @@ mod process_run_with_tests {
         };
         // Swap command for a ceiling test via the internal cap-threaded helper.
         let _ = c; // used below via process_run_with_impl directly
-        let res: IpeResult<String, ProcessRunOutput> = block(process_run_with_impl::<String>(
+        let res: IpeResult<IpeError, ProcessRunOutput> = block(process_run_with_impl::<IpeError>(
             ProcessRunWithCfg {
                 command: "printf".to_owned(),
-                args: vec!["%s".to_owned(), "x".repeat(64)],
+                args: vec!["%s".to_owned(), "x".repeat(9)],
                 cwd: IpeMaybe::Nothing,
                 env: Vec::new(),
             },
             8,
         ));
         assert!(
-            matches!(res, IpeResult::Err(_)),
-            "64-byte output under an 8-byte ceiling must fail"
+            matches!(&res, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
+                "printf: stdout exceeds the 8-byte capture ceiling (raise IPE_PROCESS_OUTPUT_MAX)"
+            )),
+            "9-byte stdout under an 8-byte ceiling is a LimitExceeded refusal"
+        );
+        let stderr_past: IpeResult<IpeError, ProcessRunOutput> =
+            block(process_run_with_impl::<IpeError>(
+                ProcessRunWithCfg {
+                    command: "sh".to_owned(),
+                    args: vec!["-c".to_owned(), "printf 123456789 >&2".to_owned()],
+                    cwd: IpeMaybe::Nothing,
+                    env: Vec::new(),
+                },
+                8,
+            ));
+        assert!(
+            matches!(&stderr_past, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
+                "sh: stderr exceeds the 8-byte capture ceiling (raise IPE_PROCESS_OUTPUT_MAX)"
+            )),
+            "9-byte stderr under an 8-byte ceiling is a LimitExceeded refusal"
         );
     }
 
@@ -5632,21 +5776,24 @@ mod process_run_in_pty_tests {
     /// test pins a small ceiling without touching the process-global env var.
     #[test]
     fn flooding_child_hits_the_output_cap() {
-        let res: IpeResult<String, ProcessPtyOutput> = block(process_run_in_pty_impl::<String>(
-            ProcessRunInPtyCfg {
-                command: "sh".to_owned(),
-                // Emit far more than the 8-byte ceiling below.
-                args: vec!["-c".to_owned(), "printf 'x%.0s' $(seq 1 4096)".to_owned()],
-                cwd: IpeMaybe::Nothing,
-                env: Vec::new(),
-                cols: 80,
-                rows: 24,
-            },
-            8,
-        ));
+        let res: IpeResult<IpeError, ProcessPtyOutput> =
+            block(process_run_in_pty_impl::<IpeError>(
+                ProcessRunInPtyCfg {
+                    command: "sh".to_owned(),
+                    // Emit far more than the 8-byte ceiling below.
+                    args: vec!["-c".to_owned(), "printf 'x%.0s' $(seq 1 4096)".to_owned()],
+                    cwd: IpeMaybe::Nothing,
+                    env: Vec::new(),
+                    cols: 80,
+                    rows: 24,
+                },
+                8,
+            ));
         assert!(
-            matches!(res, IpeResult::Err(_)),
-            "output far exceeding an 8-byte ceiling must fail the Task"
+            matches!(&res, IpeResult::Err(e) if *e == IpeError::limit_exceeded(
+                "sh: pty output exceeds the 8-byte capture ceiling (raise IPE_PROCESS_OUTPUT_MAX)"
+            )),
+            "output far exceeding an 8-byte ceiling is a LimitExceeded refusal"
         );
     }
 

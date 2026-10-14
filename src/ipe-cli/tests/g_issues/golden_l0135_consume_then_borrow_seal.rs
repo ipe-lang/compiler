@@ -16,12 +16,18 @@
 //! | `borrow_then_consume_call` | `tagFirst w.tag (consume w)` | builds + prints `10` |
 //! | `let_bound_borrow_then_consume` | `let t = w.tag in both (consume w) t` | builds + prints `10` |
 //! | `seq_kernel_read_then_consume` | `do { Io.println (String.fromInt w.tag) ; both (consume w) 0 }` | fail-closed IPE-L0135 |
-//! | `and_then_kernel_read_then_consume` | `Task.andThen (\x -> both (consume w) x) (Task.succeed w.tag)` | fail-closed IPE-L0126 |
+//! | `and_then_kernel_read_then_consume` | `Task.andThen (\x -> both (consume w) x) (Task.succeed w.tag)` | fail-closed IPE-L0135 |
 //! | `let_bound_seq_kernel_read` | `let w = mk n in do { .. w.tag .. ; both (consume w) 0 }` | fail-closed IPE-L0135 |
 //! | `destructured_seq_kernel_read` | `let (w, _) = pair n in do { .. w.tag .. ; both (consume w) 0 }` | fail-closed IPE-L0135 |
 //! | `partial_move_then_same_field` | `case w of { job } -> withLists job (Task.sequence [ w.job ]) ..` | fail-closed IPE-L0135 |
-//! | `seq_user_arg_read_then_consume` | `do { x <- tagTask w.tag ; both (consume w) x }` | fail-closed IPE-L0126 |
+//! | `seq_user_arg_read_then_consume` | `do { x <- tagTask w.tag ; both (consume w) x }` | builds + prints `10` |
+//! | `and_then_user_arg_read_then_consume` | `Task.andThen (\x -> both (consume w) x) (tagTask w.tag)` | builds + prints `10` |
+//! | `nested_bind_user_arg_reads_then_consume` | `do { x <- tagTask w.tag ; y <- tagTask w.tag ; both (consume w) (x + y) }` | builds + prints `13` |
 //! | `seq_user_statement_read_then_consume` | `do { announce w.tag ; both (consume w) 0 }` | builds + prints `3`, `7` |
+//! | `seq_bind_consume_then_user_arg_read` | `do { u <- both (consume w) 0 ; announce w.tag }` | fail-closed IPE-L0135 |
+//! | `and_then_consume_then_user_arg_read` | `Task.andThen (\u -> announce w.tag) (both (consume w) 0)` | fail-closed IPE-L0135 |
+//! | `let_bound_bind_consume_then_user_arg_read` | `let w = mk n in do { u <- both (consume w) 0 ; announce w.tag }` | fail-closed IPE-L0135 |
+//! | `nested_bind_consume_then_user_arg_read` | `do { x <- tagTask w.tag ; u <- both (consume w) x ; announce w.tag }` | fail-closed IPE-L0135 |
 //!
 //! A kernel call's argument order is chosen by its emitter, so a move and a
 //! read of the same record in sibling kernel arguments are rejected in either
@@ -40,10 +46,12 @@
 //! binds, so reading one of them again through `w` is refused too.
 //!
 //! A continuation lambda (an explicit `Task.andThen` or a `<-` bind, which
-//! desugars to one) that passes `w` to a call captures a non-`Clone` value in a
-//! closure. The capture gate refuses that with IPE-L0126 while the lambda body
-//! is lowered, before the parameter's reuse gate runs, whatever the effect
-//! reads.
+//! desugars to one) that moves `w` is a once closure the runtime calls at most
+//! once. `task_and_then` evaluates its effect before it builds the
+//! continuation, so a user-function argument read of `w.tag` in the effect
+//! borrows `w` before the closure moves it: that order builds. The mirror
+//! order, an effect that consumes `w` followed by a continuation that reads
+//! `w.tag`, is refused with IPE-L0135 in every sequencing form.
 //!
 //! ```text
 //! # gate check only (fast):
@@ -319,9 +327,8 @@ main =
     run { job = Task.succeed 7, tag = 3 }
 ";
 
-/// The same hazard through an explicit `Task.andThen` continuation. The
-/// continuation captures `w` and passes it to `consume`, so the closure-capture
-/// gate refuses it first (IPE-L0126).
+/// The same hazard through an explicit `Task.andThen` continuation: the
+/// emitter would clone the kernel-argument read for the continuation's capture.
 const AND_THEN_KERNEL_READ_THEN_CONSUME: &str = r"
 
 run : { job : Task Error Int, tag : Int } -> Task Error ()
@@ -388,8 +395,9 @@ main =
     run { job = Task.succeed 7, tag = 3 }
 ";
 
-/// A `<-` bind desugars to a `Task.andThen` continuation lambda; passing the
-/// captured `w` to `consume` there is a non-`Clone` closure capture (IPE-L0126).
+/// A `<-` bind desugars to `Task.andThen`, which evaluates the effect before it
+/// builds the continuation: the user-argument read of `w.tag` borrows `w`
+/// before the once continuation moves it. Prints `10`.
 const SEQ_USER_ARG_READ_THEN_CONSUME: &str = r"
 
 run : { job : Task Error Int, tag : Int } -> Task Error ()
@@ -397,6 +405,101 @@ run w =
     do
         x <- tagTask w.tag
         both (consume w) x
+
+
+main : Task Error ()
+main =
+    run { job = Task.succeed 7, tag = 3 }
+";
+
+/// The explicit `Task.andThen` form of the user-argument read. Prints `10`.
+const AND_THEN_USER_ARG_READ_THEN_CONSUME: &str = r"
+
+run : { job : Task Error Int, tag : Int } -> Task Error ()
+run w =
+    Task.andThen (\x -> both (consume w) x) (tagTask w.tag)
+
+
+main : Task Error ()
+main =
+    run { job = Task.succeed 7, tag = 3 }
+";
+
+/// Two nested binds read `w.tag` through a user argument before the innermost
+/// continuation moves `w`. Prints `13`.
+const NESTED_BIND_USER_ARG_READS_THEN_CONSUME: &str = r"
+
+run : { job : Task Error Int, tag : Int } -> Task Error ()
+run w =
+    do
+        x <- tagTask w.tag
+        y <- tagTask w.tag
+        both (consume w) (x + y)
+
+
+main : Task Error ()
+main =
+    run { job = Task.succeed 7, tag = 3 }
+";
+
+/// The bind's effect moves `w`; its continuation then reads `w.tag` through a
+/// user argument, a read of a moved value.
+const SEQ_BIND_CONSUME_THEN_USER_ARG_READ: &str = r"
+
+run : { job : Task Error Int, tag : Int } -> Task Error ()
+run w =
+    do
+        u <- both (consume w) 0
+        announce w.tag
+
+
+main : Task Error ()
+main =
+    run { job = Task.succeed 7, tag = 3 }
+";
+
+/// The explicit `Task.andThen` form of the consume-then-read hazard.
+const AND_THEN_CONSUME_THEN_USER_ARG_READ: &str = r"
+
+run : { job : Task Error Int, tag : Int } -> Task Error ()
+run w =
+    Task.andThen (\u -> announce w.tag) (both (consume w) 0)
+
+
+main : Task Error ()
+main =
+    run { job = Task.succeed 7, tag = 3 }
+";
+
+/// The consume-then-read hazard on a `let`-bound record.
+const LET_BOUND_BIND_CONSUME_THEN_USER_ARG_READ: &str = r"
+
+run : Int -> Task Error ()
+run n =
+    let
+        w =
+            mk n
+    in
+    do
+        u <- both (consume w) 0
+        announce w.tag
+
+
+main : Task Error ()
+main =
+    run 3
+";
+
+/// A borrow-then-consume bind followed by a third step that reads `w.tag`
+/// after the middle effect moved `w`.
+const NESTED_BIND_CONSUME_THEN_USER_ARG_READ: &str = r"
+
+run : { job : Task Error Int, tag : Int } -> Task Error ()
+run w =
+    do
+        x <- tagTask w.tag
+        u <- both (consume w) x
+        announce w.tag
 
 
 main : Task Error ()
@@ -486,7 +589,7 @@ fn and_then_kernel_read_then_consume_fails_closed() {
     assert_rejected(
         "and_then_kernel_read_then_consume",
         &seq_program(AND_THEN_KERNEL_READ_THEN_CONSUME),
-        ipe_diagnostics::IPE_L0126,
+        ipe_diagnostics::IPE_L0135,
     );
 }
 
@@ -518,11 +621,65 @@ fn partial_move_then_same_field_fails_closed() {
 }
 
 #[test]
-fn seq_user_arg_read_then_consume_capture_fails_closed() {
-    assert_rejected(
+fn seq_user_arg_read_then_consume_round_trips() {
+    assert_accepted(
         "seq_user_arg_read_then_consume",
         &seq_program(SEQ_USER_ARG_READ_THEN_CONSUME),
-        ipe_diagnostics::IPE_L0126,
+        "10",
+    );
+}
+
+#[test]
+fn and_then_user_arg_read_then_consume_round_trips() {
+    assert_accepted(
+        "and_then_user_arg_read_then_consume",
+        &seq_program(AND_THEN_USER_ARG_READ_THEN_CONSUME),
+        "10",
+    );
+}
+
+#[test]
+fn nested_bind_user_arg_reads_then_consume_round_trips() {
+    assert_accepted(
+        "nested_bind_user_arg_reads_then_consume",
+        &seq_program(NESTED_BIND_USER_ARG_READS_THEN_CONSUME),
+        "13",
+    );
+}
+
+#[test]
+fn seq_bind_consume_then_user_arg_read_fails_closed() {
+    assert_rejected(
+        "seq_bind_consume_then_user_arg_read",
+        &seq_program(SEQ_BIND_CONSUME_THEN_USER_ARG_READ),
+        ipe_diagnostics::IPE_L0135,
+    );
+}
+
+#[test]
+fn and_then_consume_then_user_arg_read_fails_closed() {
+    assert_rejected(
+        "and_then_consume_then_user_arg_read",
+        &seq_program(AND_THEN_CONSUME_THEN_USER_ARG_READ),
+        ipe_diagnostics::IPE_L0135,
+    );
+}
+
+#[test]
+fn let_bound_bind_consume_then_user_arg_read_fails_closed() {
+    assert_rejected(
+        "let_bound_bind_consume_then_user_arg_read",
+        &seq_program(LET_BOUND_BIND_CONSUME_THEN_USER_ARG_READ),
+        ipe_diagnostics::IPE_L0135,
+    );
+}
+
+#[test]
+fn nested_bind_consume_then_user_arg_read_fails_closed() {
+    assert_rejected(
+        "nested_bind_consume_then_user_arg_read",
+        &seq_program(NESTED_BIND_CONSUME_THEN_USER_ARG_READ),
+        ipe_diagnostics::IPE_L0135,
     );
 }
 

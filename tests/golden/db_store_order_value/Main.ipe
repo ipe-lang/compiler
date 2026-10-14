@@ -1,0 +1,28 @@
+module Main exposing (main)
+
+-- SEAL: a value annotated `Store.Order` (`Asc | Desc`, the join sort direction)
+-- lowers to the `Ipe.Db.Store` enum its constructors build, never to the
+-- builtin comparison `Order` (`LT | EQ | GT`) that shares its name. The
+-- emitted crate must `cargo build` and print `desc`.
+
+import Ipe.Db.Store as Store exposing (Order(..))
+import Ipe.Io as Io
+
+
+dir : Store.Order
+dir =
+    Store.Desc
+
+
+label : Store.Order -> String
+label d =
+    case d of
+        Asc ->
+            "asc"
+
+        Desc ->
+            "desc"
+
+
+main =
+    Io.println (label dir)

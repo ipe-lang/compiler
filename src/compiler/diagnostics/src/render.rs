@@ -33,10 +33,10 @@ use crate::code::{Severity, issue_tracker_url, title};
 use crate::diagnostic::{
     AppShape, Applicability, CaseDefect, CodecAutoRejection, ConsentError, Diagnostic, Expected,
     ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach, HeaderDefect, HelpLine,
-    Hint, IfDefect, ImportedAs, LetDefect, LowerError, NameError, ParseError, RoutePatternDefect,
-    SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect, StoreSelectProjectionDefect,
-    Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError, WildcardDependence,
-    intercept_context_phrase,
+    Hint, IfDefect, ImportedAs, LetDefect, LowerError, MountPrefixFault, NameError, ParseError,
+    RoutePatternDefect, SandboxError, SealRejection, SpanRole, StoreEqAccessorDefect,
+    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
+    WildcardDependence, intercept_context_phrase,
 };
 use crate::span::Span;
 
@@ -261,6 +261,28 @@ fn prose_band(d: &Diagnostic) -> String {
                  {detail}\n\
                  \n\
                  Check your connection and try again. Run `{DOC_HINT_CMD} IPE-E0001` for more help."
+            )
+        }
+        Diagnostic::TargetDirUnlinkable { detail } => {
+            format!(
+                "The compiler stopped before building your program: the host linker cannot \
+                 open a directory the build would use. This is a problem with where the project \
+                 or the toolchain lives on your machine — not a mistake in your code.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 Run `{DOC_HINT_CMD} IPE-E0002` for more help."
+            )
+        }
+        Diagnostic::HostLinkerCannotOpenInput { detail } => {
+            format!(
+                "The host linker could not open one of its input files while building your \
+                 program. This is a problem with where the build lives on your machine — not a \
+                 mistake in your code.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 Run `{DOC_HINT_CMD} IPE-E0003` for more help."
             )
         }
     }
@@ -1381,7 +1403,9 @@ fn primary_label(d: &Diagnostic) -> Option<String> {
         | Diagnostic::Ffi { .. }
         | Diagnostic::Sandbox { .. }
         | Diagnostic::Consent { .. }
-        | Diagnostic::RegistryUnreachable { .. } => None,
+        | Diagnostic::RegistryUnreachable { .. }
+        | Diagnostic::TargetDirUnlinkable { .. }
+        | Diagnostic::HostLinkerCannotOpenInput { .. } => None,
     }
 }
 
@@ -2118,7 +2142,7 @@ fn store_select_projection_label(defect: &StoreSelectProjectionDefect) -> String
 fn route_pattern_label(defect: &RoutePatternDefect) -> String {
     match defect {
         RoutePatternDefect::ParamEmpty => {
-            "a `:` or `*` segment has no parameter name after it".to_string()
+            "a `:` segment has no parameter name after it".to_string()
         }
         RoutePatternDefect::ParamNotIdentifier { name, at } => format!(
             "parameter name `{name}` is not an identifier (byte {at} is not a letter, \
@@ -2136,11 +2160,50 @@ fn route_pattern_label(defect: &RoutePatternDefect) -> String {
         RoutePatternDefect::TooLong { cap } => {
             format!("this path is longer than the {cap}-byte route ceiling")
         }
+        RoutePatternDefect::NotAbsolute => "this path does not start with `/`".to_string(),
+        RoutePatternDefect::TooManyParams { cap } => {
+            format!("this path holds more than {cap} `:` parameters")
+        }
+        RoutePatternDefect::CatchAll { segment } => {
+            format!("segment `{segment}` is a `*` catch-all, which a server route cannot hold")
+        }
+        RoutePatternDefect::MidSegmentSigil { segment, at } => format!(
+            "segment `{segment}` has a `:` or `*` at byte {at}, which is neither a parameter \
+             nor a literal"
+        ),
         RoutePatternDefect::UnrenderableLiteral { segment } => {
             format!(
                 "segment `{segment}` is empty, `.` or `..`, so this route's URL cannot be rendered"
             )
         }
+        RoutePatternDefect::UnknownMethod { method } => {
+            format!("`{method}` is not a method the server serves")
+        }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "this mount prefix is computed, not a string literal".to_string()
+        }
+        RoutePatternDefect::MountPrefix { prefix, fault } => {
+            format!(
+                "mount prefix `{prefix}` {}",
+                mount_prefix_fault_label(*fault)
+            )
+        }
+        RoutePatternDefect::MountPrefixDuplicate { prefix } => {
+            format!("two mounts in this list serve the prefix `{prefix}`")
+        }
+    }
+}
+
+fn mount_prefix_fault_label(fault: MountPrefixFault) -> String {
+    match fault {
+        MountPrefixFault::NotAbsolute => "does not start with `/`".to_string(),
+        MountPrefixFault::TrailingSlash => "ends with `/`".to_string(),
+        MountPrefixFault::EmptySegment => "has an empty segment (`//`)".to_string(),
+        MountPrefixFault::DotSegment => "has a `.` or `..` segment".to_string(),
+        MountPrefixFault::Reserved { byte } => {
+            format!("holds byte 0x{byte:02X}, which a mount prefix cannot hold")
+        }
+        MountPrefixFault::TooLong { cap } => format!("is longer than the {cap}-byte ceiling"),
     }
 }
 
@@ -2306,9 +2369,7 @@ fn hint_text(hint: Hint) -> String {
         Hint::AddTypeSignature => {
             "add a top-level type signature, e.g. `f : Int -> Int`".to_string()
         }
-        Hint::RaiseSolverBudget => {
-            "raise the budget with `IPE_SOLVER_BUDGET=<n>` (0 disables the limit)".to_string()
-        }
+        Hint::RaiseSolverBudget => "raise the budget with `IPE_SOLVER_BUDGET=<n>`".to_string(),
         Hint::NestingBoundDeliberate => {
             "this limit is deliberate, to fail fast on pathologically nested input".to_string()
         }
@@ -2357,6 +2418,13 @@ const fn feature_label(f: Feature) -> &'static str {
         Feature::FirstClassFunctions => {
             "storing a function value in a record field is not supported yet \
              [feature: first-class-functions]"
+        }
+        Feature::FnCarrierConflict => {
+            "this function value meets functions on a different carrier where \
+             no conversion reaches: inside a `Maybe`/`Result` payload, or at a \
+             generic type parameter. Bind the function to a name and pass that, \
+             or build the value from functions of one origin \
+             [feature: fn-carrier-conflict]"
         }
         Feature::Kernels => "this kernel function is not available yet [feature: kernels]",
         Feature::PartialOverApplication => {
@@ -2529,8 +2597,9 @@ const fn feature_label(f: Feature) -> &'static str {
             "this value is moved into a closure that this call builds and may \
              call more than once; a function, `Task` or `Decoder` value cannot \
              be copied into each call. Take the function as its own parameter or \
-             bind it with a plain `let` so it is shared, or write an explicit \
-             lambda that builds the `Task` or `Decoder` inside its body \
+             bind it with a plain `let` so it is shared, or apply a `let`-bound \
+             partial fully where it is used, or write an explicit lambda that \
+             builds the `Task` or `Decoder` inside its body \
              [feature: rebuilt-closure-moves-capture]"
         }
     }
@@ -2788,6 +2857,25 @@ mod tests {
     use crate::diagnostic::{
         Candidates, Diagnostic, EditTarget, Expected, ExpectedSet, ParseError, SortedNames,
     };
+    use crate::suggest;
+
+    /// The hits a resolver site gets for `typo` over `names`.
+    fn ranked(typo: &str, names: &[&str]) -> Box<[suggest::Hit<Box<str>>]> {
+        let Ok(query) = suggest::Query::parse(typo, suggest::Shape::Flat) else {
+            return Box::new([]);
+        };
+        let universe = names.iter().map(|name| suggest::Spelling {
+            text: name,
+            target: Box::<str>::from(*name),
+        });
+        let policy = suggest::Policy {
+            cap: suggest::Cap::MAX,
+            threshold: suggest::Threshold::Relative,
+        };
+        suggest::rank(&query, universe, policy)
+            .hits
+            .into_boxed_slice()
+    }
 
     /// A bidi override or zero-width character named in a diagnostic is shown
     /// by its code point, never raw where it would reorder or hide the line.
@@ -3070,18 +3158,18 @@ mod tests {
             span: Span::new(0, 6),
             msg: NameError::ValueNotFound {
                 name: "lenght".into(),
-                suggestions: Candidates::hints(Box::new(["length".into(), "list".into()])),
+                suggestions: Candidates::hints(ranked("lenght", &["lengths", "length"])),
             },
         };
         let out = render(&d, "n.ipe", "lenght\n");
         // Two-plus candidates collapse into one header; producer order of the
-        // candidate list is preserved (`length` before `list`).
+        // candidate list is preserved (`length` before `lengths`).
         assert!(
             out.contains("did you mean one of:"),
             "collapsed header:\n{out}"
         );
         let first = out.find("`length`").unwrap_or(usize::MAX);
-        let second = out.find("`list`").unwrap_or(0);
+        let second = out.find("`lengths`").unwrap_or(0);
         assert!(first < second, "producer order preserved:\n{out}");
         // Stable across runs: re-render must be byte-identical.
         assert_eq!(out, render(&d, "n.ipe", "lenght\n"));
@@ -3265,7 +3353,7 @@ mod tests {
                 name: "lenght".into(),
                 suggestions: Candidates::at(
                     EditTarget::whole(Span::new(0, 6), "lenght"),
-                    Box::new(["length".into()]),
+                    ranked("lenght", &["length"]),
                 ),
             },
         };
@@ -3289,7 +3377,7 @@ mod tests {
                 qualifier: "Lsit".into(),
                 suggestions: Candidates::at(
                     EditTarget::whole(Span::new(0, 8), "Lsit.mpa"),
-                    Box::new(["List".into()]),
+                    ranked("Lsit", &["List"]),
                 ),
             },
         };
@@ -3314,11 +3402,7 @@ mod tests {
             span: Span::new(7, 11),
             msg: NameError::ModuleNotFound {
                 name: "Fooo".into(),
-                suggestions: Candidates::hints(Box::new([
-                    "Foo".into(),
-                    "Food".into(),
-                    "Fool".into(),
-                ])),
+                suggestions: Candidates::hints(ranked("Fooo", &["Foo", "Food", "Fool"])),
             },
         };
         let out = render(&d, "n.ipe", src);
@@ -3353,7 +3437,7 @@ mod tests {
             span: Span::DUMMY,
             msg: NameError::ModuleNotFound {
                 name: "Foo".into(),
-                suggestions: Candidates::hints(Box::new(["Food".into(), "Fool".into()])),
+                suggestions: Candidates::hints(ranked("Foo", &["Food", "Fool"])),
             },
         };
         // Craft a genuine single-DidYouMean via `help()` directly: a two-plus

@@ -27,7 +27,8 @@ fn parses(src: &str) -> bool {
 fn findings(rule: &str, body: &str) -> Vec<Finding> {
     let m = module(body);
     assert!(parses(&m.source), "fixture must parse:\n{}", m.source);
-    run(&[m], &LintConfig::default())
+    let Ok(report) = run(&[m], &LintConfig::default(), &crate::NeverCancel);
+    report
         .findings
         .into_iter()
         .filter(|f| f.rule == rule)
@@ -162,7 +163,8 @@ fn findings_with(config: &LintConfig, rule: &str, src: &str) -> Vec<Finding> {
         module: vec!["Main".to_owned()],
         source: src.to_owned(),
     };
-    run(&[m], config)
+    let Ok(report) = run(&[m], config, &crate::NeverCancel);
+    report
         .findings
         .into_iter()
         .filter(|f| f.rule == rule)

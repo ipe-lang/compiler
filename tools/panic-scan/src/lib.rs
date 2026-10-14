@@ -39,6 +39,7 @@ mod includes;
 mod manifest;
 mod test_lines;
 mod test_path;
+mod walk;
 
 pub use bounded::{
     Measure, NestDepth, ParseStack, ScanError, SourceBytes, SourceReadError, TokenCeiling, measure,
@@ -53,6 +54,7 @@ pub use test_path::{
     TestPathError, UngatedBy, check_manifest, check_test_path, is_template_path, is_test_path,
     is_verified_test_path,
 };
+pub use walk::{DirDepth, EntryCeiling, WalkError, Want, rust_sources};
 
 /// Panic-invoking macros (each may be invoked with `()`, `[]`, or `{}`).
 const MACROS: &[&str] = &[

@@ -1,11 +1,12 @@
 use super::{CliError, diag_span, io_err};
 use crate::env_dir::{HomeDir, HomeRefusal};
+use crate::loose_file::LooseFileError;
 #[cfg(not(unix))]
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
 use crate::{
-    BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path,
-    ffi, fs, project, render, runtime_embed, text,
+    BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path, fs,
+    project, render, runtime_embed, text,
 };
 use ipe_backend_rust::rust_str_lit;
 use ipe_runtime_rust::encoding::MountBase;
@@ -542,10 +543,11 @@ pub struct CollectedSources {
 /// the injection routine stays single-sourced.
 ///
 /// # Errors
-/// [`CliError::Pipeline`] when the entry does not parse; [`CliError::Io`] when
-/// the entry or an imported sibling cannot be read;
-/// [`CliError::DiscoveryLimitReached`] when the import closure is too large.
-pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, CliError> {
+/// [`LooseFileError::EntryParse`] when the entry does not parse; otherwise
+/// [`LooseFileError::Refused`] carrying [`CliError::Io`] when the entry or an
+/// imported sibling cannot be read, or [`CliError::DiscoveryLimitReached`]
+/// when the import closure is too large.
+pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, LooseFileError> {
     let loaded = crate::loose_file::resolve_loose_file(
         entry,
         None,
@@ -991,14 +993,10 @@ pub fn compile_modules(
 // file); a `&BuildOptions` parameter would just push the clone this struct's
 // `Vec<String>` field (`wasm_public_env`) now needs onto every call site
 // instead of the one place that actually reads it.
-#[allow(
-    clippy::too_many_lines,
-    clippy::too_many_arguments,
-    clippy::needless_pass_by_value
-)]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn compile_modules_observed(
-    mut sources: BTreeMap<Vec<String>, (PathBuf, String)>,
-    mut discovered: Vec<project::DiscoveredModule>,
+    sources: BTreeMap<Vec<String>, (PathBuf, String)>,
+    discovered: Vec<project::DiscoveredModule>,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
@@ -1007,29 +1005,69 @@ pub fn compile_modules_observed(
     cache_site: Option<&cache::CacheSite>,
     options: BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
-    // The vendored runtime tree carries no debugger, so a `--debugger` build
-    // needs the dependency model; refused before any work, never at cargo time.
-    if options.debugger && !options.runtime_dep {
-        return (
-            Err(CliError::Usage(text::msg::debugger_needs_runtime_dep())),
-            CacheOutcome::Miss,
-        );
+    if let Err(refusal) = refuse_debugger_without_runtime_dep(&options) {
+        return (Err(refusal), CacheOutcome::Miss);
     }
-    // Inject the transitive compiled-source stdlib closure. `injected` is the
-    // driver's unforgeable record of which module paths are trusted stdlib
-    // source — the ONLY inputs that earn `ModuleOrigin::EmbeddedStdlib` below.
-    let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
-
-    // The FFI seam: the SAME catalog-load → nominal-unification →
-    // interface-inject → emit-assemble sequence `watch` and `lsp` use
-    // (`prepare_ffi`) — a divergent copy here once skipped the unification
-    // step entirely.
-    let ffi_prep = match ffi::prepare_ffi(&mut sources, blame_path) {
-        Ok(p) => p,
+    // The same stdlib-closure and FFI injection capability inference sees.
+    let source_set = match super::PackageSourceSet::assemble(sources, discovered, blame_path) {
+        Ok(set) => set,
         Err(e) => return (Err(e), CacheOutcome::Miss),
     };
-    let ffi_injected = ffi_prep.injected;
-    let ffi_emit = ffi_prep.emit;
+    compile_source_set_observed(
+        source_set,
+        entry_path,
+        target,
+        runtime_dir,
+        blame_path,
+        db_driver,
+        cache_site,
+        options,
+    )
+}
+
+/// Refuse a `--debugger` build without the dependency model.
+///
+/// The vendored runtime tree carries no debugger, so such a build is refused
+/// before any work, never at cargo time.
+///
+/// # Errors
+/// [`CliError::Usage`] for a debugger build under the vendored runtime.
+const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(), CliError> {
+    if options.debugger && !options.runtime_dep {
+        return Err(CliError::Usage(text::msg::debugger_needs_runtime_dep()));
+    }
+    Ok(())
+}
+
+/// [`compile_modules_observed`] over an already-assembled [`super::PackageSourceSet`].
+///
+/// The set is compiled as given: no source is read and nothing is injected
+/// here, so what is emitted is exactly the set a caller judged.
+// `options` is threaded onward by value, as in `compile_modules_observed`.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value
+)]
+fn compile_source_set_observed(
+    source_set: super::PackageSourceSet,
+    entry_path: &[String],
+    target: &EmitTarget,
+    runtime_dir: &Path,
+    blame_path: &Path,
+    db_driver: ipe_backend_rust::DbDriver,
+    cache_site: Option<&cache::CacheSite>,
+    options: BuildOptions,
+) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
+    if let Err(refusal) = refuse_debugger_without_runtime_dep(&options) {
+        return (Err(refusal), CacheOutcome::Miss);
+    }
+    let super::SourceSetParts {
+        sources,
+        injected,
+        ffi_injected,
+        ffi_emit,
+    } = source_set.into_parts();
 
     // Resolve the dependency-model runtime crate ONCE, fail-closed: if the
     // opt-in is set but no verified `ipe-runtime-rust` crate root is found, the
@@ -2800,15 +2838,37 @@ pub fn build_project_into(
     options: &BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
     let manifest = project::parse_manifest(manifest_path)?;
-    let discovered = project::discover_modules(&manifest.src_root)?;
+    let (sources, discovered) = super::read_package_modules(&manifest)?;
+    refuse_debugger_without_runtime_dep(options)?;
+    let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path)?;
+    build_from_sources(
+        &manifest,
+        manifest_path,
+        source_set,
+        out,
+        runtime_dir,
+        options,
+    )
+}
 
-    // For each module, read its source and extract imports.
-    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-    for m in &discovered {
-        let src = crate::io_bounded::read_walked_source(m.path())?;
-        sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
-    }
-
+/// Emit the package `source_set` of `manifest` into `out`, returning the claimed crate directory.
+///
+/// No package file is read: the emitted crate is a function of `source_set`
+/// and `manifest` alone, so a caller that judged `source_set` (a capability
+/// verdict, an audit) judged the bytes that are emitted. `manifest_path` is the
+/// blame location of a diagnostic no single module owns and the seed of the
+/// crate identity.
+///
+/// # Errors
+/// As [`build_project_into`].
+pub fn build_from_sources(
+    manifest: &project::ProjectManifest,
+    manifest_path: &Path,
+    source_set: super::PackageSourceSet,
+    out: OutTarget<'_>,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+) -> Result<EmittedCrate, CliError> {
     // A library package (declares `exposedModules`, has no runnable entry —
     // neither a `programs` stage nor a `src/Main.ipe`) has nothing to emit. Refuse
     // with a clean, honest message directing the author to `ipe type-check`
@@ -2817,7 +2877,7 @@ pub fn build_project_into(
     let entry_path = manifest.resolved_entry()?;
     if manifest.default_program().is_none()
         && !manifest.exposed_modules.is_empty()
-        && !sources.contains_key(&entry_path)
+        && !source_set.has_module(&entry_path)
     {
         return Err(CliError::Usage(text::msg::library_package_no_entry()));
     }
@@ -2870,17 +2930,19 @@ pub fn build_project_into(
 
     // The manifest is the blame location for an import cycle (no single file
     // owns it); post-link errors are blamed on the entry file inside the core.
-    let target = out.prove(&ProjectPaths::from_manifest(&manifest))?;
-    compile_modules(
-        sources,
-        discovered,
+    let target = out.prove(&ProjectPaths::from_manifest(manifest))?;
+    let cache_site = cache::env_cache_dir(&target.path()?);
+    compile_source_set_observed(
+        source_set,
         &entry_path,
         &target,
         runtime_dir,
         manifest_path,
         manifest.driver,
+        cache_site.as_ref(),
         options,
     )
+    .0
 }
 
 /// Locate the Ipê runtime module tree (`src/runtime/rust/src/`).
@@ -3237,7 +3299,12 @@ mod tests {
         let collected = collect_entry_and_siblings(&entry);
         let _ = fs::remove_dir_all(&dir);
         assert!(
-            matches!(collected, Err(CliError::DiscoveryLimitReached { .. })),
+            matches!(
+                collected,
+                Err(LooseFileError::Refused(
+                    CliError::DiscoveryLimitReached { .. }
+                ))
+            ),
             "the entry plus {count} imported siblings exceeds the ceiling"
         );
     }
@@ -3268,10 +3335,10 @@ mod tests {
         assert!(
             matches!(
                 collected,
-                Err(CliError::SourceRefused {
+                Err(LooseFileError::Refused(CliError::SourceRefused {
                     reason: crate::io_bounded::SourceRefusal::Symlink,
                     ..
-                })
+                }))
             ),
             "an imported symlink sibling is refused, never followed"
         );

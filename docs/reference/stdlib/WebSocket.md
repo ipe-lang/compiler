@@ -156,7 +156,8 @@ connect : WsUrl -> Task Error WebSocket
 The `WsUrl` constructor rejects any other scheme at construction time, so
 a non-WebSocket address is a type error, never a runtime surprise.  The
 Task resolves once the handshake completes; frames flow via `onMessage`
-after that.
+after that.  A handshake past the size limit fails the Task with a
+`LimitExceeded` error.
 
 ## `connectWith`
 
@@ -240,6 +241,7 @@ onError : WebSocket -> (Error -> msg) -> Sub msg
 ```
 
 `onError sock toMsg` — dispatch `toMsg err` on a network /
-protocol error.  The socket is closed automatically after the
-error is dispatched.
+protocol error.  A message or frame past `IPE_WS_MAX_MESSAGE_BYTES`
+dispatches a `LimitExceeded` error.  The socket is closed automatically
+after the error is dispatched.
 

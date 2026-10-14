@@ -1855,6 +1855,7 @@ Ipe.Error — the structured `Error` type.
 | `decode` | Construct an `Error` with kind `Decode` and the given message. |
 | `conflict` | Construct an `Error` with kind `Conflict` and the given message. |
 | `unavailable` | Construct an `Error` with kind `Unavailable` and the given message. |
+| `limitExceeded` | Construct an `Error` with kind `LimitExceeded` and the given message: a |
 | `timeout` | Canonical `Error` with kind `Timeout` and a fixed message. |
 | `notFound` | Canonical `Error` with kind `NotFound` and a fixed message. |
 | `permissionDenied` | Canonical `Error` with kind `PermissionDenied` and a fixed message. |
@@ -1864,7 +1865,7 @@ Ipe.Error — the structured `Error` type.
 | `withDetails` | Attach an `ErrorDetails` value to an `Error`. |
 | `kind` | Extract the `ErrorKind` classification tag from an `Error`. |
 | `message` | Extract the bare message string from an `Error`. |
-| `kindName` | Stable lowercase label of an `ErrorKind` (the same prefix `toString` uses). |
+| `kindName` | The variant name of an `ErrorKind` (`"Io"`, `"LimitExceeded"`, …), the |
 
 ## Ffi.Js
 

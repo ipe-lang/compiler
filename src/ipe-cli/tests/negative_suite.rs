@@ -2455,9 +2455,8 @@ fn exhaust_builtin_adt_nested_nonexhaustive() {
 }
 
 /// A TOP-level `case` over a Prelude built-in ADT (`ErrorKind`) that omits
-/// variants must ALSO be IPE-T0010 — not a `Diagnostic::CompilerBug` ("top
-/// constructors cover 2 of 11"), the shape the pre-fix lower backstop produced.
-/// Guards the second CO-TYPES-001 variant.
+/// variants is IPE-T0010 too, never a `Diagnostic::CompilerBug` from lower's
+/// constructor-coverage backstop.
 #[test]
 fn exhaust_builtin_adt_toplevel_nonexhaustive() {
     let src = format!(
@@ -2468,6 +2467,28 @@ fn exhaust_builtin_adt_toplevel_nonexhaustive() {
          main = Io.println (classify Io)\n"
     );
     assert_rejected("exhaust_builtin_toplevel", &src, "IPE-T0010");
+}
+
+/// A `case` over `ErrorKind` that covers every other kind but omits
+/// `LimitExceeded` is non-exhaustive (IPE-T0010): adding a kind breaks an
+/// exhaustive match at `ipe` time, never as a cargo E0004.
+#[test]
+fn exhaust_error_kind_missing_limit_exceeded_is_non_exhaustive() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         classify : ErrorKind -> String\n\
+         classify k =\n    case k of\n        \
+         Io -> \"a\"\n        Network -> \"b\"\n        Ffi -> \"c\"\n        \
+         Decode -> \"d\"\n        Timeout -> \"e\"\n        NotFound -> \"f\"\n        \
+         PermissionDenied -> \"g\"\n        InvalidInput -> \"h\"\n        \
+         Conflict -> \"i\"\n        Unavailable -> \"j\"\n        Unexpected -> \"k\"\n\n\
+         main = Io.println (classify Io)\n"
+    );
+    assert_rejected(
+        "exhaust_error_kind_missing_limit_exceeded",
+        &src,
+        "IPE-T0010",
+    );
 }
 
 /// A fold over the inbound `Ipe.Browser.Geolocation.Internals` `JsMsg` that omits
@@ -3831,6 +3852,77 @@ fn lower_server_route_param_empty() {
 }
 
 #[test]
+fn lower_server_route_catch_all() {
+    let src = server_route_fixture(r#"Server.get "/files/*rest""#);
+    assert_rejected("lower_server_route_catch_all", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_mid_segment_sigil() {
+    let src = server_route_fixture(r#"Server.get "/v-:id""#);
+    assert_rejected("lower_server_route_mid_segment_sigil", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_not_absolute() {
+    let src = server_route_fixture(r#"Server.get "health""#);
+    assert_rejected("lower_server_route_not_absolute", &src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_route_malformed_escape() {
+    let src = server_route_fixture(r#"Server.get "/a/%zz""#);
+    assert_rejected("lower_server_route_malformed_escape", &src, "IPE-L0156");
+}
+
+/// A `Server.listen` program over the literal route list `routes`.
+fn server_routes_fixture(routes: &str) -> String {
+    format!(
+        r"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+main =
+    Server.listen 8000
+        [ {routes} ]
+"
+    )
+}
+
+#[test]
+fn lower_server_static_prefix_reserved_byte() {
+    for prefix in ["/a?b", "/a#b", "/a/%zz", "/a:b", "/caf\u{e9}", "/assets/"] {
+        let src = server_routes_fixture(&format!(r#"Server.static "{prefix}" "public""#));
+        assert_rejected(
+            "lower_server_static_prefix_reserved_byte",
+            &src,
+            "IPE-L0156",
+        );
+    }
+}
+
+#[test]
+fn lower_server_static_prefix_not_literal() {
+    let src = r#"module Main exposing (main)
+import Ipe.Http.Server as Server
+import Ipe.Task
+assets : String -> Route
+assets prefix = Server.static prefix "public"
+main =
+    Server.listen 8000
+        [ assets "/assets" ]
+"#;
+    assert_rejected("lower_server_static_prefix_not_literal", src, "IPE-L0156");
+}
+
+#[test]
+fn lower_server_static_prefix_duplicate() {
+    let src = server_routes_fixture(
+        r#"Server.static "/assets" "public", Server.static "/assets" "other""#,
+    );
+    assert_rejected("lower_server_static_prefix_duplicate", &src, "IPE-L0156");
+}
+
+#[test]
 fn lower_server_api_path_param_not_identifier() {
     let src = server_route_fixture(r#"Server.api "GET /v1/:a-b""#);
     assert_rejected(
@@ -3838,6 +3930,14 @@ fn lower_server_api_path_param_not_identifier() {
         &src,
         "IPE-L0156",
     );
+}
+
+#[test]
+fn lower_server_api_unknown_method() {
+    for spec in ["FETCH /x", "po\u{17f}t /x"] {
+        let src = server_route_fixture(&format!(r#"Server.api "{spec}""#));
+        assert_rejected("lower_server_api_unknown_method", &src, "IPE-L0156");
+    }
 }
 
 /// A routed `Web.tea` app (its Model has a `page` field) over `page_ty`,
@@ -4089,7 +4189,7 @@ fn well_formed_route_paths_compile() {
     );
     assert_compiles(
         "server_route_well_formed",
-        &server_route_fixture(r#"Server.get "/files/:_dir/*rest""#),
+        &server_route_fixture(r#"Server.get "/files/:_dir/:name""#),
     );
     assert_compiles(
         "server_api_well_formed",
@@ -4265,8 +4365,8 @@ fn generic_row_model_web_embed_rejected() {
 /// A mounted `Web.embed` built inside a definition whose annotation carries a
 /// row generic the entry's model does not visibly use: the model is the
 /// concrete `Model`, and `r` is only the open tail of the `cfg` parameter the
-/// view reads a label from. Region types carry no record row tails, so whether
-/// the entry reaches `r` cannot be determined, and the entry is refused
+/// view reads a label from. The entry's region type does not mention `r`, so
+/// whether the entry reaches it cannot be determined, and the entry is refused
 /// fail-closed.
 const WEB_EMBED_ROW_IN_SCOPE: &str = r#"module Main exposing (main)
 import Ipe.Server.Http as Server

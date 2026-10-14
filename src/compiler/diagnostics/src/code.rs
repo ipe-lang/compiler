@@ -745,6 +745,10 @@ code! {
 
     /// the crate registry could not be reached (network or DNS failure)
     IPE_E0001 = "IPE-E0001", "could not reach the crate registry", "IPE-E0001";
+    /// the build directory holds a path the host linker cannot open
+    IPE_E0002 = "IPE-E0002", "the host linker cannot open the build directory", "IPE-E0002";
+    /// the host linker could not open one of its input files
+    IPE_E0003 = "IPE-E0003", "the host linker could not open an input file", "IPE-E0003";
 
     // -----------------------------------------------------------------------
     // Internal (IPE-I####)

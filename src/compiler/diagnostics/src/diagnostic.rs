@@ -10,30 +10,31 @@
 //! so existing call sites keep compiling while producers migrate.
 
 use crate::code::{
-    Code, Family, IPE_E0001, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410, IPE_F4411, IPE_F4412,
-    IPE_F4413, IPE_F4414, IPE_F4415, IPE_I0001, IPE_I0010, IPE_I0011, IPE_I0100, IPE_I0101,
-    IPE_I0102, IPE_I0103, IPE_I0200, IPE_I0201, IPE_I0202, IPE_I0203, IPE_L0100, IPE_L0101,
-    IPE_L0102, IPE_L0103, IPE_L0104, IPE_L0105, IPE_L0106, IPE_L0107, IPE_L0108, IPE_L0110,
-    IPE_L0111, IPE_L0112, IPE_L0113, IPE_L0114, IPE_L0115, IPE_L0116, IPE_L0117, IPE_L0118,
-    IPE_L0119, IPE_L0120, IPE_L0121, IPE_L0122, IPE_L0123, IPE_L0124, IPE_L0125, IPE_L0126,
-    IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130, IPE_L0131, IPE_L0132, IPE_L0134, IPE_L0135,
-    IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144, IPE_L0145, IPE_L0146,
-    IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152, IPE_L0153, IPE_L0154,
-    IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160, IPE_L0161, IPE_L0162,
-    IPE_L0200, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011,
-    IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025,
-    IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033,
-    IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042,
-    IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050,
-    IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011,
-    IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
-    IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
-    IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
-    IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003,
-    IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016,
-    IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
+    Code, Family, IPE_E0001, IPE_E0002, IPE_E0003, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410,
+    IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414, IPE_F4415, IPE_I0001, IPE_I0010, IPE_I0011,
+    IPE_I0100, IPE_I0101, IPE_I0102, IPE_I0103, IPE_I0200, IPE_I0201, IPE_I0202, IPE_I0203,
+    IPE_L0100, IPE_L0101, IPE_L0102, IPE_L0103, IPE_L0104, IPE_L0105, IPE_L0106, IPE_L0107,
+    IPE_L0108, IPE_L0110, IPE_L0111, IPE_L0112, IPE_L0113, IPE_L0114, IPE_L0115, IPE_L0116,
+    IPE_L0117, IPE_L0118, IPE_L0119, IPE_L0120, IPE_L0121, IPE_L0122, IPE_L0123, IPE_L0124,
+    IPE_L0125, IPE_L0126, IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130, IPE_L0131, IPE_L0132,
+    IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144,
+    IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152,
+    IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160,
+    IPE_L0161, IPE_L0162, IPE_L0200, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005,
+    IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023,
+    IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031,
+    IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040,
+    IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048,
+    IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003,
+    IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017,
+    IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050,
+    IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067,
+    IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001,
+    IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014,
+    IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
 };
 use crate::span::Span;
+use crate::suggest::{Confidence, Hit};
 use crate::terminal::TerminalSafe;
 
 // ===========================================================================
@@ -509,7 +510,7 @@ pub enum NameError {
         found: usize,
     },
     /// A local module named in an `import` cannot be found under `source_root`.
-    /// `suggestions` lists close matches by Levenshtein distance. [IPE-N0020]
+    /// `suggestions` lists close matches in the shared ranker's order. [IPE-N0020]
     ModuleNotFound {
         name: Box<str>,
         suggestions: Candidates,
@@ -1232,6 +1233,15 @@ pub enum Feature {
     UntypedFunctions,
     /// Bare function references / non-name callees. [IPE-L0107]
     FirstClassFunctions,
+    /// A function value that reaches a position on another function carrier inside a container.
+    ///
+    /// A function is emitted on a direct `Box` carrier or a shared `Arc`
+    /// carrier. Where a value meets a position planned on the other carrier
+    /// at the top level, lowering converts it; under a `Maybe`/`Result`
+    /// payload, or through a generic type argument, the conversion would
+    /// rebuild the container, so the program is refused here rather than
+    /// emitted as Rust `cargo` rejects. [IPE-L0107]
+    FnCarrierConflict,
     /// Kernel calls beyond the supported set. [IPE-L0108]
     Kernels,
     /// A call whose argument count differs from the callee's declared arity:
@@ -1768,7 +1778,7 @@ pub enum LowerError {
 /// literal, never the whole literal.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum RoutePatternDefect {
-    /// A `:` or `*` segment marker is followed by no name.
+    /// A `:` segment marker is followed by no name.
     ParamEmpty,
     /// A parameter name is not an identifier.
     ParamNotIdentifier {
@@ -1807,6 +1817,71 @@ pub enum RoutePatternDefect {
     UnrenderableLiteral {
         /// The offending literal segment, as written.
         segment: Box<str>,
+    },
+    /// A `Server.*` route path does not start with `/`.
+    NotAbsolute,
+    /// A `Server.*` route path holds more `:` parameters than the server
+    /// routes.
+    TooManyParams {
+        /// The most parameters one path holds.
+        cap: usize,
+    },
+    /// A `Server.*` route path has a segment led by `*`: a catch-all, which
+    /// the server does not serve.
+    CatchAll {
+        /// The offending segment.
+        segment: Box<str>,
+    },
+    /// A literal segment of a `Server.*` route path holds a `:` or `*` after
+    /// its first byte.
+    MidSegmentSigil {
+        /// The offending segment.
+        segment: Box<str>,
+        /// Byte offset of the sigil within the segment.
+        at: usize,
+    },
+    /// A `Server.api` spec names a method the server does not serve.
+    UnknownMethod {
+        /// The method, as written.
+        method: Box<str>,
+    },
+    /// A `Server.static` or `Server.mountApp` prefix is not a string literal.
+    MountPrefixNotLiteral,
+    /// A `Server.static` or `Server.mountApp` prefix is not a mount base.
+    MountPrefix {
+        /// The offending prefix.
+        prefix: Box<str>,
+        /// The mount-base rule it breaks.
+        fault: MountPrefixFault,
+    },
+    /// Two mounts in one `Server.listen` list serve the same prefix.
+    MountPrefixDuplicate {
+        /// The shared prefix.
+        prefix: Box<str>,
+    },
+}
+
+/// The mount-base rule a literal `Server.static` or `Server.mountApp` prefix
+/// breaks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum MountPrefixFault {
+    /// A non-root prefix that does not start with `/`.
+    NotAbsolute,
+    /// A non-root prefix that ends with `/`.
+    TrailingSlash,
+    /// Two adjacent separators.
+    EmptySegment,
+    /// A `.` or `..` segment.
+    DotSegment,
+    /// A byte outside `A-Z a-z 0-9 - . _ ~` and the `/` separator.
+    Reserved {
+        /// The offending byte.
+        byte: u8,
+    },
+    /// Longer than the mount-base ceiling.
+    TooLong {
+        /// The ceiling in bytes.
+        cap: usize,
     },
 }
 
@@ -2112,6 +2187,22 @@ pub enum Diagnostic {
         /// The cargo stderr detail, trimmed, for display.
         detail: String,
     },
+    /// The build directory or toolchain holds a path the host linker cannot open (`IPE-E0002`).
+    ///
+    /// Span-free: the defect is in the host environment (the project or
+    /// toolchain location), not in the user's source.
+    TargetDirUnlinkable {
+        /// Which directory is refused, and how to fix it, ready for display.
+        detail: String,
+    },
+    /// The host linker could not open one of its input files (`IPE-E0003`).
+    ///
+    /// Span-free: the defect is in the host environment (a path the linker
+    /// family cannot open), not in the user's source.
+    HostLinkerCannotOpenInput {
+        /// The file the linker could not open, and how to fix it, ready for display.
+        detail: String,
+    },
 }
 
 /// Result alias used throughout the compiler.
@@ -2248,32 +2339,49 @@ impl EditTarget {
 
 /// Ranked did-you-mean names for an unresolved name, plus where a fix may land.
 ///
+/// Built only from the hits of [`crate::suggest::rank`], so the names keep the
+/// ranker's order and each name carries the ranker's confidence in it.
 /// `region` is `None` when the producer cannot prove the exact sub-span the
 /// replacement would overwrite (a type annotation carries one span for the
 /// whole annotation); such candidates only ever render as "did you mean"
-/// lines, never as an applicable edit.
+/// lines, never as an edit.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Candidates {
     /// The region a sole candidate replaces, when provable.
-    pub region: Option<EditTarget>,
-    /// The candidate names, best first.
-    pub names: Box<[Box<str>]>,
+    region: Option<EditTarget>,
+    /// The ranked hits, best first.
+    hits: Box<[Hit<Box<str>>]>,
 }
 
 impl Candidates {
-    /// Candidates with a proven (or absent) replace region.
+    /// Ranked hits with a proven (or absent) replace region.
     #[must_use]
-    pub const fn at(region: Option<EditTarget>, names: Box<[Box<str>]>) -> Self {
-        Self { region, names }
+    pub const fn at(region: Option<EditTarget>, hits: Box<[Hit<Box<str>>]>) -> Self {
+        Self { region, hits }
     }
 
-    /// Candidates that are hints only: no region, so never machine-applicable.
+    /// Ranked hits that are hints only: no region, so never an edit.
     #[must_use]
-    pub const fn hints(names: Box<[Box<str>]>) -> Self {
-        Self {
-            region: None,
-            names,
-        }
+    pub const fn hints(hits: Box<[Hit<Box<str>>]>) -> Self {
+        Self::at(None, hits)
+    }
+
+    /// The candidate names, best first.
+    #[must_use]
+    pub fn names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.hits.iter().map(|hit| &**hit.target())
+    }
+}
+
+/// How sure an edit to a sole candidate the ranker rated `confidence` may be.
+///
+/// Only a case-only match or a unique single edit is unambiguous enough to
+/// apply unprompted; any other guess could rewrite the code to a different
+/// binding that still type-checks, so it needs the author's confirmation.
+const fn sole_applicability(confidence: Confidence) -> Applicability {
+    match confidence {
+        Confidence::CaseOnly | Confidence::UniqueSingleEdit => Applicability::MachineApplicable,
+        Confidence::Plausible => Applicability::MaybeIncorrect,
     }
 }
 
@@ -2329,6 +2437,8 @@ impl Diagnostic {
             Self::Sandbox { msg } => sandbox_code(msg),
             Self::Consent { msg } => consent_code(msg),
             Self::RegistryUnreachable { .. } => IPE_E0001,
+            Self::TargetDirUnlinkable { .. } => IPE_E0002,
+            Self::HostLinkerCannotOpenInput { .. } => IPE_E0003,
         }
     }
 
@@ -2351,7 +2461,9 @@ impl Diagnostic {
             | Self::Ffi { .. }
             | Self::Sandbox { .. }
             | Self::Consent { .. }
-            | Self::RegistryUnreachable { .. } => Severity::Error,
+            | Self::RegistryUnreachable { .. }
+            | Self::TargetDirUnlinkable { .. }
+            | Self::HostLinkerCannotOpenInput { .. } => Severity::Error,
             Self::Lower { msg, .. } => match msg {
                 LowerError::RoutedAppMissingPageField { .. } => Severity::Warning,
                 _ => Severity::Error,
@@ -2397,7 +2509,9 @@ impl Diagnostic {
             | Self::Ffi { .. }
             | Self::Sandbox { .. }
             | Self::Consent { .. }
-            | Self::RegistryUnreachable { .. } => Span::DUMMY,
+            | Self::RegistryUnreachable { .. }
+            | Self::TargetDirUnlinkable { .. }
+            | Self::HostLinkerCannotOpenInput { .. } => Span::DUMMY,
         }
     }
 
@@ -2413,7 +2527,10 @@ impl Diagnostic {
             Self::Ffi { msg } => ffi_help(msg),
             Self::Sandbox { msg } => sandbox_help(msg),
             Self::Consent { msg } => consent_help(msg),
-            Self::CompilerBug { .. } | Self::RegistryUnreachable { .. } => Vec::new(),
+            Self::CompilerBug { .. }
+            | Self::RegistryUnreachable { .. }
+            | Self::TargetDirUnlinkable { .. }
+            | Self::HostLinkerCannotOpenInput { .. } => Vec::new(),
         }
     }
 }
@@ -2500,7 +2617,9 @@ const _: () = assert!(
         && matches!(IPE_S0002.family(), Family::Security)
         && matches!(IPE_S0003.family(), Family::Security)
         && matches!(IPE_S0004.family(), Family::Security)
-        && matches!(IPE_E0001.family(), Family::Environment),
+        && matches!(IPE_E0001.family(), Family::Environment)
+        && matches!(IPE_E0002.family(), Family::Environment)
+        && matches!(IPE_E0003.family(), Family::Environment),
     "diagnostic code family drift: a producer returns a code outside its family",
 );
 
@@ -2673,7 +2792,7 @@ const fn feature_code(f: Feature) -> Code {
         Feature::TaskResults => IPE_L0104,
         Feature::ParamPatterns => IPE_L0105,
         Feature::UntypedFunctions => IPE_L0106,
-        Feature::FirstClassFunctions => IPE_L0107,
+        Feature::FirstClassFunctions | Feature::FnCarrierConflict => IPE_L0107,
         Feature::Kernels => IPE_L0108,
         Feature::PartialOverApplication => IPE_L0110,
         Feature::BoundedRecordUpdate => IPE_L0111,
@@ -3247,7 +3366,7 @@ fn unsaturated_handler_kernel_help(kernel: &str) -> Vec<HelpLine> {
 /// broke and the rewrite that satisfies it.
 fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
     let note = match defect {
-        RoutePatternDefect::ParamEmpty => "every `:` or `*` segment needs a name after it — \
+        RoutePatternDefect::ParamEmpty => "every `:` segment needs a name after it — \
              write `/posts/:id`, not `/posts/:`"
             .to_string(),
         RoutePatternDefect::ParamNotIdentifier { name, .. } => format!(
@@ -3271,8 +3390,46 @@ fn route_pattern_malformed_help(defect: &RoutePatternDefect) -> Vec<HelpLine> {
         RoutePatternDefect::TooLong { cap } => {
             format!("a route path is at most {cap} bytes — shorten it")
         }
+        RoutePatternDefect::TooManyParams { .. } => {
+            "split the route, or carry the extra values in the query string or the body".to_string()
+        }
+        RoutePatternDefect::NotAbsolute => {
+            "a server route path starts with `/` — write `/health`, not `health`".to_string()
+        }
+        RoutePatternDefect::CatchAll { .. } => {
+            "a server route matches a fixed number of segments — name each one \
+             (`/files/:dir/:name`) instead of a `*` catch-all"
+                .to_string()
+        }
+        RoutePatternDefect::MidSegmentSigil { .. } => {
+            "a parameter is a whole segment led by `:` — split `/v-:id` into `/v/:id`, or \
+             write the literal `:` or `*` as `%3A` or `%2A`"
+                .to_string()
+        }
         RoutePatternDefect::UnrenderableLiteral { .. } => {
-            "a page's path is rendered back into a URL, and a browser drops an empty,              `.` or `..` segment — remove the empty segment or rename the literal"
+            "a page's path is rendered back into a URL, and a browser drops an empty, \
+             `.` or `..` segment — remove the empty segment or rename the literal"
+                .to_string()
+        }
+        RoutePatternDefect::UnknownMethod { .. } => {
+            "name one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, \
+             `CONNECT`, `TRACE` or `ANY` before the path — or omit the method to serve every \
+             method"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixNotLiteral => {
+            "write the mount prefix as a string literal (`Server.static \"/assets\" dir`), so \
+             it is checked when the program compiles"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefix { .. } => {
+            "a mount prefix is `/` or `/`-separated segments of the letters, digits, `-`, `.`, \
+             `_` and `~`, with no trailing `/` — write `/assets` or `/app/v2`"
+                .to_string()
+        }
+        RoutePatternDefect::MountPrefixDuplicate { .. } => {
+            "give each mount its own prefix; a longer prefix nested under another is served \
+             by the longer one"
                 .to_string()
         }
     };
@@ -3512,24 +3669,24 @@ const fn consent_code(msg: &ConsentError) -> Code {
 
 // --- did_you_mean ------------------------------------------------------------
 
-/// Turns already-sorted candidates into help lines.
+/// Turns ranked candidates into help lines.
 ///
-/// A single candidate with a proven [`EditTarget`] is confident enough to offer
-/// as a [`Applicability::MachineApplicable`] suggestion over exactly that
-/// region; any other shape (several candidates, or no provable region) stays a
-/// non-committal "did you mean" line per name. The producer is responsible for
-/// the stable `(Levenshtein, name)` ordering.
+/// A single candidate with a proven [`EditTarget`] becomes a [`Suggestion`]
+/// over exactly that region, applicable unprompted only when the ranker found
+/// it unambiguous ([`sole_applicability`]); any other shape
+/// (several candidates, or no provable region) stays a non-committal "did you
+/// mean" line per name, in the ranker's order.
 fn did_you_mean(candidates: &Candidates) -> Vec<HelpLine> {
-    match (&*candidates.names, &candidates.region) {
+    match (&*candidates.hits, &candidates.region) {
         ([only], Some(target)) => vec![HelpLine::Suggest(Suggestion {
             span: target.span,
             replaces: target.replaces.clone(),
-            replacement: only.clone(),
-            applicability: Applicability::MachineApplicable,
+            replacement: only.target().clone(),
+            applicability: sole_applicability(only.confidence()),
         })],
         (many, _) => many
             .iter()
-            .map(|s| HelpLine::DidYouMean(s.clone()))
+            .map(|hit| HelpLine::DidYouMean(hit.target().clone()))
             .collect(),
     }
 }
@@ -3549,7 +3706,7 @@ mod code_family_tests {
     /// cross (the sandbox is the FFI jail) — so this table pins the exception
     /// too, not only the rule.
     fn family_representatives() -> Vec<(Diagnostic, Family)> {
-        vec![
+        [
             (
                 Diagnostic::Parse {
                     span: Span::DUMMY,
@@ -3628,12 +3785,6 @@ mod code_family_tests {
                 Family::Security,
             ),
             (
-                Diagnostic::RegistryUnreachable {
-                    detail: "test".to_owned(),
-                },
-                Family::Environment,
-            ),
-            (
                 Diagnostic::CompilerBug {
                     where_: "ir.match.non_exhaustive",
                     detail: "test".to_owned(),
@@ -3641,6 +3792,28 @@ mod code_family_tests {
                 Family::Internal,
             ),
         ]
+        .into_iter()
+        .chain(environment_representatives())
+        .collect()
+    }
+
+    /// One representative [`Diagnostic`] for every environment fault, each
+    /// paired with [`Family::Environment`].
+    fn environment_representatives() -> Vec<(Diagnostic, Family)> {
+        [
+            Diagnostic::RegistryUnreachable {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::TargetDirUnlinkable {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::HostLinkerCannotOpenInput {
+                detail: "test".to_owned(),
+            },
+        ]
+        .into_iter()
+        .map(|diagnostic| (diagnostic, Family::Environment))
+        .collect()
     }
 
     /// Every representative diagnostic's rendered code belongs to the family it

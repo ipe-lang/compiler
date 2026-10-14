@@ -14,7 +14,7 @@
 //! of a spelling read ([`SPELLING_CHARS`]), the characters one distance
 //! compares per side ([`DISTANCE_CHARS`]), and the hits returned ([`Cap`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU8;
 
 use crate::terminal::is_display_hazard;
@@ -174,6 +174,19 @@ pub struct Policy {
     pub threshold: Threshold,
 }
 
+/// The distance within which another target makes a case-only or one-edit
+/// guess ambiguous, whether or not the site's threshold shows that target.
+const RIVAL_EDITS: Distance = Distance(2);
+
+/// The longest folded query every rival comparison sees uncut.
+///
+/// A rival within [`RIVAL_EDITS`] of such a query is at most
+/// [`DISTANCE_CHARS`] characters per compared side, so no cut moves it out of
+/// reach and no cut hides an edit in the guess itself.
+fn exact_query_chars() -> usize {
+    DISTANCE_CHARS.saturating_sub(usize::from(RIVAL_EDITS.get()))
+}
+
 /// An edit distance, at most [`Distance::CEILING`] per compared pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Distance(u8);
@@ -191,12 +204,19 @@ impl Distance {
 }
 
 /// How sure the ranker is that a hit is what the query meant, best first.
+///
+/// Both confident verdicts share one rule: the hit is the best target, the
+/// scan was complete, no spelling was cut at [`SPELLING_CHARS`], the query is
+/// at most [`exact_query_chars`] long, and no other target sits within
+/// [`RIVAL_EDITS`] of the query by the one rival measure every spelling is
+/// scored with, whether the site's threshold shows it, hides it, or shows it
+/// farther. No unseen or miscounted spelling can then compete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
-    /// The query and a spelling differ only in letter case.
+    /// The query and the hit differ only in letter case, and the hit stands
+    /// alone under the shared rule.
     CaseOnly,
-    /// The one hit at one edit, with no other hit within two edits of it and
-    /// a complete scan, so no unseen spelling could compete.
+    /// The hit is one edit away and stands alone under the shared rule.
     UniqueSingleEdit,
     /// Any other hit, including an exact spelling: the site's exact lookup
     /// answers that one before ranking.
@@ -204,14 +224,54 @@ pub enum Confidence {
 }
 
 /// One ranked target.
+///
+/// Only [`rank`] builds one, so a target always carries the distance and
+/// confidence the ranker gave it: no site can pair a name with a confidence
+/// it did not earn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit<T> {
     /// The target a spelling within the threshold opens.
-    pub target: T,
+    target: T,
     /// The best distance over the target's spellings.
-    pub distance: Distance,
+    distance: Distance,
     /// How sure the ranker is.
-    pub confidence: Confidence,
+    confidence: Confidence,
+}
+
+impl<T> Hit<T> {
+    /// The target a spelling within the threshold opens.
+    #[must_use]
+    pub const fn target(&self) -> &T {
+        &self.target
+    }
+
+    /// The best distance over the target's spellings.
+    #[must_use]
+    pub const fn distance(&self) -> Distance {
+        self.distance
+    }
+
+    /// How sure the ranker is.
+    #[must_use]
+    pub const fn confidence(&self) -> Confidence {
+        self.confidence
+    }
+
+    /// The target, dropping its score.
+    #[must_use]
+    pub fn into_target(self) -> T {
+        self.target
+    }
+
+    /// The same hit over another representation of its target.
+    #[must_use]
+    pub fn map_target<U>(self, f: impl FnOnce(T) -> U) -> Hit<U> {
+        Hit {
+            target: f(self.target),
+            distance: self.distance,
+            confidence: self.confidence,
+        }
+    }
 }
 
 /// The outcome of one ranking.
@@ -240,17 +300,42 @@ pub fn rank<'a, T: Ord + Clone>(
     let query_segments: Vec<Vec<char>> = query.segments.iter().map(|s| cut_chars(s)).collect();
     let mut work = Work::default();
     let mut best: BTreeMap<T, Best> = BTreeMap::new();
+    // Every target within `RIVAL_EDITS` of the query by the one rival
+    // measure, scored for every spelling whatever the site's threshold made
+    // of it: any but the guess's own target makes a confident guess ambiguous.
+    let mut near: BTreeSet<T> = BTreeSet::new();
+    // Whether every comparison saw its sides whole: a long query or a cut
+    // spelling can hide a rival's real distance.
+    let mut exact = query.folded.chars().nth(exact_query_chars()).is_none();
+    let rival = Threshold::Nearest { max: RIVAL_EDITS };
 
     let mut scan = universe.into_iter();
     for spelling in scan.by_ref().take(MAX_UNIVERSE) {
-        let Some(found) = score(
+        let (head, cut) = head_of(spelling.text);
+        exact &= !cut;
+        let found = score(
             query,
             &query_whole,
             &query_segments,
-            spelling.text,
+            head,
+            cut,
             policy.threshold,
             &mut work,
-        ) else {
+        );
+        if score(
+            query,
+            &query_whole,
+            &query_segments,
+            head,
+            cut,
+            rival,
+            &mut work,
+        )
+        .is_some()
+        {
+            near.insert(spelling.target.clone());
+        }
+        let Some(found) = found else {
             continue;
         };
         best.entry(spelling.target)
@@ -270,13 +355,16 @@ pub fn rank<'a, T: Ord + Clone>(
         .into_iter()
         .enumerate()
         .map(|(at, (target, found))| {
-            let unique = at == 0
+            // One rule for every confident verdict: the best target of a
+            // whole, exact scan, with no other target within `RIVAL_EDITS`.
+            let alone = at == 0
                 && !truncated
-                && found.distance == Distance(1)
-                && runner_up.is_none_or(|next| next.get() >= 3);
-            let confidence = if found.case_only {
+                && exact
+                && runner_up.is_none_or(|next| next > RIVAL_EDITS)
+                && near.iter().all(|other| *other == target);
+            let confidence = if alone && found.case_only {
                 Confidence::CaseOnly
-            } else if unique {
+            } else if alone && found.distance == Distance(1) {
                 Confidence::UniqueSingleEdit
             } else {
                 Confidence::Plausible
@@ -299,7 +387,9 @@ pub fn rank<'a, T: Ord + Clone>(
 
 /// A spelling's score: its distance, and whether it is a case-only match.
 ///
-/// Ordered best first: a smaller distance, then a case-only match.
+/// Ordered best first: a smaller distance, then an exact spelling before a
+/// case-only one. A target with a spelling equal to the query is the query
+/// itself, so another of its spellings never makes it a case-only guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Best {
     distance: Distance,
@@ -316,7 +406,7 @@ impl Ord for Best {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.distance
             .cmp(&other.distance)
-            .then_with(|| other.case_only.cmp(&self.case_only))
+            .then_with(|| self.case_only.cmp(&other.case_only))
     }
 }
 
@@ -336,24 +426,30 @@ struct Rows {
     cur: Vec<usize>,
 }
 
-/// The score of `text` against the query, or `None` past the threshold.
+/// The first [`SPELLING_CHARS`] characters of `text`, and whether it was cut.
+fn head_of(text: &str) -> (&str, bool) {
+    match text.char_indices().nth(SPELLING_CHARS) {
+        Some((at, _)) => (text.get(..at).unwrap_or(text), true),
+        None => (text, false),
+    }
+}
+
+/// The score of a spelling's `head` against the query, or `None` past the
+/// threshold; `cut` says [`head_of`] cut the spelling.
 ///
 /// A dotted query is aligned against the spelling's trailing segments of the
 /// same count; when the counts differ, the whole folded strings are compared
-/// too and the smaller distance wins. A flat query, or a spelling cut at
-/// [`SPELLING_CHARS`], is compared whole only.
+/// too and the smaller distance wins. A flat query, or a cut spelling, is
+/// compared whole only.
 fn score(
     query: &Query,
     query_whole: &[char],
     query_segments: &[Vec<char>],
-    text: &str,
+    head: &str,
+    cut: bool,
     threshold: Threshold,
     work: &mut Work,
 ) -> Option<Best> {
-    let (head, cut) = match text.char_indices().nth(SPELLING_CHARS) {
-        Some((at, _)) => (text.get(..at).unwrap_or(text), true),
-        None => (text, false),
-    };
     work.folded.clear();
     work.folded
         .extend(head.chars().flat_map(char::to_lowercase));
@@ -670,7 +766,93 @@ mod tests {
         );
         let first = ranked.hits.first().expect("a hit");
         assert_eq!(first.target, "Just");
-        assert_eq!(first.confidence, Confidence::CaseOnly);
+        assert_eq!(
+            first.confidence,
+            Confidence::Plausible,
+            "`Juts` is one edit from the folded query"
+        );
+    }
+
+    /// A case-only guess stands alone under the same rule as a one-edit
+    /// guess: a rival within two edits, shown or hidden by the threshold, or
+    /// a query too long to compare exactly, keeps it plausible.
+    #[test]
+    fn a_case_only_match_with_a_near_rival_is_plausible() {
+        let confidence = |raw: &str, names: &[&str]| {
+            rank(&query(raw, Shape::Flat), spellings(names), RELATIVE)
+                .hits
+                .first()
+                .map(|h| (h.target.to_owned(), h.confidence))
+        };
+        assert_eq!(
+            confidence("just", &["Just", "must"]),
+            Some(("Just".to_owned(), Confidence::Plausible)),
+            "a shown rival one edit away"
+        );
+        assert_eq!(targets("just", Shape::Flat, &["Just", "mast"]), ["Just"]);
+        assert_eq!(
+            confidence("just", &["Just", "mast"]),
+            Some(("Just".to_owned(), Confidence::Plausible)),
+            "a rival two edits away the threshold hides"
+        );
+        assert_eq!(
+            confidence("just", &["Just", "zzzz"]),
+            Some(("Just".to_owned(), Confidence::CaseOnly)),
+            "a far name is no rival"
+        );
+        let long = "a".repeat(DISTANCE_CHARS);
+        let upper = long.to_uppercase();
+        assert_eq!(
+            confidence(&long, &[upper.as_str()]),
+            Some((upper.clone(), Confidence::Plausible)),
+            "a query past the exact length is never confident"
+        );
+    }
+
+    /// A case-only guess that shares distance zero with another target, or
+    /// whose competitors a cut list or a cut scan hides, is never confident.
+    #[test]
+    fn a_case_only_match_with_a_hidden_or_tied_competitor_is_plausible() {
+        let confidence = |ranked: Ranked<&str>| ranked.hits.first().map(Hit::confidence);
+        let one = Policy {
+            cap: Cap::new(NonZeroU8::MIN),
+            threshold: Threshold::Relative,
+        };
+        assert_eq!(
+            confidence(rank(
+                &query("just", Shape::Flat),
+                spellings(&["Just", "JUST"]),
+                one
+            )),
+            Some(Confidence::Plausible),
+            "a second case-only spelling ties at distance zero, even when the cap hides it"
+        );
+        assert_eq!(
+            confidence(rank(
+                &query("Just", Shape::Flat),
+                spellings(&["Just", "just"]),
+                RELATIVE
+            )),
+            Some(Confidence::Plausible),
+            "the typed name itself ties at distance zero"
+        );
+        let names: Vec<String> = (0..MAX_UNIVERSE).map(|n| format!("q{n}")).collect();
+        let universe = std::iter::once(Spelling {
+            text: "Just",
+            target: "Just",
+        })
+        .chain(names.iter().map(|n| Spelling {
+            text: n.as_str(),
+            target: n.as_str(),
+        }));
+        let ranked = rank(&query("just", Shape::Flat), universe, RELATIVE);
+        assert!(ranked.truncated);
+        assert_eq!(confidence(ranked), Some(Confidence::Plausible));
+        assert_eq!(
+            confidence(rank(&query("just", Shape::Flat), spellings(&["Just"]), one)),
+            Some(Confidence::CaseOnly),
+            "a lone, fully seen case-only match stays confident"
+        );
     }
 
     #[test]
@@ -810,6 +992,106 @@ mod tests {
         );
     }
 
+    /// A target two edits away is a rival even when a short query's
+    /// threshold keeps it out of the shown list.
+    #[test]
+    fn a_rival_the_threshold_hides_still_blocks_a_unique_single_edit() {
+        assert_eq!(distance("lsit", "lost"), Some(2));
+        let confidence = |names: &[&str]| {
+            rank(&query("lsit", Shape::Flat), spellings(names), RELATIVE)
+                .hits
+                .first()
+                .map(Hit::confidence)
+        };
+        assert_eq!(confidence(&["list"]), Some(Confidence::UniqueSingleEdit));
+        assert_eq!(
+            targets("lsit", Shape::Flat, &["list", "lost"]),
+            ["list"],
+            "the rival is never shown"
+        );
+        assert_eq!(
+            confidence(&["list", "lost"]),
+            Some(Confidence::Plausible),
+            "yet the one shown guess is ambiguous"
+        );
+        assert_eq!(
+            confidence(&["list", "zzzz"]),
+            Some(Confidence::UniqueSingleEdit),
+            "a far name is no rival"
+        );
+    }
+
+    /// A dotted spelling cut at [`SPELLING_CHARS`] is compared whole on its
+    /// head, so its real trailing segments, one edit away, go unseen.
+    #[test]
+    fn a_cut_spelling_blocks_a_unique_single_edit() {
+        let confidence = |rival: &str| {
+            rank(
+                &query("Lsit.map", Shape::Dotted),
+                spellings(&["List.map", rival]),
+                RELATIVE,
+            )
+            .hits
+            .first()
+            .map(Hit::confidence)
+        };
+        let shown = format!("{}Lsit.mop", "a.".repeat(8));
+        assert_eq!(confidence(&shown), Some(Confidence::Plausible));
+        let cut = format!("{}Lsit.mop", "a.".repeat(SPELLING_CHARS));
+        assert_eq!(
+            confidence(&cut),
+            Some(Confidence::Plausible),
+            "the cut rival is as near as the shown one"
+        );
+    }
+
+    /// Past [`DISTANCE_CHARS`], a cut can push a two-edit rival out of reach
+    /// and hide the guess's own tail: such a query is never confident.
+    #[test]
+    fn a_query_too_long_to_compare_exactly_is_never_a_unique_single_edit() {
+        let body = "a".repeat(DISTANCE_CHARS.saturating_sub(4));
+        let typed = format!("xy{body}bcde");
+        let rival = format!("{body}bcde");
+        let guess = format!("xyz{}bcde", body.get(1..).unwrap_or_default());
+        let ranked = rank(
+            &query(&typed, Shape::Flat),
+            spellings(&[&guess, &rival]),
+            RELATIVE,
+        );
+        assert_eq!(
+            ranked.hits.first().map(|h| (h.target, h.confidence)),
+            Some((guess.as_str(), Confidence::Plausible)),
+            "`{rival}` is two deletions from the query"
+        );
+        let short = rank(
+            &query("xyaaaabcde", Shape::Flat),
+            spellings(&["xyzaaabcde"]),
+            RELATIVE,
+        );
+        assert_eq!(
+            short.hits.first().map(Hit::confidence),
+            Some(Confidence::UniqueSingleEdit)
+        );
+    }
+
+    /// A shown hit whose aligned score is far but whose whole spelling is two
+    /// edits away is a rival like any hidden one.
+    #[test]
+    fn a_far_shown_hit_two_whole_edits_away_blocks_a_unique_single_edit() {
+        let typed = "abcdefghi.jklmnopqr";
+        let rival = "abcdefghijk.lmnopqr";
+        assert_eq!(distance(typed, rival), Some(2));
+        let ranked = rank(
+            &query(typed, Shape::Dotted),
+            spellings(&["abcdefghi.jklmnopqs", rival]),
+            RELATIVE,
+        );
+        assert_eq!(
+            ranked.hits.first().map(|h| (h.target, h.confidence)),
+            Some(("abcdefghi.jklmnopqs", Confidence::Plausible))
+        );
+    }
+
     #[test]
     fn a_truncated_scan_is_never_a_unique_single_edit() {
         let names: Vec<String> = (0..MAX_UNIVERSE).map(|n| format!("q{n}")).collect();
@@ -837,5 +1119,225 @@ mod tests {
         let first = rank(&query("maq", Shape::Flat), spellings(&names), RELATIVE);
         let again = rank(&query("maq", Shape::Flat), spellings(&reversed), RELATIVE);
         assert_eq!(first, again);
+    }
+
+    /// A target one of whose spellings is the query itself is the query, not
+    /// a case-only guess, whichever of its spellings the scan meets first.
+    #[test]
+    fn a_target_spelling_the_query_is_never_a_case_only_guess() {
+        for names in [["B", "b"], ["b", "B"]] {
+            let universe = names.into_iter().map(|text| Spelling { text, target: 0 });
+            let ranked = rank(&query("B", Shape::Flat), universe, RELATIVE);
+            assert_eq!(
+                ranked.hits.first().map(|h| (h.distance, h.confidence)),
+                Some((Distance(0), Confidence::Plausible)),
+                "{names:?}"
+            );
+        }
+    }
+
+    // -- Oracle ---------------------------------------------------------------
+
+    /// A fixed-seed xorshift stream, so the oracle sees the same cases every run.
+    struct Stream(u64);
+
+    impl Stream {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            let n = u64::try_from(n.max(1)).unwrap_or(1);
+            usize::try_from(self.0 % n).unwrap_or(0)
+        }
+
+        fn letter(&mut self) -> char {
+            const ALPHABET: [char; 13] = [
+                'a', 'b', 'A', 'B', '.', 'İ', 'i', '\u{307}', 'ß', 'ẞ', 'K', '\u{212a}', 'k',
+            ];
+            ALPHABET
+                .get(self.below(ALPHABET.len()))
+                .copied()
+                .unwrap_or('a')
+        }
+
+        /// `text` after `edits` random inserts, deletes, substitutions,
+        /// adjacent swaps, or case flips.
+        fn mutate(&mut self, text: &str, edits: usize) -> String {
+            let mut chars: Vec<char> = text.chars().collect();
+            for _ in 0..edits {
+                let at = self.below(chars.len());
+                match self.below(5) {
+                    0 => {
+                        if at < chars.len() {
+                            chars.remove(at);
+                        }
+                    }
+                    1 => {
+                        let letter = self.letter();
+                        chars.insert(at.min(chars.len()), letter);
+                    }
+                    2 => {
+                        let letter = self.letter();
+                        if let Some(slot) = chars.get_mut(at) {
+                            *slot = letter;
+                        }
+                    }
+                    3 => {
+                        if let Some(pair) = chars.get_mut(at..at.saturating_add(2)) {
+                            pair.reverse();
+                        }
+                    }
+                    _ => {
+                        if let Some(slot) = chars.get_mut(at) {
+                            let flipped = if slot.is_lowercase() {
+                                slot.to_uppercase().next()
+                            } else {
+                                slot.to_lowercase().next()
+                            };
+                            *slot = flipped.unwrap_or(*slot);
+                        }
+                    }
+                }
+            }
+            chars.into_iter().collect()
+        }
+    }
+
+    /// The optimal-string-alignment distance by plain memoised recursion,
+    /// independent of [`osa`]'s rows, limits, and early exit.
+    fn reference_distance(left: &[char], right: &[char]) -> usize {
+        fn go(left: &[char], right: &[char], memo: &mut BTreeMap<(usize, usize), usize>) -> usize {
+            let key = (left.len(), right.len());
+            if let Some(&known) = memo.get(&key) {
+                return known;
+            }
+            let found = match (left.split_last(), right.split_last()) {
+                (None, _) => right.len(),
+                (_, None) => left.len(),
+                (Some((last_l, init_l)), Some((last_r, init_r))) => {
+                    let mut best = go(init_l, right, memo)
+                        .saturating_add(1)
+                        .min(go(left, init_r, memo).saturating_add(1))
+                        .min(
+                            go(init_l, init_r, memo).saturating_add(usize::from(last_l != last_r)),
+                        );
+                    if let (Some((prev_l, rest_l)), Some((prev_r, rest_r))) =
+                        (init_l.split_last(), init_r.split_last())
+                        && last_l == prev_r
+                        && prev_l == last_r
+                    {
+                        best = best.min(go(rest_l, rest_r, memo).saturating_add(1));
+                    }
+                    best
+                }
+            };
+            memo.insert(key, found);
+            found
+        }
+        go(left, right, &mut BTreeMap::new())
+    }
+
+    /// The ranker's measure, uncut: the whole folded strings, and for a
+    /// dotted query the trailing segments too when the spelling has enough.
+    fn reference_measure(typed: &str, spelling: &str, shape: Shape) -> usize {
+        let (typed, spelling) = (fold(typed.trim()), fold(spelling));
+        let chars = |s: &str| s.chars().collect::<Vec<char>>();
+        let whole = reference_distance(&chars(&typed), &chars(&spelling));
+        let (wanted, have) = (typed.split('.').count(), spelling.split('.').count());
+        if shape == Shape::Flat || have < wanted {
+            return whole;
+        }
+        let aligned = typed
+            .rsplit('.')
+            .zip(spelling.rsplit('.'))
+            .map(|(want, got)| reference_distance(&chars(want), &chars(got)))
+            .fold(0, usize::saturating_add);
+        whole.min(aligned)
+    }
+
+    /// Why a confident hit is wrong, measured against every spelling.
+    fn oracle_refutes(
+        typed: &str,
+        shape: Shape,
+        universe: &[(String, u8)],
+        policy: Policy,
+    ) -> Option<String> {
+        let parsed = Query::parse(typed, shape).ok()?;
+        let ranked = rank(
+            &parsed,
+            universe.iter().map(|(text, target)| Spelling {
+                text: text.as_str(),
+                target: *target,
+            }),
+            policy,
+        );
+        if let Some(late) = ranked
+            .hits
+            .iter()
+            .skip(1)
+            .find(|h| h.confidence != Confidence::Plausible)
+        {
+            return Some(format!("a confident hit past the first: {late:?}"));
+        }
+        let first = ranked.hits.first()?;
+        let typed = parsed.text();
+        let own = || universe.iter().filter(|(_, t)| *t == first.target);
+        let earned = match first.confidence {
+            Confidence::Plausible => return None,
+            Confidence::CaseOnly => own().any(|(s, _)| fold(s) == parsed.folded() && s != typed),
+            Confidence::UniqueSingleEdit => {
+                own().any(|(s, _)| reference_measure(typed, s, shape) == 1)
+            }
+        };
+        if !earned || own().any(|(s, _)| s == typed) {
+            return Some(format!("{first:?} unearned"));
+        }
+        universe
+            .iter()
+            .filter(|(_, t)| *t != first.target)
+            .find(|(s, _)| reference_measure(typed, s, shape) <= usize::from(RIVAL_EDITS.get()))
+            .map(|rival| format!("{first:?} beside rival {rival:?}"))
+    }
+
+    /// A confident verdict holds against a brute-force measure of every
+    /// spelling: the guess earned it, and no other target sits within
+    /// [`RIVAL_EDITS`] of the query, over small universes of near spellings
+    /// with aliases, duplicates, dots, and multi-char case folds.
+    #[test]
+    fn every_confident_verdict_survives_the_brute_force_oracle() {
+        let nearest = Policy {
+            cap: Cap::MAX,
+            threshold: Threshold::Nearest {
+                max: Distance::CEILING,
+            },
+        };
+        let one = Policy {
+            cap: Cap::new(NonZeroU8::MIN),
+            threshold: Threshold::Relative,
+        };
+        let mut stream = Stream(0x9e37_79b9_7f4a_7c15);
+        let mut refuted = Vec::new();
+        for _ in 0..1500 {
+            let len = stream.below(7);
+            let base: String = (0..len).map(|_| stream.letter()).collect();
+            let edits = stream.below(3);
+            let typed = stream.mutate(&base, edits);
+            let count = stream.below(6).saturating_add(1);
+            let universe: Vec<(String, u8)> = (0..count)
+                .map(|_| {
+                    let edits = stream.below(4);
+                    let text = stream.mutate(&base, edits);
+                    (text, u8::try_from(stream.below(4)).unwrap_or(0))
+                })
+                .collect();
+            for shape in [Shape::Flat, Shape::Dotted] {
+                for policy in [RELATIVE, one, nearest] {
+                    if let Some(why) = oracle_refutes(&typed, shape, &universe, policy) {
+                        refuted.push(format!("{typed:?} {shape:?}: {why} in {universe:?}"));
+                    }
+                }
+            }
+        }
+        assert!(refuted.is_empty(), "{refuted:#?}");
     }
 }
