@@ -332,42 +332,47 @@ mod tests {
         assert!(woke.is_ok(), "the release must wake the waiter");
     }
 
-    /// Racing charges never pass the process budget, and some are refused.
+    /// Racing charges never pass the process budget: with every admitted
+    /// charge still held, exactly the charges that fit are admitted, and the
+    /// budget accounts for each of them, over many racing rounds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_charges_never_pass_the_budget() {
         const TASKS: u64 = 16;
+        const ROUNDS: u64 = 200;
+        const CHUNK: u64 = 63;
         const LIMIT: u64 = 1_000;
-        let process = SessionBudget::process(Bytes::new(LIMIT));
-        // Every task parks on the barrier before charging, so all race at once.
-        let barrier = Arc::new(tokio::sync::Barrier::new(16));
-        let peak = Arc::new(AtomicU64::new(0));
-        let mut tasks = Vec::new();
-        for _ in 0..TASKS {
-            let process = Arc::clone(&process);
-            let barrier = Arc::clone(&barrier);
-            let peak = Arc::clone(&peak);
-            tasks.push(tokio::spawn(async move {
-                let session = SessionBudget::session(&process, Bytes::new(LIMIT));
-                barrier.wait().await;
-                let held = session.try_charge(Bytes::new(LIMIT / TASKS + 1));
-                peak.fetch_max(process.used().get(), Ordering::AcqRel);
-                tokio::task::yield_now().await;
-                peak.fetch_max(process.used().get(), Ordering::AcqRel);
-                held.is_ok()
-            }));
-        }
-        let mut admitted = 0_u64;
-        for task in tasks {
-            if matches!(task.await, Ok(true)) {
-                admitted += 1;
+        // 15 chunks (945 bytes) fit the limit; a 16th (1008) does not.
+        const FITS: u64 = 15;
+        const FITS_BYTES: u64 = 945;
+        for _ in 0..ROUNDS {
+            let process = SessionBudget::process(Bytes::new(LIMIT));
+            // Every task parks on the barrier before charging, so all race at once.
+            let barrier = Arc::new(tokio::sync::Barrier::new(16));
+            let mut tasks = Vec::new();
+            for _ in 0..TASKS {
+                let process = Arc::clone(&process);
+                let barrier = Arc::clone(&barrier);
+                tasks.push(tokio::spawn(async move {
+                    let session = SessionBudget::session(&process, Bytes::new(LIMIT));
+                    barrier.wait().await;
+                    session.try_charge(Bytes::new(CHUNK)).ok()
+                }));
             }
+            let mut held = Vec::new();
+            for task in tasks {
+                if let Ok(Some(charge)) = task.await {
+                    held.push(charge);
+                }
+            }
+            let admitted = u64::try_from(held.len()).unwrap_or(u64::MAX);
+            assert_eq!(admitted, FITS, "exactly the charges that fit are admitted");
+            assert_eq!(
+                process.used(),
+                Bytes::new(FITS_BYTES),
+                "every admitted charge is accounted"
+            );
+            drop(held);
+            assert_eq!(process.used(), Bytes::ZERO);
         }
-        assert!(
-            peak.load(Ordering::Acquire) <= LIMIT,
-            "used passed the limit"
-        );
-        assert!(admitted < TASKS, "at least one charge must be refused");
-        assert!(admitted > 0, "the race must admit some charge");
-        assert_eq!(process.used(), Bytes::ZERO);
     }
 }
