@@ -23,7 +23,7 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
-import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Token(..))
 import Lib.Index as Index exposing (SourceRow(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
@@ -565,6 +565,37 @@ layoutOnlyWhereLanguageReadsIt =
         == []
 
 
+-- A layout's two facts alone decide what a line loses: where its grammar
+-- says a `\r` or a leading byte-order mark is text, the line keeps it; a
+-- mark is layout only on line 1, and a `\r` only at the line's end.
+layoutDecidesWhatIsHidden : Bool
+layoutDecidesWhatIsHidden =
+    let
+        mark =
+            codeText 65279
+
+        line =
+            mark ++ "x\r"
+
+        hiding =
+            { lineEnds = CrlfIsOneBreak, leadingMark = MarkSkipped }
+    in
+    View.layoutLine hiding 1 line
+        == "x"
+        && View.layoutLine { lineEnds = CrIsText, leadingMark = MarkIsText } 1 line
+        == line
+        && View.layoutLine { lineEnds = CrIsText, leadingMark = MarkSkipped } 1 line
+        == "x\r"
+        && View.layoutLine { lineEnds = CrlfIsOneBreak, leadingMark = MarkIsText } 1 line
+        == mark
+        ++ "x"
+        && View.layoutLine hiding 2 line
+        == mark
+        ++ "x"
+        && View.layoutLine hiding 1 "a\rb"
+        == "a\rb"
+
+
 -- A Rust `br"…"` or `cr"…"` is a raw string: its `\` escapes nothing, so
 -- the string closes at its quote and the next row is code.
 rawPrefixedStrings : Bool
@@ -769,6 +800,7 @@ checks =
         , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
         , Task.succeed ( "a run of source lines copies as the source spells it, line numbers apart", sourceCopiesAsWritten )
         , Task.succeed ( "only a tab, a Rust CRLF end and a Rust leading byte-order mark are layout; every other hazard draws escaped", layoutOnlyWhereLanguageReadsIt )
+        , Task.succeed ( "a layout hides a \\r or a leading mark only where its grammar reads it as layout", layoutDecidesWhatIsHidden )
         , Task.succeed ( "a Rust br or cr string is raw", rawPrefixedStrings )
         , Task.succeed ( "a shell heredoc body carries no quote past its line", heredocBodies )
         ]
