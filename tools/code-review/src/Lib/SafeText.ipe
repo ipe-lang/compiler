@@ -141,10 +141,23 @@ literal text =
 
 
 -- The pieces joined in order; adjacent `Verbatim` text merges into one
--- segment, so a segment boundary always marks an escape.
+-- segment, so a segment boundary always marks an escape. One left-to-right
+-- pass, linear in the pieces' segments and text.
 concat : List SafeText -> SafeText
 concat pieces =
-    SafeText (List.foldr (\piece acc -> List.foldr prepend acc (segments piece)) [] pieces)
+    case List.foldl joinSegment ( "", [] ) (List.concatMap segments pieces) of
+        ( pending, done ) ->
+            SafeText (flushed pending done)
+
+
+joinSegment : Segment -> ( String, List Segment ) -> ( String, List Segment )
+joinSegment seg ( pending, done ) =
+    case seg of
+        Verbatim s ->
+            ( String.append pending s, done )
+
+        Escaped c ->
+            ( "", flushed pending done ++ [ Escaped c ] )
 
 
 segments : SafeText -> List Segment
@@ -208,18 +221,6 @@ verbatim text =
         [ Verbatim text ]
 
 
--- `seg` in front of `rest`, merged into a leading `Verbatim` when both are
--- verbatim text.
-prepend : Segment -> List Segment -> List Segment
-prepend seg rest =
-    case ( seg, rest ) of
-        ( Verbatim a, (Verbatim b) :: more ) ->
-            Verbatim (a ++ b) :: more
-
-        _ ->
-            seg :: rest
-
-
 needsEscape : Bool -> Char -> Bool
 needsEscape escapeBackslash c =
     isHazard c || (escapeBackslash && (c == '\\' || c == '"'))
@@ -228,35 +229,34 @@ needsEscape escapeBackslash c =
 escapeWith : Bool -> String -> List Segment
 escapeWith escapeBackslash raw =
     if String.any (needsEscape escapeBackslash) raw then
-        let
-            ( pending, done ) =
-                String.foldr (scanChar escapeBackslash) ( [], [] ) raw
-        in
-        flush pending done
+        case String.foldl (scanChar escapeBackslash) ( "", [] ) raw of
+            ( pending, done ) ->
+                flushed pending done
 
     else
         verbatim raw
 
 
--- One step of a right-to-left scan: `pending` holds the verbatim characters
--- seen since the last escape, in order; `done` the segments to their right.
-scanChar : Bool -> Char -> ( List Char, List Segment ) -> ( List Char, List Segment )
+-- One step of a left-to-right scan: `pending` holds the verbatim text read
+-- since the last escape; `done` the segments before it, in order. Both grow
+-- at their end, so the scan is linear in the text.
+scanChar : Bool -> Char -> ( String, List Segment ) -> ( String, List Segment )
 scanChar escapeBackslash c ( pending, done ) =
     if needsEscape escapeBackslash c then
-        ( [], Escaped c :: flush pending done )
+        ( "", flushed pending done ++ [ Escaped c ] )
 
     else
-        ( c :: pending, done )
+        ( String.append pending (String.fromChar c), done )
 
 
-flush : List Char -> List Segment -> List Segment
-flush pending done =
-    case pending of
-        [] ->
-            done
+-- `done` with the verbatim text `pending` after it, when there is any.
+flushed : String -> List Segment -> List Segment
+flushed pending done =
+    if String.isEmpty pending then
+        done
 
-        _ ->
-            Verbatim (String.fromList pending) :: done
+    else
+        done ++ [ Verbatim pending ]
 
 
 -- `n` (non-negative) in lowercase hex, no leading zeros. Each step drops one

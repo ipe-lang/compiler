@@ -9,6 +9,7 @@ import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.File as File
+import Ipe.Html as Html
 import Ipe.Io as Io
 import Ipe.Json.Decode as Decode
 import Ipe.List as List
@@ -23,13 +24,14 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (SourceRow(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
-import Lib.SafeText as SafeText
+import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
+import Lib.View as View exposing (RowLine(..))
 import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
 
 
@@ -279,6 +281,261 @@ largeTokenTokenizes =
     String.length src == 1048576 && Highlight.tokenize Highlight.Rust src == [ Comment src ]
 
 
+-- Every walk on the view path is linear in the unit's bytes. Each check
+-- below drives one walk over a quarter-mebibyte or larger input; a walk that
+-- copies its rest or its accumulator per step does not finish in the test's
+-- time budget.
+rowTokens : RowLine -> List Token
+rowTokens row =
+    case row of
+        TokenLine _ toks ->
+            toks
+
+        CoveredLine ->
+            []
+
+
+hasComment : List Token -> Bool
+hasComment toks =
+    List.any isCommentToken toks
+
+
+isCommentToken : Token -> Bool
+isCommentToken tok =
+    case tok of
+        Comment _ ->
+            True
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+-- A 256 KiB one-line unit draws as one row whose tokens spell the line.
+hugeLineRows : Lang -> Bool
+hugeLineRows lang =
+    let
+        src =
+            String.repeat 32768 "a1 \"s\"; "
+    in
+    case View.rowLines lang [ Numbered 1 src ] of
+        [ TokenLine 1 toks ] ->
+            String.length src == 262144 && String.concat (List.map rawText toks) == src
+
+        _ ->
+            False
+
+
+-- Ipê comments are `--` and nested `{- -}`; `//` is not one.
+ipeComments : Bool
+ipeComments =
+    Highlight.tokenize Ipe "x -- c"
+        == [ Ident "x", Plain " ", Comment "-- c" ]
+        && Highlight.tokenize Ipe "{- a {- b -} c -} y"
+        == [ Comment "{- a {- b -} c -}", Plain " ", Ident "y" ]
+        && not (hasComment (Highlight.tokenize Ipe "a // b"))
+        && not (hasComment (Highlight.tokenize Ipe "a /* b */"))
+        && reassembles Ipe "a // b"
+
+
+-- A shell `#` after a gap opens a comment; `#` inside a word and `/*` do not.
+shellComments : Bool
+shellComments =
+    List.any (isComment "# c") (Highlight.tokenize Shell "echo x # c")
+        && not (hasComment (Highlight.tokenize Shell "a#b"))
+        && not (hasComment (Highlight.tokenize Shell "/* x */"))
+        && not (hasComment (Highlight.tokenize Shell "// x"))
+
+
+-- A string spanning lines is never read as a comment, whether the unit is
+-- lexed whole or row by row.
+multiLineStrings : Bool
+multiLineStrings =
+    not (hasComment (Highlight.tokenize Rust "\"a\n// b\" c"))
+        && not (hasComment (Highlight.tokenize Ipe "\"\"\"a\n-- b\"\"\" c"))
+        && reassembles Rust "\"a\n// b\" c"
+        && reassembles Ipe "\"\"\"a\n-- b\"\"\" c"
+        && not (List.any hasComment (List.map rowTokens (View.rowLines Rust [ Numbered 1 "\"a", Numbered 2 "// b\" c" ])))
+        && not (List.any hasComment (List.map rowTokens (View.rowLines Ipe [ Numbered 1 "\"\"\"a", Numbered 2 "-- b\"\"\" c" ])))
+
+
+-- A block comment open at a row's end carries into the next row; a covered
+-- run between them starts the next row afresh.
+blockCarry : Bool
+blockCarry =
+    case View.rowLines Ipe [ Numbered 1 "{- a", Numbered 2 "b -} x" ] of
+        [ TokenLine 1 first, TokenLine 2 second ] ->
+            first
+                == [ Comment "{- a" ]
+                && List.any (isComment "b -}") second
+                && List.any (isIdent "x") second
+                && coveredResets
+
+        _ ->
+            False
+
+
+coveredResets : Bool
+coveredResets =
+    case View.rowLines Ipe [ Numbered 1 "{- a", Covered, Numbered 3 "b -} x" ] of
+        [ _, CoveredLine, TokenLine 3 third ] ->
+            not (List.any (isComment "b -}") third)
+
+        _ ->
+            False
+
+
+-- A tab draws as the tab it is, never as an escape, while U+202E still draws
+-- as a marked escape and never as itself.
+tabDrawsAsTab : Bool
+tabDrawsAsTab =
+    let
+        html =
+            Html.render (View.lineHtml (Highlight.tokenize Rust ("a\tb" ++ codeText 8238)))
+    in
+    String.contains "\t" html
+        && not (String.contains "\\t" html)
+        && String.contains "\\u{202e}" html
+        && not (String.contains (codeText 8238) html)
+        && List.map SafeText.segments (Highlight.tokenRuns (Plain "a\tb"))
+        == [ [ Verbatim "a" ], [ Verbatim "b" ] ]
+
+
+-- The references of a 64Ki-token unit are read in one pass: one per bare
+-- word, one per dotted path.
+hugeLinks : Bool
+hugeLinks =
+    List.length (Links.references Rust (String.repeat 65536 "a "))
+        == 65536
+        && List.length (Links.references Ipe (String.repeat 32768 "a.b "))
+        == 32768
+
+
+-- A 256 KiB URL word, and 64Ki URL words, are trimmed in one pass each.
+hugeUrls : Bool
+hugeUrls =
+    let
+        url =
+            "https://x.io/" ++ String.repeat 131072 "a" ++ String.repeat 131072 "." ++ "b"
+    in
+    Links.sourceUrls ("(" ++ url ++ ")),")
+        == [ External url ]
+        && List.length (Links.sourceUrls (String.repeat 65536 "https://x.io/p, "))
+        == 65536
+
+
+-- A 256 KiB token holding one U+202E is three segments: the text before,
+-- the escape, the text after. Joining 64Ki pieces stays one segment.
+hugeSegments : Bool
+hugeSegments =
+    let
+        before =
+            String.repeat 131072 "a"
+
+        after =
+            String.repeat 131071 "b"
+    in
+    SafeText.segments (SafeText.renderForeign (before ++ codeText 8238 ++ after))
+        == [ Verbatim before, Escaped (Char.fromCode 8238), Verbatim after ]
+        && SafeText.segments (SafeText.concat (List.repeat 65536 (SafeText.renderForeign "ab")))
+        == [ Verbatim (String.repeat 65536 "ab") ]
+
+
+-- A residual over a million-line file, every second line covered, keeps
+-- each odd line with one covered row between neighbours.
+hugeResidual : Bool
+hugeResidual =
+    Index.residualText (List.map (\k -> ( 2 * k, 2 * k )) (List.range 1 500000)) (String.repeat 1000000 "x\n")
+        == "\nx"
+        ++ String.repeat 499999 "\n\nx"
+
+
+-- A `\r` before a line's `\n` is the CRLF line break in Rust and Ipê, and
+-- text in shell, where `cd /x\r` names another directory than `cd /x`.
+crlfByLanguage : Bool
+crlfByLanguage =
+    case ( View.rowLines Rust [ Numbered 1 "fn x\r" ], View.rowLines Shell [ Numbered 1 "cd /x\r" ] ) of
+        ( [ TokenLine 1 rust ], [ TokenLine 1 shell ] ) ->
+            rust
+                == [ Keyword "fn", Plain " ", Ident "x" ]
+                && List.member (Plain "\r") shell
+                && String.contains "data-review-escape" (Html.render (View.lineHtml shell))
+
+        _ ->
+            False
+
+
+-- A Rust `br"…"` or `cr"…"` is a raw string: its `\` escapes nothing, so
+-- the string closes at its quote and the next row is code.
+rawPrefixedStrings : Bool
+rawPrefixedStrings =
+    Highlight.tokenize Rust "br\"\\\" x"
+        == [ Str "br\"\\\"", Plain " ", Ident "x" ]
+        && Highlight.tokenize Rust "cr#\"a\"#"
+        == [ Str "cr#\"a\"#" ]
+        && Highlight.tokenize Rust "break crate"
+        == [ Keyword "break", Plain " ", Keyword "crate" ]
+        && rawRowCloses
+
+
+rawRowCloses : Bool
+rawRowCloses =
+    case View.rowLines Rust [ Numbered 1 "let s = br\"\\\";", Numbered 2 "fn x" ] of
+        [ _, TokenLine 2 second ] ->
+            second == [ Keyword "fn", Plain " ", Ident "x" ]
+
+        _ ->
+            False
+
+
+-- A shell heredoc body opens no string past its own line, so a `don't` in
+-- it leaves the code after the delimiter drawn as code; a `<<-` delimiter
+-- may follow tabs. A `<<<` here-string is no heredoc, so its quote carries.
+heredocBodies : Bool
+heredocBodies =
+    case View.rowLines Shell [ Numbered 1 "cat <<EOF", Numbered 2 "don't", Numbered 3 "EOF", Numbered 4 "rm -rf x" ] of
+        [ _, _, _, TokenLine 4 fourth ] ->
+            fourth
+                == [ Ident "rm", Plain " ", Plain "-", Ident "rf", Plain " ", Ident "x" ]
+                && heredocTabs
+                && hereStringCarries
+                && List.member (Ident "rm") (Highlight.tokenize Shell "cat <<EOF\ndon't\nEOF\nrm -rf x")
+
+        _ ->
+            False
+
+
+heredocTabs : Bool
+heredocTabs =
+    case View.rowLines Shell [ Numbered 1 "cat <<-'END'", Numbered 2 "it's", Numbered 3 "\tEND", Numbered 4 "rm x" ] of
+        [ _, _, _, TokenLine 4 fourth ] ->
+            fourth == [ Ident "rm", Plain " ", Ident "x" ]
+
+        _ ->
+            False
+
+
+hereStringCarries : Bool
+hereStringCarries =
+    case View.rowLines Shell [ Numbered 1 "cat <<<'a", Numbered 2 "b' c" ] of
+        [ _, TokenLine 2 second ] ->
+            List.take 1 second == [ Str "b'" ]
+
+        _ ->
+            False
+
+
 -- The keyboard shortcuts drive exactly the messages the buttons send: a/r
 -- act on the selected unit, j/k/g/1-5 move the selection, Enter/Escape
 -- confirm/cancel an open refuse panel, and every key is ignored while the
@@ -312,8 +569,9 @@ testKeys =
 decisionReachedOnlyThroughDecidableSource : Task.Task Error Bool
 decisionReachedOnlyThroughDecidableSource =
     let
-        count needle text =
-            List.length (String.split needle text) - 1
+        count =
+            \needle text ->
+                List.length (String.split needle text) - 1
 
         oneCall =
             "case Queue.decidableSource uid model.selectedView of\n                Just shown ->\n                    decideOn settings shown decision\n"
@@ -408,4 +666,18 @@ checks =
                 && Highlight.tokenize Highlight.Rust "/**/1.5_"
                 == [ Comment "/**/", Num "1.5_" ]
             )
+        , Task.succeed ( "a 256 KiB one-line Rust unit draws as one row", hugeLineRows Rust )
+        , Task.succeed ( "a 256 KiB one-line Ipe unit draws as one row", hugeLineRows Ipe )
+        , Task.succeed ( "Ipe comments are -- and nested {- -}, never //", ipeComments )
+        , Task.succeed ( "shell # after a gap is a comment, /* is not", shellComments )
+        , Task.succeed ( "a multi-line string is never a comment", multiLineStrings )
+        , Task.succeed ( "a block comment carries across rows, not across a covered run", blockCarry )
+        , Task.succeed ( "a tab draws as a tab while U+202E draws as an escape", tabDrawsAsTab )
+        , Task.succeed ( "references over a 64Ki-token unit finish", hugeLinks )
+        , Task.succeed ( "a 256 KiB URL word and 64Ki URL words are trimmed", hugeUrls )
+        , Task.succeed ( "a 256 KiB token with one U+202E is three segments", hugeSegments )
+        , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
+        , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
+        , Task.succeed ( "a Rust br or cr string is raw", rawPrefixedStrings )
+        , Task.succeed ( "a shell heredoc body carries no quote past its line", heredocBodies )
         ]
