@@ -1843,24 +1843,22 @@ fn too_large() -> axum::response::Response {
 
 /// Keep a debugger-edited session within its byte bound, or close it.
 ///
-/// # Errors
-///
-/// The 503 for a session its new state pushes past a byte bound; it is closed.
+/// `false` when its new state passes a byte bound; the session is then closed.
 #[cfg(feature = "debugger")]
 async fn debug_resident<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
     handle: &store::SessionHandle<Model, Msg>,
-) -> Result<(), axum::response::Response>
+) -> bool
 where
     Model: RetainedBytes + Send + 'static,
     Msg: RetainedBytes + Send + 'static,
 {
     if keep_resident(handle, store.as_ref()).await {
-        return Ok(());
+        return true;
     }
     close_session(store, sid, Some(handle)).await;
-    Err(too_large())
+    false
 }
 
 /// The 503 for a refused byte charge, naming the bound it would pass.
@@ -1869,6 +1867,27 @@ fn refused_charge(why: budget::OverBudget) -> axum::response::Response {
     match why {
         budget::OverBudget::Session => over_ceiling(),
         budget::OverBudget::Process => at_capacity(),
+    }
+}
+
+/// Why a page GET was refused a session.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmitRefusal {
+    /// Every driver slot is taken.
+    Capacity,
+    /// The session's fixed bytes would pass a byte bound.
+    Bytes(budget::OverBudget),
+}
+
+#[cfg(feature = "server")]
+impl AdmitRefusal {
+    /// The 503 this refusal answers.
+    fn response(self) -> axum::response::Response {
+        match self {
+            Self::Capacity => at_capacity(),
+            Self::Bytes(why) => refused_charge(why),
+        }
     }
 }
 
@@ -1932,22 +1951,24 @@ async fn charge_up<Model, Msg>(
 ///
 /// # Errors
 ///
-/// The 503 for the cap or the byte bound the admission would pass.
+/// The cap or the byte bound the admission would pass.
 #[cfg(feature = "server")]
 async fn admit<Model, Msg>(
     store: &dyn store::SessionStore<Model, Msg>,
     count: &Arc<AtomicUsize>,
     cap: std::num::NonZeroUsize,
     process: &Arc<budget::SessionBudget>,
-) -> Result<Admission, axum::response::Response> {
+) -> Result<Admission, AdmitRefusal> {
     let Some(slot) = SessionSlot::reserve(count, cap) else {
-        return Err(at_capacity());
+        return Err(AdmitRefusal::Capacity);
     };
     let session = budget::SessionBudget::session(process, budget::SESSION_CEILING);
-    let mut charge = session.try_charge(Bytes::ZERO).map_err(refused_charge)?;
+    let mut charge = session
+        .try_charge(Bytes::ZERO)
+        .map_err(AdmitRefusal::Bytes)?;
     charge_up(store, &mut charge, Some(budget::ENTRY_OVERHEAD))
         .await
-        .map_err(refused_charge)?;
+        .map_err(AdmitRefusal::Bytes)?;
     Ok(Admission { slot, charge })
 }
 
@@ -4669,7 +4690,7 @@ mod handlers {
                 .await
                 {
                     Ok(admitted) => Some(admitted),
-                    Err(refused) => return refused,
+                    Err(refused) => return refused.response(),
                 };
                 let sid = claim.key().as_str().to_owned();
                 let scope = pubsub::SessionScope::new(sid.clone());
@@ -4822,7 +4843,7 @@ mod handlers {
                     .await
                     {
                         Ok(admitted) => admitted,
-                        Err(refused) => return refused,
+                        Err(refused) => return refused.response(),
                     },
                 };
                 // Build the request context (params from routing — empty when
@@ -6111,8 +6132,8 @@ mod handlers {
             e.history.reset_to_init(init_model);
             e.debug_cursor = None;
         }
-        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
-            return refused;
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
         }
         axum::http::StatusCode::OK.into_response()
     }
@@ -6280,8 +6301,8 @@ mod handlers {
             e.model = final_model;
             e.debug_cursor = None;
         }
-        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
-            return refused;
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
         }
         axum::http::StatusCode::OK.into_response()
     }
@@ -6345,8 +6366,8 @@ mod handlers {
                 }
             }
         };
-        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
-            return refused;
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
         }
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
@@ -6425,8 +6446,8 @@ mod handlers {
                 }
             }
         };
-        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
-            return refused;
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
         }
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
@@ -6509,8 +6530,8 @@ mod handlers {
                 }
             }
         };
-        if let Err(refused) = debug_resident(&st.store, &sid, &handle).await {
-            return refused;
+        if !debug_resident(&st.store, &sid, &handle).await {
+            return too_large();
         }
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
@@ -8578,6 +8599,12 @@ mod sse_reconnect_reconcile_tests {
     enum TestPage {
         Home,
         Detail(String),
+    }
+
+    impl crate::retained::RetainedBytes for TestPage {
+        fn retained_bytes(&self) -> Option<crate::retained::Bytes> {
+            crate::retained::Bytes::inline::<Self>()
+        }
     }
 
     type TestView = Arc<dyn Fn(TestPage) -> Html<()> + Send + Sync>;
