@@ -2508,10 +2508,12 @@ pub fn own_pool<DB: sqlx::Database>(role: PoolRole, pool: &sqlx::Pool<DB>) {
     }
 }
 
-/// Close every pool of the process registry, each under `deadline`.
-pub async fn close_owned_pools(deadline: std::time::Duration) {
-    OWNED_POOLS.close_all(deadline).await;
+/// The process's owned-pool registry, which a served app's stop closes.
+#[must_use]
+pub fn process_pools() -> &'static OwnedPools {
+    &OWNED_POOLS
 }
+
 /// Connect the operator URL `url`, pooled per URL unless it names a private
 /// in-memory database.
 async fn connect_operator<E: Send + crate::FromIpeError + 'static>(
