@@ -172,7 +172,7 @@ pki_types = { package = "rustls-pki-types", version = "1", optional = true }
 # JIT default backend is kept (the module is executed once per `ipe dev run`, not a
 # cold-start-sensitive path). Optional so the default build never links the
 # engine's graph.
-wasmtime = { version = "35", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }
 wasmtime-wasi = { version = "35", default-features = false, features = ["preview1"], optional = true }
 
 # `ipe health`'s free-disk check reads the filesystem's available blocks via
