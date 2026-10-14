@@ -390,7 +390,7 @@ notSqliteRefused =
         cwd <- System.cwd ()
         writeFileText (base ++ "/index.db") "plain text, not a database\n"
         writeFileText (base ++ "/review.db") "plain text, not a database\n"
-        index <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd |> Task.andThen Index.probe)
+        index <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnset |> Task.andThen Index.probe)
         review <- probeMessage (Settings.parseReviewDb (base ++ "/review.db") |> Task.andThen (LibDb.probe ReadOnly))
         removeFileIfAny (base ++ "/index.db")
         removeFileIfAny (base ++ "/review.db")
@@ -444,9 +444,9 @@ dbRefusalsStateOneFix =
 -- and `*cwd` readers again by name, and the only admitted import is the
 -- exact `import Ipe.System as System`, so an alias or an `exposing` import
 -- cannot dodge the count. In `Main`: the environment is read on exactly two
--- code lines — `requireEnv`'s read and the `requireSettings` call in
--- `main` — and `requireEnv` is named only by its declaration and its two
--- literal-key calls, so no wrapper can pass it a key. `Settings` exports both
+-- code lines — `requireEnv`'s read and `optionalEnv`'s read — and each of
+-- `requireEnv` and `optionalEnv` is named only by its declaration and its two
+-- literal-key calls, so no wrapper can pass either a key. `Settings` exports both
 -- parsers and neither the bare `indexSettings` nor `reviewDb`.
 startupReadsAdmittedOnly : Task.Task Error Bool
 startupReadsAdmittedOnly =
@@ -513,11 +513,11 @@ occurrences needle text =
 
 -- Each needle and, for every module admitted to name it, the exact number of
 -- times its code does. A module absent from a needle's row names it zero
--- times. `System.` counts every qualified use of the module: `Main`'s
--- `getenv`, `getenvOr` and three `exit`s, `RepoPath`'s `cwd`, `ReviewKey`'s
+-- times. `System.` counts every qualified use of the module: `Main`'s two
+-- `getenv`s and three `exit`s, `RepoPath`'s `cwd`, `ReviewKey`'s
 -- one `getenv` of the review key. `absolute`
 -- counts `Path.absolute`, which resolves against the working directory, beside
--- the message text that names the word. `Ipe.Env` reads
+-- the message texts that name the word. `Ipe.Env` reads
 -- the live environment on the native target and `Ipe.Process` can run a
 -- child that prints it, so neither is admitted anywhere.
 admittedSites : List ( String, List ( String, Int ) )
@@ -529,8 +529,8 @@ admittedSites =
     , ( "System.", [ ( "Main.ipe", 5 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
-    , ( "isDir", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
-    , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 1 ) ] )
+    , ( "isDir", [ ( "Lib/RepoPath.ipe", 6 ), ( "Lib/Settings.ipe", 1 ) ] )
+    , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Index.ipe", 1 ) ] )
     , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "parseDbFile", [ ( "Lib/Settings.ipe", 4 ) ] )
@@ -611,6 +611,8 @@ startupScanRefusesEvasions =
                 && not (systemImportAdmitted "import  Ipe.System  as  System exposing (cwd)")
                 && mainAdmits (mainCode sources)
                 && not (mainAdmits (mainCode sources ++ "\nreread name = requireEnv name \"\""))
+                && not (mainAdmits (mainCode sources ++ "\nreread name = optionalEnv name"))
+                && not (mainAdmits (String.replace "rawRepos <- optionalEnv \"IPE_INDEX_REPOS\"" "rawRepos <- Task.succeed Settings.EnvUnset" (mainCode sources)))
                 && not (mainAdmits (String.replace "rawDb <- requireEnv \"IPE_INDEX_DB\" " "rawDb <- readDb " (mainCode sources) ++ "\nreadDb = requireEnv \"IPE_INDEX_DB\""))
             )
 
@@ -661,12 +663,16 @@ mainAdmits text =
     List.length envLines
         == 2
         && List.any (String.contains "(System.getenv key)") envLines
-        && List.any (\line -> String.startsWith "settings <- requireSettings" (String.trim line)) envLines
+        && List.any (String.contains "(System.getenv key |> Task.map Settings.EnvSet)") envLines
         && occurrences "getenv" text
         == 2
         && occurrences "requireEnv \"" text
         == 2
         && occurrences "requireEnv" text
+        == 4
+        && occurrences "optionalEnv \"" text
+        == 2
+        && occurrences "optionalEnv" text
         == 4
         && occurrences "requireSettings" text
         == 3
@@ -678,21 +684,26 @@ mainAdmits text =
         && mainPinned text
 
 
--- `main` opens with the two literal-key `requireEnv` reads, the review
--- key's read, the settings parse and the listen, in that order, so a partially applied `requireEnv`
--- that a request could run cannot take the place of either read.
+-- `main` opens with the two literal-key `requireEnv` reads, the two
+-- literal-key `optionalEnv` reads, the review key's read, the settings parse
+-- and the listen, in that order, so a partially applied reader that a
+-- request could run cannot take the place of any read.
 mainPinned : String -> Bool
 mainPinned text =
     case String.split "\nmain =\n    do\n" text of
         [ _, body ] ->
-            case List.take 5 (String.lines body) of
-                [ dbLine, rootLine, keyLine, settingsLine, listenLine ] ->
+            case List.take 7 (String.lines body) of
+                [ dbLine, rootLine, reposLine, reviewLine, keyLine, settingsLine, listenLine ] ->
                     String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
                         && String.startsWith "        rawRoot <- requireEnv \"IPE_INDEX_ROOT\" \"" rootLine
+                        && reposLine
+                        == "        rawRepos <- optionalEnv \"IPE_INDEX_REPOS\""
+                        && reviewLine
+                        == "        rawReview <- optionalEnv \"IPE_REVIEW_DB\""
                         && keyLine
                         == "        key <- requireReviewKey"
                         && settingsLine
-                        == "        settings <- requireSettings key rawDb rawRoot (System.getenvOr \"IPE_REVIEW_DB\" \"review.db\")"
+                        == "        settings <- requireSettings key rawDb rawRoot rawRepos rawReview"
                         && listenLine
                         == "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]"
 
@@ -1138,6 +1149,96 @@ refusesNamingVar failure =
                 && not (String.contains "OTHER_KEY" (Error.message e))
 
 
+-- An `IPE_INDEX_REPOS` that is set but unreadable refuses startup, naming the
+-- variable; it never reads as unset, which would bind `ipe` alone. Red if the
+-- unreadable value falls through to the unset branch.
+reposUnreadableRefused : Task.Task Error Bool
+reposUnreadableRefused =
+    do
+        base <- freshDir "ipe-repos-unreadable"
+        cwd <- System.cwd ()
+        unset <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnset |> Task.map (\_ -> ()))
+        unreadable <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnreadable |> Task.map (\_ -> ()))
+        Task.succeed
+            (unset
+                == Nothing
+                && maybeContains "IPE_INDEX_REPOS" unreadable
+                && maybeContains "not valid Unicode" unreadable
+            )
+
+
+-- An `IPE_REVIEW_DB` that is set but unreadable refuses startup, naming the
+-- variable; only an unset one falls back to `review.db`. Red if the
+-- unreadable value reads as unset and the server opens `review.db`.
+reviewDbUnreadableRefused : Task.Task Error Bool
+reviewDbUnreadableRefused =
+    do
+        unset <- Settings.valueOr "IPE_REVIEW_DB" "review.db" Settings.EnvUnset
+        given <- Settings.valueOr "IPE_REVIEW_DB" "review.db" (Settings.EnvSet "/abs/review.db")
+        unreadable <- probeMessage (Settings.valueOr "IPE_REVIEW_DB" "review.db" Settings.EnvUnreadable |> Task.map (\_ -> ()))
+        Task.succeed
+            (unset
+                == "review.db"
+                && given
+                == "/abs/review.db"
+                && maybeContains "IPE_REVIEW_DB" unreadable
+                && maybeContains "not valid Unicode" unreadable
+            )
+
+
+-- The README's environment table lists exactly the variables the server
+-- reads: every row names a variable `main` or the review key reads, and every
+-- read has its row, each once. Red if a read is added without its row, or a
+-- row outlives its read.
+readmeEnvTableMatchesReads : Task.Task Error Bool
+readmeEnvTableMatchesReads =
+    do
+        cwd <- System.cwd ()
+        readme <- readLibSource (cwd ++ "/README.md")
+        mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
+        Task.succeed
+            (envTableAgrees readme mainSource
+                && List.length (readmeEnvRows readme)
+                == 5
+                && not (envTableAgrees (String.replace "| `IPE_INDEX_REPOS`" "| `UNLISTED`" readme) mainSource)
+                && not (envTableAgrees readme (mainSource ++ "\nextra = optionalEnv \"IPE_EXTRA\""))
+                && not (envTableAgrees (readme ++ "\n| `IPE_INDEX_DB` | again |") mainSource)
+            )
+
+
+-- The README rows and the reads name the same variables, each once.
+envTableAgrees : String -> String -> Bool
+envTableAgrees readme mainSource =
+    let
+        documented =
+            readmeEnvRows readme
+
+        reads =
+            ReviewKey.keyVar :: mainEnvReads mainSource
+    in
+    List.sort documented == List.sort reads && List.length (List.unique documented) == List.length documented
+
+
+-- The variable each environment-table row of the README names.
+readmeEnvRows : String -> List String
+readmeEnvRows readme =
+    String.lines readme
+        |> List.filter (String.startsWith "| `IPE_")
+        |> List.filterMap (\line -> List.head (List.drop 1 (String.split "`" line)))
+
+
+-- The literal key of every `requireEnv` and `optionalEnv` call in `main`.
+mainEnvReads : String -> List String
+mainEnvReads mainSource =
+    List.concatMap
+        (\reader ->
+            String.split (reader ++ " \"") mainSource
+                |> List.drop 1
+                |> List.filterMap (\chunk -> List.head (String.split "\"" chunk))
+        )
+        [ "requireEnv", "optionalEnv" ]
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -1158,4 +1259,7 @@ checks =
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
         , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
         , check "no session state type carries the startup settings" settingsNeverInSessionState
+        , check "an unreadable IPE_INDEX_REPOS refuses startup, never reads as unset" reposUnreadableRefused
+        , check "an unreadable IPE_REVIEW_DB refuses startup, never reads as unset" reviewDbUnreadableRefused
+        , check "the README env table lists exactly the variables the server reads" readmeEnvTableMatchesReads
         ]

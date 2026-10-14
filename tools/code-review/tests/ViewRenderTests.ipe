@@ -69,6 +69,7 @@ queuePage : List Queue.QueuedUnit -> Int -> Queue.Progress -> Queue.QueuePage
 queuePage units total progress =
     { units = units
     , total = total
+    , unbound = 0
     , dbName = SafeText.literal "index.db"
     , dbBytes = 2048
     , next = Nothing

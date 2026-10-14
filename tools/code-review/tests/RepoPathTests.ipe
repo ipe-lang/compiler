@@ -28,7 +28,7 @@ import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
-import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.RepoPath as RepoPath exposing (PathError(..), ReposError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid
@@ -914,6 +914,247 @@ relativeRootLoadsQueueIn base =
         Task.succeed (checkUnits r.total r.units)
 
 
+-- ── IPE_INDEX_REPOS ──────────────────────────────────────────────────────────
+--
+-- `IPE_INDEX_REPOS` binds every repository besides `ipe`, one `name=/path`
+-- entry each. Every malformed value is refused at startup by its own
+-- `ReposError`, naming the entry and echoing it only quoted.
+
+
+-- The kind of a `ReposError`, one name per variant.
+reposErrorName : ReposError -> String
+reposErrorName err =
+    case err of
+        ReposEmpty ->
+            "empty"
+
+        ReposUnreadable ->
+            "unreadable"
+
+        ReposTooLong ->
+            "too-long"
+
+        EmptyEntry _ ->
+            "empty-entry"
+
+        MissingSeparator _ ->
+            "missing-separator"
+
+        BadName _ ->
+            "bad-name"
+
+        PathNotAbsolute _ ->
+            "not-absolute"
+
+        PathNotCanonical _ ->
+            "not-canonical"
+
+        PathTooLong _ ->
+            "path-too-long"
+
+        PathNotDirectory _ ->
+            "not-directory"
+
+
+-- `raw` is refused as `expected`, and its text names the entry at `position`
+-- (0 for a refusal of the whole value).
+reposRefusedAs : String -> String -> Int -> Task.Task Error Bool
+reposRefusedAs raw expected position =
+    RepoPath.parseRepos raw
+        |> Task.map
+            (\result ->
+                case result of
+                    Ok _ ->
+                        False
+
+                    Err err ->
+                        let
+                            text =
+                                SafeText.toString (RepoPath.describeRepos raw err)
+                        in
+                        reposErrorName err
+                            == expected
+                            && String.startsWith "IPE_INDEX_REPOS " text
+                            && noHazard text
+                            && (position
+                                    == 0
+                                    || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
+                               )
+            )
+
+
+-- `raw` parses, binding exactly the tags `names` in order.
+reposAccepted : String -> List String -> Task.Task Error Bool
+reposAccepted raw names =
+    RepoPath.parseRepos raw
+        |> Task.map
+            (\result ->
+                case result of
+                    Ok bound ->
+                        List.map (\( tag, _ ) -> RepoPath.tagName tag) bound == names
+
+                    Err _ ->
+                        False
+            )
+
+
+-- Unset, `IPE_INDEX_REPOS` binds nothing: the map holds `ipe` alone, and a
+-- stored path under any other tag is refused as unbound.
+reposUnsetBindsIpeOnly : Task.Task Error Bool
+reposUnsetBindsIpeOnly =
+    do
+        base <- freshDir "ipe-repos-unset"
+        settings <- Settings.parseIndexSettings (base ++ "/index.db") base Settings.EnvUnset
+        Task.succeed
+            (List.map (\( tag, _ ) -> RepoPath.tagName tag) (RepoPath.boundRoots settings.roots)
+                == [ "ipe" ]
+                && not (refused (RepoPath.resolve settings.roots "ipe:src/x"))
+                && refusedAs "unknown-tag" (RepoPath.resolve settings.roots "ext:src/x")
+            )
+
+
+-- The whole value and each entry are refused by their own kind, one byte
+-- past each ceiling refused and the ceiling itself accepted, naming the
+-- entry. Red if any malformed spelling reaches the directory check or binds.
+reposEntriesRefused : Task.Task Error Bool
+reposEntriesRefused =
+    do
+        base <- freshDir "ipe-repos-entries"
+        makeDir (base ++ "/ext")
+        writeFileText (base ++ "/file") "not a directory\n"
+        results <- Task.sequence (reposEntryCases base)
+        Task.succeed (List.length results == 31 && List.all identity results)
+
+
+-- Each refusal case of `reposEntriesRefused`, under scratch directory `base`
+-- holding the directory `ext` and the file `file`.
+reposEntryCases : String -> List (Task.Task Error Bool)
+reposEntryCases base =
+    let
+        ext =
+            base ++ "/ext"
+
+        longName =
+            String.repeat (RepoPath.repoNameByteCeiling + 1) "n"
+
+        ceilingName =
+            String.repeat RepoPath.repoNameByteCeiling "n"
+    in
+    [ reposRefusedAs "" "empty" 0
+    , reposRefusedAs ("a=/" ++ String.repeat (RepoPath.reposByteCeiling - 2) "x") "too-long" 0
+    , reposRefusedAs ("a=/" ++ String.repeat (RepoPath.reposByteCeiling - 3) "x") "path-too-long" 1
+    , reposRefusedAs ("a=" ++ ext ++ ",,b=" ++ ext) "empty-entry" 2
+    , reposRefusedAs (",a=" ++ ext) "empty-entry" 1
+    , reposRefusedAs ("a=" ++ ext ++ ",") "empty-entry" 2
+    , reposRefusedAs "ext" "missing-separator" 1
+    , reposRefusedAs ("a=" ++ ext ++ "," ++ ext) "missing-separator" 2
+    , reposRefusedAs ("=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a/b=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a:b=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a b=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a\tb=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a" ++ codeText 27 ++ "]0;x=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a" ++ codeText 8203 ++ "b=" ++ ext) "bad-name" 1
+    , reposRefusedAs (longName ++ "=" ++ ext) "bad-name" 1
+    , reposAccepted (ceilingName ++ "=" ++ ext) [ ceilingName ]
+    , reposRefusedAs "a=rel" "not-absolute" 1
+    , reposRefusedAs "a=C:\\x" "not-absolute" 1
+    , reposRefusedAs "a=C:/x" "not-absolute" 1
+    , reposRefusedAs "a=\\\\srv\\share" "not-absolute" 1
+    , reposRefusedAs "a=//srv/share" "not-absolute" 1
+    , reposRefusedAs "a=/a/./b" "not-canonical" 1
+    , reposRefusedAs "a=/a/../b" "not-canonical" 1
+    , reposRefusedAs "a=/a//b" "not-canonical" 1
+    , reposRefusedAs "a=/a/" "not-canonical" 1
+    , reposRefusedAs ("a=/" ++ String.repeat RepoPath.repoPathByteCeiling "x") "path-too-long" 1
+    , reposRefusedAs ("a=/" ++ String.repeat (RepoPath.repoPathByteCeiling - 1) "x") "not-directory" 1
+    , reposRefusedAs ("a=" ++ base ++ "/missing") "not-directory" 1
+    , reposRefusedAs ("a=" ++ ext ++ ",b=" ++ base ++ "/file") "not-directory" 2
+    , reposAccepted ("ext=" ++ ext ++ ",docs=" ++ base) [ "ext", "docs" ]
+    ]
+
+
+-- An entry's refusal and its root's origin name `IPE_INDEX_REPOS` and the
+-- entry's position, and `IPE_INDEX_ROOT`'s root names that variable. Red if
+-- a root from either variable is described as the other.
+reposRootsNameTheirEntry : Task.Task Error Bool
+reposRootsNameTheirEntry =
+    do
+        base <- freshDir "ipe-repos-origin"
+        makeDir (base ++ "/ext")
+        makeDir (base ++ "/docs")
+        settings <- Settings.parseIndexSettings (base ++ "/index.db") base (Settings.EnvSet ("ext=" ++ base ++ "/ext,docs=" ++ base ++ "/docs"))
+        let
+            origins =
+                List.map (\( tag, root ) -> ( RepoPath.tagName tag, SafeText.toString (RepoPath.rootOrigin tag root) )) (RepoPath.boundRoots settings.roots)
+        in
+        Task.succeed
+            (List.member ( "ipe", "IPE_INDEX_ROOT" ) origins
+                && List.any (\( name, origin ) -> name == "ext" && String.startsWith "IPE_INDEX_REPOS entry 1 (" origin) origins
+                && List.any (\( name, origin ) -> name == "docs" && String.startsWith "IPE_INDEX_REPOS entry 2 (" origin) origins
+                && List.length origins
+                == 3
+            )
+
+
+-- `count` entries `t0=base/d0`, `t1=base/d1`, ... joined by `,`.
+numberedEntries : String -> Int -> String
+numberedEntries base count =
+    String.join "," (List.map (\i -> "t" ++ String.fromInt i ++ "=" ++ base ++ "/d" ++ String.fromInt i) (List.range 0 (count - 1)))
+
+
+-- The startup refusal of `IPE_INDEX_REPOS` value `raw` beside
+-- `IPE_INDEX_ROOT` `root`, if any.
+reposSettingsRefusal : String -> String -> Task.Task Error (Maybe String)
+reposSettingsRefusal root raw =
+    probeMessage (Settings.parseIndexSettings (root ++ "/index.db") root (Settings.EnvSet raw) |> Task.map (\_ -> ()))
+
+
+-- The root map refuses what no entry can say alone: an `ipe=` entry (bound
+-- by `IPE_INDEX_ROOT`), a repeated name, and a directory another tag already
+-- binds, `IPE_INDEX_ROOT`'s included. Red if a second binding of a name or
+-- directory decides by order.
+reposMapRefusals : Task.Task Error Bool
+reposMapRefusals =
+    do
+        base <- freshDir "ipe-repos-map"
+        makeDir (base ++ "/a")
+        makeDir (base ++ "/b")
+        ipeAgain <- reposSettingsRefusal base ("ipe=" ++ base ++ "/a")
+        nameTwice <- reposSettingsRefusal base ("ext=" ++ base ++ "/a,ext=" ++ base ++ "/b")
+        rootAgain <- reposSettingsRefusal base ("ext=" ++ base)
+        dirTwice <- reposSettingsRefusal base ("ext=" ++ base ++ "/a,docs=" ++ base ++ "/a")
+        Task.succeed
+            (maybeContains "IPE_INDEX_ROOT and IPE_INDEX_REPOS" ipeAgain
+                && maybeContains "is bound to more than one root" ipeAgain
+                && maybeContains "\"ipe\"" ipeAgain
+                && maybeContains "is bound to more than one root" nameTwice
+                && maybeContains "\"ext\"" nameTwice
+                && maybeContains "are bound to one directory" rootAgain
+                && maybeContains "are bound to one directory" dirTwice
+            )
+
+
+-- `IPE_INDEX_ROOT` and `IPE_INDEX_REPOS` together bind at most the number
+-- in the shared vector file: one fewer extra entry than that is accepted,
+-- one more refused. Red if the extra entries are counted apart from `ipe`.
+reposCeilingCountsIpe : Task.Task Error Bool
+reposCeilingCountsIpe =
+    do
+        limit <- maxReposVector
+        base <- freshDir "ipe-repos-ceiling"
+        Task.sequence (List.map (\i -> makeDir (base ++ "/d" ++ String.fromInt i)) (List.range 0 (limit - 1))) |> Task.map (\_ -> ())
+        atCeiling <- reposSettingsRefusal base (numberedEntries base (limit - 1))
+        overCeiling <- reposSettingsRefusal base (numberedEntries base limit)
+        Task.succeed
+            (RepoPath.maxRoots
+                == limit
+                && atCeiling
+                == Nothing
+                && maybeContains "repository roots are configured" overCeiling
+            )
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -939,4 +1180,9 @@ checks =
         , check "root ceiling matches the shared ipe-index vector" tooManyRootsRefused
         , check "case and separator variants of a deeper root are claimed" caseAndSeparatorVariantsClaimed
         , check "roots differing only in case refused as one directory" caseVariantRootsRefused
+        , check "an unset IPE_INDEX_REPOS binds ipe alone" reposUnsetBindsIpeOnly
+        , check "each malformed IPE_INDEX_REPOS value or entry refused by its kind" reposEntriesRefused
+        , check "every root names the variable and entry that bound it" reposRootsNameTheirEntry
+        , check "ipe, a repeated name, or a bound directory in IPE_INDEX_REPOS refused" reposMapRefusals
+        , check "the root ceiling counts IPE_INDEX_ROOT beside IPE_INDEX_REPOS" reposCeilingCountsIpe
         ]

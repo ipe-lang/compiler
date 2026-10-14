@@ -105,6 +105,7 @@ queuePageOf : List Index.UnitView -> Queue.QueuePage
 queuePageOf units =
     { units = List.map queued units
     , total = List.length units
+    , unbound = 0
     , dbName = SafeText.literal "index.db"
     , dbBytes = 2048
     , next = Nothing
