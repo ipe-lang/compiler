@@ -69,10 +69,14 @@ pub fn db_format_sql(sql: String) -> String {
     //
     // Skipped spans (Postgres lexical rules):
     //   - single-quoted string literal `'…'`, `''` an embedded quote
+    //   - escape string literal `E'…'`, where `\'` is an embedded quote too
     //   - double-quoted identifier `"…"`, `""` an embedded quote
     //   - dollar-quoted string `$tag$…$tag$` (tag may be empty: `$$…$$`)
     //   - line comment `-- …` to end of line
     //   - block comment `/* … */` (Postgres nests these)
+    //
+    // A `$` or an `E` that continues an identifier (`a$b$`, `type'x'`) opens
+    // no span: Postgres lexes it as part of that identifier.
     //
     // Every span length is measured from ASCII delimiters, which never occur
     // inside a multi-byte UTF-8 sequence, so each split lands on a char
@@ -80,8 +84,12 @@ pub fn db_format_sql(sql: String) -> String {
     let mut out = String::with_capacity(sql.len().saturating_add(8));
     let mut placeholder: usize = 0;
     let mut rest: &str = &sql;
+    let mut in_identifier = false;
     while let Some(head) = rest.chars().next() {
         let tail = rest.get(head.len_utf8()..).unwrap_or_default();
+        let continues_identifier = in_identifier;
+        in_identifier =
+            head == '_' || head == '$' || head.is_ascii_alphanumeric() || !head.is_ascii();
         let span_len = match head {
             '?' => {
                 placeholder = placeholder.saturating_add(1);
@@ -92,7 +100,10 @@ pub fn db_format_sql(sql: String) -> String {
             }
             '\'' => Some(quoted_len(rest.as_bytes(), b'\'')),
             '"' => Some(quoted_len(rest.as_bytes(), b'"')),
-            '$' => dollar_quoted_len(rest.as_bytes()),
+            'E' | 'e' if !continues_identifier && tail.starts_with('\'') => {
+                Some(escape_quoted_len(tail.as_bytes()).saturating_add(1))
+            }
+            '$' if !continues_identifier => dollar_quoted_len(rest.as_bytes()),
             '-' if tail.starts_with('-') => Some(
                 rest.find('\n')
                     .map_or(rest.len(), |nl| nl.saturating_add(1)),
@@ -104,6 +115,7 @@ pub fn db_format_sql(sql: String) -> String {
             Some((span, after)) => {
                 out.push_str(span);
                 rest = after;
+                in_identifier = false;
             }
             None => {
                 out.push(head);
@@ -129,6 +141,23 @@ fn quoted_len(bytes: &[u8], quote: u8) -> usize {
             return j.saturating_add(1);
         }
         j = j.saturating_add(1);
+    }
+    bytes.len()
+}
+
+// Byte length of the escape string body opening at `bytes[0] == b'\''`, closer
+// included: a backslash escapes the byte after it, and a doubled quote is an
+// escaped quote. An unterminated span runs to the end.
+#[cfg(feature = "db")]
+fn escape_quoted_len(bytes: &[u8]) -> usize {
+    let mut j = 1usize;
+    while let Some(&c) = bytes.get(j) {
+        match c {
+            b'\\' => j = j.saturating_add(2),
+            b'\'' if bytes.get(j.saturating_add(1)) == Some(&b'\'') => j = j.saturating_add(2),
+            b'\'' => return j.saturating_add(1),
+            _ => j = j.saturating_add(1),
+        }
     }
     bytes.len()
 }

@@ -13251,6 +13251,31 @@ mod tests {
         }
     }
 
+    /// `Db.open` refuses another engine's location before its host is vetted:
+    /// a postgres `Dsn` naming a loopback host (which the dial gate refuses as
+    /// `PermissionDenied`) is an `InvalidInput` engine mismatch under this
+    /// SQLite build, and the refusal never carries the password.
+    #[tokio::test]
+    async fn db_open_refuses_another_engine_before_the_host_is_vetted() {
+        let dsn = crate::dsn::dsn_parse::<String>(
+            "postgres://alice:hunter2@127.0.0.1:5432/app".to_owned(),
+        );
+        let IpeResult::Ok(dsn) = dsn else {
+            assert!(matches!(dsn, IpeResult::Ok(_)), "{dsn:?}");
+            return;
+        };
+        let refused = open_at(db_location_dsn(dsn))
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(refused.starts_with("InvalidInput: "), "{refused}");
+        assert!(
+            refused.contains("selects PostgreSQL but this build's driver is SQLite"),
+            "{refused}"
+        );
+        assert!(!refused.contains("hunter2"), "{refused}");
+    }
+
     /// Open the file at `path` under `mode`.
     async fn open_file(path: &std::path::Path, mode: FileMode) -> Result<Db, String> {
         match file_at(path, mode) {

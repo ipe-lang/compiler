@@ -171,6 +171,35 @@ mod tests {
     }
 
     #[test]
+    fn escape_string_backslash_quote_keeps_span_open() {
+        // In `E'…'` a `\'` is an embedded quote, so the `?` after it is still
+        // inside the literal; only the later `?` is a placeholder.
+        assert_eq!(rewrite(r"SELECT E'it\'s?' , ?"), r"SELECT E'it\'s?' , $1");
+        assert_eq!(rewrite(r"SELECT e'\\' , ?"), r"SELECT e'\\' , $1");
+        assert_eq!(rewrite(r"SELECT E'a''b?' , ?"), r"SELECT E'a''b?' , $1");
+        assert_eq!(rewrite(r"? E'\"), r"$1 E'\");
+        assert_eq!(rewrite(r"? E'never closes ?"), r"$1 E'never closes ?");
+    }
+
+    #[test]
+    fn an_identifier_ending_in_e_opens_no_escape_string() {
+        // `type'a\'` is the identifier `type` then the standard literal `'a\'`,
+        // where a backslash is ordinary text, so the literal closes there.
+        assert_eq!(rewrite(r"SELECT type'a\' , ?"), r"SELECT type'a\' , $1");
+    }
+
+    #[test]
+    fn a_dollar_inside_an_identifier_opens_no_dollar_quote() {
+        // `a$b$` and `y$b$` are identifiers, not a `$b$…$b$` dollar quote, so
+        // both placeholders between and after them renumber.
+        assert_eq!(
+            rewrite("SELECT a$b$ FROM t WHERE x = ? AND y$b$ = ?"),
+            "SELECT a$b$ FROM t WHERE x = $1 AND y$b$ = $2"
+        );
+        assert_eq!(rewrite("SELECT é$$a?$$"), "SELECT é$$a$1$$");
+    }
+
+    #[test]
     fn multibyte_text_between_placeholders_is_preserved() {
         assert_eq!(rewrite("SELECT 'café?' , ?"), "SELECT 'café?' , $1");
     }
