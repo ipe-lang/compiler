@@ -2341,7 +2341,16 @@ pub trait OwnedPool: Send + Sync {
 impl<DB: sqlx::Database> OwnedPool for sqlx::Pool<DB> {
     fn close_owned(&self) -> PoolClose {
         let pool = self.clone();
-        Box::pin(async move { pool.close().await })
+        Box::pin(async move {
+            // A connection released while the first close ran lands idle in the
+            // closed pool; each further close drains it, so the loop ends only
+            // when no connection is left open (the caller's deadline bounds it).
+            pool.close().await;
+            while pool.size() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                pool.close().await;
+            }
+        })
     }
 
     fn is_closed_owned(&self) -> bool {
