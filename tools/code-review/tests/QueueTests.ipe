@@ -1065,7 +1065,99 @@ sampleQueuedUnit =
     }
     , change = Index.New
     , changed = Nothing
+    , standing = Queue.Undecided
     }
+
+
+-- ── queue labels ────────────────────────────────────────────────────────
+--
+-- Units that share a kind and name: three at different places, two at the
+-- same path and first line, one name under two kinds, and two whose kind and
+-- name would run together without length prefixes.
+labelled : String -> String -> String -> String -> Int -> Queue.QueuedUnit
+labelled id kind qualified path line =
+    let
+        base =
+            sampleQueuedUnit.unit
+    in
+    { sampleQueuedUnit
+        | unit =
+            { base
+                | uid = uid id
+                , kind = SafeText.renderForeign kind
+                , qualified = SafeText.renderForeign qualified
+                , path = SafeText.renderForeign path
+                , lineStart = line
+            }
+    }
+
+
+labelFixture : List Queue.QueuedUnit
+labelFixture =
+    [ labelled "u-file-a" "const" "crate::FILE" "ipe:src/a.rs" 1
+    , labelled "u-file-b" "const" "crate::FILE" "ipe:src/b.rs" 1
+    , labelled "u-file-b9" "const" "crate::FILE" "ipe:src/b.rs" 9
+    , labelled "u-regex-1" "struct" "crate::StaticRegex" "ipe:src/r.rs" 3
+    , labelled "u-regex-2" "struct" "crate::StaticRegex" "ipe:src/r.rs" 3
+    , labelled "u-tests-mod" "mod" "crate::tests" "ipe:src/a.rs" 20
+    , labelled "u-tests-fn" "fn" "crate::tests" "ipe:src/a.rs" 20
+    , labelled "u-split-1" "ab" "c" "ipe:src/s.rs" 1
+    , labelled "u-split-2" "a" "bc" "ipe:src/s.rs" 1
+    , labelled "u-main" "fn" "crate::main" "ipe:src/main.rs" 1
+    ]
+
+
+placeOf : String -> List ( Queue.QueuedUnit, Queue.UnitLabel ) -> Maybe Queue.Place
+placeOf id labels =
+    Maybe.map (\( _, label ) -> label.place) (List.head (List.filter (\( q, _ ) -> q.unit.uid == uid id) labels))
+
+
+-- No two labels of the page are equal, every label carries its unit's kind,
+-- and each unit gets only as much location as its collisions need.
+-- A row naming the current body that fails to verify keeps its reason; only
+-- the absence of any row is undecided.
+standingNotCounted : Bool
+standingNotCounted =
+    let
+        row why =
+            Just (Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
+    in
+    Queue.standingOf (row Tampered) == Queue.NotCounted Tampered
+        && Queue.standingOf (row ChainBroken) == Queue.NotCounted ChainBroken
+        && Queue.standingOf (row NoKey) == Queue.NotCounted NoKey
+        && Queue.standingOf (row Legacy) == Queue.NotCounted Legacy
+        && Queue.standingOf Nothing == Queue.Undecided
+        && Queue.standingOf (row Tampered) /= Queue.Undecided
+
+
+queueLabelsDistinct : Bool
+queueLabelsDistinct =
+    let
+        labels =
+            Queue.queueLabels labelFixture
+
+        only =
+            List.map (\( _, label ) -> label) labels
+
+        distinct =
+            List.all identity (List.indexedMap (\i a -> List.all identity (List.indexedMap (\j b -> i == j || a /= b) only)) only)
+
+        rs =
+            SafeText.renderForeign "ipe:src/r.rs"
+    in
+    List.length labels == List.length labelFixture
+        && distinct
+        && List.all (\( q, label ) -> label.kind == q.unit.kind && label.name == q.unit.qualified) labels
+        && placeOf "u-file-a" labels == Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1)
+        && placeOf "u-file-b9" labels == Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9)
+        && placeOf "u-regex-1" labels == Just (Queue.AtUnit rs 3 (uid "u-regex-1"))
+        && placeOf "u-regex-2" labels == Just (Queue.AtUnit rs 3 (uid "u-regex-2"))
+        && placeOf "u-tests-mod" labels == Just Queue.Named
+        && placeOf "u-tests-fn" labels == Just Queue.Named
+        && placeOf "u-split-1" labels == Just Queue.Named
+        && placeOf "u-split-2" labels == Just Queue.Named
+        && placeOf "u-main" labels == Just Queue.Named
+        && Queue.queueLabels [] == []
 
 
 -- ── review progress from the databases ──────────────────────────────────
@@ -2426,6 +2518,8 @@ checks =
             , check "a refill drains only pairs read from the review table" refillDrainsOnlyReviewPairs
             , check "re-queued change survives the drain" drainKeepsRequeuedChange
             , check "unit page states are distinct" unitPageStatesDistinct
+            , Task.succeed ( "no two queue labels on a page are equal, each kind-qualified", queueLabelsDistinct )
+            , Task.succeed ( "a row for the current body that does not verify stands as not counted, never as undecided", standingNotCounted )
             , Task.succeed ( "a byte past the ceiling reads as the next whole KiB", byteCeilingTextRoundsUp )
             , check "queue pages bound to pageSize and cover the queue once" pagesCoverQueueOnce
             , check "a deleted queue row leaves its standing unit open, unrecorded" deletedQueueRowLeavesUnitOpen
