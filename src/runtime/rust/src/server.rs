@@ -3556,7 +3556,8 @@ async fn ws_loop<E, S>(
         return;
     }
     let Some(_live) = drain.hold() else {
-        let _ = socket.send(ws_away_close()).await;
+        let _ =
+            tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE, socket.send(ws_away_close())).await;
         return;
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ceilings.send_buffer);
@@ -10225,6 +10226,76 @@ mod tests {
             assert!(matches!(closed, Ok(Some(()))), "onClose runs on the drain");
             armed.settle_live().await;
             assert_eq!(armed.live_count(), 0, "the socket's live count clears");
+        }
+
+        /// A socket whose peer never takes a frame.
+        struct StalledSocket;
+
+        impl futures_util::Stream for StalledSocket {
+            type Item = Result<axum::extract::ws::Message, axum::Error>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl futures_util::Sink<axum::extract::ws::Message> for StalledSocket {
+            type Error = std::convert::Infallible;
+
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn start_send(
+                self: Pin<&mut Self>,
+                _item: axum::extract::ws::Message,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_socket_the_full_drain_refuses_ends_within_its_close_deadline() {
+            let ceilings = WsCeilings {
+                send_buffer: 16,
+                max_connections: usize::MAX,
+                heartbeat_secs: 30,
+            };
+            let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let served = ws_loop(
+                StalledSocket,
+                ws_server_default_cfg::<String>(),
+                id,
+                ceilings,
+                ChannelCredentials::of_request(),
+                None,
+                shutdown::tests::full_drain(),
+            );
+            let ended = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served).await;
+            assert!(
+                ended.is_ok(),
+                "an uncounted socket's close frame never outlives its deadline"
+            );
         }
 
         #[tokio::test(start_paused = true)]

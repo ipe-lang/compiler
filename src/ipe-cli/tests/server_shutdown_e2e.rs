@@ -40,8 +40,10 @@ const LINE_BUDGET: Duration = Duration::from_secs(10);
 /// Budget for any one client read.
 const CLIENT_BUDGET: Duration = Duration::from_secs(20);
 
-/// The runtime's per-pool close deadline (`shutdown::DB_CLOSE_DEADLINE`).
-const DB_CLOSE_DEADLINE: Duration = Duration::from_secs(2);
+/// The longest the runtime takes to close every owned pool
+/// (`shutdown::POOLS_CLOSE_BOUND`): one 2 s deadline per close stage, two
+/// stages one after another.
+const POOLS_CLOSE_BOUND: Duration = Duration::from_secs(4);
 
 /// The stdout line the first signal writes.
 const SHUTDOWN_LINE: &str = "shutting down";
@@ -777,7 +779,7 @@ fn a_request_in_flight_completes_before_the_exit() -> Result<(), BoxError> {
 }
 
 /// E6: a request stuck far past a 300 ms grace never holds the exit past its
-/// bound: grace, settle and pool-close deadline, plus slack.
+/// bound: grace, settle and both pool-close stages, plus slack.
 #[test]
 fn a_stuck_request_never_holds_the_exit_past_its_bound() -> Result<(), BoxError> {
     if skipped() {
@@ -800,7 +802,7 @@ fn a_stuck_request_never_holds_the_exit_past_its_bound() -> Result<(), BoxError>
     served.signal("-TERM")?;
     let status = served.wait_exit(EXIT_BUDGET)?;
     let elapsed = signalled.elapsed();
-    let bound = Duration::from_millis(300) * 2 + DB_CLOSE_DEADLINE + Duration::from_secs(3);
+    let bound = Duration::from_millis(300) * 2 + POOLS_CLOSE_BOUND + Duration::from_secs(3);
     assert_eq!(
         status.code(),
         Some(0),

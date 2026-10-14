@@ -592,6 +592,18 @@ pub mod tests {
     /// How long a test waits for any one event before it fails.
     const BUDGET: Duration = Duration::from_secs(5);
 
+    /// A drain that already tracks its ceiling of tasks, so `hold` refuses.
+    #[must_use]
+    pub fn full_drain() -> Drain {
+        Drain {
+            phase: None,
+            live: Some(Arc::new(Live {
+                count: AtomicUsize::new(LIVE_CEILING),
+                idle: Notify::new(),
+            })),
+        }
+    }
+
     /// A fresh slot, armed with `plan` over an injected signal source, whose
     /// forced exit records its code in `exited`.
     #[allow(clippy::expect_used)] // a test helper fails its test on a broken fixture
