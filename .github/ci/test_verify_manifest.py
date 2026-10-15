@@ -6014,6 +6014,7 @@ class TestTestClaims(unittest.TestCase):
             ("inert geo port", _tc_ci(_TC_PIN + _tc_env(claim, 'IPE_GEO_CLIPBOARD_PORT: "0"'))),
             ("inert layout port", _tc_ci(_TC_PIN + _tc_env(claim, 'IPE_LAYOUT_FILL_PORT: "0"'))),
             ("inert focus port", _tc_ci(_TC_PIN + _tc_env(claim, 'IPE_FOCUS_ACROSS_PATCH_PORT: "0"'))),
+            ("inert csp styles port", _tc_ci(_TC_PIN + _tc_env(claim, 'IPE_CSP_STYLES_PORT: "0"'))),
             ("literal option values", _tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN.replace("--features a", "--features=a,b:c/d+e@f.g-h_0"))),
             ("workflow term env", wf_env),
         ):
