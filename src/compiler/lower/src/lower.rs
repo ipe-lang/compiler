@@ -11643,6 +11643,19 @@ pub struct Lowerer<'a> {
     /// builder recorded.  Interior mutability so `lower_def` can update it through
     /// the shared `&self` reference that the lowering walk uses.
     current_home: std::cell::RefCell<Vec<Symbol>>,
+    /// Name of the def currently being lowered, set beside [`Self::current_home`].
+    ///
+    /// Together they key the def in [`Self::var_owners`]. Before the first
+    /// def it is the wildcard marker, which names no binding, so every
+    /// generic is foreign to it.
+    current_name: Cell<Symbol>,
+    /// The one index of every solver variable a binding emits as its own generic.
+    ///
+    /// Built once from [`SolvedTypes::poly_var_map`] through
+    /// [`ipe_types::generic_var_owners`], the same index the type checker's
+    /// untyped-binding refusal reads; [`Self::var_owner`] consults it so a
+    /// variable another binding keeps generic is never read as free here.
+    var_owners: ipe_types::GenericVarOwners,
     /// Reverse map from solver-tagged union-find representative to annotation
     /// variable symbol for the def currently being lowered.  Populated by
     /// [`Self::lower_def`] from [`SolvedTypes::poly_var_map`] before recursing
@@ -13388,6 +13401,28 @@ fn mapper_wrap_eta_demand(body: &canon::Expr, home: &[Symbol], types: &SolvedTyp
     total
 }
 
+/// Who emits a type variable as a Rust generic, seen from the def being lowered.
+///
+/// Three distinct states, never folded into an `Option`: a lenient lowering
+/// default (`()` in a message slot, `JsonVal`, a `()` call pin) is consistent
+/// only for [`VarOwner::Unowned`]. A variable another binding keeps generic
+/// would otherwise be read two ways in two emitted functions, and the call
+/// between them would not type-check under cargo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VarOwner {
+    /// The current def's own generic, emitted as this type parameter.
+    Here(Symbol),
+    /// Another binding's generic: `owner` emits it as its type parameter `sym`.
+    Elsewhere {
+        /// The binding that keeps the variable generic.
+        owner: (Vec<Symbol>, Symbol),
+        /// The owner's name for the variable.
+        sym: Symbol,
+    },
+    /// No binding keeps the variable generic.
+    Unowned,
+}
+
 /// The one symbol that stands for the wildcard `any` in lowered types.
 ///
 /// Minted fresh per lowering through [`Interner::fresh_symbols`], so no
@@ -13765,6 +13800,11 @@ impl<'a> Lowerer<'a> {
             tuple_elem_binders,
             tuple_elem_cursor: Cell::new(0),
             current_home: std::cell::RefCell::new(Vec::new()),
+            current_name: Cell::new(wildcard_marker.symbol()),
+            var_owners: ipe_types::generic_var_owners(
+                &types.poly_var_map,
+                &types.msg_defaulted_vars,
+            ),
             current_poly_tvars: std::cell::RefCell::new(BTreeMap::new()),
             fn_is_async: Cell::new(false),
             promotable_fn_binders: std::cell::RefCell::new(BTreeSet::new()),
@@ -17320,6 +17360,7 @@ impl<'a> Lowerer<'a> {
         // Track the current def's home so every `region_ty(span)` lookup uses the
         // correct `(home, span)` key, matching what the constraint builder wrote.
         *self.current_home.borrow_mut() = def.home().to_vec();
+        self.current_name.set(def.name().value);
         // Deferred fn-capture signals are a per-def contract between the capture
         // classifier and the binder sites; a def that errored out mid-lowering
         // must not leak its signals into the next def.
@@ -20459,6 +20500,65 @@ impl<'a> Lowerer<'a> {
         self.current_poly_tvars.borrow().get(&key).copied()
     }
 
+    /// Which binding, if any, emits the type variable `raw` as its own generic.
+    ///
+    /// The current def's generics (`current_poly_tvars`) answer first; every
+    /// other variable is looked up in the one ownership index
+    /// ([`Self::var_owners`]), never re-derived. A variable read by a def that
+    /// does not own it, while another binding emits it as a Rust generic, is
+    /// [`VarOwner::Elsewhere`], so no lenient default can give it a second
+    /// reading in a second emitted function.
+    fn var_owner(&self, raw: u32) -> VarOwner {
+        if let Some(sym) = self.poly_tvar_symbol(raw) {
+            return VarOwner::Here(sym);
+        }
+        let Some(var) = ipe_types::SolverVar::from_raw(raw) else {
+            return VarOwner::Unowned;
+        };
+        let binding = (self.current_home.borrow().clone(), self.current_name.get());
+        self.var_owners
+            .foreign_to(var, &binding)
+            .map_or(VarOwner::Unowned, |(owner, sym)| VarOwner::Elsewhere {
+                owner: owner.clone(),
+                sym,
+            })
+    }
+
+    /// Lower the type variable `raw` by its owner: the current def's generic,
+    /// a refusal for another binding's generic, or `unowned` for a free one.
+    fn ir_type_from_owned_var(
+        &self,
+        raw: u32,
+        span: Span,
+        unowned: impl FnOnce() -> DResult<IrType>,
+    ) -> DResult<IrType> {
+        match self.var_owner(raw) {
+            VarOwner::Here(sym) => Ok(IrType::Generic(sym)),
+            VarOwner::Elsewhere { owner, sym } => {
+                Err(self.foreign_type_variable(&owner, sym, span))
+            }
+            VarOwner::Unowned => unowned(),
+        }
+    }
+
+    /// The IPE-L0102 refusal of a def reading `owner`'s generic `sym` at `span`.
+    fn foreign_type_variable(
+        &self,
+        owner: &(Vec<Symbol>, Symbol),
+        sym: Symbol,
+        span: Span,
+    ) -> Diagnostic {
+        let name = |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
+        Diagnostic::Lower {
+            span,
+            msg: LowerError::ForeignTypeVariable {
+                helper: name(self.current_name.get()),
+                owner: name(owner.1),
+                var: name(sym),
+            },
+        }
+    }
+
     // The match has one arm per Ipê builtin type — each arm adds ~5-10 lines;
     // pushing past clippy's 100-line ceiling is unavoidable without splitting on
     // an arbitrary boundary. The allow is narrow: only this function.
@@ -21359,10 +21459,11 @@ impl<'a> Lowerer<'a> {
             // violation, so it surfaces as a `Diagnostic::Lower` with the span
             // — never a `CompilerBug` for well-typed input.
             // [IPE-L0102, feature: polymorphism]
-            Ty::Var(v) => self.poly_tvar_symbol(*v).map_or_else(
-                || Err(unsupported(span, Feature::Polymorphism)),
-                |sym| Ok(IrType::Generic(sym)),
-            ),
+            //
+            // A variable another binding keeps generic is refused by name
+            // (`ForeignTypeVariable`), never as the bare polymorphism gap.
+            Ty::Var(v) => self
+                .ir_type_from_owned_var(*v, span, || Err(unsupported(span, Feature::Polymorphism))),
             // An unpinned wildcard names no generic of the enclosing def.
             Ty::Wildcard => Err(unsupported(span, Feature::Polymorphism)),
         }
@@ -21406,11 +21507,10 @@ impl<'a> Lowerer<'a> {
             // before it recurses into the body, and restored afterward) maps
             // tagged uf_rep → annotation var symbol for the current enclosing
             // function.
-            // An empty map (unannotated or non-polymorphic context) always falls
-            // through to `IrType::Unit`.
-            Ty::Var(v) => self
-                .poly_tvar_symbol(*v)
-                .map_or(Ok(IrType::Unit), |sym| Ok(IrType::Generic(sym))),
+            // A variable no binding keeps generic falls through to
+            // `IrType::Unit`; one another binding keeps generic is refused,
+            // since that binding emits it as its own Rust generic.
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Unit)),
             // A wildcard names no enclosing generic: a message-free subtree.
             Ty::Wildcard => Ok(IrType::Unit),
             // All other forms delegate to the strict helper — a concrete `Msg`
@@ -21456,10 +21556,9 @@ impl<'a> Lowerer<'a> {
             // The key difference: an unresolved `Ty::Var` in a JSON context
             // is `JsonVal` — UNLESS it's the enclosing polymorphic binding's
             // own generic (see the SEAL-fix doc comment above), in which case
-            // it must render as that binding's Rust generic instead.
-            Ty::Var(v) => self
-                .poly_tvar_symbol(*v)
-                .map_or(Ok(IrType::Json), |sym| Ok(IrType::Generic(sym))),
+            // it must render as that binding's Rust generic instead, or
+            // another binding's generic, which is refused.
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Json)),
             Ty::Wildcard => Ok(IrType::Json),
             // Recursively handle compound types so embedded `Ty::Var`s also
             // map to `IrType::Json`.
@@ -21513,11 +21612,22 @@ impl<'a> Lowerer<'a> {
                         // gating the 5th attempt: the
                         // `result_and_map_fn_payload` positive-path
                         // fixture). One defaulting policy, both sides.
+                        // Another binding's generic is refused here too, never
+                        // defaulted.
                         let err_ty = args.first().ok_or_else(result_arg_bug)?;
-                        let err = if matches!(err_ty, Ty::Var(_) | Ty::Wildcard) {
-                            IrType::Error
-                        } else {
-                            self.ir_type_from_ty_json(err_ty, span)?
+                        let err = match err_ty {
+                            Ty::Var(raw) => match self.var_owner(*raw) {
+                                VarOwner::Elsewhere { owner, sym } => {
+                                    return Err(self.foreign_type_variable(&owner, sym, span));
+                                }
+                                VarOwner::Here(_) | VarOwner::Unowned => IrType::Error,
+                            },
+                            Ty::Wildcard => IrType::Error,
+                            Ty::Unit
+                            | Ty::Fun(..)
+                            | Ty::Con { .. }
+                            | Ty::Tuple(_)
+                            | Ty::Record(..) => self.ir_type_from_ty_json(err_ty, span)?,
                         };
                         let ok = self
                             .ir_type_from_ty_json(args.get(1).ok_or_else(result_arg_bug)?, span)?;
@@ -23801,9 +23911,12 @@ impl<'a> Lowerer<'a> {
     ///
     /// A free var bound by the enclosing signature returns `false`: rustc binds
     /// it through the function's own generic, so no pin is needed OR wanted.
+    /// A var another binding keeps generic is not free either: pinning it to
+    /// `()` would give it a second reading, so it gets no pin and its own
+    /// lowering refuses it.
     fn ty_is_unbound_free(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Var(raw) => self.poly_tvar_symbol(*raw).is_none(),
+            Ty::Var(raw) => matches!(self.var_owner(*raw), VarOwner::Unowned),
             Ty::Wildcard => true,
             Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
         }
@@ -33649,6 +33762,118 @@ mod tests {
                     "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
                 );
             });
+        });
+    }
+
+    /// Run `check` against a lowerer reading `chip` while `row` owns the solver variable `5`.
+    ///
+    /// `withheld` lists `row`'s generics the type checker message-defaulted,
+    /// which the ownership index excludes.
+    fn with_foreign_var_lowerer(withheld: &[&str], check: impl FnOnce(&Lowerer<'_>)) {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let chip = interner.intern("chip").unwrap();
+        let row = interner.intern("row").unwrap();
+        let msg = interner.intern("msg").unwrap();
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let mut types = empty_solved_types();
+        types.poly_var_map.insert(
+            (Vec::new(), row),
+            BTreeMap::from([(ipe_types::SolverVar::from_var(5), msg)]),
+        );
+        let withheld: BTreeSet<_> = withheld
+            .iter()
+            .map(|w| interner.intern(w).unwrap())
+            .collect();
+        types.msg_defaulted_vars.insert((Vec::new(), row), withheld);
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        lowerer.current_name.set(chip);
+        check(&lowerer);
+    }
+
+    /// A variable another binding keeps generic is not free, so it gets no `()` call pin.
+    #[test]
+    fn foreign_generic_var_is_not_unbound_free() {
+        with_foreign_var_lowerer(&[], |lowerer| {
+            let foreign = Ty::Var(ipe_types::tag_solver_var(5));
+            assert!(
+                matches!(
+                    lowerer.var_owner(ipe_types::tag_solver_var(5)),
+                    super::VarOwner::Elsewhere { .. }
+                ),
+                "`row`'s generic is foreign to `chip`"
+            );
+            assert!(
+                !lowerer.ty_is_unbound_free(&foreign),
+                "a foreign generic must not be pinned to `()`"
+            );
+            assert!(
+                lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(6))),
+                "a variable no binding owns stays free"
+            );
+        });
+    }
+
+    /// A foreign generic in a JSON position is refused, never defaulted to `JsonVal`.
+    #[test]
+    fn foreign_generic_var_in_a_json_slot_is_refused() {
+        with_foreign_var_lowerer(&[], |lowerer| {
+            let span = Span::new(3, 4);
+            let res = lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(5)), span);
+            assert!(
+                matches!(
+                    &res,
+                    Err(super::Diagnostic::Lower {
+                        span: s,
+                        msg: super::LowerError::ForeignTypeVariable { helper, owner, var },
+                    }) if *s == span && &**helper == "chip" && &**owner == "row" && &**var == "msg"
+                ),
+                "expected ForeignTypeVariable(chip, row, msg), got {res:?}"
+            );
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(6)), span),
+                    Ok(super::IrType::Json)
+                ),
+                "a variable no binding owns stays `JsonVal`"
+            );
+        });
+    }
+
+    /// Control: a generic the owner message-defaulted is in no binding's index, so it stays free.
+    #[test]
+    fn message_defaulted_owner_var_stays_unbound_free() {
+        with_foreign_var_lowerer(&["msg"], |lowerer| {
+            assert_eq!(
+                lowerer.var_owner(ipe_types::tag_solver_var(5)),
+                super::VarOwner::Unowned
+            );
+            assert!(lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(5))));
         });
     }
 

@@ -51,6 +51,27 @@ fn run_with_regions(
     regions: BTreeMap<Span, Ty>,
     interner: &mut Interner,
 ) -> DResult<ipe_ir::Program> {
+    run_owned(defs, env, regions, Generics::default(), interner, unions)
+}
+
+/// The type checker's per-binding generic tables a hand-built program carries.
+#[derive(Default)]
+struct Generics {
+    /// Each binding's solver variable to its emitted generic name.
+    poly_var_map: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<ipe_types::SolverVar, Symbol>>,
+    /// Each binding's generics the checker message-defaulted.
+    msg_defaulted_vars: BTreeMap<(Vec<Symbol>, Symbol), std::collections::BTreeSet<Symbol>>,
+}
+
+/// Lower a hand-built module with explicit regions and per-binding generic tables.
+fn run_owned(
+    defs: Vec<canon::Def>,
+    env: BTreeMap<(Vec<Symbol>, Symbol), Ty>,
+    regions: BTreeMap<Span, Ty>,
+    generics: Generics,
+    interner: &mut Interner,
+    unions: Vec<canon::Union>,
+) -> DResult<ipe_ir::Program> {
     let m = canon::Module {
         imports_unsafe_submodule: false,
         imported_web_capabilities: std::collections::BTreeSet::new(),
@@ -67,9 +88,9 @@ fn run_with_regions(
         expected: BTreeMap::new(),
         bounds: BTreeMap::new(),
         warnings: Vec::new(),
-        poly_var_map: BTreeMap::new(),
+        poly_var_map: generics.poly_var_map,
         untyped_type_params: BTreeMap::new(),
-        msg_defaulted_vars: BTreeMap::new(),
+        msg_defaulted_vars: generics.msg_defaulted_vars,
         signature_wildcards: BTreeMap::new(),
     };
     // `lower` pairs its diagnostic with the owning def's `home`;
@@ -197,6 +218,86 @@ fn unannotated_fn_with_polymorphic_solved_type_fails_with_polymorphism() -> DRes
         Feature::Polymorphism,
         IPE_L0102,
         Span::new(10, 11),
+    );
+    Ok(())
+}
+
+/// Lower untyped `chip x = 0` solved as `String -> Html t`, where `row` owns the solver variable `t` as its generic `msg`.
+///
+/// `withheld` lists `row`'s generics the checker message-defaulted.
+fn lower_chip_reading_row_msg(withheld: &[&str], i: &mut Interner) -> DResult<ipe_ir::Program> {
+    let chip = i.intern("chip")?;
+    let row = i.intern("row")?;
+    let msg = i.intern("msg")?;
+    let x = i.intern("x")?;
+    let string = Ty::Con {
+        module: vec![],
+        name: i.intern("String")?,
+        args: vec![],
+    };
+    let html = Ty::Con {
+        module: vec![],
+        name: i.intern("Html")?,
+        args: vec![Ty::Var(ipe_types::tag_solver_var(5))],
+    };
+    let def = canon::Def::Untyped {
+        home: vec![],
+        name: Located::new(Span::new(10, 11), chip),
+        patterns: vec![Located::new(Span::new(12, 13), canon::Pattern_::PVar(x))],
+        body: int(Span::new(14, 15), 0),
+    };
+    let mut env = BTreeMap::new();
+    env.insert((vec![], chip), Ty::Fun(Box::new(string), Box::new(html)));
+    let mut generics = Generics::default();
+    generics.poly_var_map.insert(
+        (vec![], row),
+        BTreeMap::from([(ipe_types::SolverVar::from_var(5), msg)]),
+    );
+    let withheld = withheld
+        .iter()
+        .map(|w| i.intern(w))
+        .collect::<DResult<std::collections::BTreeSet<_>>>()?;
+    generics.msg_defaulted_vars.insert((vec![], row), withheld);
+    run_owned(vec![def], env, BTreeMap::new(), generics, i, Vec::new())
+}
+
+/// An untyped helper whose message slot is another binding's generic is refused by name.
+///
+/// The lenient message default would emit `chip` returning `Html<()>` while
+/// `row` emits the same variable as its own generic, so a `row` call to
+/// `chip` would not type-check under cargo.
+#[test]
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
+fn untyped_helper_reading_a_sibling_msg_generic_is_refused() -> DResult<()> {
+    let mut i = Interner::new();
+    let d = lower_chip_reading_row_msg(&[], &mut i)
+        .expect_err("a foreign message generic must not lower to `Html<()>`");
+    assert_eq!(d.code(), IPE_L0102, "{d:?}");
+    assert_eq!(d.primary_span(), Span::new(10, 11), "{d:?}");
+    assert!(
+        matches!(
+            &d,
+            Diagnostic::Lower {
+                msg: LowerError::ForeignTypeVariable { helper, owner, var },
+                ..
+            } if &**helper == "chip" && &**owner == "row" && &**var == "msg"
+        ),
+        "expected ForeignTypeVariable(chip, row, msg), got {d:?}"
+    );
+    Ok(())
+}
+
+/// Control: a generic the owner message-defaulted is in no binding's index, so the helper lowers to `Html<()>`.
+#[test]
+#[allow(clippy::expect_used)] // a failed precondition is the test failure
+fn untyped_helper_reading_a_message_defaulted_var_lowers_to_unit_msg() -> DResult<()> {
+    let mut i = Interner::new();
+    let res = lower_chip_reading_row_msg(&["msg"], &mut i);
+    let func = single_func(&res).expect("a message-defaulted variable must lower");
+    assert!(
+        matches!(&func.ret, IrType::Ui { msg, .. } if **msg == IrType::Unit),
+        "expected `Html<()>`, got {:?}",
+        func.ret
     );
     Ok(())
 }
