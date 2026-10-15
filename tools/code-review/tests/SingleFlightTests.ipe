@@ -522,11 +522,12 @@ busyRendered settings a b =
         && not (String.contains "Loading unit…" settled)
 
 
--- A save that failed on a busy review database is `SaveContended`, and the
--- banner says the review database is busy, never the error's kind, code or
--- text; any other failure, the moved-head conflict included, is
--- `SaveFailed`, its banner the fixed text with none of the error's. Red if a
--- save failure's text reaches the model or the page.
+-- A save that failed on a busy database is `SaveContended`, and the banner
+-- says the index or review database is busy, never the error's kind, code or
+-- text, and never only the review database: the index read that re-proves
+-- the shown source fails busy alike. Any other failure, the moved-head
+-- conflict included, is `SaveFailed`, its banner the fixed text with none of
+-- the error's. Red if a save failure's text reaches the model or the page.
 saveFailureRendered : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 saveFailureRendered settings a b =
     let
@@ -562,7 +563,7 @@ saveFailureRendered settings a b =
     in
     busy.decisionError
         == Just SaveContended
-        && String.contains "the review database is busy; try again" busyPage
+        && String.contains "the index or review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
         && not (String.contains "[5]" busyPage)
         && not (String.contains busyText busyPage)
