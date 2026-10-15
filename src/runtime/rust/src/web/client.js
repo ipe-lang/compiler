@@ -270,7 +270,12 @@ function __ipeCounterOrder(a, b) {
 // when it applied. A render with no epoch, or of another history, would style
 // against a nonce this document does not hold: it is never applied, and the
 // document is stale.
-function __ipeAdoptFullBody(token, applyFn) {
+//
+// `nav` is the location a navigation answer renders, `{ url, push }`, or null
+// for a render that names none. The location is recorded exactly when the
+// render applies, so on every navigation path the URL names the last render
+// applied.
+function __ipeAdoptFullBody(token, applyFn, nav) {
   if (__ipeStale) return false;
   var next = __ipeOwnEpoch(token);
   if (!next) {
@@ -281,6 +286,7 @@ function __ipeAdoptFullBody(token, applyFn) {
   if (cur && __ipeCounterOrder(next, cur) < 0) return false;
   applyFn();
   __ipeEpoch = token;
+  if (nav) __ipeRecordNav(nav.url, nav.push);
   return true;
 }
 // Where the patches diffed from render `from` to render `to` stand against the
@@ -1299,7 +1305,7 @@ function __ipePostEvent(body) {
         if (!data || typeof data.body !== "string") return;
         // The epoch gate orders this render against the DOM on screen; the
         // seq it carries is the session's, which an earlier ack may equal.
-        __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); });
+        __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, null);
       }).catch(function() { __ipeLoaderEnd(); });
     }
     if (!r.ok && r.status >= 500) {
@@ -1862,9 +1868,19 @@ var __ipeNavPath   = window.location.pathname;
 var __ipeNavSearch = window.location.search;
 var __ipeNavHref   = window.location.href;
 // The count of navigations (ipe-nav clicks and popstates) this document has
-// started. The URL follows a navigation's answer only while no later one was
-// started, or when that answer itself rendered.
+// started.
 var __ipeNavCount = 0;
+// Record `url` as the document's location: a new history entry when `push`,
+// otherwise the current entry rewritten.
+function __ipeRecordNav(url, push) {
+  try {
+    if (push) window.history.pushState({}, "", url);
+    else window.history.replaceState({}, "", url);
+  } catch (_) {}
+  __ipeNavPath   = window.location.pathname;
+  __ipeNavSearch = window.location.search;
+  __ipeNavHref   = window.location.href;
+}
 // The URL to record for a navigation fetch: the canonical URL the server
 // redirected it to, or `fallback`. A followed URL is used only when it is
 // same-origin and its path begins with exactly one `/`; the original hash is
@@ -1917,15 +1933,12 @@ __ipeDoc.on("click", function(ev) {
         window.location.href = href;
         return;
       }
-      // An older render of this history is not applied: the screen already
-      // shows a later one. That later render shows this navigation's page
-      // only when no later navigation was started meanwhile.
-      var applied = __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
-      if (__ipeStale || !(applied || nav === __ipeNavCount)) return;
-      window.history.pushState({}, "", res.url);
-      __ipeNavPath   = window.location.pathname;
-      __ipeNavSearch = window.location.search;
-      __ipeNavHref   = window.location.href;
+      // An applied answer records its URL. An older render of this history is
+      // not applied: the screen already shows a later one, which shows this
+      // navigation's page only when no later navigation was started meanwhile.
+      var target = { url: res.url, push: true };
+      var applied = __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); }, target);
+      if (!applied && !__ipeStale && nav === __ipeNavCount) __ipeRecordNav(target.url, target.push);
     })
     .catch(function() { window.location.href = href; });
 });
@@ -1943,6 +1956,9 @@ window.addEventListener("popstate", function() {
   __ipeNavPath = here.pathname;
   __ipeNavSearch = here.search;
   __ipeNavHref = here.href;
+  // The popped entry, fixed now: the live location moves with any later
+  // navigation.
+  var popped = here.href;
   ++__ipeNavCount;
   // A stale document applies no render: the browser loads the popped entry,
   // as it follows a stale document's links.
@@ -1950,19 +1966,22 @@ window.addEventListener("popstate", function() {
     window.location.reload();
     return;
   }
-  fetch(here.href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
+  fetch(popped, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
-      if (r.redirected) {
-        try { window.history.replaceState({}, "", __ipeFollowed(r, here.href)); } catch (_) {}
-        __ipeNavPath   = window.location.pathname;
-        __ipeNavSearch = window.location.search;
-        __ipeNavHref   = window.location.href;
-      }
+      var url = __ipeFollowed(r, popped);
       var epoch = r.headers.get("X-Ipe-Epoch");
-      return r.text().then(function(t) { return { t: t, epoch: epoch }; });
+      return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
     })
     .then(function(res) {
-      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
+      // An answer of no history or of another one is not this document's to
+      // show: the browser loads the entry itself, as it follows such an
+      // answer to a link.
+      if (!__ipeOwnEpoch(res.epoch)) {
+        window.location.reload();
+        return;
+      }
+      // An applied answer rewrites the current entry to its URL.
+      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); }, { url: res.url, push: false });
     })
     // The URL already names the popped entry: with no answer to show, the
     // browser loads it. One load per popstate, which only the reader starts.
@@ -2333,7 +2352,7 @@ var __ipeLiveFrames = {
         if (!frame.body) return;
         var body = frame.body.replace(/\\n/g, "\n");
         var apply = function() {
-          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
+          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); }, null);
         };
         if (__ipeSelectOpen()) __ipeHoldRender(apply);
         else {

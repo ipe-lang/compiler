@@ -22,8 +22,10 @@
  *   4. Patched styles — a style block a patch inserts, and one whose text a
  *      patch replaces, both apply (examples/shapes/web/csp-styles).
  *   5. Navigation — the URL follows the render on screen: an older answer to a
- *      navigation a later one superseded moves neither the DOM nor the URL,
- *      and a popstate whose fetch fails is a full browser load of the entry.
+ *      navigation a later one superseded moves neither the DOM nor the URL, a
+ *      popstate answer that applies after a link's answer names the URL, and
+ *      a popstate whose fetch fails or whose answer is of no history is a full
+ *      browser load of the entry.
  *
  * Each refusal serves the real page, with its own headers, and its HTML
  * rewritten in flight.
@@ -440,5 +442,90 @@ test("navigation: a popstate whose fetch fails loads the popped entry", async ({
   await expect.poll(() => loads.count, { timeout: 15000 }).toBe(2);
   await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
   await expect(page).toHaveURL(`${STYLES}/`);
+  expect(await page.locator("#e2e-away").count()).toBe(0);
+});
+
+/** A promise and the function that resolves it. */
+function gate() {
+  let open;
+  const shut = new Promise((resolve) => {
+    open = resolve;
+  });
+  return { shut, open };
+}
+
+test("navigation: a popstate answer applied after a link's answer names the URL", async ({
+  page,
+}) => {
+  const { later } = await openLive(page);
+  const [inc, n] = later.split(".");
+  const at = (k) => `${inc}.${Number(n) + k}`;
+  const link = gate();
+  const home = gate();
+  await page.route(
+    (url) => url.origin === STYLES && ["/", "/e2e-away", "/e2e-link"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/e2e-away") {
+        return route.fulfill(navAnswer(later, '<div id="e2e-away">away</div>'));
+      }
+      if (path === "/e2e-link") {
+        await link.shut;
+        return route.fulfill(navAnswer(at(1), '<div id="e2e-link">link</div>'));
+      }
+      await home.shut;
+      return route.fulfill(navAnswer(at(2), '<div id="e2e-home">home</div>'));
+    },
+  );
+  await addNavLink(page, "away", "/e2e-away");
+  await page.locator("#e2e-link-away").click();
+  await page.waitForSelector("#e2e-away", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/e2e-away`);
+  await addNavLink(page, "link", "/e2e-link");
+  await page.locator("#e2e-link-link").click();
+  await page.evaluate(() => history.back());
+  await expect(page).toHaveURL(`${STYLES}/`);
+  link.open();
+  await page.waitForSelector("#e2e-link", { timeout: 10000 });
+  home.open();
+  await page.waitForSelector("#e2e-home", { timeout: 10000 });
+  await page.waitForTimeout(1000);
+  await expect(page).toHaveURL(`${STYLES}/`);
+  expect(await page.locator("#e2e-link").count()).toBe(0);
+});
+
+test("navigation: a popstate answer of no history loads the popped entry", async ({ page }) => {
+  const loads = { count: 0 };
+  page.on("request", (r) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loads.count += 1;
+  });
+  const { later } = await openLive(page);
+  await page.route(
+    (url) => url.origin === STYLES && ["/", "/e2e-away"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      if (new URL(route.request().url()).pathname === "/") {
+        return route.fulfill({
+          status: 200,
+          headers: { "content-type": "text/html", "x-ipe-web": "1" },
+          body: '<div id="e2e-unstamped">no history</div>',
+        });
+      }
+      return route.fulfill(navAnswer(later, '<div id="e2e-away">away</div>'));
+    },
+  );
+  await addNavLink(page, "away", "/e2e-away");
+  await page.locator("#e2e-link-away").click();
+  await page.waitForSelector("#e2e-away", { timeout: 10000 });
+  expect(loads.count).toBe(1);
+  // A stale-document reload within its window is refused, so only the
+  // popstate's own load can reach the entry.
+  await page.evaluate(() => sessionStorage.setItem("__ipe_inc_reload", String(Date.now())));
+  await page.evaluate(() => history.back());
+  await expect.poll(() => loads.count, { timeout: 15000 }).toBe(2);
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  await expect(page).toHaveURL(`${STYLES}/`);
+  expect(await page.locator("#e2e-unstamped").count()).toBe(0);
   expect(await page.locator("#e2e-away").count()).toBe(0);
 });

@@ -6243,12 +6243,12 @@ mod handlers {
             crate::debugger::export_msgs(&e.history)
         };
         match json_bytes {
-            Ok(bytes) => (
+            Ok(bytes) => session_body_response(
                 axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                bytes,
-            )
-                .into_response(),
+                "application/json",
+                &[],
+                axum::body::Body::from(bytes),
+            ),
             Err(err) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
@@ -8414,6 +8414,42 @@ mod base_path_tests {
         assert!(
             diff.contains("__ipeApplyPatches(patches);"),
             "the one caller of `__ipeApplyPatches` is `__ipeAdoptPatches`"
+        );
+    }
+
+    /// A navigation answer moves the URL through `__ipeRecordNav` only, and the
+    /// full-render gate records it in the same step that applies the render:
+    /// the URL names the last navigation render applied, on every path.
+    #[test]
+    fn client_records_a_navigation_url_only_where_its_render_applies() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let record = body_of("__ipeRecordNav").unwrap_or_default();
+        let full = body_of("__ipeAdoptFullBody").unwrap_or_default();
+        assert_eq!(
+            (
+                js.matches("window.history.").count(),
+                record.matches("window.history.").count()
+            ),
+            (2, 2),
+            "navigation writes history in `__ipeRecordNav` only"
+        );
+        assert!(
+            full.contains("__ipeEpoch = token;\n  if (nav) __ipeRecordNav(nav.url, nav.push);"),
+            "the full-render gate records the location with the render it applies"
+        );
+        assert_eq!(
+            js.matches("__ipeRecordNav(").count(),
+            3,
+            "`__ipeRecordNav` has its definition, the gate, and the link fallback"
+        );
+        assert!(
+            js.contains("{ url: res.url, push: false });"),
+            "a popstate answer names its location to the gate"
         );
     }
 
@@ -17094,6 +17130,30 @@ mod web_revocation_tests {
                 is_session_lost(resp).await,
                 "export of a revoked session is lost"
             );
+        });
+    }
+
+    /// The debugger answers carrying a session's message log or model are
+    /// `no-store`.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn debugger_answers_carrying_session_data_are_never_stored() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "debug-cache-subject", 7200, "").await;
+            let cookie = sid_cookie(&opened.sid);
+            for path in ["/_ipe/debug/export", "/_ipe/debug/inspect"] {
+                let resp = send(&router, "GET", path, &cookie, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{path} answers");
+                let cache: Vec<_> = resp
+                    .headers()
+                    .get_all(header::CACHE_CONTROL)
+                    .iter()
+                    .map(|v| v.to_str().ok())
+                    .collect();
+                assert_eq!(cache, [Some("no-store")], "{path} is never stored");
+            }
         });
     }
 
