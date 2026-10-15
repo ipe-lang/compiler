@@ -21,6 +21,7 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
+import Lib.Bind as Bind exposing (BindRefusal(..))
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.EnvLookup as EnvLookup
 import Lib.Format as Format
@@ -446,8 +447,9 @@ dbRefusalsStateOneFix =
 -- exact `import Ipe.System as System`, so an alias or an `exposing` import
 -- cannot dodge the count. In `Main`: the environment is read on exactly two
 -- code lines — `requireEnv`'s read and `optionalEnv`'s read — and each of
--- `requireEnv` and `optionalEnv` is named only by its declaration and its two
--- literal-key calls, so no wrapper can pass either a key. `Settings` exports both
+-- `requireEnv` and `optionalEnv` is named only by its declaration and its
+-- literal-key calls (two of `requireEnv`, three of `optionalEnv`), so no
+-- wrapper can pass either a key. `Settings` exports both
 -- parsers and neither the bare `indexSettings` nor `reviewDb`.
 startupReadsAdmittedOnly : Task.Task Error Bool
 startupReadsAdmittedOnly =
@@ -515,19 +517,23 @@ occurrences needle text =
 -- Each needle and, for every module admitted to name it, the exact number of
 -- times its code does. A module absent from a needle's row names it zero
 -- times. `System.` counts every qualified use of the module: `Main`'s two
--- `getenv`s and three `exit`s, `RepoPath`'s `cwd`, `ReviewKey`'s
+-- `getenv`s and four `exit`s, `RepoPath`'s `cwd`, `ReviewKey`'s
 -- one `getenv` of the review key. `absolute`
 -- counts `Path.absolute`, which resolves against the working directory, beside
 -- the message texts that name the word. `Ipe.Env` reads
 -- the live environment on the native target and `Ipe.Process` can run a
--- child that prints it, so neither is admitted anywhere.
+-- child that prints it, so neither is admitted anywhere. `IPE_HTTP_BIND` is
+-- read once, by `Main`, and parsed by `Bind.parseBind` alone, called once.
+-- The bind proof rests on the runtime resolving the same value: no module
+-- installs a host setting (`appWith`) or writes the environment overlay
+-- (`setenv`, `unsetenv`, `loadEnv`), by any spelling of the name.
 admittedSites : List ( String, List ( String, Int ) )
 admittedSites =
     [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "Ipe.Ffi", [] )
     , ( "Ipe.Env", [] )
     , ( "Ipe.Process", [] )
-    , ( "System.", [ ( "Main.ipe", 5 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
+    , ( "System.", [ ( "Main.ipe", 6 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
     , ( "isDir", [ ( "Lib/RepoPath.ipe", 6 ), ( "Lib/Settings.ipe", 1 ) ] )
@@ -539,6 +545,12 @@ admittedSites =
     , ( "parseReviewDb", [ ( "Lib/Settings.ipe", 3 ), ( "Main.ipe", 1 ) ] )
     , ( "readReviewKey", [ ( "Lib/ReviewKey.ipe", 3 ), ( "Main.ipe", 1 ) ] )
     , ( "parseMacKey", [ ( "Lib/ReviewKey.ipe", 4 ) ] )
+    , ( "parseBind", [ ( "Lib/Bind.ipe", 3 ), ( "Main.ipe", 1 ) ] )
+    , ( "IPE_HTTP_BIND", [ ( "Lib/Bind.ipe", 4 ), ( "Main.ipe", 1 ) ] )
+    , ( "appWith", [] )
+    , ( "setenv", [] )
+    , ( "unsetenv", [] )
+    , ( "loadEnv", [] )
     ]
 
 
@@ -606,6 +618,11 @@ startupScanRefusesEvasions =
                 && evaded sources "Lib/Index.ipe" "fresh = Path.absolute"
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Env as Env\nraw = Env.public \"INDEX_DB\""
                 && evaded sources "Lib/Queue.ipe" "import Ipe.Process as Process\nraw = Process.run \"printenv\" []"
+                && evaded sources "Lib/Queue.ipe" "again = Bind.parseBind (Settings.EnvSet \"0.0.0.0\")"
+                && evaded sources "Main.ipe" "rebind = setenv \"X\" \"0.0.0.0\""
+                && evaded sources "Lib/Queue.ipe" "unbind = Sys.unsetenv \"X\""
+                && evaded sources "Lib/Queue.ipe" "reload = loadEnv \".env\""
+                && evaded sources "Lib/Queue.ipe" "app = Web.appWith"
                 && not (sitesAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/RepoPath.ipe") sources))
                 && not (layoutAdmits ("Pages" :: topNames) libNames)
                 && not (layoutAdmits topNames ("Extra" :: libNames))
@@ -615,6 +632,9 @@ startupScanRefusesEvasions =
                 && not (mainAdmits (mainCode sources ++ "\nreread name = optionalEnv name"))
                 && not (mainAdmits (String.replace "rawRepos <- optionalEnv \"IPE_INDEX_REPOS\"" "rawRepos <- Task.succeed Settings.EnvUnset" (mainCode sources)))
                 && not (mainAdmits (String.replace "rawDb <- requireEnv \"IPE_INDEX_DB\" " "rawDb <- readDb " (mainCode sources) ++ "\nreadDb = requireEnv \"IPE_INDEX_DB\""))
+                && not (mainAdmits (String.replace "        serve bind settings" "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]" (mainCode sources)))
+                && not (mainAdmits (String.replace "serve _loopback settings =\n    Server.listen" "serve _loopback settings =\n    Task.succeed ()\n\n\nopen settings =\n    Server.listen" (mainCode sources)))
+                && not (mainAdmits (String.replace "        bind <- requireLoopbackBind rawBind\n" "" (mainCode sources) ++ "\nlater raw = requireLoopbackBind raw"))
             )
 
 
@@ -672,9 +692,15 @@ mainAdmits text =
         && occurrences "requireEnv" text
         == 4
         && occurrences "optionalEnv \"" text
-        == 2
+        == 3
         && occurrences "optionalEnv" text
-        == 4
+        == 5
+        && occurrences "requireLoopbackBind" text
+        == 3
+        && occurrences "Server.listen" text
+        == 1
+        && occurrences serveListen text
+        == 1
         && occurrences "requireSettings" text
         == 3
         && occurrences "parseIndexSettings" text
@@ -685,17 +711,23 @@ mainAdmits text =
         && mainPinned text
 
 
--- `main` opens with the two literal-key `requireEnv` reads, the two
--- literal-key `optionalEnv` reads, the review key's read, the settings parse
--- and the listen, in that order, so a partially applied reader that a
--- request could run cannot take the place of any read.
+-- `main` opens with the bind's read and its loopback proof, then the two
+-- literal-key `requireEnv` reads, the two other literal-key `optionalEnv`
+-- reads, the review key's read, the settings parse and the listen under the
+-- proof, in that order, so a refused bind stops startup before any other
+-- read, and a partially applied reader that a request could run cannot take
+-- the place of any read.
 mainPinned : String -> Bool
 mainPinned text =
     case String.split "\nmain =\n    do\n" text of
         [ _, body ] ->
-            case List.take 7 (String.lines body) of
-                [ dbLine, rootLine, reposLine, reviewLine, keyLine, settingsLine, listenLine ] ->
-                    String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
+            case List.take 9 (String.lines body) of
+                [ rawBindLine, bindLine, dbLine, rootLine, reposLine, reviewLine, keyLine, settingsLine, listenLine ] ->
+                    rawBindLine
+                        == "        rawBind <- optionalEnv \"IPE_HTTP_BIND\""
+                        && bindLine
+                        == "        bind <- requireLoopbackBind rawBind"
+                        && String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
                         && String.startsWith "        rawRoot <- requireEnv \"IPE_INDEX_ROOT\" \"" rootLine
                         && reposLine
                         == "        rawRepos <- optionalEnv \"IPE_INDEX_REPOS\""
@@ -706,13 +738,20 @@ mainPinned text =
                         && settingsLine
                         == "        settings <- requireSettings key rawDb rawRoot rawRepos rawReview"
                         && listenLine
-                        == "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]"
+                        == "        serve bind settings"
 
                 _ ->
                     False
 
         _ ->
             False
+
+
+-- The one listen, inside `serve`, whose `Loopback` parameter makes a listen
+-- without a parsed bind fail to type-check.
+serveListen : String
+serveListen =
+    "\nserve : Bind.Loopback -> Settings.AppSettings -> Task Error ()\nserve _loopback settings =\n    Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]\n"
 
 
 -- True when the module header exports both parsers and neither the bare
@@ -1200,7 +1239,7 @@ readmeEnvTableMatchesReads =
         Task.succeed
             (envTableAgrees readme mainSource
                 && List.length (readmeEnvRows readme)
-                == 5
+                == 6
                 && not (envTableAgrees (String.replace "| `IPE_INDEX_REPOS`" "| `UNLISTED`" readme) mainSource)
                 && not (envTableAgrees readme (mainSource ++ "\nextra = optionalEnv \"IPE_EXTRA\""))
                 && not (envTableAgrees (readme ++ "\n| `IPE_INDEX_DB` | again |") mainSource)
@@ -1240,6 +1279,126 @@ mainEnvReads mainSource =
         [ "requireEnv", "optionalEnv" ]
 
 
+-- The bind as `parseBind` reads it, its proof shown as the address.
+bindParsed : Settings.EnvValue -> Result BindRefusal String
+bindParsed value =
+    Result.map Bind.loopbackAddress (Bind.parseBind value)
+
+
+-- Unset, exactly `127.0.0.1` and exactly `::1` are the binds accepted; unset
+-- is the runtime's own default, `127.0.0.1`.
+bindAcceptsLoopback : Bool
+bindAcceptsLoopback =
+    bindParsed Settings.EnvUnset
+        == Ok "127.0.0.1"
+        && bindParsed (Settings.EnvSet "127.0.0.1")
+        == Ok "127.0.0.1"
+        && bindParsed (Settings.EnvSet "::1")
+        == Ok "::1"
+
+
+-- Every value outside the accepted set, each refused as `NotLoopback` with
+-- the value it read: exposed addresses, the other loopback spellings the
+-- parser does not read as addresses, socket, bracket and scope forms,
+-- hostnames, and padded or lookalike forms of the accepted two.
+refusedBinds : List String
+refusedBinds =
+    [ "0.0.0.0"
+    , "::"
+    , "192.168.15.9"
+    , "10.0.0.1"
+    , "fe80::1"
+    , "2001:db8::1"
+    , "255.255.255.255"
+    , "127.0.0.2"
+    , "127.1.2.3"
+    , "127.255.255.255"
+    , "127.1"
+    , "127.000.000.001"
+    , "0177.0.0.1"
+    , "2130706433"
+    , "0:0:0:0:0:0:0:1"
+    , "::0:1"
+    , "::ffff:127.0.0.1"
+    , "::ffff:7f00:1"
+    , "[::1]"
+    , "[::1]:8000"
+    , "127.0.0.1:8000"
+    , "::1%lo"
+    , "[127.0.0.1]"
+    , "localhost"
+    , "LOCALHOST"
+    , "localhost."
+    , "ip6-localhost"
+    , "evil.example"
+    , " 127.0.0.1"
+    , "127.0.0.1 "
+    , "127.0.0.1\n"
+    , "\t::1"
+    , codeText 65297 ++ codeText 65298 ++ codeText 65303 ++ ".0.0.1"
+    , "::1" ++ codeText 8203
+    ]
+
+
+bindRefusesOtherValues : Bool
+bindRefusesOtherValues =
+    List.length refusedBinds
+        == 34
+        && List.all (\raw -> bindParsed (Settings.EnvSet raw) == Err (NotLoopback raw)) refusedBinds
+
+
+-- Set but empty is refused as empty, never read as unset, and a value that
+-- cannot be read is refused as unreadable.
+bindRefusesEmptyAndUnreadable : Bool
+bindRefusesEmptyAndUnreadable =
+    bindParsed (Settings.EnvSet "")
+        == Err EmptyBind
+        && bindParsed Settings.EnvUnreadable
+        == Err UnreadableBind
+
+
+-- The refusal's text names the variable, both accepted values and the SSH
+-- tunnel, and holds no hazard.
+namesBindRemedy : BindRefusal -> Bool
+namesBindRemedy refusal =
+    let
+        shown =
+            bindRefusalShown refusal
+    in
+    List.all (\needle -> String.contains needle shown) [ "IPE_HTTP_BIND", "127.0.0.1", "::1", "ssh -L" ]
+        && noHazard shown
+
+
+bindRefusalShown : BindRefusal -> String
+bindRefusalShown refusal =
+    SafeText.toString (Bind.refusalText refusal)
+
+
+-- Every bind refusal names the variable, the two accepted values and the SSH
+-- tunnel; a refused value is shown quoted, capped at 64 characters with a
+-- `…` mark, and escaped; an unreadable value is never shown.
+bindRefusalNamesRemedy : Bool
+bindRefusalNamesRemedy =
+    let
+        long =
+            bindRefusalShown (NotLoopback (String.repeat 10000 "a"))
+
+        escaped =
+            bindRefusalShown (NotLoopback (codeText 27 ++ "[31m"))
+    in
+    List.all namesBindRemedy [ EmptyBind, UnreadableBind, NotLoopback "0.0.0.0" ]
+        && String.contains "\"0.0.0.0\"" (bindRefusalShown (NotLoopback "0.0.0.0"))
+        && not (String.contains "\"" (bindRefusalShown UnreadableBind))
+        && not (String.contains "\"" (bindRefusalShown EmptyBind))
+        && String.length long
+        < 1000
+        && String.contains ("\"" ++ String.repeat 64 "a" ++ "\"…") long
+        && not (String.contains (String.repeat 65 "a") long)
+        && not (String.contains "…" (bindRefusalShown (NotLoopback (String.repeat 64 "a"))))
+        && noHazard escaped
+        && String.contains "\"\\u{1b}[31m\"" escaped
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -1263,4 +1422,8 @@ checks =
         , check "an unreadable IPE_INDEX_REPOS refuses startup, never reads as unset" reposUnreadableRefused
         , check "an unreadable IPE_REVIEW_DB refuses startup, never reads as unset" reviewDbUnreadableRefused
         , check "the README env table lists exactly the variables the server reads" readmeEnvTableMatchesReads
+        , Task.succeed ( "the bind is accepted only unset, exactly 127.0.0.1 or exactly ::1", bindAcceptsLoopback )
+        , Task.succeed ( "every other bind spelling is refused as not loopback, naming the value read", bindRefusesOtherValues )
+        , Task.succeed ( "an empty bind is refused as empty and an unreadable one as unreadable", bindRefusesEmptyAndUnreadable )
+        , Task.succeed ( "a bind refusal names the variable, both accepted values and the SSH tunnel, echoing capped and escaped", bindRefusalNamesRemedy )
         ]

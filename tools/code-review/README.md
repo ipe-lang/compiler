@@ -33,8 +33,8 @@ See `tools/ipe-index/README.md` for that tool.
 
 ## Configuration
 
-The app reads five environment variables: two are **required** and three are
-optional. `main` parses all five at startup, then opens and probes each
+The app reads six environment variables: two are **required** and four are
+optional. `main` parses all six at startup, then opens and probes each
 location before it listens, and exits non-zero with a message naming the
 variable if any is unset or unusable. An optional variable that is set but
 cannot be read (a value that is not valid Unicode) is refused too, never taken
@@ -48,6 +48,7 @@ joining a stored path outside the repo:
 | `IPE_INDEX_ROOT` | Repo root the index's `ipe:relative` paths join to; must be an existing directory holding the indexed files, checked at startup. |
 | `IPE_INDEX_REPOS` | Optional roots of the other repositories the index records: `name=/absolute/path` entries joined by `,` (e.g. `ext=/srv/ext,docs=/srv/ipe/docs`). At most 65536 bytes in all, a name of at most 128 bytes, a path of at most 4096 bytes, and 64 roots counting `IPE_INDEX_ROOT`. |
 | `IPE_REVIEW_DB`  | Optional file path of the review DB; defaults to `review.db`. |
+| `IPE_HTTP_BIND` | Optional listen address: only `127.0.0.1` or `::1`, exactly; unset, the server binds `127.0.0.1`. Any other value (another address, a hostname such as `localhost`, empty, padded) refuses startup. Reach the server from another machine through an SSH tunnel. |
 | `IPE_REVIEW_MAC_KEY` | Optional key that signs every decision: exactly 64 hex characters (32 random bytes). Unset, the server is read-only. |
 
 A relative path in `IPE_INDEX_DB`, `IPE_INDEX_ROOT` or `IPE_REVIEW_DB` resolves
@@ -267,16 +268,20 @@ IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe dev run
 to listen on another port, e.g. `IPE_SERVER_PORT=8123 ipe dev run`, or the same
 assignment before a built binary; a value that is
 not a decimal port in `1..=65535` (empty, non-numeric, signed, `0`, or too
-large) is ignored and `8000` is used. `ipe type-check` runs a fast check with
+large) refuses startup, naming the variable. `ipe type-check` runs a fast check with
 no runtime, and `ipe dev build` compiles to a native binary.
 
-The server binds `127.0.0.1` only, so other machines cannot reach it; to
-serve it on the LAN, set `IPE_HTTP_BIND` (e.g. `IPE_HTTP_BIND=0.0.0.0`), which
-prints a startup warning.
+The review page is unauthenticated, so the server listens on loopback only:
+`127.0.0.1`, or `::1` with `IPE_HTTP_BIND=::1`. Any other `IPE_HTTP_BIND`
+value stops startup with exit status 1 before a database is opened. To review
+from another machine, tunnel to it over SSH:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 <host>    # then open http://localhost:8000 locally
+```
 
 Both are development builds: with `IPE_CONSOLE_AUTH` unset, the embedded
-console at `/_ipe/console` is open only while the server binds loopback, and on
-an exposed bind (`IPE_HTTP_BIND=0.0.0.0`) it requires the admin token. An
+console at `/_ipe/console` is open on the loopback listener. An
 `ipe release` artifact keeps the console closed until `IPE_CONSOLE_AUTH` is set.
 
 A unit's source is shown, and can be approved or refused, only when its lines
