@@ -23,7 +23,9 @@ use ipe_diagnostics::{
     MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol};
-use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
+use ipe_ir::free_vars::{
+    mentions_free, pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee,
+};
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
 use ipe_ir::once_closure::{CaptureScope, ClosureKind};
 use ipe_ir::{
@@ -1559,103 +1561,17 @@ fn canon_collect_free_locals(
 //   `rewrite_multiuse_clones` — DFS rewrite; `remaining` starts at the count,
 //       decrements per occurrence; last occurrence (remaining==1) stays bare.
 
-/// Returns `true` when `expr` references `sym` as a live (non-shadowed) local
-/// at any depth, treating nested lambdas as transparent — descending into their
-/// bodies unless one of their parameters re-binds `sym`.
+/// Will a `move` closure whose body is `expr` capture `sym` from the enclosing scope?
 ///
-/// Used to decide whether a `move` closure whose body is `expr` will capture
-/// `sym` from the enclosing scope: if this returns `true`, the outer `move`
-/// closure moves `sym` in.
+/// A `move` closure captures by value every free local its body mentions, in
+/// any position and whatever the emitted form there (a borrow, a `.clone()`,
+/// a record-update base), and a nested closure that captures `sym` makes the
+/// outer one capture it too. That is exactly "`sym` occurs free in `expr`",
+/// so this is [`ipe_ir::free_vars::mentions_free`]: every capture consumer
+/// reads the one free-variable walk and none can skip a sub-expression the
+/// others visit.
 fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
-    match expr {
-        Expr::Var(s) | Expr::CloneVar(s) => *s == sym,
-        // Nested lambda: descend unless it shadows `sym` via a parameter.
-        // A nested `move` closure that captures `sym` causes the outer closure
-        // to capture `sym` too.
-        Expr::Lambda { params, body, .. }
-        | Expr::SharedLambda { params, body, .. }
-        | Expr::OnceLambda { params, body, .. } => {
-            if params.iter().any(|(s, _)| *s == sym) {
-                false // sym shadowed by inner lambda param
-            } else {
-                lambda_body_refs_sym(sym, body)
-            }
-        }
-        Expr::Let { name, value, body } => {
-            lambda_body_refs_sym(sym, value)
-                || if *name == sym {
-                    false
-                } else {
-                    lambda_body_refs_sym(sym, body)
-                }
-        }
-        Expr::Destructure {
-            binder,
-            value,
-            body,
-        } => {
-            lambda_body_refs_sym(sym, value)
-                || if pat_binds_symbol(binder, sym) {
-                    false
-                } else {
-                    lambda_body_refs_sym(sym, body)
-                }
-        }
-        Expr::Match(m) => {
-            lambda_body_refs_sym(sym, m.scrutinee())
-                || m.arms().iter().any(|arm| {
-                    !pat_binds_symbol(&arm.pat, sym) && lambda_body_refs_sym(sym, &arm.body)
-                })
-        }
-        Expr::TailLoop { params, body } => {
-            if params.iter().any(|(s, _)| *s == sym) {
-                false
-            } else {
-                lambda_body_refs_sym(sym, body)
-            }
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            lambda_body_refs_sym(sym, lhs) || lambda_body_refs_sym(sym, rhs)
-        }
-        Expr::If { cond, then_, else_ } => {
-            lambda_body_refs_sym(sym, cond)
-                || lambda_body_refs_sym(sym, then_)
-                || lambda_body_refs_sym(sym, else_)
-        }
-        Expr::Call { args, .. } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        Expr::Apply { func, args } => {
-            lambda_body_refs_sym(sym, func) || args.iter().any(|a| lambda_body_refs_sym(sym, a))
-        }
-        Expr::Tuple(items) => items.iter().any(|e| lambda_body_refs_sym(sym, e)),
-        Expr::List { items, .. } => items.iter().any(|e| lambda_body_refs_sym(sym, e)),
-        Expr::Cons { head, tail } => {
-            lambda_body_refs_sym(sym, head) || lambda_body_refs_sym(sym, tail)
-        }
-        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            lambda_body_refs_sym(sym, list)
-        }
-        Expr::Record { fields, .. } => fields.iter().any(|(_, e)| lambda_body_refs_sym(sym, e)),
-        // Update.record is wrapped in `.clone()` by emit_update (borrow, not move).
-        // Only the field value expressions are consuming captures.
-        Expr::Update { fields, .. } => fields.iter().any(|(_, e)| lambda_body_refs_sym(sym, e)),
-        Expr::Ctor { args, .. } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        Expr::TaskSeq { effect, rest } => {
-            lambda_body_refs_sym(sym, effect) || lambda_body_refs_sym(sym, rest)
-        }
-        Expr::TailRecur { args } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        // `Access.record` is borrowed by the emitted `(record).field.clone()` —
-        // a borrow of `record`, not a move.  The lambda still needs to capture
-        // `sym` if `sym` is the record expression, so we recurse.
-        Expr::Access { record, .. } => lambda_body_refs_sym(sym, record),
-        Expr::Int(_)
-        | Expr::Bool(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::CustomElementRef { .. }
-        | Expr::Char(_)
-        | Expr::Unit
-        | Expr::FuncValue { .. } => false,
-    }
+    mentions_free(sym, expr)
 }
 
 // ── Shared (Arc) capture rewrite, E0507 fix ──────────────────────────────────
@@ -1697,14 +1613,10 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 ///
 /// `scope` is where `expr` itself sits; every closure the backend emits steps
 /// it through [`CaptureScope::enter_boundary`], the `move |_|` around a
-/// `TaskSeq` continuation included. Mirrors [`lambda_body_refs_sym`]'s
-/// shadowing discipline exactly, generalised from a boolean "does it occur" to
-/// "where does it occur, possibly more than once". `Expr::Update.record` is
-/// walked too (unlike `lambda_body_refs_sym`, which treats it as borrow-only
-/// for a DIFFERENT question) -- a false positive here only costs an unneeded
-/// (but harmless) `Arc`/`.clone()`, whereas a false negative would leave a
-/// real E0507/E0382 unfixed, so this walker is deliberately the more
-/// conservative of the two.
+/// `TaskSeq` continuation included. It visits every sub-expression and
+/// honours every binder exactly as [`ipe_ir::free_vars::mentions_free`] does,
+/// answering "in which scopes does `sym` occur, possibly more than once"
+/// rather than "does it occur".
 #[allow(clippy::too_many_lines)] // exhaustive IR match; every arm is structurally required
 fn collect_capture_scopes(
     sym: Symbol,
@@ -39866,6 +39778,248 @@ mod tests {
                     "`{shape}` over {item:?} is reported as holding an Arc function"
                 );
             }
+        }
+    }
+
+    /// The capture predicate is the free-variable walk, at every capture site and binder.
+    ///
+    /// One fixture per `Expr` shape with `card` as its only possible capture
+    /// site: `lambda_body_refs_sym` and `mentions_free` must both agree with
+    /// `free_vars(e).contains(&card)` and with the pinned verdict. The
+    /// record-update base and the match guard are capture sites a `move`
+    /// closure captures whatever their emitted form.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture per `Expr` shape
+    fn mentions_free_agrees_with_free_vars() {
+        use ipe_ir::free_vars::{free_vars, mentions_free};
+        use ipe_ir::{
+            Arm, BinOp, CallPin, Callee, Expr, FuncId, IrType, Match, ModPath, OnFormKind, Pat,
+        };
+
+        use ipe_intern::Symbol;
+
+        use super::lambda_body_refs_sym;
+
+        let mut interner = Interner::new();
+        let card = interner.intern("card").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let flavor = interner.intern("flavor").expect("intern");
+        let ty = interner.intern("Card").expect("intern");
+        let var = || Expr::Var(card);
+        let update = |record: Expr| Expr::Update {
+            record: Box::new(record),
+            fields: vec![(flavor, Expr::Int(1))],
+        };
+        let access = |record: Expr| Expr::Access {
+            record: Box::new(record),
+            field: flavor,
+            field_ty: IrType::Int,
+        };
+        let lambda = |param: Symbol, body: Expr| Expr::Lambda {
+            params: vec![(param, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(body),
+        };
+        let flat = |scrutinee: Expr, arms: Vec<Arm>| {
+            Expr::Match(Match::new_flat(scrutinee, arms).expect("catch-all arm is exhaustive"))
+        };
+        let call = |args: Vec<Expr>| Expr::Call {
+            callee: Callee::Func(FuncId::from_raw(0)),
+            args,
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+
+        let cases: Vec<(&str, Expr, bool)> = vec![
+            ("var", var(), true),
+            ("clone var", Expr::CloneVar(card), true),
+            ("literal", Expr::Int(0), false),
+            ("update base", update(var()), true),
+            (
+                "update field",
+                Expr::Update {
+                    record: Box::new(Expr::Var(x)),
+                    fields: vec![(flavor, var())],
+                },
+                true,
+            ),
+            (
+                "update base access chain",
+                update(access(access(var()))),
+                true,
+            ),
+            ("nested update base", update(update(var())), true),
+            ("access", access(var()), true),
+            (
+                "record field",
+                Expr::Record {
+                    fields: vec![(flavor, var())],
+                    ty: None,
+                },
+                true,
+            ),
+            (
+                "ctor arg",
+                Expr::Ctor {
+                    home: ModPath(vec![ty]),
+                    ty,
+                    variant: ty,
+                    args: vec![var()],
+                },
+                true,
+            ),
+            ("call arg", call(vec![Expr::Unit, var()]), true),
+            (
+                "apply callee",
+                Expr::Apply {
+                    func: Box::new(var()),
+                    args: vec![Expr::Unit],
+                },
+                true,
+            ),
+            (
+                "binop",
+                Expr::BinOp {
+                    op: BinOp::IntAdd,
+                    lhs: Box::new(Expr::Int(1)),
+                    rhs: Box::new(var()),
+                },
+                true,
+            ),
+            (
+                "if branch",
+                Expr::If {
+                    cond: Box::new(Expr::Bool(true)),
+                    then_: Box::new(Expr::Unit),
+                    else_: Box::new(update(var())),
+                },
+                true,
+            ),
+            ("tuple", Expr::Tuple(vec![Expr::Unit, var()]), true),
+            (
+                "list",
+                Expr::List {
+                    elem: IrType::Int,
+                    items: vec![var()],
+                },
+                true,
+            ),
+            (
+                "cons tail",
+                Expr::Cons {
+                    head: Box::new(Expr::Int(1)),
+                    tail: Box::new(var()),
+                },
+                true,
+            ),
+            (
+                "list index",
+                Expr::ListIndexClone {
+                    list: Box::new(var()),
+                    index: 0,
+                    elem: IrType::Int,
+                },
+                true,
+            ),
+            (
+                "list len check",
+                Expr::ListLenCheck {
+                    list: Box::new(var()),
+                    len: 1,
+                    exact: true,
+                },
+                true,
+            ),
+            (
+                "match scrutinee",
+                flat(var(), vec![Arm::new(Pat::Wildcard, Expr::Unit)]),
+                true,
+            ),
+            (
+                "match guard",
+                flat(
+                    Expr::Bool(true),
+                    vec![
+                        Arm {
+                            pat: Pat::Bool(true),
+                            body: Expr::Unit,
+                            guard: Some(update(var())),
+                        },
+                        Arm::new(Pat::Wildcard, Expr::Unit),
+                    ],
+                ),
+                true,
+            ),
+            (
+                "match arm shadows",
+                flat(Expr::Unit, vec![Arm::new(Pat::Var(card), update(var()))]),
+                false,
+            ),
+            (
+                "task seq rest",
+                Expr::TaskSeq {
+                    effect: Box::new(Expr::Unit),
+                    rest: Box::new(update(var())),
+                },
+                true,
+            ),
+            ("nested lambda", lambda(x, update(var())), true),
+            ("lambda param shadows", lambda(card, update(var())), false),
+            (
+                "let value",
+                Expr::Let {
+                    name: x,
+                    value: Box::new(update(var())),
+                    body: Box::new(Expr::Unit),
+                },
+                true,
+            ),
+            (
+                "let shadows body",
+                Expr::Let {
+                    name: card,
+                    value: Box::new(Expr::Unit),
+                    body: Box::new(update(var())),
+                },
+                false,
+            ),
+            (
+                "destructure shadows body",
+                Expr::Destructure {
+                    binder: Pat::Tuple(vec![Pat::Var(card), Pat::Wildcard]),
+                    value: Box::new(Expr::Unit),
+                    body: Box::new(var()),
+                },
+                false,
+            ),
+            (
+                "tail loop shadows",
+                Expr::TailLoop {
+                    params: vec![(card, IrType::Int)],
+                    body: Box::new(var()),
+                },
+                false,
+            ),
+            (
+                "tail recur arg",
+                Expr::TailRecur { args: vec![var()] },
+                true,
+            ),
+        ];
+
+        for (label, expr, captures) in &cases {
+            let free = free_vars(expr).contains(&card);
+            assert_eq!(free, *captures, "{label}: free_vars verdict");
+            assert_eq!(mentions_free(card, expr), free, "{label}: mentions_free");
+            assert_eq!(
+                lambda_body_refs_sym(card, expr),
+                free,
+                "{label}: lambda_body_refs_sym"
+            );
+            assert!(
+                !mentions_free(ty, expr),
+                "{label}: an absent symbol is never free"
+            );
         }
     }
 }
