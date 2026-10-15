@@ -226,7 +226,7 @@ const fn reserves_vcs_kind(kind: VcsKind) -> bool {
 const fn lists_name(names: &[&str], name: &str) -> bool {
     let mut rest = names;
     while let [listed, tail @ ..] = rest {
-        if const_str_eq(*listed, name) {
+        if const_str_eq(listed, name) {
             return true;
         }
         rest = tail;
@@ -262,7 +262,23 @@ const fn same_names(a: &[&str], b: &[&str]) -> bool {
     loop {
         match (a, b) {
             ([], []) => return true,
-            ([x, a_tail @ ..], [y, b_tail @ ..]) if const_str_eq(*x, *y) => {
+            ([x, a_tail @ ..], [y, b_tail @ ..]) if const_str_eq(x, y) => {
+                a = a_tail;
+                b = b_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `a` and `b` hold the same component paths in the same order, component by component.
+#[cfg(test)]
+const fn same_markers(a: &[&[&str]], b: &[&[&str]]) -> bool {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_tail @ ..], [y, b_tail @ ..]) if same_names(x, y) => {
                 a = a_tail;
                 b = b_tail;
             }
@@ -279,7 +295,7 @@ const fn reserved_names_are(names: &[&str]) -> bool {
         match (rows, names) {
             ([], []) => return true,
             ([row, rows_tail @ ..], [name, names_tail @ ..])
-                if const_str_eq(row.dir_name(), *name) =>
+                if const_str_eq(row.dir_name(), name) =>
             {
                 rows = rows_tail;
                 names = names_tail;
@@ -293,12 +309,12 @@ const fn reserved_names_are(names: &[&str]) -> bool {
 #[cfg(test)]
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the test BUILD if the temp-root proof's markers or reserved names drift from the project layout [ledger #boundary]
 const _: () = assert!(
-    same_names(
+    same_markers(
         &ipe_test_temp::PROJECT_MARKERS,
         &[
-            crate::package_manifest::PACKAGE_IPE,
-            crate::project::IPE_TOML,
-            ipe_ffi::driver::FFI_CACHE_REL,
+            &[crate::package_manifest::PACKAGE_IPE],
+            &[crate::project::IPE_TOML],
+            &ipe_ffi::driver::FFI_CACHE_COMPONENTS,
         ]
     ) && reserved_names_are(&ipe_test_temp::RESERVED_COMPONENTS)
 );

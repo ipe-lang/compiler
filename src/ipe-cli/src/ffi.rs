@@ -29,9 +29,6 @@ use crate::remote_ingest::{
 };
 use crate::text;
 
-/// The project-relative FFI cache directory.
-const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
-
 /// The project manifest that bounds the upward cache-discovery walk.
 const PROJECT_MANIFEST: &str = crate::package_manifest::PACKAGE_IPE;
 
@@ -53,7 +50,7 @@ fn absent_as_none<T>(result: Result<T, OpenRefusal>, path: &Path) -> Result<Opti
 }
 
 /// `dir` joined with each of `below`.
-fn joined(dir: &Path, below: &[&str]) -> PathBuf {
+pub(crate) fn joined(dir: &Path, below: &[&str]) -> PathBuf {
     below
         .iter()
         .fold(dir.to_path_buf(), |path, name| path.join(name))
@@ -315,7 +312,7 @@ pub fn find_cache_root(start: &Path) -> Result<Option<TrustedCache>, CliError> {
         start.parent()
     };
     while let Some(d) = dir {
-        if let Some(cache) = owner_trust::open_cache(d, CACHE_REL)? {
+        if let Some(cache) = owner_trust::open_cache(d)? {
             return Ok(Some(cache));
         }
         // Stop at the project root: do not walk above the nearest package.ipe.
@@ -4234,6 +4231,9 @@ pub(crate) fn rust_wrapper_header_accepted_by_ffi_reader(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The project-relative FFI cache directory.
+    const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
 
     #[test]
     fn ffi_proc_cap_override_refuses_zero_and_overflow() {

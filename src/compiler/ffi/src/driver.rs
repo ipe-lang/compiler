@@ -472,10 +472,17 @@ pub const CACHE_SUBDIR: &str = "cache";
 /// The FFI artifact cache directory, component by component, relative to its project root.
 pub const FFI_CACHE_COMPONENTS: [&str; 4] = [CACHE_NAMESPACE_DIR, CACHE_SUBDIR, "ffi", "rust"];
 
-/// The FFI artifact cache directory, relative to its project root.
+/// The FFI artifact cache directory, relative to its project root, as text.
 ///
 /// It is [`FFI_CACHE_COMPONENTS`] joined by `/`; the build fails if the two drift.
+/// A path is always built from the components, never from this text: below a
+/// Windows verbatim root `/` is no separator, so the text would name one entry.
 pub const FFI_CACHE_REL: &str = ".ipe/cache/ffi/rust";
+
+/// The FFI cache path relative to its project root, built one component at a time.
+fn cache_rel() -> PathBuf {
+    FFI_CACHE_COMPONENTS.iter().collect()
+}
 
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the FFI cache path and its components drift apart [ledger #boundary]
 const _: () = assert!(rel_joins(FFI_CACHE_REL, &FFI_CACHE_COMPONENTS));
@@ -522,7 +529,7 @@ impl FfiCache {
     #[must_use]
     pub fn at_project_root(project_root: &Path) -> Self {
         Self {
-            root: project_root.join(FFI_CACHE_REL),
+            root: project_root.join(cache_rel()),
         }
     }
 
@@ -547,7 +554,7 @@ impl FfiCache {
                 got: self.root.to_string_lossy().into_owned(),
             },
         };
-        if !self.root.ends_with(FFI_CACHE_REL) {
+        if !self.root.ends_with(cache_rel()) {
             return Err(unanchored());
         }
         let depth = FFI_CACHE_COMPONENTS.len();

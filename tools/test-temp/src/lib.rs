@@ -16,11 +16,15 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
-/// The entries whose presence at a directory makes it an Ipê project root.
+/// The entries whose presence at a directory makes it an Ipê project root, component by component.
 ///
 /// The `ipe` CLI owns these names; its test build fails unless this list
-/// equals its package manifest, project manifest and FFI cache path.
-pub const PROJECT_MARKERS: [&str; 3] = ["package.ipe", "ipe.toml", ".ipe/cache/ffi/rust"];
+/// equals its package manifest, project manifest and FFI cache components.
+pub const PROJECT_MARKERS: [&[&str]; 3] = [
+    &["package.ipe"],
+    &["ipe.toml"],
+    &[".ipe", "cache", "ffi", "rust"],
+];
 
 /// The directory names the `ipe` CLI reserves, refusing build output inside them.
 ///
@@ -35,7 +39,8 @@ pub enum HostUnfit {
     MarkerAt(PathBuf),
     /// A component of the base is a reserved directory name; the path ends at it.
     ReservedComponent(PathBuf),
-    /// The base could not be resolved to its canonical form.
+    /// The base, or a marker path the proof must inspect, could not be resolved
+    /// or inspected, so its absence is unproven.
     Unresolvable(PathBuf, std::io::Error),
 }
 
@@ -49,7 +54,8 @@ pub enum HostUnfit {
 ///
 /// # Errors
 ///
-/// The first [`HostUnfit`] found; an unresolvable base is never a pass.
+/// The first [`HostUnfit`] found; an unresolvable base, or a marker path whose
+/// absence cannot be established, is never a pass.
 pub fn prove_outside_projects(base: &Path) -> Result<(), HostUnfit> {
     let canonical = std::fs::canonicalize(base)
         .map_err(|error| HostUnfit::Unresolvable(base.to_path_buf(), error))?;
@@ -85,12 +91,26 @@ fn is_reserved(name: &OsStr) -> bool {
 }
 
 /// Refuse a path where it or an ancestor holds a project marker.
+///
+/// The empty ancestor of a relative path names the working directory, not an
+/// ancestor of the base, so it is skipped; the canonical form covers the real
+/// ancestry.
 fn refuse_marker(path: &Path) -> Result<(), HostUnfit> {
     for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
         for marker in PROJECT_MARKERS {
-            let at = ancestor.join(marker);
-            if at.symlink_metadata().is_ok() {
-                return Err(HostUnfit::MarkerAt(at));
+            let mut at = ancestor.to_path_buf();
+            at.extend(marker);
+            match at.symlink_metadata() {
+                Ok(_) => return Err(HostUnfit::MarkerAt(at)),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => return Err(HostUnfit::Unresolvable(at, error)),
             }
         }
     }
@@ -110,12 +130,17 @@ fn refuse_marker(path: &Path) -> Result<(), HostUnfit> {
 #[allow(clippy::disallowed_methods)] // the sanctioned test-support reader of the temp root
 pub fn temp_root() -> PathBuf {
     let root = std::env::temp_dir();
-    #[allow(clippy::panic)] // test support: an unfit host must stop the test, never flip it
-    if let Err(unfit) = prove_outside_projects(&root) {
-        // IPE-RUST-AUDIT:ACCEPTED — test-support failure path; an unfit host fails the calling test
-        panic!("the OS temp root cannot root tests: {unfit:?}");
+    match prove_outside_projects(&root) {
+        Ok(()) => root,
+        Err(unfit) => unfit_host(&unfit),
     }
-    root
+}
+
+/// Stop the calling test on a host whose temp root fails the proof.
+#[allow(clippy::panic)] // test support: an unfit host must stop the test, never flip it
+fn unfit_host(unfit: &HostUnfit) -> ! {
+    // IPE-RUST-AUDIT:ACCEPTED — test-support failure path; an unfit host fails the calling test
+    panic!("the OS temp root cannot root tests: {unfit:?}");
 }
 
 #[cfg(test)]
@@ -174,7 +199,11 @@ mod tests {
     fn layout_names_pin() {
         assert_eq!(
             PROJECT_MARKERS,
-            ["package.ipe", "ipe.toml", ".ipe/cache/ffi/rust"]
+            [
+                &["package.ipe"][..],
+                &["ipe.toml"][..],
+                &[".ipe", "cache", "ffi", "rust"][..],
+            ]
         );
         assert_eq!(
             RESERVED_COMPONENTS,
@@ -224,7 +253,12 @@ mod tests {
         let dir = scratch("ffi-cache-ancestor");
         let base = dir.join("a").join("b");
         mkdir(&base);
-        let marker = dir.join("a").join(".ipe/cache/ffi/rust");
+        let marker = dir
+            .join("a")
+            .join(".ipe")
+            .join("cache")
+            .join("ffi")
+            .join("rust");
         mkdir(&marker);
         assert_marker(&base, &marker);
         fs::remove_dir(&marker).expect("remove marker");

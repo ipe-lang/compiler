@@ -1001,7 +1001,8 @@ fn ffi_cache_path_or_reject(project_root: &Path) -> Result<PathBuf, CliError> {
                         "the package's cache path `{}` contains a symlink at `{}`; \
                          the audit rejects this to prevent out-of-tree writes through \
                          a symlinked intermediate path component",
-                        project_root.join(ipe_ffi::driver::FFI_CACHE_REL).display(),
+                        crate::ffi::joined(project_root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS)
+                            .display(),
                         current.display(),
                     ),
                 ));

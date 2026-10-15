@@ -684,7 +684,7 @@ impl WrapperScan {
         };
         let sources: Vec<(String, String)> = crate::ffi::read_source_tree(
             cache,
-            &root.join(ipe_ffi::driver::FFI_CACHE_REL),
+            &crate::ffi::joined(root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS),
             crate::ffi::BINDING_SOURCES,
             crate::io_bounded::FFI_CACHE_CAP,
             crate::ffi::Unreadable::Refuse,
