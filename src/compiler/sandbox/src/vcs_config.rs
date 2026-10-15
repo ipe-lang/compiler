@@ -315,6 +315,10 @@ pub enum Unprovable {
     Glob,
     /// The value or its subsection names Git's `ext::` transport, which runs a program.
     ExtTransport,
+    /// Under Windows, a path is anchored on the drive or the drive's working directory the tool holds when it runs (`\x`, `/x`, `C:x`).
+    Unanchored,
+    /// Under Windows, a path names a network share or a verbatim or device namespace (`\\server\share`, `\\?\x`, `\\.\x`), which the scan never opens.
+    NetworkOrDevice,
     /// The file has more than one name.
     HardLinked,
     /// The value splits into more than [`MAX_WORDS`] words.
@@ -379,6 +383,14 @@ impl fmt::Display for Unprovable {
                  words the scan does not see",
             ),
             Self::ExtTransport => f.write_str("it runs a program through Git's `ext::` transport"),
+            Self::Unanchored => f.write_str(
+                "it names a path on the current drive or relative to a drive, which the tool \
+                 resolves against the drive and directory it runs in",
+            ),
+            Self::NetworkOrDevice => f.write_str(
+                "it names a network share or a device or verbatim namespace path, which the scan \
+                 never opens",
+            ),
             Self::HardLinked => f.write_str(
                 "it is a hard link, so another name of the same file may lie inside a writable \
                  grant",
@@ -2876,10 +2888,13 @@ impl Scan<'_> {
             };
             return Ok(vec![home.as_path().join(tail)]);
         }
-        let path = Path::new(word);
-        if path.is_absolute() {
-            return Ok(vec![path.to_path_buf()]);
+        match Anchor::of(word, self.regime) {
+            Anchor::Absolute => return Ok(vec![PathBuf::from(word)]),
+            Anchor::Unanchored => return Err(Unprovable::Unanchored),
+            Anchor::NetworkOrDevice => return Err(Unprovable::NetworkOrDevice),
+            Anchor::Relative => {}
         }
+        let path = Path::new(word);
         let command = reach == Reach::Command;
         if command
             && path
@@ -2894,6 +2909,36 @@ impl Scan<'_> {
             .map(|base| base.join(path))
             .chain(worktree)
             .collect())
+    }
+}
+
+/// What a path-shaped word is resolved against under a regime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anchor {
+    /// Nothing: it names a local root (`/x`; under Windows `C:\x`).
+    Absolute,
+    /// A base the scan knows: the home, a configuration file's directory, or the working tree.
+    Relative,
+    /// Under Windows, the drive (`\x`, `/x`) or the drive's working directory (`C:x`) the tool holds when it runs.
+    Unanchored,
+    /// Under Windows, a network share or a verbatim or device namespace, whose opening may dial a remote host.
+    NetworkOrDevice,
+}
+
+impl Anchor {
+    /// The anchor of `word` under `regime`.
+    fn of(word: &str, regime: Regime) -> Self {
+        let leads = |at: usize| word.as_bytes().get(at).is_some_and(|&c| is_sep(c, regime));
+        match Volume::parse(word, regime) {
+            Volume::None if leads(0) && regime.is_windows() => Self::Unanchored,
+            Volume::None if leads(0) => Self::Absolute,
+            Volume::None => Self::Relative,
+            Volume::Drive(letter) if leads(letter.len_utf8() + 1) => Self::Absolute,
+            Volume::Drive(_) => Self::Unanchored,
+            Volume::Unc { .. } | Volume::VerbatimUnc { .. } | Volume::Namespaced { .. } => {
+                Self::NetworkOrDevice
+            }
+        }
     }
 }
 
@@ -4916,6 +4961,132 @@ mod tests {
         write(&f.tree.join("evil.exe"), "");
         let result = scan_hg_under(&f, "[merge-tools]\nevil.priority = 1\n", Regime::Unix);
         assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    /// [`scan_git`] with every value read under `regime`.
+    fn scan_git_under(f: &Fixture, regime: Regime) -> Result<(), ConfigRefusal> {
+        let gitdir = f.tree.join(".git");
+        let roots = ConfigRoots::Git {
+            gitdir: &gitdir,
+            commondir: None,
+        };
+        scan_with_under(f, &roots, ConfigLimits::DEFAULT, regime)
+    }
+
+    #[test]
+    fn root_and_drive_relative_paths_refused_under_windows() {
+        let f = fixture("unanchoredwin");
+        // A config file reads `\\` as one backslash.
+        for value in [
+            "/no-such-ipe-hooks",
+            "\\\\no-such-ipe-hooks",
+            "C:no-such-ipe-hooks",
+        ] {
+            git_config(&f, &format!("[core]\n\thooksPath = {value}\n"));
+            let result = scan_git_under(&f, Regime::Windows);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::Unanchored),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_path_admitted_under_unix() {
+        let f = fixture("unanchoredunix");
+        for value in ["/no-such-ipe-hooks", "//no-such-ipe-srv/share/h"] {
+            git_config(&f, &format!("[core]\n\thooksPath = {value}\n"));
+            let result = scan_git_under(&f, Regime::Unix);
+            assert_eq!(result, Ok(()), "{value:?}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn share_paths_refused_under_windows_before_any_open() {
+        let f = fixture("sharewin");
+        git_config(&f, "[core]\n\thooksPath = //no-such-ipe-srv/share/h\n");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        // A config file reads `\\` as one backslash, and the value's shell-word
+        // reading drops another, so each spelling is refused under one reading
+        // or the other, never walked.
+        for value in [
+            "\\\\\\\\no-such-ipe-srv\\\\share\\\\h",
+            "/\\\\no-such-ipe-srv/share/h",
+        ] {
+            git_config(&f, &format!("[core]\n\thooksPath = {value}\n"));
+            let result = scan_git_under(&f, Regime::Windows);
+            assert!(
+                matches!(
+                    unprovable(&result),
+                    Some(Unprovable::NetworkOrDevice | Unprovable::Unanchored)
+                ),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_under_windows() {
+        for value in ["C:\\x", "c:/x", "Z:\\"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::Absolute,
+                "{value:?}"
+            );
+        }
+        for value in [
+            "\\\\srv\\share\\x",
+            "//srv/share",
+            "/\\srv\\share",
+            "\\\\srv",
+            "\\\\?\\C:\\x",
+            "\\\\?\\UNC\\srv\\share",
+            "\\\\.\\pipe\\x",
+        ] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::NetworkOrDevice,
+                "{value:?}"
+            );
+        }
+        for value in ["\\x", "/x", "C:x", "C:", "\\??\\UNC\\srv\\share"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::Unanchored,
+                "{value:?}"
+            );
+        }
+        for value in ["x", "x\\y", "./x", "..\\x"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Windows),
+                Anchor::Relative,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_under_unix() {
+        for value in ["/x", "//x"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Unix),
+                Anchor::Absolute,
+                "{value:?}"
+            );
+        }
+        for value in ["x", "\\x", "C:x", "C:\\x", "./x"] {
+            assert_eq!(
+                Anchor::of(value, Regime::Unix),
+                Anchor::Relative,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

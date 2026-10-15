@@ -2175,13 +2175,10 @@ mod read_file_beneath_stub_tests {
 
     /// A scratch root holding the regular file `f`, and the sealed root and `f`.
     fn fixture() -> (crate::scratch_core::ScratchDir, Path, Path) {
-        #[allow(clippy::expect_used)] // a test fixture that cannot be built fails the test
         let dir = crate::scratch_core::ScratchDir::new("ipe_beneath_stub")
             .expect("a scratch directory is creatable");
-        #[allow(clippy::expect_used)] // a test fixture that cannot be built fails the test
         std::fs::write(dir.path().join("f"), "inside").expect("the fixture file is writable");
         let root = tp(dir.path());
-        #[allow(clippy::expect_used)] // a test path that fails the seal fails the test
         let rel = match crate::path::path_from_string::<IpeError>("f".to_owned()) {
             IpeResult::Ok(path) => Ok(path),
             IpeResult::Err(e) => Err(e),
