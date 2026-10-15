@@ -27,7 +27,7 @@ use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use crate::doc::{ChainOperand, Doc, LeafNorm};
+use crate::doc::{ChainOperand, Doc, Leaf, LeafNorm, LeafRefusal};
 use crate::emit_expr::InfixOp;
 
 mod buf;
@@ -112,33 +112,78 @@ const CHAIN_BREAK_INDENT: usize = 4;
 /// by this width.
 const FN_CALL_WIDTH: usize = 60;
 
-/// Render `doc` to a string starting at column `col` with block indent `indent`.
-/// `col` is where the document's first character will be placed (used for the
-/// fit test); `indent` is the number of leading spaces a broken line receives.
+/// Lay `doc` out and lex the whole output as code only.
+///
+/// The only text exit from the renderer in a non-test build: `doc` lays out as
+/// if its first character lands at column `col`, with block `indent` for every
+/// line it breaks onto, within [`LAYOUT_FUEL`] (falling back to its
+/// [`Doc::plain_layout`]). Each [`Leaf`] is code only on its own; this lex sees
+/// the joins, so a comment opener or a reserved prefix formed where two leaves
+/// meet is refused too.
+///
+/// # Errors
+///
+/// The [`LeafRefusal`] [`Leaf::lex`] reports for the laid-out text.
+pub fn render_code(
+    doc: &Doc,
+    cfg: RenderConfig,
+    indent: usize,
+    col: usize,
+) -> Result<(Leaf, LayoutSpend), LeafRefusal> {
+    render_code_spend(doc, cfg, indent, col, LAYOUT_FUEL)
+}
+
+/// [`render_code`] within `fuel`, so a test can drive the plain-layout fallback.
+#[cfg(test)]
+fn render_code_within(
+    doc: &Doc,
+    cfg: RenderConfig,
+    indent: usize,
+    col: usize,
+    fuel: usize,
+) -> Result<(Leaf, LayoutSpend), LeafRefusal> {
+    render_code_spend(doc, cfg, indent, col, fuel)
+}
+
+/// Lay `doc` out within `fuel` and lex the whole output.
+fn render_code_spend(
+    doc: &Doc,
+    cfg: RenderConfig,
+    indent: usize,
+    col: usize,
+    fuel: usize,
+) -> Result<(Leaf, LayoutSpend), LeafRefusal> {
+    let (text, spend) = render_within_spend(doc, cfg, indent, col, fuel);
+    Ok((Leaf::parse(text)?, spend))
+}
+
+/// Render `doc` to an unlexed string from column 0 with no indent.
+///
+/// Test-only: production text leaves through [`render_code`].
+#[cfg(test)]
 pub fn render(doc: &Doc, cfg: RenderConfig) -> String {
     render_bounded(doc, cfg, 0, 0)
 }
 
-/// Render `doc` as if its first character lands at column `col` with the given
-/// block `indent` for any line it breaks onto. Used to lay out a construct that
-/// is spliced after a fixed prefix already occupying the start of its line — the
-/// `IpeStringify` `format!` body, which begins after `        ` (record) or after
-/// the `… => ` arm head (enum), and whose broken argument lines nest from the
-/// enclosing block indent, not from `col`. The returned string carries no leading
-/// prefix for `col` (the caller already wrote it); every broken line carries its
-/// own absolute indentation.
+/// Render `doc` to an unlexed string as if its first character lands at column
+/// `col`, with block `indent` for every line it breaks onto.
+///
+/// Test-only: production text leaves through [`render_code`]. The returned
+/// string carries no leading prefix for `col`; every broken line carries its own
+/// absolute indentation.
+#[cfg(test)]
 pub fn render_seeded(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize) -> String {
     render_bounded(doc, cfg, indent, col)
 }
 
-/// Lay `doc` out within [`LAYOUT_FUEL`]. A document whose layout search runs the
-/// fuel out gets its [`Doc::plain_layout`] instead: one pass, no fit decision, the
-/// same tokens — layout never changes what the code means.
+/// Lay `doc` out within [`LAYOUT_FUEL`], falling back to its [`Doc::plain_layout`].
+#[cfg(test)]
 fn render_bounded(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize) -> String {
     render_within(doc, cfg, indent, col, LAYOUT_FUEL)
 }
 
 /// Lay `doc` out within `fuel`, falling back to its [`Doc::plain_layout`].
+#[cfg(test)]
 fn render_within(doc: &Doc, cfg: RenderConfig, indent: usize, col: usize, fuel: usize) -> String {
     render_within_spend(doc, cfg, indent, col, fuel).0
 }
@@ -152,17 +197,7 @@ pub struct LayoutSpend {
     pub exhausted: bool,
 }
 
-/// [`render_seeded`], also reporting what its layout search spent of [`LAYOUT_FUEL`].
-pub fn render_seeded_spend(
-    doc: &Doc,
-    cfg: RenderConfig,
-    indent: usize,
-    col: usize,
-) -> (String, LayoutSpend) {
-    render_within_spend(doc, cfg, indent, col, LAYOUT_FUEL)
-}
-
-/// [`render_within`], also reporting what its layout search spent of `fuel`.
+/// Lay `doc` out within `fuel`, also reporting what its layout search spent.
 ///
 /// A scope without its memo reads as exhausted, so the render falls back to its
 /// plain layout and the report never claims a search that did not run.
@@ -255,7 +290,7 @@ fn cut_entry_bytes(layout: &Frozen) -> usize {
 /// seed column, the [`Pass`], and the buffer's [`Cursor`] — it replays the layout
 /// that render produced, shared rather than copied.
 ///
-/// Only nodes of the document passed to [`render`] / [`render_seeded`] are keyed:
+/// Only nodes of the document passed to [`render_code`] are keyed:
 /// they stay borrowed for the whole render, so no other node can take their
 /// address. A document a layout builds on the fly is rendered uncached.
 struct Memo {
@@ -5696,6 +5731,68 @@ mod p0_tests {
                 }
             }
         });
+    }
+
+    /// Two code-only leaves whose join opens a line comment: the raw-literal
+    /// prefix `r` turns the next leaf's `"\"//"` into the raw string `r"\"`
+    /// followed by `//` at byte 4.
+    fn join_comment_doc() -> Doc {
+        Doc::concat(vec![owned("r"), owned("\"\\\"//\"")])
+    }
+
+    /// The renderer's exit lexes the joined output: a comment that no leaf
+    /// holds, opened where two leaves meet, is refused at its byte.
+    #[test]
+    fn render_code_refuses_a_join_comment() {
+        let doc = join_comment_doc();
+        assert_eq!(
+            render_code(&doc, RenderConfig::default(), 0, 0).map(|(leaf, _)| leaf),
+            Err(LeafRefusal::LineComment { at: 4 })
+        );
+    }
+
+    /// The plain-layout fallback a render takes when its fuel runs out leaves
+    /// through the same lex, so it refuses the same join.
+    #[test]
+    fn render_code_refuses_a_join_comment_in_plain_fallback() {
+        let doc = join_comment_doc();
+        assert_eq!(
+            render_code_within(&doc, RenderConfig::default(), 0, 0, 0).map(|(leaf, _)| leaf),
+            Err(LeafRefusal::LineComment { at: 4 })
+        );
+        let spaced = Doc::concat(vec![owned("r"), Doc::Line, owned("\"\\\"//\"")]);
+        let fallback = render_code_within(&spaced, RenderConfig::default(), 0, 0, 0);
+        assert!(
+            fallback.is_ok_and(|(leaf, spend)| spend.exhausted && leaf.as_str() == "r \"\\\"//\""),
+            "a zero fuel must take the plain layout"
+        );
+    }
+
+    /// An identifier glued to a quoted leaf forms a reserved prefix, a cargo
+    /// error no single leaf shows; the exit refuses it at the quote.
+    #[test]
+    fn render_code_refuses_a_join_reserved_prefix() {
+        let doc = Doc::concat(vec![owned("x"), owned("\"s\"")]);
+        assert_eq!(
+            render_code(&doc, RenderConfig::default(), 0, 0).map(|(leaf, _)| leaf),
+            Err(LeafRefusal::ReservedPrefix { at: 1 })
+        );
+    }
+
+    /// Comment-shaped bytes inside literals pass the exit: the refusals above are
+    /// not vacuous.
+    #[test]
+    fn render_code_accepts_comment_text_in_literals() {
+        for text in ["\"https://\"", "r#\"//\"#"] {
+            let doc = Doc::concat(vec![owned("f("), owned(text), owned(")")]);
+            let want = format!("f({text})");
+            assert_eq!(
+                render_code(&doc, RenderConfig::default(), 0, 0)
+                    .map(|(leaf, _)| leaf.into_string()),
+                Ok(want),
+                "{text:?}"
+            );
+        }
     }
 
     /// Run `f` on a thread with the 8 MiB stack the `ipe` binary's main thread
