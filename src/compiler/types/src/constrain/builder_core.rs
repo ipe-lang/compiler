@@ -3,8 +3,8 @@ use strum::EnumCount as _;
 use super::{
     BTreeMap, BTreeSet, BinopClass, Builder, Builtins, Constraint, Content, CtorScheme, DResult,
     Diagnostic, FlatType, Generated, InferError, Interner, ModuleHome, Rc, RefCell, RowTail,
-    SchemeSlot, Span, StdlibKernel, SuperVar, Symbol, Ty, TyBounds, UnionFind, VarId, canon,
-    classify_binop, from_canon, pin_any_in_ty,
+    SchemeSlot, Span, StdlibKernel, SuperVar, Symbol, Ty, TyBounds, UnionFind, UntypedDef, VarId,
+    canon, classify_binop, from_canon, pin_any_in_ty,
 };
 
 impl<'a> Builder<'a> {
@@ -57,7 +57,7 @@ impl<'a> Builder<'a> {
             current_home: None,
             constraints: Vec::new(),
             top_level: seed_top_level, // (home, name) → Ty
-            untyped: BTreeMap::new(),  // (home, name) → VarId
+            untyped: BTreeMap::new(),  // (home, name) → UntypedDef
             field_accesses: Vec::new(),
             record_updates: Vec::new(),
             routed_web_checks: Vec::new(),
@@ -213,8 +213,14 @@ impl<'a> Builder<'a> {
                         .insert((home_key, name.value), Rc::new(normalized));
                 }
                 canon::Def::Untyped { name, .. } => {
-                    let v = builder.flex().map_err(InferError::unsited)?;
-                    builder.untyped.insert((home_key, name.value), v);
+                    let var = builder.flex().map_err(InferError::unsited)?;
+                    builder.untyped.insert(
+                        (home_key, name.value),
+                        UntypedDef {
+                            var,
+                            name_span: name.span,
+                        },
+                    );
                 }
             }
         }
