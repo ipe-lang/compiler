@@ -33,7 +33,7 @@ use ipe_diagnostics::Diagnostic;
 
 use crate::emit_expr::InfixOp;
 
-/// A layout document. Rendered by [`crate::render::render`].
+/// A layout document. Rendered by [`crate::render::render_code`].
 ///
 /// Downstream builders compose these variants. A soft break candidate is
 /// [`Doc::Line`] (a space when flat, a newline plus indent when broken) or
@@ -417,6 +417,12 @@ pub enum LeafRefusal {
         /// The byte offset of the slash.
         at: usize,
     },
+    /// An identifier glued to a `"`, `'` or `#` that no literal prefix or raw
+    /// identifier allows: a reserved prefix, which Rust 2021 and later reject.
+    ReservedPrefix {
+        /// The byte offset of the `"`, `'` or `#`.
+        at: usize,
+    },
 }
 
 impl LeafRefusal {
@@ -427,6 +433,7 @@ impl LeafRefusal {
             Self::BlockComment { .. } => "block comment",
             Self::Unterminated { .. } => "unterminated literal",
             Self::TrailingSlash { .. } => "trailing slash",
+            Self::ReservedPrefix { .. } => "reserved prefix",
         }
     }
 
@@ -436,7 +443,8 @@ impl LeafRefusal {
             Self::LineComment { at }
             | Self::BlockComment { at }
             | Self::Unterminated { at }
-            | Self::TrailingSlash { at } => at,
+            | Self::TrailingSlash { at }
+            | Self::ReservedPrefix { at } => at,
         }
     }
 }
@@ -460,31 +468,36 @@ impl Leaf {
     ///
     /// # Errors
     ///
-    /// The first comment opener outside a literal, unterminated literal, or
-    /// trailing `/`.
+    /// The first comment opener outside a literal, unterminated literal,
+    /// trailing `/`, or reserved prefix.
     pub const fn lex(s: &str) -> Result<(), LeafRefusal> {
         let all = s.as_bytes();
         let mut rest = all;
-        let mut after_ident = false;
+        let mut word = Word::None;
         while let [b, tail @ ..] = rest {
             let at = all.len().saturating_sub(rest.len());
-            let next = match (*b, tail) {
+            if word.reserves(*b) {
+                return Err(LeafRefusal::ReservedPrefix { at });
+            }
+            let after_ident = !matches!(word, Word::None);
+            let (next, glued) = match (*b, tail) {
                 (b'/', [b'/', ..]) => return Err(LeafRefusal::LineComment { at }),
                 (b'/', [b'*', ..]) => return Err(LeafRefusal::BlockComment { at }),
                 (b'/', []) => return Err(LeafRefusal::TrailingSlash { at }),
-                (b'"', _) => skip_quoted(tail),
-                (b'\'', _) => skip_char_or_lifetime(tail),
-                (b'r', _) if !after_ident => skip_raw(tail),
-                (b'b' | b'c', [b'r', raw @ ..]) if !after_ident => skip_raw(raw),
-                _ => Lexed::Code(tail),
+                (b'"', _) => (skip_quoted(tail), Word::None),
+                (b'\'', _) => (skip_char_or_lifetime(tail), Word::None),
+                (b'r', _) if !after_ident => (skip_raw(tail), Word::R),
+                (b'b', [b'r', raw @ ..]) if !after_ident => (skip_raw(raw), Word::Br),
+                (b'c', [b'r', raw @ ..]) if !after_ident => (skip_raw(raw), Word::Cr),
+                _ => (Lexed::Code(tail), word.then(*b)),
             };
             match next {
                 Lexed::Code(after) => {
-                    after_ident = is_ident_byte(*b);
+                    word = glued;
                     rest = after;
                 }
                 Lexed::Literal(after) => {
-                    after_ident = false;
+                    word = Word::None;
                     rest = after;
                 }
                 Lexed::Open => return Err(LeafRefusal::Unterminated { at }),
@@ -548,6 +561,60 @@ enum Lexed<'a> {
 /// literal prefix.
 const fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// The identifier-byte run the lexer has just passed, as far as the next byte's
+/// meaning depends on it.
+#[derive(Clone, Copy)]
+enum Word {
+    /// No identifier byte right before: the next byte starts fresh.
+    None,
+    /// A run that starts with a digit: a number, never a prefix.
+    Number,
+    /// Exactly `b`.
+    B,
+    /// Exactly `c`.
+    C,
+    /// Exactly `r`.
+    R,
+    /// Exactly `br`.
+    Br,
+    /// Exactly `cr`.
+    Cr,
+    /// Any other identifier.
+    Ident,
+}
+
+impl Word {
+    /// The run after one more code byte `b`.
+    const fn then(self, b: u8) -> Self {
+        if !is_ident_byte(b) {
+            return Self::None;
+        }
+        match (self, b) {
+            (Self::None, b'0'..=b'9') | (Self::Number, _) => Self::Number,
+            (Self::None, b'b') => Self::B,
+            (Self::None, b'c') => Self::C,
+            (Self::None, b'r') => Self::R,
+            (Self::B, b'r') => Self::Br,
+            (Self::C, b'r') => Self::Cr,
+            (Self::None | Self::B | Self::C | Self::R | Self::Br | Self::Cr | Self::Ident, _) => {
+                Self::Ident
+            }
+        }
+    }
+
+    /// Whether `b` right after this run is a reserved prefix: an identifier
+    /// glued to `"` (bar `b`, `c`, `r`, `br`, `cr`), to `'` (bar `b`), or to `#`
+    /// (bar the raw prefixes `r`, `br`, `cr`).
+    const fn reserves(self, b: u8) -> bool {
+        match b {
+            b'"' => matches!(self, Self::Ident),
+            b'\'' => matches!(self, Self::C | Self::R | Self::Br | Self::Cr | Self::Ident),
+            b'#' => matches!(self, Self::B | Self::C | Self::Ident),
+            _ => false,
+        }
+    }
 }
 
 /// Lex a quoted literal whose body, after the opening `"`, starts `s`.
@@ -1205,10 +1272,10 @@ mod tests {
     use ipe_diagnostics::{DResult, Diagnostic};
 
     use super::{Doc, Leaf, LeafRefusal};
-    use crate::render::{RenderConfig, render, render_seeded};
+    use crate::render::{RenderConfig, render, render_code, render_seeded};
 
     /// The texts a leaf refuses, each with its refusal.
-    const REFUSED: [(&str, LeafRefusal); 12] = [
+    const REFUSED: [(&str, LeafRefusal); 15] = [
         ("x // c", LeafRefusal::LineComment { at: 2 }),
         ("//", LeafRefusal::LineComment { at: 0 }),
         ("\"a\" // \"b\"", LeafRefusal::LineComment { at: 4 }),
@@ -1221,6 +1288,9 @@ mod tests {
         ("r#\"x\"", LeafRefusal::Unterminated { at: 0 }),
         ("f(b\"x)", LeafRefusal::Unterminated { at: 3 }),
         ("<'a", LeafRefusal::Unterminated { at: 1 }),
+        ("x\"s\"", LeafRefusal::ReservedPrefix { at: 1 }),
+        ("k#x", LeafRefusal::ReservedPrefix { at: 1 }),
+        ("ab'c'", LeafRefusal::ReservedPrefix { at: 2 }),
     ];
 
     /// Code-only texts, comment-shaped bytes inside literals among them.
@@ -1283,6 +1353,38 @@ mod tests {
         refused_of(|r| matches!(r, LeafRefusal::Unterminated { .. }));
     }
 
+    /// An identifier glued to `"`, `'` or `#` is a reserved prefix, a cargo
+    /// error in Rust 2021 and later.
+    #[test]
+    fn leaf_refuses_reserved_prefix() {
+        refused_of(|r| matches!(r, LeafRefusal::ReservedPrefix { .. }));
+        assert_refused("cb\"x\"", LeafRefusal::ReservedPrefix { at: 2 });
+        assert_refused("c'x'", LeafRefusal::ReservedPrefix { at: 1 });
+        assert_refused("b#x", LeafRefusal::ReservedPrefix { at: 1 });
+    }
+
+    /// The literal prefixes and the raw identifier stay legal: the refusal above
+    /// is not vacuous.
+    #[test]
+    fn leaf_accepts_literal_prefixes() {
+        for s in [
+            "r\"x\"",
+            "br#\"x\"#",
+            "b'x'",
+            "b\"x\"",
+            "c\"x\"",
+            "cr\"x\"",
+            "cr#\"x\"#",
+            "x.r#type",
+            "&'a str",
+            "<'a>",
+            "f(1, 'x')",
+            "0\"\"",
+        ] {
+            assert_eq!(Leaf::lex(s), Ok(()), "{s:?}");
+        }
+    }
+
     #[test]
     fn leaf_accepts_comment_text_inside_literals() {
         for s in ACCEPTED {
@@ -1327,7 +1429,9 @@ mod tests {
     }
 
     /// Every concatenation the layouts can write between two leaves — glued,
-    /// spaced, broken, or joined by a separator — lexes as code only.
+    /// spaced, broken, or joined by a separator — lexes as code only, except an
+    /// identifier glued to a quote: that join forms a reserved prefix, which the
+    /// joined text and the renderer's exit refuse at the quote.
     #[test]
     fn no_leaf_splice_forms_comment() {
         const CORPUS: [&str; 12] = [
@@ -1337,9 +1441,36 @@ mod tests {
         for a in CORPUS {
             assert_eq!(Leaf::lex(a), Ok(()), "{a:?}");
             for b in CORPUS {
+                // The identifier `a` ends with, and whether `b`'s opening quote
+                // glued to it is a reserved prefix (`b"…"`, `b'…'` are literals).
+                let word = a
+                    .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                let ident = word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_');
+                let reserved = ident
+                    && match b.as_bytes().first() {
+                        Some(b'"') => !matches!(word, "b" | "c" | "r" | "br" | "cr"),
+                        Some(b'\'') => word != "b",
+                        _ => false,
+                    };
+                let glued_at = |out: &str| {
+                    if reserved {
+                        Err(LeafRefusal::ReservedPrefix {
+                            at: out.len().saturating_sub(b.len()),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                };
                 for join in JOINS {
                     let spliced = format!("{a}{join}{b}");
-                    assert_eq!(Leaf::lex(&spliced), Ok(()), "{spliced:?}");
+                    let want = if join.is_empty() {
+                        glued_at(&spliced)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(Leaf::lex(&spliced), want, "{spliced:?}");
                 }
                 let soft = Doc::group(Doc::concat(vec![
                     Doc::text(leaf_of(a)),
@@ -1352,18 +1483,23 @@ mod tests {
                     Doc::text(leaf_of(a)),
                     Doc::text(leaf_of(b)),
                 ]);
-                for doc in [soft, glued] {
+                for (doc, is_glued) in [(soft, false), (glued, true)] {
                     let mut leaves = String::new();
                     doc.collect_leaves(&mut leaves);
+                    let seeded = render_seeded(&doc, RenderConfig::default(), 4, 99);
                     for out in [
                         leaves,
                         doc.plain_layout(0),
                         doc.plain_layout(8),
                         render(&doc, RenderConfig::default()),
-                        render_seeded(&doc, RenderConfig::default(), 4, 99),
+                        seeded.clone(),
                     ] {
-                        assert_eq!(Leaf::lex(&out), Ok(()), "{out:?}");
+                        let want = if is_glued { glued_at(&out) } else { Ok(()) };
+                        assert_eq!(Leaf::lex(&out), want, "{out:?}");
                     }
+                    let exit = render_code(&doc, RenderConfig::default(), 4, 99);
+                    let want = if is_glued { glued_at(&seeded) } else { Ok(()) };
+                    assert_eq!(exit.map(|_| ()), want, "{seeded:?}");
                 }
             }
         }
