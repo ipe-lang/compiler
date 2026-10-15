@@ -130,7 +130,7 @@ historyModel rows =
 
 historyRowOf : LibDb.VerifiedRow -> Queue.HistoryRow
 historyRowOf row =
-    { entry = Verified row, name = Nothing }
+    { entry = Verified row, label = Queue.Unnamed }
 
 
 -- The queue card of `loaded` on a server whose review log reads `log`.
@@ -152,7 +152,7 @@ unverifiedHistory : LogShown -> Unverified -> Model
 unverifiedHistory log why =
     { baseModel
         | page = HistoryPage
-        , history = HistoryLoaded { rows = [ { entry = Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why }, name = Nothing } ], at = HistoryStart, next = Nothing, log = log }
+        , history = HistoryLoaded { rows = [ { entry = Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why }, label = Queue.Unnamed } ], at = HistoryStart, next = Nothing, log = log }
     }
 
 
@@ -669,7 +669,7 @@ seededChecks a b =
             page (refusingModel a)
 
         hostileHistory =
-            historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Just (SafeText.renderForeign hostileText) } ]
+            historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.Labelled (Queue.unitLabel Queue.Named (Index.unitName hostileName.unit)) Queue.Indexed } ]
 
         readOnlyCard =
             page (cardModelUnder ShownUnkeyed a)

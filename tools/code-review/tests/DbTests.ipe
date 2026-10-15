@@ -629,7 +629,7 @@ historyStateTextsDistinct : Bool
 historyStateTextsDistinct =
     let
         row =
-            { entry = Unverified { uid = uid "u-h", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Nothing }
+            { entry = Unverified { uid = uid "u-h", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.Unnamed }
 
         later =
             HistoryAfter (Timestamp.fromUnixMillis 0) 1
