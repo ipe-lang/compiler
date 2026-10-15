@@ -113,16 +113,18 @@ strict policy would buy; the queue's grouping is pinned for that reason.
    repo=ipe-lang/compiler
    id=$(python3 -c 'import sys; sys.path.insert(0, ".github/ci"); import check_required_set as c; print(c.RULESET_ID)')
    gh api "repos/$repo/rulesets/$id" > /tmp/rs.json
-   jq --slurpfile want .github/ci/required-set.json \
-     '{name, target, enforcement, conditions, bypass_actors,
-       rules: [.rules[] | if .type == "required_status_checks"
-                          then .parameters.required_status_checks = $want[0] else . end]}' \
-     /tmp/rs.json > /tmp/rs-new.json
+   python3 .github/ci/check_required_set.py --render-put /tmp/rs.json > /tmp/rs-new.json
    gh api -X PUT "repos/$repo/rulesets/$id" --input /tmp/rs-new.json
    python3 .github/ci/check_required_set.py --live <(gh api "repos/$repo/rulesets/$id")
    ```
 
-   Review `/tmp/rs-new.json` before the `PUT`: it rewrites the whole ruleset.
+   `--render-put` refuses a live body the closed `Ruleset` parse refuses (an
+   unexamined key, rule or parameter, a bypass actor) and a
+   `required-set.json` that differs from the manifest, printing nothing; it
+   prints the body only once that body, re-parsed, requires exactly
+   `required-set.json`. Review `/tmp/rs-new.json` before the `PUT`: it
+   rewrites the whole ruleset. No workflow runs `--render-put` or `--write`
+   (`MAINTAINER_TOOLS` in `verify-manifest.py`).
 
 ## Break glass: a red nightly that only a merge can fix
 

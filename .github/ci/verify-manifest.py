@@ -2132,7 +2132,7 @@ def check_tool_invocations(
                 argv = call[2]
                 path = f"job {wj.job_id!r} step {i + 1} ({st.label!r})"
                 shown = " ".join([f".github/ci/{name}", *argv])
-                if (name, argv) in MAINTAINER_TOOLS:
+                if maintainer_tool(name, argv):
                     errors.append(ManifestError(
                         ErrorKind.MAINTAINER_TOOL_IN_WORKFLOW, wf.fname, path,
                         f"runs `{shown}`, a maintainer-only invocation; refused",
@@ -5290,9 +5290,18 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "ci_health_surface.py": {(): _V},
     "deterministic_checks_output.py": {(): _O},
 }
-# Maintainer-only invocations: each rewrites a committed file or renders a
-# body for an admin call, so no workflow step may run one.
-MAINTAINER_TOOLS: frozenset[tuple[str, Argv]] = frozenset({("check_required_set.py", ("--write",))})
+# Maintainer-only invocations, each a tool and its leading flag (the words
+# after it are the maintainer's operands): each rewrites a committed file or
+# renders a body for an admin call, so no workflow step may run one.
+MAINTAINER_TOOLS: frozenset[tuple[str, Argv]] = frozenset({
+    ("check_required_set.py", ("--write",)),
+    ("check_required_set.py", ("--render-put",)),
+})
+
+
+def maintainer_tool(name: str, argv: Argv) -> bool:
+    """Whether `name argv` is a `MAINTAINER_TOOLS` invocation."""
+    return any(name == tool and argv[: len(lead)] == lead for tool, lead in MAINTAINER_TOOLS)
 
 
 def tool_role(name: str, argv: Argv, table: dict[str, dict[Argv, ToolRole]] = TOOL_INVOCATIONS) -> ToolRole | None:

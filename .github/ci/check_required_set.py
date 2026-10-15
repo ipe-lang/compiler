@@ -22,6 +22,12 @@ Modes:
               `--fetch` with a ruleset-admin token: the body must also carry
               `bypass_actors`, the list must be empty, and the token's
               environment must admit `main` alone.
+  --render-put FILE
+              print the ruleset PUT body that applies `required-set.json`:
+              the admin-read ruleset JSON in FILE, parsed like `--live` save
+              for its required pairs, with those pairs replaced by the set and
+              only the writable keys (`PUT_KEYS`) kept. The body is printed
+              only once it, re-parsed, passes `--live`.
 
 The live ruleset is parsed into a closed `Ruleset`: every key the API
 returns is either examined and pinned or named as display metadata, and any
@@ -293,6 +299,32 @@ def parse_ruleset(rs: object, *, admin_read: bool) -> Ruleset:
     return Ruleset(required=required)
 
 
+# The keys of a ruleset PUT body: the writable part of the GET body.
+PUT_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors", "rules")
+
+
+def render_put(rs: object, required: list[Pair]) -> str:
+    """The PUT body applying `required` to the ruleset GET body `rs`, or
+    `Refused`. `rs` must pass the admin-read parse (its own required pairs
+    aside, which the body replaces); the body, re-read as the GET would
+    return it, must pass the same parse with exactly `required`."""
+    parse_ruleset(rs, admin_read=True)
+    if not isinstance(rs, dict):  # the parse refuses a non-object; this narrows the type
+        raise Refused("the ruleset is not an object")
+    want = json.loads(render(required))
+    rules = [
+        {**r, "parameters": {**r["parameters"], "required_status_checks": want}}
+        if r["type"] == "required_status_checks" else r
+        for r in rs["rules"]
+    ]
+    body = {k: rs[k] for k in PUT_KEYS if k in rs and k != "rules"} | {"rules": rules}
+    got = parse_ruleset({**body, "id": RULESET_ID}, admin_read=True).required
+    problems = diff(required, list(got), "the rendered PUT body", "this is a defect in render_put")
+    if problems:
+        raise Refused("; ".join(problems))
+    return json.dumps(body, indent=2) + "\n"
+
+
 def diff(expected: list[Pair], actual: list[Pair], what: str, fix: str) -> list[str]:
     """Lines naming each pair missing from and extra in `actual`, or []."""
     missing = sorted(set(expected) - set(actual))
@@ -472,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--live", metavar="FILE")
     mode.add_argument("--fetch", action="store_true")
     mode.add_argument("--fetch-admin", action="store_true")
+    mode.add_argument("--render-put", metavar="FILE")
     args = ap.parse_args(argv)
     try:
         required = derive(_load_manifest())
@@ -487,6 +520,11 @@ def main(argv: list[str] | None = None) -> int:
             required, on_disk, ".github/ci/required-set.json",
             "regenerate it: python3 .github/ci/check_required_set.py --write",
         )
+        if args.render_put:
+            if problems:
+                raise Refused("; ".join(problems))
+            sys.stdout.write(render_put(_load_json(args.render_put, args.render_put), required))
+            return 0
         live = bool(args.live or args.fetch or args.fetch_admin)
         if live:
             rs = _load_json(args.live, args.live) if args.live else fetch_live(admin=bool(args.fetch_admin))

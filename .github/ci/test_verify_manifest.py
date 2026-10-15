@@ -2395,6 +2395,8 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
         for verdict, argv in (("prose_guard.py", ()), ("e2e_shard.py", ("--plan",)),
                               ("nightly_green.py", ("--verdict",)), ("check_required_set.py", ("--fetch",))):
             self.assertIs(vm.tool_role(verdict, argv), vm.ToolRole.VERDICT, verdict)
+        self.assertTrue(vm.maintainer_tool("check_required_set.py", ("--render-put", "/tmp/rs.json")))
+        self.assertFalse(vm.maintainer_tool("check_required_set.py", ("--fetch",)))
         for name, argv in (("verify-manifest.py", ("--help",)), ("check_required_set.py", ("--write",)),
                            ("strict_yaml.py", ()), ("new.py", ())):
             self.assertIsNone(vm.tool_role(name, argv), (name, argv))
@@ -2600,6 +2602,13 @@ _ENV_MAIN_ONLY = {
 _POLICIES_MAIN = {"total_count": 1, "branch_policies": [{"id": 1, "name": "main", "type": "branch"}]}
 
 
+def crs_put_keys() -> tuple[str, ...]:
+    """`check_required_set.PUT_KEYS`, imported from this directory."""
+    import check_required_set  # noqa: PLC0415
+
+    return check_required_set.PUT_KEYS
+
+
 class TestSsotOutputTools(unittest.TestCase):
     """The SSOT-publishing tools fail closed on a malformed SSOT: exit 1 and
     write no output, so a consumer keeps its fail-safe default."""
@@ -2785,6 +2794,66 @@ class TestSsotOutputTools(unittest.TestCase):
             with self.subTest(content=content):
                 self.put("rs.json", content)
                 self.assertFailsClosed("check_required_set.py", "--live", os.path.join(self.dir, "rs.json"))
+
+    # ---- --render-put: the one ruleset PUT body ------------------------
+
+    def _render_put(self, rs: object) -> tuple[int, str, str]:
+        self.put("rs.json", json.dumps(rs).encode())
+        return self.run_tool("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+
+    def test_render_put_refuses_an_unparsed_live_body(self) -> None:
+        self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n")
+        self.put("required-set.json", _RS_A)
+        for label, rs in (
+            ("unexamined top-level key", _ruleset(frob=1)),
+            ("a bypass actor", _ruleset(bypass_actors=[{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}])),
+            ("no bypass_actors", {k: v for k, v in _ruleset().items() if k != "bypass_actors"}),
+            ("disabled", _ruleset(enforcement="disabled")),
+            ("unexamined rule type", _ruleset(rules=_ruleset()["rules"] + [{"type": "update"}])),
+            ("malformed pair", _ruleset(checks=[{"context": "a"}])),
+            ("not an object", []),
+        ):
+            with self.subTest(label=label):
+                self.put("rs.json", json.dumps(rs).encode())
+                self.assertFailsClosed("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+        for content in (None, b"", b"{"):
+            with self.subTest(content=content):
+                self.put("rs.json", content)
+                self.assertFailsClosed("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+
+    def test_render_put_refuses_a_required_set_off_the_manifest(self) -> None:
+        self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n- context: b\n  disposition: gate\n")
+        for label, content in (("missing context", _RS_A), ("extra context", json.dumps(
+            [{"context": c, "integration_id": 15368} for c in ("a", "b", "c")]).encode())):
+            with self.subTest(label=label):
+                self.put("required-set.json", content)
+                self.put("rs.json", json.dumps(_ruleset()).encode())
+                self.assertFailsClosed("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+
+    def test_render_put_applies_the_required_set_to_a_drifted_body(self) -> None:
+        self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n- context: b\n  disposition: gate\n")
+        want = [{"context": "a", "integration_id": 15368}, {"context": "b", "integration_id": 15368}]
+        self.put("required-set.json", json.dumps(want).encode())
+        for label, live in (
+            ("missing context", [_PAIR_A]),
+            ("extra context", [*want, {"context": "z", "integration_id": 15368}]),
+            ("other integration", [{"context": "a", "integration_id": 1}]),
+            ("already applied", want),
+        ):
+            with self.subTest(label=label):
+                rc, stdout, stderr = self._render_put(_ruleset(checks=live))
+                self.assertEqual(rc, 0, stderr)
+                body = json.loads(stdout)
+                self.assertEqual(tuple(body), crs_put_keys())
+                status = [r for r in body["rules"] if r["type"] == "required_status_checks"]
+                self.assertEqual(len(status), 1)
+                self.assertEqual(status[0]["parameters"]["required_status_checks"], want)
+                # Every rule but the status rule is the live one, unchanged.
+                self.assertEqual([r for r in body["rules"] if r["type"] != "required_status_checks"],
+                                 [r for r in _ruleset()["rules"] if r["type"] != "required_status_checks"])
+                # The body, re-read as the GET returns it, passes `--live`.
+                self.put("rs.json", json.dumps({**body, "id": 22326541}).encode())
+                self.assertEqual(self.run_tool("check_required_set.py", "--live", os.path.join(self.dir, "rs.json"))[0], 0)
 
     def test_check_required_set_fetch_needs_its_environment(self) -> None:
         self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n")
@@ -7903,6 +7972,7 @@ class TestToolInvocationsClosed(unittest.TestCase):
         for run, kind in (
             ("python3 .github/ci/verify-manifest.py --help", "TOOL_ARGV_UNLISTED"),
             ("python3 .github/ci/check_required_set.py --write", "MAINTAINER_TOOL_IN_WORKFLOW"),
+            ("python3 .github/ci/check_required_set.py --render-put rs.json", "MAINTAINER_TOOL_IN_WORKFLOW"),
             ("python3 .github/ci/strict_yaml.py", "TOOL_UNLISTED"),
             ("python3 .github/ci/new.py", "TOOL_UNLISTED"),
             ("python3 .github/ci/e2e_shard.py --plan --extra", "TOOL_ARGV_UNLISTED"),
