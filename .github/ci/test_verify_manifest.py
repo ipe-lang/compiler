@@ -7296,7 +7296,7 @@ class TestTypedWorkflowLoad(unittest.TestCase):
         exception from any of them fails the test (a crash is no verdict)."""
         vm = verify_manifest
         errors = list(wfs.rendered())
-        vm.check_permissions(wfs, errors)
+        vm.check_permissions(wfs, errors, {})
         vm.check_deterministic_set(wfs, errors)
         vm.check_workflow_steps(wfs, errors)
         vm.check_merge_queue(wfs, {"w.yml"}, errors)
@@ -7921,6 +7921,60 @@ class TestToolInvocationsClosed(unittest.TestCase):
     def test_live_tool_invocations_listed_and_no_row_stale(self) -> None:
         errors: list[str] = []
         verify_manifest.check_tool_invocations(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
+
+
+class TestNoForgingToken(unittest.TestCase):
+    """T8: no token can write a commit status or a check run (a forged
+    required context); every other write grant is a reviewed row."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, text: str, fname: str = "w.yml", grants: dict | None = None) -> list[str]:
+        _write(os.path.join(self.root, "workflows", fname), text)
+        errors: list[str] = []
+        verify_manifest.check_permissions(_load(self.root, errors), errors, {} if grants is None else grants)
+        return errors
+
+    def assertKind(self, kind: str, text: str, **kw: object) -> None:
+        errors = self.errors(text, **kw)  # type: ignore[arg-type]
+        self.assertTrue(any(e.endswith(f"[{kind}]") for e in errors), (kind, errors))
+
+    def test_forging_grants_refused_at_every_level(self) -> None:
+        for scope in ("statuses", "checks"):
+            top = _TL_OK.replace("  contents: read\n", f"  contents: read\n  {scope}: write\n")
+            job = _TL_OK.replace("  a:\n", f"  a:\n    permissions:\n      {scope}: write\n")
+            for text, fname in ((top, "w.yml"), (job, "w.yml"), (top, "release.yml")):
+                with self.subTest(scope=scope, fname=fname, text=text):
+                    grants = {(fname, None, scope): "x", (fname, "a", scope): "x"}
+                    self.assertKind("PERMISSIONS_FORGING", text, fname=fname, grants=grants)
+        for text in (
+            _TL_OK.replace("permissions:\n  contents: read\n", "permissions: write-all\n"),
+            _TL_OK.replace("  a:\n", "  a:\n    permissions: write-all\n"),
+        ):
+            with self.subTest(text=text):
+                errors = self.errors(text)
+                self.assertTrue(any("is `write-all`" in e and e.endswith("[PERMISSIONS_FORGING]") for e in errors), errors)
+
+    def test_unlisted_write_grant_refused_and_listed_admitted(self) -> None:
+        text = _TL_OK.replace("  contents: read\n", "  contents: write\n")
+        self.assertKind("WRITE_GRANT_UNLISTED", text)
+        self.assertEqual(self.errors(text, grants={("w.yml", None, "contents"): "why"}), [])
+        # A row binds its level: a workflow-level row does not admit a job grant.
+        job = _TL_OK.replace("  a:\n", "  a:\n    permissions:\n      contents: write\n")
+        self.assertKind("WRITE_GRANT_UNLISTED", job, grants={("w.yml", None, "contents"): "why"})
+
+    def test_stale_write_grant_row_refused(self) -> None:
+        for row in (("w.yml", None, "contents"), ("w.yml", "a", "actions"), ("gone.yml", None, "pages")):
+            with self.subTest(row=row):
+                self.assertKind("WRITE_GRANT_ROW_STALE", _TL_OK, grants={row: "why"})
+
+    def test_live_grants_are_the_table(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_permissions(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
 

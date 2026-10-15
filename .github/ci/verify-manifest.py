@@ -11,7 +11,10 @@ Checks performed
      job, a `needs:` of `''`, `false`, `0`, `[]`, `null`, a non-string,
      duplicate or unknown member, malformed `permissions:`) is a typed
      `ManifestError` refusal, never "no needs". Every workflow declares a
-     top-level `permissions:`.
+     top-level `permissions:`. No `permissions:` value, at any level of any
+     workflow, is `write-all` or grants `statuses`/`checks` write (a token
+     that could forge a required context); every other write grant is a
+     `WRITE_GRANTS` row, and a row nothing grants is refused as stale.
   1. Every status context produced by .github/workflows/*.yml or *.yaml
      (matrix legs expanded) is present in the manifest.  An unclassified
      check is the exact "silent advisory red" this SSOT exists to forbid.
@@ -1125,6 +1128,9 @@ class ErrorKind(enum.Enum):
     TOOL_ARGV_UNLISTED = "tool-argv-unlisted"
     MAINTAINER_TOOL_IN_WORKFLOW = "maintainer-tool-in-workflow"
     TOOL_ROW_STALE = "tool-row-stale"
+    PERMISSIONS_FORGING = "permissions-forging"
+    WRITE_GRANT_UNLISTED = "write-grant-unlisted"
+    WRITE_GRANT_ROW_STALE = "write-grant-row-stale"
 
 
 @dataclass(frozen=True)
@@ -1381,15 +1387,71 @@ def _load_permissions(container: dict, fname: str, where: str, refusals: list[Ma
     return perms
 
 
-def check_permissions(wfs: WorkflowSet, errors: list[str]) -> None:
+# Scopes whose write grant lets a workflow token forge a status context or a
+# check run (a required context then reads green with nothing run).
+FORGING_SCOPES = frozenset({"statuses", "checks"})
+# Every write grant a workflow token holds: (workflow, job id or None for the
+# workflow level, scope) -> why it needs it. A grant not listed, or a row no
+# workflow grants, is refused.
+WRITE_GRANTS: dict[tuple[str, str | None, str], str] = {
+    ("release-please.yml", None, "contents"): "release-please pushes the release branch and tag",
+    ("release-please.yml", None, "pull-requests"): "release-please opens and updates the release PR",
+    ("release.yml", None, "contents"): "uploads the release assets",
+    ("docs-pages.yml", None, "pages"): "deploys the docs site",
+    ("docs-pages.yml", None, "id-token"): "the Pages deployment authenticates by OIDC",
+    ("nightly-full-gate.yml", None, "actions"): "dispatches ci.yml",
+    ("rerun-failed-once.yml", None, "actions"): "reads job logs and reruns failed jobs",
+    ("ci.yml", "cancel-on-cheap-red", "actions"): "cancels the run once a cheap check is red",
+    ("ci-health.yml", None, "issues"): "opens and updates the CI health issue",
+}
+
+
+def check_permissions(
+    wfs: WorkflowSet, errors: list[str], grants: dict[tuple[str, str | None, str], str] | None = None
+) -> None:
     """Every workflow declares a top-level `permissions:` (the default token
-    may write)."""
+    may write); no `permissions:` value, workflow or job level, is
+    `write-all` or grants a `FORGING_SCOPES` write; and every other write
+    grant is a `WRITE_GRANTS` row, every row one some workflow grants."""
+    grants = WRITE_GRANTS if grants is None else grants
+    seen: set[tuple[str, str | None, str]] = set()
     for wf in wfs.workflows:
         if "permissions" not in wf.doc:
             errors.append(ManifestError(
                 ErrorKind.PERMISSIONS_MISSING, wf.fname, "",
                 "declares no top-level `permissions:` — the default token may write; refused",
             ).render())
+        levels = [(None, wf.permissions, "permissions:")]
+        levels += [(wj.job_id, wj.permissions, f"job {wj.job_id!r} permissions:") for wj in wf.jobs]
+        for jid, perms, path in levels:
+            if perms is None:
+                continue
+            if perms.every is Access.WRITE:
+                errors.append(ManifestError(
+                    ErrorKind.PERMISSIONS_FORGING, wf.fname, path,
+                    "is `write-all`, which lets the token write commit statuses and check runs; refused",
+                ).render())
+                continue
+            for scope in sorted(perms.write_scopes()):
+                if scope in FORGING_SCOPES:
+                    errors.append(ManifestError(
+                        ErrorKind.PERMISSIONS_FORGING, wf.fname, path,
+                        f"grants `{scope}: write`, which lets the token forge a required context; refused",
+                    ).render())
+                elif (wf.fname, jid, scope) not in grants:
+                    errors.append(ManifestError(
+                        ErrorKind.WRITE_GRANT_UNLISTED, wf.fname, path,
+                        f"grants `{scope}: write`, which `WRITE_GRANTS` does not list; refused",
+                    ).render())
+                else:
+                    seen.add((wf.fname, jid, scope))
+    for row in sorted(set(grants) - seen, key=str):
+        fname, jid, scope = row
+        where = f"job {jid!r} permissions:" if jid is not None else "permissions:"
+        errors.append(ManifestError(
+            ErrorKind.WRITE_GRANT_ROW_STALE, fname, where,
+            f"has a `WRITE_GRANTS` row for `{scope}: write` but grants no such write; remove the row",
+        ).render())
 
 
 @dataclass(frozen=True)
