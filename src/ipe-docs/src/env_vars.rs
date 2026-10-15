@@ -1408,8 +1408,8 @@ mod tests {
     /// runtime serves when the variable is unset: same-origin framing only.
     #[test]
     fn frame_ancestors_default_matches_runtime() {
-        use ipe_runtime_rust::csp::{ContentSecurityPolicy, Profile};
-        let served = ContentSecurityPolicy::for_profile(Profile::Response, None).header_value();
+        use ipe_runtime_rust::csp::{ContentSecurityPolicy, Guarded};
+        let served = ContentSecurityPolicy::for_guard(&Guarded::Response, None).header_value();
         assert!(
             served.ends_with("frame-ancestors 'self'"),
             "an unset framing policy must serve same-origin framing: {served}"
