@@ -49,11 +49,21 @@ Checks performed
       reporting job holds a decider under a guard whose absent input means
       run: a VERDICT `TOOL_INVOCATIONS` row, the phase verdict, a command a
       `local:` block mirrors, or the one script step its `INLINE_DECIDERS`
-      row names (a `run:` script, or a `with.run` script through an action
-      a `SCRIPT_ACTIONS` row admits by exact pinned `uses:` and `with:`
-      inputs). No such job carries a job-level `continue-on-error:` (it
-      reports a failed run as passing). `KNOWN_SKIP_AS_PASS` names, with the
-      reason, a required job that skips as pass; a row of any of the three
+      row names (a non-empty `run:` script, or a non-empty `with.run`
+      script through an action a `SCRIPT_ACTIONS` row admits by exact pinned
+      `uses:` and `with:` inputs). No such job carries a job-level
+      `continue-on-error:` (it reports a failed run as passing). Every step
+      of a reporting job that runs a mirrored command (as the mirror reads
+      its lines, or as `shell_lex` reads its commands) exits non-zero when
+      that command fails and runs it as its `local:` twin does: no
+      `continue-on-error:`; the commands bash reads are the mirror's lines,
+      word for word and in order, and each is mirrored (no `set +e`, `trap`,
+      `exit`, separator, redirection, subshell, or a comment continuation or
+      quote hiding a line from the mirror); several commands run under
+      `bash` (explicit, or the default on an Ubuntu or macOS runner); and
+      every env key of its workflow, job and step scope holds a
+      `MIRRORED_STEP_ENV` value. `KNOWN_SKIP_AS_PASS` names, with the
+      reason, a required job that skips as pass; a row of any of these
       tables that no longer applies is refused as stale.
   1d. Every `.github/ci` tool a workflow step runs is a (tool, argv) pair
       `TOOL_INVOCATIONS` lists, never a `MAINTAINER_TOOLS` invocation, and
@@ -504,6 +514,7 @@ import os
 import enum
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -1132,6 +1143,8 @@ class ErrorKind(enum.Enum):
     DECIDER_ROW_AMBIGUOUS = "decider-row-ambiguous"
     INLINE_DECIDER_UNADMITTED = "inline-decider-unadmitted"
     SCRIPT_ACTION_ROW_INVALID = "script-action-row-invalid"
+    MIRRORED_STEP_UNADMITTED = "mirrored-step-unadmitted"
+    MIRRORED_ENV_ROW_STALE = "mirrored-env-row-stale"
     TOOL_UNLISTED = "tool-unlisted"
     TOOL_ARGV_UNLISTED = "tool-argv-unlisted"
     MAINTAINER_TOOL_IN_WORKFLOW = "maintainer-tool-in-workflow"
@@ -1900,6 +1913,24 @@ KNOWN_SKIP_AS_PASS: dict[tuple[str, str], str] = {
 }
 
 
+# The env a step running a mirrored command reads, merged over workflow, job
+# and step `env:`: key -> the exact values admitted. Any other key (a
+# `CARGO_ALIAS_CLIPPY: check` turns `cargo clippy` into `cargo check`), or
+# another value (`RUSTFLAGS: --cap-lints=allow`), runs a command its `local:`
+# twin does not; a row no such step reads is refused as stale.
+MIRRORED_STEP_ENV: dict[str, frozenset[str]] = {
+    "CARGO_INCREMENTAL": frozenset({"0"}),
+    "CARGO_TERM_COLOR": frozenset({"always"}),
+    "IPE_BIN": frozenset({"${{ runner.temp }}/ipe-release/ipe"}),
+    "IPE_E2E": frozenset({"1"}),
+    "IPE_RUNTIME_DIR": frozenset({"${{ github.workspace }}/src/runtime/rust/src"}),
+    "RUSTFLAGS": frozenset({"-C link-arg=-fuse-ld=mold"}),
+}
+# Runner labels whose default shell (no `shell:` anywhere) is `bash -e`, which
+# stops a script at its first failed command; pwsh reports only the last one.
+BASH_DEFAULT_RUNNER_PREFIXES = ("ubuntu-", "macos-")
+
+
 def _step_key(st: Step) -> str:
     """How `INLINE_DECIDERS` names a step: its `name:`, else its whole
     trimmed `run:` text."""
@@ -1952,20 +1983,115 @@ def _mirrored_commands(wf: Workflow, wj: WorkflowJob, entries: list[ManifestEntr
     return out
 
 
-def _is_mirrored(wf: Workflow, wj: WorkflowJob, st: Step, mirrored: set[tuple[Argv, str]]) -> bool:
-    """Whether a command line of `st` is one a `local:` block mirrors, read
-    by `local_gate.ci_lines` itself (no second mirror grammar)."""
+def _step_ci_lines(wf: Workflow, wj: WorkflowJob, st: Step) -> list:
+    """The command lines of `st` as `local_gate.ci_lines` reads them (no
+    second mirror grammar), with the job's and workflow's env and defaults."""
     import local_gate  # noqa: PLC0415
 
-    if not mirrored or st.run is None:
-        return False
     job = {k: v for k, v in wj.raw.items() if k != "steps"}
     doc = {k: wf.doc[k] for k in ("env", "defaults") if k in wf.doc}
     doc["jobs"] = {wj.job_id: {**job, "steps": [st.raw]}}
-    return any(
-        (tuple(t for t in ln.argv if t not in local_gate.CI_ONLY_FLAGS), ln.cwd) in mirrored
-        for ln in local_gate.ci_lines(doc, wj.job_id, [])
-    )
+    return local_gate.ci_lines(doc, wj.job_id, [])
+
+
+def _mirror_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
+    """`argv` without the flags CI adds for its runner (`CI_ONLY_FLAGS`)."""
+    import local_gate  # noqa: PLC0415
+
+    return tuple(t for t in argv if t not in local_gate.CI_ONLY_FLAGS)
+
+
+def _step_cwd(wf: Workflow, wj: WorkflowJob, st: Step) -> str:
+    """The working directory `local_gate.ci_lines` gives `st`'s lines."""
+    import local_gate  # noqa: PLC0415
+
+    default = local_gate._default_working_directory(wj.raw) or local_gate._default_working_directory(wf.doc) or "."
+    return os.path.normpath(str(st.raw.get("working-directory", default)))
+
+
+def _is_mirrored(wf: Workflow, wj: WorkflowJob, st: Step, mirrored: set[tuple[Argv, str]]) -> bool:
+    """Whether `st` runs a command a `local:` block mirrors, as the mirror
+    reads its lines or as bash reads its commands (`cmd || true` is one
+    line to the mirror, and holds the mirrored command to bash)."""
+    import local_gate  # noqa: PLC0415
+
+    if not mirrored or st.run is None or st.uses is not None:
+        return False
+    if any((_mirror_argv(ln.argv), ln.cwd) in mirrored for ln in _step_ci_lines(wf, wj, st)):
+        return True
+    cwd = _step_cwd(wf, wj, st)
+    cmds = shell_lex.split_commands(local_gate.canon_expr(st.run))
+    return any((_mirror_argv(tuple(c.words)), cwd) in mirrored for c in cmds)
+
+
+def _run_shell(wf: Workflow, wj: WorkflowJob, st: Step) -> str | None:
+    """The `shell:` a `run:` step runs under: its own, else the job's, else
+    the workflow's `defaults.run.shell` (check 7 admits only bare names)."""
+    if "shell" in st.raw:
+        return str(st.raw["shell"])
+    for doc in (wj.raw, wf.doc):
+        defaults = doc.get("defaults")
+        run = defaults.get("run") if isinstance(defaults, dict) else None
+        if isinstance(run, dict) and "shell" in run:
+            return str(run["shell"])
+    return None
+
+
+def _mirrored_step_flaw(
+    wf: Workflow, wj: WorkflowJob, st: Step, mirrored: set[tuple[Argv, str]],
+    env_rows: dict[str, frozenset[str]], used_env: set[tuple[str, str]],
+) -> str | None:
+    """Why `st`, a step running a mirrored command, could exit 0 after that
+    command failed, or run it other than its `local:` twin does; None when
+    sound. Sound means: no `continue-on-error:`; the commands bash reads in
+    the script are the lines the mirror reads, word for word and in order (a
+    comment ending in a backslash, a quote across lines, `||`, `;`, `&`, a
+    pipe, a redirection or a subshell each split the two readings apart),
+    and each is mirrored, so no `set +e`, `trap` or `exit` line runs; a
+    script of several commands runs under a shell that stops at the first
+    failure; and every env key it reads holds a `MIRRORED_STEP_ENV` value."""
+    import local_gate  # noqa: PLC0415
+
+    if "continue-on-error" in st.raw:
+        return "carries `continue-on-error:`, so a failed mirrored command reports as passing"
+    text = local_gate.canon_expr(st.run or "")
+    for line in local_gate._logical_lines(text):
+        try:
+            shlex.split(line, comments=True)
+        except ValueError:
+            return f"has the line {line.strip()!r}, which the mirror cannot split into words"
+    lines = _step_ci_lines(wf, wj, st)
+    cmds = shell_lex.split_commands(text)
+    if any(c.writes or c.heredoc or c.herestring or c.pipe_source is not None or c.subshell for c in cmds):
+        return "redirects, pipes or nests a command, so the step's exit status need not be the mirrored command's"
+    if [tuple(c.words) for c in cmds] != [ln.argv for ln in lines]:
+        return (
+            "is read by bash as other commands than the mirror reads (a separator, a comment continuation "
+            "or a quote across lines)"
+        )
+    for ln in lines:
+        if (_mirror_argv(ln.argv), ln.cwd) not in mirrored:
+            return f"runs {shlex.join(ln.argv)!r} (cwd {ln.cwd!r}), which no `local:` block mirrors"
+    if len(lines) > 1:
+        shell = _run_shell(wf, wj, st)
+        runs_on = wj.raw.get("runs-on")
+        bash_default = shell is None and isinstance(runs_on, str) and runs_on.startswith(BASH_DEFAULT_RUNNER_PREFIXES)
+        if shell != "bash" and not bash_default:
+            return (
+                f"runs {len(lines)} commands under shell {shell!r} on {runs_on!r}, which need not stop at the "
+                "first failed one (only `bash`, or no `shell:` on an Ubuntu or macOS runner, does)"
+            )
+    env = {
+        **local_gate._mapping(wf.doc.get("env")),
+        **local_gate._mapping(wj.raw.get("env")),
+        **local_gate._mapping(st.raw.get("env")),
+    }
+    for key, value in sorted(env.items()):
+        admitted = {local_gate.canon_expr(v) for v in env_rows.get(key, frozenset())}
+        if value not in admitted:
+            return f"reads env {key}={value!r}, which no `MIRRORED_STEP_ENV` row admits"
+        used_env.add((key, value))
+    return None
 
 
 class DeciderKind(enum.Enum):
@@ -1976,12 +2102,14 @@ class DeciderKind(enum.Enum):
 
 
 def _decider_kind(
-    wf: Workflow, wj: WorkflowJob, st: Step, mirrored: set[tuple[Argv, str]]
+    wf: Workflow, wj: WorkflowJob, st: Step, mirrored: set[tuple[Argv, str]],
+    env_rows: dict[str, frozenset[str]] | None = None,
 ) -> DeciderKind | None:
     """What makes `st` a decider of its job, if anything. A step carrying
     `continue-on-error:` decides nothing, save the `changes` job's advisory
     classifier, whose crash leaves its outputs unset (every consumer then
-    runs everything)."""
+    runs everything); a mirrored step decides only when `_mirrored_step_flaw`
+    finds none."""
     if st.uses == PHASE_VERDICT_ACTION:
         return DeciderKind.PHASE_VERDICT if "continue-on-error" not in st.raw else None
     call = tool_call(st.run) if st.run is not None and st.uses is None else None
@@ -1993,7 +2121,8 @@ def _decider_kind(
         if role is ToolRole.ADVISORY and wj.job_id == CLASSIFIER_JOB and st.raw.get("continue-on-error", True) is True:
             return DeciderKind.CLASSIFIER
         return None
-    if "continue-on-error" not in st.raw and _is_mirrored(wf, wj, st, mirrored):
+    rows = MIRRORED_STEP_ENV if env_rows is None else env_rows
+    if _is_mirrored(wf, wj, st, mirrored) and _mirrored_step_flaw(wf, wj, st, mirrored, rows, set()) is None:
         return DeciderKind.LOCAL_MIRRORED
     return None
 
@@ -2006,7 +2135,9 @@ def _inline_decider(st: Step, actions: dict[str, "ScriptAction"]) -> str | None:
     if "continue-on-error" in st.raw:
         return "carries `continue-on-error:`"
     if st.uses is None:
-        return None if st.run is not None else "runs no script"
+        if st.run is None:
+            return "runs no script"
+        return None if shell_lex.split_commands(st.run) else "runs an empty script"
     row = actions.get(st.uses)
     if row is None:
         return f"runs the action {st.uses!r}, which no `SCRIPT_ACTIONS` row admits as a script runner"
@@ -2016,6 +2147,8 @@ def _inline_decider(st: Step, actions: dict[str, "ScriptAction"]) -> str | None:
     extra = sorted(str(k) for k in with_ if k not in row.inputs)
     if extra:
         return f"passes {st.uses!r} the inputs {extra}, which its `SCRIPT_ACTIONS` row does not admit"
+    if not shell_lex.split_commands(with_["run"]):
+        return f"runs {st.uses!r} with an empty `with.run` script"
     return None
 
 
@@ -2028,14 +2161,18 @@ def check_required_guards(
     known_skips: dict[tuple[str, str], str] | None = None,
     actions: dict[str, ScriptAction] | None = None,
     stale: bool = True,
+    env_rows: dict[str, frozenset[str]] | None = None,
 ) -> None:
-    """Check 1c (see the module docstring). `stale` off skips the
-    unused-`SCRIPT_ACTIONS`-row rule (a probe over one workflow)."""
+    """Check 1c (see the module docstring). `stale` off skips the unused
+    `SCRIPT_ACTIONS` and `MIRRORED_STEP_ENV` row rules (a probe over one
+    workflow)."""
     import local_gate  # noqa: PLC0415
 
     inline = INLINE_DECIDERS if inline is None else inline
     known_skips = KNOWN_SKIP_AS_PASS if known_skips is None else known_skips
     actions = SCRIPT_ACTIONS if actions is None else actions
+    env_rows = MIRRORED_STEP_ENV if env_rows is None else env_rows
+    used_env: set[tuple[str, str]] = set()
     locals_ = local_gate.parse_manifest_locals([e for e in raw_entries if isinstance(e, dict)], [])
     reporting, held = required_jobs(wfs, entries)
 
@@ -2095,11 +2232,20 @@ def check_required_guards(
         if (fname, jid) not in reporting:
             continue
         mirrored = _mirrored_commands(wf, wj, entries, locals_)
+        for i, st in enumerate(steps):
+            if not _is_mirrored(wf, wj, st, mirrored):
+                continue
+            flaw = _mirrored_step_flaw(wf, wj, st, mirrored, env_rows, used_env)
+            if flaw is not None:
+                refuse(
+                    ErrorKind.MIRRORED_STEP_UNADMITTED, fname, f"{jpath} step {i + 1} ({st.label!r})",
+                    f"runs a command a `local:` block mirrors but {flaw}; refused",
+                )
         decided = False
         for st, g in zip(steps, guards):
             if g is None or g.kind not in DECIDER_GUARDS:
                 continue
-            if _decider_kind(wf, wj, st, mirrored) is not None:
+            if _decider_kind(wf, wj, st, mirrored, env_rows) is not None:
                 decided = True
                 spec_decided.add((fname, jid))
                 break
@@ -2146,6 +2292,13 @@ def check_required_guards(
             refuse(ErrorKind.SCRIPT_ACTION_ROW_INVALID, "verify-manifest.py", "SCRIPT_ACTIONS", f"{uses!r} names no reason its source fails on a failed script; refused")
         elif stale and uses not in used_actions:
             refuse(ErrorKind.SCRIPT_ACTION_ROW_INVALID, "verify-manifest.py", "SCRIPT_ACTIONS", f"{uses!r} is run by no inline decider; remove the row")
+    for key, values in sorted(env_rows.items()):
+        for value in sorted(values):
+            if stale and (key, local_gate.canon_expr(value)) not in used_env:
+                refuse(
+                    ErrorKind.MIRRORED_ENV_ROW_STALE, "verify-manifest.py", "MIRRORED_STEP_ENV",
+                    f"{key}={value!r} is read by no mirrored step; remove the value",
+                )
     for (fname, jid) in sorted(known_skips):
         if (fname, jid) not in held:
             refuse(ErrorKind.KNOWN_SKIP_ROW_STALE, fname, f"job {jid!r}", "has a `KNOWN_SKIP_AS_PASS` row but is no required job; remove the row")
@@ -2153,7 +2306,9 @@ def check_required_guards(
         probe: list[str] = []
         rest = {k: v for k, v in known_skips.items() if k != (fname, jid)}
         own = {k: v for k, v in inline.items() if k[0] == fname}
-        check_required_guards(_only_workflow(wfs, fname), entries, raw_entries, probe, own, rest, actions, stale=False)
+        check_required_guards(
+            _only_workflow(wfs, fname), entries, raw_entries, probe, own, rest, actions, stale=False, env_rows=env_rows
+        )
         if not any(f"[{ErrorKind.STEP_GUARD_UNADMITTED.name}]" in p or f"[{ErrorKind.NO_DECIDER.name}]" in p for p in probe):
             refuse(ErrorKind.KNOWN_SKIP_ROW_STALE, fname, f"job {jid!r}", "has a `KNOWN_SKIP_AS_PASS` row but passes without it; remove the row")
 

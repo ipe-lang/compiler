@@ -7729,14 +7729,16 @@ class _GuardFixture(unittest.TestCase):
         self.root = self._tmp.name
 
     def errors(self, wf: str, entries: list | None = None, inline: dict | None = None,
-               skips: dict | None = None, actions: dict | None = None) -> list[str]:
+               skips: dict | None = None, actions: dict | None = None, env_rows: dict | None = None) -> list[str]:
         _write(os.path.join(self.root, "workflows", "g.yml"), wf)
         errors: list[str] = []
         wfs = _load(self.root, errors)
         raw = entries if entries is not None else [{"context": "g", "disposition": "gate", "producer": "g.yml"}]
         typed = [e for e in (verify_manifest.ManifestEntry.parse(r) for r in raw)
                  if isinstance(e, verify_manifest.ManifestEntry)]
-        verify_manifest.check_required_guards(wfs, typed, raw, errors, inline or {}, skips or {}, actions or {})
+        verify_manifest.check_required_guards(
+            wfs, typed, raw, errors, inline or {}, skips or {}, actions or {}, env_rows=env_rows or {}
+        )
         return errors
 
     def kinds(self, wf: str, **kw: object) -> set[str]:
@@ -8028,6 +8030,22 @@ class TestRequiredJobHoldsDecider(_GuardFixture):
         self.assertRefused("JOB_GUARD_UNADMITTED", _rg_wf(_rg_job("g", skipping, "github.actor == 'x'")),
                            skips={("g.yml", "g"): "no runner"})
 
+    def test_inline_decider_empty_script_refused(self) -> None:
+        pin = "vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        row = {pin: verify_manifest.ScriptAction(frozenset({"run"}), "fails on a failed script")}
+        inline = {("g.yml", "g"): "Run it"}
+        self.assertPasses(_rg_wf(_rg_job("g", "- name: Run it\n  run: ./x.sh\n")), inline=inline)
+        for steps in (
+            "- name: Run it\n  run: ''\n",
+            "- name: Run it\n  run: '  # nothing'\n",
+            f"- name: Run it\n  uses: {pin}\n  with:\n    run: ''\n",
+            f"- name: Run it\n  uses: {pin}\n  with:\n    run: '# nothing'\n",
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", steps)), inline=inline,
+                                   actions=row)
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", steps)), inline=inline, actions=row)
+
     def test_live_required_jobs_hold_closed_guards_and_deciders(self) -> None:
         errors: list[str] = []
         wfs = _load(verify_manifest.REPO_ROOT, errors)
@@ -8035,6 +8053,116 @@ class TestRequiredJobHoldsDecider(_GuardFixture):
         typed = verify_manifest.check_manifest_references(wfs, raw, [])
         verify_manifest.check_required_guards(wfs, typed, raw, errors)
         self.assertEqual(errors, [])
+
+
+_RG_MIRROR_A = "bash tools/a.sh"
+_RG_MIRROR_B = "bash tools/b.sh"
+
+
+class TestMirroredStepSound(_GuardFixture):
+    """A step running a command a `local:` block mirrors fails when that
+    command fails, and runs it as its local twin does: every command bash
+    reads in it is a mirrored line (no `set +e`, `trap`, `exit`, separator,
+    or comment continuation hiding another), several commands run under a
+    shell that stops at the first failure, and its env is closed."""
+
+    ENTRIES = [{
+        "context": "g", "disposition": "gate", "producer": "g.yml",
+        "local": {"tier": "quick", "run": [_RG_MIRROR_A, _RG_MIRROR_B]},
+    }]
+    ENV: dict = {}
+
+    def step(self, script: str, extra: str = "") -> str:
+        body = "".join(f"    {ln}\n" for ln in script.splitlines())
+        return "- name: Lint\n  run: |\n" + body + extra
+
+    def wf(self, script: str, extra: str = "", job_extra: str = "") -> str:
+        return _rg_wf(_rg_job("g", self.step(script, extra), extra=job_extra))
+
+    def test_sound_mirrored_steps_decide(self) -> None:
+        for script, extra in (
+            (_RG_MIRROR_A, ""),
+            (f"{_RG_MIRROR_A}\n{_RG_MIRROR_B}", ""),
+            (f"# self-test first\n{_RG_MIRROR_A}\n\n{_RG_MIRROR_B}", ""),
+            (f"{_RG_MIRROR_A}\n{_RG_MIRROR_B}", "  shell: bash\n"),
+            (_RG_MIRROR_A, "  shell: pwsh\n"),
+            (_RG_MIRROR_A, "  env:\n    IPE_E2E: '1'\n"),
+        ):
+            with self.subTest(script=script, extra=extra):
+                rows = {"IPE_E2E": frozenset({"1"})} if "env:" in extra else self.ENV
+                self.assertPasses(self.wf(script, extra), entries=self.ENTRIES, env_rows=rows)
+
+    def test_unmirrored_line_refused(self) -> None:
+        for script in (
+            f"set +e\n{_RG_MIRROR_A}\n{_RG_MIRROR_B}\ntrue",
+            f"trap 'exit 0' EXIT\n{_RG_MIRROR_A}\n{_RG_MIRROR_B}",
+            f"exit 0\n{_RG_MIRROR_A}",
+            f"{_RG_MIRROR_A}\necho done",
+        ):
+            with self.subTest(script=script):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(script), entries=self.ENTRIES,
+                                   env_rows=self.ENV)
+                self.assertRefused("NO_DECIDER", self.wf(script), entries=self.ENTRIES, env_rows=self.ENV)
+
+    def test_line_hidden_from_the_mirror_refused(self) -> None:
+        for script in (
+            # The mirror joins a comment's trailing backslash; bash does not.
+            f"{_RG_MIRROR_A} # self-test \\\ntrap 'exit 0' EXIT\n{_RG_MIRROR_B}",
+            # A quote across lines: the mirror skips both lines, bash runs `exit 0`.
+            f"{_RG_MIRROR_A}\necho \"\n\"; exit 0",
+            f"{_RG_MIRROR_A}; true",
+            f"{_RG_MIRROR_A} > /dev/null",
+            f"({_RG_MIRROR_A})",
+        ):
+            with self.subTest(script=script):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(script), entries=self.ENTRIES,
+                                   env_rows=self.ENV)
+
+    def test_several_commands_under_a_non_stopping_shell_refused(self) -> None:
+        both = f"{_RG_MIRROR_A}\n{_RG_MIRROR_B}"
+        for extra, job_extra in (
+            ("  shell: pwsh\n", ""),
+            ("  shell: powershell\n", ""),
+            ("", "    defaults:\n      run:\n        shell: pwsh\n"),
+        ):
+            with self.subTest(extra=extra, job_extra=job_extra):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(both, extra, job_extra),
+                                   entries=self.ENTRIES, env_rows=self.ENV)
+        windows = self.wf(both).replace("runs-on: ubuntu-latest", "runs-on: windows-latest")
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", windows, entries=self.ENTRIES, env_rows=self.ENV)
+        self.assertPasses(self.wf(both, "  shell: bash\n").replace("ubuntu-latest", "windows-latest"),
+                          entries=self.ENTRIES, env_rows=self.ENV)
+
+    def test_unadmitted_env_refused(self) -> None:
+        for extra, job_extra in (
+            ("  env:\n    CARGO_ALIAS_CLIPPY: check\n", ""),
+            ("  env:\n    RUSTFLAGS: --cap-lints=allow\n", ""),
+            ("  env:\n    IPE_E2E: '0'\n", ""),
+            ("", "    env:\n      CARGO_ALIAS_CLIPPY: check\n"),
+        ):
+            with self.subTest(extra=extra, job_extra=job_extra):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(_RG_MIRROR_A, extra, job_extra),
+                                   entries=self.ENTRIES, env_rows=self.ENV)
+        wf_env = self.wf(_RG_MIRROR_A).replace("permissions:", "env:\n  CARGO_ALIAS_CLIPPY: check\npermissions:")
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", wf_env, entries=self.ENTRIES, env_rows=self.ENV)
+
+    def test_masked_mirrored_step_refused_beside_another_decider(self) -> None:
+        steps = f"- run: {_RG_MIRROR_A}\n- run: {_RG_MIRROR_B} || true\n"
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", _rg_wf(_rg_job("g", steps)), entries=self.ENTRIES,
+                           env_rows=self.ENV)
+        coe = f"- run: {_RG_MIRROR_A}\n- run: {_RG_MIRROR_B}\n  continue-on-error: true\n"
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", _rg_wf(_rg_job("g", coe)), entries=self.ENTRIES,
+                           env_rows=self.ENV)
+
+    def test_stale_env_row_refused(self) -> None:
+        wf = self.wf(_RG_MIRROR_A, "  env:\n    IPE_E2E: '1'\n")
+        self.assertPasses(wf, entries=self.ENTRIES, env_rows={"IPE_E2E": frozenset({"1"})})
+        for rows in (
+            {"IPE_E2E": frozenset({"1", "0"})},
+            {"IPE_E2E": frozenset({"1"}), "CARGO_TERM_COLOR": frozenset({"always"})},
+        ):
+            with self.subTest(rows=rows):
+                self.assertRefused("MIRRORED_ENV_ROW_STALE", wf, entries=self.ENTRIES, env_rows=rows)
 
 
 class TestToolInvocationsClosed(unittest.TestCase):
