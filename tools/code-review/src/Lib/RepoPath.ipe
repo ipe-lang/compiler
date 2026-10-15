@@ -74,9 +74,10 @@ type RootMap
 
 
 -- Why a stored `tag:relative` index path, or a root map, was refused. Each
--- stored-path variant carries the stored path as it came off the index; the
--- path refusals also carry the `Ipe.Path` error that decided them, so the
--- rules live in `Ipe.Path` alone. `UnknownTag` is a well-formed tag the map
+-- stored-path variant carries the stored path as it came off the index and
+-- nothing else: `Ipe.Path` decides the path refusals, but its error text
+-- names the root's absolute directory, so it is dropped where the refusal is
+-- built and never reaches a page. `UnknownTag` is a well-formed tag the map
 -- does not bind; `ClaimedByDeeperRoot` is a path that lies at or under a
 -- declared root deeper than its own tag's, which owns it. `NoRoots`,
 -- `DuplicateTag`, `DuplicateRoot` (two tags on one directory, named in
@@ -84,8 +85,8 @@ type RootMap
 type PathError
     = MissingTag String
     | UnknownTag String
-    | InvalidRelative String Error
-    | NotUnderRoot String Error
+    | InvalidRelative String
+    | NotUnderRoot String
     | NoRoots
     | DuplicateTag String
     | DuplicateRoot String String
@@ -684,12 +685,12 @@ resolve roots stored =
 joinUnder : Root -> String -> String -> Result PathError Path
 joinUnder root stored rel =
     case Path.fromString rel of
-        Err e ->
-            Err (InvalidRelative stored e)
+        Err _ ->
+            Err (InvalidRelative stored)
 
         Ok relPath ->
             Path.under (rootPath root) relPath
-                |> Result.mapError (\e -> NotUnderRoot stored e)
+                |> Result.mapError (\_ -> NotUnderRoot stored)
 
 
 -- `path`, unless a root deeper than `binding`'s owns it.
@@ -706,33 +707,30 @@ refuseIfClaimed binding stored path =
         Ok path
 
 
--- A refusal as diagnostic text. The stored path and every nested error message
--- are foreign text, so they enter only through `SafeText.quoted`/`render`.
+-- A refusal as diagnostic text: fixed text per constructor around its payload.
+-- The stored path and every tag are foreign text, so they enter only through
+-- `SafeText.quoted`/`render`.
 describe : PathError -> SafeText
 describe err =
     case err of
         MissingTag stored ->
             SafeText.concat [ SafeText.literal "index path ", SafeText.quoted stored, SafeText.literal " has no `tag:` prefix" ]
 
-        InvalidRelative stored e ->
+        InvalidRelative stored ->
             SafeText.concat
                 [ SafeText.literal "index path "
                 , SafeText.quoted stored
-                , SafeText.literal " is not a valid relative path ("
-                , SafeText.render (Error.message e)
-                , SafeText.literal ")"
+                , SafeText.literal " is not a valid relative path: it holds a NUL byte, or a `..` (however spelled) that climbs out of it"
                 ]
 
         UnknownTag stored ->
             SafeText.concat [ SafeText.literal "index path ", SafeText.quoted stored, SafeText.literal " names a repo tag no configured root binds" ]
 
-        NotUnderRoot stored e ->
+        NotUnderRoot stored ->
             SafeText.concat
                 [ SafeText.literal "index path "
                 , SafeText.quoted stored
-                , SafeText.literal " does not join to a path under its repo root ("
-                , SafeText.render (Error.message e)
-                , SafeText.literal ")"
+                , SafeText.literal " does not join to a path strictly below its repo root: it is empty, `.`, or absolute, or holds an element that may not be joined"
                 ]
 
         NoRoots ->

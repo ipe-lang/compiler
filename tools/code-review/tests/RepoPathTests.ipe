@@ -24,7 +24,7 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
@@ -60,7 +60,7 @@ traversalPathsRejectedIn base =
                         unitViewTag (uid "u-esc") r.units
                 in
                 String.startsWith "unreadable: " tag
-                    && String.contains "escapes its root via `..`" tag
+                    && String.contains "is not a valid relative path" tag
                     && String.contains "ipe:a/../../escape" tag
             )
         |> Task.andThen (\ok -> removeFileIfAny (base ++ "/index.db") |> Task.map (\_ -> ok))
@@ -114,13 +114,13 @@ refusalName err =
         MissingTag _ ->
             "missing-tag"
 
-        InvalidRelative _ _ ->
+        InvalidRelative _ ->
             "invalid"
 
         UnknownTag _ ->
             "unknown-tag"
 
-        NotUnderRoot _ _ ->
+        NotUnderRoot _ ->
             "not-under-root"
 
         NoRoots ->
@@ -149,8 +149,7 @@ refusedAs expected result =
             refusalName err == expected
 
 
--- A refusal whose caller-facing message carries `fragment` from the
--- `Ipe.Path` error that decided it.
+-- A refusal whose caller-facing message carries `fragment` of its fixed text.
 refusalNames : String -> Result PathError Path.Path -> Bool
 refusalNames fragment result =
     case result of
@@ -239,8 +238,8 @@ storedPathRefusals =
                 , refusedAs "missing-tag" (RepoPath.resolve root "src/Main.ipe")
                 , refusedAs "missing-tag" (RepoPath.resolve root "")
                 , refusedAs "missing-tag" (RepoPath.resolve root ":src/Main.ipe")
-                , refusalNames "Ipe.Path.under" (RepoPath.resolve root "ipe:/etc/passwd")
-                , refusalNames "escapes its root" (RepoPath.resolve root "ipe:../x")
+                , refusalNames "strictly below its repo root" (RepoPath.resolve root "ipe:/etc/passwd")
+                , refusalNames "is not a valid relative path" (RepoPath.resolve root "ipe:../x")
                 , resolvesTo (base ++ "/src/Main.ipe") (RepoPath.resolve root "ipe:src/Main.ipe")
                 , resolvesTo (base ++ "/src/Main.ipe") (RepoPath.resolve root "ipe:./src//Main.ipe/")
                 , resolvesTo (base ++ "/a:b") (RepoPath.resolve root "ipe:a:b")
@@ -287,6 +286,56 @@ unknownTagRefused =
             (refusedAs "unknown-tag" (RepoPath.resolve roots "other:src/x.ipe")
                 && refusedAs "unknown-tag" (RepoPath.resolve roots "Ipe:package.ipe")
                 && refusalNames "names a repo tag" (RepoPath.resolve roots "other:src/x.ipe")
+            )
+
+
+-- A refused stored path reaches the page as fixed text chosen by its
+-- constructor around the quoted stored path, and nothing else: no `Ipe.Path`
+-- refusal text and none of the root's absolute directory, which the page
+-- never shows. Red if a path refusal carries the error that decided it into
+-- the page text. The accepted join is the control that the root is the
+-- absolute directory the refusals must not name.
+pathRefusalPageTextFixed : Task.Task Error Bool
+pathRefusalPageTextFixed =
+    do
+        base <- freshRootBase
+        root <- RepoPath.parseRoot (base ++ "/a")
+        roots <- mapOf [ ( "ipe", root ) ]
+        let
+            rootText =
+                Path.toString (RepoPath.rootPath root)
+
+            pageText err =
+                SafeText.toString (Index.readFailureText (PathRefused err))
+
+            fixed expected stored =
+                case RepoPath.resolve roots stored of
+                    Ok _ ->
+                        False
+
+                    Err err ->
+                        refusalName err
+                            == refusalName expected
+                            && pageText err
+                            == describeText expected
+                            && String.contains (SafeText.toString (SafeText.quoted stored)) (pageText err)
+                            && not (String.contains rootText (pageText err))
+                            && not (String.contains base (pageText err))
+                            && not (String.contains "Ipe.Path" (pageText err))
+        in
+        Task.succeed
+            (String.startsWith "/" rootText
+                && String.length base > 1
+                && resolvesTo (rootText ++ "/src/x.ipe") (RepoPath.resolve roots "ipe:src/x.ipe")
+                && List.all identity
+                    [ fixed (InvalidRelative "ipe:../x") "ipe:../x"
+                    , fixed (InvalidRelative "ipe:a/../../escape") "ipe:a/../../escape"
+                    , fixed (InvalidRelative "ipe:a\0b") "ipe:a\0b"
+                    , fixed (NotUnderRoot "ipe:/etc/passwd") "ipe:/etc/passwd"
+                    , fixed (NotUnderRoot "ipe:") "ipe:"
+                    , fixed (NotUnderRoot "ipe:.") "ipe:."
+                    , fixed (NotUnderRoot "ipe:a/..") "ipe:a/.."
+                    ]
             )
 
 
@@ -490,8 +539,8 @@ rootRefusalEscapesEnv =
 -- The same refusal with every foreign field replaced: the `case` names every
 -- `PathError` constructor, so a new one cannot join `allPathErrors` without an
 -- arm here.
-withForeign : String -> Error -> PathError -> PathError
-withForeign stored e err =
+withForeign : String -> PathError -> PathError
+withForeign stored err =
     case err of
         MissingTag _ ->
             MissingTag stored
@@ -499,11 +548,11 @@ withForeign stored e err =
         UnknownTag _ ->
             UnknownTag stored
 
-        InvalidRelative _ _ ->
-            InvalidRelative stored e
+        InvalidRelative _ ->
+            InvalidRelative stored
 
-        NotUnderRoot _ _ ->
-            NotUnderRoot stored e
+        NotUnderRoot _ ->
+            NotUnderRoot stored
 
         NoRoots ->
             NoRoots
@@ -523,14 +572,10 @@ withForeign stored e err =
 
 allPathErrors : List PathError
 allPathErrors =
-    let
-        e =
-            Error.unexpected ""
-    in
     [ MissingTag ""
     , UnknownTag ""
-    , InvalidRelative "" e
-    , NotUnderRoot "" e
+    , InvalidRelative ""
+    , NotUnderRoot ""
     , NoRoots
     , DuplicateTag ""
     , DuplicateRoot "" ""
@@ -539,17 +584,14 @@ allPathErrors =
     ]
 
 
--- Every `PathError`, fed a hazard-bearing stored path and a hazard-bearing
--- nested error, describes itself (and converts to an `Error`) free of hazards;
--- so do the refusals `resolve` builds from hazard-bearing stored paths.
+-- Every `PathError`, fed a hazard-bearing stored path, describes itself (and
+-- converts to an `Error`) free of hazards; so do the refusals `resolve`
+-- builds from hazard-bearing stored paths.
 diagnosticsNeverRaw : Task.Task Error Bool
 diagnosticsNeverRaw =
     let
         hazards =
             codeText 27 ++ "]0;pwn" ++ codeText 7 ++ "\r\n" ++ codeText 8238 ++ codeText 133 ++ codeText 8233
-
-        nested =
-            Error.invalidInput hazards
 
         clean err =
             noHazard (describeText err) && noHazard (Error.message (RepoPath.toError err))
@@ -571,7 +613,7 @@ diagnosticsNeverRaw =
         Task.succeed
             (List.length allPathErrors
                 == 9
-                && List.all (\err -> clean (withForeign hazards nested err)) allPathErrors
+                && List.all (\err -> clean (withForeign hazards err)) allPathErrors
                 && List.all
                     (resolvedClean roots)
                     [ hazards
@@ -1165,6 +1207,7 @@ checks =
         , check "empty and duplicate-tag root maps refused" rootMapRefusals
         , check "root refusal escapes the env value" rootRefusalEscapesEnv
         , check "every path refusal describes itself without raw hazards" diagnosticsNeverRaw
+        , check "a path refusal's page text is fixed and names no root" pathRefusalPageTextFixed
         , Task.succeed ( "describe escapes the stored path", describeEscapesStoredPath )
         , check "blank, missing and non-directory roots refused" badRootsRefused
         , check "relative root loads the queue" relativeRootLoadsQueue
