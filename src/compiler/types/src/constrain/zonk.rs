@@ -419,8 +419,8 @@ pub fn promote_untyped_boundaries(
         }
 
         // (b) Generalize this module's own untyped defs.
-        for (key, &shared) in generated.untyped.iter().filter(|(k, _)| &k.0 == home) {
-            let root = lift!(uf.find(shared));
+        for (key, def) in generated.untyped.iter().filter(|(k, _)| &k.0 == home) {
+            let root = lift!(uf.find(def.var));
             let candidates = reachable_flex_roots(uf, budget, root)
                 .map_err(|d| InferError::sited_at_path(d, &key.0))?;
             let mut quantified = BTreeMap::new();

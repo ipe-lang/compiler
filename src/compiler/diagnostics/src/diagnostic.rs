@@ -1771,6 +1771,23 @@ pub enum LowerError {
         /// The dotted kernel name that was used unsaturated (e.g. `Stream.stream`).
         kernel: Box<str>,
     },
+    /// An unannotated binding's type mentions a type variable another binding keeps generic.
+    ///
+    /// A same-module use of an unannotated `helper` inside the annotated,
+    /// generic `owner` shares the helper's one type with the owner's type
+    /// variable `var`. The owner emits `var` as its own Rust generic, but the
+    /// helper has no type parameter for it and would read it as free (`()` in
+    /// a message slot), so the call between the two emitted functions would
+    /// not type-check under cargo. Refused fail-closed at `ipe` time; the fix
+    /// is a signature on the helper. [IPE-L0102]
+    ForeignTypeVariable {
+        /// The unannotated binding (e.g. `chip`).
+        helper: Box<str>,
+        /// The generic binding whose type variable it borrows (e.g. `row`).
+        owner: Box<str>,
+        /// The owner's type variable (e.g. `msg`).
+        var: Box<str>,
+    },
 }
 
 /// Why a literal route pattern or server route path was refused under
@@ -2779,6 +2796,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::PointFreeAccessorKernel { .. }
         | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
+        LowerError::ForeignTypeVariable { .. } => IPE_L0102,
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
 }
@@ -3256,6 +3274,9 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             accessor_kernel_off_intercept_help(kernel, *context)
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => unsaturated_handler_kernel_help(kernel),
+        LowerError::ForeignTypeVariable { helper, owner, var } => {
+            foreign_type_variable_help(helper, owner, var)
+        }
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
         }
@@ -3342,6 +3363,22 @@ fn accessor_kernel_off_intercept_help(kernel: &str, context: InterceptContext) -
         )
         .into_boxed_str(),
     )]
+}
+
+/// The help lines for [`LowerError::ForeignTypeVariable`], factored out so
+/// [`lower_help`] stays a thin per-variant dispatcher.
+fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpLine> {
+    vec![
+        HelpLine::Note(
+            format!(
+                "give `{helper}` its own type annotation, e.g. `{helper} : ... -> Html \
+                 {var}`; it is used inside `{owner}`, whose type variable `{var}` it \
+                 would otherwise borrow without being generic over it"
+            )
+            .into_boxed_str(),
+        ),
+        HelpLine::SeeExplain("IPE-L0102"),
+    ]
 }
 
 /// The help lines for [`LowerError::UnsaturatedHandlerKernel`], factored out so

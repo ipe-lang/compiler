@@ -1527,8 +1527,21 @@ fn infer_core(
             )
         })
         .collect();
-    for (name, var) in generated.untyped {
-        env.insert(name, lift!(zonk(&mut uf, budget, var)));
+    for (name, def) in &generated.untyped {
+        env.insert(name.clone(), lift!(zonk(&mut uf, budget, def.var)));
+    }
+
+    // An untyped binding's read-back type is exactly the signature the lowerer
+    // emits, so a variable another binding keeps generic is refused here, in
+    // the solve tail both the joint and the scoped solve run.
+    let owners = generic_var_owners(&poly_var_map, &msg_defaulted_vars);
+    for (key, def) in &generated.untyped {
+        if scoped.is_some_and(|ctx| ctx.deps.contains_key(&key.0)) {
+            continue;
+        }
+        if let Some(ty) = env.get(key) {
+            refuse_foreign_type_variable(interner, &owners, key, def.name_span, ty)?;
+        }
     }
 
     Ok((
@@ -1545,6 +1558,124 @@ fn infer_core(
         },
         interface,
     ))
+}
+
+/// Every solver variable a binding emits as its own Rust generic, with its owners.
+///
+/// Built once from `poly_var_map` minus each typed binding's
+/// `msg_defaulted_vars` (the lowerer withholds those and emits `()` for them,
+/// so no binding owns them). It is the one answer to "who owns this
+/// variable": the type checker's untyped-binding refusal and the lowerer's
+/// lenient-default fallbacks both read it, never a re-derivation.
+#[derive(Clone, Debug, Default)]
+pub struct GenericVarOwners(BTreeMap<SolverVar, BTreeMap<(Vec<Symbol>, Symbol), Symbol>>);
+
+impl GenericVarOwners {
+    /// An owner of `var` other than `binding`, unless `binding` itself owns it.
+    ///
+    /// `None` means the variable is `binding`'s own generic or no binding's
+    /// generic; `Some((owner, sym))` means another binding emits it as its
+    /// type parameter `sym`, so `binding` must not read it as free.
+    #[must_use]
+    pub fn foreign_to(
+        &self,
+        var: SolverVar,
+        binding: &(Vec<Symbol>, Symbol),
+    ) -> Option<(&(Vec<Symbol>, Symbol), Symbol)> {
+        let owners = self.0.get(&var)?;
+        if owners.contains_key(binding) {
+            return None;
+        }
+        owners.first_key_value().map(|(owner, &sym)| (owner, sym))
+    }
+}
+
+/// Index every generic a binding emits by its solver variable (see [`GenericVarOwners`]).
+#[must_use]
+pub fn generic_var_owners(
+    poly_var_map: &BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<SolverVar, Symbol>>,
+    msg_defaulted_vars: &BTreeMap<(Vec<Symbol>, Symbol), BTreeSet<Symbol>>,
+) -> GenericVarOwners {
+    let mut owners: BTreeMap<SolverVar, BTreeMap<(Vec<Symbol>, Symbol), Symbol>> = BTreeMap::new();
+    for (owner, vars) in poly_var_map {
+        let withheld = msg_defaulted_vars.get(owner);
+        for (&var, &sym) in vars {
+            if withheld.is_some_and(|w| w.contains(&sym)) {
+                continue;
+            }
+            owners.entry(var).or_default().insert(owner.clone(), sym);
+        }
+    }
+    GenericVarOwners(owners)
+}
+
+/// Refuse an untyped binding whose type mentions a variable another binding keeps generic.
+///
+/// A same-module reference to an untyped binding shares its one variable, so
+/// a typed generic sibling whose body uses the binding unifies the binding's
+/// type with the sibling's skolem. The binding then has no type parameter for
+/// it and would read it as free (`()` in a message slot, `JsonVal` in a JSON
+/// position), while the sibling emits it as its own generic: the two emitted
+/// functions disagree at the call between them and cargo fails after `ipe`
+/// accepted the program. Refused with IPE-L0102 at the binding's name, naming
+/// the fix: give the binding its own signature.
+///
+/// The scoped solve sees a subset of the uses, and a pin in a subset is a pin
+/// in the whole program, so a scoped refusal implies a joint refusal. A scoped
+/// accept may still be a joint refusal: the scoped (editor) solve can miss a
+/// refusal the build issues, never the reverse.
+fn refuse_foreign_type_variable(
+    interner: &Interner,
+    owners: &GenericVarOwners,
+    helper: &(Vec<Symbol>, Symbol),
+    name_span: Span,
+    ty: &Ty,
+) -> Result<(), InferError> {
+    let mut stack: Vec<&Ty> = vec![ty];
+    while let Some(t) = stack.pop() {
+        let raw = match t {
+            Ty::Var(raw) => Some(*raw),
+            Ty::Record(fields, tail) => {
+                stack.extend(fields.values());
+                match tail {
+                    RowTail::Open(raw) => Some(*raw),
+                    RowTail::Closed => None,
+                }
+            }
+            Ty::Fun(arg, result) => {
+                stack.push(arg);
+                stack.push(result);
+                None
+            }
+            Ty::Con { args, .. } => {
+                stack.extend(args.iter());
+                None
+            }
+            Ty::Tuple(items) => {
+                stack.extend(items.iter());
+                None
+            }
+            Ty::Unit | Ty::Wildcard => None,
+        };
+        let Some(var) = raw.and_then(SolverVar::from_raw) else {
+            continue;
+        };
+        if let Some((owner, sym)) = owners.foreign_to(var, helper) {
+            let name = |s: Symbol| -> Box<str> { interner.resolve(s).unwrap_or("_").into() };
+            return Err(InferError::sited_at_path(
+                Diagnostic::Lower {
+                    span: name_span,
+                    msg: LowerError::ForeignTypeVariable {
+                        helper: name(helper.1),
+                        owner: name(owner.1),
+                        var: name(sym),
+                    },
+                },
+                &helper.0,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Per-binding use-site instantiation maps: each `(home, name)` maps to the
@@ -4783,11 +4914,32 @@ mod tests {
         );
     }
 
-    /// A rigid-contaminated untyped def (its body unifies with a typed
-    /// sibling's skolem) is not generalized — generalization conservatively
-    /// excludes rigid roots.
+    /// Whether `r` is exactly the foreign-variable refusal naming `helper`, `owner`, and `var`.
+    fn is_foreign_type_variable(
+        r: &DResult<SolvedTypes>,
+        helper: &str,
+        owner: &str,
+        var: &str,
+    ) -> bool {
+        matches!(
+            r,
+            Err(Diagnostic::Lower {
+                msg: LowerError::ForeignTypeVariable { helper: h, owner: o, var: v },
+                ..
+            }) if &**h == helper && &**o == owner && &**v == var
+        )
+    }
+
+    /// An untyped def whose body unifies with a typed sibling's skolem is refused at types.
+    ///
+    /// `ident`'s one shared variable takes `f`'s rigid `a` while `f`'s body is
+    /// checked, so `ident`'s type mentions `a` without `ident` being generic
+    /// over it. `f` emits `a` as its own Rust generic; `ident` would read it
+    /// as free. The refusal names all three so `ipe check` and `ipe build`
+    /// agree on the same diagnostic.
     #[test]
-    fn rigid_contaminated_untyped_def_stays_unquantified() {
+    #[allow(clippy::expect_used)] // a fixture that fails to parse IS the failure
+    fn rigid_contaminated_untyped_def_is_refused() {
         let src = "module Main exposing (main)\n\
                    f : a -> a\n\
                    f x =\n    ident x\n\
@@ -4798,20 +4950,51 @@ mod tests {
                    useBool =\n    f (0 == 0)\n\
                    main =\n    useInt\n";
         let (m, mut i) = canon_src(src).expect("fixture must parse and canonicalise");
-        // `ident`'s own shared var unifies with `f`'s rigid skolem `a` while
-        // `f`'s body is checked, so `ident` is rigid-contaminated. `f` itself
-        // is typed (annotated) and genuinely polymorphic — its own two uses
-        // at Int/Bool must still typecheck (this is unrelated to Boundary
-        // Scheme Promotion, just confirming the surrounding program is
-        // otherwise sound). The load-bearing assertion is only that this
-        // program's SHAPE (an untyped def rigid-contaminated by a typed
-        // sibling) does not ICE and does not silently over-generalize.
         let r = infer(&m, &mut i);
         assert!(
-            r.is_ok(),
-            "a typed polymorphic binding whose body routes through a \
-             rigid-contaminated untyped helper must still typecheck: {r:?}"
+            is_foreign_type_variable(&r, "ident", "f", "a"),
+            "an untyped helper borrowing a typed sibling's variable must be \
+             refused naming helper, owner, and variable: {r:?}"
         );
+    }
+
+    /// The type-constructor twin: the borrowed variable sits inside a constructor argument.
+    ///
+    /// `chip`'s result `Node t` unifies with `row`'s `Node msg`, so the
+    /// foreign variable is reached under `Ty::Con`, the shape a message slot
+    /// takes.
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that fails to parse IS the failure
+    fn rigid_contaminated_untyped_def_under_constructor_is_refused() {
+        let src = "module Main exposing (main)\n\
+                   type Node msg = Node msg | Empty\n\
+                   chip s =\n    Empty\n\
+                   row : String -> Node msg\n\
+                   row x =\n    chip x\n\
+                   main =\n    0\n";
+        let (m, mut i) = canon_src(src).expect("fixture must parse and canonicalise");
+        let r = infer(&m, &mut i);
+        assert!(
+            is_foreign_type_variable(&r, "chip", "row", "msg"),
+            "an untyped helper borrowing a sibling's constructor variable must be \
+             refused naming helper, owner, and variable: {r:?}"
+        );
+    }
+
+    /// The control: the same helper with its own signature is generic over its own variable.
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that fails to parse IS the failure
+    fn annotated_helper_under_generic_sibling_is_accepted() {
+        let src = "module Main exposing (main)\n\
+                   type Node msg = Node msg | Empty\n\
+                   chip : String -> Node msg\n\
+                   chip s =\n    Empty\n\
+                   row : String -> Node msg\n\
+                   row x =\n    chip x\n\
+                   main =\n    0\n";
+        let (m, mut i) = canon_src(src).expect("fixture must parse and canonicalise");
+        let r = infer(&m, &mut i);
+        assert!(r.is_ok(), "an annotated helper must typecheck: {r:?}");
     }
 
     fn con_doc(name: &str) -> ipe_diagnostics::TyDoc {
