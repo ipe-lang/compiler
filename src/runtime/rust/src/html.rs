@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use super::css_safety;
+use crate::csp::StyleNonce;
 use crate::retained::{Bytes, RetainedBytes};
 
 /// Form data delivered to an `OnForm` handler (lower-cased keys; see dispatch).
@@ -192,9 +193,64 @@ pub(crate) fn is_void(tag: &str) -> bool {
 /// attribute that the browser client reads to bind listeners.
 #[must_use]
 pub fn render_html<M>(node: &Html<M>) -> String {
+    render_html_in(node, &RenderCtx::Unstamped)
+}
+
+/// How a render stamps the `<style>` elements it admits.
+///
+/// Every serialization of a session's tree passes the session's nonce, so a
+/// `<style>` written in HTML data or foreign content carries `nonce="…"`. A
+/// `<style>` under an RCDATA or RAWTEXT ancestor is text, never stamped.
+#[derive(Clone, Debug)]
+pub enum RenderCtx<'a> {
+    /// No stamp: emitted code, the static page render, the browser runtime.
+    Unstamped,
+    /// A session's render, stamped with that session's nonce.
+    Session(&'a StyleNonce),
+}
+
+/// Render an `Html` tree to an HTML string under `stamp`.
+///
+/// It is [`render_html`] with every admitted `<style>` in data or foreign
+/// content stamped as `stamp` says.
+#[must_use]
+pub fn render_html_in<M>(node: &Html<M>, stamp: &RenderCtx<'_>) -> String {
     let mut s = String::new();
-    render_into(node, &mut s);
+    render_into_ctx(node, &mut s, ParseContext::Data, None, 0, stamp);
     s
+}
+
+/// A session render's markup and the nonce its `<style>` elements carry.
+///
+/// Only [`render_stamped`] builds one, so the nonce is the one the markup was
+/// stamped with.
+#[derive(Clone, Debug)]
+pub struct StampedHtml {
+    html: String,
+    nonce: StyleNonce,
+}
+
+impl StampedHtml {
+    /// The rendered markup.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.html.as_str()
+    }
+
+    /// The nonce every `<style>` of the markup carries.
+    #[must_use]
+    pub const fn nonce(&self) -> &StyleNonce {
+        &self.nonce
+    }
+}
+
+/// Render `node` as a session's markup, stamped with `nonce`.
+#[must_use]
+pub fn render_stamped<M>(node: &Html<M>, nonce: &StyleNonce) -> StampedHtml {
+    StampedHtml {
+        html: render_html_in(node, &RenderCtx::Session(nonce)),
+        nonce: nonce.clone(),
+    }
 }
 
 /// Marker attribute on a radio group's `<fieldset>`.
@@ -219,28 +275,22 @@ pub(crate) const RADIO_GROUP_MARKER: &str = "data-ipe-radio-group";
 /// no drift.
 pub(crate) const MAX_HTML_DEPTH: usize = 1024;
 
-/// Render `node` directly into an existing accumulator. `pub(crate)` so the
-/// SSE diff's whole-subtree replace (`live/diff.rs::render_children`) can
-/// write every child into one shared String instead of allocating a
-/// throwaway String per child (efficiency-audit §6 medium).
-pub(crate) fn render_into<M>(node: &Html<M>, s: &mut String) {
-    render_into_ctx(node, s, ParseContext::Data, None, 0);
-}
-
 /// Render the children of an element admitted as `body` into `s`.
 ///
 /// The SSE diff's whole-subtree replace writes an element's new children
 /// through this, so a patched `<script>`/`<style>` body gets the same
 /// neutralisation the first paint applies. `child_ctx` is the context the
 /// element puts its children in (`ParseContext::enter` of its own context),
-/// so a patched subtree is admitted exactly as the first paint admitted it.
+/// so a patched subtree is admitted exactly as the first paint admitted it,
+/// and `stamp` is the render context of the session the patch is sent to.
 pub(crate) fn render_children_into<M>(
     body: ElementBody,
     child_ctx: ParseContext,
     kids: &[Html<M>],
     s: &mut String,
+    stamp: &RenderCtx<'_>,
 ) {
-    render_body_into(body, child_ctx, kids, s, None, 0);
+    render_body_into(body, child_ctx, kids, s, None, 0, stamp);
 }
 
 /// Render `kids`, the children of an element admitted as `body`, into `s`.
@@ -258,25 +308,26 @@ fn render_body_into<M>(
     s: &mut String,
     select_value: Option<&str>,
     depth: usize,
+    stamp: &RenderCtx<'_>,
 ) {
     let child_depth = depth.saturating_add(1);
     match body {
         ElementBody::Markup => {
             for c in kids {
-                render_into_ctx(c, s, child_ctx, select_value, child_depth);
+                render_into_ctx(c, s, child_ctx, select_value, child_depth, stamp);
             }
         }
         ElementBody::Script => {
             let mut raw = String::new();
             for c in kids {
-                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth, stamp);
             }
             s.push_str(&css_safety::neutralise_script_close(&raw));
         }
         ElementBody::Style => {
             let mut raw = String::new();
             for c in kids {
-                render_into_ctx(c, &mut raw, child_ctx, None, child_depth);
+                render_into_ctx(c, &mut raw, child_ctx, None, child_depth, stamp);
             }
             s.push_str(&css_safety::neutralise_style_body(&raw));
         }
@@ -285,7 +336,8 @@ fn render_body_into<M>(
 
 // `select_value`: when this node renders as a direct child of a `<select>` that
 // carries a value, the chosen value is threaded here so the matching `<option>`
-// flips `selected`. `ctx` is the parse context `node` is written in.
+// flips `selected`. `ctx` is the parse context `node` is written in, and
+// `stamp` says which nonce an admitted `<style>` carries.
 #[allow(clippy::too_many_lines)]
 fn render_into_ctx<M>(
     node: &Html<M>,
@@ -293,6 +345,7 @@ fn render_into_ctx<M>(
     ctx: ParseContext,
     select_value: Option<&str>,
     depth: usize,
+    stamp: &RenderCtx<'_>,
 ) {
     // Bounded descent: a tree deeper than the cap is dropped here rather than
     // recursed into (see MAX_HTML_DEPTH). The parent has already emitted its
@@ -322,7 +375,7 @@ fn render_into_ctx<M>(
                 // with full name/attr/text gating.
                 RenderedElement::Doctype => {
                     s.push_str("<!DOCTYPE html>");
-                    render_body_into(ElementBody::Markup, ctx, kids, s, None, depth);
+                    render_body_into(ElementBody::Markup, ctx, kids, s, None, depth, stamp);
                     return;
                 }
                 RenderedElement::Element(body) => body,
@@ -444,6 +497,16 @@ fn render_into_ctx<M>(
                 crate::escape::html_attr_into(sanitise_url_attr(k, v), s);
                 s.push('"');
             }
+            // The session nonce is written by the sink alone: `nonce` is a
+            // reserved name, so no program-built attribute reaches this spot.
+            if body == ElementBody::Style
+                && ctx.opens_style_element()
+                && let RenderCtx::Session(nonce) = stamp
+            {
+                s.push_str(" nonce=\"");
+                nonce.write_token(s);
+                s.push('"');
+            }
             // Browser-client wire markers (live/client.js): the delegated
             // binder scans for `[ipe-<event>]`, reads `data-ipe-hid` for the
             // ipe-id, and posts the `ipe-<event>` value as `msg`. We make that
@@ -509,7 +572,15 @@ fn render_into_ctx<M>(
             } else {
                 None
             };
-            render_body_into(body, ctx.enter(tag), kids, s, child_select_value, depth);
+            render_body_into(
+                body,
+                ctx.enter(tag),
+                kids,
+                s,
+                child_select_value,
+                depth,
+                stamp,
+            );
             s.push_str("</");
             s.push_str(tag);
             s.push('>');
@@ -635,6 +706,16 @@ impl ParseContext {
                     Self::Data
                 }
             }
+        }
+    }
+
+    /// True when a `<style>` start tag written here opens a style element.
+    ///
+    /// Under an RCDATA or RAWTEXT ancestor the tag is that ancestor's text.
+    const fn opens_style_element(self) -> bool {
+        match self {
+            Self::Data | Self::Foreign => true,
+            Self::RawOrRcdata => false,
         }
     }
 
@@ -785,14 +866,23 @@ const KEY_ATTR: &str = "ipe-key";
 /// program-built one would route the gesture to another element's handler.
 pub(crate) const HANDLER_ID_ATTR: &str = "data-ipe-hid";
 
-/// True for a runtime wire-marker name, compared ASCII-case-insensitively.
+/// The attribute carrying a session's style nonce.
 ///
-/// That is a name starting with [`RESERVED_ATTR_PREFIX`], or [`HANDLER_ID_ATTR`].
+/// Only the render sink writes it, from the session's `RenderCtx`; a
+/// program-built one would let a page's own data pick the value a policy
+/// admits styles by.
+const NONCE_ATTR: &str = "nonce";
+
+/// True for a name only the runtime writes, compared ASCII-case-insensitively.
+///
+/// That is a name starting with [`RESERVED_ATTR_PREFIX`], [`HANDLER_ID_ATTR`],
+/// or [`NONCE_ATTR`].
 fn is_reserved_attr_name(name: &str) -> bool {
     name.as_bytes()
         .get(..RESERVED_ATTR_PREFIX.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_ATTR_PREFIX))
         || name.eq_ignore_ascii_case(HANDLER_ID_ATTR)
+        || name.eq_ignore_ascii_case(NONCE_ATTR)
 }
 
 /// A validated HTML **attribute** name (parse-don't-validate). The ONLY way to
@@ -3042,5 +3132,82 @@ mod tests {
             render_html(&element("div", vec![trusted_script("init();")])),
             "<div><script>init();</script></div>"
         );
+    }
+
+    fn css(css: &str) -> Html<()> {
+        element("style", vec![Html::HRaw(css.into())])
+    }
+
+    /// A `<style>` the tokenizer opens as an element, in HTML data state or in
+    /// foreign content, carries the session nonce; one in raw text or RCDATA
+    /// is text there, and an unstamped render stamps nothing.
+    #[test]
+    fn style_stamped_only_in_data_and_foreign() {
+        let nonce = StyleNonce::from_random_bytes([0x3e; 16]);
+        let attr = format!(" nonce=\"{}\"", nonce.as_token());
+        let page = render_stamped(&element("div", vec![css("p{}")]), &nonce);
+        assert_eq!(
+            page.as_str(),
+            format!("<div><style{attr}>p{{}}</style></div>")
+        );
+        assert_eq!(page.nonce().as_token(), nonce.as_token());
+        let svg = render_stamped(&element("svg", vec![css("p{}")]), &nonce);
+        assert!(
+            svg.as_str().contains(&format!("<style{attr}>")),
+            "{}",
+            svg.as_str()
+        );
+        for host in ["textarea", "title"] {
+            let page = render_stamped(&element(host, vec![css("p{}")]), &nonce);
+            assert!(
+                !page.as_str().contains("nonce"),
+                "{host}: {}",
+                page.as_str()
+            );
+        }
+        for host in ["div", "svg"] {
+            let out = render_html_in(&element(host, vec![css("p{}")]), &RenderCtx::Unstamped);
+            assert!(!out.contains("nonce"), "{host}: {out}");
+            assert_eq!(out, render_html(&element(host, vec![css("p{}")])));
+        }
+    }
+
+    /// Trusted raw markup is written verbatim: a `<style>` inside it is the
+    /// author's and never gets the session nonce.
+    #[test]
+    fn raw_style_never_stamped() {
+        let nonce = StyleNonce::from_random_bytes([0x4f; 16]);
+        let raw = "<style>p{}</style>";
+        let page = render_stamped(&element("div", vec![Html::HRaw(raw.into())]), &nonce);
+        assert_eq!(page.as_str(), format!("<div>{raw}</div>"));
+    }
+
+    /// A program-built `nonce` attribute, in any case, is refused at the render
+    /// sink and the patch sink, so only the runtime's stamp is ever written.
+    #[test]
+    fn author_nonce_refused_at_render_and_patch() {
+        for name in ["nonce", "NONCE", "nOnCe"] {
+            assert!(SafeAttrName::parse(name).is_none(), "{name}");
+            assert!(safe_patch_attr(name, "forged").is_none(), "{name}");
+            let forged: Html<()> = Html::HElement(
+                "style".into(),
+                vec![Attribute::Attr(name.into(), "forged".into())],
+                vec![Html::HRaw("p{}".into())],
+            );
+            assert!(!render_html(&forged).contains("forged"), "{name}");
+            let nonce = StyleNonce::from_random_bytes([0x5a; 16]);
+            let page = render_stamped(&forged, &nonce);
+            assert!(
+                !page.as_str().contains("forged"),
+                "{name}: {}",
+                page.as_str()
+            );
+            assert_eq!(
+                page.as_str().matches("nonce=").count(),
+                1,
+                "{}",
+                page.as_str()
+            );
+        }
     }
 }

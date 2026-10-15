@@ -1413,12 +1413,6 @@ async fn send_patches_frame(
     }
 }
 
-/// A fresh render-history incarnation from the OS CSPRNG.
-#[cfg(feature = "web")]
-pub(crate) fn new_incarnation() -> Incarnation {
-    Incarnation::from_random_bits(uuid::Uuid::new_v4().as_u128())
-}
-
 /// The number of tabs whose last event seq a session remembers.
 #[cfg(feature = "web")]
 pub const TAB_SEQ_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(15);
@@ -1648,11 +1642,12 @@ fn stale_render_response<Model, Msg: Clone>(
     e: &SessionEntry<Model, Msg>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let page = e.rendered.page();
     let body = serde_json::json!({
         "refused": "stale-render",
         "epoch": e.rendered.epoch().to_token(),
         "seq": e.seq,
-        "body": render_html(e.rendered.last_view()),
+        "body": page.as_str(),
     })
     .to_string();
     (
@@ -2452,7 +2447,7 @@ where
         return EntryCommit::SessionGone;
     };
     let EnterRequest { path, mode, reply } = request;
-    let model = {
+    let (model, stamp) = {
         let g = strong.lock().unwrap_or_else(|e| e.into_inner());
         let already_entered = match mode {
             EnterMode::Load => false,
@@ -2461,14 +2456,14 @@ where
         if already_entered {
             return EntryCommit::AlreadyEntered;
         }
-        g.model.clone()
+        (g.model.clone(), g.rendered.stamp())
     };
     let sid = scope.sid();
     let entered = pubsub::with_session(scope, || route_entry(model, &path));
     let mut tree = pubsub::with_session(scope, || view(entered.model.clone()));
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
-    let body = render_html(&tree);
+    let body = render_html_in(&tree, &RenderCtx::Session(&stamp));
     // Re-prove after user code ran: a revocation that landed meanwhile drops
     // the entry, its reply and its Cmd.
     if recheck_scope(scope, None) == Standing::Revoked {
@@ -2752,7 +2747,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
 
         let committed = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(e.rendered.last_view(), &tree);
+            let patches = e.rendered.diff_to(&tree);
             // noop. Here
             // `e.model` STILL holds the OLD model (top-of-loop cloned it OUT; the
             // store isn't updated until the assignment below), so `e.model ==
@@ -3489,7 +3484,7 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         // deliberately left as-is.
         let committed = {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(e.rendered.last_view(), &tree);
+            let patches = e.rendered.diff_to(&tree);
             match e.rendered.commit(tree) {
                 Ok(step) => {
                     e.seq += 1;
@@ -4849,8 +4844,12 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model.clone()));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let body = render_html(&tree);
-        let rendered = Rendered::first(new_incarnation(), tree);
+        // A session without fresh keys is refused, never given fixed ones.
+        let Ok(keys) = SessionKeys::mint() else {
+            return entry_unavailable();
+        };
+        let rendered = Rendered::first(keys, tree);
+        let body = rendered.page();
         let epoch = rendered.epoch();
 
         // Bounded per-session Msg queue: cap at 1024 to prevent a fast
@@ -4939,10 +4938,10 @@ mod handlers {
         {
             let base = web_base_path();
             let overlay = crate::debugger::server::overlay_html(&[], 0, &base);
-            page_response_with_overlay(&sid, &body, &epoch, &overlay, &csrf_tok, &headers)
+            page_response_with_overlay(&sid, body.as_str(), &epoch, &overlay, &csrf_tok, &headers)
         }
         #[cfg(not(feature = "debugger"))]
-        page_response(&sid, &body, &epoch, &csrf_tok, &headers)
+        page_response(&sid, body.as_str(), &epoch, &csrf_tok, &headers)
     }
 
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
@@ -5110,11 +5109,11 @@ mod handlers {
             g.seq += 1;
             // The current render at its current epoch: a resync re-sends the
             // view, it mints no epoch and changes no handler index.
-            let html = render_html(g.rendered.last_view());
+            let html = g.rendered.page();
             serde_json::json!({
                 "seq": g.seq,
                 "epoch": g.rendered.epoch().to_token(),
-                "body": html,
+                "body": html.as_str(),
             })
             .to_string()
         };
@@ -5981,14 +5980,16 @@ mod handlers {
     }
 
     /// Install the render a debugger endpoint shows as the session's current
-    /// render, minting its epoch; `None` when no epoch is left to mint.
+    /// render, minting its epoch, and return that epoch with the stamped
+    /// render; `None` when no epoch is left to mint.
     #[cfg(feature = "debugger")]
     fn commit_debug_render<Model, Msg: Clone>(
         handle: &store::SessionHandle<Model, Msg>,
         tree: Html<Msg>,
-    ) -> Option<RenderEpoch> {
+    ) -> Option<(RenderEpoch, StampedHtml)> {
         let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-        e.rendered.commit(tree).ok().map(|step| step.to)
+        let epoch = e.rendered.commit(tree).ok()?.to;
+        Some((epoch, e.rendered.page()))
     }
 
     // ── POST /_ipe/debug/scrub ────────────────────────────────────────
@@ -6048,11 +6049,10 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6060,7 +6060,8 @@ mod handlers {
         if !debug_resident(&st.store, &sid, &handle).await {
             return too_large();
         }
-        let resp_json = serde_json::json!({ "body": html_body, "epoch": epoch.to_token() });
+        let resp_json =
+            serde_json::json!({ "body": html_body.as_str(), "epoch": epoch.to_token() });
         (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -6366,11 +6367,10 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6379,7 +6379,7 @@ mod handlers {
             return too_large();
         }
         let resp_json = serde_json::json!({
-            "body":   html_body,
+            "body":   html_body.as_str(),
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
@@ -6450,11 +6450,10 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6463,7 +6462,7 @@ mod handlers {
             return too_large();
         }
         let resp_json = serde_json::json!({
-            "body":   html_body,
+            "body":   html_body.as_str(),
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
@@ -6538,11 +6537,10 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6551,7 +6549,7 @@ mod handlers {
             return too_large();
         }
         let resp_json = serde_json::json!({
-            "body":   html_body,
+            "body":   html_body.as_str(),
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
@@ -7300,7 +7298,7 @@ mod reload_push_tests {
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: Rendered::first(new_incarnation(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -7408,7 +7406,7 @@ mod hot_appearance_push_tests {
         let (msg_tx, _rx) = mpsc::channel::<()>(1);
         Arc::new(Mutex::new(SessionEntry {
             model: count,
-            rendered: Rendered::first(new_incarnation(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -7935,8 +7933,8 @@ mod canonical_redirect_handler_tests {
 #[cfg(all(test, feature = "web"))]
 mod base_path_tests {
     use super::{
-        Html, RenderEpoch, Rendered, client_js_path, cookie_name_for, cookie_name_with,
-        cookie_path_for, new_incarnation, normalise_base_path, render_page_full,
+        Html, RenderEpoch, Rendered, SessionKeys, client_js_path, cookie_name_for,
+        cookie_name_with, cookie_path_for, normalise_base_path, render_page_full,
     };
 
     #[test]
@@ -8371,7 +8369,7 @@ mod base_path_tests {
 
     /// The first epoch of a fresh render history, as a page GET serves it.
     fn page_epoch() -> RenderEpoch {
-        Rendered::first(new_incarnation(), Html::<()>::HText(String::new())).epoch()
+        Rendered::first(SessionKeys::distinct(), Html::<()>::HText(String::new())).epoch()
     }
 
     #[allow(clippy::expect_used)] // a fixed literal inside the mount-base grammar
@@ -8765,7 +8763,7 @@ mod sse_reconnect_reconcile_tests {
         let (enter_tx, enter_rx) = channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model,
-            rendered: Rendered::first(new_incarnation(), last_view),
+            rendered: Rendered::first(SessionKeys::distinct(), last_view),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -9537,7 +9535,7 @@ mod watch_status_handler_tests {
         let tree: Html<TestMsg> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: Rendered::first(new_incarnation(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -13531,7 +13529,7 @@ mod page_mount_base_tests {
     /// The first epoch of a fresh render history.
     fn page_epoch() -> super::RenderEpoch {
         super::Rendered::first(
-            super::new_incarnation(),
+            super::SessionKeys::distinct(),
             super::Html::<()>::HText(String::new()),
         )
         .epoch()
@@ -15133,7 +15131,7 @@ mod route_entry_cmd_tests {
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model: model.clone(),
-            rendered: Rendered::first(new_incarnation(), last_view),
+            rendered: Rendered::first(SessionKeys::distinct(), last_view),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -15231,10 +15229,15 @@ mod route_entry_cmd_tests {
     }
 
     /// Open the SSE stream for `sid` reporting `path` and read until its resync frame.
-    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
     async fn sse_resync(store: &Store, sid: &str, path: &str) -> String {
+        sse_resync_via(router(store.clone()), sid, path).await
+    }
+
+    /// Open the SSE stream through `app`, answering as [`sse_resync`] does.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn sse_resync_via(app: axum::Router, sid: &str, path: &str) -> String {
         use futures_util::StreamExt;
-        let resp = router(store.clone())
+        let resp = app
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -15261,6 +15264,75 @@ mod route_entry_cmd_tests {
         })
         .await;
         utf8_prefix(&bytes).to_owned()
+    }
+
+    /// The fixture view with a `<style>` ahead of the page text.
+    fn styled_view(model: Model) -> Html<Msg> {
+        Html::HElement(
+            "div".into(),
+            vec![],
+            vec![
+                Html::HElement("style".into(), vec![], vec![Html::HRaw("p{}".into())]),
+                view(model),
+            ],
+        )
+    }
+
+    /// The fixture router over `store`, rendering [`styled_view`].
+    #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
+    fn styled_router(store: Store) -> axum::Router {
+        let mut state = fixture_state(store, Arc::new(AtomicUsize::new(0)));
+        state.view = Arc::new(styled_view as fn(Model) -> Html<Msg>);
+        build_web_router(state, false)
+            .map(crate::server::behind_listener)
+            .expect("the fixture route table and base are well-formed")
+    }
+
+    /// Whether `token` occurs in `text`, and every occurrence is the quoted
+    /// `nonce` value of a `<style` start tag, with `quote` as the quote.
+    fn stamped_only(text: &str, token: &str, quote: &str) -> bool {
+        let attr = format!(" nonce={quote}");
+        let found: Vec<bool> = text
+            .match_indices(token)
+            .map(|(at, _)| {
+                let head = text.get(..at).unwrap_or_default();
+                let tag = head.rfind('<').and_then(|lt| head.get(lt..));
+                head.ends_with(&attr)
+                    && tag.is_some_and(|t| t.starts_with("<style ") && !t.contains('>'))
+            })
+            .collect();
+        !found.is_empty() && found.iter().all(|ok| *ok)
+    }
+
+    /// The session's style nonce reaches the page and the SSE stream only as
+    /// the `nonce` attribute of a `<style>` start tag: never in the hello
+    /// frame, the frame metadata, or anywhere else.
+    #[test]
+    fn nonce_never_on_the_stream() {
+        run(false, || async {
+            let store = memory();
+            let (status, _, sid, page) = get_via(styled_router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(settled(&store, &sid, 2).await.is_some());
+            let handle = handle_of(&store, &sid).await;
+            assert!(handle.is_some(), "the session is live");
+            let Some(handle) = handle else {
+                return;
+            };
+            let token = handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .stamp()
+                .as_token();
+
+            assert!(stamped_only(&page, &token, "\""), "{page}");
+
+            let stream = sse_resync_via(styled_router(store.clone()), &sid, "/").await;
+            assert!(stream.contains("event: hello"), "{stream}");
+            assert!(stream.contains("event: patch"), "{stream}");
+            assert!(stamped_only(&stream, &token, "\\\""), "{stream}");
+        });
     }
 
     /// The GET that creates a page and the SSE open that follows at the same
@@ -17077,6 +17149,40 @@ mod web_revocation_tests {
             .unwrap_or_default()
             .split_whitespace()
             .collect()
+    }
+
+    /// Every serialization of a session's tree is stamped with its nonce.
+    ///
+    /// An unstamped render, and a replaced render history that would carry
+    /// other keys, appear only in the static SSR fn that serves no session,
+    /// and the keys are minted at exactly one site.
+    #[test]
+    fn session_serialization_is_stamped() {
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        let bodies = fn_bodies(&code);
+        let mut owners = std::collections::BTreeSet::new();
+        let mut sites = 0_usize;
+        for marker in ["render_html(", "RenderCtx::Unstamped", ".rendered ="] {
+            for (pos, _) in code.match_indices(marker) {
+                let bounded = marker.starts_with('.')
+                    || code
+                        .get(..pos)
+                        .and_then(|head| head.chars().next_back())
+                        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                if bounded {
+                    sites += 1;
+                    owners.insert(enclosing_fn(&bodies, pos));
+                }
+            }
+        }
+        assert!(sites >= 1, "the static SSR render is found");
+        assert_eq!(
+            owners,
+            std::collections::BTreeSet::from([Some("web_render_static".to_owned())]),
+            "an unstamped render or a replaced render history serves no session"
+        );
+        let mints = code.matches("SessionKeys::mint(").count();
+        assert_eq!(mints, 1, "a session's keys are minted at one site");
     }
 
     /// Every task a Cmd dispatch spawns runs in the session's scope, every
