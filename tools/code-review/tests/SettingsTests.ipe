@@ -526,7 +526,10 @@ occurrences needle text =
 -- read once, by `Main`, and parsed by `Bind.parseBind` alone, called once.
 -- The bind proof rests on the runtime resolving the same value: no module
 -- installs a host setting (`appWith`) or writes the environment overlay
--- (`setenv`, `unsetenv`, `loadEnv`), by any spelling of the name.
+-- (`setenv`, `unsetenv`, `loadEnv`), by any spelling of the name. The
+-- server module is imported by `Main` alone, and `listen` is named only by
+-- `Main`'s one listen under the `Loopback` proof and by the refusal's prose,
+-- so no other module can listen through an alias or an `exposing` import.
 admittedSites : List ( String, List ( String, Int ) )
 admittedSites =
     [ ( "Ipe.System", [ ( "Main.ipe", 1 ), ( "Lib/RepoPath.ipe", 1 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
@@ -551,6 +554,9 @@ admittedSites =
     , ( "setenv", [] )
     , ( "unsetenv", [] )
     , ( "loadEnv", [] )
+    , ( "listen", [ ( "Main.ipe", 1 ), ( "Lib/Bind.ipe", 2 ) ] )
+    , ( "Ipe.Server", [ ( "Main.ipe", 1 ) ] )
+    , ( "Http.Server", [] )
     ]
 
 
@@ -589,8 +595,9 @@ systemImportAdmitted line =
 
 -- The scan refuses each way around it: a reader behind an alias or an
 -- `exposing` import, `getcwd` beside `cwd`, a wrapper that calls an admitted
--- parser from a request path, a reader in a module outside `src/Lib`, and a
--- directory the inventory would not read. Red while the scan matches one
+-- parser from a request path, a reader in a module outside `src/Lib`, a
+-- listen or server import outside `Main`, and a directory the inventory
+-- would not read. Red while the scan matches one
 -- qualified spelling per reader or reads `src/Lib` alone.
 startupScanRefusesEvasions : Task.Task Error Bool
 startupScanRefusesEvasions =
@@ -623,6 +630,10 @@ startupScanRefusesEvasions =
                 && evaded sources "Lib/Queue.ipe" "unbind = Sys.unsetenv \"X\""
                 && evaded sources "Lib/Queue.ipe" "reload = loadEnv \".env\""
                 && evaded sources "Lib/Queue.ipe" "app = Web.appWith"
+                && evaded sources "Lib/Queue.ipe" "rogue settings = Server.listen 8000 []"
+                && evaded sources "Lib/App.ipe" "import Ipe.Http.Server as Http\nrogue = Http.mountApp"
+                && evaded sources "Lib/Queue.ipe" "import Ipe.Server.Http as Http\nrogue = Http.mountApp"
+                && evaded sources "Main.ipe" "rogue = listen 8000 []"
                 && not (sitesAdmitted (List.filter (\( rel, _ ) -> rel /= "Lib/RepoPath.ipe") sources))
                 && not (layoutAdmits ("Pages" :: topNames) libNames)
                 && not (layoutAdmits topNames ("Extra" :: libNames))
