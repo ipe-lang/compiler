@@ -22,10 +22,11 @@
  *   4. Patched styles — a style block a patch inserts, and one whose text a
  *      patch replaces, both apply (examples/shapes/web/csp-styles).
  *   5. Navigation — the URL follows the render on screen: an older answer to a
- *      navigation a later one superseded moves neither the DOM nor the URL, a
- *      popstate answer that applies after a link's answer names the URL, and
- *      a popstate whose fetch fails or whose answer is of no history is a full
- *      browser load of the entry.
+ *      navigation a later one superseded moves neither the DOM nor the URL,
+ *      whichever order the answers arrive in; a popstate answer that applies
+ *      after a link's answer names the URL; a render's `data-ipe-path` is one
+ *      history entry that Back leaves; and a popstate whose fetch fails or
+ *      whose answer is of no history is a full browser load of the entry.
  *
  * Each refusal serves the real page, with its own headers, and its HTML
  * rewritten in flight.
@@ -493,6 +494,74 @@ test("navigation: a popstate answer applied after a link's answer names the URL"
   await page.waitForTimeout(1000);
   await expect(page).toHaveURL(`${STYLES}/`);
   expect(await page.locator("#e2e-link").count()).toBe(0);
+});
+
+test("navigation: an answer older than one already applied leaves the URL on the applied one", async ({
+  page,
+}) => {
+  const { later } = await openLive(page);
+  const [inc, n] = later.split(".");
+  const at = (k) => `${inc}.${Number(n) + k}`;
+  const first = gate();
+  const second = gate();
+  let answered = 0;
+  await page.route(
+    (url) => url.origin === STYLES && ["/e2e-first", "/e2e-second"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      // The driver entered the second route before the first, so the first
+      // answer is the newer render.
+      if (new URL(route.request().url()).pathname === "/e2e-first") {
+        await first.shut;
+        await route.fulfill(navAnswer(at(2), '<div id="e2e-first">first</div>'));
+      } else {
+        await second.shut;
+        await route.fulfill(navAnswer(at(1), '<div id="e2e-second">second</div>'));
+      }
+      answered += 1;
+    },
+  );
+  await addNavLink(page, "first", "/e2e-first");
+  await addNavLink(page, "second", "/e2e-second");
+  await page.locator("#e2e-link-first").click();
+  await page.locator("#e2e-link-second").click();
+  first.open();
+  await page.waitForSelector("#e2e-first", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/e2e-first`);
+  second.open();
+  await expect.poll(() => answered, { timeout: 10000 }).toBe(2);
+  await page.waitForTimeout(1000);
+  await expect(page).toHaveURL(`${STYLES}/e2e-first`);
+  expect(await page.locator("#e2e-first").count()).toBe(1);
+  expect(await page.locator("#e2e-second").count()).toBe(0);
+});
+
+test("navigation: a render's data-ipe-path is one history entry, and Back leaves it", async ({
+  page,
+}) => {
+  const { later } = await openLive(page);
+  const [inc, n] = later.split(".");
+  const at = (k) => `${inc}.${Number(n) + k}`;
+  await page.route(
+    (url) => url.origin === STYLES && ["/", "/e2e-path"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      if (new URL(route.request().url()).pathname === "/e2e-path") {
+        return route.fulfill(
+          navAnswer(at(1), '<div id="e2e-path" data-ipe-path="/e2e-path">path</div>'),
+        );
+      }
+      return route.fulfill(navAnswer(at(2), '<div id="e2e-home">home</div>'));
+    },
+  );
+  await addNavLink(page, "path", "/e2e-path");
+  await page.locator("#e2e-link-path").click();
+  await page.waitForSelector("#e2e-path", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/e2e-path`);
+  await page.evaluate(() => history.back());
+  await page.waitForSelector("#e2e-home", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/`);
+  expect(await page.locator("#e2e-path").count()).toBe(0);
 });
 
 test("navigation: a popstate answer of no history loads the popped entry", async ({ page }) => {

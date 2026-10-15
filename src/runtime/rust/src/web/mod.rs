@@ -8408,11 +8408,70 @@ mod base_path_tests {
         );
     }
 
-    /// A navigation answer moves the URL through `__ipeRecordNav` only, and the
-    /// full-render gate records it in the same step that applies the render:
-    /// the URL names the last navigation render applied, on every path.
+    /// The client writes its history in `__ipeRecordNav` only: no other site
+    /// names the history API, whatever receiver it reaches it through.
+    ///
+    /// A second writer, such as a `data-ipe-path` render calling
+    /// `history.pushState` itself, moves the URL without the location the
+    /// popstate handler compares against, so Back stops at an entry it takes
+    /// for the current one, and a navigation pushes its URL twice.
     #[test]
-    fn client_records_a_navigation_url_only_where_its_render_applies() {
+    fn client_writes_its_history_through_one_writer() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        // `history` followed by a member access, `.name` or `[`.
+        let history_reads = |text: &str| -> usize {
+            text.match_indices("history")
+                .filter(|(at, name)| {
+                    let after = text.get(at + name.len()..).unwrap_or_default();
+                    after.starts_with('[')
+                        || after
+                            .strip_prefix('.')
+                            .and_then(|rest| rest.chars().next())
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                })
+                .count()
+        };
+        let record = body_of("__ipeRecordNav").unwrap_or_default();
+        let paths = body_of("__ipeRunPaths").unwrap_or_default();
+        assert_eq!(
+            (history_reads(js), history_reads(record)),
+            (2, 2),
+            "the history API is reached in `__ipeRecordNav` only"
+        );
+        for api in ["pushState", "replaceState"] {
+            assert_eq!(
+                (js.matches(api).count(), record.matches(api).count()),
+                (1, 1),
+                "`{api}` is named in `__ipeRecordNav` only"
+            );
+        }
+        assert!(
+            paths.contains("__ipeRecordNav(p, true, at);")
+                && paths.contains("__ipeRecordNav(p, false, at);"),
+            "a render's `data-ipe-path` is recorded through `__ipeRecordNav`"
+        );
+        assert!(
+            record.contains(
+                "else if (new URL(url, window.location.href).href !== window.location.href) {"
+            ),
+            "a push of the current location adds no history entry"
+        );
+    }
+
+    /// A location is recorded only when no newer navigation answer or render
+    /// already named one: the newest names the route every later render
+    /// shows, whatever order the answers arrive in.
+    ///
+    /// Ordering by the navigations started instead lets an older answer that
+    /// arrives last, to the last navigation started, move the URL off the
+    /// render on screen.
+    #[test]
+    fn client_records_the_location_of_the_newest_answer_or_render() {
         let js = super::CLIENT_JS;
         let body_of = |name: &str| -> Option<&'static str> {
             let open = format!("\nfunction {name}(");
@@ -8421,26 +8480,36 @@ mod base_path_tests {
         };
         let record = body_of("__ipeRecordNav").unwrap_or_default();
         let full = body_of("__ipeAdoptFullBody").unwrap_or_default();
-        assert_eq!(
-            (
-                js.matches("window.history.").count(),
-                record.matches("window.history.").count()
+        let diff = body_of("__ipeAdoptPatches").unwrap_or_default();
+        assert!(
+            record.contains(
+                "if (__ipeNavEpoch && __ipeCounterOrder(at, __ipeNavEpoch) < 0) return;\n  __ipeNavEpoch = at;"
             ),
-            (2, 2),
-            "navigation writes history in `__ipeRecordNav` only"
+            "a location older than the one recorded is refused"
         );
         assert!(
-            full.contains("__ipeEpoch = token;\n  if (nav) __ipeRecordNav(nav.url, nav.push);"),
-            "the full-render gate records the location with the render it applies"
+            !js.contains("__ipeNavCount"),
+            "no count of started navigations orders their answers"
         );
         assert_eq!(
             js.matches("__ipeRecordNav(").count(),
-            3,
-            "`__ipeRecordNav` has its definition, the gate, and the link fallback"
+            5,
+            "`__ipeRecordNav` has its definition, two `data-ipe-path` sites, the link and the popstate answer"
         );
         assert!(
-            js.contains("{ url: res.url, push: false });"),
-            "a popstate answer names its location to the gate"
+            js.contains("__ipeRecordNav(res.url, true, next);")
+                && js.contains("__ipeRecordNav(res.url, false, next);"),
+            "each navigation answer names its location at its own epoch"
+        );
+        assert_eq!(
+            (
+                js.matches("__ipeRunPaths()").count(),
+                full.matches("__ipeEpoch = token;\n  __ipeRunPaths();")
+                    .count(),
+                diff.matches("__ipeEpoch = to;\n  __ipeRunPaths();").count()
+            ),
+            (3, 1, 1),
+            "a render's `data-ipe-path` is read after its epoch is adopted, in the two adopt functions only"
         );
     }
 

@@ -271,11 +271,8 @@ function __ipeCounterOrder(a, b) {
 // against a nonce this document does not hold: it is never applied, and the
 // document is stale.
 //
-// `nav` is the location a navigation answer renders, `{ url, push }`, or null
-// for a render that names none. The location is recorded exactly when the
-// render applies, so on every navigation path the URL names the last render
-// applied.
-function __ipeAdoptFullBody(token, applyFn, nav) {
+// An applied render then reconciles the URL with the path it declares.
+function __ipeAdoptFullBody(token, applyFn) {
   if (__ipeStale) return false;
   var next = __ipeOwnEpoch(token);
   if (!next) {
@@ -286,7 +283,7 @@ function __ipeAdoptFullBody(token, applyFn, nav) {
   if (cur && __ipeCounterOrder(next, cur) < 0) return false;
   applyFn();
   __ipeEpoch = token;
-  if (nav) __ipeRecordNav(nav.url, nav.push);
+  __ipeRunPaths();
   return true;
 }
 // Where the patches diffed from render `from` to render `to` stand against the
@@ -306,6 +303,7 @@ function __ipeAdoptPatches(from, to, patches) {
   if (__ipeStale || __ipePatchStep(from, to) !== "next") return false;
   __ipeApplyPatches(patches);
   __ipeEpoch = to;
+  __ipeRunPaths();
   return true;
 }
 // Set once this document has refused a render of another history: from then
@@ -919,7 +917,6 @@ function __ipePatch(t, mode) {
     window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
   }
   __ipeBindEvents();
-  __ipeRunPaths(root);
   __ipeReviveScripts(root);
 }
 
@@ -1305,7 +1302,7 @@ function __ipePostEvent(body) {
         if (!data || typeof data.body !== "string") return;
         // The epoch gate orders this render against the DOM on screen; the
         // seq it carries is the session's, which an earlier ack may equal.
-        __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, null);
+        __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); });
       }).catch(function() { __ipeLoaderEnd(); });
     }
     if (!r.ok && r.status >= 500) {
@@ -1576,10 +1573,6 @@ function __ipeApplyPatches(patches) {
   }
   // Any new ipe-* attribute in the patched DOM needs a listener.
   __ipeBindEvents();
-  // After SSE-driven patches the URL also needs reconciling — without
-  // this, programmatic Navigate Msgs would only update the in-memory
-  // model and leave the address bar pointing at the previous page.
-  __ipeRunPaths();
   // Any <script> in newly-patched HTML wouldn't execute via innerHTML
   // — revive them so JS bundles (e.g. ipe-editor) bootstrap correctly
   // when their host element first appears via a patch (not the initial
@@ -1618,31 +1611,28 @@ function __ipeBindEvents() {
   }
 }
 
-// __ipeRunPaths: safer, CSP-friendly alternative to data-ipe-eval for
-// the specific case of "update the address bar after a render." Looks
-// for [data-ipe-path] elements and pushes / replaces history if the
-// value differs from location. No new Function(), no eval; the only
-// DOM APIs touched are getAttribute and history.pushState /
-// replaceState. Works under strict CSP (no 'unsafe-eval') and has no
-// XSS surface (the value is a URL path, never executed).
+// __ipeRunPaths: the CSP-friendly alternative to data-ipe-eval for
+// "update the address bar after a render". Each [data-ipe-path] element of
+// the render on screen names its location: a path other than the current one
+// is a new history entry, the current path with a query rewrites the current
+// entry. No new Function(), no eval: the value is a URL path, recorded
+// through `__ipeRecordNav` at the render's epoch, never executed.
 //
 // The element is intentionally NOT removed after running — Ipe.Web's
 // patches identify elements by ipe-id and look them up via
 // querySelector; removing the data-ipe-path element would orphan its
 // ipe-id, and the next attribute patch (when the path changes) would
 // silently skip. The path-check makes the call idempotent, so leaving
-// the element in place is cheap — at most one comparison per patch.
-function __ipeRunPaths(root) {
-  var sel = "[data-ipe-path]";
-  var els = root ? root.querySelectorAll(sel) : __ipeDoc.queryAll(sel);
+// the element in place is cheap — at most one comparison per render.
+function __ipeRunPaths() {
+  var at = __ipeOwnEpoch(__ipeEpoch);
+  if (!at) return;
+  var els = __ipeDoc.queryAll("[data-ipe-path]");
   for (var i = 0; i < els.length; i++) {
     var p = els[i].getAttribute("data-ipe-path");
     if (!p) continue;
-    if (location.pathname !== p) {
-      try { history.pushState({}, "", p); } catch (_) {}
-    } else if (location.search) {
-      try { history.replaceState({}, "", p); } catch (_) {}
-    }
+    if (window.location.pathname !== p) __ipeRecordNav(p, true, at);
+    else if (window.location.search) __ipeRecordNav(p, false, at);
   }
 }
 
@@ -1867,15 +1857,24 @@ window.__ipePortSend = function(raw) {
 var __ipeNavPath   = window.location.pathname;
 var __ipeNavSearch = window.location.search;
 var __ipeNavHref   = window.location.href;
-// The count of navigations (ipe-nav clicks and popstates) this document has
-// started.
-var __ipeNavCount = 0;
-// Record `url` as the document's location: a new history entry when `push`,
-// otherwise the current entry rewritten.
-function __ipeRecordNav(url, push) {
+// The epoch, as parts, of the newest navigation answer or render whose
+// location the URL records; null before any.
+var __ipeNavEpoch = null;
+// The one writer of the document's history. Record `url`, the location the
+// navigation answer or render at epoch `at` names: a new history entry when
+// `push` (none when `url` is already the location), otherwise the current
+// entry rewritten. A location older than the one recorded is refused: the
+// driver enters routes in order, so the newest answer or render names the
+// route every later render shows, whatever order the answers arrive in.
+function __ipeRecordNav(url, push, at) {
+  if (__ipeStale) return;
+  if (__ipeNavEpoch && __ipeCounterOrder(at, __ipeNavEpoch) < 0) return;
+  __ipeNavEpoch = at;
   try {
-    if (push) window.history.pushState({}, "", url);
-    else window.history.replaceState({}, "", url);
+    if (!push) window.history.replaceState({}, "", url);
+    else if (new URL(url, window.location.href).href !== window.location.href) {
+      window.history.pushState({}, "", url);
+    }
   } catch (_) {}
   __ipeNavPath   = window.location.pathname;
   __ipeNavSearch = window.location.search;
@@ -1917,7 +1916,6 @@ __ipeDoc.on("click", function(ev) {
     if (u.origin !== window.location.origin) return;
   } catch (e) { return; }
   ev.preventDefault();
-  var nav = ++__ipeNavCount;
   fetch(href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
       var url = __ipeFollowed(r, href);
@@ -1933,12 +1931,11 @@ __ipeDoc.on("click", function(ev) {
         window.location.href = href;
         return;
       }
-      // An applied answer records its URL. An older render of this history is
-      // not applied: the screen already shows a later one, which shows this
-      // navigation's page only when no later navigation was started meanwhile.
-      var target = { url: res.url, push: true };
-      var applied = __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); }, target);
-      if (!applied && !__ipeStale && nav === __ipeNavCount) __ipeRecordNav(target.url, target.push);
+      // The answer applies unless the screen already shows a later render; its
+      // URL is recorded either way, unless a later answer or render already
+      // named the location.
+      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
+      __ipeRecordNav(res.url, true, next);
     })
     .catch(function() { window.location.href = href; });
 });
@@ -1959,7 +1956,6 @@ window.addEventListener("popstate", function() {
   // The popped entry, fixed now: the live location moves with any later
   // navigation.
   var popped = here.href;
-  ++__ipeNavCount;
   // A stale document applies no render: the browser loads the popped entry,
   // as it follows a stale document's links.
   if (__ipeStale) {
@@ -1976,12 +1972,15 @@ window.addEventListener("popstate", function() {
       // An answer of no history or of another one is not this document's to
       // show: the browser loads the entry itself, as it follows such an
       // answer to a link.
-      if (!__ipeOwnEpoch(res.epoch)) {
+      var next = __ipeOwnEpoch(res.epoch);
+      if (!next) {
         window.location.reload();
         return;
       }
-      // An applied answer rewrites the current entry to its URL.
-      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); }, { url: res.url, push: false });
+      // The answer rewrites the current entry to its URL, unless a later
+      // answer or render already named the location.
+      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
+      __ipeRecordNav(res.url, false, next);
     })
     // The URL already names the popped entry: with no answer to show, the
     // browser loads it. One load per popstate, which only the reader starts.
@@ -2352,7 +2351,7 @@ var __ipeLiveFrames = {
         if (!frame.body) return;
         var body = frame.body.replace(/\\n/g, "\n");
         var apply = function() {
-          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); }, null);
+          __ipeAdoptFullBody(frame.epoch, function() { __ipePatch(body); });
         };
         if (__ipeSelectOpen()) __ipeHoldRender(apply);
         else {
