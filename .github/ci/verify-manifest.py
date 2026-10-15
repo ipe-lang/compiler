@@ -21,7 +21,18 @@ Checks performed
        - an entry that `guards` a Security/Soundness/SEAL invariant is NOT
          `informational` (§0/§1/§3: a guarantee may not sit in an un-gated bucket);
        - a `gate`/`nightly-gate` entry has a producer workflow that exists;
-       - a `delete` entry has no producer (an orphan), else it is a live check.
+       - a `delete` entry has no producer (an orphan), else it is a live check;
+       - typed references (`ManifestEntry`): an entry's producer is the
+         workflow that produces its context (so check 8's producer set is
+         derived); a classified context is produced by its producer unless
+         `internal`; a `delete` context is produced nowhere; `aggregates:`
+         names job ids of the producer, never context names, and equals the
+         aggregator job's `needs:` minus `changes` in both directions under an
+         `if: always()` aggregator;
+       - a context's stem (its name without the ` (…)` matrix suffix) names
+         one job across every workflow, plumbing included; within one
+         workflow several jobs may share a stem only when every context of
+         it is suffixed.
   3. Fail-closed dependency surfacing: GitHub reports a job whose `needs`
      failed as SKIPPED, and a skipped required check counts as passing.  So
      every job a gate transitively `needs` must itself surface in a gate (its
@@ -1052,7 +1063,9 @@ JobNeeds = tuple[JobId, ...]
 
 
 class ErrorKind(enum.Enum):
-    """Every shape the one workflow load (`WorkflowSet.load`) refuses."""
+    """Every typed refusal: the shapes the one workflow load
+    (`WorkflowSet.load`) refuses, and the manifest-reference and
+    context-name rules checked against that load."""
 
     UNREADABLE = "unreadable"
     YAML_INVALID = "yaml-invalid"
@@ -1071,6 +1084,18 @@ class ErrorKind(enum.Enum):
     NEEDS_UNKNOWN = "needs-unknown"
     PERMISSIONS_MALFORMED = "permissions-malformed"
     PERMISSIONS_MISSING = "permissions-missing"
+    ENTRY_MALFORMED = "entry-malformed"
+    PRODUCER_UNKNOWN = "producer-unknown"
+    PRODUCER_MISMATCH = "producer-mismatch"
+    CONTEXT_NOT_PRODUCED = "context-not-produced"
+    DELETE_STILL_PRODUCED = "delete-still-produced"
+    AGGREGATE_IS_CONTEXT = "aggregate-is-context"
+    AGGREGATE_UNKNOWN_JOB = "aggregate-unknown-job"
+    AGGREGATOR_NOT_ONE_JOB = "aggregator-not-one-job"
+    AGGREGATES_NEEDS_MISMATCH = "aggregates-needs-mismatch"
+    AGGREGATOR_NOT_ALWAYS = "aggregator-not-always"
+    CONTEXT_DUPLICATE = "context-duplicate"
+    CONTEXT_STEM_SHARED = "context-stem-shared"
 
 
 @dataclass(frozen=True)
@@ -1335,6 +1360,176 @@ def check_permissions(wfs: WorkflowSet, errors: list[str]) -> None:
             errors.append(ManifestError(
                 ErrorKind.PERMISSIONS_MISSING, wf.fname, "",
                 "declares no top-level `permissions:` — the default token may write; refused",
+            ).render())
+
+
+@dataclass(frozen=True)
+class ManifestEntry:
+    """A `ci/check-manifest.yml` entry's references, typed: the context it
+    classifies, the workflow it says produces it, and the job ids (never
+    context names) whose outcome its verdict reports."""
+
+    context: ContextName
+    disposition: str
+    producer: str | None
+    aggregates: tuple[JobId, ...]
+    internal: bool
+
+    @staticmethod
+    def parse(raw: object) -> ManifestEntry | ManifestError:
+        def refuse(detail: str) -> ManifestError:
+            return ManifestError(ErrorKind.ENTRY_MALFORMED, MANIFEST_NAME, f"entry {raw!r}", f"{detail}; refused")
+
+        if not isinstance(raw, dict):
+            return refuse("is not a mapping")
+        ctx, disp, producer = raw.get("context"), raw.get("disposition"), raw.get("producer")
+        if not isinstance(ctx, str) or not ctx:
+            return refuse("`context:` is not a non-empty string")
+        if not isinstance(disp, str):
+            return refuse("`disposition:` is not a string")
+        if producer is not None and (not isinstance(producer, str) or not producer):
+            return refuse("`producer:` is not a non-empty string")
+        aggs = raw.get("aggregates", [])
+        if not isinstance(aggs, list) or ("aggregates" in raw and not aggs):
+            return refuse("`aggregates:` is not a non-empty list")
+        if not all(isinstance(a, str) and a for a in aggs) or len(set(aggs)) != len(aggs):
+            return refuse("`aggregates:` holds a non-string, empty or duplicate member")
+        internal = raw.get("internal", False)
+        if not isinstance(internal, bool):
+            return refuse("`internal:` is not a boolean")
+        return ManifestEntry(ContextName(ctx), disp, producer, tuple(JobId(a) for a in aggs), internal)
+
+
+MANIFEST_NAME = "ci/check-manifest.yml"
+# The phase classifier job a verdict needs without reporting it.
+CLASSIFIER_JOB = "changes"
+
+
+def _producing_jobs(wfs: WorkflowSet) -> dict[str, list[tuple[Workflow, WorkflowJob]]]:
+    """Every produced context -> its producing (workflow, job) pairs, over
+    every workflow, plumbing included."""
+    out: dict[str, list[tuple[Workflow, WorkflowJob]]] = {}
+    for wf in wfs.workflows:
+        for wj in wf.jobs:
+            for ctx in wj.contexts:
+                out.setdefault(ctx, []).append((wf, wj))
+    return out
+
+
+def check_manifest_references(wfs: WorkflowSet, entries: list, errors: list[str]) -> list[ManifestEntry]:
+    """Every manifest reference names what the workflows really hold: the
+    producer is the workflow that produces the context; a classified context
+    is produced (unless `internal`), a `delete` one is not; `aggregates:`
+    names job ids of the producer, exactly the aggregator's `needs:` minus
+    the classifier, under an `if: always()` aggregator. Returns the typed
+    entries."""
+    producing = _producing_jobs(wfs)
+    typed: list[ManifestEntry] = []
+
+    def refuse(kind: ErrorKind, ctx: str, detail: str) -> None:
+        errors.append(ManifestError(kind, MANIFEST_NAME, f"context {ctx!r}", detail).render())
+
+    for raw in entries:
+        entry = ManifestEntry.parse(raw)
+        if isinstance(entry, ManifestError):
+            errors.append(entry.render())
+            continue
+        typed.append(entry)
+        ctx = entry.context
+        hits = producing.get(ctx, [])
+        if entry.disposition == "delete":
+            if hits:
+                refuse(
+                    ErrorKind.DELETE_STILL_PRODUCED, ctx,
+                    f"is `delete` but {', '.join(sorted({wf.fname for wf, _ in hits}))} still produces it; refused",
+                )
+            continue
+        if entry.disposition == "gate-external" or entry.producer is None:
+            continue
+        wf = wfs.get(entry.producer)
+        if wf is None:
+            refuse(ErrorKind.PRODUCER_UNKNOWN, ctx, f"names producer {entry.producer!r}, which is not a loaded workflow; refused")
+            continue
+        others = sorted({w.fname for w, _ in hits} - {wf.fname})
+        if others:
+            refuse(
+                ErrorKind.PRODUCER_MISMATCH, ctx,
+                f"names producer {wf.fname!r} but {', '.join(others)} produces it; refused",
+            )
+            continue
+        own = [wj for w, wj in hits if w is wf]
+        if not own and not entry.internal:
+            refuse(ErrorKind.CONTEXT_NOT_PRODUCED, ctx, f"is produced by no job of its producer {wf.fname!r}; refused")
+            continue
+        if not entry.aggregates:
+            continue
+        ids = {wj.job_id for wj in wf.jobs}
+        names = {c for wj in wf.jobs for c in wj.contexts}
+        for a in entry.aggregates:
+            if a in ids:
+                continue
+            if a in names or any(c.startswith(f"{a} (") for c in names):
+                refuse(ErrorKind.AGGREGATE_IS_CONTEXT, ctx, f"aggregates {a!r}, a context name; name the job id; refused")
+            else:
+                refuse(ErrorKind.AGGREGATE_UNKNOWN_JOB, ctx, f"aggregates {a!r}, which is not a job of {wf.fname}; refused")
+        if len(own) != 1:
+            refuse(
+                ErrorKind.AGGREGATOR_NOT_ONE_JOB, ctx,
+                f"aggregates jobs but is produced by {len(own)} jobs of {wf.fname}, not one aggregator; refused",
+            )
+            continue
+        agg_job = own[0]
+        needed = set(agg_job.needs) - {CLASSIFIER_JOB}
+        listed = set(entry.aggregates)
+        if listed != needed:
+            refuse(
+                ErrorKind.AGGREGATES_NEEDS_MISMATCH, ctx,
+                f"`aggregates:` {sorted(listed)} must equal job {agg_job.job_id!r}'s `needs:` minus "
+                f"{CLASSIFIER_JOB!r} {sorted(needed)} (only in aggregates: {sorted(listed - needed)}; "
+                f"only in needs: {sorted(needed - listed)}); refused",
+            )
+        if agg_job.raw.get("if") != "always()":
+            refuse(
+                ErrorKind.AGGREGATOR_NOT_ALWAYS, ctx,
+                f"aggregator job {agg_job.job_id!r} has `if:` {agg_job.raw.get('if')!r}, not `always()` — a "
+                "skipped aggregator reports as passing; refused",
+            )
+    return typed
+
+
+_MATRIX_SUFFIX = re.compile(r" \(.*\)$", re.DOTALL)
+
+
+def check_context_stems(wfs: WorkflowSet, errors: list[str]) -> None:
+    """Every produced context names one job, over every workflow, plumbing
+    included. A context's stem is its name with the ` (…)` matrix suffix
+    removed; two workflows never share a stem, and within one workflow a
+    stem shared by several jobs is admitted only when every context of it
+    carries a suffix (never a bare `x` beside an `x (…)`)."""
+    by_ctx: dict[str, list[tuple[str, str]]] = {}
+    by_stem: dict[str, list[tuple[str, str, bool]]] = {}
+    for wf in wfs.workflows:
+        for wj in wf.jobs:
+            where = f"{wf.fname} job {wj.job_id!r}"
+            for ctx in wj.contexts:
+                by_ctx.setdefault(ctx, []).append((wf.fname, where))
+                stem = _MATRIX_SUFFIX.sub("", ctx)
+                by_stem.setdefault(stem, []).append((wf.fname, where, stem == ctx))
+    for ctx, wheres in sorted(by_ctx.items()):
+        if len(wheres) > 1:
+            errors.append(ManifestError(
+                ErrorKind.CONTEXT_DUPLICATE, wheres[0][0], f"context {ctx!r}",
+                f"is produced by {len(wheres)} jobs ({', '.join(w for _, w in wheres)}); a required context must resolve "
+                "to exactly one producer — give each job a unique `name:`",
+            ).render())
+    for stem, uses in sorted(by_stem.items()):
+        files = sorted({f for f, _, _ in uses})
+        jobs = sorted({w for _, w, _ in uses})
+        if len(files) > 1 or (len(jobs) > 1 and any(bare for _, _, bare in uses)):
+            errors.append(ManifestError(
+                ErrorKind.CONTEXT_STEM_SHARED, files[0], f"context stem {stem!r}",
+                f"is the name of {len(jobs)} jobs ({', '.join(jobs)}); a context stem names one job "
+                "across every workflow — give each job a unique `name:`",
             ).render())
 
 
@@ -3026,7 +3221,7 @@ def check_test_claims(wfs: WorkflowSet, errors: list[str]) -> None:
         # An owner job reports either as its own context or through the one
         # entry whose `aggregates:` names it (check 1), whose verdict it inherits.
         entry = next((e for e in entries if e.get("context") == name), None) or next(
-            (e for e in entries if {name, job_id} & set(e.get("aggregates") or [])), None
+            (e for e in entries if e.get("producer") == fname and job_id in (e.get("aggregates") or [])), None
         )
         disp = entry.get("disposition") if entry else None
         if entry is None or entry.get("producer") != fname:
@@ -5714,7 +5909,7 @@ def _required_ci_jobs(entries: list[dict], wf: Workflow) -> list[dict]:
         ctx = str(wj.raw.get("name", wj.job_id))
         reported = any(
             str(e.get("context")) == ctx
-            or any(a == wj.job_id or ctx == a or ctx.startswith(f"{a} (") for a in e.get("aggregates") or [])
+            or wj.job_id in (e.get("aggregates") or [])
             for e in gates
         )
         if reported:
@@ -6613,35 +6808,27 @@ def main() -> int:
     produced = produced_contexts(jobs)
     manifest_ctxs = set(by_context)
 
-    # A context named in some entry's `aggregates:` list is an internal matrix
-    # leg / prep job whose result rolls up into that single promotable context;
-    # it inherits the aggregator's disposition and is considered classified.
-    # `aggregates:` names the job id or the leg-name PREFIX (matrix legs expand
-    # to "<name> (i/n)"), so match by exact id or by prefix.
-    aggregated_prefixes: list[str] = []
-    aggregated_exact: set[str] = set()
-    for e in by_context.values():
-        for agg in e.get("aggregates") or []:
-            aggregated_exact.add(agg)
-            aggregated_prefixes.append(agg)
+    # ---- 1b. manifest references name real workflows, contexts and jobs;
+    # context names are unique over every workflow ----
+    typed_entries = check_manifest_references(workflows, entries, errors)
+    check_context_stems(workflows, errors)
 
-    def is_aggregated(ctx: str) -> bool:
-        if ctx in aggregated_exact:
-            return True
-        # matrix leg "asan (1/6)" is aggregated by "asan"
-        return any(ctx.startswith(p + " (") or ctx == p for p in aggregated_prefixes)
+    # A job some entry's `aggregates:` names (by job id, in that entry's
+    # producer) is a matrix leg / prep job whose result rolls up into that
+    # single promotable context; its contexts inherit the aggregator's
+    # disposition and are classified.
+    aggregated: set[tuple[str, str]] = {
+        (e.producer, a) for e in typed_entries if e.producer is not None for a in e.aggregates
+    }
+    aggregated_ctxs = {
+        ctx for job in jobs if (job.workflow, job.job_id) in aggregated for ctx in job.contexts
+    }
 
-    for ctx, wfs in sorted(produced.items()):
-        if len(wfs) > 1:
-            errors.append(
-                f"context {ctx!r} is produced by {len(wfs)} jobs ({', '.join(wfs)}) — "
-                "a required context must resolve to exactly one producer; give "
-                "each job a unique `name:`"
-            )
-        if ctx in manifest_ctxs or is_aggregated(ctx):
+    for ctx, producers in sorted(produced.items()):
+        if ctx in manifest_ctxs or ctx in aggregated_ctxs:
             continue
         errors.append(
-            f"produced context {ctx!r} (from {wfs[0]}) has NO disposition in "
+            f"produced context {ctx!r} (from {producers[0]}) has NO disposition in "
             "ci/check-manifest.yml — every check must be classified"
         )
 
@@ -6655,9 +6842,10 @@ def main() -> int:
     check_merge_queue(
         workflows,
         {
-            str(e["producer"])
-            for e in by_context.values()
-            if e.get("disposition") == "gate" and e.get("producer")
+            wf.fname
+            for ctx, e in by_context.items()
+            if e.get("disposition") == "gate"
+            for wf, _ in _producing_jobs(workflows).get(ctx, [])
         },
         errors,
     )
@@ -6726,12 +6914,9 @@ def main() -> int:
             entry = by_context.get(ctx)
             if entry:
                 disps.add(entry["disposition"])
-        for entry in by_context.values():
-            for agg in entry.get("aggregates") or []:
-                if agg == job.job_id or any(
-                    c == agg or c.startswith(agg + " (") for c in job.contexts
-                ):
-                    disps.add(entry["disposition"])
+        for entry in typed_entries:
+            if entry.producer == job.workflow and job.job_id in entry.aggregates:
+                disps.add(entry.disposition)
         return disps
 
     surfacing = {"gate": {"gate"}, "nightly-gate": {"gate", "nightly-gate"}}

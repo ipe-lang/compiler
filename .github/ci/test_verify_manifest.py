@@ -6114,16 +6114,16 @@ class TestTestClaims(unittest.TestCase):
         self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="renamed"), "has no manifest entry produced by ci.yml")
 
     def test_owner_aggregated_by_required_gate_passes(self) -> None:
-        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - leg\n"
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - wasm\n"
         self.assertEqual(self.errors(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg")), [])
 
     def test_owner_aggregated_by_unrequired_gate_refused(self) -> None:
-        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - leg\n"
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - wasm\n"
         self.files[".github/ci/required-set.json"] = json.dumps([{"context": "other", "integration_id": 15368}])
         self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg"), "blocks nothing")
 
     def test_owner_aggregated_by_advisory_refused(self) -> None:
-        manifest = _TC_MANIFEST.replace("gate", "advisory") + "    aggregates:\n      - leg\n"
+        manifest = _TC_MANIFEST.replace("gate", "advisory") + "    aggregates:\n      - wasm\n"
         self.files[".github/ci/check-manifest.yml"] = manifest
         self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg"), "blocks nothing")
 
@@ -7405,6 +7405,206 @@ class TestTypedWorkflowLoad(unittest.TestCase):
 
         visit(tree, "")
         self.assertEqual(found, admitted)
+
+
+_MR_CI = """\
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo classify
+  a:
+    name: alpha
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+  b:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+  verdict:
+    if: always()
+    needs: [changes, a, b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo verdict
+"""
+
+_MR_OTHER = """\
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  o:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo o
+"""
+
+
+def _mr_entries() -> list[dict]:
+    return [
+        {"context": "verdict", "disposition": "gate", "producer": "ci.yml", "aggregates": ["a", "b"]},
+        {"context": "changes", "disposition": "gate", "producer": "ci.yml"},
+        {"context": "o", "disposition": "informational", "producer": "other.yml", "owner": "x"},
+    ]
+
+
+class _ManifestFixture(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, entries: list | None = None, ci: str = _MR_CI, other: str = _MR_OTHER,
+               extra: dict[str, str] | None = None) -> list[str]:
+        for name, text in {"ci.yml": ci, "other.yml": other, **(extra or {})}.items():
+            _write(os.path.join(self.root, "workflows", name), text)
+        errors: list[str] = []
+        wfs = _load(self.root, errors)
+        verify_manifest.check_manifest_references(wfs, _mr_entries() if entries is None else entries, errors)
+        verify_manifest.check_context_stems(wfs, errors)
+        return errors
+
+    def assertKind(self, kind: str, **kw: object) -> list[str]:
+        errors = self.errors(**kw)  # type: ignore[arg-type]
+        self.assertTrue(any(e.endswith(f"[{kind}]") for e in errors), (kind, errors))
+        return errors
+
+    def with_entry(self, ctx: str, **fields: object) -> list[dict]:
+        entries = _mr_entries()
+        for e in entries:
+            if e["context"] == ctx:
+                e.update(fields)
+                for k in [k for k, v in fields.items() if v is None]:
+                    del e[k]
+        return entries
+
+
+class TestManifestReferencesExist(_ManifestFixture):
+    """A manifest entry names the workflow that really produces its context,
+    a context that exists (or, for `delete`, one that no longer does), and
+    job ids of its producer in `aggregates:`."""
+
+    def test_consistent_manifest_passes(self) -> None:
+        self.assertEqual(self.errors(), [])
+
+    def test_producer_naming_another_existing_workflow_refused(self) -> None:
+        self.assertKind("PRODUCER_MISMATCH", entries=self.with_entry("verdict", producer="other.yml"))
+
+    def test_producer_naming_no_workflow_refused(self) -> None:
+        self.assertKind("PRODUCER_UNKNOWN", entries=self.with_entry("changes", producer="nope.yml"))
+
+    def test_informational_context_nothing_produces_refused(self) -> None:
+        entries = [*_mr_entries(), {"context": "ghost", "disposition": "informational", "producer": "other.yml", "owner": "x"}]
+        self.assertKind("CONTEXT_NOT_PRODUCED", entries=entries)
+
+    def test_internal_entry_is_exempt_from_existence(self) -> None:
+        entries = [*_mr_entries(), {"context": "ghost", "disposition": "informational", "producer": "other.yml",
+                                    "owner": "x", "internal": True}]
+        self.assertEqual(self.errors(entries=entries), [])
+
+    def test_delete_entry_still_produced_refused(self) -> None:
+        self.assertKind("DELETE_STILL_PRODUCED", entries=self.with_entry("o", disposition="delete", producer=None))
+
+    def test_delete_entry_no_longer_produced_passes(self) -> None:
+        entries = [*_mr_entries(), {"context": "gone", "disposition": "delete"}]
+        self.assertEqual(self.errors(entries=entries), [])
+
+    def test_unknown_job_in_aggregates_refused(self) -> None:
+        errors = self.assertKind("AGGREGATE_UNKNOWN_JOB", entries=self.with_entry("verdict", aggregates=["a", "b", "nope"]))
+        self.assertTrue(any("'nope'" in e for e in errors), errors)
+
+    def test_context_name_in_aggregates_refused(self) -> None:
+        self.assertKind("AGGREGATE_IS_CONTEXT", entries=self.with_entry("verdict", aggregates=["alpha", "b"]))
+
+    def test_malformed_aggregates_refused(self) -> None:
+        for bad in ("a", [], ["a", "a"], [1]):
+            with self.subTest(aggregates=bad):
+                self.assertKind("ENTRY_MALFORMED", entries=self.with_entry("verdict", aggregates=bad))
+
+    def test_live_manifest_references_hold(self) -> None:
+        errors: list[str] = []
+        wfs = _load(verify_manifest.REPO_ROOT, errors)
+        verify_manifest.check_manifest_references(wfs, verify_manifest.load_manifest()["checks"], errors)
+        self.assertEqual(errors, [])
+
+
+class TestAggregatesBound(_ManifestFixture):
+    """`aggregates:` is exactly the aggregator's `needs:` minus `changes`, in
+    both directions, and the aggregator runs under `if: always()`."""
+
+    def test_aggregator_needs_one_extra_job_refused(self) -> None:
+        ci = _MR_CI.replace("needs: [changes, a, b]", "needs: [changes, a, b, c]") + (
+            "  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo c\n"
+        )
+        entries = [*_mr_entries(), {"context": "c", "disposition": "gate", "producer": "ci.yml"}]
+        errors = self.assertKind("AGGREGATES_NEEDS_MISMATCH", ci=ci, entries=entries)
+        self.assertTrue(any("only in needs: ['c']" in e for e in errors), errors)
+
+    def test_aggregates_naming_a_job_the_aggregator_does_not_need_refused(self) -> None:
+        ci = _MR_CI.replace("needs: [changes, a, b]", "needs: [changes, a]")
+        errors = self.assertKind("AGGREGATES_NEEDS_MISMATCH", ci=ci)
+        self.assertTrue(any("only in aggregates: ['b']" in e for e in errors), errors)
+
+    def test_aggregates_missing_a_needed_job_refused(self) -> None:
+        errors = self.assertKind("AGGREGATES_NEEDS_MISMATCH", entries=self.with_entry("verdict", aggregates=["a"]))
+        self.assertTrue(any("only in needs: ['b']" in e for e in errors), errors)
+
+    def test_aggregator_not_always_refused(self) -> None:
+        for guard in ("if: success()\n    ", "if: \"!cancelled()\"\n    ", ""):
+            with self.subTest(guard=guard):
+                ci = _MR_CI.replace("if: always()\n    ", guard)
+                self.assertKind("AGGREGATOR_NOT_ALWAYS", ci=ci)
+
+
+_CS_MATRIX = """\
+  build-m:
+    name: build (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [x]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo m
+"""
+
+
+class TestContextUniqueAllWorkflows(_ManifestFixture):
+    """A context stem (the name without its ` (…)` matrix suffix) names one
+    job across every workflow, plumbing included."""
+
+    def test_plumbing_job_named_like_a_gate_refused(self) -> None:
+        self.assertTrue(verify_manifest.Workflow("release.yml", {}, "", [], verify_manifest.Workspace.NONE, None).is_plumbing)
+        plumbing = _MR_OTHER.replace("  o:\n", "  shadow:\n    name: verdict\n")
+        errors = self.assertKind("CONTEXT_STEM_SHARED", extra={"release.yml": plumbing})
+        self.assertTrue(any(e.endswith("[CONTEXT_DUPLICATE]") for e in errors), errors)
+
+    def test_matrix_build_beside_a_plain_build_refused(self) -> None:
+        other = _MR_OTHER.replace("  o:\n", "  build:\n") + _CS_MATRIX
+        entries = self.with_entry("o", context="build")
+        self.assertKind("CONTEXT_STEM_SHARED", other=other, entries=entries)
+
+    def test_one_stem_in_two_workflows_refused(self) -> None:
+        other = _MR_OTHER + _CS_MATRIX
+        ci = _MR_CI + _CS_MATRIX.replace("build-m", "build-n").replace("os: [x]", "os: [y]")
+        self.assertKind("CONTEXT_STEM_SHARED", other=other, ci=ci)
+
+    def test_suffixed_legs_of_one_workflow_admitted(self) -> None:
+        # The install-smoke shape: two jobs, every context suffixed.
+        other = _MR_OTHER + _CS_MATRIX + _CS_MATRIX.replace("build-m", "build-n").replace("os: [x]", "os: [y]")
+        errors = self.errors(other=other)
+        self.assertFalse([e for e in errors if "CONTEXT_" in e], errors)
+
+    def test_live_context_stems_unique(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_context_stems(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
