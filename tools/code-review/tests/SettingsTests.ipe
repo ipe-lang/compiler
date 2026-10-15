@@ -531,7 +531,7 @@ admittedSites =
     , ( "getenv", [ ( "Main.ipe", 2 ), ( "Lib/ReviewKey.ipe", 1 ) ] )
     , ( "cwd", [ ( "Lib/RepoPath.ipe", 3 ) ] )
     , ( "isDir", [ ( "Lib/RepoPath.ipe", 6 ), ( "Lib/Settings.ipe", 1 ) ] )
-    , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Index.ipe", 1 ) ] )
+    , ( "absolute", [ ( "Main.ipe", 2 ), ( "Lib/RepoPath.ipe", 5 ), ( "Lib/Index.ipe", 1 ) ] )
     , ( "absolutize", [ ( "Lib/RepoPath.ipe", 4 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "parseRoot", [ ( "Lib/RepoPath.ipe", 3 ), ( "Lib/Settings.ipe", 1 ) ] )
     , ( "parseDbFile", [ ( "Lib/Settings.ipe", 4 ) ] )
