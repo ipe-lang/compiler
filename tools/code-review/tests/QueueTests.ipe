@@ -29,7 +29,7 @@ import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), S
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
@@ -2584,6 +2584,41 @@ unboundUnitLeavesProgress =
             )
 
 
+-- A failed save's case comes from the database failure its error carries,
+-- never from its text: a busy review database is `SaveContended`; every
+-- other failure, an error whose text names a busy database and the
+-- moved-head conflict included, is `SaveFailed`. Each case renders its own
+-- text, none holding a driver code. Red if a case is read from the message
+-- or a busy database is not told apart.
+saveFailureTyped : Bool
+saveFailureTyped =
+    let
+        lockedText =
+            "database is locked [5]"
+
+        cases =
+            [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+
+        texts =
+            List.map Queue.saveFailureText cases
+    in
+    Queue.saveFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText))
+        == SaveContended
+        && Queue.saveFailureOf (Error.withDetails (Database Db.OtherFailure) (Error.unexpected lockedText))
+        == SaveFailed
+        && Queue.saveFailureOf (Error.unexpected lockedText)
+        == SaveFailed
+        && Queue.saveFailureOf (Error.withDetails (Custom "Busy") (Error.unavailable "busy"))
+        == SaveFailed
+        && Queue.saveFailureOf (Error.withDetails (Database Db.UniqueViolation) (Error.conflict lockedText))
+        == SaveFailed
+        && Queue.saveFailureOf LibDb.headMoved
+        == SaveFailed
+        && Set.size (Set.fromList texts)
+        == List.length cases
+        && List.all (\text -> not (String.contains "[5]" text) && not (String.contains "Unexpected" text)) texts
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2614,6 +2649,7 @@ checks =
             , Task.succeed ( "a source read's outdated response is dropped", outdatedResponseDropped epoch )
             , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles epoch )
             , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
+            , Task.succeed ( "a failed save's case comes from its database failure, never its text", saveFailureTyped )
             , Task.succeed ( "units under an unbound tag are said in the header and empty states", unboundNoticeTexts )
             , check "an unbound unit leaves the page, its total and its progress as they were" unboundUnitLeavesProgress
             ]

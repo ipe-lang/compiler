@@ -1,7 +1,7 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SaveFailure(..), SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, saveFailureOf, saveFailureText, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
-import Ipe.Db as Db
+import Ipe.Db as Db exposing (DbFailure(..))
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.List as List
@@ -633,6 +633,120 @@ decide key settings db shown decision =
                 attested <- Index.reverify settings shown
                 written <- LibDb.insertDecision macKey db attested decision
                 Task.succeed ( attested, written )
+
+
+-- Why a decision was not saved, as the model holds it. Each case is decided
+-- from the failure's type, never its text, and renders a fixed text of this
+-- tool's own, so no error's text reaches the model or the page. A decision
+-- asked while another is saving, asked off the queue page, or asked on a
+-- server with no signing key is refused before it starts. `SaveContended`:
+-- the review database was busy (locked past its busy timeout, or no
+-- connection free in time), so nothing was written. `SaveFailed`: every other failure, the
+-- closed default, whose cause the reviewer recovers from by reloading.
+type SaveFailure
+    = SaveInFlight
+    | SaveOffQueue
+    | SaveReadOnly
+    | SaveContended
+    | SaveFailed
+
+
+-- The case of a failed save, from the `DbFailure` its error carries: only a
+-- busy review database is `SaveContended`; an error carrying any other
+-- detail, or none, is `SaveFailed`. The message is never read.
+saveFailureOf : Error -> SaveFailure
+saveFailureOf e =
+    case e of
+        Error _ info ->
+            case info.details of
+                Just (Database failure) ->
+                    saveFailureOfDb failure
+
+                Just (Custom _) ->
+                    SaveFailed
+
+                Just (FfiPanic _) ->
+                    SaveFailed
+
+                Just (HttpStatus _) ->
+                    SaveFailed
+
+                Just (JsonDecode _) ->
+                    SaveFailed
+
+                Just (TypeMismatch _) ->
+                    SaveFailed
+
+                Nothing ->
+                    SaveFailed
+
+
+-- Every `DbFailure` has its own row, so a cause the driver layer adds is a
+-- compile error here until it is given a case.
+saveFailureOfDb : DbFailure -> SaveFailure
+saveFailureOfDb failure =
+    case failure of
+        Busy ->
+            SaveContended
+
+        CannotOpen ->
+            SaveFailed
+
+        NotADatabase ->
+            SaveFailed
+
+        AccessDenied ->
+            SaveFailed
+
+        ReadOnlyDatabase ->
+            SaveFailed
+
+        InvalidStatement ->
+            SaveFailed
+
+        UniqueViolation ->
+            SaveFailed
+
+        ForeignKeyViolation ->
+            SaveFailed
+
+        NotNullViolation ->
+            SaveFailed
+
+        CheckViolation ->
+            SaveFailed
+
+        TriggerRaised ->
+            SaveFailed
+
+        OtherConstraint ->
+            SaveFailed
+
+        Unreachable ->
+            SaveFailed
+
+        OtherFailure ->
+            SaveFailed
+
+
+-- The fixed text each case renders.
+saveFailureText : SaveFailure -> String
+saveFailureText failure =
+    case failure of
+        SaveInFlight ->
+            "a decision is still being saved; try again once it settles"
+
+        SaveOffQueue ->
+            "decisions are made on the queue page"
+
+        SaveReadOnly ->
+            Error.message ReviewKey.readOnlyError
+
+        SaveContended ->
+            "the review database is busy; try again"
+
+        SaveFailed ->
+            "the decision was not saved; reload the queue and decide again"
 
 
 -- The session's one source slot, shared by the selected queue card and the

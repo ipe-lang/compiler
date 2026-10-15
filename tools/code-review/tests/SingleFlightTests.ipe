@@ -1,5 +1,6 @@
 module SingleFlightTests exposing (checks)
 
+import Ipe.Db as Db
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
 import Ipe.Io as Io
@@ -12,7 +13,8 @@ import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Db as LibDb
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Index as Index exposing (Change(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
@@ -316,7 +318,8 @@ decisionsSingleFlight settings a b =
         == Nothing
         && pressedAgain.decision
         == DecisionSaving ua settings.epoch
-        && busyMessage pressedAgain.decisionError
+        && pressedAgain.decisionError
+        == Just SaveInFlight
         && refusing.decision
         == DecisionSaving ua settings.epoch
         && busyMessage refusing.refuseError
@@ -466,15 +469,15 @@ decisionOffQueueHoldsNoSlot settings a b =
             after settings [ ApproveUnit ua ] shown
 
         offQueue =
-            Just (Error.message App.decisionOffQueue)
+            Just SaveOffQueue
     in
     onUnitPage.decision
         == DecisionIdle
-        && Maybe.map Error.message onUnitPage.decisionError
+        && onUnitPage.decisionError
         == offQueue
         && onHistory.decision
         == DecisionIdle
-        && Maybe.map Error.message onHistory.decisionError
+        && onHistory.decisionError
         == offQueue
         && onQueue.decision
         == DecisionSaving ua settings.epoch
@@ -517,6 +520,77 @@ busyRendered settings a b =
         && not (String.contains aName waiting)
         && String.contains aName settled
         && not (String.contains "Loading unit…" settled)
+
+
+-- A save that failed on a busy review database is `SaveContended`, and the
+-- banner says the review database is busy, never the error's kind, code or
+-- text; any other failure, the moved-head conflict included, is
+-- `SaveFailed`, its banner the fixed text with none of the error's. Red if a
+-- save failure's text reaches the model or the page.
+saveFailureRendered : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+saveFailureRendered settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        saving =
+            after settings [ ApproveUnit ua ] (queueModel [ a, b ] (ViewShown a))
+
+        busyText =
+            "database is locked [5]"
+
+        busy =
+            after settings [ DecisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.Busy) (Error.unexpected busyText))) ] saving
+
+        otherText =
+            "UNIQUE constraint failed: review_log.seq [2067]"
+
+        other =
+            after settings [ DecisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.UniqueViolation) (Error.unexpected otherText))) ] saving
+
+        moved =
+            after settings [ DecisionSaved ua settings.epoch (Err LibDb.headMoved) ] saving
+
+        busyPage =
+            page busy
+
+        otherPage =
+            page other
+
+        movedPage =
+            page moved
+    in
+    busy.decisionError
+        == Just SaveContended
+        && String.contains "the review database is busy; try again" busyPage
+        && not (String.contains "Unexpected" busyPage)
+        && not (String.contains "[5]" busyPage)
+        && not (String.contains busyText busyPage)
+        && other.decisionError
+        == Just SaveFailed
+        && String.contains (Queue.saveFailureText SaveFailed) otherPage
+        && not (String.contains "Unexpected" otherPage)
+        && not (String.contains otherText otherPage)
+        && moved.decisionError
+        == Just SaveFailed
+        && String.contains (Queue.saveFailureText SaveFailed) movedPage
+        && not (String.contains (Error.message LibDb.headMoved) movedPage)
+
+
+-- A decision asked on a server with no signing key is refused before it
+-- takes the slot, and the banner says the server is read-only. Red if a
+-- read-only server starts a decision or shows any other refusal.
+readOnlySaveRefused : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+readOnlySaveRefused settings a b =
+    let
+        refused =
+            after { settings | key = ReadOnly } [ ApproveUnit a.unit.uid ] (queueModel [ a, b ] (ViewShown a))
+    in
+    refused.decision
+        == DecisionIdle
+        && refused.decisionError
+        == Just SaveReadOnly
+        && String.contains (Error.message ReviewKey.readOnlyError) (page refused)
 
 
 -- ── harness ─────────────────────────────────────────────────────────────
@@ -565,6 +639,8 @@ checks =
             , ( "a source read in flight under another process's epoch blocks no read", foreignReadIsIdle settings otherEpoch a b )
             , ( "a decision asked off the queue page takes no decision slot", decisionOffQueueHoldsNoSlot settings a b )
             , ( "a refused decision and a unit page awaiting its read render as such", busyRendered settings a b )
+            , ( "a failed save is a typed case whose banner holds no error text", saveFailureRendered settings a b )
+            , ( "a decision on a read-only server is refused before it takes the slot", readOnlySaveRefused settings a b )
             ]
         )
         |> Task.onError (\e -> checkReporting Io.println "single-flight fixtures" (Task.fail e) |> Task.map (\failed -> [ failed ]))
