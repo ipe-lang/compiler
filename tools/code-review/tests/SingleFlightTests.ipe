@@ -12,14 +12,15 @@ import Ipe.Ui as Ui
 import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Db as LibDb
 import Lib.Epoch as Epoch exposing (Epoch)
+import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index exposing (Change(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), StandingRead(..), UnitPageState(..))
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (checkReporting, cleanupIndex, envAppSettings, freshScratch, loadUnitNow, seedIndex, uid)
+import TestSupport exposing (check, checkReporting, cleanupIndex, envAppSettings, freshScratch, loadUnitNow, refusalOf, seedIndex, testMacKey, uid)
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -125,11 +126,6 @@ queueModel units view =
 initialModel : Model
 initialModel =
     App.initialModel
-
-
-busyMessage : Maybe Error -> Bool
-busyMessage err =
-    Maybe.map Error.message err == Just (Error.message App.decisionBusy)
 
 
 -- ── refusals ────────────────────────────────────────────────────────────
@@ -302,13 +298,13 @@ decisionsSingleFlight settings a b =
             after settings [ RefuseStart ua, RefuseDraft "needs a test", RefuseSubmit ua ] saving
 
         settled =
-            after settings [ DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] pressedAgain
+            after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] pressedAgain
 
         next =
             after settings [ ApproveUnit ua ] settled
 
         lateOther =
-            after settings [ DecisionSaved b.unit.uid settings.epoch (Err (Error.conflict "boom")) ] next
+            after settings [ App.decisionSaved b.unit.uid settings.epoch (Err (Error.conflict "boom")) ] next
     in
     Queue.startDecision settings.epoch ua (DecisionSaving ua settings.epoch)
         == Nothing
@@ -322,7 +318,8 @@ decisionsSingleFlight settings a b =
         == Just SaveInFlight
         && refusing.decision
         == DecisionSaving ua settings.epoch
-        && busyMessage refusing.refuseError
+        && refusing.refuseError
+        == Just DraftWhileSaving
         && refusing.refusingUid
         == Just ua
         && refusing.refuseDraft
@@ -364,10 +361,10 @@ foreignDecisionIsIdle settings otherEpoch a b =
             after settings [ RefuseStart ua, RefuseDraft "needs a test", RefuseSubmit ua ] stale
 
         foreignResult =
-            after settings [ DecisionSaved ua otherEpoch (Err (Error.conflict "boom")) ] approved
+            after settings [ App.decisionSaved ua otherEpoch (Err (Error.conflict "boom")) ] approved
 
         ownResult =
-            after settings [ DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] foreignResult
+            after settings [ App.decisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] foreignResult
     in
     Queue.startDecision settings.epoch ua (DecisionSaving ub otherEpoch)
         == Just (DecisionSaving ua settings.epoch)
@@ -541,16 +538,16 @@ saveFailureRendered settings a b =
             "database is locked [5]"
 
         busy =
-            after settings [ DecisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.Busy) (Error.unexpected busyText))) ] saving
+            after settings [ App.decisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.Busy) (Error.unexpected busyText))) ] saving
 
         otherText =
             "UNIQUE constraint failed: review_log.seq [2067]"
 
         other =
-            after settings [ DecisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.UniqueViolation) (Error.unexpected otherText))) ] saving
+            after settings [ App.decisionSaved ua settings.epoch (Err (Error.withDetails (Database Db.UniqueViolation) (Error.unexpected otherText))) ] saving
 
         moved =
-            after settings [ DecisionSaved ua settings.epoch (Err LibDb.headMoved) ] saving
+            after settings [ App.decisionSaved ua settings.epoch (Err LibDb.headMoved) ] saving
 
         busyPage =
             page busy
@@ -560,6 +557,9 @@ saveFailureRendered settings a b =
 
         movedPage =
             page moved
+
+        changed =
+            after settings [ App.decisionSaved ua settings.epoch (Ok (Err SourceChanged)) ] saving
     in
     busy.decisionError
         == Just SaveContended
@@ -569,13 +569,18 @@ saveFailureRendered settings a b =
         && not (String.contains busyText busyPage)
         && other.decisionError
         == Just SaveFailed
-        && String.contains (Queue.saveFailureText SaveFailed) otherPage
+        && String.contains (Failure.saveFailureText SaveFailed) otherPage
         && not (String.contains "Unexpected" otherPage)
         && not (String.contains otherText otherPage)
         && moved.decisionError
         == Just SaveFailed
-        && String.contains (Queue.saveFailureText SaveFailed) movedPage
+        && String.contains (Failure.saveFailureText SaveFailed) movedPage
         && not (String.contains (Error.message LibDb.headMoved) movedPage)
+        && changed.decisionError
+        == Just (SaveRefused SourceChanged)
+        && changed.decision
+        == DecisionIdle
+        && String.contains (Failure.saveFailureText (SaveRefused SourceChanged)) (page changed)
 
 
 -- A decision asked on a server with no signing key is refused before it
@@ -591,7 +596,412 @@ readOnlySaveRefused settings a b =
         == DecisionIdle
         && refused.decisionError
         == Just SaveReadOnly
-        && String.contains (Error.message ReviewKey.readOnlyError) (page refused)
+        && String.contains ReviewKey.readOnlyText (page refused)
+
+
+-- ── typed failures ──────────────────────────────────────────────────────
+-- A failure's text, standing for an error the runtime raised with a server
+-- path in it: no page may show any of it.
+marker : String
+marker =
+    "MARKER-/abs/root"
+
+
+busyMarker : Error
+busyMarker =
+    Error.withDetails (Database Db.Busy) (Error.unexpected marker)
+
+
+plainMarker : Error
+plainMarker =
+    Error.unexpected marker
+
+
+limitMarker : Error
+limitMarker =
+    Error.limitExceeded marker
+
+
+-- `model`'s page shows `text` and none of the marker error's text.
+showsOnly : String -> Model -> Bool
+showsOnly text model =
+    let
+        rendered =
+            page model
+    in
+    String.contains text rendered
+        && not (String.contains "MARKER" rendered)
+        && not (String.contains "/abs/root" rendered)
+
+
+queueFailure : QueueState -> Maybe LoadFailure
+queueFailure state =
+    case state of
+        Failed failure ->
+            Just failure
+
+        Loading ->
+            Nothing
+
+        Loaded _ ->
+            Nothing
+
+
+historyFailure : HistoryState -> Maybe LoadFailure
+historyFailure state =
+    case state of
+        HistoryFailed failure ->
+            Just failure
+
+        HistoryLoading ->
+            Nothing
+
+        HistoryLoaded _ ->
+            Nothing
+
+
+viewFailure : SelectedView -> Maybe LoadFailure
+viewFailure state =
+    case state of
+        ViewFailed _ failure ->
+            Just failure
+
+        ViewLoading _ ->
+            Nothing
+
+        ViewShown _ ->
+            Nothing
+
+        NoneSelected ->
+            Nothing
+
+        ViewMissing _ ->
+            Nothing
+
+
+unitFailure : Model -> Maybe LoadFailure
+unitFailure model =
+    case model.page of
+        UnitPage raw ->
+            case App.unitPageState raw model of
+                UnitFailed failure ->
+                    Just failure
+
+                UnitLoading ->
+                    Nothing
+
+                UnitLoaded _ ->
+                    Nothing
+
+                UnitNotFound ->
+                    Nothing
+
+                UnitIdRefused ->
+                    Nothing
+
+        QueuePage ->
+            Nothing
+
+        HistoryPage ->
+            Nothing
+
+
+standingFailure : StandingRead -> Maybe LoadFailure
+standingFailure read =
+    case read of
+        StandingFailed _ _ failure ->
+            Just failure
+
+        StandingUnread ->
+            Nothing
+
+        StandingShown _ _ _ ->
+            Nothing
+
+
+-- A queue load's failure is decided from the error's details and kind, never
+-- its text: a busy database is `LoadContended`, a ceiling passed
+-- `LoadPastLimit`, every other failure `LoadFailed`, and the page shows the
+-- case's fixed text. A load that succeeds shows the queue. Red if a cause is
+-- read from the message, or the error's text reaches the page.
+queueLoadFailureTyped : Settings.AppSettings -> Index.UnitView -> Bool
+queueLoadFailureTyped settings a =
+    let
+        loading =
+            after settings [ Navigated QueuePage ] initialModel
+
+        settle result =
+            after settings [ App.queueLoaded loading.queueLoad result ] loading
+
+        busy =
+            settle (Err busyMarker)
+
+        plain =
+            settle (Err plainMarker)
+
+        limit =
+            settle (Err limitMarker)
+
+        succeeded =
+            settle (Ok (queuePageOf [ a ]))
+
+        lead =
+            "Queue failed to load: "
+    in
+    queueFailure busy.queueState
+        == Just LoadContended
+        && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
+        && queueFailure plain.queueState
+        == Just LoadFailed
+        && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
+        && queueFailure limit.queueState
+        == Just LoadPastLimit
+        && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
+        && queueFailure succeeded.queueState
+        == Nothing
+        && Queue.queueStatusText succeeded.queueState
+        == Nothing
+
+
+-- A History load's failure is a typed case alike, its page the case's fixed
+-- text. Red if the error's text reaches the History page.
+historyLoadFailureTyped : Settings.AppSettings -> Bool
+historyLoadFailureTyped settings =
+    let
+        loading =
+            after settings [ Navigated HistoryPage ] initialModel
+
+        settle result =
+            after settings [ App.historyLoaded loading.historyLoad result ] loading
+
+        limit =
+            settle (Err limitMarker)
+
+        plain =
+            settle (Err plainMarker)
+
+        succeeded =
+            settle (Ok { rows = [], at = LibDb.HistoryStart, next = Nothing, log = LibDb.ShownProven })
+
+        lead =
+            "History load failed: "
+    in
+    historyFailure limit.history
+        == Just LoadPastLimit
+        && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
+        && historyFailure plain.history
+        == Just LoadFailed
+        && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
+        && historyFailure succeeded.history
+        == Nothing
+        && Queue.historyStatusText succeeded.history
+        == Just "No reviews yet."
+
+
+-- The queue card's source read that fails settles the slot as a typed case,
+-- and the card shows its fixed text. Red if the error's text reaches the
+-- card.
+viewLoadFailureTyped : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+viewLoadFailureTyped settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        reading =
+            queueModel [ a, b ] (ViewLoading { uid = ua, wanted = Nothing, fresh = True, owner = settings.epoch })
+
+        settle result =
+            after settings [ App.viewLoaded ua settings.epoch result ] reading
+
+        plain =
+            settle (Err plainMarker)
+
+        busy =
+            settle (Err busyMarker)
+
+        succeeded =
+            settle (Ok (Just a))
+
+        lead =
+            "Source load failed: "
+    in
+    viewFailure plain.selectedView
+        == Just LoadFailed
+        && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
+        && viewFailure busy.selectedView
+        == Just LoadContended
+        && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
+        && viewFailure succeeded.selectedView
+        == Nothing
+        && Queue.selectedViewStatusText ua succeeded.selectedView
+        == Nothing
+
+
+-- The unit page's read that fails shows the case's fixed text. Red if the
+-- error's text reaches the unit page.
+unitLoadFailureTyped : Settings.AppSettings -> Index.UnitView -> Bool
+unitLoadFailureTyped settings a =
+    let
+        ua =
+            a.unit.uid
+
+        entered =
+            after settings [ Navigated (unitAt ua) ] initialModel
+
+        settle result =
+            after settings [ App.viewLoaded ua settings.epoch result ] entered
+
+        busy =
+            settle (Err busyMarker)
+
+        limit =
+            settle (Err limitMarker)
+
+        succeeded =
+            settle (Ok (Just a))
+
+        lead =
+            "Unit load failed: "
+    in
+    unitFailure busy
+        == Just LoadContended
+        && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
+        && unitFailure limit
+        == Just LoadPastLimit
+        && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
+        && unitFailure succeeded
+        == Nothing
+        && pageTag succeeded
+        == ("loaded " ++ Uid.toString ua)
+
+
+-- The unit page's standing read that fails shows the case's fixed text in
+-- place of the review status. Red if the error's text reaches the page.
+standingLoadFailureTyped : Settings.AppSettings -> Index.UnitView -> Bool
+standingLoadFailureTyped settings a =
+    let
+        ua =
+            a.unit.uid
+
+        shown =
+            queueModel [ a ] (ViewShown a)
+
+        onUnitPage =
+            { shown | page = unitAt ua }
+
+        settle result =
+            after settings [ App.standingLoaded ua (Index.storedHash a.unit.attested) settings.epoch result ] onUnitPage
+
+        busy =
+            settle (Err busyMarker)
+
+        plain =
+            settle (Err plainMarker)
+
+        succeeded =
+            settle (Ok Queue.Undecided)
+
+        lead =
+            "Review status read failed: "
+    in
+    standingFailure busy.standing
+        == Just LoadContended
+        && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
+        && standingFailure plain.standing
+        == Just LoadFailed
+        && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
+        && standingFailure succeeded.standing
+        == Nothing
+        && not (String.contains lead (page succeeded))
+
+
+-- A blank or over-long refusal draft stays open as a typed case, its panel
+-- the case's fixed text; a reason within the ceiling starts the decision.
+-- Red if a refused draft starts a decision or shows any other text.
+refuseDraftTyped : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+refuseDraftTyped settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        shown =
+            queueModel [ a, b ] (ViewShown a)
+
+        submit draft =
+            after settings [ RefuseStart ua, RefuseDraft draft, RefuseSubmit ua ] shown
+
+        blank =
+            submit "   "
+
+        overChars =
+            LibDb.reasonMaxChars + 1
+
+        overlong =
+            submit (String.repeat overChars "x")
+
+        overlongCase =
+            DraftRefused (ReasonOverlong { chars = overChars, limit = LibDb.reasonMaxChars })
+
+        kept =
+            submit "needs a test"
+    in
+    blank.refuseError
+        == Just (DraftRefused ReasonBlank)
+        && blank.decision
+        == DecisionIdle
+        && String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page blank)
+        && overlong.refuseError
+        == Just overlongCase
+        && overlong.decision
+        == DecisionIdle
+        && String.contains (Failure.refuseFailureText overlongCase) (page overlong)
+        && kept.refuseError
+        == Nothing
+        && kept.decision
+        == DecisionSaving ua settings.epoch
+
+
+-- A decision on a unit off the shown queue page is refused as `NotQueued`,
+-- and one on a queued unit whose source is not the one shown as
+-- `SourceNotShown`, each a value decided before any database is opened, and
+-- the save's banner the refusal's fixed text. Red if `decisionTask` decides a
+-- unit the reviewer was not shown, or a refusal is read as a failure.
+decisionRefusedBeforeReading : Task.Task Error Bool
+decisionRefusedBeforeReading =
+    do
+        at <- freshScratch "ipe-single-flight-refused"
+        seedIndex at.indexDb at.repo
+        settings <- envAppSettings
+        macKey <- testMacKey
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
+        offList <- App.decisionTask settings macKey (queueModel [ a ] (ViewShown a)) b.unit.uid LibDb.Approved
+        notShown <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) b.unit.uid LibDb.Approved
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (refusalOf offList
+                == Just NotQueued
+                && refusalOf notShown
+                == Just SourceNotShown
+                && savedRefusal (Failure.saved (Ok offList))
+                == Just NotQueued
+                && savedRefusal (Failure.saved (Ok notShown))
+                == Just SourceNotShown
+            )
+
+
+-- The refusal a settled save carries, if it was refused.
+savedRefusal : Result SaveFailure a -> Maybe DecideRefusal
+savedRefusal result =
+    case result of
+        Err (SaveRefused refusal) ->
+            Just refusal
+
+        Err _ ->
+            Nothing
+
+        Ok _ ->
+            Nothing
 
 
 -- ── harness ─────────────────────────────────────────────────────────────
@@ -630,6 +1040,13 @@ requireUnit found =
 
 checks : Task.Task Error (List ( String, Bool ))
 checks =
+    Task.map2 (\seeded refused -> seeded ++ [ refused ])
+        seededChecks
+        (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
+
+
+seededChecks : Task.Task Error (List ( String, Bool ))
+seededChecks =
     withSeeded "ipe-single-flight"
         (\settings otherEpoch a b ->
             [ ( "unit-page entries during a source read start no second read", unitEntriesDuringReadCoalesce settings a b )
@@ -642,6 +1059,12 @@ checks =
             , ( "a refused decision and a unit page awaiting its read render as such", busyRendered settings a b )
             , ( "a failed save is a typed case whose banner holds no error text", saveFailureRendered settings a b )
             , ( "a decision on a read-only server is refused before it takes the slot", readOnlySaveRefused settings a b )
+            , ( "a failed queue load is a typed case whose page holds no error text", queueLoadFailureTyped settings a )
+            , ( "a failed History load is a typed case whose page holds no error text", historyLoadFailureTyped settings )
+            , ( "a failed source read is a typed case whose card holds no error text", viewLoadFailureTyped settings a b )
+            , ( "a failed unit-page read is a typed case whose page holds no error text", unitLoadFailureTyped settings a )
+            , ( "a failed standing read is a typed case whose page holds no error text", standingLoadFailureTyped settings a )
+            , ( "a refused refusal draft is a typed case with a fixed text", refuseDraftTyped settings a b )
             ]
         )
         |> Task.onError (\e -> checkReporting Io.println "single-flight fixtures" (Task.fail e) |> Task.map (\failed -> [ failed ]))

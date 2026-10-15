@@ -16,6 +16,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Tuple as Tuple
+import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
@@ -1865,12 +1866,13 @@ attestedHash attested =
 
 -- Re-proves a shown source at decision time: the unit's row is re-read from
 -- the index and its file re-hashed through `viewOf`, and the fresh view must
--- be shown under the same hash. A unit gone from the index, or a source that
--- changed or became unreadable since it was shown, is a conflict, so no
+-- be shown under the same hash. A unit gone from the index, a source that
+-- changed or became unreadable since it was shown, or one now past a view
+-- ceiling is a `DecideRefusal` value, decided from reads alone, so no
 -- decision is recorded against bytes the reviewer did not see. The index and
 -- root are the one `settings` value resolved at startup, the tree the page
 -- showed the unit from.
-reverify : IndexSettings -> ShownSource -> Task.Task Error Attested
+reverify : IndexSettings -> ShownSource -> Task.Task Error (Result DecideRefusal Attested)
 reverify settings shown =
     case shown of
         ShownSource s ->
@@ -1880,41 +1882,32 @@ reverify settings shown =
                 case List.head rows of
                     Just row ->
                         viewOf conn settings.roots row
-                            |> Task.andThen (confirmShown s.uid s.hash)
+                            |> Task.map (confirmShown s.uid s.hash)
 
                     Nothing ->
-                        Task.fail (Error.conflict "unit no longer indexed")
+                        Task.succeed (Err SourceGone)
 
 
-confirmShown : Uid -> String -> SourceView -> Task.Task Error Attested
+-- A shown unit that grew past a view ceiling before its decision is
+-- `SourcePastCeiling`; any other view but the one shown is `SourceChanged`.
+confirmShown : Uid -> String -> SourceView -> Result DecideRefusal Attested
 confirmShown uid hash fresh =
     case fresh of
         Shown now ->
             if shownHash now == hash then
-                Task.succeed (Attested { uid = uid, hash = hash })
+                Ok (Attested { uid = uid, hash = hash })
 
             else
-                Task.fail sourceChanged
+                Err SourceChanged
 
         Stale _ ->
-            Task.fail sourceChanged
+            Err SourceChanged
 
         Unreadable _ ->
-            Task.fail sourceChanged
+            Err SourceChanged
 
         TooLarge _ ->
-            Task.fail pastCeiling
-
-
--- A shown unit that grew past a view ceiling before its decision.
-pastCeiling : Error
-pastCeiling =
-    Error.conflict "source is now past the review ceiling; it cannot be decided"
-
-
-sourceChanged : Error
-sourceChanged =
-    Error.conflict "source changed since it was shown; reload"
+            Err SourcePastCeiling
 
 
 -- Why a unit's source is withheld instead of shown.

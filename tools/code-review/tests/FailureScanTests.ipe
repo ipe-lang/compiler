@@ -1,0 +1,667 @@
+module FailureScanTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Path as Path exposing (Path)
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import TestSupport exposing (check)
+
+
+-- ── the source scan ─────────────────────────────────────────────────────
+--
+-- No error's text reaches a page: a page shows only the typed failure case
+-- its callback decided. Three scans over `src` hold that by construction.
+-- S1: an error becomes text only at the admitted sites, each keyed by its
+-- file and enclosing top-level name. S2: no type reachable from the app's
+-- `Model` and `Msg` names `Error`. S3: the view does not import `Ipe.Error`.
+-- Each scan reads tokens, maximal runs of `[A-Za-z0-9_.]`, never substrings,
+-- so `refuseError` is not `Error`. Each returns its violations; none is a
+-- pass.
+
+
+-- The modules of `src`, each by its path relative to `src` with its text.
+-- A file past `fileCeiling`, a module past `moduleByteCeiling`, or one that
+-- cannot be read fails the read.
+srcSources : Task.Task Error (List ( String, String ))
+srcSources =
+    do
+        cwd <- System.cwd ()
+        root <- Task.fromResult (Path.fromString (cwd ++ "/src"))
+        files <- File.walk root
+        bounded <- Task.fromResult (withinFileCeiling files)
+        Task.sequence (List.map (readSource (Path.toString root ++ "/")) (List.filter (\path -> String.endsWith ".ipe" (Path.toString path)) bounded))
+
+
+fileCeiling : Int
+fileCeiling =
+    64
+
+
+moduleByteCeiling : ByteSize.ByteSize
+moduleByteCeiling =
+    ByteSize.kib 512
+
+
+withinFileCeiling : List a -> Result Error (List a)
+withinFileCeiling files =
+    if List.length files > fileCeiling then
+        Err (Error.limitExceeded ("src holds more than " ++ String.fromInt fileCeiling ++ " files"))
+
+    else
+        Ok files
+
+
+readSource : String -> Path -> Task.Task Error ( String, String )
+readSource prefix path =
+    let
+        file =
+            Path.toString path
+    in
+    if String.startsWith prefix file then
+        File.readFileLimit path moduleByteCeiling
+            |> Task.map (\text -> ( String.dropLeft (String.length prefix) file, text ))
+
+    else
+        Task.fail (Error.unexpected (file ++ " is not under src"))
+
+
+-- The tokens of `line`: maximal runs of ASCII letters, digits, `_` and `.`,
+-- with each `=` and `|` a token of its own.
+tokens : String -> List String
+tokens line =
+    line
+        |> String.replace "=" " = "
+        |> String.replace "|" " | "
+        |> String.map
+            (\c ->
+                if tokenChar c then
+                    c
+
+                else
+                    ' '
+            )
+        |> String.words
+
+
+tokenChar : Char -> Bool
+tokenChar c =
+    (Char.isAlphaNum c && Char.toCode c < 128) || c == '_' || c == '.' || c == '=' || c == '|'
+
+
+-- True when `text` begins with an ASCII character `test` accepts.
+leadsWith : (Char -> Bool) -> String -> Bool
+leadsWith test text =
+    case String.uncons text of
+        Just ( c, _ ) ->
+            test c && Char.toCode c < 128
+
+        Nothing ->
+            False
+
+
+
+-- ── S1: conversion sites ────────────────────────────────────────────────
+
+
+conversionTokens : List String
+conversionTokens =
+    [ "Error.toString", "Error.message", "Error.kindName", "errorToString" ]
+
+
+-- Every site an error becomes text: the startup refusals `Main` prints, the
+-- root parse that names the failed path, and the server log.
+admittedConversions : List String
+admittedConversions =
+    [ "Lib/RepoPath.ipe:parseRoot"
+    , "Lib/ServerLog.ipe:logged"
+    , "Main.ipe:requireReviewKey"
+    , "Main.ipe:requireSettings"
+    ]
+
+
+type alias SiteScan =
+    { name : String, sites : List String }
+
+
+-- Each conversion token of `text`, keyed `rel:name` by the last column-0
+-- lowercase line above it.
+conversionSitesIn : String -> String -> List String
+conversionSitesIn rel text =
+    let
+        scanned =
+            List.foldl (siteStep rel) { name = "", sites = [] } (String.lines text)
+    in
+    scanned.sites
+
+
+siteStep : String -> String -> SiteScan -> SiteScan
+siteStep rel line scan =
+    let
+        lineTokens =
+            tokens line
+
+        name =
+            if leadsWith Char.isLower line then
+                Maybe.withDefault scan.name (List.head lineTokens)
+
+            else
+                scan.name
+
+        found =
+            List.filter (\token -> List.member token conversionTokens) lineTokens
+    in
+    { name = name, sites = List.map (\_ -> rel ++ ":" ++ name) found ++ scan.sites }
+
+
+-- A conversion site `admitted` does not list, and an admitted site no
+-- source holds.
+conversionViolations : List String -> List ( String, String ) -> List String
+conversionViolations admitted sources =
+    let
+        found =
+            List.unique (List.concatMap (\( rel, text ) -> conversionSitesIn rel text) sources)
+    in
+    List.map (\site -> "an error becomes text at " ++ site ++ ", which is not admitted") (List.filter (\site -> not (List.member site admitted)) found)
+        ++ List.map (\site -> "the admitted site " ++ site ++ " holds no conversion") (List.filter (\site -> not (List.member site found)) admitted)
+
+
+
+-- ── S2: the types a page holds ──────────────────────────────────────────
+
+
+-- The stdlib types that hold no `Error` unless given one as a parameter,
+-- which the token check sees.
+leafTypes : List String
+leafTypes =
+    [ "Int", "Float", "Bool", "String", "Char", "Maybe", "List", "Result", "Dict", "Set", "Timestamp", "ByteSize" ]
+
+
+reachCeiling : Int
+reachCeiling =
+    128
+
+
+-- A type declaration's lines, from its column-0 header to the first blank
+-- line: seeking the header, reading it, past it awaiting the next line, and
+-- closed, the flag saying whether that line is indented, a declaration
+-- continued past a blank line.
+type BlockScan
+    = Seeking
+    | Reading (List String)
+    | Ended (List String)
+    | Closed (List String) Bool
+
+
+isHeader : String -> String -> Bool
+isHeader name line =
+    let
+        lineTokens =
+            tokens line
+    in
+    String.startsWith "type " line && (List.take 2 lineTokens == [ "type", name ] || List.take 3 lineTokens == [ "type", "alias", name ])
+
+
+-- The code of `line`, its trailing comment dropped.
+codeOf : String -> String
+codeOf line =
+    Maybe.withDefault "" (List.head (String.split "--" line))
+
+
+typeBlock : String -> String -> Result String (List String)
+typeBlock name text =
+    case List.foldl (blockStep name) Seeking (String.lines text) of
+        Seeking ->
+            Err ("type " ++ name ++ " is not declared")
+
+        Reading block ->
+            Ok (List.reverse block)
+
+        Ended block ->
+            Ok (List.reverse block)
+
+        Closed block continued ->
+            if continued then
+                Err ("type " ++ name ++ " continues past a blank line")
+
+            else
+                Ok (List.reverse block)
+
+
+blockStep : String -> String -> BlockScan -> BlockScan
+blockStep name line scan =
+    case scan of
+        Seeking ->
+            if isHeader name line then
+                Reading [ codeOf line ]
+
+            else
+                Seeking
+
+        Reading block ->
+            if String.isEmpty (String.trim line) then
+                Ended block
+
+            else
+                Reading (codeOf line :: block)
+
+        Ended block ->
+            if String.isEmpty (String.trim line) then
+                Ended block
+
+            else
+                Closed block (leadsWith (\c -> c == ' ' || c == '\t') line)
+
+        Closed block continued ->
+            Closed block continued
+
+
+type alias RefScan =
+    { dropNext : Bool, refs : List String }
+
+
+-- The uppercase tokens a declaration names, its header, each constructor
+-- of a sum type, lowercase tokens and punctuation dropped.
+typeRefs : List String -> List String
+typeRefs block =
+    let
+        all =
+            List.concatMap tokens block
+
+        isAlias =
+            List.take 2 all == [ "type", "alias" ]
+
+        body =
+            if isAlias then
+                List.drop 3 all
+
+            else
+                List.drop 2 all
+
+        scanned =
+            List.foldl (refStep (not isAlias)) { dropNext = False, refs = [] } body
+    in
+    List.reverse scanned.refs
+
+
+refStep : Bool -> String -> RefScan -> RefScan
+refStep sumType token scan =
+    if token == "=" || token == "|" then
+        { scan | dropNext = sumType }
+
+    else if scan.dropNext then
+        { scan | dropNext = False }
+
+    else if leadsWith Char.isUpper token then
+        { scan | refs = token :: scan.refs }
+
+    else
+        scan
+
+
+type alias Import =
+    { moduleName : String, qualifier : String, exposed : List String }
+
+
+importsOf : String -> List Import
+importsOf text =
+    List.filterMap importOf (String.lines text)
+
+
+importOf : String -> Maybe Import
+importOf line =
+    let
+        words =
+            String.words line
+
+        pairs =
+            List.map2 (\a b -> ( a, b )) words (List.drop 1 words)
+    in
+    if String.startsWith "import " line then
+        Maybe.map
+            (\moduleName ->
+                { moduleName = moduleName
+                , qualifier = Maybe.withDefault moduleName (Maybe.map (\( _, b ) -> b) (List.find (\( a, _ ) -> a == "as") pairs))
+                , exposed = Maybe.withDefault [] (Maybe.map tokens (List.head (List.drop 1 (String.split "exposing" line))))
+                }
+            )
+            (List.head (List.drop 1 words))
+
+    else
+        Nothing
+
+
+-- Where the type `token` names in module `rel` is declared: `Ok Nothing`
+-- for a leaf, `Ok (Just ( file, name ))` for a declaration to walk, and
+-- `Err` for a name that resolves to neither.
+resolve : String -> String -> String -> Result String (Maybe ( String, String ))
+resolve rel text token =
+    let
+        segments =
+            List.reverse (String.split "." token)
+
+        typeName =
+            Maybe.withDefault token (List.head segments)
+
+        qualifier =
+            String.join "." (List.reverse (List.drop 1 segments))
+
+        imports =
+            importsOf text
+
+        unresolved =
+            Err (rel ++ ": " ++ token ++ " resolves to no declaration or leaf")
+    in
+    if String.isEmpty qualifier then
+        if List.any (isHeader token) (String.lines text) then
+            Ok (Just ( rel, token ))
+
+        else
+            case List.find (\imp -> List.member token imp.exposed) imports of
+                Just imp ->
+                    fromModule imp.moduleName typeName unresolved
+
+                Nothing ->
+                    if List.member token leafTypes then
+                        Ok Nothing
+
+                    else
+                        unresolved
+
+    else
+        case List.find (\imp -> imp.qualifier == qualifier) imports of
+            Just imp ->
+                fromModule imp.moduleName typeName unresolved
+
+            Nothing ->
+                unresolved
+
+
+fromModule : String -> String -> Result String (Maybe ( String, String )) -> Result String (Maybe ( String, String ))
+fromModule moduleName typeName unresolved =
+    if String.startsWith "Lib." moduleName then
+        Ok (Just ( String.replace "." "/" moduleName ++ ".ipe", typeName ))
+
+    else if String.startsWith "Ipe." moduleName && List.member typeName leafTypes then
+        Ok Nothing
+
+    else
+        unresolved
+
+
+type alias Visit =
+    { next : List ( String, String ), violations : List String }
+
+
+visitType : List ( String, String ) -> ( String, String ) -> Visit
+visitType sources key =
+    case key of
+        ( rel, name ) ->
+            case List.find (\( file, _ ) -> file == rel) sources of
+                Just ( _, text ) ->
+                    visitBlock rel name text
+
+                Nothing ->
+                    { next = [], violations = [ rel ++ " is not a module of src" ] }
+
+
+visitBlock : String -> String -> String -> Visit
+visitBlock rel name text =
+    case typeBlock name text of
+        Ok block ->
+            let
+                refs =
+                    typeRefs block
+
+                resolved =
+                    List.map (resolve rel text) (List.filter (\token -> token /= "Error") refs)
+
+                namesError =
+                    if List.member "Error" refs then
+                        [ rel ++ ": type " ++ name ++ " names Error" ]
+
+                    else
+                        []
+            in
+            { next = List.filterMap reached resolved, violations = namesError ++ List.filterMap unresolvedWhy resolved }
+
+        Err why ->
+            { next = [], violations = [ rel ++ ": " ++ why ] }
+
+
+reached : Result String (Maybe ( String, String )) -> Maybe ( String, String )
+reached resolved =
+    case resolved of
+        Ok found ->
+            found
+
+        Err _ ->
+            Nothing
+
+
+unresolvedWhy : Result String a -> Maybe String
+unresolvedWhy resolved =
+    case resolved of
+        Ok _ ->
+            Nothing
+
+        Err why ->
+            Just why
+
+
+type alias Walk =
+    { seen : List ( String, String ), frontier : List ( String, String ), violations : List String }
+
+
+-- Every declaration reachable from the app's `Model` and `Msg`, one round
+-- per distance from them; past `reachCeiling` declarations the walk stops
+-- and is a violation.
+reachViolations : List ( String, String ) -> List String
+reachViolations sources =
+    let
+        start =
+            { seen = [], frontier = [ ( "Lib/App.ipe", "Model" ), ( "Lib/App.ipe", "Msg" ) ], violations = [] }
+
+        walked =
+            List.foldl (\_ walk -> walkRound sources walk) start (List.range 1 (reachCeiling + 1))
+
+        unfinished =
+            if List.isEmpty walked.frontier then
+                []
+
+            else
+                [ "the type walk did not finish" ]
+
+        tooMany =
+            if List.length walked.seen > reachCeiling then
+                [ "more than " ++ String.fromInt reachCeiling ++ " types are reachable from the page" ]
+
+            else
+                []
+    in
+    walked.violations ++ unfinished ++ tooMany
+
+
+walkRound : List ( String, String ) -> Walk -> Walk
+walkRound sources walk =
+    if List.length walk.seen > reachCeiling then
+        { walk | frontier = [] }
+
+    else
+        let
+            fresh =
+                List.filter (\key -> not (List.member key walk.seen)) (List.unique walk.frontier)
+
+            visits =
+                List.map (visitType sources) fresh
+        in
+        { seen = walk.seen ++ fresh
+        , frontier = List.concatMap (\visit -> visit.next) visits
+        , violations = walk.violations ++ List.concatMap (\visit -> visit.violations) visits
+        }
+
+
+
+-- ── S3: the view ────────────────────────────────────────────────────────
+
+
+viewImportViolations : List ( String, String ) -> List String
+viewImportViolations sources =
+    case List.find (\( rel, _ ) -> rel == "Lib/View.ipe") sources of
+        Just ( _, text ) ->
+            if List.any (String.startsWith "import Ipe.Error") (String.lines text) then
+                [ "Lib/View.ipe imports Ipe.Error" ]
+
+            else
+                []
+
+        Nothing ->
+            [ "Lib/View.ipe is not a module of src" ]
+
+
+scanViolations : List ( String, String ) -> List String
+scanViolations sources =
+    conversionViolations admittedConversions sources ++ reachViolations sources ++ viewImportViolations sources
+
+
+
+-- ── the real tree ───────────────────────────────────────────────────────
+--
+-- The tree holds no violation, and each way around a scan is one: a new
+-- conversion site, a site moved to another top-level name, an admitted
+-- site removed from the list or from the source, and the view importing
+-- `Ipe.Error`. A token that only contains a conversion's name is no site.
+-- Red if a page can show an error's text, or a scan stops seeing a way
+-- around it.
+realTreeClean : Task.Task Error Bool
+realTreeClean =
+    srcSources |> Task.map (\sources -> List.isEmpty (scanViolations sources))
+
+
+scansRefuseEvasions : Task.Task Error Bool
+scansRefuseEvasions =
+    srcSources
+        |> Task.map
+            (\sources ->
+                caught (appendTo "Lib/Queue.ipe" "show e =\n    Error.toString e" sources)
+                    && caught (appendTo "Main.ipe" "moved e =\n    Error.message e" sources)
+                    && caught (appendTo "Lib/App.ipe" "named e =\n    Error.kindName e" sources)
+                    && not (List.isEmpty (conversionViolations (List.filter (\site -> site /= "Lib/ServerLog.ipe:logged") admittedConversions) sources))
+                    && not (List.isEmpty (conversionViolations admittedConversions (List.filter (\( rel, _ ) -> rel /= "Lib/ServerLog.ipe") sources)))
+                    && caught (prependTo "Lib/View.ipe" "import Ipe.Error as Error" sources)
+                    && List.isEmpty (scanViolations (appendTo "Lib/Queue.ipe" "label =\n    errorToStringLabel refuseError.messages" sources))
+            )
+
+
+caught : List ( String, String ) -> Bool
+caught sources =
+    not (List.isEmpty (scanViolations sources))
+
+
+appendTo : String -> String -> List ( String, String ) -> List ( String, String )
+appendTo rel extra sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, text ++ "\n\n" ++ extra ++ "\n" )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+prependTo : String -> String -> List ( String, String ) -> List ( String, String )
+prependTo rel extra sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, extra ++ "\n" ++ text )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+
+-- ── scanner self-tests ──────────────────────────────────────────────────
+
+
+appOnly : String -> List ( String, String )
+appOnly text =
+    [ ( "Lib/App.ipe", text ) ]
+
+
+reachFlags : List ( String, String ) -> Bool
+reachFlags sources =
+    not (List.isEmpty (reachViolations sources))
+
+
+-- A state holding an error, a message carrying one, a type in another
+-- module holding one, a name that resolves nowhere, a missing `Model`, a
+-- declaration continued past a blank line, and a walk past its ceiling are
+-- each violations; a field named `refuseError` holding a typed case is not.
+-- Red if the walk misses a path an error could reach a page by.
+typeWalkRefuses : Bool
+typeWalkRefuses =
+    reachFlags (appOnly "type alias Model =\n    { queueState : QueueState }\n\n\ntype Msg\n    = Reload\n\n\ntype QueueState\n    = Loading\n    | Failed Error\n")
+        && reachFlags (appOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = QueueLoaded (Result Error QueuePage)\n\n\ntype alias QueuePage =\n    { n : Int }\n")
+        && reachFlags
+            [ ( "Lib/App.ipe", "import Lib.Failure as Failure exposing (LoadFailure)\n\n\ntype alias Model =\n    { load : Maybe LoadFailure, save : Maybe Failure.SaveFailure }\n\n\ntype Msg\n    = Reload\n" )
+            , ( "Lib/Failure.ipe", "type LoadFailure\n    = LoadFailed\n\n\ntype SaveFailure\n    = SaveFailed Error\n" )
+            ]
+        && reachFlags (appOnly "type alias Model =\n    { x : Foo.Bar }\n\n\ntype Msg\n    = Reload\n")
+        && reachFlags (appOnly "type Msg\n    = Reload\n")
+        && reachFlags (appOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = Reload\n\n    | Failed Error\n")
+        && reachFlags (appOnly (chainedModel (reachCeiling + 2)))
+        && List.isEmpty (reachViolations (appOnly "type alias Model =\n    { refuseError : Maybe RefuseFailure }\n\n\ntype Msg\n    = Reload\n\n\ntype RefuseFailure\n    = DraftWhileSaving\n"))
+        && List.isEmpty (reachViolations (appOnly (chainedModel 8)))
+
+
+-- A `Model` reaching `depth` declarations, each naming the next.
+chainedModel : Int -> String
+chainedModel depth =
+    let
+        link i =
+            "type alias T" ++ String.fromInt i ++ " =\n    { next : T" ++ String.fromInt (i + 1) ++ " }\n"
+    in
+    String.join "\n\n"
+        ([ "type alias Model =\n    { next : T1 }\n", "type Msg\n    = Reload\n" ]
+            ++ List.map link (List.range 1 depth)
+            ++ [ "type alias T" ++ String.fromInt (depth + 1) ++ " =\n    { n : Int }\n" ]
+        )
+
+
+-- The conversion scan keys a site by its enclosing name and admits only
+-- the listed sites; a token that contains a conversion's name is no site,
+-- and more files than the ceiling refuse the read. Red if the scan matches
+-- substrings or a site's name.
+conversionScanRefuses : Bool
+conversionScanRefuses =
+    conversionSitesIn "Lib/Queue.ipe" "show e =\n    Error.toString e\n\n\nlabel =\n    errorToStringLabel refuseError\n"
+        == [ "Lib/Queue.ipe:show" ]
+        && conversionViolations [ "Lib/Queue.ipe:show" ] [ ( "Lib/Queue.ipe", "show e =\n    Error.toString e\n" ) ]
+        == []
+        && List.length (conversionViolations [ "Lib/Queue.ipe:show" ] [ ( "Lib/Queue.ipe", "other e =\n    Error.toString e\n" ) ])
+        == 2
+        && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) ""))
+        == Nothing
+        && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling ""))
+        /= Nothing
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ check "no page can show an error's text: the source scans find no violation" realTreeClean
+        , check "each way around the source scans is a violation" scansRefuseEvasions
+        , Task.succeed ( "the type walk refuses every path an error reaches a page by", typeWalkRefuses )
+        , Task.succeed ( "the conversion scan admits only the listed sites, by token", conversionScanRefuses )
+        ]

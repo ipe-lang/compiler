@@ -16,10 +16,11 @@ import Ipe.Time.Timestamp as Timestamp
 import Ipe.Ui as Ui
 import Lib.App exposing (Model, Page(..), initialModel)
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
@@ -455,7 +456,7 @@ type alias StateCase =
 stateCases : List StateCase
 stateCases =
     [ { text = "Loading queue…", model = { baseModel | queueState = Loading } }
-    , { text = "Queue failed to load: ", model = { baseModel | queueState = Failed (Error.invalidInput "boom") } }
+    , { text = "Queue failed to load: ", model = { baseModel | queueState = Failed LoadFailed } }
     , { text = "No units queued.", model = { baseModel | queueState = Loaded (queuePage [] 0 { reviewed = 0, total = 0 }) } }
     , { text = "No units to review on this page.", model = { baseModel | queueState = Loaded (queuePage [] 3 { reviewed = 0, total = 3 }) } }
     ]
@@ -516,24 +517,35 @@ countsFollowModel a b =
 
 
 -- ── error text ──────────────────────────────────────────────────────
--- A refusal error is shown in the open refusal panel, escaped.
-refuseErrorEscaped : Index.UnitView -> Bool
-refuseErrorEscaped loaded =
+-- A refused draft shows its case's fixed text in the open refusal panel,
+-- beside the Confirm button, and no other case's text. Red if a case renders
+-- another's text or the panel loses its control.
+refuseErrorFixedText : Index.UnitView -> Bool
+refuseErrorFixedText loaded =
     let
         opened =
             refusingModel loaded
 
-        hostile =
-            page { opened | refuseError = Just (Error.invalidInput hostileText) }
+        cases =
+            [ DraftRefused ReasonBlank
+            , DraftRefused (ReasonOverlong { chars = LibDb.reasonMaxChars + 1, limit = LibDb.reasonMaxChars })
+            , DraftWhileSaving
+            ]
 
-        plain =
-            page { opened | refuseError = Just (Error.invalidInput "needs a reason") }
+        rendered failure =
+            page { opened | refuseError = Just failure }
+
+        showsItsOwn failure =
+            let
+                html =
+                    rendered failure
+            in
+            has (Failure.refuseFailureText failure) html
+                && button "Confirm" html
+                && List.all (\other -> other == failure || not (has (Failure.refuseFailureText other) html)) cases
     in
-    escapesHostile hostile
-        && hostileInByteOrder "" hostile
-        && button "Confirm" hostile
-        && has "needs a reason" plain
-        && button "Confirm" plain
+    List.all showsItsOwn cases
+        && not (has (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page opened))
 
 
 -- A failed decision save shows its case's fixed text in the queue banner,
@@ -546,8 +558,21 @@ decisionErrorFixedText loaded =
             cardModel loaded
     in
     List.all
-        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decisionError = Just failure }))
-        [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+        (\failure -> has ("Decision save failed: " ++ Failure.saveFailureText failure) (page { card | decisionError = Just failure }))
+        [ SaveInFlight
+        , SaveOffQueue
+        , SaveReadOnly
+        , SaveContended
+        , SavePastLimit
+        , SaveFailed
+        , SaveRefused SourceGone
+        , SaveRefused SourceChanged
+        , SaveRefused SourcePastCeiling
+        , SaveRefused NotQueued
+        , SaveRefused SourceNotShown
+        , SaveRefused LogBroken
+        , SaveRefused LogKeyMismatch
+        ]
         && not (has "Decision save failed: " (page card))
 
 
@@ -760,7 +785,7 @@ seededChecks a b =
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
-    , ( "a refusal error is escaped in the open refusal panel", refuseErrorEscaped a )
+    , ( "a refused draft shows its case's fixed text in the open refusal panel", refuseErrorFixedText a )
     , ( "a failed decision save shows its case's fixed text in the queue banner", decisionErrorFixedText a )
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
