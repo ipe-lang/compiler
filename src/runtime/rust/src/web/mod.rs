@@ -6056,16 +6056,61 @@ mod handlers {
         Some((epoch, e.rendered.page()))
     }
 
+    /// The retained step a debugger scrub asks to show. The overlay renders
+    /// once, so a fixed index from it is bounded by the step count at page
+    /// load; the scrubber's end names [`ScrubTarget::Newest`] so it shows the
+    /// newest step however many arrived since.
+    #[cfg(feature = "debugger")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ScrubTarget {
+        /// The retained step at this index, clamped to the newest.
+        Step(usize),
+        /// The newest retained step.
+        Newest,
+    }
+
+    #[cfg(feature = "debugger")]
+    impl ScrubTarget {
+        /// Parse a scrub request body: exactly `{"index": N}` with `N` a
+        /// non-negative integer, or exactly `{"newest": true}`. Any other body
+        /// names no step and is `None`.
+        pub(super) fn parse(body: &serde_json::Value) -> Option<Self> {
+            let fields = body.as_object()?;
+            if fields.len() != 1 {
+                return None;
+            }
+            if let Some(index) = fields.get("index") {
+                let n = index.as_u64()?;
+                return Some(Self::Step(usize::try_from(n).unwrap_or(usize::MAX)));
+            }
+            match fields.get("newest") {
+                Some(serde_json::Value::Bool(true)) => Some(Self::Newest),
+                Some(_) | None => None,
+            }
+        }
+
+        /// The retained step this target names in a window of `len` steps;
+        /// `None` when no step is retained.
+        pub(super) fn resolve(self, len: usize) -> Option<usize> {
+            let newest = len.checked_sub(1)?;
+            Some(match self {
+                Self::Step(n) => n.min(newest),
+                Self::Newest => newest,
+            })
+        }
+    }
+
     // ── POST /_ipe/debug/scrub ────────────────────────────────────────
     // Session-scoped time-travel scrub endpoint. Registered only when the
     // `debugger` feature is active. The CSRF middleware (wrapped around
     // the whole router) already validates `X-Ipe-Csrf` before this handler
     // runs; the handler itself only needs to authenticate the session.
     //
-    // Request body: `{"index": N}` — reconstruct model at retained step N.
-    // Response: `{"body": "<html>"}` — the view rendered at step N.
-    // Out-of-range N is clamped to the last retained step. No Cmd is fired.
-    // The recorded history is never mutated — reconstruct is a pure re-fold.
+    // Request body: a [`ScrubTarget`] — `{"index": N}` or `{"newest": true}`;
+    // any other body is a 400.
+    // Response: `{"body": "<html>", "epoch": E, "step": N}` — the view rendered
+    // at the retained step N the target names. No Cmd is fired. The recorded
+    // history is never mutated — reconstruct is a pure re-fold.
     #[cfg(feature = "debugger")]
     pub(super) async fn scrub_handler<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
@@ -6091,24 +6136,25 @@ mod handlers {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
-        let requested_n = body
-            .get("index")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(0);
-        let model_at_n = {
+        let Some(target) = ScrubTarget::parse(&body) else {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "scrub body names no step",
+            )
+                .into_response();
+        };
+        let reconstructed = {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
-            let total = e.history.len();
-            let n = requested_n.min(total.saturating_sub(1));
-            e.history.reconstruct(n, &|m, mdl| {
-                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            target.resolve(e.history.len()).and_then(|step| {
+                e.history
+                    .reconstruct(step, &|m, mdl| {
+                        pubsub::with_session(&scope, || (*st.update)(m, mdl))
+                    })
+                    .map(|model| (step, model))
             })
         };
-        let model = match model_at_n {
-            Some(m) => m,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
-            }
+        let Some((step, model)) = reconstructed else {
+            return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
         };
         let mut tree = pubsub::with_session(&scope, || (st.view)(model));
         assign_ipe_ids(&mut tree, "r");
@@ -6124,8 +6170,11 @@ mod handlers {
         if !debug_resident(&st.store, &sid, &handle).await {
             return too_large();
         }
-        let resp_json =
-            serde_json::json!({ "body": html_body.as_str(), "epoch": epoch.to_token() });
+        let resp_json = serde_json::json!({
+            "body": html_body.as_str(),
+            "epoch": epoch.to_token(),
+            "step": step,
+        });
         session_body_response(
             axum::http::StatusCode::OK,
             "application/json",
@@ -6401,11 +6450,12 @@ mod handlers {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
-        let requested_n = match body.get("index").and_then(|v| v.as_u64()) {
-            Some(n) => n as usize,
-            None => {
-                return (axum::http::StatusCode::BAD_REQUEST, "missing index").into_response();
-            }
+        let Some(index) = body.get("index").and_then(serde_json::Value::as_u64) else {
+            return (axum::http::StatusCode::BAD_REQUEST, "missing index").into_response();
+        };
+        // An index no `usize` holds names no retained step.
+        let Ok(requested_n) = usize::try_from(index) else {
+            return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
         };
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -13184,6 +13234,145 @@ mod emitted_router_behavior_tests {
                 Some(shown.as_str()),
                 "the committed render is the one the debugger shows"
             );
+        });
+    }
+
+    /// A debugger scrub body names its step as exactly `{"index": N}` or
+    /// `{"newest": true}`; every other body names none, and an index past
+    /// what a `usize` holds saturates rather than truncating.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn a_scrub_body_parses_to_one_target_or_none() {
+        use super::handlers::ScrubTarget;
+        let parse = |raw: &str| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| ScrubTarget::parse(&v))
+        };
+        assert_eq!(parse(r#"{"index":0}"#), Some(ScrubTarget::Step(0)));
+        assert_eq!(parse(r#"{"index":7}"#), Some(ScrubTarget::Step(7)));
+        assert_eq!(parse(r#"{"newest":true}"#), Some(ScrubTarget::Newest));
+        assert_eq!(
+            parse(r#"{"index":18446744073709551615}"#),
+            Some(ScrubTarget::Step(
+                usize::try_from(u64::MAX).unwrap_or(usize::MAX)
+            ))
+        );
+        for refused in [
+            "{}",
+            "null",
+            "[0]",
+            "0",
+            r#""newest""#,
+            r#"{"index":-1}"#,
+            r#"{"index":1.5}"#,
+            r#"{"index":"1"}"#,
+            r#"{"index":null}"#,
+            r#"{"newest":false}"#,
+            r#"{"newest":1}"#,
+            r#"{"index":0,"newest":true}"#,
+            r#"{"index":0,"extra":0}"#,
+            r#"{"step":0}"#,
+        ] {
+            assert_eq!(parse(refused), None, "{refused}");
+        }
+    }
+
+    /// A target resolves within the retained window: a step past the end is
+    /// the newest, the newest of `len` steps is `len - 1`, and an empty window
+    /// holds no step.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn a_scrub_target_resolves_within_the_retained_window() {
+        use super::handlers::ScrubTarget;
+        assert_eq!(ScrubTarget::Step(1).resolve(6), Some(1));
+        assert_eq!(ScrubTarget::Step(5).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Step(6).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Step(usize::MAX).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Newest.resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Newest.resolve(1), Some(0));
+        assert_eq!(ScrubTarget::Newest.resolve(0), None);
+        assert_eq!(ScrubTarget::Step(0).resolve(0), None);
+    }
+
+    #[cfg(feature = "debugger")]
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn post_scrub(
+        store: &Arc<Store>,
+        sid: &str,
+        body: &str,
+    ) -> (StatusCode, Option<serde_json::Value>) {
+        let resp = make_router(store.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_ipe/debug/scrub")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                    .body(Body::from(body.to_owned()))
+                    .expect("build POST"),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (status, serde_json::from_slice(&bytes).ok())
+    }
+
+    /// The scrubber's end shows the newest step however many arrived since the
+    /// page loaded, a fixed index past the window shows the newest too, and a
+    /// body naming no step is refused rather than read as step 0.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_scrub_to_newest_shows_steps_that_arrived_after_load() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+
+            let (status, _) = post_scrub(&store, &sid, r#"{"newest":true}"#).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "no step is retained yet");
+
+            for count in 1..=3 {
+                let epoch = current_epoch(&store, &sid).await;
+                let event = click_body(&plus, Some(&epoch), None);
+                assert_eq!(
+                    post_event(make_router(store.clone()), &sid, &event).await,
+                    StatusCode::OK
+                );
+                await_model(&store, &sid, |m| m.count == count).await;
+            }
+
+            let step_of = |reply: Option<serde_json::Value>| {
+                reply
+                    .as_ref()
+                    .and_then(|r| r.get("step"))
+                    .and_then(serde_json::Value::as_u64)
+            };
+            let (status, reply) = post_scrub(&store, &sid, r#"{"newest":true}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(2), "newest of three steps");
+
+            let (status, reply) = post_scrub(&store, &sid, r#"{"index":1}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(1));
+
+            let (status, reply) = post_scrub(&store, &sid, r#"{"index":99}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(2), "past the window clamps to newest");
+
+            for refused in [
+                "{}",
+                r#"{"index":-1}"#,
+                r#"{"newest":false}"#,
+                r#"{"index":0,"newest":true}"#,
+            ] {
+                let (status, _) = post_scrub(&store, &sid, refused).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            }
         });
     }
 

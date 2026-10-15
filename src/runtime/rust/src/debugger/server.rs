@@ -219,7 +219,7 @@ pub const OVERLAY_JS: &str = "\n\
     var t=window.__IPE_CSRF_TOKEN;\n\
     return typeof t==='string'?t:'';\n\
   }\n\
-  function post(n){\n\
+  function post(target){\n\
     var url=endpoint('data-ipe-dbg-scrub-url','/_ipe/debug/scrub');\n\
     if(!url)return;\n\
     var xhr=new XMLHttpRequest();\n\
@@ -234,19 +234,19 @@ pub const OVERLAY_JS: &str = "\n\
           if(d&&d.body){\n\
             var root=doc.byId('ipe-root');\n\
             var adopt=window.__ipeAdoptFullBody;\n\
-            if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;});\n\
+            var step=typeof d.step==='number'?d.step:-1;\n\
+            if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);});\n\
           }\n\
         }catch(e){}\n\
       }\n\
     };\n\
-    xhr.send(JSON.stringify({index:n}));\n\
+    xhr.send(JSON.stringify(target));\n\
   }\n\
   if(scrubber)scrubber.addEventListener('input',function(){\n\
     var v=parseInt(this.value,10);\n\
     var mx=parseInt(this.max,10);\n\
-    if(v>=mx)v=mx-1;\n\
-    if(v<0)return;\n\
-    post(v);highlight(v);\n\
+    if(!(v>=0))return;\n\
+    post(v>=mx?{newest:true}:{index:v});\n\
   });\n\
   if(list)list.addEventListener('click',function(e){\n\
     var el=e.target;\n\
@@ -254,8 +254,9 @@ pub const OVERLAY_JS: &str = "\n\
       var s=el.getAttribute('data-ipe-dbg-step');\n\
       if(s!==null){\n\
         var n=parseInt(s,10);\n\
+        if(!(n>=0))return;\n\
         if(scrubber)scrubber.value=String(n);\n\
-        post(n);highlight(n);\n\
+        post({index:n});\n\
         return;\n\
       }\n\
       el=el.parentElement;\n\
@@ -360,7 +361,7 @@ mod tests {
         // document or a render of another history never reaches the DOM.
         assert!(
             html.contains(
-                "if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;});"
+                "if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;highlight(step);});"
             ),
             "a scrubbed render must pass the client's render-history gate"
         );
@@ -440,21 +441,58 @@ mod tests {
         assert!(OVERLAY_JS.contains("return typeof t==='string'?t:'';"));
     }
 
-    /// The scrubber's rightmost position scrubs to the newest step the panel
-    /// lists, whose render names its own route: a reload there would load the
-    /// route of the step scrubbed before, which the URL now records.
+    /// The panel renders once, so its `max` is the step count at page load:
+    /// the scrubber's rightmost position names the newest step rather than an
+    /// index from that count, and every fixed index the overlay posts is a
+    /// position the panel lists.
     #[test]
     fn overlay_scrubber_end_scrubs_to_the_newest_step() {
         assert!(
-            OVERLAY_JS.contains("if(v>=mx)v=mx-1;\nif(v<0)return;\npost(v);highlight(v);"),
+            OVERLAY_JS.contains(
+                "var mx=parseInt(this.max,10);\nif(!(v>=0))return;\npost(v>=mx?{newest:true}:{index:v});"
+            ),
             "{OVERLAY_JS}"
         );
+        assert!(
+            OVERLAY_JS.contains(
+                "if(!(n>=0))return;\nif(scrubber)scrubber.value=String(n);\npost({index:n});"
+            ),
+            "{OVERLAY_JS}"
+        );
+        assert_eq!(
+            OVERLAY_JS.matches("post(").count(),
+            3,
+            "the definition and its two calls: {OVERLAY_JS}"
+        );
+        assert!(
+            !OVERLAY_JS.contains("mx-1"),
+            "no post names the load-time count"
+        );
+        assert_eq!(OVERLAY_JS.matches("JSON.stringify(").count(), 1);
+        assert!(OVERLAY_JS.contains("xhr.send(JSON.stringify(target));"));
         assert_eq!(
             OVERLAY_JS.matches("location.reload()").count(),
             1,
             "only the reset answer reloads the page"
         );
         assert!(OVERLAY_JS.contains("if(xhr.status===200)window.location.reload();"));
+    }
+
+    /// The highlighted row is the step the applied answer shows, never the
+    /// position posted: a `newest` answer may name a step the panel does not
+    /// list, and an answer the render-history gate refuses changes nothing.
+    #[test]
+    fn overlay_highlights_the_step_the_applied_answer_shows() {
+        assert!(
+            OVERLAY_JS.contains("var step=typeof d.step==='number'?d.step:-1;"),
+            "{OVERLAY_JS}"
+        );
+        assert_eq!(
+            OVERLAY_JS.matches("highlight(").count(),
+            2,
+            "the definition and the call inside the gated apply: {OVERLAY_JS}"
+        );
+        assert!(OVERLAY_JS.contains("root.innerHTML=d.body;highlight(step);});"));
     }
 
     // ── SessionHistory ─────────────────────────────────────────────────────────
