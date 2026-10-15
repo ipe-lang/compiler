@@ -7195,16 +7195,7 @@ where
                 console::console_auth_mode_label()
             ),
         );
-        router = router
-            .route("/_ipe/console", get(console::console_html))
-            .route("/_ipe/console/api/overview", get(console::api_overview))
-            .route("/_ipe/console/api/logs", get(console::api_logs))
-            .route("/_ipe/console/api/errors", get(console::api_errors))
-            .route("/_ipe/console/api/traces", get(console::api_traces))
-            .route(
-                "/_ipe/console/api/metrics-summary",
-                get(console::api_metrics_summary),
-            );
+        router = console::mount_inline(router);
     }
     // The console proxy needs `http_client` (outbound reqwest). The
     // in-process console is served under `web` whenever the mount gate
