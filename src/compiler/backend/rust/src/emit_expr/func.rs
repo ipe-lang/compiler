@@ -5,8 +5,7 @@ use super::{
     render_type, tail_arm_prelude_lines,
 };
 use crate::EmitCtx;
-use crate::doc::Leaf;
-use crate::render::{LayoutSpend, render_seeded_spend};
+use crate::render::{LayoutSpend, render_code};
 use core::cell::RefCell;
 use core::fmt::Write as _;
 use ipe_intern::rust_str_lit;
@@ -1350,23 +1349,23 @@ thread_local! {
 /// character at column 4, right after the fn-body indent, and every broken line
 /// nested from that 4-column block indent.
 ///
-/// The body is lexed whole as one [`Leaf`]: each leaf is code only, but a join
-/// between two of them can still change how they lex (`r` before `"\"//"`
-/// reads as the raw string `r"\"` and a line comment), and only the joined
-/// text shows that.
+/// The body leaves through [`render_code`], which lexes it whole: each leaf is
+/// code only, but a join between two of them can still change how they lex
+/// (`r` before `"\"//"` reads as the raw string `r"\"` and a line comment), and
+/// only the joined text shows that.
 ///
 /// # Errors
 ///
 /// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when the joined body is
 /// not code only.
 fn render_fn_body(doc: &Doc) -> DResult<String> {
-    let (text, spend) = render_seeded_spend(doc, RenderConfig::default(), 4, 4);
+    let (body, spend) = render_code(doc, RenderConfig::default(), 4, 4)?;
     BODY_SPENDS.with_borrow_mut(|spends| {
         if let Some(spends) = spends {
             spends.push(spend);
         }
     });
-    Ok(Leaf::parse(text)?.into_string())
+    Ok(body.into_string())
 }
 
 /// Restores the enclosing [`BODY_SPENDS`] collector when a scope ends.
@@ -1664,7 +1663,8 @@ pub fn ty_mentions_var_under_fn(ty: &IrType, sym: Symbol, under_fn: bool) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::{Diagnostic, Doc, Leaf, render_fn_body};
+    use super::{Diagnostic, Doc, render_fn_body};
+    use crate::doc::Leaf;
 
     /// The text leaf of a test text.
     #[allow(clippy::expect_used)] // every test text is code only; a refusal fails the test

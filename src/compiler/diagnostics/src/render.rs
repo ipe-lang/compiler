@@ -880,6 +880,13 @@ fn lower_prose(msg: &LowerError) -> String {
                  store it under a name or pass it around before its handler is given."
             )
         }
+        LowerError::ForeignTypeVariable { helper, owner, var } => {
+            format!(
+                "`{helper}` has no type annotation, and its type borrows the type \
+                 variable `{var}` of `{owner}`, which uses it. Give `{helper}` its own \
+                 signature."
+            )
+        }
         LowerError::StoreSelectProjectionInvalid(defect) => match defect {
             StoreSelectProjectionDefect::NotAProjectionLambda => {
                 "A `Store.select` projection must be `\\( left, right ) -> \
@@ -2100,6 +2107,12 @@ fn lower_label(msg: &LowerError) -> String {
             )
         }
         LowerError::StoreSelectProjectionInvalid(defect) => store_select_projection_label(defect),
+        LowerError::ForeignTypeVariable { helper, owner, var } => {
+            format!(
+                "`{helper}` has no signature, so it cannot be generic over `{owner}`'s \
+                 type variable `{var}` — annotate `{helper}` with its own type"
+            )
+        }
     }
 }
 

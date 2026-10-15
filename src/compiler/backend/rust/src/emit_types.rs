@@ -15,13 +15,13 @@ use std::collections::BTreeSet;
 
 use ipe_ir::Program;
 
-use crate::doc::Doc;
+use crate::doc::{Doc, Leaf};
 use crate::items::{Items, braced};
 use crate::naming::{
     field_witness_assoc_type_name, field_witness_getter_name, field_witness_trait_name,
     mangle_reserved,
 };
-use crate::render::{RenderConfig, render_seeded};
+use crate::render::{RenderConfig, render_code};
 use crate::{EmitCtx, RecordStruct};
 
 /// SSOT tripwire pinning every unified-colour carrier string this module emits
@@ -59,6 +59,11 @@ const _COLOR_CARRIER_SSOT: fn() = || {
 /// head while `block_indent` is the arm's own indent (12). The returned string
 /// carries no leading spaces for `open_col` — the caller has already written the
 /// prefix on that line — and every broken line carries its own absolute indent.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when an operand, or the
+/// laid-out call, is not code only.
 fn render_stringify_format(
     fmt_literal: &str,
     args: &[String],
@@ -75,12 +80,8 @@ fn render_stringify_format(
         // A macro argument list breaks without a trailing comma.
         false,
     );
-    Ok(render_seeded(
-        &call,
-        RenderConfig::default(),
-        block_indent,
-        open_col,
-    ))
+    let (text, _) = render_code(&call, RenderConfig::default(), block_indent, open_col)?;
+    Ok(text.into_string())
 }
 
 /// `rustfmt`'s `max_width` (default 100): the widest line the formatter leaves
@@ -109,7 +110,13 @@ const FN_CALL_WIDTH: usize = 60;
 ///     dedented to the arm indent, and the arm keeps its trailing `,`.
 ///
 /// `arm_head` is the `            {Enum}::{Variant}(binders) => ` prefix at block
-/// indent 12; `fmt_literal` and `args` are the `format!` operands.
+/// indent 12; `fmt_literal` and `args` are the `format!` operands. Every tier's
+/// arm is lexed whole before it is returned.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when the arm is not code
+/// only.
 fn render_stringify_enum_arm(
     arm_head: &str,
     fmt_literal: &str,
@@ -130,23 +137,22 @@ fn render_stringify_enum_arm(
     let inline_call = format!("format!({args_text})");
     let inline_arm_width = open_col + inline_call.chars().count() + 1; // +1 for the `,`
 
-    if args_width <= FN_CALL_WIDTH && inline_arm_width <= MAX_WIDTH {
+    let arm = if args_width <= FN_CALL_WIDTH && inline_arm_width <= MAX_WIDTH {
         // INLINE.
-        Ok(format!("{arm_head}{inline_call},"))
+        format!("{arm_head}{inline_call},")
     } else if args_width <= FN_CALL_WIDTH {
         // BLOCK-WRAP: the call fits `fn_call_width` but the inline arm overflows,
         // so `rustfmt` brace-wraps the body. The `format!` lands at arm indent + 4.
         let body_indent = " ".repeat(ARM_INDENT + 4);
         let close_indent = " ".repeat(ARM_INDENT);
-        Ok(format!(
-            "{arm_head}{{\n{body_indent}{inline_call}\n{close_indent}}}"
-        ))
+        format!("{arm_head}{{\n{body_indent}{inline_call}\n{close_indent}}}")
     } else {
         // DELIMITER-BREAK: the argument text exceeds `fn_call_width`, so the
         // `format!` breaks one argument per line after `=> `; the arm keeps `,`.
         let call = render_stringify_format(fmt_literal, args, open_col, ARM_INDENT)?;
-        Ok(format!("{arm_head}{call},"))
-    }
+        format!("{arm_head}{call},")
+    };
+    Ok(Leaf::parse(arm)?.into_string())
 }
 
 /// The generic-type-parameter scope in effect while emitting one function's
@@ -2048,5 +2054,71 @@ mod show_pin_agreement {
             resolved_path("ipe_runtime::Attribute"),
             resolved_path("ipe_runtime_rust::html::Attribute")
         );
+    }
+}
+
+#[cfg(test)]
+mod stringify_lexed {
+    use ipe_diagnostics::{DResult, Diagnostic};
+
+    use super::render_stringify_enum_arm;
+
+    /// The arm head of a variant named `name` at block indent 12.
+    fn head(name: &str) -> String {
+        format!("            E::{name}(a) => ")
+    }
+
+    /// Assert that `got` is the `leaf_not_code` compiler bug for a line comment
+    /// at byte `at`.
+    fn assert_line_comment(got: &DResult<String>, at: usize) {
+        assert!(
+            matches!(
+                got,
+                Err(Diagnostic::CompilerBug {
+                    where_: "backend.leaf_not_code",
+                    detail,
+                }) if *detail == format!("line comment at byte {at}")
+            ),
+            "{got:?}"
+        );
+    }
+
+    /// The INLINE and BLOCK-WRAP tiers build their arm with `format!`, outside
+    /// the renderer; the arm is still lexed whole, so an operand that is not
+    /// code only is refused in every tier, not just the rendered one.
+    #[test]
+    fn stringify_enum_arm_output_is_lexed() {
+        let fmt = "\"{}\"";
+        let bad = ["a // b".to_owned()];
+        let inline_head = head("V");
+        let inline = render_stringify_enum_arm(&inline_head, fmt, &bad);
+        let inline_at = inline_head.len() + "format!(\"{}\", a ".len();
+        assert_line_comment(&inline, inline_at);
+
+        let wrap_head = head(&"V".repeat(70));
+        let wrapped = render_stringify_enum_arm(&wrap_head, fmt, &bad);
+        let wrap_at = wrap_head.len() + "{\n".len() + 16 + "format!(\"{}\", a ".len();
+        assert_line_comment(&wrapped, wrap_at);
+
+        // DELIMITER-BREAK lays the operands out as leaves, so the operand's own
+        // lex refuses it, at its offset within the operand.
+        let long = ["a // b".to_owned(), "c".repeat(64)];
+        assert_line_comment(&render_stringify_enum_arm(&inline_head, fmt, &long), 2);
+    }
+
+    /// Code-only operands pass in every tier: the refusal above is not vacuous.
+    #[test]
+    fn stringify_enum_arm_accepts_code_only_operands() {
+        let fmt = "\"//{}\"";
+        let ok = ["a".to_owned()];
+        let inline = render_stringify_enum_arm(&head("V"), fmt, &ok);
+        assert_eq!(
+            inline.ok().as_deref(),
+            Some("            E::V(a) => format!(\"//{}\", a),")
+        );
+        let wrapped = render_stringify_enum_arm(&head(&"V".repeat(70)), fmt, &ok);
+        assert!(wrapped.is_ok_and(|arm| arm.ends_with("{}\", a)\n            }")));
+        let long = ["a".to_owned(), "c".repeat(64)];
+        assert!(render_stringify_enum_arm(&head("V"), fmt, &long).is_ok());
     }
 }

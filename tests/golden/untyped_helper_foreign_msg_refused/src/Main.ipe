@@ -1,0 +1,23 @@
+module Main exposing (main)
+
+-- Pins `Widgets.row`'s `msg` to a concrete `Msg`, which keeps `row` generic.
+
+import Ipe.Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.Task as Task exposing (Task)
+import Widgets
+
+
+type Msg
+    = Clicked
+
+
+view : Html.Html Msg
+view =
+    Widgets.row [ "r" ]
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render view)
