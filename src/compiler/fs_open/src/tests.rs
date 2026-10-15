@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, HintedKind, OpenRefusal, RegularFile,
-    is_one_spelled_name,
+    is_one_spelled_name, may_open_as,
 };
 
 /// A fresh, empty scratch directory unique to this test and process.
@@ -860,4 +860,46 @@ fn link_count_counts_a_hard_link() {
     std::fs::hard_link(dir.join("one.txt"), dir.join("two.txt")).unwrap();
     let linked = held.open_regular(&name("one.txt")).unwrap().link_count();
     assert_eq!(linked.ok(), Some(2), "a hard link counts as a second name");
+}
+
+/// A name a case-folding volume opens as a reserved ASCII name matches it.
+#[test]
+fn a_folded_spelling_may_open_as_the_reserved_name() {
+    for (text, spelled) in [
+        (".git", ".git"),
+        (".GiT", ".git"),
+        ("_darc\u{17F}", "_darcs"),
+        ("_DARC\u{17F}", "_darcs"),
+        (".g\u{131}t", ".git"),
+        (".g\u{200C}it", ".git"),
+        ("\u{FEFF}.jj", ".jj"),
+        (".h\u{202E}g\u{206F}", ".hg"),
+        (".\u{212A}", ".k"),
+    ] {
+        assert!(
+            may_open_as(OsStr::new(text), spelled),
+            "{text:?} opens as {spelled:?}"
+        );
+    }
+}
+
+/// A name differing from the reserved one in more than case or ignorables does not match.
+#[test]
+fn an_other_name_may_not_open_as_the_reserved_name() {
+    for (text, spelled) in [
+        (".gitx", ".git"),
+        (".gi", ".git"),
+        ("", ".git"),
+        ("\u{200C}", ".git"),
+        ("git", ".git"),
+        (".g\u{130}t", ".git"),
+        ("\u{FF0E}git", ".git"),
+        (".g it", ".git"),
+        ("_darcs\u{17F}", "_darcs"),
+    ] {
+        assert!(
+            !may_open_as(OsStr::new(text), spelled),
+            "{text:?} is not {spelled:?}"
+        );
+    }
 }

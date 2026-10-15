@@ -104,3 +104,49 @@ fn platform_admits(name: &OsStr) -> bool {
 const fn platform_admits(_name: &OsStr) -> bool {
     true
 }
+
+/// Whether a case-insensitive volume may open `name` as the entry the ASCII name `spelled` names.
+///
+/// The one rule for matching a name against a reserved ASCII name. A char of
+/// `name` stands for a char of `spelled` when the two are equal in ASCII case,
+/// or when its one-char lowercase or uppercase mapping is that char in the
+/// same case (`ſ` for `s`, `ı` for `i`, the Kelvin sign for `k`), as
+/// Unicode-folding and upcase-table volumes compare names. A code point HFS+
+/// ignores (zero-width joiners, direction marks, the byte-order mark) stands
+/// for nothing. The match over-reaches on a case-sensitive volume, which only
+/// treats a few more exotic names as reserved.
+#[must_use]
+pub fn may_open_as(name: &OsStr, spelled: &str) -> bool {
+    let text = name.to_string_lossy();
+    let mut want = spelled.chars();
+    for got in text.chars().filter(|got| !hfs_ignorable(*got)) {
+        match want.next() {
+            Some(want) if stands_for(got, want) => {}
+            Some(_) | None => return false,
+        }
+    }
+    want.next().is_none()
+}
+
+/// Whether a volume folding case may compare `got` equal to `want`.
+fn stands_for(got: char, want: char) -> bool {
+    got.eq_ignore_ascii_case(&want)
+        || one_char(got.to_lowercase()) == Some(want.to_ascii_lowercase())
+        || one_char(got.to_uppercase()) == Some(want.to_ascii_uppercase())
+}
+
+/// The sole char of a case mapping, or `None` when it maps to several.
+fn one_char(mut mapped: impl Iterator<Item = char>) -> Option<char> {
+    match (mapped.next(), mapped.next()) {
+        (Some(only), None) => Some(only),
+        (Some(_), Some(_)) | (None, _) => None,
+    }
+}
+
+/// Whether HFS+ drops `c` when it compares names.
+const fn hfs_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}'
+    )
+}

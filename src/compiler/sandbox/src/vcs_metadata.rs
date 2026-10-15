@@ -191,17 +191,16 @@ closed_vcs_kinds! {
 }
 
 impl VcsKind {
-    /// The kind whose metadata entry `name` spells, compared ASCII
-    /// case-insensitively on every OS.
+    /// The kind whose metadata entry a case-folding volume may open `name` as
+    /// ([`ipe_fs_open::may_open_as`]), on every OS.
     ///
-    /// A case-insensitive volume opens `.GIT` as `.git`; on a case-sensitive one
-    /// carving it anyway is a harmless over-carve.
+    /// A case-insensitive volume opens `.GIT` or `_darcſ` as the metadata entry;
+    /// on a case-sensitive one carving it anyway is a harmless over-carve.
     #[must_use]
     pub fn of_entry_name(name: &EntryName) -> Option<Self> {
-        let bytes = name.as_os_str().as_encoded_bytes();
         Self::ALL
             .into_iter()
-            .find(|kind| bytes.eq_ignore_ascii_case(kind.entry_name().as_bytes()))
+            .find(|kind| ipe_fs_open::may_open_as(name.as_os_str(), kind.entry_name()))
     }
 }
 
@@ -1637,6 +1636,30 @@ mod tests {
         make_dir(&upper);
         let tree = parse(&fixture).expect("an upper-case gitdir parses");
         assert_eq!(carved(&tree), vec![upper]);
+    }
+
+    /// A spelling a Unicode-folding volume opens as a metadata entry is carved
+    /// as that entry: a long s, a dotless i, an HFS+-ignored code point.
+    #[test]
+    fn walk_name_match_unicode_folded() {
+        let name = |text: &str| EntryName::new(std::ffi::OsStr::new(text)).expect("entry name");
+        for (text, kind) in [
+            (".g\u{131}t", VcsKind::Git),
+            (".g\u{200C}it", VcsKind::Git),
+            ("\u{FEFF}.hg", VcsKind::Mercurial),
+            (".j\u{202E}j", VcsKind::Jujutsu),
+            ("_darc\u{17F}", VcsKind::Darcs),
+        ] {
+            assert_eq!(VcsKind::of_entry_name(&name(text)), Some(kind), "{text:?}");
+        }
+        for text in [".g\u{130}t", "\u{FF0E}git", "_darcs\u{17F}", "\u{200C}"] {
+            assert_eq!(VcsKind::of_entry_name(&name(text)), None, "{text:?}");
+        }
+        let fixture = fixture("walk-unicode-fold");
+        let folded = fixture.tree.join("sub").join("_darc\u{17F}");
+        make_dir(&folded);
+        let tree = parse(&fixture).expect("a folded darcs dir parses");
+        assert_eq!(carved(&tree), vec![folded]);
     }
 
     #[test]

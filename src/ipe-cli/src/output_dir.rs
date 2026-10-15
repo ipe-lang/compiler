@@ -133,12 +133,12 @@ closed_reserved_names! {
 }
 
 impl ReservedName {
-    /// The reserved name `component` spells, in any ASCII case.
+    /// The reserved name a case-folding volume may open `component` as
+    /// ([`ipe_fs_open::may_open_as`]).
     fn of(component: &std::ffi::OsStr) -> Option<Self> {
-        let bytes = component.as_encoded_bytes();
         Self::ALL
             .into_iter()
-            .find(|reserved| bytes.eq_ignore_ascii_case(reserved.dir_name().as_bytes()))
+            .find(|reserved| ipe_fs_open::may_open_as(component, reserved.dir_name()))
     }
 }
 
@@ -164,7 +164,7 @@ const fn reserved_names_distinct() -> bool {
 
 /// Whether every reserved name is one plain path component on every platform.
 ///
-/// Non-empty, neither `.` nor `..`, and free of `/`, `\`, `:` and NUL.
+/// Non-empty, neither `.` nor `..`, ASCII, and free of `/`, `\`, `:` and NUL.
 const fn reserved_names_plain() -> bool {
     let mut rows: &[ReservedName] = &ReservedName::ALL;
     while let [row, rest @ ..] = rows {
@@ -174,7 +174,7 @@ const fn reserved_names_plain() -> bool {
         }
         let mut bytes = name;
         while let [byte, tail @ ..] = bytes {
-            if matches!(*byte, b'/' | b'\\' | b':' | 0) {
+            if !byte.is_ascii() || matches!(*byte, b'/' | b'\\' | b':' | 0) {
                 return false;
             }
             bytes = tail;
@@ -3518,7 +3518,22 @@ mod tests {
             .collect()
     }
 
-    /// Every reserved name refuses an output, in any case, as the last or an inner component.
+    /// `name` as a Unicode-folding volume still opens it: led by a byte-order
+    /// mark HFS+ ignores, with `s`, `i` and `k` swapped for the long s, the
+    /// dotless i and the Kelvin sign.
+    fn unicode_folded(name: &str) -> String {
+        std::iter::once('\u{FEFF}')
+            .chain(name.chars().map(|c| match c {
+                's' => '\u{17F}',
+                'i' => '\u{131}',
+                'k' => '\u{212A}',
+                other => other,
+            }))
+            .collect()
+    }
+
+    /// Every reserved name refuses an output, in any case or Unicode fold, as
+    /// the last or an inner component.
     #[test]
     fn every_reserved_name_refuses_output() {
         let base = scratch("every_reserved");
@@ -3526,7 +3541,13 @@ mod tests {
         let elsewhere = base.join("elsewhere");
         for reserved in ReservedName::ALL {
             let name = reserved.dir_name();
-            for spelled in [name.to_owned(), name.to_ascii_uppercase(), mixed_case(name)] {
+            for spelled in [
+                name.to_owned(),
+                name.to_ascii_uppercase(),
+                mixed_case(name),
+                unicode_folded(name),
+                unicode_folded(&name.to_ascii_uppercase()),
+            ] {
                 for target in [
                     elsewhere.join(spelled.as_str()),
                     elsewhere.join(spelled.as_str()).join("out"),
