@@ -1,14 +1,16 @@
-//! Every `move` closure the expression emitters print has an inventory row
-//! tied to `ipe_ir::once_closure::boundary_kind`.
+//! Every `move` closure the backend prints has an inventory row tied to
+//! `ipe_ir::once_closure::boundary_kind`.
 //!
 //! The lowering decides whether a closure may move its captures out from the
 //! IR closure verdict. A closure the emitter prints around an IR node is
 //! covered by that verdict; a closure it prints around an already-emitted
 //! expression (a kernel or wiring adapter) sits outside it. This ratchet lexes
-//! every non-test fn of `emit_expr/` and `emit_doc.rs`, counts the string
-//! literals that print a `move |` / `move ||` closure head, and holds the
-//! count per `(file, fn)` against [`INVENTORY`]. A new producer without a row
-//! fails, and so does a row whose count no longer matches.
+//! every non-test fn of the backend's `src` tree, counts the string literals
+//! that print a `move |` / `move ||` closure head (or a `move` keyword at the
+//! literal's end or before a format placeholder, a head whose `|` is spliced
+//! in), and holds the count per
+//! `(file, fn)` against [`INVENTORY`]. A new producer without a row fails, and
+//! so does a row whose count no longer matches.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -38,6 +40,8 @@ enum Producer {
     /// An already-emitted expression wrapped by a kernel or wiring adapter;
     /// no IR node marks the closure, so the capture verdict does not see it.
     Adapter,
+    /// A layout check that matches a printed closure head and prints none.
+    Recognizer,
 }
 
 /// Where a producer sits: the file relative to `src`, and the innermost named
@@ -49,6 +53,12 @@ type Drifted = Vec<(Site, usize)>;
 
 /// The sanctioned producers, as `(file, fn, count, producer)`.
 const INVENTORY: &[(&str, &str, usize, Producer)] = &[
+    (
+        "emit_console.rs",
+        "line_handler_bridge",
+        1,
+        Producer::Adapter,
+    ),
     (
         "emit_doc.rs",
         "build_closure",
@@ -109,6 +119,19 @@ const INVENTORY: &[(&str, &str, usize, Producer)] = &[
         10,
         Producer::Adapter,
     ),
+    ("emit_tui.rs", "key_event_bridge", 1, Producer::Adapter),
+    ("emit_web.rs", "emit_route_render", 1, Producer::Adapter),
+    ("emit_web.rs", "emit_web_route", 2, Producer::Adapter),
+    ("emit_web.rs", "new", 1, Producer::Adapter),
+    ("emit_web.rs", "set_page_closure", 2, Producer::Adapter),
+    ("emit_web.rs", "wrap_view", 1, Producer::Adapter),
+    ("render.rs", "is_closure_head", 1, Producer::Recognizer),
+    (
+        "render/reference.rs",
+        "is_closure_head",
+        1,
+        Producer::Recognizer,
+    ),
 ];
 
 /// The value of a string literal token, `None` for any other token.
@@ -122,7 +145,9 @@ fn str_value(tok: &TokenTree) -> Option<String> {
     }
 }
 
-/// How many `move |` / `move ||` closure heads `text` prints.
+/// How many `move |` / `move ||` closure heads `text` prints. A trailing
+/// `move` keyword, or one followed by a format placeholder, counts as one: its
+/// `|` may sit in the next literal or the spliced text.
 fn closure_heads(text: &str) -> usize {
     text.match_indices("move")
         .filter(|&(at, word)| {
@@ -130,9 +155,11 @@ fn closure_heads(text: &str) -> usize {
                 .get(..at)
                 .and_then(|before| before.chars().next_back())
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-            let opens_params = text
-                .get(at + word.len()..)
-                .is_some_and(|after| after.trim_start().starts_with('|'));
+            let opens_params = text.get(at + word.len()..).is_some_and(|after| {
+                let after = after.trim_start();
+                let placeholder = after.starts_with('{') && !after.starts_with("{{");
+                after.is_empty() || after.starts_with('|') || placeholder
+            });
             starts_word && opens_params
         })
         .count()
@@ -328,21 +355,21 @@ fn drift(
     (unexpected, stale)
 }
 
-/// The expression emitters print exactly the inventoried `move` closures: a
-/// new producer fails, and so does a row gone stale.
+/// The backend prints exactly the inventoried `move` closures: a new
+/// producer fails, and so does a row gone stale.
 #[test]
 fn every_emitted_move_closure_has_an_inventory_row() -> Result<(), String> {
     let root = e2e_support::manifest_dir!().join("src");
     let mut found = BTreeMap::new();
-    scan_dir(&root, &root.join("emit_expr"), &mut found)?;
-    scan_file(&root, &root.join("emit_doc.rs"), &mut found)?;
+    scan_dir(&root, &root, &mut found)?;
     let (unexpected, stale) = drift(&found, INVENTORY);
     assert!(
         unexpected.is_empty() && stale.is_empty(),
-        "a `move` closure printed by an expression emitter needs an INVENTORY row: \
+        "a `move` closure printed by the backend needs an INVENTORY row: \
          `Producer::Boundary` when it prints around an IR node `boundary_kind` \
          classifies, `Producer::Adapter` when it wraps an already-emitted \
-         expression.\nunexpected (site, count): {unexpected:?}\nstale rows (site, \
+         expression, `Producer::Recognizer` when it only matches a printed \
+         head.\nunexpected (site, count): {unexpected:?}\nstale rows (site, \
          count): {stale:?}"
     );
     Ok(())
@@ -443,7 +470,7 @@ fn synthetic(src: &str) -> Result<Vec<(String, usize)>, String> {
 /// Each spelling of a printed closure head is counted at its fn.
 #[test]
 fn each_printed_closure_head_is_counted() -> Result<(), String> {
-    let cases: [(&str, usize); 5] = [
+    let cases: [(&str, usize); 7] = [
         (
             r#"fn emit(b: &str) -> String { format!("Box::new(move || {b})") }"#,
             1,
@@ -464,6 +491,14 @@ fn each_printed_closure_head_is_counted() -> Result<(), String> {
             r#"fn emit(a: &str) -> String { format!("move |e| (move || {a})()") }"#,
             2,
         ),
+        (
+            r#"fn emit(o: &mut String) { o.push_str("Box::new(move "); o.push_str("|_| x)"); }"#,
+            1,
+        ),
+        (
+            r#"fn emit(p: &str) -> String { format!("Box::new(move {p} x)") }"#,
+            1,
+        ),
     ];
     for (src, count) in cases {
         assert_eq!(synthetic(src)?, vec![("emit".to_owned(), count)], "{src}");
@@ -472,15 +507,16 @@ fn each_printed_closure_head_is_counted() -> Result<(), String> {
 }
 
 /// One step past each spelling: a closure the emitter itself runs, a word
-/// ending in `move`, a bare `move` text, comments and test-only code print no
-/// closure head.
+/// ending or starting with `move`, a `move` not opening a closure, comments
+/// and test-only code print no closure head.
 #[test]
 fn text_that_prints_no_closure_head_is_not_counted() -> Result<(), String> {
     for src in [
         r"fn ok(v: Vec<u8>) -> Vec<u8> { v.into_iter().map(move |b| b).collect() }",
         r#"fn ok() -> &'static str { "remove |x|" }"#,
-        r#"fn ok() -> &'static str { "move" }"#,
+        r#"fn ok() -> &'static str { "moved |x|" }"#,
         r#"fn ok() -> &'static str { "move x |" }"#,
+        r#"fn ok() -> String { format!("async move {{ x }}") }"#,
         "fn ok() {} // \"move |x|\"",
         r#"#[cfg(test)] mod tests { fn t() -> &'static str { "move |x| x" } }"#,
         r#"#[test] fn t() { let _ = "move || 1"; }"#,
