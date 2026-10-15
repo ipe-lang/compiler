@@ -223,11 +223,20 @@ pub fn render_html_in<M>(node: &Html<M>, stamp: &RenderCtx<'_>) -> String {
 /// A session render's markup and the nonce its `<style>` elements carry.
 ///
 /// Only [`render_stamped`] builds one, so the nonce is the one the markup was
-/// stamped with.
-#[derive(Clone, Debug)]
+/// stamped with. Its `Debug` form shows only the markup's length, since the
+/// markup holds the nonce.
+#[derive(Clone)]
 pub struct StampedHtml {
     html: String,
     nonce: StyleNonce,
+}
+
+impl std::fmt::Debug for StampedHtml {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StampedHtml")
+            .field("len", &self.html.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl StampedHtml {
@@ -3151,6 +3160,11 @@ mod tests {
             format!("<div><style{attr}>p{{}}</style></div>")
         );
         assert_eq!(page.nonce().as_token(), nonce.as_token());
+        let shown = format!("{page:?}");
+        assert!(
+            !shown.contains(&nonce.as_token()) && !shown.contains("nonce"),
+            "{shown}"
+        );
         let svg = render_stamped(&element("svg", vec![css("p{}")]), &nonce);
         assert!(
             svg.as_str().contains(&format!("<style{attr}>")),

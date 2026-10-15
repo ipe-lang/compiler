@@ -2097,7 +2097,7 @@ const _: () = assert!(store::CLAIM_WAIT.as_millis() == ENTER_REPLY_TIMEOUT.as_mi
 // Every minted sid parses back as a `SessionKey`.
 #[cfg(feature = "web")]
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a minted sid's length drifts from the session key's [ledger #boundary]
-const _: () = assert!(uuid::fmt::Simple::LENGTH == store::SESSION_ID_LEN);
+const _: () = assert!(2 * size_of::<u128>() == store::SESSION_ID_LEN);
 
 /// Build the routed entry from the route table, the `notFound` page, the
 /// app's emitted `set_page`, and its page renderer.
@@ -2821,27 +2821,41 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     drop(sub_runtime);
 }
 
-/// A fresh session id: **128 bits from the OS CSPRNG**, as 32 lowercase-hex
-/// chars.
+/// A session id from 128 bits `fill` draws, as 32 lowercase-hex chars.
 ///
 /// SECURITY: the sid is the SOLE bearer credential for a Ipe.Web session
-/// (`sid_from_cookie` + `store.get` authorise every event off it). It MUST be
-/// unpredictable. The prior scheme — `clock_nanos XOR counter` through
-/// splitmix64 — was an invertible bijection over low-entropy, partly-known
-/// inputs (the counter starts at 0; the clock is estimable), so sids were
-/// guessable → session hijacking. `uuid::Uuid::new_v4` draws its bits from the
-/// OS CSPRNG (the approved security-randomness source per `random.rs`), and its
-/// `simple` form is exactly 32 lowercase-hex chars — same shape, no `aes-gcm`.
-/// Never panics.
+/// (`sid_from_cookie` + `store.get` authorise every event off it), so its bits
+/// come from the OS CSPRNG and nothing else. A failed draw is an error the
+/// caller refuses the request with; there is no fallback value.
 #[cfg(feature = "web")]
-fn new_sid() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+fn sid_from(
+    fill: impl FnOnce(&mut [u8; 16]) -> Result<(), crate::csp::EntropyError>,
+) -> Result<String, crate::csp::EntropyError> {
+    let mut bits = [0; 16];
+    fill(&mut bits)?;
+    Ok(format!(
+        "{:0width$x}",
+        u128::from_be_bytes(bits),
+        width = store::SESSION_ID_LEN
+    ))
 }
 
 /// A fresh sid for a request whose mint was proved first-party.
+///
+/// # Errors
+///
+/// Returns [`crate::csp::EntropyError`] when the OS yields no entropy.
 #[cfg(feature = "web")]
-fn minted_sid(_proof: mint_proof::MintProof) -> String {
-    new_sid()
+fn minted_sid(_proof: mint_proof::MintProof) -> Result<String, crate::csp::EntropyError> {
+    sid_from(|bits| getrandom::getrandom(bits).map_err(|_| crate::csp::EntropyError))
+}
+
+/// A fresh sid for a test fixture.
+#[cfg(all(test, feature = "web"))]
+#[allow(clippy::expect_used)] // the test host's CSPRNG yields entropy
+fn new_sid() -> String {
+    sid_from(|bits| getrandom::getrandom(bits).map_err(|_| crate::csp::EntropyError))
+        .expect("the test host's CSPRNG yields entropy")
 }
 
 /// Normalise a raw `IPE_WEB_BASE_PATH` value: trim, drop a trailing slash,
@@ -4826,8 +4840,12 @@ mod handlers {
                 // Session fixation guard: a store MISS means this sid is NOT a
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
-                // Minted first so `init` and the entry run under it.
-                let scope = pubsub::SessionScope::new(minted_sid(proof));
+                // Minted first so `init` and the entry run under it; with no
+                // entropy for it the page is refused.
+                let Ok(sid) = minted_sid(proof) else {
+                    return entry_unavailable();
+                };
+                let scope = pubsub::SessionScope::new(sid);
                 let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
                 let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, path);
                 (
@@ -17183,6 +17201,26 @@ mod web_revocation_tests {
         );
         let mints = code.matches("SessionKeys::mint(").count();
         assert_eq!(mints, 1, "a session's keys are minted at one site");
+    }
+
+    /// A sid draw that yields no entropy is an error, never a sid, and no
+    /// production path mints an id through a generator that panics instead.
+    #[test]
+    fn sid_mint_refuses_without_entropy() {
+        use crate::csp::EntropyError;
+        assert_eq!(super::sid_from(|_| Err(EntropyError)), Err(EntropyError));
+        let sid = super::sid_from(|bits| {
+            bits.fill(0xa5);
+            Ok(())
+        });
+        assert_eq!(sid, Ok("a5".repeat(16)));
+        let parsed = sid
+            .as_deref()
+            .ok()
+            .and_then(crate::web::store::SessionKey::parse);
+        assert!(parsed.is_some(), "a minted sid is a session key");
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        assert!(!code.contains("new_v4("), "an id mint panics on no entropy");
     }
 
     /// Every task a Cmd dispatch spawns runs in the session's scope, every

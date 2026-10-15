@@ -732,11 +732,9 @@ mod tests {
             "{token}"
         );
         assert_ne!(token, b.as_token());
-        let shown = format!("{a:?}");
-        for piece in token.as_bytes().windows(4) {
-            let piece = std::str::from_utf8(piece).unwrap_or_default();
-            assert!(!shown.contains(piece), "{shown} shows {piece}");
-        }
+        // An exact form: a derived `Debug` would list the bytes in decimal,
+        // which no search for the hex token finds.
+        assert_eq!(format!("{a:?}"), "StyleNonce(..)");
     }
 
     #[test]

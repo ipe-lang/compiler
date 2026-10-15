@@ -1227,8 +1227,9 @@ mod tests {
         );
     }
 
-    /// An attribute delta that adds a program-built `nonce` in any case yields
-    /// no attribute operation, so no program can forge or overwrite a stamp.
+    /// An attribute delta that adds or drops a program-built `nonce` in any case
+    /// yields no attribute operation, so no program can forge, overwrite or
+    /// remove a stamp.
     #[test]
     fn author_nonce_is_never_patched() {
         for name in ["nonce", "NONCE", "Nonce"] {
@@ -1243,6 +1244,7 @@ mod tests {
             ids(&mut new);
             for patches in [
                 plain(&old, &new),
+                plain(&new, &old),
                 diff(
                     &old,
                     &new,
