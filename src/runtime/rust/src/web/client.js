@@ -191,6 +191,7 @@ var __ipeBoot = (function() {
   try { data = JSON.parse(node.textContent); } catch (_) { refuse("block is not JSON"); }
   if (!isObject(data)) refuse("block is not an object");
   __IPE_BOOT_STRINGS.forEach(function(k) { requireType(data, k, "string", ""); });
+  if (!__ipeEpochParts(data["epoch"])) refuse("epoch is not an epoch token");
   requireType(data, "cfg", "object", "");
   var cfg = data["cfg"];
   if (!isObject(cfg)) refuse("cfg is not an object");
@@ -220,7 +221,16 @@ var __ipeCsrfToken = __ipeBoot["csrf"];
 // handler id was read under; the server resolves the id only against that
 // render, and a refused event is answered with the current render, never
 // re-sent.
-var __ipeEpoch = __ipeBoot["epoch"] || null;
+var __ipeEpoch = __ipeBoot["epoch"];
+// The render history this document was served from, fixed for the document's
+// life. Its styles are admitted by that history's nonce, so only a render of
+// the same history can style correctly here.
+Object.defineProperty(window, "__ipeBootInc", {
+  value: __ipeEpochParts(__ipeBoot["epoch"]).inc,
+  writable: false,
+  configurable: false,
+  enumerable: false
+});
 // A random id minted once per page load. With the client seq it lets the
 // server ack a re-delivered event without dispatching it twice.
 var __ipeTabId = (function() {
@@ -235,27 +245,67 @@ var __ipeTabId = (function() {
 // Split an epoch token "<32 hex>.<counter>" into its incarnation and counter.
 function __ipeEpochParts(token) {
   if (typeof token !== "string" || token.indexOf(".") !== 32) return null;
+  var inc = token.slice(0, 32);
   var n = token.slice(33);
-  if (!/^[1-9][0-9]*$/.test(n)) return null;
-  return { inc: token.slice(0, 32), n: n };
+  if (!/^[0-9a-f]{32}$/.test(inc) || !/^[1-9][0-9]*$/.test(n)) return null;
+  return { inc: inc, n: n };
 }
-// Whether a full render at epoch `token` may replace the DOM: one from another
-// render history always may; within one history only a render no older than
-// the one on screen. Counters are canonical decimals, so a longer one is larger.
+// Whether a full render at epoch `token` may replace the DOM: only a render of
+// this document's own history, and within it only one no older than the
+// render on screen. Counters are canonical decimals, so a longer one is larger.
 function __ipeFullBodyAdmits(token) {
   var next = __ipeEpochParts(token);
+  if (!next || next.inc !== __ipeBootInc) return false;
   var cur = __ipeEpochParts(__ipeEpoch);
-  if (!next || !cur || next.inc !== cur.inc) return true;
+  if (!cur || cur.inc !== next.inc) return true;
   if (next.n.length !== cur.n.length) return next.n.length > cur.n.length;
   return next.n >= cur.n;
 }
 // Apply a full render through `applyFn` when its epoch admits it, then adopt
-// that epoch. A render without a well-formed epoch leaves none, so the next
-// event is refused and answered with the current render.
+// that epoch. A render with no epoch, or of another history, would style
+// against a nonce this document does not hold: it is never applied, and the
+// document is stale.
 function __ipeAdoptFullBody(token, applyFn) {
+  if (__ipeStale) return;
+  var next = __ipeEpochParts(token);
+  if (!next || next.inc !== __ipeBootInc) {
+    __ipeStaleDocument();
+    return;
+  }
   if (!__ipeFullBodyAdmits(token)) return;
   applyFn();
-  __ipeEpoch = __ipeEpochParts(token) ? token : null;
+  __ipeEpoch = token;
+}
+// Set once this document has refused a render of another history: from then
+// on it applies no patch and no full render.
+var __ipeStale = false;
+// The sessionStorage record of the last stale-document reload, and the window
+// within which a second one is refused.
+var __IPE_INC_RELOAD_KEY = "__ipe_inc_reload";
+var __IPE_INC_RELOAD_WINDOW_MS = 30000;
+// Leave a document whose render history is gone: reload it at most once per
+// window, so the fresh document joins the live history. Over that budget, or
+// with no sessionStorage to keep it, nothing reloads; the banner says the page
+// is out of date and the document stays as it is.
+function __ipeStaleDocument() {
+  if (__ipeStale) return;
+  __ipeStale = true;
+  var now = Date.now();
+  var stamp = String(now);
+  var reload = false;
+  try {
+    var last = Number(sessionStorage.getItem(__IPE_INC_RELOAD_KEY));
+    var recent = last > 0 && now >= last && now - last < __IPE_INC_RELOAD_WINDOW_MS;
+    if (!recent) {
+      sessionStorage.setItem(__IPE_INC_RELOAD_KEY, stamp);
+      reload = sessionStorage.getItem(__IPE_INC_RELOAD_KEY) === stamp;
+    }
+  } catch (_) { reload = false; }
+  if (reload) {
+    window.location.reload();
+    return;
+  }
+  __ipeShowStale();
 }
 // The newest full render the stream pushed while a <select> held focus (the
 // proxy for an open dropdown, which any DOM mutation around it collapses),
@@ -1266,16 +1316,11 @@ function __ipePostEvent(body) {
         }, data.globalSeq);
       });
     }
-    return r.text().then(function(t) {
-      __ipeLoaderEnd();
-      __ipeOnPostSuccess();
-      var seqStr = r.headers.get("X-Ipe-Seq");
-      var seq = seqStr ? parseInt(seqStr, 10) : 0;
-      var ackRaw = r.headers.get("X-Ipe-Ack-Inputs");
-      var ack = null;
-      if (ackRaw) { try { ack = JSON.parse(ackRaw); } catch(_) {} }
-      __ipeHandleResponse(seq, ack, function() { __ipePatch(t); });
-    });
+    // An event is answered in JSON; the one marked text answer is the
+    // session-lost 404, which no DOM may show. The probe confirms it and
+    // reloads, and the event waits in the retry queue meanwhile.
+    if (r.status === 404) __ipeProbeSessionLost();
+    throw new Error("non-json event response " + r.status);
   }).catch(function() {
     __ipeLoaderEnd();
     __ipeOnPostFailure(body);
@@ -1397,7 +1442,7 @@ var __IPE_LIVE_PROPS = Object.freeze({
   disabled: "disabled"
 });
 function __ipeApplyPatches(patches) {
-  if (!patches || patches.length === 0) return;
+  if (__ipeStale || !patches || patches.length === 0) return;
   __ipeMounted = true;
   // Open <select> defence: native dropdowns close on ANY DOM mutation
   // inside the open select OR any ancestor that would re-mount it.
@@ -1829,6 +1874,7 @@ __ipeDoc.on("click", function(ev) {
     })
     .then(function(res) {
       __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
+      if (__ipeStale) return;
       window.history.pushState({}, "", res.url);
       __ipeNavPath   = window.location.pathname;
       __ipeNavSearch = window.location.search;
@@ -1883,6 +1929,8 @@ var __ipeStatusMsgEl = null;            // text node child
 var __ipeStatusGraceTimer = null;       // 500ms anti-flicker timer
 var __ipeBuildOkTimer = null;           // auto-hide timer for build-ok toast
 function __ipeSetStatus(state, msg) {
+  // A stale document keeps its banner: no later state replaces it.
+  if (__ipeStale) return;
   // Cancel any pending build-ok auto-hide when switching to a different state.
   if (__ipeBuildOkTimer !== null && state !== "build-ok") {
     clearTimeout(__ipeBuildOkTimer);
@@ -1938,6 +1986,27 @@ function __ipeShowBootFailure() {
     var built = __ipeBuildStatusEl("offline");
     built.msgEl.textContent = "Page failed to start — reload to retry";
     (__ipeDoc.body() || __ipeDoc.root()).appendChild(built.el);
+  }
+  if (__ipeDoc.body()) show();
+  else __ipeDoc.on("DOMContentLoaded", show);
+}
+// Show the offline banner on a stale document. It ignores the banner setting:
+// a page that has stopped applying updates always says so.
+function __ipeShowStale() {
+  if (__ipeBuildOkTimer !== null) {
+    clearTimeout(__ipeBuildOkTimer);
+    __ipeBuildOkTimer = null;
+  }
+  __ipeStatus = "offline";
+  function show() {
+    if (!__ipeStatusEl) {
+      var built = __ipeBuildStatusEl("offline");
+      __ipeDoc.body().appendChild(built.el);
+      __ipeStatusEl = built.el;
+      __ipeStatusMsgEl = built.msgEl;
+    }
+    __ipeStatusEl.className = "ipe-status ipe-status--offline";
+    __ipeStatusMsgEl.textContent = "Page is out of date \u2014 reload";
   }
   if (__ipeDoc.body()) show();
   else __ipeDoc.on("DOMContentLoaded", show);
@@ -2199,21 +2268,9 @@ var __ipeLiveFrames = {
       }
     }
     var frame;
-    try { frame = JSON.parse(text); } catch (_) {
-      // Legacy frame (pre-v0.9.3 server) — raw HTML, no seq to gate on.
-      // Open-<select> defence: an SSE-pushed full-body re-render during an
-      // open dropdown would collapse it, so the body is held until the
-      // select closes. Active user paths (ipe-nav, popstate, POST text
-      // fallback) are NOT defended — those are user-initiated and holding
-      // them would be worse UX than the dropdown collapsing.
-      var raw = text.replace(/\\n/g, "\n");
-      if (__ipeSelectOpen()) {
-        __ipeHoldRender(function() { __ipePatch(raw); });
-        return;
-      }
-      __ipeHeldRender = null;
-      return __ipePatch(raw);
-    }
+    // Every patch frame is JSON carrying its epoch; any other payload has no
+    // render history to gate on and is dropped.
+    try { frame = JSON.parse(text); } catch (_) { return; }
     if (frame && typeof frame === "object") {
       __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
         if (!frame.body) return;
@@ -2287,7 +2344,7 @@ var __ipeLiveFrames = {
       // rather than running __ipePatch on garbage.
       return;
     }
-    if (!frame || typeof frame !== "object" || !frame.patches) return;
+    if (__ipeStale || !frame || typeof frame !== "object" || !frame.patches) return;
     // The patches diff the render `from` against `to`: they apply only onto
     // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
     // first frame is the full current render.

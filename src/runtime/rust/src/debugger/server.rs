@@ -177,7 +177,7 @@ pub fn overlay_html(labels: &[String], total: usize, scrub_base: &str) -> String
 /// button.
 ///
 /// It is a constant so the Web page policy admits it by the hash of these
-/// exact bytes (`csp::Profile::WebPage`); per-page values (the endpoint URLs,
+/// exact bytes (`csp::Guarded::WebPage`); per-page values (the endpoint URLs,
 /// the selected-row tint) are read from the panel's `data-ipe-dbg-*`
 /// attributes. Because injected markup can carry a copy of these bytes beside
 /// a forged panel, no attribute grants authority: an endpoint URL is posted to

@@ -120,7 +120,7 @@ pub async fn console_html() -> axum::response::Response {
         .into_response();
     crate::server::with_security_headers(
         resp,
-        telemetry::security_headers(crate::csp::Profile::Console),
+        telemetry::security_headers(&crate::csp::Guarded::Console),
     )
 }
 
@@ -718,7 +718,7 @@ mod tests {
                 .map(str::to_owned)
         };
         let want =
-            crate::csp::ContentSecurityPolicy::for_profile(crate::csp::Profile::Console, None)
+            crate::csp::ContentSecurityPolicy::for_guard(&crate::csp::Guarded::Console, None)
                 .header_value();
         let served_csp = get("content-security-policy");
         assert_eq!(served_csp, Some(want.clone()));
