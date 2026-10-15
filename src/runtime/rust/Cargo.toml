@@ -638,6 +638,9 @@ sha2 = "0.10"
 # than by a text scanner.
 syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = "1"
+# `tests/entropy_site_inventory.rs` parses the manifests and the lockfile it
+# checks for a generator.
+toml = "0.8"
 
 # `wasm-bindgen-test` drives the headless-browser test harness (`tests/
 # wasm_*` files, `#[wasm_bindgen_test]`) — meaningless on native, so it is

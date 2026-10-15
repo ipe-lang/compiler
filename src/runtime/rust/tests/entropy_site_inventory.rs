@@ -44,8 +44,22 @@ use source_tree::rust_sources;
 /// The OS entropy crate, counted at every path through it.
 const OS_CRATE: &str = "getrandom";
 
-/// Segments counted wherever they appear: the `rand_core` OS generator.
-const RNG_SEGMENTS: &[&str] = &["OsRng", "rand_core"];
+/// Segments counted wherever they appear: the generator crates and the OS
+/// generators they and `ring` expose. No generator crate is a runtime
+/// dependency (see [`RNG_CRATES`]), so a site names one only to draw past
+/// `fill_entropy`.
+const RNG_SEGMENTS: &[&str] = &[
+    "OsRng",
+    "rand_core",
+    "rand",
+    "rand_chacha",
+    "fastrand",
+    "oorandom",
+    "nanorand",
+    "thread_rng",
+    "ThreadRng",
+    "SystemRandom",
+];
 
 /// The uuid generators that draw their own entropy or read their own clock.
 const UUID_MINTS: &[&str] = &[
@@ -56,6 +70,14 @@ const UUID_MINTS: &[&str] = &[
 const WATCHED_NAMES: &[&str] = &[
     "getrandom",
     "rand_core",
+    "rand",
+    "rand_chacha",
+    "fastrand",
+    "oorandom",
+    "nanorand",
+    "thread_rng",
+    "ThreadRng",
+    "SystemRandom",
     "OsRng",
     "uuid",
     "Uuid",
@@ -364,6 +386,16 @@ impl<'ast> Visit<'ast> for Scan {
         visit::visit_expr(self, expr);
     }
 
+    /// An attribute's argument tokens are code to an attribute macro (an
+    /// `instrument(fields(..))` expression), so they are scanned like a
+    /// macro body.
+    fn visit_attribute(&mut self, attr: &'ast Attribute) {
+        if let Meta::List(list) = &attr.meta {
+            self.scan_tokens(list.tokens.clone());
+        }
+        visit::visit_attribute(self, attr);
+    }
+
     fn visit_path(&mut self, path: &'ast Path) {
         self.segments(&names_of(path));
         visit::visit_path(self, path);
@@ -386,7 +418,7 @@ impl<'ast> Visit<'ast> for Scan {
         match tree {
             UseTree::Path(p) => {
                 let name = p.ident.unraw().to_string();
-                if name == OS_CRATE || name == "rand_core" {
+                if name == OS_CRATE || RNG_SEGMENTS.contains(&name.as_str()) {
                     self.record(format!("use {name}"));
                 }
             }
@@ -622,6 +654,9 @@ fn evasion_shapes_are_seen() {
         ("path_mod.rs", MODULE_LEVEL, "#[path] mod y"),
         ("cfg_attr_path.rs", MODULE_LEVEL, "#[path] mod y"),
         ("test_only.rs", "t", "getrandom::getrandom"),
+        ("attribute_tokens.rs", "handle", "Uuid::new_v4"),
+        ("rand_crate.rs", "roll", "rand"),
+        ("ring_random.rs", "draw", "SystemRandom"),
     ];
     for (fixture, within, form) in shapes {
         let rel = format!("tests/fixtures/entropy_scan/{fixture}");
@@ -670,7 +705,8 @@ fn a_source_that_does_not_parse_fails_the_scan() {
 }
 
 // ---------------------------------------------------------------------------
-// The uuid manifests carry no generator feature.
+// The manifests carry no generator: no uuid RNG feature, no generator crate,
+// no rename of a watched crate.
 // ---------------------------------------------------------------------------
 
 /// The uuid features that compile a generator drawing its own entropy or
@@ -687,62 +723,246 @@ const UUID_RNG_FEATURES: &[&str] = &[
     "js",
 ];
 
-/// The `uuid = { .. }` dependency lines in `manifest`, and every RNG feature
-/// the manifest gives uuid, in a dependency line or through a `uuid/<f>`
-/// feature reference.
-fn uuid_rng_features(manifest: &str) -> (usize, Vec<String>) {
-    let mut entries = 0usize;
-    let mut found = Vec::new();
-    for line in manifest.lines() {
-        let line = line.trim_start();
-        assert!(
-            !line.contains("dependencies.uuid"),
-            "a table-form uuid dependency is not read by this check: {line}"
-        );
-        if line.starts_with("uuid = {") {
-            entries = entries.saturating_add(1);
-            for feature in UUID_RNG_FEATURES {
-                if line.contains(&format!("\"{feature}\"")) {
-                    found.push(format!("{feature} in `{line}`"));
-                }
+/// The generator crates no manifest may depend on: each draws past
+/// `fill_entropy`, and `rand`'s `thread_rng` panics when its seed draw fails.
+const RNG_CRATES: &[&str] = &[
+    "rand",
+    "rand_core",
+    "rand_chacha",
+    "rand_pcg",
+    "rand_xorshift",
+    "fastrand",
+    "oorandom",
+    "nanorand",
+];
+
+/// The crates a dependency key must name as themselves: a `package = ..`
+/// rename hides them from the clippy bans and from this scan.
+const UNRENAMED_CRATES: &[&str] = &["getrandom", "uuid"];
+
+/// The dependency table kinds of a manifest.
+const DEPENDENCY_KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+/// The dependency tables of a manifest, the target-specific ones included.
+fn dependency_tables(manifest: &toml::Table) -> Vec<(String, &toml::Table)> {
+    let mut tables = Vec::new();
+    for kind in DEPENDENCY_KINDS {
+        if let Some(table) = manifest.get(kind).and_then(toml::Value::as_table) {
+            tables.push((kind.to_owned(), table));
+        }
+    }
+    let targets = manifest.get("target").and_then(toml::Value::as_table);
+    for (cfg, target) in targets.into_iter().flatten() {
+        for kind in DEPENDENCY_KINDS {
+            if let Some(table) = target.get(kind).and_then(toml::Value::as_table) {
+                tables.push((format!("target.{cfg}.{kind}"), table));
             }
         }
-        for feature in UUID_RNG_FEATURES {
-            for spelling in [
-                format!("\"uuid/{feature}\""),
-                format!("\"uuid?/{feature}\""),
-            ] {
-                if line.contains(&spelling) {
-                    found.push(format!("{spelling} in `{line}`"));
+    }
+    tables
+}
+
+/// Every generator `manifest` admits: a uuid RNG feature (in a dependency or
+/// through a `uuid/<f>` feature reference), a generator crate, or a renamed
+/// watched crate.
+fn manifest_generators(manifest: &toml::Table) -> Vec<String> {
+    let mut found = Vec::new();
+    for (section, table) in dependency_tables(manifest) {
+        for (key, spec) in table {
+            let package = spec
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(key);
+            if package != key
+                && (UNRENAMED_CRATES.contains(&package) || RNG_CRATES.contains(&package))
+            {
+                found.push(format!("{section}: `{key}` renames `{package}`"));
+            }
+            if RNG_CRATES.contains(&package) {
+                found.push(format!("{section}: generator crate `{package}`"));
+            }
+            if package == "uuid" {
+                let features = spec.get("features").and_then(toml::Value::as_array);
+                for feature in features
+                    .into_iter()
+                    .flatten()
+                    .filter_map(toml::Value::as_str)
+                {
+                    if UUID_RNG_FEATURES.contains(&feature) {
+                        found.push(format!("{section}: uuid feature `{feature}`"));
+                    }
                 }
             }
         }
     }
-    (entries, found)
+    let features = manifest.get("features").and_then(toml::Value::as_table);
+    for (name, implied) in features.into_iter().flatten() {
+        for entry in implied
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
+            let feature = entry
+                .strip_prefix("uuid/")
+                .or_else(|| entry.strip_prefix("uuid?/"));
+            if feature.is_some_and(|f| UUID_RNG_FEATURES.contains(&f)) {
+                found.push(format!("feature `{name}` implies `{entry}`"));
+            }
+        }
+    }
+    found
+}
+
+/// `text` parsed as TOML; text that does not parse fails the check.
+fn parse_toml(name: &str, text: &str) -> toml::Table {
+    let parsed = text.parse::<toml::Table>();
+    assert!(
+        parsed.is_ok(),
+        "{name} does not parse as TOML: {:?}",
+        parsed.as_ref().err().map(ToString::to_string)
+    );
+    parsed.unwrap_or_default()
+}
+
+/// The wasm manifest `project.rs` emits, cut from its `WASM_CARGO_TOML`
+/// literal.
+fn emitted_wasm_manifest() -> String {
+    const OPEN: &str = "const WASM_CARGO_TOML: &str = r#\"";
+    let src = read_crate_file("../../compiler/backend/rust/src/project.rs");
+    let text = src
+        .split_once(OPEN)
+        .and_then(|(_, rest)| rest.split_once("\"#;"))
+        .map(|(text, _)| text.to_owned());
+    assert!(
+        text.is_some(),
+        "project.rs: the WASM_CARGO_TOML literal was not found"
+    );
+    text.unwrap_or_default()
 }
 
 #[test]
-fn uuid_has_no_rng_feature() {
-    for (rel, entries) in [
-        ("Cargo.toml", 2),
-        ("../../compiler/backend/rust/templates/Cargo.toml", 1),
-        ("../../compiler/backend/rust/src/project.rs", 1),
-    ] {
+fn manifests_carry_no_generator() {
+    let sources = [
+        ("Cargo.toml", read_crate_file("Cargo.toml")),
+        (
+            "templates/Cargo.toml",
+            read_crate_file("../../compiler/backend/rust/templates/Cargo.toml"),
+        ),
+        ("project.rs WASM_CARGO_TOML", emitted_wasm_manifest()),
+    ];
+    for (name, text) in &sources {
+        let parsed = parse_toml(name, text);
+        assert!(
+            dependency_tables(&parsed)
+                .iter()
+                .any(|(_, table)| table.contains_key("uuid")),
+            "{name}: the uuid dependency was not found, so its features were not read"
+        );
         assert_eq!(
-            uuid_rng_features(&read_crate_file(rel)),
-            (entries, Vec::new()),
-            "{rel}: uuid must carry no generator feature; ids draw through \
-             `entropy::fill_entropy`"
+            manifest_generators(&parsed),
+            Vec::<String>::new(),
+            "{name}: ids draw through `entropy::fill_entropy`; no manifest may admit \
+             another generator"
         );
     }
-    let (entries, refused) =
-        uuid_rng_features("uuid = { version = \"1\", features = [\"v4\", \"v7\"] }\n");
-    assert_eq!(entries, 1);
-    assert_eq!(refused.len(), 2, "the generator features must be refused");
-    let (_, implied) = uuid_rng_features("server = [\"uuid/v4\"]\n");
+}
+
+/// Each manifest shape that admits a generator is refused, a multi-line
+/// feature array, a table-form dependency and a target table included.
+#[test]
+fn manifest_generators_are_refused() {
+    let shapes: &[(&str, usize)] = &[
+        (
+            "[dependencies]\nuuid = { version = \"1\", features = [\"v4\", \"v7\"] }\n",
+            2,
+        ),
+        (
+            "[dependencies]\nuuid = { version = \"1\", features = [\n  \"std\",\n  \"v4\",\n] }\n",
+            1,
+        ),
+        (
+            "[dependencies.uuid]\nversion = \"1\"\nfeatures = [\"fast-rng\"]\n",
+            1,
+        ),
+        (
+            "[target.'cfg(unix)'.dev-dependencies]\nuuid = { version = \"1\", features = [\"js\"] }\n",
+            1,
+        ),
+        (
+            "[features]\nserver = [\"uuid/v4\"]\nweb = [\"uuid?/v7\"]\n",
+            2,
+        ),
+        ("[dependencies]\nrand = \"0.8\"\n", 1),
+        ("[dev-dependencies]\nfastrand = \"2\"\n", 1),
+        (
+            "[dependencies]\nos = { package = \"getrandom\", version = \"0.2\" }\n",
+            1,
+        ),
+        (
+            "[dependencies]\nid = { package = \"uuid\", version = \"1\", features = [\"v4\"] }\n",
+            2,
+        ),
+        (
+            "[dependencies]\nr = { package = \"rand\", version = \"0.8\" }\n",
+            2,
+        ),
+    ];
+    for (text, refusals) in shapes {
+        assert_eq!(
+            manifest_generators(&parse_toml("fixture", text)).len(),
+            *refusals,
+            "{text}"
+        );
+    }
+    let clean = "[dependencies]\nuuid = { version = \"1\" }\ngetrandom = \"0.2\"\n";
     assert_eq!(
-        implied.len(),
-        1,
-        "an implied generator feature must be refused"
+        manifest_generators(&parse_toml("fixture", clean)),
+        Vec::<String>::new()
     );
+}
+
+/// The entropy crates among a locked package's dependencies.
+fn locked_entropy_deps(package: &toml::Value) -> Vec<String> {
+    let deps = package.get("dependencies").and_then(toml::Value::as_array);
+    deps.into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .filter(|dep| {
+            let name = dep.split(' ').next().unwrap_or_default();
+            name == OS_CRATE || RNG_CRATES.contains(&name)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The workspace lockfile resolves uuid with no entropy source of its own: no
+/// crate in the graph turns a uuid generator feature on.
+#[test]
+fn locked_uuid_has_no_entropy_source() {
+    let lock = parse_toml("Cargo.lock", &read_crate_file("../../../Cargo.lock"));
+    let packages = lock.get("package").and_then(toml::Value::as_array);
+    let uuids: Vec<&toml::Value> = packages
+        .into_iter()
+        .flatten()
+        .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some("uuid"))
+        .collect();
+    assert!(!uuids.is_empty(), "Cargo.lock: no uuid package was found");
+    for uuid in uuids {
+        assert_eq!(
+            locked_entropy_deps(uuid),
+            Vec::<String>::new(),
+            "Cargo.lock: uuid must draw no entropy of its own"
+        );
+    }
+    let fixture = parse_toml(
+        "fixture",
+        "[[package]]\nname = \"uuid\"\ndependencies = [\"getrandom 0.3.4\", \"js-sys\"]\n",
+    );
+    let refused = fixture
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .and_then(|packages| packages.first())
+        .map(locked_entropy_deps);
+    assert_eq!(refused.map(|deps| deps.len()), Some(1));
 }
