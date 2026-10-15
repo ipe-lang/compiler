@@ -2782,7 +2782,7 @@ impl Scan<'_> {
                     .push_split(text, Position::Program, Tilde::Shell, ctx.regime)
                     .map_err(unproven)?;
             }
-            let shaped = is_path_shaped(text);
+            let shaped = is_path_shaped(text, ctx.regime);
             if shaped {
                 self.judge_path(ctx, text, Reach::Command)?;
             }
@@ -2866,7 +2866,7 @@ impl Scan<'_> {
             let tail = if rest.is_empty() {
                 ""
             } else {
-                let Some(tail) = rest.strip_prefix(is_separator) else {
+                let Some(tail) = rest.strip_prefix(|c| is_separator(c, self.regime)) else {
                     return Err(Unprovable::TildeUser);
                 };
                 tail
@@ -3210,8 +3210,11 @@ fn option_argument(word: &str) -> Option<&str> {
 }
 
 /// Whether `word` is shaped like a path: it holds a separator, starts with `~`, or is `.` or `..`.
-fn is_path_shaped(word: &str) -> bool {
-    word.contains(is_separator) || word.starts_with('~') || word == "." || word == ".."
+fn is_path_shaped(word: &str, regime: Regime) -> bool {
+    word.contains(|c| is_separator(c, regime))
+        || word.starts_with('~')
+        || word == "."
+        || word == ".."
 }
 
 /// `value` split into shell words: quotes group, a backslash escapes, whitespace separates.

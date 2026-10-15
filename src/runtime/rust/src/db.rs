@@ -12420,7 +12420,7 @@ mod tests {
         let (Ok(url), Ok(options)) = (url, options) else {
             return;
         };
-        let pinned = pin_postgres_options(&url, options, &[], &NoDns, 4).await;
+        let pinned = pin_postgres_options(&url, options, &[], HOST_RELAY, &NoDns, 4).await;
         assert!(matches!(
             pinned,
             Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget))

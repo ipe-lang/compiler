@@ -102,14 +102,11 @@ impl HostLinker {
     /// any other regime every linker opens any path.
     #[must_use]
     pub fn of_query(host: Option<&str>, regime: Regime) -> Self {
-        host.map_or(
-            if regime.is_windows() {
-                Self::AsciiOnly
-            } else {
-                Self::Unicode
-            },
-            |triple| Self::of_triple(HostTriple::parse(triple)),
-        )
+        match host {
+            Some(triple) => Self::of_triple(HostTriple::parse(triple)),
+            None if regime.is_windows() => Self::AsciiOnly,
+            None => Self::Unicode,
+        }
     }
 
     /// The linker family of the active toolchain's host.
