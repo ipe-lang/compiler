@@ -14,6 +14,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+// The sibling `home_core` reads its path regime and volume syntax through.
+use ipe_path_core as path_core;
+
 /// The runtime's home-variable name and value parser, spliced in verbatim.
 ///
 /// The one source lives in the runtime tree because the runtime is vendored

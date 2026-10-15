@@ -13,6 +13,12 @@
 // Regular (`//`) comments, not inner docs (`//!`): this file is `include!`d
 // verbatim into a sandbox module, where an inner doc after the `include!` item
 // is an illegal mid-file inner attribute.
+//
+// The path regime and volume syntax come from the sibling `path_core`: the
+// runtime's own module, and in the sandbox the `ipe_path_core` crate, which
+// `include!`s that same file.
+
+use super::path_core::{HOST, Regime, Volume};
 
 /// The variable naming the invoking user's profile directory on Windows.
 pub const WINDOWS_HOME_VAR: &str = "USERPROFILE";
@@ -96,7 +102,7 @@ impl HomeDir {
         if text.contains('\0') {
             return Err(HomeRefusal::ContainsNul);
         }
-        let path = std::path::PathBuf::from(text);
+        let path = std::path::Path::new(&text);
         if !path.is_absolute() {
             return Err(HomeRefusal::NotAbsolute);
         }
@@ -106,11 +112,10 @@ impl HomeDir {
         {
             return Err(HomeRefusal::ParentComponent);
         }
-        #[cfg(windows)]
-        if let Some(refusal) = windows_prefix_refusal(&path) {
+        if let Some(refusal) = prefix_refusal(&text, HOST) {
             return Err(refusal);
         }
-        Ok(Self(path))
+        Ok(Self(std::path::PathBuf::from(text)))
     }
 
     /// The verified path.
@@ -129,25 +134,21 @@ impl HomeDir {
     }
 }
 
-/// The refusal a Windows path prefix earns, if any.
+/// The refusal the volume prefix of `path` earns under `regime`, if any.
 ///
 /// A verbatim or device-namespace prefix (`\\?\...`, `\\.\...`,
 /// `\\?\UNC\...`) names a raw device or an unparsed literal path, and a UNC
 /// prefix (`\\server\share\...`) names a network share, even though
 /// `Path::is_absolute` accepts every one of them. Only a plain drive
-/// (`C:\...`) names a local directory.
-#[cfg(windows)]
-fn windows_prefix_refusal(path: &std::path::Path) -> Option<HomeRefusal> {
-    use std::path::{Component, Prefix};
-    let Some(Component::Prefix(prefix)) = path.components().next() else {
-        return None;
-    };
-    match prefix.kind() {
-        Prefix::Verbatim(_)
-        | Prefix::VerbatimUNC(_, _)
-        | Prefix::VerbatimDisk(_)
-        | Prefix::DeviceNS(_) => Some(HomeRefusal::WindowsDeviceOrVerbatim),
-        Prefix::UNC(_, _) => Some(HomeRefusal::WindowsUnc),
-        Prefix::Disk(_) => None,
+/// (`C:\...`) names a local directory. Under Unix no path has a volume, so
+/// none is refused here.
+#[must_use]
+pub fn prefix_refusal(path: &str, regime: Regime) -> Option<HomeRefusal> {
+    match Volume::parse(path, regime) {
+        Volume::Namespaced { .. } | Volume::VerbatimUnc { .. } => {
+            Some(HomeRefusal::WindowsDeviceOrVerbatim)
+        }
+        Volume::Unc { .. } => Some(HomeRefusal::WindowsUnc),
+        Volume::None | Volume::Drive(_) => None,
     }
 }
