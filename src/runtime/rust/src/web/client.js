@@ -1896,11 +1896,19 @@ function __ipeStartNav(url) {
 function __ipeSettleNav(intent) {
   if (intent === __ipeNavIntent) __ipeNavWanted = null;
 }
-// A full browser load of `url`: a reload when it is the location.
+// The document an absolute `href` loads: `href` without its fragment. A
+// serialized URL's first `#` opens its fragment.
+function __ipeDocumentOf(href) {
+  var at = href.indexOf("#");
+  return at < 0 ? href : href.slice(0, at);
+}
+// A full browser load of `url`: a reload when it names the document on
+// screen, whatever its fragment, since assigning a URL that differs from the
+// location only in its fragment scrolls and loads nothing.
 function __ipeLoad(url) {
   var target = url;
   try { target = new URL(url, window.location.href).href; } catch (_) {}
-  if (target === window.location.href) window.location.reload();
+  if (__ipeDocumentOf(target) === __ipeDocumentOf(window.location.href)) window.location.reload();
   else window.location.assign(target);
 }
 // Navigation `intent` has no answer this document can show: the browser loads

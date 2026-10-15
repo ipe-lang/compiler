@@ -772,3 +772,29 @@ test("render history: a link's answer landing on a stale document loads the link
   await page.waitForURL(`${STYLES}/e2e-pending`, { timeout: 15000 });
   expect(await page.locator("#e2e-pending").count()).toBe(0);
 });
+
+test("render history: a document gone stale while a link to its own fragment is pending reloads", async ({
+  page,
+}) => {
+  const loads = { count: 0 };
+  page.on("request", (r) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loads.count += 1;
+  });
+  const { foreign } = await openWithHeldForeignStream(page);
+  const answer = gate();
+  await page.route(
+    (url) => url.origin === STYLES && url.pathname === "/",
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      await answer.shut;
+      return route.fulfill({ status: 503, body: "" }).catch(() => {});
+    },
+  );
+  await addNavLink(page, "frag", "/#e2e-frag");
+  await page.locator("#e2e-link-frag").click();
+  // Assigning `/#e2e-frag` from `/` is a fragment navigation: it would load
+  // nothing, leaving a stale document with no banner.
+  foreign.open();
+  await expect.poll(() => loads.count, { timeout: 15000 }).toBe(2);
+  answer.open();
+});

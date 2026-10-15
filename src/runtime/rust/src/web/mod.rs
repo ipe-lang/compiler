@@ -8559,6 +8559,25 @@ mod base_path_tests {
                 && load_nav.contains("__ipeLoad(url);"),
             "only the newest navigation loads, and it loads its own target"
         );
+        // Assigning `/A#x` from `/A` is a fragment navigation, which loads
+        // nothing: the document a target names is compared without fragments.
+        assert!(
+            load.contains(
+                "if (__ipeDocumentOf(target) === __ipeDocumentOf(window.location.href)) window.location.reload();\n  else window.location.assign(target);"
+            ) && !load.contains("target === window.location.href"),
+            "a target naming the document on screen reloads, whatever its fragment"
+        );
+        let document_of = body_of("__ipeDocumentOf").unwrap_or_default();
+        assert!(
+            document_of.contains("var at = href.indexOf(\"#\");")
+                && document_of.contains("return at < 0 ? href : href.slice(0, at);"),
+            "the document of a URL is the URL before its fragment"
+        );
+        assert_eq!(
+            js.matches("__ipeDocumentOf(").count(),
+            3,
+            "`__ipeDocumentOf` has its definition and the two sides of `__ipeLoad`'s compare"
+        );
         assert!(
             reload.contains("if (typeof wanted === \"string\") __ipeLoad(wanted);"),
             "a reload goes where the pending navigation was going"
