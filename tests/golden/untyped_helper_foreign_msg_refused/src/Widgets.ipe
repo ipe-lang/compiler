@@ -1,0 +1,18 @@
+module Widgets exposing (chip, row)
+
+-- Refused: `chip` has no signature, so its one type is shared by every use in
+-- this module. `row` uses it under its own generic `msg`, so `chip`'s type
+-- borrows `msg` without `chip` being generic over it. `ipe` refuses `chip`
+-- at its name (IPE-L0102) rather than emit two functions cargo cannot join.
+
+import Ipe.Html as Html
+import Ipe.List as List
+
+
+chip s =
+    Html.em [] [ Html.text s ]
+
+
+row : List String -> Html.Html msg
+row xs =
+    Html.span [] (List.map chip xs)

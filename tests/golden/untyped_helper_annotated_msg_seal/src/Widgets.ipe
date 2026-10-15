@@ -1,0 +1,17 @@
+module Widgets exposing (chip, row)
+
+-- Accepted: `chip` carries its own signature, so it is generic over its own
+-- `msg` and `row`'s use instantiates it afresh.
+
+import Ipe.Html as Html
+import Ipe.List as List
+
+
+chip : String -> Html.Html msg
+chip s =
+    Html.em [] [ Html.text s ]
+
+
+row : List String -> Html.Html msg
+row xs =
+    Html.span [] (List.map chip xs)

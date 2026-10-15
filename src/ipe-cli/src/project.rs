@@ -2459,6 +2459,68 @@ import String
     }
 
     #[test]
+    fn a_built_entry_that_escapes_the_source_root_refuses_the_manifest() {
+        let manifest_with_entry = |name: &str, entry: &str| {
+            let root = discovery_dir(
+                name,
+                Some(&format!(
+                    "module Package exposing (package)\n\n\
+                     package =\n    \
+                     {{ name = \"solo\"\n    \
+                     , programs = [ {{ name = \"app\", entry = \"{entry}\" }} ]\n    \
+                     }}\n"
+                )),
+                None,
+            );
+            let manifest = parse_manifest(&root.join("package.ipe")).expect("manifest must parse");
+            let _ = fs::remove_dir_all(&root);
+            manifest
+        };
+        let legal = manifest_with_entry("built_entry_legal", "Cli/Main.ipe");
+        assert_eq!(legal.resolved_entry().ok(), Some(module(&["Cli", "Main"])));
+        let refusals = [
+            (
+                "built_entry_absolute",
+                "/Main.ipe",
+                EntryRefusal::EmptySegment,
+            ),
+            (
+                "built_entry_parent",
+                "../Main.ipe",
+                EntryRefusal::DotSegment,
+            ),
+            (
+                "built_entry_inner_parent",
+                "Cli/../Main.ipe",
+                EntryRefusal::DotSegment,
+            ),
+            (
+                "built_entry_current",
+                "./Main.ipe",
+                EntryRefusal::DotSegment,
+            ),
+            (
+                "built_entry_lowercase",
+                "lower/App.ipe",
+                EntryRefusal::NotModuleSegment {
+                    segment: "lower".to_owned(),
+                },
+            ),
+            ("built_entry_empty", "", EntryRefusal::Empty),
+        ];
+        for (name, entry, refusal) in refusals {
+            let expected = CliError::manifest_entry_refused(entry, &refusal).to_string();
+            assert_eq!(
+                manifest_with_entry(name, entry)
+                    .resolved_entry()
+                    .map_err(|err| err.to_string()),
+                Err(expected),
+                "the built entry {entry:?} refuses the manifest with its own refusal"
+            );
+        }
+    }
+
+    #[test]
     fn parse_manifest_rejects_a_legacy_ipe_toml_path() {
         let root = discovery_dir(
             "reject_toml",

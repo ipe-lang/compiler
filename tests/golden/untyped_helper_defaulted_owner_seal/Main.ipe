@@ -1,0 +1,27 @@
+module Main exposing (main)
+
+-- Accepted: `chip` has no signature and `row` uses it under `msg`, but no use
+-- keeps `row` generic: `row`'s `msg` is defaulted to `()`, so no binding owns
+-- it and `chip`'s `()` agrees with `row`'s.
+--
+-- Output: `row [ "r" ]` rendered.
+
+import Ipe.Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Task as Task exposing (Task)
+
+
+chip s =
+    Html.em [] [ Html.text s ]
+
+
+row : List String -> Html.Html msg
+row xs =
+    Html.span [] (List.map chip xs)
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (row [ "r" ]))

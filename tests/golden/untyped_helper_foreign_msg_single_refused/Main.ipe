@@ -1,0 +1,32 @@
+module Main exposing (main)
+
+-- Refused: `chip` has no signature, so its one type is shared by every use in
+-- this module. `row` uses it under its own generic `msg`, and `framed` uses
+-- `row` under its generic `msg`, which keeps `row` generic. `chip`'s type then
+-- borrows `msg` without `chip` being generic over it; `ipe` refuses `chip` at
+-- its name (IPE-L0102).
+
+import Ipe.Error exposing (Error)
+import Ipe.Html as Html
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Task as Task exposing (Task)
+
+
+chip s =
+    Html.em [] [ Html.text s ]
+
+
+row : List String -> Html.Html msg
+row xs =
+    Html.span [] (List.map chip xs)
+
+
+framed : Html.Html msg -> Html.Html msg
+framed inner =
+    Html.div [] [ inner, row [ "r" ] ]
+
+
+main : Task Error ()
+main =
+    Io.println (Html.render (framed (row [ "f" ])))

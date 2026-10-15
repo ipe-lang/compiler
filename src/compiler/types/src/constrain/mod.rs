@@ -172,11 +172,12 @@ pub struct Builder<'a> {
     /// `instantiate_tracked` only reads the scheme; resolved types are
     /// byte-identical. Single-threaded solver → `Rc` suffices.
     pub top_level: BTreeMap<(Vec<Symbol>, Symbol), Rc<Ty>>,
-    /// Body region-var of each untyped top-level binding, read back for `env`.
+    /// Each untyped top-level binding: its body region-var, read back for
+    /// `env`, and its name's span.
     ///
     /// Keyed by `(home_module_path, bare_name)` for the same reason as
     /// [`Self::top_level`].
-    pub untyped: BTreeMap<(Vec<Symbol>, Symbol), VarId>,
+    pub untyped: BTreeMap<(Vec<Symbol>, Symbol), UntypedDef>,
     /// Deferred record field-access obligations, resolved after the main solve.
     pub field_accesses: Vec<FieldAccess>,
     /// Deferred record-update obligations, resolved after the main solve.
@@ -300,6 +301,15 @@ pub struct Builder<'a> {
 pub enum SchemeSlot {
     Unresolved,
     Resolved(Option<Ty>),
+}
+
+/// An untyped top-level binding as constraint generation registered it.
+#[derive(Clone, Copy, Debug)]
+pub struct UntypedDef {
+    /// The binding's one shared variable, which every same-module reference resolves to.
+    pub var: VarId,
+    /// The span of the binding's name, where a refusal of its type is reported.
+    pub name_span: Span,
 }
 
 /// A cross-module reference to an untyped top-level binding, recorded during
@@ -529,7 +539,7 @@ pub struct Generated {
     /// them into the public `SolvedTypes::env` shape (refcount is 1 by then —
     /// every per-reference clone is transient inside constraint generation).
     pub top_level: BTreeMap<(Vec<Symbol>, Symbol), Rc<Ty>>,
-    pub untyped: BTreeMap<(Vec<Symbol>, Symbol), VarId>,
+    pub untyped: BTreeMap<(Vec<Symbol>, Symbol), UntypedDef>,
     pub field_accesses: Vec<FieldAccess>,
     pub record_updates: Vec<RecordUpdate>,
     /// Deferred routed-Web.tea checks, resolved after the main solve.

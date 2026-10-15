@@ -386,7 +386,7 @@ impl Builder<'_> {
                 // registration pass, which every reference resolves to.
                 // Use the same (home, name) key that the registration pass used.
                 let shared_key = (def.home().to_vec(), name.value);
-                let Some(shared) = self.untyped.get(&shared_key).copied() else {
+                let Some(shared) = self.untyped.get(&shared_key).map(|def| def.var) else {
                     return Err(Diagnostic::CompilerBug {
                         where_: STAGE,
                         detail: format!(
@@ -475,7 +475,7 @@ impl Builder<'_> {
                 });
             }
             Ok(var)
-        } else if let Some(v) = self.untyped.get(&key).copied() {
+        } else if let Some(v) = self.untyped.get(&key).map(|def| def.var) {
             if self
                 .current_home
                 .as_ref()
