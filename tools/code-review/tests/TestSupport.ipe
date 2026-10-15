@@ -86,8 +86,12 @@ module TestSupport exposing
     , testMacKey
     , testReviewKey
     , RawRow
+    , RawName
     , rawRow
+    , rawMacInput
+    , rawMacInputNamed
     , appendSigned
+    , appendSignedNamed
     , appendSignedAs
     , appendSignedClaiming
     , RawHead
@@ -1157,6 +1161,47 @@ rawMacInputWith logId seq prev uidText row =
     [ "ipe-code-review/review-row/v1", logId, String.fromInt seq, prev, uidText, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ]
         |> List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part)
         |> String.concat
+
+
+-- A unit name a signed row records, column by column.
+type alias RawName =
+    { kind : String
+    , qualified : String
+    , path : String
+    , line : Int
+    }
+
+
+-- The `v2` review-row mac input, spelled independently of the tool: the
+-- `v2` tag, the `v1` fields in order, then the name's kind, qualified name,
+-- path and line, each length-prefixed.
+rawMacInputNamed : String -> Int -> String -> RawRow -> RawName -> String
+rawMacInputNamed logId seq prev row name =
+    let
+        reasonPart =
+            case row.reason of
+                Just r ->
+                    "+" ++ r
+
+                Nothing ->
+                    "-"
+    in
+    [ "ipe-code-review/review-row/v2", logId, String.fromInt seq, prev, Uid.toString row.uid, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt, name.kind, name.qualified, name.path, String.fromInt name.line ]
+        |> List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part)
+        |> String.concat
+
+
+-- `appendSigned` for a row that records `name`: stored with its four name
+-- columns and signed over the `v2` input spelled out here.
+appendSignedNamed : Db -> RawRow -> RawName -> Task.Task Error Int
+appendSignedNamed db row name =
+    do
+        head <- rawHead db
+        mac <- Task.succeed (rawMac (rawMacInputNamed head.logId (head.seq + 1) head.head row name))
+        Db.exec db
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            [ SqlInt (head.seq + 1), Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac, SqlString name.kind, SqlString name.qualified, SqlString name.path, SqlInt name.line ]
+        Db.exec db "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1" [ SqlInt (head.seq + 1), SqlString mac ]
 
 
 -- The HMAC-SHA-256 of `input` under the test key, as lowercase hex; empty,
