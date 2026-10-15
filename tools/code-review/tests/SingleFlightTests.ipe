@@ -523,7 +523,7 @@ busyRendered settings a b =
 
 
 -- A save that failed on a busy review database is `SaveContended`, and the
--- banner says another session is saving, never the error's kind, code or
+-- banner says the review database is busy, never the error's kind, code or
 -- text; any other failure, the moved-head conflict included, is
 -- `SaveFailed`, its banner the fixed text with none of the error's. Red if a
 -- save failure's text reaches the model or the page.
@@ -562,7 +562,7 @@ saveFailureRendered settings a b =
     in
     busy.decisionError
         == Just SaveContended
-        && String.contains "another session is saving; try again" busyPage
+        && String.contains "the review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
         && not (String.contains "[5]" busyPage)
         && not (String.contains busyText busyPage)

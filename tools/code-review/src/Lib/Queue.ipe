@@ -640,8 +640,8 @@ decide key settings db shown decision =
 -- tool's own, so no error's text reaches the model or the page. A decision
 -- asked while another is saving, asked off the queue page, or asked on a
 -- server with no signing key is refused before it starts. `SaveContended`:
--- the review database stayed write-locked by another session past its busy
--- timeout, so nothing was written. `SaveFailed`: every other failure, the
+-- the review database was busy (locked past its busy timeout, or no
+-- connection free in time), so nothing was written. `SaveFailed`: every other failure, the
 -- closed default, whose cause the reviewer recovers from by reloading.
 type SaveFailure
     = SaveInFlight
@@ -743,7 +743,7 @@ saveFailureText failure =
             Error.message ReviewKey.readOnlyError
 
         SaveContended ->
-            "another session is saving; try again"
+            "the review database is busy; try again"
 
         SaveFailed ->
             "the decision was not saved; reload the queue and decide again"
