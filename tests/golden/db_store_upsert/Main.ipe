@@ -14,8 +14,8 @@ module Main exposing (main)
 --     key;
 --   * the row counts of every refused table, read before and after the
 --     refusals, are equal: no refused upsert reached the database;
---   * a raw-column row with no key cell binds the empty string (the `rowCodec`
---     encoding of an absent cell) and is upserted under that key;
+--   * a raw-column row with no key cell binds `NULL` (the `rowCodec` encoding of
+--     an absent cell) and is refused like any `NULL` key;
 --   * a single key: insert, then update in place; a `defaultNow` column keeps
 --     its stored value across the update;
 --   * a composite key: a repeated pair updates, a new pair inserts;
@@ -254,7 +254,7 @@ setup conn fx =
 
 contact : String -> String -> String -> Store.Row
 contact email name phone =
-    Dict.fromList [ ( "email", email ), ( "name", name ), ( "phone", phone ) ]
+    Dict.fromList [ ( "email", Just email ), ( "name", Just name ), ( "phone", Just phone ) ]
 
 
 refusalChecks : Db -> Fixtures -> Task Error ()
@@ -335,7 +335,11 @@ acceptChecks conn fx =
             Store.renameColumn "slug" "handle" (Store.public (StoreU.primaryKey "slug" fx.slugs))
     in
     do
-        say (counted "absent-key" (Store.upsert conn pairs (Dict.fromList [ ( "v", "v1" ) ])))
+        say
+            (refused "absent-key"
+                "NULL key in conflict-target column \"k\""
+                (Store.upsert conn pairs (Dict.fromList [ ( "v", Just "v1" ) ]))
+            )
         say (snapshot "pairs" conn pairs [ "k", "v" ])
         say (counted "single-insert" (Store.upsert conn fx.codes { code = "a", label = "one", createdAt = "CLIENT" }))
         say (counted "stamp-sentinel" (Unsafe.unsafeExecRaw conn "UPDATE codes SET created_at = 'sentinel'"))
@@ -354,14 +358,14 @@ acceptChecks conn fx =
                 (Store.upsert conn byEmail (contact "b@x" "Bob" "p1"))
             )
         say (snapshot "contacts-after-conflict" conn byEmail [ "email", "name", "phone" ])
-        say (counted "renamed-insert" (Store.upsert conn slugs (Dict.fromList [ ( "slug", "s1" ), ( "title", "A" ) ])))
-        say (counted "renamed-update" (Store.upsert conn slugs (Dict.fromList [ ( "slug", "s1" ), ( "title", "B" ) ])))
+        say (counted "renamed-insert" (Store.upsert conn slugs (Dict.fromList [ ( "slug", Just "s1" ), ( "title", Just "A" ) ])))
+        say (counted "renamed-update" (Store.upsert conn slugs (Dict.fromList [ ( "slug", Just "s1" ), ( "title", Just "B" ) ])))
         say (snapshot "slugs" conn slugs [ "slug", "title" ])
 
 
 member : String -> String -> String -> Store.Row
 member user group role =
-    Dict.fromList [ ( "user_id", user ), ( "group_id", group ), ( "role", role ) ]
+    Dict.fromList [ ( "user_id", Just user ), ( "group_id", Just group ), ( "role", Just role ) ]
 
 
 codesLine : Db -> Store Code -> Task Error String
@@ -485,8 +489,11 @@ snapshot label conn store cols =
 cell : String -> Store.Row -> String
 cell name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             s
+
+        Just Nothing ->
+            "NULL"
 
         Nothing ->
             "?"

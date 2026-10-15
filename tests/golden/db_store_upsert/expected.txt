@@ -12,8 +12,8 @@ null-key:rejected
 contacts-after:1
 tickets-after:1
 badges-after:1
-absent-key:1
-pairs:/v1
+absent-key:rejected
+pairs:
 single-insert:1
 stamp-sentinel:1
 single-update:1

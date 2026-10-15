@@ -1,0 +1,18 @@
+on-all:n1 reason=Nothing
+on-find-where:n1 reason=Nothing
+on-get:n1 reason=Nothing
+on-strict:Err InvalidInput: Ipe.Db.Codec: column "reason" is NULL but its field is not a Maybe
+join-list:n1 reason=Nothing/t1 label=Nothing
+join-maybe:n1 reason=Nothing/t1 label=Nothing
+join-strict:Err InvalidInput: Ipe.Db.Codec: column "reason" is NULL but its field is not a Maybe
+raw-find-where:Just Nothing
+raw-store:Err InvalidInput: Ipe.Db.Store: column "reason" is NULL
+select-null:Err InvalidInput: Ipe.Db.Store: column "p0" is NULL
+real-all:a=1.2345675e+06,b=3,c=0
+real-on:a=1.2345675e+06,b=3,c=0
+real-join:a=1.2345675e+06,b=3,c=0
+real-select:a=1.2345675e+06,b=3,c=0
+real-raw:a=1.2345675e+06,b=3,c=0
+non-finite-on:Err Unexpected: db: column decode error at index 1
+non-finite-join:Err Unexpected: db: column decode error at index 1
+non-finite-raw:Err Unexpected: db: column decode error at index 1

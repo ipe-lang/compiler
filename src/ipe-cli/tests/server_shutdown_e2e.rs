@@ -71,6 +71,7 @@ const DB_SERVER: &str = r#"module Main exposing (main)
 import Ipe.Db as Db exposing (Db)
 import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Db.Unsafe as Unsafe
+import Ipe.Dict as Dict
 import Ipe.Duration as Duration
 import Ipe.Error as Error exposing (Error)
 import Ipe.Http.Server as Server
@@ -132,11 +133,24 @@ column name sql =
         (Task.andThen
             (\db ->
                 Task.map
-                    (\rows -> Server.text (String.join ";" (List.map (\row -> Unsafe.unsafeGetString name row) rows)))
+                    (\rows -> Server.text (String.join ";" (List.map (cellText name) rows)))
                     (Unsafe.unsafeQuery db sql [])
             )
             connect
         )
+
+
+cellText : String -> Dict.Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""
 
 
 handleCheck : Request -> Task Error Response

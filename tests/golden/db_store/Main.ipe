@@ -46,9 +46,9 @@ userColumns =
 writeUser : User -> Store.Row
 writeUser u =
     Dict.fromList
-        [ ( "id", u.id )
-        , ( "name", u.name )
-        , ( "age", String.fromInt u.age )
+        [ ( "id", Just u.id )
+        , ( "name", Just u.name )
+        , ( "age", Just (String.fromInt u.age) )
         ]
 
 

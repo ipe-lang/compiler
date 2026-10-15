@@ -745,7 +745,7 @@ probe conn =
     (
         "unsafe_query",
         "import Ipe.Db as Db\nimport Ipe.Db.Unsafe as Unsafe\n",
-        r#"probe : Db -> Task Error (List (Dict String String))
+        r#"probe : Db -> Task Error (List (Dict String (Maybe String)))
 probe conn =
     Unsafe.unsafeQuery conn "SELECT 1" @binds@
 "#,
@@ -769,7 +769,7 @@ probe conn =
     (
         "find_projection",
         "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
-        r#"probe : Db -> Task Error (List (Dict String String))
+        r#"probe : Db -> Task Error (List (Dict String (Maybe String)))
 probe conn =
     Db.findProjection conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] @binds@
 "#,
@@ -777,7 +777,7 @@ probe conn =
     (
         "find_projection_ordered",
         "import Ipe.Db as Db\nimport Ipe.Db.Sql as Sql\n",
-        r#"probe : Db -> Task Error (List (Dict String String))
+        r#"probe : Db -> Task Error (List (Dict String (Maybe String)))
 probe conn =
     Db.findProjectionOrdered conn "t" "a0" "u" "a1" (Sql.eq (Sql.column "a0.id") (Sql.int 1)) [] @binds@ "a0" "id" True
 "#,

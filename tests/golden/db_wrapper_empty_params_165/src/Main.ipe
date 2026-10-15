@@ -6,6 +6,7 @@ import Lib1
 import Lib2
 import Ipe.Db
 import Ipe.Db.Unsafe
+import Ipe.Dict
 import Ipe.List
 import Ipe.String
 
@@ -38,7 +39,22 @@ main =
                     (\rows ->
                         Io.println
                             (String.join ","
-                                (List.map (\row -> Unsafe.unsafeGetString "name" row) rows)
+                                (List.map (\row -> cellText "name" row) rows)
                             )
                     )
         )
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""

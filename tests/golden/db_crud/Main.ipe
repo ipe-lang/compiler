@@ -41,9 +41,9 @@ main =
                                                             r1 =
                                                                 case before of
                                                                     Just row ->
-                                                                        Unsafe.unsafeGetString "name" row
+                                                                        cellText "name" row
                                                                             ++ "/"
-                                                                            ++ Unsafe.unsafeGetString "qty" row
+                                                                            ++ cellText "qty" row
 
                                                                     Nothing ->
                                                                         "missing"
@@ -51,9 +51,9 @@ main =
                                                             r2 =
                                                                 case after of
                                                                     Just row ->
-                                                                        Unsafe.unsafeGetString "name" row
+                                                                        cellText "name" row
                                                                             ++ "/"
-                                                                            ++ Unsafe.unsafeGetString "qty" row
+                                                                            ++ cellText "qty" row
 
                                                                     Nothing ->
                                                                         "missing"
@@ -76,3 +76,18 @@ main =
                 )
         )
         (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""

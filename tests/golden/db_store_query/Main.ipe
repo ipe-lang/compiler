@@ -54,9 +54,9 @@ productColumns =
 writeProduct : Product -> Store.Row
 writeProduct p =
     Dict.fromList
-        [ ( "id", p.id )
-        , ( "name", p.name )
-        , ( "qty", String.fromInt p.qty )
+        [ ( "id", Just p.id )
+        , ( "name", Just p.name )
+        , ( "qty", Just (String.fromInt p.qty) )
         ]
 
 
@@ -69,8 +69,11 @@ rowLabel row =
 cell : String -> Store.Row -> String
 cell name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             s
+
+        Just Nothing ->
+            "NULL"
 
         Nothing ->
             "?"

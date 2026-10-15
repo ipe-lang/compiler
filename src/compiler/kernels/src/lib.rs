@@ -2332,7 +2332,7 @@ pub enum StdlibKernel {
     /// it (the read-only guarantee is a compile error, not a runtime check).
     DbConnUnsafeExecRawOn,
     /// `Db.findWhereOn : Connection a -> String -> SqlFragment -> Task Error
-    /// (List (Dict String String))` — read the rows matching a `Sql.*`-built
+    /// (List (Dict String (Maybe String)))` — read the rows matching a `Sql.*`-built
     /// fragment from an EXTERNAL connection. Mode-polymorphic in `a`: a read is
     /// available on `Connection ReadOnly` and `ReadWrite` alike. Same validated
     /// identifiers + bound params as the app-`Db` `findWhere`.
@@ -2343,7 +2343,7 @@ pub enum StdlibKernel {
     /// codec. Bound-parameter-only (the safe path); mode-polymorphic in `a`.
     DbConnQueryDecode,
     /// `Db.getByIdOn : Connection a -> String -> String -> Task Error (Maybe
-    /// (Dict String String))` — read a single row by id from an EXTERNAL
+    /// (Dict String (Maybe String)))` — read a single row by id from an EXTERNAL
     /// connection; the id binds as a parameter. Mode-polymorphic in `a`.
     DbConnGetById,
     DbExecRaw,
@@ -9624,6 +9624,9 @@ impl StdlibKernel {
         // System.exit : Int -> a
         const INT_TO_A: TyShape = TyShape::Fun(&INT, &A);
         const DICT_STRING_STRING: TyShape = TyShape::Con(BuiltinTag::Dict, &[STRING, STRING]);
+        // A raw Db row as every row-returning read gives it: column name → cell
+        // text, SQL `NULL` as `Nothing` (`Ipe.Db.Store.Row`).
+        const ROW: TyShape = TyShape::Con(BuiltinTag::Dict, &[STRING, MAYBE_STRING]);
         // Db.getString / getField : String -> Dict String String -> String
         const DICT_TO_STRING: TyShape = TyShape::Fun(&DICT_STRING_STRING, &STRING);
         const DB_GET_STRING: TyShape = TyShape::Fun(&STRING, &DICT_TO_STRING);
@@ -10309,12 +10312,12 @@ impl StdlibKernel {
         // concrete pool at emit — the phantom mode is erased.
         //
         // `findWhereOn : Connection a -> String -> SqlFragment
-        //                -> Task Error (List (Dict String String))`.
+        //                -> Task Error (List (Dict String (Maybe String)))`.
         const CONN_FIND_WHERE: TyShape = TyShape::Fun(&CONNECTION_MODE, &STRING_TO_FIND_WHERE);
         // `getByIdOn : Connection a -> String -> String
-        //              -> Task Error (Maybe (Dict String String))`.
+        //              -> Task Error (Maybe (Dict String (Maybe String)))`.
         const CONN_GET_BY_ID: TyShape =
-            TyShape::Fun(&CONNECTION_MODE, &STRING_TO_STRING_TO_TASK_MAYBE_DICT_SS);
+            TyShape::Fun(&CONNECTION_MODE, &STRING_TO_STRING_TO_TASK_MAYBE_ROW);
         // `queryDecodeOn : Connection c -> String -> List b -> Decoder a
         //                  -> Task Error (List a)`. Mode var is `c` (Var 2) so it
         // never unifies with the decoder's `a` or the params list's `b`.
@@ -10584,13 +10587,13 @@ impl StdlibKernel {
         const LIST_A_TO_TASK_INT: TyShape = TyShape::Fun(&LIST_A, &TASK_INT);
         const STRING_TO_LIST_A_TO_TASK_INT: TyShape = TyShape::Fun(&STRING, &LIST_A_TO_TASK_INT);
         const DB_EXEC: TyShape = TyShape::Fun(&DB, &STRING_TO_LIST_A_TO_TASK_INT);
-        // `Db.query : Db -> String -> List a -> Task (List (Dict String String))`.
-        const LIST_DICT_SS: TyShape = TyShape::Con(BuiltinTag::List, &[DICT_STRING_STRING]);
-        const TASK_LIST_DICT_SS: TyShape = TyShape::Con(BuiltinTag::Task, &[LIST_DICT_SS]);
-        const LIST_A_TO_TASK_LIST_DICT_SS: TyShape = TyShape::Fun(&LIST_A, &TASK_LIST_DICT_SS);
-        const STRING_TO_LIST_A_TO_TASK_LIST_DICT_SS: TyShape =
-            TyShape::Fun(&STRING, &LIST_A_TO_TASK_LIST_DICT_SS);
-        const DB_QUERY: TyShape = TyShape::Fun(&DB, &STRING_TO_LIST_A_TO_TASK_LIST_DICT_SS);
+        // `Db.query : Db -> String -> List a -> Task (List (Dict String (Maybe String)))`.
+        const LIST_ROW: TyShape = TyShape::Con(BuiltinTag::List, &[ROW]);
+        const TASK_LIST_ROW: TyShape = TyShape::Con(BuiltinTag::Task, &[LIST_ROW]);
+        const LIST_A_TO_TASK_LIST_ROW: TyShape = TyShape::Fun(&LIST_A, &TASK_LIST_ROW);
+        const STRING_TO_LIST_A_TO_TASK_LIST_ROW: TyShape =
+            TyShape::Fun(&STRING, &LIST_A_TO_TASK_LIST_ROW);
+        const DB_QUERY: TyShape = TyShape::Fun(&DB, &STRING_TO_LIST_A_TO_TASK_LIST_ROW);
         // `Db.queryDecode : Db -> String -> List b -> Decoder a -> Task (List a)`.
         const DEC_A_TO_TASK_LIST_A: TyShape = TyShape::Fun(&DEC_A, &TASK_LIST_A);
         const LIST_B_TO_DEC_A_TO_TASK_LIST_A: TyShape =
@@ -10616,13 +10619,13 @@ impl StdlibKernel {
         const DICT_SS_TO_TASK_INT: TyShape = TyShape::Fun(&DICT_STRING_STRING, &TASK_INT);
         const STRING_TO_DICT_SS_TO_TASK_INT: TyShape = TyShape::Fun(&STRING, &DICT_SS_TO_TASK_INT);
         const DB_INSERT_ROW: TyShape = TyShape::Fun(&DB, &STRING_TO_DICT_SS_TO_TASK_INT);
-        // `Db.getById : Db -> String -> String -> Task (Maybe (Dict String String))`.
-        const MAYBE_DICT_SS: TyShape = TyShape::Con(BuiltinTag::Maybe, &[DICT_STRING_STRING]);
-        const TASK_MAYBE_DICT_SS: TyShape = TyShape::Con(BuiltinTag::Task, &[MAYBE_DICT_SS]);
-        const STRING_TO_TASK_MAYBE_DICT_SS: TyShape = TyShape::Fun(&STRING, &TASK_MAYBE_DICT_SS);
-        const STRING_TO_STRING_TO_TASK_MAYBE_DICT_SS: TyShape =
-            TyShape::Fun(&STRING, &STRING_TO_TASK_MAYBE_DICT_SS);
-        const DB_GET_BY_ID: TyShape = TyShape::Fun(&DB, &STRING_TO_STRING_TO_TASK_MAYBE_DICT_SS);
+        // `Db.getById : Db -> String -> String -> Task (Maybe (Dict String (Maybe String)))`.
+        const MAYBE_ROW: TyShape = TyShape::Con(BuiltinTag::Maybe, &[ROW]);
+        const TASK_MAYBE_ROW: TyShape = TyShape::Con(BuiltinTag::Task, &[MAYBE_ROW]);
+        const STRING_TO_TASK_MAYBE_ROW: TyShape = TyShape::Fun(&STRING, &TASK_MAYBE_ROW);
+        const STRING_TO_STRING_TO_TASK_MAYBE_ROW: TyShape =
+            TyShape::Fun(&STRING, &STRING_TO_TASK_MAYBE_ROW);
+        const DB_GET_BY_ID: TyShape = TyShape::Fun(&DB, &STRING_TO_STRING_TO_TASK_MAYBE_ROW);
         // `Db.updateById : Db -> String -> String -> Dict String String -> Task Int`.
         const STRING_TO_DICT_SS_TO_TASK_INT_2: TyShape =
             TyShape::Fun(&STRING, &DICT_SS_TO_TASK_INT);
@@ -10634,45 +10637,39 @@ impl StdlibKernel {
         const STRING_TO_STRING_TO_TASK_INT: TyShape = TyShape::Fun(&STRING, &STRING_TO_TASK_INT_2);
         const DB_DELETE_BY_ID: TyShape = TyShape::Fun(&DB, &STRING_TO_STRING_TO_TASK_INT);
         // `Db.findOneByField : Db -> String -> String -> String
-        //                      -> Task (Maybe (Dict String String))`.
-        const STRING_TO_STRING_TO_TASK_MAYBE_DICT_SS_2: TyShape =
-            TyShape::Fun(&STRING, &STRING_TO_TASK_MAYBE_DICT_SS);
+        //                      -> Task (Maybe (Dict String (Maybe String)))`.
+        const STRING_TO_STRING_TO_TASK_MAYBE_ROW_2: TyShape =
+            TyShape::Fun(&STRING, &STRING_TO_TASK_MAYBE_ROW);
         const STRING_TO_FIND_ONE: TyShape =
-            TyShape::Fun(&STRING, &STRING_TO_STRING_TO_TASK_MAYBE_DICT_SS_2);
+            TyShape::Fun(&STRING, &STRING_TO_STRING_TO_TASK_MAYBE_ROW_2);
         const DB_FIND_ONE_BY_FIELD: TyShape = TyShape::Fun(&DB, &STRING_TO_FIND_ONE);
         // `Db.findManyByField : Db -> String -> String -> String
-        //                       -> Task (List (Dict String String))`.
-        const STRING_TO_TASK_LIST_DICT_SS: TyShape = TyShape::Fun(&STRING, &TASK_LIST_DICT_SS);
-        const STRING_TO_STRING_TO_TASK_LIST_DICT_SS: TyShape =
-            TyShape::Fun(&STRING, &STRING_TO_TASK_LIST_DICT_SS);
+        //                       -> Task (List (Dict String (Maybe String)))`.
+        const STRING_TO_TASK_LIST_ROW: TyShape = TyShape::Fun(&STRING, &TASK_LIST_ROW);
+        const STRING_TO_STRING_TO_TASK_LIST_ROW: TyShape =
+            TyShape::Fun(&STRING, &STRING_TO_TASK_LIST_ROW);
         const STRING_TO_FIND_MANY: TyShape =
-            TyShape::Fun(&STRING, &STRING_TO_STRING_TO_TASK_LIST_DICT_SS);
+            TyShape::Fun(&STRING, &STRING_TO_STRING_TO_TASK_LIST_ROW);
         const DB_FIND_MANY_BY_FIELD: TyShape = TyShape::Fun(&DB, &STRING_TO_FIND_MANY);
         // `Db.findByConditions : Db -> String -> Dict String String
-        //                        -> Task (List (Dict String String))`.
-        const DICT_SS_TO_TASK_LIST_DICT_SS: TyShape =
-            TyShape::Fun(&DICT_STRING_STRING, &TASK_LIST_DICT_SS);
-        const STRING_TO_FIND_BY_COND: TyShape =
-            TyShape::Fun(&STRING, &DICT_SS_TO_TASK_LIST_DICT_SS);
+        //                        -> Task (List (Dict String (Maybe String)))`.
+        const DICT_SS_TO_TASK_LIST_ROW: TyShape = TyShape::Fun(&DICT_STRING_STRING, &TASK_LIST_ROW);
+        const STRING_TO_FIND_BY_COND: TyShape = TyShape::Fun(&STRING, &DICT_SS_TO_TASK_LIST_ROW);
         const DB_FIND_BY_CONDITIONS: TyShape = TyShape::Fun(&DB, &STRING_TO_FIND_BY_COND);
         // `Db.findWhere : Db -> String -> SqlFragment
-        //                 -> Task (List (Dict String String))`.
-        const SQLFRAGMENT_TO_TASK_LIST_DICT_SS: TyShape =
-            TyShape::Fun(&SQLFRAGMENT, &TASK_LIST_DICT_SS);
-        const STRING_TO_FIND_WHERE: TyShape =
-            TyShape::Fun(&STRING, &SQLFRAGMENT_TO_TASK_LIST_DICT_SS);
+        //                 -> Task (List (Dict String (Maybe String)))`.
+        const SQLFRAGMENT_TO_TASK_LIST_ROW: TyShape = TyShape::Fun(&SQLFRAGMENT, &TASK_LIST_ROW);
+        const STRING_TO_FIND_WHERE: TyShape = TyShape::Fun(&STRING, &SQLFRAGMENT_TO_TASK_LIST_ROW);
         const DB_FIND_WHERE: TyShape = TyShape::Fun(&DB, &STRING_TO_FIND_WHERE);
         // `Db.findJoin : Db -> String -> String -> List String -> String
         //                -> String -> List String -> SqlFragment
-        //                -> Task (List (Dict String String, Dict String String))`.
-        const TUPLE_DICT_SS_DICT_SS: TyShape =
-            TyShape::Tuple(&[DICT_STRING_STRING, DICT_STRING_STRING]);
-        const LIST_TUPLE_DICT_SS_DICT_SS: TyShape =
-            TyShape::Con(BuiltinTag::List, &[TUPLE_DICT_SS_DICT_SS]);
-        const TASK_LIST_TUPLE_DICT_SS_DICT_SS: TyShape =
-            TyShape::Con(BuiltinTag::Task, &[LIST_TUPLE_DICT_SS_DICT_SS]);
+        //                -> Task (List (Dict String (Maybe String), Dict String (Maybe String)))`.
+        const TUPLE_ROW_ROW: TyShape = TyShape::Tuple(&[ROW, ROW]);
+        const LIST_TUPLE_ROW_ROW: TyShape = TyShape::Con(BuiltinTag::List, &[TUPLE_ROW_ROW]);
+        const TASK_LIST_TUPLE_ROW_ROW: TyShape =
+            TyShape::Con(BuiltinTag::Task, &[LIST_TUPLE_ROW_ROW]);
         const SQLFRAGMENT_TO_FIND_JOIN: TyShape =
-            TyShape::Fun(&SQLFRAGMENT, &TASK_LIST_TUPLE_DICT_SS_DICT_SS);
+            TyShape::Fun(&SQLFRAGMENT, &TASK_LIST_TUPLE_ROW_ROW);
         const LIST_STRING_TO_FIND_JOIN: TyShape =
             TyShape::Fun(&LIST_STRING, &SQLFRAGMENT_TO_FIND_JOIN);
         const STRING_TO_LIST_STRING_TO_FIND_JOIN: TyShape =
@@ -10686,12 +10683,12 @@ impl StdlibKernel {
         const DB_FIND_JOIN: TyShape = TyShape::Fun(&DB, &STRING_4_TO_FIND_JOIN);
         // `Db.findProjection : Db -> String -> String -> String -> String
         //                      -> SqlFragment -> List ProjectionTerm -> List a
-        //                      -> Task (List (Dict String String))`.
+        //                      -> Task (List (Dict String (Maybe String)))`.
         // `List a` (= `LIST_A`) is the `extraBinds` parameter — `Store.literal`
         // bind values, schemed polymorphically so a concrete `SqlValue` element unifies.
         const PROJECTION_TERM: TyShape = TyShape::Con(BuiltinTag::ProjectionTerm, &[]);
         const LIST_PROJECTION_TERM: TyShape = TyShape::Con(BuiltinTag::List, &[PROJECTION_TERM]);
-        const LIST_A_TO_FIND_PROJECTION: TyShape = TyShape::Fun(&LIST_A, &TASK_LIST_DICT_SS);
+        const LIST_A_TO_FIND_PROJECTION: TyShape = TyShape::Fun(&LIST_A, &TASK_LIST_ROW);
         const LIST_PT_TO_FIND_PROJECTION: TyShape =
             TyShape::Fun(&LIST_PROJECTION_TERM, &LIST_A_TO_FIND_PROJECTION);
         const SQLFRAGMENT_TO_FIND_PROJECTION: TyShape =
@@ -10708,10 +10705,9 @@ impl StdlibKernel {
         // `Db.findJoinOrdered : Db -> String -> String -> List String -> String
         //                       -> String -> List String -> SqlFragment
         //                       -> String -> String -> Bool
-        //                       -> Task (List (Dict String String, Dict String String))`.
+        //                       -> Task (List (Dict String (Maybe String), Dict String (Maybe String)))`.
         // Identical to `DB_FIND_JOIN` plus 3 trailing args: orderAlias, orderCol, Bool.
-        const BOOL_TO_FIND_JOIN_ORDERED: TyShape =
-            TyShape::Fun(&BOOL, &TASK_LIST_TUPLE_DICT_SS_DICT_SS);
+        const BOOL_TO_FIND_JOIN_ORDERED: TyShape = TyShape::Fun(&BOOL, &TASK_LIST_TUPLE_ROW_ROW);
         const STRING_TO_BOOL_TO_FIND_JOIN_ORDERED: TyShape =
             TyShape::Fun(&STRING, &BOOL_TO_FIND_JOIN_ORDERED);
         const STRING_2_ORDER_TO_FIND_JOIN: TyShape =
@@ -10731,10 +10727,10 @@ impl StdlibKernel {
         // `Db.findProjectionOrdered : Db -> String -> String -> String -> String
         //                             -> SqlFragment -> List ProjectionTerm -> List a
         //                             -> String -> String -> Bool
-        //                             -> Task (List (Dict String String))`.
+        //                             -> Task (List (Dict String (Maybe String)))`.
         // `List a` is `extraBinds` (same as in `DB_FIND_PROJECTION`).
         // Three trailing args after `extraBinds`: orderAlias, orderCol, Bool.
-        const BOOL_TO_FIND_PROJ_ORD: TyShape = TyShape::Fun(&BOOL, &TASK_LIST_DICT_SS);
+        const BOOL_TO_FIND_PROJ_ORD: TyShape = TyShape::Fun(&BOOL, &TASK_LIST_ROW);
         const STRING_TO_BOOL_TO_FIND_PROJ_ORD: TyShape =
             TyShape::Fun(&STRING, &BOOL_TO_FIND_PROJ_ORD);
         const STRING_2_ORDER_TO_FIND_PROJ: TyShape =
