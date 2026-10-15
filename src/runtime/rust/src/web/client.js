@@ -250,31 +250,61 @@ function __ipeEpochParts(token) {
   if (!/^[0-9a-f]{32}$/.test(inc) || !/^[1-9][0-9]*$/.test(n)) return null;
   return { inc: inc, n: n };
 }
-// Whether a full render at epoch `token` may replace the DOM: only a render of
-// this document's own history, and within it only one no older than the
-// render on screen. Counters are canonical decimals, so a longer one is larger.
-function __ipeFullBodyAdmits(token) {
-  var next = __ipeEpochParts(token);
-  if (!next || next.inc !== __ipeBootInc) return false;
-  var cur = __ipeEpochParts(__ipeEpoch);
-  if (!cur || cur.inc !== next.inc) return true;
-  if (next.n.length !== cur.n.length) return next.n.length > cur.n.length;
-  return next.n >= cur.n;
+// The parts of `token` when it is an epoch of this document's own history;
+// null for any other value.
+function __ipeOwnEpoch(token) {
+  var parts = __ipeEpochParts(token);
+  return parts && parts.inc === __ipeBootInc ? parts : null;
 }
-// Apply a full render through `applyFn` when its epoch admits it, then adopt
-// that epoch. A render with no epoch, or of another history, would style
+// The order of two counters of one history: negative, zero or positive.
+// Counters are canonical decimals, so a longer one is larger.
+function __ipeCounterOrder(a, b) {
+  if (a.n.length !== b.n.length) return a.n.length - b.n.length;
+  return a.n === b.n ? 0 : (a.n > b.n ? 1 : -1);
+}
+// `__ipeEpoch` is written only by the two adopt functions below, and each
+// adopts only a token it has parsed as an epoch of this document's history.
+//
+// Apply a full render through `applyFn` when its epoch is of this document's
+// history and no older than the render on screen, then adopt that epoch; true
+// when it applied. A render with no epoch, or of another history, would style
 // against a nonce this document does not hold: it is never applied, and the
 // document is stale.
+//
+// An applied render then reconciles the URL with the path it declares.
 function __ipeAdoptFullBody(token, applyFn) {
-  if (__ipeStale) return;
-  var next = __ipeEpochParts(token);
-  if (!next || next.inc !== __ipeBootInc) {
+  if (__ipeStale) return false;
+  var next = __ipeOwnEpoch(token);
+  if (!next) {
     __ipeStaleDocument();
-    return;
+    return false;
   }
-  if (!__ipeFullBodyAdmits(token)) return;
+  var cur = __ipeOwnEpoch(__ipeEpoch);
+  if (cur && __ipeCounterOrder(next, cur) < 0) return false;
   applyFn();
   __ipeEpoch = token;
+  __ipeRunPaths();
+  return true;
+}
+// Where the patches diffed from render `from` to render `to` stand against the
+// DOM on screen: "next" when `from` is the render on screen and `to` follows it
+// in this document's history; "behind" when the screen is another render of
+// that history; "foreign" when either end is not an epoch of this history, or
+// `to` does not follow `from`.
+function __ipePatchStep(from, to) {
+  var a = __ipeOwnEpoch(from);
+  var b = __ipeOwnEpoch(to);
+  if (!a || !b || __ipeCounterOrder(b, a) <= 0) return "foreign";
+  return from === __ipeEpoch ? "next" : "behind";
+}
+// Apply `patches` and adopt `to`, only as the next step from the render on
+// screen; true when they applied. The one caller of `__ipeApplyPatches`.
+function __ipeAdoptPatches(from, to, patches) {
+  if (__ipeStale || __ipePatchStep(from, to) !== "next") return false;
+  __ipeApplyPatches(patches);
+  __ipeEpoch = to;
+  __ipeRunPaths();
+  return true;
 }
 // Set once this document has refused a render of another history: from then
 // on it applies no patch and no full render.
@@ -302,7 +332,7 @@ function __ipeStaleDocument() {
     }
   } catch (_) { reload = false; }
   if (reload) {
-    window.location.reload();
+    __ipeReloadDocument();
     return;
   }
   __ipeShowStale();
@@ -887,7 +917,6 @@ function __ipePatch(t, mode) {
     window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
   }
   __ipeBindEvents();
-  __ipeRunPaths(root);
   __ipeReviveScripts(root);
 }
 
@@ -1311,9 +1340,11 @@ function __ipePostEvent(body) {
         __ipeLoaderEnd();
         __ipeOnPostSuccess();
         if (!data) return;
-        __ipeHandleResponse(data.seq, data.ackInputs, function() {
-          if (data.patches) __ipeApplyPatches(data.patches);
-        }, data.globalSeq);
+        // An accepted event is acked with its seq; its render arrives over
+        // the stream, whose frames name the epochs they move between. Any
+        // patches an answer carries have no epoch to gate on: they never
+        // apply.
+        __ipeHandleResponse(data.seq, data.ackInputs, function() {}, data.globalSeq);
       });
     }
     // An event is answered in JSON; the one marked text answer is the
@@ -1542,10 +1573,6 @@ function __ipeApplyPatches(patches) {
   }
   // Any new ipe-* attribute in the patched DOM needs a listener.
   __ipeBindEvents();
-  // After SSE-driven patches the URL also needs reconciling — without
-  // this, programmatic Navigate Msgs would only update the in-memory
-  // model and leave the address bar pointing at the previous page.
-  __ipeRunPaths();
   // Any <script> in newly-patched HTML wouldn't execute via innerHTML
   // — revive them so JS bundles (e.g. ipe-editor) bootstrap correctly
   // when their host element first appears via a patch (not the initial
@@ -1584,31 +1611,28 @@ function __ipeBindEvents() {
   }
 }
 
-// __ipeRunPaths: safer, CSP-friendly alternative to data-ipe-eval for
-// the specific case of "update the address bar after a render." Looks
-// for [data-ipe-path] elements and pushes / replaces history if the
-// value differs from location. No new Function(), no eval; the only
-// DOM APIs touched are getAttribute and history.pushState /
-// replaceState. Works under strict CSP (no 'unsafe-eval') and has no
-// XSS surface (the value is a URL path, never executed).
+// __ipeRunPaths: the CSP-friendly alternative to data-ipe-eval for
+// "update the address bar after a render". Each [data-ipe-path] element of
+// the render on screen names its location: a path other than the current one
+// is a new history entry, the current path with a query rewrites the current
+// entry. No new Function(), no eval: the value is a URL path, recorded
+// through `__ipeRecordNav` at the render's epoch, never executed.
 //
 // The element is intentionally NOT removed after running — Ipe.Web's
 // patches identify elements by ipe-id and look them up via
 // querySelector; removing the data-ipe-path element would orphan its
 // ipe-id, and the next attribute patch (when the path changes) would
 // silently skip. The path-check makes the call idempotent, so leaving
-// the element in place is cheap — at most one comparison per patch.
-function __ipeRunPaths(root) {
-  var sel = "[data-ipe-path]";
-  var els = root ? root.querySelectorAll(sel) : __ipeDoc.queryAll(sel);
+// the element in place is cheap — at most one comparison per render.
+function __ipeRunPaths() {
+  var at = __ipeOwnEpoch(__ipeEpoch);
+  if (!at) return;
+  var els = __ipeDoc.queryAll("[data-ipe-path]");
   for (var i = 0; i < els.length; i++) {
     var p = els[i].getAttribute("data-ipe-path");
     if (!p) continue;
-    if (location.pathname !== p) {
-      try { history.pushState({}, "", p); } catch (_) {}
-    } else if (location.search) {
-      try { history.replaceState({}, "", p); } catch (_) {}
-    }
+    if (window.location.pathname !== p) __ipeRecordNav(p, true, at);
+    else if (window.location.search) __ipeRecordNav(p, false, at);
   }
 }
 
@@ -1833,6 +1857,79 @@ window.__ipePortSend = function(raw) {
 var __ipeNavPath   = window.location.pathname;
 var __ipeNavSearch = window.location.search;
 var __ipeNavHref   = window.location.href;
+// The epoch, as parts, of the newest navigation answer or render whose
+// location the URL records; null before any.
+var __ipeNavEpoch = null;
+// The one writer of the document's history. Record `url`, the location the
+// navigation answer or render at epoch `at` names: a new history entry when
+// `push` (none when `url` is already the location), otherwise the current
+// entry rewritten. A location older than the one recorded is refused: the
+// driver enters routes in order, so the newest answer or render names the
+// route every later render shows, whatever order the answers arrive in.
+function __ipeRecordNav(url, push, at) {
+  if (__ipeStale) return;
+  if (__ipeNavEpoch && __ipeCounterOrder(at, __ipeNavEpoch) < 0) return;
+  __ipeNavEpoch = at;
+  try {
+    if (!push) window.history.replaceState({}, "", url);
+    else if (new URL(url, window.location.href).href !== window.location.href) {
+      window.history.pushState({}, "", url);
+    }
+  } catch (_) {}
+  __ipeNavPath   = window.location.pathname;
+  __ipeNavSearch = window.location.search;
+  __ipeNavHref   = window.location.href;
+}
+// The newest navigation the reader started, a followed link or a popped
+// entry, by sequence number; and its target while its answer is pending,
+// otherwise null.
+var __ipeNavIntent = 0;
+var __ipeNavWanted = null;
+// Start a navigation to `url`; its sequence number.
+function __ipeStartNav(url) {
+  __ipeNavIntent += 1;
+  __ipeNavWanted = url;
+  return __ipeNavIntent;
+}
+// Navigation `intent` got an answer this document orders: its target is no
+// longer pending.
+function __ipeSettleNav(intent) {
+  if (intent === __ipeNavIntent) __ipeNavWanted = null;
+}
+// The document an absolute `href` loads: `href` without its fragment. A
+// serialized URL's first `#` opens its fragment.
+function __ipeDocumentOf(href) {
+  var at = href.indexOf("#");
+  return at < 0 ? href : href.slice(0, at);
+}
+// A full browser load of `url`: a reload when it names the document on
+// screen, whatever its fragment, since assigning a URL that differs from the
+// location only in its fragment scrolls and loads nothing.
+function __ipeLoad(url) {
+  var target = url;
+  try { target = new URL(url, window.location.href).href; } catch (_) {}
+  if (__ipeDocumentOf(target) === __ipeDocumentOf(window.location.href)) window.location.reload();
+  else window.location.assign(target);
+}
+// Navigation `intent` has no answer this document can show: the browser loads
+// its own target `url`, never the location, which a later answer or render
+// may have moved meanwhile. A navigation started since owns the location, so
+// an older one loads nothing.
+function __ipeLoadNav(intent, url) {
+  if (intent !== __ipeNavIntent) return;
+  __ipeNavWanted = null;
+  __ipeLoad(url);
+}
+// Reload the document where the reader is going: the target of the pending
+// navigation, otherwise the location. The reload is the newest navigation, so
+// no answer to an earlier one loads anything after it.
+function __ipeReloadDocument() {
+  var wanted = __ipeNavWanted;
+  __ipeNavIntent += 1;
+  __ipeNavWanted = null;
+  if (typeof wanted === "string") __ipeLoad(wanted);
+  else window.location.reload();
+}
 // The URL to record for a navigation fetch: the canonical URL the server
 // redirected it to, or `fallback`. A followed URL is used only when it is
 // same-origin and its path begins with exactly one `/`; the original hash is
@@ -1863,35 +1960,40 @@ __ipeDoc.on("click", function(ev) {
   if (__ipeStale) return;
   var href = el.getAttribute("href");
   if (!href || href.charAt(0) === "#") return;
-  // External links are left to the browser.
+  // External links are left to the browser. The link's target is fixed now:
+  // a later answer or render may move the location `href` is relative to.
+  var target;
   try {
     var u = new URL(href, window.location.href);
     if (u.origin !== window.location.origin) return;
+    target = u.href;
   } catch (e) { return; }
   ev.preventDefault();
-  fetch(href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
+  var intent = __ipeStartNav(target);
+  fetch(target, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
-      var url = __ipeFollowed(r, href);
+      var url = __ipeFollowed(r, target);
       var epoch = r.headers.get("X-Ipe-Epoch");
       return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
     })
     .then(function(res) {
       // An answer of no history or of another one is not this document's to
-      // show: the browser loads the link itself, so the document it gets
-      // carries the policy that answer's styles need.
+      // show, and a stale document shows none: the browser loads the link
+      // itself, so the document it gets carries the policy that answer's
+      // styles need.
       var next = __ipeEpochParts(res.epoch);
-      if (!next || next.inc !== __ipeBootInc) {
-        window.location.href = href;
+      if (!next || next.inc !== __ipeBootInc || __ipeStale) {
+        __ipeLoadNav(intent, target);
         return;
       }
+      // The answer applies unless the screen already shows a later render; its
+      // URL is recorded either way, unless a later answer or render already
+      // named the location.
+      __ipeSettleNav(intent);
       __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
-      if (__ipeStale) return;
-      window.history.pushState({}, "", res.url);
-      __ipeNavPath   = window.location.pathname;
-      __ipeNavSearch = window.location.search;
-      __ipeNavHref   = window.location.href;
+      __ipeRecordNav(res.url, true, next);
     })
-    .catch(function() { window.location.href = href; });
+    .catch(function() { __ipeLoadNav(intent, target); });
 });
 window.addEventListener("popstate", function() {
   // A pure fragment change (same path + query, only the hash differs) is
@@ -1907,20 +2009,39 @@ window.addEventListener("popstate", function() {
   __ipeNavPath = here.pathname;
   __ipeNavSearch = here.search;
   __ipeNavHref = here.href;
-  fetch(here.href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
+  // The popped entry, fixed now: the live location moves with any later
+  // navigation, or answer or render recorded while this one is pending.
+  var popped = here.href;
+  var intent = __ipeStartNav(popped);
+  // A stale document applies no render: the browser loads the popped entry,
+  // as it follows a stale document's links.
+  if (__ipeStale) {
+    __ipeLoadNav(intent, popped);
+    return;
+  }
+  fetch(popped, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
-      if (r.redirected) {
-        try { window.history.replaceState({}, "", __ipeFollowed(r, here.href)); } catch (_) {}
-        __ipeNavPath   = window.location.pathname;
-        __ipeNavSearch = window.location.search;
-        __ipeNavHref   = window.location.href;
-      }
+      var url = __ipeFollowed(r, popped);
       var epoch = r.headers.get("X-Ipe-Epoch");
-      return r.text().then(function(t) { return { t: t, epoch: epoch }; });
+      return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
     })
     .then(function(res) {
+      // An answer of no history or of another one is not this document's to
+      // show, and a stale document shows none: the browser loads the entry
+      // itself, as it follows such an answer to a link.
+      var next = __ipeOwnEpoch(res.epoch);
+      if (!next || __ipeStale) {
+        __ipeLoadNav(intent, popped);
+        return;
+      }
+      // The answer rewrites the current entry to its URL, unless a later
+      // answer or render already named the location.
+      __ipeSettleNav(intent);
       __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
-    });
+      __ipeRecordNav(res.url, false, next);
+    })
+    // With no answer to show, the browser loads the popped entry itself.
+    .catch(function() { __ipeLoadNav(intent, popped); });
 });
 // ── Status banner (connection state) ─────────────────────────
 // Single bottom-pinned element rendered by the runtime (NOT by the
@@ -2357,9 +2478,15 @@ var __ipeLiveFrames = {
     }
     if (__ipeStale || !frame || typeof frame !== "object" || !frame.patches) return;
     // The patches diff the render `from` against `to`: they apply only onto
-    // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
-    // first frame is the full current render.
-    if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
+    // the DOM of `from`. Another render of this history resyncs through a
+    // fresh SSE open, whose first frame is the full current render; a frame
+    // either end of which is not of this history leaves the document stale.
+    var step = __ipePatchStep(frame.from, frame.to);
+    if (step === "foreign") {
+      __ipeStaleDocument();
+      return;
+    }
+    if (step === "behind") {
       if (__ipeSelectOpen()) __ipeMarkHeldStale();
       else {
         __ipeHeldRender = null;
@@ -2368,8 +2495,7 @@ var __ipeLiveFrames = {
       return;
     }
     __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
-      __ipeApplyPatches(frame.patches);
-      if (typeof frame.to === "string") __ipeEpoch = frame.to;
+      __ipeAdoptPatches(frame.from, frame.to, frame.patches);
     }, frame.globalSeq);
   },
   // Dev-watch blue-green cutover cue. The watch server sends this right after
@@ -2518,7 +2644,7 @@ function __ipeProbeSessionLost() {
       }
       // Signal the freshly-loaded page to show the build-ok toast.
       try { sessionStorage.setItem("__ipe_reloaded", "1"); } catch(_) {}
-      window.location.reload();
+      __ipeReloadDocument();
     });
   }).catch(function() {
     // Network error / server down. Keep retrying via normal path.

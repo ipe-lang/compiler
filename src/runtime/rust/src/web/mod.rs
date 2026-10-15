@@ -160,7 +160,7 @@ use super::*;
 /// Body returned with a session-miss 404 from `/_ipe/event` and `/_ipe/sse`.
 ///
 /// LOAD-BEARING CONTRACT — `client.js` `__ipeProbeSessionLost` only triggers
-/// `window.location.reload()` (the SSE-reconnect recovery path) when a probe
+/// `__ipeReloadDocument()` (the SSE-reconnect recovery path) when a probe
 /// POST gets a 404 + `X-Ipê-Web: 1` AND the body CONTAINS the substring
 /// `"session not found"` (client.js l1481/l1530/l1536).  backend returns
 /// the same string; diverging it (the old `"no session"` body) silently broke
@@ -1641,7 +1641,6 @@ enum EventRefusal {
 fn stale_render_response<Model, Msg: Clone>(
     e: &SessionEntry<Model, Msg>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     let page = e.rendered.page();
     let body = serde_json::json!({
         "refused": "stale-render",
@@ -1650,15 +1649,39 @@ fn stale_render_response<Model, Msg: Clone>(
         "body": page.as_str(),
     })
     .to_string();
-    (
+    session_body_response(
         axum::http::StatusCode::CONFLICT,
-        [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
-            (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
-        ],
-        body,
+        "application/json",
+        &[("x-ipe-web", "1")],
+        axum::body::Body::from(body),
     )
-        .into_response()
+}
+
+/// The one constructor of a response whose body carries a session's render or
+/// model.
+///
+/// A render's style elements hold the nonce of its history, and both are the
+/// session's alone, so no cache may store the body: the response is
+/// `no-store`, with `content_type` and the `marks` headers. A page response
+/// takes the same `no-store` from its security headers.
+#[cfg(feature = "web")]
+fn session_body_response(
+    status: axum::http::StatusCode,
+    content_type: &'static str,
+    marks: &[(&'static str, &'static str)],
+    body: axum::body::Body,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut builder = axum::http::Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CACHE_CONTROL, "no-store");
+    for &(name, value) in marks {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// The HTTP answer to an [`EventRefusal`], one arm per variant.
@@ -5232,18 +5255,13 @@ mod handlers {
         // The closer ends the stream when the session is closed, although
         // the driver, Cmd tasks and the heartbeat may still hold senders.
         let body_stream = session_stream(rx, (SessionGauge, entry), closer, drain);
-        match Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
-            .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(axum::body::Body::from_stream(body_stream))
-        {
-            Ok(r) => r.into_response(),
-            // Headers/status are all literals, so this never fails; total
-            // fallback per the no-runtime-errors rule.
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
+        // Its frames carry renders, nonced styles included.
+        session_body_response(
+            StatusCode::OK,
+            "text/event-stream",
+            &[("x-accel-buffering", "no")],
+            axum::body::Body::from_stream(body_stream),
+        )
     }
 
     // ── POST /_ipe/event ──────────────────────────────────────────────
@@ -6038,16 +6056,61 @@ mod handlers {
         Some((epoch, e.rendered.page()))
     }
 
+    /// The retained step a debugger scrub asks to show. The overlay renders
+    /// once, so a fixed index from it is bounded by the step count at page
+    /// load; the scrubber's end names [`ScrubTarget::Newest`] so it shows the
+    /// newest step however many arrived since.
+    #[cfg(feature = "debugger")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ScrubTarget {
+        /// The retained step at this index, clamped to the newest.
+        Step(usize),
+        /// The newest retained step.
+        Newest,
+    }
+
+    #[cfg(feature = "debugger")]
+    impl ScrubTarget {
+        /// Parse a scrub request body: exactly `{"index": N}` with `N` a
+        /// non-negative integer, or exactly `{"newest": true}`. Any other body
+        /// names no step and is `None`.
+        pub(super) fn parse(body: &serde_json::Value) -> Option<Self> {
+            let fields = body.as_object()?;
+            if fields.len() != 1 {
+                return None;
+            }
+            if let Some(index) = fields.get("index") {
+                let n = index.as_u64()?;
+                return Some(Self::Step(usize::try_from(n).unwrap_or(usize::MAX)));
+            }
+            match fields.get("newest") {
+                Some(serde_json::Value::Bool(true)) => Some(Self::Newest),
+                Some(_) | None => None,
+            }
+        }
+
+        /// The retained step this target names in a window of `len` steps;
+        /// `None` when no step is retained.
+        pub(super) fn resolve(self, len: usize) -> Option<usize> {
+            let newest = len.checked_sub(1)?;
+            Some(match self {
+                Self::Step(n) => n.min(newest),
+                Self::Newest => newest,
+            })
+        }
+    }
+
     // ── POST /_ipe/debug/scrub ────────────────────────────────────────
     // Session-scoped time-travel scrub endpoint. Registered only when the
     // `debugger` feature is active. The CSRF middleware (wrapped around
     // the whole router) already validates `X-Ipe-Csrf` before this handler
     // runs; the handler itself only needs to authenticate the session.
     //
-    // Request body: `{"index": N}` — reconstruct model at retained step N.
-    // Response: `{"body": "<html>"}` — the view rendered at step N.
-    // Out-of-range N is clamped to the last retained step. No Cmd is fired.
-    // The recorded history is never mutated — reconstruct is a pure re-fold.
+    // Request body: a [`ScrubTarget`] — `{"index": N}` or `{"newest": true}`;
+    // any other body is a 400.
+    // Response: `{"body": "<html>", "epoch": E, "step": N}` — the view rendered
+    // at the retained step N the target names. No Cmd is fired. The recorded
+    // history is never mutated — reconstruct is a pure re-fold.
     #[cfg(feature = "debugger")]
     pub(super) async fn scrub_handler<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
@@ -6073,24 +6136,25 @@ mod handlers {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
-        let requested_n = body
-            .get("index")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(0);
-        let model_at_n = {
+        let Some(target) = ScrubTarget::parse(&body) else {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "scrub body names no step",
+            )
+                .into_response();
+        };
+        let reconstructed = {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
-            let total = e.history.len();
-            let n = requested_n.min(total.saturating_sub(1));
-            e.history.reconstruct(n, &|m, mdl| {
-                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            target.resolve(e.history.len()).and_then(|step| {
+                e.history
+                    .reconstruct(step, &|m, mdl| {
+                        pubsub::with_session(&scope, || (*st.update)(m, mdl))
+                    })
+                    .map(|model| (step, model))
             })
         };
-        let model = match model_at_n {
-            Some(m) => m,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
-            }
+        let Some((step, model)) = reconstructed else {
+            return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
         };
         let mut tree = pubsub::with_session(&scope, || (st.view)(model));
         assign_ipe_ids(&mut tree, "r");
@@ -6106,14 +6170,17 @@ mod handlers {
         if !debug_resident(&st.store, &sid, &handle).await {
             return too_large();
         }
-        let resp_json =
-            serde_json::json!({ "body": html_body.as_str(), "epoch": epoch.to_token() });
-        (
+        let resp_json = serde_json::json!({
+            "body": html_body.as_str(),
+            "epoch": epoch.to_token(),
+            "step": step,
+        });
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/reset ────────────────────────────────────────────
@@ -6225,12 +6292,12 @@ mod handlers {
             crate::debugger::export_msgs(&e.history)
         };
         match json_bytes {
-            Ok(bytes) => (
+            Ok(bytes) => session_body_response(
                 axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                bytes,
-            )
-                .into_response(),
+                "application/json",
+                &[],
+                axum::body::Body::from(bytes),
+            ),
             Err(err) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
@@ -6383,11 +6450,12 @@ mod handlers {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
-        let requested_n = match body.get("index").and_then(|v| v.as_u64()) {
-            Some(n) => n as usize,
-            None => {
-                return (axum::http::StatusCode::BAD_REQUEST, "missing index").into_response();
-            }
+        let Some(index) = body.get("index").and_then(serde_json::Value::as_u64) else {
+            return (axum::http::StatusCode::BAD_REQUEST, "missing index").into_response();
+        };
+        // An index no `usize` holds names no retained step.
+        let Ok(requested_n) = usize::try_from(index) else {
+            return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
         };
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -6430,12 +6498,12 @@ mod handlers {
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/back ─────────────────────────────────────────────
@@ -6513,12 +6581,12 @@ mod handlers {
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/forward ──────────────────────────────────────────
@@ -6600,12 +6668,12 @@ mod handlers {
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── GET /_ipe/debug/inspect ───────────────────────────────────────────────
@@ -6648,12 +6716,12 @@ mod handlers {
             crate::debugger::server::inspect_model(&e.model)
         };
         let resp_json = serde_json::json!({ "model": rendered });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 }
 
@@ -7177,16 +7245,7 @@ where
                 console::console_auth_mode_label()
             ),
         );
-        router = router
-            .route("/_ipe/console", get(console::console_html))
-            .route("/_ipe/console/api/overview", get(console::api_overview))
-            .route("/_ipe/console/api/logs", get(console::api_logs))
-            .route("/_ipe/console/api/errors", get(console::api_errors))
-            .route("/_ipe/console/api/traces", get(console::api_traces))
-            .route(
-                "/_ipe/console/api/metrics-summary",
-                get(console::api_metrics_summary),
-            );
+        router = console::mount_inline(router);
     }
     // The console proxy needs `http_client` (outbound reqwest). The
     // in-process console is served under `web` whenever the mount gate
@@ -8340,6 +8399,261 @@ mod base_path_tests {
             js.contains("__ipeSwapPreservingFocus(root, parsed)")
                 && js.contains("var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);"),
             "__ipePatch splices the nodes of its one parse, never a re-serialized copy"
+        );
+    }
+
+    /// The client moves its render epoch only through its two adopt
+    /// functions, and patches the DOM by diff only through `__ipeAdoptPatches`.
+    ///
+    /// Each adopt function admits only a token parsed as an epoch of the
+    /// document's own history, and a diff only as the next step from the render
+    /// on screen; a frame or an answer that bypassed them could move the epoch
+    /// to an unparsed token, or apply patches onto a DOM they were not diffed
+    /// from.
+    #[test]
+    fn client_moves_its_epoch_only_through_the_adopt_gates() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let writes = |text: &str| -> usize {
+            text.match_indices("__ipeEpoch")
+                .filter(|(at, name)| {
+                    text.get(at + name.len()..).is_some_and(|after| {
+                        let after = after.trim_start();
+                        after.starts_with('=') && !after.starts_with("==")
+                    })
+                })
+                .count()
+        };
+        let full = body_of("__ipeAdoptFullBody").unwrap_or_default();
+        let diff = body_of("__ipeAdoptPatches").unwrap_or_default();
+        let step = body_of("__ipePatchStep").unwrap_or_default();
+        assert_eq!(
+            js.matches("var __ipeEpoch = __ipeBoot[\"epoch\"];").count(),
+            1
+        );
+        assert_eq!(
+            (writes(js), writes(full), writes(diff)),
+            (3, 1, 1),
+            "`__ipeEpoch` is written at boot and in the two adopt functions only"
+        );
+        assert!(
+            full.contains("var next = __ipeOwnEpoch(token);")
+                && diff.contains("__ipePatchStep(from, to) !== \"next\"")
+                && step.contains("var a = __ipeOwnEpoch(from);")
+                && step.contains("var b = __ipeOwnEpoch(to);"),
+            "each adopt function parses the epochs it adopts"
+        );
+        assert_eq!(
+            js.matches("__ipeApplyPatches(").count(),
+            2,
+            "`__ipeApplyPatches` has its definition and one caller"
+        );
+        assert!(
+            diff.contains("__ipeApplyPatches(patches);"),
+            "the one caller of `__ipeApplyPatches` is `__ipeAdoptPatches`"
+        );
+    }
+
+    /// The client writes its history in `__ipeRecordNav` only: no other site
+    /// names the history API, whatever receiver it reaches it through.
+    ///
+    /// A second writer, such as a `data-ipe-path` render calling
+    /// `history.pushState` itself, moves the URL without the location the
+    /// popstate handler compares against, so Back stops at an entry it takes
+    /// for the current one, and a navigation pushes its URL twice.
+    #[test]
+    fn client_writes_its_history_through_one_writer() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        // `history` followed by a member access, `.name` or `[`.
+        let history_reads = |text: &str| -> usize {
+            text.match_indices("history")
+                .filter(|(at, name)| {
+                    let after = text.get(at + name.len()..).unwrap_or_default();
+                    after.starts_with('[')
+                        || after
+                            .strip_prefix('.')
+                            .and_then(|rest| rest.chars().next())
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                })
+                .count()
+        };
+        let record = body_of("__ipeRecordNav").unwrap_or_default();
+        let paths = body_of("__ipeRunPaths").unwrap_or_default();
+        assert_eq!(
+            (history_reads(js), history_reads(record)),
+            (2, 2),
+            "the history API is reached in `__ipeRecordNav` only"
+        );
+        for api in ["pushState", "replaceState"] {
+            assert_eq!(
+                (js.matches(api).count(), record.matches(api).count()),
+                (1, 1),
+                "`{api}` is named in `__ipeRecordNav` only"
+            );
+        }
+        assert!(
+            paths.contains("__ipeRecordNav(p, true, at);")
+                && paths.contains("__ipeRecordNav(p, false, at);"),
+            "a render's `data-ipe-path` is recorded through `__ipeRecordNav`"
+        );
+        assert!(
+            record.contains(
+                "else if (new URL(url, window.location.href).href !== window.location.href) {"
+            ),
+            "a push of the current location adds no history entry"
+        );
+    }
+
+    /// A location is recorded only when no newer navigation answer or render
+    /// already named one: the newest names the route every later render
+    /// shows, whatever order the answers arrive in.
+    ///
+    /// Ordering by the navigations started instead lets an older answer that
+    /// arrives last, to the last navigation started, move the URL off the
+    /// render on screen.
+    #[test]
+    fn client_records_the_location_of_the_newest_answer_or_render() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let record = body_of("__ipeRecordNav").unwrap_or_default();
+        let full = body_of("__ipeAdoptFullBody").unwrap_or_default();
+        let diff = body_of("__ipeAdoptPatches").unwrap_or_default();
+        assert!(
+            record.contains(
+                "if (__ipeNavEpoch && __ipeCounterOrder(at, __ipeNavEpoch) < 0) return;\n  __ipeNavEpoch = at;"
+            ),
+            "a location older than the one recorded is refused"
+        );
+        assert!(
+            !js.contains("__ipeNavCount"),
+            "no count of started navigations orders their answers"
+        );
+        assert_eq!(
+            js.matches("__ipeRecordNav(").count(),
+            5,
+            "`__ipeRecordNav` has its definition, two `data-ipe-path` sites, the link and the popstate answer"
+        );
+        assert!(
+            js.contains("__ipeRecordNav(res.url, true, next);")
+                && js.contains("__ipeRecordNav(res.url, false, next);"),
+            "each navigation answer names its location at its own epoch"
+        );
+        assert_eq!(
+            (
+                js.matches("__ipeRunPaths()").count(),
+                full.matches("__ipeEpoch = token;\n  __ipeRunPaths();")
+                    .count(),
+                diff.matches("__ipeEpoch = to;\n  __ipeRunPaths();").count()
+            ),
+            (3, 1, 1),
+            "a render's `data-ipe-path` is read after its epoch is adopted, in the two adopt functions only"
+        );
+    }
+
+    /// A navigation whose answer the document cannot show loads its own
+    /// target, and only while it is the newest navigation the reader started;
+    /// a reload of the document goes where a pending navigation was going.
+    ///
+    /// Loading the location instead loads whatever a later answer or render
+    /// recorded while the navigation was pending: Back whose fetch fails after
+    /// a link's answer pushed its URL reloads the link, not the popped entry.
+    #[test]
+    fn client_loads_a_navigation_target_never_the_location() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let load = body_of("__ipeLoad").unwrap_or_default();
+        let load_nav = body_of("__ipeLoadNav").unwrap_or_default();
+        let reload = body_of("__ipeReloadDocument").unwrap_or_default();
+        let stale = body_of("__ipeStaleDocument").unwrap_or_default();
+        let probe = body_of("__ipeProbeSessionLost").unwrap_or_default();
+        assert_eq!(
+            (
+                js.matches("location.reload()").count(),
+                load.matches("location.reload()").count(),
+                reload.matches("location.reload()").count(),
+            ),
+            (2, 1, 1),
+            "the document reloads in `__ipeLoad` and `__ipeReloadDocument` only"
+        );
+        assert_eq!(
+            (
+                js.matches("location.assign(").count(),
+                load.matches("location.assign(").count()
+            ),
+            (1, 1),
+            "the document assigns its location in `__ipeLoad` only"
+        );
+        assert!(
+            !js.contains("location.href =") && !js.contains("location.href="),
+            "no site assigns `location.href`"
+        );
+        assert!(
+            load_nav.contains("if (intent !== __ipeNavIntent) return;")
+                && load_nav.contains("__ipeLoad(url);"),
+            "only the newest navigation loads, and it loads its own target"
+        );
+        // Assigning `/A#x` from `/A` is a fragment navigation, which loads
+        // nothing: the document a target names is compared without fragments.
+        assert!(
+            load.contains(
+                "if (__ipeDocumentOf(target) === __ipeDocumentOf(window.location.href)) window.location.reload();\n  else window.location.assign(target);"
+            ) && !load.contains("target === window.location.href"),
+            "a target naming the document on screen reloads, whatever its fragment"
+        );
+        let document_of = body_of("__ipeDocumentOf").unwrap_or_default();
+        assert!(
+            document_of.contains("var at = href.indexOf(\"#\");")
+                && document_of.contains("return at < 0 ? href : href.slice(0, at);"),
+            "the document of a URL is the URL before its fragment"
+        );
+        assert_eq!(
+            js.matches("__ipeDocumentOf(").count(),
+            3,
+            "`__ipeDocumentOf` has its definition and the two sides of `__ipeLoad`'s compare"
+        );
+        assert!(
+            reload.contains("if (typeof wanted === \"string\") __ipeLoad(wanted);"),
+            "a reload goes where the pending navigation was going"
+        );
+        assert!(
+            stale.contains("__ipeReloadDocument();") && probe.contains("__ipeReloadDocument();"),
+            "the stale-document and lost-session reloads go through `__ipeReloadDocument`"
+        );
+        assert_eq!(
+            js.matches("__ipeStartNav(").count(),
+            3,
+            "`__ipeStartNav` has its definition, the link and the popstate"
+        );
+        for fallback in [
+            ".catch(function() { __ipeLoadNav(intent, target); });",
+            ".catch(function() { __ipeLoadNav(intent, popped); });",
+            "if (!next || next.inc !== __ipeBootInc || __ipeStale) {\n        __ipeLoadNav(intent, target);",
+            "if (!next || __ipeStale) {\n        __ipeLoadNav(intent, popped);",
+            "if (__ipeStale) {\n    __ipeLoadNav(intent, popped);",
+        ] {
+            assert_eq!(js.matches(fallback).count(), 1, "{fallback}");
+        }
+        assert_eq!(
+            js.matches("__ipeLoadNav(intent, ").count(),
+            6,
+            "`__ipeLoadNav` has its definition and the five navigation fallbacks"
         );
     }
 
@@ -12658,6 +12972,58 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// Every response carrying a session render is `no-store`: the stream,
+    /// whose frames carry renders, and the `409` refusal carrying the current
+    /// one. Their style elements hold the session's nonce.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the requests are fixtures
+    fn responses_carrying_a_render_are_never_stored() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let cookie = format!("{}={sid}", cookie_name_for(""));
+            let cache = |resp: &axum::response::Response| {
+                resp.headers()
+                    .get_all(header::CACHE_CONTROL)
+                    .iter()
+                    .map(|v| v.to_str().map(str::to_owned))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            };
+
+            let refusal = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_ipe/event")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, cookie.as_str())
+                        .body(Body::from(click_body(&plus, None, None)))
+                        .expect("build POST"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(refusal.status(), StatusCode::CONFLICT);
+            assert_eq!(cache(&refusal), Some(vec!["no-store".to_owned()]));
+
+            let stream = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(header::COOKIE, cookie.as_str())
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(stream.status(), StatusCode::OK);
+            assert_eq!(cache(&stream), Some(vec!["no-store".to_owned()]));
+        });
+    }
+
     /// A malformed epoch or tab id is a malformed body: `400 bad body`, no dispatch.
     #[test]
     #[allow(clippy::expect_used)] // the page is a fixture
@@ -12868,6 +13234,145 @@ mod emitted_router_behavior_tests {
                 Some(shown.as_str()),
                 "the committed render is the one the debugger shows"
             );
+        });
+    }
+
+    /// A debugger scrub body names its step as exactly `{"index": N}` or
+    /// `{"newest": true}`; every other body names none, and an index past
+    /// what a `usize` holds saturates rather than truncating.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn a_scrub_body_parses_to_one_target_or_none() {
+        use super::handlers::ScrubTarget;
+        let parse = |raw: &str| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| ScrubTarget::parse(&v))
+        };
+        assert_eq!(parse(r#"{"index":0}"#), Some(ScrubTarget::Step(0)));
+        assert_eq!(parse(r#"{"index":7}"#), Some(ScrubTarget::Step(7)));
+        assert_eq!(parse(r#"{"newest":true}"#), Some(ScrubTarget::Newest));
+        assert_eq!(
+            parse(r#"{"index":18446744073709551615}"#),
+            Some(ScrubTarget::Step(
+                usize::try_from(u64::MAX).unwrap_or(usize::MAX)
+            ))
+        );
+        for refused in [
+            "{}",
+            "null",
+            "[0]",
+            "0",
+            r#""newest""#,
+            r#"{"index":-1}"#,
+            r#"{"index":1.5}"#,
+            r#"{"index":"1"}"#,
+            r#"{"index":null}"#,
+            r#"{"newest":false}"#,
+            r#"{"newest":1}"#,
+            r#"{"index":0,"newest":true}"#,
+            r#"{"index":0,"extra":0}"#,
+            r#"{"step":0}"#,
+        ] {
+            assert_eq!(parse(refused), None, "{refused}");
+        }
+    }
+
+    /// A target resolves within the retained window: a step past the end is
+    /// the newest, the newest of `len` steps is `len - 1`, and an empty window
+    /// holds no step.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn a_scrub_target_resolves_within_the_retained_window() {
+        use super::handlers::ScrubTarget;
+        assert_eq!(ScrubTarget::Step(1).resolve(6), Some(1));
+        assert_eq!(ScrubTarget::Step(5).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Step(6).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Step(usize::MAX).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Newest.resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Newest.resolve(1), Some(0));
+        assert_eq!(ScrubTarget::Newest.resolve(0), None);
+        assert_eq!(ScrubTarget::Step(0).resolve(0), None);
+    }
+
+    #[cfg(feature = "debugger")]
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn post_scrub(
+        store: &Arc<Store>,
+        sid: &str,
+        body: &str,
+    ) -> (StatusCode, Option<serde_json::Value>) {
+        let resp = make_router(store.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_ipe/debug/scrub")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                    .body(Body::from(body.to_owned()))
+                    .expect("build POST"),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (status, serde_json::from_slice(&bytes).ok())
+    }
+
+    /// The scrubber's end shows the newest step however many arrived since the
+    /// page loaded, a fixed index past the window shows the newest too, and a
+    /// body naming no step is refused rather than read as step 0.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_scrub_to_newest_shows_steps_that_arrived_after_load() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+
+            let (status, _) = post_scrub(&store, &sid, r#"{"newest":true}"#).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "no step is retained yet");
+
+            for count in 1..=3 {
+                let epoch = current_epoch(&store, &sid).await;
+                let event = click_body(&plus, Some(&epoch), None);
+                assert_eq!(
+                    post_event(make_router(store.clone()), &sid, &event).await,
+                    StatusCode::OK
+                );
+                await_model(&store, &sid, |m| m.count == count).await;
+            }
+
+            let step_of = |reply: Option<serde_json::Value>| {
+                reply
+                    .as_ref()
+                    .and_then(|r| r.get("step"))
+                    .and_then(serde_json::Value::as_u64)
+            };
+            let (status, reply) = post_scrub(&store, &sid, r#"{"newest":true}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(2), "newest of three steps");
+
+            let (status, reply) = post_scrub(&store, &sid, r#"{"index":1}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(1));
+
+            let (status, reply) = post_scrub(&store, &sid, r#"{"index":99}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(2), "past the window clamps to newest");
+
+            for refused in [
+                "{}",
+                r#"{"index":-1}"#,
+                r#"{"newest":false}"#,
+                r#"{"index":0,"newest":true}"#,
+            ] {
+                let (status, _) = post_scrub(&store, &sid, refused).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            }
         });
     }
 
@@ -16968,6 +17473,30 @@ mod web_revocation_tests {
                 is_session_lost(resp).await,
                 "export of a revoked session is lost"
             );
+        });
+    }
+
+    /// The debugger answers carrying a session's message log or model are
+    /// `no-store`.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn debugger_answers_carrying_session_data_are_never_stored() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "debug-cache-subject", 7200, "").await;
+            let cookie = sid_cookie(&opened.sid);
+            for path in ["/_ipe/debug/export", "/_ipe/debug/inspect"] {
+                let resp = send(&router, "GET", path, &cookie, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{path} answers");
+                let cache: Vec<_> = resp
+                    .headers()
+                    .get_all(header::CACHE_CONTROL)
+                    .iter()
+                    .map(|v| v.to_str().ok())
+                    .collect();
+                assert_eq!(cache, [Some("no-store")], "{path} is never stored");
+            }
         });
     }
 
