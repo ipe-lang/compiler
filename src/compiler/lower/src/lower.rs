@@ -11656,6 +11656,10 @@ pub struct Lowerer<'a> {
     /// untyped-binding refusal reads; [`Self::var_owner`] consults it so a
     /// variable another binding keeps generic is never read as free here.
     var_owners: ipe_types::GenericVarOwners,
+    /// Every typed def whose annotation returns the wildcard `any` after its
+    /// parameter patterns, keyed `(home, name)`: its parameter count and its
+    /// body's span (see [`Self::any_return_slot_var`]).
+    any_return_defs: BTreeMap<(Vec<Symbol>, Symbol), (usize, Span)>,
     /// Whether the type being lowered is the current def's emitted signature
     /// or a type inside its body (see [`ReadSite`]).
     read_site: Cell<ReadSite>,
@@ -13426,6 +13430,18 @@ enum VarOwner {
     Unowned,
 }
 
+/// Whether the annotation `ty`, past `params` parameter arrows, is the wildcard `any`.
+fn canon_returns_wildcard(ty: &canon::Type, params: usize) -> bool {
+    let mut cur = ty;
+    for _ in 0..params {
+        let canon::Type::Lambda(_, rest) = cur else {
+            return false;
+        };
+        cur = rest;
+    }
+    matches!(cur, canon::Type::Wildcard)
+}
+
 /// Where a type variable is read while lowering the current def.
 ///
 /// A variable another binding keeps generic is unsound to read only in the
@@ -13587,6 +13603,22 @@ impl<'a> Lowerer<'a> {
             // modules get distinct ids after link::link merges them.
             func_ids.insert((def.home().to_vec(), def.name().value), id);
         }
+        let any_return_defs = m
+            .defs
+            .iter()
+            .filter_map(|def| match def {
+                canon::Def::Typed {
+                    home,
+                    name,
+                    patterns,
+                    body,
+                    ty,
+                    ..
+                } => canon_returns_wildcard(ty, patterns.len())
+                    .then(|| ((home.clone(), name.value), (patterns.len(), body.span))),
+                canon::Def::Untyped { .. } => None,
+            })
+            .collect();
 
         let mut enum_variants = BTreeMap::new();
         let mut ctor_arity = BTreeMap::new();
@@ -13822,6 +13854,7 @@ impl<'a> Lowerer<'a> {
             current_home: std::cell::RefCell::new(Vec::new()),
             current_name: Cell::new(wildcard_marker.symbol()),
             read_site: Cell::new(ReadSite::Body),
+            any_return_defs,
             var_owners: ipe_types::generic_var_owners(
                 &types.poly_var_map,
                 &types.msg_defaulted_vars,
@@ -17578,27 +17611,12 @@ impl<'a> Lowerer<'a> {
                 // block (next) so that the `ir_type_from_ty(body_ty)` call in
                 // the any-ret fix (after the installation) already runs with the
                 // correct current_poly_tvars.
-                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> =
-                    if let IrType::Generic(sym) = &ret {
-                        if *sym == self.wildcard_marker {
-                            self.types
-                                .regions
-                                .get(&(def.home().to_vec(), body.span))
-                                .and_then(|body_ty| {
-                                    let Ty::Con { args, .. } = body_ty else {
-                                        return None;
-                                    };
-                                    let Some(Ty::Var(uv)) = args.first() else {
-                                        return None;
-                                    };
-                                    ipe_types::SolverVar::from_raw(*uv).map(|uv| (uv, *sym))
-                                })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> = (ret
+                    == IrType::Generic(self.wildcard_marker))
+                .then(|| self.any_return_slot_var(&(def.home().to_vec(), name)))
+                .flatten()
+                .and_then(|(_, uv)| ipe_types::SolverVar::from_raw(uv))
+                .map(|uv| (uv, self.wildcard_marker));
                 // Install the binding's generic type-variable map so
                 // `ir_type_from_ty_ui_msg` can distinguish a `Ty::Var` that is an
                 // enclosing generic (→ `IrType::Generic`) from one that is a
@@ -23983,8 +24001,9 @@ impl<'a> Lowerer<'a> {
         };
         let msg_only =
             ipe_types::ui_msg_only_vars(declared, &ipe_types::ui_msg_carrier_syms(self.interner));
+        let any_slot = self.any_return_slot_pin(&key, inst);
         if msg_only.is_empty() {
-            return CallPin::None;
+            return any_slot.map_or(CallPin::None, |sym| CallPin::MsgUnit(BTreeSet::from([sym])));
         }
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, inst, &mut subst, self.interner);
@@ -24007,12 +24026,58 @@ impl<'a> Lowerer<'a> {
                     },
                 )
             })
+            .chain(any_slot)
             .collect();
         if pinned.is_empty() {
             CallPin::None
         } else {
             CallPin::MsgUnit(pinned)
         }
+    }
+
+    /// The solved type of the any-return def `key`'s body and the variable in
+    /// its first type argument, when the body solved to a constructor over a
+    /// bare variable (`Html v`, `List v`).
+    ///
+    /// The one detection behind both readings of that variable: the def's own
+    /// lowering names it by the wildcard marker (its return generic), and each
+    /// caller pins the marker by its own instantiation
+    /// ([`Self::any_return_slot_pin`]).
+    fn any_return_slot_var(&self, key: &(Vec<Symbol>, Symbol)) -> Option<(&Ty, u32)> {
+        let (_, body_span) = self.any_return_defs.get(key)?;
+        let body_ty = self.types.regions.get(&(key.0.clone(), *body_span))?;
+        let Ty::Con { args, .. } = body_ty else {
+            return None;
+        };
+        let Some(Ty::Var(uv)) = args.first() else {
+            return None;
+        };
+        Some((body_ty, *uv))
+    }
+
+    /// The wildcard marker, when the callee `key` returns `any` over a body
+    /// variable ([`Self::any_return_slot_var`]) that the use's instantiation
+    /// `inst` leaves free.
+    ///
+    /// The callee's lowering makes that variable its return generic, which no
+    /// argument determines; the use's own node type lowered it to its lenient
+    /// reading (`()`), so the pin names `()` there.
+    fn any_return_slot_pin(&self, key: &(Vec<Symbol>, Symbol), inst: &Ty) -> Option<Symbol> {
+        let (body_ty, uv) = self.any_return_slot_var(key)?;
+        let (arity, _) = self.any_return_defs.get(key)?;
+        let mut inst_ret = inst;
+        for _ in 0..*arity {
+            let Ty::Fun(_, rest) = inst_ret else {
+                return None;
+            };
+            inst_ret = rest;
+        }
+        let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
+        match_signature_template(body_ty, inst_ret, &mut subst, self.interner);
+        subst
+            .get(&uv)
+            .is_some_and(|ty| self.ty_is_unbound_free(ty))
+            .then_some(self.wildcard_marker)
     }
 
     /// The turbofish pin for a polymorphic kernel whose free result type
