@@ -1783,14 +1783,35 @@ pub struct EnterRequest {
     reply: tokio::sync::oneshot::Sender<EnterReply>,
 }
 
-/// The driver's answer to an [`EnterRequest`]: the committed page's rendered body and its epoch.
+/// A committed session render served as a page: its stamped markup and its
+/// epoch.
+///
+/// It is the one input of a page response, whose policy takes its nonce from
+/// `html`, so the header and the markup carry the same nonce.
+#[cfg(feature = "web")]
+pub struct PageRender {
+    html: StampedHtml,
+    epoch: RenderEpoch,
+}
+
+#[cfg(feature = "web")]
+impl PageRender {
+    /// The last committed view of `rendered`, at its current epoch.
+    fn current<M: Clone>(rendered: &Rendered<M>) -> Self {
+        Self {
+            html: rendered.page(),
+            epoch: rendered.epoch(),
+        }
+    }
+}
+
+/// The driver's answer to an [`EnterRequest`]: the committed page's render.
 ///
 /// Only the render crosses back; the entry Cmd stays with the driver, so a
 /// requester that stops waiting loses nothing.
 #[cfg(feature = "web")]
 pub struct EnterReply {
-    body: String,
-    epoch: RenderEpoch,
+    page: PageRender,
 }
 
 /// Queue an entry of `path` in `mode` on the session driver behind `enter_tx`.
@@ -2463,7 +2484,7 @@ where
     let mut tree = pubsub::with_session(scope, || view(entered.model.clone()));
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
-    let body = render_html_in(&tree, &RenderCtx::Session(&stamp));
+    let html = render_stamped(&tree, &stamp);
     // Re-prove after user code ran: a revocation that landed meanwhile drops
     // the entry, its reply and its Cmd.
     if recheck_scope(scope, None) == Standing::Revoked {
@@ -2493,13 +2514,18 @@ where
         close_session(store, sid, Some(&strong)).await;
         return EntryCommit::SessionGone;
     }
-    if let Err(EnterReply { body, epoch }) = reply.send(EnterReply { body, epoch }) {
+    let page = PageRender { html, epoch };
+    if let Err(EnterReply { page }) = reply.send(EnterReply { page }) {
         let (frame, sse_tx) = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
             e.seq += 1;
             (
-                serde_json::json!({ "seq": e.seq, "epoch": epoch.to_token(), "body": body })
-                    .to_string(),
+                serde_json::json!({
+                    "seq": e.seq,
+                    "epoch": page.epoch.to_token(),
+                    "body": page.html.as_str(),
+                })
+                .to_string(),
                 e.sse_tx.clone(),
             )
         };
@@ -3031,8 +3057,7 @@ fn request_is_https(headers: &axum::http::HeaderMap) -> bool {
 #[cfg(all(feature = "web", not(feature = "debugger")))]
 fn page_response(
     sid: &str,
-    body: &str,
-    epoch: &RenderEpoch,
+    page: &PageRender,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
@@ -3040,7 +3065,7 @@ fn page_response(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let Ok(html) = render_page_full(sid, &base, body, epoch, csrf_token) else {
+    let Ok(html) = render_page_full(sid, &base, page.html.as_str(), &page.epoch, csrf_token) else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
@@ -3078,13 +3103,13 @@ fn page_response(
             // The epoch of the served render, read by client navigation.
             (
                 axum::http::HeaderName::from_static("x-ipe-epoch"),
-                epoch.to_token(),
+                page.epoch.to_token(),
             ),
         ],
         html,
     )
         .into_response();
-    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie], &page.html)
 }
 
 /// Same as [`page_response`] but injects `overlay` (raw HTML) after `#ipe-root`
@@ -3092,8 +3117,7 @@ fn page_response(
 #[cfg(all(feature = "web", feature = "debugger"))]
 fn page_response_with_overlay(
     sid: &str,
-    body: &str,
-    epoch: &RenderEpoch,
+    page: &PageRender,
     overlay: &str,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
@@ -3102,8 +3126,14 @@ fn page_response_with_overlay(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let Ok(html) = render_page_full_with_overlay(sid, &base, body, epoch, csrf_token, overlay)
-    else {
+    let Ok(html) = render_page_full_with_overlay(
+        sid,
+        &base,
+        page.html.as_str(),
+        &page.epoch,
+        csrf_token,
+        overlay,
+    ) else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let Ok(ttl) = web_ttl() else {
@@ -3120,17 +3150,17 @@ fn page_response_with_overlay(
             ),
             (
                 axum::http::HeaderName::from_static("x-ipe-epoch"),
-                epoch.to_token(),
+                page.epoch.to_token(),
             ),
         ],
         html,
     )
         .into_response();
-    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie], &page.html)
 }
 
-/// `resp` with one `Set-Cookie` header per line of `cookies`, then the page
-/// security headers.
+/// `resp` with one `Set-Cookie` header per line of `cookies`, then the
+/// security headers of the page serving `markup`.
 ///
 /// A cookie line or a security header with no header representation answers
 /// `500`: a page never ships without the session or CSRF cookie it was built
@@ -3139,8 +3169,9 @@ fn page_response_with_overlay(
 fn with_page_headers(
     resp: axum::response::Response,
     cookies: &[&crate::server::SetCookie],
+    markup: &StampedHtml,
 ) -> axum::response::Response {
-    with_page_headers_checked(resp, cookies, csrf::security_headers())
+    with_page_headers_checked(resp, cookies, csrf::security_headers(markup))
 }
 
 /// [`with_page_headers`] over the outcome of reading the security headers: a
@@ -4758,7 +4789,7 @@ mod handlers {
                 let Some(reply_rx) = queue_entry(&enter_tx, path.clone(), EnterMode::Load) else {
                     return entry_unavailable();
                 };
-                let Some(EnterReply { body, epoch }) = await_entry(reply_rx).await else {
+                let Some(EnterReply { page }) = await_entry(reply_rx).await else {
                     return entry_unavailable();
                 };
                 #[cfg(feature = "debugger")]
@@ -4773,12 +4804,10 @@ mod handlers {
                         labels.len(),
                         &web_base_path(),
                     );
-                    return page_response_with_overlay(
-                        &sid, &body, &epoch, &overlay, &csrf_tok, &headers,
-                    );
+                    return page_response_with_overlay(&sid, &page, &overlay, &csrf_tok, &headers);
                 }
                 #[cfg(not(feature = "debugger"))]
-                return page_response(&sid, &body, &epoch, &csrf_tok, &headers);
+                return page_response(&sid, &page, &csrf_tok, &headers);
             }
             Some((_, store::Rejoin::Restored { claim, model, .. })) => {
                 // A returning session drives under the admission its claim
@@ -4867,8 +4896,7 @@ mod handlers {
             return entry_unavailable();
         };
         let rendered = Rendered::first(keys, tree);
-        let body = rendered.page();
-        let epoch = rendered.epoch();
+        let page = PageRender::current(&rendered);
 
         // Bounded per-session Msg queue: cap at 1024 to prevent a fast
         // client from growing the queue without bound (per-session memory DoS).
@@ -4956,10 +4984,10 @@ mod handlers {
         {
             let base = web_base_path();
             let overlay = crate::debugger::server::overlay_html(&[], 0, &base);
-            page_response_with_overlay(&sid, body.as_str(), &epoch, &overlay, &csrf_tok, &headers)
+            page_response_with_overlay(&sid, &page, &overlay, &csrf_tok, &headers)
         }
         #[cfg(not(feature = "debugger"))]
-        page_response(&sid, body.as_str(), &epoch, &csrf_tok, &headers)
+        page_response(&sid, &page, &csrf_tok, &headers)
     }
 
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
@@ -8851,7 +8879,12 @@ mod sse_reconnect_reconcile_tests {
             return (0, None);
         };
         let committed = drive_one(fx, request).await;
-        (committed, await_entry(reply_rx).await.map(|r| r.body))
+        (
+            committed,
+            await_entry(reply_rx)
+                .await
+                .map(|r| r.page.html.as_str().to_owned()),
+        )
     }
 
     /// Two reconnects at one new path, both queued before the driver runs,
@@ -13544,25 +13577,24 @@ mod emitted_router_behavior_tests {
 mod page_mount_base_tests {
     use axum::http::{HeaderMap, StatusCode};
 
-    /// The first epoch of a fresh render history.
-    fn page_epoch() -> super::RenderEpoch {
-        super::Rendered::first(
+    /// The first render of a fresh render history.
+    fn first_page() -> super::PageRender {
+        super::PageRender::current(&super::Rendered::first(
             super::SessionKeys::distinct(),
-            super::Html::<()>::HText(String::new()),
-        )
-        .epoch()
+            super::Html::<()>::HText("x".to_owned()),
+        ))
     }
 
     /// The page under the current `IPE_WEB_BASE_PATH`.
     #[cfg(not(feature = "debugger"))]
     fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response("sid", "<p>x</p>", &page_epoch(), "tok", headers)
+        super::page_response("sid", &first_page(), "tok", headers)
     }
 
     /// The page under the current `IPE_WEB_BASE_PATH`.
     #[cfg(feature = "debugger")]
     fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response_with_overlay("sid", "<p>x</p>", &page_epoch(), "", "tok", headers)
+        super::page_response_with_overlay("sid", &first_page(), "", "tok", headers)
     }
 
     /// A page asked for under a base outside the mount-base grammar answers the
@@ -15350,6 +15382,105 @@ mod route_entry_cmd_tests {
             assert!(stream.contains("event: hello"), "{stream}");
             assert!(stream.contains("event: patch"), "{stream}");
             assert!(stamped_only(&stream, &token, "\\\""), "{stream}");
+        });
+    }
+
+    /// GET `path` through `app`: the status, the `content-security-policy`,
+    /// the sid cookie value and the page body.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_with_policy(
+        app: axum::Router,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String, String, String) {
+        let name = super::cookie_name_for("");
+        let prefix = format!("{name}=");
+        let mut b = Request::builder().method("GET").uri(path);
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, format!("{name}={c}"));
+        }
+        let resp = app
+            .oneshot(b.body(Body::empty()).expect("build GET"))
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let policy = resp
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let sid = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|c| c.strip_prefix(prefix.as_str()))
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("a UTF-8 page body");
+        (status, policy, sid, body)
+    }
+
+    /// Every `'nonce-…'` token `policy` names.
+    fn policy_nonces(policy: &str) -> Vec<&str> {
+        policy
+            .split_whitespace()
+            .filter_map(|source| source.trim_end_matches(';').strip_prefix("'nonce-"))
+            .filter_map(|rest| rest.strip_suffix('\''))
+            .collect()
+    }
+
+    /// Every `nonce="…"` value in `page`.
+    fn markup_nonces(page: &str) -> Vec<&str> {
+        page.split(" nonce=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    /// The nonce a served page's policy names is the one every `<style>` of
+    /// its markup carries, on the first GET and on a reload of the live
+    /// session alike, and another session's page names another.
+    #[test]
+    fn page_header_nonce_equals_markup_nonce() {
+        run(false, || async {
+            let store = memory();
+            let (status, policy, sid, page) =
+                get_with_policy(styled_router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let named = policy_nonces(&policy);
+            assert_eq!(named.len(), 2, "style-src and style-src-elem: {policy}");
+            let token = named.first().copied().unwrap_or_default();
+            assert!(named.iter().all(|n| *n == token), "{policy}");
+            let stamped = markup_nonces(&page);
+            assert!(!stamped.is_empty(), "{page}");
+            assert!(stamped.iter().all(|n| *n == token), "{policy} {page}");
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, reload_policy, _, reload) =
+                get_with_policy(styled_router(store.clone()), "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(policy_nonces(&reload_policy), named, "{reload_policy}");
+            let restamped = markup_nonces(&reload);
+            assert!(!restamped.is_empty(), "{reload}");
+            assert!(restamped.iter().all(|n| *n == token), "{reload}");
+
+            let (status, other_policy, other_sid, other) =
+                get_with_policy(styled_router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(other_sid, sid);
+            let other_named = policy_nonces(&other_policy);
+            assert_eq!(other_named.len(), 2, "{other_policy}");
+            assert!(other_named.iter().all(|n| *n != token), "{other_policy}");
+            let other_stamped = markup_nonces(&other);
+            assert!(!other_stamped.is_empty(), "{other}");
+            assert!(other_stamped.iter().all(|n| *n != token), "{other}");
         });
     }
 
