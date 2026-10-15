@@ -2339,6 +2339,36 @@ fn read_installer_script(
     })
 }
 
+/// Whether a host can run the release installer, a POSIX `sh` script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallerSupport {
+    /// The host runs `sh` scripts.
+    Supported,
+    /// The host is not POSIX, so the installer is refused before any download.
+    Unsupported,
+}
+
+/// This host's installer support: the installer runs on Unix alone.
+const HOST_INSTALLER: InstallerSupport = if cfg!(unix) {
+    InstallerSupport::Supported
+} else {
+    InstallerSupport::Unsupported
+};
+
+/// Refuse the installer where `support` says it cannot run.
+///
+/// # Errors
+/// [`CliError::Usage`] naming the manual install command when `support` is
+/// [`InstallerSupport::Unsupported`].
+fn installer_gate(support: InstallerSupport) -> Result<(), CliError> {
+    match support {
+        InstallerSupport::Supported => Ok(()),
+        InstallerSupport::Unsupported => Err(CliError::Usage(
+            text::msg::upgrade_unsupported_platform(&installer_command()),
+        )),
+    }
+}
+
 /// Download the installer script, then run it and wait for it to finish.
 ///
 /// The script is read back through the retained handle of the file it was
@@ -2354,11 +2384,7 @@ fn read_installer_script(
 /// [`CliError::RemoteIngestExceeded`] when the download crosses its ceilings;
 /// [`CliError::UpgradeNoPrebuilt`] when the installer exits 2.
 pub fn run_installer() -> Result<(), CliError> {
-    if cfg!(not(unix)) {
-        return Err(CliError::Usage(text::msg::upgrade_unsupported_platform(
-            &installer_command(),
-        )));
-    }
+    installer_gate(HOST_INSTALLER)?;
 
     let download = progress::Stage::start(std::io::stderr(), "Downloading the release installer…");
     let script = match download_installer().and_then(read_installer_script) {
@@ -3767,6 +3793,19 @@ pub const fn diag_span(d: &Diagnostic) -> ipe_diagnostics::Span {
 #[cfg(test)]
 mod installer_tag_tests {
     use super::*;
+
+    #[test]
+    fn installer_refused_where_unsupported() {
+        assert!(matches!(
+            installer_gate(InstallerSupport::Unsupported),
+            Err(CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn installer_admitted_where_supported() {
+        assert!(installer_gate(InstallerSupport::Supported).is_ok());
+    }
 
     #[test]
     fn accepts_a_release_tag_and_normalises_it() {
