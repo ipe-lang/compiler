@@ -268,7 +268,7 @@ fn lower_chip_reading_row_msg(withheld: &[&str], i: &mut Interner) -> DResult<ip
 /// `chip` would not type-check under cargo.
 #[test]
 #[allow(clippy::expect_used)] // a failed precondition is the test failure
-fn untyped_helper_reading_a_sibling_msg_generic_is_refused() -> DResult<()> {
+fn untyped_helper_reading_a_sibling_msg_generic_is_refused() {
     let mut i = Interner::new();
     let d = lower_chip_reading_row_msg(&[], &mut i)
         .expect_err("a foreign message generic must not lower to `Html<()>`");
@@ -284,13 +284,12 @@ fn untyped_helper_reading_a_sibling_msg_generic_is_refused() -> DResult<()> {
         ),
         "expected ForeignTypeVariable(chip, row, msg), got {d:?}"
     );
-    Ok(())
 }
 
 /// Control: a generic the owner message-defaulted is in no binding's index, so the helper lowers to `Html<()>`.
 #[test]
 #[allow(clippy::expect_used)] // a failed precondition is the test failure
-fn untyped_helper_reading_a_message_defaulted_var_lowers_to_unit_msg() -> DResult<()> {
+fn untyped_helper_reading_a_message_defaulted_var_lowers_to_unit_msg() {
     let mut i = Interner::new();
     let res = lower_chip_reading_row_msg(&["msg"], &mut i);
     let func = single_func(&res).expect("a message-defaulted variable must lower");
@@ -299,7 +298,6 @@ fn untyped_helper_reading_a_message_defaulted_var_lowers_to_unit_msg() -> DResul
         "expected `Html<()>`, got {:?}",
         func.ret
     );
-    Ok(())
 }
 
 /// An unannotated function with a fully-concrete solved type (`f x = 0`,
