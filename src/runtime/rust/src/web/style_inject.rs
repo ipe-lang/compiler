@@ -11,7 +11,8 @@
 //! Pre-condition: `assign_ipe_ids` has stamped a `ipe-id` attr on every
 //! element. Post-condition: every marker attr is stripped (even on no-match, so
 //! an empty marker never leaks as an inert `data-*`) and a `<style>` child is
-//! prepended (or sibling-hoisted after a void element).
+//! prepended (or sibling-hoisted after a void element), carrying its own
+//! `ipe-id` so a later change to its CSS reaches the client as a patch.
 //!
 //! SECURITY: the `<style>` body is emitted as an `HRaw` node (CSS cannot be
 //! entity-escaped without breaking it). The marker attrs are raw Strings a
@@ -48,17 +49,81 @@ fn takes_no_style_child(tag: &str) -> bool {
             .any(|t| tag.eq_ignore_ascii_case(t))
 }
 
-/// Every style marker attr this module consumes, across all four passes. Used to
-/// strip a void TREE-ROOT's markers (see `apply_style_injections`). MUST stay in
-/// sync with the per-pass marker lists below.
-const ALL_MARKERS: &[&str] = &[
-    "data-ipe-mq-q",
-    "data-ipe-mq-rules",
-    "data-ipe-pc-rules",
-    "data-ipe-tr-rules",
-    "data-ipe-tr-respect",
-    "data-ipe-anim-rules",
-];
+/// The four kinds of scoped `<style>` block the injection passes build.
+///
+/// Each kind owns its marker attrs, the owner attr its block carries, and the
+/// segment that names its block's `ipe-id`; [`StyleBlock::ALL`] lists every kind,
+/// so the passes and the tree-root marker strip read one table.
+#[derive(Clone, Copy)]
+enum StyleBlock {
+    MediaQuery,
+    PseudoClass,
+    Transition,
+    Animation,
+}
+
+impl StyleBlock {
+    /// Every kind, in the fixed pass order.
+    const ALL: [Self; 4] = [
+        Self::MediaQuery,
+        Self::PseudoClass,
+        Self::Transition,
+        Self::Animation,
+    ];
+
+    /// The marker attrs this kind's pass consumes.
+    const fn markers(self) -> &'static [&'static str] {
+        match self {
+            Self::MediaQuery => &["data-ipe-mq-q", "data-ipe-mq-rules"],
+            Self::PseudoClass => &["data-ipe-pc-rules"],
+            Self::Transition => &["data-ipe-tr-rules", "data-ipe-tr-respect"],
+            Self::Animation => &["data-ipe-anim-rules"],
+        }
+    }
+
+    /// The attr naming the owner's `ipe-id` on this kind's block.
+    const fn owner_attr(self) -> &'static str {
+        match self {
+            Self::MediaQuery => "data-ipe-mq",
+            Self::PseudoClass => "data-ipe-pc",
+            Self::Transition => "data-ipe-tr",
+            Self::Animation => "data-ipe-anim",
+        }
+    }
+
+    /// The field appended to the owner's `ipe-id` to name this kind's block.
+    const fn id_field(self) -> &'static str {
+        match self {
+            Self::MediaQuery => "mq",
+            Self::PseudoClass => "pc",
+            Self::Transition => "tr",
+            Self::Animation => "anim",
+        }
+    }
+
+    /// The `ipe-id` of the block this kind builds for the element `owner`.
+    ///
+    /// The diff addresses every patch by `ipe-id`, and the block is built after
+    /// the stamper ran, so it is stamped here, the one place it is built. A
+    /// stamped id is a root segment followed by `_<index>_<tag>` steps: an odd
+    /// number of `_`-separated fields, since no segment holds a `_`. This id is
+    /// the owner's plus one field, an even count, so it equals no stamped id,
+    /// and the blocks of one owner differ in that last field. The block's own
+    /// rules select `[ipe-id="<owner>"]` exactly, which this id never matches.
+    fn block_id(self, owner: &str) -> String {
+        format!("{owner}_{}", self.id_field())
+    }
+
+    /// The CSS this kind's markers build on an element whose id is `owner`.
+    fn build<M>(self, owner: &str, attrs: &[Attribute<M>]) -> String {
+        match self {
+            Self::MediaQuery => build_mq(owner, attrs),
+            Self::PseudoClass => build_pc(owner, attrs),
+            Self::Transition => build_tr(owner, attrs),
+            Self::Animation => build_anim(owner, attrs),
+        }
+    }
+}
 
 /// Run every style-marker pass over the tree in  fixed order. Call
 /// immediately after `assign_ipe_ids`, on the SAME tree that becomes both the
@@ -72,34 +137,9 @@ const ALL_MARKERS: &[&str] = &[
 const MAX_STYLE_DEPTH: usize = 1024;
 
 pub fn apply_style_injections<M>(node: &mut Html<M>) {
-    inject_pass(
-        node,
-        &["data-ipe-mq-q", "data-ipe-mq-rules"],
-        "data-ipe-mq",
-        &|id, a| build_mq(id, a),
-        0,
-    );
-    inject_pass(
-        node,
-        &["data-ipe-pc-rules"],
-        "data-ipe-pc",
-        &|id, a| build_pc(id, a),
-        0,
-    );
-    inject_pass(
-        node,
-        &["data-ipe-tr-rules", "data-ipe-tr-respect"],
-        "data-ipe-tr",
-        &|id, a| build_tr(id, a),
-        0,
-    );
-    inject_pass(
-        node,
-        &["data-ipe-anim-rules"],
-        "data-ipe-anim",
-        &|id, a| build_anim(id, a),
-        0,
-    );
+    for kind in StyleBlock::ALL {
+        inject_pass(node, kind, 0);
+    }
     // An element that takes no style child (void, or value-bearing
     // textarea/select) at the TREE ROOT is never self-handled (inject_pass skips
     // its self-build) and has no parent to hoist a sibling <style> after it. Its
@@ -111,20 +151,16 @@ pub fn apply_style_injections<M>(node: &mut Html<M>) {
     if let Html::HElement(t, attrs, _) = node
         && takes_no_style_child(t)
     {
-        strip_markers(attrs, ALL_MARKERS);
+        for kind in StyleBlock::ALL {
+            strip_markers(attrs, kind.markers());
+        }
     }
 }
 
 /// One style-injection pass over a subtree: self-handle (non-void prepends a
 /// style child), then walk children splicing a sibling `<style>` after any void
 /// child whose marker survived (the void child's own self-handler bails).
-fn inject_pass<M>(
-    node: &mut Html<M>,
-    markers: &[&str],
-    style_attr: &str,
-    build: &impl Fn(&str, &[Attribute<M>]) -> String,
-    depth: usize,
-) {
+fn inject_pass<M>(node: &mut Html<M>, kind: StyleBlock, depth: usize) {
     // Stack-overflow guard: stop descending a pathologically deep tree (deeper
     // nodes keep their markers — a truncated injection beats a process abort).
     if depth >= MAX_STYLE_DEPTH {
@@ -138,7 +174,7 @@ fn inject_pass<M>(
     // strips the markers regardless of outcome). Elements that take no style child
     // (void, or value-bearing textarea/select) are hoisted by the parent below.
     if !takes_no_style_child(tag)
-        && let Some(style) = build_style_node(attrs, markers, style_attr, build)
+        && let Some(style) = build_style_node(attrs, kind)
     {
         kids.insert(0, style);
     }
@@ -147,11 +183,9 @@ fn inject_pass<M>(
     // carries a marker.
     let mut out: Vec<Html<M>> = Vec::with_capacity(kids.len());
     for mut child in std::mem::take(kids) {
-        inject_pass(&mut child, markers, style_attr, build, depth + 1);
+        inject_pass(&mut child, kind, depth + 1);
         let hoist = match &mut child {
-            Html::HElement(ct, ca, _) if takes_no_style_child(ct) => {
-                build_style_node(ca, markers, style_attr, build)
-            }
+            Html::HElement(ct, ca, _) if takes_no_style_child(ct) => build_style_node(ca, kind),
             _ => None,
         };
         out.push(child);
@@ -166,12 +200,8 @@ fn inject_pass<M>(
 /// from its attrs. Returns `None` (markers still stripped) when there's no
 /// ipe-id, an ipe-id outside [`is_selector_safe_ipe_id`], no non-empty marker,
 /// or the built CSS is empty.
-fn build_style_node<M>(
-    attrs: &mut Vec<Attribute<M>>,
-    markers: &[&str],
-    style_attr: &str,
-    build: &impl Fn(&str, &[Attribute<M>]) -> String,
-) -> Option<Html<M>> {
+fn build_style_node<M>(attrs: &mut Vec<Attribute<M>>, kind: StyleBlock) -> Option<Html<M>> {
+    let markers = kind.markers();
     let ipe_id = match attr_get(attrs, "ipe-id") {
         Some(s) if is_selector_safe_ipe_id(&s) => s,
         _ => {
@@ -186,14 +216,17 @@ fn build_style_node<M>(
         strip_markers(attrs, markers);
         return None;
     }
-    let css = build(&ipe_id, attrs); // reads markers BEFORE they're stripped
+    let css = kind.build(&ipe_id, attrs); // reads markers BEFORE they're stripped
     strip_markers(attrs, markers);
     if css.is_empty() {
         return None;
     }
     Some(Html::HElement(
         "style".to_string(),
-        vec![Attribute::Attr(style_attr.to_string(), ipe_id)],
+        vec![
+            Attribute::Attr("ipe-id".to_string(), kind.block_id(&ipe_id)),
+            Attribute::Attr(kind.owner_attr().to_string(), ipe_id),
+        ],
         vec![Html::HRaw(css)],
     ))
 }
@@ -1013,8 +1046,8 @@ mod tests {
     }
 
     /// `Ui.mediaQuery` exact-output pin at the injector: the marker pair on a
-    /// ipe-id-stamped element must expand to EXACTLY the upstream shape
-    /// `<style data-ipe-mq="<sid>">@media <q> { [ipe-id="<sid>"] { <rules> } }</style>`
+    /// ipe-id-stamped element must expand to EXACTLY the shape
+    /// `<style data-ipe-mq="<sid>" ipe-id="<sid>_mq">@media <q> { [ipe-id="<sid>"] { <rules> } }</style>`
     /// prepended as the first child, with both markers stripped.
     #[test]
     fn media_query_markers_expand_to_exact_scoped_style_block() {
@@ -1033,7 +1066,7 @@ mod tests {
         let s = render_html(&tree);
         assert!(
             s.contains(
-                "<style data-ipe-mq=\"mq0\">@media (min-width: 768px) { \
+                "<style data-ipe-mq=\"mq0\" ipe-id=\"mq0_mq\">@media (min-width: 768px) { \
                  [ipe-id=\"mq0\"] { background-color:rgba(18,18,24,1) !important } }</style>"
             ),
             "exact <style data-ipe-mq=…> block must render (with !important so the \
@@ -1352,5 +1385,133 @@ mod tests {
         let first = count_styles(&tree);
         apply_style_injections(&mut tree);
         assert_eq!(first, count_styles(&tree), "second run must be a no-op");
+    }
+
+    /// A session's view of a `button` whose hover colour is `color`, stamped
+    /// and injected the way every render is.
+    fn hover_page(color: &str) -> Html<()> {
+        let mut tree: Html<()> = Html::HElement(
+            "div".to_string(),
+            vec![],
+            vec![Html::HElement(
+                "button".to_string(),
+                vec![attr("data-ipe-pc-rules", &format!("h|color: {color}"))],
+                vec![Html::HText("x".to_string())],
+            )],
+        );
+        crate::html::assign_ipe_ids(&mut tree, "r");
+        apply_style_injections(&mut tree);
+        tree
+    }
+
+    /// A changed hover colour reaches the client as a text patch of the
+    /// existing block, so the element keeps its nonce and its place.
+    #[test]
+    fn changed_injected_css_is_a_text_patch_at_its_own_block() {
+        let patches = crate::dom::diff(
+            &hover_page("red"),
+            &hover_page("green"),
+            &crate::html::RenderCtx::Unstamped,
+        );
+        assert_eq!(patches.len(), 1, "{patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r_0_button_pc", "{patch:?}");
+        assert!(patch.html.is_none() && patch.attrs.is_empty(), "{patch:?}");
+        assert!(
+            patch
+                .text
+                .as_deref()
+                .is_some_and(|css| css.contains("green") && !css.contains("red")),
+            "{patch:?}"
+        );
+    }
+
+    /// An unchanged hover colour yields no patch.
+    #[test]
+    fn unchanged_injected_css_yields_no_patch() {
+        let patches = crate::dom::diff(
+            &hover_page("red"),
+            &hover_page("red"),
+            &crate::html::RenderCtx::Unstamped,
+        );
+        assert!(patches.is_empty(), "{patches:?}");
+    }
+
+    fn collect_ids(n: &Html<()>, elements: &mut usize, ids: &mut Vec<(String, String)>) {
+        if let Html::HElement(tag, attrs, kids) = n {
+            *elements += 1;
+            if let Some(id) = attr_get(attrs, "ipe-id") {
+                ids.push((tag.clone(), id));
+            }
+            for kid in kids {
+                collect_ids(kid, elements, ids);
+            }
+        }
+    }
+
+    /// Every element of an injected tree carries an `ipe-id`, no two alike: a
+    /// block's id names no stamped element, keyed and hoisted owners included.
+    #[test]
+    fn every_injected_block_has_its_own_ipe_id() {
+        let mut tree: Html<()> = Html::HElement(
+            "div".to_string(),
+            vec![],
+            vec![
+                Html::HElement(
+                    "li".to_string(),
+                    vec![
+                        attr("ipe-key", "a_b"),
+                        attr("data-ipe-mq-q", "(min-width: 768px)"),
+                        attr("data-ipe-mq-rules", "background-color:rgba(18,18,24,1)"),
+                        attr("data-ipe-pc-rules", "h|color: red"),
+                        attr("data-ipe-tr-rules", "color 200ms"),
+                    ],
+                    vec![Html::HElement("pc".to_string(), vec![], vec![])],
+                ),
+                Html::HElement(
+                    "input".to_string(),
+                    vec![
+                        attr("name", "x_pc"),
+                        attr("data-ipe-pc-rules", "f|outline: none"),
+                    ],
+                    vec![],
+                ),
+            ],
+        );
+        crate::html::assign_ipe_ids(&mut tree, "r");
+        apply_style_injections(&mut tree);
+        let (mut elements, mut ids) = (0, vec![]);
+        collect_ids(&tree, &mut elements, &mut ids);
+        assert_eq!(count_styles(&tree), 4, "{ids:?}");
+        assert_eq!(ids.len(), elements, "an element lacks an ipe-id: {ids:?}");
+        let mut distinct: Vec<&str> = ids.iter().map(|(_, id)| id.as_str()).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "two elements share an ipe-id: {ids:?}"
+        );
+        for (tag, id) in &ids {
+            let fields = id.split('_').count();
+            assert_eq!(
+                fields % 2 == 0,
+                tag == "style",
+                "only a block id has an even field count: {tag} {id}"
+            );
+        }
+        for kind in StyleBlock::ALL {
+            let id = kind.block_id("r");
+            assert_eq!(
+                StyleBlock::ALL
+                    .iter()
+                    .filter(|other| other.block_id("r") == id)
+                    .count(),
+                1,
+                "{id}"
+            );
+        }
     }
 }
