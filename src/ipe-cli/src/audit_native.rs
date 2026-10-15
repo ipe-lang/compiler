@@ -671,8 +671,9 @@ impl WrapperScan {
     /// [`CliError::Io`] or [`CliError::SourceRefused`] on a failure to read the
     /// FFI wrapper cache; [`CliError::FileTooLarge`] for a binding past its cap.
     pub fn over_package(root: &Path) -> Result<Self, CliError> {
-        let cache_rel: Vec<&str> = ipe_ffi::driver::FFI_CACHE_REL.split('/').collect();
-        let Some(cache) = crate::ffi::open_project_dir(root, &cache_rel)? else {
+        let Some(cache) =
+            crate::ffi::open_project_dir(root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS)?
+        else {
             // No author wrapper Rust: the static scan sees no reachable axis, so
             // it cannot veto a declared-but-unused reject. That is the correct
             // conservative reading — with no wrapper source, a declared axis that

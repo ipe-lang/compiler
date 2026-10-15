@@ -735,9 +735,6 @@ pub fn read_discovered_sources(
 /// The most directories [`find_manifest_for_ipe_file`] examines on its way up.
 pub const MAX_MANIFEST_WALK_DEPTH: usize = 64;
 
-/// Entries whose presence marks a directory as a version-control root.
-const VCS_ROOT_MARKERS: [&str; 3] = [".git", ".hg", ".jj"];
-
 /// The identity of a directory, independent of the path spelling that reached it.
 ///
 /// On Unix the device and inode pair; elsewhere the canonical path. Two
@@ -862,7 +859,8 @@ pub fn find_manifest_for_ipe_file(ipe_file: &Path) -> Result<Option<PathBuf>, Cl
 /// Walk up from `ipe_file`'s parent to the nearest `package.ipe`, below a ceiling.
 ///
 /// At each directory a manifest is looked for first; the walk then ends with
-/// `None` when that directory holds a version-control root marker, is
+/// `None` when that directory holds the metadata entry of any
+/// [`ipe_sandbox::VcsKind`] (a version-control root), is
 /// `home`, or is the filesystem root. At most `max_depth` directories are
 /// examined.
 ///
@@ -892,9 +890,9 @@ pub fn find_manifest_bounded(
             return Ok(Some(manifest));
         }
         let at_ceiling = home.stops_at(here)
-            || VCS_ROOT_MARKERS
-                .iter()
-                .any(|marker| here.join(marker).symlink_metadata().is_ok());
+            || ipe_sandbox::VcsKind::ALL
+                .into_iter()
+                .any(|kind| here.join(kind.entry_name()).symlink_metadata().is_ok());
         if at_ceiling {
             return Ok(None);
         }

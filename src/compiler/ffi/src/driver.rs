@@ -463,8 +463,53 @@ pub struct ArtifactPaths {
     pub pkg_json: PathBuf,
 }
 
+/// The per-project namespace directory ipe keeps its caches in.
+pub const CACHE_NAMESPACE_DIR: &str = ".ipe";
+
+/// The build-cache entry inside [`CACHE_NAMESPACE_DIR`].
+pub const CACHE_SUBDIR: &str = "cache";
+
+/// The FFI artifact cache directory, component by component, relative to its project root.
+pub const FFI_CACHE_COMPONENTS: [&str; 4] = [CACHE_NAMESPACE_DIR, CACHE_SUBDIR, "ffi", "rust"];
+
 /// The FFI artifact cache directory, relative to its project root.
+///
+/// It is [`FFI_CACHE_COMPONENTS`] joined by `/`; the build fails if the two drift.
 pub const FFI_CACHE_REL: &str = ".ipe/cache/ffi/rust";
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the FFI cache path and its components drift apart [ledger #boundary]
+const _: () = assert!(rel_joins(FFI_CACHE_REL, &FFI_CACHE_COMPONENTS));
+
+/// Whether `rel` is exactly `components` joined by `/`, each one non-empty and free of `/`.
+///
+/// One pass over the bytes of `rel`, consuming each component in turn.
+const fn rel_joins(rel: &str, components: &[&str]) -> bool {
+    let mut rest = rel.as_bytes();
+    let mut parts = components;
+    let mut first = true;
+    while let [part, tail @ ..] = parts {
+        if !first {
+            match rest {
+                [b'/', after @ ..] => rest = after,
+                _ => return false,
+            }
+        }
+        first = false;
+        let mut name = part.as_bytes();
+        if name.is_empty() {
+            return false;
+        }
+        while let [want, name_tail @ ..] = name {
+            match rest {
+                [got, after @ ..] if *got == *want && *want != b'/' => rest = after,
+                _ => return false,
+            }
+            name = name_tail;
+        }
+        parts = tail;
+    }
+    rest.is_empty() && !first
+}
 
 /// The project-local FFI artifact cache (`<project>/.ipe/cache/ffi/rust`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,7 +550,7 @@ impl FfiCache {
         if !self.root.ends_with(FFI_CACHE_REL) {
             return Err(unanchored());
         }
-        let depth = Path::new(FFI_CACHE_REL).components().count();
+        let depth = FFI_CACHE_COMPONENTS.len();
         let root = self.root.ancestors().nth(depth).ok_or_else(unanchored)?;
         Ok(if root.as_os_str().is_empty() {
             Path::new(".")

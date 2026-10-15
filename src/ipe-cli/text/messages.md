@@ -1116,7 +1116,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-inside-vcs
 
-{out} is inside a `.git` directory — build output must stay out of version-control metadata; choose another --out
+{out} is inside a `{dir}` directory — build output must stay out of version-control metadata; choose another --out
 
 ## output-inside-cache-namespace
 

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use super::*;
 
 /// The cache path below a project root, as the FFI loader discovers it.
-const REL: &str = ".ipe/cache/ffi/rust";
+const REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
 
 /// A fresh, empty scratch directory unique to `name` and this process.
 fn scratch(name: &str) -> PathBuf {
@@ -103,7 +103,7 @@ mod unix {
     /// Create every component of `root/REL` as a private directory; return the cache path.
     fn private_chain(root: &Path) -> PathBuf {
         let mut dir = root.to_path_buf();
-        for segment in REL.split('/') {
+        for segment in ipe_ffi::driver::FFI_CACHE_COMPONENTS {
             dir.push(segment);
             std::fs::create_dir_all(&dir).expect("create cache component");
             chmod(&dir, 0o700);

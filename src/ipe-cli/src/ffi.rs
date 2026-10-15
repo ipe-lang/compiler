@@ -33,12 +33,12 @@ use crate::text;
 const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
 
 /// The project manifest that bounds the upward cache-discovery walk.
-const PROJECT_MANIFEST: &str = "package.ipe";
+const PROJECT_MANIFEST: &str = crate::package_manifest::PACKAGE_IPE;
 
 /// The legacy TOML manifest name the `ipe rust install` text inspector reads
 /// for `[rust.dependencies]` / `[rust.wrapper]`, pending the ergonomic Rust-FFI
 /// work that lifts those bindings out of a `package.ipe`.
-const PROJECT_MANIFEST_TOML: &str = "ipe.toml";
+const PROJECT_MANIFEST_TOML: &str = crate::project::IPE_TOML;
 
 /// The most entries one source-tree read lists, across every level, before it is refused.
 const TREE_ENTRY_CAP: EntryCap = EntryCap::from_nonzero(NonZeroU32::MIN.saturating_add(65_535));
@@ -6691,9 +6691,8 @@ version = \"1\"
         let outside = root.join("outside.rs");
         std::fs::write(&outside, "pub fn elsewhere() {}\n").expect("write link target");
         std::fs::write(cache.join("real_bindings.rs"), "pub fn f() {}\n").expect("write binding");
-        let cache_rel: Vec<&str> = ipe_ffi::driver::FFI_CACHE_REL.split('/').collect();
         let held = || {
-            open_project_dir(&root, &cache_rel)
+            open_project_dir(&root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS)
                 .expect("open cache")
                 .expect("cache present")
         };
