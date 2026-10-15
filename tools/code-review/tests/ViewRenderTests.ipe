@@ -19,7 +19,7 @@ import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), R
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
@@ -536,23 +536,19 @@ refuseErrorEscaped loaded =
         && button "Confirm" plain
 
 
--- A failed decision save is shown in the queue banner, escaped.
-decisionErrorEscaped : Index.UnitView -> Bool
-decisionErrorEscaped loaded =
+-- A failed decision save shows its case's fixed text in the queue banner,
+-- and nothing when no save failed. Red if a case renders another's text or
+-- the banner shows without a failure.
+decisionErrorFixedText : Index.UnitView -> Bool
+decisionErrorFixedText loaded =
     let
         card =
             cardModel loaded
-
-        hostile =
-            page { card | decisionError = Just (Error.invalidInput hostileText) }
-
-        plain =
-            page { card | decisionError = Just (Error.invalidInput "disk full") }
     in
-    has (byteOrderOpen ++ "Decision save failed: ") hostile
-        && escapesHostile hostile
-        && has "Decision save failed: " plain
-        && has "disk full" plain
+    List.all
+        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decisionError = Just failure }))
+        [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+        && not (has "Decision save failed: " (page card))
 
 
 -- ── the address the page reports ────────────────────────────────────
@@ -765,7 +761,7 @@ seededChecks a b =
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
     , ( "a refusal error is escaped in the open refusal panel", refuseErrorEscaped a )
-    , ( "a failed decision save is escaped in the queue banner", decisionErrorEscaped a )
+    , ( "a failed decision save shows its case's fixed text in the queue banner", decisionErrorFixedText a )
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )

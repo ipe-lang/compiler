@@ -1,4 +1,4 @@
-module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, decisionOffQueue, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
+module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -9,7 +9,8 @@ import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch exposing (Epoch)
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.ReviewKey exposing (ReviewKey(..))
 import Lib.Settings as Settings
 import Lib.Uid exposing (Uid)
 
@@ -27,7 +28,8 @@ type Page
 -- read slot, read by the queue card and the unit page alike, and `decision`
 -- its one decision slot, so a second read or decision in flight has no
 -- representation. `standing` is the unit page's read of where its shown
--- body stands in the review log.
+-- body stands in the review log. `decisionError` is why the last decision
+-- was not saved, a typed case that never holds an error's text.
 type alias Model =
     { page : Page
     , queueState : Queue.QueueState
@@ -35,7 +37,7 @@ type alias Model =
     , refusingUid : Maybe Uid
     , refuseDraft : String
     , refuseError : Maybe Error
-    , decisionError : Maybe Error
+    , decisionError : Maybe Queue.SaveFailure
     , queueLoad : Queue.LoadTicket
     , history : Queue.HistoryState
     , historyLoad : Queue.LoadTicket
@@ -263,7 +265,7 @@ update settings msg model =
                     ( { settled | decisionError = Nothing, queueLoad = load }, drainAndReload settings settled attested written load )
 
                 Err e ->
-                    ( { settled | decisionError = Just e }, Cmd.none )
+                    ( { settled | decisionError = Just (Queue.saveFailureOf e) }, Cmd.none )
 
         Navigated page ->
             enterPage settings page model
@@ -462,32 +464,35 @@ clampIndex i len =
 -- Every decision, from a button or a key, takes the session's one decision
 -- slot and goes through `Queue.decide` on the selected unit's shown source,
 -- which it re-proves before writing. A decision asked off the queue page is
--- refused before it takes the slot; one asked while another is saving starts
--- nothing. Each says why.
+-- refused before it takes the slot, and so is one asked on a server with no
+-- signing key; one asked while another is saving starts nothing. Each says
+-- why.
 saveDecision : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model uid decision =
     if model.page /= QueuePage then
-        ( { model | decisionError = Just decisionOffQueue }, Cmd.none )
+        ( { model | decisionError = Just SaveOffQueue }, Cmd.none )
 
     else
-        case Queue.startDecision settings.epoch uid model.decision of
-            Just saving ->
-                ( { model | decision = saving }
-                , Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid settings.epoch)
-                )
+        case settings.key of
+            ReadOnly ->
+                ( { model | decisionError = Just SaveReadOnly }, Cmd.none )
 
-            Nothing ->
-                ( { model | decisionError = Just decisionBusy }, Cmd.none )
+            Signing _ ->
+                case Queue.startDecision settings.epoch uid model.decision of
+                    Just saving ->
+                        ( { model | decision = saving }
+                        , Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid settings.epoch)
+                        )
+
+                    Nothing ->
+                        ( { model | decisionError = Just SaveInFlight }, Cmd.none )
 
 
+-- The refusal panel's refusal of a decision submitted while another is
+-- saving, worded as the queue banner words it.
 decisionBusy : Error
 decisionBusy =
-    Error.conflict "a decision is still being saved; try again once it settles"
-
-
-decisionOffQueue : Error
-decisionOffQueue =
-    Error.conflict "decisions are made on the queue page"
+    Error.conflict (Queue.saveFailureText SaveInFlight)
 
 
 decisionTask : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )

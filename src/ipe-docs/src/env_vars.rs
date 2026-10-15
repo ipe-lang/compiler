@@ -1060,11 +1060,13 @@ static HAND_TABLE: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_FRAME_ANCESTORS",
-        default: Cow::Borrowed("unset (no embedding allowed)"),
+        default: Cow::Borrowed("unset (same-origin embedding only)"),
         purpose: "Space-separated `frame-ancestors` sources of the default \
                   `Content-Security-Policy` sent on HTML responses, e.g. \
-                  `https://app.example.com`. Enables embedding this app in a \
-                  third-party iframe; also sets `SameSite=None; Secure` on session \
+                  `https://app.example.com`. Unset, only the app's own origin \
+                  may frame it (`frame-ancestors 'self'` and \
+                  `X-Frame-Options: SAMEORIGIN`). Set, it enables embedding \
+                  this app in a third-party iframe; also sets `SameSite=None; Secure` on session \
                   cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
                   or only whitespace refuses to start the server.",
         subsystem: Subsystem::Web,
@@ -1399,6 +1401,27 @@ mod tests {
         assert!(
             entry.is_some_and(|v| v.default.starts_with(&expected)),
             "IPE_FILE_READ_MAX default must start with {expected:?}: {entry:?}"
+        );
+    }
+
+    /// The documented `IPE_WEB_FRAME_ANCESTORS` default is the policy the
+    /// runtime serves when the variable is unset: same-origin framing only.
+    #[test]
+    fn frame_ancestors_default_matches_runtime() {
+        use ipe_runtime_rust::csp::{ContentSecurityPolicy, Profile};
+        let served = ContentSecurityPolicy::for_profile(Profile::Response, None).header_value();
+        assert!(
+            served.ends_with("frame-ancestors 'self'"),
+            "an unset framing policy must serve same-origin framing: {served}"
+        );
+        let entry = ENV_VARS
+            .iter()
+            .find(|v| v.name == ipe_runtime_rust::telemetry::FRAME_ANCESTORS_ENV);
+        assert!(
+            entry.is_some_and(|v| v.default.contains("same-origin")
+                && v.purpose.contains("frame-ancestors 'self'")
+                && v.purpose.contains("X-Frame-Options: SAMEORIGIN")),
+            "IPE_WEB_FRAME_ANCESTORS must document the same-origin default: {entry:?}"
         );
     }
 
