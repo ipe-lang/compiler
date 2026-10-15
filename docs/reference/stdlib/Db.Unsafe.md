@@ -27,10 +27,12 @@ Two invariants are hatched here:
     `Sql.column` identifier validation — the caller asserts the fragment is a
     safe SQL identifier.
 
-  * Type-safety axis — the `unsafeGet*` family reads a column by string key
-    with no decode proof, bypassing the typed `Db.queryDecode` row codec. No
-    SQL is issued, so there is no injection risk; the caller asserts the
-    column's runtime type matches the read.
+  * Type-safety axis — the `unsafeGet*` family reads a field of a payload
+    `Dict String String` (a request or message field map, not a database row)
+    by string key with no decode proof. No SQL is issued, so there is no
+    injection risk; the caller asserts the field's runtime type matches the
+    read. A database row is a `Dict String (Maybe String)` whose cells
+    `Ipe.Db.Store`'s `read*` helpers parse, a SQL `NULL` cell as a typed `Err`.
 
 ## `unsafeExecRaw`
 
@@ -45,12 +47,13 @@ safe default.
 ## `unsafeQuery`
 
 ```ipe
-unsafeQuery : Db -> String -> List a -> Task Error (List (Dict String String))
+unsafeQuery : Db -> String -> List a -> Task Error (List (Dict String (Maybe String)))
 ```
 
 `unsafeQuery conn sql binds` — the query TEXT is caller-authored verbatim;
 only the `binds` are parameterised. `Db.queryDecode` with `Sql.*` is the safe
-default.
+default. Each row maps a column name to its cell text, `Nothing` for SQL
+`NULL`.
 
 ## `unsafeGetString`
 
@@ -58,8 +61,8 @@ default.
 unsafeGetString : String -> Dict String String -> String
 ```
 
-`unsafeGetString key row` — read column `key` as a `String`, bypassing the
-typed row codec. The caller asserts the column holds a string.
+`unsafeGetString key payload` — read field `key` of a payload map as a
+`String`, with no decode proof. The caller asserts the field holds a string.
 
 ## `unsafeGetInt`
 
@@ -67,8 +70,8 @@ typed row codec. The caller asserts the column holds a string.
 unsafeGetInt : String -> Dict String String -> Int
 ```
 
-`unsafeGetInt key row` — read column `key` as an `Int`, bypassing the typed
-row codec. The caller asserts the column holds an integer.
+`unsafeGetInt key payload` — read field `key` of a payload map as an `Int`,
+with no decode proof. The caller asserts the field holds an integer.
 
 ## `unsafeGetBool`
 
@@ -76,8 +79,8 @@ row codec. The caller asserts the column holds an integer.
 unsafeGetBool : String -> Dict String String -> Bool
 ```
 
-`unsafeGetBool key row` — read column `key` as a `Bool`, bypassing the typed
-row codec. The caller asserts the column holds a boolean.
+`unsafeGetBool key payload` — read field `key` of a payload map as a
+`Bool`, with no decode proof. The caller asserts the field holds a boolean.
 
 ## `unsafeGetField`
 
@@ -85,8 +88,8 @@ row codec. The caller asserts the column holds a boolean.
 unsafeGetField : String -> Dict String String -> String
 ```
 
-`unsafeGetField key row` — read column `key` as an untyped string field,
-bypassing the typed row codec. The caller asserts the column's type.
+`unsafeGetField key payload` — read field `key` of a payload map as an
+untyped string, with no decode proof. The caller asserts the field's type.
 
 ## `unsafeFragment`
 
