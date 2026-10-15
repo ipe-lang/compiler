@@ -4935,8 +4935,8 @@ mod tests {
     /// `ident`'s one shared variable takes `f`'s rigid `a` while `f`'s body is
     /// checked, so `ident`'s type mentions `a` without `ident` being generic
     /// over it. `f` emits `a` as its own Rust generic; `ident` would read it
-    /// as free. The refusal names all three so `ipe check` and `ipe build`
-    /// agree on the same diagnostic.
+    /// as free. The refusal names all three so every build path reports the
+    /// same diagnostic.
     #[test]
     #[allow(clippy::expect_used)] // a fixture that fails to parse IS the failure
     fn rigid_contaminated_untyped_def_is_refused() {
