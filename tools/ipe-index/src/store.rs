@@ -1,13 +1,33 @@
 use crate::diff::{Change, QueueOp, Snapshot, UnitState};
 use crate::extract::treesitter::Callee;
-use crate::model::{Kind, Unit};
+use crate::model::{Kind, RepoTag, Unit};
+use crate::refusal::{RefusalDigest, RefusedEntry, refusal_uid};
 use crate::repo_set::{MAX_REPOS, RecordedRoot};
+use crate::walk::{shown, shown_bytes};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 
 pub struct Store {
     pub conn: Connection,
+}
+
+/// How many blocking refusal rows a run lists by path.
+pub const BLOCKING_SHOWN: i64 = 50;
+
+/// What one run's rows hold, counted by the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tally {
+    pub files: i64,
+    pub units: i64,
+    /// Refusal rows a review can acknowledge by digest.
+    pub ackable: i64,
+    /// Refusal rows only a change to the tree clears.
+    pub blocking: i64,
+    /// Indexed files of no extracted language that hold no units.
+    pub unextracted: i64,
+    /// The first [`BLOCKING_SHOWN`] blocking rows by path: `(path, reason)`.
+    pub blocking_rows: Vec<(String, String)>,
 }
 
 /// The index tables: `units`/`links`/`callgraph`/`change_queue` are the review
@@ -26,8 +46,11 @@ pub struct Store {
 /// emits the allowed values). `call_sites` holds every call unresolved, per
 /// calling file; `callgraph` is derived from it and `units` by
 /// [`Store::resolve_calls`] alone. [`OPEN_UNITS_VIEW`] follows the tables in
-/// the schema fixture `tests/schema.sql`.
-const TABLE_SCHEMA: &str = "
+/// the schema fixture `tests/schema.sql`. `refusals` holds one row per listed
+/// entry that has no units, keyed by [`crate::refusal::refusal_uid`]: `path`
+/// is the tagged raw name as [`crate::walk::shown_bytes`] renders it, and a
+/// `digest` is present exactly when the reason can be acknowledged.
+pub const TABLE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS files   (path TEXT PRIMARY KEY, lang TEXT, role TEXT, size INTEGER, sha TEXT CHECK (length(sha) = 71 AND substr(sha, 1, 7) = 'blake3:' AND NOT substr(sha, 8) GLOB '*[^0-9a-f]*'));
 CREATE TABLE IF NOT EXISTS symbols (file TEXT, name TEXT, kind TEXT, line INTEGER, col INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS edges   (src TEXT, dst TEXT, kind TEXT, resolved TEXT);
@@ -100,6 +123,15 @@ CREATE TABLE IF NOT EXISTS reviewed_stamp (
   one  INTEGER PRIMARY KEY CHECK (one = 1),
   head TEXT NOT NULL CHECK (typeof(head) = 'text' AND head <> '')
 );
+CREATE TABLE IF NOT EXISTS refusals (
+  uid    TEXT PRIMARY KEY CHECK (length(uid) = 64 AND uid NOT GLOB '*[^0-9a-f]*'),
+  path   TEXT NOT NULL,
+  lang   TEXT NOT NULL CHECK (lang IN ('rs','sh','ts','ipe','other')),
+  reason TEXT NOT NULL CHECK (reason IN ('not-utf8','too-large','symlink-entry','gitlink-entry','unknown-mode','past-hash-ceiling','non-utf8-name','not-repo-relative','nested-repository','not-regular','unreadable','replaced')),
+  size   INTEGER CHECK (size IS NULL OR size >= 0),
+  digest TEXT CHECK (digest IS NULL OR (length(digest) = 79 AND substr(digest, 1, 15) = 'refusal-blake3:' AND NOT substr(digest, 16) GLOB '*[^0-9a-f]*')),
+  CHECK ((digest IS NULL) = (reason IN ('past-hash-ceiling','non-utf8-name','not-repo-relative','nested-repository','not-regular','unreadable','replaced')))
+) WITHOUT ROWID;
 ";
 
 /// Drops the view so [`OPEN_UNITS_VIEW`] can be created in its place.
@@ -125,7 +157,10 @@ const OPEN_UNITS_VIEW: &str = "CREATE VIEW open_units AS
   WHERE NOT EXISTS (SELECT 1 FROM reviewed r
                     WHERE r.uid = u.uid AND r.body_hash = u.body_hash)";
 
-/// Current schema version: v10 is v9 plus `call_sites`, the unresolved calls
+/// Current schema version: v11 is v10 plus `refusals`, the record of every
+/// listed entry that has no units; a v10 index has none, so its refused
+/// entries would stay unrecorded, and it is rebuilt before `update` runs over
+/// it. v10 is v9 plus `call_sites`, the unresolved calls
 /// `callgraph` is resolved from; a v9 index has none, so resolving its calls
 /// would empty its callgraph, and it is rebuilt before `update` runs over it.
 /// v9 is v8 with a [`FileStamp`] in every `files.sha`,
@@ -146,7 +181,7 @@ const OPEN_UNITS_VIEW: &str = "CREATE VIEW open_units AS
 /// stamps it only on a DB with no units yet, so a stamp always describes the
 /// rows beside it; a DB holding rows of another version keeps its stamp until
 /// `index` rebuilds it.
-const SCHEMA_VERSION: &str = "10";
+const SCHEMA_VERSION: &str = "11";
 
 /// The `blake3:` digest of this build's extractor sources, taken by `build.rs`.
 ///
@@ -435,6 +470,92 @@ impl Store {
             .execute("DELETE FROM units WHERE path=?", [path])?;
         Ok(())
     }
+    /// Records the refused entry `entry` of the root tagged `tag`.
+    ///
+    /// A plain insert: a second row for one entry fails the run, and so does
+    /// a digest on a reason that cannot be acknowledged or its absence on one
+    /// that can (the table refuses both too).
+    pub fn put_refusal(&self, tag: &RepoTag, entry: &RefusedEntry) -> Result<()> {
+        let reason = entry.refused.reason();
+        if entry.refused.digest().is_some() != reason.ackable() {
+            bail!(
+                "ipe-index: a `{}` refusal must carry a digest exactly when it can be acknowledged",
+                reason.tag()
+            );
+        }
+        let mut tagged = tag.as_str().as_bytes().to_vec();
+        tagged.push(b':');
+        tagged.extend_from_slice(&entry.name);
+        let size = entry.refused.size().map(i64::try_from).transpose()?;
+        self.conn.execute(
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?,?,?,?,?,?)",
+            rusqlite::params![
+                refusal_uid(tag, &entry.name),
+                shown_bytes(&tagged),
+                entry.lang.as_str(),
+                reason.tag(),
+                size,
+                entry.refused.digest().map(RefusalDigest::as_str),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes every refusal row, for a run that records them afresh.
+    pub fn clear_refusals(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM refusals", [])?;
+        Ok(())
+    }
+
+    /// Fails when a path has both a `files` row and a `refusals` row.
+    ///
+    /// A refusal row stores its path as [`shown_bytes`] renders it, so each
+    /// `files` path is compared in that form.
+    pub fn check_refusals_disjoint(&self) -> Result<()> {
+        let mut paths = self.conn.prepare("SELECT path FROM files")?;
+        let mut refused = self
+            .conn
+            .prepare("SELECT 1 FROM refusals WHERE path = ? LIMIT 1")?;
+        let rows = paths.query_map([], |r| r.get::<_, String>(0))?;
+        for path in rows {
+            let path = path?;
+            if refused.exists([shown_bytes(path.as_bytes())])? {
+                bail!(
+                    "ipe-index: {} is both indexed and refused; nothing was committed",
+                    shown(&path)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The counts and the blocking rows a run reports, read from the rows.
+    pub fn tally(&self) -> Result<Tally> {
+        let (files, units, ackable, blocking, unextracted) = self.conn.query_row(
+            "SELECT (SELECT count(*) FROM files), (SELECT count(*) FROM units), \
+                    (SELECT count(*) FROM refusals WHERE digest IS NOT NULL), \
+                    (SELECT count(*) FROM refusals WHERE digest IS NULL), \
+                    (SELECT count(*) FROM files f WHERE f.lang = 'other' \
+                       AND NOT EXISTS (SELECT 1 FROM units u WHERE u.path = f.path))",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )?;
+        let mut st = self.conn.prepare(
+            "SELECT path, reason FROM refusals WHERE digest IS NULL ORDER BY path LIMIT ?",
+        )?;
+        let shown_rows = st
+            .query_map([BLOCKING_SHOWN], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(Tally {
+            files,
+            units,
+            ackable,
+            blocking,
+            unextracted,
+            blocking_rows: shown_rows,
+        })
+    }
+
     pub fn set_meta(&self, k: &str, v: &str) -> Result<()> {
         self.conn
             .execute("INSERT OR REPLACE INTO meta VALUES (?,?)", [k, v])?;
@@ -505,6 +626,7 @@ impl Store {
             "callgraph" => "SELECT COUNT(*) FROM callgraph",
             "call_sites" => "SELECT COUNT(*) FROM call_sites",
             "change_queue" => "SELECT COUNT(*) FROM change_queue",
+            "refusals" => "SELECT COUNT(*) FROM refusals",
             _ => bail!("store::count: unexpected table name {table:?}"),
         };
         Ok(self.conn.query_row(sql, [], |r| r.get(0))?)
@@ -579,7 +701,7 @@ impl Store {
              DROP TABLE IF EXISTS edges; DROP TABLE IF EXISTS units; \
              DROP TABLE IF EXISTS links; DROP TABLE IF EXISTS callgraph; \
              DROP TABLE IF EXISTS call_sites; DROP TABLE IF EXISTS repos; \
-             DELETE FROM meta;",
+             DROP TABLE IF EXISTS refusals; DELETE FROM meta;",
         )?;
         self.conn.execute_batch(TABLE_SCHEMA)?;
         ensure_open_units_view(&self.conn)?;
@@ -618,7 +740,8 @@ fn ensure_open_units_view(conn: &Connection) -> Result<()> {
 /// are in the current format and were written by this build.
 fn ensure_schema_version(conn: &Connection) -> Result<()> {
     let rows: i64 = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM units) + (SELECT COUNT(*) FROM files)",
+        "SELECT (SELECT COUNT(*) FROM units) + (SELECT COUNT(*) FROM files) \
+         + (SELECT COUNT(*) FROM refusals)",
         [],
         |r| r.get(0),
     )?;
@@ -779,17 +902,109 @@ mod tests {
     // refuses to run incrementally over it, and the full rebuild stamps it
     // current.
     #[test]
-    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_10() {
-        assert_eq!(SCHEMA_VERSION, "10");
+    fn an_older_schema_stamp_forces_a_full_rebuild_at_version_11() {
+        assert_eq!(SCHEMA_VERSION, "11");
         let s = Store::open(":memory:").unwrap();
         s.put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
             .unwrap();
-        s.set_meta("schema_version", "9").unwrap();
+        s.set_meta("schema_version", "10").unwrap();
         ensure_schema_version(&s.conn).unwrap();
         assert!(!s.schema_is_current().unwrap());
         s.reset_index().unwrap();
-        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("10"));
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("11"));
         assert!(s.schema_is_current().unwrap());
+    }
+
+    // T4: a v10 index has no `refusals`; opening it adds the table but keeps
+    // the old stamp, so it is not current until the rebuild stamps it, and a
+    // DB holding only refusal rows is never restamped.
+    #[test]
+    fn a_v10_index_gains_refusals_but_stays_stale() {
+        let uri = format!(
+            "file:refusals-v10-{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let first = Store::open(&uri).unwrap();
+        first
+            .put_unit(&sample_unit("src/a.rs", "foo", "crate::foo"))
+            .unwrap();
+        first.conn.execute_batch("DROP TABLE refusals").unwrap();
+        first.set_meta("schema_version", "10").unwrap();
+        let again = Store::open(&uri).unwrap();
+        assert_eq!(again.count("refusals").unwrap(), 0);
+        assert!(!again.schema_is_current().unwrap());
+        again.reset_index().unwrap();
+        assert!(again.schema_is_current().unwrap());
+
+        let only = Store::open(":memory:").unwrap();
+        only.conn.execute("DELETE FROM meta", []).unwrap();
+        let entry = RefusedEntry {
+            name: b"img.png".to_vec(),
+            lang: crate::model::Lang::Other,
+            refused: crate::refusal::Refused::blocking(crate::refusal::Blocking::Unreadable, None),
+        };
+        only.put_refusal(&RepoTag::parse("ipe").unwrap(), &entry)
+            .unwrap();
+        ensure_schema_version(&only.conn).unwrap();
+        assert_eq!(only.get_meta("schema_version").unwrap(), None);
+    }
+
+    // The table refuses a row the constructors cannot build: a blocking
+    // reason with a digest, an ackable one without, a forged digest scheme.
+    #[test]
+    fn the_refusals_table_refuses_an_invalid_row() {
+        let s = Store::open(":memory:").unwrap();
+        let uid = "a".repeat(64);
+        let good = format!("refusal-blake3:{}", "b".repeat(64));
+        let upper = format!("refusal-blake3:{}", "B".repeat(64));
+        let cases: [(&str, &str, Option<&str>); 6] = [
+            ("rs", "unreadable", Some(good.as_str())),
+            ("rs", "not-utf8", None),
+            ("rs", "not-utf8", Some("blake3:00")),
+            ("rust", "not-utf8", Some(good.as_str())),
+            ("rs", "binary", Some(good.as_str())),
+            ("rs", "too-large", Some(upper.as_str())),
+        ];
+        for (lang, reason, digest) in cases {
+            let refused = s.conn.execute(
+                "INSERT INTO refusals VALUES (?, 'ipe:x', ?, ?, NULL, ?)",
+                rusqlite::params![uid, lang, reason, digest],
+            );
+            assert!(refused.is_err(), "{lang} {reason} {digest:?}");
+        }
+        let short = s.conn.execute(
+            "INSERT INTO refusals VALUES ('abc', 'ipe:x', 'rs', 'unreadable', NULL, NULL)",
+            [],
+        );
+        assert!(short.is_err());
+        s.conn
+            .execute(
+                "INSERT INTO refusals VALUES (?, 'ipe:x', 'rs', 'not-utf8', 3, ?)",
+                rusqlite::params![uid, good],
+            )
+            .unwrap();
+    }
+
+    // T5 (store side): a path with a `files` row and a `refusals` row fails
+    // the check, the non-ASCII spelling included.
+    #[test]
+    fn a_path_both_indexed_and_refused_fails_the_check() {
+        let s = Store::open(":memory:").unwrap();
+        let tag = RepoTag::parse("ipe").unwrap();
+        let entry = |name: &str| RefusedEntry {
+            name: name.as_bytes().to_vec(),
+            lang: crate::model::Lang::Rust,
+            refused: crate::refusal::Refused::blocking(crate::refusal::Blocking::Replaced, None),
+        };
+        s.put_file("ipe:ok.rs", "rs", "other", 1, &FileStamp::of_bytes(b"a"))
+            .unwrap();
+        s.put_refusal(&tag, &entry("other.rs")).unwrap();
+        s.check_refusals_disjoint().unwrap();
+        s.put_file("ipe:é.rs", "rs", "other", 1, &FileStamp::of_bytes(b"b"))
+            .unwrap();
+        s.put_refusal(&tag, &entry("é.rs")).unwrap();
+        assert!(s.check_refusals_disjoint().is_err());
+        assert!(s.put_refusal(&tag, &entry("é.rs")).is_err());
     }
 
     // Stored text is a stamp only in the one spelling `of_bytes` writes.

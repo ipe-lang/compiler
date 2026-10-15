@@ -189,6 +189,38 @@ ln -s /etc/passwd leak.rs && git add leak.rs
 tools/scripts/ipe-index index   # ipe-index: not indexing leak.rs: tracked as a symbolic link
 ```
 
+**Every listed entry is accounted for.** Each entry the git listings name ends
+as exactly one of: a `files` row with its units, one `refusals` row naming why
+it cannot be reviewed, gone from disk, or owned by a nested root. A refusal is
+never only a stderr line. Its `reason` is one of a fixed set, and it splits two
+ways:
+
+- **ackable** — the bytes are known, so a reviewer can acknowledge exactly
+  this version: not UTF-8 (`not-utf8`), over the 2 MB read ceiling
+  (`too-large`), or a symlink, submodule or unknown-mode entry
+  (`symlink-entry`, `gitlink-entry`, `unknown-mode`). The row carries a
+  `digest` over the reason and the content (or the object id git records), so
+  any change to the file is a new digest. An oversized file is hashed in
+  64 KiB chunks, never held whole.
+- **blocking** — nothing about the content can be vouched for: past the
+  64 MiB hash ceiling or the 512 MiB hash budget one run may spend
+  (`past-hash-ceiling`), a name that is not UTF-8 or not repo-relative, a
+  nested repository, not a regular file on disk, unreadable, or replaced while
+  it was read. The row carries no digest.
+
+The table refuses a row whose digest does not match its reason's kind, and a
+run that would record one path both indexed and refused fails without
+committing. `index` and `update` end with a summary counted from the rows:
+
+```
+ipe-index: indexed 2 files, 9 units; 5 unreviewable (4 ackable, 1 blocking)
+ipe-index:   blocking ipe:nested/: nested-repository
+ipe-index: 1 other-language files without units
+```
+
+The first 50 blocking rows are named, then `+N more`. Other-language files are
+indexed rows with no units extracted; they are not refusals.
+
 ### The change queue (what the code-review app consumes)
 
 `index` and `update` record per-unit `new`/`modified`/`deleted` events in a
