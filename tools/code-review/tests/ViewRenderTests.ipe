@@ -540,12 +540,12 @@ refuseErrorFixedText loaded =
                 html =
                     rendered failure
             in
-            has (Failure.refuseFailureText failure) html
+            has (Html.escapeHtml (Failure.refuseFailureText failure)) html
                 && button "Confirm" html
-                && List.all (\other -> other == failure || not (has (Failure.refuseFailureText other) html)) cases
+                && List.all (\other -> other == failure || not (has (Html.escapeHtml (Failure.refuseFailureText other)) html)) cases
     in
     List.all showsItsOwn cases
-        && not (has (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page opened))
+        && not (has (Html.escapeHtml (Failure.refuseFailureText (DraftRefused ReasonBlank))) (page opened))
 
 
 -- A failed decision save shows its case's fixed text in the queue banner,
@@ -558,7 +558,7 @@ decisionErrorFixedText loaded =
             cardModel loaded
     in
     List.all
-        (\failure -> has ("Decision save failed: " ++ Failure.saveFailureText failure) (page { card | decisionError = Just failure }))
+        (\failure -> has (Html.escapeHtml ("Decision save failed: " ++ Failure.saveFailureText failure)) (page { card | decisionError = Just failure }))
         [ SaveInFlight
         , SaveOffQueue
         , SaveReadOnly

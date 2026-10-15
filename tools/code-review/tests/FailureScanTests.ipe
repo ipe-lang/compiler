@@ -110,9 +110,81 @@ leadsWith test text =
 -- ── S1: conversion sites ────────────────────────────────────────────────
 
 
-conversionTokens : List String
-conversionTokens =
-    [ "Error.toString", "Error.message", "Error.kindName", "errorToString" ]
+-- The `Ipe.Error` calls that turn an error into text.
+conversionFunctions : List String
+conversionFunctions =
+    [ "toString", "message", "kindName" ]
+
+
+-- The fields of an error's record and of its details' records that hold
+-- its text.
+errorTextFields : List String
+errorTextFields =
+    [ "message", "stack", "expected", "actual" ]
+
+
+-- The details constructors whose payload is text or a record of it.
+textDetails : List String
+textDetails =
+    [ "Custom", "JsonDecode", "FfiPanic", "TypeMismatch" ]
+
+
+-- The names a conversion call goes by in a module: each conversion under
+-- `Error`, under `Ipe.Error`, and under every name the module imports
+-- `Ipe.Error` as, and bare when an import of it exposes the call or
+-- everything.
+conversionNames : String -> List String
+conversionNames text =
+    let
+        errorImports =
+            List.filter (\imp -> imp.moduleName == "Ipe.Error") (importsOf text)
+
+        qualifiers =
+            List.unique ("Error" :: "Ipe.Error" :: List.map (\imp -> imp.qualifier) errorImports)
+
+        bare =
+            List.filter (\fn -> List.any (\imp -> List.member fn imp.exposed || List.member ".." imp.exposed) errorImports) conversionFunctions
+    in
+    "errorToString" :: bare ++ List.concatMap (\q -> List.map (\fn -> q ++ "." ++ fn) conversionFunctions) qualifiers
+
+
+-- A token with its neighbours on the line, `""` past either end.
+type alias SiteToken =
+    { prev : String, token : String, next : String }
+
+
+-- The tokens of `line` as the conversion scan reads them: `tokens`, with
+-- each `,`, `{` and `}` a token of its own, so a record pattern shows.
+siteTokens : String -> List SiteToken
+siteTokens line =
+    let
+        words =
+            line
+                |> String.replace "," " , "
+                |> String.replace "{" " { "
+                |> String.replace "}" " } "
+                |> String.map
+                    (\c ->
+                        if tokenChar c || c == ',' || c == '{' || c == '}' then
+                            c
+
+                        else
+                            ' '
+                    )
+                |> String.words
+    in
+    List.map3 (\prev token next -> { prev = prev, token = token, next = next }) ("" :: words) words (List.drop 1 words ++ [ "" ])
+
+
+-- An error becoming text at `at`: a conversion call, a read of an
+-- error-text field (`info.message`, `.stack`), a record pattern binding one
+-- (`{ message }`), or a text detail bound to a name (`Custom s`).
+isConversion : List String -> SiteToken -> Bool
+isConversion names at =
+    List.member at.token names
+        || List.any (\field -> String.endsWith ("." ++ field) at.token) errorTextFields
+        || (List.member at.token errorTextFields && List.member at.prev [ "{", "," ] && List.member at.next [ ",", "}" ])
+        || (List.any (\detail -> at.token == detail || String.endsWith ("." ++ detail) at.token) textDetails && at.next /= "_")
 
 
 -- Every site an error becomes text: the startup refusals `Main` prints, the
@@ -136,26 +208,23 @@ conversionSitesIn : String -> String -> List String
 conversionSitesIn rel text =
     let
         scanned =
-            List.foldl (siteStep rel) { name = "", sites = [] } (String.lines text)
+            List.foldl (siteStep (conversionNames text) rel) { name = "", sites = [] } (String.lines text)
     in
     scanned.sites
 
 
-siteStep : String -> String -> SiteScan -> SiteScan
-siteStep rel line scan =
+siteStep : List String -> String -> String -> SiteScan -> SiteScan
+siteStep names rel line scan =
     let
-        lineTokens =
-            tokens line
-
         name =
             if leadsWith Char.isLower line then
-                Maybe.withDefault scan.name (List.head lineTokens)
+                Maybe.withDefault scan.name (List.head (tokens line))
 
             else
                 scan.name
 
         found =
-            List.filter (\token -> List.member token conversionTokens) lineTokens
+            List.filter (isConversion names) (siteTokens line)
     in
     { name = name, sites = List.map (\_ -> rel ++ ":" ++ name) found ++ scan.sites }
 
@@ -535,8 +604,11 @@ scanViolations sources =
 --
 -- The tree holds no violation, and each way around a scan is one: a new
 -- conversion site, a site moved to another top-level name, an admitted
--- site removed from the list or from the source, and the view importing
--- `Ipe.Error`. A token that only contains a conversion's name is no site.
+-- site removed from the list or from the source, the view importing
+-- `Ipe.Error`, a conversion under an import alias or exposed bare, and an
+-- error's text read from its record (`info.message`, `{ message }`) or its
+-- details (`Custom s`). A token that only contains a conversion's name, and
+-- a record field of that name that is not a pattern, are no site.
 -- Red if a page can show an error's text, or a scan stops seeing a way
 -- around it.
 realTreeClean : Task.Task Error Bool
@@ -555,7 +627,12 @@ scansRefuseEvasions =
                     && not (List.isEmpty (conversionViolations (List.filter (\site -> site /= "Lib/ServerLog.ipe:logged") admittedConversions) sources))
                     && not (List.isEmpty (conversionViolations admittedConversions (List.filter (\( rel, _ ) -> rel /= "Lib/ServerLog.ipe") sources)))
                     && caught (prependTo "Lib/View.ipe" "import Ipe.Error as Error" sources)
-                    && List.isEmpty (scanViolations (appendTo "Lib/Queue.ipe" "label =\n    errorToStringLabel refuseError.messages" sources))
+                    && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error as E" (appendTo "Lib/Queue.ipe" "shown e =\n    E.message e" sources))
+                    && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error exposing (toString)" (appendTo "Lib/Queue.ipe" "shown e =\n    toString e" sources))
+                    && caught (appendTo "Lib/Queue.ipe" "shown e =\n    case e of\n        Error _ info ->\n            info.message" sources)
+                    && caught (appendTo "Lib/Queue.ipe" "shown e =\n    case e of\n        Error _ { message } ->\n            message" sources)
+                    && caught (appendTo "Lib/Queue.ipe" "shown d =\n    case d of\n        Custom text ->\n            text" sources)
+                    && List.isEmpty (scanViolations (appendTo "Lib/Queue.ipe" "label =\n    errorToStringLabel refuseError.messages { messageCount = 1, message = \"x\" }\n\n\ntype alias Note =\n    { message : String }" sources))
             )
 
 

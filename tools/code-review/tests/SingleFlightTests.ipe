@@ -566,21 +566,21 @@ saveFailureRendered settings a b =
         && String.contains "the index or review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
         && not (String.contains "[5]" busyPage)
-        && not (String.contains busyText busyPage)
+        && not (String.contains (Html.escapeHtml busyText) busyPage)
         && other.decisionError
         == Just SaveFailed
-        && String.contains (Failure.saveFailureText SaveFailed) otherPage
+        && String.contains (Html.escapeHtml (Failure.saveFailureText SaveFailed)) otherPage
         && not (String.contains "Unexpected" otherPage)
-        && not (String.contains otherText otherPage)
+        && not (String.contains (Html.escapeHtml otherText) otherPage)
         && moved.decisionError
         == Just SaveFailed
-        && String.contains (Failure.saveFailureText SaveFailed) movedPage
-        && not (String.contains (Error.message LibDb.headMoved) movedPage)
+        && String.contains (Html.escapeHtml (Failure.saveFailureText SaveFailed)) movedPage
+        && not (String.contains (Html.escapeHtml (Error.message LibDb.headMoved)) movedPage)
         && changed.decisionError
         == Just (SaveRefused SourceChanged)
         && changed.decision
         == DecisionIdle
-        && String.contains (Failure.saveFailureText (SaveRefused SourceChanged)) (page changed)
+        && String.contains (Html.escapeHtml (Failure.saveFailureText (SaveRefused SourceChanged))) (page changed)
 
 
 -- A decision asked on a server with no signing key is refused before it
