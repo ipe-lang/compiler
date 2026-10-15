@@ -46,7 +46,7 @@ use std::rc::Rc;
 use ipe_fs_open::{
     ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal, RegularFile,
 };
-use ipe_path_core::{Regime, Volume, is_sep};
+use ipe_path_core::{Namespace, Regime, Volume, is_sep};
 
 use crate::covers::path_covers;
 use crate::mounts::CanonicalPath;
@@ -767,6 +767,7 @@ fn scan_under(
         home,
         limits,
         regime,
+        volumes: held_volumes(roots, grants, home, regime),
         marks: marks(grants, kind)?,
         files: 0,
         bytes: 0,
@@ -1502,6 +1503,8 @@ struct Scan<'s> {
     limits: ConfigLimits,
     /// The path regime every value is read under.
     regime: Regime,
+    /// The network shares and namespaces the caller's own paths lie on, the only ones a walk may open.
+    volumes: Vec<String>,
     /// The grants and carves, identified.
     marks: Vec<Mark>,
     /// Files read so far.
@@ -1828,6 +1831,7 @@ impl Scan<'_> {
         {
             return Err(Unprovable::TooLong);
         }
+        self.held_volume(path)?;
         if !path.is_absolute() {
             return Err(Unprovable::Unresolvable);
         }
@@ -1990,6 +1994,7 @@ impl Scan<'_> {
             return Err(walk.stop(Unprovable::TooLong));
         }
         if target.is_absolute() {
+            self.held_volume(&target).map_err(|why| walk.stop(why))?;
             let root = root_of(&target);
             let cur = HeldDir::open_root(&root).map_err(|_| walk.stop(Unprovable::Unresolvable))?;
             let zone = self
@@ -2881,8 +2886,15 @@ impl Scan<'_> {
                 let Some(tail) = rest.strip_prefix(|c| is_separator(c, self.regime)) else {
                     return Err(Unprovable::TildeUser);
                 };
-                tail
+                // The tool appends the text after `~` to the home, so every
+                // further leading separator collapses into the home's own.
+                tail.trim_start_matches(|c| is_separator(c, self.regime))
             };
+            match Anchor::of(tail, self.regime) {
+                Anchor::Relative => {}
+                Anchor::Absolute | Anchor::Unanchored => return Err(Unprovable::Unanchored),
+                Anchor::NetworkOrDevice => return Err(Unprovable::NetworkOrDevice),
+            }
             let Some(home) = &self.home.0 else {
                 return Err(Unprovable::NoHome);
             };
@@ -2910,6 +2922,84 @@ impl Scan<'_> {
             .chain(worktree)
             .collect())
     }
+}
+
+impl Scan<'_> {
+    /// Refuse a walk of `path` onto a network share or namespace none of the caller's own paths lies on.
+    ///
+    /// Opening such a path dials the server it names before any handle is
+    /// held, so the refusal comes before the open.
+    fn held_volume(&self, path: &Path) -> Result<(), Unprovable> {
+        match remote_volume(path, self.regime)? {
+            None => Ok(()),
+            Some(volume) if self.volumes.contains(&volume) => Ok(()),
+            Some(_) => Err(Unprovable::NetworkOrDevice),
+        }
+    }
+}
+
+/// The network shares and namespaces the roots, grants, carves, and home lie on under `regime`.
+fn held_volumes(
+    roots: &ConfigRoots<'_>,
+    grants: &Grants<'_>,
+    home: &Home,
+    regime: Regime,
+) -> Vec<String> {
+    let rooted: Vec<&Path> = match *roots {
+        ConfigRoots::Git { gitdir, commondir } => {
+            [Some(gitdir), commondir].into_iter().flatten().collect()
+        }
+        ConfigRoots::Mercurial { dot_hg, shared } => {
+            [Some(dot_hg), shared].into_iter().flatten().collect()
+        }
+        ConfigRoots::Jujutsu { dot_jj, repo } => vec![dot_jj, repo],
+        ConfigRoots::Darcs { dot_darcs } => vec![dot_darcs],
+    };
+    let granted = grants
+        .writable
+        .iter()
+        .chain(&grants.carves)
+        .copied()
+        .chain(&home.0)
+        .map(CanonicalPath::as_path);
+    let mut volumes: Vec<String> = rooted
+        .into_iter()
+        .chain(granted)
+        .filter_map(|path| remote_volume(path, regime).ok().flatten())
+        .collect();
+    volumes.sort_unstable();
+    volumes.dedup();
+    volumes
+}
+
+/// Under Windows, the network share (`server\share`) or namespace prefix `path` lies on, ASCII-lowercased; `None` for a local drive or no volume.
+///
+/// # Errors
+/// [`Unprovable::Unresolvable`] under Windows for a path that is not valid Unicode, whose volume cannot be read.
+fn remote_volume(path: &Path, regime: Regime) -> Result<Option<String>, Unprovable> {
+    if !regime.is_windows() {
+        return Ok(None);
+    }
+    let text = path.to_str().ok_or(Unprovable::Unresolvable)?;
+    let volume = Volume::parse(text, regime);
+    let is_drive = |name: &str| matches!(Volume::parse(name, regime), Volume::Drive(c) if name.len() == c.len_utf8() + 1);
+    Ok(match volume {
+        Volume::None | Volume::Drive(_) => None,
+        Volume::Namespaced {
+            tag: Namespace::Verbatim,
+            name: Some(name),
+        } if is_drive(name) => None,
+        Volume::Unc { server, share } | Volume::VerbatimUnc { server, share } => Some(format!(
+            "{}\\{}",
+            server.to_ascii_lowercase(),
+            share.unwrap_or_default().to_ascii_lowercase()
+        )),
+        Volume::Namespaced { .. } => Some(
+            text.get(..volume.byte_len())
+                .unwrap_or(text)
+                .to_ascii_lowercase(),
+        ),
+    })
 }
 
 /// What a path-shaped word is resolved against under a regime.
@@ -3254,9 +3344,10 @@ fn option_argument(word: &str) -> Option<&str> {
     Some(rest.strip_prefix('=').unwrap_or(rest))
 }
 
-/// Whether `word` is shaped like a path: it holds a separator, starts with `~`, or is `.` or `..`.
+/// Whether `word` is shaped like a path: it holds a separator, starts with `~` or (under Windows) a drive, or is `.` or `..`.
 fn is_path_shaped(word: &str, regime: Regime) -> bool {
     word.contains(|c| is_separator(c, regime))
+        || Volume::parse(word, regime).is_drive()
         || word.starts_with('~')
         || word == "."
         || word == ".."
@@ -5087,6 +5178,199 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn tilde_extra_leading_separators_collapse_into_the_home() {
+        let f = fixture("tildecollapse");
+        let root = f.tree.parent().expect("fixture root");
+        let tree = canonical(&f.tree);
+        let git = canonical(&f.tree.join(".git"));
+        let grants = Grants::new(&tree, &[]).with_carves(&[&git]);
+        let gitdir = f.tree.join(".git");
+        let roots = ConfigRoots::Git {
+            gitdir: &gitdir,
+            commondir: None,
+        };
+        let home = Home::known(canonical(root));
+        for value in ["~/tree/bin/less", "~//tree/bin/less", "~///tree/bin/less"] {
+            git_config(&f, &format!("[core]\n\tpager = {value}\n"));
+            let result = scan(&roots, &grants, &home, ConfigLimits::DEFAULT);
+            assert_eq!(
+                in_grant(&result),
+                Some(tree.as_path().join("bin").join("less").as_path()),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tilde_drive_tail_refused_under_windows() {
+        let f = fixture("tildedrivewin");
+        for value in ["~/C:x", "~//C:x"] {
+            git_config(&f, &format!("[core]\n\tpager = {value}\n"));
+            let result = scan_git_under(&f, Regime::Windows);
+            assert_eq!(
+                unprovable(&result),
+                Some(Unprovable::Unanchored),
+                "{value:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drive_relative_program_refused_under_windows() {
+        let f = fixture("driveprogwin");
+        git_config(&f, "[core]\n\tpager = C:evil\n");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::Unanchored),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn drive_shaped_program_admitted_under_unix() {
+        let f = fixture("driveprogunix");
+        git_config(&f, "[core]\n\tpager = C:evil\n");
+        let result = scan_git_under(&f, Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    #[test]
+    fn tilde_plain_tail_admitted_under_windows() {
+        let f = fixture("tildeplainwin");
+        git_config(&f, "[core]\n\tpager = ~/Cx\n");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    /// The refusal of a link whose target the scan judged unprovable for `why`.
+    #[cfg(unix)]
+    fn link_unprovable(result: &Result<(), ConfigRefusal>) -> Option<Unprovable> {
+        match result {
+            Err(ConfigRefusal::LinkNamesWritable {
+                named: Named::Unprovable(why),
+                ..
+            }) => Some(*why),
+            Ok(()) | Err(_) => None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_link_onto_a_share_refused_under_windows_before_any_open() {
+        let f = fixture("hooksharewin");
+        let hooks = f.tree.join(".git/hooks");
+        make_dir(&hooks);
+        std::os::unix::fs::symlink("//no-such-ipe-srv/share/h", hooks.join("pre-commit"))
+            .expect("plant link");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            link_unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        let result = scan_git_under(&f, Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_dir_link_onto_a_share_refused_under_windows_before_any_open() {
+        let f = fixture("hooksdirsharewin");
+        std::os::unix::fs::symlink("//no-such-ipe-srv/share", f.tree.join(".git/hooks"))
+            .expect("plant link");
+        let result = scan_git_under(&f, Regime::Windows);
+        assert_eq!(
+            link_unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        let result = scan_git_under(&f, Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    /// A share a root lies on admits the walk, never a value's word: each boundary refuses on its own.
+    #[test]
+    fn share_word_refused_under_windows_even_on_a_held_share() {
+        let f = fixture("heldsharewin");
+        let gitdir = f.tree.join(".git");
+        // A doubled leading `/` is the same directory on the host and a share under Windows.
+        let outside = canonical(&f.out);
+        let commondir = PathBuf::from(format!("/{}", outside.as_path().display()));
+        let roots = ConfigRoots::Git {
+            gitdir: &gitdir,
+            commondir: Some(&commondir),
+        };
+        let shared = format!("{}/h", commondir.display());
+        git_config(&f, &format!("[core]\n\thooksPath = {shared}\n"));
+        let result = scan_with_under(&f, &roots, ConfigLimits::DEFAULT, Regime::Windows);
+        assert_eq!(
+            unprovable(&result),
+            Some(Unprovable::NetworkOrDevice),
+            "{result:?}"
+        );
+        git_config(&f, "[core]\n\thooksPath = ~/h\n");
+        let result = scan_with_under(&f, &roots, ConfigLimits::DEFAULT, Regime::Windows);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    #[test]
+    fn remote_volume_under_windows() {
+        let share = Some("srv\\share".to_owned());
+        for value in [
+            "\\\\srv\\share\\x",
+            "//SRV/Share/x",
+            "\\\\?\\UNC\\srv\\SHARE\\y",
+        ] {
+            assert_eq!(
+                remote_volume(Path::new(value), Regime::Windows),
+                Ok(share.clone()),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            remote_volume(Path::new("\\\\.\\pipe\\x"), Regime::Windows),
+            Ok(Some("\\\\.\\pipe".to_owned()))
+        );
+        for value in ["C:\\x", "\\\\?\\C:\\x", "/x", "x"] {
+            assert_eq!(
+                remote_volume(Path::new(value), Regime::Windows),
+                Ok(None),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_volume_none_under_unix() {
+        for value in ["\\\\srv\\share\\x", "//srv/share/x", "\\\\.\\pipe\\x", "/x"] {
+            assert_eq!(
+                remote_volume(Path::new(value), Regime::Unix),
+                Ok(None),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn held_volumes_name_the_share_the_roots_lie_on() {
+        let f = fixture("heldshare");
+        let tree = canonical(&f.tree);
+        let grants = Grants::new(&tree, &[]);
+        let gitdir = Path::new("\\\\Srv\\Share\\repo\\.git");
+        let roots = ConfigRoots::Git {
+            gitdir,
+            commondir: None,
+        };
+        let home = Home::known(canonical(&f.home));
+        assert_eq!(
+            held_volumes(&roots, &grants, &home, Regime::Windows),
+            vec!["srv\\share".to_owned()]
+        );
+        assert!(held_volumes(&roots, &grants, &home, Regime::Unix).is_empty());
     }
 
     #[test]
