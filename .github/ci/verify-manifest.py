@@ -48,10 +48,13 @@ Checks performed
       `change_class.py` step of that scope; a needed job's success). A
       reporting job holds a decider under a guard whose absent input means
       run: a VERDICT `TOOL_INVOCATIONS` row, the phase verdict, a command a
-      `local:` block mirrors, or the script step its `INLINE_DECIDERS` row
-      names. `KNOWN_SKIP_AS_PASS` names, with the reason, a required job
-      that skips as pass; a row of either table that no longer applies is
-      refused as stale.
+      `local:` block mirrors, or the one script step its `INLINE_DECIDERS`
+      row names (a `run:` script, or a `with.run` script through an action
+      a `SCRIPT_ACTIONS` row admits by exact pinned `uses:` and `with:`
+      inputs). No such job carries a job-level `continue-on-error:` (it
+      reports a failed run as passing). `KNOWN_SKIP_AS_PASS` names, with the
+      reason, a required job that skips as pass; a row of any of the three
+      tables that no longer applies is refused as stale.
   1d. Every `.github/ci` tool a workflow step runs is a (tool, argv) pair
       `TOOL_INVOCATIONS` lists, never a `MAINTAINER_TOOLS` invocation, and
       every listed pair is run by some step (a stale row is refused).
@@ -493,6 +496,7 @@ Pure stdlib + PyYAML (already a CI dependency).  No network; check 12 runs
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import fnmatch
 import glob
 import json
@@ -1124,6 +1128,10 @@ class ErrorKind(enum.Enum):
     NO_DECIDER = "no-decider"
     DECIDER_ROW_STALE = "decider-row-stale"
     KNOWN_SKIP_ROW_STALE = "known-skip-row-stale"
+    JOB_MASKED = "job-masked"
+    DECIDER_ROW_AMBIGUOUS = "decider-row-ambiguous"
+    INLINE_DECIDER_UNADMITTED = "inline-decider-unadmitted"
+    SCRIPT_ACTION_ROW_INVALID = "script-action-row-invalid"
     TOOL_UNLISTED = "tool-unlisted"
     TOOL_ARGV_UNLISTED = "tool-argv-unlisted"
     MAINTAINER_TOOL_IN_WORKFLOW = "maintainer-tool-in-workflow"
@@ -1820,11 +1828,12 @@ class StepGuard:
         return f"`if:` {raw!r} is not an admitted step guard"
 
 
-# Required jobs whose decider is an inline `run:` script (or a VM action's
-# `with.run` script) rather than a listed tool, the phase verdict, or a
-# command a manifest `local:` block mirrors: (workflow, job) -> the decider
-# step's `name:` (its whole trimmed `run:` text when it has no name). A row
-# whose job is not required, whose step is missing, or whose job already
+# Required jobs whose decider is an inline `run:` script (or a
+# `SCRIPT_ACTIONS` action's `with.run` script) rather than a listed tool,
+# the phase verdict, or a command a manifest `local:` block mirrors:
+# (workflow, job) -> the decider step's `name:` (its whole trimmed `run:`
+# text when it has no name), which exactly one step of the job carries. A
+# row whose job is not required, whose step is missing, or whose job already
 # holds one of those deciders is refused as stale.
 INLINE_DECIDERS: dict[tuple[str, str], str] = {
     ("admission-sandbox.yml", "freebsd-x64"): "Run admission jail inside FreeBSD VM",
@@ -1853,6 +1862,32 @@ INLINE_DECIDERS: dict[tuple[str, str], str] = {
     ("static.yml", "linux-cfree-gate"): "C-free refusal gates",
     ("trust-root-diff.yml", "trust-root-diff"): "Judge the PR against the trusted CODEOWNERS",
 }
+@dataclasses.dataclass(frozen=True)
+class ScriptAction:
+    """A third-party action an `INLINE_DECIDERS` step may run its script
+    through: the exact `with:` inputs admitted (an input that can turn a
+    failed script green, such as `debug-on-error`, is never one) and why the
+    pinned source fails the step when the script exits non-zero."""
+
+    inputs: frozenset[str]
+    why: str
+
+
+# The actions an inline decider may be (exact `uses:`, pinned to a commit).
+# A row whose `uses:` is not pinned, whose `why` is empty, or that no
+# inline decider runs is refused.
+SCRIPT_ACTIONS: dict[str, ScriptAction] = {
+    "vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc": ScriptAction(
+        inputs=frozenset({"usesh", "synctime", "prepare", "run"}),
+        why=(
+            "the pinned `index.js` runs `with.run` through `execSSH(runCmd, sshConfig)` with `ignoreReturn` "
+            "false: a non-zero ssh exit throws, and `main` ends in `core.setFailed` plus `process.exit(1)`; "
+            "only `debug-on-error: true` catches the throw, and that input is not admitted"
+        ),
+    ),
+}
+
+
 # Required jobs that report green without running their decider, each with
 # the reason; exempt from the step-guard and decider rules (never from the
 # job-guard rule). A row whose job is not required, or that would pass
@@ -1963,15 +1998,25 @@ def _decider_kind(
     return None
 
 
-def _inline_decider(st: Step) -> bool:
-    """Whether `st` has an inline-script decider's shape: a `run:` script,
-    or an action whose `with.run` is a script, with no `continue-on-error:`."""
+def _inline_decider(st: Step, actions: dict[str, "ScriptAction"]) -> str | None:
+    """Why `st` lacks an inline-script decider's shape, or None: a `run:`
+    script, or a `SCRIPT_ACTIONS` action (exact pinned `uses:`) whose
+    `with:` keys its row admits and whose `with.run` is a script; never
+    with `continue-on-error:`."""
     if "continue-on-error" in st.raw:
-        return False
+        return "carries `continue-on-error:`"
     if st.uses is None:
-        return st.run is not None
+        return None if st.run is not None else "runs no script"
+    row = actions.get(st.uses)
+    if row is None:
+        return f"runs the action {st.uses!r}, which no `SCRIPT_ACTIONS` row admits as a script runner"
     with_ = st.raw.get("with")
-    return isinstance(with_, dict) and isinstance(with_.get("run"), str)
+    if not isinstance(with_, dict) or not isinstance(with_.get("run"), str):
+        return f"runs {st.uses!r} without a `with.run` script"
+    extra = sorted(str(k) for k in with_ if k not in row.inputs)
+    if extra:
+        return f"passes {st.uses!r} the inputs {extra}, which its `SCRIPT_ACTIONS` row does not admit"
+    return None
 
 
 def check_required_guards(
@@ -1981,12 +2026,16 @@ def check_required_guards(
     errors: list[str],
     inline: dict[tuple[str, str], str] | None = None,
     known_skips: dict[tuple[str, str], str] | None = None,
+    actions: dict[str, ScriptAction] | None = None,
+    stale: bool = True,
 ) -> None:
-    """Check 1c (see the module docstring)."""
+    """Check 1c (see the module docstring). `stale` off skips the
+    unused-`SCRIPT_ACTIONS`-row rule (a probe over one workflow)."""
     import local_gate  # noqa: PLC0415
 
     inline = INLINE_DECIDERS if inline is None else inline
     known_skips = KNOWN_SKIP_AS_PASS if known_skips is None else known_skips
+    actions = SCRIPT_ACTIONS if actions is None else actions
     locals_ = local_gate.parse_manifest_locals([e for e in raw_entries if isinstance(e, dict)], [])
     reporting, held = required_jobs(wfs, entries)
 
@@ -1994,6 +2043,7 @@ def check_required_guards(
         errors.append(ManifestError(kind, fname, path, detail).render())
 
     spec_decided: set[tuple[str, str]] = set()
+    used_actions: set[str] = set()
     for fname, jid in sorted(held):
         wf = wfs.get(fname)
         wj = wf.job(jid) if wf is not None else None
@@ -2010,6 +2060,12 @@ def check_required_guards(
                 ErrorKind.JOB_GUARD_UNADMITTED, fname, jpath,
                 "runs under `always()` but is no phase verdict (a `uses: "
                 f"{PHASE_VERDICT_ACTION}` step whose `results` names every need in order); refused",
+            )
+        if "continue-on-error" in wj.raw:
+            refuse(
+                ErrorKind.JOB_MASKED, fname, jpath,
+                f"carries a job-level `continue-on-error: {wj.raw['continue-on-error']!r}` — a failed run of a "
+                "required job (or of a job one transitively needs) then reports as passing; refused",
             )
         if (fname, jid) in known_skips:
             continue
@@ -2049,9 +2105,24 @@ def check_required_guards(
                 break
         key = inline.get((fname, jid))
         if not decided and key is not None:
-            hit = next(((st, g) for st, g in zip(steps, guards) if _step_key(st) == key), None)
-            if hit is not None and hit[1] is not None and hit[1].kind in DECIDER_GUARDS and _inline_decider(hit[0]):
-                decided = True
+            hits = [(st, g) for st, g in zip(steps, guards) if _step_key(st) == key]
+            if len(hits) > 1:
+                refuse(
+                    ErrorKind.DECIDER_ROW_AMBIGUOUS, fname, jpath,
+                    f"has {len(hits)} steps named {key!r}, the step its `INLINE_DECIDERS` row names; a row binds "
+                    "exactly one step, refused",
+                )
+            elif hits:
+                st, g = hits[0]
+                bad = _inline_decider(st, actions)
+                if bad is not None:
+                    refuse(
+                        ErrorKind.INLINE_DECIDER_UNADMITTED, fname, jpath,
+                        f"its `INLINE_DECIDERS` step {key!r} {bad}; refused",
+                    )
+                elif g is not None and g.kind in DECIDER_GUARDS:
+                    decided = True
+                    used_actions.add(st.uses or "")
         if not decided:
             refuse(
                 ErrorKind.NO_DECIDER, fname, jpath,
@@ -2068,6 +2139,13 @@ def check_required_guards(
             wj = wfs.get(fname).job(jid)
             if wj is not None and not any(_step_key(st) == key for st in _typed_steps(wj.raw, "", [])):
                 refuse(ErrorKind.DECIDER_ROW_STALE, fname, f"job {jid!r}", f"has no step {key!r}, the step its `INLINE_DECIDERS` row names; refused")
+    for uses, row in sorted(actions.items()):
+        if not PINNED_REMOTE_USES_RE.match(uses):
+            refuse(ErrorKind.SCRIPT_ACTION_ROW_INVALID, "verify-manifest.py", "SCRIPT_ACTIONS", f"{uses!r} is not pinned to a commit; refused")
+        elif not row.why.strip():
+            refuse(ErrorKind.SCRIPT_ACTION_ROW_INVALID, "verify-manifest.py", "SCRIPT_ACTIONS", f"{uses!r} names no reason its source fails on a failed script; refused")
+        elif stale and uses not in used_actions:
+            refuse(ErrorKind.SCRIPT_ACTION_ROW_INVALID, "verify-manifest.py", "SCRIPT_ACTIONS", f"{uses!r} is run by no inline decider; remove the row")
     for (fname, jid) in sorted(known_skips):
         if (fname, jid) not in held:
             refuse(ErrorKind.KNOWN_SKIP_ROW_STALE, fname, f"job {jid!r}", "has a `KNOWN_SKIP_AS_PASS` row but is no required job; remove the row")
@@ -2075,7 +2153,7 @@ def check_required_guards(
         probe: list[str] = []
         rest = {k: v for k, v in known_skips.items() if k != (fname, jid)}
         own = {k: v for k, v in inline.items() if k[0] == fname}
-        check_required_guards(_only_workflow(wfs, fname), entries, raw_entries, probe, own, rest)
+        check_required_guards(_only_workflow(wfs, fname), entries, raw_entries, probe, own, rest, actions, stale=False)
         if not any(f"[{ErrorKind.STEP_GUARD_UNADMITTED.name}]" in p or f"[{ErrorKind.NO_DECIDER.name}]" in p for p in probe):
             refuse(ErrorKind.KNOWN_SKIP_ROW_STALE, fname, f"job {jid!r}", "has a `KNOWN_SKIP_AS_PASS` row but passes without it; remove the row")
 

@@ -7729,14 +7729,14 @@ class _GuardFixture(unittest.TestCase):
         self.root = self._tmp.name
 
     def errors(self, wf: str, entries: list | None = None, inline: dict | None = None,
-               skips: dict | None = None) -> list[str]:
+               skips: dict | None = None, actions: dict | None = None) -> list[str]:
         _write(os.path.join(self.root, "workflows", "g.yml"), wf)
         errors: list[str] = []
         wfs = _load(self.root, errors)
         raw = entries if entries is not None else [{"context": "g", "disposition": "gate", "producer": "g.yml"}]
         typed = [e for e in (verify_manifest.ManifestEntry.parse(r) for r in raw)
                  if isinstance(e, verify_manifest.ManifestEntry)]
-        verify_manifest.check_required_guards(wfs, typed, raw, errors, inline or {}, skips or {})
+        verify_manifest.check_required_guards(wfs, typed, raw, errors, inline or {}, skips or {}, actions or {})
         return errors
 
     def kinds(self, wf: str, **kw: object) -> set[str]:
@@ -7910,15 +7910,78 @@ class TestRequiredJobHoldsDecider(_GuardFixture):
         self.assertPasses(_rg_wf(_rg_job("g", steps)), inline={("g.yml", "g"): "Run it"})
         unnamed = "- run: |\n    ./x.sh\n"
         self.assertPasses(_rg_wf(_rg_job("g", unnamed)), inline={("g.yml", "g"): "./x.sh"})
-        vm_action = "- name: Run it\n  uses: vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1\n  with:\n    run: ./x.sh\n"
-        self.assertPasses(_rg_wf(_rg_job("g", vm_action)), inline={("g.yml", "g"): "Run it"})
         for bad in (
             steps + "  continue-on-error: true\n",
             steps + "  if: always()\n",
-            "- name: Run it\n  uses: vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1\n",
         ):
             with self.subTest(bad=bad):
                 self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", bad)), inline={("g.yml", "g"): "Run it"})
+        self.assertRefused(
+            "INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", steps + "  continue-on-error: false\n")),
+            inline={("g.yml", "g"): "Run it"},
+        )
+
+    def test_inline_decider_action_bound_to_script_actions_row(self) -> None:
+        pin = "vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        row = {pin: verify_manifest.ScriptAction(frozenset({"run", "prepare"}), "fails on a failed script")}
+        inline = {("g.yml", "g"): "Run it"}
+
+        def step(uses: str, with_: str = "  with:\n    run: ./x.sh\n") -> str:
+            return f"- name: Run it\n  uses: {uses}\n" + with_
+
+        self.assertPasses(_rg_wf(_rg_job("g", step(pin))), inline=inline, actions=row)
+        self.assertPasses(
+            _rg_wf(_rg_job("g", step(pin, "  with:\n    prepare: x\n    run: ./x.sh\n"))), inline=inline, actions=row
+        )
+        for bad in (
+            step(pin),
+            step("vendor/vm@0000000000000000000000000000000000000000"),
+            step("vendor/vm@v1"),
+            step("other/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+        ):
+            with self.subTest(uses=bad, actions={}):
+                self.assertRefused("INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", bad)), inline=inline,
+                                   actions=({} if bad == step(pin) else row))
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", bad)), inline=inline,
+                                   actions=({} if bad == step(pin) else row))
+        for with_ in (
+            "",
+            "  with:\n    prepare: x\n",
+            "  with:\n    run: ./x.sh\n    debug-on-error: true\n",
+            "  with:\n    run: ./x.sh\n  continue-on-error: false\n",
+        ):
+            with self.subTest(with_=with_):
+                self.assertRefused("INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", step(pin, with_))),
+                                   inline=inline, actions=row)
+
+    def test_inline_decider_row_binds_exactly_one_step(self) -> None:
+        one = "- name: Run it\n  run: ./x.sh\n"
+        self.assertPasses(_rg_wf(_rg_job("g", one)), inline={("g.yml", "g"): "Run it"})
+        two = one + "- name: Run it\n  run: ./y.sh\n  if: always()\n"
+        self.assertRefused("DECIDER_ROW_AMBIGUOUS", _rg_wf(_rg_job("g", two)), inline={("g.yml", "g"): "Run it"})
+
+    def test_script_actions_row_rules(self) -> None:
+        pin = "vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        wf = _rg_wf(_rg_job("g", f"- name: Run it\n  uses: {pin}\n  with:\n    run: ./x.sh\n"))
+        inline = {("g.yml", "g"): "Run it"}
+        ok = verify_manifest.ScriptAction(frozenset({"run"}), "fails on a failed script")
+        self.assertPasses(wf, inline=inline, actions={pin: ok})
+        self.assertRefused("SCRIPT_ACTION_ROW_INVALID", wf, inline=inline,
+                           actions={pin: verify_manifest.ScriptAction(frozenset({"run"}), " ")})
+        self.assertRefused("SCRIPT_ACTION_ROW_INVALID", wf, inline=inline, actions={pin: ok, "vendor/vm@v1": ok})
+        self.assertRefused(
+            "SCRIPT_ACTION_ROW_INVALID", wf, inline=inline,
+            actions={pin: ok, "vendor/other@3d3c42e5aac5ba805825da76410c181273ba90b1": ok},
+        )
+
+    def test_live_script_actions_admit_no_failure_swallowing_input(self) -> None:
+        self.assertTrue(verify_manifest.SCRIPT_ACTIONS)
+        for uses, row in verify_manifest.SCRIPT_ACTIONS.items():
+            with self.subTest(uses=uses):
+                self.assertRegex(uses, verify_manifest.PINNED_REMOTE_USES_RE)
+                self.assertIn("run", row.inputs)
+                self.assertNotIn("debug-on-error", row.inputs)
+                self.assertTrue(row.why.strip())
 
     def test_stale_inline_decider_row_refused(self) -> None:
         wf = _rg_wf(_rg_job("g", _RG_DECIDE + "- name: Run it\n  run: ./x.sh\n") + _rg_job("o", "- run: true\n"))
@@ -7927,6 +7990,32 @@ class TestRequiredJobHoldsDecider(_GuardFixture):
                 self.assertRefused("DECIDER_ROW_STALE", wf, inline=row)
         wf = _rg_wf(_rg_job("g", "- name: Run it\n  run: ./x.sh\n"))
         self.assertRefused("DECIDER_ROW_STALE", wf, inline={("g.yml", "g"): "Missing"})
+
+    def test_job_level_continue_on_error_refused_on_every_held_job(self) -> None:
+        mask_values = ("true", "false", "${{ matrix.experimental }}", "${{ github.event_name == 'push' }}")
+        prep = _rg_job("p", _RG_DECIDE)
+        self.assertPasses(_rg_wf(_rg_job("g", _RG_DECIDE)))
+        self.assertPasses(_rg_wf(prep + _rg_job("g", _RG_DECIDE, needs="[changes, p]")))
+        for value in mask_values:
+            coe = f"    continue-on-error: {value}\n"
+            with self.subTest(job="reporting", value=value):
+                self.assertRefused("JOB_MASKED", _rg_wf(_rg_job("g", _RG_DECIDE, extra=coe)))
+            with self.subTest(job="needed", value=value):
+                wf = _rg_wf(_rg_job("p", _RG_DECIDE, extra=coe) + _rg_job("g", _RG_DECIDE, needs="[changes, p]"))
+                self.assertRefused("JOB_MASKED", wf)
+            with self.subTest(job="inline", value=value):
+                wf = _rg_wf(_rg_job("g", "- name: Run it\n  run: ./x.sh\n", extra=coe))
+                self.assertRefused("JOB_MASKED", wf, inline={("g.yml", "g"): "Run it"})
+            with self.subTest(job="known-skip", value=value):
+                skipping = "- id: probe\n  run: echo available=false\n- run: ./x.sh\n  if: steps.probe.outputs.available == 'true'\n"
+                self.assertRefused("JOB_MASKED", _rg_wf(_rg_job("g", skipping, extra=coe)),
+                                   skips={("g.yml", "g"): "no runner"})
+        info = [{"context": "g", "disposition": "gate", "producer": "g.yml"},
+                {"context": "o", "disposition": "informational", "producer": "g.yml"}]
+        self.assertPasses(
+            _rg_wf(_rg_job("g", _RG_DECIDE) + _rg_job("o", "- run: ./x.sh\n", extra="    continue-on-error: true\n")),
+            entries=info,
+        )
 
     def test_known_skip_row(self) -> None:
         skipping = "- id: probe\n  run: echo available=false\n- run: ./x.sh\n  if: steps.probe.outputs.available == 'true'\n"
