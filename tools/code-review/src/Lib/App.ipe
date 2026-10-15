@@ -1,4 +1,4 @@
-module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
+module Lib.App exposing (Model, Msg(..), Page(..), decisionSaved, historyLoaded, initialModel, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -7,10 +7,12 @@ import Ipe.Task as Task
 import Ipe.Tea.Web.Cmd as Cmd
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch exposing (Epoch)
+import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure, RefuseFailure(..), SaveFailure(..))
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.ReviewKey exposing (ReviewKey(..))
+import Lib.ServerLog as ServerLog
 import Lib.Settings as Settings
 import Lib.Uid exposing (Uid)
 
@@ -28,16 +30,18 @@ type Page
 -- read slot, read by the queue card and the unit page alike, and `decision`
 -- its one decision slot, so a second read or decision in flight has no
 -- representation. `standing` is the unit page's read of where its shown
--- body stands in the review log. `decisionError` is why the last decision
--- was not saved, a typed case that never holds an error's text.
+-- body stands in the review log. `refuseError` is why the refusal draft
+-- stays open, and `decisionError` why the last decision was not saved: like
+-- every failure the Model holds, each is a typed case that never holds an
+-- error's text.
 type alias Model =
     { page : Page
     , queueState : Queue.QueueState
     , queueCursor : Index.Cursor
     , refusingUid : Maybe Uid
     , refuseDraft : String
-    , refuseError : Maybe Error
-    , decisionError : Maybe Queue.SaveFailure
+    , refuseError : Maybe RefuseFailure
+    , decisionError : Maybe SaveFailure
     , queueLoad : Queue.LoadTicket
     , history : Queue.HistoryState
     , historyLoad : Queue.LoadTicket
@@ -48,24 +52,54 @@ type alias Model =
     }
 
 
+-- A task's result reaches a `Msg` only through the callbacks below, which
+-- turn its failure into a typed case, so no `Msg` holds an error.
 type Msg
-    = PendingLoaded Queue.LoadTicket (Result Error Queue.QueuePage)
+    = PendingLoaded Queue.LoadTicket (Result LoadFailure Queue.QueuePage)
     | NextPage Index.Cursor
     | ApproveUnit Uid
     | RefuseStart Uid
     | RefuseDraft String
     | RefuseCancel
     | RefuseSubmit Uid
-    | DecisionSaved Uid Epoch (Result Error ( Index.Attested, Index.Written ))
+    | DecisionSaved Uid Epoch (Result SaveFailure ( Index.Attested, Index.Written ))
     | Navigated Page
     | ShowQueue
     | ShowHistory
-    | HistoryPageLoaded Queue.LoadTicket (Result Error Queue.HistoryPage)
+    | HistoryPageLoaded Queue.LoadTicket (Result LoadFailure Queue.HistoryPage)
     | HistoryNext LibDb.HistoryCursor
-    | SelectedViewLoaded Uid Epoch (Result Error (Maybe Index.UnitView))
-    | StandingLoaded Uid String Epoch (Result Error Queue.Standing)
+    | SelectedViewLoaded Uid Epoch (Result LoadFailure (Maybe Index.UnitView))
+    | StandingLoaded Uid String Epoch (Result LoadFailure Queue.Standing)
     | KeyDown String
     | SelectUnit Int
+
+
+-- The callbacks every page task settles through: the one place its error
+-- becomes a typed case. The error's own text goes to the server log only,
+-- through `ServerLog.logged` on the task.
+queueLoaded : Queue.LoadTicket -> Result Error Queue.QueuePage -> Msg
+queueLoaded load result =
+    PendingLoaded load (Failure.loaded result)
+
+
+historyLoaded : Queue.LoadTicket -> Result Error Queue.HistoryPage -> Msg
+historyLoaded load result =
+    HistoryPageLoaded load (Failure.loaded result)
+
+
+viewLoaded : Uid -> Epoch -> Result Error (Maybe Index.UnitView) -> Msg
+viewLoaded uid epoch result =
+    SelectedViewLoaded uid epoch (Failure.loaded result)
+
+
+standingLoaded : Uid -> String -> Epoch -> Result Error Queue.Standing -> Msg
+standingLoaded uid bodyHash epoch result =
+    StandingLoaded uid bodyHash epoch (Failure.loaded result)
+
+
+decisionSaved : Uid -> Epoch -> Result Error (Result DecideRefusal ( Index.Attested, Index.Written )) -> Msg
+decisionSaved uid epoch result =
+    DecisionSaved uid epoch (Failure.saved result)
 
 
 -- The session's first model. It loads nothing: the route entry that follows
@@ -171,7 +205,7 @@ loadQueue settings cursor model =
             Queue.nextTicket model.queueLoad
     in
     ( { model | queueCursor = cursor, queueLoad = load }
-    , Cmd.perform (Queue.loadPage settings cursor) (PendingLoaded load)
+    , Cmd.perform (ServerLog.logged "queue load failed" (Queue.loadPage settings cursor)) (queueLoaded load)
     )
 
 
@@ -207,7 +241,7 @@ loadHistory settings cursor model =
             Queue.nextTicket model.historyLoad
     in
     ( { model | history = HistoryLoading, historyLoad = load }
-    , Cmd.perform (Queue.loadHistoryPage settings cursor) (HistoryPageLoaded load)
+    , Cmd.perform (ServerLog.logged "history load failed" (Queue.loadHistoryPage settings cursor)) (historyLoaded load)
     )
 
 
@@ -264,8 +298,8 @@ update settings msg model =
                     in
                     ( { settled | decisionError = Nothing, queueLoad = load }, drainAndReload settings settled attested written load )
 
-                Err e ->
-                    ( { settled | decisionError = Just (Queue.saveFailureOf e) }, Cmd.none )
+                Err failure ->
+                    ( { settled | decisionError = Just failure }, Cmd.none )
 
         Navigated page ->
             enterPage settings page model
@@ -324,7 +358,7 @@ withStanding settings ( model, cmd ) =
                             Index.storedHash loaded.unit.attested
                     in
                     ( model
-                    , Cmd.batch [ cmd, Cmd.perform (Queue.loadStanding settings loaded.unit.uid bodyHash) (StandingLoaded loaded.unit.uid bodyHash settings.epoch) ]
+                    , Cmd.batch [ cmd, Cmd.perform (ServerLog.logged "standing load failed" (Queue.loadStanding settings loaded.unit.uid bodyHash)) (standingLoaded loaded.unit.uid bodyHash settings.epoch) ]
                     )
 
                 UnitLoading ->
@@ -393,7 +427,7 @@ loadViewCmd : Settings.AppSettings -> Maybe Uid -> Cmd Msg
 loadViewCmd settings next =
     case next of
         Just uid ->
-            Cmd.perform (Queue.loadUnitView settings.index uid) (SelectedViewLoaded uid settings.epoch)
+            Cmd.perform (ServerLog.logged "source load failed" (Queue.loadUnitView settings.index uid)) (viewLoaded uid settings.epoch)
 
         Nothing ->
             Cmd.none
@@ -444,8 +478,8 @@ keyActionMsg settings action model =
 submitRefuse : Settings.AppSettings -> Model -> Uid -> ( Model, Cmd Msg )
 submitRefuse settings model uid =
     case LibDb.parseReason model.refuseDraft of
-        Err e ->
-            ( { model | refuseError = Just e }, Cmd.none )
+        Err refused ->
+            ( { model | refuseError = Just (DraftRefused refused) }, Cmd.none )
 
         Ok reason ->
             case Queue.startDecision settings.epoch uid model.decision of
@@ -453,7 +487,7 @@ submitRefuse settings model uid =
                     saveDecision settings { model | refusingUid = Nothing, refuseDraft = "" } uid (Refused reason)
 
                 Nothing ->
-                    ( { model | refuseError = Just decisionBusy }, Cmd.none )
+                    ( { model | refuseError = Just DraftWhileSaving }, Cmd.none )
 
 
 clampIndex : Int -> Int -> Int
@@ -481,21 +515,16 @@ saveDecision settings model uid decision =
                 case Queue.startDecision settings.epoch uid model.decision of
                     Just saving ->
                         ( { model | decision = saving }
-                        , Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid settings.epoch)
+                        , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings model uid decision)) (decisionSaved uid settings.epoch)
                         )
 
                     Nothing ->
                         ( { model | decisionError = Just SaveInFlight }, Cmd.none )
 
 
--- The refusal panel's refusal of a decision submitted while another is
--- saving, worded as the queue banner words it.
-decisionBusy : Error
-decisionBusy =
-    Error.conflict (Queue.saveFailureText SaveInFlight)
-
-
-decisionTask : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+-- The decision on `uid`'s shown source, or the refusal of one off the shown
+-- queue page or on a source not shown, decided before anything is read.
+decisionTask : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
 decisionTask settings model uid decision =
     case List.find (\q -> q.unit.uid == uid) (queueList model) of
         Just _ ->
@@ -504,15 +533,15 @@ decisionTask settings model uid decision =
                     decideOn settings shown decision
 
                 Nothing ->
-                    Task.fail (Error.conflict "this unit's source is not shown, so it cannot be decided")
+                    Task.succeed (Err SourceNotShown)
 
         Nothing ->
-            Task.fail (Error.conflict "unit is no longer in the queue")
+            Task.succeed (Err NotQueued)
 
 
-decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
 decideOn settings shown decision =
-    LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide settings.key settings.index db shown decision)
+    LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide settings.key settings.index db shown decision |> Task.map Ok)
 
 
 -- The drain loop: the decision is already saved (DecisionSaved Ok), so the
@@ -523,4 +552,4 @@ decideOn settings shown decision =
 -- rebuilds the copy.
 drainAndReload : Settings.AppSettings -> Model -> Index.Attested -> Index.Written -> Queue.LoadTicket -> Cmd Msg
 drainAndReload settings model attested written load =
-    Cmd.perform (Queue.drainThenLoad settings attested written model.queueCursor) (PendingLoaded load)
+    Cmd.perform (ServerLog.logged "queue load failed" (Queue.drainThenLoad settings attested written model.queueCursor)) (queueLoaded load)

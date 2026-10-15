@@ -129,6 +129,7 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch as Epoch
+import Lib.Failure as Failure exposing (RefuseFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
@@ -211,7 +212,12 @@ expectErr t =
 -- expects to be valid that `parseReason` refuses fails the run.
 refuse : String -> Task.Task Error Decision
 refuse text =
-    Task.fromResult (Result.map Refused (LibDb.parseReason text))
+    case LibDb.parseReason text of
+        Ok reason ->
+            Task.succeed (Refused reason)
+
+        Err refused ->
+            Task.fail (Error.invalidInput (Failure.refuseFailureText (DraftRefused refused)))
 
 
 seedIndex : String -> String -> Task.Task Error ()

@@ -1,7 +1,7 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SaveFailure(..), SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, saveFailureOf, saveFailureText, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
-import Ipe.Db as Db exposing (DbFailure(..))
+import Ipe.Db as Db
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.List as List
@@ -11,6 +11,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
 import Lib.Epoch exposing (Epoch)
+import Lib.Failure as Failure exposing (LoadFailure)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
@@ -69,7 +70,7 @@ standingOf entry =
 type StandingRead
     = StandingUnread
     | StandingShown Uid String Standing
-    | StandingFailed Uid String Error
+    | StandingFailed Uid String LoadFailure
 
 
 -- The standing of `uid`'s body `bodyHash`, under one walk of the review log.
@@ -82,7 +83,7 @@ loadStanding settings uid bodyHash =
         Task.succeed (standingOf entry)
 
 
-standingArrived : Uid -> String -> Result Error Standing -> StandingRead
+standingArrived : Uid -> String -> Result LoadFailure Standing -> StandingRead
 standingArrived uid bodyHash result =
     case result of
         Ok standing ->
@@ -93,7 +94,7 @@ standingArrived uid bodyHash result =
 
 
 -- The read's result for `unit`'s current body, Nothing while none is held.
-standingFor : Index.Unit -> StandingRead -> Maybe (Result Error Standing)
+standingFor : Index.Unit -> StandingRead -> Maybe (Result LoadFailure Standing)
 standingFor unit read =
     case read of
         StandingUnread ->
@@ -415,7 +416,7 @@ resyncCeilingRefusal bound =
 type QueueState
     = Loading
     | Loaded QueuePage
-    | Failed Error
+    | Failed LoadFailure
 
 
 -- The number of one load of a page slot (the queue, a History page, a unit
@@ -478,10 +479,10 @@ type alias HistoryPage =
 type HistoryState
     = HistoryLoading
     | HistoryLoaded HistoryPage
-    | HistoryFailed Error
+    | HistoryFailed LoadFailure
 
 
-historyStateFromResult : Result Error HistoryPage -> HistoryState
+historyStateFromResult : Result LoadFailure HistoryPage -> HistoryState
 historyStateFromResult result =
     case result of
         Ok page ->
@@ -499,8 +500,8 @@ historyStatusText state =
         HistoryLoading ->
             Just "Loading history…"
 
-        HistoryFailed e ->
-            Just ("History load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        HistoryFailed failure ->
+            Just ("History load failed: " ++ Failure.loadFailureText failure)
 
         HistoryLoaded page ->
             if List.isEmpty page.rows then
@@ -635,122 +636,6 @@ decide key settings db shown decision =
                 Task.succeed ( attested, written )
 
 
--- Why a decision was not saved, as the model holds it. Each case is decided
--- from the failure's type, never its text, and renders a fixed text of this
--- tool's own, so no error's text reaches the model or the page. A decision
--- asked while another is saving, asked off the queue page, or asked on a
--- server with no signing key is refused before it starts. `SaveContended`:
--- a database the save reads or writes was busy (locked past its busy
--- timeout, or no connection free in time) — the index, read to re-prove the
--- shown source, or the review database, written with the decision; a busy
--- failure does not say which. `SaveFailed`: every other failure, the closed
--- default, whose cause the reviewer recovers from by reloading.
-type SaveFailure
-    = SaveInFlight
-    | SaveOffQueue
-    | SaveReadOnly
-    | SaveContended
-    | SaveFailed
-
-
--- The case of a failed save, from the `DbFailure` its error carries: only a
--- busy review database is `SaveContended`; an error carrying any other
--- detail, or none, is `SaveFailed`. The message is never read.
-saveFailureOf : Error -> SaveFailure
-saveFailureOf e =
-    case e of
-        Error _ info ->
-            case info.details of
-                Just (Database failure) ->
-                    saveFailureOfDb failure
-
-                Just (Custom _) ->
-                    SaveFailed
-
-                Just (FfiPanic _) ->
-                    SaveFailed
-
-                Just (HttpStatus _) ->
-                    SaveFailed
-
-                Just (JsonDecode _) ->
-                    SaveFailed
-
-                Just (TypeMismatch _) ->
-                    SaveFailed
-
-                Nothing ->
-                    SaveFailed
-
-
--- Every `DbFailure` has its own row, so a cause the driver layer adds is a
--- compile error here until it is given a case.
-saveFailureOfDb : DbFailure -> SaveFailure
-saveFailureOfDb failure =
-    case failure of
-        Busy ->
-            SaveContended
-
-        CannotOpen ->
-            SaveFailed
-
-        NotADatabase ->
-            SaveFailed
-
-        AccessDenied ->
-            SaveFailed
-
-        ReadOnlyDatabase ->
-            SaveFailed
-
-        InvalidStatement ->
-            SaveFailed
-
-        UniqueViolation ->
-            SaveFailed
-
-        ForeignKeyViolation ->
-            SaveFailed
-
-        NotNullViolation ->
-            SaveFailed
-
-        CheckViolation ->
-            SaveFailed
-
-        TriggerRaised ->
-            SaveFailed
-
-        OtherConstraint ->
-            SaveFailed
-
-        Unreachable ->
-            SaveFailed
-
-        OtherFailure ->
-            SaveFailed
-
-
--- The fixed text each case renders.
-saveFailureText : SaveFailure -> String
-saveFailureText failure =
-    case failure of
-        SaveInFlight ->
-            "a decision is still being saved; try again once it settles"
-
-        SaveOffQueue ->
-            "decisions are made on the queue page"
-
-        SaveReadOnly ->
-            Error.message ReviewKey.readOnlyError
-
-        SaveContended ->
-            "the index or review database is busy; try again"
-
-        SaveFailed ->
-            "the decision was not saved; reload the queue and decide again"
-
-
 -- The session's one source slot, shared by the selected queue card and the
 -- unit page: nothing selected, one read in flight
 -- (with the unit wanted once it returns, when the selection moved during the
@@ -768,7 +653,7 @@ type SelectedView
     | ViewLoading { uid : Uid, wanted : Maybe Uid, fresh : Bool, owner : Epoch }
     | ViewShown Index.UnitView
     | ViewMissing Uid
-    | ViewFailed Uid Error
+    | ViewFailed Uid LoadFailure
 
 
 -- The slot as process `epoch` sees it: a read owned by another epoch has no
@@ -870,7 +755,7 @@ clearView epoch state =
 -- another unit was selected meanwhile its read starts, otherwise the result
 -- settles the view. A response for any uid but the in-flight one, or from
 -- any process but the read's owner, changes nothing.
-viewArrived : Epoch -> Uid -> Result Error (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe Uid )
+viewArrived : Epoch -> Uid -> Result LoadFailure (Maybe Index.UnitView) -> SelectedView -> ( SelectedView, Maybe Uid )
 viewArrived epoch uid result state =
     case state of
         ViewLoading loading ->
@@ -919,7 +804,7 @@ wantedAfter inFlight fresh uid =
         Just uid
 
 
-settledView : Uid -> Result Error (Maybe Index.UnitView) -> SelectedView
+settledView : Uid -> Result LoadFailure (Maybe Index.UnitView) -> SelectedView
 settledView uid result =
     case result of
         Ok (Just loaded) ->
@@ -1002,8 +887,8 @@ selectedViewStatusText uid state =
         ViewMissing _ ->
             Just "This unit is no longer in the index."
 
-        ViewFailed _ e ->
-            Just ("Source load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        ViewFailed _ failure ->
+            Just ("Source load failed: " ++ Failure.loadFailureText failure)
 
 
 -- The unit page: loading, the unit with its source and links, no such unit,
@@ -1013,7 +898,7 @@ type UnitPageState
     = UnitLoading
     | UnitLoaded Index.UnitView
     | UnitNotFound
-    | UnitFailed Error
+    | UnitFailed LoadFailure
     | UnitIdRefused
 
 
@@ -1117,8 +1002,8 @@ unitPageStatusText state =
         UnitNotFound ->
             Just "No unit with this id is in the index."
 
-        UnitFailed e ->
-            Just ("Unit load failed: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        UnitFailed failure ->
+            Just ("Unit load failed: " ++ Failure.loadFailureText failure)
 
         UnitIdRefused ->
             Just "This address does not name a unit."
@@ -1181,7 +1066,7 @@ loadUnitView settings uid =
         Index.loadView conn settings.roots uid
 
 
-stateFromResult : Result Error QueuePage -> QueueState
+stateFromResult : Result LoadFailure QueuePage -> QueueState
 stateFromResult result =
     case result of
         Ok page ->
@@ -1199,8 +1084,8 @@ queueStatusText state =
         Loading ->
             Just "Loading queue…"
 
-        Failed e ->
-            Just ("Queue failed to load: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
+        Failed failure ->
+            Just ("Queue failed to load: " ++ Failure.loadFailureText failure)
 
         Loaded page ->
             if page.total == 0 then

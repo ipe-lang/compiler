@@ -20,6 +20,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Failure as Failure exposing (LoadFailure(..), ReasonRefusal(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
@@ -370,31 +371,36 @@ reasonShown reason =
 
 
 -- `parseReason` is the only way to a refusal: blank and over-long reasons
--- have no `Reason`, the bound itself is accepted, and a stored row whose
--- reason breaks the bound still decodes, its reason shown by length only.
+-- have no `Reason`, each refused as its typed case (an over-long one with
+-- its length and the bound), the bound itself is accepted, and a stored row
+-- whose reason breaks the bound still decodes, its reason shown by length
+-- only.
 reasonBounded : Db -> Task.Task Error Bool
 reasonBounded db =
     let
         atBound =
             String.repeat LibDb.reasonMaxChars "x"
 
-        rejected raw =
+        rejected raw expected =
             case LibDb.parseReason raw of
                 Ok _ ->
                     False
 
-                Err e ->
-                    Error.kind e == Error.kind (Error.invalidInput "")
+                Err refused ->
+                    refused == expected
+
+        overlong chars =
+            ReasonOverlong { chars = chars, limit = LibDb.reasonMaxChars }
     in
     do
         appendSigned db (rawRow "long-uid" "hL" "refuse" (Just (atBound ++ "x")))
         verify <- countingVerifier db
         storedRefused <- LibDb.findDecision verify db (uid "long-uid") "hL" |> Task.map (storedReasonShown "reason not shown: 501 characters, over the 500-character limit")
         Task.succeed
-            (rejected ""
-                && rejected "   "
-                && rejected (atBound ++ "x")
-                && rejected (atBound ++ atBound)
+            (rejected "" ReasonBlank
+                && rejected "   " ReasonBlank
+                && rejected (atBound ++ "x") (overlong (LibDb.reasonMaxChars + 1))
+                && rejected (atBound ++ atBound) (overlong (2 * LibDb.reasonMaxChars))
                 && (case LibDb.parseReason atBound of
                     Ok r ->
                         String.length (reasonShown r) == LibDb.reasonMaxChars
@@ -622,9 +628,6 @@ pageOf rows =
 historyStateTextsDistinct : Bool
 historyStateTextsDistinct =
     let
-        boom =
-            Error.unexpected "boom"
-
         row =
             { entry = Unverified { uid = uid "u-h", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Nothing }
 
@@ -636,7 +639,7 @@ historyStateTextsDistinct =
     in
     List.all identity
         [ Queue.historyStatusText HistoryLoading == Just "Loading history…"
-        , Queue.historyStatusText (HistoryFailed boom) == Just ("History load failed: " ++ Error.toString boom)
+        , Queue.historyStatusText (HistoryFailed LoadFailed) == Just ("History load failed: " ++ Failure.loadFailureText LoadFailed)
         , Queue.historyStatusText (HistoryLoaded { rows = [], at = HistoryStart, next = Nothing, log = log }) == Just "No reviews yet."
         , Queue.historyStatusText (HistoryLoaded { rows = [], at = later, next = Nothing, log = log }) == Just "No more reviews."
         , Queue.historyStatusText (HistoryLoaded { rows = [ row ], at = HistoryStart, next = Nothing, log = log }) == Nothing

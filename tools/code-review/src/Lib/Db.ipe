@@ -15,6 +15,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time as Time
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
+import Lib.Failure exposing (ReasonRefusal(..))
 import Lib.Index as Index exposing (Attested, ChainVerdict(..), DecidedPair, LogStatus(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
@@ -45,17 +46,17 @@ reasonMaxChars =
 
 
 -- The reviewer's text as a `Reason`, or why it is not one.
-parseReason : String -> Result Error Reason
+parseReason : String -> Result ReasonRefusal Reason
 parseReason raw =
     case storedReason raw of
         Valid reason ->
             Ok reason
 
         Blank _ ->
-            Err (Error.invalidInput "a refusal needs a reason")
+            Err ReasonBlank
 
         Overlong text ->
-            Err (Error.invalidInput ("a refusal reason is at most " ++ String.fromInt reasonMaxChars ++ " characters; this one has " ++ String.fromInt (String.length text)))
+            Err (ReasonOverlong { chars = String.length text, limit = reasonMaxChars })
 
 
 -- A refusal's reason as the review table holds it. A row written before the

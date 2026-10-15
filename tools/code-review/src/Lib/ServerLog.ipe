@@ -1,0 +1,21 @@
+module Lib.ServerLog exposing (logged)
+
+import Ipe.Error as Error
+import Ipe.Log as Log
+import Ipe.Task as Task
+
+
+-- `task`, with the detail of its failure written to the server log under
+-- `op` before the failure passes on unchanged: a page shows only the failure's
+-- typed case, so the log is where the operator reads the cause. The one place
+-- a page task's error becomes text. A log write that fails does not replace
+-- the failure it reports.
+logged : String -> Task.Task Error a -> Task.Task Error a
+logged op task =
+    Task.onError
+        (\e ->
+            Log.warnWith op [ Error.toString e ]
+                |> Task.onError (\_ -> Task.succeed ())
+                |> Task.andThen (\_ -> Task.fail e)
+        )
+        task

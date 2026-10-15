@@ -23,13 +23,14 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Epoch as Epoch exposing (Epoch)
+import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
@@ -607,7 +608,7 @@ dbSizeAndMissingDbIn base =
             |> Task.map Ok
             |> Task.onError (\e -> Task.succeed (Err e))
         removePageFixture indexDb reviewDb repo
-        Task.succeed (bytes > 0 && isFailed (Queue.stateFromResult result))
+        Task.succeed (bytes > 0 && isFailed (Queue.stateFromResult (Failure.loaded result)))
 
 
 isFailed : Queue.QueueState -> Bool
@@ -787,7 +788,7 @@ unitPageStatesDistinct : Task.Task Error Bool
 unitPageStatesDistinct =
     let
         pageTexts =
-            List.filterMap Queue.unitPageStatusText [ UnitLoading, UnitNotFound, UnitIdRefused, UnitFailed (Error.conflict "boom") ]
+            List.filterMap Queue.unitPageStatusText [ UnitLoading, UnitNotFound, UnitIdRefused, UnitFailed LoadFailed ]
 
         withheldViews =
             [ Stale Drifted
@@ -1024,9 +1025,6 @@ neverSeen old =
 queueStateTextsDistinct : Bool
 queueStateTextsDistinct =
     let
-        boom =
-            Error.unexpected "boom"
-
         empty =
             { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
 
@@ -1039,9 +1037,9 @@ queueStateTextsDistinct =
     List.all identity
         [ Queue.queueStatusText Loading == Just "Loading queue…"
         , Queue.queueStatusText (Loaded empty) == Just "No units queued."
-        , Queue.queueStatusText (Failed boom) == Just ("Queue failed to load: " ++ Error.toString boom)
+        , Queue.queueStatusText (Failed LoadFailed) == Just ("Queue failed to load: " ++ Failure.loadFailureText LoadFailed)
         , Queue.queueStatusText Loading /= Queue.queueStatusText (Loaded empty)
-        , Queue.queueStatusText (Failed boom) /= Queue.queueStatusText (Loaded empty)
+        , Queue.queueStatusText (Failed LoadFailed) /= Queue.queueStatusText (Loaded empty)
         , Queue.queueStatusText (Loaded drained) == Just "No units to review on this page."
         , Queue.queueStatusText (Loaded full) == Nothing
         , Queue.pageHeaderText full == "index.db · 4.0 KB · showing 1 of 41000"
@@ -1614,7 +1612,7 @@ reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
 reviewWritesGoThroughWriteTransaction =
     let
         others =
-            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
     in
     do
         cwd <- System.cwd ()
@@ -2584,39 +2582,100 @@ unboundUnitLeavesProgress =
             )
 
 
--- A failed save's case comes from the database failure its error carries,
--- never from its text: a busy review database is `SaveContended`; every
--- other failure, an error whose text names a busy database and the
--- moved-head conflict included, is `SaveFailed`. Each case renders its own
--- text, none holding a driver code. Red if a case is read from the message
--- or a busy database is not told apart.
+-- A failed save's case comes from the database failure or the kind its
+-- error carries, never from its text: a busy review database is
+-- `SaveContended`, a ceiling `SavePastLimit`; every other failure, an error
+-- whose text names a busy database and the moved-head conflict included, is
+-- `SaveFailed`. A refusal the tool decided is `SaveRefused` with its case.
+-- Each case renders its own text, none holding a driver code. Red if a case
+-- is read from the message or a busy database or a ceiling is not told
+-- apart.
 saveFailureTyped : Bool
 saveFailureTyped =
     let
         lockedText =
             "database is locked [5]"
 
+        refusals =
+            [ SourceGone, SourceChanged, SourcePastCeiling, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch ]
+
         cases =
-            [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+            [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SavePastLimit, SaveFailed ] ++ List.map SaveRefused refusals
 
         texts =
-            List.map Queue.saveFailureText cases
+            List.map Failure.saveFailureText cases
     in
-    Queue.saveFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText))
+    Failure.saveFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText))
         == SaveContended
-        && Queue.saveFailureOf (Error.withDetails (Database Db.OtherFailure) (Error.unexpected lockedText))
+        && Failure.saveFailureOf (Error.withDetails (Database Db.OtherFailure) (Error.unexpected lockedText))
         == SaveFailed
-        && Queue.saveFailureOf (Error.unexpected lockedText)
+        && Failure.saveFailureOf (Error.unexpected lockedText)
         == SaveFailed
-        && Queue.saveFailureOf (Error.withDetails (Custom "Busy") (Error.unavailable "busy"))
+        && Failure.saveFailureOf (Error.withDetails (Custom "Busy") (Error.unavailable "busy"))
         == SaveFailed
-        && Queue.saveFailureOf (Error.withDetails (Database Db.UniqueViolation) (Error.conflict lockedText))
+        && Failure.saveFailureOf (Error.withDetails (Database Db.UniqueViolation) (Error.conflict lockedText))
         == SaveFailed
-        && Queue.saveFailureOf LibDb.headMoved
+        && Failure.saveFailureOf LibDb.headMoved
         == SaveFailed
+        && Failure.saveFailureOf (Error.limitExceeded lockedText)
+        == SavePastLimit
+        && Failure.saveFailureOf (Error.withDetails (Custom "x") (Error.limitExceeded lockedText))
+        == SavePastLimit
+        && Failure.saveFailureOf (Error.unexpected "LimitExceeded: past a ceiling")
+        == SaveFailed
+        && savedCount (Ok (Err LogBroken))
+        == Err (SaveRefused LogBroken)
+        && savedCount (Err (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText)))
+        == Err SaveContended
+        && savedCount (Ok (Ok 1))
+        == Ok 1
         && Set.size (Set.fromList texts)
         == List.length cases
         && List.all (\text -> not (String.contains "[5]" text) && not (String.contains "Unexpected" text)) texts
+
+
+-- The mappings at one concrete result type, so each comparison is of one.
+savedCount : Result Error (Result DecideRefusal Int) -> Result SaveFailure Int
+savedCount result =
+    Failure.saved result
+
+
+loadedCount : Result Error Int -> Result LoadFailure Int
+loadedCount result =
+    Failure.loaded result
+
+
+-- A failed read's case comes from the same typed handles: a busy database
+-- is `LoadContended`, a ceiling `LoadPastLimit`, every other failure
+-- `LoadFailed`, and no case's text holds the error's. Red if a case is read
+-- from the message.
+loadFailureTyped : Bool
+loadFailureTyped =
+    let
+        marker =
+            "MARKER-/abs/root"
+
+        cases =
+            [ LoadContended, LoadPastLimit, LoadFailed ]
+
+        texts =
+            List.map Failure.loadFailureText cases
+    in
+    Failure.loadFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected marker))
+        == LoadContended
+        && Failure.loadFailureOf (Error.withDetails (Database Db.CannotOpen) (Error.unexpected marker))
+        == LoadFailed
+        && Failure.loadFailureOf (Error.limitExceeded marker)
+        == LoadPastLimit
+        && Failure.loadFailureOf (Error.unexpected ("Busy LimitExceeded " ++ marker))
+        == LoadFailed
+        && loadedCount (Ok 1)
+        == Ok 1
+        && loadedCount (Err (Error.unexpected marker))
+        == Err LoadFailed
+        && Set.size (Set.fromList texts)
+        == List.length cases
+        && List.all (\text -> not (String.contains "MARKER" text)) texts
 
 
 checks : Task.Task Error (List ( String, Bool ))
@@ -2650,6 +2709,7 @@ checks =
             , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles epoch )
             , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
             , Task.succeed ( "a failed save's case comes from its database failure, never its text", saveFailureTyped )
+            , Task.succeed ( "a failed read's case comes from its database failure or kind, never its text", loadFailureTyped )
             , Task.succeed ( "units under an unbound tag are said in the header and empty states", unboundNoticeTexts )
             , check "an unbound unit leaves the page, its total and its progress as they were" unboundUnitLeavesProgress
             ]
