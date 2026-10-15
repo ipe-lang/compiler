@@ -3371,8 +3371,8 @@ fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpL
     vec![
         HelpLine::Note(
             format!(
-                "give `{helper}` its own type annotation, e.g. `{helper} : ... -> Html \
-                 {var}`; it is used inside `{owner}`, whose type variable `{var}` it \
+                "give `{helper}` its own type annotation, generic over its own type \
+                 variable; it is used inside `{owner}`, whose type variable `{var}` it \
                  would otherwise borrow without being generic over it"
             )
             .into_boxed_str(),
@@ -3905,6 +3905,51 @@ mod code_family_tests {
                 c.as_str()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod foreign_type_variable_help_tests {
+    use super::{HelpLine, foreign_type_variable_help};
+
+    /// The fix the note names fits every shape: a non-message borrow
+    /// (`ident` under `f : a -> a`) is never told to return a UI carrier.
+    #[test]
+    fn note_names_the_binding_and_no_type_constructor() {
+        let lines = foreign_type_variable_help("ident", "f", "a");
+        let notes: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| match line {
+                HelpLine::Note(text) => Some(&**text),
+                HelpLine::DidYouMean(_)
+                | HelpLine::Hint(_)
+                | HelpLine::SecondarySpan { .. }
+                | HelpLine::MissingConstructor(_)
+                | HelpLine::Suggest(_)
+                | HelpLine::SeeExplain(_) => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "exactly one note: {lines:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.contains("`ident`") && n.contains("`f`") && n.contains("`a`")),
+            "the note names helper, owner, and variable: {notes:?}"
+        );
+        assert!(
+            notes.iter().all(|n| {
+                !["Html", "Element", "Attribute", "Event"]
+                    .iter()
+                    .any(|carrier| n.contains(carrier))
+            }),
+            "the note must not prescribe a UI carrier for a non-message borrow: {notes:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| matches!(line, HelpLine::SeeExplain("IPE-L0102"))),
+            "the help points at the explain page: {lines:?}"
+        );
     }
 }
 
