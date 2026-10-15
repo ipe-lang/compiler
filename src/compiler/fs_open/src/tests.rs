@@ -903,3 +903,68 @@ fn an_other_name_may_not_open_as_the_reserved_name() {
         );
     }
 }
+
+/// A char a volume folds or decomposes to several ASCII chars stands for that whole run.
+#[test]
+fn an_expanding_spelling_may_open_as_the_reserved_run() {
+    for (text, spelled) in [
+        ("_FO\u{DF}IL_", "_FOSSIL_"),
+        ("\u{1E9E}", "ss"),
+        (".\u{FB01}x", ".fix"),
+        ("\u{FB03}", "FFI"),
+        ("\u{FB06}", "st"),
+        ("\u{FB05}", "st"),
+        (".g\u{37E}", ".g;"),
+        ("\u{1FEF}", "`"),
+    ] {
+        assert!(
+            may_open_as(OsStr::new(text), spelled),
+            "{text:?} opens as {spelled:?}"
+        );
+    }
+    for (text, spelled) in [
+        ("\u{DF}", "s"),
+        ("\u{DF}", "sss"),
+        ("\u{FB03}", "ff"),
+        ("s\u{DF}", "ss"),
+        ("\u{37E}", ":"),
+    ] {
+        assert!(
+            !may_open_as(OsStr::new(text), spelled),
+            "{text:?} is not {spelled:?}"
+        );
+    }
+}
+
+/// Every all-ASCII spelling of every char, by case mapping or canonical
+/// decomposition, is the one spelling the reserved-name match accepts for it.
+#[test]
+fn every_ascii_spelling_of_a_char_may_open_as_it() {
+    let ascii = |run: String| run.is_ascii().then(|| run.to_ascii_lowercase());
+    for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+        let lower = || c.to_lowercase();
+        let upper = || c.to_uppercase();
+        let mut decomposed = String::new();
+        unicode_normalization::char::decompose_canonical(c, |d| decomposed.push(d));
+        let mut spellings: Vec<String> = [
+            lower().collect::<String>(),
+            upper().collect(),
+            lower().flat_map(char::to_uppercase).collect(),
+            upper().flat_map(char::to_lowercase).collect(),
+            decomposed,
+        ]
+        .into_iter()
+        .filter_map(ascii)
+        .collect();
+        spellings.sort();
+        spellings.dedup();
+        assert!(spellings.len() <= 1, "{c:?} has spellings {spellings:?}");
+        let text = c.to_string();
+        for spelled in &spellings {
+            assert!(
+                may_open_as(OsStr::new(&text), spelled),
+                "{c:?} opens as {spelled:?}"
+            );
+        }
+    }
+}

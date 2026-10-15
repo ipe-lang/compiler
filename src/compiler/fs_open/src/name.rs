@@ -2,6 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path};
+use std::str::Chars;
 
 use crate::OpenRefusal;
 
@@ -108,38 +109,65 @@ const fn platform_admits(_name: &OsStr) -> bool {
 /// Whether a case-insensitive volume may open `name` as the entry the ASCII name `spelled` names.
 ///
 /// The one rule for matching a name against a reserved ASCII name. A char of
-/// `name` stands for a char of `spelled` when the two are equal in ASCII case,
-/// or when its one-char lowercase or uppercase mapping is that char in the
-/// same case (`ſ` for `s`, `ı` for `i`, the Kelvin sign for `k`), as
-/// Unicode-folding and upcase-table volumes compare names. A code point HFS+
-/// ignores (zero-width joiners, direction marks, the byte-order mark) stands
-/// for nothing. The match over-reaches on a case-sensitive volume, which only
-/// treats a few more exotic names as reserved.
+/// `name` stands for the next run of `spelled` when one of its spellings is
+/// that run in any ASCII case: its lowercase, its uppercase, either mapping
+/// applied to the other's result, or its canonical decomposition. So `ſ`
+/// stands for `s`, `ı` for `i`, the Kelvin sign for `k`, `ß` for `ss` and `ﬁ`
+/// for `fi`, as Unicode-folding, upcase-table and normalizing volumes compare
+/// names. A code point HFS+ ignores (zero-width joiners, direction marks, the
+/// byte-order mark) stands for nothing. The match over-reaches on a
+/// case-sensitive volume, which only treats a few more exotic names as
+/// reserved.
 #[must_use]
 pub fn may_open_as(name: &OsStr, spelled: &str) -> bool {
     let text = name.to_string_lossy();
     let mut want = spelled.chars();
     for got in text.chars().filter(|got| !hfs_ignorable(*got)) {
-        match want.next() {
-            Some(want) if stands_for(got, want) => {}
-            Some(_) | None => return false,
+        match spelled_run(got, &want) {
+            Some(rest) => want = rest,
+            None => return false,
         }
     }
     want.next().is_none()
 }
 
-/// Whether a volume folding case may compare `got` equal to `want`.
-fn stands_for(got: char, want: char) -> bool {
-    got.eq_ignore_ascii_case(&want)
-        || one_char(got.to_lowercase()) == Some(want.to_ascii_lowercase())
-        || one_char(got.to_uppercase()) == Some(want.to_ascii_uppercase())
+/// What remains of `want` after the run a spelling of `got` stands for, if one does.
+///
+/// No char has two different all-ASCII spellings, so the first that matches is the only one.
+fn spelled_run<'w>(got: char, want: &Chars<'w>) -> Option<Chars<'w>> {
+    let lower = || got.to_lowercase();
+    let upper = || got.to_uppercase();
+    run_rest(lower(), want)
+        .or_else(|| run_rest(upper(), want))
+        .or_else(|| run_rest(lower().flat_map(char::to_uppercase), want))
+        .or_else(|| run_rest(upper().flat_map(char::to_lowercase), want))
+        .or_else(|| run_rest(canonical_ascii(got).into_iter(), want))
 }
 
-/// The sole char of a case mapping, or `None` when it maps to several.
-fn one_char(mut mapped: impl Iterator<Item = char>) -> Option<char> {
-    match (mapped.next(), mapped.next()) {
-        (Some(only), None) => Some(only),
-        (Some(_), Some(_)) | (None, _) => None,
+/// What remains of `want` after `run`, when `run` is a non-empty ASCII prefix of it in any case.
+fn run_rest<'w>(run: impl Iterator<Item = char>, want: &Chars<'w>) -> Option<Chars<'w>> {
+    let mut rest = want.clone();
+    let mut matched = false;
+    for c in run {
+        let next = rest.next()?;
+        if !(c.is_ascii() && c.eq_ignore_ascii_case(&next)) {
+            return None;
+        }
+        matched = true;
+    }
+    matched.then_some(rest)
+}
+
+/// The ASCII char a non-ASCII `c` canonically decomposes to, alone.
+///
+/// Every Unicode singleton whose canonical decomposition is ASCII; a test
+/// pins the list against the normalization tables.
+const fn canonical_ascii(c: char) -> Option<char> {
+    match c {
+        '\u{37E}' => Some(';'),
+        '\u{1FEF}' => Some('`'),
+        '\u{212A}' => Some('K'),
+        _ => None,
     }
 }
 

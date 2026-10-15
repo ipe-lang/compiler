@@ -85,9 +85,10 @@ macro_rules! closed_reserved_names {
     ($($doc:literal, $variant:ident, $dir:expr, $vcs:expr;)+) => {
         /// A directory name no output may sit under, whichever project it belongs to.
         ///
-        /// Matched per path component, ASCII case-insensitively (fail closed on a
-        /// case-insensitive filesystem). The set is closed: one row list declares
-        /// every variant, its directory name and its slot in `ALL`.
+        /// Matched per path component as a case-folding volume may open it
+        /// ([`ipe_fs_open::may_open_as`]), fail closed on a case-sensitive one.
+        /// The set is closed: one row list declares every variant, its
+        /// directory name and its slot in `ALL`.
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum ReservedName {
             $(
