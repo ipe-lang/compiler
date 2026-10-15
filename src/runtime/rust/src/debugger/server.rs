@@ -233,7 +233,8 @@ pub const OVERLAY_JS: &str = "\n\
           var d=JSON.parse(xhr.responseText);\n\
           if(d&&d.body){\n\
             var root=doc.byId('ipe-root');\n\
-            if(root){root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'?d.epoch:null;}\n\
+            var adopt=window.__ipeAdoptFullBody;\n\
+            if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;});\n\
           }\n\
         }catch(e){}\n\
       }\n\
@@ -353,9 +354,23 @@ mod tests {
             html.contains("data-ipe-dbg-reset"),
             "overlay must include the reset button"
         );
+        // A scrubbed render is a full render: it is applied, and its epoch
+        // adopted, only through the client's render-history gate, so a stale
+        // document or a render of another history never reaches the DOM.
         assert!(
-            html.contains("root.innerHTML=d.body;window.__ipeEpoch=typeof d.epoch==='string'"),
-            "a scrubbed render must replace the client's render epoch with its own"
+            html.contains(
+                "if(root&&typeof adopt==='function')adopt(d.epoch,function(){root.innerHTML=d.body;});"
+            ),
+            "a scrubbed render must pass the client's render-history gate"
+        );
+        assert!(
+            !html.contains("__ipeEpoch="),
+            "the overlay must never set the client's render epoch itself"
+        );
+        assert_eq!(
+            html.matches("innerHTML=").count(),
+            1,
+            "the overlay's one markup write is inside the gated apply"
         );
     }
 

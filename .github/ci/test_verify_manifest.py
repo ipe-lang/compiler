@@ -7230,5 +7230,50 @@ class TestModuleConstantsDefinedOnce(unittest.TestCase):
         self.assertEqual(twice, [])
 
 
+class TestBrowserE2eRunScriptParity(unittest.TestCase):
+    """`tools/scripts/browser-e2e/run.sh` serves every app the `browser-e2e`
+    job serves, on the port the job gives it, so a local run drives every
+    spec the job runs."""
+
+    REPO = os.path.dirname(os.path.dirname(HERE))
+
+    def _job(self) -> dict:
+        import yaml
+
+        with open(os.path.join(self.REPO, ".github", "workflows", "ci.yml")) as f:
+            workflow = yaml.safe_load(f)
+        return workflow["jobs"]["browser-e2e"]
+
+    def _run_sh(self) -> str:
+        with open(os.path.join(self.REPO, "tools", "scripts", "browser-e2e", "run.sh")) as f:
+            return f.read()
+
+    def test_run_sh_serves_every_job_app_on_its_port(self) -> None:
+        import re
+
+        job = self._job()
+        run_sh = self._run_sh()
+        ports = {k: str(v) for k, v in job["env"].items() if re.fullmatch(r"IPE_[A-Z_]+_PORT", k)}
+        self.assertGreaterEqual(len(ports), 4, ports)
+        for key, port in ports.items():
+            exported = re.search(r'^export %s="\$(\w+)"$' % key, run_sh, re.M)
+            self.assertIsNotNone(exported, "run.sh exports no %s" % key)
+            assert exported is not None
+            default = re.search(
+                r'^%s="\$\{\d+:-(\d+)\}"$' % exported.group(1), run_sh, re.M
+            )
+            self.assertIsNotNone(default, "run.sh gives %s no default port" % key)
+            assert default is not None
+            self.assertEqual(default.group(1), port, key)
+            served = re.search(r'^serve ([\w-]+) "\$%s"$' % exported.group(1), run_sh, re.M)
+            self.assertIsNotNone(served, "run.sh serves nothing on %s" % key)
+        built = set()
+        for step in job["steps"]:
+            built.update(re.findall(r"examples/shapes/web/([\w-]+)/package\.ipe", str(step.get("run", ""))))
+        served_apps = set(re.findall(r'^serve ([\w-]+) ', run_sh, re.M))
+        self.assertTrue(built, "the job builds no example app")
+        self.assertEqual(served_apps, built)
+
+
 if __name__ == "__main__":
     unittest.main()

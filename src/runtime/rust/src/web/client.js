@@ -1858,6 +1858,9 @@ __ipeDoc.on("click", function(ev) {
   while (el && __ipeNode.tag(el) !== "A") el = __ipeNode.parent(el);
   if (!el) return;
   if (!el.hasAttribute("ipe-nav")) return;
+  // A stale document applies no render, so its links are left to the
+  // browser, whose full load joins the live history.
+  if (__ipeStale) return;
   var href = el.getAttribute("href");
   if (!href || href.charAt(0) === "#") return;
   // External links are left to the browser.
@@ -1873,6 +1876,14 @@ __ipeDoc.on("click", function(ev) {
       return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
     })
     .then(function(res) {
+      // An answer of no history or of another one is not this document's to
+      // show: the browser loads the link itself, so the document it gets
+      // carries the policy that answer's styles need.
+      var next = __ipeEpochParts(res.epoch);
+      if (!next || next.inc !== __ipeBootInc) {
+        window.location.href = href;
+        return;
+      }
       __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
       if (__ipeStale) return;
       window.history.pushState({}, "", res.url);

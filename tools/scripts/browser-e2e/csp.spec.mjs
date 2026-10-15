@@ -14,7 +14,9 @@
  *   3. Render history — a full render of another history than the document's
  *      own (or one with no epoch) is never applied: the page reloads once, and
  *      a second such render within the reload window leaves the page as it is
- *      under the out-of-date banner, applying no later update.
+ *      under the out-of-date banner, applying no later update. A navigation
+ *      so answered, or one from a stale document, is a full browser load of
+ *      its target.
  *   4. Patched styles — a style block a patch inserts, and one whose text a
  *      patch replaces, both apply (examples/shapes/web/csp-styles).
  *
@@ -213,6 +215,45 @@ test("render history: a second foreign render shows the banner and applies nothi
   expect(await page.locator("#styled").count()).toBe(0);
   expect(await page.locator("#root").innerHTML()).toBe(before);
   await expect(banner).toContainText(STALE_BANNER);
+
+  // A navigation link of the stale document is left to the browser.
+  await page.evaluate(() => {
+    const a = document.createElement("a");
+    a.id = "e2e-nav";
+    a.setAttribute("ipe-nav", "");
+    a.href = "/e2e-stale-nav";
+    a.textContent = "go";
+    document.body.appendChild(a);
+  });
+  await page.locator("#e2e-nav").click();
+  await page.waitForURL(`${STYLES}/e2e-stale-nav`, { timeout: 15000 });
+});
+
+test("render history: a navigation answered without an epoch loads its target", async ({
+  page,
+}) => {
+  let navFetches = 0;
+  await page.route(
+    (url) => url.origin === STYLES && url.pathname === "/e2e-nav",
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      navFetches += 1;
+      return route.fulfill({
+        status: 200,
+        headers: { "content-type": "text/html", "x-ipe-web": "1" },
+        body: '<div id="e2e-foreign">foreign render</div>',
+      });
+    },
+  );
+  await serveRewritten(
+    page,
+    (html) => html.replace("</body>", '<a id="e2e-nav" ipe-nav href="/e2e-nav">go</a></body>'),
+    STYLES,
+  );
+  await page.locator("#e2e-nav").click();
+  await page.waitForURL(`${STYLES}/e2e-nav`, { timeout: 15000 });
+  expect(navFetches).toBe(1);
+  expect(await page.locator("#e2e-foreign").count()).toBe(0);
 });
 
 /** The applied style element whose rules spell `color`: its nonce and mark. */
