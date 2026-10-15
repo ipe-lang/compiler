@@ -125,6 +125,15 @@ length, never its text.
 History shows 100 reviews per page, newest first; each page reads only its own
 rows, through an index in that order.
 
+Each History entry names its unit by kind, qualified name, path and line. A
+decision records that name in its signed row, so an entry still names a unit
+the index no longer holds, chipped "no longer indexed"; a name is drawn only
+from a row whose signature verifies, never from an unverified one. A row
+signed before names were recorded, or a legacy row, is named from the index
+while it holds the unit and otherwise reads "unit no longer indexed (recorded
+before names were kept)"; a uid never stands in for a name. A unit whose kind,
+qualified name or path is longer than 2048 characters cannot be decided.
+
 The queue lists the index's current units minus the `(uid, body_hash)` pairs
 in its `reviewed` table, the app's copy of the review DB's decisions. A unit
 is listed because its current body has no decision, not because a change
@@ -190,6 +199,11 @@ differ) and the review time, so an edit to any of them outside the tool, a
 forged row, or a row copied from another review DB does not verify. Such a row
 is shown in the history as not counted, with the reason, and its unit stays
 in the queue.
+
+A row also signs the unit's recorded name (kind, qualified name, path, line)
+under a second layout; rows signed before names were recorded keep verifying
+under the first. A build older than the second layout reads its rows as not
+verifying, so it counts none of the decisions a newer build saved.
 
 `review_log` is append-only: deleting or updating a row is refused, and an
 insert that would replace a row changes nothing. Each row links to the one
