@@ -10574,10 +10574,11 @@ mod tests {
         }
     }
 
+    /// One looked-up cell: `None` when the column is absent from the row.
+    type FoundCell = Option<IpeMaybe<String>>;
+
     /// Both sides' `note` cells of a one-row join; `None` unless it is `Ok` with exactly one pair.
-    fn sole_join_notes(
-        read: IpeResult<String, Vec<JoinRow>>,
-    ) -> Option<(Option<IpeMaybe<String>>, Option<IpeMaybe<String>>)> {
+    fn sole_join_notes(read: IpeResult<String, Vec<JoinRow>>) -> Option<(FoundCell, FoundCell)> {
         match read {
             IpeResult::Ok(rows) if rows.len() == 1 => rows
                 .into_iter()
