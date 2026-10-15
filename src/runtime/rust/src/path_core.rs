@@ -238,7 +238,7 @@ impl PathLitText {
 /// Unix honours only `/`; Windows ALSO honours `\`, because Windows accepts
 /// either at a syscall — so both must count, or the un-honoured one smuggles a
 /// `..` past the traversal scan.
-pub(crate) const fn is_sep(c: u8, regime: Regime) -> bool {
+pub const fn is_sep(c: u8, regime: Regime) -> bool {
     c == b'/' || (regime.is_windows() && c == b'\\')
 }
 

@@ -46,6 +46,7 @@ use std::rc::Rc;
 use ipe_fs_open::{
     ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, OpenRefusal, RegularFile,
 };
+use ipe_path_core::{Regime, Volume, is_sep};
 
 use crate::covers::path_covers;
 use crate::mounts::CanonicalPath;
@@ -736,12 +737,24 @@ pub fn scan(
     home: &Home,
     limits: ConfigLimits,
 ) -> Result<(), ConfigRefusal> {
+    scan_under(roots, grants, home, limits, ipe_path_core::HOST)
+}
+
+/// [`scan`], reading every value under `regime`.
+fn scan_under(
+    roots: &ConfigRoots<'_>,
+    grants: &Grants<'_>,
+    home: &Home,
+    limits: ConfigLimits,
+    regime: Regime,
+) -> Result<(), ConfigRefusal> {
     let kind = roots.kind();
     let mut run = Scan {
         kind,
         grants,
         home,
         limits,
+        regime,
         marks: marks(grants, kind)?,
         files: 0,
         bytes: 0,
@@ -874,6 +887,8 @@ struct FileCtx {
     scope: Scope,
     /// Whether the tool always reads it.
     reading: Reading,
+    /// The path regime its values are read under.
+    regime: Regime,
 }
 
 /// How a value is judged.
@@ -984,8 +999,8 @@ impl<'v> Line<'v> {
 }
 
 impl Runner {
-    /// The command line the tool runs for `value`.
-    fn consume(self, value: &str) -> Line<'_> {
+    /// The command line the tool runs for `value`, read under `regime`.
+    fn consume(self, value: &str, regime: Regime) -> Line<'_> {
         let strip = |prefix: &str| {
             value
                 .strip_prefix(prefix)
@@ -995,7 +1010,7 @@ impl Runner {
             Self::None => Line::of(Cow::Borrowed(value)),
             Self::Bang => strip("!").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
             Self::Python => strip("python:").unwrap_or_else(|| Line::of(Cow::Borrowed(value))),
-            Self::GitHelper if is_git_absolute(value) => Line::of(Cow::Borrowed(value)),
+            Self::GitHelper if is_git_absolute(value, regime) => Line::of(Cow::Borrowed(value)),
             Self::GitHelper => strip("!")
                 .unwrap_or_else(|| Line::of(Cow::Owned(format!("git-credential-{value}")))),
             // Git splits an alias into words and reads its own options
@@ -1011,15 +1026,10 @@ impl Runner {
     }
 }
 
-/// Git's `is_absolute_path`: a leading `/`, and on Windows a leading `\` or a drive prefix.
-fn is_git_absolute(value: &str) -> bool {
-    let mut chars = value.chars();
-    match (chars.next(), chars.next()) {
-        (Some('/'), _) => true,
-        (Some('\\'), _) => cfg!(windows),
-        (Some(letter), Some(':')) => cfg!(windows) && letter.is_ascii_alphabetic(),
-        (Some(_) | None, _) => false,
-    }
+/// Git's `is_absolute_path` under `regime`: a leading separator, or under Windows an ASCII-letter drive prefix.
+fn is_git_absolute(value: &str, regime: Regime) -> bool {
+    value.bytes().next().is_some_and(|c| is_sep(c, regime))
+        || matches!(Volume::parse(value, regime), Volume::Drive(letter) if letter.is_ascii_alphabetic())
 }
 
 /// What becomes of a value.
@@ -1478,6 +1488,8 @@ struct Scan<'s> {
     home: &'s Home,
     /// The ceilings.
     limits: ConfigLimits,
+    /// The path regime every value is read under.
+    regime: Regime,
     /// The grants and carves, identified.
     marks: Vec<Mark>,
     /// Files read so far.
@@ -2156,6 +2168,7 @@ impl Scan<'_> {
             syntax: item.syntax,
             scope: item.scope,
             reading: item.reading,
+            regime: self.regime,
         });
         let malformed = |line| ConfigFault::Malformed { line };
         match ctx.syntax {
@@ -2617,7 +2630,10 @@ impl Scan<'_> {
                     && value.bytes().all(|b| {
                         b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-')
                     });
-                if !bare || (cfg!(windows) && self.worktree_runs(value).map_err(Stop::Refused)?) {
+                if !bare
+                    || (ctx.regime.is_windows()
+                        && self.worktree_runs(value).map_err(Stop::Refused)?)
+                {
                     return Err(unproven(Unprovable::ToolPath));
                 }
                 value_checks(value).map_err(unproven)?;
@@ -2677,9 +2693,9 @@ impl Scan<'_> {
             Syntax::Toml => Tilde::Verbatim,
         };
         let mut words = Words::default();
-        match runner.consume(value) {
+        match runner.consume(value, ctx.regime) {
             Line::Shell(text) => words
-                .push_split(&text, Position::Program, tilde)
+                .push_split(&text, Position::Program, tilde, ctx.regime)
                 .map_err(unproven)?,
             // No word's leading `~` is expanded: each is judged both ways.
             Line::Split {
@@ -2687,7 +2703,7 @@ impl Scan<'_> {
                 command_prefix,
             } => {
                 words
-                    .push_split(&text, Position::Program, Tilde::Verbatim)
+                    .push_split(&text, Position::Program, Tilde::Verbatim, ctx.regime)
                     .map_err(unproven)?;
                 words.prefix_command(command_prefix);
             }
@@ -2695,7 +2711,7 @@ impl Scan<'_> {
             // splitting it without a shell; a leading `~` is judged both ways.
             Line::Exec(text) => {
                 words
-                    .push_split(&text, Position::Program, Tilde::Verbatim)
+                    .push_split(&text, Position::Program, Tilde::Verbatim, ctx.regime)
                     .map_err(unproven)?;
                 words
                     .push_forms(text.into_owned(), Position::Program)
@@ -2763,7 +2779,7 @@ impl Scan<'_> {
             }
             if text.contains(is_c_space) {
                 words
-                    .push_split(text, Position::Program, Tilde::Shell)
+                    .push_split(text, Position::Program, Tilde::Shell, ctx.regime)
                     .map_err(unproven)?;
             }
             let shaped = is_path_shaped(text);
@@ -2959,13 +2975,19 @@ impl Words {
         Ok(())
     }
 
-    /// Push the shell words of `text`, the first at `first` and the rest as arguments.
+    /// Push the shell words of `text` under `regime`, the first at `first` and the rest as arguments.
     ///
     /// A word whose leading `~` was quoted or escaped arrives as `./~...`
     /// ([`shell_words`]); one whose leading `~` was not is read as the shell
     /// reads it under [`Tilde::Shell`], and both ways under [`Tilde::Verbatim`].
-    fn push_split(&mut self, text: &str, first: Position, tilde: Tilde) -> Result<(), Unprovable> {
-        for (index, word) in shell_words(text).into_iter().enumerate().rev() {
+    fn push_split(
+        &mut self,
+        text: &str,
+        first: Position,
+        tilde: Tilde,
+        regime: Regime,
+    ) -> Result<(), Unprovable> {
+        for (index, word) in shell_words(text, regime).into_iter().enumerate().rev() {
             let position = if index == 0 {
                 first
             } else {
@@ -3130,9 +3152,9 @@ fn is_network_url(value: &str, scp: bool) -> bool {
         && host_ok(head)
 }
 
-/// A path separator of the host.
-const fn is_separator(c: char) -> bool {
-    c == '/' || (cfg!(windows) && c == '\\')
+/// A path separator under `regime`.
+fn is_separator(c: char, regime: Regime) -> bool {
+    u8::try_from(c).is_ok_and(|b| is_sep(b, regime))
 }
 
 /// A character the shell expands a word at: a glob character or a brace.
@@ -3201,7 +3223,7 @@ fn is_path_shaped(word: &str) -> bool {
 /// (`'~/x'`, `"~/x"`, `\~/x`, `''~/x`), or whose prefix holds a quote or an
 /// escape (`~"/x"`, `~\/x`, `~''/x`), names the relative path `~/x`, so it
 /// comes back as `./~/x`.
-fn shell_words(value: &str) -> Vec<String> {
+fn shell_words(value: &str, regime: Regime) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
@@ -3253,7 +3275,7 @@ fn shell_words(value: &str) -> Vec<String> {
                 if !in_word {
                     home = other == '~';
                     in_prefix = home;
-                } else if in_prefix && is_separator(other) {
+                } else if in_prefix && is_separator(other, regime) {
                     in_prefix = false;
                 }
                 in_word = true;
@@ -3958,6 +3980,16 @@ mod tests {
         roots: &ConfigRoots<'_>,
         limits: ConfigLimits,
     ) -> Result<(), ConfigRefusal> {
+        scan_with_under(fixture, roots, limits, ipe_path_core::HOST)
+    }
+
+    /// [`scan_with`] with every value read under `regime`.
+    fn scan_with_under(
+        fixture: &Fixture,
+        roots: &ConfigRoots<'_>,
+        limits: ConfigLimits,
+        regime: Regime,
+    ) -> Result<(), ConfigRefusal> {
         let tree = canonical(&fixture.tree);
         let other = canonical(&fixture.other);
         let carves =
@@ -3965,7 +3997,7 @@ mod tests {
         let [git, hg, jj, darcs] = &carves;
         let grants = Grants::new(&tree, &[&other]).with_carves(&[git, hg, jj, darcs]);
         let home = Home::known(canonical(&fixture.home));
-        scan(roots, &grants, &home, limits)
+        scan_under(roots, &grants, &home, limits, regime)
     }
 
     fn scan_git_at(fixture: &Fixture, gitdir: &Path) -> Result<(), ConfigRefusal> {
@@ -4852,17 +4884,67 @@ mod tests {
         assert!(!runs_as(".hg", "evil"));
     }
 
-    #[cfg(windows)]
+    /// [`scan_hg`] with every value read under `regime`.
+    fn scan_hg_under(f: &Fixture, text: &str, regime: Regime) -> Result<(), ConfigRefusal> {
+        let dot_hg = f.tree.join(".hg");
+        write(&dot_hg.join("hgrc"), text);
+        let roots = ConfigRoots::Mercurial {
+            dot_hg: &dot_hg,
+            shared: None,
+        };
+        scan_with_under(f, &roots, ConfigLimits::DEFAULT, regime)
+    }
+
     #[test]
-    fn hg_key_tool_in_worktree_refused_on_windows() {
+    fn hg_key_tool_in_worktree_refused_under_windows() {
         let f = fixture("hgkeywin");
         write(&f.tree.join("evil.exe"), "");
-        let result = scan_hg(&f, "[merge-tools]\nevil.priority = 1\n");
+        let result = scan_hg_under(&f, "[merge-tools]\nevil.priority = 1\n", Regime::Windows);
         assert_eq!(
             unprovable(&result),
             Some(Unprovable::ToolPath),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn hg_key_tool_in_worktree_admitted_under_unix() {
+        let f = fixture("hgkeyunix");
+        write(&f.tree.join("evil.exe"), "");
+        let result = scan_hg_under(&f, "[merge-tools]\nevil.priority = 1\n", Regime::Unix);
+        assert_eq!(result, Ok(()), "{result:?}");
+    }
+
+    #[test]
+    fn git_absolute_under_windows_admits_drive_and_backslash() {
+        for value in ["/x", "\\x", "\\\\server\\share\\x", "C:\\x", "c:/x", "Z:x"] {
+            assert!(is_git_absolute(value, Regime::Windows), "{value:?}");
+        }
+        for value in ["", "x", "x/y", "1:x", "\u{e9}:x", ":x", "~/x"] {
+            assert!(!is_git_absolute(value, Regime::Windows), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn git_absolute_under_unix_refuses_drive_and_backslash() {
+        assert!(is_git_absolute("/x", Regime::Unix));
+        for value in ["\\x", "\\\\server\\share\\x", "C:\\x", "c:/x", "Z:x", "x"] {
+            assert!(!is_git_absolute(value, Regime::Unix), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn separator_backslash_only_under_windows() {
+        assert!(is_separator('/', Regime::Windows));
+        assert!(is_separator('\\', Regime::Windows));
+        assert!(!is_separator(':', Regime::Windows));
+        assert!(!is_separator('\u{5c5c}', Regime::Windows));
+    }
+
+    #[test]
+    fn separator_slash_only_under_unix() {
+        assert!(is_separator('/', Regime::Unix));
+        assert!(!is_separator('\\', Regime::Unix));
     }
 
     #[test]
