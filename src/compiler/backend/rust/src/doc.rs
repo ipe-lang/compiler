@@ -423,6 +423,12 @@ pub enum LeafRefusal {
         /// The byte offset of the `"`, `'` or `#`.
         at: usize,
     },
+    /// A `#` glued to a `"` or another `#` outside a raw literal: a reserved
+    /// guard (`#"…"#`, `##`), which Rust 2024 rejects.
+    ReservedGuard {
+        /// The byte offset of the first `#`.
+        at: usize,
+    },
 }
 
 impl LeafRefusal {
@@ -434,6 +440,7 @@ impl LeafRefusal {
             Self::Unterminated { .. } => "unterminated literal",
             Self::TrailingSlash { .. } => "trailing slash",
             Self::ReservedPrefix { .. } => "reserved prefix",
+            Self::ReservedGuard { .. } => "reserved guard",
         }
     }
 
@@ -444,7 +451,8 @@ impl LeafRefusal {
             | Self::BlockComment { at }
             | Self::Unterminated { at }
             | Self::TrailingSlash { at }
-            | Self::ReservedPrefix { at } => at,
+            | Self::ReservedPrefix { at }
+            | Self::ReservedGuard { at } => at,
         }
     }
 }
@@ -469,7 +477,7 @@ impl Leaf {
     /// # Errors
     ///
     /// The first comment opener outside a literal, unterminated literal,
-    /// trailing `/`, or reserved prefix.
+    /// trailing `/`, reserved prefix, or reserved guard.
     pub const fn lex(s: &str) -> Result<(), LeafRefusal> {
         let all = s.as_bytes();
         let mut rest = all;
@@ -484,6 +492,7 @@ impl Leaf {
                 (b'/', [b'/', ..]) => return Err(LeafRefusal::LineComment { at }),
                 (b'/', [b'*', ..]) => return Err(LeafRefusal::BlockComment { at }),
                 (b'/', []) => return Err(LeafRefusal::TrailingSlash { at }),
+                (b'#', [b'#' | b'"', ..]) => return Err(LeafRefusal::ReservedGuard { at }),
                 (b'"', _) => (skip_quoted(tail), Word::None),
                 (b'\'', _) => (skip_char_or_lifetime(tail), Word::None),
                 (b'r', _) if !after_ident => (skip_raw(tail), Word::R),
@@ -1275,7 +1284,7 @@ mod tests {
     use crate::render::{RenderConfig, render, render_code, render_seeded};
 
     /// The texts a leaf refuses, each with its refusal.
-    const REFUSED: [(&str, LeafRefusal); 15] = [
+    const REFUSED: [(&str, LeafRefusal); 18] = [
         ("x // c", LeafRefusal::LineComment { at: 2 }),
         ("//", LeafRefusal::LineComment { at: 0 }),
         ("\"a\" // \"b\"", LeafRefusal::LineComment { at: 4 }),
@@ -1291,6 +1300,9 @@ mod tests {
         ("x\"s\"", LeafRefusal::ReservedPrefix { at: 1 }),
         ("k#x", LeafRefusal::ReservedPrefix { at: 1 }),
         ("ab'c'", LeafRefusal::ReservedPrefix { at: 2 }),
+        ("#\"x\"#", LeafRefusal::ReservedGuard { at: 0 }),
+        ("a ## b", LeafRefusal::ReservedGuard { at: 2 }),
+        ("\"#\"#\"x\"", LeafRefusal::ReservedGuard { at: 3 }),
     ];
 
     /// Code-only texts, comment-shaped bytes inside literals among them.
@@ -1361,6 +1373,26 @@ mod tests {
         assert_refused("cb\"x\"", LeafRefusal::ReservedPrefix { at: 2 });
         assert_refused("c'x'", LeafRefusal::ReservedPrefix { at: 1 });
         assert_refused("b#x", LeafRefusal::ReservedPrefix { at: 1 });
+    }
+
+    /// A `#` glued to a `"` or a `#` outside a raw literal is a reserved guard,
+    /// a cargo error in Rust 2024; a raw literal's own hashes, a raw identifier,
+    /// a `#` inside a literal, and an attribute stay legal.
+    #[test]
+    fn leaf_refuses_reserved_guard() {
+        refused_of(|r| matches!(r, LeafRefusal::ReservedGuard { .. }));
+        assert_refused("r##x", LeafRefusal::ReservedGuard { at: 1 });
+        for s in [
+            "r##\"a\"#\"##",
+            "r#\"x\"##",
+            "\"#\".to_string()",
+            "#[derive(Clone)]",
+            "#![allow(x)]",
+            "x.r#type",
+            "# \"x\"",
+        ] {
+            assert_eq!(Leaf::lex(s), Ok(()), "{s:?}");
+        }
     }
 
     /// The literal prefixes and the raw identifier stay legal: the refusal above
