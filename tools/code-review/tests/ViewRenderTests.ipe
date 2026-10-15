@@ -568,6 +568,7 @@ decisionErrorFixedText loaded =
         , SaveRefused SourceGone
         , SaveRefused SourceChanged
         , SaveRefused SourcePastCeiling
+        , SaveRefused NamePastCeiling
         , SaveRefused NotQueued
         , SaveRefused SourceNotShown
         , SaveRefused LogBroken

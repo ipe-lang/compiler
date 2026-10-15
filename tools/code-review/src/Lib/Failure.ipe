@@ -26,13 +26,15 @@ type LoadFailure
 
 -- A decision this tool refuses itself, decided before anything is written:
 -- the shown unit is gone from the index, its source changed or passed the
--- line ceiling since it was shown, it is not on the shown queue page or its
--- source is not shown, or the review log does not verify under the signing
--- key (broken, or signed by another key).
+-- line ceiling since it was shown, one of its name parts passes the
+-- recorded-name ceiling, it is not on the shown queue page or its source is
+-- not shown, or the review log does not verify under the signing key
+-- (broken, or signed by another key).
 type DecideRefusal
     = SourceGone
     | SourceChanged
     | SourcePastCeiling
+    | NamePastCeiling
     | NotQueued
     | SourceNotShown
     | LogBroken
@@ -269,6 +271,9 @@ decideRefusalText refusal =
 
         SourcePastCeiling ->
             "the unit's source is past the line ceiling, so it cannot be decided"
+
+        NamePastCeiling ->
+            "the unit's name or path is past the recorded-name ceiling, so it cannot be decided"
 
         NotQueued ->
             "the unit is no longer in the queue"

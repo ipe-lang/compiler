@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, lengthPrefixed, liveUnits, loadView, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -6,7 +6,6 @@ import Ipe.Crypto as Crypto
 import Ipe.Db
 import Ipe.Db.Decode
 import Ipe.Db.Sql as Sql
-import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Error as Error
 import Ipe.File as File
 import Ipe.List as List
@@ -26,6 +25,7 @@ import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.SetDigest as SetDigest exposing (SetDigest)
 import Lib.Settings as Settings exposing (DbRole(..), IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
+import Lib.UnitName as UnitName exposing (RecordedName, UnitName)
 
 
 -- One ipe-index unit's metadata, never its source: a queue page lists these
@@ -133,6 +133,35 @@ queryUnit conn roots uid =
             unitByUid roots uid
     in
     Db.queryDecode conn sql params rowDecoder
+
+
+-- The units of `uids` the index still holds under a bound tag, in one query
+-- over `unitByUid`'s columns with every uid bound: what a History page
+-- labels live. The caller passes one page's uids, at most
+-- `PageSize.history`. A row that does not decode fails the read, never
+-- reads as a unit gone; a unit under an unbound tag is absent, as on the
+-- unit page.
+liveUnits : Db.Db -> RootMap -> List Uid -> Task.Task Error (List Unit)
+liveUnits conn roots uids =
+    if List.isEmpty uids then
+        Task.succeed []
+
+    else
+        let
+            bound =
+                boundTags roots
+        in
+        Db.queryDecode conn
+            ("SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql)
+            (List.map Uid.toSql uids ++ bound.params)
+            rowDecoder
+            |> Task.map (List.map withRow)
+
+
+-- A live unit's name, the one bridge from a `Unit` to a `UnitName`.
+unitName : Unit -> UnitName
+unitName unit =
+    UnitName.live unit.uid { kind = unit.kind, qualified = unit.qualified, path = unit.path, line = unit.lineStart }
 
 
 -- Jump links come only from a shown view; a withheld view links nothing and
@@ -1453,41 +1482,6 @@ rebuildReviewed settings refill =
             )
 
 
--- The ipe-index `units` table modelled as a typed store over its explicit
--- columns, so a lookup runs through `Store.findBy` with a bound value rather
--- than a hand-written `WHERE` fragment. The store is read-only here — only
--- queried, never migrated — so its column set need only cover the columns a
--- query reads.
-unitsStore : Result Error (Store Store.Row)
-unitsStore =
-    Store.fromColumns "units"
-        [ Store.textColumn "uid"
-        , Store.textColumn "qualified"
-        ]
-        |> Result.map Store.public
-
-
--- The unit's qualified name from the units table, rendered for display, if
--- the unit still exists (a decided unit whose source was deleted leaves a
--- review row but no name). The `uid` value is bound as a parameter by
--- `Store.findBy`, never interpolated into SQL text.
-nameFor : Db.Db -> Uid -> Task.Task Error (Maybe SafeText)
-nameFor conn uid =
-    case unitsStore of
-        Err e ->
-            Task.fail e
-
-        Ok store ->
-            do
-                rows <- Store.findBy conn store "uid" (Uid.toSql uid)
-                case List.head rows of
-                    Just row ->
-                        Task.succeed (Maybe.map SafeText.renderForeign (Result.toMaybe (Store.readText "qualified" row)))
-
-                    Nothing ->
-                        Task.succeed Nothing
-
-
 -- The one verification of a unit's source. The stored hash is parsed first,
 -- so an unknown scheme refuses before any read; then the stored path is
 -- resolved, a span past the line ceiling is withheld before any read, a file
@@ -1714,15 +1708,15 @@ sourceCeiling =
 withRow : RowUnit -> Unit
 withRow row =
     { uid = row.uid
-    , path = SafeText.renderForeign row.path
-    , name = SafeText.renderForeign row.name
-    , qualified = SafeText.renderForeign row.qualified
-    , kind = SafeText.renderForeign row.kind
+    , path = UnitName.render row.path
+    , name = UnitName.render row.name
+    , qualified = UnitName.render row.qualified
+    , kind = UnitName.render row.kind
     , lang = langOf row.lang
     , lineStart = row.lineStart
     , lineEnd = row.lineEnd
-    , facing = SafeText.renderForeign row.facing
-    , purpose = Maybe.map SafeText.renderForeign row.purpose
+    , facing = UnitName.render row.facing
+    , purpose = Maybe.map UnitName.render row.purpose
     , attested = parseAttested row.bodyHash
     , updatedSha = row.updatedSha
     }
@@ -1844,10 +1838,12 @@ shownHash shown =
 
 
 -- The one hash a decision or drain may record: the hash of the bytes that
--- were shown, re-proved against the current index row and file. Opaque:
--- built only by `reverify`.
+-- were shown, re-proved against the current index row and file, with the
+-- unit's name as that re-read row holds it, the name the decision signs.
+-- Opaque: built only by `reverify`, so no decision without a name is
+-- representable.
 type Attested
-    = Attested { uid : Uid, hash : String }
+    = Attested { uid : Uid, hash : String, name : RecordedName }
 
 
 attestedUid : Attested -> Uid
@@ -1864,12 +1860,21 @@ attestedHash attested =
             a.hash
 
 
+attestedName : Attested -> RecordedName
+attestedName attested =
+    case attested of
+        Attested a ->
+            a.name
+
+
 -- Re-proves a shown source at decision time: the unit's row is re-read from
 -- the index and its file re-hashed through `viewOf`, and the fresh view must
 -- be shown under the same hash. A unit gone from the index, a source that
 -- changed or became unreadable since it was shown, or one now past a view
 -- ceiling is a `DecideRefusal` value, decided from reads alone, so no
--- decision is recorded against bytes the reviewer did not see. The index and
+-- decision is recorded against bytes the reviewer did not see; so is a
+-- re-read name `UnitName.record` refuses (`NamePastCeiling`), before the
+-- write transaction opens. The index and
 -- root are the one `settings` value resolved at startup, the tree the page
 -- showed the unit from.
 reverify : IndexSettings -> ShownSource -> Task.Task Error (Result DecideRefusal Attested)
@@ -1882,20 +1887,33 @@ reverify settings shown =
                 case List.head rows of
                     Just row ->
                         viewOf conn settings.roots row
-                            |> Task.map (confirmShown s.uid s.hash)
+                            |> Task.map (confirmShown s.uid s.hash (recordedNameOf row))
 
                     Nothing ->
                         Task.succeed (Err SourceGone)
 
 
+-- The name a decision on `row` signs: its kind, qualified name, path and
+-- start line as the re-read row holds them.
+recordedNameOf : RowUnit -> Result UnitName.NameRefusal RecordedName
+recordedNameOf row =
+    UnitName.record { kind = row.kind, qualified = row.qualified, path = row.path, line = row.lineStart }
+
+
 -- A shown unit that grew past a view ceiling before its decision is
--- `SourcePastCeiling`; any other view but the one shown is `SourceChanged`.
-confirmShown : Uid -> String -> SourceView -> Result DecideRefusal Attested
-confirmShown uid hash fresh =
+-- `SourcePastCeiling`; any other view but the one shown is `SourceChanged`;
+-- the one shown whose name cannot be recorded is `NamePastCeiling`.
+confirmShown : Uid -> String -> Result UnitName.NameRefusal RecordedName -> SourceView -> Result DecideRefusal Attested
+confirmShown uid hash recorded fresh =
     case fresh of
         Shown now ->
             if shownHash now == hash then
-                Ok (Attested { uid = uid, hash = hash })
+                case recorded of
+                    Ok name ->
+                        Ok (Attested { uid = uid, hash = hash, name = name })
+
+                    Err _ ->
+                        Err NamePastCeiling
 
             else
                 Err SourceChanged

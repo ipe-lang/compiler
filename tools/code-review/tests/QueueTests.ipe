@@ -2577,7 +2577,7 @@ saveFailureTyped =
             "database is locked [5]"
 
         refusals =
-            [ SourceGone, SourceChanged, SourcePastCeiling, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch ]
+            [ SourceGone, SourceChanged, SourcePastCeiling, NamePastCeiling, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch ]
 
         cases =
             [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SavePastLimit, SaveFailed ] ++ List.map SaveRefused refusals

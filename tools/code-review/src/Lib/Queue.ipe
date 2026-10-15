@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryLabel(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Presence(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, labelText, labels, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db
@@ -24,6 +24,7 @@ import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (AppSettings, IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
+import Lib.UnitName as UnitName exposing (UnitName)
 
 
 -- An open unit plus its resurfacing state. `change` is what the index
@@ -115,9 +116,9 @@ standingFor unit read =
                 Nothing
 
 
--- What a queued unit is called on screen: its kind and qualified name, plus
--- as much of its location as tells it apart from every other unit on the
--- same page. Kept as separate typed fields so no two parts can run together.
+-- What a unit is called on screen: its kind and qualified name, plus as
+-- much of its location as tells it apart from every other unit on the same
+-- page. Kept as separate typed fields so no two parts can run together.
 type alias UnitLabel =
     { kind : SafeText
     , name : SafeText
@@ -134,64 +135,107 @@ type Place
     | AtUnit SafeText Int Uid
 
 
--- The one label builder: every label on screen comes from a unit's typed
--- fields, never from a raw string.
-unitLabel : Place -> Index.Unit -> UnitLabel
-unitLabel place unit =
-    { kind = unit.kind, name = unit.qualified, place = place }
+-- The one label builder: every label on screen comes from a `UnitName`,
+-- a live unit's or the one a verified review row signed, never from a raw
+-- string or a uid.
+unitLabel : Place -> UnitName -> UnitLabel
+unitLabel place name =
+    { kind = UnitName.kind name, name = UnitName.qualified name, place = place }
 
 
--- Each unit of a page with its label; no two labels of one page are equal.
+-- Each item of a page with its unit's label; no two labels of distinct
+-- units on one page are equal.
+labels : List ( a, UnitName ) -> List ( a, UnitLabel )
+labels named =
+    let
+        place =
+            placeAmong (List.map (\( _, name ) -> name) named)
+    in
+    List.map (\( item, name ) -> ( item, unitLabel (place name) name )) named
+
+
 queueLabels : List QueuedUnit -> List ( QueuedUnit, UnitLabel )
 queueLabels units =
-    let
-        names =
-            tally nameKey units
-
-        places =
-            tally placeKey units
-    in
-    List.map (\q -> ( q, unitLabel (placeFor names places q.unit) q.unit )) units
+    labels (List.map (\q -> ( q, Index.unitName q.unit )) units)
 
 
-placeFor : Dict String Int -> Dict String Int -> Index.Unit -> Place
-placeFor names places unit =
-    if shared names (nameKey unit) then
-        if shared places (placeKey unit) then
-            AtUnit unit.path unit.lineStart unit.uid
+-- The place a name needs among the names of one page: the rule every
+-- page's labels share.
+placeAmong : List UnitName -> UnitName -> Place
+placeAmong names =
+    placeFor (tally nameKey names) (tally placeKey names)
+
+
+placeFor : Dict String (List Uid) -> Dict String (List Uid) -> UnitName -> Place
+placeFor names places name =
+    if shared names (nameKey name) then
+        if shared places (placeKey name) then
+            AtUnit (UnitName.path name) (UnitName.line name) (UnitName.uid name)
 
         else
-            At unit.path unit.lineStart
+            At (UnitName.path name) (UnitName.line name)
 
     else
         Named
 
 
-tally : (Index.Unit -> String) -> List QueuedUnit -> Dict String Int
-tally key units =
-    List.foldl (\q counts -> Dict.update (key q.unit) countOne counts) Dict.empty units
+-- The distinct uids under each key: one unit named on two rows of a page
+-- (decided at two body hashes) shares its key with no other unit.
+tally : (UnitName -> String) -> List UnitName -> Dict String (List Uid)
+tally key names =
+    List.foldl (\name seen -> Dict.update (key name) (withUid (UnitName.uid name)) seen) Dict.empty names
 
 
-countOne : Maybe Int -> Maybe Int
-countOne seen =
-    Just (Maybe.withDefault 0 seen + 1)
+withUid : Uid -> Maybe (List Uid) -> Maybe (List Uid)
+withUid unitUid seen =
+    case seen of
+        Just uids ->
+            if List.member unitUid uids then
+                Just uids
+
+            else
+                Just (unitUid :: uids)
+
+        Nothing ->
+            Just [ unitUid ]
 
 
-shared : Dict String Int -> String -> Bool
-shared counts key =
-    Maybe.withDefault 0 (Dict.get key counts) > 1
+shared : Dict String (List Uid) -> String -> Bool
+shared seen key =
+    List.length (Maybe.withDefault [] (Dict.get key seen)) > 1
+
+
+-- A label as one plain text, for a document title: kind, name and, when
+-- the label carries one, its location. The uid tie-break of `AtUnit` is
+-- drawn only on the page.
+labelText : UnitLabel -> SafeText
+labelText label =
+    SafeText.concat ([ label.kind, SafeText.literal " ", label.name ] ++ placeTextOf label.place)
+
+
+placeTextOf : Place -> List SafeText
+placeTextOf place =
+    case place of
+        Named ->
+            []
+
+        At path line ->
+            [ SafeText.literal " at ", path, SafeText.literal ":", SafeText.render (String.fromInt line) ]
+
+        AtUnit path line _ ->
+            [ SafeText.literal " at ", path, SafeText.literal ":", SafeText.render (String.fromInt line) ]
 
 
 -- Collision keys over length-prefixed parts, so no two different part lists
 -- spell the same key.
-nameKey : Index.Unit -> String
-nameKey unit =
-    keyPart (SafeText.toString unit.kind) ++ keyPart (SafeText.toString unit.qualified)
+nameKey : UnitName -> String
+nameKey name =
+    keyPart (SafeText.toString (UnitName.kind name)) ++ keyPart (SafeText.toString (UnitName.qualified name))
 
 
-placeKey : Index.Unit -> String
-placeKey unit =
-    nameKey unit ++ keyPart (SafeText.toString unit.path) ++ keyPart (String.fromInt unit.lineStart)
+placeKey : UnitName -> String
+placeKey name =
+    nameKey name ++ keyPart (SafeText.toString (UnitName.path name)) ++ keyPart (String.fromInt (UnitName.line name))
 
 
 keyPart : String -> String
@@ -454,12 +498,25 @@ ticketNumber ticket =
 
 
 -- A review as the History page shows it: the review entry, counted or not,
--- plus the unit's qualified name resolved from the index db, rendered
--- (Nothing when the unit no longer exists there).
+-- and the label its unit is named by.
 type alias HistoryRow =
     { entry : LibDb.ReviewEntry
-    , name : Maybe SafeText
+    , label : HistoryLabel
     }
+
+
+-- A History row's label: built by `unitLabel` with whether the index still
+-- holds the unit, or `Unnamed` when no trusted name exists (a row signed
+-- before names were recorded, a legacy row or one that does not verify,
+-- of a unit the index no longer holds). A uid never stands in for a name.
+type HistoryLabel
+    = Labelled UnitLabel Presence
+    | Unnamed
+
+
+type Presence
+    = Indexed
+    | NoLongerIndexed
 
 
 -- One loaded History page: its rows, the cursor it was read from, the
@@ -521,9 +578,9 @@ historyStatusText state =
 
 -- One History page from `cursor`, newest first, each row classified under
 -- the review log's verdict, taken once for the load with the `reviewed`
--- copy proved current for it (rebuilt once when its stamp is not), with the
--- unit's qualified name resolved from the index db named by `settings`. At
--- most `PageSize.history` rows are read, and one name lookup runs per row.
+-- copy proved current for it (rebuilt once when its stamp is not), each row
+-- labelled with the page's other rows. At most `PageSize.history` rows are
+-- read, and one query reads the units the index still holds among them.
 loadHistoryPage : AppSettings -> LibDb.HistoryCursor -> Task.Task Error HistoryPage
 loadHistoryPage settings cursor =
     do
@@ -531,13 +588,86 @@ loadHistoryPage settings cursor =
         conn <- Index.readConnection settings.index
         state <- freshStatus settings conn db
         page <- LibDb.historyPage (LibDb.verifier state) db PageSize.history cursor
-        rows <- Task.sequence (List.map (historyRow conn) page.rows)
-        Task.succeed { rows = rows, at = cursor, next = page.next, log = LibDb.logShown state }
+        live <- Index.liveUnits conn settings.index.roots (distinctUids (List.map entryUid page.rows))
+        Task.succeed { rows = historyRows live page.rows, at = cursor, next = page.next, log = LibDb.logShown state }
 
 
-historyRow : Db.Db -> LibDb.ReviewEntry -> Task.Task Error HistoryRow
-historyRow conn entry =
-    Task.map (\name -> { entry = entry, name = name }) (Index.nameFor conn (entryUid entry))
+distinctUids : List Uid -> List Uid
+distinctUids uids =
+    List.foldr
+        (\unitUid kept ->
+            if List.member unitUid kept then
+                kept
+
+            else
+                unitUid :: kept
+        )
+        []
+        uids
+
+
+-- One page's rows labelled together, so two rows of distinct units never
+-- share a label.
+historyRows : List Index.Unit -> List LibDb.ReviewEntry -> List HistoryRow
+historyRows live entries =
+    let
+        found =
+            List.map (\entry -> ( entry, historyName live entry )) entries
+
+        place =
+            placeAmong (List.filterMap (\( _, hit ) -> Maybe.map (\( _, name ) -> name) hit) found)
+    in
+    List.map (\( entry, hit ) -> { entry = entry, label = historyLabel place hit }) found
+
+
+historyLabel : (UnitName -> Place) -> Maybe ( Presence, UnitName ) -> HistoryLabel
+historyLabel place hit =
+    case hit of
+        Just ( presence, name ) ->
+            Labelled (unitLabel (place name) name) presence
+
+        Nothing ->
+            Unnamed
+
+
+-- A row's name, in order: the one a verified row signed, with whether the
+-- index still holds the unit; else the live unit's; else none.
+historyName : List Index.Unit -> LibDb.ReviewEntry -> Maybe ( Presence, UnitName )
+historyName live entry =
+    let
+        unitUid =
+            entryUid entry
+
+        hit =
+            List.head (List.filter (\unit -> unit.uid == unitUid) live)
+    in
+    case signedName entry of
+        Just recorded ->
+            Just ( presenceOf hit, UnitName.fromRecorded unitUid recorded )
+
+        Nothing ->
+            Maybe.map (\unit -> ( Indexed, Index.unitName unit )) hit
+
+
+-- The name a row signed, read only from a row whose mac verifies.
+signedName : LibDb.ReviewEntry -> Maybe UnitName.RecordedName
+signedName entry =
+    case entry of
+        Verified row ->
+            LibDb.verifiedName row
+
+        Unverified _ ->
+            Nothing
+
+
+presenceOf : Maybe Index.Unit -> Presence
+presenceOf hit =
+    case hit of
+        Just _ ->
+            Indexed
+
+        Nothing ->
+            NoLongerIndexed
 
 
 entryUid : LibDb.ReviewEntry -> Uid

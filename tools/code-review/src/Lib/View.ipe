@@ -19,7 +19,7 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Layout, LeadingMark(..), LineEnds(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -157,7 +157,7 @@ pageTopic model =
         UnitPage raw ->
             case App.unitPageState raw model of
                 UnitLoaded loaded ->
-                    SafeText.toString loaded.unit.qualified
+                    SafeText.toString (Queue.labelText (Queue.unitLabel Named (Index.unitName loaded.unit)))
 
                 UnitLoading ->
                     "Unit"
@@ -431,7 +431,7 @@ historyHeading row badge bodyHash reviewedAt =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
         [ badge
-        , Ui.el [ Ui.describe (Ui.descHeading 2), Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
+        , historyName row.label
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (Index.shortHash bodyHash))
@@ -464,14 +464,28 @@ unverifiedText why =
             "Not counted: the log's chain breaks before this row"
 
 
-nameOf : Queue.HistoryRow -> SafeText
-nameOf row =
-    case row.name of
-        Just n ->
-            n
+-- A History row's heading name: its label, chipped when the index no
+-- longer holds the unit; a row with no trusted name draws fixed text.
+historyName : HistoryLabel -> Ui.Element Msg
+historyName label =
+    case label of
+        Labelled named presence ->
+            Ui.row
+                [ Ui.spacing 8, Ui.centerY ]
+                (sectionHeading (labelEl 14 named) :: presenceEls presence)
 
-        Nothing ->
-            SafeText.renderForeign (Uid.toString (Queue.entryUid row.entry))
+        Unnamed ->
+            sectionHeading (Ui.el [ Font.size 14, Font.color (Ui.rgb 150 150 165) ] (Ui.text "unit no longer indexed (recorded before names were kept)"))
+
+
+presenceEls : Presence -> List (Ui.Element Msg)
+presenceEls presence =
+    case presence of
+        Indexed ->
+            []
+
+        NoLongerIndexed ->
+            [ chip (SafeText.literal "no longer indexed") ]
 
 
 -- The unit page shows the source of one unit with its resolved links —
@@ -525,7 +539,7 @@ unitPageCard standing loaded =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ sectionHeading (labelEl 14 (Queue.unitLabel Named unit))
+            [ sectionHeading (labelEl 14 (Queue.unitLabel Named (Index.unitName unit)))
             , chip unit.facing
             ]
         , unitStanding (Queue.standingFor unit standing)

@@ -1,0 +1,159 @@
+module Lib.UnitName exposing (NameRefusal(..), RecordedName, UnitName, fromColumns, fromRecorded, kind, line, live, nameMaxChars, path, qualified, record, recordedFields, render, uid)
+
+-- What names a unit on screen: its kind, qualified name, path and start
+-- line. `RecordedName` is the raw form a review row signs at decision time,
+-- each text 1 to `nameMaxChars` code points and the line not negative, built
+-- only by `record` on the write side and `fromColumns` on the read side.
+-- `UnitName` is the rendered form a label is built from, built only from a
+-- live unit (`live`, through `Index.unitName`) or from a recorded name
+-- (`fromRecorded`), so a uid or any other text never stands in for a name.
+
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Lib.SafeText as SafeText exposing (SafeText)
+import Lib.Uid as Uid exposing (Uid)
+
+
+type RecordedName
+    = RecordedName { kind : String, qualified : String, path : String, line : Int }
+
+
+type UnitName
+    = UnitName { uid : Uid, kind : SafeText, qualified : SafeText, path : SafeText, line : Int }
+
+
+-- Why a name cannot be recorded: a text part is empty, a text part passes
+-- `nameMaxChars`, or the line is negative.
+type NameRefusal
+    = PartEmpty
+    | PartPastCeiling
+    | LineNegative
+
+
+-- The most code points one recorded text part holds; the migration's
+-- `CHECK` on each name column holds the same bound.
+nameMaxChars : Int
+nameMaxChars =
+    2048
+
+
+-- The write side: the name a decision signs.
+record : { kind : String, qualified : String, path : String, line : Int } -> Result NameRefusal RecordedName
+record parts =
+    fromColumns parts.kind parts.qualified parts.path parts.line
+
+
+-- The read side: a stored row's name columns, under the same bounds.
+fromColumns : String -> String -> String -> Int -> Result NameRefusal RecordedName
+fromColumns k q p l =
+    case firstRefusal [ k, q, p ] of
+        Just refusal ->
+            Err refusal
+
+        Nothing ->
+            if l < 0 then
+                Err LineNegative
+
+            else
+                Ok (RecordedName { kind = k, qualified = q, path = p, line = l })
+
+
+firstRefusal : List String -> Maybe NameRefusal
+firstRefusal parts =
+    case parts of
+        [] ->
+            Nothing
+
+        part :: rest ->
+            case partRefusal part of
+                Just refusal ->
+                    Just refusal
+
+                Nothing ->
+                    firstRefusal rest
+
+
+partRefusal : String -> Maybe NameRefusal
+partRefusal part =
+    let
+        chars =
+            String.length part
+    in
+    if chars < 1 then
+        Just PartEmpty
+
+    else if chars > nameMaxChars then
+        Just PartPastCeiling
+
+    else
+        Nothing
+
+
+-- The raw parts, for the INSERT and the mac input.
+recordedFields : RecordedName -> { kind : String, qualified : String, path : String, line : Int }
+recordedFields name =
+    case name of
+        RecordedName parts ->
+            parts
+
+
+-- The one render of a unit's stored display text: every hazard escaped,
+-- `\` and `"` kept.
+render : String -> SafeText
+render raw =
+    SafeText.renderForeign raw
+
+
+-- The name a review row recorded for `unitUid`, rendered.
+fromRecorded : Uid -> RecordedName -> UnitName
+fromRecorded unitUid name =
+    case name of
+        RecordedName parts ->
+            UnitName
+                { uid = unitUid
+                , kind = render parts.kind
+                , qualified = render parts.qualified
+                , path = render parts.path
+                , line = parts.line
+                }
+
+
+-- A live unit's already rendered name parts.
+live : Uid -> { kind : SafeText, qualified : SafeText, path : SafeText, line : Int } -> UnitName
+live unitUid parts =
+    UnitName { uid = unitUid, kind = parts.kind, qualified = parts.qualified, path = parts.path, line = parts.line }
+
+
+uid : UnitName -> Uid
+uid name =
+    case name of
+        UnitName parts ->
+            parts.uid
+
+
+kind : UnitName -> SafeText
+kind name =
+    case name of
+        UnitName parts ->
+            parts.kind
+
+
+qualified : UnitName -> SafeText
+qualified name =
+    case name of
+        UnitName parts ->
+            parts.qualified
+
+
+path : UnitName -> SafeText
+path name =
+    case name of
+        UnitName parts ->
+            parts.path
+
+
+line : UnitName -> Int
+line name =
+    case name of
+        UnitName parts ->
+            parts.line
