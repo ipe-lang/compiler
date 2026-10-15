@@ -13,6 +13,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use ipe_path_core::Regime;
+
 use crate::CliError;
 use crate::style::TerminalSafe;
 
@@ -94,14 +96,14 @@ impl HostLinker {
         }
     }
 
-    /// The linker family of the host `rustc` reported, or of this platform when the query failed.
+    /// The linker family of the host `rustc` reported, or of a platform under `regime` when the query failed.
     ///
-    /// A failed query on Windows is [`Self::AsciiOnly`] (fail closed); on any
-    /// other platform every linker opens any path.
+    /// A failed query under Windows is [`Self::AsciiOnly`] (fail closed); under
+    /// any other regime every linker opens any path.
     #[must_use]
-    pub fn of_query(host: Option<&str>) -> Self {
+    pub fn of_query(host: Option<&str>, regime: Regime) -> Self {
         host.map_or(
-            if cfg!(windows) {
+            if regime.is_windows() {
                 Self::AsciiOnly
             } else {
                 Self::Unicode
@@ -117,6 +119,7 @@ impl HostLinker {
             crate::toolchain::RustcVersion::active()
                 .ok()
                 .map(crate::toolchain::RustcVersion::host),
+            ipe_path_core::HOST,
         )
     }
 
@@ -540,16 +543,34 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
-    fn unknown_host_on_windows_is_ascii_only() {
-        assert_eq!(HostLinker::of_query(None), HostLinker::AsciiOnly);
+    fn of_query_none_is_ascii_only_under_windows() {
+        assert_eq!(
+            HostLinker::of_query(None, Regime::Windows),
+            HostLinker::AsciiOnly
+        );
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn unknown_host_off_windows_is_unicode() {
-        assert_eq!(HostLinker::of_query(None), HostLinker::Unicode);
+    fn of_query_none_is_unicode_under_unix() {
+        assert_eq!(
+            HostLinker::of_query(None, Regime::Unix),
+            HostLinker::Unicode
+        );
+    }
+
+    #[test]
+    fn of_query_reported_host_ignores_the_regime() {
+        for regime in [Regime::Unix, Regime::Windows] {
+            assert_eq!(
+                HostLinker::of_query(Some("x86_64-unknown-linux-gnu"), regime),
+                HostLinker::Unicode
+            );
+            assert_eq!(
+                HostLinker::of_query(Some("x86_64-pc-windows-gnu"), regime),
+                HostLinker::AsciiOnly
+            );
+        }
     }
 
     #[test]
