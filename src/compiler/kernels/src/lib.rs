@@ -3578,8 +3578,8 @@ pub enum StdlibKernel {
     /// `Db.findWhereMasked : Db -> String -> List SqlFragment -> SqlFragment
     ///                        -> Decoder a -> Task Error (List a)` — the
     /// NULL-preserving projected read the secured column-masking path routes
-    /// through. Unlike `Db.findWhere` (which emits `SELECT *` and collapses SQL
-    /// NULL → `""` via `row_to_map`), it emits an EXPLICIT projection from the
+    /// through. Unlike `Db.findWhere` (which emits `SELECT *` and returns every
+    /// column as a raw `Maybe String` cell), it emits an EXPLICIT projection from the
     /// caller's validated `SqlFragment` terms (each an `Sql.column col AS col` or a
     /// masked `Sql.maskedColumn`) and decodes each row through the threaded
     /// `Decoder` over the NULL-preserving row→JSON bridge, so a masked cell arrives
