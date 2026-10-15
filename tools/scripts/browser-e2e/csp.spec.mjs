@@ -26,7 +26,11 @@
  *      whichever order the answers arrive in; a popstate answer that applies
  *      after a link's answer names the URL; a render's `data-ipe-path` is one
  *      history entry that Back leaves; and a popstate whose fetch fails or
- *      whose answer is of no history is a full browser load of the entry.
+ *      whose answer is of no history is a full browser load of the entry it
+ *      popped, even after a link's answer moved the URL meanwhile, unless the
+ *      reader followed a later link. A document gone stale while a link's
+ *      answer is pending loads that link, whether the stale document reloads
+ *      or its answer lands on it.
  *
  * Each refusal serves the real page, with its own headers, and its HTML
  * rewritten in flight.
@@ -597,4 +601,174 @@ test("navigation: a popstate answer of no history loads the popped entry", async
   await expect(page).toHaveURL(`${STYLES}/`);
   expect(await page.locator("#e2e-unstamped").count()).toBe(0);
   expect(await page.locator("#e2e-away").count()).toBe(0);
+});
+
+test("navigation: a popstate whose fetch fails after a link's answer moved the URL loads the popped entry", async ({
+  page,
+}) => {
+  const loads = { count: 0 };
+  page.on("request", (r) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loads.count += 1;
+  });
+  const { later } = await openLive(page);
+  const [inc, n] = later.split(".");
+  const at = (k) => `${inc}.${Number(n) + k}`;
+  const link = gate();
+  const home = gate();
+  await page.route(
+    (url) => url.origin === STYLES && ["/", "/e2e-away", "/e2e-link"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/e2e-away") {
+        return route.fulfill(navAnswer(later, '<div id="e2e-away">away</div>'));
+      }
+      if (path === "/e2e-link") {
+        await link.shut;
+        return route.fulfill(navAnswer(at(1), '<div id="e2e-link">link</div>'));
+      }
+      await home.shut;
+      return route.abort();
+    },
+  );
+  await addNavLink(page, "away", "/e2e-away");
+  await page.locator("#e2e-link-away").click();
+  await page.waitForSelector("#e2e-away", { timeout: 10000 });
+  await addNavLink(page, "link", "/e2e-link");
+  await page.locator("#e2e-link-link").click();
+  await page.evaluate(() => history.back());
+  await expect(page).toHaveURL(`${STYLES}/`);
+  // The link's answer lands while the popped entry's fetch is pending: it
+  // applies and records its URL.
+  link.open();
+  await page.waitForSelector("#e2e-link", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/e2e-link`);
+  expect(loads.count).toBe(1);
+  home.open();
+  await expect.poll(() => loads.count, { timeout: 15000 }).toBe(2);
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  await expect(page).toHaveURL(`${STYLES}/`);
+  expect(await page.locator("#e2e-link").count()).toBe(0);
+});
+
+test("navigation: a popstate whose fetch fails after a later link's answer loads nothing", async ({
+  page,
+}) => {
+  const loads = { count: 0 };
+  page.on("request", (r) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loads.count += 1;
+  });
+  const { later } = await openLive(page);
+  const [inc, n] = later.split(".");
+  const at = (k) => `${inc}.${Number(n) + k}`;
+  const home = gate();
+  await page.route(
+    (url) => url.origin === STYLES && ["/", "/e2e-away", "/e2e-link"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/e2e-away") {
+        return route.fulfill(navAnswer(later, '<div id="e2e-away">away</div>'));
+      }
+      if (path === "/e2e-link") {
+        return route.fulfill(navAnswer(at(1), '<div id="e2e-link">link</div>'));
+      }
+      await home.shut;
+      return route.abort();
+    },
+  );
+  await addNavLink(page, "away", "/e2e-away");
+  await addNavLink(page, "link", "/e2e-link");
+  await page.locator("#e2e-link-away").click();
+  await page.waitForSelector("#e2e-away", { timeout: 10000 });
+  await page.evaluate(() => history.back());
+  await expect(page).toHaveURL(`${STYLES}/`);
+  // The reader follows a link while the popped entry's fetch is pending: that
+  // later navigation owns the location.
+  await page.locator("#e2e-link-link").click();
+  await page.waitForSelector("#e2e-link", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/e2e-link`);
+  home.open();
+  await page.waitForTimeout(2000);
+  expect(loads.count).toBe(1);
+  await expect(page).toHaveURL(`${STYLES}/e2e-link`);
+  expect(await page.locator("#e2e-link").count()).toBe(1);
+});
+
+/**
+ * Open the csp-styles page with its first stream open held until `foreign`
+ * opens, then answered with a full render of another incarnation; later opens
+ * are the live stream. Resolves once the client has booted.
+ */
+async function openWithHeldForeignStream(page) {
+  const foreign = gate();
+  let opens = 0;
+  await page.route(
+    (url) => url.origin === STYLES && url.pathname === "/_ipe/sse",
+    async (route) => {
+      opens += 1;
+      if (opens > 1) return route.continue();
+      await foreign.shut;
+      return route
+        .fulfill({
+          status: 200,
+          headers: { "content-type": "text/event-stream", "cache-control": "no-store" },
+          body: patchStream({ epoch: FOREIGN_EPOCH }),
+        })
+        .catch(() => {});
+    },
+  );
+  await page.goto(STYLES);
+  await page.waitForFunction(() => typeof window.__IPE_EPOCH === "string", null, {
+    timeout: 15000,
+  });
+  const boot = await page.evaluate(() => window.__IPE_EPOCH);
+  return { foreign, boot };
+}
+
+/** Answer `/e2e-pending` navigation fetches with `body()` once `answer` opens. */
+async function holdPendingNav(page, answer, body) {
+  await page.route(
+    (url) => url.origin === STYLES && url.pathname === "/e2e-pending",
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      await answer.shut;
+      return route.fulfill(body()).catch(() => {});
+    },
+  );
+}
+
+test("render history: a document gone stale while a link's answer is pending loads the link", async ({
+  page,
+}) => {
+  const { foreign } = await openWithHeldForeignStream(page);
+  const answer = gate();
+  await holdPendingNav(page, answer, () => ({ status: 503, body: "" }));
+  await addNavLink(page, "pending", "/e2e-pending");
+  await page.locator("#e2e-link-pending").click();
+  foreign.open();
+  await page.waitForURL(`${STYLES}/e2e-pending`, { timeout: 15000 });
+  answer.open();
+});
+
+test("render history: a link's answer landing on a stale document loads the link", async ({
+  page,
+}) => {
+  const { foreign, boot } = await openWithHeldForeignStream(page);
+  const [inc, n] = boot.split(".");
+  const answer = gate();
+  await holdPendingNav(page, answer, () =>
+    navAnswer(`${inc}.${Number(n) + 1000}`, '<div id="e2e-pending">pending</div>'),
+  );
+  await addNavLink(page, "pending", "/e2e-pending");
+  // A stale-document reload within its window is refused, so the document
+  // stays, stale, under the banner.
+  await page.evaluate(() => sessionStorage.setItem("__ipe_inc_reload", String(Date.now())));
+  await page.locator("#e2e-link-pending").click();
+  foreign.open();
+  await expect(page.locator("#__ipe-status")).toContainText(STALE_BANNER, { timeout: 15000 });
+  await expect(page).toHaveURL(`${STYLES}/`);
+  answer.open();
+  await page.waitForURL(`${STYLES}/e2e-pending`, { timeout: 15000 });
+  expect(await page.locator("#e2e-pending").count()).toBe(0);
 });

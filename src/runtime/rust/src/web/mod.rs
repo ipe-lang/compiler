@@ -160,7 +160,7 @@ use super::*;
 /// Body returned with a session-miss 404 from `/_ipe/event` and `/_ipe/sse`.
 ///
 /// LOAD-BEARING CONTRACT — `client.js` `__ipeProbeSessionLost` only triggers
-/// `window.location.reload()` (the SSE-reconnect recovery path) when a probe
+/// `__ipeReloadDocument()` (the SSE-reconnect recovery path) when a probe
 /// POST gets a 404 + `X-Ipê-Web: 1` AND the body CONTAINS the substring
 /// `"session not found"` (client.js l1481/l1530/l1536).  backend returns
 /// the same string; diverging it (the old `"no session"` body) silently broke
@@ -8510,6 +8510,81 @@ mod base_path_tests {
             ),
             (3, 1, 1),
             "a render's `data-ipe-path` is read after its epoch is adopted, in the two adopt functions only"
+        );
+    }
+
+    /// A navigation whose answer the document cannot show loads its own
+    /// target, and only while it is the newest navigation the reader started;
+    /// a reload of the document goes where a pending navigation was going.
+    ///
+    /// Loading the location instead loads whatever a later answer or render
+    /// recorded while the navigation was pending: Back whose fetch fails after
+    /// a link's answer pushed its URL reloads the link, not the popped entry.
+    #[test]
+    fn client_loads_a_navigation_target_never_the_location() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let load = body_of("__ipeLoad").unwrap_or_default();
+        let load_nav = body_of("__ipeLoadNav").unwrap_or_default();
+        let reload = body_of("__ipeReloadDocument").unwrap_or_default();
+        let stale = body_of("__ipeStaleDocument").unwrap_or_default();
+        let probe = body_of("__ipeProbeSessionLost").unwrap_or_default();
+        assert_eq!(
+            (
+                js.matches("location.reload()").count(),
+                load.matches("location.reload()").count(),
+                reload.matches("location.reload()").count(),
+            ),
+            (2, 1, 1),
+            "the document reloads in `__ipeLoad` and `__ipeReloadDocument` only"
+        );
+        assert_eq!(
+            (
+                js.matches("location.assign(").count(),
+                load.matches("location.assign(").count()
+            ),
+            (1, 1),
+            "the document assigns its location in `__ipeLoad` only"
+        );
+        assert!(
+            !js.contains("location.href =") && !js.contains("location.href="),
+            "no site assigns `location.href`"
+        );
+        assert!(
+            load_nav.contains("if (intent !== __ipeNavIntent) return;")
+                && load_nav.contains("__ipeLoad(url);"),
+            "only the newest navigation loads, and it loads its own target"
+        );
+        assert!(
+            reload.contains("if (typeof wanted === \"string\") __ipeLoad(wanted);"),
+            "a reload goes where the pending navigation was going"
+        );
+        assert!(
+            stale.contains("__ipeReloadDocument();") && probe.contains("__ipeReloadDocument();"),
+            "the stale-document and lost-session reloads go through `__ipeReloadDocument`"
+        );
+        assert_eq!(
+            js.matches("__ipeStartNav(").count(),
+            3,
+            "`__ipeStartNav` has its definition, the link and the popstate"
+        );
+        for fallback in [
+            ".catch(function() { __ipeLoadNav(intent, target); });",
+            ".catch(function() { __ipeLoadNav(intent, popped); });",
+            "if (!next || next.inc !== __ipeBootInc || __ipeStale) {\n        __ipeLoadNav(intent, target);",
+            "if (!next || __ipeStale) {\n        __ipeLoadNav(intent, popped);",
+            "if (__ipeStale) {\n    __ipeLoadNav(intent, popped);",
+        ] {
+            assert_eq!(js.matches(fallback).count(), 1, "{fallback}");
+        }
+        assert_eq!(
+            js.matches("__ipeLoadNav(intent, ").count(),
+            6,
+            "`__ipeLoadNav` has its definition and the five navigation fallbacks"
         );
     }
 

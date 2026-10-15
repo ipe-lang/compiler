@@ -332,7 +332,7 @@ function __ipeStaleDocument() {
     }
   } catch (_) { reload = false; }
   if (reload) {
-    window.location.reload();
+    __ipeReloadDocument();
     return;
   }
   __ipeShowStale();
@@ -1880,6 +1880,48 @@ function __ipeRecordNav(url, push, at) {
   __ipeNavSearch = window.location.search;
   __ipeNavHref   = window.location.href;
 }
+// The newest navigation the reader started, a followed link or a popped
+// entry, by sequence number; and its target while its answer is pending,
+// otherwise null.
+var __ipeNavIntent = 0;
+var __ipeNavWanted = null;
+// Start a navigation to `url`; its sequence number.
+function __ipeStartNav(url) {
+  __ipeNavIntent += 1;
+  __ipeNavWanted = url;
+  return __ipeNavIntent;
+}
+// Navigation `intent` got an answer this document orders: its target is no
+// longer pending.
+function __ipeSettleNav(intent) {
+  if (intent === __ipeNavIntent) __ipeNavWanted = null;
+}
+// A full browser load of `url`: a reload when it is the location.
+function __ipeLoad(url) {
+  var target = url;
+  try { target = new URL(url, window.location.href).href; } catch (_) {}
+  if (target === window.location.href) window.location.reload();
+  else window.location.assign(target);
+}
+// Navigation `intent` has no answer this document can show: the browser loads
+// its own target `url`, never the location, which a later answer or render
+// may have moved meanwhile. A navigation started since owns the location, so
+// an older one loads nothing.
+function __ipeLoadNav(intent, url) {
+  if (intent !== __ipeNavIntent) return;
+  __ipeNavWanted = null;
+  __ipeLoad(url);
+}
+// Reload the document where the reader is going: the target of the pending
+// navigation, otherwise the location. The reload is the newest navigation, so
+// no answer to an earlier one loads anything after it.
+function __ipeReloadDocument() {
+  var wanted = __ipeNavWanted;
+  __ipeNavIntent += 1;
+  __ipeNavWanted = null;
+  if (typeof wanted === "string") __ipeLoad(wanted);
+  else window.location.reload();
+}
 // The URL to record for a navigation fetch: the canonical URL the server
 // redirected it to, or `fallback`. A followed URL is used only when it is
 // same-origin and its path begins with exactly one `/`; the original hash is
@@ -1910,34 +1952,40 @@ __ipeDoc.on("click", function(ev) {
   if (__ipeStale) return;
   var href = el.getAttribute("href");
   if (!href || href.charAt(0) === "#") return;
-  // External links are left to the browser.
+  // External links are left to the browser. The link's target is fixed now:
+  // a later answer or render may move the location `href` is relative to.
+  var target;
   try {
     var u = new URL(href, window.location.href);
     if (u.origin !== window.location.origin) return;
+    target = u.href;
   } catch (e) { return; }
   ev.preventDefault();
-  fetch(href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
+  var intent = __ipeStartNav(target);
+  fetch(target, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
-      var url = __ipeFollowed(r, href);
+      var url = __ipeFollowed(r, target);
       var epoch = r.headers.get("X-Ipe-Epoch");
       return r.text().then(function(t) { return { t: t, url: url, epoch: epoch }; });
     })
     .then(function(res) {
       // An answer of no history or of another one is not this document's to
-      // show: the browser loads the link itself, so the document it gets
-      // carries the policy that answer's styles need.
+      // show, and a stale document shows none: the browser loads the link
+      // itself, so the document it gets carries the policy that answer's
+      // styles need.
       var next = __ipeEpochParts(res.epoch);
-      if (!next || next.inc !== __ipeBootInc) {
-        window.location.href = href;
+      if (!next || next.inc !== __ipeBootInc || __ipeStale) {
+        __ipeLoadNav(intent, target);
         return;
       }
       // The answer applies unless the screen already shows a later render; its
       // URL is recorded either way, unless a later answer or render already
       // named the location.
+      __ipeSettleNav(intent);
       __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
       __ipeRecordNav(res.url, true, next);
     })
-    .catch(function() { window.location.href = href; });
+    .catch(function() { __ipeLoadNav(intent, target); });
 });
 window.addEventListener("popstate", function() {
   // A pure fragment change (same path + query, only the hash differs) is
@@ -1954,12 +2002,13 @@ window.addEventListener("popstate", function() {
   __ipeNavSearch = here.search;
   __ipeNavHref = here.href;
   // The popped entry, fixed now: the live location moves with any later
-  // navigation.
+  // navigation, or answer or render recorded while this one is pending.
   var popped = here.href;
+  var intent = __ipeStartNav(popped);
   // A stale document applies no render: the browser loads the popped entry,
   // as it follows a stale document's links.
   if (__ipeStale) {
-    window.location.reload();
+    __ipeLoadNav(intent, popped);
     return;
   }
   fetch(popped, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
@@ -1970,21 +2019,21 @@ window.addEventListener("popstate", function() {
     })
     .then(function(res) {
       // An answer of no history or of another one is not this document's to
-      // show: the browser loads the entry itself, as it follows such an
-      // answer to a link.
+      // show, and a stale document shows none: the browser loads the entry
+      // itself, as it follows such an answer to a link.
       var next = __ipeOwnEpoch(res.epoch);
-      if (!next) {
-        window.location.reload();
+      if (!next || __ipeStale) {
+        __ipeLoadNav(intent, popped);
         return;
       }
       // The answer rewrites the current entry to its URL, unless a later
       // answer or render already named the location.
+      __ipeSettleNav(intent);
       __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
       __ipeRecordNav(res.url, false, next);
     })
-    // The URL already names the popped entry: with no answer to show, the
-    // browser loads it. One load per popstate, which only the reader starts.
-    .catch(function() { window.location.reload(); });
+    // With no answer to show, the browser loads the popped entry itself.
+    .catch(function() { __ipeLoadNav(intent, popped); });
 });
 // ── Status banner (connection state) ─────────────────────────
 // Single bottom-pinned element rendered by the runtime (NOT by the
@@ -2587,7 +2636,7 @@ function __ipeProbeSessionLost() {
       }
       // Signal the freshly-loaded page to show the build-ok toast.
       try { sessionStorage.setItem("__ipe_reloaded", "1"); } catch(_) {}
-      window.location.reload();
+      __ipeReloadDocument();
     });
   }).catch(function() {
     // Network error / server down. Keep retrying via normal path.

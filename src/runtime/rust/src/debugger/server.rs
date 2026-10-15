@@ -244,7 +244,8 @@ pub const OVERLAY_JS: &str = "\n\
   if(scrubber)scrubber.addEventListener('input',function(){\n\
     var v=parseInt(this.value,10);\n\
     var mx=parseInt(this.max,10);\n\
-    if(v>=mx){window.location.reload();return;}\n\
+    if(v>=mx)v=mx-1;\n\
+    if(v<0)return;\n\
     post(v);highlight(v);\n\
   });\n\
   if(list)list.addEventListener('click',function(e){\n\
@@ -437,6 +438,23 @@ mod tests {
         assert_eq!(OVERLAY_JS.matches(".open(").count(), 2);
         assert_eq!(OVERLAY_JS.matches(".open('POST',url,true)").count(), 2);
         assert!(OVERLAY_JS.contains("return typeof t==='string'?t:'';"));
+    }
+
+    /// The scrubber's rightmost position scrubs to the newest step the panel
+    /// lists, whose render names its own route: a reload there would load the
+    /// route of the step scrubbed before, which the URL now records.
+    #[test]
+    fn overlay_scrubber_end_scrubs_to_the_newest_step() {
+        assert!(
+            OVERLAY_JS.contains("if(v>=mx)v=mx-1;\nif(v<0)return;\npost(v);highlight(v);"),
+            "{OVERLAY_JS}"
+        );
+        assert_eq!(
+            OVERLAY_JS.matches("location.reload()").count(),
+            1,
+            "only the reset answer reloads the page"
+        );
+        assert!(OVERLAY_JS.contains("if(xhr.status===200)window.location.reload();"));
     }
 
     // ── SessionHistory ─────────────────────────────────────────────────────────
