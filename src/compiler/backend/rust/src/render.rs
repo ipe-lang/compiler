@@ -197,19 +197,6 @@ pub struct LayoutSpend {
     pub exhausted: bool,
 }
 
-/// [`render_seeded`], also reporting what its layout search spent of [`LAYOUT_FUEL`].
-///
-/// Test-only: production text leaves through [`render_code`].
-#[cfg(test)]
-pub fn render_seeded_spend(
-    doc: &Doc,
-    cfg: RenderConfig,
-    indent: usize,
-    col: usize,
-) -> (String, LayoutSpend) {
-    render_within_spend(doc, cfg, indent, col, LAYOUT_FUEL)
-}
-
 /// Lay `doc` out within `fuel`, also reporting what its layout search spent.
 ///
 /// A scope without its memo reads as exhausted, so the render falls back to its
