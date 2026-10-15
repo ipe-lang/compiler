@@ -142,9 +142,11 @@ impl IntoResponse for ApiJson {
     }
 }
 
-/// Every in-process console API endpoint: its path and the body it answers.
-/// [`mount_inline`] mounts exactly these.
-const API_ROUTES: &[(&str, fn() -> ApiJson)] = &[
+/// One console API endpoint: its path and the body it answers.
+type ApiRoute = (&'static str, fn() -> ApiJson);
+
+/// Every in-process console API endpoint. [`mount_inline`] mounts exactly these.
+const API_ROUTES: &[ApiRoute] = &[
     ("/_ipe/console/api/overview", api_overview),
     ("/_ipe/console/api/logs", api_logs),
     ("/_ipe/console/api/errors", api_errors),
@@ -752,7 +754,7 @@ mod tests {
             let Ok(req) = req else { return };
             let resp = router.clone().oneshot(req).await;
             assert!(resp.is_ok(), "{path}");
-            let Ok(resp) = resp else { return };
+            let Ok(resp) = resp;
             assert_eq!(resp.status(), StatusCode::OK, "{path}");
             let get = |name: header::HeaderName| {
                 resp.headers()

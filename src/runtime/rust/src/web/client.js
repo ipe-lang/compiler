@@ -1902,14 +1902,23 @@ function __ipeDocumentOf(href) {
   var at = href.indexOf("#");
   return at < 0 ? href : href.slice(0, at);
 }
-// A full browser load of `url`: a reload when it names the document on
-// screen, whatever its fragment, since assigning a URL that differs from the
-// location only in its fragment scrolls and loads nothing.
+// A full browser load of `url` that leaves the reader on `url`. The location
+// itself reloads. A target with a fragment on the document on screen is a
+// fragment navigation, which moves the location and adds its entry at once
+// but loads nothing, so the now-current target then reloads. Any other target
+// is a full load of its own, which a reload queued behind it would cancel.
 function __ipeLoad(url) {
   var target = url;
   try { target = new URL(url, window.location.href).href; } catch (_) {}
-  if (__ipeDocumentOf(target) === __ipeDocumentOf(window.location.href)) window.location.reload();
-  else window.location.assign(target);
+  var here = window.location.href;
+  if (target === here) {
+    window.location.reload();
+  } else if (target.indexOf("#") >= 0 && __ipeDocumentOf(target) === __ipeDocumentOf(here)) {
+    window.location.assign(target);
+    window.location.reload();
+  } else {
+    window.location.assign(target);
+  }
 }
 // Navigation `intent` has no answer this document can show: the browser loads
 // its own target `url`, never the location, which a later answer or render
