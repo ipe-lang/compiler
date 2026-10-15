@@ -1,0 +1,127 @@
+module Main exposing (main)
+
+-- | csp-styles — every style the page renders is admitted by its policy.
+--
+-- The page loads with a card that changes colour on hover and fades between
+-- the two, and a label styled only below the mobile breakpoint, so the served
+-- document carries scoped style blocks. `show` adds a second hover card, so a
+-- patch inserts a new style block; `recolor` changes that card's hover colour,
+-- so a patch replaces the block's text.
+--
+-- Co-located, no capabilities, no JS ports.
+
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+import Ipe.Ui.Background as Background
+import Ipe.Ui.Transition as Transition
+
+
+type alias Model =
+    { shown : Bool
+    , warm : Bool
+    }
+
+
+type Msg
+    = Show
+    | Recolor
+    | NoOp
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { shown = False, warm = True }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Show ->
+            ( { model | shown = True }, Cmd.none )
+
+        Recolor ->
+            ( { model | warm = not model.warm }, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+fade : Ui.Attribute Msg
+fade =
+    Transition.attribute
+        [ Transition.property "background-color"
+        , Transition.duration 200
+        , Transition.easing Transition.easeOut
+        ]
+
+
+card : Ui.Element Msg
+card =
+    Ui.el
+        [ Ui.id "card"
+        , Ui.padding 8
+        , Background.color (Ui.rgb 37 99 235)
+        , Background.hoverColor (Ui.rgb 30 64 175)
+        , fade
+        ]
+        (Ui.text "card")
+
+
+-- Red while `warm`, else green.
+hoverOf : Bool -> Ui.Color
+hoverOf warm =
+    if warm then
+        Ui.rgb 220 38 38
+
+    else
+        Ui.rgb 22 163 74
+
+
+styled : Model -> List (Ui.Element Msg)
+styled model =
+    if model.shown then
+        [ Ui.el
+            [ Ui.id "styled"
+            , Ui.padding 8
+            , Background.color (Ui.rgb 107 114 128)
+            , Background.hoverColor (hoverOf model.warm)
+            , fade
+            ]
+            (Ui.text "styled")
+        ]
+
+    else
+        []
+
+
+view : Model -> Ui.Element Msg
+view model =
+    Ui.column
+        [ Ui.id "root" ]
+        ([ card
+        , Ui.breakpoint Ui.mobile
+            [ Background.color (Ui.rgb 18 18 24) ]
+            (Ui.el [ Ui.id "narrow" ] (Ui.text "narrow"))
+        , Ui.button [ Ui.id "show" ] { onPress = Just Show, label = Ui.text "show" }
+        , Ui.button [ Ui.id "recolor" ] { onPress = Just Recolor, label = Ui.text "recolor" }
+        ]
+            ++ styled model
+        )
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = NoOp
+        }

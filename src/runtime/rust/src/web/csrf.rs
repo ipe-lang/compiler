@@ -81,15 +81,19 @@ pub fn csrf_enabled() -> bool {
 
 pub use crate::telemetry::frame_ancestors;
 
-/// The security headers of an `Ipe.Web` page response.
+/// The security headers of the `Ipe.Web` page response serving `page`: its
+/// policy admits the nonce `page`'s markup was stamped with.
 ///
 /// # Errors
 ///
 /// The [`crate::telemetry::FrameAncestorsRefusal`] of a refused
 /// `IPE_WEB_FRAME_ANCESTORS`: the page answers `500`.
-pub fn security_headers()
--> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
-    crate::telemetry::security_headers(crate::csp::Profile::WebPage)
+pub fn security_headers(
+    page: &crate::html::StampedHtml,
+) -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
+    crate::telemetry::security_headers(&crate::csp::Guarded::WebPage {
+        style_nonce: page.nonce().clone(),
+    })
 }
 
 /// Whether to mark cookies `Secure`: [`cookies_secure_with`] over the process.

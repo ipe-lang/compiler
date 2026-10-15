@@ -58,8 +58,24 @@ impl Patch {
 #[must_use]
 pub fn diff<M>(old: &Html<M>, new: &Html<M>, stamp: &RenderCtx<'_>) -> Vec<Patch> {
     let mut out = vec![];
-    diff_node_depth(old, new, ParseContext::Data, &mut out, 0, stamp);
+    // A root has no ancestor to hand an unaddressed change to. Every caller
+    // stamps the root through `assign_ipe_ids` with a non-empty path, so the
+    // root is addressable and its pair never reports `Unaddressed`.
+    let (Reach::Patched | Reach::Unaddressed) =
+        diff_node_depth(old, new, ParseContext::Data, &mut out, 0, stamp);
     out
+}
+
+/// Whether every change between an element pair reached the patch list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+enum Reach {
+    /// Every change is in the patch list, or the pair has none.
+    Patched,
+    /// The pair differs, but the change lies at an element with no `ipe-id`,
+    /// which no patch can address; the nearest addressable ancestor must
+    /// replace its children.
+    Unaddressed,
 }
 
 // ─── internal helpers ─────────────────────────────────────────────────────────
@@ -77,10 +93,17 @@ fn ipe_id<M>(n: &Html<M>) -> Option<&str> {
     None
 }
 
+/// The `ipe-id` a patch to `n` is sent to, or `None` when no patch can reach it.
+fn address<M>(n: &Html<M>) -> Option<&str> {
+    ipe_id(n).filter(|id| !id.is_empty())
+}
+
 /// True when `old` and `new` are the same node for in-place patching: both
 /// elements with equal tags and equal server identity (`ipe-id`). An element
-/// unstamped on both sides lies past the stamping depth ceiling, where
-/// `diff_node_depth` emits nothing.
+/// unstamped on both sides lies past the stamping depth ceiling, where the
+/// renderer writes no node and `diff_node_depth` emits nothing, or was built
+/// after the stamper ran, where `diff_node_depth` reports a change beneath it
+/// as [`Reach::Unaddressed`].
 fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
     match (old, new) {
         (Html::HElement(ot, _, _), Html::HElement(nt, _, _)) => {
@@ -92,6 +115,9 @@ fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
 
 /// Emit a replace of every child of the element at `id`.
 ///
+/// With no `id` the replace cannot be addressed, so the change is handed to
+/// the nearest addressable ancestor as [`Reach::Unaddressed`].
+///
 /// `parent_body` is how `admit_rendered_in` admitted that element and
 /// `child_ctx` is the parse context it puts its children in. A markup body
 /// is sent as `Patch.html`, which the client parses as markup. A `<script>` or
@@ -102,16 +128,16 @@ fn same_node<M>(old: &Html<M>, new: &Html<M>) -> bool {
 /// `<img onerror>` or a `<script src>` inside it is live markup and an entity
 /// such as `&amp;` is decoded.
 fn push_children_replace<M>(
-    id: &str,
+    id: Option<&str>,
     parent_body: ElementBody,
     child_ctx: ParseContext,
     new_kids: &[Html<M>],
     out: &mut Vec<Patch>,
     stamp: &RenderCtx<'_>,
-) {
-    if id.is_empty() {
-        return;
-    }
+) -> Reach {
+    let Some(id) = id else {
+        return Reach::Unaddressed;
+    };
     let mut p = Patch::for_id(id);
     let body = render_children(parent_body, child_ctx, new_kids, stamp);
     match parent_body {
@@ -119,6 +145,7 @@ fn push_children_replace<M>(
         ElementBody::Script | ElementBody::Style => p.text = Some(body),
     }
     out.push(p);
+    Reach::Patched
 }
 
 /// True when `node`, written in `ctx`, is an element the render sink's
@@ -135,6 +162,10 @@ fn is_refused_element<M>(ctx: ParseContext, node: &Html<M>) -> bool {
 /// Model-derived tree that would overflow the thread stack. `ctx` is the parse
 /// context both nodes are written in, threaded from the root exactly as the
 /// render sink threads it, and `stamp` is the session's render context.
+///
+/// A change at an element with no `ipe-id` is never dropped: it returns
+/// [`Reach::Unaddressed`], and the first addressable ancestor replaces its
+/// children, re-rendering the change.
 fn diff_node_depth<M>(
     old: &Html<M>,
     new: &Html<M>,
@@ -142,9 +173,10 @@ fn diff_node_depth<M>(
     out: &mut Vec<Patch>,
     depth: usize,
     stamp: &RenderCtx<'_>,
-) {
+) -> Reach {
+    // Past the ceiling the renderer writes no node, so there is nothing to patch.
     if depth >= crate::html::MAX_HTML_DEPTH {
-        return;
+        return Reach::Patched;
     }
     let (ot, oa, ok, nt, na, nk) = match (old, new) {
         (Html::HElement(ot, oa, ok), Html::HElement(nt, na, nk)) if same_node(old, new) => {
@@ -155,7 +187,7 @@ fn diff_node_depth<M>(
         // so nothing is emitted; every caller stamps both trees from the same
         // root path, which a root's `ipe-id` equals, so a top-level identity
         // mismatch does not arise.
-        _ => return,
+        _ => return Reach::Patched,
     };
     // SECURITY: the render sink's own admission rule. A refused element is
     // absent from the rendered page, so neither side of a refused pair has a
@@ -167,20 +199,22 @@ fn diff_node_depth<M>(
         admit_rendered_in(ctx, nt, nk),
         admit_rendered_in(ctx, ot, ok),
     ) else {
-        return;
+        return Reach::Patched;
     };
     let body = new_rendered.body();
     let child_ctx = ctx.enter(nt);
-    // Patch id targets the element currently in the DOM — the OLD tree's id
-    // . Borrowed: `Patch::for_id` copies it only when
-    // a Patch is actually built, so an unchanged element pair allocates
-    // nothing here (efficiency-audit §6 medium).
-    let id: &str = ipe_id(old).unwrap_or("");
+    // Patch id targets the element currently in the DOM: the OLD tree's id.
+    // Borrowed: `Patch::for_id` copies it only when a Patch is actually built,
+    // so an unchanged element pair allocates nothing here.
+    let id = address(old);
 
     // Attribute + event delta.
-    let mut p = Patch::for_id(id);
+    let mut p = Patch::for_id(id.unwrap_or_default());
     diff_attrs(oa, na, &mut p);
-    if !id.is_empty() && !p.attrs.is_empty() {
+    if !p.attrs.is_empty() {
+        if id.is_none() {
+            return Reach::Unaddressed;
+        }
         out.push(p);
     }
 
@@ -189,18 +223,20 @@ fn diff_node_depth<M>(
         && nk.len() == 1
         && let (Some(Html::HText(o)), Some(Html::HText(n))) = (ok.first(), nk.first())
     {
-        if o != n && !id.is_empty() {
+        if o != n {
+            let Some(id) = id else {
+                return Reach::Unaddressed;
+            };
             let mut tp = Patch::for_id(id);
             tp.text = Some(n.clone());
             out.push(tp);
         }
-        return;
+        return Reach::Patched;
     }
 
     // Child-count change → replace the whole subtree.
     if ok.len() != nk.len() {
-        push_children_replace(id, body, child_ctx, nk, out, stamp);
-        return;
+        return push_children_replace(id, body, child_ctx, nk, out, stamp);
     }
 
     let child_depth = depth.saturating_add(1);
@@ -212,8 +248,7 @@ fn diff_node_depth<M>(
                 // (single-text is the fast path above; anything else is a
                 // parent html-replace).
                 if o != n {
-                    push_children_replace(id, body, child_ctx, nk, out, stamp);
-                    return;
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
                 }
             }
             // A changed trusted raw body (a dynamic `styleNode`, an
@@ -221,26 +256,28 @@ fn diff_node_depth<M>(
             // the same body class the first paint used.
             (Html::HRaw(o), Html::HRaw(n)) => {
                 if o != n {
-                    push_children_replace(id, body, child_ctx, nk, out, stamp);
-                    return;
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
                 }
             }
             (Html::HElement(..), Html::HElement(..)) if same_node(oc, nc) => {
                 // A child that gains or loses admission appears in or vanishes
                 // from the page, so the parent's subtree is replaced.
                 if is_refused_element(child_ctx, oc) != is_refused_element(child_ctx, nc) {
-                    push_children_replace(id, body, child_ctx, nk, out, stamp);
-                    return;
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
                 }
-                diff_node_depth(oc, nc, child_ctx, out, child_depth, stamp);
+                // A change the child cannot address is re-rendered here.
+                if diff_node_depth(oc, nc, child_ctx, out, child_depth, stamp) == Reach::Unaddressed
+                {
+                    return push_children_replace(id, body, child_ctx, nk, out, stamp);
+                }
             }
             // Tag / kind / identity mismatch → replace the subtree at the parent.
             _ => {
-                push_children_replace(id, body, child_ctx, nk, out, stamp);
-                return;
+                return push_children_replace(id, body, child_ctx, nk, out, stamp);
             }
         }
     }
+    Reach::Patched
 }
 
 /// Compute the attribute + event delta between `old` and `new`.
@@ -1261,5 +1298,132 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A stamped `div` holding a stamped `p`, then `extra` appended after the
+    /// stamper ran, so `extra` and everything beneath it carry no `ipe-id`.
+    fn with_unstamped_child(extra: Html<()>) -> Html<()> {
+        let mut tree: Html<()> = Html::HElement(
+            "div".into(),
+            vec![],
+            vec![Html::HElement(
+                "p".into(),
+                vec![],
+                vec![Html::HText("x".into())],
+            )],
+        );
+        ids(&mut tree);
+        if let Html::HElement(_, _, kids) = &mut tree {
+            kids.push(extra);
+        }
+        tree
+    }
+
+    /// The one patch a pair yields, which must replace the children of the
+    /// stamped root `r` with markup containing `needle`.
+    fn assert_root_children_replace(patches: &[Patch], needle: &str) {
+        assert_eq!(patches.len(), 1, "expected one replace; got {patches:?}");
+        let Some(patch) = patches.first() else {
+            return;
+        };
+        assert_eq!(patch.id, "r", "nearest addressed ancestor: {patch:?}");
+        let Some(html) = patch.html.as_deref() else {
+            assert!(
+                patch.html.is_some(),
+                "expected a children replace: {patch:?}"
+            );
+            return;
+        };
+        assert!(html.contains(needle), "the change is re-rendered: {html:?}");
+    }
+
+    fn raw_style(css: &str) -> Html<()> {
+        Html::HElement("style".into(), vec![], vec![Html::HRaw(css.into())])
+    }
+
+    /// A raw-text body change beneath an unstamped element reaches the client
+    /// as a replace at the nearest stamped ancestor, never as nothing.
+    #[test]
+    fn unaddressed_raw_body_change_replaces_at_nearest_addressed_ancestor() {
+        let old = with_unstamped_child(raw_style("p{color:red}"));
+        let new = with_unstamped_child(raw_style("p{color:green}"));
+        assert_root_children_replace(&plain(&old, &new), "p{color:green}");
+    }
+
+    /// An attribute change on an unstamped element is re-rendered at the
+    /// nearest stamped ancestor.
+    #[test]
+    fn unaddressed_attr_change_replaces_at_nearest_addressed_ancestor() {
+        let span = |class: &str| -> Html<()> {
+            Html::HElement(
+                "span".into(),
+                vec![Attribute::Attr("class".into(), class.into())],
+                vec![],
+            )
+        };
+        let old = with_unstamped_child(span("before"));
+        let new = with_unstamped_child(span("after"));
+        assert_root_children_replace(&plain(&old, &new), "after");
+    }
+
+    /// A sole-text change on an unstamped element is re-rendered at the
+    /// nearest stamped ancestor.
+    #[test]
+    fn unaddressed_text_change_replaces_at_nearest_addressed_ancestor() {
+        let span = |t: &str| -> Html<()> {
+            Html::HElement("span".into(), vec![], vec![Html::HText(t.into())])
+        };
+        let old = with_unstamped_child(span("before"));
+        let new = with_unstamped_child(span("after"));
+        assert_root_children_replace(&plain(&old, &new), "after");
+    }
+
+    /// An unaddressed change climbs past every unstamped ancestor to the first
+    /// stamped one.
+    #[test]
+    fn unaddressed_change_climbs_past_unstamped_ancestors() {
+        let nest = |t: &str| -> Html<()> {
+            Html::HElement(
+                "section".into(),
+                vec![],
+                vec![Html::HElement(
+                    "span".into(),
+                    vec![],
+                    vec![Html::HText(t.into())],
+                )],
+            )
+        };
+        let old = with_unstamped_child(nest("before"));
+        let new = with_unstamped_child(nest("after"));
+        assert_root_children_replace(&plain(&old, &new), "after");
+    }
+
+    /// An unchanged unstamped subtree yields no patch.
+    #[test]
+    fn unchanged_unaddressed_subtree_yields_no_patch() {
+        let old = with_unstamped_child(raw_style("p{color:red}"));
+        let new = with_unstamped_child(raw_style("p{color:red}"));
+        let patches = plain(&old, &new);
+        assert!(patches.is_empty(), "{patches:?}");
+    }
+
+    /// A change past the depth ceiling, where the renderer writes no node,
+    /// still yields no patch: the unaddressed signal is not raised there.
+    #[test]
+    fn change_past_depth_ceiling_yields_no_patch() {
+        fn chain(depth: usize, leaf: &str) -> Html<()> {
+            let mut h: Html<()> = Html::HText(leaf.into());
+            for _ in 0..depth {
+                h = Html::HElement("div".into(), vec![], vec![h]);
+            }
+            h
+        }
+        let depth = crate::html::MAX_HTML_DEPTH + 5;
+        let mut old = chain(depth, "before");
+        let mut new = chain(depth, "after");
+        ids(&mut old);
+        ids(&mut new);
+        let patches = plain(&old, &new);
+        assert!(patches.is_empty(), "{patches:?}");
     }
 }

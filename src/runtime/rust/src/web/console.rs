@@ -120,52 +120,86 @@ pub async fn console_html() -> axum::response::Response {
         .into_response();
     crate::server::with_security_headers(
         resp,
-        telemetry::security_headers(crate::csp::Profile::Console),
+        telemetry::security_headers(&crate::csp::Guarded::Console),
+    )
+}
+
+/// One operator-console API answer: a JSON body that is never stored by a
+/// cache, since every body is the process's logs, errors, traces or counters.
+///
+/// The only body type [`API_ROUTES`] admits, so an endpoint cannot be mounted
+/// without `no-store`.
+struct ApiJson(String);
+
+impl IntoResponse for ApiJson {
+    fn into_response(self) -> axum::response::Response {
+        (
+            StatusCode::OK,
+            [json_ct(), (header::CACHE_CONTROL, "no-store")],
+            self.0,
+        )
+            .into_response()
+    }
+}
+
+/// One console API endpoint: its path and the body it answers.
+type ApiRoute = (&'static str, fn() -> ApiJson);
+
+/// Every in-process console API endpoint. [`mount_inline`] mounts exactly these.
+const API_ROUTES: &[ApiRoute] = &[
+    ("/_ipe/console/api/overview", api_overview),
+    ("/_ipe/console/api/logs", api_logs),
+    ("/_ipe/console/api/errors", api_errors),
+    ("/_ipe/console/api/traces", api_traces),
+    ("/_ipe/console/api/metrics-summary", api_metrics_summary),
+];
+
+/// Mount the in-process console: the [`console_html`] shell at
+/// `/_ipe/console` and every [`API_ROUTES`] endpoint.
+pub(super) fn mount_inline<S>(router: axum::Router<S>) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    API_ROUTES.iter().fold(
+        router.route("/_ipe/console", axum::routing::get(console_html)),
+        |router, &(path, body)| {
+            router.route(path, axum::routing::get(move || async move { body() }))
+        },
     )
 }
 
 /// `GET /_ipe/console/api/overview` — request + error counters.
-pub async fn api_overview() -> impl IntoResponse {
-    let body = format!(
+fn api_overview() -> ApiJson {
+    ApiJson(format!(
         r#"{{"requests":{},"errors":{}}}"#,
         telemetry::requests_total(),
         telemetry::errors_total()
-    );
-    (StatusCode::OK, [json_ct()], body)
+    ))
 }
 
 /// `GET /_ipe/console/api/logs` — recent log ring (most recent 200).
-pub async fn api_logs() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [json_ct()],
-        telemetry::entries_json(&telemetry::recent_logs(200)),
-    )
+fn api_logs() -> ApiJson {
+    ApiJson(telemetry::entries_json(&telemetry::recent_logs(200)))
 }
 
 /// `GET /_ipe/console/api/errors` — recent error ring.
-pub async fn api_errors() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [json_ct()],
-        telemetry::entries_json(&telemetry::recent_errors(200)),
-    )
+fn api_errors() -> ApiJson {
+    ApiJson(telemetry::entries_json(&telemetry::recent_errors(200)))
 }
 
 /// `GET /_ipe/console/api/traces` — recent completed `Ipe.Trace.span`s.
-pub async fn api_traces() -> impl IntoResponse {
-    (StatusCode::OK, [json_ct()], telemetry::spans_json(200))
+fn api_traces() -> ApiJson {
+    ApiJson(telemetry::spans_json(200))
 }
 
 /// `GET /_ipe/console/api/metrics-summary` — the parsed counter snapshot the
 /// dashboard renders (mirror of  parsed Prometheus summary).
-pub async fn api_metrics_summary() -> impl IntoResponse {
-    let body = format!(
+fn api_metrics_summary() -> ApiJson {
+    ApiJson(format!(
         r#"{{"ipe_web_requests_total":{},"ipe_web_errors_total":{}}}"#,
         telemetry::requests_total(),
         telemetry::errors_total()
-    );
-    (StatusCode::OK, [json_ct()], body)
+    ))
 }
 
 /// The credential an `Authorization` header presents.
@@ -704,6 +738,48 @@ mod tests {
             .map(|(inner, _)| inner)
     }
 
+    /// Every console API route the inline mount serves answers JSON with
+    /// `no-store`, and no other site mounts a console API route, so a new
+    /// endpoint enters through [`API_ROUTES`] and inherits the header.
+    #[tokio::test]
+    async fn every_console_api_route_answers_no_store() {
+        use tower::ServiceExt;
+        assert!(!API_ROUTES.is_empty());
+        let router: axum::Router = mount_inline(axum::Router::new());
+        for &(path, _) in API_ROUTES {
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty());
+            assert!(req.is_ok(), "{path}");
+            let Ok(req) = req else { return };
+            let resp = router.clone().oneshot(req).await;
+            assert!(resp.is_ok(), "{path}");
+            let Ok(resp) = resp;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let get = |name: header::HeaderName| {
+                resp.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            assert_eq!(
+                get(header::CACHE_CONTROL).as_deref(),
+                Some("no-store"),
+                "{path}"
+            );
+            assert_eq!(
+                get(header::CONTENT_TYPE).as_deref(),
+                Some("application/json"),
+                "{path}"
+            );
+        }
+        let web_mod = include_str!("mod.rs");
+        assert!(
+            !web_mod.contains("\"/_ipe/console/api"),
+            "console API routes mount only through console::API_ROUTES"
+        );
+    }
+
     /// The console response carries the console policy, `nosniff`,
     /// `no-store` and same-origin framing, and the policy admits exactly the
     /// hash of each inline element's text as served.
@@ -718,7 +794,7 @@ mod tests {
                 .map(str::to_owned)
         };
         let want =
-            crate::csp::ContentSecurityPolicy::for_profile(crate::csp::Profile::Console, None)
+            crate::csp::ContentSecurityPolicy::for_guard(&crate::csp::Guarded::Console, None)
                 .header_value();
         let served_csp = get("content-security-policy");
         assert_eq!(served_csp, Some(want.clone()));
