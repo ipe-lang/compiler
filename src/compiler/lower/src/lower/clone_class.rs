@@ -1242,7 +1242,8 @@ fn match_arm_peak_uses(sym: Symbol, m: &ipe_ir::Match) -> usize {
 /// occurrence decrements it; when `remaining > 1` the occurrence is non-last
 /// and is rewritten:
 /// * bare `Var(sym)` → `CloneVar(sym)`;
-/// * Lambda whose body refs sym → `Let { name: sym, value: CloneVar(sym), body: Lambda }`.
+/// * Lambda that captures sym (no parameter re-binds it) →
+///   `Let { name: sym, value: CloneVar(sym), body: Lambda }`.
 ///   The pre-clone rebinding captures the CLONE into the closure while the
 ///   OUTER `sym` remains alive for subsequent uses.
 ///
@@ -1274,7 +1275,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
         // When NOT the last use, wrap in a pre-clone Let so the closure
         // captures the clone and the outer `sym` stays alive.
         Expr::Lambda { params, ret, body } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // a FURTHER-nested `move` closure inside this lambda's
                 // body that ALSO captures `sym` would move `sym` out of THIS
                 // closure's captured environment on the first call, turning a
@@ -1314,7 +1315,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
         // ALSO a `move` closure literal that may capture `sym`, so it needs
         // the same pre-clone treatment when it is not the last use.
         Expr::SharedLambda { params, ret, body } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // same nested-capture descent as the `Lambda` arm above.
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
@@ -1338,7 +1339,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
             body,
             capture,
         } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // same nested-capture descent as the `Lambda` arm above.
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {

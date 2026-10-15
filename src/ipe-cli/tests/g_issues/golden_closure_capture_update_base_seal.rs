@@ -107,11 +107,14 @@ fn update_base_capture_seal_runs() {
     crate::support::assert_self_regression(GOLDEN, &golden_dir(&root), &run.stdout);
 }
 
-/// A non-`Clone` `Task`-bearing record `w` is mentioned in the continuation only
-/// as an update base, then read again by the task the continuation follows.
+/// A non-`Clone` `Task`-bearing record `w` is mentioned by a closure only as an
+/// update base, then read again by a later closure.
 ///
-/// The closure moves `w`, so the later read is a use after move; ipe must
-/// refuse it with IPE-L0135 rather than emit a crate that fails E0382.
+/// The first closure moves `w` into `first` before the second closure captures
+/// it, so the second capture is a use after move; ipe must refuse it with
+/// IPE-L0135 rather than emit a crate that fails E0382. The reuse follows the
+/// capture in emitted order: a field read in a `Task.andThen` container runs
+/// before its continuation moves `w`, which is a borrow then a move and builds.
 const NONCLONE_UPDATE_BASE_CAPTURE_REUSE: &str = r"module Main exposing (main)
 
 import Ipe.Io as Io
@@ -126,7 +129,11 @@ tagOf r =
 
 bump : { job : Task Error Int, tag : Int } -> Task Error ()
 bump w =
-    Task.andThen (\n -> Io.println (String.fromInt (tagOf { w | tag = n }))) (Task.succeed w.tag)
+    let
+        first =
+            Task.andThen (\n -> Io.println (String.fromInt (tagOf { w | tag = n }))) (Task.succeed 1)
+    in
+    Task.andThen (\_ -> Io.println (String.fromInt w.tag)) first
 
 
 main : Task Error ()

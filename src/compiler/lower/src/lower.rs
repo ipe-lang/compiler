@@ -1563,6 +1563,9 @@ fn canon_collect_free_locals(
 
 /// Will a `move` closure whose body is `expr` capture `sym` from the enclosing scope?
 ///
+/// `expr` is a closure body or a whole closure node; on a node, a parameter
+/// named `sym` shadows the outer binding, so that closure captures nothing of it.
+///
 /// A `move` closure captures by value every free local its body mentions, in
 /// any position and whatever the emitted form there (a borrow, a `.clone()`,
 /// a record-update base), and a nested closure that captures `sym` makes the
@@ -2619,15 +2622,16 @@ fn find_first_varlocal_span(sym: Symbol, body: &canon::Expr) -> Option<Span> {
 /// * `Destructure { binder binds sym, body }` — skip `body`.
 /// * `Match` arm whose pattern binds `sym` — skip that arm's body.
 /// * `TailLoop` whose params include `sym` — skip `body`.
-/// * `Lambda` — counted as 0 or 1 via `lambda_body_refs_sym`; do NOT recurse
-///   further (inner uses are the Lambda's own business).
+/// * `Lambda` — counted as 0 or 1 via `lambda_body_refs_sym` on the closure
+///   node, so a parameter re-binding `sym` counts 0; do NOT recurse further
+///   (inner uses are the Lambda's own business).
 fn count_var_uses(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         // A pre-pass `CloneVar` at the outer scope counts like a bare `Var`.
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_var_uses(sym, value);
             let in_body = if *name == sym {
@@ -5623,9 +5627,9 @@ fn align_param_slot(
 fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_fn_value_uses(sym, value);
             let in_body = if *name == sym {
@@ -5807,10 +5811,8 @@ fn fn_value_move_walk(
         }
         // A lambda captures `sym` by move at construction; the whole lambda is
         // one consuming read of `sym` at this point.
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => {
-            if lambda_body_refs_sym(sym, body) {
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            if lambda_body_refs_sym(sym, expr) {
                 state.read(true);
             }
         }
@@ -6163,9 +6165,9 @@ fn reject_fn_value_reuse(
 fn count_value_consumes(sym: Symbol, copy_fields: &BTreeSet<Symbol>, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_value_consumes(sym, copy_fields, value);
             let in_body = if *name == sym {
@@ -6535,10 +6537,8 @@ fn nonclone_move_walk(sym: Symbol, expr: &Expr, state: &mut NonCloneMoveState<'_
                 state.read_whole(true);
             }
         }
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => {
-            if lambda_body_refs_sym(sym, body) {
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            if lambda_body_refs_sym(sym, expr) {
                 state.read_whole(true);
             }
         }
@@ -6813,9 +6813,9 @@ fn sym_is_bare_update_base(sym: Symbol, expr: &Expr) -> bool {
 fn count_var_uses_update_aware(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_var_uses_update_aware(sym, value);
             let in_body = if *name == sym {
@@ -40019,6 +40019,91 @@ mod tests {
             assert!(
                 !mentions_free(ty, expr),
                 "{label}: an absent symbol is never free"
+            );
+        }
+    }
+
+    /// A closure whose parameter re-binds `card` captures nothing of the outer `card`.
+    ///
+    /// Every capture counter and move walk asks the closure node, not its bare
+    /// body, so the shadowing closure is neither a use nor a move of the outer
+    /// binding: no spurious pre-clone, and no false IPE-L0135 for a non-`Clone`
+    /// value read after it. A closure that does capture `card` stays one
+    /// consuming use.
+    #[test]
+    fn a_closure_whose_param_shadows_sym_captures_nothing() {
+        use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath};
+
+        use super::clone_class::rewrite_multiuse_clones;
+        use super::{
+            CloneEnv, count_fn_value_uses, count_value_consumes, count_var_uses,
+            count_var_uses_update_aware, fn_value_use_after_consume, nonclone_read_after_move,
+        };
+
+        let mut interner = Interner::new();
+        let card = interner.intern("card").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let main = interner.intern("Main").expect("intern");
+        let wrap = interner.intern("Wrap").expect("intern");
+        let closure_over = |param| Expr::Lambda {
+            params: vec![(param, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(Expr::Var(card)),
+        };
+        let then_read = |param| Expr::Tuple(vec![closure_over(param), Expr::Var(card)]);
+
+        let no_copy = BTreeSet::new();
+        let transparent = BTreeSet::new();
+        let payloads = EnumPayloadTable::new();
+        let env = CloneEnv {
+            interner: &interner,
+            transparent_ffi: &transparent,
+            payloads: &payloads,
+        };
+        let wrap_task = IrType::Enum {
+            home: ModPath(vec![main]),
+            name: wrap,
+            args: vec![IrType::Task(Box::new(IrType::Int))],
+        };
+
+        for (param, uses) in [(card, 0_usize), (x, 1)] {
+            let closure = closure_over(param);
+            assert_eq!(count_var_uses(card, &closure), uses, "count_var_uses");
+            assert_eq!(
+                count_var_uses_update_aware(card, &closure),
+                uses,
+                "count_var_uses_update_aware"
+            );
+            assert_eq!(
+                count_fn_value_uses(card, &closure),
+                uses,
+                "count_fn_value_uses"
+            );
+            assert_eq!(
+                count_value_consumes(card, &no_copy, &closure),
+                uses,
+                "count_value_consumes"
+            );
+
+            let captures = uses == 1;
+            assert_eq!(
+                fn_value_use_after_consume(card, &then_read(param), &payloads),
+                captures,
+                "fn_value_use_after_consume"
+            );
+            assert_eq!(
+                nonclone_read_after_move(env, card, &wrap_task, &then_read(param)),
+                captures,
+                "nonclone_read_after_move"
+            );
+
+            let mut remaining = 2;
+            let rewritten = rewrite_multiuse_clones(card, &mut remaining, closure_over(param));
+            assert_eq!(remaining, 2 - uses, "rewrite_multiuse_clones slot");
+            assert_eq!(
+                matches!(rewritten, Expr::Let { .. }),
+                captures,
+                "rewrite_multiuse_clones pre-clone wrap"
             );
         }
     }
