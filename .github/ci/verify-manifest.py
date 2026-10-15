@@ -33,6 +33,25 @@ Checks performed
          one job across every workflow, plumbing included; within one
          workflow several jobs may share a stem only when every context of
          it is suffixed.
+  1c. A required context reads green only if its deciding step ran (GitHub
+      reports a skipped job or step as passing). Over every job reporting a
+      gate/gate-external/nightly-gate context (its producer, or a job its
+      entry aggregates) and that job's transitive `needs`: the job `if:` is a
+      closed `JobGuard` (none; `always()` on a phase verdict over exactly its
+      needs; a phase conjunction of `changes` outputs; `pull_request` only),
+      and every step `if:` a closed `StepGuard` (none; `always()`;
+      release-only run/no-op; a classifier output's `!= 'false'` run form
+      paired with its `== 'false'` no-op, read from an earlier
+      `change_class.py` step of that scope; a needed job's success). A
+      reporting job holds a decider under a guard whose absent input means
+      run: a VERDICT `TOOL_INVOCATIONS` row, the phase verdict, a command a
+      `local:` block mirrors, or the script step its `INLINE_DECIDERS` row
+      names. `KNOWN_SKIP_AS_PASS` names, with the reason, a required job
+      that skips as pass; a row of either table that no longer applies is
+      refused as stale.
+  1d. Every `.github/ci` tool a workflow step runs is a (tool, argv) pair
+      `TOOL_INVOCATIONS` lists, never a `MAINTAINER_TOOLS` invocation, and
+      every listed pair is run by some step (a stale row is refused).
   3. Fail-closed dependency surfacing: GitHub reports a job whose `needs`
      failed as SKIPPED, and a skipped required check counts as passing.  So
      every job a gate transitively `needs` must itself surface in a gate (its
@@ -105,7 +124,7 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
      and runs only after steps of one (a content-pinned checkout or
      setup-python with a closed literal `with:` and no `env:`, the canonical
      pip install with no `env:`, a typed `ToolRun` of a file that exists
-     under `.github/ci`, its words split only on bash's blanks
+     under `.github/ci` in an invocation `TOOL_INVOCATIONS` lists, its words split only on bash's blanks
      `shell_lex.BLANKS`; any `timeout-minutes` a positive integer literal).
      The job is parsed once into a `ToolJob`: a literal GitHub-hosted Ubuntu
      runner (a fresh machine per job), job keys from one closed allowlist
@@ -1096,6 +1115,16 @@ class ErrorKind(enum.Enum):
     AGGREGATOR_NOT_ALWAYS = "aggregator-not-always"
     CONTEXT_DUPLICATE = "context-duplicate"
     CONTEXT_STEM_SHARED = "context-stem-shared"
+    JOB_GUARD_UNADMITTED = "job-guard-unadmitted"
+    STEP_GUARD_UNADMITTED = "step-guard-unadmitted"
+    CLASSIFIER_UNPAIRED = "classifier-unpaired"
+    NO_DECIDER = "no-decider"
+    DECIDER_ROW_STALE = "decider-row-stale"
+    KNOWN_SKIP_ROW_STALE = "known-skip-row-stale"
+    TOOL_UNLISTED = "tool-unlisted"
+    TOOL_ARGV_UNLISTED = "tool-argv-unlisted"
+    MAINTAINER_TOOL_IN_WORKFLOW = "maintainer-tool-in-workflow"
+    TOOL_ROW_STALE = "tool-row-stale"
 
 
 @dataclass(frozen=True)
@@ -1488,7 +1517,8 @@ def check_manifest_references(wfs: WorkflowSet, entries: list, errors: list[str]
                 f"{CLASSIFIER_JOB!r} {sorted(needed)} (only in aggregates: {sorted(listed - needed)}; "
                 f"only in needs: {sorted(needed - listed)}); refused",
             )
-        if agg_job.raw.get("if") != "always()":
+        guard = JobGuard.parse(agg_job.raw.get("if"), frozenset())
+        if isinstance(guard, str) or guard.kind is not JobGuardKind.ALWAYS:
             refuse(
                 ErrorKind.AGGREGATOR_NOT_ALWAYS, ctx,
                 f"aggregator job {agg_job.job_id!r} has `if:` {agg_job.raw.get('if')!r}, not `always()` — a "
@@ -1531,6 +1561,543 @@ def check_context_stems(wfs: WorkflowSet, errors: list[str]) -> None:
                 f"is the name of {len(jobs)} jobs ({', '.join(jobs)}); a context stem names one job "
                 "across every workflow — give each job a unique `name:`",
             ).render())
+
+
+# ---- Check 1c: a required context reads green only if its decider ran ----
+#
+# GitHub reports a skipped job, and a skipped step, as passing. The jobs held
+# here (`required_jobs`) are every job producing a `gate`, `gate-external` or
+# `nightly-gate` context, every job such a context `aggregates`, and the
+# transitive `needs` closure of both, in every workflow. Each one's `if:` is a
+# closed `JobGuard`; each of its steps' `if:` a closed `StepGuard`; and each
+# job reporting a required context (directly or as an aggregated job) holds a
+# decider step under a guard whose absent input means "run".
+
+REQUIRED_DISPOSITIONS = frozenset({"gate", "gate-external", "nightly-gate"})
+
+
+def _one_condition(raw: object) -> gha_expr.Expr | str:
+    """An `if:` value as exactly one expression covering the whole text,
+    whitespace included, or why it is not one (any text beside a `${{ }}`,
+    a blank too, makes a format string, which is always truthy)."""
+    if not isinstance(raw, str):
+        return f"is not a string ({type(raw).__name__}: {raw!r})"
+    text = raw
+    parsed = gha_expr.parse_condition(text)
+    if isinstance(parsed, gha_expr.Refusal):
+        return f"is outside the expression grammar ({parsed.why})"
+    if len(parsed.exprs) != 1 or parsed.spans[0] != (0, len(text)):
+        return "is not one expression covering the whole value"
+    return parsed.exprs[0]
+
+
+def _render(e: gha_expr.Expr) -> str:
+    """`e` written back as an expression (for refusal text only)."""
+    if isinstance(e, gha_expr.Literal):
+        return repr(e.value) if e.is_string else str(e.value).lower()
+    if isinstance(e, gha_expr.ContextRef):
+        return ".".join([e.ctx, *(s.name if isinstance(s, gha_expr.Prop) else "[…]" for s in e.path)])
+    if isinstance(e, gha_expr.Call):
+        return f"{e.name}({', '.join(_render(a) for a in e.args)})"
+    if isinstance(e, gha_expr.Unary):
+        return f"{e.op}{_render(e.operand)}"
+    if isinstance(e, gha_expr.Binary):
+        return f"({_render(e.left)} {e.op} {_render(e.right)})"
+    return "<expression>"
+
+
+def _flatten(e: gha_expr.Expr, op: str) -> list[gha_expr.Expr]:
+    """The operands of a chain of `op` (`a op b op c`, any grouping)."""
+    if isinstance(e, gha_expr.Binary) and e.op == op:
+        return [*_flatten(e.left, op), *_flatten(e.right, op)]
+    return [e]
+
+
+def _ref_compare(e: gha_expr.Expr, op: str, literal: str) -> tuple[str, ...] | None:
+    """The dotted path of `<context>.<prop>... <op> '<literal>'` — a plain
+    context reference on the left, the string literal on the right — or
+    None for any other shape."""
+    if not (
+        isinstance(e, gha_expr.Binary)
+        and e.op == op
+        and isinstance(e.left, gha_expr.ContextRef)
+        and isinstance(e.right, gha_expr.Literal)
+        and e.right.is_string
+        and e.right.value == literal
+        and all(isinstance(s, gha_expr.Prop) for s in e.left.path)
+    ):
+        return None
+    return (e.left.ctx, *(s.name for s in e.left.path))  # type: ignore[union-attr]
+
+
+def _changes_output_is_true(e: gha_expr.Expr) -> str | None:
+    """`<out>` of `needs.changes.outputs.<out> == 'true'`, else None."""
+    path = _ref_compare(e, "==", "true")
+    if path is None or len(path) != 4 or path[:3] != ("needs", CLASSIFIER_JOB, "outputs"):
+        return None
+    return path[3]
+
+
+class JobGuardKind(enum.Enum):
+    UNCONDITIONAL = "unconditional"
+    ALWAYS = "always"
+    PHASE = "phase"
+    PR_ONLY = "pr-only"
+
+
+@dataclass(frozen=True)
+class JobGuard:
+    """A required job's `if:`, one of a closed set.
+
+    `UNCONDITIONAL`: no `if:`. `ALWAYS`: exactly `always()`, only on a phase
+    verdict (checked by `check_required_guards`). `PHASE`: exactly
+    `needs.changes.outputs.<phase> == 'true'` conjoined with zero or more
+    `needs.changes.outputs.<scope> == 'true'`, optionally disjoined as a
+    whole with `needs.changes.outputs.release_only == 'true'`, every output
+    one the workflow's `changes` job declares. `PR_ONLY`: exactly
+    `github.event_name == 'pull_request'`. Anything else is refused.
+    """
+
+    kind: JobGuardKind
+    phase: str | None = None
+    scopes: tuple[str, ...] = ()
+    release_only: bool = False
+
+    @staticmethod
+    def parse(raw: object, changes_outputs: frozenset[str]) -> JobGuard | str:
+        """The guard of a job whose `if:` is `raw` (None when absent), or why
+        it is none. `changes_outputs` are the declared outputs of the
+        workflow's `changes` job (empty when it has none)."""
+        if raw is None:
+            return JobGuard(JobGuardKind.UNCONDITIONAL)
+        e = _one_condition(raw)
+        if isinstance(e, str):
+            return f"`if:` {raw!r} {e}"
+        if isinstance(e, gha_expr.Call) and e.name == "always" and not e.args:
+            return JobGuard(JobGuardKind.ALWAYS)
+        if _ref_compare(e, "==", "pull_request") == ("github", "event_name"):
+            return JobGuard(JobGuardKind.PR_ONLY)
+        disjuncts = _flatten(e, "||")
+        release_only = False
+        if len(disjuncts) == 2 and _changes_output_is_true(disjuncts[1]) == _RELEASE_ONLY_OUTPUT:
+            release_only = True
+        elif len(disjuncts) != 1:
+            return f"`if:` {raw!r} is not one phase conjunction (plus at most the release-only disjunct)"
+        names: list[str] = []
+        for c in _flatten(disjuncts[0], "&&"):
+            out = _changes_output_is_true(c)
+            if out is None:
+                return f"`if:` {raw!r} has the unadmitted conjunct `{_render(c)}`"
+            names.append(out)
+        missing = sorted({*names, *([_RELEASE_ONLY_OUTPUT] if release_only else [])} - changes_outputs)
+        if missing:
+            return f"`if:` {raw!r} reads `changes` output(s) {missing}, which no `changes` job of the workflow declares"
+        phase, scopes = names[0], tuple(names[1:])
+        if phase not in PHASE_EXCLUDES:
+            return f"`if:` {raw!r} opens with `{phase}`, not a phase output {sorted(PHASE_EXCLUDES)}"
+        bad = [s for s in scopes if s in PHASE_EXCLUDES or s == _RELEASE_ONLY_OUTPUT]
+        if bad:
+            return f"`if:` {raw!r} conjoins {bad} as scopes; a scope is a `changes` output that is neither a phase nor release_only"
+        return JobGuard(JobGuardKind.PHASE, phase, scopes, release_only)
+
+
+class StepGuardKind(enum.Enum):
+    UNCONDITIONAL = "unconditional"
+    ALWAYS = "always"
+    RELEASE_ONLY_RUN = "release-only-run"
+    RELEASE_ONLY_NOOP = "release-only-noop"
+    CLASSIFIER_RUN = "classifier-run"
+    CLASSIFIER_NOOP = "classifier-noop"
+    PREP_SUCCEEDED = "prep-succeeded"
+
+
+# The guards a decider step may run under: each runs the step whenever its
+# input is absent or empty.
+DECIDER_GUARDS = frozenset({StepGuardKind.UNCONDITIONAL, StepGuardKind.RELEASE_ONLY_RUN, StepGuardKind.CLASSIFIER_RUN})
+
+
+@dataclass(frozen=True)
+class StepGuard:
+    """A step `if:` inside a required job, one of a closed set.
+
+    `UNCONDITIONAL`: no `if:`. `ALWAYS`: exactly `always()` — it never skips
+    the step, so it is admitted on a cleanup or upload step, never on the
+    decider. `RELEASE_ONLY_RUN`/`RELEASE_ONLY_NOOP`:
+    `needs.changes.outputs.release_only != 'true'` / `== 'true'`.
+    `CLASSIFIER_RUN`/`CLASSIFIER_NOOP`: `steps.<ref>.outputs.<scope> !=
+    'false'` / `== 'false'`, so an absent classifier output means run.
+    `PREP_SUCCEEDED`: `needs.<ref>.result == 'success'`. Where `ref` must
+    point, and the pairing rules, are checked by `check_required_guards`.
+    """
+
+    kind: StepGuardKind
+    ref: str | None = None
+    scope: str | None = None
+
+    @staticmethod
+    def parse(raw: object) -> StepGuard | str:
+        if raw is None:
+            return StepGuard(StepGuardKind.UNCONDITIONAL)
+        e = _one_condition(raw)
+        if isinstance(e, str):
+            return f"`if:` {raw!r} {e}"
+        if isinstance(e, gha_expr.Call) and e.name == "always" and not e.args:
+            return StepGuard(StepGuardKind.ALWAYS)
+        release = ("needs", CLASSIFIER_JOB, "outputs", _RELEASE_ONLY_OUTPUT)
+        if _ref_compare(e, "!=", "true") == release:
+            return StepGuard(StepGuardKind.RELEASE_ONLY_RUN, CLASSIFIER_JOB)
+        if _ref_compare(e, "==", "true") == release:
+            return StepGuard(StepGuardKind.RELEASE_ONLY_NOOP, CLASSIFIER_JOB)
+        for op, kind in (("!=", StepGuardKind.CLASSIFIER_RUN), ("==", StepGuardKind.CLASSIFIER_NOOP)):
+            path = _ref_compare(e, op, "false")
+            if path is not None and len(path) == 4 and path[0] == "steps" and path[2] == "outputs":
+                return StepGuard(kind, path[1], path[3])
+        path = _ref_compare(e, "==", "success")
+        if path is not None and len(path) == 3 and path[0] == "needs" and path[2] == "result":
+            return StepGuard(StepGuardKind.PREP_SUCCEEDED, path[1])
+        return f"`if:` {raw!r} is not an admitted step guard"
+
+
+# Required jobs whose decider is an inline `run:` script (or a VM action's
+# `with.run` script) rather than a listed tool, the phase verdict, or a
+# command a manifest `local:` block mirrors: (workflow, job) -> the decider
+# step's `name:` (its whole trimmed `run:` text when it has no name). A row
+# whose job is not required, whose step is missing, or whose job already
+# holds one of those deciders is refused as stale.
+INLINE_DECIDERS: dict[tuple[str, str], str] = {
+    ("admission-sandbox.yml", "freebsd-x64"): "Run admission jail inside FreeBSD VM",
+    ("admission-sandbox.yml", "linux-arm64-jail"): "Run admission jail",
+    ("admission-sandbox.yml", "linux-x64-jail"): "Run admission jail",
+    ("admission-sandbox.yml", "macos-arm64-jail"): "Run admission jail",
+    ("ci.yml", "asan"): "ASAN shard ${{ matrix.shard }}/6 (build-std, instrumented std)",
+    ("ci.yml", "browser-e2e"): "Run Playwright specs (geo + clipboard, layout fill, focus across patch)",
+    ("ci.yml", "build-tools"): "Build ipe and the doc/golden regenerator binaries",
+    ("ci.yml", "e2e"): "E2E shard ${{ matrix.shard }}/14 (THE SEAL — build+run emitted Rust)",
+    ("ci.yml", "linux-arm64-tier2"): "audit_native fail-closed refuse-to-certify on aarch64",
+    ("ci.yml", "linux-x64-tier2"): "audit_native E2E through the real Linux jail",
+    ("ci.yml", "release-targets-freebsd"): "Check in FreeBSD VM",
+    ("ci.yml", "release-targets-run"): "Check ipe + ipe-ffi-inspector",
+    ("ci.yml", "seal-modset-vendored"): "Run seal_modset under the vendored emit model",
+    ("ci.yml", "seal-smoke-run"): "Emit + build + run (examples/shapes/non-tea/hello-world)",
+    ("ci.yml", "shapes-examples"): "Check + emit + build every first-party shape",
+    ("ci.yml", "test-run"): (
+        'cargo nextest run --archive-file nextest.tar.zst --workspace-remap . --partition "count:$SHARD/4" --profile ci'
+    ),
+    ("ci.yml", "tsan"): "TSAN (build-std, concurrency-bearing crates)",
+    ("ci.yml", "windows-check"): "cargo check --locked -p ipe -p ipe_fs_open -p ipe_sandbox --all-targets",
+    ("ci.yml", "windows-test"): "Test the transfer containment and linkable build directory on Windows",
+    ("playground.yml", "build"): "Build ipe-wasm (wasm32-unknown-unknown)",
+    ("playground.yml", "playground-jail-run"): "Run jail-runner tests (unit + sandbox security proofs)",
+    ("static.yml", "linux-cfree-gate"): "C-free refusal gates",
+    ("trust-root-diff.yml", "trust-root-diff"): "Judge the PR against the trusted CODEOWNERS",
+}
+# Required jobs that report green without running their decider, each with
+# the reason; exempt from the step-guard and decider rules (never from the
+# job-guard rule). A row whose job is not required, or that would pass
+# without the exemption, is refused as stale.
+KNOWN_SKIP_AS_PASS: dict[tuple[str, str], str] = {
+    ("admission-sandbox.yml", "windows-x64"): (
+        "GitHub-hosted windows-2022 runners provide no Windows-container Docker daemon, so the jail steps "
+        "run only under `steps.winctr.outputs.available == 'true'` (issue #186)"
+    ),
+}
+
+
+def _step_key(st: Step) -> str:
+    """How `INLINE_DECIDERS` names a step: its `name:`, else its whole
+    trimmed `run:` text."""
+    return st.name if st.name is not None else shell_lex.trim(st.run or "")
+
+
+def required_jobs(wfs: WorkflowSet, entries: list[ManifestEntry]) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """(`reporting`, `held`): the (workflow, job) pairs that report a
+    required context — its producers, and the jobs its entry aggregates —
+    and those plus their transitive `needs` closure."""
+    producing = _producing_jobs(wfs)
+    reporting: set[tuple[str, str]] = set()
+    for e in entries:
+        if e.disposition not in REQUIRED_DISPOSITIONS:
+            continue
+        for wf, wj in producing.get(e.context, []):
+            reporting.add((wf.fname, wj.job_id))
+        if e.producer is not None and wfs.get(e.producer) is not None:
+            reporting.update((e.producer, a) for a in e.aggregates if wfs.get(e.producer).job(a) is not None)
+    held = set(reporting)
+    pending = list(reporting)
+    while pending:
+        fname, jid = pending.pop()
+        wj = wfs.get(fname).job(jid)
+        for n in wj.needs if wj is not None else ():
+            if (fname, n) not in held:
+                held.add((fname, n))
+                pending.append((fname, n))
+    return reporting, held
+
+
+def _changes_outputs(wf: Workflow) -> frozenset[str]:
+    changes = wf.job(CLASSIFIER_JOB)
+    outputs = changes.raw.get("outputs") if changes is not None else None
+    return frozenset(str(k) for k in outputs) if isinstance(outputs, dict) else frozenset()
+
+
+def _mirrored_commands(wf: Workflow, wj: WorkflowJob, entries: list[ManifestEntry], locals_: dict) -> set[tuple[Argv, str]]:
+    """The (argv, cwd) pairs a manifest `local:` block mirrors exactly (no
+    `differs:`) for an entry this job reports."""
+    import local_gate  # noqa: PLC0415  # sibling module; sys.path holds this dir
+
+    out: set[tuple[Argv, str]] = set()
+    for e in entries:
+        if e.producer != wf.fname or not (e.context in wj.contexts or wj.job_id in e.aggregates):
+            continue
+        disp = locals_.get(e.context)
+        if isinstance(disp, local_gate.RunLocal):
+            out.update((local_gate.ci_argv(c), c.cwd) for c in disp.commands if c.differs is None)
+    return out
+
+
+def _is_mirrored(wf: Workflow, wj: WorkflowJob, st: Step, mirrored: set[tuple[Argv, str]]) -> bool:
+    """Whether a command line of `st` is one a `local:` block mirrors, read
+    by `local_gate.ci_lines` itself (no second mirror grammar)."""
+    import local_gate  # noqa: PLC0415
+
+    if not mirrored or st.run is None:
+        return False
+    job = {k: v for k, v in wj.raw.items() if k != "steps"}
+    doc = {k: wf.doc[k] for k in ("env", "defaults") if k in wf.doc}
+    doc["jobs"] = {wj.job_id: {**job, "steps": [st.raw]}}
+    return any(
+        (tuple(t for t in ln.argv if t not in local_gate.CI_ONLY_FLAGS), ln.cwd) in mirrored
+        for ln in local_gate.ci_lines(doc, wj.job_id, [])
+    )
+
+
+class DeciderKind(enum.Enum):
+    TOOL = "listed verdict tool"
+    PHASE_VERDICT = "phase verdict"
+    LOCAL_MIRRORED = "local-mirrored command"
+    CLASSIFIER = "classifier of the `changes` job"
+
+
+def _decider_kind(
+    wf: Workflow, wj: WorkflowJob, st: Step, mirrored: set[tuple[Argv, str]]
+) -> DeciderKind | None:
+    """What makes `st` a decider of its job, if anything. A step carrying
+    `continue-on-error:` decides nothing, save the `changes` job's advisory
+    classifier, whose crash leaves its outputs unset (every consumer then
+    runs everything)."""
+    if st.uses == PHASE_VERDICT_ACTION:
+        return DeciderKind.PHASE_VERDICT if "continue-on-error" not in st.raw else None
+    call = tool_call(st.run) if st.run is not None and st.uses is None else None
+    if call is not None:
+        name = TREE_FILE_RE.fullmatch(call[1]).group(1)  # type: ignore[union-attr]
+        role = tool_role(name, call[2])
+        if role is ToolRole.VERDICT and "continue-on-error" not in st.raw:
+            return DeciderKind.TOOL
+        if role is ToolRole.ADVISORY and wj.job_id == CLASSIFIER_JOB and st.raw.get("continue-on-error", True) is True:
+            return DeciderKind.CLASSIFIER
+        return None
+    if "continue-on-error" not in st.raw and _is_mirrored(wf, wj, st, mirrored):
+        return DeciderKind.LOCAL_MIRRORED
+    return None
+
+
+def _inline_decider(st: Step) -> bool:
+    """Whether `st` has an inline-script decider's shape: a `run:` script,
+    or an action whose `with.run` is a script, with no `continue-on-error:`."""
+    if "continue-on-error" in st.raw:
+        return False
+    if st.uses is None:
+        return st.run is not None
+    with_ = st.raw.get("with")
+    return isinstance(with_, dict) and isinstance(with_.get("run"), str)
+
+
+def check_required_guards(
+    wfs: WorkflowSet,
+    entries: list[ManifestEntry],
+    raw_entries: list,
+    errors: list[str],
+    inline: dict[tuple[str, str], str] | None = None,
+    known_skips: dict[tuple[str, str], str] | None = None,
+) -> None:
+    """Check 1c (see the module docstring)."""
+    import local_gate  # noqa: PLC0415
+
+    inline = INLINE_DECIDERS if inline is None else inline
+    known_skips = KNOWN_SKIP_AS_PASS if known_skips is None else known_skips
+    locals_ = local_gate.parse_manifest_locals([e for e in raw_entries if isinstance(e, dict)], [])
+    reporting, held = required_jobs(wfs, entries)
+
+    def refuse(kind: ErrorKind, fname: str, path: str, detail: str) -> None:
+        errors.append(ManifestError(kind, fname, path, detail).render())
+
+    spec_decided: set[tuple[str, str]] = set()
+    for fname, jid in sorted(held):
+        wf = wfs.get(fname)
+        wj = wf.job(jid) if wf is not None else None
+        if wf is None or wj is None:
+            continue
+        jpath = f"job {jid!r}"
+        guard = JobGuard.parse(wj.raw.get("if"), _changes_outputs(wf))
+        if isinstance(guard, str):
+            refuse(ErrorKind.JOB_GUARD_UNADMITTED, fname, jpath, f"{guard} — a skipped job reports as passing; refused")
+        elif guard.kind is JobGuardKind.PHASE and CLASSIFIER_JOB not in wj.needs:
+            refuse(ErrorKind.JOB_GUARD_UNADMITTED, fname, jpath, f"reads `{CLASSIFIER_JOB}` outputs but does not need it; refused")
+        elif guard.kind is JobGuardKind.ALWAYS and not _is_phase_verdict(wj):
+            refuse(
+                ErrorKind.JOB_GUARD_UNADMITTED, fname, jpath,
+                "runs under `always()` but is no phase verdict (a `uses: "
+                f"{PHASE_VERDICT_ACTION}` step whose `results` names every need in order); refused",
+            )
+        if (fname, jid) in known_skips:
+            continue
+        steps = _typed_steps(wj.raw, f"{fname}: {jpath}", [])
+        guards: list[StepGuard | None] = []
+        for i, st in enumerate(steps):
+            spath = f"{jpath} step {i + 1} ({st.label!r})"
+            g = StepGuard.parse(st.raw.get("if"))
+            if isinstance(g, str):
+                refuse(ErrorKind.STEP_GUARD_UNADMITTED, fname, spath, f"{g} — a skipped step reports as passing; refused")
+                guards.append(None)
+                continue
+            why = _step_guard_context(g, wj, steps[:i])
+            if why is not None:
+                refuse(ErrorKind.STEP_GUARD_UNADMITTED, fname, spath, f"{why}; refused")
+                guards.append(None)
+                continue
+            guards.append(g)
+        run_scopes = {(g.ref, g.scope) for g in guards if g is not None and g.kind is StepGuardKind.CLASSIFIER_RUN}
+        noop_scopes = {(g.ref, g.scope) for g in guards if g is not None and g.kind is StepGuardKind.CLASSIFIER_NOOP}
+        for ref, scope in sorted(run_scopes ^ noop_scopes):
+            refuse(
+                ErrorKind.CLASSIFIER_UNPAIRED, fname, jpath,
+                f"guards steps on `steps.{ref}.outputs.{scope}` without both the `!= 'false'` run form and the "
+                "`== 'false'` no-op form; refused",
+            )
+        if (fname, jid) not in reporting:
+            continue
+        mirrored = _mirrored_commands(wf, wj, entries, locals_)
+        decided = False
+        for st, g in zip(steps, guards):
+            if g is None or g.kind not in DECIDER_GUARDS:
+                continue
+            if _decider_kind(wf, wj, st, mirrored) is not None:
+                decided = True
+                spec_decided.add((fname, jid))
+                break
+        key = inline.get((fname, jid))
+        if not decided and key is not None:
+            hit = next(((st, g) for st, g in zip(steps, guards) if _step_key(st) == key), None)
+            if hit is not None and hit[1] is not None and hit[1].kind in DECIDER_GUARDS and _inline_decider(hit[0]):
+                decided = True
+        if not decided:
+            refuse(
+                ErrorKind.NO_DECIDER, fname, jpath,
+                "reports a required context but holds no decider (a listed verdict tool, the phase verdict, a "
+                "command a `local:` block mirrors, or its `INLINE_DECIDERS` script step) under an unconditional, "
+                "release-only-run or classifier-run guard — its context could read green with nothing run; refused",
+            )
+    for (fname, jid), key in sorted(inline.items()):
+        if (fname, jid) not in reporting:
+            refuse(ErrorKind.DECIDER_ROW_STALE, fname, f"job {jid!r}", "has an `INLINE_DECIDERS` row but reports no required context; remove the row")
+        elif (fname, jid) in spec_decided:
+            refuse(ErrorKind.DECIDER_ROW_STALE, fname, f"job {jid!r}", "has an `INLINE_DECIDERS` row but already holds a tool, phase-verdict or local-mirrored decider; remove the row")
+        else:
+            wj = wfs.get(fname).job(jid)
+            if wj is not None and not any(_step_key(st) == key for st in _typed_steps(wj.raw, "", [])):
+                refuse(ErrorKind.DECIDER_ROW_STALE, fname, f"job {jid!r}", f"has no step {key!r}, the step its `INLINE_DECIDERS` row names; refused")
+    for (fname, jid) in sorted(known_skips):
+        if (fname, jid) not in held:
+            refuse(ErrorKind.KNOWN_SKIP_ROW_STALE, fname, f"job {jid!r}", "has a `KNOWN_SKIP_AS_PASS` row but is no required job; remove the row")
+            continue
+        probe: list[str] = []
+        rest = {k: v for k, v in known_skips.items() if k != (fname, jid)}
+        own = {k: v for k, v in inline.items() if k[0] == fname}
+        check_required_guards(_only_workflow(wfs, fname), entries, raw_entries, probe, own, rest)
+        if not any(f"[{ErrorKind.STEP_GUARD_UNADMITTED.name}]" in p or f"[{ErrorKind.NO_DECIDER.name}]" in p for p in probe):
+            refuse(ErrorKind.KNOWN_SKIP_ROW_STALE, fname, f"job {jid!r}", "has a `KNOWN_SKIP_AS_PASS` row but passes without it; remove the row")
+
+
+def _only_workflow(wfs: WorkflowSet, fname: str) -> WorkflowSet:
+    """`wfs` with the workflow `fname` alone (the stale-row probe of
+    `KNOWN_SKIP_AS_PASS` asks only about the jobs of the row's workflow)."""
+    return WorkflowSet(wfs.root, tuple(w for w in wfs.workflows if w.fname == fname), ())
+
+
+def _is_phase_verdict(wj: WorkflowJob) -> bool:
+    """Whether `wj` runs the phase-verdict action over exactly its needs, in
+    order (check 11 pins the rest of its shape)."""
+    want = " ".join(f"{n}=${{{{ needs.{n}.result }}}}" for n in wj.needs)
+    for st in _typed_steps(wj.raw, "", []):
+        with_ = st.raw.get("with")
+        if st.uses == PHASE_VERDICT_ACTION and isinstance(with_, dict) and with_.get("results") == want:
+            return True
+    return False
+
+
+def _step_guard_context(g: StepGuard, wj: WorkflowJob, earlier: list[Step]) -> str | None:
+    """Why a parsed step guard does not fit where it stands, or None."""
+    if g.kind in (StepGuardKind.RELEASE_ONLY_RUN, StepGuardKind.RELEASE_ONLY_NOOP) and CLASSIFIER_JOB not in wj.needs:
+        return f"reads `{CLASSIFIER_JOB}` outputs but the job does not need it"
+    if g.kind is StepGuardKind.PREP_SUCCEEDED and g.ref not in wj.needs:
+        return f"reads `needs.{g.ref}.result` but the job does not need {g.ref!r}"
+    if g.kind in (StepGuardKind.CLASSIFIER_RUN, StepGuardKind.CLASSIFIER_NOOP):
+        flag = "--" + str(g.scope).replace("_", "-")
+        for st in earlier:
+            if st.raw.get("id") != g.ref:
+                continue
+            call = tool_call(st.run) if st.run is not None and st.uses is None else None
+            if call is not None and call[1].endswith("/change_class.py") and flag in call[2]:
+                return None
+            break
+        return f"reads `steps.{g.ref}.outputs.{g.scope}`, but no earlier step {g.ref!r} runs `change_class.py {flag}`"
+    return None
+
+
+def check_tool_invocations(
+    wfs: WorkflowSet, errors: list[str], table: dict[str, dict[Argv, ToolRole]] | None = None, stale: bool = True
+) -> None:
+    """Check 1d (see the module docstring)."""
+    table = TOOL_INVOCATIONS if table is None else table
+    seen: set[tuple[str, Argv]] = set()
+    for wf in wfs.workflows:
+        for wj in wf.jobs:
+            for i, st in enumerate(_typed_steps(wj.raw, "", [])):
+                call = tool_call(st.run) if st.run is not None else None
+                if call is None:
+                    continue
+                name = TREE_FILE_RE.fullmatch(call[1]).group(1)  # type: ignore[union-attr]
+                argv = call[2]
+                path = f"job {wj.job_id!r} step {i + 1} ({st.label!r})"
+                shown = " ".join([f".github/ci/{name}", *argv])
+                if (name, argv) in MAINTAINER_TOOLS:
+                    errors.append(ManifestError(
+                        ErrorKind.MAINTAINER_TOOL_IN_WORKFLOW, wf.fname, path,
+                        f"runs `{shown}`, a maintainer-only invocation; refused",
+                    ).render())
+                elif name not in table:
+                    errors.append(ManifestError(
+                        ErrorKind.TOOL_UNLISTED, wf.fname, path,
+                        f"runs `{shown}`, a tool `TOOL_INVOCATIONS` does not list; refused",
+                    ).render())
+                elif argv not in table[name]:
+                    errors.append(ManifestError(
+                        ErrorKind.TOOL_ARGV_UNLISTED, wf.fname, path,
+                        f"runs `{shown}`, an argv `TOOL_INVOCATIONS` does not list for {name} "
+                        f"({sorted(' '.join(a) or '<none>' for a in table[name])}); refused",
+                    ).render())
+                else:
+                    seen.add((name, argv))
+    if not stale:
+        return
+    for name, argvs in sorted(table.items()):
+        for argv in sorted(argvs):
+            if (name, argv) not in seen:
+                errors.append(ManifestError(
+                    ErrorKind.TOOL_ROW_STALE, MANIFEST_NAME.replace("check-manifest.yml", "verify-manifest.py"),
+                    f"TOOL_INVOCATIONS[{name!r}]",
+                    f"lists `{' '.join(argv) or '<no argv>'}`, which no workflow step runs; remove the row",
+                ).render())
 
 
 # A full-tier test that forgot the merge queue: `!= 'pull_request'` (either
@@ -4624,14 +5191,52 @@ class ToolRole(enum.Enum):
     OUTPUT = "output"
 
 
-# The tools that are not verdicts; every other tool file is a VERDICT, so a new
-# tool is verdict-bearing until it is listed here.
-TOOL_ROLES: dict[str, ToolRole] = {
-    "release_only.py": ToolRole.ADVISORY,
-    "change_class.py": ToolRole.ADVISORY,
-    "deterministic_checks_output.py": ToolRole.OUTPUT,
-    "rerun_policy.py": ToolRole.OUTPUT,
+Argv = tuple[str, ...]
+_V, _A, _O = ToolRole.VERDICT, ToolRole.ADVISORY, ToolRole.OUTPUT
+_SELF_TEST = {("-v",): _V}
+# Every `.github/ci` tool a workflow step invokes: its exact argv tuples, each
+# with the role that invocation carries. A tool or argv outside this table is
+# refused, never defaulted; a row no workflow step invokes is refused as stale.
+# Library modules (imported, never run) are absent, so invoking one is refused.
+TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
+    "prose_guard.py": {(): _V},
+    "e2e_shard.py": {("--plan",): _V, ("--lint",): _V},
+    "release_only.py": {(): _A},
+    "change_class.py": {
+        ("--code", "--emit", "--sanitize", "--wasm", "--editors"): _A,
+        ("--code",): _A,
+        ("--panic-scan",): _A,
+        ("--playground",): _A,
+        ("--grammar",): _A,
+    },
+    "artifact-guard.sh": {(): _V},
+    "verify-manifest.py": {(): _V},
+    "test_verify_manifest.py": _SELF_TEST,
+    "test_strict_yaml.py": _SELF_TEST,
+    "test_change_class.py": _SELF_TEST,
+    "test_e2e_shard.py": _SELF_TEST,
+    "test_rerun_policy.py": _SELF_TEST,
+    "test_nightly_green.py": _SELF_TEST,
+    "test_trust_roots.py": _SELF_TEST,
+    "test_local_gate.py": _SELF_TEST,
+    "test_cargo_invocation.py": _SELF_TEST,
+    "test_claims_table.py": _SELF_TEST,
+    "rerun_policy.py": {("--lint",): _V, ("--decide",): _O},
+    "nightly_green.py": {("--lint",): _V, ("--verdict",): _V},
+    "check_required_set.py": {(): _V, ("--fetch",): _V, ("--fetch-admin",): _V},
+    "manifest-lock-consistency.sh": {(): _V},
+    "ci_health_surface.py": {(): _V},
+    "deterministic_checks_output.py": {(): _O},
 }
+# Maintainer-only invocations: each rewrites a committed file or renders a
+# body for an admin call, so no workflow step may run one.
+MAINTAINER_TOOLS: frozenset[tuple[str, Argv]] = frozenset({("check_required_set.py", ("--write",))})
+
+
+def tool_role(name: str, argv: Argv, table: dict[str, dict[Argv, ToolRole]] = TOOL_INVOCATIONS) -> ToolRole | None:
+    """The role of running `.github/ci/<name>` with exactly `argv`, or None
+    when the table lists no such invocation."""
+    return table.get(name, {}).get(argv)
 
 
 @dataclass(frozen=True)
@@ -4722,7 +5327,6 @@ class Interp(enum.Enum):
 
 TOOL_SUFFIX = {Interp.PYTHON3: ".py", Interp.BASH: ".sh", Interp.DIRECT: ".sh"}
 TREE_FILE_RE = re.compile(r"\.github/ci/([A-Za-z0-9_-]+\.(?:py|sh))")
-TOOL_FLAG_RE = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9-]*")
 # The whole-text grammar of a tool run: plain words separated by bash's blanks
 # (`shell_lex.BLANKS`), nothing else. Built from the one blank set, so the
 # words this grammar sees are the words bash runs.
@@ -4794,21 +5398,29 @@ class ToolRun:
 
     @staticmethod
     def parse(run: str, root: str) -> ToolRun | None:
-        text = ToolRunText.parse(run)
-        if text is None:
+        call = tool_call(run)
+        if call is None:
             return None
-        words = text.words
-        interp = {"python3": Interp.PYTHON3, "bash": Interp.BASH}.get(words[0], Interp.DIRECT)
-        rest = words if interp is Interp.DIRECT else words[1:]
-        if not rest:
-            return None
-        tool = TreeFile.parse(rest[0], root)
+        interp, word, flags = call
+        tool = TreeFile.parse(word, root)
         if tool is None or not tool.name.endswith(TOOL_SUFFIX[interp]):
             return None
-        flags = tuple(rest[1:])
-        if not all(TOOL_FLAG_RE.fullmatch(f) for f in flags):
-            return None
         return ToolRun(interp, tool, flags)
+
+
+def tool_call(run: str) -> tuple[Interp, str, Argv] | None:
+    """`run` read as one call of a `.github/ci` tool path, whether or not the
+    file exists: its interpreter, the tool word, and the words after it; None
+    when the text is not one `ToolRunText` naming such a path."""
+    text = ToolRunText.parse(run)
+    if text is None:
+        return None
+    words = text.words
+    interp = {"python3": Interp.PYTHON3, "bash": Interp.BASH}.get(words[0], Interp.DIRECT)
+    rest = words if interp is Interp.DIRECT else words[1:]
+    if not rest or TREE_FILE_RE.fullmatch(rest[0]) is None:
+        return None
+    return interp, rest[0], tuple(rest[1:])
 
 
 class EnvScope(enum.Enum):
@@ -4997,7 +5609,9 @@ def parse_closed_step(st: Step, root: str) -> ClosedStep | None:
         tool = ToolRun.parse(run, root)
         if tool is None or _unadmitted_env_keys(raw, EnvScope.STEP):
             return None
-        role = TOOL_ROLES.get(tool.tool.name, ToolRole.VERDICT)
+        role = tool_role(tool.tool.name, tool.flags)
+        if role is None:
+            return None
         admitted = ROLE_MASKING[role].step
         if not all(k in admitted and _masking_value_admitted(k, raw[k]) for k in masking):
             return None
@@ -5654,19 +6268,13 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> None:
       - installers that fetch without pip's hash checking beyond the refused
         `setup.py install`, `uv pip`, `uv tool`, `uvx`, `pipx`, and
         `easy_install`;
-      - `TOOL_FLAG_RE` admits any literal flag word, so `--help`/`-h` is an
-        accepted tool invocation and exits 0 without running the tool's
-        verdict logic;
-      - a `.py`/`.sh` file under the tree is accepted as a tool by its
-        filename suffix alone — a library module never meant to run
-        standalone (`strict_yaml.py`, `release_only.py`) parses the same as
-        a verdict script;
       - `run: true` (or any non-`run:` step form) is not a `ToolRun` and so
         is not a tool step at all — it neither names the tree nor is
-        refused for failing to;
-      - nothing here binds a branch-protection required context's name to
-        the tool file it is meant to report; the mapping from context to
-        script is trusted, not checked.
+        refused for failing to (a required job is held to a decider by
+        check 1c, not here);
+      - which tool a required context is meant to report is trusted: check
+        1c proves that some admitted decider ran, not that it is the right
+        one.
     Those are review-gated, not machine-gated.
     """
     root = wfs.root
@@ -6812,6 +7420,11 @@ def main() -> int:
     # context names are unique over every workflow ----
     typed_entries = check_manifest_references(workflows, entries, errors)
     check_context_stems(workflows, errors)
+
+    # ---- 1c. every required job's guards are closed and it holds a decider;
+    # 1d. every tool a step runs is a listed invocation ----
+    check_required_guards(workflows, typed_entries, entries, errors)
+    check_tool_invocations(workflows, errors)
 
     # A job some entry's `aggregates:` names (by job id, in that entry's
     # producer) is a matrix leg / prep job whose result rolls up into that

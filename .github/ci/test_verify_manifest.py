@@ -1885,11 +1885,14 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
     def test_pure_tool_runs_pass(self) -> None:
         for run in (
             "python3 .github/ci/verify-manifest.py",
-            "python3 .github/ci/verify-manifest.py -v --strict",
             "bash .github/ci/artifact-guard.sh",
             ".github/ci/artifact-guard.sh",
         ):
             self.job_accepted(f"- uses: {_CHECKOUT}\n" + _run("Verify", run))
+
+    def test_unlisted_tool_argv_is_no_tool_run(self) -> None:
+        for run in ("python3 .github/ci/verify-manifest.py -v --strict", "python3 .github/ci/rerun_policy.py --x"):
+            self.job_refused(f"- uses: {_CHECKOUT}\n" + _run("Verify", run), "step 'Verify'", "closed pre-tool shapes")
 
     # ---- env is one allowlist ------------------------------------------
 
@@ -2374,7 +2377,7 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
             self.assertNotIn("continue-on-error", masking.job)
         verdict = vm.ROLE_MASKING[vm.ToolRole.VERDICT]
         self.assertEqual(verdict.step | verdict.job, frozenset())
-        self.assertEqual(vm.TOOL_ROLES.get("verify-manifest.py", vm.ToolRole.VERDICT), vm.ToolRole.VERDICT)
+        self.assertIs(vm.tool_role("verify-manifest.py", ()), vm.ToolRole.VERDICT)
 
     def test_step_scoped_event_keys_are_refused_outside_one_step(self) -> None:
         for key in ("MERGE_GROUP_BASE_SHA", "RUN_ID"):
@@ -2386,10 +2389,17 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
 
     def test_lane_tool_roles_are_pinned(self) -> None:
         vm = verify_manifest
-        self.assertEqual(vm.TOOL_ROLES["change_class.py"], vm.ToolRole.ADVISORY)
-        self.assertEqual(vm.TOOL_ROLES["rerun_policy.py"], vm.ToolRole.OUTPUT)
-        for verdict in ("prose_guard.py", "e2e_shard.py", "nightly_green.py", "check_required_set.py"):
-            self.assertEqual(vm.TOOL_ROLES.get(verdict, vm.ToolRole.VERDICT), vm.ToolRole.VERDICT, verdict)
+        self.assertIs(vm.tool_role("change_class.py", ("--code",)), vm.ToolRole.ADVISORY)
+        self.assertIs(vm.tool_role("rerun_policy.py", ("--decide",)), vm.ToolRole.OUTPUT)
+        self.assertIs(vm.tool_role("rerun_policy.py", ("--lint",)), vm.ToolRole.VERDICT)
+        for verdict, argv in (("prose_guard.py", ()), ("e2e_shard.py", ("--plan",)),
+                              ("nightly_green.py", ("--verdict",)), ("check_required_set.py", ("--fetch",))):
+            self.assertIs(vm.tool_role(verdict, argv), vm.ToolRole.VERDICT, verdict)
+        for name, argv in (("verify-manifest.py", ("--help",)), ("check_required_set.py", ("--write",)),
+                           ("strict_yaml.py", ()), ("new.py", ())):
+            self.assertIsNone(vm.tool_role(name, argv), (name, argv))
+        for name, argv in vm.MAINTAINER_TOOLS:
+            self.assertNotIn(argv, vm.TOOL_INVOCATIONS.get(name, {}), name)
 
     def test_advisory_classifier_admits_no_job_if_or_step_if(self) -> None:
         run = "python3 .github/ci/change_class.py --code"
@@ -7604,6 +7614,313 @@ class TestContextUniqueAllWorkflows(_ManifestFixture):
     def test_live_context_stems_unique(self) -> None:
         errors: list[str] = []
         verify_manifest.check_context_stems(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
+
+
+_RG_VERDICT = "python3 .github/ci/verify-manifest.py"
+_RG_CHANGES = """\
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      cheap: ${{ steps.c.outputs.cheap }}
+      tests: ${{ steps.c.outputs.tests }}
+      code: ${{ steps.c.outputs.code }}
+      release_only: ${{ steps.c.outputs.release_only }}
+    steps:
+      - id: c
+        run: python3 .github/ci/release_only.py
+        continue-on-error: true
+"""
+
+
+def _rg_job(jid: str, steps: str, guard: str | None = None, needs: str | None = "[changes]", extra: str = "") -> str:
+    out = f"  {jid}:\n"
+    if guard is not None:
+        out += f"    if: {guard}\n"
+    if needs is not None:
+        out += f"    needs: {needs}\n"
+    out += "    runs-on: ubuntu-latest\n" + extra + "    steps:\n"
+    return out + "".join(f"      {ln}\n" for ln in steps.splitlines())
+
+
+def _rg_wf(jobs: str, changes: bool = True) -> str:
+    head = "name: g\non: pull_request\npermissions:\n  contents: read\njobs:\n"
+    return head + (_RG_CHANGES if changes else "") + jobs
+
+
+_RG_DECIDE = f"- run: {_RG_VERDICT}\n"
+
+
+class _GuardFixture(unittest.TestCase):
+    """One workflow `g.yml` whose job `g` reports the required context `g`."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, wf: str, entries: list | None = None, inline: dict | None = None,
+               skips: dict | None = None) -> list[str]:
+        _write(os.path.join(self.root, "workflows", "g.yml"), wf)
+        errors: list[str] = []
+        wfs = _load(self.root, errors)
+        raw = entries if entries is not None else [{"context": "g", "disposition": "gate", "producer": "g.yml"}]
+        typed = [e for e in (verify_manifest.ManifestEntry.parse(r) for r in raw)
+                 if isinstance(e, verify_manifest.ManifestEntry)]
+        verify_manifest.check_required_guards(wfs, typed, raw, errors, inline or {}, skips or {})
+        return errors
+
+    def kinds(self, wf: str, **kw: object) -> set[str]:
+        return {e.rsplit("[", 1)[-1].rstrip("]") for e in self.errors(wf, **kw)}  # type: ignore[arg-type]
+
+    def assertRefused(self, kind: str, wf: str, **kw: object) -> None:
+        self.assertIn(kind, self.kinds(wf, **kw), (kind, self.errors(wf, **kw)))  # type: ignore[arg-type]
+
+    def assertPasses(self, wf: str, **kw: object) -> None:
+        self.assertEqual(self.errors(wf, **kw), [])  # type: ignore[arg-type]
+
+
+_RG_UNADMITTED_JOB_GUARDS = (
+    "github.actor == 'x'",
+    "github.event.pull_request.author_association == 'OWNER'",
+    "contains(github.event.pull_request.labels.*.name, 's')",
+    "false",
+    "true",
+    "success()",
+    "needs.changes.outputs.cheap == 'true' && github.ref == 'refs/heads/main'",
+    "always()",
+    "\"${{ needs.changes.outputs.cheap == 'true' }} \"",
+    "needs.changes.outputs.code == 'true'",
+    "needs.changes.outputs.cheap == 'true' || github.actor == 'x'",
+    "needs.changes.outputs.cheap == 'true' && needs.changes.outputs.nope == 'true'",
+)
+
+
+class TestRequiredJobGuardClosed(_GuardFixture):
+    """T2: a required job, and every job in its `needs` closure, runs under a
+    closed `JobGuard` — never one that can skip it, which reports as pass."""
+
+    def test_unadmitted_guard_on_the_required_job_refused(self) -> None:
+        for guard in _RG_UNADMITTED_JOB_GUARDS:
+            for changes in (True, False):
+                with self.subTest(guard=guard, changes=changes):
+                    needs = "[changes]" if changes else None
+                    wf = _rg_wf(_rg_job("g", _RG_DECIDE, guard, needs), changes)
+                    self.assertRefused("JOB_GUARD_UNADMITTED", wf)
+
+    def test_unadmitted_guard_in_the_needs_closure_refused(self) -> None:
+        for guard in _RG_UNADMITTED_JOB_GUARDS:
+            for changes in (True, False):
+                with self.subTest(guard=guard, changes=changes):
+                    needs = "[changes]" if changes else None
+                    prep = _rg_job("prep", "- run: echo prep\n", guard, needs)
+                    deep = _rg_job("deep", "- run: echo deep\n", None, "[prep]")
+                    g = _rg_job("g", _RG_DECIDE, None, "[deep]")
+                    errors = self.errors(_rg_wf(prep + deep + g, changes))
+                    self.assertTrue(any("job 'prep'" in e and e.endswith("[JOB_GUARD_UNADMITTED]") for e in errors), errors)
+
+    def test_admitted_guards_pass(self) -> None:
+        for guard in (
+            None,
+            "needs.changes.outputs.cheap == 'true'",
+            "needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'",
+            "(needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true') "
+            "|| needs.changes.outputs.release_only == 'true'",
+            "${{ needs.changes.outputs.cheap == 'true' }}",
+            "github.event_name == 'pull_request'",
+        ):
+            with self.subTest(guard=guard):
+                self.assertPasses(_rg_wf(_rg_job("g", _RG_DECIDE, guard)))
+
+    def test_phase_guard_without_needing_changes_refused(self) -> None:
+        wf = _rg_wf(_rg_job("g", _RG_DECIDE, "needs.changes.outputs.cheap == 'true'", None))
+        self.assertRefused("JOB_GUARD_UNADMITTED", wf)
+
+    def test_always_admitted_only_on_a_phase_verdict(self) -> None:
+        a = _rg_job("a", _RG_DECIDE)
+        pv = ("- uses: ./.github/actions/phase-verdict\n  with:\n"
+              "    results: changes=${{ needs.changes.result }} a=${{ needs.a.result }}\n")
+        entries = [{"context": "g", "disposition": "gate", "producer": "g.yml", "aggregates": ["a"]}]
+        self.assertPasses(_rg_wf(a + _rg_job("g", pv, "always()", "[changes, a]")), entries=entries)
+        partial = pv.replace(" a=${{ needs.a.result }}", "")
+        self.assertRefused("JOB_GUARD_UNADMITTED", _rg_wf(a + _rg_job("g", partial, "always()", "[changes, a]")),
+                           entries=entries)
+
+    def test_informational_job_is_not_held(self) -> None:
+        entries = [{"context": "g", "disposition": "informational", "producer": "g.yml", "owner": "x"}]
+        self.assertPasses(_rg_wf(_rg_job("g", "- run: true\n", "github.actor == 'x'")), entries=entries)
+
+
+_RG_CLASSIFY = "- id: cls\n  run: python3 .github/ci/change_class.py --code\n  continue-on-error: true\n"
+
+
+class TestRequiredStepGuardClosed(_GuardFixture):
+    """T3: every step of a required job runs under a closed `StepGuard`, and
+    the decider only under one whose absent input means run."""
+
+    def test_event_guarded_decider_refused(self) -> None:
+        for coe in ("", "  continue-on-error: true\n"):
+            with self.subTest(coe=coe):
+                steps = f"- run: {_RG_VERDICT}\n  if: github.event_name == 'workflow_dispatch'\n{coe}"
+                kinds = self.kinds(_rg_wf(_rg_job("g", steps)))
+                self.assertIn("STEP_GUARD_UNADMITTED", kinds)
+                self.assertIn("NO_DECIDER", kinds)
+
+    def test_classifier_run_written_as_true_refused(self) -> None:
+        steps = (_RG_CLASSIFY + f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code == 'true'\n"
+                 "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n")
+        self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps)))
+
+    def test_unpaired_classifier_guard_refused(self) -> None:
+        run = f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code != 'false'\n"
+        noop = "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n"
+        self.assertRefused("CLASSIFIER_UNPAIRED", _rg_wf(_rg_job("g", _RG_CLASSIFY + run)))
+        self.assertRefused("CLASSIFIER_UNPAIRED", _rg_wf(_rg_job("g", _RG_CLASSIFY + noop + _RG_DECIDE)))
+        self.assertPasses(_rg_wf(_rg_job("g", _RG_CLASSIFY + run + noop)))
+
+    def test_classifier_ref_not_an_earlier_change_class_step_refused(self) -> None:
+        run = f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code != 'false'\n"
+        noop = "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n"
+        for steps in (
+            run + noop + _RG_CLASSIFY,
+            "- id: cls\n  run: echo code=true\n" + run + noop,
+            _RG_CLASSIFY.replace("--code", "--panic-scan") + run + noop,
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps)))
+
+    def test_prep_succeeded_admitted_off_the_decider_only(self) -> None:
+        prep = _rg_job("prep", _RG_DECIDE)
+        guarded = "  if: needs.prep.result == 'success'\n"
+        ok = _rg_job("g", _RG_DECIDE + "- run: echo extra\n" + guarded, None, "[changes, prep]")
+        self.assertPasses(_rg_wf(prep + ok))
+        bad = _rg_job("g", _RG_DECIDE.rstrip("\n") + "\n" + guarded, None, "[changes, prep]")
+        self.assertRefused("NO_DECIDER", _rg_wf(prep + bad))
+        unneeded = _rg_job("g", _RG_DECIDE + "- run: echo extra\n" + guarded, None, "[changes]")
+        self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(prep + unneeded))
+
+    def test_anchor_shapes_pass(self) -> None:
+        # panic-scan: classifier pair; wasm-floor: release-only pair over a
+        # phase-with-disjunct job; seal-slice: a prep-gated non-decider.
+        panic = _RG_CLASSIFY + (f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code != 'false'\n"
+                                "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n")
+        wasm = (f"- run: {_RG_VERDICT}\n  if: needs.changes.outputs.release_only != 'true'\n"
+                "- run: echo release-only\n  if: needs.changes.outputs.release_only == 'true'\n"
+                "- run: echo cleanup\n  if: always()\n")
+        guard = "needs.changes.outputs.tests == 'true' || needs.changes.outputs.release_only == 'true'"
+        for steps, g in ((panic, None), (wasm, guard)):
+            with self.subTest(steps=steps):
+                self.assertPasses(_rg_wf(_rg_job("g", steps, g)))
+
+    def test_release_only_step_guard_without_needing_changes_refused(self) -> None:
+        steps = f"- run: {_RG_VERDICT}\n  if: needs.changes.outputs.release_only != 'true'\n"
+        self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps, None, None)))
+
+    def test_always_is_never_the_decider_guard(self) -> None:
+        self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", f"- run: {_RG_VERDICT}\n  if: always()\n")))
+
+
+class TestRequiredJobHoldsDecider(_GuardFixture):
+    """T5: a job reporting a required context holds a decider; the inline
+    and known-skip tables are closed and refuse a stale row."""
+
+    def test_no_decider_refused(self) -> None:
+        for steps in (
+            "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n- run: true\n",
+            "- run: python3 .github/ci/deterministic_checks_output.py\n",
+            "- run: python3 .github/ci/release_only.py\n",
+            f"- run: {_RG_VERDICT}\n  continue-on-error: true\n",
+            f"- run: {_RG_VERDICT} --help\n",
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", steps)))
+
+    def test_inline_decider_row(self) -> None:
+        steps = "- name: Run it\n  run: ./x.sh\n"
+        self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", steps)))
+        self.assertPasses(_rg_wf(_rg_job("g", steps)), inline={("g.yml", "g"): "Run it"})
+        unnamed = "- run: |\n    ./x.sh\n"
+        self.assertPasses(_rg_wf(_rg_job("g", unnamed)), inline={("g.yml", "g"): "./x.sh"})
+        vm_action = "- name: Run it\n  uses: vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1\n  with:\n    run: ./x.sh\n"
+        self.assertPasses(_rg_wf(_rg_job("g", vm_action)), inline={("g.yml", "g"): "Run it"})
+        for bad in (
+            steps + "  continue-on-error: true\n",
+            steps + "  if: always()\n",
+            "- name: Run it\n  uses: vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1\n",
+        ):
+            with self.subTest(bad=bad):
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", bad)), inline={("g.yml", "g"): "Run it"})
+
+    def test_stale_inline_decider_row_refused(self) -> None:
+        wf = _rg_wf(_rg_job("g", _RG_DECIDE + "- name: Run it\n  run: ./x.sh\n") + _rg_job("o", "- run: true\n"))
+        for row in ({("g.yml", "g"): "Run it"}, {("g.yml", "o"): "x"}, {("g.yml", "g"): "Missing"}):
+            with self.subTest(row=row):
+                self.assertRefused("DECIDER_ROW_STALE", wf, inline=row)
+        wf = _rg_wf(_rg_job("g", "- name: Run it\n  run: ./x.sh\n"))
+        self.assertRefused("DECIDER_ROW_STALE", wf, inline={("g.yml", "g"): "Missing"})
+
+    def test_known_skip_row(self) -> None:
+        skipping = "- id: probe\n  run: echo available=false\n- run: ./x.sh\n  if: steps.probe.outputs.available == 'true'\n"
+        wf = _rg_wf(_rg_job("g", skipping))
+        self.assertRefused("STEP_GUARD_UNADMITTED", wf)
+        self.assertPasses(wf, skips={("g.yml", "g"): "no runner"})
+        self.assertRefused("KNOWN_SKIP_ROW_STALE", _rg_wf(_rg_job("g", _RG_DECIDE)), skips={("g.yml", "g"): "x"})
+        self.assertRefused("KNOWN_SKIP_ROW_STALE", wf, skips={("g.yml", "o"): "x"})
+        # The row never exempts the job guard.
+        self.assertRefused("JOB_GUARD_UNADMITTED", _rg_wf(_rg_job("g", skipping, "github.actor == 'x'")),
+                           skips={("g.yml", "g"): "no runner"})
+
+    def test_live_required_jobs_hold_closed_guards_and_deciders(self) -> None:
+        errors: list[str] = []
+        wfs = _load(verify_manifest.REPO_ROOT, errors)
+        raw = verify_manifest.load_manifest()["checks"]
+        typed = verify_manifest.check_manifest_references(wfs, raw, [])
+        verify_manifest.check_required_guards(wfs, typed, raw, errors)
+        self.assertEqual(errors, [])
+
+
+class TestToolInvocationsClosed(unittest.TestCase):
+    """T4: every `.github/ci` tool a workflow runs is a listed (tool, argv)
+    pair; a maintainer-only invocation never runs in CI; a row no step runs
+    is stale."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, run: str, table: dict | None = None, stale: bool = False) -> list[str]:
+        _write(os.path.join(self.root, "workflows", "g.yml"), _rg_wf(_rg_job("g", f"- run: {run}\n", None, None), False))
+        errors: list[str] = []
+        verify_manifest.check_tool_invocations(_load(self.root, errors), errors, table, stale)
+        return errors
+
+    def assertKind(self, kind: str, run: str, **kw: object) -> None:
+        errors = self.errors(run, **kw)  # type: ignore[arg-type]
+        self.assertTrue(any(e.endswith(f"[{kind}]") for e in errors), (kind, errors))
+
+    def test_refusals(self) -> None:
+        for run, kind in (
+            ("python3 .github/ci/verify-manifest.py --help", "TOOL_ARGV_UNLISTED"),
+            ("python3 .github/ci/check_required_set.py --write", "MAINTAINER_TOOL_IN_WORKFLOW"),
+            ("python3 .github/ci/strict_yaml.py", "TOOL_UNLISTED"),
+            ("python3 .github/ci/new.py", "TOOL_UNLISTED"),
+            ("python3 .github/ci/e2e_shard.py --plan --extra", "TOOL_ARGV_UNLISTED"),
+        ):
+            with self.subTest(run=run):
+                self.assertKind(kind, run)
+
+    def test_listed_invocation_passes_and_stale_row_refused(self) -> None:
+        self.assertEqual(self.errors("python3 .github/ci/e2e_shard.py --plan"), [])
+        V = verify_manifest.ToolRole.VERDICT
+        table = {"e2e_shard.py": {("--plan",): V, ("--lint",): V}}
+        self.assertKind("TOOL_ROW_STALE", "python3 .github/ci/e2e_shard.py --plan", table=table, stale=True)
+        self.assertEqual(self.errors("python3 .github/ci/e2e_shard.py --plan",
+                                     table={"e2e_shard.py": {("--plan",): V}}, stale=True), [])
+
+    def test_live_tool_invocations_listed_and_no_row_stale(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_tool_invocations(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
 
