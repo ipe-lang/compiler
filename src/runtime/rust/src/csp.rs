@@ -122,6 +122,53 @@ impl CspHash {
     }
 }
 
+/// Why a per-session secret could not be drawn from the OS CSPRNG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntropyError;
+
+/// The number of random bytes in a [`StyleNonce`].
+pub const STYLE_NONCE_BYTES: usize = 16;
+
+/// The per-session nonce a session's `<style>` elements carry.
+///
+/// It holds 128 bits drawn from the OS CSPRNG together with the session's
+/// render incarnation, and it is never persisted. It is `Clone` but not
+/// `Copy`, so every copy is explicit, and its `Debug` form never shows it.
+#[derive(Clone)]
+pub struct StyleNonce([u8; STYLE_NONCE_BYTES]);
+
+impl StyleNonce {
+    /// A nonce from bytes the caller drew from a CSPRNG.
+    pub(crate) const fn from_random_bytes(bytes: [u8; STYLE_NONCE_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// The nonce as its attribute value: 32 lowercase hex characters.
+    #[must_use]
+    pub fn as_token(&self) -> String {
+        let mut out = String::with_capacity(STYLE_NONCE_BYTES * 2);
+        self.write_token(&mut out);
+        out
+    }
+
+    /// Append the nonce's attribute value to `out`.
+    pub(crate) fn write_token(&self, out: &mut String) {
+        for byte in self.0 {
+            for nibble in [byte >> 4, byte & 0x0f] {
+                if let Some(digit) = char::from_digit(u32::from(nibble), 16) {
+                    out.push(digit);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for StyleNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StyleNonce(..)")
+    }
+}
+
 /// A source expression in a directive's value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source<'a> {
@@ -604,7 +651,7 @@ mod tests {
     #[test]
     fn web_page_policy_admits_every_served_script() {
         let epoch = crate::dom::dispatch::Rendered::first(
-            crate::web::new_incarnation(),
+            crate::dom::dispatch::SessionKeys::distinct(),
             crate::html::Html::<()>::HText(String::new()),
         )
         .epoch();
@@ -656,6 +703,38 @@ mod tests {
         );
         let edited = format!("{OVERLAY_JS} ");
         assert!(!admits_script(&policy, "", &edited));
+    }
+
+    /// A minted nonce is 32 lowercase hex characters, two mints differ, and
+    /// its `Debug` form holds no part of it.
+    #[test]
+    fn nonce_shape() {
+        let mint = || {
+            crate::dom::dispatch::SessionKeys::mint().map(|keys| {
+                crate::dom::dispatch::Rendered::first(
+                    keys,
+                    crate::html::Html::<()>::HText(String::new()),
+                )
+                .stamp()
+            })
+        };
+        let (a, b) = (mint(), mint());
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+        let (Ok(a), Ok(b)) = (a, b) else {
+            return;
+        };
+        let token = a.as_token();
+        assert_eq!(token.len(), 2 * STYLE_NONCE_BYTES, "{token}");
+        assert!(
+            token
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{token}"
+        );
+        assert_ne!(token, b.as_token());
+        // An exact form: a derived `Debug` would list the bytes in decimal,
+        // which no search for the hex token finds.
+        assert_eq!(format!("{a:?}"), "StyleNonce(..)");
     }
 
     #[test]

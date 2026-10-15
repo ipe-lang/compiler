@@ -1957,7 +1957,7 @@ mod tests {
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
+            rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
             tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -2060,7 +2060,7 @@ mod tests {
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model,
-            rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
+            rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
             tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -2819,6 +2819,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A checkpoint persists no style nonce, so a restored session is stamped
+    /// with keys of its own, never the ones its predecessor served.
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn checkpoint_carries_no_style_nonce() {
+        let dir = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_file_nonce_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
+        let map = dir.join("sessions.json");
+        let Some(p) = map.to_str() else {
+            assert!(map.to_str().is_some(), "utf-8 temp path");
+            return;
+        };
+        let sid = "5e55105e55105e55105e55105e551050";
+        let handle = handle_i32(42);
+        let (token, epoch) = {
+            let e = handle.lock().unwrap_or_else(PoisonError::into_inner);
+            (e.rendered.stamp().as_token(), e.rendered.epoch().to_token())
+        };
+        let raw: Vec<u8> = (0..token.len())
+            .step_by(2)
+            .filter_map(|i| token.get(i..i + 2))
+            .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
+            .collect();
+        assert_eq!(raw.len(), 16, "{token}");
+        FileStore::<i32, ()>::new(p, Duration::from_secs(60), TEST_TAG)
+            .set(sid, handle.clone())
+            .await;
+
+        let file = std::fs::read_to_string(p).unwrap_or_default();
+        let blobs: HashMap<String, (String, i64)> = serde_json::from_str(&file).unwrap_or_default();
+        let blob = blobs.get(sid).map(|(b, _)| b.clone()).unwrap_or_default();
+        assert!(
+            split_checkpoint(&blob).is_some(),
+            "the checkpoint is written: {file}"
+        );
+        let framed = {
+            use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+            B64.decode(&blob).unwrap_or_default()
+        };
+        assert!(!framed.is_empty(), "{blob}");
+        assert!(!file.contains(&token), "{file}");
+        assert!(
+            !framed.windows(raw.len()).any(|w| w == raw.as_slice())
+                && !framed.windows(token.len()).any(|w| w == token.as_bytes()),
+            "the checkpoint holds no nonce"
+        );
+
+        let restarted: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
+        assert_eq!(restored_i32(&restarted, sid).await, Some(42));
+        #[allow(clippy::expect_used)] // the test host's CSPRNG yields entropy
+        let keys = crate::web::SessionKeys::mint().expect("fresh session keys");
+        let fresh = crate::web::Rendered::first(keys, Html::<()>::HText(String::new()));
+        assert_ne!(
+            fresh.stamp().as_token(),
+            token,
+            "a restored session has its own nonce"
+        );
+        assert_ne!(fresh.epoch().to_token(), epoch, "and its own incarnation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every write, successful or failed, leaves only the map itself in its directory.
     #[cfg(feature = "web")]
     #[tokio::test]
@@ -3448,7 +3511,7 @@ mod tests {
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
             model,
-            rendered: crate::web::Rendered::first(crate::web::new_incarnation(), tree),
+            rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
             tabs: crate::web::TabSeqs::default(),
             seq: 0,
             sse_tx: None,
