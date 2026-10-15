@@ -1929,11 +1929,11 @@ fn entry_unavailable() -> axum::response::Response {
 fn page_csrf_token(
     headers: &axum::http::HeaderMap,
     mint: impl FnOnce() -> Result<String, crate::entropy::EntropyError>,
-) -> Result<String, axum::response::Response> {
+) -> Result<String, Box<axum::response::Response>> {
     csrf::cookie_value(headers, &csrf::csrf_cookie_name_for(&web_base_path()))
         .filter(|t| csrf::token_is_well_formed(t))
         .map_or_else(mint, Ok)
-        .map_err(|_| entry_unavailable())
+        .map_err(|_| Box::new(entry_unavailable()))
 }
 
 /// The 503 a request gets when the process holds as many sessions as it admits.
@@ -4653,7 +4653,7 @@ mod handlers {
         // the page JS; the client echoes it back in the `X-Ipê-Csrf` header.
         let csrf_tok = match page_csrf_token(&headers, csrf::mint_token) {
             Ok(token) => token,
-            Err(refusal) => return refusal,
+            Err(refusal) => return *refusal,
         };
 
         //

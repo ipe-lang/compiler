@@ -370,7 +370,10 @@ mod tests {
         assert!(is_unavailable(&refused), "{refused:?}");
         let second = clock.next(1_000, [0; 16]);
         assert!(first.is_ok() && second.is_ok());
-        assert!(second > first, "the counter continues after a refusal");
+        assert!(
+            second.ok() > first.ok(),
+            "the counter continues after a refusal"
+        );
     }
 
     /// Ids minted within one millisecond are strictly increasing.
@@ -401,7 +404,10 @@ mod tests {
         assert!(last.is_ok_and(|id| millis_of(id) == 7_000));
         let next = clock.next(7_000, [0xff; 16]);
         assert!(next.is_ok_and(|id| millis_of(id) == 7_001));
-        assert!(next > last, "the overflowed id sorts after the last one");
+        assert!(
+            next.ok() > last.ok(),
+            "the overflowed id sorts after the last one"
+        );
     }
 
     /// A clock that steps backwards keeps the last timestamp and order.
@@ -410,8 +416,12 @@ mod tests {
         let clock = V7Clock::new();
         let later = clock.next(9_000, [0x11; 16]);
         let earlier = clock.next(8_000, [0x11; 16]);
+        assert!(later.is_ok());
         assert!(earlier.is_ok_and(|id| millis_of(id) == 9_000));
-        assert!(earlier > later, "a backwards clock never reorders ids");
+        assert!(
+            earlier.ok() > later.ok(),
+            "a backwards clock never reorders ids"
+        );
     }
 
     /// A timestamp past 48 bits is refused, never truncated; the last legal
