@@ -751,11 +751,12 @@ seededChecks a b =
         && has (SafeText.toString unit.kind) shownCard
         && not (has (placeOf (SafeText.toString unit.path)) shownCard)
     )
-    , ( "every page has a title naming it, a language and one h1, and each unit card or history entry opens an h2"
+    , ( "every page has a title naming it, a unit page by its kind and name, a language and one h1, and each unit card or history entry opens an h2"
     , documented "Queue" shownCard
         && documented "Queue" (page baseModel)
         && documented "History" historyPage
-        && documented "Lib.answer" shownPage
+        && documented "fn Lib.answer" shownPage
+        && documented "module Main" (page (unitPageModel b))
         && documented "Unit" (page (addressModel "not a uid"))
         && has "<h2" shownCard
         && has "<h2" shownPage
@@ -944,6 +945,18 @@ storedPure loaded long ok yes =
 
         refusedInHistory =
             page (historyModel [ historyRowOf ok ])
+
+        goneLabel =
+            { kind = SafeText.renderForeign "const", name = SafeText.renderForeign "crate::FILE", place = Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9 }
+
+        goneHistory =
+            page (historyModel [ { entry = Verified yes, label = Queue.Labelled goneLabel Queue.NoLongerIndexed } ])
+
+        indexedHistory =
+            page (historyModel [ { entry = Verified yes, label = Queue.Labelled goneLabel Queue.Indexed } ])
+
+        unnamedHistory =
+            page (historyModel [ { entry = Verified yes, label = Queue.Unnamed } ])
     in
     [ ( "an over-long stored reason shows its length and none of its text, in the History and on a changed card", has lengthNote hiddenInHistory && has lengthNote hiddenOnCard && not (has (String.repeat 20 "Q") hiddenInHistory) && not (has (String.repeat 20 "Q") hiddenOnCard) )
     , ( "a valid stored reason is shown in the History and on a changed card", has "needs a test" okInHistory && has "needs a test" okOnCard && not (has "reason not shown" okInHistory) )
@@ -951,7 +964,42 @@ storedPure loaded long ok yes =
     , ( "a stored refusal shows its badge and no approval", has "✗ Refused" refusedInHistory && not (has "✓ Approved" refusedInHistory) )
     , ( "a changed card names a previous approval", has "Previously Approved" (page (changedModel loaded yes)) )
     , ( "a changed card names a previous refusal with its reason", has "Previously Refused (needs a test)" okOnCard )
+    , ( "a History entry of a unit gone from the index shows its kind, name and place, says it is no longer indexed, and holds no run of 64 hex characters, beside one still indexed"
+      , has "const" goneHistory
+            && has "crate::FILE" goneHistory
+            && has "ipe:src/b.rs:9" goneHistory
+            && has "no longer indexed" goneHistory
+            && longestHexRun goneHistory
+            < 64
+            && has "crate::FILE" indexedHistory
+            && not (has "no longer indexed" indexedHistory)
+            && longestHexRun (Uid.toString (LibDb.verifiedUid yes))
+            >= 64
+      )
+    , ( "an unnamed History entry shows its fixed text and its short body hash, and no uid"
+      , has "unit no longer indexed (recorded before names were kept)" unnamedHistory
+            && has "h-yes" unnamedHistory
+            && longestHexRun unnamedHistory
+            < 64
+            && not (has "unit no longer indexed" goneHistory)
+      )
     ]
+
+
+-- The longest run of hex digits in `text`: a uid is 64 of them.
+longestHexRun : String -> Int
+longestHexRun text =
+    String.foldl
+        (\c run ->
+            if String.contains (String.fromChar c) "0123456789abcdefABCDEF" then
+                { current = run.current + 1, longest = max run.longest (run.current + 1) }
+
+            else
+                { current = 0, longest = run.longest }
+        )
+        { current = 0, longest = 0 }
+        text
+        |> .longest
 
 
 -- ── harness ─────────────────────────────────────────────────────────────

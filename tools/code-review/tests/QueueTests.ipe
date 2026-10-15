@@ -30,12 +30,12 @@ import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), S
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Presence(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, appendSignedNamed, RawName, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -2734,4 +2734,304 @@ checks =
             , check "a progress rebuild succeeds at exactly ceiling times page size" resyncSucceedsAtExactCeilingTimesPageSize
             , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
             ]
-        Task.succeed (first ++ rest)
+        named <- Task.sequence
+            [ check "a decided unit deleted from the index keeps its signed name on History, marked no longer indexed" historyNamesDeletedUnit
+            , check "History labels tell apart units sharing a name by place, or by kind, and one unit decided twice stays named" historyLabelsTellApart
+            , check "a signed name of a row that does not verify is never drawn" historyNeverDrawsUnverifiedName
+            , check "a row signed without a name is labelled live, then unnamed once its unit is gone" historyNamesUnnamedRowLive
+            , check "a legacy row of a deleted unit is unnamed" historyLegacyRowOfDeletedUnitUnnamed
+            , check "a decision on a unit whose name is past the ceiling is refused and writes nothing" decideRefusedWhenNamePastCeiling
+            , check "a History page whose unit row does not decode fails to load" historyFailsOnUndecodableUnit
+            ]
+        Task.succeed (first ++ rest ++ named)
+
+
+-- ── History unit names ──────────────────────────────────────────────────
+-- The label of fixture unit `u-a`, alone on its page.
+answerLabel : Queue.UnitLabel
+answerLabel =
+    { kind = SafeText.renderForeign "fn", name = SafeText.renderForeign "Lib.answer", place = Queue.Named }
+
+
+historyEntryUid : ReviewEntry -> Uid
+historyEntryUid entry =
+    case entry of
+        Verified row ->
+            LibDb.verifiedUid row
+
+        Unverified row ->
+            row.uid
+
+
+-- The labels of the rows of `page` for the unit `label`, in page order.
+labelsFor : String -> Queue.HistoryPage -> List HistoryLabel
+labelsFor label page =
+    List.filterMap
+        (\row ->
+            if historyEntryUid row.entry == uid label then
+                Just row.label
+
+            else
+                Nothing
+        )
+        page.rows
+
+
+isVerifiedEntry : ReviewEntry -> Bool
+isVerifiedEntry entry =
+    case entry of
+        Verified _ ->
+            True
+
+        Unverified _ ->
+            False
+
+
+-- The place of a label, when it is one.
+placeOfLabel : HistoryLabel -> Maybe Queue.Place
+placeOfLabel label =
+    case label of
+        Labelled named _ ->
+            Just named.place
+
+        Unnamed ->
+            Nothing
+
+
+kindOfLabel : HistoryLabel -> Maybe String
+kindOfLabel label =
+    case label of
+        Labelled named _ ->
+            Just (SafeText.toString named.kind)
+
+        Unnamed ->
+            Nothing
+
+
+-- A unit approved through the tool, then deleted from the index, keeps on
+-- History the kind and name its decision signed, marked no longer indexed;
+-- before the deletion the same row is labelled and indexed. Red if History
+-- names a row through the live index alone, or draws the uid in its place.
+historyNamesDeletedUnit : Task.Task Error Bool
+historyNamesDeletedUnit =
+    do
+        at <- freshScratch "ipe-history-deleted-unit"
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        decideNow db (uid "u-a") Approved
+        before <- loadHistoryPageNow HistoryStart
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        after <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "u-a" before
+                == [ Labelled answerLabel Indexed ]
+                && labelsFor "u-a" after
+                == [ Labelled answerLabel NoLongerIndexed ]
+                && List.all (\row -> isVerifiedEntry row.entry) after.rows
+            )
+
+
+-- Units gone from the index, each with a signed name: three
+-- `const crate::FILE` at `a.rs:1`, `b.rs:1` and `b.rs:9` are told apart by
+-- their place; a `struct` and an `impl` both `StaticRegex` at one place by
+-- their kind, with no place; one unit decided at two body hashes is one
+-- unit, so both its rows stay named with no place. Red if History labels
+-- are built row by row, or the tally counts rows instead of units.
+historyLabelsTellApart : Task.Task Error Bool
+historyLabelsTellApart =
+    let
+        named kind qualified path line =
+            { kind = kind, qualified = qualified, path = path, line = line }
+
+        file path line =
+            named "const" "crate::FILE" path line
+
+        approve label hash =
+            rawRow label hash "approve" Nothing
+    in
+    do
+        at <- freshScratch "ipe-history-shared-names"
+        db <- seedProgressScratch at
+        appendSignedNamed db (approve "h-file-a" "h1") (file "ipe:src/a.rs" 1)
+        appendSignedNamed db (approve "h-file-b1" "h1") (file "ipe:src/b.rs" 1)
+        appendSignedNamed db (approve "h-file-b9" "h1") (file "ipe:src/b.rs" 9)
+        appendSignedNamed db (approve "h-struct" "h1") (named "struct" "StaticRegex" "ipe:src/r.rs" 3)
+        appendSignedNamed db (approve "h-impl" "h1") (named "impl" "StaticRegex" "ipe:src/r.rs" 3)
+        appendSignedNamed db (approve "h-twice" "h1") (named "fn" "Lib.twice" "ipe:src/t.rs" 5)
+        appendSignedNamed db (approve "h-twice" "h2") (named "fn" "Lib.twice" "ipe:src/t.rs" 5)
+        page <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        let
+            labels =
+                List.map .label page.rows
+
+            others =
+                List.map .label (List.filter (\row -> historyEntryUid row.entry /= uid "h-twice") page.rows)
+
+            placesOf label =
+                List.map placeOfLabel (labelsFor label page)
+        in
+        Task.succeed
+            (List.length page.rows
+                == 7
+                && List.all (\row -> isVerifiedEntry row.entry) page.rows
+                && placesOf "h-file-a"
+                == [ Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1) ]
+                && placesOf "h-file-b1"
+                == [ Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 1) ]
+                && placesOf "h-file-b9"
+                == [ Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9) ]
+                && placesOf "h-struct"
+                == [ Just Queue.Named ]
+                && placesOf "h-impl"
+                == [ Just Queue.Named ]
+                && List.map kindOfLabel (labelsFor "h-struct" page)
+                == [ Just "struct" ]
+                && List.map kindOfLabel (labelsFor "h-impl" page)
+                == [ Just "impl" ]
+                && placesOf "h-twice"
+                == [ Just Queue.Named, Just Queue.Named ]
+                && List.all (\label -> label /= Unnamed) labels
+                && List.length others
+                == 5
+                && distinctLabels others
+            )
+
+
+distinctLabels : List HistoryLabel -> Bool
+distinctLabels labels =
+    List.all identity (List.indexedMap (\i a -> List.all identity (List.indexedMap (\j b -> i == j || a /= b) labels)) labels)
+
+
+-- A row signed with a name, its unit gone from the index, is drawn by the
+-- name it signed while it verifies; once its review time is edited outside
+-- the tool it does not verify, and it is unnamed, its recorded text never
+-- drawn. Red if a name is read from a row whose mac does not hold.
+historyNeverDrawsUnverifiedName : Task.Task Error Bool
+historyNeverDrawsUnverifiedName =
+    let
+        gone =
+            { kind = "fn", qualified = "Lib.gone", path = "ipe:src/gone.rs", line = 4 }
+
+        goneLabel =
+            { kind = SafeText.renderForeign "fn", name = SafeText.renderForeign "Lib.gone", place = Queue.Named }
+    in
+    do
+        at <- freshScratch "ipe-history-unverified-name"
+        db <- seedProgressScratch at
+        appendSignedNamed db (rawRow "h-gone" "h1" "approve" Nothing) gone
+        verified <- loadHistoryPageNow HistoryStart
+        tamperLog db "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" []
+        tampered <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "h-gone" verified
+                == [ Labelled goneLabel NoLongerIndexed ]
+                && labelsFor "h-gone" tampered
+                == [ Unnamed ]
+                && List.map (\row -> whyOf row.entry) tampered.rows
+                == [ Just Tampered ]
+            )
+
+
+-- A row signed without a name (the layout before names were recorded)
+-- still verifies and counts; it is labelled from the live unit while the
+-- unit is indexed, and unnamed once the unit is gone. Red if such a row
+-- stops verifying, or is named by its uid.
+historyNamesUnnamedRowLive : Task.Task Error Bool
+historyNamesUnnamedRowLive =
+    do
+        at <- freshScratch "ipe-history-v1-row"
+        db <- seedProgressScratch at
+        appendSigned db (rawRow "u-a" (Index.attest viewA) "approve" Nothing)
+        page <- loadPageNow Index.Start
+        live <- loadHistoryPageNow HistoryStart
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        gone <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (page.progress.reviewed
+                == 1
+                && List.all (\row -> isVerifiedEntry row.entry) live.rows
+                && labelsFor "u-a" live
+                == [ Labelled answerLabel Indexed ]
+                && labelsFor "u-a" gone
+                == [ Unnamed ]
+            )
+
+
+-- A row of the unsigned legacy table whose unit is gone is unnamed, and
+-- labelled from the live unit while it is indexed. Red if a legacy row is
+-- named by its uid.
+historyLegacyRowOfDeletedUnitUnnamed : Task.Task Error Bool
+historyLegacyRowOfDeletedUnitUnnamed =
+    do
+        at <- freshScratch "ipe-history-legacy-row"
+        db <- seedProgressScratch at
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString "approve", SqlNull (SqlString ""), SqlInt 0 ]
+        live <- loadHistoryPageNow HistoryStart
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        gone <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "u-a" live
+                == [ Labelled answerLabel Indexed ]
+                && labelsFor "u-a" gone
+                == [ Unnamed ]
+                && List.map (\row -> whyOf row.entry) gone.rows
+                == [ Just Legacy ]
+            )
+
+
+-- A unit whose qualified name is 2049 code points is refused as
+-- `NamePastCeiling` before the write: no row is added and the head stays.
+-- At 2048 code points the decision lands and History draws the whole name.
+-- Red if a name past the ceiling is truncated, recorded, or refused only by
+-- the database after the write began.
+decideRefusedWhenNamePastCeiling : Task.Task Error Bool
+decideRefusedWhenNamePastCeiling =
+    do
+        at <- freshScratch "ipe-history-name-ceiling"
+        db <- seedProgressScratch at
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat 2049 "q"), Uid.toSql (uid "u-a") ]
+        headBefore <- headTextOf db
+        refused <- refusedAs NamePastCeiling (decidedNow db (uid "u-a") Approved)
+        rowsAfterRefusal <- logRowCount db
+        headAfter <- headTextOf db
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat 2048 "q"), Uid.toSql (uid "u-a") ]
+        decideNow db (uid "u-a") Approved
+        rows <- logRowCount db
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        history <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (refused
+                && rowsAfterRefusal
+                == 0
+                && headAfter
+                == headBefore
+                && rows
+                == 1
+                && labelsFor "u-a" history
+                == [ Labelled { answerLabel | name = SafeText.renderForeign (String.repeat 2048 "q") } NoLongerIndexed ]
+            )
+
+
+-- A History page naming a unit whose index row holds a `kind` that is not
+-- text fails to load as `LoadFailed`, beside the same page loading before
+-- the row was edited. Red if an undecodable unit row is skipped, so its
+-- entry is labelled by anything else.
+historyFailsOnUndecodableUnit : Task.Task Error Bool
+historyFailsOnUndecodableUnit =
+    do
+        at <- freshScratch "ipe-history-undecodable-unit"
+        db <- seedProgressScratch at
+        appendSigned db (rawRow "u-a" (Index.attest viewA) "approve" Nothing)
+        before <- loadHistoryPageNow HistoryStart
+        execIndexUnchecked at.indexDb "UPDATE units SET kind = X'01' WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        failed <- loadHistoryPageNow HistoryStart
+            |> Task.map (\_ -> Nothing)
+            |> Task.onError (\e -> Task.succeed (Just (Failure.loadFailureOf e)))
+        cleanupProgressScratch at
+        Task.succeed (labelsFor "u-a" before == [ Labelled answerLabel Indexed ] && failed == Just LoadFailed)
