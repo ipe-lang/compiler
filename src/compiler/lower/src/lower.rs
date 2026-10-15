@@ -11656,6 +11656,9 @@ pub struct Lowerer<'a> {
     /// untyped-binding refusal reads; [`Self::var_owner`] consults it so a
     /// variable another binding keeps generic is never read as free here.
     var_owners: ipe_types::GenericVarOwners,
+    /// Whether the type being lowered is the current def's emitted signature
+    /// or a type inside its body (see [`ReadSite`]).
+    read_site: Cell<ReadSite>,
     /// Reverse map from solver-tagged union-find representative to annotation
     /// variable symbol for the def currently being lowered.  Populated by
     /// [`Self::lower_def`] from [`SolvedTypes::poly_var_map`] before recursing
@@ -13423,6 +13426,23 @@ enum VarOwner {
     Unowned,
 }
 
+/// Where a type variable is read while lowering the current def.
+///
+/// A variable another binding keeps generic is unsound to read only in the
+/// current def's emitted signature: the owner reaches it there by calling the
+/// def with its own generic, so the def's lenient reading (`()`, `JsonVal`)
+/// disagrees with the owner's at the call. Inside a body the def meets such a
+/// variable only as a caller of the owner (a same-module untyped owner shares
+/// its one variable with every use), and the call instantiates the owner's
+/// generic at the def's own reading, so a body read keeps the lenient default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadSite {
+    /// The current def's parameter and return types.
+    Signature,
+    /// A type inside the current def's body.
+    Body,
+}
+
 /// The one symbol that stands for the wildcard `any` in lowered types.
 ///
 /// Minted fresh per lowering through [`Interner::fresh_symbols`], so no
@@ -13801,6 +13821,7 @@ impl<'a> Lowerer<'a> {
             tuple_elem_cursor: Cell::new(0),
             current_home: std::cell::RefCell::new(Vec::new()),
             current_name: Cell::new(wildcard_marker.symbol()),
+            read_site: Cell::new(ReadSite::Body),
             var_owners: ipe_types::generic_var_owners(
                 &types.poly_var_map,
                 &types.msg_defaulted_vars,
@@ -17667,7 +17688,7 @@ impl<'a> Lowerer<'a> {
                                     "no region type for body of `any`-annotated binding",
                                 )
                             })?;
-                        self.ir_type_from_ty(body_ty, sig_span)?
+                        self.signature_ir_type(body_ty, sig_span)?
                     } else {
                         // A nested `any` in return position (e.g. `foo : X -> List any`)
                         // is not covered by the bare-wildcard region substitution above.
@@ -18187,7 +18208,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let (ret, lowered_body) =
                     self.with_poly_tvars(scope_poly, || -> DResult<(IrType, Expr)> {
-                        let ret = self.ir_type_from_ty(solved_ty, sig_span)?;
+                        let ret = self.signature_ir_type(solved_ty, sig_span)?;
                         // Save/set/restore fn_is_async for the 0-param (value-binding) path.
                         let prev_async = self.fn_is_async.get();
                         self.fn_is_async.set(matches!(ret, IrType::Task(_)));
@@ -18336,7 +18357,7 @@ impl<'a> Lowerer<'a> {
                     "solved type has fewer arrows than parameters",
                 ));
             };
-            let ir_ty = self.ir_type_from_ty(arg, span)?;
+            let ir_ty = self.signature_ir_type(arg, span)?;
             let (param, maybe_prologue) = self.lower_param(pat, ir_ty)?;
             params.push(param);
             if let Some(p) = maybe_prologue {
@@ -18344,7 +18365,7 @@ impl<'a> Lowerer<'a> {
             }
             cur = rest.as_ref();
         }
-        Ok((params, prologue, self.ir_type_from_ty(cur, span)?))
+        Ok((params, prologue, self.signature_ir_type(cur, span)?))
     }
 
     /// Split a typed binding's arrow annotation into one [`IrType`] per
@@ -20524,20 +20545,30 @@ impl<'a> Lowerer<'a> {
             })
     }
 
+    /// Lower `ty` as part of the current def's emitted signature ([`ReadSite::Signature`]).
+    fn signature_ir_type(&self, ty: &Ty, span: Span) -> DResult<IrType> {
+        let saved = self.read_site.replace(ReadSite::Signature);
+        let out = self.ir_type_from_ty(ty, span);
+        self.read_site.set(saved);
+        out
+    }
+
     /// Lower the type variable `raw` by its owner: the current def's generic,
-    /// a refusal for another binding's generic, or `unowned` for a free one.
+    /// a refusal for another binding's generic read in the current def's
+    /// signature, or `lenient` for a free one or a body read (see [`ReadSite`]).
     fn ir_type_from_owned_var(
         &self,
         raw: u32,
         span: Span,
-        unowned: impl FnOnce() -> DResult<IrType>,
+        lenient: impl FnOnce() -> DResult<IrType>,
     ) -> DResult<IrType> {
-        match self.var_owner(raw) {
-            VarOwner::Here(sym) => Ok(IrType::Generic(sym)),
-            VarOwner::Elsewhere { owner, sym } => {
+        match (self.var_owner(raw), self.read_site.get()) {
+            (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => Ok(IrType::Generic(sym)),
+            (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
                 Err(self.foreign_type_variable(&owner, sym, span))
             }
-            VarOwner::Unowned => unowned(),
+            (VarOwner::Elsewhere { .. }, ReadSite::Body)
+            | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => lenient(),
         }
     }
 
@@ -21612,15 +21643,19 @@ impl<'a> Lowerer<'a> {
                         // gating the 5th attempt: the
                         // `result_and_map_fn_payload` positive-path
                         // fixture). One defaulting policy, both sides.
-                        // Another binding's generic is refused here too, never
-                        // defaulted.
+                        // Another binding's generic read in the def's signature
+                        // is refused here too, never defaulted.
                         let err_ty = args.first().ok_or_else(result_arg_bug)?;
                         let err = match err_ty {
-                            Ty::Var(raw) => match self.var_owner(*raw) {
-                                VarOwner::Elsewhere { owner, sym } => {
+                            Ty::Var(raw) => match (self.var_owner(*raw), self.read_site.get()) {
+                                (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
                                     return Err(self.foreign_type_variable(&owner, sym, span));
                                 }
-                                VarOwner::Here(_) | VarOwner::Unowned => IrType::Error,
+                                (VarOwner::Elsewhere { .. }, ReadSite::Body)
+                                | (
+                                    VarOwner::Here(_) | VarOwner::Unowned,
+                                    ReadSite::Signature | ReadSite::Body,
+                                ) => IrType::Error,
                             },
                             Ty::Wildcard => IrType::Error,
                             Ty::Unit
@@ -23911,12 +23946,15 @@ impl<'a> Lowerer<'a> {
     ///
     /// A free var bound by the enclosing signature returns `false`: rustc binds
     /// it through the function's own generic, so no pin is needed OR wanted.
-    /// A var another binding keeps generic is not free either: pinning it to
-    /// `()` would give it a second reading, so it gets no pin and its own
-    /// lowering refuses it.
+    /// A var another binding keeps generic is free here too: a pin sits in a
+    /// body, where the def meets that var only as a caller of its owner and
+    /// reads it as `()` at every occurrence ([`ReadSite::Body`]).
     fn ty_is_unbound_free(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Var(raw) => matches!(self.var_owner(*raw), VarOwner::Unowned),
+            Ty::Var(raw) => match self.var_owner(*raw) {
+                VarOwner::Here(_) => false,
+                VarOwner::Elsewhere { .. } | VarOwner::Unowned => true,
+            },
             Ty::Wildcard => true,
             Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
         }
@@ -33816,9 +33854,12 @@ mod tests {
         check(&lowerer);
     }
 
-    /// A variable another binding keeps generic is not free, so it gets no `()` call pin.
+    /// A variable another binding keeps generic reads as free in a body, so a call pin there is `()`.
+    ///
+    /// A body meets such a variable only as a caller of its owner and reads it
+    /// as `()` at every occurrence; the def's own generics are never free.
     #[test]
-    fn foreign_generic_var_is_not_unbound_free() {
+    fn foreign_generic_var_is_unbound_free_in_a_body() {
         with_foreign_var_lowerer(&[], |lowerer| {
             let foreign = Ty::Var(ipe_types::tag_solver_var(5));
             assert!(
@@ -33829,8 +33870,8 @@ mod tests {
                 "`row`'s generic is foreign to `chip`"
             );
             assert!(
-                !lowerer.ty_is_unbound_free(&foreign),
-                "a foreign generic must not be pinned to `()`"
+                lowerer.ty_is_unbound_free(&foreign),
+                "a caller reads its owner's generic leniently"
             );
             assert!(
                 lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(6))),
@@ -33839,11 +33880,21 @@ mod tests {
         });
     }
 
-    /// A foreign generic in a JSON position is refused, never defaulted to `JsonVal`.
+    /// A foreign generic in a JSON position of the def's signature is refused, never defaulted to `JsonVal`.
+    ///
+    /// The same read inside the body keeps `JsonVal`.
     #[test]
-    fn foreign_generic_var_in_a_json_slot_is_refused() {
+    fn foreign_generic_var_in_a_signature_json_slot_is_refused() {
         with_foreign_var_lowerer(&[], |lowerer| {
             let span = Span::new(3, 4);
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(5)), span),
+                    Ok(super::IrType::Json)
+                ),
+                "a body read of a foreign generic stays `JsonVal`"
+            );
+            lowerer.read_site.set(super::ReadSite::Signature);
             let res = lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(5)), span);
             assert!(
                 matches!(
