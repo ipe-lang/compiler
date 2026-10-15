@@ -1,0 +1,74 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+
+
+type Flavor
+    = Sweet
+    | Sour
+
+
+type alias Card =
+    { label : String
+    , flavor : Maybe Flavor
+    }
+
+
+render : Card -> String
+render c =
+    case c.flavor of
+        Just Sweet ->
+            c.label ++ ":sweet"
+
+        Just Sour ->
+            c.label ++ ":sour"
+
+        Nothing ->
+            c.label
+
+
+{-| `card` occurs inside the lambda ONLY as a record-update base, then is
+used again after the closure. Emits E0382 before the fix.
+-}
+captureUpdateThenReuse : String -> Bool
+captureUpdateThenReuse name =
+    let
+        card =
+            { label = name, flavor = Nothing }
+    in
+    List.all (\f -> String.contains ":" (render { card | flavor = Just f })) [ Sweet, Sour ]
+        && not (String.contains ":" (render card))
+
+
+{-| Control: a plain read inside the lambda already gets the pre-clone.
+-}
+captureReadThenReuse : String -> Bool
+captureReadThenReuse name =
+    let
+        card =
+            { label = name, flavor = Nothing }
+    in
+    List.all (\f -> String.contains ":" (render card)) [ Sweet, Sour ]
+        && not (String.contains ":" (render card))
+
+
+{-| Efficiency pin: `card` is dead after the closure, so no pre-clone.
+-}
+captureUpdateLastUse : String -> Bool
+captureUpdateLastUse name =
+    let
+        card =
+            { label = name, flavor = Nothing }
+    in
+    List.all (\f -> String.contains ":" (render { card | flavor = Just f })) [ Sweet, Sour ]
+
+
+main : Task ()
+main =
+    if captureUpdateThenReuse "x" && not (captureReadThenReuse "y") && captureUpdateLastUse "z" then
+        Io.println "ok"
+
+    else
+        Io.println "bad"
