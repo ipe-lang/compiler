@@ -791,10 +791,28 @@ test("render history: a document gone stale while a link to its own fragment is 
     },
   );
   await addNavLink(page, "frag", "/#e2e-frag");
+  const entries = await page.evaluate(() => {
+    window.__e2eOldDocument = true;
+    return history.length;
+  });
   await page.locator("#e2e-link-frag").click();
   // Assigning `/#e2e-frag` from `/` is a fragment navigation: it would load
-  // nothing, leaving a stale document with no banner.
+  // nothing, leaving a stale document with no banner. Reloading `/` instead
+  // would drop the link's fragment and its history entry.
   foreign.open();
   await expect.poll(() => loads.count, { timeout: 15000 }).toBe(2);
+  // The reload request leaves the old document on screen until its answer
+  // commits: wait for the fresh one, which carries no marker.
+  await expect
+    .poll(
+      () =>
+        page
+          .evaluate(() => window.__e2eOldDocument === undefined && document.readyState === "complete")
+          .catch(() => false),
+      { timeout: 15000 },
+    )
+    .toBe(true);
+  await expect(page).toHaveURL(`${STYLES}/#e2e-frag`);
+  expect(await page.evaluate(() => history.length)).toBe(entries + 1);
   answer.open();
 });

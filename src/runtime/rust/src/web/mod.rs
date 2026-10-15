@@ -8589,7 +8589,9 @@ mod base_path_tests {
                 load.matches("location.reload()").count(),
                 reload.matches("location.reload()").count(),
             ),
-            (2, 1, 1),
+            // `__ipeLoad` reloads the location, and reloads a same-document
+            // fragment target once it is the location.
+            (3, 2, 1),
             "the document reloads in `__ipeLoad` and `__ipeReloadDocument` only"
         );
         assert_eq!(
@@ -8597,7 +8599,9 @@ mod base_path_tests {
                 js.matches("location.assign(").count(),
                 load.matches("location.assign(").count()
             ),
-            (1, 1),
+            // `__ipeLoad` assigns a same-document fragment target before its
+            // reload, and any other document's target as its full load.
+            (2, 2),
             "the document assigns its location in `__ipeLoad` only"
         );
         assert!(
@@ -8610,12 +8614,18 @@ mod base_path_tests {
             "only the newest navigation loads, and it loads its own target"
         );
         // Assigning `/A#x` from `/A` is a fragment navigation, which loads
-        // nothing: the document a target names is compared without fragments.
+        // nothing: it moves the location to the target, which then reloads.
+        // Reloading the location alone would drop the target's fragment and
+        // entry. Assigning `/A` from `/A#y` is a full load, which a reload
+        // after it would cancel.
         assert!(
-            load.contains(
-                "if (__ipeDocumentOf(target) === __ipeDocumentOf(window.location.href)) window.location.reload();\n  else window.location.assign(target);"
-            ) && !load.contains("target === window.location.href"),
-            "a target naming the document on screen reloads, whatever its fragment"
+            load.contains("var here = window.location.href;")
+                && load.contains("if (target === here) {\n    window.location.reload();\n  }")
+                && load.contains(
+                    "} else if (target.indexOf(\"#\") >= 0 && __ipeDocumentOf(target) === __ipeDocumentOf(here)) {\n    window.location.assign(target);\n    window.location.reload();\n  }"
+                )
+                && load.contains("} else {\n    window.location.assign(target);\n  }"),
+            "the reader lands on the target, freshly loaded, whatever its fragment"
         );
         let document_of = body_of("__ipeDocumentOf").unwrap_or_default();
         assert!(
