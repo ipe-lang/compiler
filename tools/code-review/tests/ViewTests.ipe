@@ -694,7 +694,7 @@ decisionReachedOnlyThroughDecidableSource =
                 List.length (String.split needle text) - 1
 
         oneCall =
-            "case Queue.decidableSource uid model.selectedView of\n                Just shown ->\n                    decideOn settings shown decision\n"
+            "case Queue.decidableSource uid model.selectedView of\n                Just shown ->\n                    decideOn settings macKey shown decision\n"
     in
     do
         cwd <- System.cwd ()

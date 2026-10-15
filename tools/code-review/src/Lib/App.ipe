@@ -1,4 +1,4 @@
-module Lib.App exposing (Model, Msg(..), Page(..), decisionSaved, historyLoaded, initialModel, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
+module Lib.App exposing (Model, Msg(..), Page(..), decisionSaved, decisionTask, historyLoaded, initialModel, queueList, queueLoaded, selectedUid, selectedUnit, standingLoaded, unitPageState, update, viewLoaded)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -11,7 +11,7 @@ import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure, RefuseFa
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
-import Lib.ReviewKey exposing (ReviewKey(..))
+import Lib.ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.ServerLog as ServerLog
 import Lib.Settings as Settings
 import Lib.Uid exposing (Uid)
@@ -511,11 +511,11 @@ saveDecision settings model uid decision =
             ReadOnly ->
                 ( { model | decisionError = Just SaveReadOnly }, Cmd.none )
 
-            Signing _ ->
+            Signing macKey ->
                 case Queue.startDecision settings.epoch uid model.decision of
                     Just saving ->
                         ( { model | decision = saving }
-                        , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings model uid decision)) (decisionSaved uid settings.epoch)
+                        , Cmd.perform (ServerLog.logged "decision save failed" (decisionTask settings macKey model uid decision)) (decisionSaved uid settings.epoch)
                         )
 
                     Nothing ->
@@ -524,13 +524,13 @@ saveDecision settings model uid decision =
 
 -- The decision on `uid`'s shown source, or the refusal of one off the shown
 -- queue page or on a source not shown, decided before anything is read.
-decisionTask : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
-decisionTask settings model uid decision =
+decisionTask : Settings.AppSettings -> MacKey -> Model -> Uid -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decisionTask settings macKey model uid decision =
     case List.find (\q -> q.unit.uid == uid) (queueList model) of
         Just _ ->
             case Queue.decidableSource uid model.selectedView of
                 Just shown ->
-                    decideOn settings shown decision
+                    decideOn settings macKey shown decision
 
                 Nothing ->
                     Task.succeed (Err SourceNotShown)
@@ -539,9 +539,9 @@ decisionTask settings model uid decision =
             Task.succeed (Err NotQueued)
 
 
-decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
-decideOn settings shown decision =
-    LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide settings.key settings.index db shown decision |> Task.map Ok)
+decideOn : Settings.AppSettings -> MacKey -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decideOn settings macKey shown decision =
+    LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decide macKey settings.index db shown decision)
 
 
 -- The drain loop: the decision is already saved (DecisionSaved Ok), so the

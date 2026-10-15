@@ -20,7 +20,7 @@ import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (checkReporting, cleanupIndex, envAppSettings, freshScratch, loadUnitNow, seedIndex, uid)
+import TestSupport exposing (check, checkReporting, cleanupIndex, envAppSettings, freshScratch, loadUnitNow, refusalOf, seedIndex, testMacKey, uid)
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -961,6 +961,49 @@ refuseDraftTyped settings a b =
         == DecisionSaving ua settings.epoch
 
 
+-- A decision on a unit off the shown queue page is refused as `NotQueued`,
+-- and one on a queued unit whose source is not the one shown as
+-- `SourceNotShown`, each a value decided before any database is opened, and
+-- the save's banner the refusal's fixed text. Red if `decisionTask` decides a
+-- unit the reviewer was not shown, or a refusal is read as a failure.
+decisionRefusedBeforeReading : Task.Task Error Bool
+decisionRefusedBeforeReading =
+    do
+        at <- freshScratch "ipe-single-flight-refused"
+        seedIndex at.indexDb at.repo
+        settings <- envAppSettings
+        macKey <- testMacKey
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
+        offList <- App.decisionTask settings macKey (queueModel [ a ] (ViewShown a)) b.unit.uid LibDb.Approved
+        notShown <- App.decisionTask settings macKey (queueModel [ a, b ] (ViewShown a)) b.unit.uid LibDb.Approved
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (refusalOf offList
+                == Just NotQueued
+                && refusalOf notShown
+                == Just SourceNotShown
+                && savedRefusal (Failure.saved (Ok offList))
+                == Just NotQueued
+                && savedRefusal (Failure.saved (Ok notShown))
+                == Just SourceNotShown
+            )
+
+
+-- The refusal a settled save carries, if it was refused.
+savedRefusal : Result SaveFailure a -> Maybe DecideRefusal
+savedRefusal result =
+    case result of
+        Err (SaveRefused refusal) ->
+            Just refusal
+
+        Err _ ->
+            Nothing
+
+        Ok _ ->
+            Nothing
+
+
 -- ── harness ─────────────────────────────────────────────────────────────
 -- The settings a server would parse for the seeded index, an epoch minted
 -- apart from theirs, standing for another process's, and the two seeded
@@ -997,6 +1040,13 @@ requireUnit found =
 
 checks : Task.Task Error (List ( String, Bool ))
 checks =
+    Task.map2 (\seeded refused -> seeded ++ [ refused ])
+        seededChecks
+        (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
+
+
+seededChecks : Task.Task Error (List ( String, Bool ))
+seededChecks =
     withSeeded "ipe-single-flight"
         (\settings otherEpoch a b ->
             [ ( "unit-page entries during a source read start no second read", unitEntriesDuringReadCoalesce settings a b )

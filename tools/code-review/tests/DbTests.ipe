@@ -20,7 +20,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
-import Lib.Failure as Failure exposing (LoadFailure(..), ReasonRefusal(..))
+import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), SourceView(..), StaleReason(..), Written(..))
@@ -33,7 +33,7 @@ import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, appendSignedBeforeFirst, appendSignedWithUidText, rawKeyCheck, refusedWith)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, onFreshReview, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableNames, attestedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, reviewHeadOf, uid, testMacKey, countingVerifier, RawRow, rawRow, appendSigned, appendSignedAs, appendSignedClaiming, tamperLog, headTextOf, logRowCount, testReviewKey, carriesFailure, carriesNoFailure, testKeyHex, otherKeyHex, otherMacKey, logVerdictOf, appendSignedPastHead, appendSignedBeforeFirst, appendSignedWithUidText, rawKeyCheck, refusedWith, accepted, refusedAs, refusalOf)
 
 
 removeReviewFiles : String -> Task.Task Error ()
@@ -112,10 +112,10 @@ duplicateDecisionAlreadyDecided =
                 attested <- attestedFor "ipe-review-duplicate-index" (uid "u-a")
                 key <- testMacKey
                 genesis <- reviewHeadOf db
-                first <- LibDb.insertDecision key db attested Approved
+                first <- accepted "the first decision" (LibDb.insertDecision key db attested Approved)
                 afterFirst <- reviewHeadOf db
                 changed <- refuse "changed"
-                second <- LibDb.insertDecision key db attested changed
+                second <- accepted "the second decision" (LibDb.insertDecision key db attested changed)
                 afterSecond <- reviewHeadOf db
                 n <- countReviewRows db (uid "u-a") (Index.attest viewA)
                 verify <- countingVerifier db
@@ -187,7 +187,7 @@ reviewLogAppendOnly db =
     do
         attested <- attestedFor "ipe-review-append-only-index" (uid "u-a")
         key <- testMacKey
-        LibDb.insertDecision key db attested Approved
+        accepted "the decision" (LibDb.insertDecision key db attested Approved)
         head <- headTextOf db
         refusals <- Task.sequence
             (List.map refused
@@ -713,7 +713,7 @@ failedWritesKeepTheirErrorIn base =
         fresh <- attestedFor "ipe-review-failed-writes-index" (uid "u-b")
         rw <- migratedReviewAt dbPath
         key <- testMacKey
-        LibDb.insertDecision key rw seen Approved
+        accepted "the decision" (LibDb.insertDecision key rw seen Approved)
         head <- headTextOf rw
         ro <- openReadOnlyAt dbPath
         outcome <- failedWritesOutcome key rw ro seen fresh head
@@ -736,7 +736,7 @@ failedWritesOutcome key rw ro seen fresh head =
     in
     do
         verify <- countingVerifier rw
-        duplicate <- recordedNothing (LibDb.insertDecision key ro seen Approved)
+        duplicate <- recordedNothing (accepted "the duplicate" (LibDb.insertDecision key ro seen Approved))
         freshReview <- failedReadOnly (LibDb.insertDecision key ro fresh Approved)
         kept <- LibDb.findDecision verify rw (uid "u-b") (Index.attest viewB)
         headAfter <- headTextOf rw
@@ -828,9 +828,9 @@ insertBoth scratch db =
         a <- attestedFor scratch (uid "u-a")
         b <- attestedFor scratch (uid "u-b")
         key <- testMacKey
-        LibDb.insertDecision key db a Approved
+        accepted "the approval" (LibDb.insertDecision key db a Approved)
         tooBig <- refuse "too big"
-        LibDb.insertDecision key db b tooBig
+        accepted "the refusal" (LibDb.insertDecision key db b tooBig)
 
 
 -- Why a looked-up review entry does not count; Nothing when it counts or
@@ -1045,24 +1045,27 @@ chainReorderBreaks db =
         |> Task.map (\verdict -> verdict == Broken (BreaksAt 2))
 
 
--- A decision on a broken chain is refused with the break's own refusal,
--- naming the entry the chain breaks at, and nothing is inserted. Red if
--- `insertDecision` appends without walking the chain, or walks it and
--- ignores a break.
+-- A decision on a broken chain is refused as `LogBroken`, a value its
+-- transaction commits, so the refusal is decided before the first write:
+-- no entry is inserted and the head stays where it was. Red if
+-- `insertDecision` appends without walking the chain, walks it and ignores a
+-- break, or writes before it refuses.
 decideOnBrokenChainRefused : Db -> Task.Task Error Bool
 decideOnBrokenChainRefused db =
     do
         chainAfter db [ ( "DELETE FROM review_log WHERE seq = 2", [] ) ]
         before <- logRowCount db
+        headBefore <- headTextOf db
         attested <- attestedFor "ipe-review-broken-decide-index" (uid "u-a")
         key <- testMacKey
-        refused <- refusedWith (LibDb.brokenRefusal (BreaksAt 2)) (LibDb.insertDecision key db attested Approved)
+        refused <- refusedAs LogBroken (LibDb.insertDecision key db attested Approved)
         after <- logRowCount db
-        Task.succeed (refused && String.contains "chain breaks at entry 2" (Error.message (LibDb.brokenRefusal (BreaksAt 2))) && before == 2 && after == 2)
+        headAfter <- headTextOf db
+        Task.succeed (refused && before == 2 && after == 2 && headAfter == headBefore)
 
 
 -- An entry added past the head, the head left where it was, breaks the log
--- as one entry past its head: the decision is refused with that refusal,
+-- as one entry past its head: the decision is refused as `LogBroken`,
 -- never as a moved head the reviewer is told to retry against, and nothing
 -- is inserted. Red if the walk or a decision ignores the entries past the
 -- head.
@@ -1077,7 +1080,7 @@ decideWithEntryPastHeadRefused db =
         before <- logRowCount db
         attested <- attestedFor "ipe-review-past-head-decide-index" (uid "u-a")
         key <- testMacKey
-        refused <- refusedWith (LibDb.brokenRefusal (PastHead 1)) (LibDb.insertDecision key db attested Approved)
+        refused <- refusedAs LogBroken (LibDb.insertDecision key db attested Approved)
         after <- logRowCount db
         Task.succeed (walked == Broken (PastHead 1) && refused && before == 2 && after == 2)
 
@@ -1117,7 +1120,7 @@ legacyRowRedecidable db =
         legacy <- lookUp db "u-a" (Index.attest viewA)
         attested <- attestedFor "ipe-review-legacy-redecide-index" (uid "u-a")
         key <- testMacKey
-        written <- LibDb.insertDecision key db attested Approved
+        written <- accepted "the decision" (LibDb.insertDecision key db attested Approved)
         n <- logRowCount db
         redecided <- lookUp db "u-a" (Index.attest viewA)
         Task.succeed (whyOf legacy == Just Legacy && not (isAlreadyDecided written) && n == 1 && isCounted redecided)
@@ -1129,7 +1132,7 @@ legacyRowRedecidable db =
 -- log to its head but finds three entries past it, so the verdict is
 -- `Broken (PastHead 3)`; every entry, the three past the head included,
 -- reads `ChainBroken` on a History lookup and on a History page; the page
--- shows the same break; and a decision is refused with that same break,
+-- shows the same break; and a decision is refused as `LogBroken`,
 -- inserting nothing. Red if the walk stops at the head, if a row past the
 -- head counts on its own mac, or if the save path and the read path tell the
 -- log apart.
@@ -1149,7 +1152,7 @@ headRolledBackBelowRowsIsPastHead db =
         page <- LibDb.historyPage verify db PageSize.history HistoryStart
         attested <- attestedFor "ipe-review-rolled-back-index" (uid "u-a")
         macKey <- testMacKey
-        refused <- refusedWith (LibDb.brokenRefusal (PastHead 3)) (LibDb.insertDecision macKey db attested Approved)
+        refused <- refusedAs LogBroken (LibDb.insertDecision macKey db attested Approved)
         rows <- logRowCount db
         Task.succeed
             (LibDb.stateVerdict state
@@ -1203,7 +1206,7 @@ rowAppendedPastHeadNeverVerified db =
 -- An entry stored below seq 1, signed so its own mac verifies, sits where
 -- the walk never reads, so the verdict is `Broken (BeforeFirst 1)`: the
 -- entry and the proven ones above it read `ChainBroken`, and a decision is
--- refused with that break, inserting nothing. Red if the verdict counts only
+-- refused as `LogBroken`, inserting nothing. Red if the verdict counts only
 -- the entries past the head, leaving a counting reader to count it.
 rowBeforeFirstNeverVerified : Db -> Task.Task Error Bool
 rowBeforeFirstNeverVerified db =
@@ -1218,15 +1221,15 @@ rowBeforeFirstNeverVerified db =
         before <- logRowCount db
         attested <- attestedFor "ipe-review-before-first-index" (uid "u-a")
         macKey <- testMacKey
-        refused <- refusedWith (LibDb.brokenRefusal (BeforeFirst 1)) (LibDb.insertDecision macKey db attested Approved)
+        refused <- refusedAs LogBroken (LibDb.insertDecision macKey db attested Approved)
         after <- logRowCount db
         Task.succeed (verdict == Broken (BeforeFirst 1) && whyOf found == Just ChainBroken && whyOf first == Just ChainBroken && latest == Nothing && refused && after == before)
 
 
 -- Entries sharing a uid or a body hash, but no whole pair, prove; a fourth
 -- entry, signed and linked, deciding the pair the first decided breaks the
--- walk at it as `Broken (RepeatsAt 4)`, and a decision is refused with
--- that break, inserting nothing. The digest of the verified pairs is a set
+-- walk at it as `Broken (RepeatsAt 4)`, and a decision is refused as
+-- `LogBroken`, inserting nothing. The digest of the verified pairs is a set
 -- digest a repeated pair cancels out of, so a log holding one would let a
 -- copy holding another pair twice match it. Red if the walk proves a log
 -- deciding one pair twice.
@@ -1242,7 +1245,7 @@ repeatedPairBreaksTheWalk db =
         before <- logRowCount db
         attested <- attestedFor "ipe-review-repeated-pair-index" (uid "u-a")
         macKey <- testMacKey
-        refused <- refusedWith (LibDb.brokenRefusal (RepeatsAt 4)) (LibDb.insertDecision macKey db attested Approved)
+        refused <- refusedAs LogBroken (LibDb.insertDecision macKey db attested Approved)
         after <- logRowCount db
         Task.succeed (isProven distinct && repeated == Broken (RepeatsAt 4) && refused && after == before)
 
@@ -1250,7 +1253,7 @@ repeatedPairBreaksTheWalk db =
 -- An entry whose uid column holds text that is no unit id, signed so its
 -- own mac and link verify, breaks the chain at its seq: the walk reads it
 -- and returns `Broken (BreaksAt 2)` rather than failing, and a decision is
--- refused with that break, inserting nothing. Red if the walk decodes the
+-- refused as `LogBroken`, inserting nothing. Red if the walk decodes the
 -- stored uid as a unit id (the walk fails instead of breaking), or checks
 -- only the link and the mac (the log reads proven).
 storedUidNotAUnitIdBreaksAtItsSeq : Db -> Task.Task Error Bool
@@ -1262,7 +1265,7 @@ storedUidNotAUnitIdBreaksAtItsSeq db =
         before <- logRowCount db
         attested <- attestedFor "ipe-review-stored-uid-index" (uid "u-a")
         macKey <- testMacKey
-        refused <- refusedWith (LibDb.brokenRefusal (BreaksAt 2)) (LibDb.insertDecision macKey db attested Approved)
+        refused <- refusedAs LogBroken (LibDb.insertDecision macKey db attested Approved)
         after <- logRowCount db
         Task.succeed (verdict == Broken (BreaksAt 2) && refused && before == 2 && after == before)
 
@@ -1286,10 +1289,10 @@ tamperFixtures =
     ]
 
 
--- For every tamper fixture, the verdict a page load reads and the refusal a
--- decision gets are the same break: the page shows `fixture.expected` and
--- the decision is refused with `brokenRefusal fixture.expected`, inserting
--- nothing. Red if the save path decides the log apart from the read path.
+-- For every tamper fixture, a page load and a decision read the same
+-- verdict: the page shows `fixture.expected` and the decision is refused as
+-- `LogBroken`, inserting nothing. Red if the save path decides the log apart
+-- from the read path.
 saveGateAndReadPathAgree : Task.Task Error Bool
 saveGateAndReadPathAgree =
     Task.sequence (List.map (\fixture -> onFreshReview ("ipe-review-agree-" ++ fixture.name) (gateAgrees fixture)) tamperFixtures)
@@ -1305,7 +1308,7 @@ gateAgrees fixture db =
         before <- logRowCount db
         attested <- attestedFor ("ipe-review-agree-index-" ++ fixture.name) (uid "u-a")
         macKey <- testMacKey
-        refused <- refusedWith (LibDb.brokenRefusal fixture.expected) (LibDb.insertDecision macKey db attested Approved)
+        refused <- refusedAs LogBroken (LibDb.insertDecision macKey db attested Approved)
         after <- logRowCount db
         Task.succeed (LibDb.logShown state == ShownBroken fixture.expected && LibDb.stateVerdict state == Broken fixture.expected && refused && after == before)
 
@@ -1339,19 +1342,21 @@ wrongKeyRefusesStartupIn base =
 
 -- A decision recorded straight through `insertDecision` under a second
 -- valid key, the startup probe skipped, is refused inside its transaction
--- with the key-mismatch refusal, and no row is added: a log bound to one
--- key never takes an entry signed by another. Red if the save path checks
--- the key only at startup.
+-- as `LogKeyMismatch`, and no row is added and the head stays where it
+-- was: a log bound to one key never takes an entry signed by another. Red if
+-- the save path checks the key only at startup, or writes before it refuses.
 wrongKeyCannotAppend : Db -> Task.Task Error Bool
 wrongKeyCannotAppend db =
     do
         appendSigned db (rawRow "bound-1" "h" "approve" Nothing)
         before <- logRowCount db
+        headBefore <- headTextOf db
         attested <- attestedFor "ipe-review-wrong-key-append-index" (uid "u-a")
         other <- otherMacKey
-        refused <- refusedWith LibDb.keyMismatchRefusal (LibDb.insertDecision other db attested Approved)
+        refused <- refusedAs LogKeyMismatch (LibDb.insertDecision other db attested Approved)
         after <- logRowCount db
-        Task.succeed (refused && before == 1 && after == 1)
+        headAfter <- headTextOf db
+        Task.succeed (refused && before == 1 && after == 1 && headAfter == headBefore)
 
 
 -- A head with no key check, as a log written before the check had: after
@@ -1469,9 +1474,9 @@ headCasPinsKeyCheck db =
         Task.succeed (refused && n == 0)
 
 
--- The key-mismatch refusal, at startup and on a decision, and the banner a
--- page shows for it, carry neither key's hex nor the head's stored key
--- check. Red if a message renders key material or the stored check.
+-- The key-mismatch refusal at startup, the text a decision refused under
+-- another key shows, and the banner a page shows for it carry neither key's
+-- hex nor the head's stored key check. Red if a message renders key material or the stored check.
 keyCheckMismatchMessageIsSecretFree : Task.Task Error Bool
 keyCheckMismatchMessageIsSecretFree =
     freshDir "ipe-review-secret-free" |> Task.andThen keyCheckMismatchMessageIsSecretFreeIn
@@ -1491,7 +1496,7 @@ keyCheckMismatchMessageIsSecretFreeIn base =
         startup <- probeMessage (LibDb.probe (ReviewKey.Signing other) loc)
         attested <- attestedFor "ipe-review-secret-free-index" (uid "u-a")
         decision <- LibDb.insertDecision other db attested Approved
-            |> Task.map (\_ -> Nothing)
+            |> Task.map (\result -> Maybe.map (\refusal -> Failure.saveFailureText (SaveRefused refusal)) (refusalOf result))
             |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         removeReviewFiles dbPath
         let

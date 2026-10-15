@@ -11,7 +11,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), LogVerdict(..), ReviewEntry(..))
 import Lib.Epoch exposing (Epoch)
-import Lib.Failure as Failure exposing (LoadFailure)
+import Lib.Failure as Failure exposing (DecideRefusal, LoadFailure)
 import Lib.Format as Format
 -- `Index.Unit` names `Highlight.Lang` and `Index.UnitView` names
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
@@ -20,7 +20,7 @@ import Lib.Highlight as Highlight
 import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
-import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
+import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Settings as Settings exposing (AppSettings, IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
@@ -618,22 +618,22 @@ pastHeadText n =
         String.fromInt n ++ " entries"
 
 
--- The one way a decision is recorded: only under a signing key, so a
--- read-only server refuses before it reads anything; only a shown source
--- can be decided, since only a verified view holds a `ShownSource`; and only
--- after `Index.reverify` re-proves it, so the hash written is the hash of
--- the bytes the reviewer saw.
-decide : ReviewKey -> IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
-decide key settings db shown decision =
-    case key of
-        ReadOnly ->
-            Task.fail ReviewKey.readOnlyError
+-- The one way a decision is recorded: only under a signing key, the
+-- `MacKey` a read-only server does not hold; only a shown source can be
+-- decided, since only a verified view holds a `ShownSource`; and only after
+-- `Index.reverify` re-proves it, so the hash written is the hash of the
+-- bytes the reviewer saw. A refusal either step decides is a value.
+decide : MacKey -> IndexSettings -> Db.Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decide macKey settings db shown decision =
+    do
+        reverified <- Index.reverify settings shown
+        case reverified of
+            Ok attested ->
+                LibDb.insertDecision macKey db attested decision
+                    |> Task.map (Result.map (\written -> ( attested, written )))
 
-        Signing macKey ->
-            do
-                attested <- Index.reverify settings shown
-                written <- LibDb.insertDecision macKey db attested decision
-                Task.succeed ( attested, written )
+            Err refusal ->
+                Task.succeed (Err refusal)
 
 
 -- The session's one source slot, shared by the selected queue card and the

@@ -1,4 +1,4 @@
-module Lib.Db exposing (BreakAt(..), Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, brokenRefusal, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, openAt, parseReason, probe, reasonMaxChars, reasonText, stateHead, stateVerdict, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier, writeTransaction)
+module Lib.Db exposing (BreakAt(..), Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, openAt, parseReason, probe, reasonMaxChars, reasonText, stateHead, stateVerdict, storedReasonText, verifiedAt, verifiedDecision, verifiedHash, verifiedPair, verifiedUid, verifier, writeTransaction)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -15,7 +15,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Time as Time
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
-import Lib.Failure exposing (ReasonRefusal(..))
+import Lib.Failure exposing (DecideRefusal(..), ReasonRefusal(..))
 import Lib.Index as Index exposing (Attested, ChainVerdict(..), DecidedPair, LogStatus(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
@@ -1254,51 +1254,11 @@ chainEnd head walk =
         Err (BreaksAt (max 1 lastSeq))
 
 
--- The refusal of a decision on a broken log, naming where it breaks.
-brokenRefusal : BreakAt -> Error
-brokenRefusal at =
-    case at of
-        BreaksAt n ->
-            Error.conflict
-                ("the review log's chain breaks at entry "
-                    ++ String.fromInt n
-                    ++ ": a decision was removed, reordered or replaced outside this tool, so no decision is recorded until the log is restored"
-                )
-
-        PastHead n ->
-            Error.conflict
-                ("the review log holds "
-                    ++ entriesText n
-                    ++ " past its head: a decision was added outside this tool, so no decision is recorded until the log is restored"
-                )
-
-        BeforeFirst n ->
-            Error.conflict
-                ("the review log holds "
-                    ++ entriesText n
-                    ++ " before its first: a decision was added outside this tool, so no decision is recorded until the log is restored"
-                )
-
-        RepeatsAt n ->
-            Error.conflict
-                ("the review log's entry "
-                    ++ String.fromInt n
-                    ++ " decides a pair an earlier entry decided: a decision was added outside this tool, so no decision is recorded until the log is restored"
-                )
-
-
-entriesText : Int -> String
-entriesText n =
-    if n == 1 then
-        "1 entry"
-
-    else
-        String.fromInt n ++ " entries"
-
-
+-- The ceilings of a chain check are `LimitExceeded`, so a page reads them
+-- as a ceiling passed from the error's kind; startup shows their messages.
 chainCeilingRefusal : Error
 chainCeilingRefusal =
-    Error.invalidInput
+    Error.limitExceeded
         ("the review log holds more than "
             ++ String.fromInt (logPageCeiling * PageSize.toInt PageSize.pairs)
             ++ " decisions, past the "
@@ -1309,7 +1269,7 @@ chainCeilingRefusal =
 
 decideCeilingRefusal : Error
 decideCeilingRefusal =
-    Error.invalidInput
+    Error.limitExceeded
         ("the review log holds more than "
             ++ String.fromInt (logPageCeiling * PageSize.toInt PageSize.pairs)
             ++ " decisions, past the "
@@ -1331,12 +1291,14 @@ candidateCeiling =
 -- is already a parsed `Reason`, so every decision that reaches the log is
 -- well formed. One review transaction takes the log's verdict from
 -- `stateWithin`, the same producer every page load reads, and refuses any
--- verdict but `Proven`, inserting nothing; returns `AlreadyDecided` when
+-- verdict but `Proven` as a `DecideRefusal` value, inserting nothing: the
+-- refusal is decided before any row changes, so the transaction it commits
+-- holds no write. Returns `AlreadyDecided` when
 -- a row for the pair already verifies, the first verified decision winning;
 -- otherwise appends the next entry, signed over every column and linked to
 -- the head, and moves the head to it through a compare-and-set that fails,
 -- rolling the row back, if the head moved after it was read.
-insertDecision : MacKey -> Db -> Attested -> Decision -> Task.Task Error Index.Written
+insertDecision : MacKey -> Db -> Attested -> Decision -> Task.Task Error (Result DecideRefusal Index.Written)
 insertDecision key db attested decision =
     do
         now <- Time.unixMillis ()
@@ -1358,7 +1320,13 @@ writeTransaction db body =
         )
 
 
-recordDecision : MacKey -> Db -> Attested -> Decision -> Int -> Task.Task Error Index.Written
+-- A refusal returned as a value commits the transaction, so each one here
+-- is decided from reads alone, before `appendDecision`'s first write; a
+-- failure after a write (`headMoved`) stays a failed task, which rolls back.
+-- `Unkeyed` is unreachable: a verdict read under `Signing` is never
+-- `Unkeyed` (`verdictOf`); it stays a failure, the closed default a page
+-- shows as `SaveFailed`.
+recordDecision : MacKey -> Db -> Attested -> Decision -> Int -> Task.Task Error (Result DecideRefusal Index.Written)
 recordDecision key tx attested decision at =
     do
         state <- stateWithin (Signing key) tx PageSize.pairs logPageCeiling decideCeilingRefusal
@@ -1367,16 +1335,16 @@ recordDecision key tx attested decision at =
                 do
                     decided <- pairVerifies key tx proven (Index.attestedUid attested) (Index.attestedHash attested)
                     if decided then
-                        Task.succeed Index.AlreadyDecided
+                        Task.succeed (Ok Index.AlreadyDecided)
 
                     else
-                        appendDecision key tx (provenChain proven) attested decision at
+                        appendDecision key tx (provenChain proven) attested decision at |> Task.map Ok
 
-            Broken at ->
-                Task.fail (brokenRefusal at)
+            Broken _ ->
+                Task.succeed (Err LogBroken)
 
             KeyMismatch ->
-                Task.fail keyMismatchRefusal
+                Task.succeed (Err LogKeyMismatch)
 
             Unkeyed ->
                 Task.fail ReviewKey.readOnlyError
