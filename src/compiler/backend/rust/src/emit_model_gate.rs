@@ -330,6 +330,7 @@ fn leaf_of_bounded(ctx: &EmitCtx, ty: &IrType, app: AppShape, fuel: u32) -> Mode
         // same classification as `Url`/`Secret`: a Web Model field of type `Dsn`
         // is rejected by `admissible()` and this arm names it in the IPE-L0120.
         | IrType::Dsn
+        | IrType::DbLocation
         // An external `Connection` is a live pool handle, never serde — a Model
         // field of this type is rejected by `admissible()`; these arms name it in
         // the IPE-L0120. The phantom markers cannot appear in a Model field but

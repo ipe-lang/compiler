@@ -9,7 +9,7 @@ import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch exposing (Epoch)
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.Settings as Settings
 import Lib.Uid exposing (Uid)
 
@@ -26,7 +26,8 @@ type Page
 -- handler as its first argument. `selectedView` is the session's one source
 -- read slot, read by the queue card and the unit page alike, and `decision`
 -- its one decision slot, so a second read or decision in flight has no
--- representation.
+-- representation. `standing` is the unit page's read of where its shown
+-- body stands in the review log.
 type alias Model =
     { page : Page
     , queueState : Queue.QueueState
@@ -41,6 +42,7 @@ type alias Model =
     , selected : Int
     , selectedView : Queue.SelectedView
     , decision : Queue.DecisionSlot
+    , standing : Queue.StandingRead
     }
 
 
@@ -59,6 +61,7 @@ type Msg
     | HistoryPageLoaded Queue.LoadTicket (Result Error Queue.HistoryPage)
     | HistoryNext LibDb.HistoryCursor
     | SelectedViewLoaded Uid Epoch (Result Error (Maybe Index.UnitView))
+    | StandingLoaded Uid String Epoch (Result Error Queue.Standing)
     | KeyDown String
     | SelectUnit Int
 
@@ -81,6 +84,7 @@ initialModel =
     , selected = 0
     , selectedView = NoneSelected
     , decision = DecisionIdle
+    , standing = Queue.StandingUnread
     }
 
 
@@ -281,7 +285,14 @@ update settings msg model =
             loadHistory settings cursor model
 
         SelectedViewLoaded uid epoch result ->
-            viewStep settings (Queue.viewArrived epoch uid result model.selectedView) model
+            withStanding settings (viewStep settings (Queue.viewArrived epoch uid result model.selectedView) model)
+
+        StandingLoaded uid bodyHash epoch result ->
+            if epoch /= settings.epoch then
+                ( model, Cmd.none )
+
+            else
+                ( { model | standing = Queue.standingArrived uid bodyHash result }, Cmd.none )
 
         KeyDown key ->
             if model.page == QueuePage then
@@ -296,6 +307,41 @@ update settings msg model =
 
             else
                 ( model, Cmd.none )
+
+
+-- A source read settled: on the unit page, a shown unit's standing is read
+-- for the body shown, so the page says whether that body is decided.
+withStanding : Settings.AppSettings -> ( Model, Cmd Msg ) -> ( Model, Cmd Msg )
+withStanding settings ( model, cmd ) =
+    case model.page of
+        UnitPage raw ->
+            case unitPageState raw model of
+                UnitLoaded loaded ->
+                    let
+                        bodyHash =
+                            Index.storedHash loaded.unit.attested
+                    in
+                    ( model
+                    , Cmd.batch [ cmd, Cmd.perform (Queue.loadStanding settings loaded.unit.uid bodyHash) (StandingLoaded loaded.unit.uid bodyHash settings.epoch) ]
+                    )
+
+                UnitLoading ->
+                    ( model, cmd )
+
+                UnitNotFound ->
+                    ( model, cmd )
+
+                UnitFailed _ ->
+                    ( model, cmd )
+
+                UnitIdRefused ->
+                    ( model, cmd )
+
+        QueuePage ->
+            ( model, cmd )
+
+        HistoryPage ->
+            ( model, cmd )
 
 
 -- The selected card's view after a queue load: on the queue page the

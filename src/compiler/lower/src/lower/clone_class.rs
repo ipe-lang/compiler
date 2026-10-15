@@ -160,6 +160,7 @@ pub(super) fn clone_class(env: CloneEnv<'_>, t: &IrType) -> CloneClass {
         // `Relative` is `#[derive(Clone)]` (validated `String` projection fields).
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -489,14 +490,16 @@ pub(super) fn slice_ownership(env: CloneEnv<'_>, elem: &IrType) -> SliceOwnershi
 pub(super) fn pat_binds_any_name(pat: &Pat) -> bool {
     match pat {
         Pat::Var(_) | Pat::Alias(_, _) => true,
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Ctor { args, .. } => args.iter().any(pat_binds_any_name),
         Pat::Tuple(elems) => elems.iter().any(pat_binds_any_name),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_binds_any_name(p)),
         Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(pat_binds_any_name) || rest.as_deref().is_some_and(pat_binds_any_name)
         }
-        Pat::Or(alts) => alts.iter().any(pat_binds_any_name),
     }
 }
 
@@ -533,9 +536,14 @@ pub(super) fn slice_element_alias_refusal(prefix: &[Pat], span: Span) -> DResult
 fn holds_binding_alias(pat: &Pat) -> bool {
     match pat {
         Pat::Alias(inner, _) => pat_binds_any_name(inner),
-        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {
-            false
-        }
+        // A `SharedAlts` alternative holds no alias.
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Or(_) => false,
         Pat::Ctor { args, .. } => args.iter().any(holds_binding_alias),
         Pat::Tuple(elems) => elems.iter().any(holds_binding_alias),
         Pat::Record(fields) => fields.iter().any(|(_, p)| holds_binding_alias(p)),
@@ -543,7 +551,6 @@ fn holds_binding_alias(pat: &Pat) -> bool {
             prefix.iter().any(holds_binding_alias)
                 || rest.as_deref().is_some_and(holds_binding_alias)
         }
-        Pat::Or(alts) => alts.iter().any(holds_binding_alias),
     }
 }
 
@@ -578,7 +585,10 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
     let in_either = |s: &Symbol| a.contains(s) || b.contains(s);
     match pat {
         Pat::Var(s) => in_either(s),
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Alias(inner, s) => in_either(s) || pat_binds_any_in_either(inner, a, b),
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_any_in_either(p, a, b)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_any_in_either(p, a, b)),
@@ -589,7 +599,6 @@ fn pat_binds_any_in_either(pat: &Pat, a: &BTreeSet<Symbol>, b: &BTreeSet<Symbol>
                     .as_deref()
                     .is_some_and(|p| pat_binds_any_in_either(p, a, b))
         }
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_any_in_either(p, a, b)),
     }
 }
 
@@ -1233,7 +1242,8 @@ fn match_arm_peak_uses(sym: Symbol, m: &ipe_ir::Match) -> usize {
 /// occurrence decrements it; when `remaining > 1` the occurrence is non-last
 /// and is rewritten:
 /// * bare `Var(sym)` → `CloneVar(sym)`;
-/// * Lambda whose body refs sym → `Let { name: sym, value: CloneVar(sym), body: Lambda }`.
+/// * Lambda that captures sym (no parameter re-binds it) →
+///   `Let { name: sym, value: CloneVar(sym), body: Lambda }`.
 ///   The pre-clone rebinding captures the CLONE into the closure while the
 ///   OUTER `sym` remains alive for subsequent uses.
 ///
@@ -1265,7 +1275,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
         // When NOT the last use, wrap in a pre-clone Let so the closure
         // captures the clone and the outer `sym` stays alive.
         Expr::Lambda { params, ret, body } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // a FURTHER-nested `move` closure inside this lambda's
                 // body that ALSO captures `sym` would move `sym` out of THIS
                 // closure's captured environment on the first call, turning a
@@ -1305,7 +1315,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
         // ALSO a `move` closure literal that may capture `sym`, so it needs
         // the same pre-clone treatment when it is not the last use.
         Expr::SharedLambda { params, ret, body } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // same nested-capture descent as the `Lambda` arm above.
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {
@@ -1329,7 +1339,7 @@ pub(super) fn rewrite_multiuse_clones(sym: Symbol, remaining: &mut usize, expr: 
             body,
             capture,
         } => {
-            if super::lambda_body_refs_sym(sym, &body) {
+            if !params.iter().any(|(s, _)| *s == sym) && super::lambda_body_refs_sym(sym, &body) {
                 // same nested-capture descent as the `Lambda` arm above.
                 let body = Box::new(force_shared_capture_clones(sym, *body));
                 if *remaining > 1 {

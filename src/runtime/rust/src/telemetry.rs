@@ -1512,7 +1512,7 @@ mod tests {
     /// The `Ipe.Web` page set carries its full strict policy under the
     /// same-origin default and under an embed list alike, and a refused value
     /// yields no header set at all, so no page ships without its policy.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     #[test]
     fn web_page_headers_carry_the_strict_policy() {
         use crate::csp::{ContentSecurityPolicy, Profile};
@@ -1588,7 +1588,7 @@ mod tests {
         for &profile in Profile::ALL {
             let want = match profile {
                 Profile::Response => None,
-                #[cfg(all(feature = "server", feature = "web-core"))]
+                #[cfg(feature = "web")]
                 Profile::Console | Profile::WebPage => Some("no-store"),
             };
             for framing in [None, embed.as_ref()] {

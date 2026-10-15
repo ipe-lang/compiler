@@ -29,6 +29,8 @@ pub enum Grammar {
     Choice(&'static [&'static str]),
     /// A decimal ceiling under [`crate::system::EnvCeiling`]'s rules.
     Ceiling(crate::system::EnvCeiling),
+    /// A host list under [`crate::inbound_authority::DeclaredNames::parse`]'s rules.
+    HostNames,
     /// A name no longer read; setting it is refused.
     Retired {
         /// The variable that replaced it, if any.
@@ -45,6 +47,9 @@ impl Grammar {
             Self::Flag => format!("one of {}", EnvFlag::SPELLINGS.join(", ")),
             Self::Choice(names) => format!("one of {}", names.join(", ")),
             Self::Ceiling(ceiling) => format!("a {}", ceiling.unit()),
+            Self::HostNames => {
+                "a comma-separated list of DNS names or dot-prefixed DNS suffixes".to_owned()
+            }
             Self::Retired { use_instead } => use_instead.map_or_else(
                 || "unset (it is no longer read)".to_owned(),
                 |name| format!("unset (it is no longer read; use {name})"),
@@ -69,6 +74,7 @@ impl Grammar {
             Self::Flag => judge(name, self, class, raw, EnvFlag::parse).map(drop),
             Self::Choice(names) => judge(name, self, class, raw, |v| choose(names, v)).map(drop),
             Self::Ceiling(ceiling) => ceiling.parse(raw).map(drop).map_err(EnvRefusal::Ceiling),
+            Self::HostNames => host_names(name, raw).map(drop),
             Self::Retired { use_instead } => match raw {
                 Err(std::env::VarError::NotPresent) => Ok(()),
                 Ok(_) | Err(std::env::VarError::NotUnicode(_)) => {
@@ -116,6 +122,39 @@ pub fn judge<T>(
                 class,
                 shown: Shown::of(class, value.as_bytes()),
             }),
+    }
+}
+
+/// Judges a raw lookup of the host list `name`; unset is the empty set.
+///
+/// A refusal names the variable and the refused item's position, never the
+/// value.
+///
+/// # Errors
+///
+/// [`EnvRefusal::HostNames`] naming `name` when the value is set but is not a
+/// host list, a non-Unicode item refused as malformed.
+pub fn host_names(
+    name: &'static str,
+    raw: Result<String, std::env::VarError>,
+) -> Result<crate::inbound_authority::DeclaredNames, EnvRefusal> {
+    use crate::inbound_authority::{DeclaredNames, HostListRefusal, MAX_DECLARED_NAMES};
+    let refused = |refusal| EnvRefusal::HostNames { name, refusal };
+    match raw {
+        Err(std::env::VarError::NotPresent) => Ok(DeclaredNames::none()),
+        Err(std::env::VarError::NotUnicode(os)) => {
+            let index = os
+                .as_encoded_bytes()
+                .split(|b| *b == b',')
+                .position(|item| std::str::from_utf8(item).is_err())
+                .unwrap_or(0);
+            Err(refused(if index < MAX_DECLARED_NAMES {
+                HostListRefusal::Malformed { index }
+            } else {
+                HostListRefusal::TooMany
+            }))
+        }
+        Ok(value) => DeclaredNames::parse(&value).map_err(refused),
     }
 }
 
@@ -275,6 +314,13 @@ pub enum EnvRefusal {
     },
     /// A ceiling's own refusal.
     Ceiling(crate::system::EnvCeilingRefusal),
+    /// A host list's own refusal; it never echoes the value.
+    HostNames {
+        /// The variable.
+        name: &'static str,
+        /// Why the list is refused.
+        refusal: crate::inbound_authority::HostListRefusal,
+    },
     /// A name no longer read is set.
     Retired {
         /// The retired variable.
@@ -292,6 +338,7 @@ impl EnvRefusal {
             Self::Malformed { name, .. }
             | Self::NotUnicode { name, .. }
             | Self::Empty { name, .. }
+            | Self::HostNames { name, .. }
             | Self::Retired { name, .. } => name,
             Self::Ceiling(refusal) => refusal.name(),
         }
@@ -347,6 +394,7 @@ impl std::fmt::Display for EnvRefusal {
                 class_note(f, *class)
             }
             Self::Ceiling(refusal) => refusal.fmt(f),
+            Self::HostNames { name, refusal } => write!(f, "{name} {refusal}"),
             Self::Retired { name, use_instead } => match use_instead {
                 Some(other) => write!(f, "{name} is no longer read; set {other} instead"),
                 None => write!(f, "{name} is no longer read; unset it"),
@@ -623,6 +671,86 @@ mod tests {
         assert_eq!(
             refusal.to_string(),
             format!("{NAME} is no longer read; set IPE_GRAMMAR_NEW instead")
+        );
+    }
+
+    /// A host list refusal names the variable and the item, never the value;
+    /// unset is the empty set, and a list of exactly the most names parses.
+    #[test]
+    fn host_list_refusals_name_the_item_never_the_value() {
+        use crate::inbound_authority::{HostListRefusal, MAX_DECLARED_NAMES};
+        let check =
+            |raw: &str| Grammar::HostNames.check(NAME, Class::SecurityTunable, Ok(raw.to_owned()));
+        let list = |n: usize| {
+            (0..n)
+                .map(|i| format!("hidden{i}.example"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let too_many = list(MAX_DECLARED_NAMES + 1);
+        for (raw, refusal) in [
+            ("", HostListRefusal::Empty),
+            ("hidden.example:80", HostListRefusal::Malformed { index: 0 }),
+            ("hidden.example, *", HostListRefusal::Malformed { index: 1 }),
+            ("hidden.example,,", HostListRefusal::Malformed { index: 1 }),
+            (
+                "127.0.0.1, hidden.example",
+                HostListRefusal::Malformed { index: 0 },
+            ),
+            ("hidden.localhost", HostListRefusal::Malformed { index: 0 }),
+            (too_many.as_str(), HostListRefusal::TooMany),
+        ] {
+            let judged = check(raw);
+            assert_eq!(
+                judged,
+                Err(EnvRefusal::HostNames {
+                    name: NAME,
+                    refusal
+                }),
+                "{raw:?}"
+            );
+            let Err(judged) = judged else { return };
+            let text = judged.to_string();
+            assert!(text.starts_with(&format!("{NAME} ")), "{text}");
+            assert!(!text.contains("hidden"), "{text}");
+        }
+        assert_eq!(check(&list(MAX_DECLARED_NAMES)), Ok(()));
+        assert_eq!(check("hidden.example, .sub.example"), Ok(()));
+        assert_eq!(
+            host_names(NAME, Err(VarError::NotPresent)),
+            Ok(crate::inbound_authority::DeclaredNames::none())
+        );
+        assert_eq!(
+            host_names(NAME, Ok("a.example, .b.example".to_owned()))
+                .as_ref()
+                .map(crate::inbound_authority::DeclaredNames::len),
+            Ok(2)
+        );
+    }
+
+    /// A non-Unicode host list item is refused as malformed by its position,
+    /// never echoed.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_host_list_item_is_refused_by_position() {
+        use crate::inbound_authority::HostListRefusal;
+        use std::os::unix::ffi::OsStringExt;
+        let raw = Err(VarError::NotUnicode(std::ffi::OsString::from_vec(
+            b"ok.example,\xFFhidden".to_vec(),
+        )));
+        let refusal = host_names(NAME, raw);
+        assert_eq!(
+            refusal,
+            Err(EnvRefusal::HostNames {
+                name: NAME,
+                refusal: HostListRefusal::Malformed { index: 1 }
+            })
+        );
+        let Err(refusal) = refusal else { return };
+        let text = refusal.to_string();
+        assert!(
+            !text.contains("hidden") && !text.contains("\\xFF"),
+            "{text}"
         );
     }
 }

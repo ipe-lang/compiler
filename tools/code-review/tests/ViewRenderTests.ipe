@@ -62,13 +62,14 @@ baseModel =
 
 queued : Index.UnitView -> Queue.QueuedUnit
 queued loaded =
-    { unit = loaded.unit, change = New, changed = Nothing }
+    { unit = loaded.unit, change = New, changed = Nothing, standing = Queue.Undecided }
 
 
 queuePage : List Queue.QueuedUnit -> Int -> Queue.Progress -> Queue.QueuePage
 queuePage units total progress =
     { units = units
     , total = total
+    , unbound = 0
     , dbName = SafeText.literal "index.db"
     , dbBytes = 2048
     , next = Nothing
@@ -91,7 +92,7 @@ cardModel loaded =
 changedModel : Index.UnitView -> LibDb.VerifiedRow -> Model
 changedModel loaded old =
     { baseModel
-        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = LibDb.verifiedHash old }, changed = Just old } ] 1 { reviewed = 0, total = 1 })
+        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = LibDb.verifiedHash old }, changed = Just old, standing = Queue.Undecided } ] 1 { reviewed = 0, total = 1 })
         , selectedView = ViewShown loaded
     }
 
@@ -666,6 +667,45 @@ seededChecks a b =
         beforeFirstCard =
             page (cardModelUnder (ShownBroken (BeforeFirst 1)) a)
 
+        twin =
+            { unit | uid = uid "u-twin", path = SafeText.renderForeign "ipe:src/twin.rs" }
+
+        twinCard =
+            page { baseModel | queueState = Loaded (queuePage [ queued a, { unit = twin, change = New, changed = Nothing, standing = Queue.Undecided } ] 2 { reviewed = 0, total = 2 }), selectedView = ViewShown a }
+
+        placeOf path =
+            path ++ ":" ++ String.fromInt unit.lineStart
+
+        historyPage =
+            page (unverifiedHistory ShownProven Legacy)
+
+        documented title html =
+            has ("<title>" ++ title ++ " · Code review</title>") html
+                && has "lang=\"en\"" html
+                && List.length (String.split "<h1" html)
+                == 2
+
+        standingPage bodyHash standing =
+            page { baseModel | page = UnitPage (Uid.toString a.unit.uid), selectedView = ViewShown a, standing = Queue.StandingShown a.unit.uid bodyHash standing }
+
+        currentHash =
+            Index.storedHash a.unit.attested
+
+        approvedPage =
+            standingPage currentHash (Queue.Decided StoredApproved)
+
+        tamperedPage =
+            standingPage currentHash (Queue.NotCounted Tampered)
+
+        undecidedPage =
+            standingPage currentHash Queue.Undecided
+
+        olderBodyPage =
+            standingPage (currentHash ++ "-older") (Queue.Decided StoredApproved)
+
+        tamperedCard =
+            page { baseModel | queueState = Loaded (queuePage [ { unit = a.unit, change = Unrecorded, changed = Nothing, standing = Queue.NotCounted Tampered } ] 1 { reviewed = 0, total = 1 }), selectedView = ViewShown a }
+
         noControl html =
             not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
 
@@ -683,6 +723,44 @@ seededChecks a b =
     , ( "a hostile history name is escaped", escapesHostile (page hostileHistory) )
     , ( "a hostile unit name, unit path and history name each draw in byte order", hostileInByteOrder "" (page (cardModel hostileName)) && hostileInByteOrder "" (page (unitPageModel hostileName)) && hostileInByteOrder "" (page (cardModel hostilePath)) && hostileInByteOrder "" (page hostileHistory) )
     , ( "untrusted text draws in byte order, and text with no hazard draws no escape marker", has "unicode-bidi:bidi-override" View.displayOrderCss && has "direction:ltr" View.displayOrderCss && has "background-color:" View.escapeCss && has "border:" View.escapeCss && not (has "data-review-escape" shownCard) && has (byteOrderOpen ++ "Lib.answer") shownCard )
+    , ( "two units sharing a kind and name each show their place, a unit alone shows its kind and no place"
+    , has (placeOf "ipe:src/twin.rs") twinCard
+        && has (placeOf (SafeText.toString unit.path)) twinCard
+        && has (SafeText.toString unit.kind) shownCard
+        && not (has (placeOf (SafeText.toString unit.path)) shownCard)
+    )
+    , ( "every page has a title naming it, a language and one h1, and each unit card or history entry opens an h2"
+    , documented "Queue" shownCard
+        && documented "Queue" (page baseModel)
+        && documented "History" historyPage
+        && documented "Lib.answer" shownPage
+        && documented "Unit" (page (addressModel "not a uid"))
+        && has "<h2" shownCard
+        && has "<h2" shownPage
+        && has "<h2" historyPage
+        && not (has "<title></title>" shownCard)
+        && not (has "<h2" (page baseModel))
+    )
+    , ( "the unit page of a decided unit names its decision, a reopened unit says why its row is not counted, and an undecided one says it is not reviewed"
+    , has "Approved" approvedPage
+        && not (has "Not reviewed" approvedPage)
+        && has "signature does not verify" tamperedPage
+        && not (has "Approved" tamperedPage)
+        && has "Not reviewed" undecidedPage
+        && not (has "Approved" undecidedPage)
+        && noDecisionButtons approvedPage
+    )
+    , ( "a standing read for another body of the unit shows no decision, only that the read is running"
+    , not (has "Approved" olderBodyPage)
+        && has "Reading review status" olderBodyPage
+        && has "Reading review status" shownPage
+    )
+    , ( "a queued unit whose row for the current body does not verify says so on its card and in the rail, never as an unreviewed unit"
+    , List.length (String.split "signature does not verify" tamperedCard)
+        == 3
+        && not (has "Not reviewed" tamperedCard)
+        && has "Not reviewed" shownCard
+    )
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )

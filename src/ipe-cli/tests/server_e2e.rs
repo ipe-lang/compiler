@@ -301,13 +301,11 @@ main =
         ]
 "#;
 
-/// Ipê server that uses BOTH `Server.listen` and a `Db.open` call — the
+/// Ipê server that uses BOTH `Server.listen` and a `Db.connect` call — the
 /// minimal program that sets both `uses_server` and `uses_db` in the lowerer,
-/// exercising the server+db manifest composition (GAP 1 fix).
+/// exercising the server+db manifest composition.
 ///
-/// `Db.open : String -> String -> Task Error Db` (driver, url).
-/// `Db.connect : () -> Task Error Db` takes unit, not a URL string, so we use
-/// `Db.open` here for clarity.
+/// `Db.connect : () -> Task Error Db` opens the operator `DATABASE_URL`.
 const IPE_SERVER_AND_DB_PROGRAM: &str = r#"module Main exposing (main)
 
 import Ipe.Http.Server as Server
@@ -325,7 +323,7 @@ main =
             Server.listen port
                 [ Server.get "/" (\req -> Task.succeed (Server.text "ok"))
                 ])
-        (Db.open "sqlite" (System.getenvOr "DATABASE_URL" "sqlite::memory:"))
+        (Db.connect ())
 "#;
 
 /// Ipê server exercising `Middleware.withCsrf` end-to-end.  Mirrors

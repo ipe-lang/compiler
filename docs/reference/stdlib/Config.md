@@ -232,6 +232,19 @@ decodeYaml : String -> Decoder a -> Result Error a
 
 Run a decoder against a YAML document.
 
+The accepted YAML is a strict subset: exactly one document; YAML 1.2 core
+booleans only (`true` / `false` in any letter case; `yes`, `no`, `on` and
+`off` stay strings); `null` in any letter case, `~`, an empty value, and an
+empty source are null; integers take `0x`, `0o` and `0b` prefixes; no
+duplicate mapping keys, no merge keys (`<<`), and no tags beyond the core
+schema (`!!str`, `!!int`, ...), so `!include` and local
+tags are refused; no `.nan` or `.inf`; nesting at most 128 deep. A plain
+leading-zero number such as `012` decodes as the number 12; quote it to keep
+the string. A source past `IPE_YAML_MAX_BYTES`, or past a parser ceiling
+(nesting depth, node count, anchor and alias expansion), is an `Err` of kind
+`LimitExceeded`; every other refusal names its class and position, never
+the source text.
+
 ## `decodeJson`
 
 ```ipe

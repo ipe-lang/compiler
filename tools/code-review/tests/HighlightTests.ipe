@@ -1,0 +1,305 @@
+module HighlightTests exposing (checks)
+
+import Ipe.Error as Error
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Task as Task
+import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Separator(..), Token(..))
+
+
+-- Each check pins one language's lexical grammar: a delimiter opens a
+-- comment or string only in the language whose grammar names it, and a
+-- lexeme open at a line's end carries into the next line.
+rawText : Token -> String
+rawText tok =
+    case tok of
+        Keyword t ->
+            t
+
+        Str t ->
+            t
+
+        Comment t ->
+            t
+
+        Num t ->
+            t
+
+        Ident t ->
+            t
+
+        Plain t ->
+            t
+
+
+reassembles : Lang -> String -> Bool
+reassembles lang src =
+    String.concat (List.map rawText (Highlight.tokenize lang src)) == src
+
+
+isComment : Token -> Bool
+isComment tok =
+    case tok of
+        Comment _ ->
+            True
+
+        Keyword _ ->
+            False
+
+        Str _ ->
+            False
+
+        Num _ ->
+            False
+
+        Ident _ ->
+            False
+
+        Plain _ ->
+            False
+
+
+-- The tokens of two consecutive lines, the second lexed with the carry out
+-- of the first, as the source view lexes its rows.
+twoLines : Lang -> String -> String -> ( List Token, List Token )
+twoLines lang first second =
+    case Highlight.lexLine lang Highlight.lineStart first of
+        ( firstToks, carry ) ->
+            case Highlight.lexLine lang carry second of
+                ( secondToks, _ ) ->
+                    ( firstToks, secondToks )
+
+
+-- Ipê: `--` opens a line comment that swallows a `//` after it; `//`,
+-- `/* */` and `#` are punctuation; `->` opens nothing.
+ipeLineComments : Bool
+ipeLineComments =
+    Highlight.tokenize Ipe "x -- c // d"
+        == [ Ident "x", Plain " ", Comment "-- c // d" ]
+        && Highlight.tokenize Ipe "a // b"
+        == [ Ident "a", Plain " ", Plain "/", Plain "/", Plain " ", Ident "b" ]
+        && Highlight.tokenize Ipe "/* b */"
+        == [ Plain "/", Plain "*", Plain " ", Ident "b", Plain " ", Plain "*", Plain "/" ]
+        && Highlight.tokenize Ipe "a # b"
+        == [ Ident "a", Plain " ", Plain "#", Plain " ", Ident "b" ]
+        && Highlight.tokenize Ipe "a -> b"
+        == [ Ident "a", Plain " ", Plain "-", Plain ">", Plain " ", Ident "b" ]
+
+
+-- Ipê: a nested `{- -}` block comment carries its depth across lines; a
+-- `{-|` doc comment does not nest, so it closes at its first `-}`.
+ipeBlockComments : Bool
+ipeBlockComments =
+    twoLines Ipe "{- a {- b" "-} c -} x"
+        == ( [ Comment "{- a {- b" ], [ Comment "-} c -}", Plain " ", Ident "x" ] )
+        && Highlight.tokenize Ipe "{-| a {- b -} c"
+        == [ Comment "{-| a {- b -}", Plain " ", Ident "c" ]
+
+
+-- Ipê: `--` inside a string or after a `'"'` char literal is code, and an
+-- unterminated one-line string ends with its line, so the next line's
+-- `--` is a comment.
+ipeStrings : Bool
+ipeStrings =
+    Highlight.tokenize Ipe "\"a -- b\" c"
+        == [ Str "\"a -- b\"", Plain " ", Ident "c" ]
+        && Highlight.tokenize Ipe "'\"' -- q"
+        == [ Str "'\"'", Plain " ", Comment "-- q" ]
+        && twoLines Ipe "\"a" "-- c"
+        == ( [ Plain "\"a" ], [ Comment "-- c" ] )
+
+
+-- Shell: a `#` at a word start is a comment and swallows a `/*` after it;
+-- `/* */` is punctuation on one line or across two; `--` and `$#` open
+-- nothing.
+shellComments : Bool
+shellComments =
+    Highlight.tokenize Shell "echo x # c /* d */"
+        == [ Keyword "echo", Plain " ", Ident "x", Plain " ", Comment "# c /* d */" ]
+        && Highlight.tokenize Shell "/* x */"
+        == [ Plain "/", Plain "*", Plain " ", Ident "x", Plain " ", Plain "*", Plain "/" ]
+        && twoLines Shell "/* a" "b */ # c"
+        == ( [ Plain "/", Plain "*", Plain " ", Ident "a" ], [ Ident "b", Plain " ", Plain "*", Plain "/", Plain " ", Comment "# c" ] )
+        && Highlight.tokenize Shell "ls --all"
+        == [ Ident "ls", Plain " ", Plain "-", Plain "-", Ident "all" ]
+        && Highlight.tokenize Shell "echo $#"
+        == [ Keyword "echo", Plain " ", Plain "$", Plain "#" ]
+
+
+-- Shell: a `'…'` string spans lines, so a `#` inside it is no comment and
+-- the code after its close is lexed as code.
+shellStrings : Bool
+shellStrings =
+    twoLines Shell "echo 'a # b" "c' # d"
+        == ( [ Keyword "echo", Plain " ", Str "'a # b" ], [ Str "c'", Plain " ", Comment "# d" ] )
+
+
+-- Rust: a `'"'` char literal opens no string, so the `//` after it is a
+-- comment; `//` inside a string is the string's; `--` and `#` open nothing;
+-- a lifetime's `'` is punctuation; block comments nest.
+rustComments : Bool
+rustComments =
+    Highlight.tokenize Rust "let q = '\"'; // c"
+        == [ Keyword "let", Plain " ", Ident "q", Plain " ", Plain "=", Plain " ", Str "'\"'", Plain ";", Plain " ", Comment "// c" ]
+        && Highlight.tokenize Rust "\"a // b\" c"
+        == [ Str "\"a // b\"", Plain " ", Ident "c" ]
+        && Highlight.tokenize Rust "x -- y"
+        == [ Ident "x", Plain " ", Plain "-", Plain "-", Plain " ", Ident "y" ]
+        && Highlight.tokenize Rust "#[test]"
+        == [ Plain "#", Plain "[", Ident "test", Plain "]" ]
+        && Highlight.tokenize Rust "&'a str"
+        == [ Plain "&", Plain "'", Ident "a", Plain " ", Ident "str" ]
+        && Highlight.tokenize Rust "/* a /* b */ c */ x"
+        == [ Comment "/* a /* b */ c */", Plain " ", Ident "x" ]
+
+
+-- Rust: a `r#"…"#` raw string closes only at `"#`, on its line or a later
+-- one, and a `"…"` string carries across lines; a `//` inside either is
+-- the string's.
+rustStrings : Bool
+rustStrings =
+    Highlight.tokenize Rust "r#\"a \" // b\"# c"
+        == [ Str "r#\"a \" // b\"#", Plain " ", Ident "c" ]
+        && twoLines Rust "let s = r#\"a" "// b\"# + 1"
+        == ( [ Keyword "let", Plain " ", Ident "s", Plain " ", Plain "=", Plain " ", Str "r#\"a" ], [ Str "// b\"#", Plain " ", Plain "+", Plain " ", Num "1" ] )
+        && twoLines Rust "let s = \"a" "// b\";"
+        == ( [ Keyword "let", Plain " ", Ident "s", Plain " ", Plain "=", Plain " ", Str "\"a" ], [ Str "// b\"", Plain ";" ] )
+
+
+-- A language with no grammar is one Plain token, whole or per line.
+unknownIsPlain : Bool
+unknownIsPlain =
+    Highlight.tokenize Unknown "// a # b -- c {- d"
+        == [ Plain "// a # b -- c {- d" ]
+        && twoLines Unknown "/* a" "b */"
+        == ( [ Plain "/* a" ], [ Plain "b */" ] )
+
+
+-- Lexemes left open at the end of the input close as Plain, in one pass:
+-- a 256 KiB unterminated block comment, 64Ki nested `{-` openers, and a raw
+-- string open over 64Ki lines (each carried line a Str piece). Red if a
+-- step copies its state or the tokens so far per character or per line.
+unterminatedAtEof : Bool
+unterminatedAtEof =
+    let
+        block =
+            "/* " ++ String.repeat 262144 "a"
+
+        nested =
+            String.repeat 65536 "{-"
+
+        raw =
+            "r#\"" ++ String.repeat 65536 "a\n"
+
+        rawToks =
+            Highlight.tokenize Rust raw
+    in
+    Highlight.tokenize Rust block
+        == [ Plain block ]
+        && Highlight.tokenize Ipe nested
+        == [ Plain nested ]
+        && List.length rawToks
+        == 131072
+        && not (List.any isComment rawToks)
+        && reassembles Rust raw
+
+
+-- A quarter-mebibyte line in each language tokenizes whole and loses
+-- nothing; a mebibyte Ipê line comment is one token.
+longLines : Bool
+longLines =
+    let
+        comment =
+            "-- " ++ String.repeat 1048573 "x"
+    in
+    reassembles Ipe (String.repeat 32768 "a -> {b} ")
+        && reassembles Shell (String.repeat 32768 "a 'b' \\c ")
+        && reassembles Rust (String.repeat 32768 "r\"a\" '\"' ")
+        && Highlight.tokenize Ipe comment
+        == [ Comment comment ]
+
+
+-- Each language's layout and path facts are its grammar row's: a CRLF is
+-- one line break in Rust and Ipê, only Rust skips a leading byte-order mark,
+-- and a path joins with `::` (Rust, `crate` its own root) or `.` (Ipê). A
+-- language with no grammar, and shell, hide nothing and spell no path.
+languageFacts : Bool
+languageFacts =
+    List.map factsOf [ Rust, Ipe, Shell, Unknown ]
+        == [ "crlf-break mark-skipped :: crate", "crlf-break mark-text .", "cr-text mark-text none", "cr-text mark-text none" ]
+
+
+factsOf : Lang -> String
+factsOf lang =
+    let
+        layout =
+            Highlight.layoutOf lang
+    in
+    lineEndsName layout.lineEnds ++ " " ++ leadingMarkName layout.leadingMark ++ " " ++ pathName lang
+
+
+lineEndsName : LineEnds -> String
+lineEndsName ends =
+    case ends of
+        CrlfIsOneBreak ->
+            "crlf-break"
+
+        CrIsText ->
+            "cr-text"
+
+
+leadingMarkName : LeadingMark -> String
+leadingMarkName mark =
+    case mark of
+        MarkSkipped ->
+            "mark-skipped"
+
+        MarkIsText ->
+            "mark-text"
+
+
+pathName : Lang -> String
+pathName lang =
+    case Highlight.pathRule lang of
+        Just rule ->
+            separatorName rule.separator ++ ownRootName rule.ownRoot
+
+        Nothing ->
+            "none"
+
+
+separatorName : Separator -> String
+separatorName sep =
+    case sep of
+        DotSeparator ->
+            "."
+
+        DoubleColonSeparator ->
+            "::"
+
+
+ownRootName : Maybe String -> String
+ownRootName root =
+    case root of
+        Just word ->
+            " " ++ word
+
+        Nothing ->
+            ""
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.succeed
+        [ ( "Ipe -- is a line comment; //, /* and # are not", ipeLineComments )
+        , ( "Ipe {- -} nests across lines; {-| does not nest", ipeBlockComments )
+        , ( "Ipe -- in a string or after '\"' is code", ipeStrings )
+        , ( "shell # is a comment; /* */, -- and $# are not", shellComments )
+        , ( "shell '...' spans lines and hides #", shellStrings )
+        , ( "Rust '\"' opens no string; // in a string is the string's", rustComments )
+        , ( "Rust raw and plain strings carry across lines", rustStrings )
+        , ( "a language with no grammar is plain", unknownIsPlain )
+        , ( "lexemes open at end of input close in one pass", unterminatedAtEof )
+        , ( "a quarter-mebibyte line lexes whole in each language", longLines )
+        , ( "each language's layout and path facts are its grammar row", languageFacts )
+        ]

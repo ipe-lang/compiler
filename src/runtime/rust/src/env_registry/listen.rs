@@ -1,6 +1,6 @@
-//! The `Server.listen` HTTP listener's port variables.
+//! The HTTP app listener's variables.
 
-use super::{DefaultValue, Doc, EnvEntry, Feature, Lifetime, PortKey, Subsystem};
+use super::{DefaultValue, Doc, EnvEntry, Feature, HostNamesKey, Lifetime, PortKey, Subsystem};
 use crate::env_grammar::Class;
 
 /// The operator's port for an `Ipe.Http.Server` app.
@@ -34,5 +34,30 @@ pub const LISTEN_PORT_RELOCATION: PortKey = PortKey::new(
     },
 );
 
+/// The DNS names an app listener admits besides IP literals and loopback names.
+pub const ALLOWED_HOSTS: HostNamesKey = HostNamesKey::new(
+    "IPE_HTTP_ALLOWED_HOSTS",
+    Doc {
+        class: Class::SecurityTunable,
+        feature: Feature::Server,
+        lifetime: Lifetime::Startup,
+        subsystem: Subsystem::Http,
+        purpose: "Comma-separated DNS names an `Ipe.Http.Server` or `Ipe.Web` app \
+                  serves besides IP literals and loopback names (`localhost` and \
+                  `*.localhost`), each trimmed of spaces: `name` admits exactly that \
+                  name, `.name` every name below it (not the name itself). A request \
+                  whose `Host` is any other DNS name answers `421`, in every build, \
+                  so a DNS name pointed at the app cannot reach it unless declared. \
+                  Set it to the public name a reverse proxy forwards as `Host`. An \
+                  empty value, an empty item, a port, `*`, an IP literal, a loopback \
+                  name, or more than 64 items refuses startup, naming the variable \
+                  and the item's position, never the value.",
+    },
+);
+
 /// This subsystem's entries.
-pub const ENTRIES: &[EnvEntry] = &[SERVER_PORT.entry(), LISTEN_PORT_RELOCATION.entry()];
+pub const ENTRIES: &[EnvEntry] = &[
+    SERVER_PORT.entry(),
+    LISTEN_PORT_RELOCATION.entry(),
+    ALLOWED_HOSTS.entry(),
+];

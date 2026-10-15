@@ -6,7 +6,7 @@ import Ipe.List as List
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.Set as Set
 import Ipe.String as String
-import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
+import Lib.Highlight as Highlight exposing (Lang, PathRule, Separator(..), Token(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Uid as Uid exposing (Uid)
 
@@ -144,29 +144,23 @@ type alias UnitName =
 -- chain that follows a separator (`x.0.len`, `(a).b`, `::std`, the `::new`
 -- after a turbofish) or a Rust `.` (`a.len`, `self.go`) is a member access and
 -- names nothing; neither does a lone keyword. A `::<` turbofish ends a chain;
--- a `..` range does not start a member. Shell and unknown languages have no
--- references.
+-- a `..` range does not start a member. A language whose grammar spells no
+-- path (shell, and one with no grammar) has no references.
 references : Lang -> String -> List Reference
 references lang source =
-    case lang of
-        Rust ->
-            referencesOf lang (Highlight.tokenize lang source)
+    case Highlight.pathRule lang of
+        Just rule ->
+            referencesOf rule.separator (Highlight.tokenize lang source)
 
-        Ipe ->
-            referencesOf lang (Highlight.tokenize lang source)
-
-        Shell ->
-            []
-
-        Unknown ->
+        Nothing ->
             []
 
 
 -- One left-to-right pass over the tokens: each token is read once and moves
 -- the walk on, so the pass is linear in the tokens.
-referencesOf : Lang -> List Token -> List Reference
-referencesOf lang tokens =
-    case List.foldl (walkToken lang) ( Between, [] ) tokens of
+referencesOf : Separator -> List Token -> List Reference
+referencesOf sep tokens =
+    case List.foldl (walkToken sep) ( Between, [] ) tokens of
         ( walk, refs ) ->
             closeWalk walk refs
 
@@ -234,16 +228,16 @@ type Walk
     | ChainColons Head
 
 
-walkToken : Lang -> Token -> ( Walk, List Reference ) -> ( Walk, List Reference )
-walkToken lang tok ( walk, refs ) =
-    walkPiece lang (pieceOf tok) walk refs
+walkToken : Separator -> Token -> ( Walk, List Reference ) -> ( Walk, List Reference )
+walkToken sep tok ( walk, refs ) =
+    walkPiece sep (pieceOf tok) walk refs
 
 
-walkPiece : Lang -> Piece -> Walk -> List Reference -> ( Walk, List Reference )
-walkPiece lang piece walk refs =
+walkPiece : Separator -> Piece -> Walk -> List Reference -> ( Walk, List Reference )
+walkPiece sep piece walk refs =
     case walk of
         Between ->
-            startAt lang piece refs
+            startAt sep piece refs
 
         AfterDot ->
             case piece of
@@ -254,7 +248,7 @@ walkPiece lang piece walk refs =
                     ( InChain Discard, refs )
 
                 Colon ->
-                    startAt lang Colon refs
+                    startAt sep Colon refs
 
                 Other ->
                     ( Between, refs )
@@ -265,10 +259,10 @@ walkPiece lang piece walk refs =
                     ( AfterColons, refs )
 
                 Word w reserved ->
-                    startAt lang (Word w reserved) refs
+                    startAt sep (Word w reserved) refs
 
                 Dot ->
-                    startAt lang Dot refs
+                    startAt sep Dot refs
 
                 Other ->
                     ( Between, refs )
@@ -279,10 +273,10 @@ walkPiece lang piece walk refs =
                     ( InChain Discard, refs )
 
                 Dot ->
-                    startAt lang Dot refs
+                    startAt sep Dot refs
 
                 Colon ->
-                    startAt lang Colon refs
+                    startAt sep Colon refs
 
                 Other ->
                     ( Between, refs )
@@ -290,21 +284,23 @@ walkPiece lang piece walk refs =
         InChain head ->
             case piece of
                 Dot ->
-                    if lang == Ipe then
-                        ( ChainDot head, refs )
+                    case sep of
+                        DotSeparator ->
+                            ( ChainDot head, refs )
 
-                    else
-                        startAt lang Dot (emit head refs)
+                        DoubleColonSeparator ->
+                            startAt sep Dot (emit head refs)
 
                 Colon ->
-                    if lang == Rust then
-                        ( ChainColon head, refs )
+                    case sep of
+                        DoubleColonSeparator ->
+                            ( ChainColon head, refs )
 
-                    else
-                        startAt lang Colon (emit head refs)
+                        DotSeparator ->
+                            startAt sep Colon (emit head refs)
 
                 Word w reserved ->
-                    startAt lang (Word w reserved) (emit head refs)
+                    startAt sep (Word w reserved) (emit head refs)
 
                 Other ->
                     ( Between, emit head refs )
@@ -315,13 +311,13 @@ walkPiece lang piece walk refs =
                     ( InChain (extend head "." w), refs )
 
                 Dot ->
-                    walkPiece lang Dot AfterDot (emit head refs)
+                    walkPiece sep Dot AfterDot (emit head refs)
 
                 Colon ->
-                    walkPiece lang Colon AfterDot (emit head refs)
+                    walkPiece sep Colon AfterDot (emit head refs)
 
                 Other ->
-                    walkPiece lang Other AfterDot (emit head refs)
+                    walkPiece sep Other AfterDot (emit head refs)
 
         ChainColon head ->
             case piece of
@@ -329,13 +325,13 @@ walkPiece lang piece walk refs =
                     ( ChainColons head, refs )
 
                 Word w reserved ->
-                    walkPiece lang (Word w reserved) AfterColon (emit head refs)
+                    walkPiece sep (Word w reserved) AfterColon (emit head refs)
 
                 Dot ->
-                    walkPiece lang Dot AfterColon (emit head refs)
+                    walkPiece sep Dot AfterColon (emit head refs)
 
                 Other ->
-                    walkPiece lang Other AfterColon (emit head refs)
+                    walkPiece sep Other AfterColon (emit head refs)
 
         ChainColons head ->
             case piece of
@@ -343,19 +339,19 @@ walkPiece lang piece walk refs =
                     ( InChain (extend head "::" w), refs )
 
                 Dot ->
-                    walkPiece lang Dot AfterColons (emit head refs)
+                    walkPiece sep Dot AfterColons (emit head refs)
 
                 Colon ->
-                    walkPiece lang Colon AfterColons (emit head refs)
+                    walkPiece sep Colon AfterColons (emit head refs)
 
                 Other ->
-                    walkPiece lang Other AfterColons (emit head refs)
+                    walkPiece sep Other AfterColons (emit head refs)
 
 
 -- The walk after `piece` with no chain open: a word opens a chain, a `.`
--- (or a Rust `:`) may open a separator.
-startAt : Lang -> Piece -> List Reference -> ( Walk, List Reference )
-startAt lang piece refs =
+-- (or a `:` where paths join with `::`) may open a separator.
+startAt : Separator -> Piece -> List Reference -> ( Walk, List Reference )
+startAt sep piece refs =
     case piece of
         Word w reserved ->
             ( InChain (Emit w 1 reserved), refs )
@@ -364,11 +360,12 @@ startAt lang piece refs =
             ( AfterDot, refs )
 
         Colon ->
-            if lang == Rust then
-                ( AfterColon, refs )
+            case sep of
+                DoubleColonSeparator ->
+                    ( AfterColon, refs )
 
-            else
-                ( Between, refs )
+                DotSeparator ->
+                    ( Between, refs )
 
         Other ->
             ( Between, refs )
@@ -457,10 +454,13 @@ type alias CandidateAcc =
 candidates : Lang -> UnitName -> List Reference -> Candidates
 candidates lang unit refs =
     let
+        rule =
+            Highlight.pathRule lang
+
         base =
-            moduleBase lang unit
+            moduleBase rule unit
     in
-    case List.foldl candidateStep (Open Set.empty { lookups = [], names = [], count = 0 }) (List.map (alternatives lang unit base) (distinctReferences refs)) of
+    case List.foldl candidateStep (Open Set.empty { lookups = [], names = [], count = 0 }) (List.map (alternatives rule unit base) (distinctReferences refs)) of
         Open _ acc ->
             { lookups = acc.lookups, names = acc.names, reach = Complete }
 
@@ -549,29 +549,49 @@ referenceKey ref =
             "b:" ++ t
 
 
-alternatives : Lang -> UnitName -> Maybe String -> Reference -> List String
-alternatives lang unit base ref =
+alternatives : Maybe PathRule -> UnitName -> Maybe String -> Reference -> List String
+alternatives rule unit base ref =
     case ref of
         Path p ->
-            [ crateRewrite lang unit p ]
+            [ ownRootRewrite rule unit p ]
 
         Bare t ->
-            case base of
-                Just b ->
-                    [ t, b ++ separator lang ++ t ]
+            case ( rule, base ) of
+                ( Just r, Just b ) ->
+                    [ t, b ++ separatorText r.separator ++ t ]
 
-                Nothing ->
+                ( Just _, Nothing ) ->
+                    [ t ]
+
+                ( Nothing, _ ) ->
                     [ t ]
 
 
--- A Rust `crate::` path names the unit's own crate: the first segment of its
--- qualified name, the crate root ipe-index roots every Rust module path at.
-crateRewrite : Lang -> UnitName -> String -> String
-crateRewrite lang unit path =
-    if lang == Rust && String.startsWith "crate::" path then
-        case List.head (String.split "::" unit.qualified) of
-            Just root ->
-                root ++ "::" ++ String.dropLeft 7 path
+-- A path opening with its language's own-root word and separator (Rust
+-- `crate::`) names the unit's own crate: the first segment of its qualified
+-- name, the crate root ipe-index roots every module path at. A language
+-- with no such word looks every path up as written.
+ownRootRewrite : Maybe PathRule -> UnitName -> String -> String
+ownRootRewrite rule unit path =
+    case rule of
+        Just r ->
+            case r.ownRoot of
+                Just root ->
+                    rootedAt (separatorText r.separator) (root ++ separatorText r.separator) unit path
+
+                Nothing ->
+                    path
+
+        Nothing ->
+            path
+
+
+rootedAt : String -> String -> UnitName -> String -> String
+rootedAt sep prefix unit path =
+    if String.startsWith prefix path then
+        case List.head (String.split sep unit.qualified) of
+            Just ownCrate ->
+                ownCrate ++ sep ++ String.dropLeft (String.length prefix) path
 
             Nothing ->
                 path
@@ -580,34 +600,40 @@ crateRewrite lang unit path =
         path
 
 
--- The separator ipe-index joins a module and a unit name with.
-separator : Lang -> String
-separator lang =
-    case lang of
-        Ipe ->
+-- The text a path's segments are joined with, as ipe-index joins a module
+-- and a unit name.
+separatorText : Separator -> String
+separatorText sep =
+    case sep of
+        DotSeparator ->
             "."
 
-        Rust ->
-            "::"
-
-        Shell ->
-            "::"
-
-        Unknown ->
+        DoubleColonSeparator ->
             "::"
 
 
 -- The unit's own module: its qualified name without a trailing `#<digits>`
 -- duplicate ordinal, then without `separator ++ name` at its end. A file
--- unit, or a qualified name without that suffix, has none.
-moduleBase : Lang -> UnitName -> Maybe String
-moduleBase lang unit =
+-- unit, a qualified name without that suffix, and a language that spells no
+-- path have none.
+moduleBase : Maybe PathRule -> UnitName -> Maybe String
+moduleBase rule unit =
+    case rule of
+        Just r ->
+            moduleUnder (separatorText r.separator) unit
+
+        Nothing ->
+            Nothing
+
+
+moduleUnder : String -> UnitName -> Maybe String
+moduleUnder sep unit =
     let
         qualified =
             dropOrdinal unit.qualified
 
         suffix =
-            separator lang ++ unit.name
+            sep ++ unit.name
     in
     if unit.kind == "file" || unit.name == "" then
         Nothing

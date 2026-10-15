@@ -299,6 +299,7 @@ fn ir_type_name_at(interner: &Interner, ty: &IrType, depth: u16) -> String {
         IrType::Url => "Url".to_owned(),
         IrType::UrlRelative => "Url.Relative".to_owned(),
         IrType::Dsn => "Dsn".to_owned(),
+        IrType::DbLocation => "DbLocation".to_owned(),
         // The phantom access mode is shown for a readable IR dump; it never
         // renders to a standalone Rust type (erased at emit).
         IrType::Connection => "Connection".to_owned(),
@@ -444,6 +445,7 @@ fn pat_name_at(interner: &Interner, pat: &Pat, depth: u16) -> String {
             }
         }
         Pat::Or(alts) => alts
+            .as_slice()
             .iter()
             .map(|p| pat_name_at(interner, p, depth))
             .collect::<Vec<_>>()

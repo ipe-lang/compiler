@@ -1851,6 +1851,7 @@ pub(crate) enum StaticRequest {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum StaticRefusal {
     /// The strict core refused the path text itself.
+    #[cfg(any(test, feature = "web"))]
     Malformed(crate::encoding::DecodeRefusal),
     /// A decoded segment is not a plain name under the serving regime.
     Segment(crate::path_core::RelPathRefusal),
@@ -1874,6 +1875,7 @@ pub(crate) enum StaticRefusal {
 /// # Errors
 ///
 /// The [`StaticRefusal`] of the first boundary that refused the path.
+#[cfg(any(test, feature = "web"))]
 pub(crate) fn static_request(
     uri_path: &str,
     root: &std::path::Path,
@@ -1884,7 +1886,7 @@ pub(crate) fn static_request(
     static_request_of(&decoded, root, regime)
 }
 
-/// [`static_request`] over a path already decoded.
+/// `static_request` over a path already decoded.
 ///
 /// # Errors
 ///
@@ -1948,7 +1950,7 @@ pub(crate) fn strict_serve_dir(
 /// [`strict_serve_dir`] under an explicit `regime`, so any host proves the
 /// Windows refusals.
 ///
-/// A request path [`static_request`] refuses is answered a bare 404 that never
+/// A request path `static_request` refuses is answered a bare 404 that never
 /// echoes the path, whether or not the entry exists. Every answer carries the
 /// response security headers.
 fn strict_serve_dir_with(
@@ -2540,6 +2542,8 @@ impl RecordedHost {
     }
 }
 
+pub(crate) mod shutdown;
+
 /// A bound app listener and the Host admission every request on it is judged
 /// by.
 ///
@@ -2552,25 +2556,62 @@ pub(crate) struct AppListener {
     tag: &'static str,
 }
 
+/// Why an app listener does not bind.
+#[derive(Debug)]
+pub(crate) enum AppBindError {
+    /// The declared host list is refused; no socket was opened.
+    Admission(crate::env_grammar::EnvRefusal),
+    /// The socket's own bind error.
+    Bind(std::io::Error),
+}
+
+/// The DNS names every app listener of this process admits, judged once.
+///
+/// Fixed by the first call, which [`crate::env_registry::startup_check`] makes,
+/// so a later environment write cannot widen a running app's admission.
+///
+/// # Errors
+///
+/// The refusal of a malformed `IPE_HTTP_ALLOWED_HOSTS`, naming the variable
+/// and never the value.
+pub(crate) fn declared_names()
+-> Result<&'static crate::inbound_authority::DeclaredNames, &'static crate::env_grammar::EnvRefusal>
+{
+    type Judged = Result<crate::inbound_authority::DeclaredNames, crate::env_grammar::EnvRefusal>;
+    static NAMES: std::sync::OnceLock<Judged> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| crate::env_registry::listen::ALLOWED_HOSTS.read())
+        .as_ref()
+}
+
+/// Fixes [`declared_names`] for the process.
+pub(crate) fn fix_declared_names() {
+    let _ = declared_names();
+}
+
 /// Bind an app listener on `host` and `port`, then log where it listens, which
 /// hosts it admits and, for an exposed host, who exposed it.
 ///
 /// The one app bind site: `Server.listen` and `serve_web` both bind through
-/// it, so neither keeps a `TcpListener::bind` of its own.
+/// it, so neither keeps a `TcpListener::bind` of its own, and neither admits a
+/// DNS name `IPE_HTTP_ALLOWED_HOSTS` does not declare.
 ///
 /// # Errors
 ///
-/// The bind's own error, for the caller to word.
+/// [`AppBindError::Admission`] for a refused host list, before any socket
+/// opens; [`AppBindError::Bind`] with the bind's own error, for the caller to
+/// word.
 pub(crate) async fn bind_app_listener(
     tag: &'static str,
     host: RecordedHost,
     port: u16,
-) -> std::io::Result<AppListener> {
+) -> Result<AppListener, AppBindError> {
+    let names = declared_names().map_err(|refusal| AppBindError::Admission(refusal.clone()))?;
     let addr = host.addr(port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let admission = crate::inbound_authority::HostAdmission::new(
-        crate::inbound_authority::DeclaredNames::none(),
-    );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(AppBindError::Bind)?;
+    let admission = crate::inbound_authority::HostAdmission::new(names.clone());
     for line in startup_lines(addr, host.0, admission.names()) {
         crate::system::emit_runtime_log(tag, &line);
     }
@@ -2582,12 +2623,19 @@ pub(crate) async fn bind_app_listener(
 }
 
 /// Serve `router` on `app`, judging every request's target authority against
-/// the listener's Host admission before routing, until `shutdown` resolves.
+/// the listener's Host admission before routing, until the armed shutdown
+/// owner drains it; then close every owned pool.
 ///
 /// The one app serve site. The admission wraps the router as a service, never
 /// through `Router::layer` (which runs after routing), so an unrouted path and
 /// the fallback are refused alike and a refused request reaches no handler,
 /// session or concurrency permit.
+///
+/// Its only success is [`shutdown::Stopped`]: after the first signal the
+/// in-flight requests and long-lived tasks get what is left of the grace, every
+/// other serve site sharing the owner drains too, the exporters flush, and
+/// every owned pool closes under its deadline. A signal
+/// that arrived before the serve skips accepting altogether.
 ///
 /// # Errors
 ///
@@ -2596,23 +2644,47 @@ pub(crate) async fn bind_app_listener(
 pub(crate) async fn serve_app(
     app: AppListener,
     router: axum::Router,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
+    armed: shutdown::Armed,
+) -> std::io::Result<shutdown::Stopped> {
     use axum::ServiceExt as _;
     use tower::Layer as _;
-    let AppListener {
-        listener,
-        admission,
-        tag,
-    } = app;
-    let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
-        .layer(CanonicalUrl::new(router));
-    axum::serve(
-        listener,
-        svc.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    if !armed.is_draining() {
+        // This site counts as live while it serves, so a sibling site sharing
+        // the owner closes the shared pools only after this one has drained.
+        let serving = armed.drain().hold();
+        let AppListener {
+            listener,
+            admission,
+            tag,
+        } = app;
+        let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
+            .layer(CanonicalUrl::new(router));
+        let mut stop = armed.drain();
+        let serve = std::future::IntoFuture::into_future(
+            axum::serve(
+                listener,
+                svc.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { stop.wait().await }),
+        );
+        tokio::pin!(serve);
+        let mut drain = armed.drain();
+        tokio::select! {
+            biased;
+            served = serve.as_mut() => served?,
+            () = drain.wait() => {
+                if let Ok(served) = tokio::time::timeout(armed.remaining_grace(), serve.as_mut()).await {
+                    served?;
+                }
+            }
+        }
+        drop(serving);
+    }
+    armed.settle_live().await;
+    #[cfg(all(feature = "web", feature = "http_client"))]
+    crate::web::flush_exporters().await;
+    let closed = shutdown::close_owned_pools(&armed).await;
+    Ok(shutdown::Stopped::after(closed))
 }
 
 /// Serve a test upstream `router` on `listener` with no Host admission.
@@ -2691,11 +2763,15 @@ fn startup_lines(
 }
 
 /// The startup line naming which hosts an app listener admits; it counts the
-/// declared names and never echoes one.
+/// declared names and never echoes one, and with none names the variable that
+/// declares them.
 fn admission_line(names: &crate::inbound_authority::DeclaredNames) -> String {
     const ADMITTED: &str = "host admission: IP literals and localhost";
     if names.is_empty() {
-        ADMITTED.to_owned()
+        format!(
+            "{ADMITTED}; set {}=<name> to serve a DNS name",
+            crate::env_registry::listen::ALLOWED_HOSTS.name()
+        )
     } else {
         format!("{ADMITTED}, and {} declared name(s)", names.len())
     }
@@ -2898,12 +2974,35 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
             }
         };
         let port = resolved.port.get();
+        let grace = match shutdown::shutdown_grace() {
+            Ok(grace) => grace,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                    "Server.listen: {refusal}"
+                ))));
+            }
+        };
+        // Armed before the bind, so no accepted connection precedes the owner.
+        let armed = match shutdown::arm(shutdown::ShutdownPlan::server(), grace) {
+            Ok(armed) => armed,
+            Err(e) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::io(format!(
+                    "Server.listen: shutdown signals: {}",
+                    crate::system::scrub_log_controls(&e.to_string())
+                ))));
+            }
+        };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
         let host = RecordedHost::record(host);
         let addr = host.addr(port);
         let listener = match bind_app_listener("http.server", host, port).await {
             Ok(l) => l,
-            Err(e) => {
+            Err(AppBindError::Admission(refusal)) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                    "Server.listen: {refusal}"
+                ))));
+            }
+            Err(AppBindError::Bind(e)) => {
                 return IpeResult::Err(E::from_ipe_error(resolved.bind_refusal(
                     "Server.listen",
                     addr,
@@ -2913,8 +3012,8 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         };
         // `serve_app` serves with connect-info, so each request carries the peer
         // `SocketAddr` (`ServerRequest.remoteAddr`, per-IP rate limiting).
-        match serve_app(listener, app, std::future::pending()).await {
-            Ok(()) => ok_res(()),
+        match serve_app(listener, app, armed).await {
+            Ok(shutdown::Stopped { .. }) => ok_res(()),
             Err(e) => IpeResult::Err(E::from_ipe_error(IpeError::io(format!(
                 "Server.listen: serve: {}",
                 crate::system::scrub_log_controls(&e.to_string())
@@ -3420,12 +3519,31 @@ pub(crate) fn channel_unsettled(gate: &mut Option<ChannelGate>) -> bool {
     gate.as_mut().is_some_and(|gate| gate.settle().is_err())
 }
 
+/// The close frame a WebSocket sends when the server stops serving it.
+fn ws_away_close() -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Close(Some(axum::extract::ws::CloseFrame {
+        code: axum::extract::ws::close_code::AWAY,
+        reason: "server shutting down".into(),
+    }))
+}
+
 /// The close frame a gated WebSocket sends once its credentials no longer hold.
 fn ws_denied_close() -> axum::extract::ws::Message {
     axum::extract::ws::Message::Close(Some(axum::extract::ws::CloseFrame {
         code: axum::extract::ws::close_code::POLICY,
         reason: CHANNEL_DENIED_REASON.into(),
     }))
+}
+
+/// Send the close `frame`, waiting at most [`shutdown::WS_CLOSE_DEADLINE`]: a
+/// peer that stops reading never holds the socket's loop, its `onClose` or its
+/// registry slot past the deadline.
+async fn ws_send_close<S>(socket: &mut S, frame: axum::extract::ws::Message)
+where
+    S: futures_util::Sink<axum::extract::ws::Message> + Unpin,
+{
+    use futures_util::SinkExt;
+    let _ = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE, socket.send(frame)).await;
 }
 
 tokio::task_local! {
@@ -3460,6 +3578,10 @@ fn ws_max_message_bytes(max_message_bytes: i64) -> usize {
 /// joined and a revocation whose coalesced recheck is due; it also ends on a
 /// coalesced revocation and at the earliest deadline. A denial sends close
 /// code 1008 and ends the loop.
+///
+/// The drain counts the socket until `onClose` returns. Once it drains, the
+/// socket sends close code 1001 and ends the loop. Every close frame goes
+/// through [`ws_send_close`], under [`shutdown::WS_CLOSE_DEADLINE`].
 async fn ws_loop<E, S>(
     mut socket: S,
     cfg: WsServerCfg<E>,
@@ -3467,6 +3589,7 @@ async fn ws_loop<E, S>(
     ceilings: WsCeilings,
     credentials: ChannelCredentials,
     mut gate: Option<ChannelGate>,
+    mut drain: shutdown::Drain,
 ) where
     E: From<String> + Send + 'static,
     S: futures_util::Stream<Item = Result<axum::extract::ws::Message, axum::Error>>
@@ -3486,9 +3609,13 @@ async fn ws_loop<E, S>(
     // A credential revoked between the upgrade and now opens nothing: no
     // registration, no `onConnect`.
     if channel_refuses(&mut gate) {
-        let _ = socket.send(ws_denied_close()).await;
+        ws_send_close(&mut socket, ws_denied_close()).await;
         return;
     }
+    let Some(_live) = drain.hold() else {
+        ws_send_close(&mut socket, ws_away_close()).await;
+        return;
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ceilings.send_buffer);
     // Live-peer ceiling, application-layer defense in depth: the upgrade gate in
     // `server_web_socket_upgrade` is the primary check, but under high
@@ -3507,7 +3634,7 @@ async fn ws_loop<E, S>(
         // guard dropped here — never held across the awaits below.
     };
     if !admitted {
-        let _ = socket.send(Message::Close(None)).await;
+        ws_send_close(&mut socket, Message::Close(None)).await;
         return;
     }
     let _ = credentials
@@ -3522,23 +3649,27 @@ async fn ws_loop<E, S>(
     heartbeat.tick().await; // consume the immediate first tick
     loop {
         if channel_unsettled(&mut gate) {
-            let _ = socket.send(ws_denied_close()).await;
+            ws_send_close(&mut socket, ws_denied_close()).await;
             break;
         }
         tokio::select! {
             biased;
             () = channel_denial(&mut gate) => {
-                let _ = socket.send(ws_denied_close()).await;
+                ws_send_close(&mut socket, ws_denied_close()).await;
+                break;
+            },
+            () = drain.wait() => {
+                ws_send_close(&mut socket, ws_away_close()).await;
                 break;
             },
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Text(t))) => {
                     if t.len() > max_bytes {
-                        let _ = socket.send(Message::Close(None)).await;
+                        ws_send_close(&mut socket, Message::Close(None)).await;
                         break;
                     }
                     if channel_refuses(&mut gate) {
-                        let _ = socket.send(ws_denied_close()).await;
+                        ws_send_close(&mut socket, ws_denied_close()).await;
                         break;
                     }
                     let _ = credentials
@@ -3547,11 +3678,11 @@ async fn ws_loop<E, S>(
                 }
                 Some(Ok(Message::Binary(b))) => {
                     if b.len() > max_bytes {
-                        let _ = socket.send(Message::Close(None)).await;
+                        ws_send_close(&mut socket, Message::Close(None)).await;
                         break;
                     }
                     if channel_refuses(&mut gate) {
-                        let _ = socket.send(ws_denied_close()).await;
+                        ws_send_close(&mut socket, ws_denied_close()).await;
                         break;
                     }
                     // Convert binary frame bytes to String via UTF-8 (lossy): Ipê's
@@ -3582,12 +3713,12 @@ async fn ws_loop<E, S>(
             outgoing = rx.recv() => match outgoing {
                 Some(WsOut::Text(s)) => { if socket.send(Message::Text(s)).await.is_err() { break; } }
                 Some(WsOut::Binary(b)) => { if socket.send(Message::Binary(b)).await.is_err() { break; } }
-                Some(WsOut::Close) => { let _ = socket.send(Message::Close(None)).await; break; }
+                Some(WsOut::Close) => { ws_send_close(&mut socket, Message::Close(None)).await; break; }
                 None => break,
             },
             _ = heartbeat.tick() => {
                 if channel_refuses(&mut gate) {
-                    let _ = socket.send(ws_denied_close()).await;
+                    ws_send_close(&mut socket, ws_denied_close()).await;
                     break;
                 }
                 // Send a Ping frame; if the peer has gone away the send will
@@ -3786,8 +3917,9 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
                 // the limit holds even before `ws_loop`'s in-loop check runs.
                 let max_bytes = ws_max_message_bytes(cfg.maxMessageBytes);
                 let up = up.max_message_size(max_bytes).max_frame_size(max_bytes);
+                let drain = shutdown::drain();
                 let resp = up.on_upgrade(move |socket| {
-                    ws_loop(socket, cfg, id, ceilings, credentials, gate)
+                    ws_loop(socket, cfg, id, ceilings, credentials, gate, drain)
                 });
                 let _ = WS_RESPONSE.try_with(|c| c.set(Some(resp)));
                 // Sentinel — method_router returns WS_RESPONSE instead of this.
@@ -4921,6 +5053,125 @@ mod tests {
     use super::*;
     use std::future::ready;
 
+    #[tokio::test]
+    async fn a_request_stuck_past_the_grace_still_stops_within_its_bound() {
+        use tokio::io::AsyncWriteExt as _;
+        let grace = std::time::Duration::from_millis(200);
+        let (armed, signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            grace,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let host = RecordedHost::record(crate::app_config::ListenHost::Loopback(
+            crate::app_config::LoopbackIp::DEFAULT,
+        ));
+        let app = bind_app_listener("test", host, 0)
+            .await
+            .expect("a loopback port binds");
+        let port = app.listener.local_addr().expect("a bound port").port();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entering = Arc::clone(&entered);
+        let router = axum::Router::new().route(
+            "/stuck",
+            axum::routing::get(move || {
+                let entering = Arc::clone(&entering);
+                async move {
+                    entering.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let served = tokio::spawn(serve_app(app, router, armed));
+        let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("the app accepts");
+        let request = format!("GET /stuck HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the handler runs");
+        let signalled = std::time::Instant::now();
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        #[cfg(feature = "db")]
+        let close = shutdown::POOLS_CLOSE_BOUND;
+        #[cfg(not(feature = "db"))]
+        let close = std::time::Duration::ZERO;
+        let bound = grace + close + std::time::Duration::from_secs(2);
+        let stopped = tokio::time::timeout(bound, served)
+            .await
+            .expect("a stuck request never holds the stop past its bound");
+        assert!(matches!(stopped, Ok(Ok(shutdown::Stopped { .. }))));
+        assert!(signalled.elapsed() < bound);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_site_that_drains_first_waits_for_its_sibling_before_closing_pools() {
+        use tokio::io::AsyncWriteExt as _;
+        let budget = std::time::Duration::from_secs(5);
+        let (idle_site, busy_site, signals) =
+            shutdown::tests::armed_pair(std::time::Duration::from_secs(30));
+        let bind = || {
+            bind_app_listener(
+                "test",
+                RecordedHost::record(crate::app_config::ListenHost::Loopback(
+                    crate::app_config::LoopbackIp::DEFAULT,
+                )),
+                0,
+            )
+        };
+        let idle_app = bind().await.expect("a loopback port binds");
+        let busy_app = bind().await.expect("a loopback port binds");
+        let port = busy_app.listener.local_addr().expect("a bound port").port();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entering, released) = (Arc::clone(&entered), Arc::clone(&release));
+        let router = axum::Router::new().route(
+            "/held",
+            axum::routing::get(move || {
+                let (entering, released) = (Arc::clone(&entering), Arc::clone(&released));
+                async move {
+                    entering.notify_one();
+                    released.notified().await;
+                    "done"
+                }
+            }),
+        );
+        let idle = tokio::spawn(serve_app(idle_app, axum::Router::new(), idle_site));
+        let busy = tokio::spawn(serve_app(busy_app, router, busy_site));
+        let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("the app accepts");
+        let request =
+            format!("GET /held HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        tokio::time::timeout(budget, entered.notified())
+            .await
+            .expect("the handler runs");
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !idle.is_finished(),
+            "an idle site closes the shared pools while a sibling still serves a request"
+        );
+        release.notify_one();
+        let busy = tokio::time::timeout(budget, busy)
+            .await
+            .expect("the busy site stops");
+        assert!(matches!(busy, Ok(Ok(shutdown::Stopped { .. }))));
+        let idle = tokio::time::timeout(budget, idle)
+            .await
+            .expect("the idle site stops");
+        assert!(matches!(idle, Ok(Ok(shutdown::Stopped { .. }))));
+        drop(client);
+    }
+
     /// `Ipe.Http.Server` resolves through the shared resolver under its own
     /// operator var: an operator value wins over the source port, and a
     /// supervisor relocation wins over both.
@@ -5462,7 +5713,9 @@ mod tests {
         use crate::app_config::{ExposedBy, ListenHost, LoopbackIp};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let none = crate::inbound_authority::DeclaredNames::none();
-        let admission = "host admission: IP literals and localhost".to_owned();
+        let admission = "host admission: IP literals and localhost; set \
+                         IPE_HTTP_ALLOWED_HOSTS=<name> to serve a DNS name"
+            .to_owned();
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
         assert_eq!(
             startup_lines(loopback, ListenHost::Loopback(LoopbackIp::DEFAULT), &none),
@@ -6301,7 +6554,11 @@ mod tests {
         let seen = |name: &'static str, runs: Arc<AtomicUsize>| {
             move |uri: axum::http::Uri, strict: Option<axum::Extension<StrictUrl>>| async move {
                 runs.fetch_add(1, Ordering::SeqCst);
+                // The spelling is a web-tier fact; a server-only build sees the parse alone.
+                #[cfg(feature = "web")]
                 let spelling = strict.map(|axum::Extension(s)| s.spelling());
+                #[cfg(not(feature = "web"))]
+                let spelling = strict.map(|_| "parsed");
                 format!("{name} {uri} {spelling:?}")
             }
         };
@@ -6433,6 +6690,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "web")]
     #[tokio::test]
     async fn canonical_url_routes_every_spelling_of_a_path_as_its_canonical_one() {
         for (uri, want) in [
@@ -8714,6 +8972,56 @@ mod tests {
         crate::system::locked_remove_var("IPE_HTTP_BIND");
     }
 
+    /// A real `Server.listen` admits a name `IPE_HTTP_ALLOWED_HOSTS` declares,
+    /// and still refuses a name below it with 421.
+    #[tokio::test]
+    async fn dev_posture_pin_declared_name_admits_on_listen() {
+        crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "review.example.com");
+        let (port, task) = spawn_listen().unwrap();
+        let declared = format!("review.example.com:{port}");
+        let resp = raw_exchange(port, &get_with_host("/", &declared))
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&resp), 200, "{resp}");
+        let below = format!("x.review.example.com:{port}");
+        let resp = raw_exchange(port, &get_with_host("/", &below))
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&resp), 421, "{resp}");
+        assert!(resp.contains("host_not_admitted"), "{resp}");
+        task.abort();
+        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// A malformed `IPE_HTTP_ALLOWED_HOSTS` refuses `Server.listen` before its
+    /// socket opens, naming the variable and never the value. The port is
+    /// held, so a bind attempted first would answer its own address-in-use
+    /// refusal instead of the host list's.
+    #[tokio::test]
+    async fn listen_refuses_a_malformed_allowed_hosts_before_binding() {
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "hidden.example:80");
+        crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+        crate::system::locked_remove_var(crate::env_registry::listen::SERVER_PORT.name());
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        let route = server_get::<String, _>("/".to_owned(), |_req: ServerRequest| {
+            Box::pin(ready(ok_res::<String, _>(server_text("ok".to_owned()))))
+                as IpeTask<String, ServerResponse>
+        });
+        let outcome = server_listen::<String>(i64::from(port), vec![route]).await;
+        drop(held);
+        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+        assert!(matches!(outcome, IpeResult::Err(_)), "{outcome:?}");
+        let IpeResult::Err(message) = outcome else {
+            return;
+        };
+        assert!(message.contains("IPE_HTTP_ALLOWED_HOSTS"), "{message}");
+        assert!(!message.contains("hidden"), "{message}");
+    }
+
     /// A real `Server.listen` refuses a malformed URL with 400 whether or not
     /// a route would match it, and routes another spelling of `/api` to
     /// `/api`, its handler reading the canonical path.
@@ -8764,6 +9072,91 @@ mod tests {
         assert!(resp.contains("host_not_admitted"), "{resp}");
         task.abort();
         crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// A socket whose peer never takes a frame.
+    struct StalledSocket;
+
+    impl futures_util::Stream for StalledSocket {
+        type Item = Result<axum::extract::ws::Message, axum::Error>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures_util::Sink<axum::extract::ws::Message> for StalledSocket {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: axum::extract::ws::Message,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Whether `ws_loop` over a [`StalledSocket`] ends within twice the
+    /// close deadline, under `max_connections` and `drain`.
+    async fn stalled_loop_ends(max_connections: usize, drain: shutdown::Drain) -> bool {
+        let ceilings = WsCeilings {
+            send_buffer: 16,
+            max_connections,
+            heartbeat_secs: 30,
+        };
+        let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let served = ws_loop(
+            StalledSocket,
+            ws_server_default_cfg::<String>(),
+            id,
+            ceilings,
+            ChannelCredentials::of_request(),
+            None,
+            drain,
+        );
+        tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_the_full_drain_refuses_ends_within_its_close_deadline() {
+        assert!(
+            stalled_loop_ends(usize::MAX, shutdown::tests::full_drain()).await,
+            "an uncounted socket's close frame never outlives its deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_over_the_peer_ceiling_ends_within_its_close_deadline() {
+        assert!(
+            stalled_loop_ends(0, shutdown::Drain::never()).await,
+            "a refused peer's close frame never outlives its deadline"
+        );
     }
 
     // ── authenticated routes (fail-closed) ────────────────────────────
@@ -9306,6 +9699,8 @@ mod tests {
             delivered: tokio::sync::mpsc::UnboundedReceiver<String>,
             /// One unit per `onConnect` run.
             connected: tokio::sync::mpsc::UnboundedReceiver<()>,
+            /// One unit per `onClose` run.
+            closed: tokio::sync::mpsc::UnboundedReceiver<()>,
         }
 
         /// What the served socket's `onMessage` does with a text before it
@@ -9327,13 +9722,28 @@ mod tests {
             gate: Option<ChannelGate>,
             on_message: OnMessage,
         ) -> WsPeer {
+            spawn_ws_draining(credentials, gate, on_message, shutdown::Drain::never())
+        }
+
+        /// [`spawn_ws`] whose loop ends when `drain` drains.
+        fn spawn_ws_draining(
+            credentials: ChannelCredentials,
+            gate: Option<ChannelGate>,
+            on_message: OnMessage,
+            drain: shutdown::Drain,
+        ) -> WsPeer {
             let (to_server, inbound) = tokio::sync::mpsc::unbounded_channel();
             let (outbound, from_server) = tokio::sync::mpsc::unbounded_channel();
             let (seen, delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
             let (connected_tx, connected) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (closed_tx, closed) = tokio::sync::mpsc::unbounded_channel::<()>();
             let cfg = WsServerCfg {
                 onConnect: Arc::new(move |_: WsHandle| {
                     let _ = connected_tx.send(());
+                    Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
+                }),
+                onClose: Arc::new(move |_: WsHandle| {
+                    let _ = closed_tx.send(());
                     Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
                 }),
                 onMessage: Arc::new(move |_: WsHandle, text: String| {
@@ -9366,13 +9776,14 @@ mod tests {
             };
             let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let socket = MemSocket { inbound, outbound };
-            tokio::spawn(ws_loop(socket, cfg, id, ceilings, credentials, gate));
+            tokio::spawn(ws_loop(socket, cfg, id, ceilings, credentials, gate, drain));
             WsPeer {
                 id,
                 to_server,
                 from_server,
                 delivered,
                 connected,
+                closed,
             }
         }
 
@@ -9972,6 +10383,38 @@ mod tests {
                 peer.delivered.try_recv().is_err(),
                 "a binary frame after the revocation never reaches the handler"
             );
+        }
+
+        #[tokio::test]
+        async fn a_draining_socket_closes_going_away_and_runs_on_close() {
+            let exited = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let (armed, signals) = shutdown::tests::armed_with(
+                shutdown::ShutdownPlan::bare("test"),
+                std::time::Duration::from_secs(5),
+                exited,
+            );
+            let mut peer = spawn_ws_draining(
+                ChannelCredentials::of_request(),
+                None,
+                OnMessage::Report,
+                armed.drain(),
+            );
+            let opened = tokio::time::timeout(RECHECK_COALESCE, peer.connected.recv()).await;
+            assert!(matches!(opened, Ok(Some(()))), "the socket must connect");
+            assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+            let frame = next_frame(&mut peer, shutdown::WS_CLOSE_DEADLINE).await;
+            assert!(
+                matches!(
+                    frame,
+                    Some(axum::extract::ws::Message::Close(Some(ref close)))
+                        if close.code == axum::extract::ws::close_code::AWAY
+                ),
+                "a draining socket closes 1001: {frame:?}"
+            );
+            let closed = tokio::time::timeout(RECHECK_COALESCE, peer.closed.recv()).await;
+            assert!(matches!(closed, Ok(Some(()))), "onClose runs on the drain");
+            armed.settle_live().await;
+            assert_eq!(armed.live_count(), 0, "the socket's live count clears");
         }
 
         #[tokio::test(start_paused = true)]

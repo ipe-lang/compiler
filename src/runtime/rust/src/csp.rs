@@ -11,10 +11,10 @@
 
 use crate::telemetry::FrameAncestors;
 
-#[cfg(all(feature = "server", feature = "web-core"))]
+#[cfg(feature = "web")]
 use crate::web::console::{CONSOLE_CSS, CONSOLE_JS};
 
-#[cfg(all(feature = "server", feature = "web-core", feature = "debugger"))]
+#[cfg(all(feature = "web", feature = "debugger"))]
 use crate::debugger::server::OVERLAY_JS;
 
 /// A policy directive the runtime emits.
@@ -104,7 +104,7 @@ pub struct CspHash(String);
 
 impl CspHash {
     /// The hash source of `text`: `'sha256-<base64(sha256(text))>'`.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     #[must_use]
     pub fn of(text: &str) -> Self {
         use base64::{Engine, engine::general_purpose::STANDARD};
@@ -119,6 +119,53 @@ impl CspHash {
     #[must_use]
     pub const fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+}
+
+/// Why a per-session secret could not be drawn from the OS CSPRNG.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntropyError;
+
+/// The number of random bytes in a [`StyleNonce`].
+pub const STYLE_NONCE_BYTES: usize = 16;
+
+/// The per-session nonce a session's `<style>` elements carry.
+///
+/// It holds 128 bits drawn from the OS CSPRNG together with the session's
+/// render incarnation, and it is never persisted. It is `Clone` but not
+/// `Copy`, so every copy is explicit, and its `Debug` form never shows it.
+#[derive(Clone)]
+pub struct StyleNonce([u8; STYLE_NONCE_BYTES]);
+
+impl StyleNonce {
+    /// A nonce from bytes the caller drew from a CSPRNG.
+    pub(crate) const fn from_random_bytes(bytes: [u8; STYLE_NONCE_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// The nonce as its attribute value: 32 lowercase hex characters.
+    #[must_use]
+    pub fn as_token(&self) -> String {
+        let mut out = String::with_capacity(STYLE_NONCE_BYTES * 2);
+        self.write_token(&mut out);
+        out
+    }
+
+    /// Append the nonce's attribute value to `out`.
+    pub(crate) fn write_token(&self, out: &mut String) {
+        for byte in self.0 {
+            for nibble in [byte >> 4, byte & 0x0f] {
+                if let Some(digit) = char::from_digit(u32::from(nibble), 16) {
+                    out.push(digit);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for StyleNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StyleNonce(..)")
     }
 }
 
@@ -182,13 +229,13 @@ profiles! {
     Response,
     /// The `/_ipe/console` operator dashboard: its one script and one style
     /// element are admitted by hash, and it is never framed cross-origin.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     Console,
     /// An `Ipe.Web` page: its scripts are the same-origin, SRI-pinned client
     /// files plus, under the debugger, the overlay script admitted by hash; its
     /// scoped `<style>` elements are rendered per view, so style elements are
     /// admitted inline.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     WebPage,
 }
 
@@ -199,9 +246,9 @@ impl Profile {
     pub const fn embed_list(self, framing: Option<&FrameAncestors>) -> Option<&FrameAncestors> {
         match self {
             Self::Response => framing,
-            #[cfg(all(feature = "server", feature = "web-core"))]
+            #[cfg(feature = "web")]
             Self::Console => None,
-            #[cfg(all(feature = "server", feature = "web-core"))]
+            #[cfg(feature = "web")]
             Self::WebPage => framing,
         }
     }
@@ -213,21 +260,21 @@ impl Profile {
     pub const fn cache_control(self) -> Option<&'static str> {
         match self {
             Self::Response => None,
-            #[cfg(all(feature = "server", feature = "web-core"))]
+            #[cfg(feature = "web")]
             Self::Console | Self::WebPage => Some("no-store"),
         }
     }
 }
 
 /// The inline-element hashes of the console page.
-#[cfg(all(feature = "server", feature = "web-core"))]
+#[cfg(feature = "web")]
 struct ConsoleHashes {
     script: CspHash,
     style: CspHash,
 }
 
 /// The console hashes, computed once from [`CONSOLE_JS`] and [`CONSOLE_CSS`].
-#[cfg(all(feature = "server", feature = "web-core"))]
+#[cfg(feature = "web")]
 fn console_hashes() -> &'static ConsoleHashes {
     static CELL: std::sync::OnceLock<ConsoleHashes> = std::sync::OnceLock::new();
     CELL.get_or_init(|| ConsoleHashes {
@@ -237,14 +284,14 @@ fn console_hashes() -> &'static ConsoleHashes {
 }
 
 /// The hash of the debugger overlay script, computed once from [`OVERLAY_JS`].
-#[cfg(all(feature = "server", feature = "web-core", feature = "debugger"))]
+#[cfg(all(feature = "web", feature = "debugger"))]
 fn overlay_hash() -> &'static CspHash {
     static CELL: std::sync::OnceLock<CspHash> = std::sync::OnceLock::new();
     CELL.get_or_init(|| CspHash::of(OVERLAY_JS))
 }
 
 /// The `script-src` sources of an `Ipe.Web` page.
-#[cfg(all(feature = "server", feature = "web-core"))]
+#[cfg(feature = "web")]
 fn web_page_scripts<'a>() -> Vec<Source<'a>> {
     #[cfg(feature = "debugger")]
     {
@@ -271,9 +318,9 @@ impl<'a> ContentSecurityPolicy<'a> {
             .map_or(Source::SelfOrigin, Source::Embed);
         match profile {
             Profile::Response => Self::response(ancestors),
-            #[cfg(all(feature = "server", feature = "web-core"))]
+            #[cfg(feature = "web")]
             Profile::Console => Self::console(ancestors),
-            #[cfg(all(feature = "server", feature = "web-core"))]
+            #[cfg(feature = "web")]
             Profile::WebPage => Self::web_page(ancestors),
         }
     }
@@ -303,7 +350,7 @@ impl<'a> ContentSecurityPolicy<'a> {
     }
 
     /// The `Console` profile with `frame-ancestors` set to `ancestors`.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     fn console(ancestors: Source<'a>) -> Self {
         use Directive as D;
         use Source as S;
@@ -322,7 +369,7 @@ impl<'a> ContentSecurityPolicy<'a> {
     }
 
     /// The `WebPage` profile with `frame-ancestors` set to `ancestors`.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     fn web_page(ancestors: Source<'a>) -> Self {
         use Directive as D;
         use Source as S;
@@ -424,11 +471,7 @@ mod tests {
         for (i, p) in Profile::ALL.iter().enumerate() {
             assert_eq!(Profile::ALL.iter().position(|q| q == p), Some(i), "{p:?}");
         }
-        let declared = if cfg!(all(feature = "server", feature = "web-core")) {
-            3
-        } else {
-            1
-        };
+        let declared = if cfg!(feature = "web") { 3 } else { 1 };
         assert_eq!(Profile::ALL.len(), declared);
     }
 
@@ -440,7 +483,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     #[test]
     fn console_profile_exact_header() {
         use base64::{Engine, engine::general_purpose::STANDARD};
@@ -493,9 +536,9 @@ mod tests {
     fn unsafe_inline_holders(profile: Profile) -> &'static [Directive] {
         match profile {
             Profile::Response => &[Directive::StyleSrcAttr],
-            #[cfg(all(feature = "server", feature = "web-core"))]
+            #[cfg(feature = "web")]
             Profile::Console => &[],
-            #[cfg(all(feature = "server", feature = "web-core"))]
+            #[cfg(feature = "web")]
             Profile::WebPage => &[
                 Directive::StyleSrc,
                 Directive::StyleSrcElem,
@@ -532,7 +575,7 @@ mod tests {
     }
 
     /// The exact `WebPage` header value under the same-origin default.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     #[test]
     fn web_page_profile_exact_header() {
         #[cfg(feature = "debugger")]
@@ -563,7 +606,7 @@ mod tests {
 
     /// Each `<script>` element of `html`: its open-tag attribute text and its
     /// body, cut as a browser cuts a raw-text element.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     fn script_elements(html: &str) -> Vec<(&str, &str)> {
         let mut out = Vec::new();
         let mut rest = html;
@@ -586,7 +629,7 @@ mod tests {
     /// Whether `policy`'s `script-src` admits a `<script>` with `attrs` and
     /// `body`: a same-origin path `src`, an inert JSON data block, or a body
     /// whose hash the policy names.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     fn admits_script(policy: &ContentSecurityPolicy<'_>, attrs: &str, body: &str) -> bool {
         let sources = policy.sources(Directive::ScriptSrc).unwrap_or(&[]);
         if let Some((_, src)) = attrs.split_once(" src=\"") {
@@ -604,11 +647,11 @@ mod tests {
 
     /// Every script of a served `Ipe.Web` page runs under its policy, and an
     /// injected inline script is refused by it.
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     #[test]
     fn web_page_policy_admits_every_served_script() {
         let epoch = crate::dom::dispatch::Rendered::first(
-            crate::web::new_incarnation(),
+            crate::dom::dispatch::SessionKeys::distinct(),
             crate::html::Html::<()>::HText(String::new()),
         )
         .epoch();
@@ -641,7 +684,7 @@ mod tests {
 
     /// The debugger overlay's inline script is the constant whose hash the
     /// `WebPage` policy names, and an edited copy of it is refused.
-    #[cfg(all(feature = "server", feature = "web-core", feature = "debugger"))]
+    #[cfg(all(feature = "web", feature = "debugger"))]
     #[test]
     fn debugger_overlay_script_is_hash_admitted() {
         let policy = ContentSecurityPolicy::for_profile(Profile::WebPage, None);
@@ -662,6 +705,38 @@ mod tests {
         assert!(!admits_script(&policy, "", &edited));
     }
 
+    /// A minted nonce is 32 lowercase hex characters, two mints differ, and
+    /// its `Debug` form holds no part of it.
+    #[test]
+    fn nonce_shape() {
+        let mint = || {
+            crate::dom::dispatch::SessionKeys::mint().map(|keys| {
+                crate::dom::dispatch::Rendered::first(
+                    keys,
+                    crate::html::Html::<()>::HText(String::new()),
+                )
+                .stamp()
+            })
+        };
+        let (a, b) = (mint(), mint());
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+        let (Ok(a), Ok(b)) = (a, b) else {
+            return;
+        };
+        let token = a.as_token();
+        assert_eq!(token.len(), 2 * STYLE_NONCE_BYTES, "{token}");
+        assert!(
+            token
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{token}"
+        );
+        assert_ne!(token, b.as_token());
+        // An exact form: a derived `Debug` would list the bytes in decimal,
+        // which no search for the hex token finds.
+        assert_eq!(format!("{a:?}"), "StyleNonce(..)");
+    }
+
     #[test]
     fn no_profile_carries_a_nonce() {
         let framing = embed();
@@ -670,7 +745,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "server", feature = "web-core"))]
+    #[cfg(feature = "web")]
     #[test]
     fn hashes_match_constants() {
         use base64::{Engine, engine::general_purpose::STANDARD};

@@ -70,11 +70,15 @@ checks:
       run:
         - cargo clippy -p ipe-runtime-rust --no-default-features --features db --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features db,web --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features server --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features server,web-core --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features debugger,tui --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features debugger,web --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --all-targets --features dev-posture -- -D warnings
         - cargo clippy -p ipe-runtime-rust --all-targets --features full,dev-posture -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features full --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features db-postgres -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --features full,db-postgres -- -D warnings
     guards: >-
       Every runtime feature combination the emitter can select builds clean
       under clippy (SEAL); path-gated, so a skip on a non-emit PR passes.

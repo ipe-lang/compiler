@@ -155,12 +155,7 @@ fn on_behalf_of_caller<F: std::future::Future>(
 
 /// `task`, kept inside the Web session its caller runs on behalf of, so a
 /// credential it verifies binds to that session.
-#[cfg(all(
-    feature = "tokio",
-    feature = "web-core",
-    feature = "server",
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "tokio", feature = "web", not(target_arch = "wasm32")))]
 fn carry_web_session<F: std::future::Future>(
     task: F,
 ) -> impl std::future::Future<Output = F::Output> {
@@ -168,11 +163,7 @@ fn carry_web_session<F: std::future::Future>(
 }
 
 /// `task` as it is: without the served Web runtime no session scope exists.
-#[cfg(all(
-    feature = "tokio",
-    not(all(feature = "web-core", feature = "server")),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "tokio", not(feature = "web"), not(target_arch = "wasm32")))]
 const fn carry_web_session<F: std::future::Future>(task: F) -> F {
     task
 }
@@ -2017,8 +2008,7 @@ mod spawn_scope_scan_tests {
 #[cfg(all(
     test,
     feature = "tokio",
-    feature = "web-core",
-    feature = "server",
+    feature = "web",
     feature = "jwt",
     not(target_arch = "wasm32")
 ))]

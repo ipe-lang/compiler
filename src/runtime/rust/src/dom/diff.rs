@@ -1,4 +1,4 @@
-use crate::html::{Attribute, ElementBody, Html, ParseContext, admit_rendered_in};
+use crate::html::{Attribute, ElementBody, Html, ParseContext, RenderCtx, admit_rendered_in};
 use std::collections::HashMap;
 
 /// A single DOM patch emitted by `diff` (JSON: `id`, `text`, `html`, `attrs`,
@@ -52,10 +52,13 @@ impl Patch {
 /// - Keyed identity is carried by `assign_ipe_ids` (the `:{key}` segment): a
 ///   position whose key differs between the trees holds a different node, so
 ///   its parent's children are replaced rather than patched under the old id.
+///
+/// Every subtree a patch carries as markup is rendered under `stamp`, the
+/// render context of the session the patches are sent to.
 #[must_use]
-pub fn diff<M>(old: &Html<M>, new: &Html<M>) -> Vec<Patch> {
+pub fn diff<M>(old: &Html<M>, new: &Html<M>, stamp: &RenderCtx<'_>) -> Vec<Patch> {
     let mut out = vec![];
-    diff_node_depth(old, new, ParseContext::Data, &mut out, 0);
+    diff_node_depth(old, new, ParseContext::Data, &mut out, 0, stamp);
     out
 }
 
@@ -104,12 +107,13 @@ fn push_children_replace<M>(
     child_ctx: ParseContext,
     new_kids: &[Html<M>],
     out: &mut Vec<Patch>,
+    stamp: &RenderCtx<'_>,
 ) {
     if id.is_empty() {
         return;
     }
     let mut p = Patch::for_id(id);
-    let body = render_children(parent_body, child_ctx, new_kids);
+    let body = render_children(parent_body, child_ctx, new_kids, stamp);
     match parent_body {
         ElementBody::Markup => p.html = Some(body),
         ElementBody::Script | ElementBody::Style => p.text = Some(body),
@@ -130,13 +134,14 @@ fn is_refused_element<M>(ctx: ParseContext, node: &Html<M>) -> bool {
 /// `html.rs::render_into_ctx`) rather than recursing into an arbitrarily deep
 /// Model-derived tree that would overflow the thread stack. `ctx` is the parse
 /// context both nodes are written in, threaded from the root exactly as the
-/// render sink threads it.
+/// render sink threads it, and `stamp` is the session's render context.
 fn diff_node_depth<M>(
     old: &Html<M>,
     new: &Html<M>,
     ctx: ParseContext,
     out: &mut Vec<Patch>,
     depth: usize,
+    stamp: &RenderCtx<'_>,
 ) {
     if depth >= crate::html::MAX_HTML_DEPTH {
         return;
@@ -194,7 +199,7 @@ fn diff_node_depth<M>(
 
     // Child-count change → replace the whole subtree.
     if ok.len() != nk.len() {
-        push_children_replace(id, body, child_ctx, nk, out);
+        push_children_replace(id, body, child_ctx, nk, out, stamp);
         return;
     }
 
@@ -207,7 +212,7 @@ fn diff_node_depth<M>(
                 // (single-text is the fast path above; anything else is a
                 // parent html-replace).
                 if o != n {
-                    push_children_replace(id, body, child_ctx, nk, out);
+                    push_children_replace(id, body, child_ctx, nk, out, stamp);
                     return;
                 }
             }
@@ -216,7 +221,7 @@ fn diff_node_depth<M>(
             // the same body class the first paint used.
             (Html::HRaw(o), Html::HRaw(n)) => {
                 if o != n {
-                    push_children_replace(id, body, child_ctx, nk, out);
+                    push_children_replace(id, body, child_ctx, nk, out, stamp);
                     return;
                 }
             }
@@ -224,14 +229,14 @@ fn diff_node_depth<M>(
                 // A child that gains or loses admission appears in or vanishes
                 // from the page, so the parent's subtree is replaced.
                 if is_refused_element(child_ctx, oc) != is_refused_element(child_ctx, nc) {
-                    push_children_replace(id, body, child_ctx, nk, out);
+                    push_children_replace(id, body, child_ctx, nk, out, stamp);
                     return;
                 }
-                diff_node_depth(oc, nc, child_ctx, out, child_depth);
+                diff_node_depth(oc, nc, child_ctx, out, child_depth, stamp);
             }
             // Tag / kind / identity mismatch → replace the subtree at the parent.
             _ => {
-                push_children_replace(id, body, child_ctx, nk, out);
+                push_children_replace(id, body, child_ctx, nk, out, stamp);
                 return;
             }
         }
@@ -357,9 +362,10 @@ fn render_children<M>(
     parent_body: ElementBody,
     child_ctx: ParseContext,
     kids: &[Html<M>],
+    stamp: &RenderCtx<'_>,
 ) -> String {
     let mut s = String::new();
-    crate::html::render_children_into(parent_body, child_ctx, kids, &mut s);
+    crate::html::render_children_into(parent_body, child_ctx, kids, &mut s, stamp);
     s
 }
 
@@ -371,6 +377,11 @@ mod tests {
     use super::*;
     use crate::{Event, assign_ipe_ids};
 
+    /// The diff of an unstamped render.
+    fn plain<M>(old: &Html<M>, new: &Html<M>) -> Vec<Patch> {
+        diff(old, new, &RenderCtx::Unstamped)
+    }
+
     fn ids(h: &mut Html<()>) {
         assign_ipe_ids(h, "r");
     }
@@ -381,7 +392,7 @@ mod tests {
         let mut b: Html<()> = Html::HElement("p".into(), vec![], vec![Html::HText("2".into())]);
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].id, "r");
         assert_eq!(p[0].text.as_deref(), Some("2"));
@@ -404,7 +415,7 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         let attrs = &p[0].attrs;
         assert_eq!(attrs.get("class").map(String::as_str), Some("y"));
@@ -433,7 +444,7 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         // The onerror attr never reaches the patch; only the (unchanged) src is
         // absent too, so the patch carries no dangerous attribute.
         assert!(
@@ -459,7 +470,7 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         // href is still patched (the key passes the name gate) but the
         // dangerous value is neutralised to empty.
@@ -472,7 +483,7 @@ mod tests {
         let mut b = a.clone();
         ids(&mut a);
         ids(&mut b);
-        assert!(diff(&a, &b).is_empty());
+        assert!(plain(&a, &b).is_empty());
     }
 
     #[test]
@@ -485,7 +496,7 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         // present BoolAttr encodes as {k: k}, NOT {k: ""}.
         assert_eq!(
@@ -505,7 +516,7 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert_eq!(
             p[0].attrs.get("ipe-click").map(String::as_str),
@@ -527,7 +538,7 @@ mod tests {
         let mut b: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         // Removal sentinel: empty string for both the marker and the (now-stale) hid.
         assert_eq!(p[0].attrs.get("ipe-click").map(String::as_str), Some(""));
@@ -552,7 +563,7 @@ mod tests {
         let mut b = button("r_9_button");
         ids(&mut a);
         ids(&mut b);
-        assert!(diff(&a, &b).is_empty());
+        assert!(plain(&a, &b).is_empty());
         let mut patch = Patch {
             id: "r".into(),
             text: None,
@@ -586,7 +597,7 @@ mod tests {
         let mut b = mk("y");
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].id, "r");
         assert!(p[0].html.is_some(), "expected html replace, got {:?}", p[0]);
@@ -610,7 +621,7 @@ mod tests {
         );
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         assert!(p[0].html.is_some());
     }
@@ -625,7 +636,7 @@ mod tests {
         let mut b: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         ids(&mut a);
         ids(&mut b);
-        let p = diff(&a, &b);
+        let p = plain(&a, &b);
         assert_eq!(p.len(), 1);
         // Removal sentinel: empty string.
         assert_eq!(p[0].attrs.get("disabled").map(String::as_str), Some(""));
@@ -651,7 +662,7 @@ mod tests {
         assign_ipe_ids(&mut old, "r");
         assign_ipe_ids(&mut new, "r");
         // This call must return, not overflow the stack.
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         // Identical trees produce no patches (or only structural no-ops).
         // The exact count is less important than the call completing.
         let _ = patches;
@@ -676,7 +687,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
         let Some(patch) = p.first() else {
             return;
@@ -714,7 +725,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one text-replace patch");
         let Some(patch) = p.first() else {
             return;
@@ -753,7 +764,7 @@ mod tests {
             ids(&mut old);
             ids(&mut new);
             assert!(
-                diff(&old, &new).is_empty(),
+                plain(&old, &new).is_empty(),
                 "<{tag}> text body must not be patched"
             );
         }
@@ -777,7 +788,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
         let html = p[0].html.as_deref().expect("expected html field on patch");
         assert!(
@@ -813,7 +824,7 @@ mod tests {
             let mut new: Html<()> = Html::HElement(parent.into(), vec![], vec![script()]);
             ids(&mut old);
             ids(&mut new);
-            let patches = diff(&old, &new);
+            let patches = plain(&old, &new);
             assert_eq!(patches.len(), 1, "{parent}: {patches:?}");
             let [patch] = patches.as_slice() else {
                 return;
@@ -843,7 +854,7 @@ mod tests {
         let mut new = page(vec![script]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         for p in &patches {
             let html = p.html.as_deref().unwrap_or_default();
@@ -865,7 +876,7 @@ mod tests {
         let mut new = page("<img src=x onerror=alert(1)>");
         ids(&mut old);
         ids(&mut new);
-        assert!(diff(&old, &new).is_empty());
+        assert!(plain(&old, &new).is_empty());
     }
 
     /// A child-count change that adds a text-bodied `<script>` (or an empty,
@@ -892,7 +903,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let p = diff(&old, &new);
+        let p = plain(&old, &new);
         assert_eq!(p.len(), 1, "expected exactly one html-replace patch");
         let html = p[0].html.as_deref().expect("expected html field on patch");
         assert!(
@@ -919,7 +930,7 @@ mod tests {
         let mut new = page("after");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -941,7 +952,7 @@ mod tests {
         let mut new = tree("after");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -975,7 +986,7 @@ mod tests {
         let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![script(body)]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         assert!(
             patches
@@ -1014,7 +1025,7 @@ mod tests {
         );
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "expected one text patch; got {patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1057,7 +1068,7 @@ mod tests {
         let mut new = tree();
         ids(&mut old);
         ids(&mut new);
-        assert!(diff(&old, &new).is_empty());
+        assert!(plain(&old, &new).is_empty());
     }
 
     fn keyed_li(key: &str, text: &str) -> Html<()> {
@@ -1077,7 +1088,7 @@ mod tests {
         let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("b", "x")]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1104,7 +1115,7 @@ mod tests {
         let mut new: Html<()> = Html::HElement("ul".into(), vec![], vec![keyed_li("a", "y")]);
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1129,7 +1140,7 @@ mod tests {
         let mut new = list("b", "a");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1157,7 +1168,7 @@ mod tests {
         let mut new = tree("b");
         ids(&mut old);
         ids(&mut new);
-        let patches = diff(&old, &new);
+        let patches = plain(&old, &new);
         assert_eq!(patches.len(), 1, "{patches:?}");
         let Some(patch) = patches.first() else {
             return;
@@ -1171,5 +1182,84 @@ mod tests {
             html.contains("ipe-id=\"r_0_ul_0_li:b\""),
             "the replace carries the new identity; got {html:?}"
         );
+    }
+
+    /// An inserted `<style>` carries the session's nonce only under that
+    /// session's context, and a replaced style body never holds it.
+    #[test]
+    fn inserted_style_carries_the_session_nonce() {
+        let nonce = crate::csp::StyleNonce::from_random_bytes([0xa7; 16]);
+        let token = nonce.as_token();
+        let style = |css: &str| -> Html<()> {
+            Html::HElement("style".into(), vec![], vec![Html::HRaw(css.into())])
+        };
+        let mut old: Html<()> = Html::HElement("div".into(), vec![], vec![]);
+        let mut new: Html<()> = Html::HElement("div".into(), vec![], vec![style("p{}")]);
+        ids(&mut old);
+        ids(&mut new);
+        let stamped = diff(&old, &new, &RenderCtx::Session(&nonce));
+        let html: Vec<&str> = stamped.iter().filter_map(|p| p.html.as_deref()).collect();
+        assert_eq!(html.len(), 1, "{stamped:?}");
+        let want = format!("nonce=\"{token}\"");
+        assert!(html.iter().all(|h| h.contains(&want)), "{html:?}");
+        let unstamped = plain(&old, &new);
+        assert!(unstamped.iter().any(|p| p.html.is_some()), "{unstamped:?}");
+        assert!(
+            unstamped
+                .iter()
+                .filter_map(|p| p.html.as_deref())
+                .all(|h| !h.contains("nonce")),
+            "{unstamped:?}"
+        );
+
+        let mut old = Html::HElement("div".into(), vec![], vec![style("p{}")]);
+        let mut new = Html::HElement("div".into(), vec![], vec![style("a{}")]);
+        ids(&mut old);
+        ids(&mut new);
+        let patches = diff(&old, &new, &RenderCtx::Session(&nonce));
+        let texts: Vec<&str> = patches.iter().filter_map(|p| p.text.as_deref()).collect();
+        assert_eq!(texts, vec!["a{}"], "{patches:?}");
+        assert!(
+            patches
+                .iter()
+                .all(|p| p.html.is_none() && !p.attrs.values().any(|v| v.contains(&token))),
+            "{patches:?}"
+        );
+    }
+
+    /// An attribute delta that adds or drops a program-built `nonce` in any case
+    /// yields no attribute operation, so no program can forge, overwrite or
+    /// remove a stamp.
+    #[test]
+    fn author_nonce_is_never_patched() {
+        for name in ["nonce", "NONCE", "Nonce"] {
+            let mut old: Html<()> =
+                Html::HElement("style".into(), vec![], vec![Html::HRaw("p{}".into())]);
+            let mut new: Html<()> = Html::HElement(
+                "style".into(),
+                vec![Attribute::Attr(name.into(), "forged".into())],
+                vec![Html::HRaw("p{}".into())],
+            );
+            ids(&mut old);
+            ids(&mut new);
+            for patches in [
+                plain(&old, &new),
+                plain(&new, &old),
+                diff(
+                    &old,
+                    &new,
+                    &RenderCtx::Session(&crate::csp::StyleNonce::from_random_bytes([0x11; 16])),
+                ),
+            ] {
+                assert!(
+                    patches.iter().all(|p| p
+                        .attrs
+                        .keys()
+                        .all(|k| !k.eq_ignore_ascii_case("nonce"))
+                        && p.html.as_deref().is_none_or(|h| !h.contains("forged"))),
+                    "{name}: {patches:?}"
+                );
+            }
+        }
     }
 }

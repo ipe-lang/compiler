@@ -4,6 +4,12 @@
 
 mod support;
 
+#[path = "g_issues/golden_3121_boxed_field_nested_pat_seal.rs"]
+mod golden_3121_boxed_field_nested_pat_seal;
+#[path = "g_issues/golden_3610_or_pattern_normal_form.rs"]
+mod golden_3610_or_pattern_normal_form;
+#[path = "g_issues/golden_closure_capture_update_base_seal.rs"]
+mod golden_closure_capture_update_base_seal;
 #[path = "g_issues/golden_cross_module_chained_msg_slot_seal.rs"]
 mod golden_cross_module_chained_msg_slot_seal;
 #[path = "g_issues/golden_declared_any_param_seal.rs"]

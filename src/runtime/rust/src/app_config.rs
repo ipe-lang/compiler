@@ -322,7 +322,7 @@ pub fn ipe_setting_web_auth_revocation_mode(mode_tag: i64) -> Setting {
 /// (including an out-of-range one) is `Unspecified` — it leaves the default in
 /// place. There is deliberately no `Disabled` variant, so a setting cannot lower
 /// the posture below the fail-closed default; only an operator env override may.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CsrfSetting {
     /// The setting pins CSRF protection on (the strict, fail-closed posture).
@@ -331,7 +331,7 @@ enum CsrfSetting {
     Unspecified,
 }
 
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 impl CsrfSetting {
     /// The posture a `Web.csrf` tag requests: only `0` enforces.
     const fn from_tag(tag: i64) -> Self {
@@ -353,23 +353,23 @@ struct ResolvedConfig {
     #[cfg(feature = "server")]
     host_bind: Option<HostMode>,
     log_level: Option<i64>,
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     csrf: Option<CsrfSetting>,
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     session_ttl_secs: Option<i64>,
     #[cfg(feature = "jwt")]
     auth_max_lifetime_secs: Option<i64>,
     #[cfg(all(feature = "jwt", feature = "server"))]
     auth_slide_window_secs: Option<i64>,
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     auth_revocation_mode: Option<RevocationMode>,
     #[cfg(feature = "db")]
     db_url: Option<crate::secret::Secret>,
-    #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
+    #[cfg(all(feature = "secret", feature = "web"))]
     console_admin_token: Option<crate::secret::Secret>,
-    #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
+    #[cfg(all(feature = "secret", feature = "web"))]
     console_ingest_token: Option<crate::secret::Secret>,
-    #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
+    #[cfg(all(feature = "secret", feature = "web"))]
     console_metrics_token: Option<crate::secret::Secret>,
 }
 
@@ -393,12 +393,12 @@ pub fn install_web(settings: Vec<Setting>) {
             // Stricter-only: `0` is the strict/enforced tag; every other value
             // (including a would-be "disabled" tag) leaves the default posture,
             // so an in-code setting can never weaken CSRF below fail-closed.
-            #[cfg(all(feature = "web-core", feature = "server"))]
+            #[cfg(feature = "web")]
             Setting::WebCsrf(tag) => cfg.csrf = Some(CsrfSetting::from_tag(tag)),
-            #[cfg(all(feature = "web-core", feature = "server"))]
+            #[cfg(feature = "web")]
             Setting::WebSessionTtl(seconds) => cfg.session_ttl_secs = Some(seconds),
             // No reader in this build.
-            #[cfg(not(all(feature = "web-core", feature = "server")))]
+            #[cfg(not(feature = "web"))]
             Setting::WebCsrf(_) | Setting::WebSessionTtl(_) => {}
             #[cfg(feature = "jwt")]
             Setting::WebAuthMaxLifetime(seconds) => cfg.auth_max_lifetime_secs = Some(seconds),
@@ -412,7 +412,7 @@ pub fn install_web(settings: Vec<Setting>) {
             Setting::WebAuthSlideWindow(_) => {}
             // Stricter-only: `Store` arms the gate; `Off` only applies when no
             // prior `Store` setting was seen (take the maximum/strictest value).
-            #[cfg(all(feature = "web-core", feature = "server"))]
+            #[cfg(feature = "web")]
             Setting::WebAuthRevocationMode(mode) => {
                 cfg.auth_revocation_mode = Some(match cfg.auth_revocation_mode {
                     Some(RevocationMode::Store) => RevocationMode::Store, // already armed
@@ -420,21 +420,21 @@ pub fn install_web(settings: Vec<Setting>) {
                 });
             }
             // No reader in this build.
-            #[cfg(not(all(feature = "web-core", feature = "server")))]
+            #[cfg(not(feature = "web"))]
             Setting::WebAuthRevocationMode(_) => {}
             #[cfg(feature = "db")]
             Setting::DbUrl(url) => cfg.db_url = Some(url),
             // No reader in this build.
             #[cfg(all(feature = "secret", not(feature = "db")))]
             Setting::DbUrl(_) => {}
-            #[cfg(all(feature = "secret", feature = "web-core", feature = "server"))]
+            #[cfg(all(feature = "secret", feature = "web"))]
             Setting::ConsoleToken(kind, token) => match kind {
                 ConsoleTokenKind::Admin => cfg.console_admin_token = Some(token),
                 ConsoleTokenKind::Ingest => cfg.console_ingest_token = Some(token),
                 ConsoleTokenKind::Metrics => cfg.console_metrics_token = Some(token),
             },
             // No reader in this build.
-            #[cfg(all(feature = "secret", not(all(feature = "web-core", feature = "server"))))]
+            #[cfg(all(feature = "secret", not(feature = "web")))]
             Setting::ConsoleToken(..) => {}
         }
     }
@@ -588,7 +588,7 @@ fn installed_log_level(cfg: Option<&ResolvedConfig>) -> Option<i64> {
 /// precedence); a `Web.csrf` setting may only ENFORCE it, never disable it; and
 /// absent both signals the built-in fail-closed default (on) stands. A setting
 /// therefore cannot lower the posture below the default.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 pub(crate) fn resolve_csrf_enabled(env_enabled: bool, default_enabled: bool) -> bool {
     csrf_enabled_from(
         env_enabled,
@@ -601,7 +601,7 @@ pub(crate) fn resolve_csrf_enabled(env_enabled: bool, default_enabled: bool) -> 
 /// only enforce (`CsrfSetting::Enforced`), never disable; absent both the
 /// default stands. Split out so the stricter-only monotonicity is unit tested
 /// without process-wide state.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 const fn csrf_enabled_from(
     env_enabled: bool,
     default_enabled: bool,
@@ -625,7 +625,7 @@ const fn csrf_enabled_from(
 ///
 /// A refusal naming `Web.sessionTtl` when the installed value is not positive
 /// or exceeds `ttl`'s bound.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 pub(crate) fn resolve_session_ttl_override(
     ttl: crate::system::EnvDuration,
 ) -> Result<Option<u64>, crate::system::EnvCeilingRefusal> {
@@ -640,7 +640,7 @@ pub(crate) fn resolve_session_ttl_override(
 /// Pure session-TTL resolution: the installed setting applies only when no env
 /// override is present, and it must lie within `ttl`'s bound. Split out for
 /// unit testing without process-wide state.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 fn session_ttl_from(
     env_present: bool,
     setting: Option<i64>,
@@ -821,7 +821,7 @@ pub(crate) fn env_revocation_floor() -> RevocationMode {
 
 /// The installed `Web.withRevocation` mode; `Off` when none is installed or
 /// this build compiles no reader for it.
-#[cfg(all(feature = "jwt", feature = "web-core", feature = "server"))]
+#[cfg(all(feature = "jwt", feature = "web"))]
 pub(crate) fn installed_revocation_mode() -> RevocationMode {
     INSTALLED
         .get()
@@ -831,13 +831,13 @@ pub(crate) fn installed_revocation_mode() -> RevocationMode {
 
 /// The installed `Web.withRevocation` mode; `Off` when none is installed or
 /// this build compiles no reader for it.
-#[cfg(all(feature = "jwt", not(all(feature = "web-core", feature = "server"))))]
+#[cfg(all(feature = "jwt", not(feature = "web")))]
 pub(crate) const fn installed_revocation_mode() -> RevocationMode {
     RevocationMode::Off
 }
 
 /// Why a `Web` app cannot start under the auth configuration it was given.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthStartupRefusal {
     /// `IPE_AUTH_REVOCATION` is present but not a mode.
@@ -847,7 +847,7 @@ pub(crate) enum AuthStartupRefusal {
     RevocationUnbound,
 }
 
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 impl std::fmt::Display for AuthStartupRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -871,7 +871,7 @@ impl std::fmt::Display for AuthStartupRefusal {
 /// [`AuthStartupRefusal::Revocation`] for a malformed `IPE_AUTH_REVOCATION`;
 /// [`AuthStartupRefusal::RevocationUnbound`] when the installed
 /// `Web.withRevocation` or the env is `Store` and `jwt_compiled` is false.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 pub(crate) fn refuse_unbound_web_revocation(jwt_compiled: bool) -> Result<(), AuthStartupRefusal> {
     web_revocation_gate(
         INSTALLED.get().and_then(|c| c.auth_revocation_mode),
@@ -885,7 +885,7 @@ pub(crate) fn refuse_unbound_web_revocation(jwt_compiled: bool) -> Result<(), Au
 ///
 /// An armed request starts enforcing when the verifier is compiled; without
 /// it nothing could bind, so the setting would be inert and it refuses.
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 const fn web_revocation_gate(
     installed: Option<RevocationMode>,
     env: Option<RevocationMode>,
@@ -974,7 +974,7 @@ pub(crate) fn resolve_db_url_override() -> Option<String> {
 /// its env var FIRST (env wins) and only consulting this in-code setting when the
 /// env var is absent. The secret is revealed only here, at the auth check, and is
 /// never logged (a `Secret` cannot be stringified to anything but `<redacted>`).
-#[cfg(all(feature = "web-core", feature = "server"))]
+#[cfg(feature = "web")]
 pub(crate) fn resolve_console_token(kind: ConsoleTokenKind) -> Option<String> {
     // The token settings carry a `Secret`, so they only exist in a `secret`-
     // feature build; without it there is no in-code token to resolve and the
@@ -1166,20 +1166,20 @@ mod tests {
 
     // ── CSRF: stricter-only, env may disable, setting may only enforce ────
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn csrf_default_on_stands_without_signals() {
         assert!(csrf_enabled_from(true, true, None));
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn csrf_enforcing_setting_turns_on_where_default_off() {
         // A setting can STRENGTHEN: default-off but the setting enforces → on.
         assert!(csrf_enabled_from(true, false, Some(CsrfSetting::Enforced)));
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn csrf_setting_cannot_disable_below_default() {
         // The stricter-only floor: no setting value (including the absence of an
@@ -1192,7 +1192,7 @@ mod tests {
         assert!(csrf_enabled_from(true, true, None));
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn csrf_only_operator_env_can_disable() {
         // The env override (top of precedence) is the sole disable path; an
@@ -1201,7 +1201,7 @@ mod tests {
         assert!(!csrf_enabled_from(false, false, None));
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn csrf_install_maps_only_zero_tag_to_enforced() {
         // The `install_web` fold: `0` → Enforced, everything else → Unspecified
@@ -1218,12 +1218,12 @@ mod tests {
     // ── Session TTL: env > setting > fallback, out of range refused ───────
 
     /// The session TTL bound `web_ttl` applies: 400 days.
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     const SESSION_TTL: crate::system::EnvDuration =
         crate::system::EnvDuration::new("IPE_WEB_TTL", 1800, "duration")
             .at_most(400 * 24 * 60 * 60);
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn session_ttl_setting_applies_when_no_env() {
         assert_eq!(
@@ -1236,14 +1236,14 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn session_ttl_env_overrides_setting() {
         assert_eq!(session_ttl_from(true, Some(3600), SESSION_TTL), Ok(None));
         assert_eq!(session_ttl_from(true, Some(0), SESSION_TTL), Ok(None));
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn session_ttl_out_of_range_setting_is_refused_never_defaulted() {
         use crate::system::CeilingDefect;
@@ -1262,7 +1262,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn session_ttl_absent_setting_falls_through() {
         assert_eq!(session_ttl_from(false, None, SESSION_TTL), Ok(None));
@@ -1566,7 +1566,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn the_web_revocation_gate_starts_every_request_with_a_verifier() {
         use RevocationMode::Off;
@@ -1594,7 +1594,7 @@ mod tests {
     }
 
     /// Every installed and env pair that asks for the gate.
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     const ARMED_REQUESTS: [(Option<RevocationMode>, Option<RevocationMode>); 5] = [
         (Some(RevocationMode::Store), None),
         (Some(RevocationMode::Store), Some(RevocationMode::Off)),
@@ -1604,7 +1604,7 @@ mod tests {
     ];
 
     /// Without a token verifier an armed request refuses startup, naming the fix.
-    #[cfg(all(feature = "web-core", feature = "server"))]
+    #[cfg(feature = "web")]
     #[test]
     fn web_revocation_gate_without_jwt_refuses() {
         for (installed, env) in ARMED_REQUESTS {

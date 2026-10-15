@@ -29,6 +29,7 @@ fn runtime() -> PathBuf {
 const MAIN_IPE: &str = "\
 module Main exposing (main)
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Unsafe
 import Ipe.Task
 
@@ -37,7 +38,7 @@ main =
         (\\conn ->
             Unsafe.unsafeExecRaw conn \"CREATE TABLE t (id INTEGER)\"
         )
-        (Db.open \"sqlite\" \"sqlite::memory:\")
+        (Db.open Location.memory)
 ";
 
 /// Write a minimal project (`package.ipe` + `src/Main.ipe`) under a fresh temp

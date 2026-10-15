@@ -591,8 +591,9 @@ static HAND_TABLE: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_YAML_MAX_BYTES",
-        default: Cow::Borrowed("16777216 (16 MiB)"),
-        purpose: "Maximum YAML source size (bytes) that `Config.loadYaml` will parse. \
+        default: Cow::Borrowed("4194304 (4 MiB)"),
+        purpose: "Maximum YAML source size (bytes) that `Config.decodeYaml` will parse, \
+                  including a `.yaml`/`.yml` file read by `Config.loadFromFile`. \
                   A separate ceiling from `IPE_CONFIG_MAX_BYTES`.",
         subsystem: Subsystem::Config,
         class: Class::Tunable,
@@ -1153,9 +1154,10 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_SHUTDOWN_GRACE_MS",
         default: Cow::Borrowed("1500"),
-        purpose: "Grace period (ms) between receiving SIGTERM and closing active \
-                  connections. Allows in-flight requests to complete. Set to `0` for \
-                  immediate shutdown.",
+        purpose: "Grace period (ms) a served app (`Http.Server` or `Ipe.Web`) gives \
+                  in-flight requests and live streams after the first SIGTERM or \
+                  SIGINT, before it closes its connections and database pools. Set \
+                  to `0` for immediate shutdown.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },

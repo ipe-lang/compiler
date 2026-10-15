@@ -123,8 +123,9 @@ pub fn list_view<'p>(pats: impl Iterator<Item = &'p Pat> + Clone, tag: usize) ->
                 longest = longest.max(prefix.len());
             }
             Pat::Alias(inner, _) => pending.push(inner),
-            Pat::Or(alts) => pending.extend(alts),
-            Pat::Var(_)
+            // A `SharedAlts` alternative holds no slice.
+            Pat::Or(_)
+            | Pat::Var(_)
             | Pat::Wildcard
             | Pat::Int(_)
             | Pat::Bool(_)
@@ -224,8 +225,9 @@ fn borrowed_column_clone_proof<'p>(
         match pat {
             Pat::Slice { elem, .. } => elem_clone_proof(ctx, elem)?,
             Pat::Alias(inner, _) => pending.push(inner),
-            Pat::Or(alts) => pending.extend(alts),
-            Pat::Var(_)
+            // A `SharedAlts` alternative holds no slice.
+            Pat::Or(_)
+            | Pat::Var(_)
             | Pat::Wildcard
             | Pat::Int(_)
             | Pat::Bool(_)
@@ -312,12 +314,6 @@ pub fn emit_match_scrutinee(
     Ok((scrut, ScrutMode::Whole { str_mode, list }))
 }
 
-/// Render one match-arm head to its Rust pattern plus any leading rebind/unbox
-/// prelude. A constructor head goes through `emit_ctor_arm_pat` (which unboxes a
-/// cyclic self-field binder); a flat-match leaf head — literal / wildcard /
-/// variable / alias / slice — goes through `render_pat` (total over the whole
-/// set), with a `String`/slice binder rebind prelude in string/list mode. Shared
-/// by the value-context and tail-context match emitters.
 /// AND together the two guard sources on a match arm: the synthesized
 /// string-column `as_str()` guard and the arm's own IR guard. Either,
 /// both, or neither may be present; both present are joined `synth && ir` (the
@@ -342,82 +338,75 @@ pub fn emit_arm_head(
     pat: &Pat,
     mode: &ScrutMode,
 ) -> DResult<(String, String, Option<String>)> {
-    let (rendered, prelude, guards) = match mode {
-        ScrutMode::Whole { str_mode, list } => emit_whole_arm_head(ctx, pat, *str_mode, *list)?,
-        ScrutMode::Tuple(cols) => emit_tuple_arm_head(ctx, pat, cols)?,
+    let mut sink = ArmSink::default();
+    let rendered = match mode {
+        ScrutMode::Whole { str_mode, list } => {
+            emit_whole_arm_head(ctx, pat, *str_mode, *list, &mut sink)?
+        }
+        ScrutMode::Tuple(cols) => emit_tuple_arm_head(ctx, pat, cols, &mut sink)?,
     };
-    let guard = if guards.is_empty() {
+    let guard = if sink.guards.is_empty() {
         None
     } else {
-        Some(guards.join(" && "))
+        Some(sink.guards.join(" && "))
     };
-    Ok((rendered, prelude, guard))
+    Ok((rendered, sink.prelude, guard))
 }
 
-/// Render a WHOLE-scrutinee arm head (the string / list / plain shapes) to its
-/// Rust pattern, any leading binder-rebind/unbox prelude, and any synthesized
-/// match GUARDS. The guards are the `__sgN.as_str() == "lit"` checks for a
+/// Render a WHOLE-scrutinee arm head (the string / list / plain shapes) to its Rust pattern.
+///
+/// The leading binder-rebind/unbox prelude and any synthesized match GUARDS go
+/// into `sink`. The guards are the `__sgN.as_str() == "lit"` checks for a
 /// by-value string-literal column — the caller ANDs them onto the arm; they are
-/// empty for every other shape (so existing emission is byte-identical).
+/// empty for every other shape. A constructor head is matched by value whatever
+/// the column's coercion flags say, so it takes the by-value renderer.
 pub fn emit_whole_arm_head(
     ctx: &EmitCtx,
     pat: &Pat,
     str_mode: bool,
     list: ListView,
-) -> DResult<(String, String, Vec<String>)> {
-    if let Pat::Ctor {
-        home,
-        ty,
-        variant,
-        args,
-    } = pat
-    {
-        emit_ctor_arm_pat(ctx, home, *ty, *variant, args)
-    } else if str_mode {
+    sink: &mut ArmSink,
+) -> DResult<String> {
+    let ctor_head = matches!(pat, Pat::Ctor { .. });
+    if !ctor_head && str_mode {
         // STR mode: the scrutinee IS a reference (`.as_str()`), so
         // `render_pat`'s `name @ inner` is a borrow and sound for any inner
         // shape. A top-level `Pat::Str` matches the `&str`-wrapped scrutinee
         // directly (a literal pattern), so no guard is synthesized here.
-        Ok((
-            render_pat(ctx, pat)?,
-            str_binder_rebinds(ctx, pat)?,
-            Vec::new(),
-        ))
-    } else if list != ListView::Off {
-        list_arm_head(ctx, pat, list)
+        let rendered = render_pat(ctx, pat)?;
+        sink.prelude.push_str(&str_binder_rebinds(ctx, pat)?);
+        Ok(rendered)
+    } else if !ctor_head && list != ListView::Off {
+        list_arm_head(ctx, pat, list, sink)
     } else {
-        // WHOLE mode, by value: a top-level dispatch-free alias head
+        // WHOLE mode, by value: a constructor head reads its boxed fields
+        // through the box; a top-level dispatch-free alias head
         // (`(a, b) as w ->`) takes the alias-safe clone-rebuild path; a
         // by-value string-literal column (`( "transform", v )` on a variable
         // tuple scrutinee) accumulates its `as_str()` guard here.
-        let mut alias_counter: usize = 0;
-        let mut prelude = String::new();
-        let mut guards = Vec::new();
-        let rendered =
-            render_arm_pat_alias_safe(ctx, pat, &mut alias_counter, &mut prelude, &mut guards)?;
-        Ok((rendered, prelude, guards))
+        render_arm_pat_alias_safe(ctx, pat, sink)
     }
 }
 
-/// Render a TUPLE-scrutinee arm head — a `(c0, c1, …)` tuple pattern or a `_`
-/// catch-all — plus any per-column binder-rebind prelude. Each column renders
-/// against its own coercion: a list column's binders rebind from `&T` / `&[T]`
-/// to owned `T` / `Vec<T>`; a string column's binders rebind from `&str` to
-/// `String`; a constructor column reuses the whole-scrutinee constructor path
-/// (so a cyclic self-edge payload binder is unboxed). The lowerer only produces
-/// a tuple or wildcard head here (`tuple_case_supported`), so a whole-value
+/// Render a TUPLE-scrutinee arm head — a `(c0, c1, …)` tuple pattern or a `_` catch-all.
+///
+/// Each column renders against its own coercion: a list column's binders
+/// rebind from `&T` / `&[T]` to owned `T` / `Vec<T>`; a string column's binders
+/// rebind from `&str` to `String`; a constructor column reads its boxed fields
+/// through the box. Every column writes into the one arm `sink`, so a fresh
+/// `__ipe_` name is unique across the whole head. The lowerer only produces a
+/// tuple or wildcard head here (`tuple_case_supported`), so a whole-value
 /// variable / alias binder — which would see the wrong per-column-coerced type —
 /// is an internal invariant violation, surfaced as a `CompilerBug`.
 pub fn emit_tuple_arm_head(
     ctx: &EmitCtx,
     pat: &Pat,
     cols: &[ColMode],
-) -> DResult<(String, String, Vec<String>)> {
+    sink: &mut ArmSink,
+) -> DResult<String> {
     match pat {
         Pat::Tuple(elems) => {
             let mut rendered = Vec::with_capacity(elems.len());
-            let mut prelude = String::new();
-            let mut guards = Vec::new();
             for (c, sub) in elems.iter().enumerate() {
                 // `unwrap_or` on a missing column would silently coerce a
                 // wider-than-known tuple pattern to `str_mode: false,
@@ -437,14 +426,11 @@ pub fn emit_tuple_arm_head(
                         ),
                     }
                 })?;
-                let (rp, pre, gs) = emit_whole_arm_head(ctx, sub, col.str_mode, col.list)?;
-                rendered.push(rp);
-                prelude.push_str(&pre);
-                guards.extend(gs);
+                rendered.push(emit_whole_arm_head(ctx, sub, col.str_mode, col.list, sink)?);
             }
-            Ok((format!("({})", rendered.join(", ")), prelude, guards))
+            Ok(format!("({})", rendered.join(", ")))
         }
-        Pat::Wildcard => Ok(("_".to_owned(), String::new(), Vec::new())),
+        Pat::Wildcard => Ok("_".to_owned()),
         _ => Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::emit_tuple_arm_head",
             detail: "tuple-scrutinee match arm head is neither a tuple nor a wildcard".to_owned(),
@@ -452,116 +438,309 @@ pub fn emit_tuple_arm_head(
     }
 }
 
-/// Render a constructor arm head to its Rust pattern plus any leading unbox
-/// statements. A cyclic self-edge payload field is boxed in the enum, so a
-/// variable bound to it is unboxed (`let x = *x;`) at the arm body's head.
-pub fn emit_ctor_arm_pat(
+/// The accumulators one arm head threads through its sub-pattern renderers.
+#[derive(Default)]
+pub struct ArmSink {
+    /// The fresh-name counter behind every `__ipe_` temp and `__sgN` guard slot.
+    pub counter: usize,
+    /// Statements spliced at the head of the arm body.
+    pub prelude: String,
+    /// Match guards joined onto the arm with a logical AND.
+    pub guards: Vec<String>,
+    /// Binders bound to a whole boxed field and unboxed in the prelude.
+    pub unboxed: BTreeSet<Symbol>,
+    /// Whether a boxed field was bound to a fresh temp and destructured from it.
+    pub boxed_temp: bool,
+}
+
+impl ArmSink {
+    /// A sink for one or-pattern alternative, numbering fresh names on from `self`.
+    fn alternative(&self) -> Self {
+        Self {
+            counter: self.counter,
+            ..Self::default()
+        }
+    }
+
+    /// Take the next fresh-name number.
+    const fn fresh(&mut self) -> usize {
+        let n = self.counter;
+        self.counter += 1;
+        n
+    }
+
+    /// Append one prelude statement.
+    fn push_stmt(&mut self, stmt: &str) {
+        self.prelude.push_str(stmt);
+        self.prelude.push(' ');
+    }
+}
+
+/// How a constructor pattern's scrutinee is held, which decides how a boxed field is read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldAccess {
+    /// Matched by value: a boxed binder moves out of its box (`*x`).
+    ByValue,
+    /// Matched through a borrow: a boxed binder is `&Box<T>`, copied out with `(**x).clone()`.
+    ByRef,
+    /// Rendered with no prelude slot: a boxed position can only be ignored.
+    NoPrelude,
+}
+
+/// A constructor pattern's parts, borrowed from a [`Pat::Ctor`].
+#[derive(Clone, Copy)]
+pub struct CtorPat<'p> {
+    pub home: &'p ModPath,
+    pub ty: Symbol,
+    pub variant: Symbol,
+    pub args: &'p [Pat],
+}
+
+/// How a sub-pattern at a boxed field position is honoured.
+///
+/// Rust cannot match through a `Box` on stable, so a boxed position takes a
+/// binder that the arm prelude unboxes; a sub-pattern that must test the
+/// field's value there has no rendering and is refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BoxedSub<'p> {
+    /// A sub-pattern that binds nothing and tests nothing: the field is not read.
+    Ignore,
+    /// A variable bound to the whole field.
+    Bind(Symbol),
+    /// A tuple, record or alias that binds a name and tests nothing, rebuilt from the unboxed field.
+    Destructure(&'p Pat),
+    /// A sub-pattern that tests the field's value.
+    Dispatch,
+}
+
+impl<'p> BoxedSub<'p> {
+    /// Classify the sub-pattern at a boxed field position.
+    #[must_use]
+    pub fn of(pat: &'p Pat) -> Self {
+        match pat {
+            Pat::Wildcard => Self::Ignore,
+            Pat::Var(name) => Self::Bind(*name),
+            Pat::Tuple(_) | Pat::Record(_) | Pat::Alias(..) => {
+                match (binds_without_dispatch(pat), binds_any(pat)) {
+                    (false, _) => Self::Dispatch,
+                    (true, true) => Self::Destructure(pat),
+                    (true, false) => Self::Ignore,
+                }
+            }
+            Pat::Ctor { .. }
+            | Pat::Int(_)
+            | Pat::Bool(_)
+            | Pat::Char(_)
+            | Pat::Str(_)
+            | Pat::Slice { .. }
+            | Pat::Or(_) => Self::Dispatch,
+        }
+    }
+}
+
+/// Can `pat` be bound by an irrefutable `let`, testing nothing?
+///
+/// A record field must also hold no alias: a by-value `let` renders it as
+/// `name @ inner`, which moves the part twice.
+fn binds_without_dispatch(pat: &Pat) -> bool {
+    match pat {
+        Pat::Wildcard | Pat::Var(_) => true,
+        Pat::Alias(inner, _) => binds_without_dispatch(inner),
+        Pat::Tuple(elems) => elems.iter().all(binds_without_dispatch),
+        Pat::Record(fields) => fields
+            .iter()
+            .all(|(_, p)| !pat_contains_alias_in_arm(p) && binds_without_dispatch(p)),
+        Pat::Ctor { .. }
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Slice { .. }
+        | Pat::Or(_) => false,
+    }
+}
+
+/// Render a constructor pattern, reading its boxed fields the same way at every depth.
+///
+/// A built-in runtime enum (`Maybe`, `Result`, …) has no boxed field, so each
+/// argument renders through `plain`; a user enum's arguments go through
+/// [`render_user_ctor_args`].
+pub fn render_ctor_pat<F>(
     ctx: &EmitCtx,
-    home: &ModPath,
-    ty: Symbol,
-    variant: Symbol,
-    args: &[Pat],
-) -> DResult<(String, String, Vec<String>)> {
-    // A built-in `Maybe` / `Result` pattern matches the runtime enum; its
-    // payload is never a boxed self-edge field, so no unbox prelude is needed.
-    if let Some(runtime) = ctx.builtin_runtime_enum(home, ty) {
-        let path = format!("{runtime}::{}", ctx.emit_ident(variant)?);
-        if args.is_empty() {
-            return Ok((path, String::new(), Vec::new()));
+    ctor: CtorPat<'_>,
+    access: FieldAccess,
+    sink: &mut ArmSink,
+    plain: &mut F,
+) -> DResult<String>
+where
+    F: FnMut(&Pat, &mut ArmSink) -> DResult<String>,
+{
+    let (path, subs) = if let Some(runtime) = ctx.builtin_runtime_enum(ctor.home, ctor.ty) {
+        let path = format!("{runtime}::{}", ctx.emit_ident(ctor.variant)?);
+        let mut subs = Vec::with_capacity(ctor.args.len());
+        for sub in ctor.args {
+            subs.push(plain(sub, sink)?);
         }
-        // the concrete repro (`Just ((a, b) as w)`) lives HERE — a
-        // builtin `Maybe`/`Result` payload matched by value. Route through
-        // the alias-safe renderer; alias-free payloads are byte-identical. A
-        // by-value string-literal payload (`Just "x"` on a `Maybe String`
-        // scrutinee) accumulates its `as_str()` guard in `guards`.
-        let mut alias_counter: usize = 0;
-        let mut alias_prelude = String::new();
-        let mut guards = Vec::new();
-        let mut sub_pats = Vec::with_capacity(args.len());
-        for sub in args {
-            sub_pats.push(render_arm_pat_alias_safe(
-                ctx,
-                sub,
-                &mut alias_counter,
-                &mut alias_prelude,
-                &mut guards,
-            )?);
+        (path, subs)
+    } else {
+        let path = format!(
+            "{}::{}",
+            ctx.enum_name(ctor.home, ctor.ty)?,
+            ctx.emit_ident(ctor.variant)?
+        );
+        if ctor.args.is_empty() {
+            return Ok(path);
         }
-        return Ok((
-            format!("{path}({})", sub_pats.join(", ")),
-            alias_prelude,
-            guards,
-        ));
+        (path, render_user_ctor_args(ctx, ctor, access, sink, plain)?)
+    };
+    if subs.is_empty() {
+        Ok(path)
+    } else {
+        Ok(format!("{path}({})", subs.join(", ")))
     }
-    let path = format!("{}::{}", ctx.enum_name(home, ty)?, ctx.emit_ident(variant)?);
-    if args.is_empty() {
-        return Ok((path, String::new(), Vec::new()));
-    }
-    let fields = ctx.variant_fields(home, ty, variant)?;
-    if fields.len() != args.len() {
+}
+
+/// Render a user constructor pattern's arguments against the variant's declared fields.
+///
+/// The one place a pattern asks whether a field is boxed. An argument at a
+/// boxed (cyclic self-edge) field is classified by [`BoxedSub::of`] and read
+/// through the box as `access` dictates; every other argument renders through
+/// `plain`.
+pub fn render_user_ctor_args<F>(
+    ctx: &EmitCtx,
+    ctor: CtorPat<'_>,
+    access: FieldAccess,
+    sink: &mut ArmSink,
+    plain: &mut F,
+) -> DResult<Vec<String>>
+where
+    F: FnMut(&Pat, &mut ArmSink) -> DResult<String>,
+{
+    let fields = ctx.variant_fields(ctor.home, ctor.ty, ctor.variant)?;
+    if fields.len() != ctor.args.len() {
         return Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::emit_match",
             detail: format!(
                 "constructor pattern {} of enum {} binds {} sub-patterns but the \
                  variant declares {} fields",
-                variant.as_raw(),
-                ty.as_raw(),
-                args.len(),
+                ctor.variant.as_raw(),
+                ctor.ty.as_raw(),
+                ctor.args.len(),
                 fields.len()
             ),
         });
     }
-    let mut sub_pats = Vec::with_capacity(args.len());
-    let mut unbox_lines = String::new();
-    let mut guards = Vec::new();
-    // a dispatch-free `as`-alias in a by-value ctor payload renders via
-    // the alias-safe clone-rebuild path; its re-derivation `let`s share the
-    // arm's existing prelude slot. Alias-free sub-patterns take the
-    // byte-identical `render_pat` fast path inside.
-    let mut alias_counter: usize = 0;
-    for (sub, field_ty) in args.iter().zip(fields.iter()) {
-        let self_edge = ctx.is_cyclic_self_field(field_ty, home, ty);
-        // self-edge fix: an ALIAS over a cyclic-self-edge (recursive)
-        // field is boxed in the enum (`Box<Self>`), so the clone-rebuild
-        // path must re-derive its binders from the UNBOXED temp — otherwise
-        // both the alias binder and the inner bindings stay `Box<T>` where
-        // `T` is required (ipe-0-then-cargo-E0308). Bind the field to a fresh
-        // raw temp, then re-derive the whole alias shape via the
-        // `emit_binding_stmts` machinery against `*temp`.
-        if self_edge && pat_contains_alias_in_arm(sub) {
-            let temp = format!("__ipe_selfedge_alias_{alias_counter}");
-            alias_counter += 1;
-            for stmt in emit_binding_stmts(ctx, sub, &format!("*{temp}"))? {
-                unbox_lines.push_str(&stmt);
-                unbox_lines.push(' ');
-            }
-            sub_pats.push(temp);
-            continue;
-        }
-        sub_pats.push(render_arm_pat_alias_safe(
-            ctx,
-            sub,
-            &mut alias_counter,
-            &mut unbox_lines,
-            &mut guards,
-        )?);
-        // A variable bound to a boxed self-edge field is unboxed so the body
-        // sees the payload's own type, not `Box<…>`.
-        if self_edge && let Pat::Var(s) = sub {
-            let binder = ctx.emit_ident(*s)?;
-            write!(unbox_lines, "let {binder} = *{binder}; ").map_err(|e| {
-                Diagnostic::CompilerBug {
-                    where_: "ipe_backend_rust::emit_match",
-                    detail: format!("writing unbox binder failed: {e}"),
-                }
-            })?;
+    let mut subs = Vec::with_capacity(ctor.args.len());
+    for (sub, field_ty) in ctor.args.iter().zip(fields) {
+        if ctx.is_cyclic_self_field(field_ty, ctor.home, ctor.ty) {
+            subs.push(render_boxed_sub(ctx, sub, access, sink)?);
+        } else {
+            subs.push(plain(sub, sink)?);
         }
     }
-    Ok((
-        format!("{path}({})", sub_pats.join(", ")),
-        unbox_lines,
-        guards,
-    ))
+    Ok(subs)
+}
+
+/// Render the sub-pattern at one boxed field position, unboxing what it binds in the prelude.
+fn render_boxed_sub(
+    ctx: &EmitCtx,
+    sub: &Pat,
+    access: FieldAccess,
+    sink: &mut ArmSink,
+) -> DResult<String> {
+    let refuse = |detail: &str| Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::render_user_ctor_args",
+        detail: detail.to_owned(),
+    };
+    match (BoxedSub::of(sub), access) {
+        (BoxedSub::Ignore, _) => Ok("_".to_owned()),
+        (BoxedSub::Bind(name), FieldAccess::ByValue | FieldAccess::ByRef) => {
+            let binder = ctx.emit_ident(name)?;
+            let src = unboxed_read(access, &binder);
+            sink.push_stmt(&format!("let {binder} = {src};"));
+            sink.unboxed.insert(name);
+            Ok(binder)
+        }
+        (BoxedSub::Destructure(part), FieldAccess::ByValue | FieldAccess::ByRef) => {
+            let temp = format!("__ipe_box_{}", sink.fresh());
+            let src = unboxed_read(access, &temp);
+            for stmt in emit_binding_stmts(ctx, part, &src)? {
+                sink.push_stmt(&stmt);
+            }
+            sink.boxed_temp = true;
+            Ok(temp)
+        }
+        (BoxedSub::Bind(_) | BoxedSub::Destructure(_), FieldAccess::NoPrelude) => Err(refuse(
+            "a binder at a boxed field position reached a renderer with no unbox prelude",
+        )),
+        (BoxedSub::Dispatch, _) => Err(refuse(
+            "a sub-pattern that tests a boxed field's value reached the backend; Rust \
+             cannot match through a `Box`, so it has no rendering",
+        )),
+    }
+}
+
+/// The owned payload read out of the boxed binder `boxed` under `access`.
+fn unboxed_read(access: FieldAccess, boxed: &str) -> String {
+    match access {
+        FieldAccess::ByRef => format!("(**{boxed}).clone()"),
+        FieldAccess::ByValue | FieldAccess::NoPrelude => format!("*{boxed}"),
+    }
+}
+
+/// Render an or-pattern's alternatives, each into its own sink, and fold them into `sink`.
+///
+/// A Rust or-pattern binds one name set at one type in every alternative, and
+/// the arm body runs one prelude whichever alternative matched. So every
+/// alternative numbers its fresh names from the same base: alternatives that
+/// mint the same temps for the same binders render the same prelude, and that
+/// one prelude serves them all. Alternatives whose unboxed binders differ, that
+/// destructure a boxed field through a fresh temp (its type is fixed by the
+/// variant, not by the names it binds), or that mint fresh names into
+/// different preludes or guards have no single prelude, and are refused.
+/// Otherwise the first alternative's prelude and guards serve the arm: every
+/// alternative binds and rebinds the same names.
+fn render_or_alternatives<F>(alts: &[Pat], sink: &mut ArmSink, render: &mut F) -> DResult<String>
+where
+    F: FnMut(&Pat, &mut ArmSink) -> DResult<String>,
+{
+    let base = sink.counter;
+    let mut parts = Vec::with_capacity(alts.len());
+    let mut done = Vec::with_capacity(alts.len());
+    for alt in alts {
+        let mut alt_sink = sink.alternative();
+        parts.push(render(alt, &mut alt_sink)?);
+        done.push(alt_sink);
+    }
+    let Some((first, rest)) = done.split_first() else {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::render_or_alternatives",
+            detail: "an or-pattern reached the backend with no alternatives".to_owned(),
+        });
+    };
+    let minted = done.iter().any(|alt| alt.counter != base);
+    let uneven = rest.iter().any(|alt| alt.unboxed != first.unboxed);
+    let boxed_temp = done.iter().any(|alt| alt.boxed_temp);
+    let diverging_mints = minted
+        && rest.iter().any(|alt| {
+            alt.counter != first.counter
+                || alt.prelude != first.prelude
+                || alt.guards != first.guards
+        });
+    if uneven || boxed_temp || diverging_mints {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::render_or_alternatives",
+            detail: "or-pattern alternatives bind through different arm preludes (different \
+                     unboxed binders, a boxed field destructured through a temp, or fresh \
+                     names minted differently); no single prelude serves every alternative"
+                .to_owned(),
+        });
+    }
+    sink.counter = first.counter;
+    sink.prelude.push_str(&first.prelude);
+    sink.guards.extend(first.guards.iter().cloned());
+    sink.unboxed.extend(first.unboxed.iter().copied());
+    Ok(parts.join(" | "))
 }
 
 /// Build the `let name = name.to_string();` prelude that rebinds every top-level
@@ -606,40 +785,27 @@ pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResul
         | Pat::Ctor { .. }
         | Pat::Tuple(_)
         | Pat::Record(_)
-        | Pat::Slice { .. } => Ok(()),
-        // Every alternative of an or-pattern binds the same names at the same
-        // types, so rebinding via the first alternative produces the one correct
-        // set of `let` rebinds (one per name, never per-alternative).
-        Pat::Or(alts) => alts
-            .first()
-            .map_or(Ok(()), |first| collect_str_rebinds(ctx, first, out)),
+        | Pat::Slice { .. }
+        // A `SharedAlts` alternative is binder-free.
+        | Pat::Or(_) => Ok(()),
     }
 }
 
 /// Render one arm head of a list column for the column's [`ListView`].
 ///
 /// Every list-column arm head passes through here. A borrowed view renders the
-/// slice pattern and the copy-out rebinds of [`list_binder_rebinds`]; a head
-/// that binds nothing has no rebind, whatever its slices' ownership. An owned
-/// view renders the move-out pattern of [`owned_list_arm_head`].
+/// slice pattern together with the copy-out rebinds of [`borrow_list_head`]; a
+/// head that binds nothing has no rebind, whatever its slices' ownership. An
+/// owned view renders the move-out pattern of [`owned_list_arm_head`].
 pub fn list_arm_head(
     ctx: &EmitCtx,
     pat: &Pat,
     list: ListView,
-) -> DResult<(String, String, Vec<String>)> {
+    sink: &mut ArmSink,
+) -> DResult<String> {
     match list {
-        ListView::Borrow => {
-            let rebinds = if pat_moves_nested_part(pat) {
-                list_binder_rebinds(ctx, pat, SliceOwnership::BorrowClone)?
-            } else {
-                String::new()
-            };
-            Ok((render_pat(ctx, pat)?, rebinds, Vec::new()))
-        }
-        ListView::Owned { width, tag } => {
-            let (head, prelude) = owned_list_arm_head(ctx, pat, width, tag)?;
-            Ok((head, prelude, Vec::new()))
-        }
+        ListView::Borrow => borrow_list_head(ctx, pat, pat_moves_nested_part(pat), sink),
+        ListView::Owned { width, tag } => owned_list_arm_head(ctx, pat, width, tag, sink),
         ListView::Off => Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::list_arm_head",
             detail: "a list arm head was rendered for a column no slice arm matches".to_owned(),
@@ -647,59 +813,59 @@ pub fn list_arm_head(
     }
 }
 
-/// Build the copy-out prelude of a list arm over a borrowed slice.
+/// Render a list arm head over a borrowed slice, with its copy-out prelude.
 ///
 /// Under [`SliceOwnership::BorrowClone`] the scrutinee is matched as a slice
 /// (`(v).as_slice()`), so every binder a list arm introduces is a borrow: an
-/// ELEMENT binder is `&T` and a REST / whole-list binder is `&[T]`. This builds
-/// the `let … = …;` prelude that rebinds each to the owned Ipê value the arm
-/// body expects — an element via `.clone()` (so the body sees `T`), a rest /
-/// whole list via `.to_vec()` (so the body sees `Vec<T>`). The lowerer stamps
-/// `BorrowClone` only on an element type whose clone class is `Clone` (a bare
-/// type parameter carries the emitted `Clone` bound), and the scrutinee
-/// emitter re-proves the column's element type with [`elem_clone_proof`]
-/// before any arm renders, so the `.clone()` / `.to_vec()` always resolve.
-/// A non-`Clone` element is
+/// ELEMENT binder is `&T` and a REST / whole-list binder is `&[T]`. The
+/// prelude rebinds each to the owned Ipê value the arm body expects — an
+/// element via `.clone()` (so the body sees `T`), a rest / whole list via
+/// `.to_vec()` (so the body sees `Vec<T>`). The lowerer stamps `BorrowClone`
+/// only on an element type whose clone class is `Clone` (a bare type parameter
+/// carries the emitted `Clone` bound), and the scrutinee emitter re-proves the
+/// column's element type with [`elem_clone_proof`] before any arm renders, so
+/// the `.clone()` / `.to_vec()` always resolve. A non-`Clone` element is
 /// [`SliceOwnership::OwnedMove`], whose binders move out of the owned view and
-/// have no copy-out prelude, so reaching here with it is an internal error.
-pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat, own: SliceOwnership) -> DResult<String> {
-    match own {
-        SliceOwnership::BorrowClone => {}
-        SliceOwnership::OwnedMove => {
-            return Err(Diagnostic::CompilerBug {
-                where_: "ipe_backend_rust::list_binder_rebinds",
-                detail: "an owned-move list arm reached the copy-out rebinds".to_owned(),
-            });
-        }
-    }
-    let mut out = String::new();
+/// have no copy-out prelude, so a binding head reaching here with it is an
+/// internal error.
+fn borrow_list_head(ctx: &EmitCtx, pat: &Pat, moves: bool, sink: &mut ArmSink) -> DResult<String> {
     match pat {
         Pat::Slice {
-            prefix,
-            rest,
-            own: here,
-            ..
+            prefix, rest, own, ..
         } => {
-            if *here != own {
+            if moves && *own != SliceOwnership::BorrowClone {
                 return Err(Diagnostic::CompilerBug {
-                    where_: "ipe_backend_rust::list_binder_rebinds",
+                    where_: "ipe_backend_rust::borrow_list_head",
                     detail: "a list arm's slice ownership disagrees with its column's view"
                         .to_owned(),
                 });
             }
+            let mut parts = Vec::with_capacity(prefix.len().saturating_add(1));
             for sub in prefix {
-                collect_elem_rebinds(ctx, sub, &mut out)?;
+                parts.push(borrow_elem(ctx, sub, sink)?);
             }
             if let Some(r) = rest {
-                collect_list_rebinds(ctx, r, &mut out)?;
+                parts.push(render_rest_pat(ctx, r)?);
+                collect_list_rebinds(ctx, r, &mut sink.prelude)?;
             }
+            Ok(format!("[{}]", parts.join(", ")))
         }
         // A whole-list catch-all binder (`xs ->`) or an alias over a list arm
         // (`(x :: rest) as whole ->`): the matched value IS the list.
-        Pat::Var(_) => collect_list_rebinds(ctx, pat, &mut out)?,
+        Pat::Var(name) => {
+            rebind_to_vec(ctx, *name, &mut sink.prelude)?;
+            ctx.emit_ident(*name)
+        }
         Pat::Alias(inner, name) => {
-            rebind_to_vec(ctx, *name, &mut out)?;
-            out.push_str(&list_binder_rebinds(ctx, inner, own)?);
+            rebind_to_vec(ctx, *name, &mut sink.prelude)?;
+            let inner = borrow_list_head(ctx, inner, moves, sink)?;
+            Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
+        }
+        // A `SharedAlts` alternative is binder-free, so it contributes no rebinds.
+        Pat::Or(alts) => {
+            render_or_alternatives(alts.as_slice(), sink, &mut |p: &Pat, s: &mut ArmSink| {
+                borrow_list_head(ctx, p, moves, s)
+            })
         }
         // A wildcard binds nothing; other heads never reach a list `case`.
         Pat::Wildcard
@@ -709,16 +875,8 @@ pub fn list_binder_rebinds(ctx: &EmitCtx, pat: &Pat, own: SliceOwnership) -> DRe
         | Pat::Char(_)
         | Pat::Ctor { .. }
         | Pat::Tuple(_)
-        | Pat::Record(_) => {}
-        // Every alternative binds the same names at the same types, so the first
-        // alternative's rebinds are the whole arm's set.
-        Pat::Or(alts) => {
-            if let Some(first) = alts.first() {
-                out.push_str(&list_binder_rebinds(ctx, first, own)?);
-            }
-        }
+        | Pat::Record(_) => render_pat(ctx, pat),
     }
-    Ok(out)
 }
 
 /// The slot-array name of the owned view tagged `tag`.
@@ -757,7 +915,7 @@ fn push_view_rest(
     })
 }
 
-/// Render one arm head of an owned list view `width` slots wide, plus its prelude.
+/// Render one arm head of an owned list view `width` slots wide, its prelude into `sink`.
 ///
 /// The column is matched against `([Option<T>; width], Vec<T>)` by value, so
 /// every binder moves out of the view and none is cloned:
@@ -777,13 +935,13 @@ pub fn owned_list_arm_head(
     pat: &Pat,
     width: usize,
     tag: usize,
-) -> DResult<(String, String)> {
-    let mut prelude = String::new();
+    sink: &mut ArmSink,
+) -> DResult<String> {
     if matches!(pat, Pat::Wildcard) {
-        return Ok(("_".to_owned(), prelude));
+        return Ok("_".to_owned());
     }
-    let (slots, tail) = owned_view_shape(ctx, pat, width, tag, &mut prelude)?;
-    Ok((format!("({slots}, {tail})"), prelude))
+    let (slots, tail) = owned_view_shape(ctx, pat, width, tag, sink)?;
+    Ok(format!("({slots}, {tail})"))
 }
 
 /// The slot-array pattern and tail pattern of an owned list arm head.
@@ -792,7 +950,7 @@ fn owned_view_shape(
     pat: &Pat,
     width: usize,
     tag: usize,
-    prelude: &mut String,
+    sink: &mut ArmSink,
 ) -> DResult<(String, String)> {
     let fault = |detail: &str| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::owned_list_arm_head",
@@ -802,7 +960,7 @@ fn owned_view_shape(
         Pat::Wildcard => Ok(("_".to_owned(), "_".to_owned())),
         Pat::Var(name) => {
             let (slots, tail) = (view_slots(tag), view_tail(tag));
-            push_view_rest(ctx, *name, &slots, &tail, prelude)?;
+            push_view_rest(ctx, *name, &slots, &tail, &mut sink.prelude)?;
             Ok((slots, tail))
         }
         Pat::Slice {
@@ -817,7 +975,7 @@ fn owned_view_shape(
             }
             let mut parts = Vec::with_capacity(width.saturating_add(1));
             for sub in prefix {
-                parts.push(format!("Some({})", render_owned_elem(ctx, sub)?));
+                parts.push(format!("Some({})", render_owned_elem(ctx, sub, sink)?));
             }
             let tail = match rest.as_deref() {
                 None => {
@@ -834,7 +992,13 @@ fn owned_view_shape(
                         (k..width).map(|i| format!("__ipe_v{tag}_s{i}")).collect();
                     parts.extend(spill.iter().cloned());
                     let tail = view_tail(tag);
-                    push_view_rest(ctx, *r, &format!("[{}]", spill.join(", ")), &tail, prelude)?;
+                    push_view_rest(
+                        ctx,
+                        *r,
+                        &format!("[{}]", spill.join(", ")),
+                        &tail,
+                        &mut sink.prelude,
+                    )?;
                     tail
                 }
                 Some(_) => return Err(fault("a slice rest is neither a variable nor a wildcard")),
@@ -852,25 +1016,20 @@ fn owned_view_shape(
                      the lowerer refuses it (IPE-L0135)",
                 ));
             }
-            let (inner_slots, _) = owned_view_shape(ctx, inner, width, tag, prelude)?;
+            let (inner_slots, _) = owned_view_shape(ctx, inner, width, tag, sink)?;
             let (slots, tail) = (view_slots(tag), view_tail(tag));
-            push_view_rest(ctx, *name, &slots, &tail, prelude)?;
+            push_view_rest(ctx, *name, &slots, &tail, &mut sink.prelude)?;
             if inner_slots == "_" {
                 Ok((slots, tail))
             } else {
                 Ok((format!("{slots} @ {inner_slots}"), tail))
             }
         }
+        // A `SharedAlts` alternative is binder-free, so it takes no slot.
         Pat::Or(alts) => {
-            if binds_any(pat) {
-                return Err(fault(
-                    "a binding or-pattern reached an owned list view; the lowerer \
-                     refuses it (IPE-L0116)",
-                ));
-            }
-            let mut parts = Vec::with_capacity(alts.len());
-            for alt in alts {
-                parts.push(owned_view_shape(ctx, alt, width, tag, prelude)?.0);
+            let mut parts = Vec::with_capacity(alts.as_slice().len());
+            for alt in alts.as_slice() {
+                parts.push(owned_view_shape(ctx, alt, width, tag, sink)?.0);
             }
             Ok((format!("({})", parts.join(" | ")), "_".to_owned()))
         }
@@ -886,12 +1045,13 @@ fn owned_view_shape(
 
 /// Render an element sub-pattern of an owned list view, matched by value.
 ///
-/// Each binder moves its part out of the element. An alias whose inner binds
-/// nothing renders `n @ p`, which moves only `n`. An alias whose inner binds a
-/// name would own its part twice and is refused at lowering (IPE-L0135); a
-/// string literal or a nested list in an element is refused there too
-/// (IPE-L0116). Reaching any of the three here is an internal error.
-fn render_owned_elem(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
+/// Each binder moves its part out of the element; a binder at a boxed field
+/// moves out of its box. An alias whose inner binds nothing renders `n @ p`,
+/// which moves only `n`. An alias whose inner binds a name would own its part
+/// twice and is refused at lowering (IPE-L0135); a string literal or a nested
+/// list in an element is refused there too (IPE-L0116). Reaching any of the
+/// three here is an internal error.
+fn render_owned_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> {
     if owned_elem_fault(pat) {
         return Err(Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::render_owned_elem",
@@ -900,7 +1060,54 @@ fn render_owned_elem(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
                 .to_owned(),
         });
     }
-    render_pat(ctx, pat)
+    owned_elem(ctx, pat, sink)
+}
+
+/// Render an owned list element already cleared by [`owned_elem_fault`].
+fn owned_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> {
+    match pat {
+        Pat::Ctor {
+            home,
+            ty,
+            variant,
+            args,
+        } => render_ctor_pat(
+            ctx,
+            CtorPat {
+                home,
+                ty: *ty,
+                variant: *variant,
+                args,
+            },
+            FieldAccess::ByValue,
+            sink,
+            &mut |p: &Pat, s: &mut ArmSink| owned_elem(ctx, p, s),
+        ),
+        Pat::Tuple(elems) => {
+            let mut subs = Vec::with_capacity(elems.len());
+            for sub in elems {
+                subs.push(owned_elem(ctx, sub, sink)?);
+            }
+            Ok(format!("({})", subs.join(", ")))
+        }
+        Pat::Record(fields) => render_record_with(ctx, fields, |p| owned_elem(ctx, p, sink)),
+        Pat::Alias(inner, name) => {
+            let inner = owned_elem(ctx, inner, sink)?;
+            Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
+        }
+        Pat::Or(alts) => {
+            render_or_alternatives(alts.as_slice(), sink, &mut |p: &Pat, s: &mut ArmSink| {
+                owned_elem(ctx, p, s)
+            })
+        }
+        Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_)
+        | Pat::Slice { .. } => render_pat(ctx, pat),
+    }
 }
 
 /// Does an owned list element hold a shape that cannot be matched by value?
@@ -911,38 +1118,59 @@ fn owned_elem_fault(pat: &Pat) -> bool {
         Pat::Tuple(subs) => subs.iter().any(owned_elem_fault),
         Pat::Ctor { args, .. } => args.iter().any(owned_elem_fault),
         Pat::Record(fields) => fields.iter().any(|(_, p)| owned_elem_fault(p)),
-        Pat::Or(alts) => alts.iter().any(owned_elem_fault),
-        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) => false,
+        // A `SharedAlts` alternative holds no alias, string or list.
+        Pat::Or(_) | Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) => {
+            false
+        }
     }
 }
 
-/// Collect the owned-by-`clone` rebinds for an ELEMENT sub-pattern (a head
-/// position of a slice). Every variable / alias binder there is `&T` and is
-/// cloned to `T`; nested tuple / constructor / record element patterns recurse.
-pub fn collect_elem_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResult<()> {
+/// Render an ELEMENT sub-pattern of a borrowed slice, with its owned-by-`clone` rebinds.
+///
+/// Every variable / alias binder there is `&T` and is cloned to `T`; a binder
+/// at a boxed field is `&Box<T>` and is copied out of its box. Nested tuple /
+/// constructor / record element patterns recurse.
+fn borrow_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> {
     match pat {
-        Pat::Var(s) => rebind_clone(ctx, *s, out),
+        Pat::Var(name) => {
+            rebind_clone(ctx, *name, &mut sink.prelude)?;
+            ctx.emit_ident(*name)
+        }
         Pat::Alias(inner, name) => {
-            rebind_clone(ctx, *name, out)?;
-            collect_elem_rebinds(ctx, inner, out)
+            rebind_clone(ctx, *name, &mut sink.prelude)?;
+            let inner = borrow_elem(ctx, inner, sink)?;
+            Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
         }
-        Pat::Tuple(subs) => {
-            for sub in subs {
-                collect_elem_rebinds(ctx, sub, out)?;
+        Pat::Tuple(elems) => {
+            let mut subs = Vec::with_capacity(elems.len());
+            for sub in elems {
+                subs.push(borrow_elem(ctx, sub, sink)?);
             }
-            Ok(())
+            Ok(format!("({})", subs.join(", ")))
         }
-        Pat::Ctor { args, .. } => {
-            for sub in args {
-                collect_elem_rebinds(ctx, sub, out)?;
-            }
-            Ok(())
-        }
-        Pat::Record(fields) => {
-            for (_, sub) in fields {
-                collect_elem_rebinds(ctx, sub, out)?;
-            }
-            Ok(())
+        Pat::Ctor {
+            home,
+            ty,
+            variant,
+            args,
+        } => render_ctor_pat(
+            ctx,
+            CtorPat {
+                home,
+                ty: *ty,
+                variant: *variant,
+                args,
+            },
+            FieldAccess::ByRef,
+            sink,
+            &mut |p: &Pat, s: &mut ArmSink| borrow_elem(ctx, p, s),
+        ),
+        Pat::Record(fields) => render_record_with(ctx, fields, |p| borrow_elem(ctx, p, sink)),
+        // A `SharedAlts` alternative is binder-free, so it contributes no rebinds.
+        Pat::Or(alts) => {
+            render_or_alternatives(alts.as_slice(), sink, &mut |p: &Pat, s: &mut ArmSink| {
+                borrow_elem(ctx, p, s)
+            })
         }
         // A wildcard / literal element binds nothing. A nested slice element is
         // gated at lowering (it never reaches the backend), so it needs no rebind.
@@ -951,12 +1179,7 @@ pub fn collect_elem_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResu
         | Pat::Bool(_)
         | Pat::Char(_)
         | Pat::Str(_)
-        | Pat::Slice { .. } => Ok(()),
-        // Every alternative binds the same names at the same types; rebind via
-        // the first alternative.
-        Pat::Or(alts) => alts
-            .first()
-            .map_or(Ok(()), |first| collect_elem_rebinds(ctx, first, out)),
+        | Pat::Slice { .. } => render_pat(ctx, pat),
     }
 }
 
@@ -978,12 +1201,9 @@ pub fn collect_list_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResu
         | Pat::Ctor { .. }
         | Pat::Tuple(_)
         | Pat::Record(_)
-        | Pat::Slice { .. } => Ok(()),
-        // Every alternative binds the same names at the same types; rebind via
-        // the first alternative.
-        Pat::Or(alts) => alts
-            .first()
-            .map_or(Ok(()), |first| collect_list_rebinds(ctx, first, out)),
+        | Pat::Slice { .. }
+        // A `SharedAlts` alternative is binder-free.
+        | Pat::Or(_) => Ok(()),
     }
 }
 
@@ -1080,32 +1300,25 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
             }
             Ok(format!("({})", subs.join(", ")))
         }
+        // A constructor renders through the field-aware funnel. This renderer
+        // has no prelude slot, so a binder at a boxed field is refused there.
         Pat::Ctor {
             home,
             ty,
             variant,
             args,
-        } => {
-            // A built-in `Maybe` / `Result` pattern routes to the runtime enum
-            // path; otherwise it is a user enum resolved by `enum_name`.
-            let path = match ctx.builtin_runtime_enum(home, *ty) {
-                Some(runtime) => format!("{runtime}::{}", ctx.emit_ident(*variant)?),
-                None => format!(
-                    "{}::{}",
-                    ctx.enum_name(home, *ty)?,
-                    ctx.emit_ident(*variant)?
-                ),
-            };
-            if args.is_empty() {
-                Ok(path)
-            } else {
-                let mut subs = Vec::with_capacity(args.len());
-                for sub in args {
-                    subs.push(render_pat(ctx, sub)?);
-                }
-                Ok(format!("{path}({})", subs.join(", ")))
-            }
-        }
+        } => render_ctor_pat(
+            ctx,
+            CtorPat {
+                home,
+                ty: *ty,
+                variant: *variant,
+                args,
+            },
+            FieldAccess::NoPrelude,
+            &mut ArmSink::default(),
+            &mut |p: &Pat, _: &mut ArmSink| render_pat(ctx, p),
+        ),
         Pat::Record(fields) => render_record_pat(ctx, fields),
         // A list / cons pattern renders as a native Rust slice pattern. A closed
         // (exact-length) pattern is `[p0, p1]`; an open cons tail is
@@ -1131,8 +1344,8 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         // overlap and ordering across alternatives exactly as it does across
         // arms.
         Pat::Or(alts) => {
-            let mut parts = Vec::with_capacity(alts.len());
-            for alt in alts {
+            let mut parts = Vec::with_capacity(alts.as_slice().len());
+            for alt in alts.as_slice() {
                 parts.push(render_pat(ctx, alt)?);
             }
             Ok(parts.join(" | "))
@@ -1187,46 +1400,43 @@ pub fn pat_contains_alias_in_arm(pat: &Pat) -> bool {
             prefix.iter().any(pat_contains_alias_in_arm)
                 || rest.as_deref().is_some_and(pat_contains_alias_in_arm)
         }
-        // An or-pattern carries an alias iff any alternative does.
-        Pat::Or(alts) => alts.iter().any(pat_contains_alias_in_arm),
-        Pat::Var(_) | Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {
-            false
-        }
+        // A `SharedAlts` alternative holds no alias.
+        Pat::Or(_)
+        | Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_) => false,
     }
 }
 
-/// Render a BY-VALUE (whole-scrutinee, non-str, non-list) match-arm
-/// sub-pattern, routing any [`Pat::Alias`] through the SAME "bind the whole,
-/// destructure the inner shape from a CLONE" strategy
-/// [`emit_binding_stmts`] already proves sound for irrefutable Destructure
-/// positions — because in THIS context the scrutinee is matched BY VALUE
-/// (never `&str`/`&[T]`), so `render_pat`'s `name @ inner` spelling (sound
-/// only under a by-REF default binding mode) would double-move `name` and
-/// `inner`'s own bindings for any non-`Copy` payload.
+/// Render a BY-VALUE (whole-scrutinee, non-str, non-list) match-arm sub-pattern.
 ///
-/// A subtree with no alias anywhere renders through the existing,
-/// byte-identical [`render_pat`] (fast path — zero behavior change for the
-/// overwhelmingly common alias-free case). `prelude` accumulates the `let`
-/// statements that re-derive every aliased binder; the caller splices it
-/// into the SAME prelude slot `emit_ctor_arm_pat`'s cyclic-self-edge
-/// unboxing already uses (`unbox_lines`) or `emit_whole_arm_head`'s
-/// `prelude` return.
+/// Any [`Pat::Alias`] routes through the SAME "bind the whole, destructure the
+/// inner shape from a CLONE" strategy [`emit_binding_stmts`] proves sound for
+/// irrefutable Destructure positions — in THIS context the scrutinee is
+/// matched BY VALUE (never `&str`/`&[T]`), so `render_pat`'s `name @ inner`
+/// spelling (sound only under a by-REF default binding mode) would double-move
+/// `name` and `inner`'s own bindings for any non-`Copy` payload. A constructor
+/// with a payload renders through [`render_ctor_pat`], which reads its boxed
+/// fields through the box.
+///
+/// A subtree with no alias, no by-value string literal and no constructor
+/// payload renders through [`render_pat`]. `sink` accumulates the `let`
+/// statements that re-derive every aliased or unboxed binder, and the
+/// by-value string-literal guards.
 #[allow(clippy::too_many_lines)] // one arm per IR pattern shape — a rendering table, not branching logic
-pub fn render_arm_pat_alias_safe(
-    ctx: &EmitCtx,
-    pat: &Pat,
-    counter: &mut usize,
-    prelude: &mut String,
-    guards: &mut Vec<String>,
-) -> DResult<String> {
-    // Fast path: no alias AND no by-value string-literal leaf → the plain,
-    // byte-identical renderer. A `Pat::Str` in a by-value position would render
-    // as a `&str` literal pattern against an owned `String` field (E0308), so
-    // its presence forces the guard walk below even when there is no alias.
-    // `pat_has_str_guard_slot` is the one classifier the lowerer's move gate
-    // (`PartialMove::of_pattern`) shares, so a guard slot minted here is always
-    // counted there as a move of its part.
-    if !pat_contains_alias_in_arm(pat) && !pat_has_str_guard_slot(pat) {
+pub fn render_arm_pat_alias_safe(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> {
+    // Fast path: no alias, no by-value string-literal leaf and no constructor
+    // payload → the plain renderer. A `Pat::Str` in a by-value position would
+    // render as a `&str` literal pattern against an owned `String` field
+    // (E0308), so its presence forces the guard walk below even when there is
+    // no alias. `pat_has_str_guard_slot` is the one classifier the lowerer's
+    // move gate (`PartialMove::of_pattern`) shares, so a guard slot minted here
+    // is always counted there as a move of its part.
+    if !pat_contains_alias_in_arm(pat) && !pat_has_str_guard_slot(pat) && !pat_has_ctor_payload(pat)
+    {
         return render_pat(ctx, pat);
     }
     match pat {
@@ -1235,19 +1445,18 @@ pub fn render_arm_pat_alias_safe(
         // fresh `__sgN` and emit an `if __sgN.as_str() == "lit"` match guard. The
         // caller ANDs the accumulated guards onto the arm — a false guard falls
         // through to the next arm, exactly matching the `case`'s literal-column
-        // semantics. Mirrors the reference's `renderPatGuarded`.
+        // semantics.
         Pat::Str(s) => {
-            let binder = format!("__sg{}", *counter);
-            *counter += 1;
-            guards.push(format!("{binder}.as_str() == {}", rust_str_lit(s)));
+            let binder = format!("__sg{}", sink.fresh());
+            sink.guards
+                .push(format!("{binder}.as_str() == {}", rust_str_lit(s)));
             Ok(binder)
         }
         Pat::Alias(inner, _name) => {
             // IPE-L0128 (`gate_by_value_dispatch_needing_aliases`) guarantees
             // `inner` is dispatch-free by the time lowering succeeds; fail
             // closed rather than silently mis-emit if that invariant is ever
-            // violated — never trust a backend-side "this can't happen"
-            // silently.
+            // violated.
             if !ipe_ir::is_dispatch_free(inner) {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::render_arm_pat_alias_safe",
@@ -1256,22 +1465,19 @@ pub fn render_arm_pat_alias_safe(
                         .to_owned(),
                 });
             }
-            let temp = format!("__ipe_arm_alias_{}", *counter);
-            *counter += 1;
-            // `emit_binding_stmts` already handles
-            // `Pat::Alias` exactly this way: `let <name> = <src>; let
-            // <inner-pattern> = <name>.clone();` — reuse it verbatim, passing
-            // the WHOLE alias node and the fresh temp as `src`.
+            let temp = format!("__ipe_arm_alias_{}", sink.fresh());
+            // `emit_binding_stmts` handles `Pat::Alias` exactly this way:
+            // `let <name> = <src>; let <inner-pattern> = <name>.clone();` —
+            // pass the WHOLE alias node and the fresh temp as `src`.
             for stmt in emit_binding_stmts(ctx, pat, &temp)? {
-                prelude.push_str(&stmt);
-                prelude.push(' ');
+                sink.push_stmt(&stmt);
             }
             Ok(temp)
         }
         Pat::Tuple(elems) => {
             let mut subs = Vec::with_capacity(elems.len());
             for e in elems {
-                subs.push(render_arm_pat_alias_safe(ctx, e, counter, prelude, guards)?);
+                subs.push(render_arm_pat_alias_safe(ctx, e, sink)?);
             }
             Ok(format!("({})", subs.join(", ")))
         }
@@ -1280,51 +1486,20 @@ pub fn render_arm_pat_alias_safe(
             ty,
             variant,
             args,
-        } => {
-            let path = match ctx.builtin_runtime_enum(home, *ty) {
-                Some(runtime) => format!("{runtime}::{}", ctx.emit_ident(*variant)?),
-                None => format!(
-                    "{}::{}",
-                    ctx.enum_name(home, *ty)?,
-                    ctx.emit_ident(*variant)?
-                ),
-            };
-            if args.is_empty() {
-                Ok(path)
-            } else {
-                let mut subs = Vec::with_capacity(args.len());
-                for a in args {
-                    subs.push(render_arm_pat_alias_safe(ctx, a, counter, prelude, guards)?);
-                }
-                Ok(format!("{path}({})", subs.join(", ")))
-            }
-        }
+        } => render_ctor_pat(
+            ctx,
+            CtorPat {
+                home,
+                ty: *ty,
+                variant: *variant,
+                args,
+            },
+            FieldAccess::ByValue,
+            sink,
+            &mut |p: &Pat, s: &mut ArmSink| render_arm_pat_alias_safe(ctx, p, s),
+        ),
         Pat::Record(fields) => {
-            // Mirror [`render_record_pat`]'s struct-name resolution but
-            // recurse sub-patterns through this alias-safe renderer instead
-            // of the plain one.
-            let mut key = Vec::with_capacity(fields.len());
-            for (sym, _) in fields {
-                key.push(ctx.resolve_ident(*sym)?.to_owned());
-            }
-            let struct_name = ctx.record_name_for_literal(&key, None)?.to_owned();
-            let mut parts = Vec::with_capacity(fields.len());
-            for (sym, sub) in fields {
-                let field_ident = ctx.emit_ident(*sym)?;
-                if let Pat::Var(var) = sub
-                    && ctx.emit_ident(*var)? == field_ident
-                {
-                    parts.push(field_ident);
-                } else {
-                    let rendered = render_arm_pat_alias_safe(ctx, sub, counter, prelude, guards)?;
-                    parts.push(format!("{field_ident}: {rendered}"));
-                }
-            }
-            if parts.is_empty() {
-                Ok(format!("{struct_name} {{ .. }}"))
-            } else {
-                Ok(format!("{struct_name} {{ {}, .. }}", parts.join(", ")))
-            }
+            render_record_with(ctx, fields, |p| render_arm_pat_alias_safe(ctx, p, sink))
         }
         // Every `Slice` head selects a list view (`list_arm_head`): a borrowed
         // view matches by reference, an owned view renders through
@@ -1336,16 +1511,10 @@ pub fn render_arm_pat_alias_safe(
                      arms must route through list_arm_head"
                 .to_owned(),
         }),
-        // An or-pattern reaching the alias-safe body carries an alias or a
-        // by-value string leaf inside SOME alternative. A per-alternative match
-        // guard cannot attach to one branch of a Rust or-pattern, so a
-        // string-literal alternative is the residual guarded-alternative case
-        // (design §4.3) — fail closed rather than emit an invalid guarded
-        // or-pattern. An alias-only or-pattern renders each alternative through
-        // this same alias-safe renderer (its clone-split prelude binds the
-        // shared names) and joins with ` | `.
+        // `SharedAlts` holds no string leaf; a per-alternative guard cannot attach
+        // to one branch of a Rust or-pattern, so refuse defensively.
         Pat::Or(alts) => {
-            if alts.iter().any(pat_has_str_guard_slot) {
+            if alts.as_slice().iter().any(pat_has_str_guard_slot) {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::render_arm_pat_alias_safe",
                     detail: "a by-value string-literal leaf inside an or-pattern \
@@ -1355,13 +1524,9 @@ pub fn render_arm_pat_alias_safe(
                         .to_owned(),
                 });
             }
-            let mut parts = Vec::with_capacity(alts.len());
-            for alt in alts {
-                parts.push(render_arm_pat_alias_safe(
-                    ctx, alt, counter, prelude, guards,
-                )?);
-            }
-            Ok(parts.join(" | "))
+            render_or_alternatives(alts.as_slice(), sink, &mut |p: &Pat, s: &mut ArmSink| {
+                render_arm_pat_alias_safe(ctx, p, s)
+            })
         }
         // `Pat::Str` is intercepted above (binder + guard); the remaining
         // leaves render directly.
@@ -1371,6 +1536,23 @@ pub fn render_arm_pat_alias_safe(
     }
 }
 
+/// Does `pat` hold a constructor with a payload anywhere outside a slice?
+fn pat_has_ctor_payload(pat: &Pat) -> bool {
+    match pat {
+        Pat::Ctor { args, .. } => !args.is_empty(),
+        Pat::Alias(inner, _) => pat_has_ctor_payload(inner),
+        Pat::Tuple(elems) => elems.iter().any(pat_has_ctor_payload),
+        Pat::Record(fields) => fields.iter().any(|(_, p)| pat_has_ctor_payload(p)),
+        Pat::Or(alts) => alts.as_slice().iter().any(pat_has_ctor_payload),
+        Pat::Slice { .. }
+        | Pat::Var(_)
+        | Pat::Wildcard
+        | Pat::Int(_)
+        | Pat::Bool(_)
+        | Pat::Char(_)
+        | Pat::Str(_) => false,
+    }
+}
 /// Emit the Rust `let` statement sequence for an irrefutable destructuring
 /// binding `<binder> = <value>` (WITHOUT the trailing body). Shared by both
 /// `Expr::Destructure` emit sites (value-context and tail-context), which is the
@@ -1485,6 +1667,11 @@ pub fn render_rest_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
 
 /// Render a record pattern `{ field0 = p0, … }` to a Rust struct pattern
 /// `RecXY { field0: p0, …, .. }`.
+pub fn render_record_pat(ctx: &EmitCtx, fields: &[(Symbol, Pat)]) -> DResult<String> {
+    render_record_with(ctx, fields, |p| render_pat(ctx, p))
+}
+
+/// Render a record pattern, each field's sub-pattern through `sub`.
 ///
 /// The struct is resolved by the pattern's field-name set, exactly as a record
 /// LITERAL resolves its struct (Rust names struct-pattern fields, so write order
@@ -1497,7 +1684,12 @@ pub fn render_rest_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
 /// bind (zero remaining fields under the complete-set contract — a legal,
 /// no-op `..`). A field whose sub-pattern is a variable bound to the field's own
 /// name renders in Rust shorthand (`x` rather than the lint-flagged `x: x`).
-pub fn render_record_pat(ctx: &EmitCtx, fields: &[(Symbol, Pat)]) -> DResult<String> {
+/// `sub` runs on every field, a shorthand one included, so the prelude it
+/// writes covers every binder.
+fn render_record_with<F>(ctx: &EmitCtx, fields: &[(Symbol, Pat)], mut sub: F) -> DResult<String>
+where
+    F: FnMut(&Pat) -> DResult<String>,
+{
     // Resolve the struct by the (sorted) set of bound field names.
     let mut key = Vec::with_capacity(fields.len());
     for (sym, _) in fields {
@@ -1509,18 +1701,18 @@ pub fn render_record_pat(ctx: &EmitCtx, fields: &[(Symbol, Pat)]) -> DResult<Str
     let struct_name = ctx.record_name_for_literal(&key, None)?.to_owned();
 
     let mut parts = Vec::with_capacity(fields.len());
-    for (sym, sub) in fields {
+    for (sym, field_pat) in fields {
         let field_ident = ctx.emit_ident(*sym)?;
+        let rendered = sub(field_pat)?;
         // Field-pun shorthand: `Rec { x, .. }` instead of `Rec { x: x, .. }`
         // (the latter trips rustc's `non_shorthand_field_patterns` lint). Only
         // when the sub-pattern is a variable whose emitted name equals the
         // field's emitted name.
-        if let Pat::Var(var) = sub
+        if let Pat::Var(var) = field_pat
             && ctx.emit_ident(*var)? == field_ident
         {
             parts.push(field_ident);
         } else {
-            let rendered = render_pat(ctx, sub)?;
             parts.push(format!("{field_ident}: {rendered}"));
         }
     }

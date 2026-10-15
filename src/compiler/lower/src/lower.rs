@@ -23,14 +23,17 @@ use ipe_diagnostics::{
     MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol};
-use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
+use ipe_ir::free_vars::{
+    mentions_free, pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee,
+};
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
 use ipe_ir::once_closure::{CaptureScope, ClosureKind};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
-    ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde, is_dispatch_free, is_irrefutable,
+    RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant,
+    fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde,
+    is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
 use ipe_types::{
@@ -1558,103 +1561,20 @@ fn canon_collect_free_locals(
 //   `rewrite_multiuse_clones` — DFS rewrite; `remaining` starts at the count,
 //       decrements per occurrence; last occurrence (remaining==1) stays bare.
 
-/// Returns `true` when `expr` references `sym` as a live (non-shadowed) local
-/// at any depth, treating nested lambdas as transparent — descending into their
-/// bodies unless one of their parameters re-binds `sym`.
+/// Will a `move` closure whose body is `expr` capture `sym` from the enclosing scope?
 ///
-/// Used to decide whether a `move` closure whose body is `expr` will capture
-/// `sym` from the enclosing scope: if this returns `true`, the outer `move`
-/// closure moves `sym` in.
+/// `expr` is a closure body or a whole closure node; on a node, a parameter
+/// named `sym` shadows the outer binding, so that closure captures nothing of it.
+///
+/// A `move` closure captures by value every free local its body mentions, in
+/// any position and whatever the emitted form there (a borrow, a `.clone()`,
+/// a record-update base), and a nested closure that captures `sym` makes the
+/// outer one capture it too. That is exactly "`sym` occurs free in `expr`",
+/// so this is [`ipe_ir::free_vars::mentions_free`]: every capture consumer
+/// reads the one free-variable walk and none can skip a sub-expression the
+/// others visit.
 fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
-    match expr {
-        Expr::Var(s) | Expr::CloneVar(s) => *s == sym,
-        // Nested lambda: descend unless it shadows `sym` via a parameter.
-        // A nested `move` closure that captures `sym` causes the outer closure
-        // to capture `sym` too.
-        Expr::Lambda { params, body, .. }
-        | Expr::SharedLambda { params, body, .. }
-        | Expr::OnceLambda { params, body, .. } => {
-            if params.iter().any(|(s, _)| *s == sym) {
-                false // sym shadowed by inner lambda param
-            } else {
-                lambda_body_refs_sym(sym, body)
-            }
-        }
-        Expr::Let { name, value, body } => {
-            lambda_body_refs_sym(sym, value)
-                || if *name == sym {
-                    false
-                } else {
-                    lambda_body_refs_sym(sym, body)
-                }
-        }
-        Expr::Destructure {
-            binder,
-            value,
-            body,
-        } => {
-            lambda_body_refs_sym(sym, value)
-                || if pat_binds_symbol(binder, sym) {
-                    false
-                } else {
-                    lambda_body_refs_sym(sym, body)
-                }
-        }
-        Expr::Match(m) => {
-            lambda_body_refs_sym(sym, m.scrutinee())
-                || m.arms().iter().any(|arm| {
-                    !pat_binds_symbol(&arm.pat, sym) && lambda_body_refs_sym(sym, &arm.body)
-                })
-        }
-        Expr::TailLoop { params, body } => {
-            if params.iter().any(|(s, _)| *s == sym) {
-                false
-            } else {
-                lambda_body_refs_sym(sym, body)
-            }
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            lambda_body_refs_sym(sym, lhs) || lambda_body_refs_sym(sym, rhs)
-        }
-        Expr::If { cond, then_, else_ } => {
-            lambda_body_refs_sym(sym, cond)
-                || lambda_body_refs_sym(sym, then_)
-                || lambda_body_refs_sym(sym, else_)
-        }
-        Expr::Call { args, .. } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        Expr::Apply { func, args } => {
-            lambda_body_refs_sym(sym, func) || args.iter().any(|a| lambda_body_refs_sym(sym, a))
-        }
-        Expr::Tuple(items) => items.iter().any(|e| lambda_body_refs_sym(sym, e)),
-        Expr::List { items, .. } => items.iter().any(|e| lambda_body_refs_sym(sym, e)),
-        Expr::Cons { head, tail } => {
-            lambda_body_refs_sym(sym, head) || lambda_body_refs_sym(sym, tail)
-        }
-        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            lambda_body_refs_sym(sym, list)
-        }
-        Expr::Record { fields, .. } => fields.iter().any(|(_, e)| lambda_body_refs_sym(sym, e)),
-        // Update.record is wrapped in `.clone()` by emit_update (borrow, not move).
-        // Only the field value expressions are consuming captures.
-        Expr::Update { fields, .. } => fields.iter().any(|(_, e)| lambda_body_refs_sym(sym, e)),
-        Expr::Ctor { args, .. } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        Expr::TaskSeq { effect, rest } => {
-            lambda_body_refs_sym(sym, effect) || lambda_body_refs_sym(sym, rest)
-        }
-        Expr::TailRecur { args } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        // `Access.record` is borrowed by the emitted `(record).field.clone()` —
-        // a borrow of `record`, not a move.  The lambda still needs to capture
-        // `sym` if `sym` is the record expression, so we recurse.
-        Expr::Access { record, .. } => lambda_body_refs_sym(sym, record),
-        Expr::Int(_)
-        | Expr::Bool(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::CustomElementRef { .. }
-        | Expr::Char(_)
-        | Expr::Unit
-        | Expr::FuncValue { .. } => false,
-    }
+    mentions_free(sym, expr)
 }
 
 // ── Shared (Arc) capture rewrite, E0507 fix ──────────────────────────────────
@@ -1696,14 +1616,10 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 ///
 /// `scope` is where `expr` itself sits; every closure the backend emits steps
 /// it through [`CaptureScope::enter_boundary`], the `move |_|` around a
-/// `TaskSeq` continuation included. Mirrors [`lambda_body_refs_sym`]'s
-/// shadowing discipline exactly, generalised from a boolean "does it occur" to
-/// "where does it occur, possibly more than once". `Expr::Update.record` is
-/// walked too (unlike `lambda_body_refs_sym`, which treats it as borrow-only
-/// for a DIFFERENT question) -- a false positive here only costs an unneeded
-/// (but harmless) `Arc`/`.clone()`, whereas a false negative would leave a
-/// real E0507/E0382 unfixed, so this walker is deliberately the more
-/// conservative of the two.
+/// `TaskSeq` continuation included. It visits every sub-expression and
+/// honours every binder exactly as [`ipe_ir::free_vars::mentions_free`] does,
+/// answering "in which scopes does `sym` occur, possibly more than once"
+/// rather than "does it occur".
 #[allow(clippy::too_many_lines)] // exhaustive IR match; every arm is structurally required
 fn collect_capture_scopes(
     sym: Symbol,
@@ -2706,15 +2622,16 @@ fn find_first_varlocal_span(sym: Symbol, body: &canon::Expr) -> Option<Span> {
 /// * `Destructure { binder binds sym, body }` — skip `body`.
 /// * `Match` arm whose pattern binds `sym` — skip that arm's body.
 /// * `TailLoop` whose params include `sym` — skip `body`.
-/// * `Lambda` — counted as 0 or 1 via `lambda_body_refs_sym`; do NOT recurse
-///   further (inner uses are the Lambda's own business).
+/// * `Lambda` — counted as 0 or 1 via `lambda_body_refs_sym` on the closure
+///   node, so a parameter re-binding `sym` counts 0; do NOT recurse further
+///   (inner uses are the Lambda's own business).
 fn count_var_uses(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         // A pre-pass `CloneVar` at the outer scope counts like a bare `Var`.
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_var_uses(sym, value);
             let in_body = if *name == sym {
@@ -3345,6 +3262,7 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
         | IrType::UrlRelative
         // `Dsn` is non-parametric — mentions no type var.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -3514,6 +3432,7 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -3633,6 +3552,7 @@ fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -4196,7 +4116,7 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(a, out);
             }
         }
-        Pat::Tuple(items) | Pat::Or(items) => {
+        Pat::Tuple(items) => {
             for item in items {
                 collect_ir_pat_syms(item, out);
             }
@@ -4214,7 +4134,8 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(t, out);
             }
         }
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
     }
 }
 
@@ -4790,7 +4711,8 @@ fn arg_forwarded_binders(arg: &Expr, out: &mut Vec<Symbol>) {
 fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
     match pat {
         Pat::Var(s) => out.push(*s),
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
         Pat::Alias(inner, s) => {
             out.push(*s);
             pat_binder_syms(inner, out);
@@ -4811,13 +4733,6 @@ fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
             }
             if let Some(p) = rest.as_deref() {
                 pat_binder_syms(p, out);
-            }
-        }
-        // Every alternative of an or-pattern binds the same names, so walking
-        // one alternative surfaces the complete binder set.
-        Pat::Or(alts) => {
-            if let Some(first) = alts.first() {
-                pat_binder_syms(first, out);
             }
         }
     }
@@ -5712,9 +5627,9 @@ fn align_param_slot(
 fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_fn_value_uses(sym, value);
             let in_body = if *name == sym {
@@ -5896,10 +5811,8 @@ fn fn_value_move_walk(
         }
         // A lambda captures `sym` by move at construction; the whole lambda is
         // one consuming read of `sym` at this point.
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => {
-            if lambda_body_refs_sym(sym, body) {
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            if lambda_body_refs_sym(sym, expr) {
                 state.read(true);
             }
         }
@@ -6252,9 +6165,9 @@ fn reject_fn_value_reuse(
 fn count_value_consumes(sym: Symbol, copy_fields: &BTreeSet<Symbol>, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_value_consumes(sym, copy_fields, value);
             let in_body = if *name == sym {
@@ -6624,10 +6537,8 @@ fn nonclone_move_walk(sym: Symbol, expr: &Expr, state: &mut NonCloneMoveState<'_
                 state.read_whole(true);
             }
         }
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => {
-            if lambda_body_refs_sym(sym, body) {
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            if lambda_body_refs_sym(sym, expr) {
                 state.read_whole(true);
             }
         }
@@ -6902,9 +6813,9 @@ fn sym_is_bare_update_base(sym: Symbol, expr: &Expr) -> bool {
 fn count_var_uses_update_aware(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_var_uses_update_aware(sym, value);
             let in_body = if *name == sym {
@@ -7748,6 +7659,7 @@ fn carrier_shape(ty: &IrType) -> CarrierShape<'_> {
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -8163,6 +8075,7 @@ const fn tag_carrier(tag: ipe_kernels::BuiltinTag) -> TagCarrier {
         | BuiltinTag::Url
         | BuiltinTag::UrlRelative
         | BuiltinTag::Dsn
+        | BuiltinTag::DbLocation
         | BuiltinTag::Connection
         | BuiltinTag::ConnReadOnly
         | BuiltinTag::ConnReadWrite
@@ -8894,37 +8807,6 @@ fn owned_slice_refusal(own: SliceOwnership, prefix: &[Pat], span: Span) -> DResu
     match own {
         SliceOwnership::BorrowClone => Ok(()),
         SliceOwnership::OwnedMove => slice_element_alias_refusal(prefix, span),
-    }
-}
-
-/// Refuse (IPE-L0116) a binding or-pattern over an owned list view.
-///
-/// An owned list view moves each binder out of one view shape, so every
-/// alternative would have to bind each name at the same position of the view;
-/// the owned rendering supports alternatives that bind nothing.
-fn owned_or_refusal(alts: &[Pat], span: Span) -> DResult<()> {
-    let owned = alts.iter().any(holds_owned_slice_head);
-    if owned && alts.iter().any(clone_class::pat_binds_any_name) {
-        return Err(unsupported(span, Feature::NestedCtorDiscrimination));
-    }
-    Ok(())
-}
-
-/// Is `pat` an owned-move slice head, directly or under an alias or or-pattern?
-fn holds_owned_slice_head(pat: &Pat) -> bool {
-    match pat {
-        Pat::Slice { own, .. } => *own == SliceOwnership::OwnedMove,
-        Pat::Alias(inner, _) => holds_owned_slice_head(inner),
-        Pat::Or(alts) => alts.iter().any(holds_owned_slice_head),
-        Pat::Var(_)
-        | Pat::Wildcard
-        | Pat::Int(_)
-        | Pat::Bool(_)
-        | Pat::Char(_)
-        | Pat::Str(_)
-        | Pat::Ctor { .. }
-        | Pat::Tuple(_)
-        | Pat::Record(_) => false,
     }
 }
 
@@ -10117,8 +9999,14 @@ fn collect_pat_ir_type_refs(pat: &Pat, enums: &mut BTreeSet<(ModPath, Symbol)>) 
                 collect_pat_ir_type_refs(p, enums);
             }
         }
-        Pat::Tuple(ps) | Pat::Or(ps) => {
+        Pat::Tuple(ps) => {
             for p in ps {
+                collect_pat_ir_type_refs(p, enums);
+            }
+        }
+        // Each constructor alternative names its enum, so every one is walked.
+        Pat::Or(alts) => {
+            for p in alts.as_slice() {
                 collect_pat_ir_type_refs(p, enums);
             }
         }
@@ -10447,7 +10335,11 @@ fn pat_matches_sqlvalue(pat: &Pat, enums: &[Symbol]) -> bool {
             (home.0.is_empty() && enums.contains(ty))
                 || args.iter().any(|p| pat_matches_sqlvalue(p, enums))
         }
-        Pat::Tuple(ps) | Pat::Or(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
+        Pat::Tuple(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
+        Pat::Or(alts) => alts
+            .as_slice()
+            .iter()
+            .any(|p| pat_matches_sqlvalue(p, enums)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_matches_sqlvalue(p, enums)),
         Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_matches_sqlvalue(p, enums))
@@ -10575,7 +10467,7 @@ pub fn capabilities_reached_from(
 /// yet, carrying the offending node's source `span`. This is the
 /// "not supported yet" channel (`IPE-L01##`), distinct from [`bug`] ("the
 /// compiler is broken"): the input is valid Ipê the supported subset has not reached.
-const fn unsupported(span: Span, feature: Feature) -> Diagnostic {
+pub const fn unsupported(span: Span, feature: Feature) -> Diagnostic {
     Diagnostic::Lower {
         span,
         msg: LowerError::Unsupported(feature),
@@ -11151,6 +11043,7 @@ const fn ir_type_label(ty: &IrType) -> &'static str {
         IrType::Url => "Url",
         IrType::UrlRelative => "Url.Relative",
         IrType::Dsn => "Dsn",
+        IrType::DbLocation => "DbLocation",
         IrType::Connection => "Connection",
         IrType::ConnReadOnly => "ReadOnly",
         IrType::ConnReadWrite => "ReadWrite",
@@ -11181,7 +11074,10 @@ const fn ir_type_label(ty: &IrType) -> &'static str {
 fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
     match pat {
         Pat::Var(s) => *s == target,
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Alias(inner, s) => *s == target || pat_binds_symbol(inner, target),
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_symbol(p, target)),
@@ -11190,9 +11086,6 @@ fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
             prefix.iter().any(|p| pat_binds_symbol(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_symbol(p, target))
         }
-        // Every alternative of an or-pattern binds the same names, so it binds
-        // `target` iff any (equivalently, the first) alternative does.
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_symbol(p, target)),
     }
 }
 
@@ -14178,6 +14071,7 @@ impl<'a> Lowerer<'a> {
             | IrType::Url
             | IrType::UrlRelative
             | IrType::Dsn
+            | IrType::DbLocation
             | IrType::Connection
             | IrType::ConnReadOnly
             | IrType::ConnReadWrite
@@ -18984,6 +18878,9 @@ impl<'a> Lowerer<'a> {
                 // `Dsn` is `Ipe.Db.Dsn`'s opaque validated connection descriptor.
                 // Backed by `ipe_runtime::dsn::Dsn`.
                 "Dsn" => Ok(IrType::Dsn),
+                // `DbLocation` is `Ipe.Db.Location`'s opaque typed location.
+                // Backed by `ipe_runtime::db::DbLocation`.
+                "DbLocation" => Ok(IrType::DbLocation),
                 // `Connection mode` is `Ipe.Db`'s external-connection handle. The
                 // phantom access mode is erased here — the argument is dropped, so
                 // both `Connection ReadOnly` and `Connection ReadWrite` lower to the
@@ -20650,6 +20547,9 @@ impl<'a> Lowerer<'a> {
                 // `Dsn` is `Ipe.Db.Dsn`'s opaque validated connection descriptor.
                 // Backed by `ipe_runtime::dsn::Dsn`.
                 "Dsn" => Ok(IrType::Dsn),
+                // `DbLocation` is `Ipe.Db.Location`'s opaque typed location.
+                // Backed by `ipe_runtime::db::DbLocation`.
+                "DbLocation" => Ok(IrType::DbLocation),
                 // `Connection mode` is `Ipe.Db`'s external-connection handle. The
                 // phantom access mode is erased here — the argument is dropped, so
                 // both `Connection ReadOnly` and `Connection ReadWrite` lower to the
@@ -27084,6 +26984,8 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::MathNan
                 | KernelFn::DictEmpty
                 | KernelFn::SetEmpty
+                // ── `Ipe.Db.Location.memory : DbLocation` — arity 0 ─────────
+                | KernelFn::DbLocationMemory
                 // ── Bytes arity-0 ────────────────────────────────────────────
                 | KernelFn::BytesEmpty
                 // ── JsonEnc arity-0 ────────────────────────────────────
@@ -27367,6 +27269,10 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::DbConnect
                 // `DbClose : Db -> Task Error ()` — takes the pool handle
                 | KernelFn::DbClose
+                // `DbOpen : DbLocation -> Task Error Db`
+                | KernelFn::DbOpen
+                // `Ipe.Db.Location.dsn : Dsn -> DbLocation`
+                | KernelFn::DbLocationDsn
                 // `DbDefaultMigration : String -> Migration` — pure record builder
                 | KernelFn::DbDefaultMigration
                 // ── Ipe.Db.Dsn arity-1 ───────────────────────────────
@@ -27707,8 +27613,9 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::HttpWithUrl
                 | KernelFn::HttpWithRedirects
                 // ── Db arity-2 ───────────────────────────────────────
-                // `DbOpen : String -> String -> Task Error Db`
-                | KernelFn::DbOpen
+                // `Ipe.Db.Location.file`'s kernel : `Int -> Path -> Result
+                //   Error DbLocation` (mode tag, path)
+                | KernelFn::DbLocationFile
                 // `DbExecRaw : Db -> String -> Task Error Int`
                 | KernelFn::DbExecRaw
                 // `unsafeExecRawOn : Connection ReadWrite -> String
@@ -30144,6 +30051,10 @@ impl<'a> Lowerer<'a> {
                     ("Db.Dsn", "user") => Ok(Callee::Kernel(KernelFn::DsnUser)),
                     ("Db.Dsn", "tlsTag") => Ok(Callee::Kernel(KernelFn::DsnTlsTag)),
                     ("Db.Dsn", "redacted") => Ok(Callee::Kernel(KernelFn::DsnRedacted)),
+                    // Ipe.Db.Location — the typed location `Db.open` takes.
+                    ("Db.Location", "file") => Ok(Callee::Kernel(KernelFn::DbLocationFile)),
+                    ("Db.Location", "memory") => Ok(Callee::Kernel(KernelFn::DbLocationMemory)),
+                    ("Db.Location", "dsn") => Ok(Callee::Kernel(KernelFn::DbLocationDsn)),
                     // External Connection — connect a parsed `Dsn`, close it, and
                     // the `Ipe.Db.Unsafe`-homed raw exec hatch.
                     ("Db.Dsn", "open") => Ok(Callee::Kernel(KernelFn::DbConnOpen)),
@@ -31019,18 +30930,14 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
                 Err(unsupported(p.span, Feature::NestedCtorDiscrimination))
             }
-            // A nested or-pattern inside a constructor payload (`Wrap (Red |
-            // Green)`) lowers each alternative through this same payload lowerer
-            // into a [`Pat::Or`]; the backend renders `Wrap(Red | Green)`, which
-            // Rust accepts. Bindings shared across the alternatives (proved in
-            // canon/types) resolve directly, with the body emitted once.
-            canon::Pattern_::POr(alts) => {
-                let lowered = alts
-                    .iter()
-                    .map(|a| self.lower_payload_pat(a))
-                    .collect::<DResult<Vec<_>>>()?;
-                Ok(Pat::Or(lowered))
-            }
+            // `or_split` lifts every nested or-pattern to whole case-arm heads
+            // before lowering, so none survives in a constructor payload.
+            canon::Pattern_::POr(_) => Err(Diagnostic::CompilerBug {
+                where_: "lower.lower_payload_pat",
+                detail: "an or-pattern survived inside a constructor payload; \
+                         or_split lifts every nested or-pattern to the arm head"
+                    .to_owned(),
+            }),
         }
     }
 
@@ -32467,9 +32374,12 @@ impl<'a> Lowerer<'a> {
         // survived to `Match::new_flat` and ICE'd on well-typed source.
         let branches = live;
 
+        // A native or-pattern head discriminates on each of its alternatives,
+        // so a constructor-alternative head counts as constructor-headed.
         let all_ctor = branches
             .iter()
-            .all(|br| matches!(br.pat.value, canon::Pattern_::PCtor { .. }));
+            .flat_map(|br| crate::or_split::head_alternatives(&br.pat))
+            .all(|p| matches!(p.value, canon::Pattern_::PCtor { .. }));
 
         let arms = branches
             .iter()
@@ -32613,9 +32523,11 @@ impl<'a> Lowerer<'a> {
             // The scrutinee's enum is one this module declared (the type checker
             // pinned the constructor's union), so it is always in
             // `enum_variants` — the *true* variant set handed to `Match::new`.
-            let canon::Pattern_::PCtor {
+            let Some(canon::Pattern_::PCtor {
                 home, type_name, ..
-            } = &first.pat.value
+            }) = crate::or_split::head_alternatives(&first.pat)
+                .first()
+                .map(|p| &p.value)
             else {
                 return Err(bug(
                     "ipe_lower::lower_case",
@@ -32658,10 +32570,9 @@ impl<'a> Lowerer<'a> {
                         .as_deref()
                         .is_some_and(Self::arm_has_dispatch_needing_alias)
             }
-            // An or-pattern carries a dispatch-needing alias iff any alternative
-            // does — recurse into every alternative.
-            Pat::Or(alts) => alts.iter().any(Self::arm_has_dispatch_needing_alias),
-            Pat::Var(_)
+            // A `SharedAlts` alternative holds no alias.
+            Pat::Or(_)
+            | Pat::Var(_)
             | Pat::Wildcard
             | Pat::Int(_)
             | Pat::Bool(_)
@@ -32806,19 +32717,23 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
                 self.lower_list_arm_pat(p, ty_span)
             }
-            // An or-pattern `p1 | p2 | …` lowers each alternative through this
-            // same arm lowerer into a single [`Pat::Or`]. The backend renders it
-            // as the native Rust or-pattern `p1 | p2 | …` with the arm body
-            // emitted ONCE — every alternative binds the same names (proved in
-            // canon/types), so a single body reads those binders whichever
-            // alternative matched. No body duplication.
+            // An or-pattern arm head that `or_split` kept native: binder-free
+            // constructor or Int/Char/Bool alternatives, rendered as the native
+            // Rust or-pattern `p1 | p2 | …` with the arm body emitted once.
             canon::Pattern_::POr(alts) => {
                 let lowered = alts
                     .iter()
                     .map(|a| self.lower_arm_pat(a, ty_span))
                     .collect::<DResult<Vec<_>>>()?;
-                owned_or_refusal(&lowered, p.span)?;
-                Ok(Pat::Or(lowered))
+                SharedAlts::new(lowered)
+                    .map(Pat::Or)
+                    .ok_or_else(|| Diagnostic::CompilerBug {
+                        where_: "lower.lower_arm_pat",
+                        detail: "an or-pattern arm head holds an alternative other than a \
+                                 binder-free constructor or an Int/Char/Bool literal; \
+                                 or_split splits every such arm"
+                            .to_owned(),
+                    })
             }
         }
     }
@@ -37595,6 +37510,7 @@ mod tests {
             | ipe_ir::IrType::Url
             | ipe_ir::IrType::UrlRelative
             | ipe_ir::IrType::Dsn
+            | ipe_ir::IrType::DbLocation
             | ipe_ir::IrType::Connection
             | ipe_ir::IrType::ConnReadOnly
             | ipe_ir::IrType::ConnReadWrite
@@ -39381,47 +39297,6 @@ mod tests {
         );
     }
 
-    /// A binding or-pattern over an owned list view is refused with IPE-L0116; one binding nothing is accepted.
-    #[test]
-    fn owned_or_pattern_binding_fails_closed() {
-        use ipe_diagnostics::Feature;
-        use ipe_ir::{Pat, SliceOwnership};
-
-        use super::{owned_or_refusal, unsupported};
-
-        let mut fx = OwnFixture::new();
-        let x = fx.sym("x");
-        let span = Span::new(17, 23);
-        let slice = |own, prefix: Vec<Pat>| Pat::Slice {
-            prefix,
-            rest: None,
-            own,
-            elem: ipe_ir::IrType::Task(Box::new(ipe_ir::IrType::Int)),
-        };
-        let binding = [
-            slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),
-            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard, Pat::Var(x)]),
-        ];
-        assert_eq!(
-            owned_or_refusal(&binding, span),
-            Err(unsupported(span, Feature::NestedCtorDiscrimination))
-        );
-        let unbound = [
-            slice(SliceOwnership::OwnedMove, vec![]),
-            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard]),
-        ];
-        assert_eq!(owned_or_refusal(&unbound, span), Ok(()));
-        // A borrowed view copies each binder out, so a binding or-pattern stays accepted.
-        let borrowed = [
-            slice(SliceOwnership::BorrowClone, vec![Pat::Var(x)]),
-            slice(
-                SliceOwnership::BorrowClone,
-                vec![Pat::Wildcard, Pat::Var(x)],
-            ),
-        ];
-        assert_eq!(owned_or_refusal(&borrowed, span), Ok(()));
-    }
-
     /// A binding nested list in a constructor payload over a non-`Clone` element is refused with IPE-L0116.
     #[test]
     fn nested_owned_cons_in_ctor_payload_fails_closed() {
@@ -39903,6 +39778,333 @@ mod tests {
                     "`{shape}` over {item:?} is reported as holding an Arc function"
                 );
             }
+        }
+    }
+
+    /// The capture predicate is the free-variable walk, at every capture site and binder.
+    ///
+    /// One fixture per `Expr` shape with `card` as its only possible capture
+    /// site: `lambda_body_refs_sym` and `mentions_free` must both agree with
+    /// `free_vars(e).contains(&card)` and with the pinned verdict. The
+    /// record-update base and the match guard are capture sites a `move`
+    /// closure captures whatever their emitted form.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture per `Expr` shape
+    fn mentions_free_agrees_with_free_vars() {
+        use ipe_ir::free_vars::{free_vars, mentions_free};
+        use ipe_ir::{
+            Arm, BinOp, CallPin, Callee, Expr, FuncId, IrType, Match, ModPath, OnFormKind, Pat,
+        };
+
+        use ipe_intern::Symbol;
+
+        use super::lambda_body_refs_sym;
+
+        let mut interner = Interner::new();
+        let card = interner.intern("card").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let flavor = interner.intern("flavor").expect("intern");
+        let ty = interner.intern("Card").expect("intern");
+        let var = || Expr::Var(card);
+        let update = |record: Expr| Expr::Update {
+            record: Box::new(record),
+            fields: vec![(flavor, Expr::Int(1))],
+        };
+        let access = |record: Expr| Expr::Access {
+            record: Box::new(record),
+            field: flavor,
+            field_ty: IrType::Int,
+        };
+        let lambda = |param: Symbol, body: Expr| Expr::Lambda {
+            params: vec![(param, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(body),
+        };
+        let flat = |scrutinee: Expr, arms: Vec<Arm>| {
+            Expr::Match(Match::new_flat(scrutinee, arms).expect("catch-all arm is exhaustive"))
+        };
+        let call = |args: Vec<Expr>| Expr::Call {
+            callee: Callee::Func(FuncId::from_raw(0)),
+            args,
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+
+        let cases: Vec<(&str, Expr, bool)> = vec![
+            ("var", var(), true),
+            ("clone var", Expr::CloneVar(card), true),
+            ("literal", Expr::Int(0), false),
+            ("update base", update(var()), true),
+            (
+                "update field",
+                Expr::Update {
+                    record: Box::new(Expr::Var(x)),
+                    fields: vec![(flavor, var())],
+                },
+                true,
+            ),
+            (
+                "update base access chain",
+                update(access(access(var()))),
+                true,
+            ),
+            ("nested update base", update(update(var())), true),
+            ("access", access(var()), true),
+            (
+                "record field",
+                Expr::Record {
+                    fields: vec![(flavor, var())],
+                    ty: None,
+                },
+                true,
+            ),
+            (
+                "ctor arg",
+                Expr::Ctor {
+                    home: ModPath(vec![ty]),
+                    ty,
+                    variant: ty,
+                    args: vec![var()],
+                },
+                true,
+            ),
+            ("call arg", call(vec![Expr::Unit, var()]), true),
+            (
+                "apply callee",
+                Expr::Apply {
+                    func: Box::new(var()),
+                    args: vec![Expr::Unit],
+                },
+                true,
+            ),
+            (
+                "binop",
+                Expr::BinOp {
+                    op: BinOp::IntAdd,
+                    lhs: Box::new(Expr::Int(1)),
+                    rhs: Box::new(var()),
+                },
+                true,
+            ),
+            (
+                "if branch",
+                Expr::If {
+                    cond: Box::new(Expr::Bool(true)),
+                    then_: Box::new(Expr::Unit),
+                    else_: Box::new(update(var())),
+                },
+                true,
+            ),
+            ("tuple", Expr::Tuple(vec![Expr::Unit, var()]), true),
+            (
+                "list",
+                Expr::List {
+                    elem: IrType::Int,
+                    items: vec![var()],
+                },
+                true,
+            ),
+            (
+                "cons tail",
+                Expr::Cons {
+                    head: Box::new(Expr::Int(1)),
+                    tail: Box::new(var()),
+                },
+                true,
+            ),
+            (
+                "list index",
+                Expr::ListIndexClone {
+                    list: Box::new(var()),
+                    index: 0,
+                    elem: IrType::Int,
+                },
+                true,
+            ),
+            (
+                "list len check",
+                Expr::ListLenCheck {
+                    list: Box::new(var()),
+                    len: 1,
+                    exact: true,
+                },
+                true,
+            ),
+            (
+                "match scrutinee",
+                flat(var(), vec![Arm::new(Pat::Wildcard, Expr::Unit)]),
+                true,
+            ),
+            (
+                "match guard",
+                flat(
+                    Expr::Bool(true),
+                    vec![
+                        Arm {
+                            pat: Pat::Bool(true),
+                            body: Expr::Unit,
+                            guard: Some(update(var())),
+                        },
+                        Arm::new(Pat::Wildcard, Expr::Unit),
+                    ],
+                ),
+                true,
+            ),
+            (
+                "match arm shadows",
+                flat(Expr::Unit, vec![Arm::new(Pat::Var(card), update(var()))]),
+                false,
+            ),
+            (
+                "task seq rest",
+                Expr::TaskSeq {
+                    effect: Box::new(Expr::Unit),
+                    rest: Box::new(update(var())),
+                },
+                true,
+            ),
+            ("nested lambda", lambda(x, update(var())), true),
+            ("lambda param shadows", lambda(card, update(var())), false),
+            (
+                "let value",
+                Expr::Let {
+                    name: x,
+                    value: Box::new(update(var())),
+                    body: Box::new(Expr::Unit),
+                },
+                true,
+            ),
+            (
+                "let shadows body",
+                Expr::Let {
+                    name: card,
+                    value: Box::new(Expr::Unit),
+                    body: Box::new(update(var())),
+                },
+                false,
+            ),
+            (
+                "destructure shadows body",
+                Expr::Destructure {
+                    binder: Pat::Tuple(vec![Pat::Var(card), Pat::Wildcard]),
+                    value: Box::new(Expr::Unit),
+                    body: Box::new(var()),
+                },
+                false,
+            ),
+            (
+                "tail loop shadows",
+                Expr::TailLoop {
+                    params: vec![(card, IrType::Int)],
+                    body: Box::new(var()),
+                },
+                false,
+            ),
+            (
+                "tail recur arg",
+                Expr::TailRecur { args: vec![var()] },
+                true,
+            ),
+        ];
+
+        for (label, expr, captures) in &cases {
+            let free = free_vars(expr).contains(&card);
+            assert_eq!(free, *captures, "{label}: free_vars verdict");
+            assert_eq!(mentions_free(card, expr), free, "{label}: mentions_free");
+            assert_eq!(
+                lambda_body_refs_sym(card, expr),
+                free,
+                "{label}: lambda_body_refs_sym"
+            );
+            assert!(
+                !mentions_free(ty, expr),
+                "{label}: an absent symbol is never free"
+            );
+        }
+    }
+
+    /// A closure whose parameter re-binds `card` captures nothing of the outer `card`.
+    ///
+    /// Every capture counter and move walk asks the closure node, not its bare
+    /// body, so the shadowing closure is neither a use nor a move of the outer
+    /// binding: no spurious pre-clone, and no false IPE-L0135 for a non-`Clone`
+    /// value read after it. A closure that does capture `card` stays one
+    /// consuming use.
+    #[test]
+    fn a_closure_whose_param_shadows_sym_captures_nothing() {
+        use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath};
+
+        use super::clone_class::rewrite_multiuse_clones;
+        use super::{
+            CloneEnv, count_fn_value_uses, count_value_consumes, count_var_uses,
+            count_var_uses_update_aware, fn_value_use_after_consume, nonclone_read_after_move,
+        };
+
+        let mut interner = Interner::new();
+        let card = interner.intern("card").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let main = interner.intern("Main").expect("intern");
+        let wrap = interner.intern("Wrap").expect("intern");
+        let closure_over = |param| Expr::Lambda {
+            params: vec![(param, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(Expr::Var(card)),
+        };
+        let then_read = |param| Expr::Tuple(vec![closure_over(param), Expr::Var(card)]);
+
+        let no_copy = BTreeSet::new();
+        let transparent = BTreeSet::new();
+        let payloads = EnumPayloadTable::new();
+        let env = CloneEnv {
+            interner: &interner,
+            transparent_ffi: &transparent,
+            payloads: &payloads,
+        };
+        let wrap_task = IrType::Enum {
+            home: ModPath(vec![main]),
+            name: wrap,
+            args: vec![IrType::Task(Box::new(IrType::Int))],
+        };
+
+        for (param, uses) in [(card, 0_usize), (x, 1)] {
+            let closure = closure_over(param);
+            assert_eq!(count_var_uses(card, &closure), uses, "count_var_uses");
+            assert_eq!(
+                count_var_uses_update_aware(card, &closure),
+                uses,
+                "count_var_uses_update_aware"
+            );
+            assert_eq!(
+                count_fn_value_uses(card, &closure),
+                uses,
+                "count_fn_value_uses"
+            );
+            assert_eq!(
+                count_value_consumes(card, &no_copy, &closure),
+                uses,
+                "count_value_consumes"
+            );
+
+            let captures = uses == 1;
+            assert_eq!(
+                fn_value_use_after_consume(card, &then_read(param), &payloads),
+                captures,
+                "fn_value_use_after_consume"
+            );
+            assert_eq!(
+                nonclone_read_after_move(env, card, &wrap_task, &then_read(param)),
+                captures,
+                "nonclone_read_after_move"
+            );
+
+            let mut remaining = 2;
+            let rewritten = rewrite_multiuse_clones(card, &mut remaining, closure_over(param));
+            assert_eq!(remaining, 2 - uses, "rewrite_multiuse_clones slot");
+            assert_eq!(
+                matches!(rewritten, Expr::Let { .. }),
+                captures,
+                "rewrite_multiuse_clones pre-clone wrap"
+            );
         }
     }
 }

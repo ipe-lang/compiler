@@ -434,6 +434,10 @@ impl ServerPendingStream {
     /// so the handler's next `emit` reports the client gone. A gate that
     /// cannot prove those credentials now answers 401 and never runs the
     /// handler (fail closed).
+    ///
+    /// The body ends once the server drains, and counts as live until it
+    /// ends. A server already past its live ceiling answers 503 and never
+    /// runs the handler.
     #[must_use]
     pub fn serve(self, head: ServerResponseHead) -> axum::response::Response {
         use axum::response::IntoResponse;
@@ -443,6 +447,10 @@ impl ServerPendingStream {
         } = self;
         let Some(gate) = crate::server::ChannelGate::open(&credentials).ok() else {
             return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        };
+        let drain = crate::server::shutdown::drain();
+        let Some(live) = drain.hold() else {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
         let id = loop {
@@ -471,31 +479,79 @@ impl ServerPendingStream {
                 .remove(&id);
         });
 
-        // Receiver to byte stream: unfold yields each chunk; `None` ends the
-        // body once every sender has dropped (finish / handler exit), or once
-        // the gate denies, which drops the receiver. A chunk is written only
-        // after the gate settles, so a credential the handler bound, or a
-        // revocation already due, is proved before the chunk leaves.
-        let body_stream =
-            futures_util::stream::unfold((rx, gate), |(mut rx, mut gate)| async move {
-                tokio::select! {
-                    biased;
-                    () = crate::server::channel_denial(&mut gate) => None,
-                    chunk = rx.recv() => match chunk {
-                        Some(chunk) if !crate::server::channel_unsettled(&mut gate) => {
-                            Some((Ok::<String, std::io::Error>(chunk), (rx, gate)))
-                        }
-                        Some(_) | None => None,
-                    },
-                }
-            });
+        let body_stream = stream_body(rx, gate, drain, live);
         head.into_response(axum::body::Body::from_stream(body_stream))
     }
+}
+
+/// A served stream's body: the handler's chunks until it ends, the gate denies, or the server drains.
+///
+/// `None` ends the body once every sender has dropped (finish / handler
+/// exit), once the gate denies, or once the server drains; each drops the
+/// receiver, and the end drops `live`. A chunk is written only after the gate
+/// settles, so a credential the handler bound, or a revocation already due,
+/// is proved before the chunk leaves.
+fn stream_body(
+    rx: tokio::sync::mpsc::Receiver<String>,
+    gate: Option<crate::server::ChannelGate>,
+    drain: crate::server::shutdown::Drain,
+    live: crate::server::shutdown::LiveGuard,
+) -> impl futures_util::Stream<Item = Result<String, std::io::Error>> + Send {
+    futures_util::stream::unfold(
+        (rx, gate, drain, live),
+        |(mut rx, mut gate, mut drain, live)| async move {
+            tokio::select! {
+                biased;
+                () = crate::server::channel_denial(&mut gate) => None,
+                () = drain.wait() => None,
+                chunk = rx.recv() => match chunk {
+                    Some(chunk) if !crate::server::channel_unsettled(&mut gate) => {
+                        Some((Ok(chunk), (rx, gate, drain, live)))
+                    }
+                    Some(_) | None => None,
+                },
+            }
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt as _;
+
+    /// A served stream's body ends once the server drains, and its live count clears.
+    #[tokio::test]
+    async fn a_stream_body_ends_on_the_drain_and_releases_its_live_count() {
+        let (armed, signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let drain = armed.drain();
+        let live = drain.hold();
+        assert!(live.is_some(), "a serving server admits the stream");
+        let Some(live) = live else {
+            return;
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(STREAM_CHAN_BUFFER);
+        let mut body = Box::pin(stream_body(rx, None, drain, live));
+        assert!(tx.send("chunk".to_owned()).await.is_ok());
+        let first = body.next().await;
+        assert!(matches!(first, Some(Ok(ref c)) if c == "chunk"));
+        assert_eq!(armed.live_count(), 1, "an open body is live");
+        assert!(
+            signals
+                .send(crate::server::shutdown::Signal::Terminate)
+                .await
+                .is_ok()
+        );
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await;
+        assert!(matches!(end, Ok(None)), "the body ends on the drain");
+        drop(body);
+        assert_eq!(armed.live_count(), 0, "the ended body is no longer live");
+        drop(tx);
+    }
 
     /// The kind and message of a refused task, or `None` when it succeeded.
     fn refusal<A>(result: IpeResult<IpeError, A>) -> Option<(IpeErrorKind, String)> {

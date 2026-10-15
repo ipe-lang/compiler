@@ -1,0 +1,81 @@
+-- | Ipe.Db.Location — the typed location `Db.open` opens.
+--
+-- `DbLocation` is opaque and reserved: the only ways to obtain one are `file`,
+-- `memory` and `dsn`. A location is never text a database driver parses as a
+-- URL or a connection string, so no character of a file name can change how
+-- the file is opened.
+--
+-- `file` parses its `Path` once: a relative path is taken relative to the
+-- working directory, and any byte but `:` may appear in a file name (`?`, `#`,
+-- `&` and `%` are ordinary bytes). A path that names no file, holds a `:` after
+-- its drive, names a network share, or runs past 512 bytes is a typed `Err`.
+--
+-- There is no accessor: code that names the file in a message keeps its own
+-- `Path`. A location may carry a `Dsn`, so it is shown redacted.
+module Ipe.Db.Location exposing
+    ( DbLocation
+    , Mode(..)
+    , file
+    , memory
+    , dsn
+    )
+
+
+import Ipe.Ffi.Kernel as Kernel
+import Ipe.Error exposing (Error)
+import Ipe.Path exposing (Path)
+import Ipe.Db.Dsn exposing (Dsn)
+
+
+-- | How `file` opens its file.
+type Mode
+    = ReadExisting
+    | WriteExisting
+    | CreateIfMissing
+
+
+-- | `file mode path` — the SQLite file at `path`, opened under `mode`.
+-- `ReadExisting` opens read-only and `WriteExisting` read-write, and both fail
+-- when the file is absent; `CreateIfMissing` opens read-write and creates the
+-- file when absent. Returns `Err` with kind `InvalidInput` when `path` names no
+-- file (empty, `.`, `..`, a root, or a trailing separator), holds a `:` after
+-- its drive or is drive-relative, starts with two separators (`//`, `\\`) or
+-- with `\??\` (a network share or device), or runs past 512
+-- bytes once a relative path gains its leading `./`.
+file : Mode -> Path -> Result Error DbLocation
+file mode path =
+    fileKernel (modeTag mode) path
+
+
+-- | `memory` — a fresh private in-memory SQLite database. Each `Db.open` of it
+-- is a separate database that no other open can see.
+memory : DbLocation
+memory =
+    Kernel.kernel "Db.Location_memory"
+
+
+-- | `dsn descriptor` — the database a parsed `Dsn` names.
+dsn : Dsn -> DbLocation
+dsn =
+    Kernel.kernel "Db.Location_dsn"
+
+
+-- The runtime constructor over the mode's tag. `Mode` is marshalled to its
+-- small-integer discriminant by `modeTag` before the call, so no ADT crosses
+-- the kernel boundary.
+fileKernel : Int -> Path -> Result Error DbLocation
+fileKernel =
+    Kernel.kernel "Db.Location_file"
+
+
+modeTag : Mode -> Int
+modeTag mode =
+    case mode of
+        ReadExisting ->
+            0
+
+        WriteExisting ->
+            1
+
+        CreateIfMissing ->
+            2

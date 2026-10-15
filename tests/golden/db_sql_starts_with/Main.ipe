@@ -1,6 +1,7 @@
 module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Unsafe
 import Ipe.Db.Sql
 import Ipe.Error as Error
@@ -95,4 +96,4 @@ main =
                         |> Task.andThen (\_ -> Task.succeed ())
                 )
         )
-        (Db.open "sqlite" "sqlite::memory:")
+        (Db.open Location.memory)

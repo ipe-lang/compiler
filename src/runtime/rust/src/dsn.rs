@@ -104,9 +104,11 @@ impl DsnHost {
 /// Holds its decoded text and reaches a connection URL only percent-encoded
 /// ([`DsnPart::encoded`]), so no character in it can end the component it sits
 /// in and add URL syntax such as a `sslmode` parameter. A user name is
-/// credential-adjacent, so it has no derived (early-exit) equality.
+/// credential-adjacent, so its equality is constant-time, never derived.
 #[derive(Clone, Debug)]
 struct DsnPart(String);
+
+crate::ct_eq::impl_ct_eq!(DsnPart);
 
 impl DsnPart {
     /// A part written percent-encoded in a URL, held decoded.
@@ -169,11 +171,12 @@ enum SqliteDb {
 impl SqliteDb {
     /// The database a literal file name opens.
     ///
-    /// `:memory:` names the in-memory database; a name starting `file:` is
+    /// `:memory:` names the in-memory database; a name starting `file:` or
+    /// naming a network share or device ([`names_network_or_device`]) is
     /// refused.
     fn of_name(name: String) -> Result<Self, DsnReject> {
         clean_text(&name)?;
-        if name.starts_with("file:") {
+        if name.starts_with("file:") || names_network_or_device(&name) {
             Err(DsnReject::InvalidComponent)
         } else if name == SQLITE_MEMORY {
             Ok(Self::Memory)
@@ -245,6 +248,16 @@ struct Credentials {
     password: Option<Secret>,
 }
 
+impl PartialEq for Credentials {
+    /// Both halves are always compared, so a matching user name does not
+    /// shorten the time a differing password takes.
+    fn eq(&self, other: &Self) -> bool {
+        let same_user = self.user == other.user;
+        let same_password = self.password == other.password;
+        same_user && same_password
+    }
+}
+
 impl Credentials {
     /// The credentials of an optional user name and a literal password.
     ///
@@ -264,7 +277,7 @@ impl Credentials {
 }
 
 /// What a DSN connects to, per driver.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum DsnTarget {
     /// A PostgreSQL database name.
     Postgres(DsnPart),
@@ -279,7 +292,11 @@ enum DsnTarget {
 /// (cloning observes no plaintext — `Secret`'s own `Clone` does not reveal the
 /// payload). No `Display`/`IpeStringify` is derived: a `Dsn` is only ever
 /// rendered through its explicit redacted form.
-#[derive(Clone)]
+///
+/// `PartialEq` compares the non-secret fields, then the credentials in
+/// constant time ([`Credentials`]), so a record holding a `Dsn` derives
+/// equality like every other derivable field.
+#[derive(Clone, PartialEq)]
 pub struct Dsn {
     target: DsnTarget,
     host: DsnHost,
@@ -450,6 +467,18 @@ fn clean_text(s: &str) -> Result<(), DsnReject> {
     } else {
         Ok(())
     }
+}
+
+/// True when the file name `name` starts with two separators (`//`, `\\`, or a
+/// mix) or the NT object prefix `\??\` (either separator).
+///
+/// On Windows each names a network share or a device, so opening it can dial
+/// a remote host; no SQLite file name may take either form on any platform.
+pub(crate) fn names_network_or_device(name: &str) -> bool {
+    let separator = |b: &u8| matches!(b, b'/' | b'\\');
+    let bytes = name.as_bytes();
+    matches!(bytes, [a, b, ..] if separator(a) && separator(b))
+        || matches!(bytes, [a, b'?', b'?', d, ..] if separator(a) && separator(d))
 }
 
 /// True when `s` names the Postgres driver.
@@ -904,6 +933,23 @@ mod tests {
         match dsn_parse::<String>(s.to_string()) {
             IpeResult::Ok(_) => panic!("expected {s:?} to be rejected, but it parsed"),
             IpeResult::Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn equality_compares_every_part_including_credentials() {
+        let base = "postgres://alice:pw1@db.example:5432/app";
+        assert!(parse_ok(base) == parse_ok(base));
+        for other in [
+            "postgres://bob:pw1@db.example:5432/app",
+            "postgres://alice:pw2@db.example:5432/app",
+            "postgres://alice@db.example:5432/app",
+            "postgres://alice:pw1@db.example:5433/app",
+            "postgres://alice:pw1@other.example:5432/app",
+            "postgres://alice:pw1@db.example:5432/other",
+            "postgres://alice:pw1@db.example:5432/app?sslmode=prefer",
+        ] {
+            assert!(parse_ok(base) != parse_ok(other), "{other} must differ");
         }
     }
 
@@ -1401,7 +1447,7 @@ mod tests {
         "sqlite:x.db",
         "u:p@x.db",
         "/abs/p?q#r.db",
-        "//x/caf\u{e9}[1].db",
+        "x/caf\u{e9}[1].db",
     ];
 
     /// A built SQLite file name opens that very file `mode=rwc`, for the
@@ -1522,6 +1568,44 @@ mod tests {
                 "{name:?} must be refused"
             );
         }
+    }
+
+    /// A SQLite file name naming a network share or device is refused, built
+    /// or parsed (spelled out or percent-encoded); a single leading separator
+    /// is the control.
+    #[test]
+    fn sqlite_network_and_device_names_are_refused() {
+        for name in [
+            "//host/s/x.db",
+            "\\\\host\\s\\x.db",
+            "\\\\?\\C:\\x.db",
+            "\\\\.\\pipe\\x",
+            "/\\host\\s\\x.db",
+            "\\/host/s/x.db",
+            "\\??\\UNC\\host\\s\\x.db",
+            "/??/UNC/host/s/x.db",
+        ] {
+            assert!(
+                matches!(sqlite_build(name), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{name:?} must be refused"
+            );
+        }
+        for dsn in [
+            "sqlite:////host/s/x.db",
+            "sqlite://%5C%5Chost%5Cs%5Cx.db",
+            "sqlite:%5C%3F%3F%5CUNC%5Chost%5Cs%5Cx.db",
+            "sqlite:/%2Fhost/s/x.db",
+        ] {
+            assert!(
+                matches!(dsn_parse::<String>(dsn.to_owned()), IpeResult::Err(ref e) if e.contains("invalid DSN component")),
+                "{dsn:?} must be refused"
+            );
+        }
+        assert!(matches!(sqlite_build("/host/s/x.db"), IpeResult::Ok(_)));
+        assert!(matches!(
+            dsn_parse::<String>("sqlite:///host/s/x.db".to_owned()),
+            IpeResult::Ok(_)
+        ));
     }
 
     // ── Secure defaults ──────────────────────────────────────────────────────
