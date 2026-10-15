@@ -8879,7 +8879,12 @@ mod sse_reconnect_reconcile_tests {
             return (0, None);
         };
         let committed = drive_one(fx, request).await;
-        (committed, await_entry(reply_rx).await.map(|r| r.body))
+        (
+            committed,
+            await_entry(reply_rx)
+                .await
+                .map(|r| r.page.html.as_str().to_owned()),
+        )
     }
 
     /// Two reconnects at one new path, both queued before the driver runs,
