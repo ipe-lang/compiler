@@ -17220,7 +17220,16 @@ mod web_revocation_tests {
             .and_then(crate::web::store::SessionKey::parse);
         assert!(parsed.is_some(), "a minted sid is a session key");
         let code = production_only(&code_only(include_str!("mod.rs")));
-        assert!(!code.contains("new_v4("), "an id mint panics on no entropy");
+        assert!(
+            code.contains("fn minted_sid(") && !code.contains("fn new_sid("),
+            "the scan sees the production mint and not the test fixture"
+        );
+        assert_eq!(
+            code.matches("sid_from(").count(),
+            2,
+            "a production sid is drawn only through the fallible `sid_from`"
+        );
+        assert!(!code.contains("new_v4"), "an id mint panics on no entropy");
     }
 
     /// Every task a Cmd dispatch spawns runs in the session's scope, every
