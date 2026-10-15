@@ -1920,6 +1920,22 @@ fn entry_unavailable() -> axum::response::Response {
         .into_response()
 }
 
+/// The page's CSRF double-submit token, reused from a well-formed cookie or minted.
+///
+/// Reusing the browser's per-app cookie keeps a reload on the same token. A
+/// refused mint is the 503 [`entry_unavailable`] answer, sent with no cookie;
+/// there is no fallback token.
+#[cfg(feature = "web")]
+fn page_csrf_token(
+    headers: &axum::http::HeaderMap,
+    mint: impl FnOnce() -> Result<String, crate::entropy::EntropyError>,
+) -> Result<String, axum::response::Response> {
+    csrf::cookie_value(headers, &csrf::csrf_cookie_name_for(&web_base_path()))
+        .filter(|t| csrf::token_is_well_formed(t))
+        .map_or_else(mint, Ok)
+        .map_err(|_| entry_unavailable())
+}
+
 /// The 503 a request gets when the process holds as many sessions as it admits.
 #[cfg(feature = "web")]
 fn at_capacity() -> axum::response::Response {
@@ -2878,8 +2894,8 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
 /// caller refuses the request with; there is no fallback value.
 #[cfg(feature = "web")]
 fn sid_from(
-    fill: impl FnOnce(&mut [u8; 16]) -> Result<(), crate::csp::EntropyError>,
-) -> Result<String, crate::csp::EntropyError> {
+    fill: impl FnOnce(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError>,
+) -> Result<String, crate::entropy::EntropyError> {
     let mut bits = [0; 16];
     fill(&mut bits)?;
     Ok(format!(
@@ -2893,17 +2909,17 @@ fn sid_from(
 ///
 /// # Errors
 ///
-/// Returns [`crate::csp::EntropyError`] when the OS yields no entropy.
+/// Returns [`crate::entropy::EntropyError`] when the OS yields no entropy.
 #[cfg(feature = "web")]
-fn minted_sid(_proof: mint_proof::MintProof) -> Result<String, crate::csp::EntropyError> {
-    sid_from(|bits| getrandom::getrandom(bits).map_err(|_| crate::csp::EntropyError))
+fn minted_sid(_proof: mint_proof::MintProof) -> Result<String, crate::entropy::EntropyError> {
+    sid_from(|bits| crate::entropy::fill_entropy(bits))
 }
 
 /// A fresh sid for a test fixture.
 #[cfg(all(test, feature = "web"))]
 #[allow(clippy::expect_used)] // the test host's CSPRNG yields entropy
 fn new_sid() -> String {
-    sid_from(|bits| getrandom::getrandom(bits).map_err(|_| crate::csp::EntropyError))
+    sid_from(|bits| crate::entropy::fill_entropy(bits))
         .expect("the test host's CSPRNG yields entropy")
 }
 
@@ -4635,9 +4651,10 @@ mod handlers {
         // per-app CSRF cookie (so a reload keeps the same token), else mint a
         // fresh one. `page_response` sets the cookie + injects the value into
         // the page JS; the client echoes it back in the `X-Ipê-Csrf` header.
-        let csrf_tok = csrf::cookie_value(&headers, &csrf::csrf_cookie_name_for(&web_base_path()))
-            .filter(|t| csrf::token_is_well_formed(t))
-            .unwrap_or_else(csrf::gen_token);
+        let csrf_tok = match page_csrf_token(&headers, csrf::mint_token) {
+            Ok(token) => token,
+            Err(refusal) => return refusal,
+        };
 
         //
         // serve from the static root) BEFORE any session work — they must
@@ -17877,7 +17894,7 @@ mod web_revocation_tests {
     /// production path mints an id through a generator that panics instead.
     #[test]
     fn sid_mint_refuses_without_entropy() {
-        use crate::csp::EntropyError;
+        use crate::entropy::EntropyError;
         assert_eq!(super::sid_from(|_| Err(EntropyError)), Err(EntropyError));
         let sid = super::sid_from(|bits| {
             bits.fill(0xa5);
@@ -18184,5 +18201,53 @@ mod web_static_mount_tests {
         for uri in ["/static//hello.txt", "/static///hello.txt"] {
             assert_eq!(serve(uri).await, axum::http::StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+mod page_csrf_mint_tests {
+    //! The page GET's CSRF token is reused or minted, and a refused mint is a 503.
+
+    use super::page_csrf_token;
+    use crate::entropy::EntropyError;
+    use std::cell::Cell;
+
+    /// A page GET with no cookie and a failing mint answers 503 with
+    /// `Retry-After: 1` and sets no cookie.
+    #[test]
+    fn page_csrf_mint_failure_is_503() {
+        let headers = axum::http::HeaderMap::new();
+        let refused = page_csrf_token(&headers, || Err(EntropyError));
+        assert!(refused.is_err(), "a refused mint yields no token");
+        let Err(resp) = refused else { return };
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
+    }
+
+    /// A well-formed cookie token is reused and the mint is never called.
+    #[test]
+    #[allow(clippy::expect_used)] // test: a fixed ASCII cookie header
+    fn page_csrf_reuses_a_well_formed_cookie_without_minting() {
+        let token = "ab".repeat(32);
+        let name = super::csrf::csrf_cookie_name_for(&super::web_base_path());
+        let mut headers = axum::http::HeaderMap::new();
+        let cookie = format!("{}={token}", name.as_str());
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&cookie).expect("an ASCII cookie header"),
+        );
+        let mints = Cell::new(0_u32);
+        let reused = page_csrf_token(&headers, || {
+            mints.set(mints.get() + 1);
+            Err(EntropyError)
+        });
+        assert_eq!(reused.ok(), Some(token));
+        assert_eq!(mints.get(), 0, "a reused token draws nothing");
     }
 }

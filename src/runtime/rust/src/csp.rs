@@ -127,10 +127,6 @@ impl CspHash {
     }
 }
 
-/// Why a per-session secret could not be drawn from the OS CSPRNG.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EntropyError;
-
 /// The number of random bytes in a [`StyleNonce`].
 pub const STYLE_NONCE_BYTES: usize = 16;
 

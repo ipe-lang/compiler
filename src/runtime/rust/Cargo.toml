@@ -91,7 +91,8 @@ serde_urlencoded = { version = "0.7", optional = true }
 # Optional, behind `crypto-core` (and `secret`, which implies `crypto-core`): a
 # program that reaches neither the crypto floor nor a `Secret` drops it.
 subtle = { version = "2", optional = true }
-# OS CSPRNG for the `crypto_core` entropy pair (`Crypto.randomBytes` /
+# OS CSPRNG, called only by `entropy::fill_entropy`, the runtime's one entropy
+# source. Its draws back the `crypto_core` entropy pair (`Crypto.randomBytes` /
 # `randomToken`), `random.rs`'s seed, and every scratch name the always-present
 # `scratch_core` primitive creates (the `File.tempFile`/`tempDir` kernels, the
 # console store, atomic-replace siblings). The wasm32 target block below adds
@@ -133,10 +134,12 @@ unicode-general-category = { version = "1", optional = true }
 # the crypto/db/server/email/jwt/web surfaces — those features each imply
 # `encoding`. A program that reaches none of these drops all three crates.
 base64 = { version = "0.22", optional = true }
-# `Ipe.Uuid` v4/v7/parse, behind the `uuid` feature. The `server` / `web`
-# surfaces mint session/CSRF ids via `uuid::new_v4` (they imply `uuid`); a bare
-# Program that reaches none drops the crate.
-uuid = { version = "1", features = ["v4", "v7"], optional = true }
+# `Ipe.Uuid` v4/v7/parse and the `jwt` `jti`, behind the `uuid` feature. No
+# RNG feature: ids are built with uuid's infallible builders from
+# `entropy::fill_entropy` draws, so uuid's panicking generators do not exist in
+# the build. The `server` / `web` surfaces imply `uuid`; a bare Program that
+# reaches none drops the crate.
+uuid = { version = "1", optional = true }
 hex = { version = "0.4", optional = true }
 percent-encoding = { version = "2", optional = true }
 # `chrono` (base calendar/clock) is optional, behind the `time-core` feature.
@@ -219,16 +222,15 @@ rustix = { version = "1", features = ["pty", "termios", "fs", "process", "std"] 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"], optional = true }
 
-# wasm32 floor: uuid's entropy backend needs the getrandom js shim in the
-# browser; `js` is a no-op on native targets so scoping it here keeps the
-# native feature graph identical.
+# wasm32 floor: the static wasm module set declares `uuid_kernel`, so the
+# crate is always present there. Like the native entry it carries no RNG
+# feature; its ids draw through `entropy::fill_entropy`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-uuid = { version = "1", features = ["v4", "v7", "js"] }
+uuid = { version = "1" }
 # `Random.*` / `Crypto.randomBytes` / `Crypto.randomToken` browser substitute:
 # the `js` feature backs `getrandom()` with `crypto.getRandomValues` (the exact
-# mechanism `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q3 names). Direct dep (not just
-# transitively via uuid) so `random.rs`/`crypto.rs` can call it without pulling
-# `aes-gcm` just for its `OsRng` re-export.
+# mechanism `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q3 names). It backs
+# `entropy::fill_entropy`, the runtime's one entropy source, on every target.
 getrandom = { version = "0.2", features = ["js"] }
 # Browser sink (`wasm` module, feature `wasm-client`). Pinned exact
 # wasm-bindgen: the emitted-project glue is produced by the wasm-bindgen CLI,
@@ -343,11 +345,11 @@ encoding = ["dep:base64", "dep:hex", "dep:percent-encoding"]
 # reaches neither an `Ipe.Regex` kernel nor `String.isUrl` drops all four crates.
 regex = ["dep:regex"]
 # `Ipe.Uuid` v4/v7/parse: the `uuid` crate and the `uuid_kernel.rs` module. The
-# `server` / `web` surfaces mint session/CSRF ids via `uuid::new_v4`, so both
-# imply `uuid`; a bare Program that reaches no `Ipe.Uuid` kernel drops the crate.
+# `server` / `web` surfaces imply `uuid`; a bare Program that reaches no
+# `Ipe.Uuid` kernel drops the crate.
 uuid = ["dep:uuid"]
 # `Ipe.Random` non-cryptographic PRNG: gates the `random.rs` module, whose
-# seed draws from the always-present `getrandom`.
+# wasm seed draws from the always-present `entropy::fill_entropy`.
 random = []
 # The cryptographic floor: `crypto_core.rs` (SHA-2 hash + HMAC + RSA-gated arm +
 # constant-time compare + entropy pair + typed Key/Mac). Pulls `sha2` / `hmac` /
@@ -425,10 +427,10 @@ crypto = ["rsa", "bcrypt", "aes-gcm", "chacha20poly1305", "pbkdf2", "dep:sha1", 
 # `jwt.rs` signs with `crypto_core`'s HMAC/RSA (via `crypto`, which implies
 # `crypto-core`) and wraps its `Algorithm` in a `secret::Secret`, so it implies
 # `secret` (which itself implies `crypto-core`).
-# `auth.rs` (compiled under `#[cfg(feature = "jwt")]`) calls
-# `uuid::Uuid::new_v4()` to mint per-session `jti` ids — so `jwt` implies
-# `uuid`. A jwt-or-auth program that reaches no direct `Ipe.Uuid` kernel still
-# needs the crate for `auth_sign_token`'s entropy call.
+# `auth.rs` (compiled under `#[cfg(feature = "jwt")]`) builds per-session
+# `jti` ids with `uuid::Builder` from `entropy::fill_entropy` bytes — so `jwt`
+# implies `uuid`. A jwt-or-auth program that reaches no direct `Ipe.Uuid`
+# kernel still needs the crate for `auth_sign_token`'s id.
 jwt = ["json", "crypto", "secret", "dep:jsonwebtoken", "uuid"]
 compression = ["flate2", "zstd", "tokio", "random"]
 csv_kernel = ["csv", "tokio", "random"]
@@ -486,7 +488,7 @@ email = ["tokio", "reqwest", "lettre", "dep:serde_json", "json", "serde", "http_
 # `http_client`. `tokio/net`: `ws_client.rs` opens the pinned TCP socket.
 # `serde`: `ws_client.rs` derives Serialize/Deserialize on its frame wire types.
 websocket_client = ["tokio", "tokio/net", "tokio/sync", "tokio-tungstenite", "futures-util", "url", "random", "serde"]
-# The session-id / CSRF-token RNG draws from the OS CSPRNG via `uuid`, so `web`
+# The session-id / CSRF-token mints draw from `entropy::fill_entropy`, so `web`
 # needs no `aes-gcm`; `subtle` (constant-time compare) and `sha2` (client-JS SRI
 # integrity hash) ride the `crypto-core` feature `web` lists below. `serde` (the
 # floor-type wire derives) + `serde_urlencoded` (typed form-record decode, whose
@@ -651,8 +653,8 @@ proc-macro2 = "1"
 # test`/`cargo check --tests` targets, including wasm32 — `bcrypt 0.17` and
 # `proptest`'s `rand 0.9` chain both pull `getrandom 0.3` (`rand_core 0.9`),
 # which collides with the pinned `getrandom 0.2` (`features = ["js"]`) this
-# crate's own `[dependencies]` uses for the wasm entropy shim (`uuid`/
-# `crypto_random_bytes`/`random.rs`'s `lcg_init`). getrandom 0.2 and 0.3 are
+# crate's own `[dependencies]` uses for the wasm entropy shim
+# (`entropy::fill_entropy`). getrandom 0.2 and 0.3 are
 # NOT the same crate to cargo (SemVer-major difference) so cargo happily
 # resolves both into one dependency graph — but `getrandom 0.3` refuses to
 # build on `wasm32-unknown-unknown` at all without an explicit

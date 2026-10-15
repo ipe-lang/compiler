@@ -4,16 +4,17 @@
 // seeded from the wall clock), implementing Ipê's `Random.*` surface with the
 // SAME contract as the  `math/rand`. Its output is fully predictable
 // and MUST NEVER back a secret, token, session id, nonce, salt, or any value an
-// attacker must not guess. Every security-bearing draw in this runtime already
-// uses the OS CSPRNG (`OsRng` / `getrandom`) instead:
-//   - session ids        → live/mod.rs `new_sid` (OsRng, 128-bit)
-//   - tokens / entropy    → crypto.rs `crypto_random_token` / `crypto_random_bytes`
-//   - AEAD nonces, keys   → crypto.rs (OsRng)
-//   - CSRF token          → live/csrf.rs `gen_token` (OsRng)
-//   - UUID v4             → `uuid::new_v4` (getrandom)
-// When adding a new security-bearing random value, route it through `OsRng`, NOT
-// through any `lcg_*` / `random_*` fn here. (Audit finding: low/weak-crypto —
-// recorded as an invariant so a future change can't silently violate it.)
+// attacker must not guess. The runtime's one cryptographic random door is
+// `entropy::fill_entropy`; every security-bearing draw goes through it:
+//   - session ids         → web/mod.rs `new_sid`
+//   - tokens / entropy    → crypto_core.rs `crypto_random_token` / `crypto_random_bytes`
+//   - AEAD nonces         → crypto.rs `crypto_aes_gcm_encrypt` / `crypto_chacha20_encrypt`
+//   - CSRF token          → server.rs `mint_csrf_token`
+//   - UUID v4 / v7, `jti` → uuid_kernel.rs, auth.rs `auth_sign_token`
+// When adding a new security-bearing random value, draw it through
+// `entropy::fill_entropy`, NOT through any `lcg_*` / `random_*` fn here.
+// (Audit finding: low/weak-crypto — recorded as an invariant so a future
+// change can't silently violate it.)
 use super::{IpeMaybe, IpeResult, IpeTask, ok_res, str_err};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,7 +24,7 @@ static LCG_STATE: AtomicU64 = AtomicU64::new(0);
 /// `wasm32-unknown-unknown` (part of std) but TRAPS at runtime — no clock
 /// without the `wasmbind` feature this target does not carry. The M4 browser
 /// substitute (`Random.*` — Q3: "SUBSTITUTE | `crypto.getRandomValues`")
-/// seeds from `getrandom(js)` instead: real entropy, not merely a
+/// seeds from `entropy::fill_entropy` instead: real entropy, not merely a
 /// platform-safe stand-in, and the same source `crypto_random_bytes` uses.
 #[cfg(not(target_arch = "wasm32"))]
 fn lcg_seed() -> u64 {
@@ -36,12 +37,12 @@ fn lcg_seed() -> u64 {
 #[cfg(target_arch = "wasm32")]
 fn lcg_seed() -> u64 {
     let mut buf = [0u8; 8];
-    // A `getrandom` failure is vanishingly rare (no browser entropy source);
-    // falling back to a fixed non-zero constant keeps `lcg_init` infallible
-    // (its callers are non-Task pure kernels) rather than panicking — the LCG
-    // is documented non-cryptographic regardless, so a degraded-but-total
-    // fallback is sound here specifically.
-    if getrandom::getrandom(&mut buf).is_err() {
+    // A refused draw (no browser entropy source) falls back to a fixed
+    // non-zero constant, keeping `lcg_init` infallible (its callers are
+    // non-Task pure kernels) rather than panicking — the LCG is documented
+    // non-cryptographic regardless, so a degraded-but-total fallback is sound
+    // here specifically.
+    if crate::entropy::fill_entropy(&mut buf).is_err() {
         return 0x9E37_79B9_7F4A_7C15;
     }
     u64::from_le_bytes(buf)
