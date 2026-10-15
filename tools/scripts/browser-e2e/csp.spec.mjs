@@ -16,9 +16,14 @@
  *      a second such render within the reload window leaves the page as it is
  *      under the out-of-date banner, applying no later update. A navigation
  *      so answered, or one from a stale document, is a full browser load of
- *      its target.
+ *      its target. A patches frame either end of which is not an epoch of the
+ *      document's history reloads the same way, and patches in an event
+ *      answer, which no epoch orders, never apply.
  *   4. Patched styles — a style block a patch inserts, and one whose text a
  *      patch replaces, both apply (examples/shapes/web/csp-styles).
+ *   5. Navigation — the URL follows the render on screen: an older answer to a
+ *      navigation a later one superseded moves neither the DOM nor the URL,
+ *      and a popstate whose fetch fails is a full browser load of the entry.
  *
  * Each refusal serves the real page, with its own headers, and its HTML
  * rewritten in flight.
@@ -300,4 +305,140 @@ test("patched styles: an inserted and a rewritten style block both apply", async
     .toEqual({ nonced: true, mark: "inserted" });
   expect(await page.evaluate(styleRuling, red)).toBeNull();
   expect(await page.evaluate(() => window.__e2eViolations)).toEqual([]);
+});
+
+/** A complete SSE body of one `patches` frame carrying `fields`. */
+function patchesStream(fields) {
+  const frame = { globalSeq: 1, patches: [], ...fields };
+  return `event: patches\ndata: ${JSON.stringify(frame)}\n\n`;
+}
+
+for (const [label, fields] of [
+  ["no `from` and a `to` of another history", { to: FOREIGN_EPOCH }],
+  ["a `from` that is no epoch", { from: 7, to: FOREIGN_EPOCH }],
+]) {
+  test(`render history: a patches frame with ${label} reloads once`, async ({ page }) => {
+    const loads = await openWithStream(page, patchesStream(fields), 1);
+    await expect.poll(() => loads.count, { timeout: 15000 }).toBe(2);
+    await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+    await page.waitForTimeout(2000);
+    expect(loads.count).toBe(2);
+    expect(await page.locator("#card").count()).toBe(1);
+  });
+}
+
+/** Open the csp-styles page live; its boot epoch and one of the same history 1000 renders on. */
+async function openLive(page) {
+  await page.goto(STYLES);
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  const boot = await page.evaluate(() => window.__IPE_EPOCH);
+  const [inc, n] = boot.split(".");
+  return { boot, later: `${inc}.${Number(n) + 1000}` };
+}
+
+/** Append an `ipe-nav` link to `path` with id `e2e-link-<name>`. */
+async function addNavLink(page, name, path) {
+  await page.evaluate(
+    ([name, path]) => {
+      const a = document.createElement("a");
+      a.id = `e2e-link-${name}`;
+      a.setAttribute("ipe-nav", "");
+      a.href = path;
+      a.textContent = name;
+      document.body.appendChild(a);
+    },
+    [name, path],
+  );
+}
+
+/** A navigation answer at `epoch` whose render is `body`. */
+function navAnswer(epoch, body) {
+  return {
+    status: 200,
+    headers: { "content-type": "text/html", "x-ipe-web": "1", "x-ipe-epoch": epoch },
+    body,
+  };
+}
+
+test("render history: patches in an event answer never apply", async ({ page }) => {
+  await openLive(page);
+  const id = await page.evaluate(() =>
+    document.querySelector("#ipe-root [ipe-id]").getAttribute("ipe-id"),
+  );
+  let answered = 0;
+  await page.route(
+    (url) => url.origin === STYLES && url.pathname === "/_ipe/event",
+    async (route) => {
+      answered += 1;
+      return route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json", "x-ipe-web": "1" },
+        body: JSON.stringify({
+          seq: 1000000,
+          patches: [{ id, html: '<div id="e2e-foreign">foreign patch</div>' }],
+        }),
+      });
+    },
+  );
+  await page.locator("#show").click();
+  await expect.poll(() => answered, { timeout: 10000 }).toBeGreaterThan(0);
+  await page.waitForTimeout(1500);
+  expect(await page.locator("#e2e-foreign").count()).toBe(0);
+});
+
+test("navigation: a superseded navigation's older answer moves neither the DOM nor the URL", async ({
+  page,
+}) => {
+  const { boot, later } = await openLive(page);
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    (url) => url.origin === STYLES && ["/e2e-first", "/e2e-second"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      if (new URL(route.request().url()).pathname === "/e2e-first") {
+        await held;
+        return route.fulfill(navAnswer(boot, '<div id="e2e-foreign">older render</div>'));
+      }
+      return route.fulfill(navAnswer(later, '<div id="e2e-second">later render</div>'));
+    },
+  );
+  await addNavLink(page, "first", "/e2e-first");
+  await addNavLink(page, "second", "/e2e-second");
+  await page.locator("#e2e-link-first").click();
+  await page.locator("#e2e-link-second").click();
+  await page.waitForSelector("#e2e-second", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/e2e-second`);
+  release();
+  await page.waitForTimeout(2000);
+  await expect(page).toHaveURL(`${STYLES}/e2e-second`);
+  expect(await page.locator("#e2e-foreign").count()).toBe(0);
+});
+
+test("navigation: a popstate whose fetch fails loads the popped entry", async ({ page }) => {
+  const loads = { count: 0 };
+  page.on("request", (r) => {
+    if (r.isNavigationRequest() && r.frame() === page.mainFrame()) loads.count += 1;
+  });
+  const { later } = await openLive(page);
+  await page.route(
+    (url) => url.origin === STYLES && ["/", "/e2e-away"].includes(url.pathname),
+    async (route) => {
+      if (route.request().headers()["x-ipe-nav"] !== "1") return route.continue();
+      if (new URL(route.request().url()).pathname === "/") return route.abort();
+      return route.fulfill(navAnswer(later, '<div id="e2e-away">away</div>'));
+    },
+  );
+  await addNavLink(page, "away", "/e2e-away");
+  await page.locator("#e2e-link-away").click();
+  await page.waitForSelector("#e2e-away", { timeout: 10000 });
+  await expect(page).toHaveURL(`${STYLES}/e2e-away`);
+  expect(loads.count).toBe(1);
+  await page.evaluate(() => history.back());
+  await expect.poll(() => loads.count, { timeout: 15000 }).toBe(2);
+  await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+  await expect(page).toHaveURL(`${STYLES}/`);
+  expect(await page.locator("#e2e-away").count()).toBe(0);
 });

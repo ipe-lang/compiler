@@ -1641,7 +1641,6 @@ enum EventRefusal {
 fn stale_render_response<Model, Msg: Clone>(
     e: &SessionEntry<Model, Msg>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     let page = e.rendered.page();
     let body = serde_json::json!({
         "refused": "stale-render",
@@ -1650,15 +1649,39 @@ fn stale_render_response<Model, Msg: Clone>(
         "body": page.as_str(),
     })
     .to_string();
-    (
+    session_body_response(
         axum::http::StatusCode::CONFLICT,
-        [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
-            (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
-        ],
-        body,
+        "application/json",
+        &[("x-ipe-web", "1")],
+        axum::body::Body::from(body),
     )
-        .into_response()
+}
+
+/// The one constructor of a response whose body carries a session's render or
+/// model.
+///
+/// A render's style elements hold the nonce of its history, and both are the
+/// session's alone, so no cache may store the body: the response is
+/// `no-store`, with `content_type` and the `marks` headers. A page response
+/// takes the same `no-store` from its security headers.
+#[cfg(feature = "web")]
+fn session_body_response(
+    status: axum::http::StatusCode,
+    content_type: &'static str,
+    marks: &[(&'static str, &'static str)],
+    body: axum::body::Body,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut builder = axum::http::Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CACHE_CONTROL, "no-store");
+    for &(name, value) in marks {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// The HTTP answer to an [`EventRefusal`], one arm per variant.
@@ -5232,18 +5255,13 @@ mod handlers {
         // The closer ends the stream when the session is closed, although
         // the driver, Cmd tasks and the heartbeat may still hold senders.
         let body_stream = session_stream(rx, (SessionGauge, entry), closer, drain);
-        match Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
-            .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(axum::body::Body::from_stream(body_stream))
-        {
-            Ok(r) => r.into_response(),
-            // Headers/status are all literals, so this never fails; total
-            // fallback per the no-runtime-errors rule.
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
+        // Its frames carry renders, nonced styles included.
+        session_body_response(
+            StatusCode::OK,
+            "text/event-stream",
+            &[("x-accel-buffering", "no")],
+            axum::body::Body::from_stream(body_stream),
+        )
     }
 
     // ── POST /_ipe/event ──────────────────────────────────────────────
@@ -6108,12 +6126,12 @@ mod handlers {
         }
         let resp_json =
             serde_json::json!({ "body": html_body.as_str(), "epoch": epoch.to_token() });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/reset ────────────────────────────────────────────
@@ -6430,12 +6448,12 @@ mod handlers {
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/back ─────────────────────────────────────────────
@@ -6513,12 +6531,12 @@ mod handlers {
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/forward ──────────────────────────────────────────
@@ -6600,12 +6618,12 @@ mod handlers {
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── GET /_ipe/debug/inspect ───────────────────────────────────────────────
@@ -6648,12 +6666,12 @@ mod handlers {
             crate::debugger::server::inspect_model(&e.model)
         };
         let resp_json = serde_json::json!({ "model": rendered });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 }
 
@@ -8340,6 +8358,62 @@ mod base_path_tests {
             js.contains("__ipeSwapPreservingFocus(root, parsed)")
                 && js.contains("var parsed = __ipeShellRoot(__ipeParseFor(root, t), t);"),
             "__ipePatch splices the nodes of its one parse, never a re-serialized copy"
+        );
+    }
+
+    /// The client moves its render epoch only through its two adopt
+    /// functions, and patches the DOM by diff only through `__ipeAdoptPatches`.
+    ///
+    /// Each adopt function admits only a token parsed as an epoch of the
+    /// document's own history, and a diff only as the next step from the render
+    /// on screen; a frame or an answer that bypassed them could move the epoch
+    /// to an unparsed token, or apply patches onto a DOM they were not diffed
+    /// from.
+    #[test]
+    fn client_moves_its_epoch_only_through_the_adopt_gates() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let writes = |text: &str| -> usize {
+            text.match_indices("__ipeEpoch")
+                .filter(|(at, name)| {
+                    text.get(at + name.len()..).is_some_and(|after| {
+                        let after = after.trim_start();
+                        after.starts_with('=') && !after.starts_with("==")
+                    })
+                })
+                .count()
+        };
+        let full = body_of("__ipeAdoptFullBody").unwrap_or_default();
+        let diff = body_of("__ipeAdoptPatches").unwrap_or_default();
+        let step = body_of("__ipePatchStep").unwrap_or_default();
+        assert_eq!(
+            js.matches("var __ipeEpoch = __ipeBoot[\"epoch\"];").count(),
+            1
+        );
+        assert_eq!(
+            (writes(js), writes(full), writes(diff)),
+            (3, 1, 1),
+            "`__ipeEpoch` is written at boot and in the two adopt functions only"
+        );
+        assert!(
+            full.contains("var next = __ipeOwnEpoch(token);")
+                && diff.contains("__ipePatchStep(from, to) !== \"next\"")
+                && step.contains("var a = __ipeOwnEpoch(from);")
+                && step.contains("var b = __ipeOwnEpoch(to);"),
+            "each adopt function parses the epochs it adopts"
+        );
+        assert_eq!(
+            js.matches("__ipeApplyPatches(").count(),
+            2,
+            "`__ipeApplyPatches` has its definition and one caller"
+        );
+        assert!(
+            diff.contains("__ipeApplyPatches(patches);"),
+            "the one caller of `__ipeApplyPatches` is `__ipeAdoptPatches`"
         );
     }
 
@@ -12655,6 +12729,58 @@ mod emitted_router_behavior_tests {
                 rx.try_recv().map(|queued| queued.msg).is_err(),
                 "an unstamped event must not dispatch"
             );
+        });
+    }
+
+    /// Every response carrying a session render is `no-store`: the stream,
+    /// whose frames carry renders, and the `409` refusal carrying the current
+    /// one. Their style elements hold the session's nonce.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the requests are fixtures
+    fn responses_carrying_a_render_are_never_stored() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let cookie = format!("{}={sid}", cookie_name_for(""));
+            let cache = |resp: &axum::response::Response| {
+                resp.headers()
+                    .get_all(header::CACHE_CONTROL)
+                    .iter()
+                    .map(|v| v.to_str().map(str::to_owned))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            };
+
+            let refusal = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_ipe/event")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, cookie.as_str())
+                        .body(Body::from(click_body(&plus, None, None)))
+                        .expect("build POST"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(refusal.status(), StatusCode::CONFLICT);
+            assert_eq!(cache(&refusal), Some(vec!["no-store".to_owned()]));
+
+            let stream = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(header::COOKIE, cookie.as_str())
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(stream.status(), StatusCode::OK);
+            assert_eq!(cache(&stream), Some(vec!["no-store".to_owned()]));
         });
     }
 

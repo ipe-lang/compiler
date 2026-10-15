@@ -250,31 +250,57 @@ function __ipeEpochParts(token) {
   if (!/^[0-9a-f]{32}$/.test(inc) || !/^[1-9][0-9]*$/.test(n)) return null;
   return { inc: inc, n: n };
 }
-// Whether a full render at epoch `token` may replace the DOM: only a render of
-// this document's own history, and within it only one no older than the
-// render on screen. Counters are canonical decimals, so a longer one is larger.
-function __ipeFullBodyAdmits(token) {
-  var next = __ipeEpochParts(token);
-  if (!next || next.inc !== __ipeBootInc) return false;
-  var cur = __ipeEpochParts(__ipeEpoch);
-  if (!cur || cur.inc !== next.inc) return true;
-  if (next.n.length !== cur.n.length) return next.n.length > cur.n.length;
-  return next.n >= cur.n;
+// The parts of `token` when it is an epoch of this document's own history;
+// null for any other value.
+function __ipeOwnEpoch(token) {
+  var parts = __ipeEpochParts(token);
+  return parts && parts.inc === __ipeBootInc ? parts : null;
 }
-// Apply a full render through `applyFn` when its epoch admits it, then adopt
-// that epoch. A render with no epoch, or of another history, would style
+// The order of two counters of one history: negative, zero or positive.
+// Counters are canonical decimals, so a longer one is larger.
+function __ipeCounterOrder(a, b) {
+  if (a.n.length !== b.n.length) return a.n.length - b.n.length;
+  return a.n === b.n ? 0 : (a.n > b.n ? 1 : -1);
+}
+// `__ipeEpoch` is written only by the two adopt functions below, and each
+// adopts only a token it has parsed as an epoch of this document's history.
+//
+// Apply a full render through `applyFn` when its epoch is of this document's
+// history and no older than the render on screen, then adopt that epoch; true
+// when it applied. A render with no epoch, or of another history, would style
 // against a nonce this document does not hold: it is never applied, and the
 // document is stale.
 function __ipeAdoptFullBody(token, applyFn) {
-  if (__ipeStale) return;
-  var next = __ipeEpochParts(token);
-  if (!next || next.inc !== __ipeBootInc) {
+  if (__ipeStale) return false;
+  var next = __ipeOwnEpoch(token);
+  if (!next) {
     __ipeStaleDocument();
-    return;
+    return false;
   }
-  if (!__ipeFullBodyAdmits(token)) return;
+  var cur = __ipeOwnEpoch(__ipeEpoch);
+  if (cur && __ipeCounterOrder(next, cur) < 0) return false;
   applyFn();
   __ipeEpoch = token;
+  return true;
+}
+// Where the patches diffed from render `from` to render `to` stand against the
+// DOM on screen: "next" when `from` is the render on screen and `to` follows it
+// in this document's history; "behind" when the screen is another render of
+// that history; "foreign" when either end is not an epoch of this history, or
+// `to` does not follow `from`.
+function __ipePatchStep(from, to) {
+  var a = __ipeOwnEpoch(from);
+  var b = __ipeOwnEpoch(to);
+  if (!a || !b || __ipeCounterOrder(b, a) <= 0) return "foreign";
+  return from === __ipeEpoch ? "next" : "behind";
+}
+// Apply `patches` and adopt `to`, only as the next step from the render on
+// screen; true when they applied. The one caller of `__ipeApplyPatches`.
+function __ipeAdoptPatches(from, to, patches) {
+  if (__ipeStale || __ipePatchStep(from, to) !== "next") return false;
+  __ipeApplyPatches(patches);
+  __ipeEpoch = to;
+  return true;
 }
 // Set once this document has refused a render of another history: from then
 // on it applies no patch and no full render.
@@ -1311,9 +1337,11 @@ function __ipePostEvent(body) {
         __ipeLoaderEnd();
         __ipeOnPostSuccess();
         if (!data) return;
-        __ipeHandleResponse(data.seq, data.ackInputs, function() {
-          if (data.patches) __ipeApplyPatches(data.patches);
-        }, data.globalSeq);
+        // An accepted event is acked with its seq; its render arrives over
+        // the stream, whose frames name the epochs they move between. Any
+        // patches an answer carries have no epoch to gate on: they never
+        // apply.
+        __ipeHandleResponse(data.seq, data.ackInputs, function() {}, data.globalSeq);
       });
     }
     // An event is answered in JSON; the one marked text answer is the
@@ -1833,6 +1861,10 @@ window.__ipePortSend = function(raw) {
 var __ipeNavPath   = window.location.pathname;
 var __ipeNavSearch = window.location.search;
 var __ipeNavHref   = window.location.href;
+// The count of navigations (ipe-nav clicks and popstates) this document has
+// started. The URL follows a navigation's answer only while no later one was
+// started, or when that answer itself rendered.
+var __ipeNavCount = 0;
 // The URL to record for a navigation fetch: the canonical URL the server
 // redirected it to, or `fallback`. A followed URL is used only when it is
 // same-origin and its path begins with exactly one `/`; the original hash is
@@ -1869,6 +1901,7 @@ __ipeDoc.on("click", function(ev) {
     if (u.origin !== window.location.origin) return;
   } catch (e) { return; }
   ev.preventDefault();
+  var nav = ++__ipeNavCount;
   fetch(href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
       var url = __ipeFollowed(r, href);
@@ -1884,8 +1917,11 @@ __ipeDoc.on("click", function(ev) {
         window.location.href = href;
         return;
       }
-      __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
-      if (__ipeStale) return;
+      // An older render of this history is not applied: the screen already
+      // shows a later one. That later render shows this navigation's page
+      // only when no later navigation was started meanwhile.
+      var applied = __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
+      if (__ipeStale || !(applied || nav === __ipeNavCount)) return;
       window.history.pushState({}, "", res.url);
       __ipeNavPath   = window.location.pathname;
       __ipeNavSearch = window.location.search;
@@ -1907,6 +1943,13 @@ window.addEventListener("popstate", function() {
   __ipeNavPath = here.pathname;
   __ipeNavSearch = here.search;
   __ipeNavHref = here.href;
+  ++__ipeNavCount;
+  // A stale document applies no render: the browser loads the popped entry,
+  // as it follows a stale document's links.
+  if (__ipeStale) {
+    window.location.reload();
+    return;
+  }
   fetch(here.href, { headers: { "X-Ipe-Nav": "1" }, credentials: "same-origin" })
     .then(function(r) {
       if (r.redirected) {
@@ -1920,7 +1963,10 @@ window.addEventListener("popstate", function() {
     })
     .then(function(res) {
       __ipeAdoptFullBody(res.epoch, function() { __ipePatch(res.t, "nav"); });
-    });
+    })
+    // The URL already names the popped entry: with no answer to show, the
+    // browser loads it. One load per popstate, which only the reader starts.
+    .catch(function() { window.location.reload(); });
 });
 // ── Status banner (connection state) ─────────────────────────
 // Single bottom-pinned element rendered by the runtime (NOT by the
@@ -2357,9 +2403,15 @@ var __ipeLiveFrames = {
     }
     if (__ipeStale || !frame || typeof frame !== "object" || !frame.patches) return;
     // The patches diff the render `from` against `to`: they apply only onto
-    // the DOM of `from`. Any other DOM resyncs through a fresh SSE open, whose
-    // first frame is the full current render.
-    if (typeof frame.from === "string" && frame.from !== __ipeEpoch) {
+    // the DOM of `from`. Another render of this history resyncs through a
+    // fresh SSE open, whose first frame is the full current render; a frame
+    // either end of which is not of this history leaves the document stale.
+    var step = __ipePatchStep(frame.from, frame.to);
+    if (step === "foreign") {
+      __ipeStaleDocument();
+      return;
+    }
+    if (step === "behind") {
       if (__ipeSelectOpen()) __ipeMarkHeldStale();
       else {
         __ipeHeldRender = null;
@@ -2368,8 +2420,7 @@ var __ipeLiveFrames = {
       return;
     }
     __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
-      __ipeApplyPatches(frame.patches);
-      if (typeof frame.to === "string") __ipeEpoch = frame.to;
+      __ipeAdoptPatches(frame.from, frame.to, frame.patches);
     }, frame.globalSeq);
   },
   // Dev-watch blue-green cutover cue. The watch server sends this right after
