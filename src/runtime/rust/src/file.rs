@@ -641,7 +641,11 @@ mod beneath {
 
 /// The confined read on a platform without a handle-relative open.
 #[cfg(not(unix))]
-mod beneath {
+use unsupported_beneath as beneath;
+
+/// The refusing confined read, compiled under test on every host so its refusal runs.
+#[cfg(any(not(unix), test))]
+mod unsupported_beneath {
     use super::{BENEATH_KERNEL, IpeError, Path};
 
     /// Refuses every read: nothing here could hold the walk beneath the root.
@@ -2165,23 +2169,43 @@ mod read_file_beneath_tests {
 }
 
 #[cfg(test)]
-#[cfg(not(unix))]
 #[cfg(not(target_arch = "wasm32"))]
 mod read_file_beneath_stub_tests {
     use super::*;
 
-    #[test]
-    fn every_confined_read_is_refused_as_unsupported() {
-        let path = match crate::path::path_from_string::<IpeError>("x".to_owned()) {
+    /// A scratch root holding the regular file `f`, and the sealed root and `f`.
+    fn fixture() -> (crate::scratch_core::ScratchDir, Path, Path) {
+        let dir = crate::scratch_core::ScratchDir::new("ipe_beneath_stub")
+            .expect("a scratch directory is creatable");
+        std::fs::write(dir.path().join("f"), "inside").expect("the fixture file is writable");
+        let root = tp(dir.path());
+        let rel = match crate::path::path_from_string::<IpeError>("f".to_owned()) {
             IpeResult::Ok(path) => Ok(path),
             IpeResult::Err(e) => Err(e),
         }
         .expect("a test path passes the seal");
-        let res = beneath::read(&path, &path, 0);
-        assert!(
-            matches!(&res, Err(IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
-                if info.message.contains("unsupported on this platform")),
-            "{res:?}"
-        );
+        (dir, root, rel)
+    }
+
+    #[test]
+    fn beneath_stub_refuses_every_read() {
+        let (_dir, root, rel) = fixture();
+        for cap in [0, 1024, u64::MAX] {
+            let res = unsupported_beneath::read(&root, &rel, cap);
+            assert!(
+                matches!(&res, Err(IpeError::Error(crate::IpeErrorKind::InvalidInput, info))
+                    if info.message.contains("unsupported on this platform")),
+                "{res:?}"
+            );
+        }
+    }
+
+    /// The twin: the handle-relative walk admits the read the stub refuses.
+    #[cfg(unix)]
+    #[test]
+    fn beneath_walk_admits_the_read_the_stub_refuses() {
+        let (_dir, root, rel) = fixture();
+        let res = beneath::read(&root, &rel, 1024);
+        assert!(matches!(&res, Ok(text) if text == "inside"), "{res:?}");
     }
 }

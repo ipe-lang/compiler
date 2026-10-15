@@ -140,12 +140,10 @@ impl std::fmt::Display for ToolchainMissing {
     }
 }
 
-/// The executable name of `cargo` for the host platform.
-#[cfg(windows)]
-const CARGO_EXE: &str = "cargo.exe";
-/// The executable name of `cargo` for the host platform.
-#[cfg(not(windows))]
-const CARGO_EXE: &str = "cargo";
+/// The executable file name of `cargo` on this host.
+fn cargo_exe() -> String {
+    crate::health::exe_name("cargo", ipe_path_core::HOST)
+}
 
 /// Resolve `cargo`, or produce a typed [`ToolchainMissing`].
 ///
@@ -211,15 +209,16 @@ enum Resolution {
 /// `PATH`". Pure over its inputs — it reads only the filesystem, never the
 /// environment — so callers and tests supply the search space explicitly.
 fn resolve(path_var: &OsString, install_dirs: &[PathBuf]) -> Resolution {
+    let exe = cargo_exe();
     if let Some(found) = std::env::split_paths(path_var)
-        .map(|dir| dir.join(CARGO_EXE))
+        .map(|dir| dir.join(&exe))
         .find(|candidate| is_executable_file(candidate))
     {
         return Resolution::Found(found);
     }
     let disposition = install_dirs
         .iter()
-        .find(|dir| is_executable_file(&dir.join(CARGO_EXE)))
+        .find(|dir| is_executable_file(&dir.join(&exe)))
         .map_or(Disposition::NotInstalled, |dir| Disposition::NotOnPath {
             found_in: TerminalSafe::sanitize(&dir.display().to_string()),
         });
@@ -575,7 +574,7 @@ mod tests {
                 ipe_test_temp::temp_root().join(format!("ipe_tc_{tag}_{}", std::process::id()));
             let created = std::fs::create_dir_all(&dir);
             assert!(created.is_ok(), "create probe dir: {created:?}");
-            let cargo = dir.join(CARGO_EXE);
+            let cargo = dir.join(cargo_exe());
             let wrote = std::fs::write(&cargo, b"#!/bin/sh\n");
             assert!(wrote.is_ok(), "write dummy cargo: {wrote:?}");
             #[cfg(unix)]
@@ -631,7 +630,7 @@ mod tests {
         let probe = ProbeDir::with_cargo("onpath");
         let path_var = OsString::from(probe.dir());
         match resolve(&path_var, &[]) {
-            Resolution::Found(found) => assert_eq!(found, probe.dir().join(CARGO_EXE)),
+            Resolution::Found(found) => assert_eq!(found, probe.dir().join(cargo_exe())),
             Resolution::Missing(d) => panic!("expected a resolved cargo, got {d:?}"),
         }
     }
