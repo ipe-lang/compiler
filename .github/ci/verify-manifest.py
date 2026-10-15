@@ -5,6 +5,13 @@ Fails (exit 1) when the manifest and reality disagree, so no check can exist
 without a declared disposition and no `gate` can silently lose its producer.
 
 Checks performed
+  0. One typed load: `WorkflowSet.load` parses every workflow once into typed
+     jobs, `needs:` (`JobNeeds`) and `permissions:`; every check reads that
+     load, never the file. A shape it cannot type (a non-mapping document or
+     job, a `needs:` of `''`, `false`, `0`, `[]`, `null`, a non-string,
+     duplicate or unknown member, malformed `permissions:`) is a typed
+     `ManifestError` refusal, never "no needs". Every workflow declares a
+     top-level `permissions:`.
   1. Every status context produced by .github/workflows/*.yml or *.yaml
      (matrix legs expanded) is present in the manifest.  An unclassified
      check is the exact "silent advisory red" this SSOT exists to forbid.
@@ -463,6 +470,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from typing import NewType
 
 try:
     import tomllib
@@ -826,33 +834,6 @@ class Job:
         self.needs = needs
 
 
-def workflow_jobs() -> list[Job]:
-    """Every job of every non-plumbing workflow, matrix legs expanded."""
-    jobs: list[Job] = []
-    paths = sorted(p for g in WORKFLOW_GLOBS for p in glob.glob(g))
-    for path in paths:
-        fname = os.path.basename(path)
-        if fname in PLUMBING_WORKFLOWS:
-            continue
-        try:
-            doc = strict_yaml.safe_load(open(path))
-        except yaml.YAMLError as e:
-            print(f"verify-manifest: {fname} is not valid YAML: {e}", file=sys.stderr)
-            sys.exit(2)
-        if not isinstance(doc, dict):
-            continue
-        for job_id, job in (doc.get("jobs") or {}).items():
-            if not isinstance(job, dict):
-                continue
-            name = job.get("name", job_id)
-            needs = job.get("needs") or []
-            if isinstance(needs, str):
-                needs = [needs]
-            contexts = expand_matrix_names(str(name), job.get("strategy") or {})
-            jobs.append(Job(fname, str(job_id), contexts, [str(n) for n in needs]))
-    return jobs
-
-
 def produced_contexts(jobs: list[Job]) -> dict[str, list[str]]:
     """Map produced status-context string -> producing workflow filenames."""
     contexts: dict[str, list[str]] = {}
@@ -908,26 +889,24 @@ def load_deterministic_checks(
     return pairs
 
 
-def check_deterministic_set(jobs: list[Job], errors: list[str]) -> None:
+def check_deterministic_set(wfs: WorkflowSet, errors: list[str]) -> None:
     """`ci/deterministic-checks.json` is the one SSOT behind ci.yml's
     `cancel-on-cheap-red` watcher. Its job set must equal the watcher's `needs:`, and each pair's step must
     be a literal `name:` of that job's steps — a renamed or unnamed check step
     would otherwise never match and silently disable the watcher.
 
-    This check reads `jobs` (the plain `Job` pass `main` shares across
-    checks 1-4) for the watcher's `needs:` and contexts, but re-reads
-    ci.yml as raw YAML for each listed job's own steps and masking keys —
-    it does not consume the typed `ToolJob`/`ClosedStep` structures that
-    `check_workflow_steps` parses for checks 6-7, since a deterministic
-    check is not itself required to be a tool job.
+    It reads the watcher workflow's typed jobs (`WorkflowSet`) for the
+    watcher's `needs:`, contexts, steps and masking keys — not the
+    `ToolJob`/`ClosedStep` structures `check_workflow_steps` parses for
+    checks 6-7, since a deterministic check is not itself required to be a
+    tool job.
     """
-    pairs = load_deterministic_checks(errors)
+    pairs = load_deterministic_checks(errors, wfs.root)
     if pairs is None:
         return
 
-    by_job_id = {
-        j.job_id: j for j in jobs if j.workflow == CANCEL_WATCHER_WORKFLOW
-    }
+    wf = wfs.get(CANCEL_WATCHER_WORKFLOW)
+    by_job_id = {j.job_id: j for j in wf.jobs} if wf is not None else {}
     watcher = by_job_id.get(CANCEL_WATCHER_JOB_ID)
     if watcher is None:
         errors.append(
@@ -935,11 +914,6 @@ def check_deterministic_set(jobs: list[Job], errors: list[str]) -> None:
             f"{DETERMINISTIC_CHECKS_FILE} has no watcher to check against"
         )
         return
-
-    with open(
-        os.path.join(REPO_ROOT, "workflows", CANCEL_WATCHER_WORKFLOW), encoding="utf-8"
-    ) as f:
-        raw_jobs = strict_yaml.safe_load(f).get("jobs") or {}
 
     # context -> job id, over single-context (non-matrix) jobs of ci.yml only:
     # a matrix leg's context cannot be tied to one check step unambiguously.
@@ -958,7 +932,7 @@ def check_deterministic_set(jobs: list[Job], errors: list[str]) -> None:
             )
             continue
         listed_ids.add(job_id)
-        raw_job = raw_jobs.get(job_id) or {}
+        raw_job = by_job_id[job_id].raw
         if "strategy" in raw_job:
             errors.append(
                 f"{DETERMINISTIC_CHECKS_FILE}: job {job_id!r} has a `strategy:`; "
@@ -1072,10 +1046,157 @@ def _typed_steps(container: dict, loc: str, errors: list[str]) -> list[Step]:
     return out
 
 
+JobId = NewType("JobId", str)
+ContextName = NewType("ContextName", str)
+JobNeeds = tuple[JobId, ...]
+
+
+class ErrorKind(enum.Enum):
+    """Every shape the one workflow load (`WorkflowSet.load`) refuses."""
+
+    UNREADABLE = "unreadable"
+    YAML_INVALID = "yaml-invalid"
+    DOCUMENT_NOT_MAPPING = "document-not-mapping"
+    JOBS_NOT_MAPPING = "jobs-not-mapping"
+    JOB_NOT_MAPPING = "job-not-mapping"
+    NEEDS_EMPTY_STRING = "needs-empty-string"
+    NEEDS_EMPTY_LIST = "needs-empty-list"
+    NEEDS_NULL = "needs-null"
+    NEEDS_BOOL = "needs-bool"
+    NEEDS_NUMBER = "needs-number"
+    NEEDS_NOT_LIST = "needs-not-list"
+    NEEDS_MEMBER_NOT_STRING = "needs-member-not-string"
+    NEEDS_MEMBER_EMPTY = "needs-member-empty"
+    NEEDS_DUPLICATE = "needs-duplicate"
+    NEEDS_UNKNOWN = "needs-unknown"
+    PERMISSIONS_MALFORMED = "permissions-malformed"
+    PERMISSIONS_MISSING = "permissions-missing"
+
+
+@dataclass(frozen=True)
+class ManifestError:
+    """A typed refusal: what (`kind`), where (`file`, `path` inside it), why."""
+
+    kind: ErrorKind
+    file: str
+    path: str
+    detail: str
+
+    def render(self) -> str:
+        loc = f"{self.file}: {self.path}" if self.path else self.file
+        return f"{loc}: {self.detail} [{self.kind.name}]"
+
+
+def _parse_needs(raw: object, jid: str, ids: frozenset[str], fname: str) -> JobNeeds | ManifestError:
+    """A job's `needs:` value (present key) as `JobNeeds`: a non-empty string,
+    or a non-empty list of non-empty, unique strings, each a job of the same
+    workflow. Every other shape is its own refusal — none means "no needs"."""
+    path = f"job {jid!r} needs:"
+
+    def refuse(kind: ErrorKind, detail: str) -> ManifestError:
+        return ManifestError(kind, fname, path, f"{detail} (got {raw!r}); refused")
+
+    if isinstance(raw, bool):
+        return refuse(ErrorKind.NEEDS_BOOL, "is a boolean, not a job id or list of job ids")
+    if raw is None:
+        return refuse(ErrorKind.NEEDS_NULL, "is null; omit the key for a job with no needs")
+    if isinstance(raw, (int, float)):
+        return refuse(ErrorKind.NEEDS_NUMBER, "is a number, not a job id or list of job ids")
+    if isinstance(raw, str):
+        members: list[object] = [raw]
+        if not raw:
+            return refuse(ErrorKind.NEEDS_EMPTY_STRING, "is the empty string")
+    elif isinstance(raw, list):
+        if not raw:
+            return refuse(ErrorKind.NEEDS_EMPTY_LIST, "is the empty list; omit the key for a job with no needs")
+        members = list(raw)
+    else:
+        return refuse(ErrorKind.NEEDS_NOT_LIST, "is not a job id or list of job ids")
+    out: list[JobId] = []
+    for m in members:
+        if not isinstance(m, str):
+            return refuse(ErrorKind.NEEDS_MEMBER_NOT_STRING, f"member {m!r} is not a string")
+        if not m:
+            return refuse(ErrorKind.NEEDS_MEMBER_EMPTY, "holds the empty string")
+        if m in out:
+            return refuse(ErrorKind.NEEDS_DUPLICATE, f"names {m!r} twice")
+        if m not in ids:
+            return refuse(ErrorKind.NEEDS_UNKNOWN, f"names {m!r}, which is not a job of {fname}")
+        out.append(JobId(m))
+    return tuple(out)
+
+
+class Access(enum.Enum):
+    READ = "read"
+    WRITE = "write"
+    NONE = "none"
+
+
+# Every `permissions:` scope GitHub defines for a `GITHUB_TOKEN`.
+PERMISSION_SCOPES = frozenset({
+    "actions", "attestations", "checks", "contents", "deployments", "discussions", "id-token",
+    "issues", "models", "packages", "pages", "pull-requests", "repository-projects",
+    "security-events", "statuses",
+})
+
+
+@dataclass(frozen=True)
+class Permissions:
+    """A `permissions:` value: `read-all`/`write-all` (`every` set), or a
+    mapping from a scope of `PERMISSION_SCOPES` to an `Access` (`{}` is the
+    empty mapping: no scope at all)."""
+
+    every: Access | None
+    scopes: tuple[tuple[str, Access], ...]
+
+    @staticmethod
+    def parse(raw: object) -> Permissions | str:
+        """The typed value, or why `raw` is no `permissions:` value."""
+        if isinstance(raw, str):
+            word = {"read-all": Access.READ, "write-all": Access.WRITE}.get(raw)
+            return Permissions(word, ()) if word else f"{raw!r} is neither read-all nor write-all"
+        if not isinstance(raw, dict):
+            return f"{raw!r} is not read-all, write-all, or a scope mapping"
+        scopes: list[tuple[str, Access]] = []
+        for k, v in raw.items():
+            if not isinstance(k, str) or k not in PERMISSION_SCOPES:
+                return f"scope {k!r} is not one of {sorted(PERMISSION_SCOPES)}"
+            access = next((a for a in Access if a.value == v), None) if isinstance(v, str) else None
+            if access is None:
+                return f"scope {k!r} has access {v!r}, not read, write, or none"
+            scopes.append((k, access))
+        return Permissions(None, tuple(scopes))
+
+    def write_scopes(self) -> frozenset[str]:
+        """Every scope this value grants `write` (all of them for `write-all`)."""
+        if self.every is Access.WRITE:
+            return PERMISSION_SCOPES
+        return frozenset(k for k, a in self.scopes if a is Access.WRITE)
+
+
+def _grants_write(raw: object) -> bool:
+    """True when a raw `permissions:` value grants a write scope, or is no
+    `permissions:` value at all (fail closed)."""
+    perms = Permissions.parse(raw)
+    return isinstance(perms, str) or bool(perms.write_scopes())
+
+
 @dataclass(frozen=True)
 class WorkflowJob:
-    job_id: str
+    """One job, typed: its id, raw mapping, `needs:` (parsed by
+    `_parse_needs`; a refused value reads as no needs, its refusal on record),
+    and its own `permissions:` (None when absent or refused)."""
+
+    job_id: JobId
     raw: dict
+    needs: JobNeeds
+    permissions: Permissions | None
+
+    @property
+    def contexts(self) -> list[str]:
+        """The status contexts this job reports, matrix legs expanded."""
+        strategy = self.raw.get("strategy")
+        return expand_matrix_names(str(self.raw.get("name", self.job_id)), strategy if isinstance(strategy, dict) else {})
 
 
 class Workspace(enum.Enum):
@@ -1095,47 +1216,126 @@ class Workspace(enum.Enum):
 
 @dataclass(frozen=True)
 class Workflow:
+    """One workflow file, typed. `text` is its source (several checks scan
+    the raw text as defence in depth); `permissions` its top-level value
+    (None when absent or refused)."""
+
     fname: str
     doc: dict
+    text: str
     jobs: list[WorkflowJob]
     workspace: Workspace
+    permissions: Permissions | None
+
+    @property
+    def is_plumbing(self) -> bool:
+        """Release/automation plumbing: never a PR or promotion status gate."""
+        return self.fname in PLUMBING_WORKFLOWS
+
+    def job(self, job_id: str) -> WorkflowJob | None:
+        return next((j for j in self.jobs if j.job_id == job_id), None)
 
 
-def _load_workflows(root: str, errors: list[str]) -> list[Workflow]:
-    """Every workflow (`*.yml` and `*.yaml`), typed. A document that is not a
-    mapping, a `jobs:` that is not a non-empty mapping, or a job that is not a
-    mapping is refused, never skipped."""
-    out: list[Workflow] = []
-    paths = sorted(
-        p
-        for pattern in ("*.yml", "*.yaml")
-        for p in glob.glob(os.path.join(root, "workflows", pattern))
-    )
-    for path in paths:
-        fname = os.path.basename(path)
-        with open(path) as f:
-            text = f.read()
-        try:
-            doc = strict_yaml.safe_load(text)
-        except yaml.YAMLError as e:
-            errors.append(f"{fname} is not valid YAML: {e}")
-            continue
-        if not isinstance(doc, dict):
-            _refuse_shape(fname, "the workflow document", "a mapping", doc, errors)
-            continue
-        raw_jobs = doc.get("jobs")
-        if not isinstance(raw_jobs, dict) or not raw_jobs:
-            _refuse_shape(fname, "jobs:", "a non-empty mapping", raw_jobs, errors)
-            continue
-        jobs: list[WorkflowJob] = []
-        for jid, j in raw_jobs.items():
-            if isinstance(j, dict):
-                jobs.append(WorkflowJob(str(jid), j))
-            else:
-                _refuse_shape(f"{fname}: job {str(jid)!r}", "the job", "a mapping", j, errors)
-        workspace = Workspace.NONE if head_free(doc, text) else Workspace.CHECKOUT
-        out.append(Workflow(fname, doc, jobs, workspace))
-    return out
+@dataclass(frozen=True)
+class WorkflowSet:
+    """Every workflow under `root/workflows` (`*.yml` and `*.yaml`), parsed
+    once. A file refused whole (invalid YAML, not a mapping) is absent from
+    `workflows`; every refusal is in `refusals`, rendered once by `main`."""
+
+    root: str
+    workflows: tuple[Workflow, ...]
+    refusals: tuple[ManifestError, ...]
+
+    @staticmethod
+    def load(root: str) -> WorkflowSet:
+        """The one YAML load of a workflow file in this module."""
+        out: list[Workflow] = []
+        refusals: list[ManifestError] = []
+        for path in _workflow_files(root):
+            fname = os.path.basename(path)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read()
+            except (OSError, UnicodeDecodeError) as e:
+                refusals.append(ManifestError(ErrorKind.UNREADABLE, fname, "", f"cannot read: {e}"))
+                continue
+            try:
+                doc = strict_yaml.safe_load(text)
+            except yaml.YAMLError as e:
+                refusals.append(ManifestError(ErrorKind.YAML_INVALID, fname, "", f"is not valid YAML: {e}"))
+                continue
+            if not isinstance(doc, dict):
+                refusals.append(ManifestError(
+                    ErrorKind.DOCUMENT_NOT_MAPPING, fname, "",
+                    f"the workflow document is not a mapping (got {type(doc).__name__}: {doc!r}); refused",
+                ))
+                continue
+            raw_jobs = doc.get("jobs")
+            if not isinstance(raw_jobs, dict) or not raw_jobs:
+                refusals.append(ManifestError(
+                    ErrorKind.JOBS_NOT_MAPPING, fname, "",
+                    f"jobs: is not a non-empty mapping (got {type(raw_jobs).__name__}: {raw_jobs!r}); refused",
+                ))
+                raw_jobs = {}
+            ids = frozenset(str(j) for j in raw_jobs)
+            jobs: list[WorkflowJob] = []
+            for jid, j in raw_jobs.items():
+                jid = str(jid)
+                if not isinstance(j, dict):
+                    refusals.append(ManifestError(
+                        ErrorKind.JOB_NOT_MAPPING, fname, f"job {jid!r}",
+                        f"the job is not a mapping (got {type(j).__name__}: {j!r}); refused",
+                    ))
+                    continue
+                needs: JobNeeds = ()
+                if "needs" in j:
+                    parsed = _parse_needs(j["needs"], jid, ids, fname)
+                    if isinstance(parsed, ManifestError):
+                        refusals.append(parsed)
+                    else:
+                        needs = parsed
+                jobs.append(WorkflowJob(JobId(jid), j, needs, _load_permissions(j, fname, f"job {jid!r}", refusals)))
+            workspace = Workspace.NONE if head_free(doc, text) else Workspace.CHECKOUT
+            out.append(Workflow(fname, doc, text, jobs, workspace, _load_permissions(doc, fname, "", refusals)))
+        return WorkflowSet(root, tuple(out), tuple(refusals))
+
+    def get(self, fname: str) -> Workflow | None:
+        return next((w for w in self.workflows if w.fname == fname), None)
+
+    def rendered(self) -> list[str]:
+        return [r.render() for r in self.refusals]
+
+    def jobs(self) -> list[Job]:
+        """Every job of every non-plumbing workflow, as the plain `Job` view
+        checks 1, 3 and 5 share."""
+        return [
+            Job(wf.fname, j.job_id, j.contexts, list(j.needs))
+            for wf in self.workflows
+            if not wf.is_plumbing
+            for j in wf.jobs
+        ]
+
+
+def _load_permissions(container: dict, fname: str, where: str, refusals: list[ManifestError]) -> Permissions | None:
+    if "permissions" not in container:
+        return None
+    perms = Permissions.parse(container["permissions"])
+    if isinstance(perms, str):
+        path = f"{where} permissions:" if where else "permissions:"
+        refusals.append(ManifestError(ErrorKind.PERMISSIONS_MALFORMED, fname, path, f"{perms}; refused"))
+        return None
+    return perms
+
+
+def check_permissions(wfs: WorkflowSet, errors: list[str]) -> None:
+    """Every workflow declares a top-level `permissions:` (the default token
+    may write)."""
+    for wf in wfs.workflows:
+        if "permissions" not in wf.doc:
+            errors.append(ManifestError(
+                ErrorKind.PERMISSIONS_MISSING, wf.fname, "",
+                "declares no top-level `permissions:` — the default token may write; refused",
+            ).render())
 
 
 # A full-tier test that forgot the merge queue: `!= 'pull_request'` (either
@@ -1342,35 +1542,12 @@ def _triggers(doc: dict) -> set[str] | None:
     return None
 
 
-def _write_scopes(perms: object) -> bool:
-    """True when a `permissions:` value grants any write scope."""
-    if isinstance(perms, str):
-        return perms.strip().casefold() != "read-all"
-    if isinstance(perms, dict):
-        return any(str(v).strip().casefold() == "write" for v in perms.values())
-    return True
-
-
-def check_merge_queue(gate_producers: set[str], errors: list[str], root: str = REPO_ROOT) -> None:
-    """Check 8 (see the module docstring). Unparseable workflows are refused by
-    check 6; here they are skipped only after that refusal is on record."""
-    paths = sorted(
-        p
-        for pattern in ("*.yml", "*.yaml")
-        for p in glob.glob(os.path.join(root, "workflows", pattern))
-    )
-    seen: set[str] = set()
-    for path in paths:
-        fname = os.path.basename(path)
-        seen.add(fname)
-        with open(path) as f:
-            text = f.read()
-        try:
-            doc = strict_yaml.safe_load(text)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(doc, dict):
-            continue
+def check_merge_queue(wfs: WorkflowSet, gate_producers: set[str], errors: list[str]) -> None:
+    """Check 8 (see the module docstring). A workflow the load refused is
+    absent from `wfs`; its refusal is on record."""
+    seen = {os.path.basename(p) for p in _workflow_files(wfs.root)}
+    for wf in wfs.workflows:
+        fname, doc, text = wf.fname, wf.doc, wf.text
         triggers = _triggers(doc)
         if triggers is None:
             errors.append(f"{fname}: `on:` is not a string, list of strings, or mapping")
@@ -1409,16 +1586,14 @@ def check_merge_queue(gate_producers: set[str], errors: list[str], root: str = R
             )
         if "permissions" not in doc:
             errors.append(f"{fname}: a merge_group workflow must declare top-level `permissions:`")
-        elif _write_scopes(doc["permissions"]):
+        elif _grants_write(doc["permissions"]):
             errors.append(
                 f"{fname}: a merge_group workflow's top-level `permissions:` must be "
                 f"read-only, got {doc['permissions']!r}"
             )
-        jobs = doc.get("jobs")
-        for jid, job in (jobs.items() if isinstance(jobs, dict) else ()):
-            if not isinstance(job, dict) or "permissions" not in job:
-                continue
-            if not _write_scopes(job["permissions"]):
+        for wj in wf.jobs:
+            jid, job = wj.job_id, wj.raw
+            if "permissions" not in job or not _grants_write(job["permissions"]):
                 continue
             conjuncts = _top_level_conjuncts(str(job.get("if", "")))
             if conjuncts is None or _PR_ONLY not in conjuncts:
@@ -1510,33 +1685,15 @@ def _release_only_mention(doc: dict) -> re.Pattern[str]:
         names |= found
 
 
-def check_release_only_skips(gate_contexts: set[str], errors: list[str], root: str = REPO_ROOT) -> None:
-    """Check 9 (see the module docstring). Unparseable workflows are refused by
-    check 6; here they are skipped only after that refusal is on record."""
-    paths = sorted(
-        p
-        for pattern in ("*.yml", "*.yaml")
-        for p in glob.glob(os.path.join(root, "workflows", pattern))
-    )
-    for path in paths:
-        fname = os.path.basename(path)
-        try:
-            with open(path) as f:
-                doc = strict_yaml.safe_load(f)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(doc, dict):
-            continue
-        mention = _release_only_mention(doc)
-        jobs = doc.get("jobs")
-        for jid, job in (jobs.items() if isinstance(jobs, dict) else ()):
-            if not isinstance(job, dict):
-                continue
-            strategy = job.get("strategy")
-            contexts = expand_matrix_names(
-                str(job.get("name", jid)), strategy if isinstance(strategy, dict) else {}
-            )
-            if not gate_contexts.intersection(contexts):
+def check_release_only_skips(wfs: WorkflowSet, gate_contexts: set[str], errors: list[str]) -> None:
+    """Check 9 (see the module docstring). A workflow the load refused is
+    absent from `wfs`; its refusal is on record."""
+    for wf in wfs.workflows:
+        fname = wf.fname
+        mention = _release_only_mention(wf.doc)
+        for wj in wf.jobs:
+            jid, job = wj.job_id, wj.raw
+            if not gate_contexts.intersection(wj.contexts):
                 continue
             cond = str(job.get("if", ""))
             steps = job.get("steps")
@@ -1579,15 +1736,6 @@ def check_release_only_skips(gate_contexts: set[str], errors: list[str], root: s
                 )
 
 
-def _needs_list(job: dict) -> list[str] | None:
-    needs = job.get("needs", [])
-    if isinstance(needs, str):
-        return [needs]
-    if isinstance(needs, list) and all(isinstance(n, str) for n in needs):
-        return list(needs)
-    return None
-
-
 def _downloads_archive(job: dict) -> bool:
     for st in job.get("steps") or []:
         if not isinstance(st, dict):
@@ -1603,24 +1751,19 @@ def _downloads_archive(job: dict) -> bool:
     return False
 
 
-def check_fast_gate_first(gate_contexts: set[str], errors: list[str], root: str = REPO_ROOT) -> None:
+def check_fast_gate_first(wfs: WorkflowSet, gate_contexts: set[str], errors: list[str]) -> None:
     """Check 10 (see the module docstring). Refuses, never skips, a shape it
     cannot read."""
-    where = os.path.join(root, "workflows", FAST_GATE_WORKFLOW)
-    try:
-        with open(where) as f:
-            doc = strict_yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as e:
-        errors.append(f"check 10: cannot read {where}: {e}")
+    wf = wfs.get(FAST_GATE_WORKFLOW)
+    if wf is None or not wf.jobs:
+        errors.append(f"check 10: {FAST_GATE_WORKFLOW} is not a loaded workflow with a `jobs:` mapping")
         return
-    jobs = doc.get("jobs") if isinstance(doc, dict) else None
-    if not isinstance(jobs, dict):
-        errors.append(f"check 10: {FAST_GATE_WORKFLOW} has no `jobs:` mapping")
-        return
+    typed = {j.job_id: j for j in wf.jobs}
+    jobs = {jid: j.raw for jid, j in typed.items()}
 
     for gate in FAST_GATES:
         job = jobs.get(gate)
-        if not isinstance(job, dict):
+        if job is None:
             errors.append(f"check 10: fast gate {gate!r} is not a job of {FAST_GATE_WORKFLOW}")
             continue
         if "strategy" in job:
@@ -1628,10 +1771,8 @@ def check_fast_gate_first(gate_contexts: set[str], errors: list[str], root: str 
         ctx = job.get("name", gate)
         if ctx not in gate_contexts:
             errors.append(f"check 10: fast gate {gate!r} (context {ctx!r}) is not a manifest `gate`")
-        needs = _needs_list(job)
-        if needs is None:
-            errors.append(f"check 10: fast gate {gate!r} has a malformed `needs:`")
-        elif not set(needs) <= FAST_GATE_NEEDS_ALLOWED:
+        needs = typed[gate].needs
+        if not set(needs) <= FAST_GATE_NEEDS_ALLOWED:
             errors.append(
                 f"check 10: fast gate {gate!r} needs {sorted(set(needs) - FAST_GATE_NEEDS_ALLOWED)}; "
                 f"a fast gate may need only {sorted(FAST_GATE_NEEDS_ALLOWED)}"
@@ -1640,8 +1781,7 @@ def check_fast_gate_first(gate_contexts: set[str], errors: list[str], root: str 
     heavy = sorted(
         str(jid)
         for jid, job in jobs.items()
-        if isinstance(job, dict)
-        and isinstance(job.get("strategy"), dict)
+        if isinstance(job.get("strategy"), dict)
         and "matrix" in job["strategy"]
         and _downloads_archive(job)
     )
@@ -1653,16 +1793,12 @@ def check_fast_gate_first(gate_contexts: set[str], errors: list[str], root: str 
             )
     for jid in heavy:
         job = jobs[jid]
-        needs = _needs_list(job)
-        if needs is None:
-            errors.append(f"check 10: heavy shard job {jid!r} has a malformed `needs:`")
-        else:
-            missing = [g for g in FAST_GATES if g not in needs]
-            if missing:
-                errors.append(
-                    f"check 10: heavy shard job {jid!r} does not `needs:` fast gate(s) {missing}; "
-                    "a fast red would still launch it"
-                )
+        missing = [g for g in FAST_GATES if g not in typed[jid].needs]
+        if missing:
+            errors.append(
+                f"check 10: heavy shard job {jid!r} does not `needs:` fast gate(s) {missing}; "
+                "a fast red would still launch it"
+            )
         cond = job.get("if")
         if cond is not None and (not isinstance(cond, str) or _STATUS_FN.search(cond)):
             errors.append(
@@ -1732,11 +1868,11 @@ def _strip_outer_parens(expr: str) -> str:
     return expr
 
 
-def _job_phase(where: str, job: dict, errors: list[str]) -> tuple[bool, str | None]:
+def _job_phase(where: str, wj: WorkflowJob, errors: list[str]) -> tuple[bool, str | None]:
     """(ok, phase) of a routed work job: phase None means unconditional.
     Refuses an `if:` naming the event or carrying no single phase marker."""
-    needs = _needs_list(job)
-    cond = job.get("if")
+    needs = wj.needs
+    cond = wj.raw.get("if")
     if cond is None:
         if needs:
             errors.append(f"check 11: {where} has `needs:` but no phase `if:`; a job runs in exactly one phase")
@@ -1774,7 +1910,7 @@ def _job_phase(where: str, job: dict, errors: list[str]) -> tuple[bool, str | No
                 "on a cheap job"
             )
             return False, None
-    if phase != _PR_PHASE and (needs is None or "changes" not in needs):
+    if phase != _PR_PHASE and "changes" not in needs:
         errors.append(f"check 11: {where} reads a `changes` phase output but does not need `changes`")
         return False, None
     if _EVENT_NAME.search(cond) and phase != _PR_PHASE:
@@ -1783,14 +1919,15 @@ def _job_phase(where: str, job: dict, errors: list[str]) -> tuple[bool, str | No
     return True, phase
 
 
-def _check_aggregator(where: str, jobs: dict, job: dict, errors: list[str]) -> None:
+def _check_aggregator(where: str, wf: Workflow, wj: WorkflowJob, errors: list[str]) -> None:
+    job = wj.raw
     extra = set(job) - _AGGREGATOR_KEYS
     if extra:
         errors.append(f"check 11: {where} (phase verdict) carries {sorted(extra)}; only {sorted(_AGGREGATOR_KEYS)} are admitted")
     if job.get("if") != "always()":
         errors.append(f"check 11: {where} (phase verdict) `if:` must be exactly `always()`, so no need's state skips it")
-    needs = _needs_list(job)
-    if needs is None or len(needs) < 2 or needs[0] != "changes" or len(set(needs)) != len(needs):
+    needs = wj.needs
+    if len(needs) < 2 or needs[0] != "changes":
         errors.append(f"check 11: {where} (phase verdict) `needs:` must list `changes` first, then each aggregated job once")
         return
     steps = job.get("steps")
@@ -1830,38 +1967,26 @@ def _check_aggregator(where: str, jobs: dict, job: dict, errors: list[str]) -> N
         return
     run_if = f"needs.changes.outputs.{phase} == 'true' && needs.changes.outputs.{m.group(1)} == 'true'"
     for n in needs[1:]:
-        dep = jobs.get(n)
-        if not isinstance(dep, dict):
-            errors.append(f"check 11: {where} (phase verdict) needs unknown job {n!r}")
-        elif dep.get("if") != run_if:
+        dep = wf.job(n)
+        if dep is not None and dep.raw.get("if") != run_if:
             errors.append(
                 f"check 11: {where} (phase verdict) aggregates {n!r}, whose `if:` must be exactly "
                 f"{run_if!r} so the verdict's tier and scope are the job's own"
             )
 
 
-def check_phase_routing(gate_contexts: set[str], errors: list[str], root: str = REPO_ROOT) -> None:
-    """Check 11 (see the module docstring). Unparseable workflows are refused
-    by check 6."""
-    paths = sorted(
-        p for pattern in ("*.yml", "*.yaml") for p in glob.glob(os.path.join(root, "workflows", pattern))
-    )
-    for path in paths:
-        fname = os.path.basename(path)
-        try:
-            with open(path) as f:
-                doc = strict_yaml.safe_load(f)
-        except (OSError, yaml.YAMLError):
+def check_phase_routing(wfs: WorkflowSet, gate_contexts: set[str], errors: list[str]) -> None:
+    """Check 11 (see the module docstring). A workflow the load refused is
+    absent from `wfs`; its refusal is on record."""
+    for wf in wfs.workflows:
+        fname = wf.fname
+        triggers = _triggers(wf.doc)
+        if triggers is None or "merge_group" not in triggers or not wf.jobs:
             continue
-        if not isinstance(doc, dict):
+        changes_job = wf.job("changes")
+        if changes_job is None:
             continue
-        triggers = _triggers(doc)
-        jobs = doc.get("jobs")
-        if triggers is None or "merge_group" not in triggers or not isinstance(jobs, dict):
-            continue
-        changes = jobs.get("changes")
-        if not isinstance(changes, dict):
-            continue
+        changes = changes_job.raw
         if "if" in changes or "needs" in changes:
             errors.append(f"check 11: {fname}: `changes` must run on every event (no `if:`/`needs:`)")
         outputs = changes.get("outputs")
@@ -1871,16 +1996,16 @@ def check_phase_routing(gate_contexts: set[str], errors: list[str], root: str = 
                 errors.append(f"check 11: {fname}: `changes` output {phase!r} must be exactly {value!r}, got {got!r}")
         phases: dict[str, str | None] = {"changes": None}
         aggregators: list[str] = []
-        for jid, job in jobs.items():
-            jid = str(jid)
-            if jid == "changes" or not isinstance(job, dict):
+        for wj in wf.jobs:
+            jid, job = wj.job_id, wj.raw
+            if jid == "changes":
                 continue
             where = f"{fname}: job {jid!r}"
             if any(isinstance(s, dict) and s.get("uses") == PHASE_VERDICT_ACTION for s in job.get("steps") or []):
                 aggregators.append(jid)
-                _check_aggregator(where, jobs, job, errors)
+                _check_aggregator(where, wf, wj, errors)
                 continue
-            ok, phase = _job_phase(where, job, errors)
+            ok, phase = _job_phase(where, wj, errors)
             if not ok:
                 continue
             phases[jid] = phase
@@ -1895,8 +2020,8 @@ def check_phase_routing(gate_contexts: set[str], errors: list[str], root: str = 
         required = {
             n
             for a in aggregators
-            if str(jobs[a].get("name", a)) in gate_contexts
-            for n in _needs_list(jobs[a]) or []
+            if str(wf.job(a).raw.get("name", a)) in gate_contexts
+            for n in wf.job(a).needs
             if n != "changes"
         }
         for jid, phase in phases.items():
@@ -1906,7 +2031,7 @@ def check_phase_routing(gate_contexts: set[str], errors: list[str], root: str = 
                     "its red never reaches the merge decision"
                 )
         for jid, phase in phases.items():
-            needs = _needs_list(jobs[jid]) or []
+            needs = wf.job(jid).needs
             own = _phase_events(phase)
             for n in needs:
                 if n in aggregators:
@@ -2005,7 +2130,7 @@ def pull_request_target_violations(doc: dict, text: str) -> list[str]:
         )
     if "permissions" not in doc:
         out.append("declares no top-level `permissions:` (the default token may write)")
-    elif _write_scopes(doc["permissions"]):
+    elif _grants_write(doc["permissions"]):
         out.append(f"top-level `permissions:` must be read-only, got {doc['permissions']!r}")
     jobs = doc.get("jobs")
     if not isinstance(jobs, dict) or not jobs:
@@ -2018,7 +2143,7 @@ def pull_request_target_violations(doc: dict, text: str) -> list[str]:
             continue
         if "uses" in job:
             out.append(f"{loc} calls a reusable workflow — its steps are not auditable here")
-        if "permissions" in job and _write_scopes(job["permissions"]):
+        if "permissions" in job and _grants_write(job["permissions"]):
             out.append(f"{loc} `permissions:` must be read-only, got {job['permissions']!r}")
         steps = job.get("steps", [])
         if not isinstance(steps, list):
@@ -2063,19 +2188,11 @@ def head_free(doc: dict, text: str) -> bool:
     )
 
 
-def check_pull_request_target(errors: list[str], root: str = REPO_ROOT) -> None:
-    """Check 12a (see the module docstring). Unparseable workflows are refused
-    by check 6."""
-    for path in sorted(p for pattern in ("*.yml", "*.yaml") for p in glob.glob(os.path.join(root, "workflows", pattern))):
-        fname = os.path.basename(path)
-        with open(path) as f:
-            text = f.read()
-        try:
-            doc = strict_yaml.safe_load(text)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(doc, dict):
-            continue
+def check_pull_request_target(wfs: WorkflowSet, errors: list[str]) -> None:
+    """Check 12a (see the module docstring). A workflow the load refused is
+    absent from `wfs`; its refusal is on record."""
+    for wf in wfs.workflows:
+        fname, doc, text = wf.fname, wf.doc, wf.text
         triggers = _triggers(doc)
         if triggers is None:
             # Fail closed: an `on:` this reader cannot enumerate may still
@@ -2250,19 +2367,12 @@ def _check_merge_group_site(fname: str, where: str, group: str, cancel: object, 
         )
 
 
-def check_push_concurrency(errors: list[str], root: str = REPO_ROOT) -> None:
-    """Check 13 (see the module docstring). Unparseable workflows are refused
-    by check 6."""
+def check_push_concurrency(wfs: WorkflowSet, errors: list[str]) -> None:
+    """Check 13 (see the module docstring). A workflow the load refused is
+    absent from `wfs`; its refusal is on record."""
     seen: set[str] = set()
-    for path in sorted(p for pattern in ("*.yml", "*.yaml") for p in glob.glob(os.path.join(root, "workflows", pattern))):
-        fname = os.path.basename(path)
-        try:
-            with open(path) as f:
-                doc = strict_yaml.safe_load(f)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(doc, dict):
-            continue
+    for wf in wfs.workflows:
+        fname, doc = wf.fname, wf.doc
         triggers = _triggers(doc)
         if triggers is None:
             errors.append(f"{fname}: `on:` has no recognised shape; check 13 cannot tell whether it runs on push or merge_group")
@@ -2273,11 +2383,8 @@ def check_push_concurrency(errors: list[str], root: str = REPO_ROOT) -> None:
             seen.add(fname)
         if not on_merge_group and (not on_push or fname in LATEST_WINS_PUSH_GROUPS):
             continue
-        jobs = doc.get("jobs")
         sites = [("workflow", doc.get("concurrency"))] + [
-            (f"job {jid!r}", job.get("concurrency"))
-            for jid, job in (jobs.items() if isinstance(jobs, dict) else ())
-            if isinstance(job, dict)
+            (f"job {wj.job_id!r}", wj.raw.get("concurrency")) for wj in wf.jobs
         ]
         for where, conc in sites:
             if conc is None:
@@ -2330,6 +2437,13 @@ def _lock_path_packages(text: str) -> set[str] | str:
     return names
 
 
+def _dependabot_doc(root: str) -> object:
+    """`.github/dependabot.yml`, parsed: the one load checks 14 and 18 read.
+    Raises `OSError`/`yaml.YAMLError` for the caller to refuse."""
+    with open(os.path.join(root, "dependabot.yml"), encoding="utf-8") as f:
+        return strict_yaml.safe_load(f)
+
+
 def check_one_lock_per_graph(
     errors: list[str], root: str = REPO_ROOT, tracked: list[str] | None = None
 ) -> None:
@@ -2375,10 +2489,8 @@ def check_one_lock_per_graph(
         else:
             authoritative.add(lock)
 
-    path = os.path.join(root, "dependabot.yml")
     try:
-        with open(path) as f:
-            doc = strict_yaml.safe_load(f)
+        doc = _dependabot_doc(root)
     except FileNotFoundError:
         errors.append("check 14: .github/dependabot.yml is missing — nothing proposes updates to the root Cargo.lock")
         return
@@ -2435,10 +2547,8 @@ DEPENDABOT_OPEN_PR_BUDGET = 3
 
 def check_dependabot_pr_budget(errors: list[str], root: str = REPO_ROOT) -> None:
     """Check 18 (see the module docstring)."""
-    path = os.path.join(root, "dependabot.yml")
     try:
-        with open(path) as f:
-            doc = strict_yaml.safe_load(f)
+        doc = _dependabot_doc(root)
     except (OSError, yaml.YAMLError) as e:
         errors.append(f"check 18: .github/dependabot.yml refused: {e}")
         return
@@ -2806,8 +2916,9 @@ def _claim_run(
     return ClaimRun(cell, runner[2])
 
 
-def check_test_claims(errors: list[str], root: str = REPO_ROOT) -> None:
+def check_test_claims(wfs: WorkflowSet, errors: list[str]) -> None:
     """Check 20 (see the module docstring)."""
+    root = wfs.root
     repo = os.path.dirname(root)
     cells = claims_table.load_cells(os.path.join(root, *TEST_CLAIMS))
     if isinstance(cells, str):
@@ -2823,7 +2934,7 @@ def check_test_claims(errors: list[str], root: str = REPO_ROOT) -> None:
         tool_versions[tool] = got[0]
     claims: dict[tuple[str, str, str], list[str]] = {c.key: [] for c in cells}
     owner_jobs: dict[str, tuple[str, dict]] = {}
-    for wf in _load_workflows(root, errors):
+    for wf in wfs.workflows:
         for wj in wf.jobs:
             job, loc_job = wj.raw, f"{wf.fname}: job {wj.job_id!r}"
             steps = job.get("steps") if isinstance(job.get("steps"), list) else []
@@ -2899,8 +3010,7 @@ def check_test_claims(errors: list[str], root: str = REPO_ROOT) -> None:
     if not owner_jobs:
         return
     try:
-        with open(os.path.join(root, "ci", "check-manifest.yml")) as f:
-            manifest = strict_yaml.safe_load(f)
+        manifest = read_manifest(os.path.join(root, "ci", "check-manifest.yml"))
         with open(os.path.join(root, "ci", "required-set.json")) as f:
             required = {c for c, _ in check_required_set.parse_pairs(json.load(f), "ci/required-set.json")}
     except (OSError, ValueError, yaml.YAMLError, check_required_set.Refused) as e:
@@ -2941,6 +3051,13 @@ WORKFLOW_PATTERNS = ("*.yml", "*.yaml")
 def _workflow_files(root: str) -> list[str]:
     """Every workflow file under `root`, both extensions."""
     return sorted(f for pat in WORKFLOW_PATTERNS for f in glob.glob(os.path.join(root, "workflows", pat)))
+
+
+def _read_action(path: str) -> object:
+    """A local action's `action.yml`/`action.yaml`, parsed: the one load of an
+    action file. Raises `OSError`/`yaml.YAMLError` for the caller to refuse."""
+    with open(path, encoding="utf-8") as f:
+        return strict_yaml.safe_load(f)
 
 
 def _local_action_files(root: str) -> list[str]:
@@ -2988,8 +3105,7 @@ def _steps_cargo(
                 out.append(cargo_invocation.Found(uses, f"local action {uses!r} {why}", None))
                 continue
             try:
-                with open(found[0]) as f:
-                    action = strict_yaml.safe_load(f)
+                action = _read_action(found[0])
             except (OSError, yaml.YAMLError) as e:
                 out.append(cargo_invocation.Found(uses, f"local action {uses!r} is unreadable: {e}", None))
                 continue
@@ -3099,37 +3215,30 @@ def _artifact_steps(job: dict, action: str) -> set[str]:
     return out
 
 
-def check_one_ipe_build(errors: list[str], root: str = REPO_ROOT, tracked: list[str] | None = None) -> None:
+def check_one_ipe_build(wfs: WorkflowSet, errors: list[str], tracked: list[str] | None = None) -> None:
     """Check 15 (see the module docstring). Refuses, never skips, a shape it
     cannot read."""
-    repo = os.path.dirname(root)
+    repo = os.path.dirname(wfs.root)
     layout = _workspace_layout(repo, tracked)
     if isinstance(layout, str):
         errors.append(f"check 15: {layout}; cannot tell what a cargo command builds")
         return
-    where = os.path.join(root, "workflows", FAST_GATE_WORKFLOW)
-    try:
-        with open(where) as f:
-            doc = strict_yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as e:
-        errors.append(f"check 15: cannot read {where}: {e}")
+    wf = wfs.get(FAST_GATE_WORKFLOW)
+    if wf is None or not wf.jobs:
+        errors.append(f"check 15: {FAST_GATE_WORKFLOW} is not a loaded workflow with a `jobs:` mapping")
         return
-    jobs = doc.get("jobs") if isinstance(doc, dict) else None
-    if not isinstance(jobs, dict):
-        errors.append(f"check 15: {FAST_GATE_WORKFLOW} has no `jobs:` mapping")
-        return
-    producer = jobs.get(IPE_BUILD_PRODUCER)
-    if not isinstance(producer, dict):
+    doc = wf.doc
+    producer = wf.job(IPE_BUILD_PRODUCER)
+    producer = producer.raw if producer is not None else None
+    if producer is None:
         errors.append(f"check 15: producer {IPE_BUILD_PRODUCER!r} is not a job of {FAST_GATE_WORKFLOW}")
     else:
         if not any("unreadable" not in h for h in _builds_ipe(producer, repo, layout, doc)):
             errors.append(f"check 15: producer {IPE_BUILD_PRODUCER!r} does not build the `ipe` package")
         if IPE_RELEASE_ARTIFACT not in _artifact_steps(producer, "upload"):
             errors.append(f"check 15: producer {IPE_BUILD_PRODUCER!r} does not upload {IPE_RELEASE_ARTIFACT!r}")
-    for jid, job in jobs.items():
-        if not isinstance(job, dict):
-            errors.append(f"check 15: job {jid!r} is not a mapping; refused")
-            continue
+    for wj in wf.jobs:
+        jid, job = wj.job_id, wj.raw
         if jid != IPE_BUILD_PRODUCER:
             for hit in _builds_ipe(job, repo, layout, doc):
                 errors.append(
@@ -3141,8 +3250,7 @@ def check_one_ipe_build(errors: list[str], root: str = REPO_ROOT, tracked: list[
         # may fetch the producer's, so it needs the producer too.
         wanted = sorted(downloads.intersection(IPE_BUILD_ARTIFACTS) | ({"<unnamed>"} if "" in downloads else set()))
         if wanted:
-            needs = _needs_list(job)
-            if needs is None or IPE_BUILD_PRODUCER not in needs:
+            if IPE_BUILD_PRODUCER not in wj.needs:
                 errors.append(
                     f"check 15: job {jid!r} downloads {wanted} without `needs: {IPE_BUILD_PRODUCER}`; "
                     "it could start before the artifact exists"
@@ -3158,36 +3266,40 @@ def _untracked_blind_diffs(lines: list[str]) -> list[str]:
     return [a.command for line in lines for a in drift_assertion.parse(line.split()) if not a.sees_untracked]
 
 
-def check_drift_sees_untracked(errors: list[str], root: str = REPO_ROOT, manifest: str | None = None) -> None:
+def check_drift_sees_untracked(wfs: WorkflowSet, errors: list[str], manifest: str | None = None) -> None:
     """Check 17 (see the module docstring). Refuses, never skips, a file it
-    cannot read."""
+    cannot read; a workflow the load refused is absent from `wfs`, its
+    refusal on record."""
+    root = wfs.root
     fix = f"assert with {DRIFT_ASSERTION}, which also fails on untracked output"
-    for wf in _workflow_files(root) + _local_action_files(root):
-        name = os.path.relpath(wf, root)
+    sources: list[tuple[str, list[tuple[str, object]]]] = [
+        (os.path.join("workflows", wf.fname), [(f"job {wj.job_id!r}", wj.raw.get("steps")) for wj in wf.jobs])
+        for wf in wfs.workflows
+    ]
+    for path in _local_action_files(root):
+        name = os.path.relpath(path, root)
         try:
-            with open(wf) as f:
-                doc = strict_yaml.safe_load(f)
+            doc = _read_action(path)
         except (OSError, yaml.YAMLError) as e:
-            errors.append(f"check 17: cannot read {wf}: {e}")
+            errors.append(f"check 17: cannot read {path}: {e}")
             continue
         if not isinstance(doc, dict):
             errors.append(f"check 17: {name} is not a mapping; refused")
             continue
-        jobs = doc.get("jobs")
         runs_ = doc.get("runs")
-        groups = (
-            [(f"job {jid!r}", job.get("steps") if isinstance(job, dict) else None) for jid, job in jobs.items()]
-            if isinstance(jobs, dict)
-            else [("composite steps", runs_.get("steps"))] if isinstance(runs_, dict) else []
-        )
+        sources.append((name, [("composite steps", runs_.get("steps"))] if isinstance(runs_, dict) else []))
+    for name, groups in sources:
         for what, steps in groups:
-            runs = [st["run"] for st in steps or [] if isinstance(st, dict) and isinstance(st.get("run"), str)]
+            runs = [
+                st["run"]
+                for st in (steps if isinstance(steps, list) else [])
+                if isinstance(st, dict) and isinstance(st.get("run"), str)
+            ]
             for line in _untracked_blind_diffs(_quote_removed(runs)):
                 errors.append(f"check 17: {name} {what} runs `{line}`, blind to new generated files; {fix}")
     where = manifest or os.path.join(root, "ci", "check-manifest.yml")
     try:
-        with open(where) as f:
-            mdoc = strict_yaml.safe_load(f)
+        mdoc = read_manifest(where)
     except (OSError, yaml.YAMLError) as e:
         errors.append(f"check 17: cannot read {where}: {e}")
         return
@@ -3260,12 +3372,11 @@ def _selected_packages(
     return names, dirs
 
 
-def check_scoped_package_coverage(
-    errors: list[str], root: str = REPO_ROOT, tracked: list[str] | None = None
-) -> None:
+def check_scoped_package_coverage(wfs: WorkflowSet, errors: list[str], tracked: list[str] | None = None) -> None:
     """Check 16 (see the module docstring). Refuses, never skips, a shape it
-    cannot read."""
-    repo = os.path.dirname(root)
+    cannot read; a workflow the load refused is absent from `wfs`, its
+    refusal on record."""
+    repo = os.path.dirname(wfs.root)
     if tracked is None:
         tracked = _tracked_paths(repo)
         if tracked is None:
@@ -3277,19 +3388,11 @@ def check_scoped_package_coverage(
         return
     narrow = set(change_class.SCOPES) - {"code"}
     scoped: list[tuple[str, str, list[str], list[str], list[str]]] = []
-    for wf in _workflow_files(root):
-        name = os.path.basename(wf)
-        try:
-            with open(wf) as f:
-                doc = strict_yaml.safe_load(f)
-        except (OSError, yaml.YAMLError) as e:
-            errors.append(f"check 16: cannot read {wf}: {e}")
-            continue
-        jobs = doc.get("jobs") if isinstance(doc, dict) else None
-        if not isinstance(jobs, dict):
-            continue
-        for jid, job in jobs.items():
-            if not isinstance(job, dict) or not isinstance(job.get("if"), str):
+    for wf in wfs.workflows:
+        name, doc = wf.fname, wf.doc
+        for wj in wf.jobs:
+            jid, job = wj.job_id, wj.raw
+            if not isinstance(job.get("if"), str):
                 continue
             scopes = sorted(set(_SCOPE_REF.findall(job["if"])).intersection(narrow))
             if not scopes:
@@ -4777,11 +4880,6 @@ def _step_refusal_detail(st: Step) -> list[str]:
     return detail
 
 
-def _needs_of(raw: dict) -> list[str]:
-    needs = raw.get("needs") or []
-    return [str(n) for n in ([needs] if isinstance(needs, str) else needs if isinstance(needs, list) else [needs])]
-
-
 @dataclass(frozen=True)
 class ToolJob:
     """A job that names `.github/ci/**`, parsed once.
@@ -4898,14 +4996,14 @@ class ToolJob:
                 "only an output tool's terminal job admits a job if:; refused"
             )
         if masking:
-            dependents = sorted(j.job_id for j in wf.jobs if job.job_id in _needs_of(j.raw))
+            dependents = sorted(j.job_id for j in wf.jobs if job.job_id in j.needs)
             if dependents:
                 refusals.append(
                     f"{jloc} runs {PROTECTED_TREE}/ with a job {'/'.join(sorted(masking))}: but "
                     f"job(s) {dependents} need it — a skipped job skips its dependents, which "
                     "then report success; refused"
                 )
-        job_needs = _needs_of(raw)
+        job_needs = list(job.needs)
         if job_needs and (head_free_job or any(not ROLE_MASKING[t.role].job for t in tools)):
             refusals.append(
                 f"{jloc} runs {PROTECTED_TREE}/ with needs: {job_needs!r} — a job whose tool "
@@ -5092,8 +5190,7 @@ class LocalActions:
             return None
         path = found[0]
         try:
-            with open(path) as f:
-                doc = strict_yaml.safe_load(f)
+            doc = _read_action(path)
         except yaml.YAMLError as e:
             self.errors.append(f"{path} is not valid YAML: {e}")
             return None
@@ -5207,7 +5304,7 @@ def _job_sub_env_scopes(job_raw: dict, loc: str, errors: list[str]) -> list[tupl
     return scopes
 
 
-def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
+def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> None:
     """Checks 6 and 7 over every step of every workflow and reachable local action.
 
     No job wraps or replaces rustc, and only `main` saves the dependency
@@ -5377,6 +5474,7 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
         script is trusted, not checked.
     Those are review-gated, not machine-gated.
     """
+    root = wfs.root
     start = len(errors)
     policy = StepPolicy(
         load_github_env_allowlist(errors, root), os.path.dirname(os.path.abspath(root)), Workspace.CHECKOUT
@@ -5394,7 +5492,7 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
             actions.resolve(f"./.github/{rel}", "local action audit")
 
     base_policy = policy
-    for wf in _load_workflows(root, errors):
+    for wf in wfs.workflows:
         policy = replace(base_policy, workspace=wf.workspace)
         wloc = f"{wf.fname}: workflow-level"
         _refuse_env_keys(_scoped_env(wf.doc, f"{wloc} env", errors), wloc, errors)
@@ -5429,8 +5527,9 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
 
 
 
-def check_ci_suites_required(entries: list[dict], errors: list[str], root: str = REPO_ROOT) -> None:
+def check_ci_suites_required(wfs: WorkflowSet, entries: list[dict], errors: list[str]) -> None:
     """Check 21 (see the module docstring)."""
+    root = wfs.root
     gate_producer = {
         str(e["context"]): str(e["producer"])
         for e in entries
@@ -5438,7 +5537,7 @@ def check_ci_suites_required(entries: list[dict], errors: list[str], root: str =
     }
     suites = sorted(os.path.basename(p) for p in glob.glob(os.path.join(root, "ci", "test_*.py")))
     run_by: dict[str, list[str]] = {s: [] for s in suites}
-    for wf in _load_workflows(root, errors):
+    for wf in wfs.workflows:
         for wj in wf.jobs:
             job = wj.raw
             context = str(job.get("name", wj.job_id))
@@ -5680,9 +5779,10 @@ def _invocation_seeds(
 
 
 def check_feature_coverage(
-    entries: list[dict], errors: list[str], root: str = REPO_ROOT, tracked: list[str] | None = None
+    wfs: WorkflowSet, entries: list[dict], errors: list[str], tracked: list[str] | None = None
 ) -> None:
     """Check 22 (see the module docstring)."""
+    root = wfs.root
     repo = os.path.dirname(root)
     members = _feature_members(repo, errors)
     layout = _workspace_layout(repo, tracked)
@@ -5692,7 +5792,7 @@ def check_feature_coverage(
     if members is None:
         return
     covered: set[tuple[str, str]] = set()
-    for wf in _load_workflows(root, errors):
+    for wf in wfs.workflows:
         if wf.fname != "ci.yml":
             continue
         for job in _required_ci_jobs(entries, wf):
@@ -6139,8 +6239,7 @@ def _local_composite(uses: str, repo: str, where: str, depth: int, errors: list[
         _refuse_once(errors, f"check 23: {where}: local action {uses!r} {why}, so what it runs cannot be read; refused")
         return None
     try:
-        with open(found[0]) as f:
-            doc = strict_yaml.safe_load(f)
+        doc = _read_action(found[0])
     except (OSError, yaml.YAMLError) as e:
         _refuse_once(errors, f"check 23: {where}: local action {uses!r} is unreadable ({e}); refused")
         return None
@@ -6347,10 +6446,11 @@ def _check_tail(job: dict, where: str, first_tail: int, vm_tail: str | None, rep
             )
 
 
-def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> None:
+def check_release_target_parity(wfs: WorkflowSet, errors: list[str]) -> None:
     """Check 23 (see the module docstring)."""
+    root = wfs.root
     repo = os.path.dirname(root)
-    by_file = {wf.fname: wf for wf in _load_workflows(root, errors)}
+    by_file = {wf.fname: wf for wf in wfs.workflows}
     jobs: dict[str, dict[str, dict]] = {}
     for fname, wanted in (
         ("ci.yml", (CI_RELEASE_NATIVE_JOB, CI_RELEASE_FREEBSD_JOB)),
@@ -6446,8 +6546,15 @@ def check_release_target_parity(errors: list[str], root: str = REPO_ROOT) -> Non
             errors.append(f"check 23: {RELEASE_WORKFLOW}'s completeness gate expects {name!r}, which no job publishes")
 
 
+def read_manifest(path: str) -> object:
+    """`check-manifest.yml` at `path`, parsed: the one manifest load. Raises
+    `OSError`/`yaml.YAMLError` for the caller to refuse."""
+    with open(path, encoding="utf-8") as f:
+        return strict_yaml.safe_load(f)
+
+
 def load_manifest() -> dict:
-    doc = strict_yaml.safe_load(open(MANIFEST))
+    doc = read_manifest(MANIFEST)
     if not isinstance(doc, dict) or "checks" not in doc:
         print("verify-manifest: manifest missing top-level `checks:`", file=sys.stderr)
         sys.exit(2)
@@ -6496,8 +6603,13 @@ def main() -> int:
                 "check may not be marked delete"
             )
 
+    # ---- 0. one typed load of every workflow; its refusals are errors ----
+    workflows = WorkflowSet.load(REPO_ROOT)
+    errors.extend(workflows.rendered())
+    check_permissions(workflows, errors)
+
     # ---- 1. every produced context is classified ----
-    jobs = workflow_jobs()
+    jobs = workflows.jobs()
     produced = produced_contexts(jobs)
     manifest_ctxs = set(by_context)
 
@@ -6534,13 +6646,14 @@ def main() -> int:
         )
 
     # ---- 5. ci/deterministic-checks.json vs the watcher + ci.yml steps ----
-    check_deterministic_set(jobs, errors)
+    check_deterministic_set(workflows, errors)
 
     # ---- 6+7. rustc wiring + cache saves; pinned CI inputs + env-file writes ----
-    check_workflow_steps(errors)
+    check_workflow_steps(workflows, errors)
 
     # ---- 8. merge queue: gate producers trigger on it; its runs stay secret-free ----
     check_merge_queue(
+        workflows,
         {
             str(e["producer"])
             for e in by_context.values()
@@ -6551,38 +6664,41 @@ def main() -> int:
 
     # ---- 9. no release-only skip-as-pass on a gate producer ----
     check_release_only_skips(
+        workflows,
         {ctx for ctx, e in by_context.items() if e.get("disposition") == "gate"},
         errors,
     )
 
     # ---- 10. fast gate first: heavy test shards need every fast gate ----
     check_fast_gate_first(
+        workflows,
         {ctx for ctx, e in by_context.items() if e.get("disposition") == "gate"},
         errors,
     )
     # ---- 11. CI phases: each job in one phase; later-phase contexts report a fail-closed verdict ----
     check_phase_routing(
+        workflows,
         {ctx for ctx, e in by_context.items() if e.get("disposition") == "gate"},
         errors,
     )
     # ---- 12. gate integrity: pull_request_target runs no head code; trust roots live ----
-    check_pull_request_target(errors)
+    check_pull_request_target(workflows, errors)
     check_trust_roots(errors)
 
     # ---- 13. push runs: every push commit gets its own concurrency group ----
-    check_push_concurrency(errors)
+    check_push_concurrency(workflows, errors)
 
     # ---- 14. one lock per dependency graph; Dependabot updates that lock ----
     check_one_lock_per_graph(errors)
 
     # ---- 15. one `ipe` build in ci.yml; its consumers need the producer ----
-    check_one_ipe_build(errors)
+    check_one_ipe_build(workflows, errors)
 
     # ---- 16. a path-scoped job's scope covers every file it compiles ----
-    check_scoped_package_coverage(errors)
+    check_scoped_package_coverage(workflows, errors)
 
     # ---- 17. a drift check also sees untracked generated files ----
-    check_drift_sees_untracked(errors)
+    check_drift_sees_untracked(workflows, errors)
 
     # ---- 18. Dependabot's open update PRs fit the open-PR budget ----
     check_dependabot_pr_budget(errors)
@@ -6591,16 +6707,16 @@ def main() -> int:
     check_workspace_inheritance(errors)
 
     # ---- 20. Every non-host test cell is run by the job that claims it ----
-    check_test_claims(errors)
+    check_test_claims(workflows, errors)
 
     # ---- 21. Every CI-tooling refusal suite runs in a required job ----
-    check_ci_suites_required(entries, errors)
+    check_ci_suites_required(workflows, entries, errors)
 
     # ---- 22. Every cargo feature is compiled by a required job ----
-    check_feature_coverage(entries, errors)
+    check_feature_coverage(workflows, entries, errors)
 
     # ---- 23. ci.yml checks exactly the targets release.yml builds ----
-    check_release_target_parity(errors)
+    check_release_target_parity(workflows, errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

@@ -60,6 +60,14 @@ check_ci_suites_required = verify_manifest.check_ci_suites_required
 check_feature_coverage = verify_manifest.check_feature_coverage
 check_release_target_parity = verify_manifest.check_release_target_parity
 
+def _load(root: str, errors: list[str]) -> verify_manifest.WorkflowSet:
+    """The typed workflow load `main` runs once, its refusals recorded as
+    `main` records them, for a check under test to consume."""
+    wfs = verify_manifest.WorkflowSet.load(root)
+    errors.extend(wfs.rendered())
+    return wfs
+
+
 with open(os.path.join(HERE, "github-env-allowlist.txt")) as _f:
     VALID_ENV_ALLOWLIST = _f.read()
 
@@ -109,7 +117,7 @@ class WorkflowFixture:
 
     def errors(self) -> list[str]:
         errors: list[str] = []
-        check_workflow_steps(errors, root=self.root)
+        check_workflow_steps(_load(self.root, errors), errors)
         return errors
 
 
@@ -941,7 +949,7 @@ class TestRustcWiringClosure(unittest.TestCase):
             "    steps:\n      - run: cargo build\n"
             "    steps:\n      - run: RUSTC_WRAPPER=evil cargo build\n",
         )
-        self.assertRefused("ci.yml is not valid YAML", "duplicate key")
+        self.assertRefused("ci.yml: is not valid YAML", "duplicate key", "[YAML_INVALID]")
 
     def test_merge_key_workflow_is_refused(self) -> None:
         self.fx.workflow(
@@ -950,7 +958,7 @@ class TestRustcWiringClosure(unittest.TestCase):
             "name: ci\non: push\njobs:\n  clippy:\n"
             "    <<: *base\n    steps:\n      - run: cargo build\n",
         )
-        self.assertRefused("ci.yml is not valid YAML")
+        self.assertRefused("ci.yml: is not valid YAML", "[YAML_INVALID]")
 
     def test_anchor_alias_workflow_is_refused(self) -> None:
         self.fx.workflow(
@@ -958,7 +966,7 @@ class TestRustcWiringClosure(unittest.TestCase):
             "name: ci\non: push\njobs:\n  clippy: &clippy\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - run: cargo build\n  clippy2: *clippy\n",
         )
-        self.assertRefused("ci.yml is not valid YAML")
+        self.assertRefused("ci.yml: is not valid YAML", "[YAML_INVALID]")
 
 
 class TestRustCacheSavesMainOnly(unittest.TestCase):
@@ -1020,7 +1028,7 @@ class TestRustCacheSavesMainOnly(unittest.TestCase):
 
     def test_live_workflows_all_save_main_only(self) -> None:
         errors: list[str] = []
-        check_workflow_steps(errors, root=os.path.dirname(HERE))
+        check_workflow_steps(_load(os.path.dirname(HERE), errors), errors)
         self.assertFalse([e for e in errors if "rust-cache" in e], errors)
 
 
@@ -2392,7 +2400,7 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
     def test_live_masked_tool_jobs_parse_as_output_jobs(self) -> None:
         vm = verify_manifest
         errors: list[str] = []
-        wfs = {wf.fname: wf for wf in vm._load_workflows(vm.REPO_ROOT, errors)}
+        wfs = {wf.fname: wf for wf in _load(vm.REPO_ROOT, errors).workflows}
         self.assertEqual(errors, [])
         for fname, job_id, masking in (
             ("ci.yml", "cancel-on-cheap-red", {"if"}),
@@ -3191,17 +3199,15 @@ class TestDeterministicSetMasking(unittest.TestCase):
                 "name: ci\non: push\njobs:\n"
                 "  clippy:\n    runs-on: ubuntu-latest\n" + textwrap.indent(job_extra, "    ")
                 + "    steps:\n      - name: Run clippy\n        run: cargo clippy\n"
-                + textwrap.indent(step_extra, "        "),
+                + textwrap.indent(step_extra, "        ")
+                + f"  {vm.CANCEL_WATCHER_JOB_ID}:\n    name: cancel\n    needs: [clippy]\n"
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: echo cancel\n",
             )
-            jobs = [
-                vm.Job("ci.yml", "clippy", ["clippy"], []),
-                vm.Job("ci.yml", vm.CANCEL_WATCHER_JOB_ID, ["cancel"], ["clippy"]),
-            ]
             errors: list[str] = []
-            with mock.patch.object(vm, "REPO_ROOT", tmp), mock.patch.object(
-                vm, "load_deterministic_checks", lambda errs: [("clippy", "Run clippy")]
+            with mock.patch.object(
+                vm, "load_deterministic_checks", lambda errs, root: [("clippy", "Run clippy")]
             ):
-                vm.check_deterministic_set(jobs, errors)
+                vm.check_deterministic_set(_load(tmp, errors), errors)
             return errors
 
     def test_unmasked_check_and_a_path_filter_if_pass(self) -> None:
@@ -3275,7 +3281,7 @@ class TestMergeQueueSafety(unittest.TestCase):
     def errors(self, content: str, *, gates: set[str] | None = None) -> list[str]:
         self.fx.workflow("gate.yml", content)
         errors: list[str] = []
-        check_merge_queue({"gate.yml"} if gates is None else gates, errors, root=self.fx.root)
+        check_merge_queue(_load(self.fx.root, errors), {"gate.yml"} if gates is None else gates, errors)
         return errors
 
     def assertRefused(self, content: str, needle: str, **kw: object) -> None:
@@ -3342,7 +3348,7 @@ class TestMergeQueueSafety(unittest.TestCase):
     def admin_errors(self, fname: str, content: str) -> list[str]:
         self.fx.workflow(fname, content)
         errors: list[str] = []
-        check_merge_queue(set(), errors, root=self.fx.root)
+        check_merge_queue(_load(self.fx.root, errors), set(), errors)
         return errors
 
     def assertAdminRefused(self, fname: str, content: str, needle: str) -> None:
@@ -3607,7 +3613,7 @@ class TestReleaseOnlySkipAsPass(unittest.TestCase):
     def errors(self, content: str, *, gates: set[str] | None = None) -> list[str]:
         self.fx.workflow("gate.yml", content)
         errors: list[str] = []
-        check_release_only_skips({"heavy (linux)"} if gates is None else gates, errors, root=self.fx.root)
+        check_release_only_skips(_load(self.fx.root, errors), {"heavy (linux)"} if gates is None else gates, errors)
         return errors
 
     def assertRefused(self, content: str, needle: str) -> None:
@@ -3801,7 +3807,7 @@ class TestFastGateFirst(unittest.TestCase):
     def errors(self, content: str, *, gates: set[str] = _FG_GATES) -> list[str]:
         _write(os.path.join(self.root, "workflows", "ci.yml"), content)
         errors: list[str] = []
-        check_fast_gate_first(gates, errors, root=self.root)
+        check_fast_gate_first(_load(self.root, errors), gates, errors)
         return errors
 
     def assertRefused(self, content: str, needle: str, **kw: object) -> None:
@@ -3813,7 +3819,7 @@ class TestFastGateFirst(unittest.TestCase):
 
     def test_repo_ci_yml_passes(self) -> None:
         errors: list[str] = []
-        check_fast_gate_first(_FG_GATES, errors)
+        check_fast_gate_first(_load(verify_manifest.REPO_ROOT, errors), _FG_GATES, errors)
         self.assertEqual(errors, [])
 
     def test_heavy_shard_missing_a_fast_gate_refused(self) -> None:
@@ -3882,15 +3888,17 @@ class TestFastGateFirst(unittest.TestCase):
         bad = _FG_OK.replace(
             "needs: [test-prep, fmt, clippy, manifest-lock-consistency, panic-scan]", "needs: {a: b}"
         )
-        self.assertRefused(bad, "'test-run' has a malformed `needs:`")
+        self.assertRefused(bad, "job 'test-run' needs:")
+        self.assertRefused(bad, "[NEEDS_NOT_LIST]")
 
     def test_unreadable_workflow_refused(self) -> None:
-        self.assertRefused("jobs: [", "cannot read")
+        self.assertRefused("jobs: [", "[YAML_INVALID]")
+        self.assertRefused("jobs: [", "check 10: ci.yml is not a loaded workflow")
 
     def test_missing_workflow_refused(self) -> None:
         errors: list[str] = []
-        check_fast_gate_first(_FG_GATES, errors, root=self.root)
-        self.assertTrue(any("cannot read" in e for e in errors), errors)
+        check_fast_gate_first(_load(self.root, errors), _FG_GATES, errors)
+        self.assertTrue(any("check 10: ci.yml is not a loaded workflow" in e for e in errors), errors)
 
 
 # A head-free pull_request_target + merge_group workflow: the shape
@@ -4021,7 +4029,7 @@ class TestPhaseRouting(unittest.TestCase):
     def errors(self, content: str, *, gates: frozenset[str] = _PH_GATES) -> list[str]:
         _write(os.path.join(self.root, "workflows", "ci.yml"), content)
         errors: list[str] = []
-        check_phase_routing(set(gates), errors, root=self.root)
+        check_phase_routing(_load(self.root, errors), set(gates), errors)
         return errors
 
     def assertRefused(self, old: str, new: str, needle: str, **kw: object) -> None:
@@ -4037,7 +4045,7 @@ class TestPhaseRouting(unittest.TestCase):
             str(e["context"]) for e in verify_manifest.load_manifest()["checks"] if e.get("disposition") == "gate"
         }
         errors: list[str] = []
-        check_phase_routing(gates, errors)
+        check_phase_routing(_load(verify_manifest.REPO_ROOT, errors), gates, errors)
         self.assertEqual(errors, [])
 
     def test_workflow_outside_the_merge_queue_is_not_routed(self) -> None:
@@ -4277,7 +4285,7 @@ class TestPhaseRouting(unittest.TestCase):
         any other spelling still trips it."""
         _write(os.path.join(self.root, "workflows", "ci.yml"), _PH_OK)
         errors: list[str] = []
-        check_merge_queue(set(), errors, root=self.root)
+        check_merge_queue(_load(self.root, errors), set(), errors)
         self.assertEqual(errors, [])
         bad = _PH_OK.replace(
             "needs.changes.outputs.cheap == 'true'\n    steps:\n      - run: echo fmt",
@@ -4287,7 +4295,7 @@ class TestPhaseRouting(unittest.TestCase):
         self.assertNotEqual(bad, _PH_OK)
         _write(os.path.join(self.root, "workflows", "ci.yml"), bad)
         errors = []
-        check_merge_queue(set(), errors, root=self.root)
+        check_merge_queue(_load(self.root, errors), set(), errors)
         self.assertTrue(any("without `&& github.event_name != 'merge_group'`" in e for e in errors), errors)
 
 
@@ -4403,7 +4411,7 @@ class TestPullRequestTarget(unittest.TestCase):
     def errors(self, content: str) -> list[str]:
         self.fx.workflow("prt.yml", content)
         errors: list[str] = []
-        check_pull_request_target(errors, root=self.fx.root)
+        check_pull_request_target(_load(self.fx.root, errors), errors)
         return errors
 
     def assertRefused(self, content: str, needle: str) -> None:
@@ -4516,7 +4524,7 @@ class TestPullRequestTarget(unittest.TestCase):
         self.assertRefused(bad, "interpolates")
 
     def test_whitespace_normalised_token_admitted(self) -> None:
-        self.assertEqual(self.errors(_PRT_OK.replace("${{ github.token }}", "${{   github.token\t}}")), [])
+        self.assertEqual(self.errors(_PRT_OK.replace("${{ github.token }}", "${{   github.token   }}")), [])
 
     def test_missing_permissions_refused(self) -> None:
         bad = _PRT_OK.replace("permissions:\n  contents: read\n  pull-requests: read\n", "")
@@ -4550,7 +4558,7 @@ class TestPullRequestTarget(unittest.TestCase):
 
     def test_live_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_pull_request_target(errors)
+        check_pull_request_target(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_live_trust_root_diff_is_head_free_under_both_triggers(self) -> None:
@@ -4559,7 +4567,7 @@ class TestPullRequestTarget(unittest.TestCase):
         self.assertIn("pull_request_target", live)
         self.assertEqual(self.errors(live), [])
         errors: list[str] = []
-        check_merge_queue({"prt.yml"}, errors, root=self.fx.root)
+        check_merge_queue(_load(self.fx.root, errors), {"prt.yml"}, errors)
         self.assertEqual(errors, [])
 
 
@@ -4610,7 +4618,7 @@ class TestHeadFreeExemption(unittest.TestCase):
     def test_live_workspaces(self) -> None:
         vm = verify_manifest
         errors: list[str] = []
-        wfs = {wf.fname: wf.workspace for wf in vm._load_workflows(vm.REPO_ROOT, errors)}
+        wfs = {wf.fname: wf.workspace for wf in _load(vm.REPO_ROOT, errors).workflows}
         self.assertEqual(errors, [])
         self.assertEqual(sorted(f for f, w in wfs.items() if w is vm.Workspace.NONE), ["trust-root-diff.yml"])
         self.assertIs(wfs["ci.yml"], vm.Workspace.CHECKOUT)
@@ -4811,7 +4819,7 @@ class TestPushConcurrency(unittest.TestCase):
             _write(os.path.join(self.root, "workflows", n), c)
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.LATEST_WINS_PUSH_GROUPS, {}, clear=True):
-            check_push_concurrency(errors, root=self.root)
+            check_push_concurrency(_load(self.root, errors), errors)
         return errors
 
     def group(self, group: str) -> list[str]:
@@ -4889,13 +4897,13 @@ class TestPushConcurrency(unittest.TestCase):
         _write(os.path.join(self.root, "workflows", "w.yml"), _PUSH_WF.replace("GROUP", "pages"))
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.LATEST_WINS_PUSH_GROUPS, {"w.yml": "r", "gone.yml": "r"}, clear=True):
-            check_push_concurrency(errors, root=self.root)
+            check_push_concurrency(_load(self.root, errors), errors)
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("gone.yml", errors[0])
 
     def test_live_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_push_concurrency(errors)
+        check_push_concurrency(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_every_live_exemption_carries_a_reason(self) -> None:
@@ -4933,7 +4941,7 @@ class TestMergeGroupConcurrency(unittest.TestCase):
         _write(os.path.join(self.root, "workflows", "w.yml"), content)
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.LATEST_WINS_PUSH_GROUPS, {}, clear=True):
-            check_push_concurrency(errors, root=self.root)
+            check_push_concurrency(_load(self.root, errors), errors)
         return errors
 
     def site(self, group: str, cancel: str) -> list[str]:
@@ -5192,6 +5200,10 @@ class TestDependabotPrBudget(unittest.TestCase):
 _IB_OK = """\
 on: pull_request
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo classify
   build-tools:
     runs-on: ubuntu-latest
     steps:
@@ -5246,7 +5258,7 @@ class TestOneIpeBuild(unittest.TestCase):
             _write(os.path.join(self.repo, rel), text)
         _write(os.path.join(self.root, "workflows", "ci.yml"), content)
         errors: list[str] = []
-        check_one_ipe_build(errors, root=self.root, tracked=sorted(self.files))
+        check_one_ipe_build(_load(self.root, errors), errors, tracked=sorted(self.files))
         return errors
 
     def with_consumer_step(self, run: str, extra: str = "") -> str:
@@ -5266,7 +5278,7 @@ class TestOneIpeBuild(unittest.TestCase):
 
     def test_repo_ci_yml_passes(self) -> None:
         errors: list[str] = []
-        check_one_ipe_build(errors)
+        check_one_ipe_build(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_second_ipe_build_refused_in_every_spelling(self) -> None:
@@ -5426,7 +5438,8 @@ class TestOneIpeBuild(unittest.TestCase):
         self.assertRefused(bad, "does not upload 'ci-ipe-release'")
 
     def test_unreadable_workflow_refused(self) -> None:
-        self.assertRefused("jobs: [1]\n", "has no `jobs:` mapping")
+        self.assertRefused("jobs: [1]\n", "[JOBS_NOT_MAPPING]")
+        self.assertRefused("jobs: [1]\n", "check 15: ci.yml is not a loaded workflow")
 
 
 
@@ -5464,6 +5477,10 @@ _SC_FILES = {
 _SC_WF = """\
 on: pull_request
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo classify
   asan:
     needs: changes
     if: needs.changes.outputs.emit != 'false' || github.event_name != 'pull_request'
@@ -5491,7 +5508,7 @@ class TestScopedPackageCoverage(unittest.TestCase):
         _write(os.path.join(self.repo, ".github", "workflows", "ci.yml"), wf)
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.change_class.SCOPES, {"emit": scope}):
-            check_scoped_package_coverage(errors, root=os.path.join(self.repo, ".github"), tracked=sorted(self.files))
+            check_scoped_package_coverage(_load(os.path.join(self.repo, ".github"), errors), errors, tracked=sorted(self.files))
         return errors
 
     def assertRefused(self, needle: str, **kw: object) -> None:
@@ -5503,7 +5520,7 @@ class TestScopedPackageCoverage(unittest.TestCase):
 
     def test_repo_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_scoped_package_coverage(errors)
+        check_scoped_package_coverage(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_uncovered_path_dependency_refused(self) -> None:
@@ -5625,7 +5642,7 @@ class TestDriftSeesUntracked(unittest.TestCase):
         _write(os.path.join(self.root, "workflows", "ci.yml"), wf)
         _write(os.path.join(self.root, "ci", "check-manifest.yml"), manifest)
         errors: list[str] = []
-        check_drift_sees_untracked(errors, root=self.root)
+        check_drift_sees_untracked(_load(self.root, errors), errors)
         return errors
 
     def test_valid_passes(self) -> None:
@@ -5633,7 +5650,7 @@ class TestDriftSeesUntracked(unittest.TestCase):
 
     def test_repo_passes(self) -> None:
         errors: list[str] = []
-        check_drift_sees_untracked(errors)
+        check_drift_sees_untracked(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_workflow_git_diff_exit_code_refused_in_every_spelling(self) -> None:
@@ -5696,7 +5713,7 @@ class TestDriftSeesUntracked(unittest.TestCase):
             self.assertTrue(any(path in e for e in errors), (path, errors))
 
     def test_unreadable_inputs_refused(self) -> None:
-        self.assertTrue(any("check 17: cannot read" in e for e in self.errors(wf="jobs: [\n")))
+        self.assertTrue(any("[YAML_INVALID]" in e for e in self.errors(wf="jobs: [\n")))
         self.assertTrue(any("no `checks:` list" in e for e in self.errors(manifest="checks: 1\n")))
 
 
@@ -5865,7 +5882,7 @@ class TestTestClaims(unittest.TestCase):
             _write(os.path.join(self.repo, rel), text)
         _write(os.path.join(self.root, "workflows", "ci.yml"), ci)
         errors: list[str] = []
-        check_test_claims(errors, root=self.root)
+        check_test_claims(_load(self.root, errors), errors)
         return errors
 
     def assertRefused(self, ci: str, needle: str) -> None:
@@ -5877,7 +5894,7 @@ class TestTestClaims(unittest.TestCase):
 
     def test_repo_passes(self) -> None:
         errors: list[str] = []
-        check_test_claims(errors)
+        check_test_claims(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_all_features_satisfies_the_cell(self) -> None:
@@ -6152,7 +6169,7 @@ class TestCiSuitesRequired(unittest.TestCase):
         wf = _SUITE_WF.replace("JOB_KEYS", job_keys).replace("STEP_KEYS", step_keys).replace("RUN", run)
         _write(os.path.join(self.root, "workflows", "w.yml"), wf)
         errors: list[str] = []
-        check_ci_suites_required(_SUITE_GATE if entries is None else entries, errors, root=self.root)
+        check_ci_suites_required(_load(self.root, errors), _SUITE_GATE if entries is None else entries, errors)
         return errors
 
     def assertRefused(self, errors: list[str]) -> None:
@@ -6188,7 +6205,7 @@ class TestCiSuitesRequired(unittest.TestCase):
 
     def test_live_tree_runs_every_suite(self) -> None:
         errors: list[str] = []
-        check_ci_suites_required(verify_manifest.load_manifest()["checks"], errors)
+        check_ci_suites_required(_load(verify_manifest.REPO_ROOT, errors), verify_manifest.load_manifest()["checks"], errors)
         self.assertEqual(errors, [])
 
 _FC_CI = """\
@@ -6237,9 +6254,7 @@ class TestFeatureCoverage(unittest.TestCase):
             _write(os.path.join(self.repo, rel), text)
         _write(os.path.join(self.root, "workflows", "ci.yml"), ci)
         errors: list[str] = []
-        check_feature_coverage(
-            _FC_ENTRIES if entries is None else entries, errors, root=self.root, tracked=sorted(self.files)
-        )
+        check_feature_coverage(_load(self.root, errors), _FC_ENTRIES if entries is None else entries, errors, tracked=sorted(self.files))
         return errors
 
     def assertRefused(self, ci: str, needle: str) -> None:
@@ -6254,7 +6269,7 @@ class TestFeatureCoverage(unittest.TestCase):
 
     def test_repo_passes(self) -> None:
         errors: list[str] = []
-        check_feature_coverage(verify_manifest.load_manifest()["checks"], errors)
+        check_feature_coverage(_load(verify_manifest.REPO_ROOT, errors), verify_manifest.load_manifest()["checks"], errors)
         self.assertEqual(errors, [])
 
     def test_uncovered_feature_refused(self) -> None:
@@ -6530,7 +6545,7 @@ class TestReleaseTargetParity(unittest.TestCase):
             if toolchain is not None:
                 _write(os.path.join(root, "actions", "release-target-toolchain", "action.yml"), toolchain)
             errors: list[str] = []
-            check_release_target_parity(errors, root=root)
+            check_release_target_parity(_load(root, errors), errors)
             return errors
 
     def assertRefused(
@@ -6599,7 +6614,7 @@ class TestReleaseTargetParity(unittest.TestCase):
 
     def test_repo_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_release_target_parity(errors)
+        check_release_target_parity(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_target_missing_from_ci_refused(self) -> None:
@@ -7227,6 +7242,169 @@ class TestModuleConstantsDefinedOnce(unittest.TestCase):
                         twice.append(f"{t.id} (lines {seen[t.id]} and {node.lineno})")
                     seen.setdefault(t.id, node.lineno)
         self.assertEqual(twice, [])
+
+
+_TL_OK = """\
+name: ok
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+  c:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo c
+"""
+
+
+class TestTypedWorkflowLoad(unittest.TestCase):
+    """The one workflow load (`WorkflowSet.load`) parses each workflow into
+    typed jobs and typed `needs:` once, refusing every other shape with its
+    own `ErrorKind`; no check downstream of it raises on any shape."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def load(self, text: str) -> verify_manifest.WorkflowSet:
+        _write(os.path.join(self.root, "workflows", "w.yml"), text)
+        return verify_manifest.WorkflowSet.load(self.root)
+
+    def every_check(self, wfs: verify_manifest.WorkflowSet) -> list[str]:
+        """Every check that consumes the load, as `main` runs it: an
+        exception from any of them fails the test (a crash is no verdict)."""
+        vm = verify_manifest
+        errors = list(wfs.rendered())
+        vm.check_permissions(wfs, errors)
+        vm.check_deterministic_set(wfs, errors)
+        vm.check_workflow_steps(wfs, errors)
+        vm.check_merge_queue(wfs, {"w.yml"}, errors)
+        vm.check_release_only_skips(wfs, {"a"}, errors)
+        vm.check_fast_gate_first(wfs, {"a"}, errors)
+        vm.check_phase_routing(wfs, {"a"}, errors)
+        vm.check_pull_request_target(wfs, errors)
+        vm.check_push_concurrency(wfs, errors)
+        vm.check_one_ipe_build(wfs, errors, tracked=[])
+        vm.check_ci_suites_required(wfs, [], errors)
+        vm.check_release_target_parity(wfs, errors)
+        vm.produced_contexts(wfs.jobs())
+        return errors
+
+    def assertRefusedWith(self, text: str, kind: str) -> None:
+        wfs = self.load(text)
+        rendered = wfs.rendered()
+        self.assertTrue(any(f"[{kind}]" in e for e in rendered), (kind, rendered))
+        self.assertTrue(any(f"[{kind}]" in e for e in self.every_check(wfs)), kind)
+
+    def test_well_formed_workflow_loads_typed(self) -> None:
+        wfs = self.load(_TL_OK)
+        self.assertEqual(wfs.rendered(), [])
+        wf = wfs.get("w.yml")
+        assert wf is not None
+        self.assertEqual({j.job_id: j.needs for j in wf.jobs}, {"a": (), "b": ("a",), "c": ("a", "b")})
+        self.assertEqual([e for e in self.every_check(wfs) if "[" in e and e.endswith("]")], [])
+
+    def test_document_not_a_mapping_refused(self) -> None:
+        for text in ("- a\n- b\n", "just a scalar\n", ""):
+            with self.subTest(text=text):
+                self.assertRefusedWith(text, "DOCUMENT_NOT_MAPPING")
+                self.assertIsNone(self.load(text).get("w.yml"))
+
+    def test_invalid_yaml_refused(self) -> None:
+        self.assertRefusedWith("jobs: [\n", "YAML_INVALID")
+
+    def test_jobs_as_a_list_refused(self) -> None:
+        self.assertRefusedWith(_TL_OK.split("jobs:")[0] + "jobs:\n  - a\n", "JOBS_NOT_MAPPING")
+
+    def test_job_not_a_mapping_refused(self) -> None:
+        self.assertRefusedWith(_TL_OK + "  d: 1\n", "JOB_NOT_MAPPING")
+
+    def test_each_malformed_needs_has_its_own_kind(self) -> None:
+        for value, kind in (
+            ("''", "NEEDS_EMPTY_STRING"),
+            ("false", "NEEDS_BOOL"),
+            ("0", "NEEDS_NUMBER"),
+            ("[]", "NEEDS_EMPTY_LIST"),
+            ("null", "NEEDS_NULL"),
+            ("{a: b}", "NEEDS_NOT_LIST"),
+            ("[1]", "NEEDS_MEMBER_NOT_STRING"),
+            ("['']", "NEEDS_MEMBER_EMPTY"),
+            ("[a, a]", "NEEDS_DUPLICATE"),
+            ("[a, nope]", "NEEDS_UNKNOWN"),
+            ("nope", "NEEDS_UNKNOWN"),
+        ):
+            with self.subTest(needs=value):
+                bad = _TL_OK.replace("needs: [a, b]", f"needs: {value}")
+                self.assertNotEqual(bad, _TL_OK)
+                self.assertRefusedWith(bad, kind)
+
+    def test_malformed_needs_is_never_read_as_no_needs(self) -> None:
+        # The refused job keeps no needs a downstream check could trust, and
+        # the refusal stays on record for `main`.
+        wfs = self.load(_TL_OK.replace("needs: [a, b]", "needs: false"))
+        self.assertEqual(len(wfs.refusals), 1)
+        self.assertIs(wfs.refusals[0].kind, verify_manifest.ErrorKind.NEEDS_BOOL)
+
+    def test_malformed_permissions_refused(self) -> None:
+        self.assertRefusedWith(_TL_OK.replace("contents: read", "contents: bogus"), "PERMISSIONS_MALFORMED")
+        self.assertRefusedWith(_TL_OK.replace("  contents: read\n", "  - read\n"), "PERMISSIONS_MALFORMED")
+
+    def test_missing_workflow_permissions_refused(self) -> None:
+        wfs = self.load(_TL_OK.replace("permissions:\n  contents: read\n", ""))
+        self.assertEqual(wfs.rendered(), [])
+        self.assertTrue(any("[PERMISSIONS_MISSING]" in e for e in self.every_check(wfs)))
+
+    def test_live_tree_loads_clean(self) -> None:
+        wfs = verify_manifest.WorkflowSet.load(verify_manifest.REPO_ROOT)
+        self.assertEqual(wfs.rendered(), [])
+        errors: list[str] = []
+        verify_manifest.check_permissions(wfs, errors)
+        self.assertEqual(errors, [])
+
+    def test_yaml_is_loaded_only_at_admitted_sites(self) -> None:
+        """A second load of a workflow file is a second parser that can
+        disagree with the first; each YAML load lives at one admitted site."""
+        import ast  # noqa: PLC0415
+
+        admitted = {
+            ("verify-manifest.py", "WorkflowSet.load"): 1,
+            ("verify-manifest.py", "read_manifest"): 1,
+            ("verify-manifest.py", "_read_action"): 1,
+            ("verify-manifest.py", "_dependabot_doc"): 1,
+        }
+        found: dict[tuple[str, str], int] = {}
+        with open(MODULE_PATH, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        def visit(node: ast.AST, scope: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                inner = scope
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    inner = f"{scope}.{child.name}" if scope else child.name
+                if isinstance(child, ast.Call):
+                    fn = child.func
+                    name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
+                    if name in ("safe_load", "load", "full_load", "unsafe_load", "load_all", "safe_load_all") and (
+                        not isinstance(fn, ast.Attribute)
+                        or (isinstance(fn.value, ast.Name) and fn.value.id in ("yaml", "strict_yaml"))
+                    ):
+                        key = ("verify-manifest.py", scope)
+                        found[key] = found.get(key, 0) + 1
+                visit(child, inner)
+
+        visit(tree, "")
+        self.assertEqual(found, admitted)
 
 
 if __name__ == "__main__":
