@@ -2191,10 +2191,10 @@ fn to_axum_response(r: ServerResponse, streams: RequestStreams) -> axum::respons
 }
 
 /// The security headers of a handler response or a static file: the
-/// [`crate::csp::Profile::Response`] policy.
+/// [`crate::csp::Guarded::Response`] policy.
 fn response_security_headers()
 -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
-    crate::telemetry::security_headers(crate::csp::Profile::Response)
+    crate::telemetry::security_headers(&crate::csp::Guarded::Response)
 }
 
 /// [`to_axum_response`] over the outcome of reading the security headers.
@@ -7602,8 +7602,8 @@ mod tests {
     /// The `content-security-policy` the `Response` profile sends under this
     /// process's framing configuration.
     fn response_policy() -> String {
-        crate::csp::ContentSecurityPolicy::for_profile(
-            crate::csp::Profile::Response,
+        crate::csp::ContentSecurityPolicy::for_guard(
+            &crate::csp::Guarded::Response,
             crate::telemetry::frame_ancestors(),
         )
         .header_value()
