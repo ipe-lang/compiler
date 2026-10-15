@@ -622,8 +622,9 @@ pub enum NameError {
     /// (TEA) app entry — imports a shape module under `Ipe.Tea.*`. The
     /// `Ipe.Tea.*` namespace holds only live-loop machinery; importing any part
     /// of it marks a module a TEA app, so a Program that does so is a
-    /// contradiction rejected here. `module` is the offending `Ipe.Tea.*` import
-    /// path. [IPE-N0033]
+    /// contradiction rejected here. The one admitted Program is a server whose
+    /// `main` ends in a direct `Server.listen` call, mounting a `Web.embed` app.
+    /// `module` is the offending `Ipe.Tea.*` import path. [IPE-N0033]
     ProgramImportsTeaShape { module: Box<str> },
     /// A TEA app imports another shape's `Cmd` / `Sub` re-export module. `Cmd`
     /// and `Sub` are shape-specific and reached through the app's own shape

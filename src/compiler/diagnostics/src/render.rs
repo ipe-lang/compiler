@@ -1588,7 +1588,9 @@ fn name_label(msg: &NameError) -> Option<String> {
             "this module has a plain `main` (a Program) but imports `{module}`; \
              a module that imports any `Ipe.Tea.*` shape is a TEA app, so give \
              `main` a shape entry (`Web.tea` / `Tui.tea` / \
-             `Cli.tea`), or drop the `{module}` import \
+             `Cli.tea`), end `main` in a direct \
+             `Server.listen port [ Server.mountApp path (Web.embed config) ]` \
+             to serve an embedded web app, or drop the `{module}` import \
              if this is a Program"
         )),
         NameError::RuntimeBranchedMain => Some(

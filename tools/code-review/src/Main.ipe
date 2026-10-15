@@ -151,12 +151,14 @@ requireLoopbackBind raw =
                 System.exit 1
 
 
--- The one listen. It takes the `Loopback` proof, so the server cannot listen
--- without a bind `Bind.parseBind` accepted; the runtime resolves the address
--- from the same variable the proof was parsed from.
-serve : Bind.Loopback -> Settings.AppSettings -> Task Error ()
-serve _loopback settings =
-    Server.listen 8000 [ Server.mountApp "/" (reviewApp settings) ]
+-- The one mount list. It takes the `Loopback` proof, so the server cannot
+-- listen without a bind `Bind.parseBind` accepted; the runtime resolves the
+-- address from the same variable the proof was parsed from. `main` ends in
+-- `Server.listen` itself, the one head the managed-update-loop import check
+-- admits.
+mounts : Bind.Loopback -> Settings.AppSettings -> List Server.Route
+mounts _loopback settings =
+    [ Server.mountApp "/" (reviewApp settings) ]
 
 
 main : Task Error ()
@@ -170,4 +172,4 @@ main =
         rawReview <- optionalEnv "IPE_REVIEW_DB"
         key <- requireReviewKey
         settings <- requireSettings key rawDb rawRoot rawRepos rawReview
-        serve bind settings
+        Server.listen 8000 (mounts bind settings)
