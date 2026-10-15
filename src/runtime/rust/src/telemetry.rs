@@ -969,10 +969,10 @@ fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>)
     parts.join(", ")
 }
 
-/// Safe-by-default security response headers for `profile`.
+/// Safe-by-default security response headers for `guard`.
 ///
-/// Every set carries the full `Content-Security-Policy` of `profile`: no
-/// profile assembles a set without one. Returned as owned `(name, value)`
+/// Every set carries the full `Content-Security-Policy` of `guard`: no
+/// guard assembles a set without one. Returned as owned `(name, value)`
 /// pairs so each caller splices them into its response builder only when the
 /// header is unset (an explicit handler override wins).
 ///
@@ -981,18 +981,19 @@ fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>)
 /// The [`FrameAncestorsRefusal`] of a refused `IPE_WEB_FRAME_ANCESTORS`: the
 /// caller answers `500` rather than send a response without its framing policy.
 pub fn security_headers(
-    profile: crate::csp::Profile,
+    guard: &crate::csp::Guarded,
 ) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
-    security_headers_with(profile, frame_ancestors_config())
+    security_headers_with(guard, frame_ancestors_config())
 }
 
 /// [`security_headers`] under an explicit framing configuration.
 fn security_headers_with(
-    profile: crate::csp::Profile,
+    guard: &crate::csp::Guarded,
     framing: Result<Option<&FrameAncestors>, FrameAncestorsRefusal>,
 ) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
     use crate::csp::ContentSecurityPolicy;
     let framing = framing?;
+    let profile = guard.kind();
     let mut h: Vec<(&'static str, String)> = vec![
         //
         ("x-content-type-options", "nosniff".to_string()),
@@ -1009,7 +1010,7 @@ fn security_headers_with(
     ];
     h.push((
         "content-security-policy",
-        ContentSecurityPolicy::for_profile(profile, framing).header_value(),
+        ContentSecurityPolicy::for_guard(guard, framing).header_value(),
     ));
     // A response framed same-origin only also carries `X-Frame-Options` for
     // browsers without `frame-ancestors`.
@@ -1515,8 +1516,9 @@ mod tests {
     #[cfg(feature = "web")]
     #[test]
     fn web_page_headers_carry_the_strict_policy() {
-        use crate::csp::{ContentSecurityPolicy, Profile};
-        let page = Profile::WebPage;
+        use crate::csp::{ContentSecurityPolicy, Guarded, Profile};
+        let guard = Guarded::sample(Profile::WebPage, 7);
+        let page = &guard;
         let embed = FrameAncestors::parse("https://a.example").ok().flatten();
         let framed = security_headers_with(page, Ok(embed.as_ref()));
         assert!(
@@ -1529,7 +1531,7 @@ mod tests {
             "{framed:?}"
         );
         let same_origin = security_headers_with(page, Ok(None));
-        let want = ContentSecurityPolicy::for_profile(page, None).header_value();
+        let want = ContentSecurityPolicy::for_guard(page, None).header_value();
         assert!(
             same_origin.as_ref().is_ok_and(|h| {
                 header(h, "x-frame-options") == Some("SAMEORIGIN")
@@ -1539,6 +1541,13 @@ mod tests {
         );
         assert!(
             !want.contains("script-src 'self' 'unsafe-inline'"),
+            "{want}"
+        );
+        assert!(
+            want.contains(&format!(
+                "style-src-elem 'self' 'nonce-{}' ",
+                "07".repeat(16)
+            )),
             "{want}"
         );
         assert_eq!(
@@ -1551,12 +1560,13 @@ mod tests {
     /// builder, framed by the embed list only where the profile follows it.
     #[test]
     fn security_headers_carry_the_profile_policy() {
-        use crate::csp::{ContentSecurityPolicy, Profile};
+        use crate::csp::{ContentSecurityPolicy, Guarded, Profile};
         let embed = FrameAncestors::parse("https://a.example").ok().flatten();
         for &profile in Profile::ALL {
+            let guard = Guarded::sample(profile, 9);
             for framing in [None, embed.as_ref()] {
-                let set = security_headers_with(profile, Ok(framing));
-                let want = ContentSecurityPolicy::for_profile(profile, framing).header_value();
+                let set = security_headers_with(&guard, Ok(framing));
+                let want = ContentSecurityPolicy::for_guard(&guard, framing).header_value();
                 let xfo = profile
                     .embed_list(framing)
                     .is_none()
@@ -1583,7 +1593,7 @@ mod tests {
     /// handler.
     #[test]
     fn session_pages_are_never_stored() {
-        use crate::csp::Profile;
+        use crate::csp::{Guarded, Profile};
         let embed = FrameAncestors::parse("https://a.example").ok().flatten();
         for &profile in Profile::ALL {
             let want = match profile {
@@ -1591,8 +1601,9 @@ mod tests {
                 #[cfg(feature = "web")]
                 Profile::Console | Profile::WebPage => Some("no-store"),
             };
+            let guard = Guarded::sample(profile, 9);
             for framing in [None, embed.as_ref()] {
-                let set = security_headers_with(profile, Ok(framing));
+                let set = security_headers_with(&guard, Ok(framing));
                 assert!(
                     set.as_ref()
                         .is_ok_and(|h| header(h, "cache-control") == want),
@@ -1606,14 +1617,14 @@ mod tests {
     /// so its response answers 500 rather than ship without a framing policy.
     #[test]
     fn frame_ancestors_refusal_answers_500() {
-        use crate::csp::Profile;
+        use crate::csp::{Guarded, Profile};
         for raw in ["'self'; script-src *", "a, b", "a\rb", "a\u{1}b", " \t "] {
             let parsed = FrameAncestors::parse(raw);
             assert!(parsed.is_err(), "{raw:?}");
             if let Err(refusal) = parsed {
                 for &profile in Profile::ALL {
                     assert_eq!(
-                        security_headers_with(profile, Err(refusal)),
+                        security_headers_with(&Guarded::sample(profile, 9), Err(refusal)),
                         Err(refusal),
                         "{raw:?} {profile:?}"
                     );

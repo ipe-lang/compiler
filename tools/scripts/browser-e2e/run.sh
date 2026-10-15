@@ -2,13 +2,14 @@
 # Run the browser E2E Playwright specs against locally built binaries.
 #
 # Usage:
-#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT]
+#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT] [CSP_STYLES_PORT]
 #
-# GEO_PORT defaults to 18080, LAYOUT_PORT to 18081 and FOCUS_PORT to 18082.
+# GEO_PORT defaults to 18080, LAYOUT_PORT to 18081, FOCUS_PORT to 18082 and
+# CSP_STYLES_PORT to 18083.
 # The script:
 #   1. Builds the ipe compiler (cargo build -p ipe --release).
-#   2. Compiles each example (geo-clipboard, layout-fill, focus-across-patch)
-#      via `ipe dev build`.
+#   2. Compiles each example (geo-clipboard, layout-fill, focus-across-patch,
+#      csp-styles) via `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
 #   5. Runs the Playwright specs.
@@ -23,10 +24,12 @@ SPEC_DIR="$(cd "$(dirname "$0")" && pwd)"
 GEO_PORT="${1:-18080}"
 LAYOUT_PORT="${2:-18081}"
 FOCUS_PORT="${3:-18082}"
+CSP_STYLES_PORT="${4:-18083}"
 
 export IPE_GEO_CLIPBOARD_PORT="$GEO_PORT"
 export IPE_LAYOUT_FILL_PORT="$LAYOUT_PORT"
 export IPE_FOCUS_ACROSS_PATCH_PORT="$FOCUS_PORT"
+export IPE_CSP_STYLES_PORT="$CSP_STYLES_PORT"
 export IPE_RUNTIME_DIR="${IPE_RUNTIME_DIR:-$REPO_ROOT/src/runtime/rust/src}"
 
 echo "==> Building ipe compiler..."
@@ -81,6 +84,7 @@ serve() {
 serve geo-clipboard "$GEO_PORT"
 serve layout-fill "$LAYOUT_PORT"
 serve focus-across-patch "$FOCUS_PORT"
+serve csp-styles "$CSP_STYLES_PORT"
 
 echo "==> Installing Playwright + Chromium (if not cached)..."
 cd "$SPEC_DIR"
