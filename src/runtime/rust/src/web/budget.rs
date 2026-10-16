@@ -364,6 +364,7 @@ impl SessionCmds {
     }
 
     /// The Cmds this session has in flight now.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn used(&self) -> Cmds {
         self.budget.used()
@@ -481,12 +482,14 @@ mod tests {
             let held: Vec<CmdPermit> = std::thread::scope(|scope| {
                 let workers: Vec<_> = (0..THREADS)
                     .map(move |_| {
-                        scope.spawn(move || {
-                            barrier.wait();
-                            (0..TRIES)
-                                .filter_map(|_| racing.try_permit().ok())
-                                .collect::<Vec<_>>()
-                        })
+                        std::thread::Builder::new()
+                            .spawn_scoped(scope, move || {
+                                barrier.wait();
+                                (0..TRIES)
+                                    .filter_map(|_| racing.try_permit().ok())
+                                    .collect::<Vec<_>>()
+                            })
+                            .expect("the race test spawns its worker thread")
                     })
                     .collect();
                 workers
