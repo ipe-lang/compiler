@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 mod name;
 pub mod prefix;
+pub mod reparse;
 pub mod win32_name;
 
 pub use name::{EntryName, is_one_spelled_name, may_open_as};
@@ -140,8 +141,13 @@ pub enum HintedKind {
     Dir,
     /// A regular file.
     Regular,
-    /// A symbolic link (on Windows, any reparse point).
+    /// A symbolic link (on Windows, a name-surrogate reparse point: a symlink or a junction).
     Link,
+    /// A reparse point whose tag is no name surrogate, or is unknown (Windows).
+    ///
+    /// A filter driver answers for the entry (a cloud placeholder, an app
+    /// execution alias), so what it lists is not what the volume holds.
+    Transparent,
     /// A FIFO, socket, or device.
     Other,
     /// The listing did not carry a type.
@@ -244,6 +250,12 @@ impl FileId {
     /// The refusal of a handle that cannot be stat'd.
     pub fn of_file(file: &File) -> Result<Self, OpenRefusal> {
         sys::id_of_file(file)
+    }
+
+    /// The volume the object lives on, for a same-volume check.
+    #[must_use]
+    pub const fn volume(&self) -> u64 {
+        self.volume
     }
 }
 

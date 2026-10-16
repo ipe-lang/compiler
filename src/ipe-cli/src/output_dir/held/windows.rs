@@ -30,6 +30,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
+use ipe_fs_open::reparse::{
+    FILE_ATTRIBUTE_DIRECTORY as ATTR_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT as ATTR_REPARSE_POINT,
+};
 use ipe_fs_open::{EntryName, HeldDir, OpenRefusal};
 
 use super::Listed;
@@ -46,10 +49,6 @@ const SHARE_READ: u32 = 0x1;
 const SHARE_NO_DELETE: u32 = 0x1 | 0x2;
 /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
 const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
-/// `FILE_ATTRIBUTE_DIRECTORY`.
-const ATTR_DIRECTORY: u32 = 0x10;
-/// `FILE_ATTRIBUTE_REPARSE_POINT`.
-const ATTR_REPARSE_POINT: u32 = 0x400;
 /// `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY`, for the pin sentinel.
 const ATTR_HIDDEN_TEMPORARY: u32 = 0x2 | 0x100;
 /// `ERROR_REPARSE_POINT_ENCOUNTERED`: the typed refusal of a reparse point.

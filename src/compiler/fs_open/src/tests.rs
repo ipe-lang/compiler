@@ -782,24 +782,10 @@ fn kind_of_classifies_without_following() {
     }
 }
 
-/// A reparse point is a link whatever else its attributes say, never a directory.
+/// A junction, a name-surrogate reparse point, is listed as a link, never a directory.
 #[cfg(windows)]
 #[test]
-fn entries_hinted_reports_reparse_as_link() {
-    use super::sys::hint_of_attributes;
-    const DIRECTORY: u32 = 0x10;
-    const REPARSE_POINT: u32 = 0x400;
-    const ARCHIVE: u32 = 0x20;
-    const DEVICE: u32 = 0x40;
-    assert_eq!(
-        hint_of_attributes(DIRECTORY | REPARSE_POINT),
-        HintedKind::Link
-    );
-    assert_eq!(hint_of_attributes(REPARSE_POINT), HintedKind::Link);
-    assert_eq!(hint_of_attributes(DIRECTORY), HintedKind::Dir);
-    assert_eq!(hint_of_attributes(ARCHIVE), HintedKind::Regular);
-    assert_eq!(hint_of_attributes(DEVICE), HintedKind::Other);
-
+fn entries_hinted_reports_a_junction_as_link() {
     let dir = scratch("hinted_junction");
     std::fs::create_dir(dir.join("real")).unwrap();
     let made = std::process::Command::new("cmd")
