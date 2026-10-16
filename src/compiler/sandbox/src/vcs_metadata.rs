@@ -1151,6 +1151,9 @@ mod tests {
     impl WritableTree {
         /// Test-only: `tree` taken with `carve` as given, for pure plan tests
         /// over paths that need not exist.
+        ///
+        /// # Panics
+        /// When the working directory cannot be opened.
         #[must_use]
         pub fn assumed(tree: CanonicalPath, carve: Vec<CanonicalPath>) -> Self {
             let id = HeldDir::open_root(Path::new(""))

@@ -212,7 +212,7 @@ fn enclosing_fn(code: &str, at: usize) -> String {
                 .and_then(|j| before.get(j..i))
                 .is_none_or(|prev| !prev.chars().any(is_ident))
         })
-        .next_back()
+        .last()
         .and_then(|(i, _)| before.get(i.saturating_add(3)..))
         .map(|rest| rest.chars().take_while(|&c| is_ident(c)).collect())
         .unwrap_or_default()
