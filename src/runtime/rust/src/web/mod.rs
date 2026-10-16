@@ -2429,10 +2429,10 @@ fn dispatch_cmd<Msg: Send + 'static>(
                 dispatch_cmd(c, tx, scope);
             }
         }
-        IpeCmd::Perform(thunk) => {
+        IpeCmd::Perform(body) => {
             let tx = tx.clone();
             tokio::spawn(scope.clone().scoped(async move {
-                let m = thunk().await;
+                let m = body.run().await;
                 // Bounded send: drop the Msg and warn if the session queue is
                 // full (a stalled driver or a burst of fast Perform tasks).
                 if tx.send(m).await.is_err() {
@@ -14205,9 +14205,10 @@ mod route_entry_cmd_tests {
 
     /// A Cmd whose only effect is logging `label` into the model through `update`.
     fn load(label: String) -> IpeCmd<Msg> {
-        IpeCmd::Perform(Box::new(move || {
-            Box::pin(async move { Msg::Loaded(label) })
-        }))
+        crate::tea::perform_for_test(
+            move || Box::pin(async move { Msg::Loaded(label) }),
+            Msg::Loaded("refused".to_owned()),
+        )
     }
 
     thread_local! {
@@ -16277,12 +16278,15 @@ mod web_revocation_tests {
 
     /// A Cmd that counts its own dispatch in [`REVOKED_CMDS`].
     fn revoked_cmd() -> IpeCmd<Msg> {
-        IpeCmd::Perform(Box::new(|| {
-            Box::pin(async {
-                REVOKED_CMDS.fetch_add(1, Ordering::Relaxed);
-                Msg::Bump
-            })
-        }))
+        crate::tea::perform_for_test(
+            || {
+                Box::pin(async {
+                    REVOKED_CMDS.fetch_add(1, Ordering::Relaxed);
+                    Msg::Bump
+                })
+            },
+            Msg::Bump,
+        )
     }
 
     fn update(msg: Msg, model: Model) -> (Model, IpeCmd<Msg>) {
@@ -16307,9 +16311,10 @@ mod web_revocation_tests {
             }
             Msg::RunTask => {
                 let token = model.task_token.clone();
-                let task: IpeCmd<Msg> = IpeCmd::Perform(Box::new(move || {
-                    Box::pin(async move { Msg::TaskDone(verifies(&token)) })
-                }));
+                let task: IpeCmd<Msg> = crate::tea::perform_for_test(
+                    move || Box::pin(async move { Msg::TaskDone(verifies(&token)) }),
+                    Msg::TaskDone(false),
+                );
                 (model, task)
             }
             Msg::TaskDone(ok) => (
