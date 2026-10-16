@@ -17977,12 +17977,16 @@ mod web_revocation_tests {
         let mut pending = vec![web_dir];
         let mut destructures = Vec::new();
         while let Some(dir) = pending.pop() {
-            let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
-            for path in entries.map(|e| e.path()) {
+            // An unreadable directory or file fails the scan: a source it
+            // cannot read is never counted as one without the destructure.
+            let entries =
+                std::fs::read_dir(&dir).expect("the scan lists every directory of `web/`");
+            for path in entries.map(|e| e.expect("the scan reads every entry of `web/`").path()) {
                 if path.is_dir() {
                     pending.push(path);
                 } else if path.extension().is_some_and(|x| x == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    let text = std::fs::read_to_string(&path)
+                        .expect("the scan reads every source file of `web/`");
                     let stripped: String = production_only(&code_only(&text))
                         .split_whitespace()
                         .collect();
