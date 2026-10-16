@@ -293,13 +293,23 @@ fn select_to_point_free_rejected() {
     );
 }
 
-/// A `Select` bound to a name and piped into `Store.selectToList` (and one
-/// taken as a parameter) hides its projected column types. After the pipe
-/// collapses to the direct call, it is refused with `SelectArgNotProjection`.
+/// A `Select` bound to a name and piped into `Store.selectToList` hides its
+/// projected column types. After the pipe collapses to the direct call, it is
+/// refused with `SelectArgNotProjection`.
 #[test]
 fn select_to_let_bound_select_rejected() {
     assert_eq!(
         projection_defect("db_store_select_to_let_bound_select_rejected"),
+        Some(StoreSelectProjectionDefect::SelectArgNotProjection)
+    );
+}
+
+/// A `Select` taken as a parameter hides its projected column types and is
+/// refused with `SelectArgNotProjection`.
+#[test]
+fn select_to_param_select_rejected() {
+    assert_eq!(
+        projection_defect("db_store_select_to_param_select_rejected"),
         Some(StoreSelectProjectionDefect::SelectArgNotProjection)
     );
 }

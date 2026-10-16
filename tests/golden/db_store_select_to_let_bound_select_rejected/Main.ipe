@@ -1,11 +1,10 @@
 module Main exposing (main)
 
 -- NEGATIVE golden: a `Select` bound to a name and piped into
--- `Store.selectToList`, and a `Select` taken as a parameter. The pipe
--- collapses to the direct call, whose `Select` argument is a name, not a
--- `Store.select` expression: its projected column types are hidden, so no
--- per-row decode can be emitted. Both are rejected with IPE-L0149
--- (`SelectArgNotProjection`).
+-- `Store.selectToList`. The pipe collapses to the direct call, whose
+-- `Select` argument is a name, not a `Store.select` expression: its
+-- projected column types are hidden, so no per-row decode can be emitted.
+-- Rejected with IPE-L0149 (`SelectArgNotProjection`).
 
 
 import Ipe.Codec as Codec exposing (Codec)
@@ -72,11 +71,6 @@ badRead db books authors =
                 (Store.join books .authorId authors .id)
     in
     names |> Store.selectToList db
-
-
-readSelect : Db -> Store.Select String -> Task Error (List String)
-readSelect db sel =
-    Store.selectToList db sel
 
 
 run : Db -> Task Error ()

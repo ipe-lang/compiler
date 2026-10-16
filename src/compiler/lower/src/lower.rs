@@ -13051,12 +13051,9 @@ fn non_var_params(pats: &[canon::Pattern]) -> usize {
 /// intercept site (matched syntactically by name).
 fn is_select_to_callee(callee: &canon::Expr, interner: &Interner) -> bool {
     match &callee.value {
-        canon::Expr_::VarTopLevel { name, .. } | canon::Expr_::VarKernel { name, .. } => {
-            matches!(
-                interner.resolve(*name),
-                Some("selectToList" | "selectToMaybe")
-            )
-        }
+        canon::Expr_::VarTopLevel { name, .. } | canon::Expr_::VarKernel { name, .. } => interner
+            .resolve(*name)
+            .is_some_and(|n| SELECT_TO_HELPERS.iter().any(|(helper, _)| *helper == n)),
         _ => false,
     }
 }
