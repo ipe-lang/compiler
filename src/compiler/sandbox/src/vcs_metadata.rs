@@ -1906,7 +1906,11 @@ mod tests {
             !shown.contains('\n') && !shown.contains('\u{1b}'),
             "{shown}"
         );
-        assert!(shown.contains("Always keep on this device"), "{shown}");
+        assert!(
+            shown.contains("move the working tree to a folder no sync client manages"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Always keep"), "{shown}");
     }
 
     #[test]

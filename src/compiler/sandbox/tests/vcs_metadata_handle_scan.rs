@@ -16,18 +16,25 @@
 use std::path::Path;
 
 /// The tokens of a path-based filesystem query.
-const FORBIDDEN: [&str; 13] = [
+///
+/// A renamed import (`fs as`, `rustix as`) is refused too: the paths it
+/// names would no longer spell `fs::` or `rustix::`.
+const FORBIDDEN: [&str; 17] = [
     "fs::",
+    "fs as ",
     "File::open",
     "rustix::",
+    "rustix as ",
     "symlink_metadata",
     ".metadata(",
     ".is_dir(",
     ".is_file(",
+    ".is_symlink(",
     ".exists(",
     ".try_exists(",
     "canonicalize(",
     ".read_dir(",
+    ".read_link(",
     "open_user_named",
     "RegularFile::open(",
 ];
@@ -321,6 +328,10 @@ fn the_scan_refuses_the_control_fixture() {
             (".exists(", "entry_at"),
             ("canonicalize(", "entry_at"),
             (".read_dir(", "entry_at"),
+            (".read_link(", "entry_at"),
+            (".is_symlink(", "entry_at"),
+            ("fs as ", "entry_at"),
+            ("rustix as ", "entry_at"),
         ],
         "each refused form in code is found, and none in a comment, string, or test"
     );
@@ -338,7 +349,7 @@ fn the_scan_refuses_the_control_fixture() {
     assert_eq!(resolves, ["entry_at"]);
     assert_eq!(
         findings.violations().len(),
-        7,
+        11,
         "{:?}",
         findings.violations()
     );

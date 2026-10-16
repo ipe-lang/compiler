@@ -20,6 +20,10 @@ fn entry_at<'g>(&mut self, entry: &'g Path) -> Result<(), JailPathError> {
     let real = CanonicalPath::resolve(entry)?;
     let again_real = entry.canonicalize();
     let listed = entry.read_dir();
+    let stored = entry.read_link();
+    let linked = entry.is_symlink();
+    use std::fs as filesystem;
+    use rustix as sys;
     Ok(())
 }
 

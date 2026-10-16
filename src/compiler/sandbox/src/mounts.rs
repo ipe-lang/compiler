@@ -246,8 +246,9 @@ impl fmt::Display for JailPathError {
                 f,
                 "the entry {} in the writable working tree is a placeholder a filter driver \
                  answers for (such as a cloud-synced folder), so version-control metadata \
-                 inside it could go unprotected; refusing to build the jail: make it local \
-                 (\"Always keep on this device\"), or run without the filesystem grant",
+                 inside it could go unprotected; refusing to build the jail: move the working \
+                 tree to a folder no sync client manages (a placeholder kept on the device \
+                 stays one), or run without the filesystem grant",
                 ShownPath(path)
             ),
         }
