@@ -309,6 +309,10 @@ function __ipeAdoptPatches(from, to, patches) {
 // Set once this document has refused a render of another history: from then
 // on it applies no patch and no full render.
 var __ipeStale = false;
+// Set once the server closed this document's session with a `closed` frame:
+// from then on nothing reopens the stream, posts an event, probes the session
+// or reloads the page.
+var __ipeEnded = false;
 // The sessionStorage record of the last stale-document reload, and the window
 // within which a second one is refused.
 var __IPE_INC_RELOAD_KEY = "__ipe_inc_reload";
@@ -1279,6 +1283,7 @@ var __ipeReconnectSince = 0;
 // __ipeEventQueueMax are templated at the top of this script from
 // the IPE_WEB_RETRY_* / IPE_WEB_QUEUE_MAX env vars.
 function __ipePostEvent(body) {
+  if (__ipeEnded) return;
   // Phase 1.2 — attach the per-session CSRF token. The server-side
   // middleware () rejects POSTs
   // without a matching X-Ipe-Csrf / __ipe_csrf cookie pair. Empty
@@ -1428,6 +1433,7 @@ function __ipeExpBackoffDelay() {
   return __ipeJitter(Math.min(__ipeRetryBaseMs * Math.pow(2, __ipeRetryAttempts - 1), __ipeRetryMaxMs));
 }
 function __ipeScheduleRetry() {
+  if (__ipeEnded) return;
   if (__ipeRetryTimer !== null) return;  // already pending
   var delay;
   if (__ipeInFastReconnect()) {
@@ -1446,6 +1452,7 @@ function __ipeScheduleRetry() {
   }, delay);
 }
 function __ipeDrainQueue() {
+  if (__ipeEnded) return;
   if (__ipeEventQueue.length === 0) return;
   // Send the head of the queue. If it succeeds, __ipeOnPostSuccess
   // recurses into __ipeDrainQueue to send the next one. If it
@@ -2152,6 +2159,61 @@ function __ipeShowStale() {
   if (__ipeDoc.body()) show();
   else __ipeDoc.on("DOMContentLoaded", show);
 }
+// The notice for a session the server closed, by the frame's tag. The text is
+// the client's own: the tag only picks it, and a tag outside this set gets the
+// generic notice.
+function __ipeClosedNotice(tag) {
+  switch (tag) {
+    case "over_ceiling":
+      return "This page grew past its session limit and was closed \u2014 reload to start over";
+    case "revoked":
+      return "Your sign-in is no longer valid \u2014 reload to sign in again";
+    case "ended":
+      return "This session has ended \u2014 reload to start a new one";
+    default:
+      return "This session was closed \u2014 reload to start a new one";
+  }
+}
+// End this document's session for good: the server closed it, so no reopen,
+// retry, probe or reload can bring it back. The banner tells the reader why
+// and the document stays as it is.
+function __ipeEndSession(tag) {
+  if (__ipeEnded) return;
+  __ipeEnded = true;
+  __ipeStale = true;
+  __ipeProbedReload = true;
+  __ipeCloseSSE();
+  __ipeSetLive(false);
+  __ipeHelloOk = false;
+  if (__ipeRetryTimer !== null) {
+    clearTimeout(__ipeRetryTimer);
+    __ipeRetryTimer = null;
+  }
+  if (__ipeStatusGraceTimer !== null) {
+    clearTimeout(__ipeStatusGraceTimer);
+    __ipeStatusGraceTimer = null;
+  }
+  if (__ipeBuildOkTimer !== null) {
+    clearTimeout(__ipeBuildOkTimer);
+    __ipeBuildOkTimer = null;
+  }
+  __ipeEventQueue.length = 0;
+  __ipeStatus = "offline";
+  var notice = __ipeClosedNotice(tag);
+  function show() {
+    if (!__ipeStatusEl) {
+      var built = __ipeBuildStatusEl("offline");
+      __ipeDoc.body().appendChild(built.el);
+      __ipeStatusEl = built.el;
+      __ipeStatusMsgEl = built.msgEl;
+    }
+    __ipeStatusEl.className = "ipe-status ipe-status--offline";
+    __ipeStatusEl.setAttribute("data-ipe-closed", "1");
+    __ipeStatusMsgEl.textContent = notice;
+  }
+  if (__ipeDoc.body()) show();
+  else __ipeDoc.on("DOMContentLoaded", show);
+}
 // The `#__ipe-status` banner element in `state`, with its message span. Its
 // state colours are the page shell's `STATUS_CSS` rules, so the client
 // creates no `<style>` element.
@@ -2268,6 +2330,7 @@ function __ipeSetLive(on) {
 }
 __ipeSetLive(false);
 function __ipeOpenSSE() {
+  if (__ipeEnded) return;
   // Only the tab that holds the session's stream opens one (see "One live
   // stream per session" below).
   if (!__ipeLiveOwnsStream()) return;
@@ -2311,6 +2374,7 @@ function __ipeOpenSSE() {
     __ipeLastSseAt = Date.now();
   });
   __ipeSSE.addEventListener("error", function() {
+    if (__ipeEnded) return;
     // Suppress the banner when we triggered the close ourselves
     // (force-reopen path) — those errors are an artefact of our own
     // teardown, not a real outage signal.
@@ -2537,6 +2601,11 @@ var __ipeLiveFrames = {
       // reloads before this event lands.
       __ipeShowBuildOk();
     }
+  },
+  // The server closed the session; the data is the reason's tag. It is the
+  // stream's last frame.
+  closed: function(text, relayed) {
+    __ipeEndSession(text);
   }
 };
 
@@ -2554,6 +2623,7 @@ var __ipeLiveFrames = {
 // render with its epoch.
 // A tab that follows another's stream asks the leader to reopen instead.
 function __ipeResyncRender() {
+  if (__ipeEnded) return;
   if (!__ipeLiveOwnsStream()) {
     __ipeLiveAskResync();
     return;
@@ -2572,6 +2642,7 @@ function __ipeCloseSSE() {
   }
 }
 function __ipeForceReopenSSE() {
+  if (__ipeEnded) return;
   if (!__ipeLiveOwnsStream()) return;
   __ipeForcedClose = true;
   __ipeSetLive(false);
@@ -2630,7 +2701,7 @@ var __ipeProbedReload = false;  // one-shot guard so we don't trigger
                                 // multiple reloads from a burst of
                                 // failed reopen attempts.
 function __ipeProbeSessionLost() {
-  if (__ipeProbedReload) return;
+  if (__ipeEnded || __ipeProbedReload) return;
   var headers = {"Content-Type": "application/json"};
   if (__ipeCsrfToken) headers["X-Ipe-Csrf"] = __ipeCsrfToken;
   fetch(__ipeBase + "/_ipe/event", {
@@ -2680,6 +2751,7 @@ function __ipeProbeSessionLost() {
 // healed proxy reconnects automatically without a refresh.
 var __ipeServerSpeaksV2 = false;
 function __ipeWatchdog() {
+  if (__ipeEnded) return;
   __ipeReleaseHeldRender(false);
   // A follower watches the leader instead of a stream of its own.
   if (__ipeLiveRole === "follower") {
@@ -2753,7 +2825,7 @@ function __ipeWatchdog() {
 //     same path, so a tab never takes another route's render.
 // A browser without Web Locks or BroadcastChannel (an insecure context) keeps
 // one stream per tab ("solo").
-var __ipeLiveRelayed = ["hello", "heartbeat", "patch", "patches", "swapped", "ipe-build-status"];
+var __ipeLiveRelayed = ["hello", "heartbeat", "patch", "patches", "swapped", "ipe-build-status", "closed"];
 var __ipeLiveStatuses = ["connected", "reconnecting", "offline"];
 var __ipeLiveName = typeof __ipeSid === "string" && __ipeSid !== ""
     ? "ipe-live:" + __ipeBase + ":" + __ipeSid
