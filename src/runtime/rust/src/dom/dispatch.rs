@@ -1,4 +1,7 @@
-use crate::html::{Attribute, Event, FormData, Html};
+use crate::csp::{STYLE_NONCE_BYTES, StyleNonce};
+use crate::dom::diff::{Patch, diff};
+use crate::entropy::{EntropyError, fill_entropy};
+use crate::html::{Attribute, Event, FormData, Html, RenderCtx, StampedHtml, render_stamped};
 use crate::retained::{Bytes, RetainedBytes, hash_table};
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -145,11 +148,55 @@ const INCARNATION_HEX_LEN: usize = 32;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Incarnation(u128);
 
-impl Incarnation {
-    /// An incarnation from 128 bits the caller drew from a CSPRNG.
-    #[must_use]
-    pub const fn from_random_bits(bits: u128) -> Self {
-        Self(bits)
+/// The keys a new render history is born with.
+///
+/// They are its [`Incarnation`] and the [`StyleNonce`] its renders are
+/// stamped with. [`Self::mint`] is the one place either is drawn, and it draws
+/// them separately, so neither value says anything about the other.
+#[derive(Debug)]
+pub struct SessionKeys {
+    incarnation: Incarnation,
+    style_nonce: StyleNonce,
+}
+
+impl SessionKeys {
+    /// Fresh keys from the OS CSPRNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EntropyError`] when the OS yields no entropy; the caller
+    /// refuses the session and never falls back to a fixed value.
+    pub fn mint() -> Result<Self, EntropyError> {
+        Self::mint_with(|buf| fill_entropy(buf))
+    }
+
+    /// Keys from two draws of `fill`: the incarnation first, then the nonce.
+    fn mint_with(
+        mut fill: impl FnMut(&mut [u8; STYLE_NONCE_BYTES]) -> Result<(), EntropyError>,
+    ) -> Result<Self, EntropyError> {
+        let mut incarnation = [0; STYLE_NONCE_BYTES];
+        fill(&mut incarnation)?;
+        let mut style_nonce = [0; STYLE_NONCE_BYTES];
+        fill(&mut style_nonce)?;
+        Ok(Self {
+            incarnation: Incarnation(u128::from_be_bytes(incarnation)),
+            style_nonce: StyleNonce::from_random_bytes(style_nonce),
+        })
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl SessionKeys {
+    /// Keys no earlier call returned, from a counter instead of the CSPRNG.
+    pub fn distinct() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = u128::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        Self {
+            incarnation: Incarnation((n << 64) | 0x00c0_ffee),
+            style_nonce: StyleNonce::from_random_bytes(
+                (n.rotate_left(32) ^ 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834).to_be_bytes(),
+            ),
+        }
     }
 }
 
@@ -257,6 +304,7 @@ pub struct EpochStep {
 /// epoch.
 pub struct Rendered<M> {
     incarnation: Incarnation,
+    style_nonce: StyleNonce,
     current: NonZeroU64,
     last_view: Html<M>,
     history: VecDeque<(NonZeroU64, HandlerIndex<M>)>,
@@ -279,16 +327,23 @@ impl<M: RetainedBytes> Rendered<M> {
 
 impl<M: Clone> Rendered<M> {
     /// The first render of a new history, at counter 1.
+    ///
+    /// `keys` are the history's for its whole life: no method replaces them.
     #[must_use]
-    pub fn first(incarnation: Incarnation, tree: Html<M>) -> Self {
-        Self::starting_at(incarnation, NonZeroU64::MIN, tree)
+    pub fn first(keys: SessionKeys, tree: Html<M>) -> Self {
+        Self::starting_at(keys, NonZeroU64::MIN, tree)
     }
 
-    fn starting_at(incarnation: Incarnation, n: NonZeroU64, tree: Html<M>) -> Self {
+    fn starting_at(keys: SessionKeys, n: NonZeroU64, tree: Html<M>) -> Self {
+        let SessionKeys {
+            incarnation,
+            style_nonce,
+        } = keys;
         let mut history = VecDeque::with_capacity(RENDER_HISTORY_DEPTH.get());
         history.push_back((n, build_index(&tree)));
         Self {
             incarnation,
+            style_nonce,
             current: n,
             last_view: tree,
             history,
@@ -332,6 +387,29 @@ impl<M: Clone> Rendered<M> {
     #[must_use]
     pub const fn last_view(&self) -> &Html<M> {
         &self.last_view
+    }
+
+    /// A copy of the history's style nonce, for a render made before its
+    /// commit takes the session lock again.
+    #[must_use]
+    pub fn stamp(&self) -> StyleNonce {
+        self.style_nonce.clone()
+    }
+
+    /// The current view as the session's stamped markup.
+    #[must_use]
+    pub fn page(&self) -> StampedHtml {
+        render_stamped(&self.last_view, &self.style_nonce)
+    }
+
+    /// The patches from the current view to `tree`, stamped for this session.
+    #[must_use]
+    pub fn diff_to(&self, tree: &Html<M>) -> Vec<Patch> {
+        diff(
+            &self.last_view,
+            tree,
+            &RenderCtx::Session(&self.style_nonce),
+        )
     }
 
     fn index_at(&self, at: &RenderEpoch) -> Result<&HandlerIndex<M>, StaleEpoch> {
@@ -409,7 +487,7 @@ mod tests {
     // index, up to the history depth and no further.
     #[test]
     fn a_rendered_history_counts_its_view_and_every_index() {
-        let mut rendered = Rendered::first(INCARNATION, tree());
+        let mut rendered = Rendered::first(keys(), tree());
         let first = rendered.resident_bytes().map(Bytes::get);
         let view = tree().view_bytes().map(Bytes::get);
         assert!(
@@ -640,8 +718,15 @@ mod tests {
         );
     }
 
-    const INCARNATION: Incarnation =
-        Incarnation::from_random_bits(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+    const INCARNATION: Incarnation = Incarnation(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+
+    /// Keys with the fixed [`INCARNATION`].
+    fn keys() -> SessionKeys {
+        SessionKeys {
+            incarnation: INCARNATION,
+            style_nonce: StyleNonce::from_random_bytes([0x5c; STYLE_NONCE_BYTES]),
+        }
+    }
 
     /// A view whose first child button dispatches `Typed(label)` on click.
     fn labelled(label: &str) -> Html<Msg> {
@@ -668,7 +753,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // a commit below u64::MAX always mints an epoch
     fn ring_evicts_the_oldest_render_and_keeps_the_rest() {
-        let mut r = Rendered::first(INCARNATION, labelled("e1"));
+        let mut r = Rendered::first(keys(), labelled("e1"));
         let e1 = r.epoch();
         let e2 = r.commit(labelled("e2")).expect("second commit").to;
         for k in 3..=RENDER_HISTORY_DEPTH.get() + 1 {
@@ -693,7 +778,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // the tokens are built well-formed
     fn future_and_other_incarnation_refuse_with_their_own_variant() {
-        let r = Rendered::first(INCARNATION, labelled("only"));
+        let r = Rendered::first(keys(), labelled("only"));
         let current = r.epoch().to_token();
         let (hex, _) = current.split_once('.').expect("a token has a dot");
         let future = RenderEpoch::parse(&format!("{hex}.2")).expect("future token");
@@ -746,7 +831,7 @@ mod tests {
     #[test]
     #[allow(clippy::expect_used)] // the token was minted by `to_token`
     fn epoch_token_round_trips() {
-        let mut r = Rendered::first(INCARNATION, labelled("a"));
+        let mut r = Rendered::first(keys(), labelled("a"));
         let first = r.epoch();
         assert_eq!(RenderEpoch::parse(&first.to_token()), Ok(first));
         let step = r.commit(labelled("b")).expect("commit");
@@ -757,13 +842,55 @@ mod tests {
 
     #[test]
     fn commit_at_the_last_counter_is_exhausted_and_keeps_the_view() {
-        let mut r = Rendered::starting_at(INCARNATION, NonZeroU64::MAX, labelled("last"));
+        let mut r = Rendered::starting_at(keys(), NonZeroU64::MAX, labelled("last"));
         let before = r.epoch();
         assert_eq!(r.commit(labelled("past")), Err(EpochExhausted));
         assert_eq!(r.epoch(), before);
         assert_eq!(
             r.resolve(&before, "r_0_button", "click", &[]),
             Ok(Some(Msg::Typed("last".into())))
+        );
+    }
+
+    /// The incarnation and the nonce come from two separate draws, and a
+    /// failure of either draw refuses the keys.
+    #[test]
+    fn session_keys_are_two_draws() {
+        assert!(SessionKeys::mint_with(|_| Err(EntropyError)).is_err());
+        let mut calls = 0_u8;
+        let second_fails = SessionKeys::mint_with(|buf| {
+            calls += 1;
+            buf.fill(calls);
+            if calls == 2 {
+                Err(EntropyError)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(second_fails.is_err(), "{second_fails:?}");
+
+        let mut calls = 0_u8;
+        let keys = SessionKeys::mint_with(|buf| {
+            calls += 1;
+            buf.fill(calls);
+            Ok(())
+        });
+        assert_eq!(calls, 2);
+        assert!(keys.is_ok(), "{keys:?}");
+        let Ok(keys) = keys else {
+            return;
+        };
+        assert_eq!(keys.incarnation, Incarnation(u128::from_be_bytes([1; 16])));
+        assert_eq!(keys.style_nonce.as_token(), "02".repeat(16));
+
+        let minted = SessionKeys::mint();
+        assert!(minted.is_ok(), "{minted:?}");
+        let Ok(minted) = minted else {
+            return;
+        };
+        assert_ne!(
+            format!("{:032x}", minted.incarnation.0),
+            minted.style_nonce.as_token()
         );
     }
 }

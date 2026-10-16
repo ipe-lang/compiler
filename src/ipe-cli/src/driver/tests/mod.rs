@@ -1123,10 +1123,19 @@ fn find_manifest_stops_at_a_git_file() {
     assert!(matches!(found, Ok(None)), "{found:?}");
 }
 
-/// A `.hg` or `.jj` root, as a directory or a file, is a ceiling like `.git`.
+/// Every version-control root, as a directory or a file, is a ceiling.
 #[test]
 fn find_manifest_stops_at_every_vcs_marker() {
-    for marker in [".hg", ".jj"] {
+    let markers: std::collections::BTreeSet<&str> = ipe_sandbox::VcsKind::ALL
+        .into_iter()
+        .map(ipe_sandbox::VcsKind::entry_name)
+        .collect();
+    assert_eq!(
+        markers,
+        std::collections::BTreeSet::from([".git", ".hg", ".jj", "_darcs"]),
+        "the ceiling covers every version-control root"
+    );
+    for marker in markers {
         for as_dir in [true, false] {
             let tag = format!("marker{marker}_{as_dir}");
             let (tmp, main_ipe) = manifest_walk_tree(&tag, "proj");
@@ -1135,6 +1144,7 @@ fn find_manifest_stops_at_every_vcs_marker() {
                 "module Package exposing (package)\n",
             )
             .expect("write planted package.ipe");
+            let unbounded = find_manifest_for_ipe_file(&main_ipe);
             let marker_path = tmp.join("proj").join(marker);
             if as_dir {
                 fs::create_dir_all(&marker_path).expect("create marker dir");
@@ -1143,6 +1153,10 @@ fn find_manifest_stops_at_every_vcs_marker() {
             }
             let found = find_manifest_for_ipe_file(&main_ipe);
             let _ = fs::remove_dir_all(&tmp);
+            assert!(
+                !matches!(unbounded, Ok(None)),
+                "{marker} dir={as_dir}: without the marker the planted manifest is reached: {unbounded:?}"
+            );
             assert!(
                 matches!(found, Ok(None)),
                 "{marker} dir={as_dir}: {found:?}"

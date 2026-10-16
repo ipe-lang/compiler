@@ -2,12 +2,14 @@
 //!
 //! One typed builder, [`ContentSecurityPolicy`], composes every header value
 //! from the closed [`Directive`] and [`Source`] vocabularies, so no call site
-//! spells a directive string. A [`Profile`] names the response a policy guards;
-//! header assembly (`telemetry::security_headers`) takes it as a required
-//! parameter, and every profile is a full policy, so no HTML response is sent
-//! without one. An inline script a profile admits is admitted by a hash computed
-//! from the same constant the response embeds, never a copied digest, and no
-//! profile's `script-src` holds `'unsafe-inline'`.
+//! spells a directive string. A [`Guarded`] names the response a policy guards
+//! together with the per-response values its policy names; header assembly
+//! (`telemetry::security_headers`) takes it as a required parameter, and every
+//! guard yields a full policy, so no HTML response is sent without one. An
+//! inline element a policy admits is admitted by a hash computed from the same
+//! constant the response embeds, never a copied digest, or by the page's own
+//! style nonce. No policy holds `'unsafe-inline'` in a `script-src*` directive
+//! or in an element-level `style-src*` directive.
 
 use crate::telemetry::FrameAncestors;
 
@@ -16,6 +18,9 @@ use crate::web::console::{CONSOLE_CSS, CONSOLE_JS};
 
 #[cfg(all(feature = "web", feature = "debugger"))]
 use crate::debugger::server::OVERLAY_JS;
+
+#[cfg(feature = "web")]
+use crate::web_page_core::{BASE_CSS, STATUS_CSS};
 
 /// A policy directive the runtime emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +127,62 @@ impl CspHash {
     }
 }
 
+/// The number of random bytes in a [`StyleNonce`].
+pub const STYLE_NONCE_BYTES: usize = 16;
+
+/// The per-session nonce a session's `<style>` elements carry.
+///
+/// It holds 128 bits drawn from the OS CSPRNG together with the session's
+/// render incarnation, and it is never persisted. It is `Clone` but not
+/// `Copy`, so every copy is explicit, and its `Debug` form never shows it.
+#[derive(Clone)]
+pub struct StyleNonce([u8; STYLE_NONCE_BYTES]);
+
+impl StyleNonce {
+    /// A nonce from bytes the caller drew from a CSPRNG.
+    pub(crate) const fn from_random_bytes(bytes: [u8; STYLE_NONCE_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// The nonce as its attribute value: 32 lowercase hex characters.
+    #[must_use]
+    pub fn as_token(&self) -> String {
+        let mut out = String::with_capacity(STYLE_NONCE_BYTES * 2);
+        self.write_token(&mut out);
+        out
+    }
+
+    /// Append the nonce's attribute value to `out`.
+    pub(crate) fn write_token(&self, out: &mut String) {
+        for byte in self.0 {
+            for nibble in [byte >> 4, byte & 0x0f] {
+                if let Some(digit) = char::from_digit(u32::from(nibble), 16) {
+                    out.push(digit);
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for StyleNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StyleNonce(..)")
+    }
+}
+
+/// Equality in time independent of where two nonces first differ.
+impl PartialEq for StyleNonce {
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+    }
+}
+
+impl Eq for StyleNonce {}
+
 /// A source expression in a directive's value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source<'a> {
@@ -129,8 +190,8 @@ pub enum Source<'a> {
     None,
     /// `'self'`: the response's own origin.
     SelfOrigin,
-    /// `'unsafe-inline'`; the profiles place it only in a `style-src*`
-    /// directive that holds no hash, never in a `script-src*` one.
+    /// `'unsafe-inline'`; the policies place it only in a `style-src*`
+    /// directive that holds no hash and no nonce, never in a `script-src*` one.
     UnsafeInline,
     /// The `data:` scheme.
     Data,
@@ -140,13 +201,14 @@ pub enum Source<'a> {
     Hash(&'a CspHash),
     /// The operator's parsed `IPE_WEB_FRAME_ANCESTORS` sources.
     Embed(&'a FrameAncestors),
+    /// `'nonce-…'`: the elements stamped with one page's style nonce.
+    Nonce(&'a StyleNonce),
 }
 
-impl<'a> Source<'a> {
-    /// The source expression as the header spells it.
-    #[must_use]
-    pub const fn text(self) -> &'a str {
-        match self {
+impl Source<'_> {
+    /// Append the source expression, as the header spells it, to `out`.
+    pub fn write_to(self, out: &mut String) {
+        let text = match self {
             Self::None => "'none'",
             Self::SelfOrigin => "'self'",
             Self::UnsafeInline => "'unsafe-inline'",
@@ -154,7 +216,14 @@ impl<'a> Source<'a> {
             Self::Blob => "blob:",
             Self::Hash(hash) => hash.as_str(),
             Self::Embed(framing) => framing.sources(),
-        }
+            Self::Nonce(nonce) => {
+                out.push_str("'nonce-");
+                nonce.write_token(out);
+                out.push('\'');
+                return;
+            }
+        };
+        out.push_str(text);
     }
 }
 
@@ -186,10 +255,59 @@ profiles! {
     Console,
     /// An `Ipe.Web` page: its scripts are the same-origin, SRI-pinned client
     /// files plus, under the debugger, the overlay script admitted by hash; its
-    /// scoped `<style>` elements are rendered per view, so style elements are
-    /// admitted inline.
+    /// style elements are the shell's two constants, admitted by hash, and the
+    /// session's scoped `<style>` elements, admitted by the page's nonce.
     #[cfg(feature = "web")]
     WebPage,
+}
+
+/// The response a policy guards, carrying the values its policy names.
+///
+/// A page's nonce lives in its variant, so neither a `WebPage` policy without
+/// a nonce nor a nonce on another response has a representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Guarded {
+    /// See [`Profile::Response`].
+    Response,
+    /// See [`Profile::Console`].
+    #[cfg(feature = "web")]
+    Console,
+    /// See [`Profile::WebPage`].
+    #[cfg(feature = "web")]
+    WebPage {
+        /// The nonce the page's markup was stamped with.
+        style_nonce: StyleNonce,
+    },
+}
+
+impl Guarded {
+    /// The profile indexing the guard's per-profile tables.
+    #[must_use]
+    pub const fn kind(&self) -> Profile {
+        match self {
+            Self::Response => Profile::Response,
+            #[cfg(feature = "web")]
+            Self::Console => Profile::Console,
+            #[cfg(feature = "web")]
+            Self::WebPage { .. } => Profile::WebPage,
+        }
+    }
+
+    /// The guard of `profile`; a `WebPage` carries a fixed nonce drawn from
+    /// `seed`.
+    #[cfg(test)]
+    pub(crate) const fn sample(profile: Profile, seed: u8) -> Self {
+        let _ = seed;
+        match profile {
+            Profile::Response => Self::Response,
+            #[cfg(feature = "web")]
+            Profile::Console => Self::Console,
+            #[cfg(feature = "web")]
+            Profile::WebPage => Self::WebPage {
+                style_nonce: StyleNonce::from_random_bytes([seed; STYLE_NONCE_BYTES]),
+            },
+        }
+    }
 }
 
 impl Profile {
@@ -243,6 +361,24 @@ fn overlay_hash() -> &'static CspHash {
     CELL.get_or_init(|| CspHash::of(OVERLAY_JS))
 }
 
+/// The hashes of the page shell's two inline style constants.
+#[cfg(feature = "web")]
+struct PageStyleHashes {
+    base: CspHash,
+    status: CspHash,
+}
+
+/// The page-shell style hashes, computed once from [`BASE_CSS`] and
+/// [`STATUS_CSS`].
+#[cfg(feature = "web")]
+fn page_style_hashes() -> &'static PageStyleHashes {
+    static CELL: std::sync::OnceLock<PageStyleHashes> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| PageStyleHashes {
+        base: CspHash::of(BASE_CSS),
+        status: CspHash::of(STATUS_CSS),
+    })
+}
+
 /// The `script-src` sources of an `Ipe.Web` page.
 #[cfg(feature = "web")]
 fn web_page_scripts<'a>() -> Vec<Source<'a>> {
@@ -263,18 +399,19 @@ pub struct ContentSecurityPolicy<'a> {
 }
 
 impl<'a> ContentSecurityPolicy<'a> {
-    /// The policy of `profile` under the operator's embed list `framing`.
+    /// The policy of `guard` under the operator's embed list `framing`.
     #[must_use]
-    pub fn for_profile(profile: Profile, framing: Option<&'a FrameAncestors>) -> Self {
-        let ancestors = profile
+    pub fn for_guard(guard: &'a Guarded, framing: Option<&'a FrameAncestors>) -> Self {
+        let ancestors = guard
+            .kind()
             .embed_list(framing)
             .map_or(Source::SelfOrigin, Source::Embed);
-        match profile {
-            Profile::Response => Self::response(ancestors),
+        match guard {
+            Guarded::Response => Self::response(ancestors),
             #[cfg(feature = "web")]
-            Profile::Console => Self::console(ancestors),
+            Guarded::Console => Self::console(ancestors),
             #[cfg(feature = "web")]
-            Profile::WebPage => Self::web_page(ancestors),
+            Guarded::WebPage { style_nonce } => Self::web_page(ancestors, style_nonce),
         }
     }
 
@@ -321,17 +458,27 @@ impl<'a> ContentSecurityPolicy<'a> {
             .with(D::FrameAncestors, vec![ancestors])
     }
 
-    /// The `WebPage` profile with `frame-ancestors` set to `ancestors`.
+    /// The `WebPage` profile of the page stamped with `nonce`, with
+    /// `frame-ancestors` set to `ancestors`.
     #[cfg(feature = "web")]
-    fn web_page(ancestors: Source<'a>) -> Self {
+    fn web_page(ancestors: Source<'a>, nonce: &'a StyleNonce) -> Self {
         use Directive as D;
         use Source as S;
+        let shell = page_style_hashes();
+        let styles = || {
+            vec![
+                S::SelfOrigin,
+                S::Nonce(nonce),
+                S::Hash(&shell.base),
+                S::Hash(&shell.status),
+            ]
+        };
         Self::default()
             .with(D::DefaultSrc, vec![S::None])
             .with(D::ScriptSrc, web_page_scripts())
             .with(D::ScriptSrcAttr, vec![S::None])
-            .with(D::StyleSrc, vec![S::SelfOrigin, S::UnsafeInline])
-            .with(D::StyleSrcElem, vec![S::SelfOrigin, S::UnsafeInline])
+            .with(D::StyleSrc, styles())
+            .with(D::StyleSrcElem, styles())
             .with(D::StyleSrcAttr, vec![S::UnsafeInline])
             .with(D::ImgSrc, vec![S::SelfOrigin, S::Data, S::Blob])
             .with(D::FontSrc, vec![S::SelfOrigin, S::Data])
@@ -380,7 +527,7 @@ impl<'a> ContentSecurityPolicy<'a> {
             out.push_str(d.name());
             for source in sources {
                 out.push(' ');
-                out.push_str(source.text());
+                source.write_to(&mut out);
             }
         }
         out
@@ -406,17 +553,42 @@ mod tests {
             .flatten()
     }
 
-    /// Every profile's policy, same-origin and under an embed list.
-    fn every_policy(framing: Option<&FrameAncestors>) -> Vec<(Profile, ContentSecurityPolicy<'_>)> {
+    /// One guard per profile.
+    fn guards() -> Vec<Guarded> {
         Profile::ALL
             .iter()
-            .flat_map(|p| {
+            .map(|p| Guarded::sample(*p, 0x5a))
+            .collect()
+    }
+
+    /// Every guard's policy, same-origin and under an embed list.
+    fn every_policy<'a>(
+        guards: &'a [Guarded],
+        framing: Option<&'a FrameAncestors>,
+    ) -> Vec<(Profile, ContentSecurityPolicy<'a>)> {
+        guards
+            .iter()
+            .flat_map(|g| {
                 [
-                    (*p, ContentSecurityPolicy::for_profile(*p, None)),
-                    (*p, ContentSecurityPolicy::for_profile(*p, framing)),
+                    (g.kind(), ContentSecurityPolicy::for_guard(g, None)),
+                    (g.kind(), ContentSecurityPolicy::for_guard(g, framing)),
                 ]
             })
             .collect()
+    }
+
+    /// The header spelling of `source`.
+    fn spelled(source: Source<'_>) -> String {
+        let mut out = String::new();
+        source.write_to(&mut out);
+        out
+    }
+
+    #[test]
+    fn guard_kind_is_its_profile() {
+        let guards = guards();
+        let kinds: Vec<Profile> = guards.iter().map(Guarded::kind).collect();
+        assert_eq!(kinds, Profile::ALL);
     }
 
     #[test]
@@ -431,7 +603,7 @@ mod tests {
     #[test]
     fn response_profile_exact_header() {
         assert_eq!(
-            ContentSecurityPolicy::for_profile(Profile::Response, None).header_value(),
+            ContentSecurityPolicy::for_guard(&Guarded::Response, None).header_value(),
             RESPONSE_SAME_ORIGIN
         );
     }
@@ -451,7 +623,7 @@ mod tests {
         let framing = embed();
         for framing in [None, framing.as_ref()] {
             assert_eq!(
-                ContentSecurityPolicy::for_profile(Profile::Console, framing).header_value(),
+                ContentSecurityPolicy::for_guard(&Guarded::Console, framing).header_value(),
                 want
             );
         }
@@ -460,16 +632,18 @@ mod tests {
     #[test]
     fn script_src_never_unsafe() {
         let framing = embed();
-        for (profile, policy) in every_policy(framing.as_ref()) {
+        let guards = guards();
+        for (profile, policy) in every_policy(&guards, framing.as_ref()) {
             for directive in [Directive::ScriptSrc, Directive::ScriptSrcAttr] {
                 let sources = policy.sources(directive);
                 assert!(sources.is_some(), "{profile:?} omits {directive:?}");
                 for source in sources.into_iter().flatten() {
-                    let text = source.text();
+                    let text = spelled(*source);
                     for banned in [
                         "'unsafe-inline'",
                         "'unsafe-eval'",
                         "'unsafe-hashes'",
+                        "'nonce-",
                         "data:",
                         "*",
                     ] {
@@ -484,28 +658,26 @@ mod tests {
     }
 
     /// The directives that may hold `'unsafe-inline'` under `profile`: the
-    /// `style=""` attribute wherever one is admitted, plus `<style>` elements
-    /// on the `Ipe.Web` page alone, whose scoped elements are rendered per view.
+    /// `style=""` attribute wherever one is admitted, and no element-level
+    /// directive.
     fn unsafe_inline_holders(profile: Profile) -> &'static [Directive] {
         match profile {
             Profile::Response => &[Directive::StyleSrcAttr],
             #[cfg(feature = "web")]
             Profile::Console => &[],
             #[cfg(feature = "web")]
-            Profile::WebPage => &[
-                Directive::StyleSrc,
-                Directive::StyleSrcElem,
-                Directive::StyleSrcAttr,
-            ],
+            Profile::WebPage => &[Directive::StyleSrcAttr],
         }
     }
 
     /// `'unsafe-inline'` sits exactly in the style directives its profile
-    /// names, and never beside a hash there, where a browser would ignore it.
+    /// names, and never beside a hash or a nonce there, where a browser would
+    /// ignore it.
     #[test]
     fn unsafe_inline_only_in_the_profiles_hashless_style_directives() {
         let framing = embed();
-        for (profile, policy) in every_policy(framing.as_ref()) {
+        let guards = guards();
+        for (profile, policy) in every_policy(&guards, framing.as_ref()) {
             let holders: Vec<Directive> = policy
                 .directives()
                 .filter(|(_, sources)| sources.contains(&Source::UnsafeInline))
@@ -515,8 +687,10 @@ mod tests {
             for (directive, sources) in policy.directives() {
                 assert!(
                     !(sources.contains(&Source::UnsafeInline)
-                        && sources.iter().any(|s| matches!(s, Source::Hash(_)))),
-                    "{profile:?} {directive:?} pairs a hash with 'unsafe-inline'"
+                        && sources
+                            .iter()
+                            .any(|s| matches!(s, Source::Hash(_) | Source::Nonce(_)))),
+                    "{profile:?} {directive:?} pairs a hash or a nonce with 'unsafe-inline'"
                 );
             }
             assert_eq!(
@@ -542,19 +716,53 @@ mod tests {
         };
         #[cfg(not(feature = "debugger"))]
         let scripts = "'self'";
+        let digest = |text: &str| {
+            use base64::{Engine, engine::general_purpose::STANDARD};
+            use sha2::{Digest, Sha256};
+            STANDARD.encode(Sha256::digest(text.as_bytes()))
+        };
+        let (base, status) = (digest(BASE_CSS), digest(STATUS_CSS));
+        let guard = Guarded::sample(Profile::WebPage, 0xab);
+        let nonce = "ab".repeat(STYLE_NONCE_BYTES);
+        let styles = format!("'self' 'nonce-{nonce}' 'sha256-{base}' 'sha256-{status}'");
         let want = format!(
             "default-src 'none'; script-src {scripts}; script-src-attr 'none'; \
-             style-src 'self' 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; \
+             style-src {styles}; style-src-elem {styles}; \
              style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; \
              font-src 'self' data:; media-src 'self' blob:; connect-src 'self'; \
              manifest-src 'self'; worker-src 'self'; frame-src 'self'; \
              object-src 'none'; base-uri 'none'; form-action 'self'; \
              frame-ancestors 'self'"
         );
-        assert_eq!(
-            ContentSecurityPolicy::for_profile(Profile::WebPage, None).header_value(),
-            want
-        );
+        let value = ContentSecurityPolicy::for_guard(&guard, None).header_value();
+        assert_eq!(value, want);
+        let other = Guarded::sample(Profile::WebPage, 0xcd);
+        let other_value = ContentSecurityPolicy::for_guard(&other, None).header_value();
+        assert_ne!(value, other_value, "the nonce is the page's own");
+        assert!(!other_value.contains(&nonce), "{other_value}");
+    }
+
+    /// The page shell's inline style constants close no raw-text element early,
+    /// so the hash the policy names covers every byte the browser applies.
+    #[cfg(feature = "web")]
+    #[test]
+    fn page_style_constants_are_hash_admitted() {
+        assert!(!ends_raw_text_early(BASE_CSS) && !ends_raw_text_early(STATUS_CSS));
+        let guard = Guarded::sample(Profile::WebPage, 1);
+        let policy = ContentSecurityPolicy::for_guard(&guard, None);
+        let shell = page_style_hashes();
+        for directive in [Directive::StyleSrc, Directive::StyleSrcElem] {
+            let sources = policy.sources(directive).unwrap_or(&[]);
+            for text in [BASE_CSS, STATUS_CSS] {
+                assert!(
+                    sources.contains(&Source::Hash(&CspHash::of(text))),
+                    "{directive:?}"
+                );
+            }
+            assert!(!sources.contains(&Source::Hash(&CspHash::of(&format!("{BASE_CSS} ")))));
+            assert!(sources.contains(&Source::Hash(&shell.base)));
+            assert!(sources.contains(&Source::Hash(&shell.status)));
+        }
     }
 
     /// Each `<script>` element of `html`: its open-tag attribute text and its
@@ -604,7 +812,7 @@ mod tests {
     #[test]
     fn web_page_policy_admits_every_served_script() {
         let epoch = crate::dom::dispatch::Rendered::first(
-            crate::web::new_incarnation(),
+            crate::dom::dispatch::SessionKeys::distinct(),
             crate::html::Html::<()>::HText(String::new()),
         )
         .epoch();
@@ -617,7 +825,8 @@ mod tests {
         );
         assert!(page.is_ok(), "{page:?}");
         let page = page.unwrap_or_default();
-        let policy = ContentSecurityPolicy::for_profile(Profile::WebPage, None);
+        let guard = Guarded::sample(Profile::WebPage, 2);
+        let policy = ContentSecurityPolicy::for_guard(&guard, None);
         let scripts = script_elements(&page);
         assert!(scripts.len() >= 2, "{page}");
         for (attrs, body) in &scripts {
@@ -640,7 +849,8 @@ mod tests {
     #[cfg(all(feature = "web", feature = "debugger"))]
     #[test]
     fn debugger_overlay_script_is_hash_admitted() {
-        let policy = ContentSecurityPolicy::for_profile(Profile::WebPage, None);
+        let guard = Guarded::sample(Profile::WebPage, 3);
+        let policy = ContentSecurityPolicy::for_guard(&guard, None);
         for base in ["", "/myapp"] {
             let overlay = crate::debugger::server::overlay_html(&["Add(1)".to_owned()], 1, base);
             let scripts = script_elements(&overlay);
@@ -658,11 +868,61 @@ mod tests {
         assert!(!admits_script(&policy, "", &edited));
     }
 
+    /// A minted nonce is 32 lowercase hex characters, two mints differ, and
+    /// its `Debug` form holds no part of it.
     #[test]
-    fn no_profile_carries_a_nonce() {
+    fn nonce_shape() {
+        let mint = || {
+            crate::dom::dispatch::SessionKeys::mint().map(|keys| {
+                crate::dom::dispatch::Rendered::first(
+                    keys,
+                    crate::html::Html::<()>::HText(String::new()),
+                )
+                .stamp()
+            })
+        };
+        let (a, b) = (mint(), mint());
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+        let (Ok(a), Ok(b)) = (a, b) else {
+            return;
+        };
+        let token = a.as_token();
+        assert_eq!(token.len(), 2 * STYLE_NONCE_BYTES, "{token}");
+        assert!(
+            token
+                .bytes()
+                .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')),
+            "{token}"
+        );
+        assert_ne!(token, b.as_token());
+        // An exact form: a derived `Debug` would list the bytes in decimal,
+        // which no search for the hex token finds.
+        assert_eq!(format!("{a:?}"), "StyleNonce(..)");
+    }
+
+    /// Only a page's policy names a nonce, and it names the page's own nonce
+    /// in exactly its two element-level style directives.
+    #[test]
+    fn only_the_web_page_carries_a_nonce() {
         let framing = embed();
-        for (profile, policy) in every_policy(framing.as_ref()) {
-            assert!(!policy.header_value().contains("'nonce-"), "{profile:?}");
+        let guards = guards();
+        for (profile, policy) in every_policy(&guards, framing.as_ref()) {
+            let value = policy.header_value();
+            let nonced: Vec<Directive> = policy
+                .directives()
+                .filter(|(_, sources)| sources.iter().any(|s| matches!(s, Source::Nonce(_))))
+                .map(|(d, _)| d)
+                .collect();
+            #[cfg(feature = "web")]
+            if profile == Profile::WebPage {
+                let token = format!("'nonce-{}'", "5a".repeat(STYLE_NONCE_BYTES));
+                assert_eq!(nonced, [Directive::StyleSrc, Directive::StyleSrcElem]);
+                assert_eq!(value.matches(&token).count(), 2, "{value}");
+                assert_eq!(value.matches("'nonce-").count(), 2, "{value}");
+                continue;
+            }
+            assert!(nonced.is_empty(), "{profile:?}");
+            assert!(!value.contains("'nonce-"), "{profile:?}: {value}");
         }
     }
 
@@ -685,7 +945,12 @@ mod tests {
         assert_ne!(hashes.script.as_str(), recompute(&mutated_js));
         assert_ne!(hashes.style.as_str(), recompute(&mutated_css));
         assert_ne!(hashes.script, CspHash::of(&mutated_js));
-        let policy = ContentSecurityPolicy::for_profile(Profile::Console, None);
+        let shell = page_style_hashes();
+        assert_eq!(shell.base.as_str(), recompute(BASE_CSS));
+        assert_eq!(shell.status.as_str(), recompute(STATUS_CSS));
+        assert_ne!(shell.base.as_str(), recompute(&format!("{BASE_CSS} ")));
+        assert_ne!(shell.status.as_str(), recompute(&format!("{STATUS_CSS} ")));
+        let policy = ContentSecurityPolicy::for_guard(&Guarded::Console, None);
         assert_eq!(
             policy.sources(Directive::ScriptSrc),
             Some([Source::Hash(&hashes.script)].as_slice())
@@ -700,7 +965,7 @@ mod tests {
     fn frame_ancestors_substituted() {
         let framing = embed();
         assert!(framing.is_some());
-        let framed = ContentSecurityPolicy::for_profile(Profile::Response, framing.as_ref());
+        let framed = ContentSecurityPolicy::for_guard(&Guarded::Response, framing.as_ref());
         let value = framed.header_value();
         let rest = value.strip_suffix("frame-ancestors https://a.example https://b.example");
         let same_origin_rest = RESPONSE_SAME_ORIGIN.strip_suffix("frame-ancestors 'self'");

@@ -160,7 +160,7 @@ use super::*;
 /// Body returned with a session-miss 404 from `/_ipe/event` and `/_ipe/sse`.
 ///
 /// LOAD-BEARING CONTRACT — `client.js` `__ipeProbeSessionLost` only triggers
-/// `window.location.reload()` (the SSE-reconnect recovery path) when a probe
+/// `__ipeReloadDocument()` (the SSE-reconnect recovery path) when a probe
 /// POST gets a 404 + `X-Ipê-Web: 1` AND the body CONTAINS the substring
 /// `"session not found"` (client.js l1481/l1530/l1536).  backend returns
 /// the same string; diverging it (the old `"no session"` body) silently broke
@@ -1413,12 +1413,6 @@ async fn send_patches_frame(
     }
 }
 
-/// A fresh render-history incarnation from the OS CSPRNG.
-#[cfg(feature = "web")]
-pub(crate) fn new_incarnation() -> Incarnation {
-    Incarnation::from_random_bits(uuid::Uuid::new_v4().as_u128())
-}
-
 /// The number of tabs whose last event seq a session remembers.
 #[cfg(feature = "web")]
 pub const TAB_SEQ_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN.saturating_add(15);
@@ -1647,23 +1641,47 @@ enum EventRefusal {
 fn stale_render_response<Model, Msg: Clone>(
     e: &SessionEntry<Model, Msg>,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
+    let page = e.rendered.page();
     let body = serde_json::json!({
         "refused": "stale-render",
         "epoch": e.rendered.epoch().to_token(),
         "seq": e.seq,
-        "body": render_html(e.rendered.last_view()),
+        "body": page.as_str(),
     })
     .to_string();
-    (
+    session_body_response(
         axum::http::StatusCode::CONFLICT,
-        [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
-            (axum::http::HeaderName::from_static("x-ipe-web"), "1"),
-        ],
-        body,
+        "application/json",
+        &[("x-ipe-web", "1")],
+        axum::body::Body::from(body),
     )
-        .into_response()
+}
+
+/// The one constructor of a response whose body carries a session's render or
+/// model.
+///
+/// A render's style elements hold the nonce of its history, and both are the
+/// session's alone, so no cache may store the body: the response is
+/// `no-store`, with `content_type` and the `marks` headers. A page response
+/// takes the same `no-store` from its security headers.
+#[cfg(feature = "web")]
+fn session_body_response(
+    status: axum::http::StatusCode,
+    content_type: &'static str,
+    marks: &[(&'static str, &'static str)],
+    body: axum::body::Body,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut builder = axum::http::Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CACHE_CONTROL, "no-store");
+    for &(name, value) in marks {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// The HTTP answer to an [`EventRefusal`], one arm per variant.
@@ -1788,14 +1806,35 @@ pub struct EnterRequest {
     reply: tokio::sync::oneshot::Sender<EnterReply>,
 }
 
-/// The driver's answer to an [`EnterRequest`]: the committed page's rendered body and its epoch.
+/// A committed session render served as a page: its stamped markup and its
+/// epoch.
+///
+/// It is the one input of a page response, whose policy takes its nonce from
+/// `html`, so the header and the markup carry the same nonce.
+#[cfg(feature = "web")]
+pub struct PageRender {
+    html: StampedHtml,
+    epoch: RenderEpoch,
+}
+
+#[cfg(feature = "web")]
+impl PageRender {
+    /// The last committed view of `rendered`, at its current epoch.
+    fn current<M: Clone>(rendered: &Rendered<M>) -> Self {
+        Self {
+            html: rendered.page(),
+            epoch: rendered.epoch(),
+        }
+    }
+}
+
+/// The driver's answer to an [`EnterRequest`]: the committed page's render.
 ///
 /// Only the render crosses back; the entry Cmd stays with the driver, so a
 /// requester that stops waiting loses nothing.
 #[cfg(feature = "web")]
 pub struct EnterReply {
-    body: String,
-    epoch: RenderEpoch,
+    page: PageRender,
 }
 
 /// Queue an entry of `path` in `mode` on the session driver behind `enter_tx`.
@@ -1879,6 +1918,22 @@ fn entry_unavailable() -> axum::response::Response {
         "session busy entering a page",
     )
         .into_response()
+}
+
+/// The page's CSRF double-submit token, reused from a well-formed cookie or minted.
+///
+/// Reusing the browser's per-app cookie keeps a reload on the same token. A
+/// refused mint is the 503 [`entry_unavailable`] answer, sent with no cookie;
+/// there is no fallback token.
+#[cfg(feature = "web")]
+fn page_csrf_token(
+    headers: &axum::http::HeaderMap,
+    mint: impl FnOnce() -> Result<String, crate::entropy::EntropyError>,
+) -> Result<String, Box<axum::response::Response>> {
+    csrf::cookie_value(headers, &csrf::csrf_cookie_name_for(&web_base_path()))
+        .filter(|t| csrf::token_is_well_formed(t))
+        .map_or_else(mint, Ok)
+        .map_err(|_| Box::new(entry_unavailable()))
 }
 
 /// The 503 a request gets when the process holds as many sessions as it admits.
@@ -2102,7 +2157,7 @@ const _: () = assert!(store::CLAIM_WAIT.as_millis() == ENTER_REPLY_TIMEOUT.as_mi
 // Every minted sid parses back as a `SessionKey`.
 #[cfg(feature = "web")]
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a minted sid's length drifts from the session key's [ledger #boundary]
-const _: () = assert!(uuid::fmt::Simple::LENGTH == store::SESSION_ID_LEN);
+const _: () = assert!(2 * size_of::<u128>() == store::SESSION_ID_LEN);
 
 /// Build the routed entry from the route table, the `notFound` page, the
 /// app's emitted `set_page`, and its page renderer.
@@ -2452,7 +2507,7 @@ where
         return EntryCommit::SessionGone;
     };
     let EnterRequest { path, mode, reply } = request;
-    let model = {
+    let (model, stamp) = {
         let g = strong.lock().unwrap_or_else(|e| e.into_inner());
         let already_entered = match mode {
             EnterMode::Load => false,
@@ -2461,14 +2516,14 @@ where
         if already_entered {
             return EntryCommit::AlreadyEntered;
         }
-        g.model.clone()
+        (g.model.clone(), g.rendered.stamp())
     };
     let sid = scope.sid();
     let entered = pubsub::with_session(scope, || route_entry(model, &path));
     let mut tree = pubsub::with_session(scope, || view(entered.model.clone()));
     assign_ipe_ids(&mut tree, "r");
     style_inject::apply_style_injections(&mut tree);
-    let body = render_html(&tree);
+    let html = render_stamped(&tree, &stamp);
     // Re-prove after user code ran: a revocation that landed meanwhile drops
     // the entry, its reply and its Cmd.
     if recheck_scope(scope, None) == Standing::Revoked {
@@ -2498,13 +2553,18 @@ where
         close_session(store, sid, Some(&strong)).await;
         return EntryCommit::SessionGone;
     }
-    if let Err(EnterReply { body, epoch }) = reply.send(EnterReply { body, epoch }) {
+    let page = PageRender { html, epoch };
+    if let Err(EnterReply { page }) = reply.send(EnterReply { page }) {
         let (frame, sse_tx) = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
             e.seq += 1;
             (
-                serde_json::json!({ "seq": e.seq, "epoch": epoch.to_token(), "body": body })
-                    .to_string(),
+                serde_json::json!({
+                    "seq": e.seq,
+                    "epoch": page.epoch.to_token(),
+                    "body": page.html.as_str(),
+                })
+                .to_string(),
                 e.sse_tx.clone(),
             )
         };
@@ -2752,7 +2812,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
 
         let committed = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(e.rendered.last_view(), &tree);
+            let patches = e.rendered.diff_to(&tree);
             // noop. Here
             // `e.model` STILL holds the OLD model (top-of-loop cloned it OUT; the
             // store isn't updated until the assignment below), so `e.model ==
@@ -2826,27 +2886,41 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     drop(sub_runtime);
 }
 
-/// A fresh session id: **128 bits from the OS CSPRNG**, as 32 lowercase-hex
-/// chars.
+/// A session id from 128 bits `fill` draws, as 32 lowercase-hex chars.
 ///
 /// SECURITY: the sid is the SOLE bearer credential for a Ipe.Web session
-/// (`sid_from_cookie` + `store.get` authorise every event off it). It MUST be
-/// unpredictable. The prior scheme — `clock_nanos XOR counter` through
-/// splitmix64 — was an invertible bijection over low-entropy, partly-known
-/// inputs (the counter starts at 0; the clock is estimable), so sids were
-/// guessable → session hijacking. `uuid::Uuid::new_v4` draws its bits from the
-/// OS CSPRNG (the approved security-randomness source per `random.rs`), and its
-/// `simple` form is exactly 32 lowercase-hex chars — same shape, no `aes-gcm`.
-/// Never panics.
+/// (`sid_from_cookie` + `store.get` authorise every event off it), so its bits
+/// come from the OS CSPRNG and nothing else. A failed draw is an error the
+/// caller refuses the request with; there is no fallback value.
 #[cfg(feature = "web")]
-fn new_sid() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+fn sid_from(
+    fill: impl FnOnce(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError>,
+) -> Result<String, crate::entropy::EntropyError> {
+    let mut bits = [0; 16];
+    fill(&mut bits)?;
+    Ok(format!(
+        "{:0width$x}",
+        u128::from_be_bytes(bits),
+        width = store::SESSION_ID_LEN
+    ))
 }
 
 /// A fresh sid for a request whose mint was proved first-party.
+///
+/// # Errors
+///
+/// Returns [`crate::entropy::EntropyError`] when the OS yields no entropy.
 #[cfg(feature = "web")]
-fn minted_sid(_proof: mint_proof::MintProof) -> String {
-    new_sid()
+fn minted_sid(_proof: mint_proof::MintProof) -> Result<String, crate::entropy::EntropyError> {
+    sid_from(|bits| crate::entropy::fill_entropy(bits))
+}
+
+/// A fresh sid for a test fixture.
+#[cfg(all(test, feature = "web"))]
+#[allow(clippy::expect_used)] // the test host's CSPRNG yields entropy
+fn new_sid() -> String {
+    sid_from(|bits| crate::entropy::fill_entropy(bits))
+        .expect("the test host's CSPRNG yields entropy")
 }
 
 /// Normalise a raw `IPE_WEB_BASE_PATH` value: trim, drop a trailing slash,
@@ -3022,8 +3096,7 @@ fn request_is_https(headers: &axum::http::HeaderMap) -> bool {
 #[cfg(all(feature = "web", not(feature = "debugger")))]
 fn page_response(
     sid: &str,
-    body: &str,
-    epoch: &RenderEpoch,
+    page: &PageRender,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
 ) -> axum::response::Response {
@@ -3031,7 +3104,7 @@ fn page_response(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let Ok(html) = render_page_full(sid, &base, body, epoch, csrf_token) else {
+    let Ok(html) = render_page_full(sid, &base, page.html.as_str(), &page.epoch, csrf_token) else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     // Session cookie carries `Secure` without a dev intent / in frame-ancestors mode, OR
@@ -3069,13 +3142,13 @@ fn page_response(
             // The epoch of the served render, read by client navigation.
             (
                 axum::http::HeaderName::from_static("x-ipe-epoch"),
-                epoch.to_token(),
+                page.epoch.to_token(),
             ),
         ],
         html,
     )
         .into_response();
-    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie], &page.html)
 }
 
 /// Same as [`page_response`] but injects `overlay` (raw HTML) after `#ipe-root`
@@ -3083,8 +3156,7 @@ fn page_response(
 #[cfg(all(feature = "web", feature = "debugger"))]
 fn page_response_with_overlay(
     sid: &str,
-    body: &str,
-    epoch: &RenderEpoch,
+    page: &PageRender,
     overlay: &str,
     csrf_token: &str,
     headers: &axum::http::HeaderMap,
@@ -3093,8 +3165,14 @@ fn page_response_with_overlay(
     let Ok(base) = web_mount_base() else {
         return ttl_unavailable_response();
     };
-    let Ok(html) = render_page_full_with_overlay(sid, &base, body, epoch, csrf_token, overlay)
-    else {
+    let Ok(html) = render_page_full_with_overlay(
+        sid,
+        &base,
+        page.html.as_str(),
+        &page.epoch,
+        csrf_token,
+        overlay,
+    ) else {
         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let Ok(ttl) = web_ttl() else {
@@ -3111,17 +3189,17 @@ fn page_response_with_overlay(
             ),
             (
                 axum::http::HeaderName::from_static("x-ipe-epoch"),
-                epoch.to_token(),
+                page.epoch.to_token(),
             ),
         ],
         html,
     )
         .into_response();
-    with_page_headers(resp, &[&session_cookie, &csrf_cookie])
+    with_page_headers(resp, &[&session_cookie, &csrf_cookie], &page.html)
 }
 
-/// `resp` with one `Set-Cookie` header per line of `cookies`, then the page
-/// security headers.
+/// `resp` with one `Set-Cookie` header per line of `cookies`, then the
+/// security headers of the page serving `markup`.
 ///
 /// A cookie line or a security header with no header representation answers
 /// `500`: a page never ships without the session or CSRF cookie it was built
@@ -3130,8 +3208,9 @@ fn page_response_with_overlay(
 fn with_page_headers(
     resp: axum::response::Response,
     cookies: &[&crate::server::SetCookie],
+    markup: &StampedHtml,
 ) -> axum::response::Response {
-    with_page_headers_checked(resp, cookies, csrf::security_headers())
+    with_page_headers_checked(resp, cookies, csrf::security_headers(markup))
 }
 
 /// [`with_page_headers`] over the outcome of reading the security headers: a
@@ -3489,7 +3568,7 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         // deliberately left as-is.
         let committed = {
             let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-            let patches = diff(e.rendered.last_view(), &tree);
+            let patches = e.rendered.diff_to(&tree);
             match e.rendered.commit(tree) {
                 Ok(step) => {
                     e.seq += 1;
@@ -4572,9 +4651,10 @@ mod handlers {
         // per-app CSRF cookie (so a reload keeps the same token), else mint a
         // fresh one. `page_response` sets the cookie + injects the value into
         // the page JS; the client echoes it back in the `X-Ipê-Csrf` header.
-        let csrf_tok = csrf::cookie_value(&headers, &csrf::csrf_cookie_name_for(&web_base_path()))
-            .filter(|t| csrf::token_is_well_formed(t))
-            .unwrap_or_else(csrf::gen_token);
+        let csrf_tok = match page_csrf_token(&headers, csrf::mint_token) {
+            Ok(token) => token,
+            Err(refusal) => return *refusal,
+        };
 
         //
         // serve from the static root) BEFORE any session work — they must
@@ -4749,7 +4829,7 @@ mod handlers {
                 let Some(reply_rx) = queue_entry(&enter_tx, path.clone(), EnterMode::Load) else {
                     return entry_unavailable();
                 };
-                let Some(EnterReply { body, epoch }) = await_entry(reply_rx).await else {
+                let Some(EnterReply { page }) = await_entry(reply_rx).await else {
                     return entry_unavailable();
                 };
                 #[cfg(feature = "debugger")]
@@ -4764,12 +4844,10 @@ mod handlers {
                         labels.len(),
                         &web_base_path(),
                     );
-                    return page_response_with_overlay(
-                        &sid, &body, &epoch, &overlay, &csrf_tok, &headers,
-                    );
+                    return page_response_with_overlay(&sid, &page, &overlay, &csrf_tok, &headers);
                 }
                 #[cfg(not(feature = "debugger"))]
-                return page_response(&sid, &body, &epoch, &csrf_tok, &headers);
+                return page_response(&sid, &page, &csrf_tok, &headers);
             }
             Some((_, store::Rejoin::Restored { claim, model, .. })) => {
                 // A returning session drives under the admission its claim
@@ -4831,8 +4909,12 @@ mod handlers {
                 // Session fixation guard: a store MISS means this sid is NOT a
                 // known session, so NEVER adopt the client-supplied cookie value
                 // — always mint a fresh sid. (A HIT path keeps cookie_sid.)
-                // Minted first so `init` and the entry run under it.
-                let scope = pubsub::SessionScope::new(minted_sid(proof));
+                // Minted first so `init` and the entry run under it; with no
+                // entropy for it the page is refused.
+                let Ok(sid) = minted_sid(proof) else {
+                    return entry_unavailable();
+                };
+                let scope = pubsub::SessionScope::new(sid);
                 let (m, init_cmd) = pubsub::with_session(&scope, || (st.init)(req));
                 let (m, c) = enter_session(&st.route_entry, &scope, m, init_cmd, path);
                 (
@@ -4849,9 +4931,12 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model.clone()));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let body = render_html(&tree);
-        let rendered = Rendered::first(new_incarnation(), tree);
-        let epoch = rendered.epoch();
+        // A session without fresh keys is refused, never given fixed ones.
+        let Ok(keys) = SessionKeys::mint() else {
+            return entry_unavailable();
+        };
+        let rendered = Rendered::first(keys, tree);
+        let page = PageRender::current(&rendered);
 
         // Bounded per-session Msg queue: cap at 1024 to prevent a fast
         // client from growing the queue without bound (per-session memory DoS).
@@ -4939,10 +5024,10 @@ mod handlers {
         {
             let base = web_base_path();
             let overlay = crate::debugger::server::overlay_html(&[], 0, &base);
-            page_response_with_overlay(&sid, &body, &epoch, &overlay, &csrf_tok, &headers)
+            page_response_with_overlay(&sid, &page, &overlay, &csrf_tok, &headers)
         }
         #[cfg(not(feature = "debugger"))]
-        page_response(&sid, &body, &epoch, &csrf_tok, &headers)
+        page_response(&sid, &page, &csrf_tok, &headers)
     }
 
     // ── GET /_ipe/sse ─────────────────────────────────────────────────
@@ -5110,11 +5195,11 @@ mod handlers {
             g.seq += 1;
             // The current render at its current epoch: a resync re-sends the
             // view, it mints no epoch and changes no handler index.
-            let html = render_html(g.rendered.last_view());
+            let html = g.rendered.page();
             serde_json::json!({
                 "seq": g.seq,
                 "epoch": g.rendered.epoch().to_token(),
-                "body": html,
+                "body": html.as_str(),
             })
             .to_string()
         };
@@ -5187,18 +5272,13 @@ mod handlers {
         // The closer ends the stream when the session is closed, although
         // the driver, Cmd tasks and the heartbeat may still hold senders.
         let body_stream = session_stream(rx, (SessionGauge, entry), closer, drain);
-        match Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
-            .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .header("x-accel-buffering", "no")
-            .body(axum::body::Body::from_stream(body_stream))
-        {
-            Ok(r) => r.into_response(),
-            // Headers/status are all literals, so this never fails; total
-            // fallback per the no-runtime-errors rule.
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
+        // Its frames carry renders, nonced styles included.
+        session_body_response(
+            StatusCode::OK,
+            "text/event-stream",
+            &[("x-accel-buffering", "no")],
+            axum::body::Body::from_stream(body_stream),
+        )
     }
 
     // ── POST /_ipe/event ──────────────────────────────────────────────
@@ -5981,14 +6061,60 @@ mod handlers {
     }
 
     /// Install the render a debugger endpoint shows as the session's current
-    /// render, minting its epoch; `None` when no epoch is left to mint.
+    /// render, minting its epoch, and return that epoch with the stamped
+    /// render; `None` when no epoch is left to mint.
     #[cfg(feature = "debugger")]
     fn commit_debug_render<Model, Msg: Clone>(
         handle: &store::SessionHandle<Model, Msg>,
         tree: Html<Msg>,
-    ) -> Option<RenderEpoch> {
+    ) -> Option<(RenderEpoch, StampedHtml)> {
         let mut e = handle.lock().unwrap_or_else(|e| e.into_inner());
-        e.rendered.commit(tree).ok().map(|step| step.to)
+        let epoch = e.rendered.commit(tree).ok()?.to;
+        Some((epoch, e.rendered.page()))
+    }
+
+    /// The retained step a debugger scrub asks to show. The overlay renders
+    /// once, so a fixed index from it is bounded by the step count at page
+    /// load; the scrubber's end names [`ScrubTarget::Newest`] so it shows the
+    /// newest step however many arrived since.
+    #[cfg(feature = "debugger")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ScrubTarget {
+        /// The retained step at this index, clamped to the newest.
+        Step(usize),
+        /// The newest retained step.
+        Newest,
+    }
+
+    #[cfg(feature = "debugger")]
+    impl ScrubTarget {
+        /// Parse a scrub request body: exactly `{"index": N}` with `N` a
+        /// non-negative integer, or exactly `{"newest": true}`. Any other body
+        /// names no step and is `None`.
+        pub(super) fn parse(body: &serde_json::Value) -> Option<Self> {
+            let fields = body.as_object()?;
+            if fields.len() != 1 {
+                return None;
+            }
+            if let Some(index) = fields.get("index") {
+                let n = index.as_u64()?;
+                return Some(Self::Step(usize::try_from(n).unwrap_or(usize::MAX)));
+            }
+            match fields.get("newest") {
+                Some(serde_json::Value::Bool(true)) => Some(Self::Newest),
+                Some(_) | None => None,
+            }
+        }
+
+        /// The retained step this target names in a window of `len` steps;
+        /// `None` when no step is retained.
+        pub(super) fn resolve(self, len: usize) -> Option<usize> {
+            let newest = len.checked_sub(1)?;
+            Some(match self {
+                Self::Step(n) => n.min(newest),
+                Self::Newest => newest,
+            })
+        }
     }
 
     // ── POST /_ipe/debug/scrub ────────────────────────────────────────
@@ -5997,10 +6123,11 @@ mod handlers {
     // the whole router) already validates `X-Ipe-Csrf` before this handler
     // runs; the handler itself only needs to authenticate the session.
     //
-    // Request body: `{"index": N}` — reconstruct model at retained step N.
-    // Response: `{"body": "<html>"}` — the view rendered at step N.
-    // Out-of-range N is clamped to the last retained step. No Cmd is fired.
-    // The recorded history is never mutated — reconstruct is a pure re-fold.
+    // Request body: a [`ScrubTarget`] — `{"index": N}` or `{"newest": true}`;
+    // any other body is a 400.
+    // Response: `{"body": "<html>", "epoch": E, "step": N}` — the view rendered
+    // at the retained step N the target names. No Cmd is fired. The recorded
+    // history is never mutated — reconstruct is a pure re-fold.
     #[cfg(feature = "debugger")]
     pub(super) async fn scrub_handler<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
@@ -6026,33 +6153,33 @@ mod handlers {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
-        let requested_n = body
-            .get("index")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize)
-            .unwrap_or(0);
-        let model_at_n = {
+        let Some(target) = ScrubTarget::parse(&body) else {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "scrub body names no step",
+            )
+                .into_response();
+        };
+        let reconstructed = {
             let e = handle.lock().unwrap_or_else(|e| e.into_inner());
-            let total = e.history.len();
-            let n = requested_n.min(total.saturating_sub(1));
-            e.history.reconstruct(n, &|m, mdl| {
-                pubsub::with_session(&scope, || (*st.update)(m, mdl))
+            target.resolve(e.history.len()).and_then(|step| {
+                e.history
+                    .reconstruct(step, &|m, mdl| {
+                        pubsub::with_session(&scope, || (*st.update)(m, mdl))
+                    })
+                    .map(|model| (step, model))
             })
         };
-        let model = match model_at_n {
-            Some(m) => m,
-            None => {
-                return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
-            }
+        let Some((step, model)) = reconstructed else {
+            return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
         };
         let mut tree = pubsub::with_session(&scope, || (st.view)(model));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6060,13 +6187,17 @@ mod handlers {
         if !debug_resident(&st.store, &sid, &handle).await {
             return too_large();
         }
-        let resp_json = serde_json::json!({ "body": html_body, "epoch": epoch.to_token() });
-        (
+        let resp_json = serde_json::json!({
+            "body": html_body.as_str(),
+            "epoch": epoch.to_token(),
+            "step": step,
+        });
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/reset ────────────────────────────────────────────
@@ -6178,12 +6309,12 @@ mod handlers {
             crate::debugger::export_msgs(&e.history)
         };
         match json_bytes {
-            Ok(bytes) => (
+            Ok(bytes) => session_body_response(
                 axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                bytes,
-            )
-                .into_response(),
+                "application/json",
+                &[],
+                axum::body::Body::from(bytes),
+            ),
             Err(err) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 err.to_string(),
@@ -6336,11 +6467,12 @@ mod handlers {
             Ok(live) => live,
             Err(lost) => return lost.into_response(),
         };
-        let requested_n = match body.get("index").and_then(|v| v.as_u64()) {
-            Some(n) => n as usize,
-            None => {
-                return (axum::http::StatusCode::BAD_REQUEST, "missing index").into_response();
-            }
+        let Some(index) = body.get("index").and_then(serde_json::Value::as_u64) else {
+            return (axum::http::StatusCode::BAD_REQUEST, "missing index").into_response();
+        };
+        // An index no `usize` holds names no retained step.
+        let Ok(requested_n) = usize::try_from(index) else {
+            return (axum::http::StatusCode::NOT_FOUND, "step out of range").into_response();
         };
         let (model_at_n, cursor, total) = {
             let mut e = handle.lock().unwrap_or_else(|p| p.into_inner());
@@ -6366,11 +6498,10 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6379,17 +6510,17 @@ mod handlers {
             return too_large();
         }
         let resp_json = serde_json::json!({
-            "body":   html_body,
+            "body":   html_body.as_str(),
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/back ─────────────────────────────────────────────
@@ -6450,11 +6581,10 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6463,17 +6593,17 @@ mod handlers {
             return too_large();
         }
         let resp_json = serde_json::json!({
-            "body":   html_body,
+            "body":   html_body.as_str(),
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── POST /_ipe/debug/forward ──────────────────────────────────────────
@@ -6538,11 +6668,10 @@ mod handlers {
         let mut tree = pubsub::with_session(&scope, || (st.view)(model_at_n));
         assign_ipe_ids(&mut tree, "r");
         style_inject::apply_style_injections(&mut tree);
-        let html_body = render_html(&tree);
         // The debugger shows this render, so it becomes the session's current
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
-        let Some(epoch) = commit_debug_render(&handle, tree) else {
+        let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
             st.store.delete(&sid).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
@@ -6551,17 +6680,17 @@ mod handlers {
             return too_large();
         }
         let resp_json = serde_json::json!({
-            "body":   html_body,
+            "body":   html_body.as_str(),
             "epoch":  epoch.to_token(),
             "cursor": cursor,
             "total":  total,
         });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 
     // ── GET /_ipe/debug/inspect ───────────────────────────────────────────────
@@ -6604,12 +6733,12 @@ mod handlers {
             crate::debugger::server::inspect_model(&e.model)
         };
         let resp_json = serde_json::json!({ "model": rendered });
-        (
+        session_body_response(
             axum::http::StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            resp_json.to_string(),
+            "application/json",
+            &[],
+            axum::body::Body::from(resp_json.to_string()),
         )
-            .into_response()
     }
 }
 
@@ -7133,16 +7262,7 @@ where
                 console::console_auth_mode_label()
             ),
         );
-        router = router
-            .route("/_ipe/console", get(console::console_html))
-            .route("/_ipe/console/api/overview", get(console::api_overview))
-            .route("/_ipe/console/api/logs", get(console::api_logs))
-            .route("/_ipe/console/api/errors", get(console::api_errors))
-            .route("/_ipe/console/api/traces", get(console::api_traces))
-            .route(
-                "/_ipe/console/api/metrics-summary",
-                get(console::api_metrics_summary),
-            );
+        router = console::mount_inline(router);
     }
     // The console proxy needs `http_client` (outbound reqwest). The
     // in-process console is served under `web` whenever the mount gate
@@ -7300,7 +7420,7 @@ mod reload_push_tests {
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: Rendered::first(new_incarnation(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -7408,7 +7528,7 @@ mod hot_appearance_push_tests {
         let (msg_tx, _rx) = mpsc::channel::<()>(1);
         Arc::new(Mutex::new(SessionEntry {
             model: count,
-            rendered: Rendered::first(new_incarnation(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -7935,8 +8055,8 @@ mod canonical_redirect_handler_tests {
 #[cfg(all(test, feature = "web"))]
 mod base_path_tests {
     use super::{
-        Html, RenderEpoch, Rendered, client_js_path, cookie_name_for, cookie_name_with,
-        cookie_path_for, new_incarnation, normalise_base_path, render_page_full,
+        Html, RenderEpoch, Rendered, SessionKeys, client_js_path, cookie_name_for,
+        cookie_name_with, cookie_path_for, normalise_base_path, render_page_full,
     };
 
     #[test]
@@ -8299,6 +8419,271 @@ mod base_path_tests {
         );
     }
 
+    /// The client moves its render epoch only through its two adopt
+    /// functions, and patches the DOM by diff only through `__ipeAdoptPatches`.
+    ///
+    /// Each adopt function admits only a token parsed as an epoch of the
+    /// document's own history, and a diff only as the next step from the render
+    /// on screen; a frame or an answer that bypassed them could move the epoch
+    /// to an unparsed token, or apply patches onto a DOM they were not diffed
+    /// from.
+    #[test]
+    fn client_moves_its_epoch_only_through_the_adopt_gates() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let writes = |text: &str| -> usize {
+            text.match_indices("__ipeEpoch")
+                .filter(|(at, name)| {
+                    text.get(at + name.len()..).is_some_and(|after| {
+                        let after = after.trim_start();
+                        after.starts_with('=') && !after.starts_with("==")
+                    })
+                })
+                .count()
+        };
+        let full = body_of("__ipeAdoptFullBody").unwrap_or_default();
+        let diff = body_of("__ipeAdoptPatches").unwrap_or_default();
+        let step = body_of("__ipePatchStep").unwrap_or_default();
+        assert_eq!(
+            js.matches("var __ipeEpoch = __ipeBoot[\"epoch\"];").count(),
+            1
+        );
+        assert_eq!(
+            (writes(js), writes(full), writes(diff)),
+            (3, 1, 1),
+            "`__ipeEpoch` is written at boot and in the two adopt functions only"
+        );
+        assert!(
+            full.contains("var next = __ipeOwnEpoch(token);")
+                && diff.contains("__ipePatchStep(from, to) !== \"next\"")
+                && step.contains("var a = __ipeOwnEpoch(from);")
+                && step.contains("var b = __ipeOwnEpoch(to);"),
+            "each adopt function parses the epochs it adopts"
+        );
+        assert_eq!(
+            js.matches("__ipeApplyPatches(").count(),
+            2,
+            "`__ipeApplyPatches` has its definition and one caller"
+        );
+        assert!(
+            diff.contains("__ipeApplyPatches(patches);"),
+            "the one caller of `__ipeApplyPatches` is `__ipeAdoptPatches`"
+        );
+    }
+
+    /// The client writes its history in `__ipeRecordNav` only: no other site
+    /// names the history API, whatever receiver it reaches it through.
+    ///
+    /// A second writer, such as a `data-ipe-path` render calling
+    /// `history.pushState` itself, moves the URL without the location the
+    /// popstate handler compares against, so Back stops at an entry it takes
+    /// for the current one, and a navigation pushes its URL twice.
+    #[test]
+    fn client_writes_its_history_through_one_writer() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        // `history` followed by a member access, `.name` or `[`.
+        let history_reads = |text: &str| -> usize {
+            text.match_indices("history")
+                .filter(|(at, name)| {
+                    let after = text.get(at + name.len()..).unwrap_or_default();
+                    after.starts_with('[')
+                        || after
+                            .strip_prefix('.')
+                            .and_then(|rest| rest.chars().next())
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                })
+                .count()
+        };
+        let record = body_of("__ipeRecordNav").unwrap_or_default();
+        let paths = body_of("__ipeRunPaths").unwrap_or_default();
+        assert_eq!(
+            (history_reads(js), history_reads(record)),
+            (2, 2),
+            "the history API is reached in `__ipeRecordNav` only"
+        );
+        for api in ["pushState", "replaceState"] {
+            assert_eq!(
+                (js.matches(api).count(), record.matches(api).count()),
+                (1, 1),
+                "`{api}` is named in `__ipeRecordNav` only"
+            );
+        }
+        assert!(
+            paths.contains("__ipeRecordNav(p, true, at);")
+                && paths.contains("__ipeRecordNav(p, false, at);"),
+            "a render's `data-ipe-path` is recorded through `__ipeRecordNav`"
+        );
+        assert!(
+            record.contains(
+                "else if (new URL(url, window.location.href).href !== window.location.href) {"
+            ),
+            "a push of the current location adds no history entry"
+        );
+    }
+
+    /// A location is recorded only when no newer navigation answer or render
+    /// already named one: the newest names the route every later render
+    /// shows, whatever order the answers arrive in.
+    ///
+    /// Ordering by the navigations started instead lets an older answer that
+    /// arrives last, to the last navigation started, move the URL off the
+    /// render on screen.
+    #[test]
+    fn client_records_the_location_of_the_newest_answer_or_render() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let record = body_of("__ipeRecordNav").unwrap_or_default();
+        let full = body_of("__ipeAdoptFullBody").unwrap_or_default();
+        let diff = body_of("__ipeAdoptPatches").unwrap_or_default();
+        assert!(
+            record.contains(
+                "if (__ipeNavEpoch && __ipeCounterOrder(at, __ipeNavEpoch) < 0) return;\n  __ipeNavEpoch = at;"
+            ),
+            "a location older than the one recorded is refused"
+        );
+        assert!(
+            !js.contains("__ipeNavCount"),
+            "no count of started navigations orders their answers"
+        );
+        assert_eq!(
+            js.matches("__ipeRecordNav(").count(),
+            5,
+            "`__ipeRecordNav` has its definition, two `data-ipe-path` sites, the link and the popstate answer"
+        );
+        assert!(
+            js.contains("__ipeRecordNav(res.url, true, next);")
+                && js.contains("__ipeRecordNav(res.url, false, next);"),
+            "each navigation answer names its location at its own epoch"
+        );
+        assert_eq!(
+            (
+                js.matches("__ipeRunPaths()").count(),
+                full.matches("__ipeEpoch = token;\n  __ipeRunPaths();")
+                    .count(),
+                diff.matches("__ipeEpoch = to;\n  __ipeRunPaths();").count()
+            ),
+            (3, 1, 1),
+            "a render's `data-ipe-path` is read after its epoch is adopted, in the two adopt functions only"
+        );
+    }
+
+    /// A navigation whose answer the document cannot show loads its own
+    /// target, and only while it is the newest navigation the reader started;
+    /// a reload of the document goes where a pending navigation was going.
+    ///
+    /// Loading the location instead loads whatever a later answer or render
+    /// recorded while the navigation was pending: Back whose fetch fails after
+    /// a link's answer pushed its URL reloads the link, not the popped entry.
+    #[test]
+    fn client_loads_a_navigation_target_never_the_location() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let load = body_of("__ipeLoad").unwrap_or_default();
+        let load_nav = body_of("__ipeLoadNav").unwrap_or_default();
+        let reload = body_of("__ipeReloadDocument").unwrap_or_default();
+        let stale = body_of("__ipeStaleDocument").unwrap_or_default();
+        let probe = body_of("__ipeProbeSessionLost").unwrap_or_default();
+        assert_eq!(
+            (
+                js.matches("location.reload()").count(),
+                load.matches("location.reload()").count(),
+                reload.matches("location.reload()").count(),
+            ),
+            // `__ipeLoad` reloads the location, and reloads a same-document
+            // fragment target once it is the location.
+            (3, 2, 1),
+            "the document reloads in `__ipeLoad` and `__ipeReloadDocument` only"
+        );
+        assert_eq!(
+            (
+                js.matches("location.assign(").count(),
+                load.matches("location.assign(").count()
+            ),
+            // `__ipeLoad` assigns a same-document fragment target before its
+            // reload, and any other document's target as its full load.
+            (2, 2),
+            "the document assigns its location in `__ipeLoad` only"
+        );
+        assert!(
+            !js.contains("location.href =") && !js.contains("location.href="),
+            "no site assigns `location.href`"
+        );
+        assert!(
+            load_nav.contains("if (intent !== __ipeNavIntent) return;")
+                && load_nav.contains("__ipeLoad(url);"),
+            "only the newest navigation loads, and it loads its own target"
+        );
+        // Assigning `/A#x` from `/A` is a fragment navigation, which loads
+        // nothing: it moves the location to the target, which then reloads.
+        // Reloading the location alone would drop the target's fragment and
+        // entry. Assigning `/A` from `/A#y` is a full load, which a reload
+        // after it would cancel.
+        assert!(
+            load.contains("var here = window.location.href;")
+                && load.contains("if (target === here) {\n    window.location.reload();\n  }")
+                && load.contains(
+                    "} else if (target.indexOf(\"#\") >= 0 && __ipeDocumentOf(target) === __ipeDocumentOf(here)) {\n    window.location.assign(target);\n    window.location.reload();\n  }"
+                )
+                && load.contains("} else {\n    window.location.assign(target);\n  }"),
+            "the reader lands on the target, freshly loaded, whatever its fragment"
+        );
+        let document_of = body_of("__ipeDocumentOf").unwrap_or_default();
+        assert!(
+            document_of.contains("var at = href.indexOf(\"#\");")
+                && document_of.contains("return at < 0 ? href : href.slice(0, at);"),
+            "the document of a URL is the URL before its fragment"
+        );
+        assert_eq!(
+            js.matches("__ipeDocumentOf(").count(),
+            3,
+            "`__ipeDocumentOf` has its definition and the two sides of `__ipeLoad`'s compare"
+        );
+        assert!(
+            reload.contains("if (typeof wanted === \"string\") __ipeLoad(wanted);"),
+            "a reload goes where the pending navigation was going"
+        );
+        assert!(
+            stale.contains("__ipeReloadDocument();") && probe.contains("__ipeReloadDocument();"),
+            "the stale-document and lost-session reloads go through `__ipeReloadDocument`"
+        );
+        assert_eq!(
+            js.matches("__ipeStartNav(").count(),
+            3,
+            "`__ipeStartNav` has its definition, the link and the popstate"
+        );
+        for fallback in [
+            ".catch(function() { __ipeLoadNav(intent, target); });",
+            ".catch(function() { __ipeLoadNav(intent, popped); });",
+            "if (!next || next.inc !== __ipeBootInc || __ipeStale) {\n        __ipeLoadNav(intent, target);",
+            "if (!next || __ipeStale) {\n        __ipeLoadNav(intent, popped);",
+            "if (__ipeStale) {\n    __ipeLoadNav(intent, popped);",
+        ] {
+            assert_eq!(js.matches(fallback).count(), 1, "{fallback}");
+        }
+        assert_eq!(
+            js.matches("__ipeLoadNav(intent, ").count(),
+            6,
+            "`__ipeLoadNav` has its definition and the five navigation fallbacks"
+        );
+    }
+
     /// The string items of `var {name} = [ … ];` in `js`.
     fn js_string_array(js: &str, name: &str) -> Option<Vec<String>> {
         let open = format!("var {name} = [");
@@ -8371,7 +8756,7 @@ mod base_path_tests {
 
     /// The first epoch of a fresh render history, as a page GET serves it.
     fn page_epoch() -> RenderEpoch {
-        Rendered::first(new_incarnation(), Html::<()>::HText(String::new())).epoch()
+        Rendered::first(SessionKeys::distinct(), Html::<()>::HText(String::new())).epoch()
     }
 
     #[allow(clippy::expect_used)] // a fixed literal inside the mount-base grammar
@@ -8765,7 +9150,7 @@ mod sse_reconnect_reconcile_tests {
         let (enter_tx, enter_rx) = channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model,
-            rendered: Rendered::first(new_incarnation(), last_view),
+            rendered: Rendered::first(SessionKeys::distinct(), last_view),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -8835,7 +9220,12 @@ mod sse_reconnect_reconcile_tests {
             return (0, None);
         };
         let committed = drive_one(fx, request).await;
-        (committed, await_entry(reply_rx).await.map(|r| r.body))
+        (
+            committed,
+            await_entry(reply_rx)
+                .await
+                .map(|r| r.page.html.as_str().to_owned()),
+        )
     }
 
     /// Two reconnects at one new path, both queued before the driver runs,
@@ -9537,7 +9927,7 @@ mod watch_status_handler_tests {
         let tree: Html<TestMsg> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             model: (),
-            rendered: Rendered::first(new_incarnation(), tree),
+            rendered: Rendered::first(SessionKeys::distinct(), tree),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx,
@@ -12609,6 +12999,58 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// Every response carrying a session render is `no-store`: the stream,
+    /// whose frames carry renders, and the `409` refusal carrying the current
+    /// one. Their style elements hold the session's nonce.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the requests are fixtures
+    fn responses_carrying_a_render_are_never_stored() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let cookie = format!("{}={sid}", cookie_name_for(""));
+            let cache = |resp: &axum::response::Response| {
+                resp.headers()
+                    .get_all(header::CACHE_CONTROL)
+                    .iter()
+                    .map(|v| v.to_str().map(str::to_owned))
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            };
+
+            let refusal = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_ipe/event")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::COOKIE, cookie.as_str())
+                        .body(Body::from(click_body(&plus, None, None)))
+                        .expect("build POST"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(refusal.status(), StatusCode::CONFLICT);
+            assert_eq!(cache(&refusal), Some(vec!["no-store".to_owned()]));
+
+            let stream = make_router(store.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_ipe/sse?path=%2F")
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(header::COOKIE, cookie.as_str())
+                        .body(Body::empty())
+                        .expect("build SSE GET"),
+                )
+                .await
+                .expect("router responds");
+            assert_eq!(stream.status(), StatusCode::OK);
+            assert_eq!(cache(&stream), Some(vec!["no-store".to_owned()]));
+        });
+    }
+
     /// A malformed epoch or tab id is a malformed body: `400 bad body`, no dispatch.
     #[test]
     #[allow(clippy::expect_used)] // the page is a fixture
@@ -12819,6 +13261,145 @@ mod emitted_router_behavior_tests {
                 Some(shown.as_str()),
                 "the committed render is the one the debugger shows"
             );
+        });
+    }
+
+    /// A debugger scrub body names its step as exactly `{"index": N}` or
+    /// `{"newest": true}`; every other body names none, and an index past
+    /// what a `usize` holds saturates rather than truncating.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn a_scrub_body_parses_to_one_target_or_none() {
+        use super::handlers::ScrubTarget;
+        let parse = |raw: &str| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| ScrubTarget::parse(&v))
+        };
+        assert_eq!(parse(r#"{"index":0}"#), Some(ScrubTarget::Step(0)));
+        assert_eq!(parse(r#"{"index":7}"#), Some(ScrubTarget::Step(7)));
+        assert_eq!(parse(r#"{"newest":true}"#), Some(ScrubTarget::Newest));
+        assert_eq!(
+            parse(r#"{"index":18446744073709551615}"#),
+            Some(ScrubTarget::Step(
+                usize::try_from(u64::MAX).unwrap_or(usize::MAX)
+            ))
+        );
+        for refused in [
+            "{}",
+            "null",
+            "[0]",
+            "0",
+            r#""newest""#,
+            r#"{"index":-1}"#,
+            r#"{"index":1.5}"#,
+            r#"{"index":"1"}"#,
+            r#"{"index":null}"#,
+            r#"{"newest":false}"#,
+            r#"{"newest":1}"#,
+            r#"{"index":0,"newest":true}"#,
+            r#"{"index":0,"extra":0}"#,
+            r#"{"step":0}"#,
+        ] {
+            assert_eq!(parse(refused), None, "{refused}");
+        }
+    }
+
+    /// A target resolves within the retained window: a step past the end is
+    /// the newest, the newest of `len` steps is `len - 1`, and an empty window
+    /// holds no step.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn a_scrub_target_resolves_within_the_retained_window() {
+        use super::handlers::ScrubTarget;
+        assert_eq!(ScrubTarget::Step(1).resolve(6), Some(1));
+        assert_eq!(ScrubTarget::Step(5).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Step(6).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Step(usize::MAX).resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Newest.resolve(6), Some(5));
+        assert_eq!(ScrubTarget::Newest.resolve(1), Some(0));
+        assert_eq!(ScrubTarget::Newest.resolve(0), None);
+        assert_eq!(ScrubTarget::Step(0).resolve(0), None);
+    }
+
+    #[cfg(feature = "debugger")]
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn post_scrub(
+        store: &Arc<Store>,
+        sid: &str,
+        body: &str,
+    ) -> (StatusCode, Option<serde_json::Value>) {
+        let resp = make_router(store.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_ipe/debug/scrub")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                    .body(Body::from(body.to_owned()))
+                    .expect("build POST"),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (status, serde_json::from_slice(&bytes).ok())
+    }
+
+    /// The scrubber's end shows the newest step however many arrived since the
+    /// page loaded, a fixed index past the window shows the newest too, and a
+    /// body naming no step is refused rather than read as step 0.
+    #[cfg(feature = "debugger")]
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_scrub_to_newest_shows_steps_that_arrived_after_load() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+
+            let (status, _) = post_scrub(&store, &sid, r#"{"newest":true}"#).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "no step is retained yet");
+
+            for count in 1..=3 {
+                let epoch = current_epoch(&store, &sid).await;
+                let event = click_body(&plus, Some(&epoch), None);
+                assert_eq!(
+                    post_event(make_router(store.clone()), &sid, &event).await,
+                    StatusCode::OK
+                );
+                await_model(&store, &sid, |m| m.count == count).await;
+            }
+
+            let step_of = |reply: Option<serde_json::Value>| {
+                reply
+                    .as_ref()
+                    .and_then(|r| r.get("step"))
+                    .and_then(serde_json::Value::as_u64)
+            };
+            let (status, reply) = post_scrub(&store, &sid, r#"{"newest":true}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(2), "newest of three steps");
+
+            let (status, reply) = post_scrub(&store, &sid, r#"{"index":1}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(1));
+
+            let (status, reply) = post_scrub(&store, &sid, r#"{"index":99}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(step_of(reply), Some(2), "past the window clamps to newest");
+
+            for refused in [
+                "{}",
+                r#"{"index":-1}"#,
+                r#"{"newest":false}"#,
+                r#"{"index":0,"newest":true}"#,
+            ] {
+                let (status, _) = post_scrub(&store, &sid, refused).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+            }
         });
     }
 
@@ -13528,25 +14109,24 @@ mod emitted_router_behavior_tests {
 mod page_mount_base_tests {
     use axum::http::{HeaderMap, StatusCode};
 
-    /// The first epoch of a fresh render history.
-    fn page_epoch() -> super::RenderEpoch {
-        super::Rendered::first(
-            super::new_incarnation(),
-            super::Html::<()>::HText(String::new()),
-        )
-        .epoch()
+    /// The first render of a fresh render history.
+    fn first_page() -> super::PageRender {
+        super::PageRender::current(&super::Rendered::first(
+            super::SessionKeys::distinct(),
+            super::Html::<()>::HText("x".to_owned()),
+        ))
     }
 
     /// The page under the current `IPE_WEB_BASE_PATH`.
     #[cfg(not(feature = "debugger"))]
     fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response("sid", "<p>x</p>", &page_epoch(), "tok", headers)
+        super::page_response("sid", &first_page(), "tok", headers)
     }
 
     /// The page under the current `IPE_WEB_BASE_PATH`.
     #[cfg(feature = "debugger")]
     fn page(headers: &HeaderMap) -> axum::response::Response {
-        super::page_response_with_overlay("sid", "<p>x</p>", &page_epoch(), "", "tok", headers)
+        super::page_response_with_overlay("sid", &first_page(), "", "tok", headers)
     }
 
     /// A page asked for under a base outside the mount-base grammar answers the
@@ -15133,7 +15713,7 @@ mod route_entry_cmd_tests {
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         let entry = Arc::new(Mutex::new(SessionEntry {
             model: model.clone(),
-            rendered: Rendered::first(new_incarnation(), last_view),
+            rendered: Rendered::first(SessionKeys::distinct(), last_view),
             tabs: TabSeqs::default(),
             seq: 0,
             sse_tx: None,
@@ -15231,10 +15811,15 @@ mod route_entry_cmd_tests {
     }
 
     /// Open the SSE stream for `sid` reporting `path` and read until its resync frame.
-    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
     async fn sse_resync(store: &Store, sid: &str, path: &str) -> String {
+        sse_resync_via(router(store.clone()), sid, path).await
+    }
+
+    /// Open the SSE stream through `app`, answering as [`sse_resync`] does.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn sse_resync_via(app: axum::Router, sid: &str, path: &str) -> String {
         use futures_util::StreamExt;
-        let resp = router(store.clone())
+        let resp = app
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -15261,6 +15846,174 @@ mod route_entry_cmd_tests {
         })
         .await;
         utf8_prefix(&bytes).to_owned()
+    }
+
+    /// The fixture view with a `<style>` ahead of the page text.
+    fn styled_view(model: Model) -> Html<Msg> {
+        Html::HElement(
+            "div".into(),
+            vec![],
+            vec![
+                Html::HElement("style".into(), vec![], vec![Html::HRaw("p{}".into())]),
+                view(model),
+            ],
+        )
+    }
+
+    /// The fixture router over `store`, rendering [`styled_view`].
+    #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
+    fn styled_router(store: Store) -> axum::Router {
+        let mut state = fixture_state(store, Arc::new(AtomicUsize::new(0)));
+        state.view = Arc::new(styled_view as fn(Model) -> Html<Msg>);
+        build_web_router(state, false)
+            .map(crate::server::behind_listener)
+            .expect("the fixture route table and base are well-formed")
+    }
+
+    /// Whether `token` occurs in `text`, and every occurrence is the quoted
+    /// `nonce` value of a `<style` start tag, with `quote` as the quote.
+    fn stamped_only(text: &str, token: &str, quote: &str) -> bool {
+        let attr = format!(" nonce={quote}");
+        let found: Vec<bool> = text
+            .match_indices(token)
+            .map(|(at, _)| {
+                let head = text.get(..at).unwrap_or_default();
+                let tag = head.rfind('<').and_then(|lt| head.get(lt..));
+                head.ends_with(&attr)
+                    && tag.is_some_and(|t| t.starts_with("<style ") && !t.contains('>'))
+            })
+            .collect();
+        !found.is_empty() && found.iter().all(|ok| *ok)
+    }
+
+    /// The session's style nonce reaches the page and the SSE stream only as
+    /// the `nonce` attribute of a `<style>` start tag: never in the hello
+    /// frame, the frame metadata, or anywhere else.
+    #[test]
+    fn nonce_never_on_the_stream() {
+        run(false, || async {
+            let store = memory();
+            let (status, _, sid, page) = get_via(styled_router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(settled(&store, &sid, 2).await.is_some());
+            let handle = handle_of(&store, &sid).await;
+            assert!(handle.is_some(), "the session is live");
+            let Some(handle) = handle else {
+                return;
+            };
+            let token = handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .stamp()
+                .as_token();
+
+            assert!(stamped_only(&page, &token, "\""), "{page}");
+
+            let stream = sse_resync_via(styled_router(store.clone()), &sid, "/").await;
+            assert!(stream.contains("event: hello"), "{stream}");
+            assert!(stream.contains("event: patch"), "{stream}");
+            assert!(stamped_only(&stream, &token, "\\\""), "{stream}");
+        });
+    }
+
+    /// GET `path` through `app`: the status, the `content-security-policy`,
+    /// the sid cookie value and the page body.
+    #[allow(clippy::expect_used)] // test helper — request build / router failure is a test environment issue
+    async fn get_with_policy(
+        app: axum::Router,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String, String, String) {
+        let name = super::cookie_name_for("");
+        let prefix = format!("{name}=");
+        let mut b = Request::builder().method("GET").uri(path);
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, format!("{name}={c}"));
+        }
+        let resp = app
+            .oneshot(b.body(Body::empty()).expect("build GET"))
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let policy = resp
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let sid = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|c| c.strip_prefix(prefix.as_str()))
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("a UTF-8 page body");
+        (status, policy, sid, body)
+    }
+
+    /// Every `'nonce-…'` token `policy` names.
+    fn policy_nonces(policy: &str) -> Vec<&str> {
+        policy
+            .split_whitespace()
+            .filter_map(|source| source.trim_end_matches(';').strip_prefix("'nonce-"))
+            .filter_map(|rest| rest.strip_suffix('\''))
+            .collect()
+    }
+
+    /// Every `nonce="…"` value in `page`.
+    fn markup_nonces(page: &str) -> Vec<&str> {
+        page.split(" nonce=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    /// The nonce a served page's policy names is the one every `<style>` of
+    /// its markup carries, on the first GET and on a reload of the live
+    /// session alike, and another session's page names another.
+    #[test]
+    fn page_header_nonce_equals_markup_nonce() {
+        run(false, || async {
+            let store = memory();
+            let (status, policy, sid, page) =
+                get_with_policy(styled_router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let named = policy_nonces(&policy);
+            assert_eq!(named.len(), 2, "style-src and style-src-elem: {policy}");
+            let token = named.first().copied().unwrap_or_default();
+            assert!(named.iter().all(|n| *n == token), "{policy}");
+            let stamped = markup_nonces(&page);
+            assert!(!stamped.is_empty(), "{page}");
+            assert!(stamped.iter().all(|n| *n == token), "{policy} {page}");
+            assert!(settled(&store, &sid, 2).await.is_some());
+
+            let (status, reload_policy, _, reload) =
+                get_with_policy(styled_router(store.clone()), "/", Some(&sid)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(policy_nonces(&reload_policy), named, "{reload_policy}");
+            let restamped = markup_nonces(&reload);
+            assert!(!restamped.is_empty(), "{reload}");
+            assert!(restamped.iter().all(|n| *n == token), "{reload}");
+
+            let (status, other_policy, other_sid, other) =
+                get_with_policy(styled_router(store.clone()), "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(other_sid, sid);
+            let other_named = policy_nonces(&other_policy);
+            assert_eq!(other_named.len(), 2, "{other_policy}");
+            assert!(other_named.iter().all(|n| *n != token), "{other_policy}");
+            let other_stamped = markup_nonces(&other);
+            assert!(!other_stamped.is_empty(), "{other}");
+            assert!(other_stamped.iter().all(|n| *n != token), "{other}");
+        });
     }
 
     /// The GET that creates a page and the SSE open that follows at the same
@@ -16750,6 +17503,30 @@ mod web_revocation_tests {
         });
     }
 
+    /// The debugger answers carrying a session's message log or model are
+    /// `no-store`.
+    #[cfg(feature = "debugger")]
+    #[test]
+    fn debugger_answers_carrying_session_data_are_never_stored() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "debug-cache-subject", 7200, "").await;
+            let cookie = sid_cookie(&opened.sid);
+            for path in ["/_ipe/debug/export", "/_ipe/debug/inspect"] {
+                let resp = send(&router, "GET", path, &cookie, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{path} answers");
+                let cache: Vec<_> = resp
+                    .headers()
+                    .get_all(header::CACHE_CONTROL)
+                    .iter()
+                    .map(|v| v.to_str().ok())
+                    .collect();
+                assert_eq!(cache, [Some("no-store")], "{path} is never stored");
+            }
+        });
+    }
+
     /// A page load naming a revoked session never rejoins it: it mints a fresh
     /// sid, re-runs `init`, and the old session is gone.
     #[test]
@@ -17079,6 +17856,69 @@ mod web_revocation_tests {
             .collect()
     }
 
+    /// Every serialization of a session's tree is stamped with its nonce.
+    ///
+    /// An unstamped render, and a replaced render history that would carry
+    /// other keys, appear only in the static SSR fn that serves no session,
+    /// and the keys are minted at exactly one site.
+    #[test]
+    fn session_serialization_is_stamped() {
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        let bodies = fn_bodies(&code);
+        let mut owners = std::collections::BTreeSet::new();
+        let mut sites = 0_usize;
+        for marker in ["render_html(", "RenderCtx::Unstamped", ".rendered ="] {
+            for (pos, _) in code.match_indices(marker) {
+                let bounded = marker.starts_with('.')
+                    || code
+                        .get(..pos)
+                        .and_then(|head| head.chars().next_back())
+                        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                if bounded {
+                    sites += 1;
+                    owners.insert(enclosing_fn(&bodies, pos));
+                }
+            }
+        }
+        assert!(sites >= 1, "the static SSR render is found");
+        assert_eq!(
+            owners,
+            std::collections::BTreeSet::from([Some("web_render_static".to_owned())]),
+            "an unstamped render or a replaced render history serves no session"
+        );
+        let mints = code.matches("SessionKeys::mint(").count();
+        assert_eq!(mints, 1, "a session's keys are minted at one site");
+    }
+
+    /// A sid draw that yields no entropy is an error, never a sid, and no
+    /// production path mints an id through a generator that panics instead.
+    #[test]
+    fn sid_mint_refuses_without_entropy() {
+        use crate::entropy::EntropyError;
+        assert_eq!(super::sid_from(|_| Err(EntropyError)), Err(EntropyError));
+        let sid = super::sid_from(|bits| {
+            bits.fill(0xa5);
+            Ok(())
+        });
+        assert_eq!(sid, Ok("a5".repeat(16)));
+        let parsed = sid
+            .as_deref()
+            .ok()
+            .and_then(crate::web::store::SessionKey::parse);
+        assert!(parsed.is_some(), "a minted sid is a session key");
+        let code = production_only(&code_only(include_str!("mod.rs")));
+        assert!(
+            code.contains("fn minted_sid(") && !code.contains("fn new_sid("),
+            "the scan sees the production mint and not the test fixture"
+        );
+        assert_eq!(
+            code.matches("sid_from(").count(),
+            2,
+            "a production sid is drawn only through the fallible `sid_from`"
+        );
+        assert!(!code.contains("new_v4"), "an id mint panics on no entropy");
+    }
+
     /// Every task a Cmd dispatch spawns runs in the session's scope, every
     /// dispatch re-proves the session first, and a sid becomes a live entry
     /// only through the resolver.
@@ -17361,5 +18201,53 @@ mod web_static_mount_tests {
         for uri in ["/static//hello.txt", "/static///hello.txt"] {
             assert_eq!(serve(uri).await, axum::http::StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+mod page_csrf_mint_tests {
+    //! The page GET's CSRF token is reused or minted, and a refused mint is a 503.
+
+    use super::page_csrf_token;
+    use crate::entropy::EntropyError;
+    use std::cell::Cell;
+
+    /// A page GET with no cookie and a failing mint answers 503 with
+    /// `Retry-After: 1` and sets no cookie.
+    #[test]
+    fn page_csrf_mint_failure_is_503() {
+        let headers = axum::http::HeaderMap::new();
+        let refused = page_csrf_token(&headers, || Err(EntropyError));
+        assert!(refused.is_err(), "a refused mint yields no token");
+        let Err(resp) = refused else { return };
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
+    }
+
+    /// A well-formed cookie token is reused and the mint is never called.
+    #[test]
+    #[allow(clippy::expect_used)] // test: a fixed ASCII cookie header
+    fn page_csrf_reuses_a_well_formed_cookie_without_minting() {
+        let token = "ab".repeat(32);
+        let name = super::csrf::csrf_cookie_name_for(&super::web_base_path());
+        let mut headers = axum::http::HeaderMap::new();
+        let cookie = format!("{}={token}", name.as_str());
+        headers.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(&cookie).expect("an ASCII cookie header"),
+        );
+        let mints = Cell::new(0_u32);
+        let reused = page_csrf_token(&headers, || {
+            mints.set(mints.get() + 1);
+            Err(EntropyError)
+        });
+        assert_eq!(reused.ok(), Some(token));
+        assert_eq!(mints.get(), 0, "a reused token draws nothing");
     }
 }

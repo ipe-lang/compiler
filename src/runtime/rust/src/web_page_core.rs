@@ -28,7 +28,7 @@
 /// Authors can override per-element with `Ui.focusVisible [Ui.style "outline" "…"]`
 /// — but the `no-silent-outline-none` lint fires if they erase it without a
 /// visible replacement, keeping the default path accessible by construction.
-const BASE_CSS: &str = concat!(
+pub(crate) const BASE_CSS: &str = concat!(
     "*,*::before,*::after{box-sizing:border-box}",
     "html,body{margin:0;padding:0;min-height:100%}",
     "body{min-height:100vh;display:flex;flex-direction:column;font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,\"Helvetica Neue\",Arial,sans-serif;line-height:1.4}",
@@ -53,7 +53,7 @@ const BASE_CSS: &str = concat!(
 /// client never creates a `<style>` element and every inline style the shell
 /// carries is a fixed literal a hash can admit. The client sets the banner's
 /// base layout through CSSOM; these rules map each state class to its colour.
-const STATUS_CSS: &str = concat!(
+pub(crate) const STATUS_CSS: &str = concat!(
     "#__ipe-status.ipe-status--connected{display:none}",
     "#__ipe-status.ipe-status--reconnecting{background:#b45309}",
     "#__ipe-status.ipe-status--offline{background:#b91c1c}",
@@ -65,6 +65,13 @@ const STATUS_CSS: &str = concat!(
     "#__ipe-status.ipe-status--build-ok{background:#14532d}",
     "#__ipe-status.ipe-status--build-failed{background:#7f1d1d}",
     "}",
+);
+
+// The page policy admits both constants by hash, so neither may close or
+// re-mode its `<style>` element before the bytes the hash covers end.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an inline page style constant could end its element early, serving bytes its policy hash does not cover [ledger #boundary]
+const _: () = assert!(
+    !crate::csp::ends_raw_text_early(BASE_CSS) && !crate::csp::ends_raw_text_early(STATUS_CSS)
 );
 
 /// Shared HTML page scaffold used by every render path.

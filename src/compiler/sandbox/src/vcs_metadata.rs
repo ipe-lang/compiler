@@ -141,59 +141,72 @@ impl fmt::Display for WalkCeiling {
     }
 }
 
-/// One version-control system whose in-tree metadata the host executes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VcsKind {
-    /// Git: `.git/hooks/*`, and the `core.fsmonitor`, `core.hooksPath`,
-    /// `core.pager`, `core.sshCommand`, filter and diff drivers `.git/config`
-    /// names.
-    Git,
-    /// Mercurial: the hooks and extensions `.hg/hgrc` names.
-    Mercurial,
-    /// Jujutsu: the commands and hooks `.jj/repo/config.toml` names.
-    Jujutsu,
-    /// Darcs: the posthooks `_darcs/prefs/defaults` names.
-    Darcs,
+/// Declares [`VcsKind`], its [`VcsKind::ALL`], its entry names and its tool
+/// names from one row list, so no kind lacks a name or a slot.
+macro_rules! closed_vcs_kinds {
+    ($($doc:literal, $variant:ident, $entry:literal, $tool:literal;)+) => {
+        /// One version-control system whose in-tree metadata the host executes from.
+        ///
+        /// The set is closed: [`VcsKind::ALL`] lists each kind once, in
+        /// declaration order.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum VcsKind {
+            $(
+                #[doc = $doc]
+                $variant,
+            )+
+        }
+
+        impl VcsKind {
+            /// Every kind, the one list every carve, rule and test derives from.
+            pub const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
+
+            const COUNT: usize = [$(Self::$variant),+].len();
+
+            /// The entry name the kind keeps its metadata under at a tree's root.
+            #[must_use]
+            pub const fn entry_name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $entry,)+
+                }
+            }
+
+            /// The tool's name.
+            const fn tool(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $tool,)+
+                }
+            }
+        }
+    };
+}
+
+closed_vcs_kinds! {
+    "Git: `.git/hooks/*`, and the `core.fsmonitor`, `core.hooksPath`, \
+     `core.pager`, `core.sshCommand`, filter and diff drivers `.git/config` names.",
+    Git, ".git", "Git";
+    "Mercurial: the hooks and extensions `.hg/hgrc` names.", Mercurial, ".hg", "Mercurial";
+    "Jujutsu: the commands and hooks `.jj/repo/config.toml` names.", Jujutsu, ".jj", "Jujutsu";
+    "Darcs: the posthooks `_darcs/prefs/defaults` names.", Darcs, "_darcs", "Darcs";
 }
 
 impl VcsKind {
-    /// Every kind, the one list every carve, rule and test derives from.
-    pub const ALL: [Self; 4] = [Self::Git, Self::Mercurial, Self::Jujutsu, Self::Darcs];
-
-    /// The kind whose metadata entry `name` spells, compared ASCII
-    /// case-insensitively on every OS.
+    /// The kind whose metadata entry a case-folding volume may open `name` as
+    /// ([`ipe_fs_open::may_open_as`]), on every OS.
     ///
-    /// A case-insensitive volume opens `.GIT` as `.git`; on a case-sensitive one
-    /// carving it anyway is a harmless over-carve.
+    /// A case-insensitive volume opens `.GIT` or `_darcſ` as the metadata entry;
+    /// on a case-sensitive one carving it anyway is a harmless over-carve.
     #[must_use]
     pub fn of_entry_name(name: &EntryName) -> Option<Self> {
-        let bytes = name.as_os_str().as_encoded_bytes();
         Self::ALL
             .into_iter()
-            .find(|kind| bytes.eq_ignore_ascii_case(kind.entry_name().as_bytes()))
-    }
-
-    /// The entry name the kind keeps its metadata under at a tree's root.
-    #[must_use]
-    pub const fn entry_name(self) -> &'static str {
-        match self {
-            Self::Git => ".git",
-            Self::Mercurial => ".hg",
-            Self::Jujutsu => ".jj",
-            Self::Darcs => "_darcs",
-        }
+            .find(|kind| ipe_fs_open::may_open_as(name.as_os_str(), kind.entry_name()))
     }
 }
 
 impl fmt::Display for VcsKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let tool = match self {
-            Self::Git => "Git",
-            Self::Mercurial => "Mercurial",
-            Self::Jujutsu => "Jujutsu",
-            Self::Darcs => "Darcs",
-        };
-        write!(f, "{tool} ({})", self.entry_name())
+        write!(f, "{} ({})", self.tool(), self.entry_name())
     }
 }
 
@@ -1623,6 +1636,30 @@ mod tests {
         make_dir(&upper);
         let tree = parse(&fixture).expect("an upper-case gitdir parses");
         assert_eq!(carved(&tree), vec![upper]);
+    }
+
+    /// A spelling a Unicode-folding volume opens as a metadata entry is carved
+    /// as that entry: a long s, a dotless i, an HFS+-ignored code point.
+    #[test]
+    fn walk_name_match_unicode_folded() {
+        let name = |text: &str| EntryName::new(std::ffi::OsStr::new(text)).expect("entry name");
+        for (text, kind) in [
+            (".g\u{131}t", VcsKind::Git),
+            (".g\u{200C}it", VcsKind::Git),
+            ("\u{FEFF}.hg", VcsKind::Mercurial),
+            (".j\u{202E}j", VcsKind::Jujutsu),
+            ("_darc\u{17F}", VcsKind::Darcs),
+        ] {
+            assert_eq!(VcsKind::of_entry_name(&name(text)), Some(kind), "{text:?}");
+        }
+        for text in [".g\u{130}t", "\u{FF0E}git", "_darcs\u{17F}", "\u{200C}"] {
+            assert_eq!(VcsKind::of_entry_name(&name(text)), None, "{text:?}");
+        }
+        let fixture = fixture("walk-unicode-fold");
+        let folded = fixture.tree.join("sub").join("_darc\u{17F}");
+        make_dir(&folded);
+        let tree = parse(&fixture).expect("a folded darcs dir parses");
+        assert_eq!(carved(&tree), vec![folded]);
     }
 
     #[test]

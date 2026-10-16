@@ -19,12 +19,12 @@ import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), R
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
 import Lib.View as View
-import TestSupport exposing (checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
+import TestSupport exposing (checkReporting, cleanupIndex, codeText, envAppSettings, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
 
 
 -- Every check here renders the real `View.view` to HTML, the exact string the
@@ -75,6 +75,9 @@ queuePage units total progress =
     , next = Nothing
     , progress = progress
     , log = ShownProven
+    , refusals = []
+    , refusalsOpen = 0
+    , refusalsUnbound = 0
     }
 
 
@@ -536,23 +539,19 @@ refuseErrorEscaped loaded =
         && button "Confirm" plain
 
 
--- A failed decision save is shown in the queue banner, escaped.
-decisionErrorEscaped : Index.UnitView -> Bool
-decisionErrorEscaped loaded =
+-- A failed decision save shows its case's fixed text in the queue banner,
+-- and nothing when no save failed. Red if a case renders another's text or
+-- the banner shows without a failure.
+decisionErrorFixedText : Index.UnitView -> Bool
+decisionErrorFixedText loaded =
     let
         card =
             cardModel loaded
-
-        hostile =
-            page { card | decisionError = Just (Error.invalidInput hostileText) }
-
-        plain =
-            page { card | decisionError = Just (Error.invalidInput "disk full") }
     in
-    has (byteOrderOpen ++ "Decision save failed: ") hostile
-        && escapesHostile hostile
-        && has "Decision save failed: " plain
-        && has "disk full" plain
+    List.all
+        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decisionError = Just failure }))
+        [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+        && not (has "Decision save failed: " (page card))
 
 
 -- ── the address the page reports ────────────────────────────────────
@@ -765,7 +764,7 @@ seededChecks a b =
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
     , ( "a refusal error is escaped in the open refusal panel", refuseErrorEscaped a )
-    , ( "a failed decision save is escaped in the queue banner", decisionErrorEscaped a )
+    , ( "a failed decision save shows its case's fixed text in the queue banner", decisionErrorFixedText a )
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
@@ -956,12 +955,55 @@ shortcutRootAutofocused =
         == 2
 
 
+-- ── unreviewable files ──────────────────────────────────────────────────
+--
+-- An unreviewable file's stored path is index text: it reaches the queue
+-- card and the History page escaped, and only an acknowledgeable file on a
+-- server that can sign is offered a decision. The rows are read from a
+-- seeded index, so the card renders what the decoder makes of them.
+refusalChecks : Task.Task Error (List ( String, Bool ))
+refusalChecks =
+    do
+        at <- freshScratch "ipe-view-render-refusals"
+        seedIndex at.indexDb at.repo
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
+        db <- migratedReviewAt at.reviewDb
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'symlink-entry', NULL, ?)"
+            [ Uid.toSql (uid "r-link"), SqlString ("ipe:src/" ++ hostileText), SqlString ("refusal-blake3:" ++ String.repeat 64 "a") ]
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-gone"), SqlString "ipe:src/replaced.txt" ]
+        loaded <- loadPageNow Index.Start
+        settings <- envAppSettings
+        decided <- case Maybe.andThen (\row -> row.digest) (List.find (\row -> row.uid == uid "r-link") loaded.refusals) of
+            Just digest ->
+                Queue.decideRefusal settings.key settings.index db (uid "r-link") digest LibDb.Approved
+                    |> Task.map (\_ -> True)
+
+            Nothing ->
+                Task.succeed False
+        history <- loadHistoryPageNow HistoryStart
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
+        proven <- Task.succeed (page { baseModel | queueState = Loaded { loaded | log = ShownProven } })
+        unkeyed <- Task.succeed (page { baseModel | queueState = Loaded { loaded | log = ShownUnkeyed } })
+        historyHtml <- Task.succeed (page (historyModel history.rows))
+        Task.succeed
+            [ ( "an unreviewable file's hostile path is escaped on its queue card", escapesHostile proven && has "Unreviewable files" proven )
+            , ( "only the acknowledgeable file is offered Acknowledge; the blocking one says to fix it", List.length (String.split ">Acknowledge<" proven) == 2 && has "Cannot be acknowledged: fix it in the tree." proven && has "Replaced while the index read it" proven )
+            , ( "a server that cannot sign offers no acknowledgement", not (button "Acknowledge" unkeyed) && has "Cannot be acknowledged: fix it in the tree." unkeyed )
+            , ( "an acknowledged file is named on the History page, its hostile path escaped", decided && escapesHostile historyHtml )
+            ]
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
         [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b)))
         , group "hostile source fixture" hostileSourceChecks
         , group "stored decision fixture" storedChecks
+        , group "unreviewable file fixture" refusalChecks
         , Task.succeed [ ( "the shortcut root takes focus on page load", shortcutRootAutofocused ) ]
         , group "withheld constructors" (everyWithheldConstructorRendered |> Task.map (\ok -> [ ( "every withheld source constructor Lib.Index declares is rendered", ok ) ]))
         ]

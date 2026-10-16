@@ -3197,7 +3197,9 @@ fn pat_binds_any(pat: &Pat, params: &BTreeSet<Symbol>) -> bool {
 /// generic.
 fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
     match ty {
-        IrType::Generic(g) => *g == tv,
+        // A row generic is a variable occurrence like `Generic`: it mentions
+        // exactly its own row variable.
+        IrType::Generic(g) | IrType::RowGeneric(g) => *g == tv,
         IrType::Task(inner)
         | IrType::Maybe(inner)
         | IrType::List(inner)
@@ -3299,10 +3301,7 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
         | IrType::WebApp
         | IrType::TuiApp
         | IrType::CliApp
-        | IrType::WorkerApp
-        // A row variable is a distinct row generic (`R{n}`), never the ordinary
-        // `T{n}` type variable this predicate tracks.
-        | IrType::RowGeneric(_) => false,
+        | IrType::WorkerApp => false,
     }
 }
 
@@ -3462,6 +3461,8 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
         | IrType::TuiApp
         | IrType::CliApp
         | IrType::WorkerApp
+        // A row generic is a leaf like `Generic`, never itself a carrier; a
+        // carrier holding one is answered by the `is_carrier` test above.
         | IrType::RowGeneric(_) => false,
     }
 }
@@ -3485,8 +3486,10 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
 /// already draw).
 fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
     match ty {
-        // A bare occurrence of the tracked tvar is the reach itself.
-        IrType::Generic(g) => *g == tv,
+        // A bare occurrence of the tracked tvar is the reach itself; a row
+        // generic is the caller's record held by value, so its own row
+        // variable reaches it bare.
+        IrType::Generic(g) | IrType::RowGeneric(g) => *g == tv,
         // Transparent value-containers: a bare element under them is reachable.
         IrType::List(inner) | IrType::Maybe(inner) | IrType::Set(inner) => {
             ir_type_generic_reaches_bare(inner, tv)
@@ -3581,8 +3584,7 @@ fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
         | IrType::WebApp
         | IrType::TuiApp
         | IrType::CliApp
-        | IrType::WorkerApp
-        | IrType::RowGeneric(_) => false,
+        | IrType::WorkerApp => false,
     }
 }
 
@@ -11635,6 +11637,26 @@ pub struct Lowerer<'a> {
     /// builder recorded.  Interior mutability so `lower_def` can update it through
     /// the shared `&self` reference that the lowering walk uses.
     current_home: std::cell::RefCell<Vec<Symbol>>,
+    /// Name of the def currently being lowered, set beside [`Self::current_home`].
+    ///
+    /// Together they key the def in [`Self::var_owners`]. Before the first
+    /// def it is the wildcard marker, which names no binding, so every
+    /// generic is foreign to it.
+    current_name: Cell<Symbol>,
+    /// The one index of every solver variable a binding emits as its own generic.
+    ///
+    /// Built once from [`SolvedTypes::poly_var_map`] through
+    /// [`ipe_types::generic_var_owners`], the same index the type checker's
+    /// untyped-binding refusal reads; [`Self::var_owner`] consults it so a
+    /// variable another binding keeps generic is never read as free here.
+    var_owners: ipe_types::GenericVarOwners,
+    /// Every typed def whose annotation returns the wildcard `any` after its
+    /// parameter patterns, keyed `(home, name)`: its parameter count and its
+    /// body's span (see [`Self::any_return_slot_var`]).
+    any_return_defs: BTreeMap<(Vec<Symbol>, Symbol), (usize, Span)>,
+    /// Whether the type being lowered is the current def's emitted signature
+    /// or a type inside its body (see [`ReadSite`]).
+    read_site: Cell<ReadSite>,
     /// Reverse map from solver-tagged union-find representative to annotation
     /// variable symbol for the def currently being lowered.  Populated by
     /// [`Self::lower_def`] from [`SolvedTypes::poly_var_map`] before recursing
@@ -11650,6 +11672,11 @@ pub struct Lowerer<'a> {
     /// the Rust emitted for polymorphic functions such as
     /// `view : (Msg -> parentMsg) -> Counter -> Html parentMsg`.
     current_poly_tvars: std::cell::RefCell<BTreeMap<ipe_types::SolverVar, Symbol>>,
+    /// Which [`Self::current_poly_tvars`] symbols name a signature row variable.
+    ///
+    /// Installed and restored together with `current_poly_tvars` by
+    /// [`Self::with_poly_tvars`], so the two can never describe different defs.
+    current_row_params: std::cell::RefCell<BTreeSet<Symbol>>,
     /// Whether the function (def or lambda) currently being lowered has a Task
     /// return type. Set to `true` when `lower_def` / `lower_lambda` detects that
     /// the inferred return type is `IrType::Task(_)`; reset to `false` on entry to
@@ -13380,6 +13407,57 @@ fn mapper_wrap_eta_demand(body: &canon::Expr, home: &[Symbol], types: &SolvedTyp
     total
 }
 
+/// Who emits a type variable as a Rust generic, seen from the def being lowered.
+///
+/// Three distinct states, never folded into an `Option`: a lenient lowering
+/// default (`()` in a message slot, `JsonVal`, a `()` call pin) is consistent
+/// only for [`VarOwner::Unowned`]. A variable another binding keeps generic
+/// would otherwise be read two ways in two emitted functions, and the call
+/// between them would not type-check under cargo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VarOwner {
+    /// The current def's own generic, emitted as this type parameter.
+    Here(Symbol),
+    /// Another binding's generic: `owner` emits it as its type parameter `sym`.
+    Elsewhere {
+        /// The binding that keeps the variable generic.
+        owner: (Vec<Symbol>, Symbol),
+        /// The owner's name for the variable.
+        sym: Symbol,
+    },
+    /// No binding keeps the variable generic.
+    Unowned,
+}
+
+/// Whether the annotation `ty`, past `params` parameter arrows, is the wildcard `any`.
+fn canon_returns_wildcard(ty: &canon::Type, params: usize) -> bool {
+    let mut cur = ty;
+    for _ in 0..params {
+        let canon::Type::Lambda(_, rest) = cur else {
+            return false;
+        };
+        cur = rest;
+    }
+    matches!(cur, canon::Type::Wildcard)
+}
+
+/// Where a type variable is read while lowering the current def.
+///
+/// A variable another binding keeps generic is unsound to read only in the
+/// current def's emitted signature: the owner reaches it there by calling the
+/// def with its own generic, so the def's lenient reading (`()`, `JsonVal`)
+/// disagrees with the owner's at the call. Inside a body the def meets such a
+/// variable only as a caller of the owner (a same-module untyped owner shares
+/// its one variable with every use), and the call instantiates the owner's
+/// generic at the def's own reading, so a body read keeps the lenient default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadSite {
+    /// The current def's parameter and return types.
+    Signature,
+    /// A type inside the current def's body.
+    Body,
+}
+
 /// The one symbol that stands for the wildcard `any` in lowered types.
 ///
 /// Minted fresh per lowering through [`Interner::fresh_symbols`], so no
@@ -13524,6 +13602,22 @@ impl<'a> Lowerer<'a> {
             // modules get distinct ids after link::link merges them.
             func_ids.insert((def.home().to_vec(), def.name().value), id);
         }
+        let any_return_defs = m
+            .defs
+            .iter()
+            .filter_map(|def| match def {
+                canon::Def::Typed {
+                    home,
+                    name,
+                    patterns,
+                    body,
+                    ty,
+                    ..
+                } => canon_returns_wildcard(ty, patterns.len())
+                    .then(|| ((home.clone(), name.value), (patterns.len(), body.span))),
+                canon::Def::Untyped { .. } => None,
+            })
+            .collect();
 
         let mut enum_variants = BTreeMap::new();
         let mut ctor_arity = BTreeMap::new();
@@ -13757,7 +13851,15 @@ impl<'a> Lowerer<'a> {
             tuple_elem_binders,
             tuple_elem_cursor: Cell::new(0),
             current_home: std::cell::RefCell::new(Vec::new()),
+            current_name: Cell::new(wildcard_marker.symbol()),
+            read_site: Cell::new(ReadSite::Body),
+            any_return_defs,
+            var_owners: ipe_types::generic_var_owners(
+                &types.poly_var_map,
+                &types.msg_defaulted_vars,
+            ),
             current_poly_tvars: std::cell::RefCell::new(BTreeMap::new()),
+            current_row_params: std::cell::RefCell::new(BTreeSet::new()),
             fn_is_async: Cell::new(false),
             promotable_fn_binders: std::cell::RefCell::new(BTreeSet::new()),
             deferred_fun_captures: std::cell::RefCell::new(BTreeMap::new()),
@@ -17341,6 +17443,7 @@ impl<'a> Lowerer<'a> {
         // Track the current def's home so every `region_ty(span)` lookup uses the
         // correct `(home, span)` key, matching what the constraint builder wrote.
         *self.current_home.borrow_mut() = def.home().to_vec();
+        self.current_name.set(def.name().value);
         // Deferred fn-capture signals are a per-def contract between the capture
         // classifier and the binder sites; a def that errored out mid-lowering
         // must not leak its signals into the next def.
@@ -17537,27 +17640,12 @@ impl<'a> Lowerer<'a> {
                 // block (next) so that the `ir_type_from_ty(body_ty)` call in
                 // the any-ret fix (after the installation) already runs with the
                 // correct current_poly_tvars.
-                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> =
-                    if let IrType::Generic(sym) = &ret {
-                        if *sym == self.wildcard_marker {
-                            self.types
-                                .regions
-                                .get(&(def.home().to_vec(), body.span))
-                                .and_then(|body_ty| {
-                                    let Ty::Con { args, .. } = body_ty else {
-                                        return None;
-                                    };
-                                    let Some(Ty::Var(uv)) = args.first() else {
-                                        return None;
-                                    };
-                                    ipe_types::SolverVar::from_raw(*uv).map(|uv| (uv, *sym))
-                                })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> = (ret
+                    == IrType::Generic(self.wildcard_marker))
+                .then(|| self.any_return_slot_var(&(def.home().to_vec(), name)))
+                .flatten()
+                .and_then(|(_, uv)| ipe_types::SolverVar::from_raw(uv))
+                .map(|uv| (uv, self.wildcard_marker));
                 // Install the binding's generic type-variable map so
                 // `ir_type_from_ty_ui_msg` can distinguish a `Ty::Var` that is an
                 // enclosing generic (→ `IrType::Generic`) from one that is a
@@ -17634,78 +17722,85 @@ impl<'a> Lowerer<'a> {
                 // Everything that resolves a `Ty` against the def's generics —
                 // the return, the body, the parameter prologues — runs inside
                 // one scope, so an early exit cannot leak the map.
-                let scoped = self.with_poly_tvars(Some(poly), || -> DResult<(IrType, Expr)> {
-                    let ret = if ret_is_any_wildcard {
-                        // The body's region type is the concrete return type.
-                        let body_ty = self
-                            .types
-                            .regions
-                            .get(&(def.home().to_vec(), body.span))
-                            .ok_or_else(|| {
-                                bug(
-                                    "ipe_lower::lower_def",
-                                    "no region type for body of `any`-annotated binding",
-                                )
-                            })?;
-                        self.ir_type_from_ty(body_ty, sig_span)?
-                    } else {
-                        // A nested `any` in return position (e.g. `foo : X -> List any`)
-                        // is not covered by the bare-wildcard region substitution above.
-                        // Freshen every wildcard-marker generic in the return type so each
-                        // occurrence becomes a distinct fresh symbol — the same treatment
-                        // `split_typed_sig` applies to param-position `any`s.
-                        //
-                        // A wildcard `any` promises one concrete type per position. Each
-                        // `any` freshens to its own distinct symbol, so a return `any` and a
-                        // param `any` never denote the same type — the only thing that can
-                        // determine a return `any` is the body pinning it to a concrete
-                        // value, handled by the region substitution above. Reaching here with
-                        // a freshened return `any` means the body did not pin it: it would
-                        // surface as a type parameter appearing only in the result, which no
-                        // call site can fix. Reject it rather than emit Rust no caller can
-                        // satisfy.
-                        let mut ret_any_mints: Vec<Symbol> = Vec::new();
-                        let freshened_ret = self.freshen_any_generics(ret, &mut ret_any_mints)?;
-                        if !ret_any_mints.is_empty() {
-                            return Err(Diagnostic::Lower {
-                                span: sig_span,
-                                msg: LowerError::UndeterminableReturnAny,
-                            });
-                        }
-                        any_syms_minted.extend(ret_any_mints);
-                        freshened_ret
-                    };
-                    // A tuple-destructuring parameter binds its synthetic name to the
-                    // tuple, then the body opens it with a `Destructure`. Fold the
-                    // prologue OUTERMOST-first (reverse) so the first parameter's
-                    // destructure is the outermost binding, matching source order.
-                    // Save/set/restore fn_is_async so nested lambdas/defs see the
-                    // correct async context for their own scope.
-                    let prev_async = self.fn_is_async.get();
-                    self.fn_is_async.set(matches!(ret, IrType::Task(_)));
-                    // Params are promotable fn binders for the body's capture
-                    // classifier (an inner lambda capturing a pure-`Fun` param
-                    // defers to the param loop below instead of IPE-L0126); a name
-                    // bound inside a destructuring param shadows instead.
-                    let param_scope = param_binder_scope(params.iter().map(|(s, _)| *s), patterns);
-                    let mut row_vars = BTreeSet::new();
-                    canon_sig_collect_arg_row_vars(ty, &mut row_vars);
-                    let body_result = self
-                        .reject_generic_app_entries_in(body, &row_vars)
-                        .and_then(|()| {
-                            self.with_binders(&param_scope, || {
-                                self.with_param_binders(&params, patterns, || {
-                                    self.lower_returned_body(body, &ret)
+                let row_param_vars: BTreeSet<Symbol> = row_params.iter().map(|rp| rp.var).collect();
+                let scoped = self.with_poly_tvars(
+                    Some(poly),
+                    row_param_vars,
+                    || -> DResult<(IrType, Expr)> {
+                        let ret = if ret_is_any_wildcard {
+                            // The body's region type is the concrete return type.
+                            let body_ty = self
+                                .types
+                                .regions
+                                .get(&(def.home().to_vec(), body.span))
+                                .ok_or_else(|| {
+                                    bug(
+                                        "ipe_lower::lower_def",
+                                        "no region type for body of `any`-annotated binding",
+                                    )
+                                })?;
+                            self.signature_ir_type(body_ty, sig_span)?
+                        } else {
+                            // A nested `any` in return position (e.g. `foo : X -> List any`)
+                            // is not covered by the bare-wildcard region substitution above.
+                            // Freshen every wildcard-marker generic in the return type so each
+                            // occurrence becomes a distinct fresh symbol — the same treatment
+                            // `split_typed_sig` applies to param-position `any`s.
+                            //
+                            // A wildcard `any` promises one concrete type per position. Each
+                            // `any` freshens to its own distinct symbol, so a return `any` and a
+                            // param `any` never denote the same type — the only thing that can
+                            // determine a return `any` is the body pinning it to a concrete
+                            // value, handled by the region substitution above. Reaching here with
+                            // a freshened return `any` means the body did not pin it: it would
+                            // surface as a type parameter appearing only in the result, which no
+                            // call site can fix. Reject it rather than emit Rust no caller can
+                            // satisfy.
+                            let mut ret_any_mints: Vec<Symbol> = Vec::new();
+                            let freshened_ret =
+                                self.freshen_any_generics(ret, &mut ret_any_mints)?;
+                            if !ret_any_mints.is_empty() {
+                                return Err(Diagnostic::Lower {
+                                    span: sig_span,
+                                    msg: LowerError::UndeterminableReturnAny,
+                                });
+                            }
+                            any_syms_minted.extend(ret_any_mints);
+                            freshened_ret
+                        };
+                        // A tuple-destructuring parameter binds its synthetic name to the
+                        // tuple, then the body opens it with a `Destructure`. Fold the
+                        // prologue OUTERMOST-first (reverse) so the first parameter's
+                        // destructure is the outermost binding, matching source order.
+                        // Save/set/restore fn_is_async so nested lambdas/defs see the
+                        // correct async context for their own scope.
+                        let prev_async = self.fn_is_async.get();
+                        self.fn_is_async.set(matches!(ret, IrType::Task(_)));
+                        // Params are promotable fn binders for the body's capture
+                        // classifier (an inner lambda capturing a pure-`Fun` param
+                        // defers to the param loop below instead of IPE-L0126); a name
+                        // bound inside a destructuring param shadows instead.
+                        let param_scope =
+                            param_binder_scope(params.iter().map(|(s, _)| *s), patterns);
+                        let mut row_vars = BTreeSet::new();
+                        canon_sig_collect_arg_row_vars(ty, &mut row_vars);
+                        let body_result = self
+                            .reject_generic_app_entries_in(body, &row_vars)
+                            .and_then(|()| {
+                                self.with_binders(&param_scope, || {
+                                    self.with_param_binders(&params, patterns, || {
+                                        self.lower_returned_body(body, &ret)
+                                    })
                                 })
-                            })
-                        });
-                    self.fn_is_async.set(prev_async);
-                    // The prologue binders' types mention the def's own generics, so
-                    // they resolve before those generics go out of scope.
-                    let folded =
-                        body_result.and_then(|b| self.fold_param_prologues(prologue, b, body))?;
-                    Ok((ret, folded))
-                });
+                            });
+                        self.fn_is_async.set(prev_async);
+                        // The prologue binders' types mention the def's own generics, so
+                        // they resolve before those generics go out of scope.
+                        let folded = body_result
+                            .and_then(|b| self.fold_param_prologues(prologue, b, body))?;
+                        Ok((ret, folded))
+                    },
+                );
                 let (mut ret, mut lowered_body) = scoped?;
                 // Param-position wildcard-`any` region substitution — the SEAL
                 // dual of the return substitution above. A bare-`any` parameter
@@ -18110,8 +18205,10 @@ impl<'a> Lowerer<'a> {
                     // unsound `any`-shaped parameters — fail-closed by design
                     // (Divergence D1: an ambiguous instantiation the reference
                     // erasure-accepts is rejected here, strictly safer).
-                    let scoped =
-                        self.with_poly_tvars(scope_poly, || -> DResult<UnannotatedFnParts> {
+                    let scoped = self.with_poly_tvars(
+                        scope_poly,
+                        BTreeSet::new(),
+                        || -> DResult<UnannotatedFnParts> {
                             let (params, prologue, ret) =
                                 self.split_unannotated_sig(solved_ty, patterns, sig_span)?;
                             // Save/set/restore fn_is_async (same rationale as Typed path).
@@ -18135,7 +18232,8 @@ impl<'a> Lowerer<'a> {
                             let folded = body_result
                                 .and_then(|b| self.fold_param_prologues(prologue, b, body))?;
                             Ok((params, ret, folded))
-                        });
+                        },
+                    );
                     let (params, ret, mut lowered_body) = scoped?;
                     // Same move-ownership discipline as the Typed path above —
                     // one `apply_param_move_ownership` per param (see that call
@@ -18165,9 +18263,11 @@ impl<'a> Lowerer<'a> {
                         body: lowered_body,
                     });
                 }
-                let (ret, lowered_body) =
-                    self.with_poly_tvars(scope_poly, || -> DResult<(IrType, Expr)> {
-                        let ret = self.ir_type_from_ty(solved_ty, sig_span)?;
+                let (ret, lowered_body) = self.with_poly_tvars(
+                    scope_poly,
+                    BTreeSet::new(),
+                    || -> DResult<(IrType, Expr)> {
+                        let ret = self.signature_ir_type(solved_ty, sig_span)?;
                         // Save/set/restore fn_is_async for the 0-param (value-binding) path.
                         let prev_async = self.fn_is_async.get();
                         self.fn_is_async.set(matches!(ret, IrType::Task(_)));
@@ -18176,7 +18276,8 @@ impl<'a> Lowerer<'a> {
                             .and_then(|()| self.lower_returned_body(body, &ret));
                         self.fn_is_async.set(prev_async);
                         Ok((ret, lowered_body?))
-                    })?;
+                    },
+                )?;
                 // Zero-param generalized value bindings (no value restriction,
                 // e.g. `empty = []` used at two element types cross-module)
                 // take the identical `params: []` path the backend already
@@ -18316,7 +18417,7 @@ impl<'a> Lowerer<'a> {
                     "solved type has fewer arrows than parameters",
                 ));
             };
-            let ir_ty = self.ir_type_from_ty(arg, span)?;
+            let ir_ty = self.signature_ir_type(arg, span)?;
             let (param, maybe_prologue) = self.lower_param(pat, ir_ty)?;
             params.push(param);
             if let Some(p) = maybe_prologue {
@@ -18324,7 +18425,7 @@ impl<'a> Lowerer<'a> {
             }
             cur = rest.as_ref();
         }
-        Ok((params, prologue, self.ir_type_from_ty(cur, span)?))
+        Ok((params, prologue, self.signature_ir_type(cur, span)?))
     }
 
     /// Split a typed binding's arrow annotation into one [`IrType`] per
@@ -19805,6 +19906,12 @@ impl<'a> Lowerer<'a> {
     /// first use site through [`Self::binder_ir_type`]. A capture is a use, so a
     /// capture whose type does not resolve refuses rather than going
     /// unclassified.
+    ///
+    /// A capture holding a row value ([`IrType::RowGeneric`]) refuses with
+    /// IPE-L0131: a row value is emittable only as the direct receiver of a
+    /// field read, and a captured read is a `CloneVar` receiver the witness
+    /// getter does not route — the escape the row-containment guard refuses
+    /// after the body, reported here before the capture is classified.
     fn captured_locals_at(
         &self,
         lambda_param_pats: &[&canon::Pattern],
@@ -19817,7 +19924,16 @@ impl<'a> Lowerer<'a> {
         let mut free: BTreeMap<Symbol, Span> = BTreeMap::new();
         canon_collect_free_locals(&mut free, &outer_bound, canon_body);
         free.into_iter()
-            .map(|(sym, span)| Ok((sym, span, self.used_binder_ir_type(span)?)))
+            .map(|(sym, span)| {
+                let binder_ty = self.used_binder_ir_type(span)?;
+                let holds_row = ir_type_holds(binder_ty.classified(), &self.enum_payloads, &|t| {
+                    matches!(t, IrType::RowGeneric(_))
+                });
+                if holds_row {
+                    return Err(unsupported(span, Feature::RowPolyRecordAnnotation));
+                }
+                Ok((sym, span, binder_ty))
+            })
             .collect()
     }
 
@@ -19946,20 +20062,24 @@ impl<'a> Lowerer<'a> {
 
     /// Run `f` with `poly` installed as the enclosing def's generic type-variable map.
     ///
-    /// The previous map is restored once `f` returns, whatever path `f` exits
+    /// `row_params` names which of those generics are signature row
+    /// variables. Both are restored once `f` returns, whatever path `f` exits
     /// by, so a definition's generics can never stay in scope for the next
-    /// definition. `None` leaves the current map untouched.
+    /// definition. `None` leaves both untouched.
     fn with_poly_tvars<T>(
         &self,
         poly: Option<BTreeMap<ipe_types::SolverVar, Symbol>>,
+        row_params: BTreeSet<Symbol>,
         f: impl FnOnce() -> T,
     ) -> T {
         let Some(poly) = poly else {
             return f();
         };
         let saved = self.current_poly_tvars.replace(poly);
+        let saved_rows = self.current_row_params.replace(row_params);
         let out = f();
         self.current_poly_tvars.replace(saved);
+        self.current_row_params.replace(saved_rows);
         out
     }
 
@@ -20478,6 +20598,75 @@ impl<'a> Lowerer<'a> {
     fn poly_tvar_symbol(&self, raw: u32) -> Option<Symbol> {
         let key = ipe_types::SolverVar::from_raw(raw)?;
         self.current_poly_tvars.borrow().get(&key).copied()
+    }
+
+    /// Which binding, if any, emits the type variable `raw` as its own generic.
+    ///
+    /// The current def's generics (`current_poly_tvars`) answer first; every
+    /// other variable is looked up in the one ownership index
+    /// ([`Self::var_owners`]), never re-derived. A variable read by a def that
+    /// does not own it, while another binding emits it as a Rust generic, is
+    /// [`VarOwner::Elsewhere`], so no lenient default can give it a second
+    /// reading in a second emitted function.
+    fn var_owner(&self, raw: u32) -> VarOwner {
+        if let Some(sym) = self.poly_tvar_symbol(raw) {
+            return VarOwner::Here(sym);
+        }
+        let Some(var) = ipe_types::SolverVar::from_raw(raw) else {
+            return VarOwner::Unowned;
+        };
+        let binding = (self.current_home.borrow().clone(), self.current_name.get());
+        self.var_owners
+            .foreign_to(var, &binding)
+            .map_or(VarOwner::Unowned, |(owner, sym)| VarOwner::Elsewhere {
+                owner: owner.clone(),
+                sym,
+            })
+    }
+
+    /// Lower `ty` as part of the current def's emitted signature ([`ReadSite::Signature`]).
+    fn signature_ir_type(&self, ty: &Ty, span: Span) -> DResult<IrType> {
+        let saved = self.read_site.replace(ReadSite::Signature);
+        let out = self.ir_type_from_ty(ty, span);
+        self.read_site.set(saved);
+        out
+    }
+
+    /// Lower the type variable `raw` by its owner: the current def's generic,
+    /// a refusal for another binding's generic read in the current def's
+    /// signature, or `lenient` for a free one or a body read (see [`ReadSite`]).
+    fn ir_type_from_owned_var(
+        &self,
+        raw: u32,
+        span: Span,
+        lenient: impl FnOnce() -> DResult<IrType>,
+    ) -> DResult<IrType> {
+        match (self.var_owner(raw), self.read_site.get()) {
+            (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => Ok(IrType::Generic(sym)),
+            (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+                Err(self.foreign_type_variable(&owner, sym, span))
+            }
+            (VarOwner::Elsewhere { .. }, ReadSite::Body)
+            | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => lenient(),
+        }
+    }
+
+    /// The IPE-L0102 refusal of a def reading `owner`'s generic `sym` at `span`.
+    fn foreign_type_variable(
+        &self,
+        owner: &(Vec<Symbol>, Symbol),
+        sym: Symbol,
+        span: Span,
+    ) -> Diagnostic {
+        let name = |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
+        Diagnostic::Lower {
+            span,
+            msg: LowerError::ForeignTypeVariable {
+                helper: name(self.current_name.get()),
+                owner: name(owner.1),
+                var: name(sym),
+            },
+        }
     }
 
     // The match has one arm per Ipê builtin type — each arm adds ~5-10 lines;
@@ -21240,11 +21429,16 @@ impl<'a> Lowerer<'a> {
                     .collect::<DResult<Vec<_>>>()?;
                 Ok(IrType::Tuple(lowered))
             }
-            // A record type (closed or open): lower each field type, keyed by
-            // field name. The RowTail is a solver artefact — the IR type is
-            // always a flat field map. Open fields not present in the resolved
-            // `Ty` are simply absent from the IR (the optional-field mechanism
-            // works through the open row var at type-check time, not at codegen).
+            // A record type: the row tail decides first, before any nominal
+            // shape fold can name the fields.
+            //  - open over the def's own signature row variable → that row
+            //    parameter's generic (`R{n}`): the value is whatever record the
+            //    caller passed, never a struct synthesised from the fields the
+            //    body happens to read;
+            //  - open over any other quantified variable → no row parameter
+            //    carries it, so it has no lowering (IPE-L0131);
+            //  - open over an unquantified variable, or closed → the flat field
+            //    map below, keyed by field name.
             //
             // Special case: detect the canonical 6-field `HttpRequest` record —
             // `body`, `headers`, `method`, `redirects`, `timeout`, `url` —
@@ -21252,7 +21446,19 @@ impl<'a> Lowerer<'a> {
             // so call sites that pass the value to `http_stream_open` /
             // `http_request` kernels see the correct runtime type, rather than a
             // backend-synthesised struct with an auto-generated name.
-            Ty::Record(fields, _tail) => {
+            Ty::Record(fields, tail) => {
+                match tail {
+                    RowTail::Open(raw) => match self.poly_tvar_symbol(*raw) {
+                        Some(sym) if self.current_row_params.borrow().contains(&sym) => {
+                            return Ok(IrType::RowGeneric(sym));
+                        }
+                        Some(_) => {
+                            return Err(unsupported(span, Feature::RowPolyRecordAnnotation));
+                        }
+                        None => {}
+                    },
+                    RowTail::Closed => {}
+                }
                 // `BTreeMap<Symbol, _>` iterates in Symbol-integer order (intern
                 // assignment order), NOT in alphabetical order.  Collect
                 // (name, type) pairs, then let the shared
@@ -21380,10 +21586,11 @@ impl<'a> Lowerer<'a> {
             // violation, so it surfaces as a `Diagnostic::Lower` with the span
             // — never a `CompilerBug` for well-typed input.
             // [IPE-L0102, feature: polymorphism]
-            Ty::Var(v) => self.poly_tvar_symbol(*v).map_or_else(
-                || Err(unsupported(span, Feature::Polymorphism)),
-                |sym| Ok(IrType::Generic(sym)),
-            ),
+            //
+            // A variable another binding keeps generic is refused by name
+            // (`ForeignTypeVariable`), never as the bare polymorphism gap.
+            Ty::Var(v) => self
+                .ir_type_from_owned_var(*v, span, || Err(unsupported(span, Feature::Polymorphism))),
             // An unpinned wildcard names no generic of the enclosing def.
             Ty::Wildcard => Err(unsupported(span, Feature::Polymorphism)),
         }
@@ -21427,11 +21634,10 @@ impl<'a> Lowerer<'a> {
             // before it recurses into the body, and restored afterward) maps
             // tagged uf_rep → annotation var symbol for the current enclosing
             // function.
-            // An empty map (unannotated or non-polymorphic context) always falls
-            // through to `IrType::Unit`.
-            Ty::Var(v) => self
-                .poly_tvar_symbol(*v)
-                .map_or(Ok(IrType::Unit), |sym| Ok(IrType::Generic(sym))),
+            // A variable no binding keeps generic falls through to
+            // `IrType::Unit`; one another binding keeps generic is refused,
+            // since that binding emits it as its own Rust generic.
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Unit)),
             // A wildcard names no enclosing generic: a message-free subtree.
             Ty::Wildcard => Ok(IrType::Unit),
             // All other forms delegate to the strict helper — a concrete `Msg`
@@ -21477,10 +21683,9 @@ impl<'a> Lowerer<'a> {
             // The key difference: an unresolved `Ty::Var` in a JSON context
             // is `JsonVal` — UNLESS it's the enclosing polymorphic binding's
             // own generic (see the SEAL-fix doc comment above), in which case
-            // it must render as that binding's Rust generic instead.
-            Ty::Var(v) => self
-                .poly_tvar_symbol(*v)
-                .map_or(Ok(IrType::Json), |sym| Ok(IrType::Generic(sym))),
+            // it must render as that binding's Rust generic instead, or
+            // another binding's generic, which is refused.
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Json)),
             Ty::Wildcard => Ok(IrType::Json),
             // Recursively handle compound types so embedded `Ty::Var`s also
             // map to `IrType::Json`.
@@ -21534,11 +21739,26 @@ impl<'a> Lowerer<'a> {
                         // gating the 5th attempt: the
                         // `result_and_map_fn_payload` positive-path
                         // fixture). One defaulting policy, both sides.
+                        // Another binding's generic read in the def's signature
+                        // is refused here too, never defaulted.
                         let err_ty = args.first().ok_or_else(result_arg_bug)?;
-                        let err = if matches!(err_ty, Ty::Var(_) | Ty::Wildcard) {
-                            IrType::Error
-                        } else {
-                            self.ir_type_from_ty_json(err_ty, span)?
+                        let err = match err_ty {
+                            Ty::Var(raw) => match (self.var_owner(*raw), self.read_site.get()) {
+                                (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+                                    return Err(self.foreign_type_variable(&owner, sym, span));
+                                }
+                                (VarOwner::Elsewhere { .. }, ReadSite::Body)
+                                | (
+                                    VarOwner::Here(_) | VarOwner::Unowned,
+                                    ReadSite::Signature | ReadSite::Body,
+                                ) => IrType::Error,
+                            },
+                            Ty::Wildcard => IrType::Error,
+                            Ty::Unit
+                            | Ty::Fun(..)
+                            | Ty::Con { .. }
+                            | Ty::Tuple(_)
+                            | Ty::Record(..) => self.ir_type_from_ty_json(err_ty, span)?,
                         };
                         let ok = self
                             .ir_type_from_ty_json(args.get(1).ok_or_else(result_arg_bug)?, span)?;
@@ -23822,9 +24042,15 @@ impl<'a> Lowerer<'a> {
     ///
     /// A free var bound by the enclosing signature returns `false`: rustc binds
     /// it through the function's own generic, so no pin is needed OR wanted.
+    /// A var another binding keeps generic is free here too: a pin sits in a
+    /// body, where the def meets that var only as a caller of its owner and
+    /// reads it as `()` at every occurrence ([`ReadSite::Body`]).
     fn ty_is_unbound_free(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Var(raw) => self.poly_tvar_symbol(*raw).is_none(),
+            Ty::Var(raw) => match self.var_owner(*raw) {
+                VarOwner::Here(_) => false,
+                VarOwner::Elsewhere { .. } | VarOwner::Unowned => true,
+            },
             Ty::Wildcard => true,
             Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
         }
@@ -23853,8 +24079,9 @@ impl<'a> Lowerer<'a> {
         };
         let msg_only =
             ipe_types::ui_msg_only_vars(declared, &ipe_types::ui_msg_carrier_syms(self.interner));
+        let any_slot = self.any_return_slot_pin(&key, inst);
         if msg_only.is_empty() {
-            return CallPin::None;
+            return any_slot.map_or(CallPin::None, |sym| CallPin::MsgUnit(BTreeSet::from([sym])));
         }
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, inst, &mut subst, self.interner);
@@ -23877,12 +24104,58 @@ impl<'a> Lowerer<'a> {
                     },
                 )
             })
+            .chain(any_slot)
             .collect();
         if pinned.is_empty() {
             CallPin::None
         } else {
             CallPin::MsgUnit(pinned)
         }
+    }
+
+    /// The solved type of the any-return def `key`'s body and the variable in
+    /// its first type argument, when the body solved to a constructor over a
+    /// bare variable (`Html v`, `List v`).
+    ///
+    /// The one detection behind both readings of that variable: the def's own
+    /// lowering names it by the wildcard marker (its return generic), and each
+    /// caller pins the marker by its own instantiation
+    /// ([`Self::any_return_slot_pin`]).
+    fn any_return_slot_var(&self, key: &(Vec<Symbol>, Symbol)) -> Option<(&Ty, u32)> {
+        let (_, body_span) = self.any_return_defs.get(key)?;
+        let body_ty = self.types.regions.get(&(key.0.clone(), *body_span))?;
+        let Ty::Con { args, .. } = body_ty else {
+            return None;
+        };
+        let Some(Ty::Var(uv)) = args.first() else {
+            return None;
+        };
+        Some((body_ty, *uv))
+    }
+
+    /// The wildcard marker, when the callee `key` returns `any` over a body
+    /// variable ([`Self::any_return_slot_var`]) that the use's instantiation
+    /// `inst` leaves free.
+    ///
+    /// The callee's lowering makes that variable its return generic, which no
+    /// argument determines; the use's own node type lowered it to its lenient
+    /// reading (`()`), so the pin names `()` there.
+    fn any_return_slot_pin(&self, key: &(Vec<Symbol>, Symbol), inst: &Ty) -> Option<Symbol> {
+        let (body_ty, uv) = self.any_return_slot_var(key)?;
+        let (arity, _) = self.any_return_defs.get(key)?;
+        let mut inst_ret = inst;
+        for _ in 0..*arity {
+            let Ty::Fun(_, rest) = inst_ret else {
+                return None;
+            };
+            inst_ret = rest;
+        }
+        let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
+        match_signature_template(body_ty, inst_ret, &mut subst, self.interner);
+        subst
+            .get(&uv)
+            .is_some_and(|ty| self.ty_is_unbound_free(ty))
+            .then_some(self.wildcard_marker)
     }
 
     /// The turbofish pin for a polymorphic kernel whose free result type
@@ -33653,7 +33926,7 @@ mod tests {
         const BARE_VAR: u32 = 7;
         with_binder_type_lowerer(|lowerer, generic| {
             let poly = BTreeMap::from([(ipe_types::SolverVar::from_var(BARE_VAR), generic)]);
-            lowerer.with_poly_tvars(Some(poly), || {
+            lowerer.with_poly_tvars(Some(poly), BTreeSet::new(), || {
                 assert_eq!(
                     lowerer.poly_tvar_symbol(ipe_types::tag_solver_var(BARE_VAR)),
                     Some(generic),
@@ -33670,6 +33943,349 @@ mod tests {
                     "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
                 );
             });
+        });
+    }
+
+    /// The bare solver variable the row-tail tests quantify as a signature row variable.
+    const ROW_VAR: u32 = 11;
+
+    /// Run `check` against a lowerer whose interner already holds `names`, in order.
+    fn with_named_lowerer(names: &[&str], check: impl FnOnce(&Lowerer<'_>, &[ipe_intern::Symbol])) {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let syms: Vec<ipe_intern::Symbol> =
+            names.iter().map(|n| interner.intern(n).unwrap()).collect();
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        check(&lowerer, &syms);
+    }
+
+    /// A nullary built-in `Ty::Con` named `name`.
+    const fn builtin_leaf(name: ipe_intern::Symbol) -> Ty {
+        Ty::Con {
+            module: Vec::new(),
+            name,
+            args: Vec::new(),
+        }
+    }
+
+    /// An open record over [`ROW_VAR`] carrying `fields`.
+    fn row_open_record(fields: Vec<(ipe_intern::Symbol, Ty)>) -> Ty {
+        Ty::Record(
+            fields.into_iter().collect(),
+            ipe_types::RowTail::Open(ipe_types::tag_solver_var(ROW_VAR)),
+        )
+    }
+
+    /// The generic map that quantifies [`ROW_VAR`] as `row`.
+    fn row_poly(row: ipe_intern::Symbol) -> BTreeMap<ipe_types::SolverVar, ipe_intern::Symbol> {
+        BTreeMap::from([(ipe_types::SolverVar::from_var(ROW_VAR), row)])
+    }
+
+    /// Whether `result` is the row-polymorphic-annotation refusal (`IPE-L0131`).
+    const fn is_row_poly_refusal(result: &ipe_diagnostics::DResult<super::IrType>) -> bool {
+        matches!(
+            result,
+            Err(ipe_diagnostics::Diagnostic::Lower {
+                msg: ipe_diagnostics::LowerError::Unsupported(
+                    ipe_diagnostics::Feature::RowPolyRecordAnnotation
+                ),
+                ..
+            })
+        )
+    }
+
+    /// A record open over the def's own signature row variable lowers to that row generic.
+    ///
+    /// The same record outside any generic scope keeps the flat field map.
+    #[test]
+    fn ir_type_lowers_poly_row_tail_to_row_generic() {
+        with_named_lowerer(&["r", "x", "Int"], |lowerer, syms| {
+            let [r, x, int] = syms else { return };
+            let ty = row_open_record(vec![(*x, builtin_leaf(*int))]);
+            let span = Span::new(0, 1);
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty(&ty, span),
+                    Ok(super::IrType::Record(_))
+                ),
+                "an unquantified open tail keeps the flat field map"
+            );
+            lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::from([*r]), || {
+                assert_eq!(
+                    lowerer.ir_type_from_ty(&ty, span),
+                    Ok(super::IrType::RowGeneric(*r)),
+                    "the def's own row variable lowers to its row generic"
+                );
+            });
+        });
+    }
+
+    /// A record open over a quantified variable no row parameter carries is refused.
+    ///
+    /// The refusal is the typed `IPE-L0131`, never a compiler bug and never a
+    /// struct synthesised from the fields the body reads.
+    #[test]
+    fn ir_type_refuses_foreign_poly_row_tail() {
+        with_named_lowerer(&["r", "x", "Int"], |lowerer, syms| {
+            let [r, x, int] = syms else { return };
+            let ty = row_open_record(vec![(*x, builtin_leaf(*int))]);
+            lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::new(), || {
+                let lowered = lowerer.ir_type_from_ty(&ty, Span::new(0, 1));
+                assert!(
+                    is_row_poly_refusal(&lowered),
+                    "a foreign quantified row tail must be IPE-L0131, got {lowered:?}"
+                );
+            });
+        });
+    }
+
+    /// A row generic reaches its own row variable bare, and no other variable.
+    #[test]
+    fn row_generic_reaches_its_own_tvar() {
+        with_named_lowerer(&["r", "s"], |_, syms| {
+            let [r, s] = syms else { return };
+            let row = super::IrType::RowGeneric(*r);
+            assert!(
+                super::ir_type_generic_reaches_bare(&row, *r),
+                "a row generic holds its own row variable by value"
+            );
+            assert!(
+                !super::ir_type_generic_reaches_bare(&row, *s),
+                "a row generic never reaches another variable"
+            );
+            assert!(
+                super::ir_type_mentions_generic(&row, *r),
+                "a row generic mentions its own row variable"
+            );
+            assert!(
+                !super::ir_type_mentions_generic(&row, *s),
+                "a row generic mentions no other variable"
+            );
+        });
+    }
+
+    /// An open row whose visible fields match the `HttpRequest` shape is the row generic, never folded.
+    ///
+    /// The caller's record carries more fields than the six the body reads, so
+    /// folding it to the runtime `HttpRequest` would drop them; the closed
+    /// record of the same six fields still folds.
+    #[test]
+    fn http_request_shaped_open_row_is_not_folded() {
+        let names = [
+            "r",
+            "body",
+            "headers",
+            "method",
+            "redirects",
+            "timeout",
+            "url",
+            "String",
+            "Int",
+            "List",
+            "HttpMethod",
+            "RedirectPolicy",
+        ];
+        with_named_lowerer(&names, |lowerer, syms| {
+            let [
+                r,
+                body,
+                headers,
+                method,
+                redirects,
+                timeout,
+                url,
+                string,
+                int,
+                list,
+                http_method,
+                redirect_policy,
+            ] = syms
+            else {
+                return;
+            };
+            let header_list = Ty::Con {
+                module: vec![],
+                name: *list,
+                args: vec![Ty::Tuple(vec![
+                    builtin_leaf(*string),
+                    builtin_leaf(*string),
+                ])],
+            };
+            let fields = vec![
+                (*body, builtin_leaf(*string)),
+                (*headers, header_list),
+                (*method, builtin_leaf(*http_method)),
+                (*redirects, builtin_leaf(*redirect_policy)),
+                (*timeout, builtin_leaf(*int)),
+                (*url, builtin_leaf(*string)),
+            ];
+            let span = Span::new(0, 1);
+            let closed = Ty::Record(fields.iter().cloned().collect(), ipe_types::RowTail::Closed);
+            assert_eq!(
+                lowerer.ir_type_from_ty(&closed, span),
+                Ok(super::IrType::HttpRequest),
+                "the closed six-field record is the runtime HttpRequest"
+            );
+            let open = row_open_record(fields);
+            lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::from([*r]), || {
+                assert_eq!(
+                    lowerer.ir_type_from_ty(&open, span),
+                    Ok(super::IrType::RowGeneric(*r)),
+                    "an open row over the def's row variable is never folded to HttpRequest"
+                );
+            });
+        });
+    }
+
+    /// Run `check` against a lowerer reading `chip` while `row` owns the solver variable `5`.
+    ///
+    /// `withheld` lists `row`'s generics the type checker message-defaulted,
+    /// which the ownership index excludes.
+    fn with_foreign_var_lowerer(withheld: &[&str], check: impl FnOnce(&Lowerer<'_>)) {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let chip = interner.intern("chip").unwrap();
+        let row = interner.intern("row").unwrap();
+        let msg = interner.intern("msg").unwrap();
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let mut types = empty_solved_types();
+        types.poly_var_map.insert(
+            (Vec::new(), row),
+            BTreeMap::from([(ipe_types::SolverVar::from_var(5), msg)]),
+        );
+        let withheld: BTreeSet<_> = withheld
+            .iter()
+            .map(|w| interner.intern(w).unwrap())
+            .collect();
+        types.msg_defaulted_vars.insert((Vec::new(), row), withheld);
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        lowerer.current_name.set(chip);
+        check(&lowerer);
+    }
+
+    /// A variable another binding keeps generic reads as free in a body, so a call pin there is `()`.
+    ///
+    /// A body meets such a variable only as a caller of its owner and reads it
+    /// as `()` at every occurrence; the def's own generics are never free.
+    #[test]
+    fn foreign_generic_var_is_unbound_free_in_a_body() {
+        with_foreign_var_lowerer(&[], |lowerer| {
+            let foreign = Ty::Var(ipe_types::tag_solver_var(5));
+            assert!(
+                matches!(
+                    lowerer.var_owner(ipe_types::tag_solver_var(5)),
+                    super::VarOwner::Elsewhere { .. }
+                ),
+                "`row`'s generic is foreign to `chip`"
+            );
+            assert!(
+                lowerer.ty_is_unbound_free(&foreign),
+                "a caller reads its owner's generic leniently"
+            );
+            assert!(
+                lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(6))),
+                "a variable no binding owns stays free"
+            );
+        });
+    }
+
+    /// A foreign generic in a JSON position of the def's signature is refused, never defaulted to `JsonVal`.
+    ///
+    /// The same read inside the body keeps `JsonVal`.
+    #[test]
+    fn foreign_generic_var_in_a_signature_json_slot_is_refused() {
+        with_foreign_var_lowerer(&[], |lowerer| {
+            let span = Span::new(3, 4);
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(5)), span),
+                    Ok(super::IrType::Json)
+                ),
+                "a body read of a foreign generic stays `JsonVal`"
+            );
+            lowerer.read_site.set(super::ReadSite::Signature);
+            let res = lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(5)), span);
+            assert!(
+                matches!(
+                    &res,
+                    Err(super::Diagnostic::Lower {
+                        span: s,
+                        msg: super::LowerError::ForeignTypeVariable { helper, owner, var },
+                    }) if *s == span && &**helper == "chip" && &**owner == "row" && &**var == "msg"
+                ),
+                "expected ForeignTypeVariable(chip, row, msg), got {res:?}"
+            );
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(6)), span),
+                    Ok(super::IrType::Json)
+                ),
+                "a variable no binding owns stays `JsonVal`"
+            );
+        });
+    }
+
+    /// Control: a generic the owner message-defaulted is in no binding's index, so it stays free.
+    #[test]
+    fn message_defaulted_owner_var_stays_unbound_free() {
+        with_foreign_var_lowerer(&["msg"], |lowerer| {
+            assert_eq!(
+                lowerer.var_owner(ipe_types::tag_solver_var(5)),
+                super::VarOwner::Unowned
+            );
+            assert!(lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(5))));
         });
     }
 

@@ -1116,7 +1116,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-inside-vcs
 
-{out} is inside a `.git` directory — build output must stay out of version-control metadata; choose another --out
+{out} is inside a `{dir}` directory — build output must stay out of version-control metadata; choose another --out
 
 ## output-inside-cache-namespace
 
@@ -1385,11 +1385,11 @@ package.ipe: program entry {entry} does not end in `.ipe`. An entry names an Ip�
 
 ## manifest-entry-segment-invalid
 
-package.ipe: program entry {entry} has a path segment {segment} that is not a valid module name (segments must match [A-Z][A-Za-z0-9_]*)
+package.ipe: program entry {entry} has a path segment {segment} that is not a valid module name (segments must match [A-Z][A-Za-z0-9_]*). Name each directory and the file after the module it holds, e.g. `Cli/Main.ipe`.
 
 ## manifest-entry-no-module
 
-package.ipe: program entry {entry} names no module
+package.ipe: program entry {entry} names no module. An entry names a module file under `src/`, e.g. `Cli/Main.ipe`.
 
 ## manifest-base-path-too-long
 

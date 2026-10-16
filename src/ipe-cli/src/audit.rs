@@ -989,11 +989,8 @@ fn purge_committed_ffi_cache(project_root: &Path) -> Result<(), CliError> {
 /// canonical project root. The check uses [`std::fs::symlink_metadata`] so it
 /// never follows symlinks.
 fn ffi_cache_path_or_reject(project_root: &Path) -> Result<PathBuf, CliError> {
-    // The relative components we walk: `.ipe`, `cache`, `ffi`, `rust`.
-    const CACHE_COMPONENTS: &[&str] = &[".ipe", "cache", "ffi", "rust"];
-
     let mut current = project_root.to_path_buf();
-    for component in CACHE_COMPONENTS {
+    for component in ipe_ffi::driver::FFI_CACHE_COMPONENTS {
         current.push(component);
         // Check this component without following the symlink.
         match std::fs::symlink_metadata(&current) {
@@ -1004,7 +1001,8 @@ fn ffi_cache_path_or_reject(project_root: &Path) -> Result<PathBuf, CliError> {
                         "the package's cache path `{}` contains a symlink at `{}`; \
                          the audit rejects this to prevent out-of-tree writes through \
                          a symlinked intermediate path component",
-                        project_root.join(".ipe/cache/ffi/rust").display(),
+                        crate::ffi::joined(project_root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS)
+                            .display(),
                         current.display(),
                     ),
                 ));
@@ -2581,7 +2579,7 @@ mod tests {
              \x20   { name = \"cache-pkg\", version = \"0.1.0\" }\n",
         )
         .expect("write package.ipe");
-        let cache = dir.join(".ipe/cache/ffi/rust");
+        let cache = dir.join(ipe_ffi::driver::FFI_CACHE_REL);
         std::fs::create_dir_all(&cache).expect("create committed cache");
         std::fs::write(cache.join("evil_bindings.rs"), "pub fn evil() {}\n")
             .expect("plant committed bindings");
@@ -2641,7 +2639,7 @@ mod tests {
         let target = make_test_dir("symlink-target");
 
         // Plant `.ipe` as a symlink pointing outside the project root.
-        let ipe_link = dir.join(".ipe");
+        let ipe_link = dir.join(ipe_ffi::driver::CACHE_NAMESPACE_DIR);
         symlink(&target, &ipe_link).expect("create .ipe symlink");
 
         let err =

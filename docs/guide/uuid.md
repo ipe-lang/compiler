@@ -68,6 +68,12 @@ a v4 id also parses: yes
 rejects 'not-a-uuid': yes
 ```
 
+When the host cannot supply entropy (early boot, a sandbox that denies the OS
+random source), `v4` and `v7` fail their task with an `Unavailable` error rather
+than minting an id from a weaker source. `Unavailable` is the transient kind, so
+retrying the mint later is sound: a failed mint consumes nothing, and the next
+`v7` id still sorts after every id minted before it.
+
 ## The why
 
 Typing generation as a `Task` is [soundness][principles]: minting an id reads

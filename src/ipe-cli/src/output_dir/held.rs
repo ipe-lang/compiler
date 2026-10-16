@@ -929,12 +929,12 @@ impl HeldDir {
         self.replace_file(name, OsStr::new(&tmp), permissions, fill)
     }
 
-    /// Whether `name` spells the marker or the claim name, in any ASCII case.
+    /// Whether a case-folding volume may open `name` as the marker or the
+    /// claim file ([`ipe_fs_open::may_open_as`]).
     fn is_reserved(name: &OsStr) -> bool {
-        let name = name.to_string_lossy();
         [OWNERSHIP_MARKER, CLAIM_FILE]
             .into_iter()
-            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            .any(|reserved| ipe_fs_open::may_open_as(name, reserved))
     }
 
     /// Fill the new file `tmp`, then rename it over `name`; `tmp` is removed on failure.
@@ -2403,6 +2403,8 @@ mod tests {
             CLAIM_FILE,
             ".IPE-OUTPUT",
             ".Ipe-Output.Claim",
+            ".\u{131}pe-output",
+            "\u{FEFF}.ipe-output.cla\u{131}m",
         ] {
             let written = held.write_file(OsStr::new(name), None, |file| {
                 file.write_all(MARKER_TEXT.as_bytes())

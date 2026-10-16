@@ -194,8 +194,8 @@ pub mod file;
 pub mod log;
 // `Ipe.Random` non-cryptographic PRNG. Behind the `random` feature: a program
 // that reaches no `Ipe.Random` kernel drops the module. The feature gates only
-// this module. `getrandom` (the entropy source shared with `crypto_core`,
-// `scratch_core`, and this module's seed) is always present.
+// this module. Its wasm seed draws through `entropy::fill_entropy`, the
+// runtime's one OS random source, which is always present.
 #[cfg(feature = "random")]
 pub mod random;
 // `system` is always compiled (not tokio-gated): it owns the process-local env
@@ -417,9 +417,10 @@ pub mod tui;
 pub use tui::{tui_app, tui_app_ui};
 
 // `Ipe.Uuid` v4 / v7 / parse. Behind the `uuid` feature (the `uuid` crate is
-// optional): a program that reaches no `Ipe.Uuid` kernel — and no `server` /
-// `web` surface (whose runtime modules mint session/CSRF ids via `uuid::new_v4`,
-// so both imply `uuid`) — drops the crate.
+// optional, with no RNG feature: ids are built from `entropy::fill_entropy`
+// draws): a program that reaches no `Ipe.Uuid` kernel, no `jwt` surface (its
+// `jti` builder) and no `server` / `web` surface (both imply `uuid`) drops the
+// crate.
 #[cfg(feature = "uuid")]
 pub mod uuid_kernel;
 #[cfg(feature = "uuid")]
@@ -647,6 +648,10 @@ pub mod telemetry;
 // The one typed `Content-Security-Policy` builder every HTML response's
 // security headers are assembled from.
 pub mod csp;
+
+// The runtime's one OS entropy source: every random mint draws through
+// `entropy::fill_entropy`, which refuses instead of panicking.
+pub mod entropy;
 
 // Ipe.Ui shared element tree — the general UI abstraction (Element/Attribute/
 // Length/Color/...). Backends (Web/Tui/WebView) each render it to their target.

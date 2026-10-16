@@ -42,7 +42,7 @@
 //! arms simply do not yet gain multi-line layout.
 //!
 //! This is the production function-body emit path: [`crate::emit_expr::emit_func`]
-//! renders every body through `build_doc` + [`crate::render::render`], so the
+//! renders every body through `build_doc` + [`crate::render::render_code`], so the
 //! emitted body is `rustfmt`-clean by construction. The string emitter's
 //! [`emit_expr_at`] survives as the leaf builder the structured arms delegate to
 //! (and as the SEAL / byte-golden test oracle), not as the body formatter.
@@ -504,7 +504,7 @@ pub fn native_vs_legacy_sweep(
                 continue;
             };
             let doc = build_doc(&ctx, &func.body, 1, 0, generics)?;
-            let native = render_body_dedented(&doc);
+            let native = render_body_dedented(&doc)?;
             compared += 1;
             if native != legacy {
                 divergences.push(SweepDivergence {
@@ -525,17 +525,23 @@ pub fn native_vs_legacy_sweep(
 /// body indent). The body's opening character lands at column 4 (matching the
 /// `fn f() {` body column rustfmt measures against), then the four-space prefix is
 /// removed from each line so both sides are compared at column 0.
-fn render_body_dedented(doc: &Doc) -> String {
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] `backend.leaf_not_code` when the rendered body is
+/// not code only.
+fn render_body_dedented(doc: &Doc) -> DResult<String> {
     // Seed the render with four spaces so the body starts at column 4, and wrap the
     // doc in `Nest(4)` so every internal newline indents from the block indent —
     // exactly the `render_fn_body` test framing.
     let seeded = Doc::nest(4, Doc::concat(vec![Doc::text(leaf!("    ")), doc.clone()]));
-    let rendered = crate::render::render(&seeded, crate::render::RenderConfig::default());
-    rendered
+    let (rendered, _) =
+        crate::render::render_code(&seeded, crate::render::RenderConfig::default(), 0, 0)?;
+    Ok(rendered
         .lines()
         .map(|l| l.strip_prefix("    ").unwrap_or(l))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n"))
 }
 
 /// A short identifying prefix of an [`Expr`]'s debug form (the variant name and a

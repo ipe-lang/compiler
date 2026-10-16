@@ -572,11 +572,11 @@ mod tests {
         );
     }
 
-    /// Make every component of `root/rel` a directory only its owner may write.
+    /// Make every one of `components` below `root` a directory only its owner may write.
     #[allow(clippy::expect_used)] // test fixture: a failed mkdir IS the failure
-    fn private_chain(root: &Path, rel: &str) -> PathBuf {
+    fn private_chain(root: &Path, components: &[&str]) -> PathBuf {
         let mut dir = root.to_path_buf();
-        for segment in rel.split('/') {
+        for segment in components {
             dir.push(segment);
             fs::create_dir_all(&dir).expect("create cache component");
             #[cfg(unix)]
@@ -593,7 +593,7 @@ mod tests {
         let main = dir.join("Main.ipe");
         let text = "module Main exposing (main)\n\nmain = 0\n";
         fs::write(&main, text).expect("write Main.ipe");
-        let cache = private_chain(&dir, ipe_ffi::driver::FFI_CACHE_REL);
+        let cache = private_chain(&dir, &ipe_ffi::driver::FFI_CACHE_COMPONENTS);
         fs::write(cache.join("x.consumer.json"), "{ not json").expect("write artifact");
         let loaded = DriverLoader.load(None, &main, Some(text));
         let _ = fs::remove_dir_all(&dir);

@@ -41,6 +41,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ipe_path_core::Regime;
+
 use zeroize::Zeroizing;
 
 use crate::cli_args::OutputFormat;
@@ -1253,25 +1255,21 @@ const fn cfg_host_triple_fallback() -> &'static str {
 /// Resolve `name` on `PATH` to its absolute executable path, or `None`.
 fn which_on_path(name: &str) -> Option<PathBuf> {
     let path_var = ipe_env::var_os("PATH")?;
-    let exe = exe_name(name);
+    let exe = exe_name(name, ipe_path_core::HOST);
     std::env::split_paths(&path_var)
         .map(|dir| dir.join(&exe))
         .find(|candidate| is_executable_file(candidate))
 }
 
-/// The platform executable file name for a bare tool name.
-fn exe_name(name: &str) -> String {
-    #[cfg(windows)]
-    {
-        if name.ends_with(".exe") {
-            name.to_owned()
-        } else {
-            format!("{name}.exe")
-        }
-    }
-    #[cfg(not(windows))]
-    {
+/// The executable file name of the bare tool `name` under `regime`.
+///
+/// Windows runs a program file carrying the `.exe` suffix; Unix runs the bare name.
+pub(crate) fn exe_name(name: &str, regime: Regime) -> String {
+    let suffix = if regime.is_windows() { ".exe" } else { "" };
+    if name.ends_with(suffix) {
         name.to_owned()
+    } else {
+        format!("{name}{suffix}")
     }
 }
 
@@ -1929,6 +1927,18 @@ fn write_atomic_config(path: &Path, contents: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exe_name_gains_exe_only_under_windows() {
+        assert_eq!(exe_name("cargo", Regime::Windows), "cargo.exe");
+        assert_eq!(exe_name("cargo.exe", Regime::Windows), "cargo.exe");
+    }
+
+    #[test]
+    fn exe_name_is_bare_under_unix() {
+        assert_eq!(exe_name("cargo", Regime::Unix), "cargo");
+        assert_eq!(exe_name("cargo.exe", Regime::Unix), "cargo.exe");
+    }
 
     /// A temp directory removed on drop, so config-edit tests never touch a real
     /// home.

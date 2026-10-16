@@ -1,7 +1,7 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SaveFailure(..), SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decideRefusal, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, saveFailureOf, saveFailureText, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
-import Ipe.Db as Db
+import Ipe.Db as Db exposing (DbFailure(..))
 import Ipe.Dict as Dict
 import Ipe.Error as Error
 import Ipe.List as List
@@ -16,7 +16,7 @@ import Lib.Format as Format
 -- `Links.LinkSet`, and an imported alias resolves its qualified names in this
 -- module.
 import Lib.Highlight as Highlight
-import Lib.Index as Index exposing (Oversize(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Oversize(..), RefusalReason(..), SourceView(..), StaleReason(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
@@ -203,7 +203,11 @@ keyPart part =
 -- configured root binds, which are in neither the queue nor its progress;
 -- `next` is the cursor of the following page, Nothing on the last page;
 -- `dbName` is the index file's name, rendered once; `log` is the review
--- log's verdict the page was read under.
+-- log's verdict the page was read under. `refusals` are the first open
+-- files the index could not review and `refusalsOpen` counts every open
+-- one: open review work the page shows apart from its units.
+-- `refusalsUnbound` counts the unreviewable files under a tag no
+-- configured root binds, said beside the unbound units.
 type alias QueuePage =
     { units : List QueuedUnit
     , total : Int
@@ -213,13 +217,17 @@ type alias QueuePage =
     , next : Maybe Index.Cursor
     , progress : Progress
     , log : LogShown
+    , refusals : List Index.RefusalRow
+    , refusalsOpen : Int
+    , refusalsUnbound : Int
     }
 
 
 -- Review progress over the index as it stands, never from a session:
--- `total` counts the index's units under a bound tag and `reviewed` those
--- not open, so `reviewed` can reach `total` and a unit
--- is reviewed exactly when its current (uid, body_hash) pair has a decision.
+-- `total` counts the index's units and unreviewable files under a bound
+-- tag and `reviewed` those not open, so `reviewed` reaches `total` only
+-- when every unit's current (uid, body_hash) pair and every unreviewable
+-- file's (uid, digest) pair has a decision.
 -- Both come from the same read as the page's rows, after the `reviewed`
 -- copy is proved current against the review log's head. Deciding a unit
 -- moves it from open to reviewed, so `total` holds while the queue drains,
@@ -633,6 +641,140 @@ decide key settings db shown decision =
                 attested <- Index.reverify settings shown
                 written <- LibDb.insertDecision macKey db attested decision
                 Task.succeed ( attested, written )
+
+
+-- The one way a decision on an unreviewable file is recorded, `decide`'s
+-- counterpart: only under a signing key, so a read-only server refuses
+-- before it reads anything, and only after `Index.reverifyRefusal`
+-- re-proves the row still carries `digest`, so the hash written is the
+-- digest the reviewer was shown.
+decideRefusal : ReviewKey -> IndexSettings -> Db.Db -> Uid -> Index.RefusalDigest -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+decideRefusal key settings db uid digest decision =
+    case key of
+        ReadOnly ->
+            Task.fail ReviewKey.readOnlyError
+
+        Signing macKey ->
+            do
+                attested <- Index.reverifyRefusal settings uid digest
+                written <- LibDb.insertDecision macKey db attested decision
+                Task.succeed ( attested, written )
+
+
+-- Why a decision was not saved, as the model holds it. Each case is decided
+-- from the failure's type, never its text, and renders a fixed text of this
+-- tool's own, so no error's text reaches the model or the page. A decision
+-- asked while another is saving, asked off the queue page, or asked on a
+-- server with no signing key is refused before it starts. `SaveContended`:
+-- a database the save reads or writes was busy (locked past its busy
+-- timeout, or no connection free in time) — the index, read to re-prove the
+-- shown source, or the review database, written with the decision; a busy
+-- failure does not say which. `SaveFailed`: every other failure, the closed
+-- default, whose cause the reviewer recovers from by reloading.
+type SaveFailure
+    = SaveInFlight
+    | SaveOffQueue
+    | SaveReadOnly
+    | SaveContended
+    | SaveFailed
+
+
+-- The case of a failed save, from the `DbFailure` its error carries: only a
+-- busy review database is `SaveContended`; an error carrying any other
+-- detail, or none, is `SaveFailed`. The message is never read.
+saveFailureOf : Error -> SaveFailure
+saveFailureOf e =
+    case e of
+        Error _ info ->
+            case info.details of
+                Just (Database failure) ->
+                    saveFailureOfDb failure
+
+                Just (Custom _) ->
+                    SaveFailed
+
+                Just (FfiPanic _) ->
+                    SaveFailed
+
+                Just (HttpStatus _) ->
+                    SaveFailed
+
+                Just (JsonDecode _) ->
+                    SaveFailed
+
+                Just (TypeMismatch _) ->
+                    SaveFailed
+
+                Nothing ->
+                    SaveFailed
+
+
+-- Every `DbFailure` has its own row, so a cause the driver layer adds is a
+-- compile error here until it is given a case.
+saveFailureOfDb : DbFailure -> SaveFailure
+saveFailureOfDb failure =
+    case failure of
+        Busy ->
+            SaveContended
+
+        CannotOpen ->
+            SaveFailed
+
+        NotADatabase ->
+            SaveFailed
+
+        AccessDenied ->
+            SaveFailed
+
+        ReadOnlyDatabase ->
+            SaveFailed
+
+        InvalidStatement ->
+            SaveFailed
+
+        UniqueViolation ->
+            SaveFailed
+
+        ForeignKeyViolation ->
+            SaveFailed
+
+        NotNullViolation ->
+            SaveFailed
+
+        CheckViolation ->
+            SaveFailed
+
+        TriggerRaised ->
+            SaveFailed
+
+        OtherConstraint ->
+            SaveFailed
+
+        Unreachable ->
+            SaveFailed
+
+        OtherFailure ->
+            SaveFailed
+
+
+-- The fixed text each case renders.
+saveFailureText : SaveFailure -> String
+saveFailureText failure =
+    case failure of
+        SaveInFlight ->
+            "a decision is still being saved; try again once it settles"
+
+        SaveOffQueue ->
+            "decisions are made on the queue page"
+
+        SaveReadOnly ->
+            Error.message ReviewKey.readOnlyError
+
+        SaveContended ->
+            "the index or review database is busy; try again"
+
+        SaveFailed ->
+            "the decision was not saved; reload the queue and decide again"
 
 
 -- The session's one source slot, shared by the selected queue card and the
@@ -1087,7 +1229,10 @@ queueStatusText state =
             Just ("Queue failed to load: " ++ SafeText.toString (SafeText.renderForeign (Error.toString e)))
 
         Loaded page ->
-            if page.total == 0 then
+            if page.total == 0 && page.refusalsOpen > 0 then
+                Just ("No units queued, but" ++ refusalsWord page.refusalsOpen ++ " still open." ++ unboundNotice page)
+
+            else if page.total == 0 then
                 Just ("No units queued." ++ unboundNotice page)
 
             else if List.isEmpty page.units then
@@ -1098,7 +1243,8 @@ queueStatusText state =
 
 
 -- The queue header: database name, size, how many of the open units this
--- page shows, and how many units it leaves out as unbound.
+-- page shows, how many unreviewable files are open, and how many units it
+-- leaves out as unbound.
 pageHeaderText : QueuePage -> String
 pageHeaderText page =
     String.concat
@@ -1109,8 +1255,72 @@ pageHeaderText page =
         , String.fromInt (List.length page.units)
         , " of "
         , String.fromInt page.total
+        , refusalsNotice page
         , unboundNotice page
         ]
+
+
+-- The open unreviewable files, said where the queue's counts are; empty
+-- when none is open.
+refusalsNotice : QueuePage -> String
+refusalsNotice page =
+    if page.refusalsOpen > 0 then
+        " ·" ++ refusalsWord page.refusalsOpen ++ " open"
+
+    else
+        ""
+
+
+-- " 1 unreviewable file" for one, " N unreviewable files" for any other
+-- count.
+refusalsWord : Int -> String
+refusalsWord count =
+    if count == 1 then
+        " 1 unreviewable file"
+
+    else
+        " " ++ String.fromInt count ++ " unreviewable files"
+
+
+-- The fixed text naming why the index could not review a file.
+refusalReasonText : Index.RefusalReason -> String
+refusalReasonText reason =
+    case reason of
+        NotUtf8 ->
+            "Not UTF-8 text"
+
+        Oversized ->
+            "Larger than the index reads as source"
+
+        SymlinkEntry ->
+            "A symbolic link"
+
+        GitlinkEntry ->
+            "A submodule (gitlink) entry"
+
+        UnknownMode ->
+            "A git entry of unknown mode"
+
+        PastHashCeiling ->
+            "Too large to hash"
+
+        NonUtf8Name ->
+            "Its name is not UTF-8"
+
+        NotRepoRelative ->
+            "Its path is not inside the repository"
+
+        NestedRepository ->
+            "Inside a nested repository"
+
+        NotRegular ->
+            "Not a regular file"
+
+        UnreadableEntry ->
+            "Could not be read"
+
+        ReplacedEntry ->
+            "Replaced while the index read it"
 
 
 -- " unit" for one, " units" for any other count.
@@ -1123,12 +1333,19 @@ unitsWord count =
         " units"
 
 
--- The units under a tag no configured root binds, left out of the queue
--- and its progress, said where the queue's counts are; empty when none is.
+-- The units and the unreviewable files under a tag no configured root
+-- binds, left out of the queue and its progress, said where the queue's
+-- counts are; empty when none is.
 unboundNotice : QueuePage -> String
 unboundNotice page =
-    if page.unbound > 0 then
-        " · " ++ String.fromInt page.unbound ++ unitsWord page.unbound ++ " in unbound repositories not shown"
+    unboundPart page.unbound (String.fromInt page.unbound ++ unitsWord page.unbound)
+        ++ unboundPart page.refusalsUnbound (String.dropLeft 1 (refusalsWord page.refusalsUnbound))
+
+
+unboundPart : Int -> String -> String
+unboundPart count what =
+    if count > 0 then
+        " · " ++ what ++ " in unbound repositories not shown"
 
     else
         ""
@@ -1178,8 +1395,14 @@ pageOf settings db fresh =
                     , dbName = SafeText.renderForeign (Settings.dbFileName settings.index.db.path)
                     , dbBytes = snap.bytes
                     , next = nextCursor snap.rows
-                    , progress = { reviewed = snap.units - snap.open, total = snap.units }
+                    , progress =
+                        { reviewed = snap.units - snap.open + (snap.refusalsAll - snap.refusalsOpen)
+                        , total = snap.units + snap.refusalsAll
+                        }
                     , log = LibDb.logShown state
+                    , refusals = snap.refusals
+                    , refusalsOpen = snap.refusalsOpen
+                    , refusalsUnbound = snap.refusalsUnbound
                     }
 
 

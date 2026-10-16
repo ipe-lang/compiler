@@ -277,7 +277,20 @@ pub fn auth_password_strength<E: From<String>>(pw: String) -> IpeResult<E, Strin
 /// that already supplies a `jti` claim (re-issue scenario) keeps its original value —
 /// only a fresh token (no `jti` in the supplied claims) gets a new random id. This
 /// guarantees `jti` is immutable across re-issues, exactly like `cap`.
-pub fn auth_sign_token<E: From<String>>(
+///
+/// A fresh `jti` is drawn from the OS random source; a host without entropy
+/// mints no token and fails with kind `Unavailable`.
+pub fn auth_sign_token<E: From<String> + crate::FromUnavailable>(
+    secret: String,
+    claims: HashMap<String, String>,
+    expiry_seconds: i64,
+) -> IpeResult<E, String> {
+    sign_token_with(crate::entropy::fill_entropy, secret, claims, expiry_seconds)
+}
+
+/// [`auth_sign_token`] drawing a fresh `jti`'s bytes from `fill`.
+fn sign_token_with<E: From<String> + crate::FromUnavailable>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
     secret: String,
     claims: HashMap<String, String>,
     expiry_seconds: i64,
@@ -341,12 +354,18 @@ pub fn auth_sign_token<E: From<String>>(
     let jti: String = match claims.get("jti").filter(|s| !s.is_empty()) {
         Some(existing) => existing.clone(),
         None => {
-            // Mint a new random session id. `uuid::Uuid::new_v4` draws from the
-            // OS entropy source; its output is not guessable by an attacker who
-            // does not hold the HS256 secret (which already protects the token),
-            // but the `jti` provides an additional per-session handle for
-            // targeted revocation without needing to know the secret.
-            uuid::Uuid::new_v4().to_string()
+            // A new random session id: 122 random bits in the UUIDv4 layout,
+            // a per-session handle for targeted revocation. A refused draw
+            // mints no token; there is no fallback id.
+            let mut bytes = [0_u8; 16];
+            if fill(&mut bytes).is_err() {
+                return IpeResult::Err(E::from_unavailable(
+                    "Auth.signToken: the OS random source is unavailable".to_owned(),
+                ));
+            }
+            uuid::Builder::from_random_bytes(bytes)
+                .into_uuid()
+                .to_string()
         }
     };
     // A caller-supplied `nbf` is signed as a NumericDate, the only form the
@@ -1266,6 +1285,39 @@ mod tests {
         let token: IpeResult<String, String> =
             auth_sign_token("short".into(), HashMap::new(), 3600);
         assert!(matches!(token, IpeResult::Err(_)));
+    }
+
+    /// A fresh token on a host without entropy is refused with kind
+    /// `Unavailable` and no token string; a carried `jti` draws nothing.
+    #[test]
+    fn sign_token_refuses_without_entropy() {
+        use crate::entropy::EntropyError;
+        use std::cell::Cell;
+        let secret = "a-test-secret-of-32-bytes-padding".to_string();
+        let refused: IpeResult<crate::IpeError, String> =
+            sign_token_with(|_| Err(EntropyError), secret.clone(), HashMap::new(), 3600);
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(crate::IpeError::Error(crate::IpeErrorKind::Unavailable, _))
+            ),
+            "a refused draw mints no token and reports kind Unavailable: {refused:?}"
+        );
+
+        let draws = Cell::new(0_u32);
+        let mut claims = HashMap::new();
+        claims.insert("jti".to_string(), "carried-session".to_string());
+        let carried: IpeResult<crate::IpeError, String> = sign_token_with(
+            |_| {
+                draws.set(draws.get() + 1);
+                Err(EntropyError)
+            },
+            secret,
+            claims,
+            3600,
+        );
+        assert!(matches!(carried, IpeResult::Ok(_)), "a carried jti signs");
+        assert_eq!(draws.get(), 0, "a carried jti draws no entropy");
     }
 
     // The signed payload must have its claim keys in ascending order, which makes
@@ -3420,8 +3472,8 @@ fn header(raw: &str) -> bool { HeaderValue::from_str(raw).is_ok() }
         assert_eq!(
             text_reads(include_str!("auth.rs")),
             [
-                "auth_sign_token",
-                "auth_sign_token",
+                "sign_token_with",
+                "sign_token_with",
                 "test_auth_sign_token_payload_keys_sorted",
                 "tampered_cap_fails_signature_verification",
                 "verified_time_claims_are_the_numbers_the_checks_read",

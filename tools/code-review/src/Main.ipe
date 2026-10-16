@@ -8,7 +8,9 @@ import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
+import Ipe.Result exposing (Result(..))
 import Lib.App as App exposing (Model, Msg(..), Page(..))
+import Lib.Bind as Bind
 import Lib.Db as LibDb
 import Lib.EnvLookup as EnvLookup
 import Lib.Epoch as Epoch
@@ -134,13 +136,40 @@ requireSettings key rawDb rawRoot rawRepos rawReview =
         )
 
 
+-- The listen address, proved loopback before anything else is read: a
+-- refused value stops startup with its refusal and exit status 1, before any
+-- database is opened, the review key is read, or a socket is bound.
+requireLoopbackBind : Settings.EnvValue -> Task Error Bind.Loopback
+requireLoopbackBind raw =
+    case Bind.parseBind raw of
+        Ok bind ->
+            Task.succeed bind
+
+        Err refusal ->
+            do
+                Io.eprintln ("code-review: " ++ SafeText.toString (Bind.refusalText refusal))
+                System.exit 1
+
+
+-- The one mount list. It takes the `Loopback` proof, so the server cannot
+-- listen without a bind `Bind.parseBind` accepted; the runtime resolves the
+-- address from the same variable the proof was parsed from. `main` ends in
+-- `Server.listen` itself, the one head the managed-update-loop import check
+-- admits.
+mounts : Bind.Loopback -> Settings.AppSettings -> List Server.Route
+mounts _loopback settings =
+    [ Server.mountApp "/" (reviewApp settings) ]
+
+
 main : Task Error ()
 main =
     do
+        rawBind <- optionalEnv "IPE_HTTP_BIND"
+        bind <- requireLoopbackBind rawBind
         rawDb <- requireEnv "IPE_INDEX_DB" "Set it to the file path of the ipe-index index.db (absolute, or relative to the working directory).\n  Build the index first from the repo root:  tools/scripts/ipe-index index"
         rawRoot <- requireEnv "IPE_INDEX_ROOT" "Set it to the repo root the index's tag:relative paths join to (absolute, or relative to the working directory)."
         rawRepos <- optionalEnv "IPE_INDEX_REPOS"
         rawReview <- optionalEnv "IPE_REVIEW_DB"
         key <- requireReviewKey
         settings <- requireSettings key rawDb rawRoot rawRepos rawReview
-        Server.listen 8000 [ Server.mountApp "/" (reviewApp settings) ]
+        Server.listen 8000 (mounts bind settings)

@@ -1,4 +1,4 @@
-module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, decisionOffQueue, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
+module Lib.App exposing (Model, Msg(..), Page(..), decisionBusy, initialModel, queueList, selectedUid, selectedUnit, unitPageState, update)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.List as List
@@ -9,7 +9,8 @@ import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch exposing (Epoch)
 import Lib.Index as Index
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.ReviewKey exposing (ReviewKey(..))
 import Lib.Settings as Settings
 import Lib.Uid exposing (Uid)
 
@@ -27,7 +28,8 @@ type Page
 -- read slot, read by the queue card and the unit page alike, and `decision`
 -- its one decision slot, so a second read or decision in flight has no
 -- representation. `standing` is the unit page's read of where its shown
--- body stands in the review log.
+-- body stands in the review log. `decisionError` is why the last decision
+-- was not saved, a typed case that never holds an error's text.
 type alias Model =
     { page : Page
     , queueState : Queue.QueueState
@@ -35,7 +37,7 @@ type alias Model =
     , refusingUid : Maybe Uid
     , refuseDraft : String
     , refuseError : Maybe Error
-    , decisionError : Maybe Error
+    , decisionError : Maybe Queue.SaveFailure
     , queueLoad : Queue.LoadTicket
     , history : Queue.HistoryState
     , historyLoad : Queue.LoadTicket
@@ -54,6 +56,8 @@ type Msg
     | RefuseDraft String
     | RefuseCancel
     | RefuseSubmit Uid
+    | AckRefusal Uid
+    | RefuseRefusalSubmit Uid
     | DecisionSaved Uid Epoch (Result Error ( Index.Attested, Index.Written ))
     | Navigated Page
     | ShowQueue
@@ -235,7 +239,10 @@ update settings msg model =
             loadQueue settings cursor { model | queueState = Loading, selected = 0 }
 
         ApproveUnit uid ->
-            saveDecision settings model uid Approved
+            saveDecision settings model OnUnit uid Approved
+
+        AckRefusal uid ->
+            saveDecision settings model OnRefusal uid Approved
 
         RefuseStart uid ->
             ( { model | refusingUid = Just uid, refuseDraft = "", refuseError = Nothing }, Cmd.none )
@@ -247,7 +254,10 @@ update settings msg model =
             ( { model | refusingUid = Nothing, refuseDraft = "", refuseError = Nothing }, Cmd.none )
 
         RefuseSubmit uid ->
-            submitRefuse settings model uid
+            submitRefuse settings model OnUnit uid
+
+        RefuseRefusalSubmit uid ->
+            submitRefuse settings model OnRefusal uid
 
         DecisionSaved uid epoch result ->
             let
@@ -263,7 +273,7 @@ update settings msg model =
                     ( { settled | decisionError = Nothing, queueLoad = load }, drainAndReload settings settled attested written load )
 
                 Err e ->
-                    ( { settled | decisionError = Just e }, Cmd.none )
+                    ( { settled | decisionError = Just (Queue.saveFailureOf e) }, Cmd.none )
 
         Navigated page ->
             enterPage settings page model
@@ -405,7 +415,7 @@ keyActionMsg settings action model =
         ApproveSelected ->
             case selectedUid model of
                 Just uid ->
-                    saveDecision settings model uid Approved
+                    saveDecision settings model OnUnit uid Approved
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -424,7 +434,7 @@ keyActionMsg settings action model =
         ConfirmRefuse ->
             case model.refusingUid of
                 Just uid ->
-                    submitRefuse settings model uid
+                    submitRefuse settings model (targetOf model uid) uid
 
                 Nothing ->
                     ( model, Cmd.none )
@@ -439,8 +449,8 @@ keyActionMsg settings action model =
 -- The draft is parsed into a bounded `Reason` here, the one point where the
 -- reviewer's text enters; a blank or over-long draft stays open with why,
 -- and so does a draft submitted while another decision is saving.
-submitRefuse : Settings.AppSettings -> Model -> Uid -> ( Model, Cmd Msg )
-submitRefuse settings model uid =
+submitRefuse : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> ( Model, Cmd Msg )
+submitRefuse settings model target uid =
     case LibDb.parseReason model.refuseDraft of
         Err e ->
             ( { model | refuseError = Just e }, Cmd.none )
@@ -448,7 +458,7 @@ submitRefuse settings model uid =
         Ok reason ->
             case Queue.startDecision settings.epoch uid model.decision of
                 Just _ ->
-                    saveDecision settings { model | refusingUid = Nothing, refuseDraft = "" } uid (Refused reason)
+                    saveDecision settings { model | refusingUid = Nothing, refuseDraft = "" } target uid (Refused reason)
 
                 Nothing ->
                     ( { model | refuseError = Just decisionBusy }, Cmd.none )
@@ -459,50 +469,102 @@ clampIndex i len =
     max 0 (min i (len - 1))
 
 
--- Every decision, from a button or a key, takes the session's one decision
--- slot and goes through `Queue.decide` on the selected unit's shown source,
--- which it re-proves before writing. A decision asked off the queue page is
--- refused before it takes the slot; one asked while another is saving starts
--- nothing. Each says why.
-saveDecision : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
-saveDecision settings model uid decision =
-    if model.page /= QueuePage then
-        ( { model | decisionError = Just decisionOffQueue }, Cmd.none )
-
-    else
-        case Queue.startDecision settings.epoch uid model.decision of
-            Just saving ->
-                ( { model | decision = saving }
-                , Cmd.perform (decisionTask settings model uid decision) (DecisionSaved uid settings.epoch)
-                )
-
-            Nothing ->
-                ( { model | decisionError = Just decisionBusy }, Cmd.none )
+-- What a decision is asked on: a queued unit, decided on its shown source,
+-- or an unreviewable file the loaded page lists, decided on its digest.
+type DecisionTarget
+    = OnUnit
+    | OnRefusal
 
 
-decisionBusy : Error
-decisionBusy =
-    Error.conflict "a decision is still being saved; try again once it settles"
-
-
-decisionOffQueue : Error
-decisionOffQueue =
-    Error.conflict "decisions are made on the queue page"
-
-
-decisionTask : Settings.AppSettings -> Model -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
-decisionTask settings model uid decision =
-    case List.find (\q -> q.unit.uid == uid) (queueList model) of
+-- The target of a decision asked by uid alone (the refusal panel's key):
+-- an unreviewable file when the loaded page lists one under `uid`, a unit
+-- otherwise.
+targetOf : Model -> Uid -> DecisionTarget
+targetOf model uid =
+    case pageRefusal model uid of
         Just _ ->
-            case Queue.decidableSource uid model.selectedView of
-                Just shown ->
-                    decideOn settings shown decision
-
-                Nothing ->
-                    Task.fail (Error.conflict "this unit's source is not shown, so it cannot be decided")
+            OnRefusal
 
         Nothing ->
-            Task.fail (Error.conflict "unit is no longer in the queue")
+            OnUnit
+
+
+pageRefusal : Model -> Uid -> Maybe Index.RefusalRow
+pageRefusal model uid =
+    case model.queueState of
+        Loaded page ->
+            List.find (\row -> row.uid == uid) page.refusals
+
+        Loading ->
+            Nothing
+
+        Failed _ ->
+            Nothing
+
+
+-- Every decision, from a button or a key, takes the session's one decision
+-- slot and goes through `Queue.decide` on the selected unit's shown source,
+-- or `Queue.decideRefusal` on a listed unreviewable file's digest, each
+-- re-proved before writing. A decision asked off the queue page is
+-- refused before it takes the slot, and so is one asked on a server with no
+-- signing key; one asked while another is saving starts nothing. Each says
+-- why.
+saveDecision : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
+saveDecision settings model target uid decision =
+    if model.page /= QueuePage then
+        ( { model | decisionError = Just SaveOffQueue }, Cmd.none )
+
+    else
+        case settings.key of
+            ReadOnly ->
+                ( { model | decisionError = Just SaveReadOnly }, Cmd.none )
+
+            Signing _ ->
+                case Queue.startDecision settings.epoch uid model.decision of
+                    Just saving ->
+                        ( { model | decision = saving }
+                        , Cmd.perform (decisionTask settings model target uid decision) (DecisionSaved uid settings.epoch)
+                        )
+
+                    Nothing ->
+                        ( { model | decisionError = Just SaveInFlight }, Cmd.none )
+
+
+-- The refusal panel's refusal of a decision submitted while another is
+-- saving, worded as the queue banner words it.
+decisionBusy : Error
+decisionBusy =
+    Error.conflict (Queue.saveFailureText SaveInFlight)
+
+
+decisionTask : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+decisionTask settings model target uid decision =
+    case target of
+        OnUnit ->
+            case List.find (\q -> q.unit.uid == uid) (queueList model) of
+                Just _ ->
+                    case Queue.decidableSource uid model.selectedView of
+                        Just shown ->
+                            decideOn settings shown decision
+
+                        Nothing ->
+                            Task.fail (Error.conflict "this unit's source is not shown, so it cannot be decided")
+
+                Nothing ->
+                    Task.fail (Error.conflict "unit is no longer in the queue")
+
+        OnRefusal ->
+            case pageRefusal model uid of
+                Just row ->
+                    case row.digest of
+                        Just digest ->
+                            LibDb.openAt settings.review |> Task.andThen (\db -> Queue.decideRefusal settings.key settings.index db uid digest decision)
+
+                        Nothing ->
+                            Task.fail (Error.conflict "this file cannot be acknowledged; fix it in the tree")
+
+                Nothing ->
+                    Task.fail (Error.conflict "file is no longer in the queue")
 
 
 decideOn : Settings.AppSettings -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )

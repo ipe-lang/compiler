@@ -109,11 +109,11 @@ pub enum RuntimeFeature {
     /// reaches neither drops all four crates.
     Regex,
     /// `uuid` — the `uuid` crate and the `uuid_kernel.rs` module
-    /// (`reaches_uuid()`: an `Ipe.Uuid` kernel, OR the `server` / `web` surfaces
-    /// whose runtime modules mint ids via `uuid::new_v4`, OR the `jwt` / `auth`
-    /// surface whose `auth.rs` calls `uuid::Uuid::new_v4()` to mint per-session
-    /// `jti` ids in `auth_sign_token`). A bare Program that reaches none drops the
-    /// crate.
+    /// (`reaches_uuid()`: an `Ipe.Uuid` kernel, OR the `server` / `web` surfaces,
+    /// which imply the feature, OR the `jwt` / `auth` surface whose `auth.rs`
+    /// builds per-session `jti` ids in `auth_sign_token` with `uuid::Builder`).
+    /// The crate carries no RNG feature: ids draw through
+    /// `entropy::fill_entropy`. A bare Program that reaches none drops the crate.
     Uuid,
     /// `random` — the `random.rs` module (`reaches_random()`: an `Ipe.Random`
     /// kernel). A standalone leaf — no surface implies it. The feature gates the

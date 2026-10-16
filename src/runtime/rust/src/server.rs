@@ -24,6 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::entropy::EntropyError;
 use crate::redact::{Redacted, redacting_debug};
 
 /// Ipe.Http.Server.Request — opaque parsed request handle.
@@ -2191,10 +2192,10 @@ fn to_axum_response(r: ServerResponse, streams: RequestStreams) -> axum::respons
 }
 
 /// The security headers of a handler response or a static file: the
-/// [`crate::csp::Profile::Response`] policy.
+/// [`crate::csp::Guarded::Response`] policy.
 fn response_security_headers()
 -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
-    crate::telemetry::security_headers(crate::csp::Profile::Response)
+    crate::telemetry::security_headers(&crate::csp::Guarded::Response)
 }
 
 /// [`to_axum_response`] over the outcome of reading the security headers.
@@ -4667,16 +4668,28 @@ const fn cookie_secure_floor_with(dev: Option<&crate::telemetry::DevIntent>) -> 
     dev.is_none()
 }
 
-/// 64 lowercase-hex chars (two concatenated UUIDv4s, ~244 combined random
-/// bits — comfortably above the 128-bit CSRF-token floor). `uuid::Uuid::new_v4`
-/// draws from the OS CSPRNG, the approved security-bearing-randomness source
-/// per `random.rs`. Re-exported from `web/csrf.rs` as `gen_token`.
-pub fn csrf_gen_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
+/// The number of random bytes in a CSRF token (256 bits, 64 hex chars).
+const CSRF_TOKEN_BYTES: usize = 32;
+
+/// A fresh CSRF token: 256 bits from the OS CSPRNG as 64 lowercase-hex chars.
+///
+/// Re-exported from `web/csrf.rs` as `mint_token`.
+///
+/// # Errors
+///
+/// [`EntropyError`] when the OS random source refuses the draw; there is no
+/// fallback token.
+pub fn mint_csrf_token() -> Result<String, EntropyError> {
+    mint_csrf_token_with(crate::entropy::fill_entropy)
+}
+
+/// [`mint_csrf_token`] drawing its bytes from `fill`.
+pub(crate) fn mint_csrf_token_with(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), EntropyError>,
+) -> Result<String, EntropyError> {
+    let mut bytes = [0_u8; CSRF_TOKEN_BYTES];
+    fill(&mut bytes)?;
+    Ok(hex::encode(bytes))
 }
 
 /// A token "looks valid" if it is the expected 64 lowercase-hex shape — used
@@ -4759,6 +4772,20 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
+    middleware_with_csrf_minting(h, mint_csrf_token)
+}
+
+/// [`middleware_with_csrf`] minting a missing token through `mint`.
+///
+/// An unsafe method is judged before any mint. A safe request reuses a
+/// well-formed cookie token and mints only without one; a refused mint answers
+/// 503 with `Retry-After` and never reaches the handler.
+fn middleware_with_csrf_minting<E, H, M>(h: H, mint: M) -> ServerHandler<E>
+where
+    E: Send + 'static,
+    H: IntoServerHandler<E>,
+    M: Fn() -> Result<String, EntropyError> + Send + Sync + 'static,
+{
     let h = h.into_server_handler();
     Arc::new(move |req: ServerRequest| {
         let safe = matches!(
@@ -4767,29 +4794,28 @@ where
         );
         let cookie_name = csrf_cookie_name();
         let existing = req.cookies.get(cookie_name.text()).cloned();
-        let token = existing
-            .clone()
-            .filter(|t| csrf_token_well_formed(t))
-            .unwrap_or_else(csrf_gen_token);
         if !safe {
-            let cookie_tok = existing.unwrap_or_default();
-            let header_tok = header_ci(&req.headers, "x-csrf-token")
-                .unwrap_or("")
-                .to_string();
-            if !csrf_pair_valid(&cookie_tok, &header_tok) {
+            let cookie_tok = existing.as_deref().unwrap_or_default();
+            let header_tok = header_ci(&req.headers, "x-csrf-token").unwrap_or("");
+            if !csrf_pair_valid(cookie_tok, header_tok) {
                 return Box::pin(async move {
                     ok_res(plain_resp(403, "csrf token invalid or missing", &[]))
                 });
             }
         }
+        let reused = existing.filter(|t| csrf_token_well_formed(t));
+        let Ok(token) = reused.map_or_else(&mint, Ok) else {
+            return Box::pin(async move {
+                ok_res(plain_resp(
+                    503,
+                    "service unavailable",
+                    &[("retry-after", "1")],
+                ))
+            });
+        };
         // Capture the request-scoped TLS signal HERE — before `req` is moved
-        // into `h(req)` below. `ServerRequest` is not `Clone`-cheap-by-design
-        // (it owns the full body/headers/cookies maps) and the wrapped
-        // handler legitimately needs to consume it, so there is no request
-        // left to inspect once `task` is awaited. `bool` is `Copy`, so this
-        // one-line snapshot is the entire adaptation needed versus the
-        // session-cookie fix (which reads `headers` at cookie-set time
-        // because `page_response` runs BEFORE the request is handed off).
+        // into `h(req)` below: the wrapped handler consumes the request, so
+        // nothing is left to inspect once `task` is awaited.
         let is_https = request_is_https(&req.headers);
         let task = h(req);
         Box::pin(async move {
@@ -7602,8 +7628,8 @@ mod tests {
     /// The `content-security-policy` the `Response` profile sends under this
     /// process's framing configuration.
     fn response_policy() -> String {
-        crate::csp::ContentSecurityPolicy::for_profile(
-            crate::csp::Profile::Response,
+        crate::csp::ContentSecurityPolicy::for_guard(
+            &crate::csp::Guarded::Response,
             crate::telemetry::frame_ancestors(),
         )
         .header_value()
@@ -8704,6 +8730,76 @@ mod tests {
             IpeResult::Ok(r) => assert_eq!(r.cookies.len(), 1, "GET must mint a fresh cookie"),
             IpeResult::Err(_) => panic!("GET must never be rejected"),
         }
+    }
+
+    /// A CSRF mint is drawn only for a safe request with no well-formed
+    /// cookie, and a refused mint answers 503 without reaching the handler.
+    #[tokio::test]
+    async fn csrf_mint_failure_is_503() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let mint_calls = Arc::clone(&mints);
+        let h = middleware_with_csrf_minting::<String, _, _>(
+            move |_req: ServerRequest| {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
+                    as IpeTask<String, ServerResponse>
+            },
+            move || {
+                mint_calls.fetch_add(1, Ordering::SeqCst);
+                Err(EntropyError)
+            },
+        );
+        let got = h(mk_req("GET", HashMap::new(), HashMap::new())).await;
+        assert!(matches!(&got, IpeResult::Ok(r) if r.status == 503));
+        let IpeResult::Ok(resp) = got else { return };
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("retry-after") && v == "1"),
+            "a refused mint asks the client to retry"
+        );
+        assert!(resp.cookies.is_empty(), "a refused mint sets no cookie");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never runs");
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+
+        let got = h(mk_req("POST", HashMap::new(), HashMap::new())).await;
+        assert!(matches!(&got, IpeResult::Ok(r) if r.status == 403));
+        assert_eq!(
+            mints.load(Ordering::SeqCst),
+            1,
+            "an unsafe method never mints"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut cookies = HashMap::new();
+        cookies.insert(csrf_cookie_name().text().to_owned(), "e".repeat(64));
+        let got = h(mk_req("GET", cookies, HashMap::new())).await;
+        assert!(matches!(&got, IpeResult::Ok(r) if r.status == 200));
+        assert_eq!(
+            mints.load(Ordering::SeqCst),
+            1,
+            "a well-formed cookie is reused"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A minted CSRF token is the 64 lowercase-hex rendering of its 32 drawn
+    /// bytes, and a refused draw yields no token.
+    #[test]
+    fn csrf_token_renders_its_draw_and_refuses_without_entropy() {
+        let tok = mint_csrf_token_with(|buf| {
+            buf.fill(0xa5);
+            Ok(())
+        });
+        assert_eq!(tok, Ok("a5".repeat(32)));
+        assert!(tok.as_deref().is_ok_and(csrf_token_well_formed));
+        assert_eq!(
+            mint_csrf_token_with(|_| Err(EntropyError)),
+            Err(EntropyError)
+        );
     }
 
     #[tokio::test]

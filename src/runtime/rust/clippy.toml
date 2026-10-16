@@ -32,6 +32,13 @@ allow-expect-in-tests = true
 # The process ends only through `system::exit_process`, which runs the pre-exit
 # stages Drop would have run (terminal restore, telemetry exporter flush) before
 # its one `std::process::exit`.
+#
+# Every random mint draws from `entropy::fill_entropy`, the one OS entropy
+# source, which refuses with `EntropyError` instead of panicking. A direct
+# `getrandom` call, uuid's clock read (which panics on a clock before the epoch)
+# and rand_core's `OsRng` (which panics when the source fails) are denied.
+# `uuid` and `rand_core` (through `aes-gcm`) are optional, so their entries
+# tolerate a build without them.
 disallowed-methods = [
     # The abrupt-failure constructs the root `clippy.toml` bans, mirrored here
     # because this crate reads its own config.
@@ -61,9 +68,12 @@ disallowed-methods = [
     { path = "serde_urlencoded::from_reader", reason = "lenient; decode a query or form body through `encoding::decode_form_query`", allow-invalid = true },
     { path = "url::Url::query_pairs", reason = "lenient; decode a query through `encoding::decode_form_query` (a driver-parity read goes through `ssrf::DriverParityQuery`)", allow-invalid = true },
     { path = "axum::serve::serve", reason = "serve an app listener through server::serve_app (Host admission)", allow-invalid = true },
+    { path = "getrandom::getrandom", reason = "draw entropy through `entropy::fill_entropy`, the runtime's one source" },
+    { path = "uuid::Timestamp::now", reason = "panics on an unreadable clock; build ids through `uuid_kernel`'s checked clock", allow-invalid = true },
 ]
 
 disallowed-types = [
     { path = "axum::extract::Query", reason = "lenient; read the request query through `server::strict_url_query`", allow-invalid = true },
     { path = "axum::extract::Form", reason = "lenient; decode a form body through `encoding::decode_form_query`", allow-invalid = true },
+    { path = "rand_core::OsRng", reason = "panics when the OS source fails; draw entropy through `entropy::fill_entropy`", allow-invalid = true },
 ]

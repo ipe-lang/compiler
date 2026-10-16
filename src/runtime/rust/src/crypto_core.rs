@@ -197,57 +197,59 @@ pub(crate) fn crypto_key_reveal(key: Key) -> String {
 // LOWERCASE HEX string — the Ipê signature is `String`, so the Rust side
 // must return a hex `String` (not a byte list).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn crypto_random_bytes<E: From<String> + Send + 'static>(n: i64) -> IpeTask<E, String> {
-    Box::pin(async move {
-        // SECURITY: reject size <= 0 || size > 1024 to prevent unbounded
-        // attacker-controlled allocation (DoS vector).
-        if n <= 0 || n > 1024 {
-            return IpeResult::Err(
-                "Crypto.randomBytes: size must be 1..1024"
-                    .to_string()
-                    .into(),
-            );
-        }
-        let count = n as usize;
-        let mut buf = vec![0u8; count];
-        if getrandom::getrandom(&mut buf).is_err() {
-            return IpeResult::Err(
-                "Crypto.randomBytes: OS entropy source unavailable"
-                    .to_string()
-                    .into(),
-            );
-        }
-        ok_res(hex_lower(&buf))
-    })
+pub fn crypto_random_bytes<E: From<String> + FromUnavailable + Send + 'static>(
+    n: i64,
+) -> IpeTask<E, String> {
+    Box::pin(async move { random_bytes_with(crate::entropy::fill_entropy, n) })
 }
 
-/// Browser substitute: `crypto.getRandomValues` via the `getrandom` crate's
-/// `js` backend (Q3: "`Random.*` / `Crypto.randomBytes` | SUBSTITUTE |
-/// `crypto.getRandomValues`") — no `aes-gcm`/`OsRng` dependency pulled into
-/// the bundle just for entropy. Same size guard + hex encoding as the native
-/// arm — same size guard + hex encoding as the native arm; the size guard is a
-/// real DoS control on both targets.
+/// Browser arm of `Crypto.randomBytes`: the same draw through
+/// [`crate::entropy::fill_entropy`] (`crypto.getRandomValues` in a browser),
+/// the same size guard and hex encoding, with no `Send` bound.
 #[cfg(target_arch = "wasm32")]
-pub fn crypto_random_bytes<E: From<String> + 'static>(n: i64) -> IpeTask<E, String> {
-    Box::pin(async move {
-        if n <= 0 || n > 1024 {
-            return IpeResult::Err(
-                "Crypto.randomBytes: size must be 1..1024"
-                    .to_string()
-                    .into(),
-            );
-        }
-        let count = n as usize;
-        let mut buf = vec![0u8; count];
-        if getrandom::getrandom(&mut buf).is_err() {
-            return IpeResult::Err(
-                "Crypto.randomBytes: browser entropy source unavailable"
-                    .to_string()
-                    .into(),
-            );
-        }
-        ok_res(hex_lower(&buf))
-    })
+pub fn crypto_random_bytes<E: From<String> + FromUnavailable + 'static>(
+    n: i64,
+) -> IpeTask<E, String> {
+    Box::pin(async move { random_bytes_with(crate::entropy::fill_entropy, n) })
+}
+
+/// The largest entropy draw a random kernel serves, in bytes.
+const MAX_RANDOM_BYTES: usize = 1024;
+
+/// `n` bytes `fill` draws for the kernel `name`, or the kernel's refusal.
+///
+/// SECURITY: a size outside `1..=1024` is refused before any allocation, so a
+/// caller cannot request an unbounded buffer. A refused draw fails with kind
+/// `Unavailable`; no bytes are produced from a weaker source.
+fn random_draw<E: From<String> + FromUnavailable>(
+    name: &str,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
+    n: i64,
+) -> Result<Vec<u8>, E> {
+    let Some(count) = usize::try_from(n)
+        .ok()
+        .filter(|c| (1..=MAX_RANDOM_BYTES).contains(c))
+    else {
+        return Err(format!("{name}: size must be 1..{MAX_RANDOM_BYTES}").into());
+    };
+    let mut buf = vec![0_u8; count];
+    match fill(&mut buf) {
+        Ok(()) => Ok(buf),
+        Err(crate::entropy::EntropyError) => Err(E::from_unavailable(format!(
+            "{name}: the OS random source is unavailable"
+        ))),
+    }
+}
+
+/// `Crypto.randomBytes` over the draw `fill` makes.
+fn random_bytes_with<E: From<String> + FromUnavailable>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
+    n: i64,
+) -> IpeResult<E, String> {
+    match random_draw("Crypto.randomBytes", fill, n) {
+        Ok(buf) => ok_res(hex_lower(&buf)),
+        Err(e) => IpeResult::Err(e),
+    }
 }
 
 /// Lowercase hex encoding, byte-order + nibble-order identical to
@@ -305,53 +307,30 @@ fn base64url_no_pad(buf: &[u8]) -> String {
 // WITHOUT padding — the `-_` alphabet, no `=` pad. Width `n` is bytes of
 // ENTROPY; the returned string is longer (ceil(n*4/3) chars).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn crypto_random_token<E: From<String> + Send + 'static>(n: i64) -> IpeTask<E, String> {
-    Box::pin(async move {
-        // SECURITY: reject size <= 0 || size > 1024 to prevent unbounded
-        // attacker-controlled allocation (DoS vector).
-        if n <= 0 || n > 1024 {
-            return IpeResult::Err(
-                "Crypto.randomToken: size must be 1..1024"
-                    .to_string()
-                    .into(),
-            );
-        }
-        let count = n as usize;
-        let mut buf = vec![0u8; count];
-        if getrandom::getrandom(&mut buf).is_err() {
-            return IpeResult::Err(
-                "Crypto.randomToken: OS entropy source unavailable"
-                    .to_string()
-                    .into(),
-            );
-        }
-        ok_res(base64url_no_pad(&buf))
-    })
+pub fn crypto_random_token<E: From<String> + FromUnavailable + Send + 'static>(
+    n: i64,
+) -> IpeTask<E, String> {
+    Box::pin(async move { random_token_with(crate::entropy::fill_entropy, n) })
 }
 
-/// Browser substitute — same `getrandom(js)` entropy source as
-/// `crypto_random_bytes`, URL-safe-no-pad base64 encoded.
+/// Browser arm of `Crypto.randomToken`: the same draw as
+/// `crypto_random_bytes`, URL-safe-no-pad base64 encoded, with no `Send` bound.
 #[cfg(target_arch = "wasm32")]
-pub fn crypto_random_token<E: From<String> + 'static>(n: i64) -> IpeTask<E, String> {
-    Box::pin(async move {
-        if n <= 0 || n > 1024 {
-            return IpeResult::Err(
-                "Crypto.randomToken: size must be 1..1024"
-                    .to_string()
-                    .into(),
-            );
-        }
-        let count = n as usize;
-        let mut buf = vec![0u8; count];
-        if getrandom::getrandom(&mut buf).is_err() {
-            return IpeResult::Err(
-                "Crypto.randomToken: browser entropy source unavailable"
-                    .to_string()
-                    .into(),
-            );
-        }
-        ok_res(base64url_no_pad(&buf))
-    })
+pub fn crypto_random_token<E: From<String> + FromUnavailable + 'static>(
+    n: i64,
+) -> IpeTask<E, String> {
+    Box::pin(async move { random_token_with(crate::entropy::fill_entropy, n) })
+}
+
+/// `Crypto.randomToken` over the draw `fill` makes.
+fn random_token_with<E: From<String> + FromUnavailable>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
+    n: i64,
+) -> IpeResult<E, String> {
+    match random_draw("Crypto.randomToken", fill, n) {
+        Ok(buf) => ok_res(base64url_no_pad(&buf)),
+        Err(e) => IpeResult::Err(e),
+    }
 }
 
 pub fn crypto_sha256(s: String) -> String {
@@ -566,6 +545,55 @@ pub fn ipe_crypto_rsa_sha256_sign(
 #[cfg(not(target_arch = "wasm32"))]
 mod tests_core {
     use super::*;
+
+    /// A random kernel without entropy fails with kind `Unavailable`, never the
+    /// `Unexpected` a stringly error would carry.
+    #[test]
+    fn random_bytes_refuse_unavailable() {
+        use crate::entropy::EntropyError;
+        use crate::{IpeError, IpeErrorKind};
+        let refused: IpeResult<IpeError, String> = random_bytes_with(|_| Err(EntropyError), 16);
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(IpeError::Error(IpeErrorKind::Unavailable, _))
+            ),
+            "{refused:?}"
+        );
+        let drawn: IpeResult<IpeError, String> = random_bytes_with(|_| Ok(()), 2);
+        assert!(
+            matches!(&drawn, IpeResult::Ok(hex) if hex == "0000"),
+            "{drawn:?}"
+        );
+        let oversized: IpeResult<IpeError, String> = random_bytes_with(|_| Ok(()), 1025);
+        assert!(
+            matches!(
+                &oversized,
+                IpeResult::Err(IpeError::Error(kind, _)) if *kind != IpeErrorKind::Unavailable
+            ),
+            "{oversized:?}"
+        );
+    }
+
+    /// A token mint without entropy fails with kind `Unavailable`.
+    #[test]
+    fn random_token_refuse_unavailable() {
+        use crate::entropy::EntropyError;
+        use crate::{IpeError, IpeErrorKind};
+        let refused: IpeResult<IpeError, String> = random_token_with(|_| Err(EntropyError), 16);
+        assert!(
+            matches!(
+                &refused,
+                IpeResult::Err(IpeError::Error(IpeErrorKind::Unavailable, _))
+            ),
+            "{refused:?}"
+        );
+        let drawn: IpeResult<IpeError, String> = random_token_with(|_| Ok(()), 3);
+        assert!(
+            matches!(&drawn, IpeResult::Ok(t) if t == "AAAA"),
+            "{drawn:?}"
+        );
+    }
 
     // Extract the `Key` from a `crypto_key_from_string`/`_bytes` construction in
     // tests that pass a known non-empty key (always `Just`). A `Nothing` is a

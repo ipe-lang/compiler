@@ -1937,6 +1937,7 @@ async fn vet_dial_target<R: HostResolver>(
 async fn postgres_connect_options<R: HostResolver>(
     url: &PostgresUrl,
     policy: DialPolicy,
+    relay: RelaySupport,
     resolver: &R,
     max_connections: u32,
 ) -> Result<PinnedPgOptions, DbConnectError> {
@@ -1953,10 +1954,26 @@ async fn postgres_connect_options<R: HostResolver>(
     match policy {
         DialPolicy::AllowAll => Ok((options, None)),
         DialPolicy::DenyPrivate => {
-            pin_postgres_options(&url.url, options, &vetted, resolver, max_connections).await
+            pin_postgres_options(&url.url, options, &vetted, relay, resolver, max_connections).await
         }
     }
 }
+
+/// Whether a host can carry a pinned dial through a local relay socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaySupport {
+    /// A `PinnedRelay` can be opened.
+    Available,
+    /// No relay exists, so a dial that needs one is refused.
+    Absent,
+}
+
+/// This host's relay support: a `PinnedRelay` listens on a Unix-domain socket.
+const HOST_RELAY: RelaySupport = if cfg!(unix) {
+    RelaySupport::Available
+} else {
+    RelaySupport::Absent
+};
 
 /// Pin the dial of `options`, the driver's reading of `url`, to its vetted address.
 ///
@@ -1969,12 +1986,13 @@ async fn postgres_connect_options<R: HostResolver>(
 /// its name, because the driver sends it as SNI and verifies the certificate
 /// against it; the driver instead dials the socket of a `PinnedRelay` that
 /// carries every connection to the vetted address, so no dial resolves the
-/// name again. Where no relay exists, `verify-full` on a named host is refused
-/// rather than silently weakened.
+/// name again. Where `relay` is [`RelaySupport::Absent`], `verify-full` on a
+/// named host is refused rather than silently weakened.
 async fn pin_postgres_options<R: HostResolver>(
     url: &UnambiguousUrl,
     options: sqlx::postgres::PgConnectOptions,
     vetted: &[(DialTarget, VettedDial)],
+    relay: RelaySupport,
     resolver: &R,
     max_connections: u32,
 ) -> Result<PinnedPgOptions, DbConnectError> {
@@ -1991,8 +2009,8 @@ async fn pin_postgres_options<R: HostResolver>(
         .is_ok();
     #[cfg(not(unix))]
     let _no_relay_to_cap = max_connections;
-    #[cfg(not(unix))]
-    if !literal
+    if relay == RelaySupport::Absent
+        && !literal
         && matches!(
             options.get_ssl_mode(),
             sqlx::postgres::PgSslMode::VerifyFull
@@ -2021,7 +2039,8 @@ async fn pin_postgres_options<R: HostResolver>(
         }
     };
     #[cfg(unix)]
-    if let VettedDial::Pinned(target) = dial
+    if relay == RelaySupport::Available
+        && let VettedDial::Pinned(target) = dial
         && !literal
         && !matches!(
             options.get_ssl_mode(),
@@ -2087,6 +2106,7 @@ impl GatedDial for sqlx::Postgres {
                 let (options, pinned) = postgres_connect_options(
                     postgres,
                     DialPolicy::from_env(),
+                    HOST_RELAY,
                     &SystemResolver,
                     max_connections,
                 )
@@ -12642,7 +12662,17 @@ mod tests {
         policy: DialPolicy,
         resolver: &R,
     ) -> Result<PinnedPgOptions, DbConnectError> {
-        postgres_connect_options(&PostgresUrl::parse(url)?, policy, resolver, 4).await
+        postgres_connect_options(&PostgresUrl::parse(url)?, policy, HOST_RELAY, resolver, 4).await
+    }
+
+    /// The gate's verdict on `url` under deny-private, with `relay` as the host's relay support.
+    async fn pg_gate_relay<R: HostResolver>(
+        url: &str,
+        relay: RelaySupport,
+        resolver: &R,
+    ) -> Result<PinnedPgOptions, DbConnectError> {
+        let url = PostgresUrl::parse(url)?;
+        postgres_connect_options(&url, DialPolicy::DenyPrivate, relay, resolver, 4).await
     }
 
     /// The gate's verdict on `url` under `policy`, with no DNS available.
@@ -12715,7 +12745,7 @@ mod tests {
         let (Ok(url), Ok(options)) = (url, options) else {
             return;
         };
-        let pinned = pin_postgres_options(&url, options, &[], &NoDns, 4).await;
+        let pinned = pin_postgres_options(&url, options, &[], HOST_RELAY, &NoDns, 4).await;
         assert!(matches!(
             pinned,
             Err(DbConnectError::HostRefused(SsrfRefusal::UnprovenTarget))
@@ -12811,13 +12841,12 @@ mod tests {
     /// Without a relay, a named host under `sslmode=verify-full` cannot be
     /// pinned without losing the certificate's host-name check, so it is
     /// refused; an IP literal under the same mode is pinned as itself.
-    #[cfg(not(unix))]
     #[tokio::test]
-    async fn pg_gate_refuses_verify_full_on_a_named_host_under_deny_private() {
+    async fn pg_verify_full_named_host_refused_when_relay_absent() {
         let resolver = PublicThenPrivate::new();
-        let refused = pg_gate_with(
+        let refused = pg_gate_relay(
             "postgres://db.example/x?sslmode=verify-full",
-            DialPolicy::DenyPrivate,
+            RelaySupport::Absent,
             &resolver,
         )
         .await;
@@ -12829,12 +12858,26 @@ mod tests {
                 }
             ))
         );
-        let literal = pg_gate(
+        let literal = pg_gate_relay(
             "postgres://1.1.1.1/x?sslmode=verify-full",
-            DialPolicy::DenyPrivate,
+            RelaySupport::Absent,
+            &NoDns,
         )
         .await;
         assert!(literal.is_ok(), "{:?}", literal.err());
+    }
+
+    /// With a relay, the same named host under `sslmode=verify-full` is admitted.
+    #[tokio::test]
+    async fn pg_verify_full_named_host_admitted_when_relay_available() {
+        let resolver = PublicThenPrivate::new();
+        let admitted = pg_gate_relay(
+            "postgres://db.example/x?sslmode=verify-full",
+            RelaySupport::Available,
+            &resolver,
+        )
+        .await;
+        assert!(admitted.is_ok(), "{:?}", admitted.err());
     }
 
     /// DNS rebinding under every mode that may negotiate TLS: the host keeps

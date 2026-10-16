@@ -622,8 +622,9 @@ pub enum NameError {
     /// (TEA) app entry — imports a shape module under `Ipe.Tea.*`. The
     /// `Ipe.Tea.*` namespace holds only live-loop machinery; importing any part
     /// of it marks a module a TEA app, so a Program that does so is a
-    /// contradiction rejected here. `module` is the offending `Ipe.Tea.*` import
-    /// path. [IPE-N0033]
+    /// contradiction rejected here. The one admitted Program is a server whose
+    /// `main` ends in a direct `Server.listen` call, mounting a `Web.embed` app.
+    /// `module` is the offending `Ipe.Tea.*` import path. [IPE-N0033]
     ProgramImportsTeaShape { module: Box<str> },
     /// A TEA app imports another shape's `Cmd` / `Sub` re-export module. `Cmd`
     /// and `Sub` are shape-specific and reached through the app's own shape
@@ -1771,6 +1772,23 @@ pub enum LowerError {
         /// The dotted kernel name that was used unsaturated (e.g. `Stream.stream`).
         kernel: Box<str>,
     },
+    /// An unannotated binding's type mentions a type variable another binding keeps generic.
+    ///
+    /// A same-module use of an unannotated `helper` inside the annotated,
+    /// generic `owner` shares the helper's one type with the owner's type
+    /// variable `var`. The owner emits `var` as its own Rust generic, but the
+    /// helper has no type parameter for it and would read it as free (`()` in
+    /// a message slot), so the call between the two emitted functions would
+    /// not type-check under cargo. Refused fail-closed at `ipe` time; the fix
+    /// is a signature on the helper. [IPE-L0102]
+    ForeignTypeVariable {
+        /// The unannotated binding (e.g. `chip`).
+        helper: Box<str>,
+        /// The generic binding whose type variable it borrows (e.g. `row`).
+        owner: Box<str>,
+        /// The owner's type variable (e.g. `msg`).
+        var: Box<str>,
+    },
 }
 
 /// Why a literal route pattern or server route path was refused under
@@ -2779,6 +2797,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::PointFreeAccessorKernel { .. }
         | LowerError::AccessorKernelOffIntercept { .. } => IPE_L0146,
         LowerError::UnsaturatedHandlerKernel { .. } => IPE_L0152,
+        LowerError::ForeignTypeVariable { .. } => IPE_L0102,
         LowerError::StoreSelectProjectionInvalid(_) => IPE_L0149,
     })
 }
@@ -3256,6 +3275,9 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             accessor_kernel_off_intercept_help(kernel, *context)
         }
         LowerError::UnsaturatedHandlerKernel { kernel } => unsaturated_handler_kernel_help(kernel),
+        LowerError::ForeignTypeVariable { helper, owner, var } => {
+            foreign_type_variable_help(helper, owner, var)
+        }
         LowerError::StoreSelectProjectionInvalid(defect) => {
             store_select_projection_invalid_help(defect)
         }
@@ -3342,6 +3364,22 @@ fn accessor_kernel_off_intercept_help(kernel: &str, context: InterceptContext) -
         )
         .into_boxed_str(),
     )]
+}
+
+/// The help lines for [`LowerError::ForeignTypeVariable`], factored out so
+/// [`lower_help`] stays a thin per-variant dispatcher.
+fn foreign_type_variable_help(helper: &str, owner: &str, var: &str) -> Vec<HelpLine> {
+    vec![
+        HelpLine::Note(
+            format!(
+                "give `{helper}` its own type annotation, generic over its own type \
+                 variable; it is used inside `{owner}`, whose type variable `{var}` it \
+                 would otherwise borrow without being generic over it"
+            )
+            .into_boxed_str(),
+        ),
+        HelpLine::SeeExplain("IPE-L0102"),
+    ]
 }
 
 /// The help lines for [`LowerError::UnsaturatedHandlerKernel`], factored out so
@@ -3868,6 +3906,51 @@ mod code_family_tests {
                 c.as_str()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod foreign_type_variable_help_tests {
+    use super::{HelpLine, foreign_type_variable_help};
+
+    /// The fix the note names fits every shape: a non-message borrow
+    /// (`ident` under `f : a -> a`) is never told to return a UI carrier.
+    #[test]
+    fn note_names_the_binding_and_no_type_constructor() {
+        let lines = foreign_type_variable_help("ident", "f", "a");
+        let notes: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| match line {
+                HelpLine::Note(text) => Some(&**text),
+                HelpLine::DidYouMean(_)
+                | HelpLine::Hint(_)
+                | HelpLine::SecondarySpan { .. }
+                | HelpLine::MissingConstructor(_)
+                | HelpLine::Suggest(_)
+                | HelpLine::SeeExplain(_) => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1, "exactly one note: {lines:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|n| n.contains("`ident`") && n.contains("`f`") && n.contains("`a`")),
+            "the note names helper, owner, and variable: {notes:?}"
+        );
+        assert!(
+            notes.iter().all(|n| {
+                !["Html", "Element", "Attribute", "Event"]
+                    .iter()
+                    .any(|carrier| n.contains(carrier))
+            }),
+            "the note must not prescribe a UI carrier for a non-message borrow: {notes:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| matches!(line, HelpLine::SeeExplain("IPE-L0102"))),
+            "the help points at the explain page: {lines:?}"
+        );
     }
 }
 
