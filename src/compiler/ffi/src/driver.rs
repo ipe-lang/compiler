@@ -2277,6 +2277,10 @@ mod tests {
         ]
     }
 
+    /// The permission bits granting access to a file's group or to others.
+    #[cfg(unix)]
+    const GROUP_OR_OTHER: u32 = 0o077;
+
     /// Whether the entry at `path`, not followed, grants nothing to its group or to others.
     #[cfg(unix)]
     fn owner_only(path: &Path) -> bool {
@@ -2285,7 +2289,7 @@ mod tests {
             .expect("stat")
             .permissions()
             .mode();
-        mode & 0o077 == 0
+        mode & GROUP_OR_OTHER == 0
     }
 
     #[cfg(unix)]
@@ -2293,12 +2297,12 @@ mod tests {
     fn write_package_creates_owner_only_directories_and_artifacts() {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
         assert_eq!(
-            PRIVATE_DIR_MODE & 0o077,
+            PRIVATE_DIR_MODE & GROUP_OR_OTHER,
             0,
             "the directory mode is owner-only"
         );
         assert_eq!(
-            PRIVATE_FILE_MODE & 0o077,
+            PRIVATE_FILE_MODE & GROUP_OR_OTHER,
             0,
             "the artifact mode is owner-only"
         );
