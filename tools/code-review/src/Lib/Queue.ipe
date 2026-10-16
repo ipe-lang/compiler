@@ -206,6 +206,8 @@ keyPart part =
 -- log's verdict the page was read under. `refusals` are the first open
 -- files the index could not review and `refusalsOpen` counts every open
 -- one: open review work the page shows apart from its units.
+-- `refusalsUnbound` counts the unreviewable files under a tag no
+-- configured root binds, said beside the unbound units.
 type alias QueuePage =
     { units : List QueuedUnit
     , total : Int
@@ -217,6 +219,7 @@ type alias QueuePage =
     , log : LogShown
     , refusals : List Index.RefusalRow
     , refusalsOpen : Int
+    , refusalsUnbound : Int
     }
 
 
@@ -1330,12 +1333,19 @@ unitsWord count =
         " units"
 
 
--- The units under a tag no configured root binds, left out of the queue
--- and its progress, said where the queue's counts are; empty when none is.
+-- The units and the unreviewable files under a tag no configured root
+-- binds, left out of the queue and its progress, said where the queue's
+-- counts are; empty when none is.
 unboundNotice : QueuePage -> String
 unboundNotice page =
-    if page.unbound > 0 then
-        " · " ++ String.fromInt page.unbound ++ unitsWord page.unbound ++ " in unbound repositories not shown"
+    unboundPart page.unbound (String.fromInt page.unbound ++ unitsWord page.unbound)
+        ++ unboundPart page.refusalsUnbound (String.dropLeft 1 (refusalsWord page.refusalsUnbound))
+
+
+unboundPart : Int -> String -> String
+unboundPart count what =
+    if count > 0 then
+        " · " ++ what ++ " in unbound repositories not shown"
 
     else
         ""
@@ -1392,6 +1402,7 @@ pageOf settings db fresh =
                     , log = LibDb.logShown state
                     , refusals = snap.refusals
                     , refusalsOpen = snap.refusalsOpen
+                    , refusalsUnbound = snap.refusalsUnbound
                     }
 
 

@@ -1191,13 +1191,13 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
 snapshotReaders : List String
 snapshotReaders =
-    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "countUnbound", "countAll", "loadRefusalPage", "countOpenRefusals", "countRefusals", "dbBytes" ]
+    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "countUnbound", "countAll", "loadRefusalPage", "countOpenRefusals", "countRefusals", "countRefusalsPartitioned", "countUnboundRefusals", "countAllRefusals", "dbBytes" ]
 
 
 -- True when the module header of `source` exposes exactly `indexExposes`.
