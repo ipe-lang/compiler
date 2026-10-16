@@ -70,9 +70,13 @@ pub enum Attribute<M> {
 /// at the codegen call site, never `Arc<dyn Any>`. A payload erased behind
 /// `Arc<dyn Any>` would be undispatchable in any backend, so no such variant
 /// exists.
+///
+/// `OnMsg` boxes its message, so an attribute's inline size is the same for
+/// every app's `Msg` and a wide `Msg` costs one allocation per handler, which
+/// the view measure counts.
 #[derive(Clone)]
 pub enum Event<M> {
-    OnMsg(String, M),
+    OnMsg(String, Box<M>),
     OnString(String, std::sync::Arc<dyn Fn(String) -> M + Send + Sync>),
     OnBool(String, std::sync::Arc<dyn Fn(bool) -> M + Send + Sync>),
     /// Form-submit handler. Returns `Option<M>`: a malformed/incomplete form
@@ -95,6 +99,9 @@ pub enum Event<M> {
         std::sync::Arc<dyn Fn(String) -> Option<M> + Send + Sync>,
     ),
 }
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an event's message is stored inline, so an attribute's size would depend on the app's `Msg` [ledger #boundary]
+const _: () = assert!(size_of::<Attribute<[u8; 4096]>>() == size_of::<Attribute<()>>());
 
 impl<M: PartialEq> PartialEq for Attribute<M> {
     fn eq(&self, o: &Self) -> bool {
@@ -1160,6 +1167,7 @@ fn assign_ipe_ids_depth<M>(node: &mut Html<M>, path: &str, depth: usize, group: 
     }
     if let Html::HElement(tag, attrs, kids) = node {
         attrs.retain(|a| !is_unstamped_reserved_attr(a));
+        attrs.reserve_exact(1);
         attrs.push(Attribute::Attr(STAMPED_ID_ATTR.to_owned(), path.to_owned()));
         let own_group = (tag.as_str() == "fieldset" && take_radio_group_marker(attrs))
             .then(|| format!("ipe-rg-{path}"));
@@ -1291,7 +1299,7 @@ pub fn html_no_attr_<M>() -> Attribute<M> {
 /// attacker data).
 #[must_use]
 pub fn html_on_msg_<M>(name: String, msg: M) -> Attribute<M> {
-    Attribute::EventAttr(Event::OnMsg(name, msg))
+    Attribute::EventAttr(Event::OnMsg(name, Box::new(msg)))
 }
 
 /// `Ipe.Html.Events.{onInput,onChange,onKeyDown,onKeyUp}` — a
@@ -1533,6 +1541,8 @@ impl<M: RetainedBytes> RetainedBytes for Event<M> {
     fn retained_bytes(&self) -> Option<Bytes> {
         let inline = Bytes::inline::<Self>()?;
         match self {
+            // `plus` on the box counts its allocation (`size_of::<M>()`) and
+            // the heap `M` owns.
             Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
             // A handler's captured heap is not reachable through `dyn Fn`, so
             // its measure is unknown rather than an undercount.
@@ -1547,6 +1557,7 @@ impl<M: RetainedBytes> Event<M> {
     pub(crate) fn handler_floor(&self) -> Option<Bytes> {
         let inline = Bytes::inline::<Self>()?;
         match self {
+            // As in the retained measure: the box's allocation and `M`'s heap.
             Self::OnMsg(name, msg) => inline.plus(name)?.plus(msg),
             Self::OnString(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
             Self::OnWidget(name, f) => inline.plus(name)?.checked_add(closure_bytes(f.as_ref())?),
@@ -1613,7 +1624,7 @@ mod tests {
             "p".into(),
             vec![
                 Attribute::Attr("class".into(), "c".repeat(64)),
-                Attribute::EventAttr(Event::OnMsg("click".into(), "m".repeat(64))),
+                Attribute::EventAttr(Event::OnMsg("click".into(), Box::new("m".repeat(64)))),
             ],
             vec![Html::HText("x".repeat(64))],
         );
@@ -1625,8 +1636,118 @@ mod tests {
     #[test]
     fn an_event_counts_its_message() {
         let msg = "m".repeat(4096);
-        let attr: Attribute<String> = Attribute::EventAttr(Event::OnMsg("click".into(), msg));
+        let attr: Attribute<String> =
+            Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(msg)));
         assert!(attr.retained_bytes().is_some_and(|n| n.get() >= 4096));
+    }
+
+    /// A 600-byte message, as wide as a rich app `Msg`.
+    #[derive(Clone)]
+    #[allow(dead_code)] // the bytes are the width; nothing reads them
+    struct Wide([u8; 600]);
+
+    /// A 4 KiB message.
+    #[derive(Clone)]
+    #[allow(dead_code)] // the bytes are the width; nothing reads them
+    struct Huge([u8; 4096]);
+
+    crate::retained::inline_measure!(Wide, Huge);
+
+    // A wide message does not widen the attribute that carries it.
+    #[test]
+    fn a_wide_message_keeps_the_attribute_size() {
+        assert_eq!(size_of::<Attribute<Wide>>(), size_of::<Attribute<()>>());
+        assert_eq!(size_of::<Attribute<Huge>>(), size_of::<Attribute<()>>());
+    }
+
+    // Every boxed message is charged at its full width, not by its pointer.
+    #[test]
+    fn a_boxed_message_is_charged_at_its_width() {
+        let n = 32_usize;
+        let view: Html<Huge> = Html::HElement(
+            "div".into(),
+            Vec::new(),
+            (0..n)
+                .map(|_| {
+                    Html::HElement(
+                        "button".into(),
+                        vec![html_on_msg_("click".into(), Huge([0; 4096]))],
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+        );
+        let floor = u64::try_from(n * 4096).ok();
+        let measured = view.view_bytes().map(Bytes::get);
+        assert!(
+            measured.zip(floor).is_some_and(|(m, f)| m >= f),
+            "{measured:?} < {floor:?}"
+        );
+    }
+
+    // Stamping an element adds exactly the one slot its id needs.
+    #[test]
+    fn a_stamped_element_holds_no_spare_attribute_slot() {
+        let mut view: Html<()> = Html::HElement(
+            "div".into(),
+            vec![Attribute::Attr("class".into(), "c".into())],
+            vec![Html::HElement("span".into(), Vec::new(), Vec::new())],
+        );
+        assign_ipe_ids(&mut view, "0");
+        let mut pending = vec![&view];
+        let mut seen = 0_usize;
+        while let Some(node) = pending.pop() {
+            if let Html::HElement(_, attrs, kids) = node {
+                assert_eq!(attrs.capacity(), attrs.len(), "{attrs:?}");
+                seen += 1;
+                pending.extend(kids);
+            }
+        }
+        assert_eq!(seen, 2);
+    }
+
+    /// The bound on one drawn element's resident bytes that an app sizing its
+    /// view by element count relies on.
+    const DRAWN_ELEMENT_BYTES: u64 = 768;
+
+    // A 1000-token source view in the shape a code viewer draws (a `code`
+    // block, one line element with a click handler carrying a 600-byte
+    // message, one styled span per token run) stays within the per-element
+    // bound once stamped.
+    #[test]
+    fn a_drawn_source_view_stays_within_the_element_bound() {
+        let (lines, per_line) = (100_usize, 10_usize);
+        let line = |row: usize| {
+            Html::HElement(
+                "span".into(),
+                vec![html_on_msg_("click".into(), Wide([0; 600]))],
+                (0..per_line)
+                    .map(|col| {
+                        Html::HElement(
+                            "span".into(),
+                            vec![Attribute::Attr("style".into(), "color:#cdcdd7".into())],
+                            vec![Html::HText(format!("t{row}x{col}"))],
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let mut view: Html<Wide> = Html::HElement(
+            "code".into(),
+            vec![Attribute::Attr(
+                "style".into(),
+                "unicode-bidi:bidi-override;white-space:pre".into(),
+            )],
+            (0..lines).map(line).collect(),
+        );
+        assign_ipe_ids(&mut view, "0");
+        let elements = u64::try_from(1 + lines + lines * per_line).ok();
+        let measured = view.view_bytes().map(Bytes::get);
+        let bound = elements.and_then(|e| e.checked_mul(DRAWN_ELEMENT_BYTES));
+        assert!(
+            measured.zip(bound).is_some_and(|(m, b)| m <= b),
+            "{measured:?} > {bound:?}"
+        );
     }
 
     // An attribute's `{:?}` names the attribute and hides its value.
@@ -1910,7 +2031,10 @@ mod tests {
     fn render_emits_data_event_attr() {
         let t: Html<()> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(()),
+            ))],
             vec![],
         );
         let mut t = t;
@@ -2422,7 +2546,7 @@ mod tests {
             vec![
                 Attribute::Attr("data-ipe-hid".into(), "r_9_button".into()),
                 Attribute::Attr("Data-Ipe-Hid".into(), "r_9_button".into()),
-                Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+                Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(()))),
             ],
             vec![],
         );
@@ -2471,7 +2595,10 @@ mod tests {
     fn html_tree_constructs() {
         let t: Html<Msg> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), Msg::Inc))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(Msg::Inc),
+            ))],
             vec![Html::HText("+".into())],
         );
         match &t {
@@ -2484,7 +2611,8 @@ mod tests {
         }
 
         // Clone + PartialEq round-trip on an attribute holding a closure.
-        let attr: Attribute<Msg> = Attribute::EventAttr(Event::OnMsg("click".into(), Msg::Inc));
+        let attr: Attribute<Msg> =
+            Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(Msg::Inc)));
         assert_eq!(attr, attr.clone());
         // Debug prints the variant name + event name, not a numeric discriminant.
         let dbg = format!("{attr:?}");

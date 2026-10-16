@@ -429,7 +429,7 @@ mod tests {
             "button".to_string(),
             vec![Attribute::EventAttr(crate::html::Event::OnMsg(
                 "click".to_string(),
-                1,
+                Box::new(1),
             ))],
             vec![Html::HText("+".to_string())],
         );

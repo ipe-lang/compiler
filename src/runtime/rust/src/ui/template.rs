@@ -456,14 +456,15 @@ impl UiTemplateAttr {
         float_fills: &[Option<f64>],
     ) -> Attribute<M> {
         match self {
-            Self::HandlerHole { event, handler_id } => match handlers
-                .and_then(|h| h.resolve(*handler_id))
-            {
-                Some(msg) => {
-                    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(event.clone(), msg)))
+            Self::HandlerHole { event, handler_id } => {
+                match handlers.and_then(|h| h.resolve(*handler_id)) {
+                    Some(msg) => Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
+                        event.clone(),
+                        Box::new(msg),
+                    ))),
+                    None => Attribute::NoAttribute,
                 }
-                None => Attribute::NoAttribute,
-            },
+            }
             Self::AttrHoleFloat { attr, hole_id } => {
                 let value = float_fills.get(*hole_id as usize).and_then(|v| *v);
                 match value {
@@ -491,7 +492,7 @@ impl UiTemplateAttr {
                 let handler_id = u32::try_from(captures.len())
                     .ok()
                     .filter(|_| captures.len() < u32::MAX as usize)?;
-                captures.push(msg.clone());
+                captures.push(M::clone(msg));
                 Some(Self::HandlerHole {
                     event: event.clone(),
                     handler_id,
@@ -1548,7 +1549,7 @@ mod tests {
             "button".to_string(),
             Description::NoDescription,
             vec![Attribute::AttrEvent(crate::html::Attribute::EventAttr(
-                crate::html::Event::OnMsg("click".to_string(), 1),
+                crate::html::Event::OnMsg("click".to_string(), Box::new(1)),
             ))],
             vec![Element::Text("+".to_string())],
         );
@@ -1604,7 +1605,7 @@ mod tests {
                 "button".to_string(),
                 Description::NoDescription,
                 vec![Attribute::AttrEvent(crate::html::Attribute::EventAttr(
-                    crate::html::Event::OnMsg("click".to_string(), 7),
+                    crate::html::Event::OnMsg("click".to_string(), Box::new(7)),
                 ))],
                 vec![],
             )],
@@ -1877,7 +1878,7 @@ mod tests {
                 "button".to_string(),
                 Description::NoDescription,
                 vec![Attribute::AttrEvent(HtmlAttribute::EventAttr(
-                    Event::OnMsg("click".to_string(), msg),
+                    Event::OnMsg("click".to_string(), Box::new(msg)),
                 ))],
                 vec![Element::Text("pick".to_string())],
             )
@@ -1934,7 +1935,7 @@ mod tests {
                 "button".to_string(),
                 Description::NoDescription,
                 vec![Attribute::AttrEvent(HtmlAttribute::EventAttr(
-                    Event::OnMsg("click".to_string(), ()),
+                    Event::OnMsg("click".to_string(), Box::new(())),
                 ))],
                 vec![Element::Text("go".to_string())],
             );
@@ -2096,7 +2097,7 @@ mod tests {
                 "button".to_string(),
                 Description::NoDescription,
                 vec![Attribute::AttrEvent(HtmlAttribute::EventAttr(
-                    Event::OnMsg("click".to_string(), Msg::Select(3)),
+                    Event::OnMsg("click".to_string(), Box::new(Msg::Select(3))),
                 ))],
                 vec![Element::Text("one".to_string())],
             );
@@ -2105,7 +2106,7 @@ mod tests {
                 "button".to_string(),
                 Description::NoDescription,
                 vec![Attribute::AttrEvent(HtmlAttribute::EventAttr(
-                    Event::OnMsg("click".to_string(), Msg::Select(3)),
+                    Event::OnMsg("click".to_string(), Box::new(Msg::Select(3))),
                 ))],
                 vec![
                     Element::Text("one".to_string()),
@@ -2155,7 +2156,7 @@ mod tests {
                 Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(name, msg)))
                     if name == "click" =>
                 {
-                    Some(msg.clone())
+                    Some(Msg::clone(msg))
                 }
                 _ => None,
             })
@@ -2481,7 +2482,7 @@ mod tests {
                 Element::Node(
                     Description::NoDescription,
                     vec![Attribute::AttrEvent(HtmlAttribute::EventAttr(
-                        Event::OnMsg("click".to_string(), Msg::Submit),
+                        Event::OnMsg("click".to_string(), Box::new(Msg::Submit)),
                     ))],
                     vec![fill],
                 ),

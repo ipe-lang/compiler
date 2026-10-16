@@ -36,7 +36,7 @@ impl<M: Clone> HandlerIndex<M> {
     #[must_use]
     pub fn resolve(&self, ipe_id: &str, event: &str, args: &[String]) -> Option<M> {
         match self.map.get(ipe_id)?.get(event)? {
-            Event::OnMsg(_, m) => Some(m.clone()),
+            Event::OnMsg(_, m) => Some(M::clone(m)),
             Event::OnString(_, f) => Some(f(args.first().cloned().unwrap_or_default())),
             Event::OnBool(_, f) => Some(f(args.first().is_some_and(|s| s == "true"))),
             Event::OnForm(_, _) => None, // dispatched via resolve_form
@@ -325,6 +325,14 @@ impl<M: RetainedBytes> Rendered<M> {
     }
 }
 
+#[cfg(all(test, feature = "web", not(target_arch = "wasm32")))]
+impl<M> Rendered<M> {
+    /// Move the counter to its last value, so the next commit is exhausted.
+    pub(crate) const fn exhaust(&mut self) {
+        self.current = NonZeroU64::MAX;
+    }
+}
+
 impl<M: Clone> Rendered<M> {
     /// The first render of a new history, at counter 1.
     ///
@@ -352,8 +360,9 @@ impl<M: Clone> Rendered<M> {
 
     /// Install `tree` as the current view under a newly minted epoch.
     ///
-    /// The oldest retained index is evicted once the history holds
-    /// [`RENDER_HISTORY_DEPTH`] renders.
+    /// The oldest retained index is evicted before the new one is kept once
+    /// the history holds [`RENDER_HISTORY_DEPTH`] renders, so the history
+    /// never grows past the capacity it starts with.
     ///
     /// # Errors
     ///
@@ -362,10 +371,11 @@ impl<M: Clone> Rendered<M> {
     pub fn commit(&mut self, tree: Html<M>) -> Result<EpochStep, EpochExhausted> {
         let from = self.epoch();
         let next = self.current.checked_add(1).ok_or(EpochExhausted)?;
-        self.history.push_back((next, build_index(&tree)));
-        while self.history.len() > RENDER_HISTORY_DEPTH.get() {
+        let index = build_index(&tree);
+        while self.history.len() >= RENDER_HISTORY_DEPTH.get() {
             self.history.pop_front();
         }
+        self.history.push_back((next, index));
         self.current = next;
         self.last_view = tree;
         Ok(EpochStep {
@@ -513,6 +523,83 @@ mod tests {
         );
     }
 
+    /// A 600-byte message, as wide as a rich app `Msg`.
+    #[derive(Clone)]
+    #[allow(dead_code)] // the bytes are the width; nothing reads them
+    struct Wide([u8; 600]);
+
+    crate::retained::inline_measure!(Wide);
+
+    /// A stamped `code` block of `n` token spans; each span carries a click
+    /// handler when `handlers` holds.
+    fn drawn(n: usize, handlers: bool) -> Html<Wide> {
+        let span = |i: usize| {
+            let mut attrs = vec![Attribute::Attr("style".into(), "color:#cdcdd7".into())];
+            if handlers {
+                attrs.push(Attribute::EventAttr(Event::OnMsg(
+                    "click".into(),
+                    Box::new(Wide([0; 600])),
+                )));
+            }
+            Html::HElement("span".into(), attrs, vec![Html::HText(format!("t{i}"))])
+        };
+        let mut view = Html::HElement("code".into(), Vec::new(), (0..n).map(span).collect());
+        assign_ipe_ids(&mut view, "0");
+        view
+    }
+
+    /// The bytes a full render history of `drawn(n, handlers)` keeps resident
+    /// beyond its current view.
+    fn history_bytes(n: usize, handlers: bool) -> Option<u64> {
+        let mut rendered = Rendered::first(keys(), drawn(n, handlers));
+        for _ in 0..RENDER_HISTORY_DEPTH.get() {
+            rendered.commit(drawn(n, handlers)).ok()?;
+        }
+        let all = rendered.resident_bytes()?.get();
+        all.checked_sub(rendered.last_view().view_bytes()?.get())
+    }
+
+    // A full history evicts before it keeps, so it never reallocates past the
+    // capacity it started with, and every slot it is charged for holds a render.
+    #[test]
+    fn a_full_history_keeps_its_starting_capacity() {
+        let mut rendered = Rendered::first(keys(), tree());
+        let start = rendered.history.capacity();
+        for _ in 0..RENDER_HISTORY_DEPTH.get() + 4 {
+            assert!(rendered.commit(tree()).is_ok());
+        }
+        assert_eq!(rendered.history.len(), RENDER_HISTORY_DEPTH.get());
+        assert_eq!(rendered.history.capacity(), start);
+    }
+
+    // An element with no handler costs the render history nothing, so a drawn
+    // view of handler-free elements is bounded by its view bytes alone.
+    #[test]
+    fn a_handler_free_element_adds_nothing_to_the_history() {
+        let few = history_bytes(10, false);
+        let many = history_bytes(1000, false);
+        assert!(few.is_some(), "{few:?}");
+        assert_eq!(few, many);
+    }
+
+    // Each retained render holds its own copy of every handler's message, so
+    // an element with a handler costs the history at least the history depth
+    // times the message's width: a per-element bound measured on the view
+    // alone does not cover it.
+    #[test]
+    fn a_handler_element_costs_the_history_its_message_per_render() {
+        let n = 100_usize;
+        let held = history_bytes(n, true);
+        let floor = n
+            .checked_mul(RENDER_HISTORY_DEPTH.get())
+            .and_then(|k| k.checked_mul(size_of::<Wide>()))
+            .and_then(|f| u64::try_from(f).ok());
+        assert!(
+            held.zip(floor).is_some_and(|(h, f)| h >= f),
+            "{held:?} < {floor:?}"
+        );
+    }
+
     fn tree() -> Html<Msg> {
         let mut t = Html::HElement(
             "div".into(),
@@ -520,7 +607,10 @@ mod tests {
             vec![
                 Html::HElement(
                     "button".into(),
-                    vec![Attribute::EventAttr(Event::OnMsg("click".into(), Msg::Inc))],
+                    vec![Attribute::EventAttr(Event::OnMsg(
+                        "click".into(),
+                        Box::new(Msg::Inc),
+                    ))],
                     vec![],
                 ),
                 Html::HElement(
@@ -737,7 +827,7 @@ mod tests {
                 "button".into(),
                 vec![Attribute::EventAttr(Event::OnMsg(
                     "click".into(),
-                    Msg::Typed(label.into()),
+                    Box::new(Msg::Typed(label.into())),
                 ))],
                 vec![],
             )],

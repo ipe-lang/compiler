@@ -145,7 +145,7 @@ pub fn ui_button_<M: Clone>(
     match on_press {
         IpeMaybe::Just(msg) => {
             full.push(Attribute::AttrEvent(HtmlAttribute::EventAttr(
-                Event::OnMsg("click".into(), msg),
+                Event::OnMsg("click".into(), Box::new(msg)),
             )));
             full.push(Attribute::AttrPointer);
         }
@@ -713,24 +713,33 @@ use crate::html::{Attribute as HtmlAttribute, Event};
 
 /// `Ui.onClick : msg -> Attribute msg`
 pub fn ui_on_click_<M>(msg: M) -> Attribute<M> {
-    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg("click".into(), msg)))
+    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
+        "click".into(),
+        Box::new(msg),
+    )))
 }
 
 /// `Ui.onFocus : msg -> Attribute msg`
 pub fn ui_on_focus_<M>(msg: M) -> Attribute<M> {
-    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg("focus".into(), msg)))
+    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
+        "focus".into(),
+        Box::new(msg),
+    )))
 }
 
 /// `Ui.onBlur : msg -> Attribute msg`
 pub fn ui_on_blur_<M>(msg: M) -> Attribute<M> {
-    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg("blur".into(), msg)))
+    Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
+        "blur".into(),
+        Box::new(msg),
+    )))
 }
 
 /// `Ui.onMouseOver : msg -> Attribute msg`
 pub fn ui_on_mouse_over_<M>(msg: M) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
         "mouseover".into(),
-        msg,
+        Box::new(msg),
     )))
 }
 
@@ -738,7 +747,7 @@ pub fn ui_on_mouse_over_<M>(msg: M) -> Attribute<M> {
 pub fn ui_on_mouse_out_<M>(msg: M) -> Attribute<M> {
     Attribute::AttrEvent(HtmlAttribute::EventAttr(Event::OnMsg(
         "mouseout".into(),
-        msg,
+        Box::new(msg),
     )))
 }
 

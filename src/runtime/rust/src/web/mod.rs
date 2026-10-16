@@ -680,8 +680,12 @@ pub struct QueuedEvent<Msg> {
 }
 
 /// How many browser events one session's driver queue holds.
+///
+/// The worst-case backlog one session can hold is this many events, each
+/// costing its update, render, diff, index and recharge once the driver takes
+/// it; a full queue answers `429`.
 #[cfg(feature = "web")]
-const EVENT_QUEUE_CAP: usize = 1024;
+const EVENT_QUEUE_CAP: usize = 64;
 
 /// How many Msgs one session's driver queue holds (Cmd results, refusals,
 /// subscription deliveries).
@@ -691,6 +695,10 @@ const MSG_QUEUE_CAP: usize = 1024;
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's admitted Cmds could outnumber the Msg queue slots their results land in [ledger #boundary]
 #[cfg(feature = "web")]
 const _: () = assert!(budget::SESSION_CMD_CEILING.get() <= MSG_QUEUE_CAP as u64);
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's browser-event backlog could outgrow its Msg queue [ledger #boundary]
+#[cfg(feature = "web")]
+const _: () = assert!(EVENT_QUEUE_CAP <= MSG_QUEUE_CAP);
 
 /// Per-session live state behind an `Arc<Mutex<…>>`. `rendered` is advanced by
 /// every commit; `sse_tx` is filled when the browser attaches the SSE channel;
@@ -786,15 +794,63 @@ impl<Model, Msg> SessionEntry<Model, Msg> {
     }
 }
 
+/// Whether a session is open, or why the runtime closed it.
+#[cfg(feature = "web")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// The session runs.
+    Open,
+    /// [`close_session`] ended the session for this reason.
+    Closed(CloseReason),
+}
+
+#[cfg(feature = "web")]
+impl Liveness {
+    /// The reason the session was closed, or `None` while it is open.
+    #[must_use]
+    pub const fn closed(self) -> Option<CloseReason> {
+        match self {
+            Self::Open => None,
+            Self::Closed(reason) => Some(reason),
+        }
+    }
+}
+
+/// Why the runtime closed a session, as the browser is told it.
+#[cfg(feature = "web")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseReason {
+    /// Its resident state passed its byte bound.
+    OverCeiling,
+    /// Its bound credentials no longer stand.
+    Revoked,
+    /// Its render history cannot mint another epoch.
+    Ended,
+}
+
+#[cfg(feature = "web")]
+impl CloseReason {
+    /// The fixed tag the `closed` frame carries; no model or server text enters it.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::OverCeiling => "over_ceiling",
+            Self::Revoked => "revoked",
+            Self::Ended => "ended",
+        }
+    }
+}
+
 /// A live session's credential scope and the switch that ends its channels.
 #[cfg(feature = "web")]
 pub struct SessionLiveness {
     /// The scope every call into user code on behalf of the session runs in;
     /// it carries the session's bound credentials.
     pub scope: pubsub::SessionScope,
-    /// Set to `true` by [`close_session`]; the SSE stream and its heartbeat end
-    /// on it even while other senders on the channel are still held.
-    pub closer: tokio::sync::watch::Sender<bool>,
+    /// Set to [`Liveness::Closed`] by [`close_session`]; the SSE stream tells
+    /// the browser why and ends, and its heartbeat ends, even while other
+    /// senders on the channel are still held.
+    pub closer: tokio::sync::watch::Sender<Liveness>,
     /// Revocation rechecks the driver ran, read by the coalescing test.
     #[cfg(test)]
     pub rechecks: Arc<AtomicUsize>,
@@ -807,7 +863,7 @@ impl SessionLiveness {
     pub fn new(scope: pubsub::SessionScope) -> Self {
         Self {
             scope,
-            closer: tokio::sync::watch::Sender::new(false),
+            closer: tokio::sync::watch::Sender::new(Liveness::Open),
             #[cfg(test)]
             rechecks: Arc::default(),
         }
@@ -939,12 +995,13 @@ where
 /// session-lost path. The closer flips before the delete, so a
 /// [`checkpoint`] racing this close either sees it and undoes its write, or
 /// writes before the delete runs. Idempotent: a second close finds nothing
-/// left to end.
+/// left to end; the first reason stands.
 #[cfg(feature = "web")]
 async fn close_session<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
     sid: &str,
     entry: Option<&store::SessionHandle<Model, Msg>>,
+    reason: CloseReason,
 ) where
     Model: Send + 'static,
     Msg: Send + 'static,
@@ -953,7 +1010,15 @@ async fn close_session<Model, Msg>(
         let mut e = entry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        e.liveness.closer.send_replace(true);
+        e.liveness
+            .closer
+            .send_if_modified(|liveness| match *liveness {
+                Liveness::Open => {
+                    *liveness = Liveness::Closed(reason);
+                    true
+                }
+                Liveness::Closed(_) => false,
+            });
         e.sse_tx = None;
     }
     store.delete(sid).await;
@@ -985,13 +1050,14 @@ where
     Msg: Send + 'static,
 {
     store.set(sid, Arc::clone(entry)).await;
-    let closed = *entry
+    let closed = entry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .liveness
         .closer
-        .borrow();
-    if closed {
+        .borrow()
+        .closed();
+    if closed.is_some() {
         store.delete(sid).await;
         Checkpoint::Closed
     } else {
@@ -1064,7 +1130,7 @@ where
             scope,
         }),
         Standing::Revoked => {
-            close_session(store, sid, Some(&handle)).await;
+            close_session(store, sid, Some(&handle), CloseReason::Revoked).await;
             None
         }
     }
@@ -1155,24 +1221,38 @@ fn rejoin_from_cookie(
         .map_err(CookieRefusal::Refused)
 }
 
-/// Resolve once the session's closer reads `true`.
+/// Resolve once the session's closer reads closed, with the reason.
 ///
-/// A dropped closer counts as closed: its session entry is gone.
+/// A dropped closer counts as closed with no reason: its session entry is gone.
 #[cfg(feature = "web")]
-async fn session_closed(closer: &mut tokio::sync::watch::Receiver<bool>) {
-    let _ = closer.wait_for(|closed| *closed).await;
+async fn session_closed(
+    closer: &mut tokio::sync::watch::Receiver<Liveness>,
+) -> Option<CloseReason> {
+    closer
+        .wait_for(|liveness| liveness.closed().is_some())
+        .await
+        .ok()
+        .and_then(|liveness| liveness.closed())
+}
+
+/// The one frame a closed session's stream ends with: `closed`, its data the
+/// reason's fixed tag.
+#[cfg(feature = "web")]
+fn closed_frame(reason: CloseReason) -> String {
+    sse::frame("closed", reason.tag())
 }
 
 /// A session's SSE body: its queued frames until the session closes or the server drains.
 ///
 /// `keep` lives as long as the body. On a drain the body yields the frames
 /// already queued, at most the channel's capacity, then ends, so a frame a
-/// shutdown hook queued (the dev reload) still reaches the browser.
+/// shutdown hook queued (the dev reload) still reaches the browser. On a close
+/// it yields the [`closed_frame`] for the reason, then ends.
 #[cfg(feature = "web")]
 fn session_stream<K: Send + 'static>(
     rx: tokio::sync::mpsc::Receiver<SsePatch>,
     keep: K,
-    closer: tokio::sync::watch::Receiver<bool>,
+    closer: tokio::sync::watch::Receiver<Liveness>,
     drain: crate::server::shutdown::Drain,
 ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send {
     futures_util::stream::unfold(
@@ -1183,7 +1263,10 @@ fn session_stream<K: Send + 'static>(
             }
             let frame = tokio::select! {
                 biased;
-                () = session_closed(&mut closer) => return None,
+                reason = session_closed(&mut closer) => {
+                    let closed = Ok(axum::body::Bytes::from(closed_frame(reason?)));
+                    return Some((closed, (rx, keep, closer, drain, true)));
+                },
                 () = drain.wait() => {
                     let queued = queued_frames(&mut rx);
                     if queued.is_empty() {
@@ -1997,7 +2080,7 @@ where
     if keep_resident(handle, store.as_ref()).await {
         return true;
     }
-    close_session(store, sid, Some(handle)).await;
+    close_session(store, sid, Some(handle), CloseReason::OverCeiling).await;
     false
 }
 
@@ -2550,7 +2633,7 @@ where
     // Re-prove after user code ran: a revocation that landed meanwhile drops
     // the entry, its reply and its Cmd.
     if recheck_scope(scope, None) == Standing::Revoked {
-        close_session(store, sid, Some(&strong)).await;
+        close_session(store, sid, Some(&strong), CloseReason::Revoked).await;
         return EntryCommit::SessionGone;
     }
     let committed = {
@@ -2565,15 +2648,15 @@ where
         }
     };
     let Some(epoch) = committed else {
-        // The render history cannot mint another epoch: drop the session so
+        // The render history cannot mint another epoch: close the session so
         // the next request takes the session-lost path.
-        store.delete(sid).await;
+        close_session(store, sid, Some(&strong), CloseReason::Ended).await;
         return EntryCommit::SessionGone;
     };
     // The entered model is charged before any reply or Cmd: a session it
     // pushes past its byte bound closes instead.
     if !keep_resident(&strong, store.as_ref()).await {
-        close_session(store, sid, Some(&strong)).await;
+        close_session(store, sid, Some(&strong), CloseReason::OverCeiling).await;
         return EntryCommit::SessionGone;
     }
     let page = PageRender { html, epoch };
@@ -2733,7 +2816,8 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                 // Re-prove the credentials before the entry runs; a refused
                 // entry's request is dropped, so its requester answers 503.
                 if recheck_scope(&scope, None) == Standing::Revoked {
-                    close_session(&store, &sid, entry.upgrade().as_ref()).await;
+                    close_session(&store, &sid, entry.upgrade().as_ref(), CloseReason::Revoked)
+                        .await;
                     break;
                 }
                 let (next, cmd) =
@@ -2764,7 +2848,8 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                     rechecks.fetch_add(1, Ordering::Relaxed);
                 }
                 if standing_after(&scope, wake) == Standing::Revoked {
-                    close_session(&store, &sid, entry.upgrade().as_ref()).await;
+                    close_session(&store, &sid, entry.upgrade().as_ref(), CloseReason::Revoked)
+                        .await;
                     break;
                 }
                 revocation.rearm(&scope);
@@ -2786,7 +2871,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // Re-prove the credentials before the Msg runs: a revoked session
         // applies no further action.
         if recheck_scope(&scope, None) == Standing::Revoked {
-            close_session(&store, &sid, Some(&strong)).await;
+            close_session(&store, &sid, Some(&strong), CloseReason::Revoked).await;
             break;
         }
         // Clone the model under a short lock, release before update.
@@ -2831,7 +2916,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // Re-prove after user code ran: a revocation that landed meanwhile
         // drops this Msg's commit and its Cmd.
         if recheck_scope(&scope, None) == Standing::Revoked {
-            close_session(&store, &sid, Some(&strong)).await;
+            close_session(&store, &sid, Some(&strong), CloseReason::Revoked).await;
             break;
         }
 
@@ -2863,15 +2948,15 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             }
         };
         let Some((patches, step, seq, sse, noop)) = committed else {
-            // The render history cannot mint another epoch: drop the session so
+            // The render history cannot mint another epoch: close the session so
             // the next request takes the session-lost path.
-            store.delete(&sid).await;
+            close_session(&store, &sid, Some(&strong), CloseReason::Ended).await;
             break;
         };
         // The committed model (and its history) is charged before any patch,
         // checkpoint or Cmd: a session it pushes past its byte bound closes.
         if !keep_resident(&strong, store.as_ref()).await {
-            close_session(&store, &sid, Some(&strong)).await;
+            close_session(&store, &sid, Some(&strong), CloseReason::OverCeiling).await;
             break;
         }
         // Msg counter. All
@@ -3579,7 +3664,7 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         };
         // A session whose credentials no longer stand renders nothing more.
         if recheck_scope(&scope, None) == Standing::Revoked {
-            close_session(store, scope.sid(), Some(&handle)).await;
+            close_session(store, scope.sid(), Some(&handle), CloseReason::Revoked).await;
             continue;
         }
         let mut tree = pubsub::with_session(&scope, || view(model));
@@ -3610,7 +3695,7 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
         // The re-rendered view is charged before it is pushed, as a commit
         // the driver makes is.
         if !keep_resident(&handle, store.as_ref()).await {
-            close_session(store, scope.sid(), Some(&handle)).await;
+            close_session(store, scope.sid(), Some(&handle), CloseReason::OverCeiling).await;
             continue;
         }
         send_patches_frame(sse, seq, step, &patches).await;
@@ -5262,7 +5347,7 @@ mod handlers {
                     // heartbeat: the sender clone held here must not outlive
                     // the stream it keeps alive.
                     tokio::select! {
-                        () = session_closed(&mut closer) => break,
+                        _ = session_closed(&mut closer) => break,
                         () = drain.wait() => break,
                         () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
                     }
@@ -5436,6 +5521,9 @@ mod handlers {
                 "live",
                 &format!("event_handler: session msg queue full or closed; dropping event ({err})"),
             );
+            // The refused event holds its charge; dropping it here releases
+            // the bytes before the 429 is answered.
+            drop(err);
             return (StatusCode::TOO_MANY_REQUESTS, "event queue full").into_response();
         }
         if let Some((tab, seq)) = replay_key {
@@ -6207,7 +6295,7 @@ mod handlers {
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
         let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
-            st.store.delete(&sid).await;
+            close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
         // The render it now holds is charged as well as the model it shows.
@@ -6529,7 +6617,7 @@ mod handlers {
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
         let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
-            st.store.delete(&sid).await;
+            close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
         // The render it now holds is charged as well as the model it shows.
@@ -6612,7 +6700,7 @@ mod handlers {
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
         let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
-            st.store.delete(&sid).await;
+            close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
         // The render it now holds is charged as well as the model it shows.
@@ -6699,7 +6787,7 @@ mod handlers {
         // render under a new epoch: the ids in the DOM it shows resolve against
         // its own handler index, never the one it replaced.
         let Some((epoch, html_body)) = commit_debug_render(&handle, tree) else {
-            st.store.delete(&sid).await;
+            close_session(&st.store, &sid, Some(&handle), CloseReason::Ended).await;
             return (axum::http::StatusCode::NOT_FOUND, "session not found").into_response();
         };
         // The render it now holds is charged as well as the model it shows.
@@ -8446,6 +8534,152 @@ mod base_path_tests {
         );
     }
 
+    /// A `closed` frame ends the client's session for good, and its notice is
+    /// the client's own text.
+    ///
+    /// The frame's tag only picks a fixed notice, written through
+    /// `textContent`; every path that would reopen the stream, send, post,
+    /// beacon or retry an event, send a port message, probe the session or
+    /// reload the page returns at once on an ended session, and a follower tab
+    /// is relayed the frame.
+    #[test]
+    fn client_ends_a_closed_session_with_its_own_notice() {
+        let js = super::CLIENT_JS;
+        let body_of = |name: &str| -> Option<&'static str> {
+            let open = format!("\nfunction {name}(");
+            let rest = js.get(js.find(&open)?..)?;
+            rest.get(..rest.find("\n}\n")?)
+        };
+        let end = body_of("__ipeEndSession").unwrap_or_default();
+        assert!(
+            end.contains("__ipeStatusMsgEl.textContent = notice;")
+                && end.contains("var notice = __ipeClosedNotice(tag);")
+                && !end.contains("innerHTML")
+                && !end.contains("insertAdjacentHTML"),
+            "the notice is the client's text, set as text"
+        );
+        assert!(
+            end.contains("__ipeCloseSSE();")
+                && end.contains("__ipeEventQueue.length = 0;")
+                && end.contains("__ipeLoaderEnd();"),
+            "an ended session drops its stream, its queued events and its loader"
+        );
+        let notice = body_of("__ipeClosedNotice").unwrap_or_default();
+        assert!(
+            notice.contains("    default:\n      return \""),
+            "a tag outside the set gets the generic notice"
+        );
+        assert!(
+            !notice.contains("+ tag") && !notice.contains("tag +"),
+            "the tag never enters the notice"
+        );
+        for guarded in [
+            "__ipeOpenSSE",
+            "__ipeForceReopenSSE",
+            "__ipeResyncRender",
+            "__ipePostEvent",
+            "__ipeScheduleRetry",
+            "__ipeDrainQueue",
+            "__ipeWatchdog",
+            "__ipeSend",
+            "__ipeFlushPendingBeacon",
+            "__ipeReloadDocument",
+        ] {
+            let body = body_of(guarded).unwrap_or_default();
+            assert!(
+                body.contains(") {\n  if (__ipeEnded) return;\n"),
+                "`{guarded}` returns first on an ended session"
+            );
+        }
+        assert!(
+            body_of("__ipeProbeSessionLost")
+                .unwrap_or_default()
+                .contains("  if (__ipeEnded || __ipeProbedReload) return;\n"),
+            "an ended session never probes for a reload"
+        );
+        assert!(
+            js.contains("window.__ipePortSend = function(raw) {\n  if (__ipeEnded) return;\n"),
+            "an ended session sends no port message"
+        );
+        // Every network or page-load sink sits in a definition that returns
+        // first on an ended session, or in a navigation the reader starts; a
+        // new sink anywhere else is refused here.
+        let guarded_heads = [
+            "function __ipeFlushPendingBeacon(",
+            "function __ipePostEvent(",
+            "window.__ipePortSend = function(",
+            "function __ipeReloadDocument(",
+            "function __ipeOpenSSE(",
+            "function __ipeProbeSessionLost(",
+        ];
+        let reader_heads = [
+            "function __ipeLoad(",
+            "__ipeDoc.on(\"click\", function(",
+            "window.addEventListener(\"popstate\", function(",
+        ];
+        let sinks = [
+            "fetch(",
+            "sendBeacon(",
+            "new EventSource(",
+            "location.reload(",
+            "location.assign(",
+            "location.replace(",
+            "location.href =",
+            "new WebSocket(",
+            "XMLHttpRequest",
+        ];
+        let mut head = "";
+        let mut kinds = std::collections::BTreeSet::new();
+        for line in js.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if !line.starts_with([' ', '}', ')']) && !line.is_empty() {
+                head = line;
+            }
+            for sink in sinks.iter().filter(|s| line.contains(**s)) {
+                kinds.insert(*sink);
+                assert!(
+                    guarded_heads
+                        .iter()
+                        .chain(reader_heads.iter())
+                        .any(|h| head.starts_with(h)),
+                    "`{line}` issues `{sink}` outside a guarded definition (under `{head}`)"
+                );
+            }
+        }
+        for sink in [
+            "fetch(",
+            "sendBeacon(",
+            "new EventSource(",
+            "location.reload(",
+        ] {
+            assert!(kinds.contains(sink), "the scan saw no `{sink}`");
+        }
+        for head in guarded_heads {
+            let at = js.find(&format!("\n{head}")).unwrap_or(js.len());
+            let rest = js.get(at..).unwrap_or_default();
+            let body = rest
+                .get(..rest.find("\n}").unwrap_or(0))
+                .unwrap_or_default();
+            assert!(
+                body.contains("  if (__ipeEnded) return;\n")
+                    || body.contains("  if (__ipeEnded || __ipeProbedReload) return;\n"),
+                "`{head}` returns first on an ended session"
+            );
+        }
+        assert!(
+            js.contains("  closed: function(text, relayed) {\n    __ipeEndSession(text);\n  }"),
+            "the `closed` frame ends the session"
+        );
+        assert!(
+            js_string_array(js, "__ipeLiveRelayed")
+                .is_some_and(|types| types.iter().any(|t| t == "closed")),
+            "a leader relays the `closed` frame to its followers"
+        );
+    }
+
     /// The client moves its render epoch only through its two adopt
     /// functions, and patches the DOM by diff only through `__ipeAdoptPatches`.
     ///
@@ -9015,7 +9249,7 @@ mod sse_drain_tests {
             Arc::new(std::sync::atomic::AtomicI32::new(0)),
         );
         let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
-        let (_closer_tx, closer) = tokio::sync::watch::channel(false);
+        let (_closer_tx, closer) = tokio::sync::watch::channel(Liveness::Open);
         let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
         assert!(tx.send(SsePatch("live".into())).await.is_ok());
         let first = body.next().await;
@@ -9046,7 +9280,7 @@ mod sse_drain_tests {
             Arc::new(std::sync::atomic::AtomicI32::new(0)),
         );
         let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
-        let (_closer_tx, closer) = tokio::sync::watch::channel(false);
+        let (_closer_tx, closer) = tokio::sync::watch::channel(Liveness::Open);
         let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
         assert!(
             signals
@@ -9056,6 +9290,77 @@ mod sse_drain_tests {
         );
         let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await;
         assert!(matches!(end, Ok(None)), "an empty drained body ends");
+        drop(tx);
+    }
+
+    /// The tag the `closed` frame must carry for `reason`; a new reason
+    /// breaks this match until its tag is named here.
+    const fn expected_tag(reason: CloseReason) -> &'static str {
+        match reason {
+            CloseReason::OverCeiling => "over_ceiling",
+            CloseReason::Revoked => "revoked",
+            CloseReason::Ended => "ended",
+        }
+    }
+
+    // Every close reason ends the stream with one `closed` frame whose data is
+    // that reason's fixed tag, and nothing after it.
+    #[tokio::test]
+    async fn a_closed_session_stream_ends_with_its_fixed_tag() {
+        let reasons = [
+            CloseReason::OverCeiling,
+            CloseReason::Revoked,
+            CloseReason::Ended,
+        ];
+        let tags: Vec<&str> = reasons.iter().map(|r| expected_tag(*r)).collect();
+        for reason in reasons {
+            let (armed, _signals) = crate::server::shutdown::tests::armed_with(
+                crate::server::shutdown::ShutdownPlan::bare("test"),
+                std::time::Duration::from_secs(5),
+                Arc::new(std::sync::atomic::AtomicI32::new(0)),
+            );
+            let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
+            let (closer_tx, closer) = tokio::sync::watch::channel(Liveness::Open);
+            let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
+            assert!(tx.send(SsePatch("live".into())).await.is_ok());
+            let first = body.next().await;
+            assert!(matches!(first, Some(Ok(ref b)) if b.as_ref() == b"live"));
+            closer_tx.send_replace(Liveness::Closed(reason));
+            assert!(tx.send(SsePatch("late".into())).await.is_ok());
+            let bound = std::time::Duration::from_secs(5);
+            let closed = tokio::time::timeout(bound, body.next()).await;
+            let want = format!("event: closed\ndata: {}\n\n", expected_tag(reason));
+            assert!(
+                matches!(closed, Ok(Some(Ok(ref b))) if b.as_ref() == want.as_bytes()),
+                "{reason:?} yields its fixed frame: {closed:?}"
+            );
+            assert!(
+                tags.contains(&reason.tag()),
+                "{reason:?} tag is in the fixed set"
+            );
+            let end = tokio::time::timeout(bound, body.next()).await;
+            assert!(
+                matches!(end, Ok(None)),
+                "{reason:?}: nothing follows the closed frame"
+            );
+        }
+    }
+
+    // A closer dropped with the session entry still open ends the stream with
+    // no `closed` frame: there is no reason to tell.
+    #[tokio::test]
+    async fn a_dropped_closer_ends_the_stream_without_a_frame() {
+        let (armed, _signals) = crate::server::shutdown::tests::armed_with(
+            crate::server::shutdown::ShutdownPlan::bare("test"),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<SsePatch>(4);
+        let (closer_tx, closer) = tokio::sync::watch::channel(Liveness::Open);
+        let mut body = std::pin::pin!(session_stream(rx, (), closer, armed.drain()));
+        drop(closer_tx);
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), body.next()).await;
+        assert!(matches!(end, Ok(None)), "a dropped closer ends the body");
         drop(tx);
     }
 }
@@ -9367,7 +9672,10 @@ mod sse_reconnect_reconcile_tests {
         let view: TestView = Arc::new(|_p| {
             Html::HElement(
                 "div".into(),
-                vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+                vec![Attribute::EventAttr(Event::OnMsg(
+                    "click".into(),
+                    Box::new(()),
+                ))],
                 vec![Html::HText("go".into())],
             )
         });
@@ -12013,7 +12321,7 @@ mod emitted_router_behavior_tests {
             "div".to_string(),
             vec![Attribute::EventAttr(Event::OnMsg(
                 "click".to_string(),
-                Msg::Increment,
+                Box::new(Msg::Increment),
             ))],
             vec![Html::HText("+".to_string())],
         );
@@ -12022,7 +12330,7 @@ mod emitted_router_behavior_tests {
             "div".to_string(),
             vec![Attribute::EventAttr(Event::OnMsg(
                 "click".to_string(),
-                Msg::Decrement,
+                Box::new(Msg::Decrement),
             ))],
             vec![Html::HText("-".to_string())],
         );
@@ -12819,7 +13127,10 @@ mod emitted_router_behavior_tests {
         let button = |label: &str, msg: Msg| {
             Html::HElement(
                 "div".to_string(),
-                vec![Attribute::EventAttr(Event::OnMsg("click".to_string(), msg))],
+                vec![Attribute::EventAttr(Event::OnMsg(
+                    "click".to_string(),
+                    Box::new(msg),
+                ))],
                 vec![Html::HText(label.to_string())],
             )
         };
@@ -13431,7 +13742,8 @@ mod emitted_router_behavior_tests {
     }
 
     /// A `429` leaves the tab's seq unrecorded, so the client's retry of the
-    /// same event dispatches once the queue drains.
+    /// same event dispatches once the queue drains, and it releases the
+    /// refused event's charge and queues nothing.
     #[test]
     #[allow(clippy::expect_used)] // the page and the one-slot channel are fixtures
     fn a_full_queue_does_not_record_the_seq() {
@@ -13441,12 +13753,15 @@ mod emitted_router_behavior_tests {
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
             let first = epoch_of(&body).expect("the page carries its render epoch");
             let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(1);
-            let charge = session_of(&store, &sid)
-                .await
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .charge
-                .budget()
+            let budget = Arc::clone(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .charge
+                    .budget(),
+            );
+            let charge = budget
                 .try_charge(crate::retained::Bytes::new(0))
                 .expect("an empty charge fits");
             tx.try_send(QueuedEvent {
@@ -13458,15 +13773,25 @@ mod emitted_router_behavior_tests {
             capture_dispatches(&store, &sid, tx).await;
 
             let event = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let held = budget.used().get();
             let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
             assert_eq!(
                 status,
                 StatusCode::TOO_MANY_REQUESTS,
                 "a full queue answers 429"
             );
+            assert_eq!(
+                budget.used().get(),
+                held,
+                "the refused event's charge is released"
+            );
             assert!(
                 matches!(rx.try_recv().map(|queued| queued.msg), Ok(Msg::Decrement)),
                 "drain the filler"
+            );
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "the refused event is not queued"
             );
 
             let (status, _, reply) =
@@ -13480,6 +13805,163 @@ mod emitted_router_behavior_tests {
                 rx.try_recv().map(|queued| queued.msg),
                 Ok(Msg::Increment)
             ));
+        });
+    }
+
+    /// Open the session's SSE stream.
+    #[allow(clippy::expect_used)] // test helper: a fixed request always builds and the router always answers
+    async fn open_sse(
+        store: &Arc<Store>,
+        sid: &str,
+    ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>> {
+        let resp = make_router(store.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/_ipe/sse?path=%2F")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header(header::COOKIE, format!("{}={sid}", cookie_name_for("")))
+                    .body(Body::empty())
+                    .expect("build SSE GET"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.into_body().into_data_stream()
+    }
+
+    /// The SSE text read until `stop` holds of it, the stream ends, or 10 s
+    /// pass, and whether the stream ended.
+    async fn read_sse(
+        stream: impl futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>>,
+        stop: impl Fn(&str) -> bool,
+    ) -> (String, bool) {
+        use futures_util::StreamExt;
+        let mut stream = std::pin::pin!(stream);
+        let mut bytes = Vec::new();
+        let mut ended = false;
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            while bytes.len() < 256 * 1024 {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        bytes.extend_from_slice(&chunk);
+                        if stop(utf8_prefix(&bytes)) {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => break,
+                    None => {
+                        ended = true;
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        (utf8_prefix(&bytes).to_owned(), ended)
+    }
+
+    /// A commit that passes the session's byte ceiling closes the session: its
+    /// stream yields the one `closed` frame tagged `over_ceiling`, then ends,
+    /// and the session is gone.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn an_over_ceiling_commit_ends_the_stream_with_a_closed_frame() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let stream = open_sse(&store, &sid).await;
+            let budget = Arc::clone(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .charge
+                    .budget(),
+            );
+            // Room for the click's Msg and a little more, never for the
+            // render the commit adds to the history.
+            let msg = Msg::Increment
+                .retained_bytes()
+                .expect("a Msg has a measure")
+                .get();
+            let keep = msg.saturating_add(64);
+            let filler = budget
+                .try_charge(crate::retained::Bytes::new(
+                    budget.room().get().saturating_sub(keep),
+                ))
+                .expect("the session's room is free");
+            let click = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &click).await;
+            assert_eq!(status, StatusCode::OK, "the click itself fits");
+            let (text, ended) = read_sse(stream, |_| false).await;
+            assert!(ended, "the stream ends:\n{text}");
+            assert!(
+                text.ends_with("event: closed\ndata: over_ceiling\n\n"),
+                "the last frame names the close:\n{text}"
+            );
+            assert_eq!(text.matches("event: closed").count(), 1, "{text}");
+            assert!(store.get(&sid).await.is_none(), "the session is gone");
+            drop(filler);
+        });
+    }
+
+    /// A commit whose render history cannot mint another epoch closes the
+    /// session: its stream yields the one `closed` frame tagged `ended`, then
+    /// ends, and the session is gone.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn an_exhausted_epoch_ends_the_stream_with_a_closed_frame() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let stream = open_sse(&store, &sid).await;
+            session_of(&store, &sid)
+                .await
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .exhaust();
+            let click = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &click).await;
+            assert_eq!(status, StatusCode::OK, "the click itself resolves");
+            let (text, ended) = read_sse(stream, |_| false).await;
+            assert!(ended, "the stream ends:\n{text}");
+            assert!(
+                text.ends_with("event: closed\ndata: ended\n\n"),
+                "the last frame names the close:\n{text}"
+            );
+            assert_eq!(text.matches("event: closed").count(), 1, "{text}");
+            assert!(store.get(&sid).await.is_none(), "the session is gone");
+        });
+    }
+
+    /// The control: the same commit under the ceiling keeps the session and
+    /// its stream open, and no `closed` frame is sent.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn a_commit_under_the_ceiling_keeps_the_stream_open() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let stream = open_sse(&store, &sid).await;
+            let click = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &click).await;
+            assert_eq!(status, StatusCode::OK);
+            let (text, ended) = read_sse(stream, |t| t.contains("event: patches")).await;
+            assert!(!ended, "the stream stays open:\n{text}");
+            assert!(
+                text.contains("event: patches"),
+                "the commit is pushed:\n{text}"
+            );
+            assert!(!text.contains("event: closed"), "{text}");
+            assert!(store.get(&sid).await.is_some(), "the session stays");
         });
     }
 
@@ -16565,7 +17047,7 @@ mod web_revocation_tests {
             .liveness
             .closer
             .subscribe();
-        tokio::time::timeout(within, closer.wait_for(|closed| *closed))
+        tokio::time::timeout(within, closer.wait_for(|l| l.closed().is_some()))
             .await
             .is_ok_and(|seen| seen.is_ok())
     }
@@ -17187,7 +17669,7 @@ mod web_revocation_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .liveness
                 .closer
-                .send_replace(true);
+                .send_replace(Liveness::Closed(CloseReason::Ended));
             store.delete(&closed.sid).await;
             assert_eq!(
                 checkpoint(&dyn_store, &closed.sid, &handle).await,
@@ -17230,13 +17712,15 @@ mod web_revocation_tests {
             self.inner.set(sid, handle).await;
         }
         async fn delete(&self, sid: &str) {
-            let closed = *self
+            let closed = self
                 .watched
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .liveness
                 .closer
-                .borrow();
+                .borrow()
+                .closed()
+                .is_some();
             self.closed_at_delete
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -17271,13 +17755,47 @@ mod web_revocation_tests {
                 closed_at_delete: Mutex::new(Vec::new()),
             });
             let dyn_probe = Arc::clone(&probe) as Arc<dyn store::SessionStore<Model, Msg>>;
-            close_session(&dyn_probe, &opened.sid, Some(&handle)).await;
+            close_session(&dyn_probe, &opened.sid, Some(&handle), CloseReason::Revoked).await;
             let seen = probe
                 .closed_at_delete
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             assert_eq!(seen, vec![true], "the closer is set when the delete runs");
+        });
+    }
+
+    /// A session closed twice keeps its first reason: the frame its stream
+    /// sends names the close that ended it, never a later one.
+    #[test]
+    fn a_closed_session_keeps_its_first_reason() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "first-reason", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let closer = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .closer
+                .subscribe();
+            let dyn_store = Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>;
+            close_session(
+                &dyn_store,
+                &opened.sid,
+                Some(&handle),
+                CloseReason::OverCeiling,
+            )
+            .await;
+            close_session(&dyn_store, &opened.sid, Some(&handle), CloseReason::Revoked).await;
+            assert_eq!(
+                *closer.borrow(),
+                Liveness::Closed(CloseReason::OverCeiling),
+                "the first reason stands"
+            );
         });
     }
 
