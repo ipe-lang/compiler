@@ -218,6 +218,7 @@ queueStateBody model =
                     , nextPageButton page.next
                     ]
                 , chainBannerLine page.log
+                , refusalBlock model page
                 , queueUnits model
                 ]
 
@@ -226,6 +227,88 @@ queueStateBody model =
 
         Failed _ ->
             queueUnits model
+
+
+-- The open files the index could not review, listed apart from the units.
+-- Each card shows the file's escaped path, why the index refused it, its
+-- size and its digest's first characters, never a byte of the file. An
+-- acknowledgeable file on a page that records decisions offers Acknowledge
+-- and Refuse; a blocking one says only a change to the tree closes it.
+refusalBlock : Model -> Queue.QueuePage -> Ui.Element Msg
+refusalBlock model page =
+    if List.isEmpty page.refusals then
+        Ui.none
+
+    else
+        Ui.column
+            [ Ui.width Ui.fill, Ui.spacing 8 ]
+            (Ui.el [ Font.size 13, Font.bold, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Unreviewable files")
+                :: List.map (refusalCard model page.log) page.refusals
+            )
+
+
+refusalCard : Model -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalCard model shown row =
+    Ui.column
+        [ Ui.width Ui.fill
+        , Ui.padding 12
+        , Ui.spacing 6
+        , Background.color (Ui.rgb 24 24 32)
+        , Border.rounded 8
+        , Border.solid
+        , Border.width 1
+        , Border.color (Ui.rgb 165 110 60)
+        ]
+        [ Ui.row
+            [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
+            [ sectionHeading (Ui.el [ Font.size 13, Font.bold, Font.family Font.monospace, Font.color (Ui.rgb 235 235 240) ] (safeText row.path))
+            , Ui.el
+                [ Ui.paddingXY 8 3, Background.color (Ui.rgb 40 40 52), Border.rounded 4, Font.size 11, Font.bold, Font.color (Ui.rgb 220 220 230) ]
+                (Ui.text (Queue.refusalReasonText row.reason))
+            , Ui.el [ Ui.width Ui.fill ] Ui.none
+            , refusalControls model shown row
+            ]
+        , Ui.row
+            [ Ui.spacing 10, Font.size 12, Font.color (Ui.rgb 150 150 165) ]
+            [ case row.size of
+                Just size ->
+                    Ui.text (Format.byteSize size)
+
+                Nothing ->
+                    Ui.none
+            , case row.digest of
+                Just digest ->
+                    Ui.el [ Font.family Font.monospace ] (safeText (Index.shortHash (Index.refusalDigestText digest)))
+
+                Nothing ->
+                    Ui.none
+            ]
+        ]
+
+
+-- Acknowledge and Refuse for a file a decision can bind on a page that
+-- records decisions; otherwise why there is no control.
+refusalControls : Model -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalControls model shown row =
+    case row.digest of
+        Nothing ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Cannot be acknowledged: fix it in the tree.")
+
+        Just _ ->
+            case noDecisionReason shown of
+                Just why ->
+                    Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text why)
+
+                Nothing ->
+                    if model.refusingUid == Just row.uid then
+                        refusePanel model (RefuseRefusalSubmit row.uid)
+
+                    else
+                        Ui.row
+                            [ Ui.spacing 8 ]
+                            [ approveButton "Acknowledge" (AckRefusal row.uid)
+                            , refuseButton "Refuse" (RefuseStart row.uid)
+                            ]
 
 
 nextPageButton : Maybe Index.Cursor -> Ui.Element Msg
@@ -946,34 +1029,45 @@ decisionButtons model loaded =
 verifiedDecisionButtons : Model -> Index.Unit -> Ui.Element Msg
 verifiedDecisionButtons model unit =
     if model.refusingUid == Just unit.uid then
-        refusePanel model unit.uid
+        refusePanel model (RefuseSubmit unit.uid)
 
     else
         Ui.row
             [ Ui.spacing 8 ]
-            [ Ui.button
-                [ Ui.paddingXY 10 5
-                , Background.color (Ui.rgb 46 160 67)
-                , Border.rounded 4
-                , Font.size 12
-                , Font.bold
-                , Font.color (Ui.rgb 10 20 12)
-                ]
-                { onPress = Just (ApproveUnit unit.uid), label = Ui.text "Approve" }
-            , Ui.button
-                [ Ui.paddingXY 10 5
-                , Background.color (Ui.rgb 165 60 60)
-                , Border.rounded 4
-                , Font.size 12
-                , Font.bold
-                , Font.color (Ui.rgb 245 235 235)
-                ]
-                { onPress = Just (RefuseStart unit.uid), label = Ui.text "Refuse" }
+            [ approveButton "Approve" (ApproveUnit unit.uid)
+            , refuseButton "Refuse" (RefuseStart unit.uid)
             ]
 
 
-refusePanel : Model -> Uid -> Ui.Element Msg
-refusePanel model uid =
+approveButton : String -> Msg -> Ui.Element Msg
+approveButton label msg =
+    Ui.button
+        [ Ui.paddingXY 10 5
+        , Background.color (Ui.rgb 46 160 67)
+        , Border.rounded 4
+        , Font.size 12
+        , Font.bold
+        , Font.color (Ui.rgb 10 20 12)
+        ]
+        { onPress = Just msg, label = Ui.text label }
+
+
+refuseButton : String -> Msg -> Ui.Element Msg
+refuseButton label msg =
+    Ui.button
+        [ Ui.paddingXY 10 5
+        , Background.color (Ui.rgb 165 60 60)
+        , Border.rounded 4
+        , Font.size 12
+        , Font.bold
+        , Font.color (Ui.rgb 245 235 235)
+        ]
+        { onPress = Just msg, label = Ui.text label }
+
+
+-- The refusal reason input with Confirm, which sends `submit`, and Cancel.
+refusePanel : Model -> Msg -> Ui.Element Msg
+refusePanel model submit =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]
         [ Input.text
@@ -991,15 +1085,7 @@ refusePanel model uid =
                 Ui.none
         , Ui.row
             [ Ui.spacing 8 ]
-            [ Ui.button
-                [ Ui.paddingXY 10 5
-                , Background.color (Ui.rgb 165 60 60)
-                , Border.rounded 4
-                , Font.size 12
-                , Font.bold
-                , Font.color (Ui.rgb 245 235 235)
-                ]
-                { onPress = Just (RefuseSubmit uid), label = Ui.text "Confirm" }
+            [ refuseButton "Confirm" submit
             , Ui.button
                 [ Ui.paddingXY 10 5
                 , Background.color (Ui.rgb 55 55 70)

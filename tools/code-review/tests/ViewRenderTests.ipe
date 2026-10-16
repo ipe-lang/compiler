@@ -75,6 +75,8 @@ queuePage units total progress =
     , next = Nothing
     , progress = progress
     , log = ShownProven
+    , refusals = []
+    , refusalsOpen = 0
     }
 
 
