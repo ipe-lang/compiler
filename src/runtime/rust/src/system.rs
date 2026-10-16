@@ -1587,7 +1587,7 @@ pub enum SpawnRefusal {
     ///
     /// Nothing was forked. Tokio panics here when the runtime was built without
     /// `enable_io`. Reachable only where panics unwind: under `panic = "abort"`
-    /// (every emitted release build) the panic aborts the process instead.
+    /// the panic aborts the process instead.
     #[cfg(all(feature = "web", unix))]
     ProbePanicked,
     /// The spawn panicked on the spawner thread, which caught it and lives on.
@@ -1595,8 +1595,8 @@ pub enum SpawnRefusal {
     /// From `spawn_hardened_tokio` the panic may follow the fork (tokio panics
     /// registering a child with a runtime missing a driver), leaving a child
     /// that only the parent-death floor bounds. Reachable only where panics
-    /// unwind: under `panic = "abort"` (every emitted release build) the panic
-    /// aborts the process, and the floor SIGTERMs any forked child.
+    /// unwind: under `panic = "abort"` the panic aborts the process, and the
+    /// floor SIGTERMs any forked child.
     SpawnPanicked,
     /// `spawn_hardened_tokio` was called outside a tokio runtime.
     #[cfg(all(feature = "web", not(target_arch = "wasm32")))]

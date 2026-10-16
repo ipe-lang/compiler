@@ -2413,13 +2413,29 @@ struct EndpointRefusal {
 /// How many characters of a refused path a listen error quotes.
 const PATH_EXCERPT_CHARS: usize = 64;
 
-/// `METHOD path` for a listen error: log hazards escaped and the path cut to
-/// [`PATH_EXCERPT_CHARS`] characters.
+/// How many characters of a refused method a listen error quotes: every HTTP
+/// method the server serves is shorter.
+const METHOD_EXCERPT_CHARS: usize = 16;
+
+/// The first `max` characters of `text`, ending in `…` when it is longer.
+fn excerpt(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let mut head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        head.push('…');
+    }
+    head
+}
+
+/// `METHOD path` for a listen error: log hazards escaped, the method cut to
+/// [`METHOD_EXCERPT_CHARS`] and the path to [`PATH_EXCERPT_CHARS`]
+/// characters.
 fn quoted_endpoint(method: &str, path: &str) -> RefusedText {
-    let mut chars = path.chars();
-    let head: String = chars.by_ref().take(PATH_EXCERPT_CHARS).collect();
-    let more = if chars.next().is_some() { "…" } else { "" };
-    RefusedText::new(&format!("{method} {head}{more}"))
+    RefusedText::new(&format!(
+        "{} {}",
+        excerpt(method, METHOD_EXCERPT_CHARS),
+        excerpt(path, PATH_EXCERPT_CHARS)
+    ))
 }
 
 impl std::fmt::Display for EndpointRefusal {
@@ -5860,6 +5876,84 @@ mod tests {
             assert!(!msg.contains('\u{202e}'), "{raw:?}: {msg:?}");
         }
         assert_eq!(RefusedText::new("a\tb").as_str(), "a\\tb");
+    }
+
+    /// Prove the bound on a refused method: a method of any length is quoted
+    /// as a short excerpt, so a refusal's size never follows its input.
+    #[test]
+    fn a_refused_method_is_quoted_as_an_excerpt() {
+        let method = "X".repeat(10_000);
+        let refused = parse_routes(vec![handler_route(&method, "/ok")]).err();
+        assert_eq!(
+            refused.as_ref().map(|r| r.cause.clone()),
+            Some(RouteCause::Method)
+        );
+        let msg = refused.map(|r| r.to_string()).unwrap_or_default();
+        let quoted = format!("`{} /ok`", excerpt(&method, METHOD_EXCERPT_CHARS));
+        assert!(msg.contains(&quoted), "{msg:.200}");
+        assert!(msg.len() < 400, "{msg:.200}");
+        assert_eq!(excerpt("CONNECT", METHOD_EXCERPT_CHARS), "CONNECT");
+    }
+
+    /// Every listen refusal fails with the kind it is, never `Unexpected`.
+    #[test]
+    fn every_start_refusal_has_its_own_kind() {
+        use crate::IpeErrorKind as K;
+        use crate::encoding::{MountBaseRefusal, ServerPatternRefusal};
+        let text = || RefusedText::new("GET /a");
+        let route = |cause| {
+            ServerStartRefusal::Route(EndpointRefusal {
+                endpoint: text(),
+                cause,
+            })
+        };
+        let too_many = ServerPatternRefusal::TooManyParams {
+            cap: crate::encoding::MAX_SERVER_PARAMS,
+        };
+        let cases = [
+            (route(RouteCause::Method), K::InvalidInput),
+            (
+                route(RouteCause::Pattern(ServerPatternRefusal::NotAbsolute)),
+                K::InvalidInput,
+            ),
+            (route(RouteCause::Pattern(too_many)), K::LimitExceeded),
+            (
+                route(RouteCause::Prefix(MountBaseRefusal::TooLong { len: 1 })),
+                K::LimitExceeded,
+            ),
+            (
+                route(RouteCause::Prefix(MountBaseRefusal::NoLeadingSlash)),
+                K::InvalidInput,
+            ),
+            (
+                ServerStartRefusal::Overlap {
+                    earlier: text(),
+                    later: text(),
+                },
+                K::Conflict,
+            ),
+            (
+                ServerStartRefusal::SharedPrefix {
+                    earlier: text(),
+                    later: text(),
+                },
+                K::Conflict,
+            ),
+            (
+                ServerStartRefusal::RouterRejected { endpoint: text() },
+                K::Conflict,
+            ),
+            #[cfg(feature = "web")]
+            (ServerStartRefusal::SecondMount, K::Conflict),
+        ];
+        for (refusal, kind) in cases {
+            let shown = refusal.to_string();
+            assert_eq!(
+                crate::ipe_error_kind(refusal.into_ipe_error()),
+                kind,
+                "{shown}"
+            );
+        }
     }
 
     /// An endpoint registers under its rendered spelling behind the
