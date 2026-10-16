@@ -907,6 +907,84 @@ probeAfter name sql =
         Task.succeed (probeNames "IPE_INDEX_DB" at.indexDb message)
 
 
+-- An index without the `refusals` table stops startup naming `IPE_INDEX_DB`:
+-- a queue that could not list the files the index refused would read as all
+-- reviewed. Red if the probe stops selecting the refusal columns.
+probeRefusesIndexWithoutRefusals : Task.Task Error Bool
+probeRefusesIndexWithoutRefusals =
+    probeAfter "ipe-index-probe-refusals" "DROP TABLE refusals"
+
+
+-- A refusal row the real schema would refuse fails the snapshot rather than
+-- show the file under some other reason or digest: an unknown reason, a
+-- digest of another scheme or in uppercase, a digest on a blocking reason,
+-- none on an acknowledgeable one, a negative size. The row is written with
+-- the schema's CHECKs off, as a foreign or tampered index could hold it; the
+-- same row with a well-formed digest reads. Red if the decoder has a
+-- catch-all reason, or reads the digest without its scheme or its pairing
+-- with the reason.
+refusalDecodeFailsClosed : Task.Task Error Bool
+refusalDecodeFailsClosed =
+    let
+        lower =
+            SqlString ("refusal-blake3:" ++ String.repeat 64 "a")
+    in
+    do
+        valid <- refusalReadFailsWith "ipe-index-refusal-valid" "not-utf8" (SqlInt 3) lower
+        unknown <- refusalReadFailsWith "ipe-index-refusal-unknown" "binary" (SqlInt 3) lower
+        otherScheme <- refusalReadFailsWith "ipe-index-refusal-foreign" "not-utf8" (SqlInt 3) (SqlString ("blake3:" ++ String.repeat 64 "a"))
+        upper <- refusalReadFailsWith "ipe-index-refusal-upper" "not-utf8" (SqlInt 3) (SqlString ("refusal-blake3:" ++ String.repeat 64 "A"))
+        blocking <- refusalReadFailsWith "ipe-index-refusal-blocking" "replaced" (SqlInt 3) lower
+        undigested <- refusalReadFailsWith "ipe-index-refusal-undigested" "not-utf8" (SqlInt 3) (SqlNull (SqlString ""))
+        negative <- refusalReadFailsWith "ipe-index-refusal-negative" "not-utf8" (SqlInt (0 - 1)) lower
+        Task.succeed (not valid && unknown && otherScheme && upper && blocking && undigested && negative)
+
+
+-- True when the first page's snapshot fails on a seeded index holding one
+-- refusal row of `reason`, `size` and `digest`, written with CHECKs off.
+refusalReadFailsWith : String -> String -> SqlValue -> SqlValue -> Task.Task Error Bool
+refusalReadFailsWith name reason size digest =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', ?, ?, ?)"
+            [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin", SqlString reason, size, digest ]
+        conn <- indexConn
+        failed <- snapshotOn conn
+            |> Task.map (\_ -> False)
+            |> Task.onError (\_ -> Task.succeed True)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed failed
+
+
+-- The app's reasons are the index's: the real schema's `reason` CHECK lists
+-- exactly `Index.refusalReasons` in order, and its blocking list exactly
+-- the reasons `Index.ackable` refuses. Red if either side gains, loses or
+-- reorders a reason without the other.
+refusalReasonsMatchSchema : Task.Task Error Bool
+refusalReasonsMatchSchema =
+    let
+        quoted reasons =
+            "reason IN (" ++ String.join "," (List.map (\r -> "'" ++ Index.refusalTag r ++ "'") reasons) ++ ")"
+
+        allReasons =
+            quoted Index.refusalReasons
+
+        blocking =
+            "(digest IS NULL) = (" ++ quoted (List.filter (\r -> not (Index.ackable r)) Index.refusalReasons) ++ ")"
+    in
+    do
+        cwd <- System.cwd ()
+        statements <- indexSchemaStatements cwd
+        Task.succeed
+            (List.any (\s -> String.contains allReasons s && String.contains blocking s) statements
+                && List.length (List.filter Index.ackable Index.refusalReasons)
+                == 5
+            )
+
+
 -- A unit with no change_queue row for its current body is still open: it
 -- is listed and counted, its change `Unrecorded`. Membership is the current
 -- pair against the decided set, never the event log. Red while the page
@@ -1113,13 +1191,13 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "residualText", "reverify", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
 snapshotReaders : List String
 snapshotReaders =
-    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "countUnbound", "countAll", "dbBytes" ]
+    [ "reviewedDigest", "loadPendingPage", "countPending", "countUnits", "countUnbound", "countAll", "loadRefusalPage", "countOpenRefusals", "countRefusals", "countRefusalsPartitioned", "countUnboundRefusals", "countAllRefusals", "dbBytes" ]
 
 
 -- True when the module header of `source` exposes exactly `indexExposes`.
@@ -1317,6 +1395,26 @@ unjudgedUnitFailsSnapshot =
         Task.succeed (intact && maybeContains "the index's unit counts do not add up" message)
 
 
+
+-- A refusal whose path the tag condition cannot judge (a NULL path in a
+-- table rebuilt without the schema's NOT NULL) is in neither refusal count,
+-- and the snapshot read fails rather than report totals that hide it. Red
+-- if the bound and unbound refusal counts may fall short of the rows held.
+unjudgedRefusalFailsSnapshot : Task.Task Error Bool
+unjudgedRefusalFailsSnapshot =
+    do
+        at <- freshScratch "ipe-index-unjudged-refusal"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin" ]
+        intact <- indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> True) |> Task.onError (\_ -> Task.succeed False)
+        execIndexScript at.indexDb "CREATE TABLE refusals_copy AS SELECT * FROM refusals; DROP TABLE refusals; CREATE TABLE refusals AS SELECT * FROM refusals_copy; DROP TABLE refusals_copy; UPDATE refusals SET path = NULL"
+        message <- probeMessage (indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> ()))
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (intact && maybeContains "the index's refusal counts do not add up" message)
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -1337,6 +1435,9 @@ checks =
         , check "a unit's language comes from its file's indexed language" langFromFilesTable
         , check "an index without a files table fails the probe" probeRefusesIndexWithoutFiles
         , check "an index without the change queue or the stamp fails the probe" probeRefusesIndexWithoutQueueOrStamp
+        , check "an index without the refusals table fails the probe" probeRefusesIndexWithoutRefusals
+        , check "a refusal row the schema would refuse fails the snapshot" refusalDecodeFailsClosed
+        , check "the refusal reasons and blocking reasons are the schema's" refusalReasonsMatchSchema
         , check "a unit with no change row is still listed" unrecordedUnitListed
         , check "a modified row without its old hash fails the page" changeDecodeRefusesModifiedWithoutOld
         , check "an unknown change kind fails the page" changeDecodeRefusesUnknown
@@ -1360,4 +1461,5 @@ checks =
         , check "a bound, recorded or nested tag the index disagrees on refuses startup" reposProbeRefusesDisagreement
         , check "a unit under an unbound tag is counted, never shown" unboundUnitsExcluded
         , check "a unit neither bound nor unbound fails the snapshot" unjudgedUnitFailsSnapshot
+        , check "a refusal neither bound nor unbound fails the snapshot" unjudgedRefusalFailsSnapshot
         ]

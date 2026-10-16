@@ -113,6 +113,9 @@ queuePageOf units =
     , next = Nothing
     , progress = { reviewed = 0, total = List.length units }
     , log = LibDb.ShownProven
+    , refusals = []
+    , refusalsOpen = 0
+    , refusalsUnbound = 0
     }
 
 

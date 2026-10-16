@@ -684,8 +684,11 @@ testKeys =
 -- `Queue.decidableSource` gives: `Queue.decide ` appears once in the app
 -- (inside `decideOn`), `decideOn ` exactly three times (its signature, its
 -- definition and the one call in the `Just shown` arm), and neither in
--- `Main`. A site list with exact counts, since `ipe test` builds no
--- `update`. Red if a second path to `decide` is added.
+-- `Main`; `Queue.decideRefusal ` appears once in the app, in the arm of a
+-- refusal listed on the page with its digest, and never in `Main`. The arms
+-- are matched with whitespace runs collapsed, so re-indenting them keeps the
+-- scan. A site list with exact counts, since `ipe test` builds no `update`.
+-- Red if a second path to either decision is added.
 decisionReachedOnlyThroughDecidableSource : Task.Task Error Bool
 decisionReachedOnlyThroughDecidableSource =
     let
@@ -693,8 +696,14 @@ decisionReachedOnlyThroughDecidableSource =
             \needle text ->
                 List.length (String.split needle text) - 1
 
+        squashed =
+            \text -> String.join " " (String.words text)
+
         oneCall =
-            "case Queue.decidableSource uid model.selectedView of\n                Just shown ->\n                    decideOn settings shown decision\n"
+            "case Queue.decidableSource uid model.selectedView of Just shown -> decideOn settings shown decision "
+
+        oneRefusalCall =
+            "case pageRefusal model uid of Just row -> case row.digest of Just digest -> LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal settings.key settings.index db uid digest decision) "
     in
     do
         cwd <- System.cwd ()
@@ -707,11 +716,17 @@ decisionReachedOnlyThroughDecidableSource =
                 == 1
                 && count "decideOn " app
                 == 3
-                && count oneCall app
+                && count oneCall (squashed app)
+                == 1
+                && count "Queue.decideRefusal " app
+                == 1
+                && count oneRefusalCall (squashed app)
                 == 1
                 && count "Queue.decide " mainSrc
                 == 0
                 && count "decideOn" mainSrc
+                == 0
+                && count "decideRefusal" mainSrc
                 == 0
             )
 
