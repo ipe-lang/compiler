@@ -1028,7 +1028,7 @@ queueStateTextsDistinct =
             Error.unexpected "boom"
 
         empty =
-            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0 }
 
         drained =
             { empty | total = 41000 }
@@ -2532,7 +2532,7 @@ unboundNoticeTexts : Bool
 unboundNoticeTexts =
     let
         empty =
-            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0 }
 
         one =
             { empty | unbound = 1 }
