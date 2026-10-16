@@ -1,0 +1,320 @@
+module Lib.Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..), loadFailureOf, loadFailureText, loaded, refuseFailureText, saveFailureOf, saveFailureText, saved)
+
+import Ipe.Db as Db exposing (DbFailure(..))
+import Ipe.Error as Error
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Lib.ReviewKey as ReviewKey
+
+
+-- Every failure a page can show is a case of one of these closed types. Each
+-- is decided from an error's details and kind, never its text, once, in the
+-- callback a page's task settles through, and renders a fixed text of this
+-- tool's own, so no error's text reaches the model or the page.
+
+
+-- Why a read a page started (the queue, a History page, a source, a unit's
+-- standing) settled with nothing to show. `LoadContended`: a database the
+-- read used was busy. `LoadPastLimit`: the read passed one of the ceilings
+-- every read is bounded by. `LoadFailed`: every other failure, the closed
+-- default.
+type LoadFailure
+    = LoadContended
+    | LoadPastLimit
+    | LoadFailed
+
+
+-- A decision this tool refuses itself, decided before anything is written:
+-- the shown unit is gone from the index, its source changed or passed the
+-- line ceiling since it was shown, it is not on the shown queue page or its
+-- source is not shown, or the review log does not verify under the signing
+-- key (broken, or signed by another key). An unreviewable file's decision is
+-- refused when the file is no longer listed unreviewable, its digest changed,
+-- it is one no decision acknowledges, it could not be re-probed, it now reads
+-- as text, or it is not on the shown queue page.
+type DecideRefusal
+    = SourceGone
+    | SourceChanged
+    | SourcePastCeiling
+    | NotQueued
+    | SourceNotShown
+    | LogBroken
+    | LogKeyMismatch
+    | FileGone
+    | FileChanged
+    | FileNotAcknowledgeable
+    | FileNotReprobed
+    | FileReadsAsText
+    | FileNotQueued
+
+
+-- Why a decision was not saved, as the model holds it. A decision asked off
+-- the queue page, or asked on a server with no signing key, is refused
+-- before it starts; one asked while another is busy starts nothing and
+-- leaves that decision's pending state shown; one this tool refuses on its
+-- way is `SaveRefused`. `SaveContended`: a database the save reads or
+-- writes was busy (locked past its busy timeout, or no connection free in
+-- time); a busy failure does not say which. `SavePastLimit`: a read the save
+-- made passed its ceiling. `SaveFailed`: every other failure, the closed
+-- default, whose cause the reviewer recovers from by reloading.
+type SaveFailure
+    = SaveOffQueue
+    | SaveReadOnly
+    | SaveRefused DecideRefusal
+    | SaveContended
+    | SavePastLimit
+    | SaveFailed
+
+
+-- Why the reviewer's draft is not a refusal reason: blank, or `chars`
+-- characters where at most `limit` are kept.
+type ReasonRefusal
+    = ReasonBlank
+    | ReasonOverlong { chars : Int, limit : Int }
+
+
+-- Why a refusal draft stays open: its reason is refused, or another decision
+-- is still saving.
+type RefuseFailure
+    = DraftRefused ReasonRefusal
+    | DraftWhileSaving
+
+
+-- What an error's cause says to a page: the closed cases its details and
+-- kind decide.
+type Cause
+    = Contended
+    | PastLimit
+    | Other
+
+
+-- Every `ErrorDetails` has its own row, and every `DbFailure` its own row in
+-- `causeOfDb`, so a cause the runtime adds is a compile error here until it
+-- is given a case. Only a busy database is `Contended`; a ceiling is read
+-- from the error's kind, a closed tag. The message is never read.
+causeOf : Error -> Cause
+causeOf e =
+    case e of
+        Error _ info ->
+            case info.details of
+                Just (Database failure) ->
+                    causeOfDb failure
+
+                Just (Custom _) ->
+                    causeOfKind e
+
+                Just (FfiPanic _) ->
+                    causeOfKind e
+
+                Just (HttpStatus _) ->
+                    causeOfKind e
+
+                Just (JsonDecode _) ->
+                    causeOfKind e
+
+                Just (TypeMismatch _) ->
+                    causeOfKind e
+
+                Nothing ->
+                    causeOfKind e
+
+
+causeOfKind : Error -> Cause
+causeOfKind e =
+    if Error.kind e == Error.kind (Error.limitExceeded "") then
+        PastLimit
+
+    else
+        Other
+
+
+causeOfDb : DbFailure -> Cause
+causeOfDb failure =
+    case failure of
+        Busy ->
+            Contended
+
+        CannotOpen ->
+            Other
+
+        NotADatabase ->
+            Other
+
+        AccessDenied ->
+            Other
+
+        ReadOnlyDatabase ->
+            Other
+
+        InvalidStatement ->
+            Other
+
+        UniqueViolation ->
+            Other
+
+        ForeignKeyViolation ->
+            Other
+
+        NotNullViolation ->
+            Other
+
+        CheckViolation ->
+            Other
+
+        TriggerRaised ->
+            Other
+
+        OtherConstraint ->
+            Other
+
+        Unreachable ->
+            Other
+
+        OtherFailure ->
+            Other
+
+
+loadFailureOf : Error -> LoadFailure
+loadFailureOf e =
+    case causeOf e of
+        Contended ->
+            LoadContended
+
+        PastLimit ->
+            LoadPastLimit
+
+        Other ->
+            LoadFailed
+
+
+saveFailureOf : Error -> SaveFailure
+saveFailureOf e =
+    case causeOf e of
+        Contended ->
+            SaveContended
+
+        PastLimit ->
+            SavePastLimit
+
+        Other ->
+            SaveFailed
+
+
+-- A page read's result, its failure a typed case.
+loaded : Result Error a -> Result LoadFailure a
+loaded result =
+    case result of
+        Ok value ->
+            Ok value
+
+        Err e ->
+            Err (loadFailureOf e)
+
+
+-- A save's result: a refusal the tool decided is `SaveRefused`, and a failure
+-- its typed case.
+saved : Result Error (Result DecideRefusal a) -> Result SaveFailure a
+saved result =
+    case result of
+        Ok (Ok value) ->
+            Ok value
+
+        Ok (Err refusal) ->
+            Err (SaveRefused refusal)
+
+        Err e ->
+            Err (saveFailureOf e)
+
+
+-- The fixed text each case renders, after the page's own "failed to load"
+-- lead.
+loadFailureText : LoadFailure -> String
+loadFailureText failure =
+    case failure of
+        LoadContended ->
+            "the index or review database is busy; reload to try again"
+
+        LoadPastLimit ->
+            "it is larger than this tool reads; the server log says which ceiling it passed"
+
+        LoadFailed ->
+            "reload to try again; the server log says why"
+
+
+-- The fixed text each case renders.
+saveFailureText : SaveFailure -> String
+saveFailureText failure =
+    case failure of
+        SaveOffQueue ->
+            "decisions are made on the queue page"
+
+        SaveReadOnly ->
+            ReviewKey.readOnlyText
+
+        SaveRefused refusal ->
+            decideRefusalText refusal
+
+        SaveContended ->
+            "the index or review database is busy; try again"
+
+        SavePastLimit ->
+            "the decision was not saved: a read passed this tool's ceiling; the server log says which"
+
+        SaveFailed ->
+            "the decision was not saved; reload the queue and decide again"
+
+
+decideRefusalText : DecideRefusal -> String
+decideRefusalText refusal =
+    case refusal of
+        SourceGone ->
+            "the unit is no longer indexed; reload the queue"
+
+        SourceChanged ->
+            "the unit's source changed since it was shown; reload it and decide again"
+
+        SourcePastCeiling ->
+            "the unit's source is past the line ceiling, so it cannot be decided"
+
+        NotQueued ->
+            "the unit is no longer in the queue"
+
+        SourceNotShown ->
+            "this unit's source is not shown, so it cannot be decided"
+
+        LogBroken ->
+            "the review log does not verify, so no decision can be recorded"
+
+        LogKeyMismatch ->
+            "the review log was signed by a different " ++ ReviewKey.keyVar ++ ", so no decision can be recorded"
+
+        FileGone ->
+            "the file is no longer unreviewable in the index; reload the queue"
+
+        FileChanged ->
+            "the file changed since it was shown; reload the queue and decide again"
+
+        FileNotAcknowledgeable ->
+            "this file cannot be acknowledged; fix it in the tree"
+
+        FileNotReprobed ->
+            "this file could not be re-probed, so it cannot be decided"
+
+        FileReadsAsText ->
+            "the file now reads as text; re-run the index"
+
+        FileNotQueued ->
+            "the file is no longer in the queue"
+
+
+refuseFailureText : RefuseFailure -> String
+refuseFailureText failure =
+    case failure of
+        DraftRefused ReasonBlank ->
+            "a refusal needs a reason"
+
+        DraftRefused (ReasonOverlong over) ->
+            "a refusal reason is at most " ++ String.fromInt over.limit ++ " characters; this one has " ++ String.fromInt over.chars
+
+        DraftWhileSaving ->
+            "a decision is still being saved; try again once it settles"

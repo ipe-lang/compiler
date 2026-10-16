@@ -23,18 +23,19 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (BreakAt(..), Decision(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Epoch as Epoch exposing (Epoch)
+import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), SaveFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf, insertUnboundUnit)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -42,9 +43,9 @@ import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr
 -- A decision is written only through `Queue.decide`, which re-proves the shown
 -- source against the current index row and file. Each case seeds the bridge
 -- fixture, runs `prepare`, loads the page, runs `mutate`, decides `u-a` and
--- reports whether the decision failed as a conflict and how many review rows
+-- reports the refusal the decision came back with and how many review rows
 -- `u-a` holds afterwards.
-decideAfter : String -> (Scratch -> Task.Task Error ()) -> (Scratch -> Task.Task Error ()) -> Decision -> Task.Task Error { conflict : Bool, rows : Int }
+decideAfter : String -> (Scratch -> Task.Task Error ()) -> (Scratch -> Task.Task Error ()) -> Decision -> Task.Task Error { refused : Maybe DecideRefusal, rows : Int }
 decideAfter name prepare mutate decision =
     do
         at <- freshScratch name
@@ -55,25 +56,25 @@ decideAfter name prepare mutate decision =
         r <- loadFirstPage
         mutate at
         db <- migratedReviewAt at.reviewDb
-        conflict <- decideOutcome db (List.find (\u -> u.uid == uid "u-a") r.units) decision
+        refused <- decideOutcome db (List.find (\u -> u.uid == uid "u-a") r.units) decision
         rows <- countUidRows db "u-a"
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
-        Task.succeed { conflict = conflict, rows = rows }
+        Task.succeed { refused = refused, rows = rows }
 
 
--- True when deciding `found`'s shown source fails with a conflict; False
--- when it succeeds, fails otherwise, or the unit was not loaded shown.
-decideOutcome : Db -> Maybe PageEntry -> Decision -> Task.Task Error Bool
+-- The refusal deciding `found`'s shown source comes back with; Nothing when
+-- it is accepted, fails, or the unit was not loaded shown.
+decideOutcome : Db -> Maybe PageEntry -> Decision -> Task.Task Error (Maybe DecideRefusal)
 decideOutcome db found decision =
     case Maybe.andThen (\entry -> shownOf entry.view) found of
         Just shown ->
             decideShownNow db shown decision
-                |> Task.map (\_ -> False)
-                |> Task.onError (\e -> Task.succeed (Error.kind e == Error.kind (Error.conflict "")))
+                |> Task.map refusalOf
+                |> Task.onError (\_ -> Task.succeed Nothing)
 
         Nothing ->
-            Task.succeed False
+            Task.succeed Nothing
 
 
 countUidRows : Db -> String -> Task.Task Error Int
@@ -104,7 +105,7 @@ decideRecordsShownHash =
         db <- migratedReviewAt at.reviewDb
         recorded <- case Maybe.andThen (\entry -> shownOf entry.view) (List.find (\u -> u.uid == uid "u-a") r.units) of
             Just shown ->
-                decideShownNow db shown Approved
+                accepted "the decision on u-a" (decideShownNow db shown Approved)
                     |> Task.map (\( a, written ) -> isInserted written && Index.attestedUid a == uid "u-a" && Index.attestedHash a == Index.attest viewA)
 
             Nothing ->
@@ -120,7 +121,7 @@ decideRecordsShownHash =
 approveRefusedAfterDrift : Task.Task Error Bool
 approveRefusedAfterDrift =
     decideAfter "ipe-index-decide-drift" noChange driftLib Approved
-        |> Task.map (\o -> o.conflict && o.rows == 0)
+        |> Task.map (\o -> o.refused == Just SourceChanged && o.rows == 0)
 
 
 -- R5: a re-index after the page loaded: the file and the stored hash move
@@ -136,7 +137,7 @@ approveRefusedAfterReindex =
                 (execIndex at.indexDb "UPDATE units SET body_hash = ? WHERE uid = ?" [ SqlString (Index.attest (String.replace "42" "43" viewA)), Uid.toSql (uid "u-a") ])
     in
     decideAfter "ipe-index-decide-reindex" noChange reindex Approved
-        |> Task.map (\o -> o.conflict && o.rows == 0)
+        |> Task.map (\o -> o.refused == Just SourceChanged && o.rows == 0)
 
 
 -- R6: the unit's row is gone from the index after the page loaded.
@@ -144,7 +145,7 @@ approveRefusedAfterUnitDeleted : Task.Task Error Bool
 approveRefusedAfterUnitDeleted =
     refuse "x"
         |> Task.andThen (decideAfter "ipe-index-decide-deleted" noChange deleteUnitA)
-        |> Task.map (\o -> o.conflict && o.rows == 0)
+        |> Task.map (\o -> o.refused == Just SourceGone && o.rows == 0)
 
 
 deleteUnitA : Scratch -> Task.Task Error ()
@@ -226,13 +227,12 @@ tooLargeNotDecidable =
 
 -- Decides the shown unit `u-a` of an already loaded page; the decision's
 -- outcome is the value, a refusal its `Err`.
-decideUnitA : Db -> List PageEntry -> Task.Task Error (Result Error Bool)
+decideUnitA : Db -> List PageEntry -> Task.Task Error (Result DecideRefusal Bool)
 decideUnitA db units =
     case Maybe.andThen (\entry -> shownOf entry.view) (List.find (\u -> u.uid == uid "u-a") units) of
         Just shown ->
             decideShownNow db shown Approved
-                |> Task.map (\_ -> Ok True)
-                |> Task.onError (\e -> Task.succeed (Err e))
+                |> Task.map (Result.map (\_ -> True))
 
         Nothing ->
             Task.fail (Error.conflict "fixture unit u-a is not shown")
@@ -267,16 +267,8 @@ decideRefusedWhenGrownPastCeiling =
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
         Task.succeed
-            ((case refused of
-                Err e ->
-                    Error.kind e
-                        == Error.kind (Error.conflict "")
-                        && Error.message e
-                        == "source is now past the review ceiling; it cannot be decided"
-
-                Ok _ ->
-                    False
-            )
+            (refusalOf refused
+                == Just SourcePastCeiling
                 && before
                 == 0
                 && afterRefusal
@@ -607,7 +599,7 @@ dbSizeAndMissingDbIn base =
             |> Task.map Ok
             |> Task.onError (\e -> Task.succeed (Err e))
         removePageFixture indexDb reviewDb repo
-        Task.succeed (bytes > 0 && isFailed (Queue.stateFromResult result))
+        Task.succeed (bytes > 0 && isFailed (Queue.stateFromResult (Failure.loaded result)))
 
 
 isFailed : Queue.QueueState -> Bool
@@ -787,7 +779,7 @@ unitPageStatesDistinct : Task.Task Error Bool
 unitPageStatesDistinct =
     let
         pageTexts =
-            List.filterMap Queue.unitPageStatusText [ UnitLoading, UnitNotFound, UnitIdRefused, UnitFailed (Error.conflict "boom") ]
+            List.filterMap Queue.unitPageStatusText [ UnitLoading, UnitNotFound, UnitIdRefused, UnitFailed LoadFailed ]
 
         withheldViews =
             [ Stale Drifted
@@ -893,7 +885,7 @@ decideUnit : Db -> Maybe PageEntry -> Task.Task Error ( Index.Attested, Index.Wr
 decideUnit db found =
     case Maybe.andThen (\entry -> shownOf entry.view) found of
         Just shown ->
-            decideShownNow db shown Approved
+            accepted "the decision on the fixture unit" (decideShownNow db shown Approved)
 
         Nothing ->
             Task.fail (Error.conflict "fixture unit not loaded shown")
@@ -1025,9 +1017,6 @@ neverSeen old =
 queueStateTextsDistinct : Bool
 queueStateTextsDistinct =
     let
-        boom =
-            Error.unexpected "boom"
-
         empty =
             { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0, refusalsUnbound = 0 }
 
@@ -1040,9 +1029,9 @@ queueStateTextsDistinct =
     List.all identity
         [ Queue.queueStatusText Loading == Just "Loading queue…"
         , Queue.queueStatusText (Loaded empty) == Just "No units queued."
-        , Queue.queueStatusText (Failed boom) == Just ("Queue failed to load: " ++ Error.toString boom)
+        , Queue.queueStatusText (Failed LoadFailed) == Just ("Queue failed to load: " ++ Failure.loadFailureText LoadFailed)
         , Queue.queueStatusText Loading /= Queue.queueStatusText (Loaded empty)
-        , Queue.queueStatusText (Failed boom) /= Queue.queueStatusText (Loaded empty)
+        , Queue.queueStatusText (Failed LoadFailed) /= Queue.queueStatusText (Loaded empty)
         , Queue.queueStatusText (Loaded drained) == Just "No units to review on this page."
         , Queue.queueStatusText (Loaded full) == Nothing
         , Queue.pageHeaderText full == "index.db · 4.0 KB · showing 1 of 41000"
@@ -1615,7 +1604,7 @@ reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
 reviewWritesGoThroughWriteTransaction =
     let
         others =
-            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
     in
     do
         cwd <- System.cwd ()
@@ -2365,7 +2354,7 @@ brokenChainCountsNothing =
         mirrored <- mirroredCount at.indexDb
         page <- loadPageNow Index.Start
         history <- loadHistoryPageNow HistoryStart
-        refused <- refusedWith (LibDb.brokenRefusal (BreaksAt 2)) (decideNow db (uid "u-a") Approved)
+        refused <- refusedAs LogBroken (decidedNow db (uid "u-a") Approved)
         rows <- logRowCount db
         cleanupProgressScratch at
         Task.succeed
@@ -2487,11 +2476,10 @@ whyOf entry =
             Nothing
 
 
--- A server with no key records nothing and counts nothing: its decision is
--- refused with the read-only error before any write, no log row is added,
--- and a unit decided under the key stays queued, the log read as unsigned.
--- Red if `decide` reaches the database without a key, or if a keyless load
--- counts a row it cannot verify.
+-- A server with no key counts nothing: `decide` takes the signing key, so a
+-- keyless server has no decision to make, and a unit decided under the key
+-- stays queued, the log read as unsigned. Red if a keyless load counts a row
+-- it cannot verify.
 readOnlyRecordsAndCountsNothing : Task.Task Error Bool
 readOnlyRecordsAndCountsNothing =
     do
@@ -2500,21 +2488,11 @@ readOnlyRecordsAndCountsNothing =
         decideNow db (uid "u-a") Approved
         signing <- envAppSettings
         keyless <- Task.succeed { signing | key = ReadOnly }
-        found <- loadUnitNow (uid "u-b")
-        refused <- case Maybe.andThen (\loaded -> shownOf loaded.view) found of
-            Just shown ->
-                Queue.decide ReadOnly keyless.index db shown Approved
-                    |> Task.map (\_ -> False)
-                    |> Task.onError (\e -> Task.succeed (Error.toString e == Error.toString ReviewKey.readOnlyError))
-
-            Nothing ->
-                Task.succeed False
         rows <- logRowCount db
         page <- Queue.loadPage keyless Index.Start
         cleanupProgressScratch at
         Task.succeed
-            (refused
-                && Error.message ReviewKey.readOnlyError
+            (Error.message ReviewKey.readOnlyError
                 == "This server is read-only: IPE_REVIEW_MAC_KEY is not set, so no decision can be signed. Restart it with the key set to record decisions."
                 && rows
                 == 1
@@ -2585,36 +2563,53 @@ unboundUnitLeavesProgress =
             )
 
 
--- A failed save's case comes from the database failure its error carries,
--- never from its text: a busy review database is `SaveContended`; every
--- other failure, an error whose text names a busy database and the
--- moved-head conflict included, is `SaveFailed`. Each case renders its own
--- text, none holding a driver code. Red if a case is read from the message
--- or a busy database is not told apart.
+-- A failed save's case comes from the database failure or the kind its
+-- error carries, never from its text: a busy review database is
+-- `SaveContended`, a ceiling `SavePastLimit`; every other failure, an error
+-- whose text names a busy database and the moved-head conflict included, is
+-- `SaveFailed`. A refusal the tool decided is `SaveRefused` with its case.
+-- Each case renders its own text, none holding a driver code. Red if a case
+-- is read from the message or a busy database or a ceiling is not told
+-- apart.
 saveFailureTyped : Bool
 saveFailureTyped =
     let
         lockedText =
             "database is locked [5]"
 
+        refusals =
+            [ SourceGone, SourceChanged, SourcePastCeiling, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch, FileGone, FileChanged, FileNotAcknowledgeable, FileNotReprobed, FileReadsAsText, FileNotQueued ]
+
         cases =
-            [ SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+            [ SaveOffQueue, SaveReadOnly, SaveContended, SavePastLimit, SaveFailed ] ++ List.map SaveRefused refusals
 
         texts =
-            List.map Queue.saveFailureText cases
+            List.map Failure.saveFailureText cases
     in
-    Queue.saveFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText))
+    Failure.saveFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText))
         == SaveContended
-        && Queue.saveFailureOf (Error.withDetails (Database Db.OtherFailure) (Error.unexpected lockedText))
+        && Failure.saveFailureOf (Error.withDetails (Database Db.OtherFailure) (Error.unexpected lockedText))
         == SaveFailed
-        && Queue.saveFailureOf (Error.unexpected lockedText)
+        && Failure.saveFailureOf (Error.unexpected lockedText)
         == SaveFailed
-        && Queue.saveFailureOf (Error.withDetails (Custom "Busy") (Error.unavailable "busy"))
+        && Failure.saveFailureOf (Error.withDetails (Custom "Busy") (Error.unavailable "busy"))
         == SaveFailed
-        && Queue.saveFailureOf (Error.withDetails (Database Db.UniqueViolation) (Error.conflict lockedText))
+        && Failure.saveFailureOf (Error.withDetails (Database Db.UniqueViolation) (Error.conflict lockedText))
         == SaveFailed
-        && Queue.saveFailureOf LibDb.headMoved
+        && Failure.saveFailureOf LibDb.headMoved
         == SaveFailed
+        && Failure.saveFailureOf (Error.limitExceeded lockedText)
+        == SavePastLimit
+        && Failure.saveFailureOf (Error.withDetails (Custom "x") (Error.limitExceeded lockedText))
+        == SavePastLimit
+        && Failure.saveFailureOf (Error.unexpected "LimitExceeded: past a ceiling")
+        == SaveFailed
+        && savedCount (Ok (Err LogBroken))
+        == Err (SaveRefused LogBroken)
+        && savedCount (Err (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText)))
+        == Err SaveContended
+        && savedCount (Ok (Ok 1))
+        == Ok 1
         && Set.size (Set.fromList texts)
         == List.length cases
         && List.all (\text -> not (String.contains "[5]" text) && not (String.contains "Unexpected" text)) texts
@@ -2660,7 +2655,8 @@ shownRefusalDigest label =
 -- Refusal `label` acknowledged under the test key, bound to `digest`.
 decideRefusalNow : Db -> String -> Index.RefusalDigest -> Task.Task Error ( Index.Attested, Index.Written )
 decideRefusalNow db label digest =
-    envAppSettings |> Task.andThen (\settings -> Queue.decideRefusal settings.key settings.index db (uid label) digest Approved)
+    accepted ("the acknowledgement of " ++ label) (decidedRefusalNow db label digest)
+
 
 
 -- Every unit decided and drained, one acknowledgeable file still open: the
@@ -2738,26 +2734,26 @@ acknowledgedRefusalReopensOnNewDigest =
             )
 
 
--- A refusal decision is refused, and nothing is logged, when between the
--- page and the decision the row turns blocking, takes another digest, or
--- leaves the index, or when the file now reads as text; and on a server
--- with no key. Red if any re-proof is skipped.
+-- A refusal decision is refused with its typed case, and nothing is logged,
+-- when between the page and the decision the row turns blocking, takes
+-- another digest, or leaves the index, or when the file now reads as text.
+-- A server with no key has no `MacKey`, so it has no acknowledgement to
+-- make. Red if any re-proof is skipped or decided as an error's text.
 refusalDecisionRefusedOnChange : Task.Task Error Bool
 refusalDecisionRefusedOnChange =
     do
-        blocking <- refusalDecisionAfter "ipe-index-refusal-blocking" "UPDATE refusals SET reason = 'unreadable', size = NULL, digest = NULL" (Error.conflict "this file cannot be acknowledged; fix it in the tree")
-        changed <- refusalDecisionAfter "ipe-index-refusal-changed" "UPDATE refusals SET digest = 'refusal-blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'" (Error.conflict "source changed since it was shown; reload")
-        gone <- refusalDecisionAfter "ipe-index-refusal-gone" "DELETE FROM refusals" (Error.conflict "file is no longer unreviewable in the index; reload")
-        readable <- refusalDecisionAfter "ipe-index-refusal-readable" "UPDATE refusals SET reason = 'not-utf8'" (Error.conflict "file now reads as text; re-run the index")
-        shrunk <- refusalDecisionAfter "ipe-index-refusal-shrunk" "UPDATE refusals SET size = 11" (Error.conflict "file now reads as text; re-run the index")
-        readOnly <- refusalReadOnlyRefused
-        Task.succeed (blocking && changed && gone && readable && shrunk && readOnly)
+        blocking <- refusalDecisionAfter "ipe-index-refusal-blocking" "UPDATE refusals SET reason = 'unreadable', size = NULL, digest = NULL" FileNotAcknowledgeable
+        changed <- refusalDecisionAfter "ipe-index-refusal-changed" "UPDATE refusals SET digest = 'refusal-blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'" FileChanged
+        gone <- refusalDecisionAfter "ipe-index-refusal-gone" "DELETE FROM refusals" FileGone
+        readable <- refusalDecisionAfter "ipe-index-refusal-readable" "UPDATE refusals SET reason = 'not-utf8'" FileReadsAsText
+        shrunk <- refusalDecisionAfter "ipe-index-refusal-shrunk" "UPDATE refusals SET size = 11" FileReadsAsText
+        Task.succeed (blocking && changed && gone && readable && shrunk)
 
 
 -- True when refusal `r-big`, an oversized text file shown with its digest,
 -- is refused with exactly `expected` after `sql` ran on the index, and no
 -- log row was written.
-refusalDecisionAfter : String -> String -> Error -> Task.Task Error Bool
+refusalDecisionAfter : String -> String -> DecideRefusal -> Task.Task Error Bool
 refusalDecisionAfter name sql expected =
     do
         at <- freshScratch name
@@ -2766,24 +2762,7 @@ refusalDecisionAfter name sql expected =
         insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
         digest <- shownRefusalDigest "r-big"
         execIndex at.indexDb sql []
-        refused <- refusedWith expected (decideRefusalNow db "r-big" digest)
-        rows <- logRowCount db
-        cleanupProgressScratch at
-        Task.succeed (refused && rows == 0)
-
-
--- A server with no key acknowledges nothing: the decision is refused with
--- the read-only error before the index or the file is read.
-refusalReadOnlyRefused : Task.Task Error Bool
-refusalReadOnlyRefused =
-    do
-        at <- freshScratch "ipe-index-refusal-read-only"
-        db <- seedProgressScratch at
-        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
-        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
-        digest <- shownRefusalDigest "r-big"
-        settings <- envAppSettings
-        refused <- refusedWith ReviewKey.readOnlyError (Queue.decideRefusal ReadOnly settings.index db (uid "r-big") digest Approved)
+        refused <- refusedAs expected (decidedRefusalNow db "r-big" digest)
         rows <- logRowCount db
         cleanupProgressScratch at
         Task.succeed (refused && rows == 0)
@@ -2895,7 +2874,7 @@ escapedRefusalAcknowledged =
         acked <- case decided of
             ( attested, written ) ->
                 drainThenLoadNow attested written Index.Start
-        refused <- refusedWith (Error.conflict "this file could not be re-probed, so it cannot be decided") (decideRefusalNow db "r-a" digestA)
+        refused <- refusedAs FileNotReprobed (decidedRefusalNow db "r-a" digestA)
         rows <- logRowCount db
         cleanupProgressScratch at
         Task.succeed (acked.refusalsOpen == 1 && refused && rows == 1)
@@ -2942,6 +2921,51 @@ escapedTagAcknowledged db =
                 == [ uid "r-s" ]
             )
 
+
+-- The mappings at one concrete result type, so each comparison is of one.
+savedCount : Result Error (Result DecideRefusal Int) -> Result SaveFailure Int
+savedCount result =
+    Failure.saved result
+
+
+loadedCount : Result Error Int -> Result LoadFailure Int
+loadedCount result =
+    Failure.loaded result
+
+
+-- A failed read's case comes from the same typed handles: a busy database
+-- is `LoadContended`, a ceiling `LoadPastLimit`, every other failure
+-- `LoadFailed`, and no case's text holds the error's. Red if a case is read
+-- from the message.
+loadFailureTyped : Bool
+loadFailureTyped =
+    let
+        marker =
+            "MARKER-/abs/root"
+
+        cases =
+            [ LoadContended, LoadPastLimit, LoadFailed ]
+
+        texts =
+            List.map Failure.loadFailureText cases
+    in
+    Failure.loadFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected marker))
+        == LoadContended
+        && Failure.loadFailureOf (Error.withDetails (Database Db.CannotOpen) (Error.unexpected marker))
+        == LoadFailed
+        && Failure.loadFailureOf (Error.limitExceeded marker)
+        == LoadPastLimit
+        && Failure.loadFailureOf (Error.unexpected ("Busy LimitExceeded " ++ marker))
+        == LoadFailed
+        && loadedCount (Ok 1)
+        == Ok 1
+        && loadedCount (Err (Error.unexpected marker))
+        == Err LoadFailed
+        && Set.size (Set.fromList texts)
+        == List.length cases
+        && List.all (\text -> not (String.contains "MARKER" text)) texts
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2973,6 +2997,7 @@ checks =
             , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles epoch )
             , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
             , Task.succeed ( "a failed save's case comes from its database failure, never its text", saveFailureTyped )
+            , Task.succeed ( "a failed read's case comes from its database failure or kind, never its text", loadFailureTyped )
             , Task.succeed ( "units under an unbound tag are said in the header and empty states", unboundNoticeTexts )
             , check "an unbound unit leaves the page, its total and its progress as they were" unboundUnitLeavesProgress
             ]
