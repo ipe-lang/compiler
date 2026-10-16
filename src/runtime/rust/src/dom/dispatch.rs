@@ -325,7 +325,7 @@ impl<M: RetainedBytes> Rendered<M> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 impl<M> Rendered<M> {
     /// Move the counter to its last value, so the next commit is exhausted.
     pub(crate) const fn exhaust(&mut self) {
