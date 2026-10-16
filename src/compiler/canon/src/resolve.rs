@@ -5743,13 +5743,17 @@ fn import_required(
 /// The import path of the module every `do` bind sequences through.
 pub const DO_BIND_MODULE: &[&str] = &["Ipe", "Task"];
 
+/// The `do` statement operator whose bind sequences through [`DO_BIND_MODULE`].
+const DO_BIND_OPERATOR: &str = "<-";
+
 /// Resolve a `do` bind's [`src::Expr_::TaskAndThen`] to the `Task.andThen`
 /// kernel, by identity.
 ///
 /// The gate is an import of [`DO_BIND_MODULE`] under any spelling: an alias
 /// renames the module, never what `do` means, and a different module aliased
 /// `Task` never stands in for it. With no such import the bind is IPE-N0034
-/// naming `import Ipe.Task`.
+/// naming the `<-` the source wrote and `import Ipe.Task`, never a `Task`
+/// qualifier the source does not spell.
 ///
 /// # Errors
 /// IPE-N0034 when no import of [`DO_BIND_MODULE`] exists;
@@ -5766,13 +5770,13 @@ fn resolve_task_and_then(span: Span, env: &Env, interner: &mut Interner) -> DRes
         .imported_modules
         .contains(&ModuleIdentity::Source(path))
     {
-        let module: Box<str> = DO_BIND_MODULE.join(".").into_boxed_str();
-        return Err(import_required(
-            def.qualifier.into(),
-            Box::new([module]),
+        return Err(Diagnostic::Name {
             span,
-            env,
-        ));
+            msg: NameError::OperatorImportRequired {
+                operator: DO_BIND_OPERATOR.into(),
+                module: DO_BIND_MODULE.join(".").into_boxed_str(),
+            },
+        });
     }
     Ok(canon::Expr_::VarKernel {
         id: Some(kernel),
@@ -9387,7 +9391,8 @@ mod do_bind_identity_tests {
         let task_path: Vec<Symbol> = DO_BIND_MODULE.iter().map(|s| sym(&mut i, s)).collect();
         let main_path = vec![sym(&mut i, "Main")];
         let mut deps: BTreeMap<Vec<Symbol>, crate::ModuleExports> = BTreeMap::new();
-        let producer = "module Ipe.Task exposing (succeed)\n\nsucceed a =\n    a\n";
+        let producer =
+            "module Ipe.Task exposing (succeed)\n\nsucceed : a -> a\nsucceed a =\n    a\n";
         let parsed_task = ipe_parse::parse_module(producer, &mut i).expect("producer parses");
         let (_, exports) = canonicalise_module_with_origin(
             &parsed_task,
@@ -9419,20 +9424,17 @@ mod do_bind_identity_tests {
             })
     }
 
-    /// Whether `result` is IPE-N0034 asking for `import Ipe.Task`, with no
-    /// alias remedy (no `Ipe.Task` import exists to rename).
+    /// Whether `result` is IPE-N0034 naming the `<-` the source wrote and
+    /// `import Ipe.Task`, never a `Task` qualifier the source does not spell
+    /// (a module aliased `Task` is imported, so "`Task` is the module
+    /// `Ipe.Task`" would misdescribe it).
     fn requires_task_import(result: &DResult<canon::Module>) -> bool {
         matches!(
             result,
             Err(Diagnostic::Name {
-                msg: NameError::ImportRequired {
-                    reached: StdlibReach::Qualifier(qualifier),
-                    candidates,
-                    imported_as: None,
-                },
+                msg: NameError::OperatorImportRequired { operator, module },
                 ..
-            }) if &**qualifier == "Task"
-                && candidates.iter().map(|c| &**c).eq(["Ipe.Task"])
+            }) if &**operator == "<-" && &**module == "Ipe.Task"
         )
     }
 
