@@ -81,14 +81,7 @@ fn engine_output(text: &str) -> Option<ipe_fmt::Formatted> {
 
 /// The engine's verdict as an edit decision: every refusal is no edit.
 fn accepted<T>(verdict: Result<T, ipe_fmt::FmtError>) -> Option<T> {
-    match verdict {
-        Ok(value) => Some(value),
-        Err(
-            ipe_fmt::FmtError::Parse { .. }
-            | ipe_fmt::FmtError::RoundTrip { .. }
-            | ipe_fmt::FmtError::Limit(ipe_fmt::FmtLimit::OutputBytes { .. }),
-        ) => None,
-    }
+    verdict.ok()
 }
 
 /// The edits replacing each declaration of `formatted` whose input bytes lie
@@ -596,7 +589,7 @@ mod tests {
         let real = ipe_fmt::format_with_segments(src).expect("formats");
         let segment = real.decls.first().cloned().expect("one declaration");
         let overlapping = ipe_fmt::Formatted {
-            text: real.text.clone(),
+            text: real.text,
             decls: vec![segment.clone(), segment],
         };
         assert_eq!(
