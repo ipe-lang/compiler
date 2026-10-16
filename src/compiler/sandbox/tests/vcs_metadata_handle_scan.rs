@@ -13,7 +13,6 @@
 //! blanked first, so only code is matched. A control fixture holding each
 //! refused form proves the scan turns red on it.
 
-use std::path::Path;
 
 /// The tokens of a path-based filesystem query.
 ///
@@ -287,15 +286,16 @@ fn scan(source: &str) -> Option<Findings> {
     })
 }
 
-#[allow(clippy::expect_used)] // the scanned files ship with this crate
-fn read(relative: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
-    std::fs::read_to_string(path).expect("a scanned file of this crate reads")
-}
+const METADATA_SOURCE: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/vcs_metadata.rs"));
+const CONTROL_FIXTURE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/vcs_metadata_handle_scan/path_query.rs.txt"
+));
 
 #[test]
 fn the_metadata_parse_queries_no_path() {
-    let findings = scan(&read("src/vcs_metadata.rs"));
+    let findings = scan(METADATA_SOURCE);
     assert!(
         findings.is_some(),
         "src/vcs_metadata.rs lost its `mod tests`"
@@ -311,10 +311,7 @@ fn the_metadata_parse_queries_no_path() {
 #[test]
 #[allow(clippy::expect_used)] // the fixture is this crate's own
 fn the_scan_refuses_the_control_fixture() {
-    let findings = scan(&read(
-        "tests/fixtures/vcs_metadata_handle_scan/path_query.rs.txt",
-    ))
-    .expect("the control fixture holds a `mod tests`");
+    let findings = scan(CONTROL_FIXTURE).expect("the control fixture holds a `mod tests`");
     let forbidden: Vec<(&str, &str)> = findings
         .forbidden
         .iter()
