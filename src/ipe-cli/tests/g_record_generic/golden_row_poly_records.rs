@@ -31,6 +31,8 @@
 //! | `row_poly_subset_pattern_param_neg` | row containment | reject | a row param bound with a subset pattern (`getName {name} = name`) → IPE-L0131 (else the destructure of `R1` is E0308) |
 //! | `row_poly_non_first_arg_neg` | row containment | reject | a single-field row in a non-first arg reached via a body lambda → clean IPE-L0131 (else the IPE-I0001 ICE backstop) |
 //! | `row_poly_captured_clone_neg` | row containment | reject | a row field read captured into an inner lambda (`\_ -> rec.name`) becomes a `CloneVar` receiver the emitter cannot route → IPE-L0131 (else the emitted `rec.name` on the bare `R1` generic is E0609) |
+//! | `row_poly_free_row_unused` | ground pre-pass | accept | an exposed, unused, unannotated `getX r = r.x + 1`: its open row is free, so the scope-less record pre-pass skips it instead of lowering a tail no def scope reads |
+//! | `row_poly_helper_borrows_row_neg` | row-tail owner | reject | an unannotated `helper rec = rec.name` called from `greet : { r \| name : String } -> String` reads `greet`'s row in its own signature → IPE-L0102 naming `helper`, `greet`, `r` |
 //!
 //! Run the E2E accept-path bodies (real `cargo build` + run) with:
 //! ```text
@@ -1138,6 +1140,70 @@ fn unannotated_relay_of_row_poly_fn_is_ipe_l0131() {
         Some(ipe_diagnostics::IPE_L0131),
         "a foreign row variable must be IPE-L0131 (else `lib_relay(r: RecName)` \
          is E0308 at the `RecAgeName` call); err = {err}"
+    );
+    assert!(
+        !out.join("src").join("main.rs").exists(),
+        "{name}: no Rust must be emitted on a rejection"
+    );
+}
+
+/// An exposed, unused, unannotated getter leaves its open row free. The record
+/// pre-pass runs outside every def scope and lowers only ground types, so it
+/// skips the open row; the build must accept.
+#[test]
+fn free_unused_row_is_accepted() {
+    let name = "row_poly_free_row_unused";
+    let entry = golden_dir(name).join("Main.ipe");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
+    let _ = std::fs::remove_dir_all(&out);
+
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&entry, &out, &runtime);
+    assert!(
+        built.is_ok(),
+        "{name}: a free open row must not reach a scope-less lowering: {:?}",
+        built.err()
+    );
+}
+
+/// An unannotated helper called from a row-polymorphic def borrows that def's
+/// row variable. Read in the helper's own signature, the row tail is another
+/// binding's generic, so the lowering refuses it with IPE-L0102 naming the
+/// helper, the owner, and the variable (else the helper's signature names a
+/// generic it never declares).
+#[test]
+fn helper_borrowing_a_signature_row_is_ipe_l0102() {
+    use ipe_diagnostics::{Diagnostic, LowerError};
+
+    let name = "row_poly_helper_borrows_row_neg";
+    let entry = golden_dir(name).join("Main.ipe");
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_out"));
+    let _ = std::fs::remove_dir_all(&out);
+
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build(&entry, &out, &runtime);
+    let Err(ipe::CliError::Pipeline { diag, .. }) = &built else {
+        assert!(
+            matches!(built, Err(ipe::CliError::Pipeline { .. })),
+            "{name}: a helper borrowing another def's row must be refused with a \
+             pipeline diagnostic, got: {built:?}"
+        );
+        return;
+    };
+    assert_eq!(
+        diag.code(),
+        ipe_diagnostics::IPE_L0102,
+        "{name}: a borrowed row tail must be IPE-L0102, got: {diag:?}"
+    );
+    assert!(
+        matches!(
+            &**diag,
+            Diagnostic::Lower {
+                msg: LowerError::ForeignTypeVariable { helper, owner, var },
+                ..
+            } if &**helper == "helper" && &**owner == "greet" && &**var == "r"
+        ),
+        "{name}: the refusal must name helper `helper`, owner `greet`, variable `r`, got: {diag:?}"
     );
     assert!(
         !out.join("src").join("main.rs").exists(),
