@@ -2808,6 +2808,30 @@ unboundRefusalNoticed =
             )
 
 
+-- A page's worth of blocking refusals sorting before an acknowledgeable one
+-- leaves the acknowledgeable one listed, all of them counted. Red if the
+-- page orders by path alone.
+acknowledgeableRefusalListedFirst : Task.Task Error Bool
+acknowledgeableRefusalListedFirst =
+    do
+        at <- freshScratch "ipe-index-refusal-order"
+        _ <- seedProgressScratch at
+        execIndex at.indexDb
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) INSERT INTO refusals (uid, path, lang, reason, size, digest) SELECT printf('%064d', i), printf('ipe:a/%03d', i), 'other', 'unreadable', NULL, NULL FROM n"
+            []
+        insertRefusal at.indexDb "r-z" "ipe:z/blob.bin" "not-utf8" (SqlInt 4) (refusalDigestOf "a")
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (page.refusalsOpen
+                == 201
+                && List.length page.refusals
+                == 200
+                && List.map (\row -> row.uid) (List.take 1 page.refusals)
+                == [ uid "r-z" ]
+            )
+
+
 -- The index's escape of a name parses back to exactly that name, and text
 -- it never writes parses to nothing: a raw character it escapes, an escape
 -- of a character it writes bare or of a leading zero, a byte of a name that
@@ -2953,6 +2977,7 @@ checks =
             , check "an acknowledged file leaves the open set and a new digest re-opens it" acknowledgedRefusalReopensOnNewDigest
             , check "a refusal decision on a changed row or file, or without a key, is refused" refusalDecisionRefusedOnChange
             , check "a refusal under an unbound tag is said in the header, never open" unboundRefusalNoticed
+            , check "a page of blocking refusals keeps an acknowledgeable one listed" acknowledgeableRefusalListedFirst
             , Task.succeed ( "the index's path escape parses back exactly, and nothing else parses", shownEscapeParsedExactly )
             , check "a file at an escaped name is acknowledged at the name it escapes" escapedRefusalAcknowledged
             , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
