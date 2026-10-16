@@ -1,13 +1,16 @@
-//! The byte budgets a web session's resident state is charged against.
+//! The budgets a web session's resident state and in-flight Cmds are charged against.
 //!
 //! Each session holds one [`Charge`] on its own [`SessionBudget`] of
 //! [`SESSION_CEILING`], nested in the one process budget of [`SESSION_BUDGET`]
-//! every app of the process shares. A charge takes its bytes from every budget of the chain or
-//! from none, each step one atomic `fetch_update`, so no budget's `used` ever
-//! passes its `limit`; the bytes return only when the charge drops.
+//! every app of the process shares. Each in-flight Cmd holds one [`CmdPermit`]
+//! on its session's [`SessionCmds`] of [`SESSION_CMD_CEILING`], nested in the
+//! one process budget of [`PROCESS_CMD_BUDGET`]. Both run on one engine,
+//! [`Budget`]: a charge takes its units from every budget of the chain or from
+//! none, each step one atomic `fetch_update`, so no budget's `used` ever passes
+//! its `limit`; the units return only when the charge drops.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::retained::Bytes;
@@ -32,6 +35,66 @@ const _: () = assert!(ENTRY_OVERHEAD.get() < SESSION_CEILING.get());
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if one session's ceiling could pass the process budget [ledger #boundary]
 const _: () = assert!(SESSION_CEILING.get() < SESSION_BUDGET.get());
 
+/// A count a [`Budget`] is kept in.
+pub trait Quantity: Copy + std::fmt::Debug {
+    /// The count as a number of units.
+    fn units(self) -> u64;
+    /// The count of `units` units.
+    fn of_units(units: u64) -> Self;
+}
+
+impl Quantity for Bytes {
+    fn units(self) -> u64 {
+        self.get()
+    }
+
+    fn of_units(units: u64) -> Self {
+        Self::new(units)
+    }
+}
+
+/// A count of in-flight Cmds, a role distinct from [`Bytes`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Cmds(u64);
+
+impl Cmds {
+    /// The count of `n` Cmds.
+    #[must_use]
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    /// The count as a number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Quantity for Cmds {
+    fn units(self) -> u64 {
+        self.0
+    }
+
+    fn of_units(units: u64) -> Self {
+        Self(units)
+    }
+}
+
+/// The Cmds one session may have in flight.
+pub const SESSION_CMD_CEILING: Cmds = Cmds::new(64);
+
+/// The Cmds every session of the process may have in flight together.
+///
+/// It also counts the Cmds an evicted session left running, so evicting and
+/// rejoining cannot escape [`SESSION_CMD_CEILING`].
+pub const PROCESS_CMD_BUDGET: Cmds = Cmds::new(16_384);
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session could admit no Cmd at all [ledger #boundary]
+const _: () = assert!(SESSION_CMD_CEILING.get() > 0);
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if one session's Cmd ceiling could pass the process Cmd budget [ledger #boundary]
+const _: () = assert!(SESSION_CMD_CEILING.get() < PROCESS_CMD_BUDGET.get());
+
 /// The process budget every app's sessions are charged against.
 #[must_use]
 pub fn shared() -> Arc<SessionBudget> {
@@ -49,21 +112,35 @@ pub enum OverBudget {
     Process,
 }
 
-/// A byte limit and the bytes charged against it.
+/// The process Cmd budget every session's [`SessionCmds`] is nested in.
+#[must_use]
+pub fn shared_cmds() -> Arc<Budget<Cmds>> {
+    static SHARED: std::sync::LazyLock<Arc<Budget<Cmds>>> =
+        std::sync::LazyLock::new(|| Budget::process(PROCESS_CMD_BUDGET));
+    Arc::clone(&SHARED)
+}
+
+/// The byte budget of a session or of the process.
+pub type SessionBudget = Budget<Bytes>;
+
+/// Bytes held against a byte budget chain, returned when dropped.
+pub type Charge = Held<Bytes>;
+
+/// A limit and the units charged against it.
 #[derive(Debug)]
-pub struct SessionBudget {
-    limit: Bytes,
+pub struct Budget<U> {
+    limit: U,
     used: AtomicU64,
     /// The budget this one is nested in; `None` for the process budget.
     parent: Option<Arc<Self>>,
-    /// Woken whenever a charge returns bytes to this budget.
+    /// Woken whenever a charge returns units to this budget.
     freed: tokio::sync::Notify,
 }
 
-impl SessionBudget {
-    /// A process budget of `limit` bytes.
+impl<U: Quantity> Budget<U> {
+    /// A process budget of `limit`.
     #[must_use]
-    pub fn process(limit: Bytes) -> Arc<Self> {
+    pub fn process(limit: U) -> Arc<Self> {
         Arc::new(Self {
             limit,
             used: AtomicU64::new(0),
@@ -72,9 +149,9 @@ impl SessionBudget {
         })
     }
 
-    /// A session budget of `limit` bytes nested in `process`.
+    /// A session budget of `limit` nested in `process`.
     #[must_use]
-    pub fn session(process: &Arc<Self>, limit: Bytes) -> Arc<Self> {
+    pub fn session(process: &Arc<Self>, limit: U) -> Arc<Self> {
         Arc::new(Self {
             limit,
             used: AtomicU64::new(0),
@@ -89,19 +166,19 @@ impl SessionBudget {
         Arc::clone(self.parent.as_ref().unwrap_or(self))
     }
 
-    /// The bytes charged against this budget now.
+    /// The units charged against this budget now.
     #[must_use]
-    pub fn used(&self) -> Bytes {
-        Bytes::new(self.used.load(Ordering::Acquire))
+    pub fn used(&self) -> U {
+        U::of_units(self.used.load(Ordering::Acquire))
     }
 
-    /// The bytes still free under this budget's limit.
+    /// The units still free under this budget's limit.
     #[must_use]
-    pub fn room(&self) -> Bytes {
-        Bytes::new(self.limit.get().saturating_sub(self.used().get()))
+    pub fn room(&self) -> U {
+        U::of_units(self.limit.units().saturating_sub(self.used().units()))
     }
 
-    /// A future woken the next time a charge returns bytes to this budget.
+    /// A future woken the next time a charge returns units to this budget.
     pub fn freed(&self) -> tokio::sync::futures::Notified<'_> {
         self.freed.notified()
     }
@@ -115,72 +192,72 @@ impl SessionBudget {
         }
     }
 
-    /// Charge `bytes` to this budget alone, or refuse leaving it unchanged.
-    fn take(&self, bytes: Bytes) -> Result<(), OverBudget> {
-        let limit = self.limit.get();
+    /// Charge `amount` to this budget alone, or refuse leaving it unchanged.
+    fn take(&self, amount: U) -> Result<(), OverBudget> {
+        let limit = self.limit.units();
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes.get()).filter(|now| *now <= limit)
+                used.checked_add(amount.units()).filter(|now| *now <= limit)
             })
             .map(drop)
             .map_err(|_| self.refusal())
     }
 
-    /// Return `bytes` to this budget alone.
-    fn give(&self, bytes: Bytes) {
+    /// Return `amount` to this budget alone.
+    fn give(&self, amount: U) {
         // A charge returns only what it took, so the subtraction never floors;
         // saturating keeps a broken pairing from wrapping into a huge `used`.
         let _ = self
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used.saturating_sub(bytes.get()))
+                Some(used.saturating_sub(amount.units()))
             });
         self.freed.notify_waiters();
     }
 
-    /// Charge `bytes` to this budget and every budget it is nested in, or to none.
-    fn take_chain(&self, bytes: Bytes) -> Result<(), OverBudget> {
-        self.take(bytes)?;
+    /// Charge `amount` to this budget and every budget it is nested in, or to none.
+    fn take_chain(&self, amount: U) -> Result<(), OverBudget> {
+        self.take(amount)?;
         if let Some(parent) = &self.parent
-            && let Err(refusal) = parent.take_chain(bytes)
+            && let Err(refusal) = parent.take_chain(amount)
         {
-            self.give(bytes);
+            self.give(amount);
             return Err(refusal);
         }
         Ok(())
     }
 
-    /// Return `bytes` to this budget and every budget it is nested in.
-    fn give_chain(&self, bytes: Bytes) {
-        self.give(bytes);
+    /// Return `amount` to this budget and every budget it is nested in.
+    fn give_chain(&self, amount: U) {
+        self.give(amount);
         if let Some(parent) = &self.parent {
-            parent.give_chain(bytes);
+            parent.give_chain(amount);
         }
     }
 
-    /// Charge `bytes` to this budget and its parents.
+    /// Charge `amount` to this budget and its parents.
     ///
     /// # Errors
     ///
     /// The [`OverBudget`] bound the charge would pass; nothing is charged then.
-    pub fn try_charge(self: &Arc<Self>, bytes: Bytes) -> Result<Charge, OverBudget> {
-        self.take_chain(bytes)?;
-        Ok(Charge {
+    pub fn try_charge(self: &Arc<Self>, amount: U) -> Result<Held<U>, OverBudget> {
+        self.take_chain(amount)?;
+        Ok(Held {
             budget: Arc::clone(self),
-            held: bytes,
+            held: amount,
         })
     }
 }
 
-/// Bytes held against a budget chain, returned when dropped.
+/// Units held against a budget chain, returned when dropped.
 #[derive(Debug)]
-#[must_use = "a dropped charge returns its bytes at once"]
-pub struct Charge {
-    budget: Arc<SessionBudget>,
-    held: Bytes,
+#[must_use = "a dropped charge returns its units at once"]
+pub struct Held<U: Quantity> {
+    budget: Arc<Budget<U>>,
+    held: U,
 }
 
-impl Charge {
+impl Held<Bytes> {
     /// A charge of no bytes against a fresh session budget of its own.
     #[cfg(test)]
     pub fn detached() -> Self {
@@ -190,47 +267,251 @@ impl Charge {
             held: Bytes::ZERO,
         }
     }
+}
 
-    /// The bytes this charge holds.
+impl<U: Quantity> Held<U> {
+    /// The units this charge holds.
     #[must_use]
-    pub const fn held(&self) -> Bytes {
+    pub const fn held(&self) -> U {
         self.held
     }
 
-    /// The budget this charge holds bytes against.
+    /// The budget this charge holds units against.
     #[must_use]
-    pub const fn budget(&self) -> &Arc<SessionBudget> {
+    pub const fn budget(&self) -> &Arc<Budget<U>> {
         &self.budget
     }
 
-    /// Grow or shrink the charge to `now` bytes.
+    /// Grow or shrink the charge to `now`.
     ///
     /// # Errors
     ///
     /// The [`OverBudget`] bound growing would pass; the charge keeps holding
     /// what it held before.
-    pub fn recharge(&mut self, now: Bytes) -> Result<(), OverBudget> {
-        let (now_n, held_n) = (now.get(), self.held.get());
+    pub fn recharge(&mut self, now: U) -> Result<(), OverBudget> {
+        let (now_n, held_n) = (now.units(), self.held.units());
         if let Some(grow) = now_n.checked_sub(held_n) {
-            self.budget.take_chain(Bytes::new(grow))?;
+            self.budget.take_chain(U::of_units(grow))?;
         } else {
             self.budget
-                .give_chain(Bytes::new(held_n.saturating_sub(now_n)));
+                .give_chain(U::of_units(held_n.saturating_sub(now_n)));
         }
         self.held = now;
         Ok(())
     }
 }
 
-impl Drop for Charge {
+impl<U: Quantity> Drop for Held<U> {
     fn drop(&mut self) {
         self.budget.give_chain(self.held);
+    }
+}
+
+/// One in-flight Cmd's unit, held against its session and the process.
+///
+/// It is not `Clone` and holds exactly one unit; dropping it returns the unit
+/// to both budgets.
+#[derive(Debug)]
+#[must_use = "a dropped permit returns its Cmd unit at once"]
+pub struct CmdPermit {
+    _held: Held<Cmds>,
+}
+
+/// Whether a process-bound Cmd refusal has been logged yet.
+static PROCESS_CMDS_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// One session's in-flight Cmd budget, nested in the process Cmd budget.
+#[derive(Debug)]
+pub struct SessionCmds {
+    budget: Arc<Budget<Cmds>>,
+    /// Whether this session's first refusal has been logged yet.
+    warned: AtomicBool,
+}
+
+impl SessionCmds {
+    /// A session budget of [`SESSION_CMD_CEILING`] under [`shared_cmds`].
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::under(&shared_cmds(), SESSION_CMD_CEILING)
+    }
+
+    /// A session budget of `session` under `process`, for boundary tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_limits(process: &Arc<Budget<Cmds>>, session: Cmds) -> Self {
+        Self::under(process, session)
+    }
+
+    fn under(process: &Arc<Budget<Cmds>>, session: Cmds) -> Self {
+        Self {
+            budget: Budget::session(process, session),
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    /// One Cmd's unit from this session and the process.
+    ///
+    /// # Errors
+    ///
+    /// The [`OverBudget`] bound the unit would pass; nothing is held then.
+    pub(crate) fn try_permit(&self) -> Result<CmdPermit, OverBudget> {
+        self.budget
+            .try_charge(Cmds::new(1))
+            .map(|held| CmdPermit { _held: held })
+    }
+
+    /// The Cmds this session has in flight now.
+    #[must_use]
+    pub(crate) fn used(&self) -> Cmds {
+        self.budget.used()
+    }
+
+    /// Whether this refusal of `why` is the first one worth logging.
+    ///
+    /// True once per session for its first refusal, and once per process for
+    /// the first refusal by the process bound.
+    pub(crate) fn first_refusal(&self, why: OverBudget) -> bool {
+        let session_first = !self.warned.swap(true, Ordering::AcqRel);
+        let process_first =
+            why == OverBudget::Process && !PROCESS_CMDS_WARNED.swap(true, Ordering::AcqRel);
+        session_first || process_first
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pinned per-session Cmd ceiling of the binding decision.
+    #[test]
+    fn cmd_ceiling_value_pin() {
+        assert_eq!(SESSION_CMD_CEILING, Cmds::new(64));
+        assert_eq!(PROCESS_CMD_BUDGET, Cmds::new(16_384));
+    }
+
+    /// Exactly the ceiling's permits admit; the next refuses naming the
+    /// session; dropping one admits exactly one more.
+    #[test]
+    fn cmd_ceiling_boundary() {
+        let cmds = SessionCmds::new();
+        let mut held: Vec<CmdPermit> = Vec::new();
+        for _ in 0..SESSION_CMD_CEILING.get() {
+            let permit = cmds.try_permit();
+            assert!(permit.is_ok(), "a permit under the ceiling admits");
+            held.extend(permit.ok());
+        }
+        assert_eq!(cmds.used(), SESSION_CMD_CEILING);
+        assert_eq!(
+            cmds.try_permit().err(),
+            Some(OverBudget::Session),
+            "one Cmd past the ceiling refuses"
+        );
+        assert_eq!(cmds.used(), SESSION_CMD_CEILING, "a refusal holds nothing");
+        drop(held.pop());
+        let again = cmds.try_permit();
+        assert!(again.is_ok(), "a returned unit admits one more");
+        assert_eq!(cmds.try_permit().err(), Some(OverBudget::Session));
+        drop((held, again));
+        assert_eq!(cmds.used(), Cmds::new(0));
+    }
+
+    /// The process bound refuses across sessions and rolls the session unit back.
+    #[test]
+    fn cmd_process_boundary() {
+        let process = Budget::process(Cmds::new(6));
+        let a = SessionCmds::with_limits(&process, Cmds::new(4));
+        let b = SessionCmds::with_limits(&process, Cmds::new(4));
+        let held: Vec<_> = [&a, &a, &a, &a, &b, &b]
+            .into_iter()
+            .map(SessionCmds::try_permit)
+            .collect();
+        assert!(held.iter().all(Result::is_ok), "six units fit the process");
+        assert_eq!(process.used(), Cmds::new(6));
+        assert_eq!(
+            b.try_permit().err(),
+            Some(OverBudget::Process),
+            "the seventh unit passes the process bound"
+        );
+        assert_eq!(
+            b.used(),
+            Cmds::new(2),
+            "a process refusal leaks no session unit"
+        );
+        assert_eq!(process.used(), Cmds::new(6));
+        drop(held);
+        assert_eq!(process.used(), Cmds::new(0));
+    }
+
+    /// A permit held by a cancelled task returns its unit.
+    #[tokio::test]
+    async fn cmd_permit_cancelled_holder_returns() {
+        let process = Budget::process(Cmds::new(8));
+        let cmds = SessionCmds::with_limits(&process, Cmds::new(4));
+        let permit = cmds.try_permit();
+        assert!(permit.is_ok());
+        let holder = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!((cmds.used(), process.used()), (Cmds::new(1), Cmds::new(1)));
+        holder.abort();
+        let _ = holder.await;
+        assert_eq!((cmds.used(), process.used()), (Cmds::new(0), Cmds::new(0)));
+    }
+
+    /// Racing threads never hold more permits than the ceiling.
+    #[test]
+    fn cmd_permit_concurrent_race() {
+        const THREADS: usize = 16;
+        const TRIES: usize = 16;
+        for _ in 0..50 {
+            let process = Budget::process(PROCESS_CMD_BUDGET);
+            let cmds = SessionCmds::with_limits(&process, SESSION_CMD_CEILING);
+            let barrier = std::sync::Barrier::new(THREADS);
+            let (barrier, racing) = (&barrier, &cmds);
+            let held: Vec<CmdPermit> = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..THREADS)
+                    .map(move |_| {
+                        scope.spawn(move || {
+                            barrier.wait();
+                            (0..TRIES)
+                                .filter_map(|_| racing.try_permit().ok())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .filter_map(|w| w.join().ok())
+                    .flatten()
+                    .collect()
+            });
+            let admitted = u64::try_from(held.len()).unwrap_or(u64::MAX);
+            assert_eq!(
+                admitted,
+                SESSION_CMD_CEILING.get(),
+                "exactly the ceiling admits"
+            );
+            assert_eq!(process.used(), SESSION_CMD_CEILING);
+            drop(held);
+            assert_eq!((cmds.used(), process.used()), (Cmds::new(0), Cmds::new(0)));
+        }
+    }
+
+    /// The first refusal of a session is logged once; a later one is not.
+    #[test]
+    fn first_refusal_once_per_session() {
+        let process = Budget::process(Cmds::new(8));
+        let cmds = SessionCmds::with_limits(&process, Cmds::new(1));
+        assert!(cmds.first_refusal(OverBudget::Session));
+        assert!(!cmds.first_refusal(OverBudget::Session));
+        let other = SessionCmds::with_limits(&process, Cmds::new(1));
+        assert!(
+            other.first_refusal(OverBudget::Session),
+            "each session logs once"
+        );
+    }
 
     /// A process budget of `process` bytes and one session budget of `session` in it.
     fn chain(process: u64, session: u64) -> (Arc<SessionBudget>, Arc<SessionBudget>) {
