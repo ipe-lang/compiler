@@ -782,7 +782,7 @@ unitPageStatesDistinct : Task.Task Error Bool
 unitPageStatesDistinct =
     let
         pageTexts =
-            List.filterMap Queue.unitPageStatusText [ UnitLoading, UnitNotFound, UnitIdRefused, UnitFailed LoadFailed ]
+            List.filterMap (Queue.unitPageStatusText >> Maybe.map SafeText.toString) [ UnitLoading, UnitNotFound, UnitIdRefused, UnitFailed LoadFailed ]
 
         withheldViews =
             [ Stale Drifted
@@ -798,7 +798,7 @@ unitPageStatesDistinct =
             ]
 
         sourceTexts =
-            List.filterMap Queue.sourceStatusText withheldViews
+            List.filterMap (Queue.sourceStatusText >> Maybe.map SafeText.toString) withheldViews
     in
     do
         at <- freshScratch "ipe-index-unit-page-states"
@@ -827,7 +827,7 @@ byteCeilingTextRoundsUp : Bool
 byteCeilingTextRoundsUp =
     maybeContains
         "257 KiB"
-        (Queue.sourceStatusText (TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })))
+        (Maybe.map SafeText.toString (Queue.sourceStatusText (TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) }))))
 
 
 isNotFound : Queue.UnitPageState -> Bool
@@ -1030,14 +1030,14 @@ queueStateTextsDistinct =
             { drained | units = [ sampleQueuedUnit ] }
     in
     List.all identity
-        [ Queue.queueStatusText Loading == Just "Loading queue…"
-        , Queue.queueStatusText (Loaded empty) == Just "No units queued."
-        , Queue.queueStatusText (Failed LoadFailed) == Just ("Queue failed to load: " ++ Failure.loadFailureText LoadFailed)
+        [ Maybe.map SafeText.toString (Queue.queueStatusText Loading) == Just "Loading queue…"
+        , Maybe.map SafeText.toString (Queue.queueStatusText (Loaded empty)) == Just "No units queued."
+        , Maybe.map SafeText.toString (Queue.queueStatusText (Failed LoadFailed)) == Just ("Queue failed to load: " ++ Failure.loadFailureText LoadFailed)
         , Queue.queueStatusText Loading /= Queue.queueStatusText (Loaded empty)
         , Queue.queueStatusText (Failed LoadFailed) /= Queue.queueStatusText (Loaded empty)
-        , Queue.queueStatusText (Loaded drained) == Just "No units to review on this page."
-        , Queue.queueStatusText (Loaded full) == Nothing
-        , Queue.pageHeaderText full == "index.db · 4.0 KB · showing 1 of 41000"
+        , Maybe.map SafeText.toString (Queue.queueStatusText (Loaded drained)) == Just "No units to review on this page."
+        , Maybe.map SafeText.toString (Queue.queueStatusText (Loaded full)) == Nothing
+        , SafeText.toString (Queue.pageHeaderText full) == "index.db · 4.0 KB · showing 1 of 41000"
         , Format.byteSize 512 == "512 B"
         ]
 
@@ -2378,7 +2378,7 @@ brokenChainCountsNothing =
                 == 0
                 && page.log
                 == ShownBroken (BreaksAt 2)
-                && Queue.chainBanner page.log
+                && Maybe.map SafeText.toString (Queue.chainBanner page.log)
                 == Just "The review log's chain breaks at entry 2: a decision was removed, reordered or replaced outside this tool."
                 && history.log
                 == ShownBroken (BreaksAt 2)
@@ -2474,7 +2474,7 @@ decidedThenReopened before page =
         && not (onPage "u-b" before)
         && page.log
         == ShownBroken (BreaksAt 1)
-        && Queue.chainBanner page.log
+        && Maybe.map SafeText.toString (Queue.chainBanner page.log)
         == Just "The review log's chain breaks at entry 1: a decision was removed, reordered or replaced outside this tool."
         && onPage "u-a" page
         && onPage "u-b" page
@@ -2537,12 +2537,12 @@ unboundNoticeTexts =
             { many | units = [] }
     in
     List.all identity
-        [ Queue.pageHeaderText empty == "index.db · 4.0 KB · showing 0 of 0"
-        , Queue.queueStatusText (Loaded empty) == Just "No units queued."
-        , Queue.pageHeaderText one == "index.db · 4.0 KB · showing 0 of 0 · 1 unit in unbound repositories not shown"
-        , Queue.queueStatusText (Loaded one) == Just "No units queued. · 1 unit in unbound repositories not shown"
-        , Queue.pageHeaderText many == "index.db · 4.0 KB · showing 1 of 41000 · 3 units in unbound repositories not shown"
-        , Queue.queueStatusText (Loaded drained) == Just "No units to review on this page. · 3 units in unbound repositories not shown"
+        [ SafeText.toString (Queue.pageHeaderText empty) == "index.db · 4.0 KB · showing 0 of 0"
+        , Maybe.map SafeText.toString (Queue.queueStatusText (Loaded empty)) == Just "No units queued."
+        , SafeText.toString (Queue.pageHeaderText one) == "index.db · 4.0 KB · showing 0 of 0 · 1 unit in unbound repositories not shown"
+        , Maybe.map SafeText.toString (Queue.queueStatusText (Loaded one)) == Just "No units queued. · 1 unit in unbound repositories not shown"
+        , SafeText.toString (Queue.pageHeaderText many) == "index.db · 4.0 KB · showing 1 of 41000 · 3 units in unbound repositories not shown"
+        , Maybe.map SafeText.toString (Queue.queueStatusText (Loaded drained)) == Just "No units to review on this page. · 3 units in unbound repositories not shown"
         ]
 
 
@@ -2573,7 +2573,7 @@ unboundUnitLeavesProgress =
                 && after.progress.reviewed
                 == before.progress.reviewed
                 && consistentPage after
-                && String.endsWith " · 1 unit in unbound repositories not shown" (Queue.pageHeaderText after)
+                && String.endsWith " · 1 unit in unbound repositories not shown" (SafeText.toString (Queue.pageHeaderText after))
             )
 
 
@@ -2704,9 +2704,9 @@ openRefusalBlocksAllReviewed =
                 && page.progress.total
                 == page.progress.reviewed
                 + 1
-                && Queue.queueStatusText (Loaded page)
+                && Maybe.map SafeText.toString (Queue.queueStatusText (Loaded page))
                 == Just "No units queued, but 1 unreviewable file still open."
-                && String.contains "· 1 unreviewable file open" (Queue.pageHeaderText page)
+                && String.contains "· 1 unreviewable file open" (SafeText.toString (Queue.pageHeaderText page))
             )
 
 
@@ -2798,7 +2798,7 @@ unboundRefusalNoticed =
                 && List.isEmpty page.refusals
                 && page.refusalsUnbound
                 == 1
-                && String.contains "· 1 unreviewable file in unbound repositories not shown" (Queue.pageHeaderText page)
+                && String.contains "· 1 unreviewable file in unbound repositories not shown" (SafeText.toString (Queue.pageHeaderText page))
             )
 
 

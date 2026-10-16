@@ -41,6 +41,7 @@ import RepoPathTests
 import SafeTextTests
 import SettingsTests
 import SingleFlightTests
+import TextSinkScanTests
 import TypedRowsTests
 import ViewRenderTests
 import ViewTests
@@ -75,6 +76,7 @@ gatherChecks =
         , ViewRenderTests.checks |> Task.andThen (contributesChecks "ViewRenderTests")
         , SingleFlightTests.checks |> Task.andThen (contributesChecks "SingleFlightTests")
         , FailureScanTests.checks |> Task.andThen (contributesChecks "FailureScanTests")
+        , TextSinkScanTests.checks |> Task.andThen (contributesChecks "TextSinkScanTests")
         ]
         |> Task.map List.concat
 

@@ -1,0 +1,97 @@
+module Main exposing (main)
+
+-- NEGATIVE golden: `Store.selectToMaybe db` passed to `Task.andThen` is a
+-- partial application used as a function value. No `Store.select` projection
+-- is visible at the reference, so no per-row decode can be emitted for it; the
+-- build is rejected with IPE-L0149 (`SelectToNotSaturated`).
+
+
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Task as Task exposing (Task)
+
+
+type alias Book =
+    { id : String
+    , title : String
+    , authorId : String
+    }
+
+
+type alias Author =
+    { id : String
+    , name : String
+    }
+
+
+blankBook : Book
+blankBook =
+    { id = "", title = "", authorId = "" }
+
+
+blankAuthor : Author
+blankAuthor =
+    { id = "", name = "" }
+
+
+bookCodec : Codec Book
+bookCodec =
+    Codec.auto blankBook
+
+
+authorCodec : Codec Author
+authorCodec =
+    Codec.auto blankAuthor
+
+
+booksStore : Result Error (Store Book)
+booksStore =
+    Store.fromCodec "books" bookCodec
+        |> Result.map (\s -> Store.public (Store.primaryKey .id s))
+
+
+authorsStore : Result Error (Store Author)
+authorsStore =
+    Store.fromCodec "authors" authorCodec
+        |> Result.map (\s -> Store.public (Store.primaryKey .id s))
+
+
+badRead : Db -> Store Book -> Store Author -> Task Error (Maybe String)
+badRead db books authors =
+    Task.andThen (Store.selectToMaybe db)
+        (Task.succeed
+            (Store.select (\( _, author ) -> author.name)
+                (Store.join books .authorId authors .id)
+            )
+        )
+
+
+run : Db -> Task Error ()
+run db =
+    case booksStore of
+        Ok books ->
+            case authorsStore of
+                Ok authors ->
+                    Task.map (\_ -> ()) (badRead db books authors)
+
+                Err e ->
+                    Task.fail e
+
+        Err e ->
+            Task.fail e
+
+
+main : Task Error ()
+main =
+    Task.andThen
+        (\_ -> Io.println "unreachable")
+        (Task.onError
+            (\_ -> Task.succeed ())
+            (Task.andThen run (Db.connect ()))
+        )

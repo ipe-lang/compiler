@@ -11,6 +11,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
+import Ipe.Tuple as Tuple
 import TestSupport exposing (check)
 
 
@@ -133,11 +134,11 @@ textDetails =
 -- `Error`, under `Ipe.Error`, and under every name the module imports
 -- `Ipe.Error` as, and bare when an import of it exposes the call or
 -- everything.
-conversionNames : String -> List String
-conversionNames text =
+conversionNames : List Import -> List String
+conversionNames imports =
     let
         errorImports =
-            List.filter (\imp -> imp.moduleName == "Ipe.Error") (importsOf text)
+            List.filter (\imp -> imp.moduleName == "Ipe.Error") imports
 
         qualifiers =
             List.unique ("Error" :: "Ipe.Error" :: List.map (\imp -> imp.qualifier) errorImports)
@@ -206,9 +207,14 @@ type alias SiteScan =
 -- lowercase line above it.
 conversionSitesIn : String -> String -> List String
 conversionSitesIn rel text =
+    (indexModule ( rel, text )).sites
+
+
+conversionSitesOf : String -> List Import -> List String -> List String
+conversionSitesOf rel imports lines =
     let
         scanned =
-            List.foldl (siteStep (conversionNames text) rel) { name = "", sites = [] } (String.lines text)
+            List.foldl (siteStep (conversionNames imports) rel) { name = "", sites = [] } lines
     in
     scanned.sites
 
@@ -231,11 +237,11 @@ siteStep names rel line scan =
 
 -- A conversion site `admitted` does not list, and an admitted site no
 -- source holds.
-conversionViolations : List String -> List ( String, String ) -> List String
-conversionViolations admitted sources =
+conversionViolations : List String -> List ScanModule -> List String
+conversionViolations admitted modules =
     let
         found =
-            List.unique (List.concatMap (\( rel, text ) -> conversionSitesIn rel text) sources)
+            List.unique (List.concatMap (\scanned -> scanned.sites) modules)
     in
     List.map (\site -> "an error becomes text at " ++ site ++ ", which is not admitted") (List.filter (\site -> not (List.member site admitted)) found)
         ++ List.map (\site -> "the admitted site " ++ site ++ " holds no conversion") (List.filter (\site -> not (List.member site found)) admitted)
@@ -258,23 +264,20 @@ reachCeiling =
 
 
 -- A type declaration's lines, from its column-0 header to the first blank
--- line: seeking the header, reading it, past it awaiting the next line, and
--- closed, the flag saying whether that line is indented, a declaration
--- continued past a blank line.
+-- line: reading it, past it awaiting the next line, and closed, the flag
+-- saying whether that line is indented, a declaration continued past a
+-- blank line.
 type BlockScan
-    = Seeking
-    | Reading (List String)
+    = Reading (List String)
     | Ended (List String)
     | Closed (List String) Bool
 
 
-isHeader : String -> String -> Bool
-isHeader name line =
-    let
-        lineTokens =
-            tokens line
-    in
-    String.startsWith "type " line && (List.take 2 lineTokens == [ "type", name ] || List.take 3 lineTokens == [ "type", "alias", name ])
+-- True when `lineTokens`, the tokens of a `type` line, open the declaration
+-- of `name`.
+declares : String -> List String -> Bool
+declares name lineTokens =
+    List.take 2 lineTokens == [ "type", name ] || List.take 3 lineTokens == [ "type", "alias", name ]
 
 
 -- The code of `line`, its trailing comment dropped.
@@ -283,36 +286,38 @@ codeOf line =
     Maybe.withDefault "" (List.head (String.split "--" line))
 
 
-typeBlock : String -> String -> Result String (List String)
-typeBlock name text =
-    case List.foldl (blockStep name) Seeking (String.lines text) of
-        Seeking ->
+-- A line opening with `type `, by its tokens, and the declaration read
+-- from it.
+type alias Decl =
+    { tokens : List String, scan : BlockScan }
+
+
+-- The declaration of `name`: the first `type` line declaring it, read on.
+typeBlock : String -> List Decl -> Result String (List String)
+typeBlock name decls =
+    case List.find (\decl -> declares name decl.tokens) decls of
+        Just decl ->
+            case decl.scan of
+                Reading block ->
+                    Ok (List.reverse block)
+
+                Ended block ->
+                    Ok (List.reverse block)
+
+                Closed block continued ->
+                    if continued then
+                        Err ("type " ++ name ++ " continues past a blank line")
+
+                    else
+                        Ok (List.reverse block)
+
+        Nothing ->
             Err ("type " ++ name ++ " is not declared")
 
-        Reading block ->
-            Ok (List.reverse block)
 
-        Ended block ->
-            Ok (List.reverse block)
-
-        Closed block continued ->
-            if continued then
-                Err ("type " ++ name ++ " continues past a blank line")
-
-            else
-                Ok (List.reverse block)
-
-
-blockStep : String -> String -> BlockScan -> BlockScan
-blockStep name line scan =
+blockStep : String -> BlockScan -> BlockScan
+blockStep line scan =
     case scan of
-        Seeking ->
-            if isHeader name line then
-                Reading [ codeOf line ]
-
-            else
-                Seeking
-
         Reading block ->
             if String.isEmpty (String.trim line) then
                 Ended block
@@ -329,6 +334,54 @@ blockStep name line scan =
 
         Closed block continued ->
             Closed block continued
+
+
+-- The declarations of a module in one pass over its lines: each line moves
+-- every open declaration on, a closed one is done, and a `type` line opens
+-- one more. Declarations close in the order they open.
+type alias DeclScan =
+    { open : List Decl, done : List Decl }
+
+
+declsOf : List String -> List Decl
+declsOf lines =
+    let
+        scanned =
+            List.foldl declStep { open = [], done = [] } lines
+    in
+    scanned.done ++ scanned.open
+
+
+declStep : String -> DeclScan -> DeclScan
+declStep line scan =
+    let
+        moved =
+            List.map (\decl -> { decl | scan = blockStep line decl.scan }) scan.open
+
+        closed =
+            List.filter (\decl -> isClosed decl.scan) moved
+
+        opened =
+            if String.startsWith "type " line then
+                [ { tokens = tokens line, scan = Reading [ codeOf line ] } ]
+
+            else
+                []
+    in
+    { open = List.filter (\decl -> not (isClosed decl.scan)) moved ++ opened, done = scan.done ++ closed }
+
+
+isClosed : BlockScan -> Bool
+isClosed scan =
+    case scan of
+        Closed _ _ ->
+            True
+
+        Reading _ ->
+            False
+
+        Ended _ ->
+            False
 
 
 type alias RefScan =
@@ -378,13 +431,17 @@ type alias Import =
     { moduleName : String, qualifier : String, exposed : List String }
 
 
-importsOf : String -> List Import
-importsOf text =
-    List.filterMap importOf (String.lines text)
-
-
 importOf : String -> Maybe Import
 importOf line =
+    if String.startsWith "import " line then
+        importFrom line
+
+    else
+        Nothing
+
+
+importFrom : String -> Maybe Import
+importFrom line =
     let
         words =
             String.words line
@@ -392,25 +449,50 @@ importOf line =
         pairs =
             List.map2 (\a b -> ( a, b )) words (List.drop 1 words)
     in
-    if String.startsWith "import " line then
-        Maybe.map
-            (\moduleName ->
-                { moduleName = moduleName
-                , qualifier = Maybe.withDefault moduleName (Maybe.map (\( _, b ) -> b) (List.find (\( a, _ ) -> a == "as") pairs))
-                , exposed = Maybe.withDefault [] (Maybe.map tokens (List.head (List.drop 1 (String.split "exposing" line))))
-                }
-            )
-            (List.head (List.drop 1 words))
+    Maybe.map
+        (\moduleName ->
+            { moduleName = moduleName
+            , qualifier = Maybe.withDefault moduleName (Maybe.map (\( _, b ) -> b) (List.find (\( a, _ ) -> a == "as") pairs))
+            , exposed = Maybe.withDefault [] (Maybe.map tokens (List.head (List.drop 1 (String.split "exposing" line))))
+            }
+        )
+        (List.head (List.drop 1 words))
 
-    else
-        Nothing
+
+-- A module of `src` as the scans read it, split and lexed once: its text,
+-- its imports, its conversion sites, whether a line imports `Ipe.Error`,
+-- and its declarations. A scan reads the index, never the text; a changed
+-- text is a new index.
+type alias ScanModule =
+    { rel : String, text : String, imports : List Import, sites : List String, importsError : Bool, decls : List Decl }
+
+
+indexModule : ( String, String ) -> ScanModule
+indexModule source =
+    case source of
+        ( rel, text ) ->
+            let
+                lines =
+                    String.lines text
+
+                imports =
+                    List.filterMap importOf lines
+            in
+            { rel = rel
+            , text = text
+            , imports = imports
+            , sites = conversionSitesOf rel imports lines
+            , importsError = List.any (String.startsWith "import Ipe.Error") lines
+            , decls = declsOf lines
+            }
 
 
 -- Where the type `token` names in module `rel` is declared: `Ok Nothing`
 -- for a leaf, `Ok (Just ( file, name ))` for a declaration to walk, and
--- `Err` for a name that resolves to neither.
-resolve : String -> String -> String -> Result String (Maybe ( String, String ))
-resolve rel text token =
+-- `Err` for a name that resolves to neither. `headers` are the tokens of
+-- the module's `type` lines.
+resolve : String -> List (List String) -> List Import -> String -> Result String (Maybe ( String, String ))
+resolve rel headers imports token =
     let
         segments =
             List.reverse (String.split "." token)
@@ -421,14 +503,11 @@ resolve rel text token =
         qualifier =
             String.join "." (List.reverse (List.drop 1 segments))
 
-        imports =
-            importsOf text
-
         unresolved =
             Err (rel ++ ": " ++ token ++ " resolves to no declaration or leaf")
     in
     if String.isEmpty qualifier then
-        if List.any (isHeader token) (String.lines text) then
+        if List.any (declares token) headers then
             Ok (Just ( rel, token ))
 
         else
@@ -468,28 +547,48 @@ type alias Visit =
     { next : List ( String, String ), violations : List String }
 
 
-visitType : List ( String, String ) -> ( String, String ) -> Visit
-visitType sources key =
-    case key of
-        ( rel, name ) ->
-            case List.find (\( file, _ ) -> file == rel) sources of
-                Just ( _, text ) ->
-                    visitBlock rel name text
+-- The visits of the keys in `fresh` that name a declaration of `scanned`.
+visitsIn : List ( String, String ) -> ScanModule -> List Visit
+visitsIn fresh scanned =
+    let
+        rel =
+            scanned.rel
 
-                Nothing ->
-                    { next = [], violations = [ rel ++ " is not a module of src" ] }
+        decls =
+            scanned.decls
+
+        headers =
+            List.map (\decl -> decl.tokens) decls
+
+        imports =
+            scanned.imports
+
+        names =
+            List.filterMap
+                (\key ->
+                    case key of
+                        ( file, name ) ->
+                            if file == rel then
+                                Just name
+
+                            else
+                                Nothing
+                )
+                fresh
+    in
+    List.map (visitBlock rel decls headers imports) names
 
 
-visitBlock : String -> String -> String -> Visit
-visitBlock rel name text =
-    case typeBlock name text of
+visitBlock : String -> List Decl -> List (List String) -> List Import -> String -> Visit
+visitBlock rel decls headers imports name =
+    case typeBlock name decls of
         Ok block ->
             let
                 refs =
                     typeRefs block
 
                 resolved =
-                    List.map (resolve rel text) (List.filter (\token -> token /= "Error") refs)
+                    List.map (resolve rel headers imports) (List.filter (\token -> token /= "Error") refs)
 
                 namesError =
                     if List.member "Error" refs then
@@ -529,16 +628,22 @@ type alias Walk =
 
 
 -- Every declaration reachable from the app's `Model` and `Msg`, one round
--- per distance from them; past `reachCeiling` declarations the walk stops
--- and is a violation.
+-- per distance from them, over each module indexed once. The walk stops at
+-- its fixed point, an empty frontier, and after `reachCeiling + 1` rounds
+-- at most; past `reachCeiling` declarations it stops and is a violation.
 reachViolations : List ( String, String ) -> List String
 reachViolations sources =
+    reachViolationsOf (List.map indexModule sources)
+
+
+reachViolationsOf : List ScanModule -> List String
+reachViolationsOf modules =
     let
         start =
             { seen = [], frontier = [ ( "Lib/App.ipe", "Model" ), ( "Lib/App.ipe", "Msg" ) ], violations = [] }
 
         walked =
-            List.foldl (\_ walk -> walkRound sources walk) start (List.range 1 (reachCeiling + 1))
+            walkFrom modules (reachCeiling + 1) start
 
         unfinished =
             if List.isEmpty walked.frontier then
@@ -557,8 +662,18 @@ reachViolations sources =
     walked.violations ++ unfinished ++ tooMany
 
 
-walkRound : List ( String, String ) -> Walk -> Walk
-walkRound sources walk =
+-- `walk` after at most `rounds` more rounds, none past its fixed point.
+walkFrom : List ScanModule -> Int -> Walk -> Walk
+walkFrom modules rounds walk =
+    if rounds <= 0 || List.isEmpty walk.frontier then
+        walk
+
+    else
+        walkFrom modules (rounds - 1) (walkRound modules walk)
+
+
+walkRound : List ScanModule -> Walk -> Walk
+walkRound modules walk =
     if List.length walk.seen > reachCeiling then
         { walk | frontier = [] }
 
@@ -567,24 +682,29 @@ walkRound sources walk =
             fresh =
                 List.filter (\key -> not (List.member key walk.seen)) (List.unique walk.frontier)
 
+            rels =
+                List.map (\scanned -> scanned.rel) modules
+
+            strays =
+                List.filter (\key -> not (List.member (Tuple.first key) rels)) fresh
+
             visits =
-                List.map (visitType sources) fresh
+                List.concatMap (visitsIn fresh) modules
         in
         { seen = walk.seen ++ fresh
         , frontier = List.concatMap (\visit -> visit.next) visits
-        , violations = walk.violations ++ List.concatMap (\visit -> visit.violations) visits
+        , violations = walk.violations ++ List.concatMap (\visit -> visit.violations) visits ++ List.map (\key -> Tuple.first key ++ " is not a module of src") strays
         }
-
 
 
 -- ── the view ────────────────────────────────────────────────────────────
 
 
-viewImportViolations : List ( String, String ) -> List String
-viewImportViolations sources =
-    case List.find (\( rel, _ ) -> rel == "Lib/View.ipe") sources of
-        Just ( _, text ) ->
-            if List.any (String.startsWith "import Ipe.Error") (String.lines text) then
+viewImportViolations : List ScanModule -> List String
+viewImportViolations modules =
+    case List.find (\scanned -> scanned.rel == "Lib/View.ipe") modules of
+        Just scanned ->
+            if scanned.importsError then
                 [ "Lib/View.ipe imports Ipe.Error" ]
 
             else
@@ -594,9 +714,9 @@ viewImportViolations sources =
             [ "Lib/View.ipe is not a module of src" ]
 
 
-scanViolations : List ( String, String ) -> List String
-scanViolations sources =
-    conversionViolations admittedConversions sources ++ reachViolations sources ++ viewImportViolations sources
+scanViolations : List ScanModule -> List String
+scanViolations modules =
+    conversionViolations admittedConversions modules ++ reachViolationsOf modules ++ viewImportViolations modules
 
 
 
@@ -613,19 +733,20 @@ scanViolations sources =
 -- around it.
 realTreeClean : Task.Task Error Bool
 realTreeClean =
-    srcSources |> Task.map (\sources -> List.isEmpty (scanViolations sources))
+    srcSources |> Task.map (\sources -> List.isEmpty (scanViolations (List.map indexModule sources)))
 
 
 scansRefuseEvasions : Task.Task Error Bool
 scansRefuseEvasions =
     srcSources
+        |> Task.map (List.map indexModule)
         |> Task.map
             (\sources ->
                 caught (appendTo "Lib/Queue.ipe" "show e =\n    Error.toString e" sources)
                     && caught (appendTo "Main.ipe" "moved e =\n    Error.message e" sources)
                     && caught (appendTo "Lib/App.ipe" "named e =\n    Error.kindName e" sources)
                     && not (List.isEmpty (conversionViolations (List.filter (\site -> site /= "Lib/ServerLog.ipe:logged") admittedConversions) sources))
-                    && not (List.isEmpty (conversionViolations admittedConversions (List.filter (\( rel, _ ) -> rel /= "Lib/ServerLog.ipe") sources)))
+                    && not (List.isEmpty (conversionViolations admittedConversions (List.filter (\scanned -> scanned.rel /= "Lib/ServerLog.ipe") sources)))
                     && caught (prependTo "Lib/View.ipe" "import Ipe.Error as Error" sources)
                     && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error as E" (appendTo "Lib/Queue.ipe" "shown e =\n    E.message e" sources))
                     && caught (prependTo "Lib/Queue.ipe" "import Ipe.Error exposing (toString)" (appendTo "Lib/Queue.ipe" "shown e =\n    toString e" sources))
@@ -636,33 +757,35 @@ scansRefuseEvasions =
             )
 
 
-caught : List ( String, String ) -> Bool
+caught : List ScanModule -> Bool
 caught sources =
     not (List.isEmpty (scanViolations sources))
 
 
-appendTo : String -> String -> List ( String, String ) -> List ( String, String )
+-- `sources` with `extra` after the text of `rel`, that module indexed anew.
+appendTo : String -> String -> List ScanModule -> List ScanModule
 appendTo rel extra sources =
     List.map
-        (\( name, text ) ->
-            if name == rel then
-                ( name, text ++ "\n\n" ++ extra ++ "\n" )
+        (\scanned ->
+            if scanned.rel == rel then
+                indexModule ( rel, scanned.text ++ "\n\n" ++ extra ++ "\n" )
 
             else
-                ( name, text )
+                scanned
         )
         sources
 
 
-prependTo : String -> String -> List ( String, String ) -> List ( String, String )
+-- `sources` with `extra` before the text of `rel`, that module indexed anew.
+prependTo : String -> String -> List ScanModule -> List ScanModule
 prependTo rel extra sources =
     List.map
-        (\( name, text ) ->
-            if name == rel then
-                ( name, extra ++ "\n" ++ text )
+        (\scanned ->
+            if scanned.rel == rel then
+                indexModule ( rel, extra ++ "\n" ++ scanned.text )
 
             else
-                ( name, text )
+                scanned
         )
         sources
 
@@ -682,9 +805,11 @@ reachFlags sources =
 
 
 -- A state holding an error, a message carrying one, a type in another
--- module holding one, a name that resolves nowhere, a missing `Model`, a
--- declaration continued past a blank line, and a walk past its ceiling are
--- each violations; a field named `refuseError` holding a typed case is not.
+-- module holding one, a name that resolves nowhere, a type in a module
+-- `src` does not hold, a missing `Model`, a declaration continued past a
+-- blank line, and a walk past its ceiling, by one declaration or more, are
+-- each violations; a field named `refuseError` holding a typed case, and a
+-- walk of exactly `reachCeiling` declarations, are not.
 -- Red if the walk misses a path an error could reach a page by.
 typeWalkRefuses : Bool
 typeWalkRefuses =
@@ -695,14 +820,18 @@ typeWalkRefuses =
             , ( "Lib/Failure.ipe", "type LoadFailure\n    = LoadFailed\n\n\ntype SaveFailure\n    = SaveFailed Error\n" )
             ]
         && reachFlags (appOnly "type alias Model =\n    { x : Foo.Bar }\n\n\ntype Msg\n    = Reload\n")
+        && reachFlags (appOnly "import Lib.Gone exposing (Gone)\n\n\ntype alias Model =\n    { gone : Gone }\n\n\ntype Msg\n    = Reload\n")
         && reachFlags (appOnly "type Msg\n    = Reload\n")
         && reachFlags (appOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = Reload\n\n    | Failed Error\n")
         && reachFlags (appOnly (chainedModel (reachCeiling + 2)))
+        && reachFlags (appOnly (chainedModel (reachCeiling - 2)))
+        && List.isEmpty (reachViolations (appOnly (chainedModel (reachCeiling - 3))))
         && List.isEmpty (reachViolations (appOnly "type alias Model =\n    { refuseError : Maybe RefuseFailure }\n\n\ntype Msg\n    = Reload\n\n\ntype RefuseFailure\n    = DraftWhileSaving\n"))
         && List.isEmpty (reachViolations (appOnly (chainedModel 8)))
 
 
--- A `Model` reaching `depth` declarations, each naming the next.
+-- A `Model` and `Msg` reaching `depth + 1` more declarations, each naming
+-- the next: `depth + 3` in all.
 chainedModel : Int -> String
 chainedModel depth =
     let
@@ -724,9 +853,9 @@ conversionScanRefuses : Bool
 conversionScanRefuses =
     conversionSitesIn "Lib/Queue.ipe" "show e =\n    Error.toString e\n\n\nlabel =\n    errorToStringLabel refuseError\n"
         == [ "Lib/Queue.ipe:show" ]
-        && conversionViolations [ "Lib/Queue.ipe:show" ] [ ( "Lib/Queue.ipe", "show e =\n    Error.toString e\n" ) ]
+        && conversionViolations [ "Lib/Queue.ipe:show" ] [ indexModule ( "Lib/Queue.ipe", "show e =\n    Error.toString e\n" ) ]
         == []
-        && List.length (conversionViolations [ "Lib/Queue.ipe:show" ] [ ( "Lib/Queue.ipe", "other e =\n    Error.toString e\n" ) ])
+        && List.length (conversionViolations [ "Lib/Queue.ipe:show" ] [ indexModule ( "Lib/Queue.ipe", "other e =\n    Error.toString e\n" ) ])
         == 2
         && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) ""))
         == Nothing

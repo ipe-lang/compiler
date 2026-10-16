@@ -58,6 +58,8 @@ mod golden_db_store_projection_upper_lower_seal;
 mod golden_db_store_rename_column;
 #[path = "g_db/golden_db_store_rls_composition_builders_seal.rs"]
 mod golden_db_store_rls_composition_builders_seal;
+#[path = "g_db/golden_db_store_select_pipe.rs"]
+mod golden_db_store_select_pipe;
 #[path = "g_db/golden_db_store_upsert.rs"]
 mod golden_db_store_upsert;
 #[path = "g_db/golden_db_wrapper_empty_params_165.rs"]

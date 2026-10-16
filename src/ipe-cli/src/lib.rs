@@ -332,7 +332,13 @@ pub use driver::{
     watch_banner_enabled,
 };
 #[cfg(any(test, feature = "test-fixtures"))]
-pub use project_root::fixture::{RootFixture, build_fixture, build_fixture_with_options};
+pub use driver::{emitted_bin_filename, emitted_bin_name};
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use project_root::fixture::{
+    BuiltFixture, RootFixture, build_fixture, build_fixture_with_options,
+};
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use project_root::golden::build_golden_dir;
 // Crate-internal driver items reached as `crate::…` by sibling modules
 // (`watch`, `pkg`, …). Kept `pub(crate)` so no originally-private helper widens
 // to public API; the block above re-exports the genuine public surface as `pub`.
