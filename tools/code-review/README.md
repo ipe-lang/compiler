@@ -243,6 +243,20 @@ to drain a decided unit: in one transaction its pair enters `reviewed`, its
 consumed `change_queue` row is deleted, and the stamp moves. The app creates
 and owns the review DB.
 
+### Unreviewable files
+
+A file the index could not read as units (not UTF-8, too large, a symbolic
+link, a submodule, an unreadable entry, …) is listed above the queue under
+**Unreviewable files** with the index's reason. Each one counts as open in the
+header and in the progress total, so the queue never reads as all reviewed
+while one is open. A file that is not UTF-8, too large, a symbolic link, a
+submodule or a git entry of unknown mode can be acknowledged or refused; the
+decision binds the index's refusal digest of the file, so a changed file is
+open again after the next `ipe-index` run. Before the decision is recorded the
+index row is read again and a content reason is re-probed: a file that now
+reads as text is refused, with "re-run the index". The other reasons say
+"Cannot be acknowledged: fix it in the tree." and offer no decision.
+
 ## Checks
 
 From this directory, type-check the app itself, then run its tests and the
