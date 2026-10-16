@@ -78,6 +78,7 @@ pub mod scratch;
 pub mod screen;
 pub mod secret_file;
 pub mod signing;
+mod source_snapshot;
 pub mod ssh_signing_key;
 pub mod style;
 mod target_dir;

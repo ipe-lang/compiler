@@ -308,6 +308,26 @@ impl ProjectRoot {
         &self.entries
     }
 
+    /// The held `src/` directory.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the source snapshot reader is its consumer")
+    )]
+    #[must_use]
+    pub(crate) const fn src(&self) -> &HeldDir {
+        &self.src
+    }
+
+    /// The held `tests/` directory, when the project has one.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the source snapshot reader is its consumer")
+    )]
+    #[must_use]
+    pub(crate) const fn tests(&self) -> Option<&HeldDir> {
+        self.tests.as_ref()
+    }
+
     /// Judge a file argument against this project.
     ///
     /// The project's `package.ipe` names the whole project; a module file
