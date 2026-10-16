@@ -7594,8 +7594,14 @@ mod reload_push_tests {
     async fn push_reload_to_web_sessions_sends_one_frame_per_web_session() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store_impl.set("with_sse", handle_with(Some(sse_tx))).await;
-        store_impl.set("without_sse", handle_with(None)).await;
+        assert_eq!(
+            store_impl.set("with_sse", handle_with(Some(sse_tx))).await,
+            crate::web::Installed::Held
+        );
+        assert_eq!(
+            store_impl.set("without_sse", handle_with(None)).await,
+            crate::web::Installed::Held
+        );
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
         push_reload_to_web_sessions(&store).await;
@@ -7619,7 +7625,10 @@ mod reload_push_tests {
     async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store_impl.set("s", handle_with(Some(sse_tx))).await;
+        assert_eq!(
+            store_impl.set("s", handle_with(Some(sse_tx))).await,
+            crate::web::Installed::Held
+        );
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
         maybe_push_reload_with(&store, None).await;
@@ -7737,9 +7746,12 @@ mod hot_appearance_push_tests {
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
             let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
             // A non-initial Model, to prove the re-render uses the CURRENT Model.
-            store_impl
-                .set("live", session_with_current_view(7, Some(sse_tx)))
-                .await;
+            assert_eq!(
+                store_impl
+                    .set("live", session_with_current_view(7, Some(sse_tx)))
+                    .await,
+                crate::web::Installed::Held
+            );
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -7802,7 +7814,10 @@ mod hot_appearance_push_tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .rendered
                 .epoch();
-            store_impl.set("live", handle.clone()).await;
+            assert_eq!(
+                store_impl.set("live", handle.clone()).await,
+                crate::web::Installed::Held
+            );
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -7850,9 +7865,12 @@ mod hot_appearance_push_tests {
 
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
             let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-            store_impl
-                .set("live", session_with_current_view(3, Some(sse_tx)))
-                .await;
+            assert_eq!(
+                store_impl
+                    .set("live", session_with_current_view(3, Some(sse_tx)))
+                    .await,
+                crate::web::Installed::Held
+            );
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -10398,9 +10416,12 @@ mod watch_status_handler_tests {
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store
-            .set("live-session", make_session_handle(Some(sse_tx)))
-            .await;
+        assert_eq!(
+            store
+                .set("live-session", make_session_handle(Some(sse_tx)))
+                .await,
+            crate::web::Installed::Held
+        );
         let state = make_state(store);
         let router = make_router(state);
 
@@ -10518,9 +10539,12 @@ mod watch_status_handler_tests {
     async fn no_sse_event_emitted_when_route_absent() {
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store
-            .set("session", make_session_handle(Some(sse_tx)))
-            .await;
+        assert_eq!(
+            store
+                .set("session", make_session_handle(Some(sse_tx)))
+                .await,
+            crate::web::Installed::Held
+        );
         // Route not mounted — production scenario.
         let prod_router: Router = Router::new();
         let req = Request::builder()
