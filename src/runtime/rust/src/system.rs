@@ -842,6 +842,34 @@ pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
     out
 }
 
+/// Author, operator or remote text a refusal quotes, scrubbed for a log line.
+///
+/// Built only by [`RefusedText::new`], which runs [`scrub_log_controls`], so a
+/// refusal's `Display` prints it as is: every log hazard in it is already a
+/// visible escape, and no refusal can carry the raw text by mistake.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RefusedText(String);
+
+impl RefusedText {
+    /// The scrubbed form of `raw`.
+    #[must_use]
+    pub fn new(raw: &str) -> Self {
+        Self(scrub_log_controls(raw).into_owned())
+    }
+
+    /// The scrubbed text.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Display for RefusedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Append the scrubbed spelling of one character to `out`.
 fn push_scrubbed(c: char, out: &mut String) {
     use std::fmt::Write as _;
