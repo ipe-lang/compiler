@@ -559,9 +559,10 @@ nodeOversizeRanksBeforeDrift =
 
 
 -- The relation the element ceiling is chosen by: its elements at the cost
--- of one, plus the reserve, fit half the runtime's session ceiling, and the
--- reserve holds the largest view's text four times over. Red if a ceiling
--- or a cost moves without the other.
+-- of one, plus the reserve, fit three quarters of the runtime's session
+-- ceiling, and the reserve holds the largest view's text sixteen times over
+-- with 128 bytes for each of its lines. Red if a ceiling or a cost moves
+-- without the other.
 nodeCeilingFitsSessionCeiling : Bool
 nodeCeilingFitsSessionCeiling =
     0
@@ -570,9 +571,12 @@ nodeCeilingFitsSessionCeiling =
         * ByteSize.toBytes Index.elementResidentBytes
         + ByteSize.toBytes Index.viewReserve
         <= ByteSize.toBytes Index.runtimeSessionCeiling
-        // 2
-        && 4
+        // 4
+        * 3
+        && 16
         * ByteSize.toBytes Index.viewByteCeiling
+        + 128
+        * Index.viewLineCeiling
         <= ByteSize.toBytes Index.viewReserve
 
 
@@ -1632,7 +1636,7 @@ checks =
         , Task.succeed ( "a view too many elements to highlight is shown plain, a small one highlighted", plainFallbackWhenColorsTooMany )
         , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is withheld", longTokenLinesNeverHighlighted )
         , Task.succeed ( "a view past the element ceiling is too large, never drifted", nodeOversizeRanksBeforeDrift )
-        , Task.succeed ( "the element ceiling, at the cost per element, fits half the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
+        , Task.succeed ( "the element ceiling, at the cost per element, fits three quarters of the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
         , check "the mirrored session ceiling is the runtime's" sessionCeilingMirrorsRuntime
         , check "roots agreeing with the recorded repositories pass the startup check" reposProbeAccepts
         , check "a missing or oversized recorded repository set refuses startup" reposProbeRefusesSetShape

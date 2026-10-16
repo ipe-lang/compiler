@@ -2205,13 +2205,14 @@ viewByteCeiling =
     ByteSize.kib 256
 
 
--- The most elements a shown view's drawing may take. The page is held in the
--- runtime's per-session memory, refused past `runtimeSessionCeiling`; a
--- render may hold the previous tree beside the next, so one tree is kept to
--- half the ceiling: `viewNodeCeiling` elements at `elementResidentBytes`
--- each, plus `viewReserve` for the view's text and the page around it.
--- (16 MiB / 2 - 2 MiB) / 3 KiB = 2048. The relation is checked by a test, and
--- the ceiling can rise as the runtime's cost per element falls.
+-- The most elements a shown view's drawing may take. The session's model and
+-- its one charged tree are refused past `runtimeSessionCeiling`;
+-- `viewNodeCeiling` elements at `elementResidentBytes` each, plus
+-- `viewReserve` for every copy of the view's text, fit three quarters of it.
+-- The last quarter holds the page outside the view and the error of the
+-- per-element cost, which is estimated, not measured:
+-- 2048 * 3 KiB + 5 MiB = 11 MiB <= 12 MiB. The relation is checked by a test,
+-- and the ceiling can rise as the runtime's cost per element falls.
 viewNodeCeiling : Int
 viewNodeCeiling =
     2048
@@ -2234,12 +2235,15 @@ elementResidentBytes =
     ByteSize.kib 3
 
 
--- The part of half the session ceiling kept for what is not a counted
--- element: the view's text, at most `viewByteCeiling`, held in the tree and
--- the model, and the page's other elements.
+-- What a shown view holds besides its counted elements, at most
+-- `viewByteCeiling` bytes of text and `viewLineCeiling` lines: the text in
+-- the rows and again whole in the model, the drawing's escaped characters
+-- at four bytes each with up to as much again of spare capacity, and the
+-- tree's escape spelling, six bytes for one source byte; sixteen copies in
+-- all, plus each line's row, string and line number.
 viewReserve : ByteSize
 viewReserve =
-    ByteSize.mib 2
+    ByteSize.mib 5
 
 
 -- The largest source file a unit is sliced from; a bigger file under the root
