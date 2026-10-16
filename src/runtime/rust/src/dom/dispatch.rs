@@ -36,7 +36,7 @@ impl<M: Clone> HandlerIndex<M> {
     #[must_use]
     pub fn resolve(&self, ipe_id: &str, event: &str, args: &[String]) -> Option<M> {
         match self.map.get(ipe_id)?.get(event)? {
-            Event::OnMsg(_, m) => Some(m.clone()),
+            Event::OnMsg(_, m) => Some(M::clone(m)),
             Event::OnString(_, f) => Some(f(args.first().cloned().unwrap_or_default())),
             Event::OnBool(_, f) => Some(f(args.first().is_some_and(|s| s == "true"))),
             Event::OnForm(_, _) => None, // dispatched via resolve_form
@@ -520,7 +520,10 @@ mod tests {
             vec![
                 Html::HElement(
                     "button".into(),
-                    vec![Attribute::EventAttr(Event::OnMsg("click".into(), Msg::Inc))],
+                    vec![Attribute::EventAttr(Event::OnMsg(
+                        "click".into(),
+                        Box::new(Msg::Inc),
+                    ))],
                     vec![],
                 ),
                 Html::HElement(
@@ -737,7 +740,7 @@ mod tests {
                 "button".into(),
                 vec![Attribute::EventAttr(Event::OnMsg(
                     "click".into(),
-                    Msg::Typed(label.into()),
+                    Box::new(Msg::Typed(label.into())),
                 ))],
                 vec![],
             )],

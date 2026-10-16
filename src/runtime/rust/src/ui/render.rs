@@ -2951,7 +2951,7 @@ mod tests {
         // Constructs TestMsg::Click — suppresses the dead-code lint while adding
         // genuine coverage for the AttrEvent/Event::OnMsg path through
         // collect_html_attrs → render_html's data-ipe-on emission.
-        let evt = HtmlAttr::EventAttr(Event::OnMsg("click".to_owned(), TestMsg::Click));
+        let evt = HtmlAttr::EventAttr(Event::OnMsg("click".to_owned(), Box::new(TestMsg::Click)));
         let attrs = vec![Attribute::AttrEvent(evt)];
         let elem: Element<TestMsg> = Element::Text("press me".to_owned());
         let html = ui_layout(attrs, elem);

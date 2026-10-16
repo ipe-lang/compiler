@@ -548,7 +548,10 @@ mod tests {
         let mut a: Html<()> = Html::HElement("button".into(), vec![], vec![]);
         let mut b: Html<()> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(()),
+            ))],
             vec![],
         );
         ids(&mut a);
@@ -569,7 +572,10 @@ mod tests {
     fn diff_event_removed_clears_marker_and_hid() {
         let mut a: Html<()> = Html::HElement(
             "button".into(),
-            vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+            vec![Attribute::EventAttr(Event::OnMsg(
+                "click".into(),
+                Box::new(()),
+            ))],
             vec![],
         );
         let mut b: Html<()> = Html::HElement("button".into(), vec![], vec![]);
@@ -591,7 +597,7 @@ mod tests {
                 "button".into(),
                 vec![
                     Attribute::Attr("data-ipe-hid".into(), hid.into()),
-                    Attribute::EventAttr(Event::OnMsg("click".into(), ())),
+                    Attribute::EventAttr(Event::OnMsg("click".into(), Box::new(()))),
                 ],
                 vec![],
             )

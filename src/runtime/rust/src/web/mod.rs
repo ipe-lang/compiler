@@ -9367,7 +9367,10 @@ mod sse_reconnect_reconcile_tests {
         let view: TestView = Arc::new(|_p| {
             Html::HElement(
                 "div".into(),
-                vec![Attribute::EventAttr(Event::OnMsg("click".into(), ()))],
+                vec![Attribute::EventAttr(Event::OnMsg(
+                    "click".into(),
+                    Box::new(()),
+                ))],
                 vec![Html::HText("go".into())],
             )
         });
@@ -12013,7 +12016,7 @@ mod emitted_router_behavior_tests {
             "div".to_string(),
             vec![Attribute::EventAttr(Event::OnMsg(
                 "click".to_string(),
-                Msg::Increment,
+                Box::new(Msg::Increment),
             ))],
             vec![Html::HText("+".to_string())],
         );
@@ -12022,7 +12025,7 @@ mod emitted_router_behavior_tests {
             "div".to_string(),
             vec![Attribute::EventAttr(Event::OnMsg(
                 "click".to_string(),
-                Msg::Decrement,
+                Box::new(Msg::Decrement),
             ))],
             vec![Html::HText("-".to_string())],
         );
@@ -12819,7 +12822,10 @@ mod emitted_router_behavior_tests {
         let button = |label: &str, msg: Msg| {
             Html::HElement(
                 "div".to_string(),
-                vec![Attribute::EventAttr(Event::OnMsg("click".to_string(), msg))],
+                vec![Attribute::EventAttr(Event::OnMsg(
+                    "click".to_string(),
+                    Box::new(msg),
+                ))],
                 vec![Html::HText(label.to_string())],
             )
         };
