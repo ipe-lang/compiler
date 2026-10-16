@@ -772,8 +772,11 @@ impl<Model: RetainedBytes, Msg: RetainedBytes> SessionEntry<Model, Msg> {
 impl<Model, Msg> SessionEntry<Model, Msg> {
     /// Whether nothing on its way to this session's `update` would be lost were it evicted now.
     ///
-    /// No Cmd holds a unit of its budget and its Msg, event and entry queues
-    /// are empty. A session whose driver is gone has nothing left to deliver.
+    /// No Cmd holds a unit of its budget, no input taken off its queues is
+    /// still on its way to starting its Cmds, and its Msg, event and entry
+    /// queues are empty. A session whose driver is gone has nothing left to
+    /// deliver. Judged under the entry's lock, the lock the driver takes an
+    /// input under, so a taken input is either still queued or in its turn.
     #[must_use]
     pub fn is_quiescent(&self) -> bool {
         fn drained<T>(tx: &Sender<T>) -> bool {
@@ -781,6 +784,7 @@ impl<Model, Msg> SessionEntry<Model, Msg> {
         }
         self.msg_tx.is_closed()
             || (self.cmds.used().get() == 0
+                && !self.cmds.in_turn()
                 && drained(&self.msg_tx)
                 && drained(&self.event_tx)
                 && drained(&self.enter_tx))
@@ -2710,6 +2714,48 @@ where
     }
 }
 
+/// What [`take_input`] took off one session queue.
+#[cfg(feature = "web")]
+enum Taken<T> {
+    /// The next input, and the turn that keeps the session from eviction
+    /// until the input's Cmds hold their own units.
+    Input(T, budget::Turn),
+    /// The queue's senders are gone.
+    Closed,
+    /// The session is gone.
+    Gone,
+}
+
+/// Take the next input off `rx`, beginning its turn under the session's lock.
+///
+/// An eviction judges quiescence under the same lock, so it sees the input
+/// either still queued or in its turn, never neither.
+#[cfg(feature = "web")]
+async fn take_input<Model, Msg, T>(
+    entry: &Weak<Mutex<SessionEntry<Model, Msg>>>,
+    cmds: &Arc<budget::SessionCmds>,
+    rx: &mut Receiver<T>,
+) -> Taken<T> {
+    std::future::poll_fn(|cx| {
+        let Some(strong) = entry.upgrade() else {
+            return std::task::Poll::Ready(Taken::Gone);
+        };
+        let held = strong
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = match rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                std::task::Poll::Ready(Taken::Input(item, cmds.begin_turn()))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Taken::Closed),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        };
+        drop(held);
+        taken
+    })
+    .await
+}
+
 /// The per-session driver: folds each Msg through `update`, diffs the new view
 /// against the last, pushes patches over SSE (if attached), runs the resulting
 /// Cmd, and re-evaluates subscriptions.
@@ -2823,20 +2869,24 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // disabled and the liveness tick ends the driver.
     let mut events_open = true;
     loop {
-        let (msg, queued) = tokio::select! {
-            maybe = msg_rx.recv() => match maybe {
-                Some(m) => (m, None),
-                None => break,
+        // Each input is taken with its turn, held until the Cmds it produced
+        // hold their own units: dropped at the end of the iteration, after
+        // `run_cmd`, or on the way out.
+        let (msg, queued, _turn) = tokio::select! {
+            taken = take_input(&entry, &cmds, &mut msg_rx) => match taken {
+                Taken::Input(m, turn) => (m, None, turn),
+                Taken::Closed | Taken::Gone => break,
             },
-            maybe = event_rx.recv(), if events_open => match maybe {
-                Some(QueuedEvent { msg, charge }) => (msg, Some(charge)),
-                None => {
+            taken = take_input(&entry, &cmds, &mut event_rx), if events_open => match taken {
+                Taken::Input(QueuedEvent { msg, charge }, turn) => (msg, Some(charge), turn),
+                Taken::Closed => {
                     events_open = false;
                     continue;
                 }
+                Taken::Gone => break,
             },
-            maybe = enter_rx.recv() => {
-                let Some(request) = maybe else {
+            taken = take_input(&entry, &cmds, &mut enter_rx) => {
+                let Taken::Input(request, turn) = taken else {
                     break;
                 };
                 // Re-prove the credentials before the entry runs; a refused
@@ -2856,6 +2906,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                     run_cmd(cmd, &msg_tx, &scope, &cmds);
                     sub_runtime.reconcile(subs(next));
                 });
+                drop(turn);
                 revocation.rearm(&scope);
                 continue;
             }
@@ -5124,6 +5175,9 @@ mod handlers {
         let view = st.view.clone();
         let subs = st.subs.clone();
         let route_entry = st.route_entry.clone();
+        // The session's first turn: from before the store holds it until its
+        // seed Cmd holds its own unit.
+        let birth = cmds.begin_turn();
         let commit = tokio::spawn(async move {
             let sid = owner.sid();
             if store.set(sid, entry.clone()).await == store::Installed::Displaced {
@@ -5148,6 +5202,7 @@ mod handlers {
             ));
             // Fire the entry Cmd into the loop (batched after init's on a miss).
             pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope, &cmds));
+            drop(birth);
             drop(owner);
             store::Installed::Held
         });
@@ -14967,12 +15022,14 @@ mod route_entry_cmd_tests {
                     "resident bytes stay in budget"
                 );
                 // A session whose `init` and entry Cmds are still on their way
-                // is not evictable; let both land before the next mint.
+                // is not evictable; let both land and the driver's turn end
+                // before the next mint.
                 assert!(
                     settled(&store, &sid, 2)
                         .await
                         .is_some_and(|m| m.log.len() == 2)
                 );
+                assert!(quiescent(&store, &sid).await, "the session settles");
                 minted.push(sid);
             }
             assert_eq!(
@@ -15077,6 +15134,128 @@ mod route_entry_cmd_tests {
             HELD_GATE.with(|g| *g.borrow_mut() = None);
             drop(store);
             let _ = std::fs::remove_file(p.as_str());
+        });
+    }
+
+    /// A memory store whose `set` of a model `pause` matches waits, once the
+    /// handle is installed, for the test's release, so a test evicts between
+    /// a write and the Cmds the writer starts after it.
+    struct PausedAfterInstall {
+        inner: MemoryStore<Model, Msg>,
+        pause: fn(&Model) -> bool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl PausedAfterInstall {
+        fn new(pause: fn(&Model) -> bool) -> Self {
+            Self {
+                inner: MemoryStore::new(Duration::from_secs(60)),
+                pause,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for PausedAfterInstall {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
+            let paused = (self.pause)(&handle.lock().unwrap_or_else(|e| e.into_inner()).model);
+            let installed = self.inner.set(sid, handle).await;
+            if paused {
+                self.entered.notify_one();
+                if let Ok(permit) = self.release.acquire().await {
+                    permit.forget();
+                }
+            }
+            installed
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
+        }
+    }
+
+    /// Byte pressure while a new session's first write is in progress never
+    /// evicts it before its `init` and entry Cmds have started: both Msgs
+    /// reach the model.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the spawned request answers
+    fn eviction_never_takes_a_new_session_before_its_cmds_start() {
+        run(false, || async {
+            let paused = Arc::new(PausedAfterInstall::new(|m| m.log.is_empty()));
+            let store: Store = paused.clone();
+            let app = router(store.clone());
+            let request = tokio::spawn(async move { get_via(app, "/", None).await });
+            paused.entered.notified().await;
+            let _ = store
+                .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
+                .await;
+            paused.release.add_permits(1);
+            let (status, _, sid, _) = request.await.expect("the page answers");
+            assert_eq!(status, StatusCode::OK);
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| (count(&m, "init"), count(&m, "enter:home"))),
+                Some((1, 1)),
+                "the session stayed resident until its Cmds started"
+            );
+        });
+    }
+
+    /// The fixture `update`, whose second Msg starts one more Cmd.
+    fn chaining_update(msg: Msg, model: Model) -> (Model, IpeCmd<Msg>) {
+        let (next, _) = update(msg, model);
+        let cmd = if next.log.len() == 2 {
+            load("chained".to_owned())
+        } else {
+            IpeCmd::None
+        };
+        (next, cmd)
+    }
+
+    /// Byte pressure while the driver writes the model an `update` produced
+    /// never evicts the session before that update's Cmd has started: the
+    /// Cmd's Msg reaches the model.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the fixture route table and base are well-formed
+    fn eviction_never_takes_a_session_mid_update() {
+        run(false, || async {
+            let paused = Arc::new(PausedAfterInstall::new(|m| m.log.len() == 2));
+            let store: Store = paused.clone();
+            let mut state = fixture_state(store.clone(), Arc::new(AtomicUsize::new(0)));
+            state.update = Arc::new(chaining_update);
+            let app = build_web_router(state, false)
+                .map(crate::server::behind_listener)
+                .expect("the fixture route table and base are well-formed");
+            let (status, _, sid, _) = get_via(app, "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            paused.entered.notified().await;
+            let _ = store
+                .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
+                .await;
+            paused.release.add_permits(1);
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(
+                m.map(|m| count(&m, "chained")),
+                Some(1),
+                "the session stayed resident until its update's Cmd started"
+            );
         });
     }
 
@@ -15463,6 +15642,20 @@ mod route_entry_cmd_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         model_of(store, sid).await
+    }
+
+    /// Wait (bounded) until the session has nothing on its way to `update`.
+    async fn quiescent(store: &Store, sid: &str) -> bool {
+        for _ in 0..200 {
+            if handle_of(store, sid)
+                .await
+                .is_some_and(|h| h.lock().unwrap_or_else(|e| e.into_inner()).is_quiescent())
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 
     fn count(model: &Model, label: &str) -> usize {

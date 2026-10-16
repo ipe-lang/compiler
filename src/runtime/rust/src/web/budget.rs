@@ -10,7 +10,7 @@
 //! its `limit`; the units return only when the charge drops.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::retained::Bytes;
@@ -328,6 +328,26 @@ pub struct SessionCmds {
     warned: AtomicBool,
     /// Whether this session's first dropped refusal has been logged yet.
     dropped_warned: AtomicBool,
+    /// The [`Turn`]s alive now: inputs taken off the session's queues whose
+    /// Cmds do not yet hold their own units.
+    turns: AtomicUsize,
+}
+
+/// The driver's hold on one input it took off a session queue, from the take
+/// until the Cmds that input produced hold their own units.
+///
+/// Not `Clone`; dropping it ends the turn. The count it adds is bounded by the
+/// live turns, each of which owns a strong count of the same `Arc`.
+#[derive(Debug)]
+#[must_use = "a dropped turn lets an eviction take its session at once"]
+pub struct Turn {
+    cmds: Arc<SessionCmds>,
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        self.cmds.turns.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl SessionCmds {
@@ -349,7 +369,23 @@ impl SessionCmds {
             budget: Budget::session(process, session),
             warned: AtomicBool::new(false),
             dropped_warned: AtomicBool::new(false),
+            turns: AtomicUsize::new(0),
         }
+    }
+
+    /// Begin a turn on this session: an input was taken whose Cmds have not
+    /// started.
+    pub(crate) fn begin_turn(self: &Arc<Self>) -> Turn {
+        self.turns.fetch_add(1, Ordering::AcqRel);
+        Turn {
+            cmds: Arc::clone(self),
+        }
+    }
+
+    /// Whether a [`Turn`] is alive on this session.
+    #[must_use]
+    pub(crate) fn in_turn(&self) -> bool {
+        self.turns.load(Ordering::Acquire) != 0
     }
 
     /// One Cmd's unit from this session and the process.
@@ -389,6 +425,21 @@ impl SessionCmds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session is in its turn while any turn lives, and out of it once the
+    /// last one drops.
+    #[test]
+    fn turn_lasts_until_its_last_holder_drops() {
+        let cmds = Arc::new(SessionCmds::new());
+        assert!(!cmds.in_turn());
+        let first = cmds.begin_turn();
+        let second = cmds.begin_turn();
+        assert!(cmds.in_turn());
+        drop(first);
+        assert!(cmds.in_turn(), "one turn still lives");
+        drop(second);
+        assert!(!cmds.in_turn());
+    }
 
     /// The pinned per-session Cmd ceiling of the binding decision.
     #[test]
