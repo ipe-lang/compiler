@@ -831,10 +831,10 @@ decisionReachedOnlyThroughDecidableSource =
             \text -> String.join " " (String.words text)
 
         oneCall =
-            "case Queue.decidableSource uid model.selectedView of Just shown -> decideOn settings shown decision "
+            "case Queue.decidableSource uid model.selectedView of Just shown -> decideOn settings macKey shown decision "
 
         oneRefusalCall =
-            "case pageRefusal model uid of Just row -> case row.digest of Just digest -> LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal settings.key settings.index db uid digest decision) "
+            "case pageRefusal model uid of Just row -> case row.digest of Just digest -> LibDb.openAt settings.review |> Task.andThen (\\db -> Queue.decideRefusal macKey settings.index db uid digest decision) "
     in
     do
         cwd <- System.cwd ()

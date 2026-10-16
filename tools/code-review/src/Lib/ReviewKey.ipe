@@ -1,4 +1,4 @@
-module Lib.ReviewKey exposing (MacKey, ReviewKey(..), keyFromLookup, keyVar, parseMacKey, readOnlyError, readOnlyNotice, readReviewKey, sign, verifies)
+module Lib.ReviewKey exposing (MacKey, ReviewKey(..), keyFromLookup, keyVar, parseMacKey, readOnlyError, readOnlyNotice, readOnlyText, readReviewKey, sign, verifies)
 
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
@@ -96,7 +96,13 @@ readOnlyNotice =
 -- The refusal of a decision on a server running with no key.
 readOnlyError : Error
 readOnlyError =
-    Error.withMessage ("This server is read-only: " ++ keyVar ++ " is not set, so no decision can be signed. Restart it with the key set to record decisions.") Error.permissionDenied
+    Error.withMessage readOnlyText Error.permissionDenied
+
+
+-- Why a server running with no key records no decision, as a page says it.
+readOnlyText : String
+readOnlyText =
+    "This server is read-only: " ++ keyVar ++ " is not set, so no decision can be signed. Restart it with the key set to record decisions."
 
 
 -- The HMAC-SHA-256 tag of `message`, as the lowercase hex the log stores.

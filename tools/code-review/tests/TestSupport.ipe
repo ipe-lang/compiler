@@ -43,6 +43,11 @@ module TestSupport exposing
     , loadUnitViewNow
     , drainUnitNow
     , decideShownNow
+    , decidedRefusalNow
+    , decidedNow
+    , accepted
+    , refusedAs
+    , refusalOf
     , resyncReviewedNow
     , resyncReviewedWithinNow
     , checkUnits
@@ -129,6 +134,7 @@ import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Epoch as Epoch
+import Lib.Failure as Failure exposing (DecideRefusal(..), RefuseFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
@@ -211,7 +217,12 @@ expectErr t =
 -- expects to be valid that `parseReason` refuses fails the run.
 refuse : String -> Task.Task Error Decision
 refuse text =
-    Task.fromResult (Result.map Refused (LibDb.parseReason text))
+    case LibDb.parseReason text of
+        Ok reason ->
+            Task.succeed (Refused reason)
+
+        Err refused ->
+            Task.fail (Error.invalidInput (Failure.refuseFailureText (DraftRefused refused)))
 
 
 seedIndex : String -> String -> Task.Task Error ()
@@ -631,9 +642,73 @@ loadUnitViewNow unit =
     envSettings |> Task.andThen (\settings -> Queue.loadUnitView settings unit)
 
 
-decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
+-- `Queue.decide` on `shown` under the environment's signing key; a server
+-- with no signing key fails the run, since it decides nothing.
+decideShownNow : Db -> Index.ShownSource -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
 decideShownNow db shown decision =
-    envAppSettings |> Task.andThen (\settings -> Queue.decide settings.key settings.index db shown decision)
+    envAppSettings
+        |> Task.andThen
+            (\settings ->
+                case settings.key of
+                    Signing macKey ->
+                        Queue.decide macKey settings.index db shown decision
+
+                    ReadOnly ->
+                        Task.fail (Error.conflict "the test environment has no signing key")
+            )
+
+
+
+-- `Queue.decideRefusal` approving refusal `label`, bound to `digest`, under
+-- the environment's signing key; a server with no signing key fails the
+-- run, since it acknowledges nothing.
+decidedRefusalNow : Db -> String -> Index.RefusalDigest -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decidedRefusalNow db label digest =
+    envAppSettings
+        |> Task.andThen
+            (\settings ->
+                case settings.key of
+                    Signing macKey ->
+                        Queue.decideRefusal macKey settings.index db (uid label) digest Approved
+
+                    ReadOnly ->
+                        Task.fail (Error.conflict "the test environment has no signing key")
+            )
+
+-- `task`'s value when it is not refused; a refusal fails the run, naming
+-- `what`.
+accepted : String -> Task.Task Error (Result DecideRefusal a) -> Task.Task Error a
+accepted what task =
+    task
+        |> Task.andThen
+            (\result ->
+                case result of
+                    Ok value ->
+                        Task.succeed value
+
+                    Err _ ->
+                        Task.fail (Error.conflict (what ++ " was refused"))
+            )
+
+
+-- The refusal `result` carries, if any.
+refusalOf : Result DecideRefusal a -> Maybe DecideRefusal
+refusalOf result =
+    case result of
+        Ok _ ->
+            Nothing
+
+        Err refusal ->
+            Just refusal
+
+
+-- True when `task` succeeds with exactly the refusal `expected`; a failure
+-- or an accepted value is False.
+refusedAs : DecideRefusal -> Task.Task Error (Result DecideRefusal a) -> Task.Task Error Bool
+refusedAs expected task =
+    task
+        |> Task.map (\result -> refusalOf result == Just expected)
+        |> Task.onError (\_ -> Task.succeed False)
 
 
 drainUnitNow : Index.Attested -> Index.Written -> Task.Task Error Int
@@ -721,6 +796,12 @@ loadUnitNow unit =
 -- the run.
 decideNow : Db -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )
 decideNow db unit decision =
+    accepted ("the decision on " ++ Uid.toString unit) (decidedNow db unit decision)
+
+
+-- `decideNow`'s result with a refusal kept as a value.
+decidedNow : Db -> Uid -> LibDb.Decision -> Task.Task Error (Result DecideRefusal ( Index.Attested, Index.Written ))
+decidedNow db unit decision =
     loadUnitNow unit
         |> Task.andThen
             (\found ->
@@ -1305,7 +1386,7 @@ reverifyShown unit found =
         Just loaded ->
             case loaded.view of
                 Shown shown ->
-                    envSettings |> Task.andThen (\settings -> Index.reverify settings shown)
+                    envSettings |> Task.andThen (\settings -> accepted ("fixture unit " ++ Uid.toString unit) (Index.reverify settings shown))
 
                 Stale _ ->
                     Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is stale"))

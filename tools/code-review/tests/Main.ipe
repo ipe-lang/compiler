@@ -1,6 +1,7 @@
 module Main exposing (main)
 
 import DbTests
+import FailureScanTests
 import HarnessTests
 import HighlightTests
 import IndexTests
@@ -73,6 +74,7 @@ gatherChecks =
         , TypedRowsTests.checks |> Task.andThen (contributesChecks "TypedRowsTests")
         , ViewRenderTests.checks |> Task.andThen (contributesChecks "ViewRenderTests")
         , SingleFlightTests.checks |> Task.andThen (contributesChecks "SingleFlightTests")
+        , FailureScanTests.checks |> Task.andThen (contributesChecks "FailureScanTests")
         ]
         |> Task.map List.concat
 

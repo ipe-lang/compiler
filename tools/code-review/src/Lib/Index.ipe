@@ -18,6 +18,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Tuple as Tuple
 import Lib.Drawn as Drawn exposing (DrawnSource, SourceRow(..))
+import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
@@ -2434,12 +2435,13 @@ attestedHash attested =
 
 -- Re-proves a shown source at decision time: the unit's row is re-read from
 -- the index and its file re-hashed through `viewOf`, and the fresh view must
--- be shown under the same hash. A unit gone from the index, or a source that
--- changed or became unreadable since it was shown, is a conflict, so no
+-- be shown under the same hash. A unit gone from the index, a source that
+-- changed or became unreadable since it was shown, or one now past a view
+-- ceiling is a `DecideRefusal` value, decided from reads alone, so no
 -- decision is recorded against bytes the reviewer did not see. The index and
 -- root are the one `settings` value resolved at startup, the tree the page
 -- showed the unit from.
-reverify : IndexSettings -> ShownSource -> Task.Task Error Attested
+reverify : IndexSettings -> ShownSource -> Task.Task Error (Result DecideRefusal Attested)
 reverify settings shown =
     case shown of
         ShownSource s ->
@@ -2449,54 +2451,46 @@ reverify settings shown =
                 case List.head rows of
                     Just row ->
                         viewOf conn settings.roots row
-                            |> Task.andThen (confirmShown s.uid s.hash)
+                            |> Task.map (confirmShown s.uid s.hash)
 
                     Nothing ->
-                        Task.fail (Error.conflict "unit no longer indexed")
+                        Task.succeed (Err SourceGone)
 
 
-confirmShown : Uid -> String -> SourceView -> Task.Task Error Attested
+-- A shown unit that grew past a view ceiling before its decision is
+-- `SourcePastCeiling`; any other view but the one shown is `SourceChanged`.
+confirmShown : Uid -> String -> SourceView -> Result DecideRefusal Attested
 confirmShown uid hash fresh =
     case fresh of
         Shown now ->
             if shownHash now == hash then
-                Task.succeed (Attested { uid = uid, hash = hash })
+                Ok (Attested { uid = uid, hash = hash })
 
             else
-                Task.fail sourceChanged
+                Err SourceChanged
 
         Stale _ ->
-            Task.fail sourceChanged
+            Err SourceChanged
 
         Unreadable _ ->
-            Task.fail sourceChanged
+            Err SourceChanged
 
         TooLarge _ ->
-            Task.fail pastCeiling
-
-
--- A shown unit that grew past a view ceiling before its decision.
-pastCeiling : Error
-pastCeiling =
-    Error.conflict "source is now past the review ceiling; it cannot be decided"
-
-
-sourceChanged : Error
-sourceChanged =
-    Error.conflict "source changed since it was shown; reload"
+            Err SourcePastCeiling
 
 
 -- Re-proves an unreviewable file at decision time, the refusal row's
 -- counterpart of `reverify`: its row is re-read by uid, under a bound tag,
 -- in a fresh index read, and must still carry `digest`. A row gone, a
--- blocking row (no digest), or another digest is a conflict. A content
--- reason re-probes the file, which must still be refused: a not-UTF-8 file
--- must still fail to read as text within `sourceCeiling`; an oversized one
--- must still hold at least its recorded size, or more than `sourceCeiling`.
+-- blocking row (no digest), or another digest is a `DecideRefusal` value,
+-- decided from reads alone. A content reason re-probes the file, which must
+-- still be refused: a not-UTF-8 file must still fail to read as text within
+-- `sourceCeiling`; an oversized one must still hold at least its recorded
+-- size, or more than `sourceCeiling`.
 -- The app has no bounded byte read to re-hash the file with, so the
 -- decision binds the index's digest, and the next index run re-hashes: a
 -- changed digest is a new, open pair.
-reverifyRefusal : IndexSettings -> Uid -> RefusalDigest -> Task.Task Error Attested
+reverifyRefusal : IndexSettings -> Uid -> RefusalDigest -> Task.Task Error (Result DecideRefusal Attested)
 reverifyRefusal settings uid digest =
     let
         bound =
@@ -2510,7 +2504,7 @@ reverifyRefusal settings uid digest =
                 confirmRefusal settings.roots digest row stored
 
             Nothing ->
-                Task.fail (Error.conflict "file is no longer unreviewable in the index; reload")
+                Task.succeed (Err FileGone)
 
 
 -- A refusal row with its stored path, the one form `RepoPath.resolve` reads.
@@ -2521,26 +2515,26 @@ refusalWithPathDecoder =
         rawRefusalDecoder
 
 
-confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> String -> Task.Task Error Attested
+confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> String -> Task.Task Error (Result DecideRefusal Attested)
 confirmRefusal roots digest row stored =
     case row.digest of
         Nothing ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
         Just now ->
             if refusalDigestText now == refusalDigestText digest then
                 stillRefused roots row stored
-                    |> Task.map (\_ -> Attested { uid = row.uid, hash = refusalDigestText now })
+                    |> Task.map (Result.map (\_ -> Attested { uid = row.uid, hash = refusalDigestText now }))
 
             else
-                Task.fail sourceChanged
+                Task.succeed (Err FileChanged)
 
 
 -- The re-probe of a refusal row's reason before a decision binds it: a
 -- content reason's file must still be refused, an entry reason's digest is
 -- of the staged entry and needs no read, and a blocking reason is never
 -- decided.
-stillRefused : RootMap -> RefusalRow -> String -> Task.Task Error ()
+stillRefused : RootMap -> RefusalRow -> String -> Task.Task Error (Result DecideRefusal ())
 stillRefused roots row stored =
     case row.reason of
         NotUtf8 ->
@@ -2553,40 +2547,40 @@ stillRefused roots row stored =
                         stillUnreadable roots stored (ByteSize.bytes (atMostSourceCeiling (size - 1)))
 
                     else
-                        Task.fail notReprobed
+                        Task.succeed (Err FileNotReprobed)
 
                 Nothing ->
-                    Task.fail notReprobed
+                    Task.succeed (Err FileNotReprobed)
 
         SymlinkEntry ->
-            Task.succeed ()
+            Task.succeed (Ok ())
 
         GitlinkEntry ->
-            Task.succeed ()
+            Task.succeed (Ok ())
 
         UnknownMode ->
-            Task.succeed ()
+            Task.succeed (Ok ())
 
         PastHashCeiling ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
         NonUtf8Name ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
         NotRepoRelative ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
         NestedRepository ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
         NotRegular ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
         UnreadableEntry ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
         ReplacedEntry ->
-            Task.fail cannotAcknowledge
+            Task.succeed (Err FileNotAcknowledgeable)
 
 
 atMostSourceCeiling : Int -> Int
@@ -2603,7 +2597,7 @@ atMostSourceCeiling n =
 -- escapes by `unescapeShown`; a path that is not the index's escape of a
 -- name names no file this app can join, so it is never re-probed and never
 -- decided.
-stillUnreadable : RootMap -> String -> ByteSize -> Task.Task Error ()
+stillUnreadable : RootMap -> String -> ByteSize -> Task.Task Error (Result DecideRefusal ())
 stillUnreadable roots stored cap =
     case Maybe.map (RepoPath.resolve roots) (unescapeShown stored) of
         Just (Ok path) ->
@@ -2613,16 +2607,16 @@ stillUnreadable roots stored cap =
                     File.readFileLimit path cap
                         |> Task.map (\_ -> False)
                         |> Task.onError (\_ -> Task.succeed True)
-                        |> Task.andThen refusedStill
+                        |> Task.map refusedStill
 
                 else
-                    Task.fail notReprobed
+                    Task.succeed (Err FileNotReprobed)
 
         Just (Err _) ->
-            Task.fail notReprobed
+            Task.succeed (Err FileNotReprobed)
 
         Nothing ->
-            Task.fail notReprobed
+            Task.succeed (Err FileNotReprobed)
 
 
 -- Where `unescapeShown` stands after the characters read so far: plain
@@ -2803,23 +2797,13 @@ lowerHexValue c =
         Nothing
 
 
-refusedStill : Bool -> Task.Task Error ()
+refusedStill : Bool -> Result DecideRefusal ()
 refusedStill refused =
     if refused then
-        Task.succeed ()
+        Ok ()
 
     else
-        Task.fail (Error.conflict "file now reads as text; re-run the index")
-
-
-cannotAcknowledge : Error
-cannotAcknowledge =
-    Error.conflict "this file cannot be acknowledged; fix it in the tree"
-
-
-notReprobed : Error
-notReprobed =
-    Error.conflict "this file could not be re-probed, so it cannot be decided"
+        Err FileReadsAsText
 
 
 -- Why a unit's source is withheld instead of shown.
