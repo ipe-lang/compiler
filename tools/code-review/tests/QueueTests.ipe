@@ -2900,6 +2900,47 @@ escapedRefusalAcknowledged =
         Task.succeed (acked.refusalsOpen == 1 && refused && rows == 1)
 
 
+-- Refusals under bound tags the index escapes, `é` (stored `\u{e9}`) and
+-- `x` + backslash + U+1D54F (stored `x\\\u{1d54f}`), are listed and
+-- counted as bound, and the first is acknowledged at its name under its
+-- tag's root. Red if refusal rows are judged bound by the raw tag: both
+-- files are then counted unbound, never listed, and no decision binds them.
+escapedTagRefusalBound : Task.Task Error Bool
+escapedTagRefusalBound =
+    do
+        at <- freshScratch "ipe-index-refusal-escaped-tag"
+        db <- seedProgressScratch at
+        first <- freshDir "ipe-index-refusal-escaped-tag-first"
+        second <- freshDir "ipe-index-refusal-escaped-tag-second"
+        writeFileText (first ++ "/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-t" "\\u{e9}:big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        insertRefusal at.indexDb "r-s" "x\\\\\\u{1d54f}:big.txt" "too-large" (SqlInt 10) (refusalDigestOf "b")
+        System.setenv "IPE_INDEX_REPOS" (String.fromList [ Char.fromCode 233 ] ++ "=" ++ first ++ "," ++ String.fromList [ 'x', Char.fromCode 92, Char.fromCode 120143 ] ++ "=" ++ second)
+        outcome <- escapedTagAcknowledged db
+            |> Task.onError (\e -> System.unsetenv "IPE_INDEX_REPOS" |> Task.andThen (\_ -> Task.fail e))
+        System.unsetenv "IPE_INDEX_REPOS"
+        cleanupProgressScratch at
+        Task.succeed outcome
+
+
+escapedTagAcknowledged : Db -> Task.Task Error Bool
+escapedTagAcknowledged db =
+    do
+        before <- loadPageNow Index.Start
+        digest <- shownRefusalDigest "r-t"
+        decided <- decideRefusalNow db "r-t" digest
+        acked <- case decided of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        Task.succeed
+            (before.refusalsOpen
+                == 2
+                && before.refusalsUnbound
+                == 0
+                && List.map (\row -> row.uid) acked.refusals
+                == [ uid "r-s" ]
+            )
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2980,6 +3021,7 @@ checks =
             , check "a page of blocking refusals keeps an acknowledgeable one listed" acknowledgeableRefusalListedFirst
             , Task.succeed ( "the index's path escape parses back exactly, and nothing else parses", shownEscapeParsedExactly )
             , check "a file at an escaped name is acknowledged at the name it escapes" escapedRefusalAcknowledged
+            , check "a refusal under an escaped bound tag is listed and acknowledged" escapedTagRefusalBound
             , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
             ]
         Task.succeed (first ++ rest)

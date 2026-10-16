@@ -91,9 +91,16 @@ type alias BoundTags =
 
 boundTags : RootMap -> BoundTags
 boundTags roots =
+    boundTagsAs (\tag -> tag) roots
+
+
+-- The bound-tag condition with each tag as `spell` writes it in a stored
+-- path.
+boundTagsAs : (String -> String) -> RootMap -> BoundTags
+boundTagsAs spell roots =
     let
         tags =
-            List.map (\( tag, _ ) -> SqlString (RepoPath.tagName tag)) (RepoPath.boundRoots roots)
+            List.map (\( tag, _ ) -> SqlString (spell (RepoPath.tagName tag))) (RepoPath.boundRoots roots)
     in
     { sql = " substr(u.path, 1, instr(u.path, ':') - 1) COLLATE BINARY IN (" ++ placeholders (List.length tags) ++ ")"
     , params = tags
@@ -1226,12 +1233,39 @@ openRefusalMembership =
     " NOT EXISTS (SELECT 1 FROM reviewed r WHERE r.uid = u.uid COLLATE BINARY AND r.body_hash = u.digest COLLATE BINARY)"
 
 
+-- The bound-tag condition on a refusal row `u`. A refusal's stored path is
+-- ipe-index's `shown` escape of the whole tagged name, tag included, so
+-- each bound tag is compared as `escapeShown` writes it: a tag holding a
+-- `\\` or a character outside printable ASCII is then judged bound exactly
+-- when its row's name, read back by `unescapeShown`, has that tag, the one
+-- `RepoPath.resolve` joins it under. Its own type, so the units' condition,
+-- which compares raw tags, cannot stand in for it.
+type RefusalTags
+    = RefusalTags BoundTags
+
+
+refusalTags : RootMap -> RefusalTags
+refusalTags roots =
+    RefusalTags (boundTagsAs escapeShown roots)
+
+
+refusalCondition : RefusalTags -> BoundTags
+refusalCondition tags =
+    case tags of
+        RefusalTags bound ->
+            bound
+
+
 -- The first `size` open refusals under a bound tag: every acknowledgeable
 -- one before any blocking one, each by path. A blocking row leaves the open
 -- set only when the tree is fixed, so listing it first would let enough of
 -- them keep an acknowledgeable file off the page for good.
-loadRefusalPage : Db.Db -> BoundTags -> PageSize -> Task.Task Error (List RefusalRow)
-loadRefusalPage conn bound size =
+loadRefusalPage : Db.Db -> RefusalTags -> PageSize -> Task.Task Error (List RefusalRow)
+loadRefusalPage conn tags size =
+    let
+        bound =
+            refusalCondition tags
+    in
     Db.queryDecode conn
         (refusalColumns ++ openRefusalMembership ++ " AND" ++ bound.sql ++ " ORDER BY u.digest IS NULL, u.path COLLATE BINARY, u.uid COLLATE BINARY LIMIT ?")
         (bound.params ++ [ SqlInt (PageSize.toInt size) ])
@@ -1240,16 +1274,24 @@ loadRefusalPage conn bound size =
 
 -- How many refusals under a bound tag are open, counted over
 -- `openRefusalMembership` without loading a row.
-countOpenRefusals : Db.Db -> BoundTags -> Task.Task Error Int
-countOpenRefusals conn bound =
+countOpenRefusals : Db.Db -> RefusalTags -> Task.Task Error Int
+countOpenRefusals conn tags =
+    let
+        bound =
+            refusalCondition tags
+    in
     do
         rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM refusals u WHERE" ++ openRefusalMembership ++ " AND" ++ bound.sql) bound.params countDecoder
         singleInt "COUNT(*) of open refusals" rows
 
 
 -- How many refusals under a bound tag the index holds, open or decided.
-countRefusals : Db.Db -> BoundTags -> Task.Task Error Int
-countRefusals conn bound =
+countRefusals : Db.Db -> RefusalTags -> Task.Task Error Int
+countRefusals conn tags =
+    let
+        bound =
+            refusalCondition tags
+    in
     do
         rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM refusals u WHERE" ++ bound.sql) bound.params countDecoder
         singleInt "COUNT(*) over bound refusals" rows
@@ -1257,8 +1299,12 @@ countRefusals conn bound =
 
 -- How many refusals the index holds under a tag no root binds: files no
 -- page lists and no decision here can bind, said beside the unbound units.
-countUnboundRefusals : Db.Db -> BoundTags -> Task.Task Error Int
-countUnboundRefusals conn bound =
+countUnboundRefusals : Db.Db -> RefusalTags -> Task.Task Error Int
+countUnboundRefusals conn tags =
+    let
+        bound =
+            refusalCondition tags
+    in
     do
         rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM refusals u WHERE NOT (" ++ bound.sql ++ ")") bound.params countDecoder
         singleInt "COUNT(*) over unbound refusals" rows
@@ -1311,6 +1357,9 @@ readSnapshot key roots conn cursor =
     let
         bound =
             boundTags roots
+
+        refused =
+            refusalTags roots
     in
     Db.withTransaction conn
         (\tx ->
@@ -1323,8 +1372,8 @@ readSnapshot key roots conn cursor =
                 unbound <- countUnbound tx bound
                 held <- countAll tx
                 partitioned "unit" units unbound held
-                refusals <- loadRefusalPage tx bound PageSize.queue
-                counted <- countRefusalsPartitioned tx bound
+                refusals <- loadRefusalPage tx refused PageSize.queue
+                counted <- countRefusalsPartitioned tx refused
                 bytes <- dbBytes tx
                 Task.succeed
                     { stamp = stamp
@@ -1353,7 +1402,7 @@ type alias RefusalCounts =
 
 -- The refusal counts on `tx`, failed unless the bound and unbound rows are
 -- every row the index holds.
-countRefusalsPartitioned : Db.Db -> BoundTags -> Task.Task Error RefusalCounts
+countRefusalsPartitioned : Db.Db -> RefusalTags -> Task.Task Error RefusalCounts
 countRefusalsPartitioned tx bound =
     do
         open <- countOpenRefusals tx bound
@@ -2363,7 +2412,7 @@ reverifyRefusal : IndexSettings -> Uid -> RefusalDigest -> Task.Task Error Attes
 reverifyRefusal settings uid digest =
     let
         bound =
-            boundTags settings.roots
+            refusalCondition (refusalTags settings.roots)
     in
     do
         conn <- readConnection settings
@@ -2591,6 +2640,56 @@ escapedChar name code digits =
 
     else
         Malformed
+
+
+-- ipe-index's `shown` escape of `text`, the one `unescapeShown` inverts:
+-- `\\` for a backslash, the character itself for a space or printable
+-- ASCII, and `\u{h}` in lowercase hex without a leading zero for any other.
+escapeShown : String -> String
+escapeShown text =
+    String.concat (List.map escapeShownChar (String.toList text))
+
+
+escapeShownChar : Char -> String
+escapeShownChar c =
+    let
+        code =
+            Char.toCode c
+    in
+    if c == '\\' then
+        "\\\\"
+
+    else if shownBare code then
+        String.fromChar c
+
+    else
+        "\\u{" ++ lowerHex code ++ "}"
+
+
+-- A code point in lowercase hex without a leading zero: at most six digits,
+-- as no code point passes 0x10ffff.
+lowerHex : Int -> String
+lowerHex code =
+    let
+        digit place written =
+            let
+                d =
+                    modBy 16 (code // place)
+            in
+            if d == 0 && written == "" then
+                written
+
+            else
+                written ++ String.slice d (d + 1) "0123456789abcdef"
+
+        digits =
+            List.foldl digit "" [ 1048576, 65536, 4096, 256, 16, 1 ]
+    in
+    if digits == "" then
+        "0"
+
+    else
+        digits
 
 
 -- A code point `shown` writes as itself: a space or printable ASCII other
