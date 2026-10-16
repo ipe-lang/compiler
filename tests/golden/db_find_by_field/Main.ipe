@@ -3,6 +3,7 @@ import Ipe.Io as Io
 import Ipe.Db
 import Ipe.Db.Location as Location
 import Ipe.Db.Unsafe
+import Ipe.Dict
 import Ipe.List
 import Ipe.String
 import Ipe.Task
@@ -27,7 +28,7 @@ import Ipe.Task
 -- captures.
 --
 -- NOTE on the empty-vs-non-empty check for `many`/`none` (both
--- `List (Dict String String)`): this is written as
+-- `List (Dict String (Maybe String))`): this is written as
 -- `String.isEmpty (String.join "," (List.map ...))` rather than the more
 -- obvious `if List.isEmpty many then "empty" else ...many...`. The latter
 -- shape hits an UNRELATED, pre-existing emitter bug (found while writing this
@@ -63,11 +64,11 @@ import Ipe.Task
 -- enumerated there — reported separately as a blocking finding.
 
 formatRow row =
-    Unsafe.unsafeGetString "name" row
+    cellText "name" row
         ++ ":"
-        ++ Unsafe.unsafeGetString "category" row
+        ++ cellText "category" row
         ++ ":"
-        ++ String.fromInt (Unsafe.unsafeGetInt "qty" row)
+        ++ String.fromInt (cellInt "qty" row)
 
 
 formatRows rows =
@@ -117,7 +118,7 @@ main =
                                             (\many ->
                                                 let
                                                     sorted =
-                                                        List.sortBy (\r -> Unsafe.unsafeGetString "name" r) many
+                                                        List.sortBy (\r -> cellText "name" r) many
 
                                                     joined3 =
                                                         formatRows sorted
@@ -154,3 +155,29 @@ main =
                 )
         )
         (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""
+
+
+-- The integer in column `key` of a raw Db row, `0` when the cell is not one.
+cellInt : String -> Dict String (Maybe String) -> Int
+cellInt key row =
+    case String.toInt (cellText key row) of
+        Just n ->
+            n
+
+        Nothing ->
+            0

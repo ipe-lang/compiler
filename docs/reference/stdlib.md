@@ -1491,7 +1491,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `ColumnSpec` | A DB-only fact the record type cannot express: primary key, serial |
 | `PrimaryKeyDecl` | The table's primary key: none, one column, or several columns forming one |
 | `IndexSpec` | A declarative performance index over one or more of the store's columns. |
-| `Row` | A row read back from the database: every column keyed by its name, values |
+| `Row` | A row read back from the database: every column keyed by its name, each |
 | `validSqlIdent` | `validSqlIdent name` — accept `name` as a (possibly dotted) SQL identifier, |
 | `validSqlIdentPlain` | `validSqlIdentPlain name` — the dot-free identifier gate, byte-equivalent to |
 | `column` | `column name colType` — a column of an explicit `ColType`. The name is |
@@ -1525,10 +1525,10 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `tableName` | The store's current table name (reflects any `renameTable` ops applied). |
 | `columnNames` | The store's current column names, in declaration order (reflects any |
 | `createSql` | `createSql store` — the `CREATE TABLE` DDL for the store, or `Err`. Every |
-| `readText` | Read a column as a `String`. A missing column is a typed `Err`. |
-| `readInt` | Read a column as an `Int`. A missing or non-integer column is a typed `Err`. |
+| `readText` | Read a column as a `String`. A missing or `NULL` column is a typed `Err`. |
+| `readInt` | Read a column as an `Int`. A missing, `NULL` or non-integer column is a |
 | `readBool` | Read a column as a `Bool`. The stored form is SQLite's `0` / `1` integer |
-| `readFloat` | Read a column as a `Float`. A missing or non-numeric column is a typed |
+| `readFloat` | Read a column as a `Float`. A missing, `NULL` or non-numeric column is a |
 | `insert` | `insert conn store row` — insert one row and return its generated id. The |
 | `insertReturning` | `insertReturning conn store row` — insert one row and return the stored row |
 | `upsert` | `upsert conn store row` — insert `row`, or, when a row with the same key |
@@ -1679,10 +1679,10 @@ Ipe.Db.Unsafe — the raw-SQL and untyped-column-read escape hatches for
 |--------|----------|
 | `unsafeExecRaw` | `unsafeExecRaw conn sql` — run verbatim, caller-authored SQL. No validator |
 | `unsafeQuery` | `unsafeQuery conn sql binds` — the query TEXT is caller-authored verbatim; |
-| `unsafeGetString` | `unsafeGetString key row` — read column `key` as a `String`, bypassing the |
-| `unsafeGetInt` | `unsafeGetInt key row` — read column `key` as an `Int`, bypassing the typed |
-| `unsafeGetBool` | `unsafeGetBool key row` — read column `key` as a `Bool`, bypassing the typed |
-| `unsafeGetField` | `unsafeGetField key row` — read column `key` as an untyped string field, |
+| `unsafeGetString` | `unsafeGetString key payload` — read field `key` of a payload map as a |
+| `unsafeGetInt` | `unsafeGetInt key payload` — read field `key` of a payload map as an `Int`, |
+| `unsafeGetBool` | `unsafeGetBool key payload` — read field `key` of a payload map as a |
+| `unsafeGetField` | `unsafeGetField key payload` — read field `key` of a payload map as an |
 | `unsafeFragment` | `unsafeFragment s` — mint a `SqlFragment` from `s` verbatim, WITHOUT the |
 | `unsafeExecRawOn` | `unsafeExecRawOn conn sql` — run verbatim, caller-authored SQL against an |
 

@@ -341,10 +341,23 @@ dumpQuery table =
         Nothing
 
 
-dumpRow : Dict.Dict String String -> String
+dumpCell : String -> Dict.Dict String (Maybe String) -> String
+dumpCell col row =
+    case Dict.get col row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""
+
+
+dumpRow : Dict.Dict String (Maybe String) -> String
 dumpRow row =
     String.join "|"
-        (List.map (\col -> Unsafe.unsafeGetString col row) [ "id", "author", "status", "body" ])
+        (List.map (\col -> dumpCell col row) [ "id", "author", "status", "body" ])
 
 
 handleDump : Request -> Task Error Response

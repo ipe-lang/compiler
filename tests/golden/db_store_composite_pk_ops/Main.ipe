@@ -88,18 +88,18 @@ illegalDraft =
 hijackTemplate : Store.Row
 hijackTemplate =
     Dict.fromList
-        [ ( "user_id", "hijack" )
-        , ( "group_id", "hijack" )
-        , ( "role", "admin" )
+        [ ( "user_id", Just "hijack" )
+        , ( "group_id", Just "hijack" )
+        , ( "role", Just "admin" )
         ]
 
 
 newRow : Store.Row
 newRow =
     Dict.fromList
-        [ ( "user_id", "u9" )
-        , ( "group_id", "g9" )
-        , ( "role", "member" )
+        [ ( "user_id", Just "u9" )
+        , ( "group_id", Just "g9" )
+        , ( "role", Just "member" )
         ]
 
 
@@ -218,8 +218,11 @@ renderRow row =
 cell : String -> Store.Row -> String
 cell name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             s
+
+        Just Nothing ->
+            "NULL"
 
         Nothing ->
             "?"
