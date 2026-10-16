@@ -270,6 +270,7 @@ mod tests {
             TrustRefusal::ManifestUnverifiable(manifest()),
             TrustRefusal::FfiCacheUnverifiable(path()),
             TrustRefusal::FfiCacheSymlink(path()),
+            TrustRefusal::FfiCacheEscapes(path()),
             TrustRefusal::FfiCacheUntrusted(path()),
             TrustRefusal::FfiCacheNotRegular(path()),
             TrustRefusal::FfiCacheTooManyEntries {

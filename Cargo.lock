@@ -3337,6 +3337,7 @@ dependencies = [
  "ipe_parse",
  "ipe_syntax",
  "proc-macro2",
+ "rustix 0.38.44",
  "serde",
  "serde_json",
  "toml",
