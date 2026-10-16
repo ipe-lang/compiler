@@ -19885,6 +19885,12 @@ impl<'a> Lowerer<'a> {
     /// first use site through [`Self::binder_ir_type`]. A capture is a use, so a
     /// capture whose type does not resolve refuses rather than going
     /// unclassified.
+    ///
+    /// A capture holding a row value ([`IrType::RowGeneric`]) refuses with
+    /// IPE-L0131: a row value is emittable only as the direct receiver of a
+    /// field read, and a captured read is a `CloneVar` receiver the witness
+    /// getter does not route — the escape the row-containment guard refuses
+    /// after the body, reported here before the capture is classified.
     fn captured_locals_at(
         &self,
         lambda_param_pats: &[&canon::Pattern],
@@ -19897,7 +19903,16 @@ impl<'a> Lowerer<'a> {
         let mut free: BTreeMap<Symbol, Span> = BTreeMap::new();
         canon_collect_free_locals(&mut free, &outer_bound, canon_body);
         free.into_iter()
-            .map(|(sym, span)| Ok((sym, span, self.used_binder_ir_type(span)?)))
+            .map(|(sym, span)| {
+                let binder_ty = self.used_binder_ir_type(span)?;
+                let holds_row = ir_type_holds(binder_ty.classified(), &self.enum_payloads, &|t| {
+                    matches!(t, IrType::RowGeneric(_))
+                });
+                if holds_row {
+                    return Err(unsupported(span, Feature::RowPolyRecordAnnotation));
+                }
+                Ok((sym, span, binder_ty))
+            })
             .collect()
     }
 
