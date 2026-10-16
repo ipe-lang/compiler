@@ -362,16 +362,22 @@ pieceStep raw ( pending, pieces ) =
                     PendingChars texts ->
                         ( PendingChars (texts ++ [ s ]), pieces )
 
-                    _ ->
-                        ( PendingChars [ s ], flushPending pending pieces )
+                    NoPending ->
+                        ( PendingChars [ s ], pieces )
+
+                    PendingEscapes cs ->
+                        ( PendingChars [ s ], pieces ++ [ Escapes cs ] )
 
         RawEscape c ->
             case pending of
                 PendingEscapes cs ->
                     ( PendingEscapes (cs ++ [ c ]), pieces )
 
-                _ ->
-                    ( PendingEscapes [ c ], flushPending pending pieces )
+                NoPending ->
+                    ( PendingEscapes [ c ], pieces )
+
+                PendingChars texts ->
+                    ( PendingEscapes [ c ], pieces ++ [ Chars (String.concat texts) ] )
 
 
 flushPending : Pending -> List Piece -> List Piece
