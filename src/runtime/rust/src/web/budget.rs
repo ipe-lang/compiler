@@ -364,7 +364,6 @@ impl SessionCmds {
     }
 
     /// The Cmds this session has in flight now.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn used(&self) -> Cmds {
         self.budget.used()
