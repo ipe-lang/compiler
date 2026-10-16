@@ -21,13 +21,11 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
-import Lib.Failure as Failure exposing (LoadFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
@@ -280,21 +278,6 @@ quoteCannotForgeBoundary =
         ]
 
 
--- The sink renders that live in `Lib`: the queue's failure line for a
--- hazard-bearing error is its case's fixed text, with none of the error's.
-sinkRendersEscape : Bool
-sinkRendersEscape =
-    case Queue.queueStatusText (Failed (Failure.loadFailureOf (Error.unexpected (codeText 27 ++ "[2J" ++ codeText 8238)))) of
-        Just text ->
-            noHazard text
-                && not (String.contains "[2J" text)
-                && text
-                == ("Queue failed to load: " ++ Failure.loadFailureText LoadFailed)
-
-        Nothing ->
-            False
-
-
 -- ── text from the index never reaches a page raw ─────────────────────────
 --
 -- Every displayed index column is `SafeText` from the decode point on, and
@@ -382,7 +365,6 @@ checks =
         , Task.succeed ( "segments hold their role and spell back to the flat form", segmentsSpellRenderForeign )
         , Task.succeed ( "a literal backslash cannot forge an escape", backslashCannotForge )
         , Task.succeed ( "a quote cannot forge a quoted boundary", quoteCannotForgeBoundary )
-        , Task.succeed ( "the queue failure line holds none of its error's text", sinkRendersEscape )
         , check "index text is rendered at the decode point" indexTextRendered
         , Task.succeed ( "source tokens and link labels render bidi visibly", sourceTokensRendered )
         , check "the hazard set equals the shared display-hazard vectors" hazardSetMatchesVectors

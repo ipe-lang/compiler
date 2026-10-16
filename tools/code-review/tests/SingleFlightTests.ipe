@@ -454,7 +454,7 @@ foreignReadIsIdle settings otherEpoch a b =
         == Just ( ub, Nothing )
         && inFlight ownResult
         == Nothing
-        && Queue.selectedViewStatusText ub ownResult.selectedView
+        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ub ownResult.selectedView)
         == Nothing
 
 
@@ -779,7 +779,7 @@ queueLoadFailureTyped settings a =
         && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
         && queueFailure succeeded.queueState
         == Nothing
-        && Queue.queueStatusText succeeded.queueState
+        && Maybe.map SafeText.toString (Queue.queueStatusText succeeded.queueState)
         == Nothing
 
 
@@ -814,7 +814,7 @@ historyLoadFailureTyped settings =
         && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
         && historyFailure succeeded.history
         == Nothing
-        && Queue.historyStatusText succeeded.history
+        && Maybe.map SafeText.toString (Queue.historyStatusText succeeded.history)
         == Just "No reviews yet."
 
 
@@ -853,7 +853,7 @@ viewLoadFailureTyped settings a b =
         && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
         && viewFailure succeeded.selectedView
         == Nothing
-        && Queue.selectedViewStatusText ua succeeded.selectedView
+        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ua succeeded.selectedView)
         == Nothing
 
 
