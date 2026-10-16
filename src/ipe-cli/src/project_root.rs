@@ -20,6 +20,7 @@ use crate::contained_path::ResolvedPath;
 use crate::io_bounded::{self, MANIFEST_CAP};
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::held::{EntryKind, HeldDir};
+use crate::owner_trust::{self, TrustedCache};
 use crate::package_manifest::{PACKAGE_IPE, parse_package_manifest_source};
 use crate::project::{IPE_TOML, ProjectManifest, parse_entry};
 use crate::text;
@@ -205,6 +206,8 @@ enum Located {
 #[derive(Debug)]
 pub struct ProjectRoot {
     dir: HeldDir,
+    /// The handle the manifest was read through, proven to hold the same directory as `dir`.
+    fs_root: ipe_fs_open::HeldDir,
     manifest: ProjectManifest,
     src: HeldDir,
     tests: Option<HeldDir>,
@@ -263,6 +266,7 @@ impl ProjectRoot {
         let entries = entry_set(&src, &manifest, &path)?;
         Ok(Self {
             dir,
+            fs_root,
             manifest,
             src,
             tests,
@@ -274,6 +278,22 @@ impl ProjectRoot {
     #[must_use]
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// The project's FFI cache, held open beneath the root's own handle.
+    ///
+    /// Each component of the cache path is opened through the handle on the
+    /// level above it, starting at the handle [`ProjectRoot::resolve`] proved
+    /// is the root, never following a link, and owner-checked on the opened
+    /// handle: the cache returned is the directory checked, never a path
+    /// resolved again. `Ok(None)` when a component is absent.
+    ///
+    /// # Errors
+    /// As [`owner_trust::open_cache_beneath`]: [`CliError::TrustRefused`] for a
+    /// component that is a link or not a directory, or that another user can
+    /// write (on a host with no owner check, for any cache that exists).
+    pub fn cache_dir(&self) -> Result<Option<TrustedCache>, CliError> {
+        owner_trust::open_cache_beneath(self.fs_root.handle(), self.path())
     }
 
     /// The parsed `package.ipe`.
@@ -1093,5 +1113,130 @@ mod tests {
             EntrySet::Programs(_) => None,
         }
         .expect("the project is a library")
+    }
+
+    // ── FFI cache ─────────────────────────────────────────────────────────────
+
+    /// The FFI cache path below `root`, one component at a time, as the loader opens it.
+    fn cache_below(root: &Path) -> PathBuf {
+        let mut cache = root.to_path_buf();
+        cache.extend(ipe_ffi::driver::FFI_CACHE_COMPONENTS);
+        cache
+    }
+
+    /// The text of the trust refusal `result` carries, if any.
+    fn trust_message(result: Result<Option<TrustedCache>, CliError>) -> Option<text::Message> {
+        match result {
+            Err(CliError::TrustRefused(refusal)) => Some(refusal.message()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn an_absent_cache_dir_is_no_cache() {
+        let s = app("cache-absent");
+        let root = resolve(s.path()).expect("resolves");
+        let cache = root.cache_dir().expect("an absent cache is not an error");
+        assert!(cache.is_none());
+    }
+
+    /// A project whose FFI cache levels are each created with `mode`; returns the cache path.
+    #[cfg(unix)]
+    fn app_with_cache(tag: &str, mode: u32) -> (Scratch, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let s = app(tag);
+        let mut level = s.path().to_path_buf();
+        for component in ipe_ffi::driver::FFI_CACHE_COMPONENTS {
+            level.push(component);
+            fs::create_dir_all(&level).expect("create cache level");
+            fs::set_permissions(&level, fs::Permissions::from_mode(mode)).expect("chmod");
+        }
+        (s, level)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_cache_dir_is_held() {
+        let (s, cache) = app_with_cache("cache-private", 0o700);
+        assert_eq!(cache, cache_below(s.path()));
+        let root = resolve(s.path()).expect("resolves");
+        let held = root
+            .cache_dir()
+            .expect("a 0700 invoker-owned cache is trusted");
+        assert_eq!(held.as_ref().map(TrustedCache::path), Some(cache.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_dir_another_user_can_write_is_untrusted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (s, _) = app_with_cache("cache-world", 0o700);
+        let shared = s.path().join(".ipe/cache");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o702)).expect("chmod");
+        let root = resolve(s.path()).expect("resolves");
+        assert_eq!(
+            trust_message(root.cache_dir()),
+            Some(text::msg::ffi_cache_untrusted(&shared.display()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_cache_component_escapes() {
+        let (s, _) = app_with_cache("cache-link", 0o700);
+        fs::rename(s.path().join(".ipe/cache"), s.path().join("elsewhere")).expect("move level");
+        s.link("elsewhere", ".ipe/cache");
+        let root = resolve(s.path()).expect("resolves");
+        assert_eq!(
+            trust_message(root.cache_dir()),
+            Some(text::msg::ffi_cache_escapes(
+                &s.path().join(".ipe/cache").display()
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_component_that_is_a_file_escapes() {
+        let s = app("cache-file");
+        s.mkdir(".ipe");
+        s.write(".ipe/cache", "");
+        let root = resolve(s.path()).expect("resolves");
+        assert_eq!(
+            trust_message(root.cache_dir()),
+            Some(text::msg::ffi_cache_escapes(
+                &s.path().join(".ipe/cache").display()
+            ))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_cache_dir_is_the_resolved_roots_not_the_paths() {
+        let (s, cache) = app_with_cache("cache-moved", 0o700);
+        let root = resolve(s.path()).expect("resolves");
+        let moved = s.path().with_extension("moved");
+        let _ = fs::remove_dir_all(&moved);
+        fs::rename(s.path(), &moved).expect("move the root away");
+        fs::create_dir_all(s.path()).expect("recreate the root path");
+        std::os::unix::fs::symlink(moved.join(".ipe"), s.path().join(".ipe"))
+            .expect("plant a link at the old path");
+        let held = root.cache_dir().expect("the held root is unchanged");
+        let _ = fs::remove_dir_all(&moved);
+        assert_eq!(held.as_ref().map(TrustedCache::path), Some(cache.as_path()));
+    }
+
+    /// Off Unix the witness has no constructor: an existing cache is refused, never held.
+    #[cfg(all(not(unix), not(target_arch = "wasm32")))]
+    #[test]
+    fn an_existing_cache_dir_is_unverifiable() {
+        let s = app("cache-unverifiable");
+        let cache = cache_below(s.path());
+        fs::create_dir_all(&cache).expect("create cache");
+        let root = resolve(s.path()).expect("resolves");
+        assert_eq!(
+            trust_message(root.cache_dir()),
+            Some(text::msg::ffi_cache_unverifiable(&cache.display()))
+        );
     }
 }
