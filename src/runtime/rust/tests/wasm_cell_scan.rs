@@ -208,6 +208,7 @@ fn eval(predicate: &Meta, env: CfgEnv<'_>) -> Result<Tri, String> {
                     Arch::Wasm32 => Tri::of(value == "unknown"),
                     Arch::Native => Tri::Unknown,
                 }),
+                "panic" => Ok(Tri::Unknown),
                 _ => Err(format!("unknown cfg predicate `{key} = \"{value}\"`")),
             }
         }
@@ -1544,6 +1545,7 @@ fn the_cfg_evaluator_keeps_unknown_facts_unknown() {
         ("target_arch = \"x86_64\"", Tri::Unknown),
         ("not(target_arch = \"wasm32\")", Tri::True),
         ("unix", Tri::Unknown),
+        ("panic = \"abort\"", Tri::Unknown),
         ("all(test, feature = \"x\")", Tri::Unknown),
         ("any(test, feature = \"x\")", Tri::True),
     ];
