@@ -89,10 +89,11 @@ each nested under the same enclosing root as `ipe-index` recorded it from the
 files themselves: a repository the index records but no variable binds, a bound
 tag the index does not record, or a root nested otherwise than the index
 records stops startup. A tag is the text before the first `:` when no `/`
-precedes it, matching how `ipe-index` reads it back. A unit stored under a tag
-no root binds is never listed, counted in the queue or its progress, or read;
-should one appear after startup (the index rebuilt while the server runs), the
-queue header shows how many units it leaves out.
+precedes it, matching how `ipe-index` reads it back. A unit or an unreviewable
+file stored under a tag no root binds is never listed, counted in the queue or
+its progress, or read; should one appear after startup (the index rebuilt while
+the server runs), the queue header shows how many units and files it leaves
+out.
 
 Every stored `tag:relative` path is sealed with `Ipe.Path.fromString` and joined
 with `Ipe.Path.under`, so it must land strictly under its tag's root: an
@@ -255,7 +256,9 @@ decision binds the index's refusal digest of the file, so a changed file is
 open again after the next `ipe-index` run. Before the decision is recorded the
 index row is read again and a content reason is re-probed: a file that now
 reads as text is refused, with "re-run the index". The other reasons say
-"Cannot be acknowledged: fix it in the tree." and offer no decision.
+"Cannot be acknowledged: fix it in the tree." and offer no decision. The list
+shows up to 200 open files, every acknowledgeable one before any that cannot
+be acknowledged; the header counts them all.
 
 ## Checks
 
