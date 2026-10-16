@@ -1329,8 +1329,10 @@ messages! {
     ffi_cache_untrusted(path) = "ffi-cache-untrusted";
     /// The FFI cache's ownership cannot be verified on this platform.
     ffi_cache_unverifiable(path) = "ffi-cache-unverifiable";
-    /// An FFI cache component or artifact is a symbolic link.
+    /// An FFI cache artifact is a symbolic link.
     ffi_cache_symlink(path) = "ffi-cache-symlink";
+    /// An FFI cache directory component is a symbolic link or not a directory.
+    ffi_cache_escapes(path) = "ffi-cache-escapes";
     /// An FFI cache artifact is not a regular file.
     ffi_cache_not_regular(path) = "ffi-cache-not-regular";
     /// An FFI cache directory lists more entries than the loader admits.

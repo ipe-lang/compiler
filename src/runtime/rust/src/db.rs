@@ -1,7 +1,9 @@
 // DB kernel functions — generic over E and over backend.
 // Uses DbPool, DbRow, ipe_db_url, db_last_insert_id, db_format_sql from
 // config.rs (generated at build time per package.ipe database driver).
-use super::json::{Decoder, JsonVal, decode_and_map, decode_err_str, decode_field, decode_ok};
+use super::json::{
+    Decoder, JsonVal, decode_and_map, decode_err_str, decode_field, decode_ok, integral_i64,
+};
 use super::*;
 use crate::ssrf::{
     ConfiguredHost, DialPolicy, HostResolver, SsrfRefusal, SystemResolver, UnambiguousUrl,
@@ -570,59 +572,33 @@ fn column_is_boolean<R: Row>(row: &R, i: usize) -> bool {
         })
 }
 
-/// Decode column `i` into a `String` for the untyped `row_to_map` path.
-///
-/// A boolean-typed column reads via `bool` first; every other column reads
-/// numeric-first (i64 → f64) so a SQLite INTEGER is never stolen by the bool
-/// reader. `Ok(None)` at any arm = SQL NULL → `""`. The final fallback is
-/// `String::new()` — the untyped path has no typed consumer to distinguish NULL
-/// from empty (documented at call site).
-fn column_to_string(row: &DbRow, i: usize) -> String {
-    if column_is_boolean(row, i)
-        && let Ok(opt) = row.try_get::<Option<bool>, _>(i)
-    {
-        return opt.map_or_else(String::new, |b| b.to_string());
-    }
-    // NULL at any arm → ""; continue to next probe only on decode error.
-    if let Ok(opt) = row.try_get::<Option<i64>, _>(i) {
-        return opt.map_or_else(String::new, |n| n.to_string());
-    }
-    if let Ok(opt) = row.try_get::<Option<f64>, _>(i) {
-        return opt.map_or_else(String::new, |f| f.to_string());
-    }
-    if let Ok(opt) = row.try_get::<Option<String>, _>(i) {
-        return opt.unwrap_or_default();
-    }
-    // BYTEA / BLOB: encode as lowercase hex so the value survives round-trip
-    // through `db_decode_bytes` (which hex-decodes back to `Vec<u8>`).
-    if let Ok(Some(bytes)) = row.try_get::<Option<Vec<u8>>, _>(i) {
-        return hex::encode(bytes);
-    }
-    String::new()
-}
-
 /// The `ColumnDecode` reason [`read_cell`] gives a `NaN` / `±Inf` `REAL` cell.
 const NON_FINITE_REAL: &str = "non-finite REAL (NaN / +Inf / -Inf has no cell value)";
 
 /// The `ColumnDecode` reason [`read_cell`] gives a cell no probe reads.
 const UNSUPPORTED_COLUMN_TYPE: &str = "unsupported column type (not bool/i64/f64/String/bytes)";
 
-/// A finite `f64`, held as the JSON number every finite float has.
+/// A finite `f64`, held with the JSON number every finite float has.
 ///
 /// The only constructor, [`FiniteF64::new`], refuses `NaN` and `±Inf`, so a cell
-/// float always has a JSON projection and never needs a `Null` fallback.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FiniteF64(serde_json::Number);
+/// float always has both a text and a JSON projection and never needs a
+/// fallback. The fields are private: `value` and `json` always denote the same
+/// number.
+#[derive(Clone, Debug, PartialEq)]
+struct FiniteF64 {
+    value: f64,
+    json: serde_json::Number,
+}
 
 impl FiniteF64 {
     /// `Some` for a finite `f`; `None` for `NaN`, `+Inf` and `-Inf`.
     fn new(f: f64) -> Option<Self> {
-        serde_json::Number::from_f64(f).map(Self)
+        serde_json::Number::from_f64(f).map(|json| Self { value: f, json })
     }
 }
 
 /// One database cell as [`read_cell`] reads it; SQL `NULL` is its own arm.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Cell {
     /// SQL `NULL`.
     Null,
@@ -648,10 +624,30 @@ impl Cell {
             Self::Null => JsonVal::Null,
             Self::Bool(b) => JsonVal::Bool(b),
             Self::Int(n) => JsonVal::Number(serde_json::Number::from(n)),
-            Self::Float(FiniteF64(n)) => JsonVal::Number(n),
+            Self::Float(f) => JsonVal::Number(f.json),
             Self::Text(s) => JsonVal::String(s),
             Self::Bytes(b) => JsonVal::String(hex::encode(b)),
         }
+    }
+
+    /// The cell as the text a raw row carries; SQL `NULL` is `Nothing`.
+    ///
+    /// The text is the one an app-path Store read gives the same cell: an
+    /// integral float renders as its `Int` through the shared
+    /// [`integral_i64`], exactly as the Store
+    /// `cellsDecoder` reaches it by trying `Int` before `Float`, so `3.0` is
+    /// `"3"` and `-0.0` is `"0"` on every path. Bytes become lowercase hex text.
+    fn into_text(self) -> IpeMaybe<String> {
+        IpeMaybe::Just(match self {
+            Self::Null => return IpeMaybe::Nothing,
+            Self::Bool(b) => string_from_bool(b),
+            Self::Int(n) => string_from_int(n),
+            Self::Float(f) => {
+                integral_i64(f.value).map_or_else(|| string_from_float(f.value), string_from_int)
+            }
+            Self::Text(s) => s,
+            Self::Bytes(b) => hex::encode(b),
+        })
     }
 }
 
@@ -701,18 +697,38 @@ where
     Err(refuse(UNSUPPORTED_COLUMN_TYPE))
 }
 
-// needless_range_loop (accepted, cosmetic): the loop indexes by position to pair
-// column name[i] with value[i] across two parallel slices — an iterator can't
-// thread both. Not a soundness concern.
-#[allow(clippy::needless_range_loop)]
-fn row_to_map(row: &DbRow) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+/// A raw Db row: column name → cell text, SQL `NULL` as `Nothing` (`Ipe.Db.Store.Row`).
+pub type RowCells = IpeDict<IpeMaybe<String>>;
+
+/// An app or external row as the [`RowCells`] every raw read returns.
+///
+/// Each column goes through [`read_cell`] then [`Cell::into_text`], so SQL
+/// `NULL` stays `Nothing`. An unreadable cell is `Err(ColumnDecode)`; the caller
+/// converts it through [`raw_read`], so the read fails closed.
+fn row_cells<R>(row: &R) -> Result<RowCells, sqlx::Error>
+where
+    R: Row,
+    usize: sqlx::ColumnIndex<R>,
+    for<'a> Option<bool>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<f64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+    for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
+{
     let cols = row.columns();
+    let mut map = RowCells::with_capacity(cols.len());
     for (i, col) in cols.iter().enumerate() {
-        let name = col.name().to_string();
-        map.insert(name, column_to_string(row, i));
+        map.insert(col.name().to_string(), read_cell(row, i)?.into_text());
     }
-    map
+    Ok(map)
+}
+
+/// A raw read's cells as the task result; an unreadable cell is the redacted [`ipe_err`].
+fn raw_read<E: crate::FromIpeError, A>(
+    engine: DbEngine,
+    cells: Result<A, sqlx::Error>,
+) -> IpeResult<E, A> {
+    cells.map_or_else(|e| IpeResult::Err(ipe_err(engine, &e)), ok_res)
 }
 
 /// An app or external row as the `JsonVal::Object` the typed decoders read.
@@ -3045,7 +3061,7 @@ pub fn db_query<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     sql: String,
     params: Vec<String>,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         let final_sql = db_format_sql(sql);
         let mut q = sqlx::query(&final_sql);
@@ -3053,7 +3069,7 @@ pub fn db_query<E: Send + From<String> + crate::FromIpeError + 'static>(
             q = q.bind(p);
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
+            Ok(rows) => raw_read(KERNEL_ENGINE, rows.iter().map(row_cells).collect()),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
@@ -3098,7 +3114,7 @@ pub fn db_query_params<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     sql: String,
     params: Vec<SqlParam>,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         let final_sql = db_format_sql(sql);
         let mut q = sqlx::query(&final_sql);
@@ -3106,7 +3122,7 @@ pub fn db_query_params<E: Send + From<String> + crate::FromIpeError + 'static>(
             q = bind_sql_param(q, p);
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
+            Ok(rows) => raw_read(KERNEL_ENGINE, rows.iter().map(row_cells).collect()),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
@@ -3115,8 +3131,9 @@ pub fn db_query_params<E: Send + From<String> + crate::FromIpeError + 'static>(
 /// A value a Ipê `Db.get*` accessor can read string-keyed fields from.
 ///
 /// Ipê's `getString : String -> row -> String` is polymorphic in `row`; the
-/// row can be a query result (`Dict String String`), a pub/sub `Dict` payload,
-/// or the typed `WebReq` an `init` handler receives. `IpeRow` is the seam that
+/// row can be a `Dict String String` payload (a pub/sub `Dict` payload) or the
+/// typed `WebReq` an `init` handler receives. A raw Db row is not one: its
+/// cells are `Maybe String` ([`RowCells`]), so SQL `NULL` never reads as `""`. `IpeRow` is the seam that
 /// lets the Rust accessors stay generic and monomorphise per row type — no
 /// `dyn Any`, no panic (an absent field reads as `""`).
 pub trait IpeRow {
@@ -3124,8 +3141,7 @@ pub trait IpeRow {
 }
 
 // `IpeDict<String>` is a transparent alias for `HashMap<String, String>`, so this
-// is the impl for every Dict-shaped row (query rows + pub/sub Dict payloads).
-// Named via the alias for intent; a genuine newtype is tracked as a future task.
+// is the impl for every `Dict String String` payload (pub/sub Dict payloads).
 impl IpeRow for IpeDict<String> {
     fn ipe_get(&self, field: &str) -> String {
         self.get(field).cloned().unwrap_or_default()
@@ -3216,6 +3232,10 @@ fn migrate_checksum(sql: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// The refusal [`db_migrate_apply`] gives a ledger row with a `NULL` `name` or `checksum`.
+const MIGRATION_LEDGER_NULL_IDENTITY: &str =
+    "db.migrate: corrupt _ipe_migrations ledger: a row has a NULL name or checksum";
+
 /// `migrate : Db -> List (String, String) -> Task Error (List String)` — apply
 /// forward-only schema migrations, recording each in the `_ipe_migrations`
 /// ledger so re-runs are idempotent. `Db_migrateApply`'s library
@@ -3291,7 +3311,7 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
         // 2. Snapshot already-applied migrations: name -> (checksum, applied_at).
         //    Read OUTSIDE any transaction (the per-migration txns come below);
         //    single-deployer so no TOCTOU concern. No interpolation in the SELECT.
-        let rows: Vec<HashMap<String, String>> = match db_query::<E>(
+        let rows: Vec<RowCells> = match db_query::<E>(
             db.clone(),
             "SELECT name, checksum, applied_at FROM _ipe_migrations".to_string(),
             Vec::new(),
@@ -3301,14 +3321,26 @@ pub fn db_migrate_apply<E: Send + From<String> + crate::FromIpeError + 'static>(
             IpeResult::Ok(r) => r,
             IpeResult::Err(e) => db_op_fail!("read _ipe_migrations", e),
         };
-        let mut applied: HashMap<String, (String, String)> = HashMap::new();
-        for row in &rows {
-            // Total: a row missing a column is skipped rather than panicking
-            // (applied_at defaults to empty — only used for the status report).
-            if let (Some(name), Some(sum)) = (row.get("name"), row.get("checksum")) {
-                let at = row.get("applied_at").cloned().unwrap_or_default();
-                applied.insert(name.clone(), (sum.clone(), at));
-            }
+        let mut applied: HashMap<String, (String, String)> = HashMap::with_capacity(rows.len());
+        for mut row in rows {
+            // A ledger row whose `name` or `checksum` is SQL `NULL` has no
+            // identity to compare a declared migration against, so the ledger is
+            // corrupt and the run refuses rather than report a drift or a match
+            // against an invented value.
+            let (Some(IpeMaybe::Just(name)), Some(IpeMaybe::Just(sum))) =
+                (row.remove("name"), row.remove("checksum"))
+            else {
+                db_op_fail!(
+                    "read _ipe_migrations",
+                    str_err(MIGRATION_LEDGER_NULL_IDENTITY)
+                );
+            };
+            // `applied_at` only feeds the status report: `NULL` shows as no date.
+            let at = match row.remove("applied_at") {
+                Some(IpeMaybe::Just(at)) => at,
+                Some(IpeMaybe::Nothing) | None => String::new(),
+            };
+            applied.insert(name, (sum, at));
         }
 
         // 2b. `status` op mode — read-only report from `applied` × `migrations`,
@@ -3618,12 +3650,12 @@ pub fn db_insert_row<E: Send + From<String> + crate::FromIpeError + 'static>(
     })
 }
 
-/// `getById : Db -> String -> String -> Task Error (Maybe (Dict String String))`.
+/// `getById : Db -> String -> String -> Task Error (Maybe (Dict String (Maybe String)))`.
 pub fn db_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     id: String,
-) -> IpeTask<E, IpeMaybe<HashMap<String, String>>> {
+) -> IpeTask<E, IpeMaybe<RowCells>> {
     Box::pin(async move {
         let qtable = match SqlIdent::parse_plain(&table) {
             Some(t) => t,
@@ -3638,7 +3670,7 @@ pub fn db_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
             qtable.as_str()
         ));
         match fetch_optional_routed(&conn, sqlx::query(&sql).bind(id)).await {
-            Ok(Some(r)) => ok_res(IpeMaybe::Just(row_to_map(&r))),
+            Ok(Some(r)) => raw_read(KERNEL_ENGINE, row_cells(&r).map(IpeMaybe::Just)),
             Ok(None) => ok_res(IpeMaybe::Nothing),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
@@ -3718,13 +3750,13 @@ pub fn db_delete_by_id<E: Send + From<String> + crate::FromIpeError + 'static>(
     })
 }
 
-/// `findOneByField : Db -> String -> String -> String -> Task Error (Maybe (Dict String String))`.
+/// `findOneByField : Db -> String -> String -> String -> Task Error (Maybe (Dict String (Maybe String)))`.
 pub fn db_find_one_by_field<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     field: String,
     value: String,
-) -> IpeTask<E, IpeMaybe<HashMap<String, String>>> {
+) -> IpeTask<E, IpeMaybe<RowCells>> {
     Box::pin(async move {
         let (qtable, qfield) = match (SqlIdent::parse_plain(&table), SqlIdent::parse_plain(&field))
         {
@@ -3745,20 +3777,20 @@ pub fn db_find_one_by_field<E: Send + From<String> + crate::FromIpeError + 'stat
             qfield.as_str()
         ));
         match fetch_optional_routed(&conn, sqlx::query(&sql).bind(value)).await {
-            Ok(Some(r)) => ok_res(IpeMaybe::Just(row_to_map(&r))),
+            Ok(Some(r)) => raw_read(KERNEL_ENGINE, row_cells(&r).map(IpeMaybe::Just)),
             Ok(None) => ok_res(IpeMaybe::Nothing),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
-/// `findManyByField : Db -> String -> String -> String -> Task Error (List (Dict String String))`.
+/// `findManyByField : Db -> String -> String -> String -> Task Error (List (Dict String (Maybe String)))`.
 pub fn db_find_many_by_field<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     field: String,
     value: String,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         let (qtable, qfield) = match (SqlIdent::parse_plain(&table), SqlIdent::parse_plain(&field))
         {
@@ -3779,19 +3811,19 @@ pub fn db_find_many_by_field<E: Send + From<String> + crate::FromIpeError + 'sta
             qfield.as_str()
         ));
         match fetch_all_routed(&conn, sqlx::query(&sql).bind(value)).await {
-            Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
+            Ok(rows) => raw_read(KERNEL_ENGINE, rows.iter().map(row_cells).collect()),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
 }
 
-/// `findByConditions : Db -> String -> Dict String String -> Task Error (List (Dict String String))` —
+/// `findByConditions : Db -> String -> Dict String String -> Task Error (List (Dict String (Maybe String)))` —
 /// AND-joined equality on every key/value pair.
 pub fn db_find_by_conditions<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     conditions: HashMap<String, String>,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         let qtable = match SqlIdent::parse_plain(&table) {
             Some(t) => t,
@@ -3841,7 +3873,7 @@ pub fn db_find_by_conditions<E: Send + From<String> + crate::FromIpeError + 'sta
             q = q.bind(conditions.get(*k).cloned().unwrap_or_default());
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
+            Ok(rows) => raw_read(KERNEL_ENGINE, rows.iter().map(row_cells).collect()),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
@@ -4835,7 +4867,7 @@ pub fn sql_masked_column(pred: SqlFragment, col: String) -> SqlFragment {
     }
 }
 
-/// `Db.findWhere : Db -> String -> SqlFragment -> Task Error (List (Dict String String))`
+/// `Db.findWhere : Db -> String -> SqlFragment -> Task Error (List (Dict String (Maybe String)))`
 /// — the `SqlFragment`-typed replacement for the removed `unsafeFindWhere`.
 /// The WHERE clause can only be built through the `Sql.*` combinators above,
 /// so `frag.sql` is always `?`-placeholder text with a matching `frag.binds`
@@ -4845,7 +4877,7 @@ pub fn db_find_where<E: Send + From<String> + crate::FromIpeError + 'static>(
     conn: Db,
     table: String,
     frag: SqlFragment,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         if let Some(poison) = frag.invalid {
             return IpeResult::Err(poison.to_error("db.findWhere"));
@@ -4866,7 +4898,7 @@ pub fn db_find_where<E: Send + From<String> + crate::FromIpeError + 'static>(
             q = bind_sql_param(q, p);
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
+            Ok(rows) => raw_read(KERNEL_ENGINE, rows.iter().map(row_cells).collect()),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
@@ -4879,8 +4911,7 @@ pub fn db_find_where<E: Send + From<String> + crate::FromIpeError + 'static>(
 /// projections masked).
 ///
 /// It is `db_find_where`'s column-masking counterpart. Where `db_find_where`
-/// emits `SELECT * … ` and returns cells via `row_to_map` (which collapses SQL
-/// NULL → `""`, so a masked cell would decode `Just ""`), this builds an
+/// emits `SELECT * … ` and returns every column as raw [`RowCells`], this builds an
 /// EXPLICIT projection from the caller's validated `projections` fragments — each
 /// a plain `Sql.column col AS col` for an unmasked column, or a
 /// `CASE WHEN (<pred>) THEN col ELSE NULL END AS col` from [`sql_masked_column`]
@@ -4981,7 +5012,7 @@ const JOIN_ALIAS_SEP: &str = "__";
 /// One joined result row: the two sides' plain-keyed cell maps (left, right).
 /// Each side decodes through its own store codec exactly as a single-table read
 /// does, so `Db.findJoin` returns a `List` of these pairs.
-pub type JoinRow = (HashMap<String, String>, HashMap<String, String>);
+pub type JoinRow = (RowCells, RowCells);
 
 /// One join side: its validated table name, the alias bound to it, and the
 /// validated column names to project. Both aliases and every column reach SQL
@@ -5053,14 +5084,14 @@ impl JoinSide {
 /// side's map under the bare `column`, so each side decodes through its own
 /// codec exactly as a single-table read does. A cell matching neither prefix is
 /// dropped (the SELECT projects only the two aliases' columns, so none arise).
-fn split_join_row(row: &HashMap<String, String>, left_prefix: &str, right_prefix: &str) -> JoinRow {
-    let mut left = HashMap::new();
-    let mut right = HashMap::new();
+fn split_join_row(row: RowCells, left_prefix: &str, right_prefix: &str) -> JoinRow {
+    let mut left = RowCells::new();
+    let mut right = RowCells::new();
     for (name, value) in row {
         if let Some(col) = name.strip_prefix(left_prefix) {
-            left.insert(col.to_string(), value.clone());
+            left.insert(col.to_string(), value);
         } else if let Some(col) = name.strip_prefix(right_prefix) {
-            right.insert(col.to_string(), value.clone());
+            right.insert(col.to_string(), value);
         }
     }
     (left, right)
@@ -5068,7 +5099,7 @@ fn split_join_row(row: &HashMap<String, String>, left_prefix: &str, right_prefix
 
 /// `Db.findJoin : Db -> String -> String -> List String -> String -> String
 ///                -> List String -> SqlFragment
-///                -> Task Error (List (Dict String String, Dict String String))`
+///                -> Task Error (List (Dict String (Maybe String), Dict String (Maybe String)))`
 /// — read an inner join of two tables as one parameterized statement, returning
 /// each result row as the pair of the two sides' plain-keyed cell maps.
 ///
@@ -5115,9 +5146,10 @@ pub fn db_find_join<E: Send + From<String> + crate::FromIpeError + 'static>(
             q = bind_sql_param(q, p);
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(
+            Ok(rows) => raw_read(
+                KERNEL_ENGINE,
                 rows.iter()
-                    .map(|r| split_join_row(&row_to_map(r), &left_prefix, &right_prefix))
+                    .map(|r| row_cells(r).map(|c| split_join_row(c, &left_prefix, &right_prefix)))
                     .collect(),
             ),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
@@ -5226,7 +5258,7 @@ impl ProjectionColumn {
 
 /// `Db.findProjection : Db -> String -> String -> String -> String
 ///                      -> SqlFragment -> List (String, String) -> List SqlValue
-///                      -> Task Error (List (Dict String String))` — read a typed
+///                      -> Task Error (List (Dict String (Maybe String)))` — read a typed
 /// projection over a two-table join as one parameterized statement.
 ///
 /// The two `(table, alias)` pairs name the join sides; `frag` is the WHERE
@@ -5251,7 +5283,7 @@ pub fn db_find_projection<E: Send + From<String> + crate::FromIpeError + 'static
     frag: SqlFragment,
     projections: Vec<ProjectionTerm>,
     extra_binds: Vec<SqlParam>,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         if let Some(poison) = frag.invalid {
             return IpeResult::Err(poison.to_error("db.findProjection"));
@@ -5285,7 +5317,7 @@ pub fn db_find_projection<E: Send + From<String> + crate::FromIpeError + 'static
             q = bind_sql_param(q, p);
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
+            Ok(rows) => raw_read(KERNEL_ENGINE, rows.iter().map(row_cells).collect()),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
@@ -5293,7 +5325,7 @@ pub fn db_find_projection<E: Send + From<String> + crate::FromIpeError + 'static
 
 /// `Db.findJoinOrdered : Db -> String -> String -> List String -> String -> String
 ///                       -> List String -> SqlFragment -> String -> String -> Bool
-///                       -> Task Error (List (Dict String String, Dict String String))`
+///                       -> Task Error (List (Dict String (Maybe String), Dict String (Maybe String)))`
 /// — ordered variant of `db_find_join`. Identical to `db_find_join` but appends
 /// `ORDER BY <order_alias>.<order_col> ASC|DESC` to the join statement. The three
 /// trailing arguments are the validated order-column alias, column name, and
@@ -5340,9 +5372,10 @@ pub fn db_find_join_ordered<E: Send + From<String> + crate::FromIpeError + 'stat
             q = bind_sql_param(q, p);
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(
+            Ok(rows) => raw_read(
+                KERNEL_ENGINE,
                 rows.iter()
-                    .map(|r| split_join_row(&row_to_map(r), &left_prefix, &right_prefix))
+                    .map(|r| row_cells(r).map(|c| split_join_row(c, &left_prefix, &right_prefix)))
                     .collect(),
             ),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
@@ -5353,7 +5386,7 @@ pub fn db_find_join_ordered<E: Send + From<String> + crate::FromIpeError + 'stat
 /// `Db.findProjectionOrdered : Db -> String -> String -> String -> String
 ///                             -> SqlFragment -> List (String, String) -> List SqlValue
 ///                             -> String -> String -> Bool
-///                             -> Task Error (List (Dict String String))`
+///                             -> Task Error (List (Dict String (Maybe String)))`
 /// — ordered variant of `db_find_projection`. Identical to `db_find_projection`
 /// but appends `ORDER BY <order_alias>.<order_col> ASC|DESC` to the projection
 /// statement. `extra_binds` holds `SqlParam` values for any `Store.literal`
@@ -5374,7 +5407,7 @@ pub fn db_find_projection_ordered<E: Send + From<String> + crate::FromIpeError +
     order_alias: String,
     order_col: String,
     order_asc: bool,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         if let Some(poison) = frag.invalid {
             return IpeResult::Err(poison.to_error("db.findProjectionOrdered"));
@@ -5416,7 +5449,7 @@ pub fn db_find_projection_ordered<E: Send + From<String> + crate::FromIpeError +
             q = bind_sql_param(q, p);
         }
         match fetch_all_routed(&conn, q).await {
-            Ok(rows) => ok_res(rows.iter().map(row_to_map).collect()),
+            Ok(rows) => raw_read(KERNEL_ENGINE, rows.iter().map(row_cells).collect()),
             Err(e) => IpeResult::Err(ipe_err(KERNEL_ENGINE, &e)),
         }
     })
@@ -5985,62 +6018,6 @@ fn external_format_sql_postgres(sql: &str) -> String {
     out
 }
 
-/// Decode column `i` of an EXTERNAL row into a `String`, mirroring the app-path
-/// [`column_to_string`] probe order (bool → i64 → f64 → String → bytes-hex).
-/// Generic over the sqlx row type so a single body serves both external
-/// dialects; each caller monomorphises it to its concrete row (no `dyn`).
-#[cfg(feature = "db")]
-fn external_column_to_string<R>(row: &R, i: usize) -> String
-where
-    R: Row,
-    usize: sqlx::ColumnIndex<R>,
-    for<'a> Option<bool>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<f64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-{
-    if column_is_boolean(row, i)
-        && let Ok(opt) = row.try_get::<Option<bool>, _>(i)
-    {
-        return opt.map_or_else(String::new, |b| b.to_string());
-    }
-    if let Ok(opt) = row.try_get::<Option<i64>, _>(i) {
-        return opt.map_or_else(String::new, |n| n.to_string());
-    }
-    if let Ok(opt) = row.try_get::<Option<f64>, _>(i) {
-        return opt.map_or_else(String::new, |f| f.to_string());
-    }
-    if let Ok(opt) = row.try_get::<Option<String>, _>(i) {
-        return opt.unwrap_or_default();
-    }
-    if let Ok(Some(bytes)) = row.try_get::<Option<Vec<u8>>, _>(i) {
-        return hex::encode(bytes);
-    }
-    String::new()
-}
-
-/// Decode an EXTERNAL row into the untyped `Dict String String` shape, mirroring
-/// the app-path [`row_to_map`]. Generic over the sqlx row type.
-#[cfg(feature = "db")]
-#[allow(clippy::needless_range_loop)]
-fn external_row_to_map<R>(row: &R) -> HashMap<String, String>
-where
-    R: Row,
-    usize: sqlx::ColumnIndex<R>,
-    for<'a> Option<bool>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<i64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<f64>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<String>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-    for<'a> Option<Vec<u8>>: sqlx::Decode<'a, R::Database> + sqlx::Type<R::Database>,
-{
-    let mut map = HashMap::new();
-    for (i, col) in row.columns().iter().enumerate() {
-        map.insert(col.name().to_string(), external_column_to_string(row, i));
-    }
-    map
-}
-
 /// Bind a `SqlParam` onto a query builder for a SPECIFIC external dialect,
 /// generic over the sqlx database. Same total per-variant mapping as the
 /// app-path [`bind_sql_param`], including the typed-NULL witness that gives
@@ -6092,7 +6069,7 @@ pub fn db_conn_find_where<E: Send + From<String> + crate::FromIpeError + 'static
     conn: ExternalConnection,
     table: String,
     frag: SqlFragment,
-) -> IpeTask<E, Vec<HashMap<String, String>>> {
+) -> IpeTask<E, Vec<RowCells>> {
     Box::pin(async move {
         if let Some(poison) = frag.invalid {
             return IpeResult::Err(poison.to_error("db.findWhereOn"));
@@ -6112,7 +6089,7 @@ pub fn db_conn_find_where<E: Send + From<String> + crate::FromIpeError + 'static
                     q = external_bind_sql_param(q, p);
                 }
                 match q.fetch_all(&pool).await {
-                    Ok(rows) => ok_res(rows.iter().map(external_row_to_map).collect()),
+                    Ok(rows) => raw_read(DbEngine::Postgres, rows.iter().map(row_cells).collect()),
                     Err(e) => IpeResult::Err(ipe_err(DbEngine::Postgres, &e)),
                 }
             }
@@ -6122,7 +6099,7 @@ pub fn db_conn_find_where<E: Send + From<String> + crate::FromIpeError + 'static
                     q = external_bind_sql_param(q, p);
                 }
                 match q.fetch_all(&pool).await {
-                    Ok(rows) => ok_res(rows.iter().map(external_row_to_map).collect()),
+                    Ok(rows) => raw_read(DbEngine::Sqlite, rows.iter().map(row_cells).collect()),
                     Err(e) => IpeResult::Err(ipe_err(DbEngine::Sqlite, &e)),
                 }
             }
@@ -6199,7 +6176,7 @@ pub fn db_conn_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>
     conn: ExternalConnection,
     table: String,
     id: String,
-) -> IpeTask<E, IpeMaybe<HashMap<String, String>>> {
+) -> IpeTask<E, IpeMaybe<RowCells>> {
     Box::pin(async move {
         let qtable = match SqlIdent::parse_plain(&table) {
             Some(t) => t,
@@ -6214,14 +6191,14 @@ pub fn db_conn_get_by_id<E: Send + From<String> + crate::FromIpeError + 'static>
             ExternalConnection::Postgres(pool) => {
                 let sql = external_format_sql_postgres(&base);
                 match sqlx::query(&sql).bind(id).fetch_optional(&pool).await {
-                    Ok(Some(r)) => ok_res(IpeMaybe::Just(external_row_to_map(&r))),
+                    Ok(Some(r)) => raw_read(DbEngine::Postgres, row_cells(&r).map(IpeMaybe::Just)),
                     Ok(None) => ok_res(IpeMaybe::Nothing),
                     Err(e) => IpeResult::Err(ipe_err(DbEngine::Postgres, &e)),
                 }
             }
             ExternalConnection::Sqlite(pool) => {
                 match sqlx::query(&base).bind(id).fetch_optional(&pool).await {
-                    Ok(Some(r)) => ok_res(IpeMaybe::Just(external_row_to_map(&r))),
+                    Ok(Some(r)) => raw_read(DbEngine::Sqlite, row_cells(&r).map(IpeMaybe::Just)),
                     Ok(None) => ok_res(IpeMaybe::Nothing),
                     Err(e) => IpeResult::Err(ipe_err(DbEngine::Sqlite, &e)),
                 }
@@ -6808,6 +6785,21 @@ pub fn db_insert_fields_returning<
 mod tests {
     use super::*;
 
+    /// Read a raw row's cell text in an assertion.
+    trait CellText {
+        /// The text of column `col`; `None` when the column is absent or SQL `NULL`.
+        fn text(&self, col: &str) -> Option<&str>;
+    }
+
+    impl CellText for RowCells {
+        fn text(&self, col: &str) -> Option<&str> {
+            match self.get(col) {
+                Some(IpeMaybe::Just(s)) => Some(s.as_str()),
+                Some(IpeMaybe::Nothing) | None => None,
+            }
+        }
+    }
+
     #[test]
     fn env_ceilings_honour_the_shared_contract() {
         crate::system::assert_env_ceiling_contract(DB_CONNECTIONS_CEILING);
@@ -7034,18 +7026,18 @@ mod tests {
             sql_column("amount".to_string()),
             sql_param(SqlParam::Int(7)),
         );
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> =
+        let rows: IpeResult<String, Vec<RowCells>> =
             db_conn_find_where(conn.clone(), "ledger".into(), frag).await;
         match rows {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 1);
-                assert_eq!(v[0].get("amount").map(String::as_str), Some("7"));
+                assert_eq!(v[0].text("amount"), Some("7"));
             }
             other => panic!("external findWhere failed: {:?}", other),
         }
         // A hostile TABLE identifier is rejected by the same `SqlIdent` gate — the
         // read runner never interpolates an unvalidated name into SQL.
-        let bad: IpeResult<String, Vec<HashMap<String, String>>> = db_conn_find_where(
+        let bad: IpeResult<String, Vec<RowCells>> = db_conn_find_where(
             conn,
             "ledger; DROP TABLE ledger".into(),
             sql_eq(sql_param(SqlParam::Int(1)), sql_param(SqlParam::Int(1))),
@@ -7067,7 +7059,7 @@ mod tests {
             sql_column("amount; DROP TABLE ledger".to_string()),
             sql_param(SqlParam::Int(7)),
         );
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> =
+        let rows: IpeResult<String, Vec<RowCells>> =
             db_conn_find_where(conn, "ledger".into(), poisoned).await;
         assert!(
             matches!(rows, IpeResult::Err(_)),
@@ -7080,11 +7072,11 @@ mod tests {
     #[tokio::test]
     async fn external_get_by_id_binds_id() {
         let conn = fresh_external_conn().await;
-        let got: IpeResult<String, IpeMaybe<HashMap<String, String>>> =
+        let got: IpeResult<String, IpeMaybe<RowCells>> =
             db_conn_get_by_id(conn, "ledger".into(), "1".into()).await;
         match got {
             IpeResult::Ok(IpeMaybe::Just(row)) => {
-                assert_eq!(row.get("amount").map(String::as_str), Some("7"));
+                assert_eq!(row.text("amount"), Some("7"));
             }
             other => panic!("external getById failed: {:?}", other),
         }
@@ -7916,7 +7908,7 @@ mod tests {
         }
 
         // Ledger recorded exactly the two migrations.
-        let ledger: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let ledger: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT name, checksum FROM _ipe_migrations ORDER BY name".to_string(),
             Vec::new(),
@@ -8003,7 +7995,7 @@ mod tests {
         assert!(matches!(ins, IpeResult::Ok(1)), "insert: {ins:?}");
 
         // Row is readable under full_name; the old `name` column is absent.
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT full_name, age FROM users WHERE id = 'u1'".to_string(),
             Vec::new(),
@@ -8013,9 +8005,7 @@ mod tests {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 1, "expected 1 row, got {}", v.len());
                 assert_eq!(
-                    v.first()
-                        .and_then(|r| r.get("full_name"))
-                        .map(String::as_str),
+                    v.first().and_then(|r| r.text("full_name")),
                     Some("Alice"),
                     "full_name should be Alice"
                 );
@@ -8024,7 +8014,7 @@ mod tests {
         }
 
         // `name` column is gone — selecting it is an error.
-        let bad: IpeResult<String, Vec<HashMap<String, String>>> =
+        let bad: IpeResult<String, Vec<RowCells>> =
             db_query(db.clone(), "SELECT name FROM users".to_string(), Vec::new()).await;
         assert!(
             matches!(bad, IpeResult::Err(_)),
@@ -8071,7 +8061,7 @@ mod tests {
         }
 
         // Data unchanged.
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT full_name FROM users WHERE id = 'u1'".to_string(),
             Vec::new(),
@@ -8079,9 +8069,7 @@ mod tests {
         .await;
         match rows {
             IpeResult::Ok(v) => assert_eq!(
-                v.first()
-                    .and_then(|r| r.get("full_name"))
-                    .map(String::as_str),
+                v.first().and_then(|r| r.text("full_name")),
                 Some("Bob"),
                 "data unchanged after re-run"
             ),
@@ -8121,7 +8109,7 @@ mod tests {
         .await;
         assert!(matches!(ins, IpeResult::Ok(1)), "fresh-db insert: {ins:?}");
 
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT full_name FROM users WHERE id = 'u2'".to_string(),
             Vec::new(),
@@ -8129,9 +8117,7 @@ mod tests {
         .await;
         match rows {
             IpeResult::Ok(v) => assert_eq!(
-                v.first()
-                    .and_then(|r| r.get("full_name"))
-                    .map(String::as_str),
+                v.first().and_then(|r| r.text("full_name")),
                 Some("Carol"),
                 "fresh-db convergence"
             ),
@@ -8172,7 +8158,7 @@ mod tests {
             "table-rename insert: {ins:?}"
         );
 
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT email FROM accounts WHERE id = 'a1'".to_string(),
             Vec::new(),
@@ -8180,7 +8166,7 @@ mod tests {
         .await;
         match rows {
             IpeResult::Ok(v) => assert_eq!(
-                v.first().and_then(|r| r.get("email")).map(String::as_str),
+                v.first().and_then(|r| r.text("email")),
                 Some("dave@example.com"),
                 "row readable under new table name"
             ),
@@ -8188,7 +8174,7 @@ mod tests {
         }
 
         // Old table name is gone.
-        let bad: IpeResult<String, Vec<HashMap<String, String>>> =
+        let bad: IpeResult<String, Vec<RowCells>> =
             db_query(db.clone(), "SELECT * FROM users".to_string(), Vec::new()).await;
         assert!(
             matches!(bad, IpeResult::Err(_)),
@@ -8220,7 +8206,7 @@ mod tests {
         assert!(matches!(r_create, IpeResult::Ok(_)), "create: {r_create:?}");
 
         // Ledger row count before the failing rename.
-        let before: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let before: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT name FROM _ipe_migrations ORDER BY name".to_string(),
             Vec::new(),
@@ -8253,7 +8239,7 @@ mod tests {
         );
 
         // Ledger must be unadvanced — the failing rename entry was not recorded.
-        let after: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let after: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT name FROM _ipe_migrations ORDER BY name".to_string(),
             Vec::new(),
@@ -8330,7 +8316,7 @@ mod tests {
         assert!(matches!(ins2, IpeResult::Ok(1)), "null insert: {ins2:?}");
 
         // SELECT with an Int SqlValue param.
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query_params(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
             db.clone(),
             "SELECT name, qty FROM items WHERE qty = ?".to_string(),
             vec![SqlParam::Int(7)],
@@ -8339,8 +8325,8 @@ mod tests {
         let rs = rows.with_default(Vec::new());
         assert_eq!(rs.len(), 1, "expected exactly 1 matching row, got {rs:?}");
         if let Some(r) = rs.first() {
-            assert_eq!(r.get("name").map(String::as_str), Some("widget"));
-            assert_eq!(r.get("qty").map(String::as_str), Some("7"));
+            assert_eq!(r.text("name"), Some("widget"));
+            assert_eq!(r.text("qty"), Some("7"));
         }
     }
 
@@ -8357,10 +8343,10 @@ mod tests {
         };
         assert!(id > 0);
 
-        let fetched: IpeResult<String, IpeMaybe<HashMap<String, String>>> =
+        let fetched: IpeResult<String, IpeMaybe<RowCells>> =
             db_get_by_id(db, "todos".into(), id.to_string()).await;
         match fetched {
-            IpeResult::Ok(IpeMaybe::Just(m)) => assert_eq!(m.get("title").unwrap(), "buy milk"),
+            IpeResult::Ok(IpeMaybe::Just(m)) => assert_eq!(m.text("title"), Some("buy milk")),
             other => panic!("unexpected: {:?}", other),
         }
     }
@@ -8470,7 +8456,7 @@ mod tests {
     }
 
     async fn count_title(db: &Db, title: &str) -> usize {
-        let rs: IpeResult<String, Vec<HashMap<String, String>>> = db_find_many_by_field(
+        let rs: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
             db.clone(),
             "todos".into(),
             "title".into(),
@@ -8969,7 +8955,7 @@ mod tests {
         let mut row = HashMap::new();
         row.insert("title".to_string(), "find me".to_string());
         let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), row).await;
-        let found: IpeResult<String, IpeMaybe<HashMap<String, String>>> =
+        let found: IpeResult<String, IpeMaybe<RowCells>> =
             db_find_one_by_field(db, "todos".into(), "title".into(), "find me".into()).await;
         assert!(matches!(found, IpeResult::Ok(IpeMaybe::Just(_))));
     }
@@ -8983,7 +8969,7 @@ mod tests {
             r.insert("done".to_string(), "1".to_string());
             let _: IpeResult<String, i64> = db_insert_row(db.clone(), "todos".into(), r).await;
         }
-        let many: IpeResult<String, Vec<HashMap<String, String>>> =
+        let many: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db.clone(), "todos".into(), "done".into(), "1".into()).await;
         match many {
             IpeResult::Ok(v) => assert_eq!(v.len(), 3),
@@ -8993,7 +8979,7 @@ mod tests {
         let mut cond = HashMap::new();
         cond.insert("done".to_string(), "1".to_string());
         cond.insert("title".to_string(), "b".to_string());
-        let one: IpeResult<String, Vec<HashMap<String, String>>> =
+        let one: IpeResult<String, Vec<RowCells>> =
             db_find_by_conditions(db.clone(), "todos".into(), cond).await;
         match one {
             IpeResult::Ok(v) => assert_eq!(v.len(), 1),
@@ -9003,7 +8989,7 @@ mod tests {
         // Empty condition set MUST be refused (would otherwise return every
         // row — a cross-tenant read when request-derived filters come back empty).
         let empty_cond: HashMap<String, String> = HashMap::new();
-        let refused: IpeResult<String, Vec<HashMap<String, String>>> =
+        let refused: IpeResult<String, Vec<RowCells>> =
             db_find_by_conditions(db.clone(), "todos".into(), empty_cond).await;
         assert!(
             matches!(refused, IpeResult::Err(_)),
@@ -9013,7 +8999,7 @@ mod tests {
         // Non-empty conditions still return filtered rows (happy-path regression).
         let mut only_done = HashMap::new();
         only_done.insert("done".to_string(), "1".to_string());
-        let filtered: IpeResult<String, Vec<HashMap<String, String>>> =
+        let filtered: IpeResult<String, Vec<RowCells>> =
             db_find_by_conditions(db, "todos".into(), only_done).await;
         match filtered {
             IpeResult::Ok(v) => assert_eq!(v.len(), 3, "expected 3 done rows"),
@@ -9034,7 +9020,7 @@ mod tests {
         .await;
         assert!(matches!(r, IpeResult::Ok(_)));
         // The inserted row should be visible after commit:
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
+        let found: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db, "todos".into(), "title".into(), "txn".into()).await;
         match found {
             IpeResult::Ok(v) => assert_eq!(v.len(), 1),
@@ -9058,7 +9044,7 @@ mod tests {
         })
         .await;
         assert!(matches!(r, IpeResult::Err(_)));
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
+        let found: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db, "todos".into(), "title".into(), "txn-err".into()).await;
         match found {
             IpeResult::Ok(v) => assert_eq!(v.len(), 0, "rollback must undo the INSERT"),
@@ -9561,7 +9547,7 @@ mod tests {
         assert!(matches!(r, IpeResult::Err(_)), "body Err propagates");
 
         // The row MUST be absent — rollback actually undid the write.
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_many_by_field(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
             db.clone(),
             "todos".into(),
             "title".into(),
@@ -9597,7 +9583,7 @@ mod tests {
         .await;
         assert!(matches!(r, IpeResult::Ok(_)), "body Ok");
 
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_many_by_field(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
             db.clone(),
             "todos".into(),
             "title".into(),
@@ -9642,9 +9628,9 @@ mod tests {
         assert!(matches!(r, IpeResult::Ok(_)), "nested commit Ok");
 
         // Both rows committed (flattened into one transaction).
-        let outer: IpeResult<String, Vec<HashMap<String, String>>> =
+        let outer: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db.clone(), "todos".into(), "title".into(), "outer".into()).await;
-        let inner: IpeResult<String, Vec<HashMap<String, String>>> =
+        let inner: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db.clone(), "todos".into(), "title".into(), "inner".into()).await;
         assert!(
             matches!(outer, IpeResult::Ok(ref v) if v.len() == 1),
@@ -9774,7 +9760,7 @@ mod tests {
         assert!(matches!(r, IpeResult::Ok(_)), "outer+nested commit Ok");
 
         // The dbB row must land in dbB, NOT dbA.
-        let a_has_b_row: IpeResult<String, Vec<HashMap<String, String>>> =
+        let a_has_b_row: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db_a.clone(), "todos".into(), "title".into(), "in-b".into())
                 .await;
         assert!(
@@ -9782,7 +9768,7 @@ mod tests {
             "dbA must NOT contain dbB's row"
         );
 
-        let b_has_b_row: IpeResult<String, Vec<HashMap<String, String>>> =
+        let b_has_b_row: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db_b.clone(), "todos".into(), "title".into(), "in-b".into())
                 .await;
         assert!(
@@ -9790,7 +9776,7 @@ mod tests {
             "dbB must contain its own row"
         );
 
-        let a_has_a_row: IpeResult<String, Vec<HashMap<String, String>>> =
+        let a_has_a_row: IpeResult<String, Vec<RowCells>> =
             db_find_many_by_field(db_a.clone(), "todos".into(), "title".into(), "in-a".into())
                 .await;
         assert!(
@@ -9843,7 +9829,7 @@ mod tests {
             "outer commit Ok despite inner rollback"
         );
 
-        let a_row: IpeResult<String, Vec<HashMap<String, String>>> = db_find_many_by_field(
+        let a_row: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
             db_a.clone(),
             "todos".into(),
             "title".into(),
@@ -9855,7 +9841,7 @@ mod tests {
             "dbA row committed"
         );
 
-        let b_row: IpeResult<String, Vec<HashMap<String, String>>> = db_find_many_by_field(
+        let b_row: IpeResult<String, Vec<RowCells>> = db_find_many_by_field(
             db_b.clone(),
             "todos".into(),
             "title".into(),
@@ -10461,6 +10447,354 @@ mod tests {
         );
     }
 
+    /// The text an app-path Store read gives a cell's JSON: `cellsDecoder`'s
+    /// `string`, `int`, `float`, `bool` order over the same decoders.
+    fn app_text(j: &JsonVal) -> IpeMaybe<String> {
+        match j {
+            JsonVal::Null => IpeMaybe::Nothing,
+            JsonVal::String(s) => IpeMaybe::Just(s.clone()),
+            JsonVal::Bool(b) => IpeMaybe::Just(string_from_bool(*b)),
+            other => IpeMaybe::Just(match (json_decode_int::<String>().run)(other) {
+                IpeResult::Ok(i) => string_from_int(i),
+                IpeResult::Err(_) => match (json_decode_float::<String>().run)(other) {
+                    IpeResult::Ok(f) => string_from_float(f),
+                    IpeResult::Err(e) => format!("undecodable cell: {e}"),
+                },
+            }),
+        }
+    }
+
+    /// `Cell::into_text` keeps SQL NULL as `Nothing`, renders every storage
+    /// class to its exact text, and agrees with the app path cell by cell;
+    /// `row_cells` refuses an infinite `REAL` at its index.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test fixture: a failed fetch is a failed test
+    async fn into_text_matrix_keeps_null_and_matches_the_app_path() {
+        let pool = cells_pool().await;
+        let row = sqlx::query("SELECT nul, empty, zero, ratio, bytes, flag, pinf, ninf FROM cells")
+            .fetch_one(&pool)
+            .await
+            .expect("fetch cells");
+        let just = |s: &str| Some(IpeMaybe::Just(s.to_string()));
+        let text: Vec<Option<IpeMaybe<String>>> = (0..6)
+            .map(|i| read_cell(&row, i).ok().map(Cell::into_text))
+            .collect();
+        assert_eq!(
+            text,
+            vec![
+                Some(IpeMaybe::Nothing),
+                just(""),
+                just("0"),
+                just("1.5"),
+                just("00ff"),
+                just("true"),
+            ]
+        );
+        for i in 0..6 {
+            let cell = read_cell(&row, i).ok();
+            assert_eq!(
+                cell.clone().map(Cell::into_text),
+                cell.map(|c| app_text(&c.into_json())),
+                "column {i}"
+            );
+        }
+        assert_eq!(
+            column_decode_refusal(row_cells(&row)),
+            Some(("6".to_string(), NON_FINITE_REAL.to_string()))
+        );
+        let finite = sqlx::query("SELECT nul, empty, zero FROM cells")
+            .fetch_one(&pool)
+            .await
+            .expect("fetch finite cells");
+        let cells = row_cells(&finite).ok();
+        assert_eq!(
+            cells.as_ref().and_then(|c| c.get("nul")),
+            Some(&IpeMaybe::Nothing)
+        );
+        assert_eq!(
+            cells.as_ref().and_then(|c| c.get("empty")),
+            Some(&IpeMaybe::Just(String::new()))
+        );
+    }
+
+    /// A float cell's raw text is the app path's text for every float the
+    /// integral rule could split: an integral value inside the open `i64`
+    /// range renders as its `Int`, every other value through `String.fromFloat`.
+    #[test]
+    fn float_cell_text_matches_the_app_path() {
+        let two_63 = 2f64.powi(63);
+        for f in [
+            -0.0,
+            3.0,
+            1e20,
+            1_234_567.5,
+            0.00001,
+            i64::MIN as f64,
+            two_63,
+            -two_63,
+        ] {
+            let cell = FiniteF64::new(f).map(Cell::Float);
+            assert!(cell.is_some(), "{f} is finite");
+            let Some(cell) = cell else { return };
+            assert_eq!(cell.clone().into_text(), app_text(&cell.into_json()), "{f}");
+        }
+        let text = |f: f64| FiniteF64::new(f).map(|c| Cell::Float(c).into_text());
+        assert_eq!(text(3.0), Some(IpeMaybe::Just("3".to_string())));
+        assert_eq!(text(-0.0), Some(IpeMaybe::Just("0".to_string())));
+        assert_eq!(
+            text(1_234_567.5),
+            Some(IpeMaybe::Just(string_from_float(1_234_567.5)))
+        );
+        assert_eq!(
+            text(two_63),
+            Some(IpeMaybe::Just(string_from_float(two_63)))
+        );
+    }
+
+    /// One single-connection in-memory SQLite pool with a `l` row whose `note`
+    /// is SQL `NULL` and whose `empty` is the empty text, joined by an `r` row
+    /// whose `note` is `NULL` too.
+    #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
+    async fn null_cells_pool() -> sqlx::sqlite::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        for sql in [
+            "CREATE TABLE l (id TEXT PRIMARY KEY, k TEXT, note TEXT, empty TEXT)",
+            "CREATE TABLE r (id TEXT PRIMARY KEY, lid TEXT, note TEXT)",
+            "INSERT INTO l VALUES ('1', 'a', NULL, '')",
+            "INSERT INTO r VALUES ('9', '1', NULL)",
+        ] {
+            sqlx::query(sql)
+                .execute(&pool)
+                .await
+                .expect("seed null cells");
+        }
+        pool
+    }
+
+    /// The `note` cell of a one-row raw read; `None` unless it is `Ok` with exactly one row.
+    fn sole_note(read: IpeResult<String, Vec<RowCells>>) -> Option<Option<IpeMaybe<String>>> {
+        match read {
+            IpeResult::Ok(rows) if rows.len() == 1 => {
+                rows.into_iter().next().map(|mut r| r.remove("note"))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `note` cell of a found raw row; `None` unless it is `Ok(Just _)`.
+    fn found_note(read: IpeResult<String, IpeMaybe<RowCells>>) -> Option<Option<IpeMaybe<String>>> {
+        match read {
+            IpeResult::Ok(IpeMaybe::Just(mut r)) => Some(r.remove("note")),
+            _ => None,
+        }
+    }
+
+    /// One looked-up cell: `None` when the column is absent from the row.
+    type FoundCell = Option<IpeMaybe<String>>;
+
+    /// Both sides' `note` cells of a one-row join; `None` unless it is `Ok` with exactly one pair.
+    fn sole_join_notes(read: IpeResult<String, Vec<JoinRow>>) -> Option<(FoundCell, FoundCell)> {
+        match read {
+            IpeResult::Ok(rows) if rows.len() == 1 => rows
+                .into_iter()
+                .next()
+                .map(|(mut l, mut r)| (l.remove("note"), r.remove("note"))),
+            _ => None,
+        }
+    }
+
+    /// Every app raw read gives a SQL `NULL` cell as `Nothing`, on both join sides too.
+    #[tokio::test]
+    async fn app_raw_reads_keep_null_as_nothing() {
+        let db = null_cells_pool().await;
+        let null = Some(Some(IpeMaybe::Nothing));
+        let key = || sql_eq(sql_column("k".to_string()), sql_param("a".to_string()));
+        let on = || {
+            sql_eq(
+                sql_column("a1.lid".to_string()),
+                sql_column("a0.id".to_string()),
+            )
+        };
+        let note_term = || vec![ProjectionTerm::ColumnTerm("a0".into(), "note".into())];
+
+        assert_eq!(
+            sole_note(db_query(db.clone(), "SELECT note FROM l".into(), vec![]).await),
+            null
+        );
+        assert_eq!(
+            sole_note(db_query_params(db.clone(), "SELECT note FROM l".into(), vec![]).await),
+            null
+        );
+        assert_eq!(
+            found_note(db_get_by_id(db.clone(), "l".into(), "1".into()).await),
+            null
+        );
+        assert_eq!(
+            found_note(db_find_one_by_field(db.clone(), "l".into(), "k".into(), "a".into()).await),
+            null
+        );
+        assert_eq!(
+            sole_note(db_find_many_by_field(db.clone(), "l".into(), "k".into(), "a".into()).await),
+            null
+        );
+        let conditions: HashMap<String, String> =
+            std::iter::once(("k".to_string(), "a".to_string())).collect();
+        assert_eq!(
+            sole_note(db_find_by_conditions(db.clone(), "l".into(), conditions).await),
+            null
+        );
+        assert_eq!(
+            sole_note(db_find_where(db.clone(), "l".into(), key()).await),
+            null
+        );
+        let both_null = Some((Some(IpeMaybe::Nothing), Some(IpeMaybe::Nothing)));
+        assert_eq!(
+            sole_join_notes(
+                db_find_join(
+                    db.clone(),
+                    "l".into(),
+                    "a0".into(),
+                    vec!["id".into(), "note".into()],
+                    "r".into(),
+                    "a1".into(),
+                    vec!["id".into(), "note".into()],
+                    on(),
+                )
+                .await
+            ),
+            both_null
+        );
+        assert_eq!(
+            sole_join_notes(
+                db_find_join_ordered(
+                    db.clone(),
+                    "l".into(),
+                    "a0".into(),
+                    vec!["id".into(), "note".into()],
+                    "r".into(),
+                    "a1".into(),
+                    vec!["id".into(), "note".into()],
+                    on(),
+                    "a0".into(),
+                    "id".into(),
+                    true,
+                )
+                .await
+            ),
+            both_null
+        );
+        let p0 = |read: IpeResult<String, Vec<RowCells>>| match read {
+            IpeResult::Ok(rows) if rows.len() == 1 => {
+                rows.into_iter().next().map(|mut r| r.remove("p0"))
+            }
+            _ => None,
+        };
+        assert_eq!(
+            p0(db_find_projection(
+                db.clone(),
+                "l".into(),
+                "a0".into(),
+                "r".into(),
+                "a1".into(),
+                on(),
+                note_term(),
+                vec![],
+            )
+            .await),
+            null
+        );
+        assert_eq!(
+            p0(db_find_projection_ordered(
+                db.clone(),
+                "l".into(),
+                "a0".into(),
+                "r".into(),
+                "a1".into(),
+                on(),
+                note_term(),
+                vec![],
+                "a0".into(),
+                "id".into(),
+                true,
+            )
+            .await),
+            null
+        );
+    }
+
+    /// The external reads give a SQL `NULL` cell as `Nothing` and an empty-text
+    /// cell as `Just("")`.
+    #[tokio::test]
+    async fn external_raw_reads_keep_null_apart_from_empty_text() {
+        let pool = null_cells_pool().await;
+        let conn = || ExternalConnection::Sqlite(pool.clone());
+        let key = sql_eq(sql_column("k".to_string()), sql_param("a".to_string()));
+        let found: IpeResult<String, Vec<RowCells>> =
+            db_conn_find_where(conn(), "l".into(), key).await;
+        let row = match found {
+            IpeResult::Ok(rows) if rows.len() == 1 => rows.into_iter().next(),
+            _ => None,
+        };
+        assert_eq!(
+            row.as_ref().and_then(|r| r.get("note")),
+            Some(&IpeMaybe::Nothing)
+        );
+        assert_eq!(
+            row.as_ref().and_then(|r| r.get("empty")),
+            Some(&IpeMaybe::Just(String::new()))
+        );
+        let got: IpeResult<String, IpeMaybe<RowCells>> =
+            db_conn_get_by_id(conn(), "l".into(), "1".into()).await;
+        let row = match got {
+            IpeResult::Ok(IpeMaybe::Just(r)) => Some(r),
+            _ => None,
+        };
+        assert_eq!(
+            row.as_ref().and_then(|r| r.get("note")),
+            Some(&IpeMaybe::Nothing)
+        );
+        assert_eq!(
+            row.as_ref().and_then(|r| r.get("empty")),
+            Some(&IpeMaybe::Just(String::new()))
+        );
+    }
+
+    /// A migration ledger row with a SQL `NULL` `checksum` or `name` is the
+    /// corrupt-ledger refusal, never a drift or a match against `""`.
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test fixture: a failed setup is a failed test
+    async fn migrate_refuses_a_ledger_row_with_a_null_identity() {
+        for seed in [
+            "INSERT INTO _ipe_migrations VALUES ('001_users', NULL, '2026-01-01')",
+            "INSERT INTO _ipe_migrations VALUES (NULL, 'abc', '2026-01-01')",
+        ] {
+            let db = fresh_db().await;
+            sqlx::query(
+                "CREATE TABLE _ipe_migrations (name TEXT PRIMARY KEY, checksum TEXT, \
+                 applied_at TEXT)",
+            )
+            .execute(&db)
+            .await
+            .expect("create a nullable ledger");
+            sqlx::query(seed).execute(&db).await.expect("seed ledger");
+            let migrations = vec![(
+                "001_users".to_string(),
+                "CREATE TABLE users (id INTEGER PRIMARY KEY)".to_string(),
+            )];
+            let r: IpeResult<String, Vec<String>> = db_migrate_apply(db, migrations).await;
+            assert_eq!(
+                r,
+                IpeResult::Err(MIGRATION_LEDGER_NULL_IDENTITY.to_string()),
+                "{seed}"
+            );
+        }
+    }
+
     /// A stored infinite `REAL` is a typed decode refusal on the app and the
     /// external decoder paths, never `Nothing` through `db_decode_nullable`;
     /// the same query over a finite value decodes, so the refusal is the
@@ -10539,12 +10873,11 @@ mod tests {
             sql_column("title".to_string()),
             sql_param("alpha".to_string()),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
-            db_find_where(db, "todos".into(), frag).await;
+        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
         match found {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 1);
-                assert_eq!(v[0].get("title").map(String::as_str), Some("alpha"));
+                assert_eq!(v[0].text("title"), Some("alpha"));
             }
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
@@ -10565,8 +10898,7 @@ mod tests {
             ),
             sql_gt(sql_column("id".to_string()), sql_param(1_i64)),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
-            db_find_where(db, "todos".into(), frag).await;
+        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
         match found {
             IpeResult::Ok(v) => assert_eq!(v.len(), 2),
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
@@ -10696,7 +11028,7 @@ mod tests {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 2, "only active author Ada's two books");
                 for (_book, author) in &v {
-                    assert_eq!(author.get("name").map(String::as_str), Some("Ada"));
+                    assert_eq!(author.text("name"), Some("Ada"));
                 }
             }
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
@@ -11003,7 +11335,7 @@ mod tests {
             ),
             sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_projection(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
             db,
             "books".into(),
             "a0".into(),
@@ -11018,7 +11350,7 @@ mod tests {
             IpeResult::Ok(rows) => {
                 assert_eq!(rows.len(), 2, "only active author Ada's two books");
                 for row in &rows {
-                    assert_eq!(row.get("p0").map(String::as_str), Some("Ada"));
+                    assert_eq!(row.text("p0"), Some("Ada"));
                     assert_eq!(row.len(), 1, "only the projected column is read");
                 }
             }
@@ -11040,7 +11372,7 @@ mod tests {
             ),
             sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_projection(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
             db,
             "books".into(),
             "a0".into(),
@@ -11057,14 +11389,11 @@ mod tests {
         match found {
             IpeResult::Ok(rows) => {
                 assert_eq!(rows.len(), 2, "only active author Ada's two books");
-                let mut titles: Vec<&str> = rows
-                    .iter()
-                    .filter_map(|r| r.get("p0").map(String::as_str))
-                    .collect();
+                let mut titles: Vec<&str> = rows.iter().filter_map(|r| r.text("p0")).collect();
                 titles.sort_unstable();
                 assert_eq!(titles, ["Engines", "Structures"], "p0 is the book title");
                 for row in &rows {
-                    assert_eq!(row.get("p1").map(String::as_str), Some("Ada"));
+                    assert_eq!(row.text("p1"), Some("Ada"));
                     assert_eq!(row.len(), 2, "exactly the two projected columns");
                 }
             }
@@ -11086,7 +11415,7 @@ mod tests {
         let deleted: IpeResult<String, i64> =
             db_delete_where(db.clone(), "todos".into(), frag).await;
         assert_eq!(deleted, IpeResult::Ok(1));
-        let remaining: IpeResult<String, Vec<HashMap<String, String>>> = db_find_where(
+        let remaining: IpeResult<String, Vec<RowCells>> = db_find_where(
             db,
             "todos".into(),
             sql_is_not_null(sql_column("title".to_string())),
@@ -11112,8 +11441,7 @@ mod tests {
                 SqlParam::Text("gamma".to_string()),
             ],
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
-            db_find_where(db, "todos".into(), frag).await;
+        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
         match found {
             IpeResult::Ok(v) => assert_eq!(v.len(), 2),
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
@@ -11128,8 +11456,7 @@ mod tests {
         let db = fresh_db().await;
         insert_todo(&db, "alpha").await;
         let frag = sql_in_list(sql_column("title".to_string()), Vec::new());
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
-            db_find_where(db, "todos".into(), frag).await;
+        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
         match found {
             IpeResult::Ok(v) => assert_eq!(v.len(), 0),
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
@@ -11147,8 +11474,7 @@ mod tests {
             sql_column("todos.title".to_string()),
             sql_param("alpha".to_string()),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
-            db_find_where(db, "todos".into(), frag).await;
+        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
         match found {
             IpeResult::Ok(v) => assert_eq!(v.len(), 1),
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
@@ -11167,8 +11493,7 @@ mod tests {
             sql_column("title; DROP TABLE todos".to_string()),
             sql_param("alpha".to_string()),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
-            db_find_where(db, "todos".into(), frag).await;
+        let found: IpeResult<String, Vec<RowCells>> = db_find_where(db, "todos".into(), frag).await;
         assert!(
             matches!(found, IpeResult::Err(_)),
             "poisoned column must surface as Task::Err, got {found:?}"
@@ -11261,7 +11586,7 @@ mod tests {
         .await;
         assert!(matches!(ins, IpeResult::Ok(1))); // exec returns rows-affected
 
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query(
             db,
             "SELECT title, done FROM todos WHERE title = ?".into(),
             vec!["buy milk".to_string()],
@@ -11270,8 +11595,8 @@ mod tests {
         match rows {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 1);
-                assert_eq!(v[0].get("title").unwrap(), "buy milk");
-                assert_eq!(v[0].get("done").unwrap(), "0");
+                assert_eq!(v[0].text("title"), Some("buy milk"));
+                assert_eq!(v[0].text("done"), Some("0"));
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -11293,7 +11618,7 @@ mod tests {
         assert!(matches!(ins, IpeResult::Ok(1))); // exec returns rows-affected
 
         // The value comes back byte-for-byte (proves it was bound, not splice-escaped-into-SQL).
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query(
             db.clone(),
             "SELECT title FROM todos WHERE title = ?".into(),
             vec![nasty.clone()],
@@ -11302,13 +11627,13 @@ mod tests {
         match rows {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 1);
-                assert_eq!(v[0].get("title").unwrap(), &nasty);
+                assert_eq!(v[0].text("title"), Some(nasty.as_str()));
             }
             other => panic!("unexpected: {:?}", other),
         }
 
         // The table still exists with exactly the one row — the DROP never ran.
-        let all: IpeResult<String, Vec<HashMap<String, String>>> =
+        let all: IpeResult<String, Vec<RowCells>> =
             db_query(db, "SELECT title FROM todos".into(), vec![]).await;
         match all {
             IpeResult::Ok(v) => assert_eq!(v.len(), 1, "injection must not have dropped the table"),
@@ -11634,7 +11959,7 @@ mod tests {
             1,
             "conflict must update, not add a row: {after:?}"
         );
-        let all: IpeResult<String, Vec<HashMap<String, String>>> =
+        let all: IpeResult<String, Vec<RowCells>> =
             db_query_params(db.clone(), "SELECT k FROM kv".to_string(), Vec::new()).await;
         assert_eq!(all.with_default(Vec::new()).len(), 2, "row count changed");
         let row = after.first();
@@ -11643,9 +11968,9 @@ mod tests {
             rid_before,
             "rowid changed"
         );
-        assert_eq!(row.and_then(|r| r.get("v")).map(String::as_str), Some("2"));
+        assert_eq!(row.and_then(|r| r.text("v")), Some("2"));
         assert_eq!(
-            row.and_then(|r| r.get("note")).map(String::as_str),
+            row.and_then(|r| r.text("note")),
             Some("kept"),
             "column outside the SET list must be preserved"
         );
@@ -11663,7 +11988,7 @@ mod tests {
         );
         let last = read().await.with_default(Vec::new());
         assert_eq!(
-            last.first().and_then(|r| r.get("v")).map(String::as_str),
+            last.first().and_then(|r| r.text("v")),
             Some("2"),
             "DO NOTHING must leave the row untouched"
         );
@@ -11698,7 +12023,7 @@ mod tests {
             "empty WHERE must be refused, got {r:?}"
         );
         // No row should have been zeroed.
-        let zeroed: IpeResult<String, Vec<HashMap<String, String>>> = db_query_params(
+        let zeroed: IpeResult<String, Vec<RowCells>> = db_query_params(
             db.clone(),
             "SELECT bal FROM acct WHERE bal = ?".to_string(),
             vec![SqlParam::Int(0)],
@@ -11779,7 +12104,7 @@ mod tests {
             "the owner-scoped update should affect exactly the caller's row: {updated:?}"
         );
 
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query_params(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
             db.clone(),
             "SELECT stamped FROM docs WHERE body = ?".to_string(),
             vec![SqlParam::Text("doc1".to_string())],
@@ -11789,7 +12114,7 @@ mod tests {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 1, "the row must still exist");
                 assert_eq!(
-                    v[0].get("stamped").map(String::as_str),
+                    v[0].text("stamped"),
                     Some("original"),
                     "the immutable column MUST retain its insert-time value — a \
                      dropped (OmitField) column is never written by an update"
@@ -11836,7 +12161,7 @@ mod tests {
         .await;
         assert!(matches!(updated, IpeResult::Ok(1)), "{updated:?}");
 
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query_params(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
             db.clone(),
             "SELECT stamped FROM docs WHERE body = ?".to_string(),
             vec![SqlParam::Text("doc1".to_string())],
@@ -11845,7 +12170,7 @@ mod tests {
         match rows {
             IpeResult::Ok(v) => {
                 assert_eq!(
-                    v[0].get("stamped").map(String::as_str),
+                    v[0].text("stamped"),
                     Some("tampered"),
                     "with the immutable column left in the SET it WOULD change — \
                      confirming the drop is what enforces immutability"
@@ -11886,7 +12211,7 @@ mod tests {
             matches!(refused, IpeResult::Err(_)),
             "empty WHERE must be refused, got {refused:?}"
         );
-        let zeroed: IpeResult<String, Vec<HashMap<String, String>>> = db_query_params(
+        let zeroed: IpeResult<String, Vec<RowCells>> = db_query_params(
             db.clone(),
             "SELECT bal FROM acct WHERE bal = ?".to_string(),
             vec![SqlParam::Int(0)],
@@ -11915,7 +12240,7 @@ mod tests {
 
         // The matching row carries the verbatim value; the non-matching row is
         // untouched; and the table still exists (the DROP never ran).
-        let rows: IpeResult<String, Vec<HashMap<String, String>>> = db_query_params(
+        let rows: IpeResult<String, Vec<RowCells>> = db_query_params(
             db.clone(),
             "SELECT id, owner FROM acct ORDER BY id".to_string(),
             vec![],
@@ -11924,12 +12249,12 @@ mod tests {
         match rows {
             IpeResult::Ok(v) => {
                 assert_eq!(v.len(), 2, "injection must not have dropped the table");
-                assert_eq!(v[0].get("owner").unwrap(), &nasty, "matching row updated");
                 assert_eq!(
-                    v[1].get("owner").unwrap(),
-                    "b",
-                    "non-matching row untouched"
+                    v[0].text("owner"),
+                    Some(nasty.as_str()),
+                    "matching row updated"
                 );
+                assert_eq!(v[1].text("owner"), Some("b"), "non-matching row untouched");
             }
             other => panic!("table gone or errored: {other:?}"),
         }
@@ -13268,7 +13593,7 @@ mod tests {
             ),
             sql_eq(sql_column("a1.active".to_string()), sql_param(1_i64)),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_projection(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
             db,
             "books".into(),
             "a0".into(),
@@ -13287,15 +13612,11 @@ mod tests {
                 assert_eq!(rows.len(), 2, "only active author Ada's two books");
                 for row in &rows {
                     assert_eq!(
-                        row.get("p0").map(String::as_str),
+                        row.text("p0"),
                         Some("fiction"),
                         "p0 is the literal value bound as a parameter"
                     );
-                    assert_eq!(
-                        row.get("p1").map(String::as_str),
-                        Some("Ada"),
-                        "p1 is the projected column"
-                    );
+                    assert_eq!(row.text("p1"), Some("Ada"), "p1 is the projected column");
                     assert_eq!(row.len(), 2, "exactly two projected columns");
                 }
             }
@@ -13312,7 +13633,7 @@ mod tests {
             sql_column("a1.id".to_string()),
             sql_column("a0.author_id".to_string()),
         );
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_projection(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
             db,
             "books".into(),
             "a0".into(),
@@ -13448,7 +13769,7 @@ mod tests {
         );
         // COALESCE(a1.name, ?) — the column is non-null for active Ada, so COALESCE
         // returns the column value ("Ada"), not the fallback literal.
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_projection(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
             db,
             "books".into(),
             "a0".into(),
@@ -13467,7 +13788,7 @@ mod tests {
                 assert_eq!(rows.len(), 2, "only active author Ada's two books");
                 for row in &rows {
                     assert_eq!(
-                        row.get("p0").map(String::as_str),
+                        row.text("p0"),
                         Some("Ada"),
                         "COALESCE returns the non-null column value"
                     );
@@ -13630,7 +13951,7 @@ mod tests {
             sql_eq(sql_column("a0.id".to_string()), sql_param(10_i64)),
         );
         // (a0.id + ?) with the book id 10 and a bound literal 5 → 15.
-        let found: IpeResult<String, Vec<HashMap<String, String>>> = db_find_projection(
+        let found: IpeResult<String, Vec<RowCells>> = db_find_projection(
             db,
             "books".into(),
             "a0".into(),
@@ -13648,11 +13969,7 @@ mod tests {
         match found {
             IpeResult::Ok(rows) => {
                 assert_eq!(rows.len(), 1, "exactly the one book with id 10");
-                assert_eq!(
-                    rows[0].get("p0").map(String::as_str),
-                    Some("15"),
-                    "(a0.id + ?) = 10 + 5 = 15"
-                );
+                assert_eq!(rows[0].text("p0"), Some("15"), "(a0.id + ?) = 10 + 5 = 15");
             }
             IpeResult::Err(e) => panic!("expected Ok, got Err({e})"),
         }
@@ -14660,13 +14977,16 @@ mod like_prefix_tests {
 
     /// The sorted `name` values `frag` selects from `names`.
     async fn names_where(db: &Db, frag: SqlFragment) -> Result<Vec<String>, String> {
-        let found: IpeResult<String, Vec<HashMap<String, String>>> =
+        let found: IpeResult<String, Vec<RowCells>> =
             db_find_where(db.clone(), "names".into(), frag).await;
         match found {
             IpeResult::Ok(rows) => {
                 let mut names: Vec<String> = rows
                     .iter()
-                    .filter_map(|row| row.get("name").cloned())
+                    .filter_map(|row| match row.get("name") {
+                        Some(IpeMaybe::Just(name)) => Some(name.clone()),
+                        Some(IpeMaybe::Nothing) | None => None,
+                    })
                     .collect();
                 names.sort();
                 Ok(names)

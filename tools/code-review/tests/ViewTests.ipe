@@ -22,9 +22,9 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Drawn as Drawn exposing (Code(..), Hue(..), LayoutNote(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Token(..))
-import Lib.Drawn as Drawn exposing (Code(..), Hue(..), LayoutNote(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))

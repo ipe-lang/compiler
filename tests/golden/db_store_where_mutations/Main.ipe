@@ -91,17 +91,20 @@ injectionOwner =
 updateTemplate : Store.Row
 updateTemplate =
     Dict.fromList
-        [ ( "id", "" )
-        , ( "owner", injectionOwner )
-        , ( "balance", "200" )
+        [ ( "id", Just "" )
+        , ( "owner", Just injectionOwner )
+        , ( "balance", Just "200" )
         ]
 
 
 cell : String -> Store.Row -> String
 cell name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             s
+
+        Just Nothing ->
+            "NULL"
 
         Nothing ->
             "?"

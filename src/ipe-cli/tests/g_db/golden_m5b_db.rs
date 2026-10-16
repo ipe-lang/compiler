@@ -14,7 +14,7 @@
 //!
 //! * The Rust backend emits `sqlx` + `sqlx-sqlite` for database access.
 //! * The row type the runtime returns from `Db.query` is
-//!   `Vec<HashMap<String, String>>`.
+//!   `Vec<HashMap<String, IpeMaybe<String>>>`, SQL `NULL` as `Nothing`.
 //! * Connection management for `sqlite::memory:` pools uses async `sqlx`
 //!   pooling (serialised-mode `SQLite`).
 //!
@@ -35,7 +35,7 @@
 //! * `db_exec` — `Db.open` → `Db.withTransaction` → `Unsafe.unsafeExecRaw` (DDL,
 //!   from `Ipe.Db.Unsafe`) → `Db.exec` with `[SqlString, SqlInt]` params (two
 //!   INSERTs) → `Unsafe.unsafeQuery` with empty params (SELECT ORDER BY name) →
-//!   `Unsafe.unsafeGetString` / `unsafeGetInt` field access → `println`.
+//!   `cellText` / `cellInt` row-cell reads → `println`.
 //!   Output: `"apple:5\nbanana:3"`.
 //! * `db_find_by_conditions` — `Db.exec` two INSERTs →
 //!   `Db.findByConditions conn "items" (Dict.fromList [("name","apple")])` →
@@ -133,7 +133,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
 /// `Db.open` → `Db.withTransaction` → `Db.unsafeExecRaw` (DDL) →
 /// `Db.exec [SqlString "apple", SqlInt 5]` + `[SqlString "banana", SqlInt 3]`
 /// (two INSERTs) → `Db.unsafeQuery [] (SELECT ORDER BY name)` →
-/// `Db.unsafeGetString` / `Db.unsafeGetInt` → `println`.
+/// `cellText` / `cellInt` row-cell reads → `println`.
 /// Output: `"apple:5\nbanana:3"`.
 ///
 /// Recorded sanctioned divergence (the prior backend `SQLite` vs Rust+sqlx): the Ipê source
@@ -363,6 +363,23 @@ fn db_store_to_maybe() {
 #[test]
 fn db_store_null_roundtrip() {
     assert_runs_and_matches_oracle("db_store_null_roundtrip");
+}
+
+/// SQL `NULL` is never text on any read path: one `SQLite` file opened through
+/// `Db.open` (app) and `Dsn.open` (external) reads an all-`NULL` row back as
+/// `Nothing` through `allOn` / `findWhereOn` / `getOn`, both join sides, a raw
+/// `Db.findWhere` (`Just Nothing`), and refuses it with a typed `Err` through a
+/// plain `String` field, a raw-column store's `readText`, and a `Store.select`
+/// projection. A stored `REAL` reads as one text on every path (`3.0` is `3`,
+/// `-0.0` is `0`), and a non-finite `REAL` is a typed `Err` on `allOn`, the join
+/// and the raw read.
+///
+/// Sanctioned divergence: Ipê emits Rust+sqlx; `Ipe.Db.Store` and external
+/// connections are Ipê-only additions with no prior counterpart; oracle is Ipê's
+/// own output.
+#[test]
+fn db_store_null_external_join() {
+    assert_runs_and_matches_oracle("db_store_null_external_join");
 }
 
 /// SEAL regression: cross-call auto-trait-bound propagation through a NON-BARE

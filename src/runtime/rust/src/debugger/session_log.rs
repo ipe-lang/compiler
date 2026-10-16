@@ -831,10 +831,13 @@ mod tests {
         let effectful = move |msg: Msg, m: Model| -> (Model, IpeCmd<Msg>) {
             let flag = Arc::clone(&flag);
             let (next, _) = update(msg, m);
-            let cmd = IpeCmd::Perform(Box::new(move || {
-                flag.store(true, Ordering::SeqCst);
-                Box::pin(async { Msg::Add(0) })
-            }));
+            let cmd = crate::tea::perform_for_test(
+                move || {
+                    flag.store(true, Ordering::SeqCst);
+                    Box::pin(async { Msg::Add(0) })
+                },
+                Msg::Add(0),
+            );
             (next, cmd)
         };
         let (buf, _) = record(&[Msg::Add(1), Msg::Add(2)], 16);

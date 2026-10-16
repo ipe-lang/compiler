@@ -106,18 +106,11 @@ import Ipe.Error as Error exposing (Error)
 -- ─── Types ─────────────────────────────────────────────────────────
 
 
--- | A row read back from the database: every column keyed by its name, values
--- as strings (the `Db.findWhere` representation). The typed `read*` helpers
--- parse a column back into its Ipê type; the raw-column escape (`fromColumns`)
--- stores rows in this form.
+-- | A row read back from the database: every column keyed by its name, each
+-- cell its text form, `Nothing` for SQL `NULL` (the `Db.findWhere`
+-- representation). The typed `read*` helpers parse a column back into its Ipê
+-- type; the raw-column escape (`fromColumns`) stores rows in this form.
 type alias Row =
-    Dict String String
-
-
--- A row as a codec read decodes it: every projected column keyed by its name,
--- `Nothing` for SQL `NULL`. Distinct from `Row`, whose cells cannot express
--- `NULL`, so a nullable column decodes `Nothing` only from a real `NULL`.
-type alias RowCells =
     Dict String (Maybe String)
 
 
@@ -419,8 +412,8 @@ columnFromShape pair =
 
 
 -- | `fromColumns table columns` — the raw-column escape: build a `Draft Row`
--- for a dynamic or non-codec table, whose rows are the untyped
--- `Dict String String` the DB layer returns. The draft's codec is the row codec
+-- for a dynamic or non-codec table, whose rows are the untyped `Row` cell maps
+-- the DB layer returns. The draft's codec is the row codec
 -- derived from `columns` (`rowCodec`), so the same codec-driven CRUD applies once
 -- the draft is classified: writes bind each declared column, reads decode back
 -- into a `Row`, and the typed `read*` helpers parse a column into its Ipê type.
@@ -498,16 +491,14 @@ columnColType col =
 
 
 -- | `rowCodec columns` — the `Codec Row` a raw-column store uses: a record
--- codec over `Dict String String` whose `Shape` is `SRecord` naming each
--- declared column. Every column is carried as nullable text (`CNull CText`) at
--- the JSON layer, because a `Row` cell is already the string form the DB layer
--- returns and accepts (the same lossless-string basis the `read*` helpers parse
--- from); the DDL still uses each column's declared `ColType` (held on the
--- store's frozen columns), so a raw store creates its table with real types
--- while its rows stay untyped strings. The encoder emits the declared columns as
--- a JSON object; the decoder reads that object back into a `Row`, where a `Row`
--- cannot express SQL `NULL`, so a `NULL` cell reads as the empty string — the
--- untyped `Row` representation, never a codec-typed field.
+-- codec over `Row` whose `Shape` is `SRecord` naming each declared column.
+-- Every column is carried as nullable text (`CNull CText`) at the JSON layer,
+-- because a `Row` cell is already the text form the DB layer returns and
+-- accepts (the same lossless-string basis the `read*` helpers parse from); the
+-- DDL still uses each column's declared `ColType` (held on the store's frozen
+-- columns), so a raw store creates its table with real types while its rows stay
+-- untyped text. The encoder emits the declared columns as a JSON object; the
+-- decoder reads that object back into a `Row`, a SQL `NULL` cell as `Nothing`.
 rowCodec : List Column -> Codec Row
 rowCodec columns =
     let
@@ -516,28 +507,31 @@ rowCodec columns =
     in
     Codec
         { enc = \row -> Encode.object (rowFields names row)
-        , mkDec = \_ -> Config.dict (Config.map (Maybe.withDefault "") (Config.nullable Config.string))
+        , mkDec = \_ -> Config.dict (Config.nullable Config.string)
         , shp = SRecord (List.map (\name -> ( name, CNull CText )) names)
         }
 
 
 -- | Project a `Row` to the JSON fields for the declared columns, in order. A
--- column absent from the row emits the empty string, so the encoded object
--- always names every declared column (the shape's contract), never a missing
--- field the bind step would reject.
+-- `Nothing` cell and a column absent from the row both emit `null`, so the
+-- encoded object always names every declared column (the shape's contract) and
+-- an absent cell binds SQL `NULL`, never an invented value.
 rowFields : List String -> Row -> List ( String, Value )
 rowFields names row =
-    List.map (\name -> ( name, Encode.string (rowCell name row) )) names
+    List.map (\name -> ( name, rowCell name row )) names
 
 
-rowCell : String -> Row -> String
+rowCell : String -> Row -> Value
 rowCell name row =
     case Dict.get name row of
-        Just s ->
-            s
+        Just (Just s) ->
+            Encode.string s
+
+        Just Nothing ->
+            Encode.null
 
         Nothing ->
-            ""
+            Encode.null
 
 
 -- ─── Classification (the only Draft → queryable promotions) ─────────
@@ -1965,10 +1959,8 @@ insertReturningNoRowError =
 -- * a row whose key value is `NULL` (a `NULL` key never conflicts, so the row
 --   would be duplicated).
 --
--- A raw-column (`fromColumns`) row has no absent cell at this boundary:
--- `rowCodec` writes a missing cell as the empty string, so a `Row` without its
--- key cell is upserted under the key `""` (and overwrites a row already keyed
--- `""`). Give every `Row` its key cell.
+-- A raw-column (`fromColumns`) row without its key cell binds the key as SQL
+-- `NULL`, so it is refused as a `NULL` key above.
 --
 -- On conflict, every non-key column the row supplies is overwritten; `serial` /
 -- `defaultNow` / `touchOnUpdate` columns are omitted from the write and keep
@@ -2603,8 +2595,7 @@ hasColumn columns name =
 
 -- | `allOn conn store` — read every row from an external connection and decode
 -- each through the store's codec. The external counterpart to `all`.
--- Unlike `all`, a SQL `NULL` cell reaches the codec as the empty string on
--- this path, so a `Maybe String` field reads `NULL` as `Just ""`.
+-- As with `all`, a SQL `NULL` cell reaches the codec as `Nothing`.
 allOn : Connection mode -> Store a -> Task Error (List a)
 allOn conn store =
     case store of
@@ -2615,15 +2606,14 @@ allOn conn store =
 
                 Nothing ->
                     Task.andThen
-                        (\rows -> decodeRows r.codec (List.map textCells rows))
+                        (\rows -> decodeRows r.codec rows)
                         (Db.findWhereOn conn r.table alwaysTrue)
 
 
 -- | `findWhereOn conn store cond` — read the rows matching `cond` from an
 -- external connection and decode each through the store's codec. The external
 -- counterpart to `findWhere`; the same audited `SqlFragment` barrier applies.
--- Unlike `findWhere`, a SQL `NULL` cell reaches the codec as the empty string on
--- this path, so a `Maybe String` field reads `NULL` as `Just ""`.
+-- As with `findWhere`, a SQL `NULL` cell reaches the codec as `Nothing`.
 findWhereOn : Connection mode -> Store a -> SqlFragment -> Task Error (List a)
 findWhereOn conn store cond =
     case store of
@@ -2634,7 +2624,7 @@ findWhereOn conn store cond =
 
                 Nothing ->
                     Task.andThen
-                        (\rows -> decodeRows r.codec (List.map textCells rows))
+                        (\rows -> decodeRows r.codec rows)
                         (Db.findWhereOn conn r.table cond)
 
 
@@ -2643,8 +2633,7 @@ findWhereOn conn store cond =
 -- store's codec. The external counterpart to `get`; keys on the store's
 -- validated `pk`, binds the value as a parameter, and fails closed for a store
 -- with no primary key.
--- Unlike `get`, a SQL `NULL` cell reaches the codec as the empty string on
--- this path, so a `Maybe String` field reads `NULL` as `Just ""`.
+-- As with `get`, a SQL `NULL` cell reaches the codec as `Nothing`.
 getOn : Connection mode -> Store a -> SqlValue -> Task Error (Maybe a)
 getOn conn store keyValue =
     case store of
@@ -2655,7 +2644,7 @@ getOn conn store keyValue =
 
                 Ok keyCol ->
                     Task.andThen
-                        (\rows -> firstDecoded r.codec (List.map textCells rows))
+                        (\rows -> firstDecoded r.codec rows)
                         (Db.findWhereOn conn r.table (keyEquals keyCol keyValue))
 
 
@@ -2690,9 +2679,9 @@ alwaysTrue =
 -- | `readCells conn store cond` — read the rows matching `cond` with SQL `NULL`
 -- kept: the explicit projection of the store's current columns runs through the
 -- NULL-preserving `Db.findWhereMasked` with no mask, and each row decodes into
--- `RowCells`. Every codec-decoded app read goes through here, so a nullable field
+-- a `Row`. Every codec-decoded app read goes through here, so a nullable field
 -- is `Just` only when its column is not `NULL`.
-readCells : Db -> Store a -> SqlFragment -> Task Error (List RowCells)
+readCells : Db -> Store a -> SqlFragment -> Task Error (List Row)
 readCells conn store cond =
     case store of
         Store r ->
@@ -2703,11 +2692,14 @@ readCells conn store cond =
                 cellsDecoder
 
 
--- Decode one NULL-preserving row object into `RowCells`: a JSON `null` is SQL
+-- Decode one NULL-preserving row object into a `Row`: a JSON `null` is SQL
 -- `NULL`; every scalar becomes its text form (an integer in decimal, a float
 -- through `String.fromFloat`, a boolean as `"true"`/`"false"`, text verbatim),
--- the same text the codec's per-column parser reads.
-cellsDecoder : Decoder RowCells
+-- the same text the codec's per-column parser reads. `Config.int` is tried
+-- before `Config.float`, so an integral float inside the `Int` range renders as
+-- its `Int` (`3.0` is `"3"`, `-0.0` is `"0"`): the rule the raw reads apply
+-- through the same runtime function, so every read path gives a cell one text.
+cellsDecoder : Decoder Row
 cellsDecoder =
     Config.dict
         (Config.nullable
@@ -2721,16 +2713,7 @@ cellsDecoder =
         )
 
 
--- Lift an untyped `Row` to `RowCells`, every cell present. The external
--- (`Db.findWhereOn`) and join (`Db.findJoin`) kernels return `Row`, whose cells
--- cannot express SQL `NULL` (it arrives as the empty string), so a nullable
--- column read through them decodes `NULL` as `Just ""`.
-textCells : Row -> RowCells
-textCells row =
-    Dict.map (\_ cell -> Just cell) row
-
-
-decodeRows : Codec a -> List RowCells -> Task Error (List a)
+decodeRows : Codec a -> List Row -> Task Error (List a)
 decodeRows codec rows =
     case rows of
         [] ->
@@ -2745,7 +2728,7 @@ decodeRows codec rows =
                     Task.map (\more -> value :: more) (decodeRows codec rest)
 
 
-firstDecoded : Codec a -> List RowCells -> Task Error (Maybe a)
+firstDecoded : Codec a -> List Row -> Task Error (Maybe a)
 firstDecoded codec rows =
     case rows of
         [] ->
@@ -3851,9 +3834,8 @@ setJoinOrder alias view col ascending joined =
 -- both aliases, every projected column) is re-validated at the runtime boundary,
 -- and every filter value is a bound parameter. A poisoned join (a filter naming
 -- an unknown column) fails closed with the typed `Err`; a row that does not
--- decode to its side's type is a typed `Err`. Unlike the single-store reads, a
--- SQL `NULL` cell reaches each side's codec as the empty string, so a
--- `Maybe String` field reads `NULL` as `Just ""`.
+-- decode to its side's type is a typed `Err`. As with the single-store reads, a
+-- SQL `NULL` cell reaches each side's codec as `Nothing`.
 --
 -- Example:
 --
@@ -3906,7 +3888,7 @@ joinToList conn joined =
 
 -- | `joinToMaybe conn joined` — run the join and decode the FIRST matched pair,
 -- or `Nothing`. As with `joinToList`, a SQL `NULL` cell reaches each side's
--- codec as the empty string, so a `Maybe String` field reads `NULL` as `Just ""`.
+-- codec as `Nothing`.
 --
 -- Example:
 --
@@ -4239,7 +4221,9 @@ liveAliased left right alias col =
 -- (`SELECT proj … FROM ta AS a0, tb AS a1 WHERE …`) through `Db.findProjection`:
 -- every projected identifier is re-validated at the runtime boundary, and every
 -- filter value is a bound parameter. A poisoned projection (an inherited filter
--- naming an unknown column) fails closed with the typed `Err`.
+-- naming an unknown column) fails closed with the typed `Err`, and so does a
+-- projected cell that is SQL `NULL` (the per-column decode names its output
+-- column), never an empty string.
 --
 -- The `Select` argument must be a `Store.select` projection expression: the
 -- compiler reads the projected shape and each column's type from it and emits the
@@ -4409,12 +4393,12 @@ decodeJoinRows codecA codecB pairs =
         first :: rest ->
             case first of
                 ( leftRow, rightRow ) ->
-                    case DbCodec.codecFromRow codecA (textCells leftRow) of
+                    case DbCodec.codecFromRow codecA leftRow of
                         Err e ->
                             Task.fail e
 
                         Ok a ->
-                            case DbCodec.codecFromRow codecB (textCells rightRow) of
+                            case DbCodec.codecFromRow codecB rightRow of
                                 Err e ->
                                     Task.fail e
 
@@ -4610,7 +4594,7 @@ admitFragment admit =
 
 -- Order then paginate the raw rows: sort by each ordering key (numeric-aware for
 -- `CInt` / `CReal` columns), skip `off` rows, keep `lim` rows.
-paginateRows : List OrderKey -> Maybe Int -> Maybe Int -> List RowCells -> List RowCells
+paginateRows : List OrderKey -> Maybe Int -> Maybe Int -> List Row -> List Row
 paginateRows orderings off lim rows =
     applyLimit lim (applyOffset off (orderRowsWith orderings rows))
 
@@ -4619,7 +4603,7 @@ paginateRows orderings off lim rows =
 -- is applied first so a stable sort leaves the FIRST ordering as the dominant key
 -- (the primary sort). The sort compares each row's text cell, numerically when
 -- the column type is `CInt` / `CReal`; a `NULL` cell sorts before every value.
-orderRowsWith : List OrderKey -> List RowCells -> List RowCells
+orderRowsWith : List OrderKey -> List Row -> List Row
 orderRowsWith orderings rows =
     List.foldr
         (\ordering acc -> sortByOrdering ordering acc)
@@ -4627,14 +4611,14 @@ orderRowsWith orderings rows =
         orderings
 
 
-sortByOrdering : OrderKey -> List RowCells -> List RowCells
+sortByOrdering : OrderKey -> List Row -> List Row
 sortByOrdering ordering rows =
     case ordering of
         ( col, cellType, dir ) ->
             List.sortWith (\a b -> cellCompare cellType dir col a b) rows
 
 
-cellCompare : CellType -> SortDir -> String -> RowCells -> RowCells -> Basics.Order
+cellCompare : CellType -> SortDir -> String -> Row -> Row -> Basics.Order
 cellCompare cellType dir col a b =
     let
         base =
@@ -4649,7 +4633,7 @@ cellCompare cellType dir col a b =
 
 
 -- The cell a sort reads: `Nothing` for SQL `NULL` (or a column the row lacks).
-sortCell : String -> RowCells -> Maybe String
+sortCell : String -> Row -> Maybe String
 sortCell col row =
     Maybe.withDefault Nothing (Dict.get col row)
 
@@ -4742,7 +4726,7 @@ flipOrder ord =
             LT
 
 
-applyOffset : Maybe Int -> List RowCells -> List RowCells
+applyOffset : Maybe Int -> List Row -> List Row
 applyOffset off rows =
     case off of
         Just n ->
@@ -4752,7 +4736,7 @@ applyOffset off rows =
             rows
 
 
-applyLimit : Maybe Int -> List RowCells -> List RowCells
+applyLimit : Maybe Int -> List Row -> List Row
 applyLimit lim rows =
     case lim of
         Just n ->
@@ -4764,29 +4748,33 @@ applyLimit lim rows =
 
 -- ─── Typed column reads (row -> value) ─────────────────────────────
 --
--- `Db.findWhere` returns each row as `Dict String String`. These helpers read
--- one column back into its Ipê type, failing closed with a typed error when the
--- column is absent or malformed — never a silent default. They are the readers
+-- `Db.findWhere` returns each row as a `Row`. These helpers read one column
+-- back into its Ipê type, failing closed with a typed error when the column is
+-- absent, SQL `NULL`, or malformed — never a silent default. They are the readers
 -- for a raw-column `Store Row`: a codec-driven store decodes whole rows through
 -- its own codec, but a raw store reads columns individually.
 
 
--- | Read a column as a `String`. A missing column is a typed `Err`.
+-- | Read a column as a `String`. A missing or `NULL` column is a typed `Err`.
 readText : String -> Row -> Result Error String
 readText name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             Ok s
+
+        Just Nothing ->
+            Err (nullColumnError name)
 
         Nothing ->
             Err (missingColumnError name)
 
 
--- | Read a column as an `Int`. A missing or non-integer column is a typed `Err`.
+-- | Read a column as an `Int`. A missing, `NULL` or non-integer column is a
+-- typed `Err`.
 readInt : String -> Row -> Result Error Int
 readInt name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             case String.toInt s of
                 Just n ->
                     Ok n
@@ -4794,16 +4782,19 @@ readInt name row =
                 Nothing ->
                     Err (badColumnError name "Int" s)
 
+        Just Nothing ->
+            Err (nullColumnError name)
+
         Nothing ->
             Err (missingColumnError name)
 
 
--- | Read a column as a `Float`. A missing or non-numeric column is a typed
--- `Err`.
+-- | Read a column as a `Float`. A missing, `NULL` or non-numeric column is a
+-- typed `Err`.
 readFloat : String -> Row -> Result Error Float
 readFloat name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             case String.toFloat s of
                 Just f ->
                     Ok f
@@ -4811,17 +4802,20 @@ readFloat name row =
                 Nothing ->
                     Err (badColumnError name "Float" s)
 
+        Just Nothing ->
+            Err (nullColumnError name)
+
         Nothing ->
             Err (missingColumnError name)
 
 
 -- | Read a column as a `Bool`. The stored form is SQLite's `0` / `1` integer
--- convention (and the literals `true` / `false`); anything else is a typed
--- `Err`.
+-- convention (and the literals `true` / `false`); anything else, a `NULL` and a
+-- missing column included, is a typed `Err`.
 readBool : String -> Row -> Result Error Bool
 readBool name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             if s == "1" || s == "true" then
                 Ok True
 
@@ -4830,6 +4824,9 @@ readBool name row =
 
             else
                 Err (badColumnError name "Bool" s)
+
+        Just Nothing ->
+            Err (nullColumnError name)
 
         Nothing ->
             Err (missingColumnError name)
@@ -7348,6 +7345,12 @@ missingColumnError : String -> Error
 missingColumnError name =
     Error.invalidInput
         (String.concat [ "Ipe.Db.Store: row is missing column \"", name, "\"" ])
+
+
+nullColumnError : String -> Error
+nullColumnError name =
+    Error.invalidInput
+        (String.concat [ "Ipe.Db.Store: column \"", name, "\" is NULL" ])
 
 
 badColumnError : String -> String -> String -> Error

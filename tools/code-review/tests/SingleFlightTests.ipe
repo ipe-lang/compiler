@@ -10,7 +10,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Lib.App as App exposing (Model, Msg(..), Page(..))
-import Lib.Db as LibDb
+import Lib.Db as LibDb exposing (Decision(..))
 import Lib.Epoch as Epoch exposing (Epoch)
 import Lib.Index as Index exposing (Change(..))
 import Lib.Queue as Queue exposing (DecisionSlot(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
@@ -19,7 +19,7 @@ import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (checkReporting, cleanupIndex, envAppSettings, freshScratch, loadUnitNow, seedIndex, uid)
+import TestSupport exposing (checkReporting, cleanupIndex, decideNow, envAppSettings, freshScratch, loadUnitNow, migratedReviewAt, removeFileIfAny, seedIndex, uid)
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -282,10 +282,11 @@ unitPageSettlesOnItsOwnRead settings a b =
         == "refused"
 
 
--- One decision is in flight per session: a decision asked, by button, key or
--- refusal, while one is saving starts nothing and says why, and keeps the
--- refusal draft; once the decision settles the next one starts. Red if a
--- second decision, with its source re-read, starts beside the first.
+-- One decision is in flight per session: a decision asked, by button or key,
+-- while one is saving starts nothing and leaves the saving one's pending
+-- state; one asked by refusal says why and keeps the draft. A save that
+-- failed leaves its notice, and the next decision starts and drops it. Red
+-- if a second decision, with its source re-read, starts beside the first.
 decisionsSingleFlight : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 decisionsSingleFlight settings a b =
     let
@@ -317,12 +318,8 @@ decisionsSingleFlight settings a b =
         == Nothing
         && saving.decision
         == DecisionSaving ua settings.epoch
-        && saving.decisionError
-        == Nothing
         && pressedAgain.decision
         == DecisionSaving ua settings.epoch
-        && pressedAgain.decisionError
-        == Just SaveInFlight
         && refusing.decision
         == DecisionSaving ua settings.epoch
         && busyMessage refusing.refuseError
@@ -330,8 +327,8 @@ decisionsSingleFlight settings a b =
         == Just ua
         && refusing.refuseDraft
         == "needs a test"
-        && settled.decision
-        == DecisionIdle
+        && Queue.notSavedOf settled.decision
+        == Just SaveFailed
         && next.decision
         == DecisionSaving ua settings.epoch
         && lateOther.decision
@@ -342,9 +339,11 @@ decisionsSingleFlight settings a b =
 -- idle: slot ownership is tied to process lifetime. A decision saving under
 -- a foreign epoch blocks no decision, by button or refusal, and a decision
 -- result from a foreign epoch settles no slot this process owns, while a
--- decision saving under this epoch still refuses a second. Red if a
--- persisted `DecisionSaving` blocks the session after a restart, or if any
--- process's result frees this process's slot.
+-- decision busy under this epoch still refuses a second. A page entry
+-- shows a foreign busy decision as idle, so no pending state is left on
+-- screen. Red if a persisted busy decision blocks the session or stays
+-- shown after a restart, or if any process's result frees this process's
+-- slot.
 foreignDecisionIsIdle : Settings.AppSettings -> Epoch -> Index.UnitView -> Index.UnitView -> Bool
 foreignDecisionIsIdle settings otherEpoch a b =
     let
@@ -371,23 +370,35 @@ foreignDecisionIsIdle settings otherEpoch a b =
 
         ownResult =
             after settings [ DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] foreignResult
+
+        entered =
+            after settings [ Navigated QueuePage ] { shown | decision = DecisionRefreshing ub otherEpoch }
+
+        ownEntered =
+            after settings [ Navigated QueuePage ] { shown | decision = DecisionRefreshing ub settings.epoch }
     in
     Queue.startDecision settings.epoch ua (DecisionSaving ub otherEpoch)
         == Just (DecisionSaving ua settings.epoch)
+        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub otherEpoch)
+        == Just (DecisionSaving ua settings.epoch)
         && Queue.startDecision settings.epoch ua (DecisionSaving ub settings.epoch)
         == Nothing
+        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub settings.epoch)
+        == Nothing
+        && entered.decision
+        == DecisionIdle
+        && ownEntered.decision
+        == DecisionRefreshing ub settings.epoch
         && approved.decision
         == DecisionSaving ua settings.epoch
-        && approved.decisionError
-        == Nothing
         && refused.decision
         == DecisionSaving ua settings.epoch
         && refused.refuseError
         == Nothing
         && foreignResult.decision
         == DecisionSaving ua settings.epoch
-        && ownResult.decision
-        == DecisionIdle
+        && Queue.notSavedOf ownResult.decision
+        == Just SaveFailed
 
 
 -- A source read left in flight by another process is `NoneSelected`: a
@@ -450,9 +461,10 @@ foreignReadIsIdle settings otherEpoch a b =
         == Nothing
 
 
--- A decision asked off the queue page is refused before it takes the slot,
--- so it holds nothing a later decision would wait on. Red if a decision
--- asked on the unit page or History takes the decision slot.
+-- A decision asked off the queue page is refused before it takes the slot:
+-- it leaves only its notice, which a later decision replaces, and it never
+-- replaces a decision already saving. Red if a decision asked on the unit
+-- page or History takes the decision slot or drops a busy one.
 decisionOffQueueHoldsNoSlot : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 decisionOffQueueHoldsNoSlot settings a b =
     let
@@ -471,18 +483,21 @@ decisionOffQueueHoldsNoSlot settings a b =
         onQueue =
             after settings [ ApproveUnit ua ] shown
 
-        offQueue =
-            Just SaveOffQueue
+        backOnQueue =
+            after settings [ ApproveUnit ua ] { onUnitPage | page = QueuePage }
+
+        savingThenOff =
+            after settings [ ApproveUnit ua ] { onQueue | page = HistoryPage }
     in
-    onUnitPage.decision
-        == DecisionIdle
-        && onUnitPage.decisionError
-        == offQueue
-        && onHistory.decision
-        == DecisionIdle
-        && onHistory.decisionError
-        == offQueue
+    Queue.notSavedOf onUnitPage.decision
+        == Just SaveOffQueue
+        && Queue.notSavedOf onHistory.decision
+        == Just SaveOffQueue
         && onQueue.decision
+        == DecisionSaving ua settings.epoch
+        && backOnQueue.decision
+        == DecisionSaving ua settings.epoch
+        && savingThenOff.decision
         == DecisionSaving ua settings.epoch
 
 
@@ -492,21 +507,24 @@ page model =
     Html.render (Ui.layout [] (View.view model))
 
 
--- A decision refused while one is saving says why on the queue page, beside
--- the card it was asked on; a unit page whose read is still in flight shows
--- loading and none of the unit the slot last showed. Each sits beside the
--- settled form, rendered through the same path.
+-- A decision saving shows its pending state on the queue card in place of
+-- Approve and Refuse, and a second press keeps it; a unit page whose read
+-- is still in flight shows loading and none of the unit the slot last
+-- showed. Each sits beside the settled form, rendered through the same path.
 busyRendered : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
 busyRendered settings a b =
     let
         shown =
             queueModel [ a ] (ViewShown a)
 
+        pending =
+            page (after settings [ ApproveUnit a.unit.uid ] shown)
+
         busy =
             page (after settings [ ApproveUnit a.unit.uid, ApproveUnit a.unit.uid ] shown)
 
         idle =
-            page (after settings [ ApproveUnit a.unit.uid ] shown)
+            page shown
 
         aName =
             SafeText.toString a.unit.qualified
@@ -517,8 +535,11 @@ busyRendered settings a b =
         settled =
             page { shown | page = unitAt a.unit.uid }
     in
-    String.contains "a decision is still being saved" busy
-        && not (String.contains "a decision is still being saved" idle)
+    String.contains "Saving the decision…" pending
+        && not (String.contains ">Approve<" pending)
+        && String.contains "Saving the decision…" busy
+        && not (String.contains "Saving the decision…" idle)
+        && String.contains ">Approve<" idle
         && String.contains "Loading unit…" waiting
         && not (String.contains aName waiting)
         && String.contains aName settled
@@ -564,18 +585,18 @@ saveFailureRendered settings a b =
         movedPage =
             page moved
     in
-    busy.decisionError
+    Queue.notSavedOf busy.decision
         == Just SaveContended
         && String.contains "the index or review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
         && not (String.contains "[5]" busyPage)
         && not (String.contains busyText busyPage)
-        && other.decisionError
+        && Queue.notSavedOf other.decision
         == Just SaveFailed
         && String.contains (Queue.saveFailureText SaveFailed) otherPage
         && not (String.contains "Unexpected" otherPage)
         && not (String.contains otherText otherPage)
-        && moved.decisionError
+        && Queue.notSavedOf moved.decision
         == Just SaveFailed
         && String.contains (Queue.saveFailureText SaveFailed) movedPage
         && not (String.contains (Error.message LibDb.headMoved) movedPage)
@@ -590,9 +611,7 @@ readOnlySaveRefused settings a b =
         refused =
             after { settings | key = ReadOnly } [ ApproveUnit a.unit.uid ] (queueModel [ a, b ] (ViewShown a))
     in
-    refused.decision
-        == DecisionIdle
-        && refused.decisionError
+    Queue.notSavedOf refused.decision
         == Just SaveReadOnly
         && String.contains (Error.message ReviewKey.readOnlyError) (page refused)
 
@@ -631,6 +650,161 @@ requireUnit found =
             Task.fail (Error.conflict "a fixture unit is missing from the seeded index")
 
 
+-- A saved decision stays busy until the queue reload that follows it
+-- settles, so the row it was made on, still listed until then, offers no
+-- control a second decision could land on: a press by button, key or
+-- acknowledgement starts nothing, and the card says the queue is
+-- refreshing. An older load's result leaves it busy; the reload settling,
+-- failed or superseded by a later load, ends it. Red if a decision is idle
+-- once written while its row is still listed, or if no later load frees it.
+writtenStaysPending : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> ( Index.Attested, Index.Written ) -> Bool
+writtenStaysPending settings a b pair =
+    let
+        ua =
+            a.unit.uid
+
+        saving =
+            after settings [ ApproveUnit ua ] (queueModel [ a, b ] (ViewShown a))
+
+        written =
+            after settings [ DecisionSaved ua settings.epoch (Ok pair) ] saving
+
+        pressed =
+            after settings [ ApproveUnit ua, KeyDown "a", AckRefusal ua ] written
+
+        olderLoad =
+            after settings [ PendingLoaded saving.queueLoad (Ok (queuePageOf [ a, b ])) ] pressed
+
+        reloaded =
+            after settings [ PendingLoaded written.queueLoad (Ok (queuePageOf [ b ])) ] pressed
+
+        reloadFailed =
+            after settings [ PendingLoaded written.queueLoad (Err (Error.conflict "boom")) ] pressed
+
+        superseding =
+            after settings [ Navigated QueuePage ] pressed
+
+        superseded =
+            after settings [ PendingLoaded written.queueLoad (Ok (queuePageOf [ a, b ])), PendingLoaded superseding.queueLoad (Ok (queuePageOf [ b ])) ] superseding
+
+        writtenPage =
+            page written
+    in
+    written.decision
+        == DecisionRefreshing ua settings.epoch
+        && pressed.decision
+        == DecisionRefreshing ua settings.epoch
+        && String.contains "Decision saved; refreshing the queue…" writtenPage
+        && not (String.contains ">Approve<" writtenPage)
+        && olderLoad.decision
+        == DecisionRefreshing ua settings.epoch
+        && reloaded.decision
+        == DecisionIdle
+        && reloadFailed.decision
+        == DecisionIdle
+        && superseding.decision
+        == DecisionRefreshing ua settings.epoch
+        && superseded.decision
+        == DecisionIdle
+
+
+-- The notice of a decision that was not saved advises a reload, and the
+-- reload clears it: the queue load that a page entry starts, once it
+-- succeeds, leaves no notice. A load that fails keeps it. Red if the
+-- notice survives the reload its text tells the reviewer to make.
+notSavedClearedByReload : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+notSavedClearedByReload settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        failed =
+            after settings [ ApproveUnit ua, DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] (queueModel [ a, b ] (ViewShown a))
+
+        reloading =
+            after settings [ Navigated QueuePage ] failed
+
+        reloaded =
+            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+
+        reloadFailed =
+            after settings [ PendingLoaded reloading.queueLoad (Err (Error.conflict "boom")) ] reloading
+
+        banner =
+            "Decision save failed: " ++ Queue.saveFailureText SaveFailed
+    in
+    Queue.notSavedOf failed.decision
+        == Just SaveFailed
+        && String.contains banner (page failed)
+        && Queue.notSavedOf reloading.decision
+        == Just SaveFailed
+        && reloaded.decision
+        == DecisionIdle
+        && not (String.contains banner (page reloaded))
+        && Queue.notSavedOf reloadFailed.decision
+        == Just SaveFailed
+
+
+-- Only a reload started after the failure clears its notice: a queue load
+-- started while the decision was saving, by a page entry or a reconnect,
+-- read the queue before the failure was known, so its result keeps the
+-- notice, and the reload after it clears it. Red if a load that predates
+-- the failure wipes the notice before the reviewer saw why the decision
+-- was not saved.
+notSavedOutlivesOlderLoad : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+notSavedOutlivesOlderLoad settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        enteredWhileSaving =
+            after settings [ ApproveUnit ua, Navigated QueuePage ] (queueModel [ a, b ] (ViewShown a))
+
+        failed =
+            after settings [ DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] enteredWhileSaving
+
+        olderLoaded =
+            after settings [ PendingLoaded enteredWhileSaving.queueLoad (Ok (queuePageOf [ a, b ])) ] failed
+
+        reloading =
+            after settings [ Navigated QueuePage ] olderLoaded
+
+        reloaded =
+            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+
+        banner =
+            "Decision save failed: " ++ Queue.saveFailureText SaveFailed
+    in
+    Queue.notSavedOf failed.decision
+        == Just SaveFailed
+        && Queue.notSavedOf olderLoaded.decision
+        == Just SaveFailed
+        && String.contains banner (page olderLoaded)
+        && reloaded.decision
+        == DecisionIdle
+        && not (String.contains banner (page reloaded))
+
+
+-- The written-decision checks, on a decision really written through
+-- `Queue.decide` to a fresh review database, so the app receives the saved
+-- result a server's decision returns.
+writtenChecks : Task.Task Error (List ( String, Bool ))
+writtenChecks =
+    do
+        at <- freshScratch "ipe-single-flight-written"
+        removeFileIfAny at.indexDb
+        removeFileIfAny at.reviewDb
+        seedIndex at.indexDb at.repo
+        settings <- envAppSettings
+        a <- loadUnitNow (uid "u-a") |> Task.andThen requireUnit
+        b <- loadUnitNow (uid "u-b") |> Task.andThen requireUnit
+        db <- migratedReviewAt at.reviewDb
+        pair <- decideNow db (uid "u-a") Approved
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
+        Task.succeed [ ( "a saved decision withholds its row's controls until the queue reload settles", writtenStaysPending settings a b pair ) ]
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     withSeeded "ipe-single-flight"
@@ -645,6 +819,9 @@ checks =
             , ( "a refused decision and a unit page awaiting its read render as such", busyRendered settings a b )
             , ( "a failed save is a typed case whose banner holds no error text", saveFailureRendered settings a b )
             , ( "a decision on a read-only server is refused before it takes the slot", readOnlySaveRefused settings a b )
+            , ( "a not-saved notice is cleared by the reload it advises", notSavedClearedByReload settings a b )
+            , ( "a queue load started before a failed save keeps its notice", notSavedOutlivesOlderLoad settings a b )
             ]
         )
+        |> Task.andThen (\rows -> writtenChecks |> Task.map (\written -> rows ++ written))
         |> Task.onError (\e -> checkReporting Io.println "single-flight fixtures" (Task.fail e) |> Task.map (\failed -> [ failed ]))
