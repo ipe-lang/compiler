@@ -35,7 +35,7 @@ pub mod csrf;
 mod mint_proof;
 // Every byte a session keeps resident is charged against a nested byte budget.
 #[cfg(feature = "web")]
-mod budget;
+pub(crate) mod budget;
 // Every `Perform` Cmd a session starts holds one unit of its nested Cmd budget.
 #[cfg(feature = "web")]
 mod cmd_admission;
