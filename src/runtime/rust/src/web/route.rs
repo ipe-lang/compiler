@@ -35,6 +35,7 @@ pub use crate::encoding::{
 };
 #[cfg(feature = "web")]
 use crate::encoding::{EncodedBase, QueryText};
+use crate::system::RefusedText;
 
 /// A declared route: a parsed URL pattern + a builder that applies the
 /// captured `:param` strings (in pattern order) to the page constructor.
@@ -212,14 +213,14 @@ pub enum MountRefusal {
         /// The DOM event name.
         event: &'static str,
         /// The platform's report.
-        detail: String,
+        detail: RefusedText,
     },
     /// A DOM construction step failed.
     Dom {
         /// The step that failed.
         step: &'static str,
         /// The platform's report, when it gave one.
-        detail: Option<String>,
+        detail: Option<RefusedText>,
     },
 }
 
@@ -232,17 +233,14 @@ impl std::fmt::Display for MountRefusal {
             Self::NoWindow => f.write_str("no window (not a browser context)"),
             Self::NoDocument => f.write_str("the window has no document"),
             Self::NoBody => f.write_str("the document has no <body>"),
-            Self::Listener { event, detail } => write!(
-                f,
-                "addEventListener({}) failed: {}",
-                scrub(event),
-                scrub(detail)
-            ),
+            Self::Listener { event, detail } => {
+                write!(f, "addEventListener({}) failed: {detail}", scrub(event))
+            }
             Self::Dom { step, detail: None } => write!(f, "{} failed", scrub(step)),
             Self::Dom {
                 step,
                 detail: Some(detail),
-            } => write!(f, "{} failed: {}", scrub(step), scrub(detail)),
+            } => write!(f, "{} failed: {detail}", scrub(step)),
         }
     }
 }
@@ -1173,6 +1171,25 @@ mod tests {
         assert_scrubbed(&refusal.to_string());
     }
 
+    /// A platform report is scrubbed once, where the refusal is built: a `\`
+    /// renders as `\\`, never re-escaped to `\\\\` by the `Display`.
+    #[test]
+    fn mount_refusal_scrubs_platform_detail_once() {
+        let listener = MountRefusal::Listener {
+            event: "click",
+            detail: RefusedText::new("a\\b\n"),
+        };
+        let dom = MountRefusal::Dom {
+            step: "createElement(div)",
+            detail: Some(RefusedText::new("a\\b\n")),
+        };
+        assert_eq!(
+            listener.to_string(),
+            "addEventListener(click) failed: a\\\\b\\n"
+        );
+        assert_eq!(dom.to_string(), "createElement(div) failed: a\\\\b\\n");
+    }
+
     #[test]
     fn mount_refusal_scrubs_bidi_and_controls() {
         let every = [
@@ -1186,11 +1203,11 @@ mod tests {
             MountRefusal::NoBody,
             MountRefusal::Listener {
                 event: "click",
-                detail: HOSTILE.to_owned(),
+                detail: RefusedText::new(HOSTILE),
             },
             MountRefusal::Dom {
                 step: "createElement(div)",
-                detail: Some(HOSTILE.to_owned()),
+                detail: Some(RefusedText::new(HOSTILE)),
             },
             MountRefusal::Dom {
                 step: "root cast to HtmlElement",

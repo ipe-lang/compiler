@@ -4329,12 +4329,12 @@ pub(crate) enum StartupRefusal {
     SessionStore(store::StoreConfigError),
     /// The base path (`IPE_WEB_BASE_PATH` / the mount prefix) does not decode.
     BasePath {
-        base: String,
+        base: crate::system::RefusedText,
         refusal: crate::encoding::DecodeRefusal,
     },
     /// The base path is outside the mount-base grammar every shell URL uses.
     MountBase {
-        base: String,
+        base: crate::system::RefusedText,
         refusal: crate::encoding::MountBaseRefusal,
     },
     /// An environment ceiling the app applies is present but malformed.
@@ -4357,16 +4357,12 @@ impl std::fmt::Display for StartupRefusal {
                 "session store misconfigured: {}",
                 crate::system::scrub_log_controls(&e.to_string())
             ),
-            Self::BasePath { base, refusal } => write!(
-                f,
-                "web base path `{}` is malformed: {refusal}",
-                crate::system::scrub_log_controls(base)
-            ),
-            Self::MountBase { base, refusal } => write!(
-                f,
-                "web base path `{}` is not a mount base: {refusal}",
-                crate::system::scrub_log_controls(base)
-            ),
+            Self::BasePath { base, refusal } => {
+                write!(f, "web base path `{base}` is malformed: {refusal}")
+            }
+            Self::MountBase { base, refusal } => {
+                write!(f, "web base path `{base}` is not a mount base: {refusal}")
+            }
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
             Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
             Self::Bind(refusal) => write!(f, "{refusal}"),
@@ -4399,7 +4395,7 @@ pub(crate) const FAIL_CLOSED_BODY: &str =
 #[cfg(feature = "web")]
 fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
     route::DecodedPath::parse(base).map_err(|refusal| StartupRefusal::BasePath {
-        base: base.to_string(),
+        base: crate::system::RefusedText::new(base),
         refusal,
     })
 }
@@ -4413,7 +4409,7 @@ fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
 #[cfg(feature = "web")]
 fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRefusal> {
     crate::encoding::MountBase::parse(base).map_err(|refusal| StartupRefusal::MountBase {
-        base: base.to_string(),
+        base: crate::system::RefusedText::new(base),
         refusal,
     })
 }
@@ -9997,13 +9993,34 @@ mod sse_reconnect_reconcile_tests {
             assert!(
                 matches!(
                     parse_mount_base(bad),
-                    Err(StartupRefusal::MountBase { ref base, .. }) if base == bad
+                    Err(StartupRefusal::MountBase { ref base, .. }) if base.as_str() == bad
                 ),
                 "base {bad} must be refused"
             );
         }
         assert_eq!(parse_mount_base(""), Ok(crate::encoding::MountBase::root()));
         assert!(parse_mount_base("/_ipe/console").is_ok_and(|b| b.prefix() == "/_ipe/console"));
+    }
+
+    /// A refused base path is scrubbed once, where the refusal is built: a
+    /// `\` in it renders as `\\`, never re-escaped to `\\\\` by the `Display`.
+    #[test]
+    fn startup_refusal_scrubs_the_base_once() {
+        let refusals = [
+            parse_route_base("/%zz\\").err(),
+            parse_mount_base("/a\\b").err(),
+        ];
+        let expected = [
+            "web base path `/%zz\\\\` is malformed",
+            "web base path `/a\\\\b` is not a mount base",
+        ];
+        for (refusal, expected) in refusals.into_iter().zip(expected) {
+            let rendered = refusal.map(|r| r.to_string()).unwrap_or_default();
+            assert!(
+                rendered.starts_with(expected) && !rendered.contains("\\\\\\\\"),
+                "{rendered:?} must start with {expected:?}"
+            );
+        }
     }
 
     /// A refused base path renders bidi overrides and control characters as
@@ -10020,7 +10037,7 @@ mod sse_reconnect_reconcile_tests {
                 matches!(
                     &refusal,
                     Some(StartupRefusal::BasePath { base, .. } | StartupRefusal::MountBase { base, .. })
-                        if base == hostile
+                        if *base == crate::system::RefusedText::new(hostile)
                 ),
                 "{refusal:?}"
             );
@@ -10043,7 +10060,7 @@ mod sse_reconnect_reconcile_tests {
             assert!(
                 matches!(
                     parse_route_base(bad),
-                    Err(StartupRefusal::BasePath { ref base, .. }) if base == bad
+                    Err(StartupRefusal::BasePath { ref base, .. }) if base.as_str() == bad
                 ),
                 "base {bad} must be refused"
             );
@@ -12707,7 +12724,7 @@ mod emitted_router_behavior_tests {
         .err();
         crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
         assert!(
-            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base == "/app/x%41"),
+            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base.as_str() == "/app/x%41"),
             "a non-mount base must refuse the router, got {refused:?}"
         );
     }

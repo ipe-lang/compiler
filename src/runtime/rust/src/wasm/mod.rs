@@ -734,7 +734,7 @@ fn document() -> Result<web_sys::Document, MountRefusal> {
 fn listener_refusal(event: &'static str, error: &JsValue) -> MountRefusal {
     MountRefusal::Listener {
         event,
-        detail: format!("{error:?}"),
+        detail: crate::system::RefusedText::new(&format!("{error:?}")),
     }
 }
 

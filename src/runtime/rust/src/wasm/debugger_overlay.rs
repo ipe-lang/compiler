@@ -151,7 +151,7 @@ pub(super) fn mount_overlay() -> Option<Rc<OverlayState>> {
 fn dom_refusal(step: &'static str, error: &JsValue) -> MountRefusal {
     MountRefusal::Dom {
         step,
-        detail: Some(format!("{error:?}")),
+        detail: Some(crate::system::RefusedText::new(&format!("{error:?}"))),
     }
 }
 
