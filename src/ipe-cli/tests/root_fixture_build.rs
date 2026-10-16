@@ -25,7 +25,16 @@ fn a_fixture_builds_under_the_default_package_name() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     build_fixture(&fixture, &out, &runtime).expect("the fixture builds");
     let cargo = std::fs::read_to_string(out.join("Cargo.toml")).expect("emitted Cargo.toml");
-    assert!(cargo.contains("name = \"ipe-app\""), "{cargo}");
+    let dir = fixture
+        .path()
+        .canonicalize()
+        .expect("canonical fixture dir");
+    let identity = ipe_backend_rust::crate_identity(ipe::project_root::DEFAULT_NAME, &dir);
+    assert!(identity.starts_with("ipe-app_"), "{identity}");
+    assert!(
+        cargo.contains(&format!("name = \"{identity}\"")),
+        "the crate is named by the fixture's package name and directory: {cargo}"
+    );
     assert!(out.join("src/main.rs").is_file());
 }
 
@@ -37,6 +46,7 @@ fn a_multi_module_fixture_builds_through_its_manifest() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     build_fixture(&fixture, &out, &runtime).expect("the fixture builds");
     assert!(out.join("src/main.rs").is_file());
+    assert!(out.join("src/ipe_mods/ipe_mod_lib.rs").is_file());
 }
 
 #[test]
