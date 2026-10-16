@@ -528,7 +528,7 @@ occurrences needle text =
 -- installs a host setting (`appWith`) or writes the environment overlay
 -- (`setenv`, `unsetenv`, `loadEnv`), by any spelling of the name. The
 -- server module is imported by `Main` alone, and `listen` is named only by
--- `Main`'s one listen under the `Loopback` proof and by the refusal's prose,
+-- the tail of `main`, over the `Loopback` proof, and by the refusal's prose,
 -- so no other module can listen through an alias or an `exposing` import.
 admittedSites : List ( String, List ( String, Int ) )
 admittedSites =
@@ -596,8 +596,9 @@ systemImportAdmitted line =
 -- The scan refuses each way around it: a reader behind an alias or an
 -- `exposing` import, `getcwd` beside `cwd`, a wrapper that calls an admitted
 -- parser from a request path, a reader in a module outside `src/Lib`, a
--- listen or server import outside `Main`, and a directory the inventory
--- would not read. Red while the scan matches one
+-- listen or server import outside `Main`, a listen that is not `main`'s
+-- tail or not over the proof-taking `mounts`, a second listen or mount, and a
+-- directory the inventory would not read. Red while the scan matches one
 -- qualified spelling per reader or reads `src/Lib` alone.
 startupScanRefusesEvasions : Task.Task Error Bool
 startupScanRefusesEvasions =
@@ -643,8 +644,12 @@ startupScanRefusesEvasions =
                 && not (mainAdmits (mainCode sources ++ "\nreread name = optionalEnv name"))
                 && not (mainAdmits (String.replace "rawRepos <- optionalEnv \"IPE_INDEX_REPOS\"" "rawRepos <- Task.succeed Settings.EnvUnset" (mainCode sources)))
                 && not (mainAdmits (String.replace "rawDb <- requireEnv \"IPE_INDEX_DB\" " "rawDb <- readDb " (mainCode sources) ++ "\nreadDb = requireEnv \"IPE_INDEX_DB\""))
-                && not (mainAdmits (String.replace "        serve bind settings" "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]" (mainCode sources)))
-                && not (mainAdmits (String.replace "serve _loopback settings =\n    Server.listen" "serve _loopback settings =\n    Task.succeed ()\n\n\nopen settings =\n    Server.listen" (mainCode sources)))
+                && not (mainAdmits (String.replace mainTail "        Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]" (mainCode sources)))
+                && not (mainAdmits (String.replace mainTail "        open bind settings" (mainCode sources) ++ "\nopen b s =\n    Server.listen 8000 (mounts b s)"))
+                && not (mainAdmits (mainCode sources ++ "\n        Task.succeed ()"))
+                && not (mainAdmits (mainCode sources ++ "\nagain = Server.listen 8000 []"))
+                && not (mainAdmits (String.replace "mounts : Bind.Loopback -> Settings.AppSettings" "mounts : Settings.AppSettings" (mainCode sources)))
+                && not (mainAdmits (String.replace "(reviewApp settings) ]" "(reviewApp settings), Server.mountApp \"/x\" (reviewApp settings) ]" (mainCode sources)))
                 && not (mainAdmits (String.replace "        bind <- requireLoopbackBind rawBind\n" "" (mainCode sources) ++ "\nlater raw = requireLoopbackBind raw"))
             )
 
@@ -710,7 +715,11 @@ mainAdmits text =
         == 3
         && occurrences "Server.listen" text
         == 1
-        && occurrences serveListen text
+        && occurrences mountsDefinition text
+        == 1
+        && occurrences "mounts" text
+        == 3
+        && occurrences "mountApp" text
         == 1
         && occurrences "requireSettings" text
         == 3
@@ -724,17 +733,18 @@ mainAdmits text =
 
 -- `main` opens with the bind's read and its loopback proof, then the two
 -- literal-key `requireEnv` reads, the two other literal-key `optionalEnv`
--- reads, the review key's read, the settings parse and the listen under the
--- proof, in that order, so a refused bind stops startup before any other
--- read, and a partially applied reader that a request could run cannot take
--- the place of any read.
+-- reads, the review key's read, the settings parse and, as the block's tail,
+-- the listen over the proof-consuming `mounts`, in that order, so a refused
+-- bind stops startup before any other read, and a partially applied reader
+-- that a request could run cannot take the place of any read.
 mainPinned : String -> Bool
 mainPinned text =
     case String.split "\nmain =\n    do\n" text of
         [ _, body ] ->
             case List.take 9 (String.lines body) of
                 [ rawBindLine, bindLine, dbLine, rootLine, reposLine, reviewLine, keyLine, settingsLine, listenLine ] ->
-                    rawBindLine
+                    endsBlock (List.drop 9 (String.lines body))
+                        && rawBindLine
                         == "        rawBind <- optionalEnv \"IPE_HTTP_BIND\""
                         && bindLine
                         == "        bind <- requireLoopbackBind rawBind"
@@ -749,7 +759,7 @@ mainPinned text =
                         && settingsLine
                         == "        settings <- requireSettings key rawDb rawRoot rawRepos rawReview"
                         && listenLine
-                        == "        serve bind settings"
+                        == mainTail
 
                 _ ->
                     False
@@ -758,11 +768,29 @@ mainPinned text =
             False
 
 
--- The one listen, inside `serve`, whose `Loopback` parameter makes a listen
--- without a parsed bind fail to type-check.
-serveListen : String
-serveListen =
-    "\nserve : Bind.Loopback -> Settings.AppSettings -> Task Error ()\nserve _loopback settings =\n    Server.listen 8000 [ Server.mountApp \"/\" (reviewApp settings) ]\n"
+-- `main`'s tail: the one listen, over the routes `mounts` builds.
+mainTail : String
+mainTail =
+    "        Server.listen 8000 (mounts bind settings)"
+
+
+-- The one mount list, whose `Loopback` parameter makes a listen without a
+-- parsed bind fail to type-check.
+mountsDefinition : String
+mountsDefinition =
+    "\nmounts : Bind.Loopback -> Settings.AppSettings -> List Server.Route\nmounts _loopback settings =\n    [ Server.mountApp \"/\" (reviewApp settings) ]\n"
+
+
+-- True when no line of `rest` continues the block it follows: the first
+-- non-blank line, if any, starts a new top-level declaration.
+endsBlock : List String -> Bool
+endsBlock rest =
+    case List.filter (\line -> String.trim line /= "") rest of
+        [] ->
+            True
+
+        next :: _ ->
+            not (String.startsWith " " next)
 
 
 -- True when the module header exports both parsers and neither the bare
