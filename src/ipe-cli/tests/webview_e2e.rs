@@ -9,9 +9,10 @@
 //!
 //! ## Architecture
 //!
-//! 1. A minimal `Web.tea` program is written to a temp dir.
-//! 2. `ipe::build_with_options` compiles it with `webview_host = true` — the
-//!    same host decision the CLI derives from a resolved `web desktop` delivery.
+//! 1. A minimal `Web.tea` program is written as a project whose manifest
+//!    carries a `delivery.desktop` window.
+//! 2. `ipe::build_fixture_for` compiles it for the host a resolved `web desktop`
+//!    delivery asks for — the same host decision the CLI makes.
 //! 3. `e2e_support::build_rust_binary` runs `cargo build` on the emitted project.
 //!
 //! ## Test tiers
@@ -35,8 +36,8 @@
 /// A minimal `Web.tea` counter, built under a webview host.
 ///
 /// The webview executor takes `init/update/view/subscriptions`; the window is a
-/// delivery-host decision (threaded via `BuildOptions::webview_window`), never a
-/// source `main` field. `view` returns `Element Msg` — the same portable Ipe.Ui
+/// delivery-host decision (the manifest's `delivery.desktop`), never a source
+/// `main` field. `view` returns `Element Msg` — the same portable Ipe.Ui
 /// view a served `Web` page uses; the framework applies `Ui.layout` internally.
 /// `init` takes `WebReq`, matching the `Web.tea` cfg scheme.
 const IPE_WEB_COUNTER: &str = r#"module Main exposing (main)
@@ -148,19 +149,19 @@ const WIDGET_JS: &str = "export function mount(host, emit) { return {}; }\n";
 /// Shared error type for E2E helpers.
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// Build options that force the webview-native host — the same signal the CLI
-/// derives from a resolved `web desktop` delivery — with an explicit desktop
-/// window (there is no manifest on the single-file build path).
-fn webview_host_options() -> ipe::BuildOptions {
-    ipe::BuildOptions {
-        webview_host: true,
-        webview_window: Some(ipe_backend_rust::WebViewWindow {
-            title: "Counter".to_owned(),
-            width: 400,
-            height: 300,
-        }),
-        ..ipe::BuildOptions::from_env()
-    }
+/// The manifest field that sizes and titles the desktop window.
+const DESKTOP_WINDOW: &str =
+    "delivery = { desktop = { title = \"Counter\", width = 400, height = 300 } }";
+
+/// The host a resolved `web desktop` delivery asks the emit for.
+fn web_desktop_host() -> Result<ipe::delivery::HostIntent, BoxError> {
+    ipe::delivery::Delivery::resolve(
+        ipe::delivery::Shape::Web,
+        None,
+        ipe::delivery::Host::Desktop,
+    )
+    .map(ipe::delivery::Delivery::host_intent)
+    .map_err(|e| -> BoxError { format!("web desktop does not resolve: {e}").into() })
 }
 
 /// Compile a `Web.tea` program string under a webview host, build the emitted
@@ -177,15 +178,14 @@ fn compile_and_build_with_files(
     ipe_source: &str,
     extra: &[(&str, &str)],
 ) -> Result<std::path::PathBuf, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("webview_e2e_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).map_err(|e| -> BoxError {
-        format!("{test_name}: cannot create ipe source dir: {e}").into()
-    })?;
+    let tree = ipe::project_root::SourceTree::main(ipe_source).field(DESKTOP_WINDOW);
+    let fixture = ipe::RootFixture::from_tree(&tree)
+        .map_err(|e| -> BoxError { format!("{test_name}: fixture: {e}").into() })?;
 
+    // Extra files sit beside the entry module, where its widget paths resolve.
+    let src_dir = fixture.path().join("src");
     for (rel, contents) in extra {
-        let path = ipe_dir.join(rel);
+        let path = src_dir.join(rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| -> BoxError {
                 format!("{test_name}: cannot create {rel} parent dir: {e}").into()
@@ -195,18 +195,29 @@ fn compile_and_build_with_files(
             .map_err(|e| -> BoxError { format!("{test_name}: cannot write {rel}: {e}").into() })?;
     }
 
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, ipe_source)
-        .map_err(|e| -> BoxError { format!("{test_name}: cannot write Main.ipe: {e}").into() })?;
-
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("webview_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    ipe::build_with_options(&entry, &out_dir, &runtime, webview_host_options())
-        .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
+    ipe::build_fixture_for(
+        &fixture,
+        &out_dir,
+        &runtime,
+        &ipe::BuildOptions::from_env(),
+        web_desktop_host()?,
+    )
+    .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
+
+    let main_rs = std::fs::read_to_string(out_dir.join("src/main.rs"))
+        .map_err(|e| -> BoxError { format!("{test_name}: cannot read main.rs: {e}").into() })?;
+    if !main_rs.contains("WebViewApp") || !main_rs.contains("\"Counter\"") {
+        return Err(format!(
+            "{test_name}: the emit is not a webview app titled from the manifest window"
+        )
+        .into());
+    }
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;

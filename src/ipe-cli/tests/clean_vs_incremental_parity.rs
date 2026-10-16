@@ -80,18 +80,20 @@ fn cold_compile(user: &UserSources) -> CompileOutcome {
         ipe::create_source_root(&db, &sources, &injected, &std::collections::BTreeSet::new());
     let config = ipe_db::BuildConfig::new(
         &db,
-        ipe_backend_rust::DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
     ipe::compile_prepared(
         &db,
@@ -155,18 +157,20 @@ impl WarmSession {
         let config = *self.config.get_or_insert_with(|| {
             ipe_db::BuildConfig::new(
                 &self.db,
-                ipe_backend_rust::DbDriver::Sqlite,
-                None,
-                ipe_ir::Target::Native,
-                Vec::new(),
-                ipe_backend_rust::MountBase::root(),
-                false,
-                ipe_backend_rust::BuildIntent::Development,
-                None,
-                false,
-                String::new(),
-                false,
-                false,
+                ipe_backend_rust::EmitSettings {
+                    db_driver: ipe_backend_rust::DbDriver::Sqlite,
+                    ffi: None,
+                    target: ipe_ir::Target::Native,
+                    wasm_public_env: Vec::new(),
+                    mount_base: ipe_backend_rust::MountBase::root(),
+                    wasm_hydrate_mode: false,
+                    runtime_dep: None,
+                    debugger: false,
+                    crate_name: ipe_backend_rust::CrateName::SingleFile,
+                    hot_appearance: false,
+                    host: ipe_backend_rust::EmitHost::Served,
+                    intent: ipe_backend_rust::BuildIntent::Development,
+                },
             )
         });
         ipe::compile_prepared(

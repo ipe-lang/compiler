@@ -339,7 +339,7 @@ pub fn typechecks(source: &str, snippet: &Path) -> StageOutcome {
 const ORACLE_SHARED_TARGET: &str = "IPE_ORACLE_SHARED_TARGET";
 
 /// The env var naming a unique emitted-crate package name, honoured by the
-/// single-file `ipe dev run` emit ([`crate::driver::single_file_cargo_name_from_env`]).
+/// single-file `ipe dev run` emit, which reads it once in the build pipeline.
 const EMIT_PACKAGE_NAME: &str = "IPE_EMIT_PACKAGE_NAME";
 
 /// Locate the `ipe` binary the probe drives `ipe dev run` through.
