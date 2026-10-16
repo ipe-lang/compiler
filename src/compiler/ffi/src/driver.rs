@@ -488,40 +488,218 @@ pub const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Permission bits of each FFI cache artifact [`FfiCache::write_package`] writes on Unix: its owner's only.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 
-/// Create `dir` and every missing ancestor, each new level owner-only on Unix.
+/// The FFI cache directory, reached level by level beneath its project root, never through a link.
 ///
-/// A level that already exists keeps its mode; the loader's owner rule judges it.
-fn create_private_dirs(dir: &Path) -> std::io::Result<()> {
+/// Every write and removal goes through it, so a link planted at a cache level
+/// (a cloned repository can commit one) never redirects an artifact outside
+/// the project; on Unix no later path lookup can be swapped either, since each
+/// level is opened through the handle on the level above it.
+struct CacheDir {
+    /// The held handle on the cache directory.
+    #[cfg(unix)]
+    dir: std::fs::File,
+    /// The cache directory, checked level by level without following a link.
+    #[cfg(not(unix))]
+    dir: PathBuf,
+}
+
+/// Why a cache level could not be reached: the level and the cause.
+struct LevelError {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+/// The name of a fresh temporary sibling of the entry `name`, unique to this call within this process.
+fn temp_name(name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Create the directory at `project_root` and any absent parent, owner-only on Unix.
+///
+/// The root is the anchor its caller named, so it is reached as named; only the
+/// cache levels beneath it are opened without following a link.
+fn create_project_root(project_root: &Path) -> Result<(), LevelError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, PRIVATE_DIR_MODE);
-    builder.create(dir)
+    builder.create(project_root).map_err(|source| LevelError {
+        path: project_root.to_path_buf(),
+        source,
+    })
 }
 
-/// Replace the entry at `path` with a new owner-only file holding `contents`.
-///
-/// The bytes go to a temporary sibling created exclusively, which refuses a
-/// link planted at its name, then a rename replaces the entry at `path`
-/// itself: a link planted there is replaced, never written through, and an
-/// existing artifact never keeps a wider mode than [`PRIVATE_FILE_MODE`].
-fn replace_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(format!(".{}.tmp", std::process::id()));
-    let temp = PathBuf::from(temp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, PRIVATE_FILE_MODE);
-    let mut file = options.open(&temp)?;
-    let written = file
-        .write_all(contents.as_bytes())
-        .and_then(|()| std::fs::rename(&temp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
+#[cfg(unix)]
+impl CacheDir {
+    /// Flags for opening one directory level.
+    fn dir_flags() -> rustix::fs::OFlags {
+        use rustix::fs::OFlags;
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC
     }
-    written
+
+    /// The cache beneath the directory at `project_root`; `None` when a level is absent and `create` is off.
+    ///
+    /// `project_root` itself is created (when `create`) and opened as named; each of
+    /// [`FFI_CACHE_COMPONENTS`] is opened beneath its parent's handle without
+    /// following a link, and created owner-only first when absent and `create`.
+    /// A level that already exists keeps its mode; the loader's owner rule judges it.
+    fn open(project_root: &Path, create: bool) -> Result<Option<Self>, LevelError> {
+        use rustix::fs::{CWD, Mode, OFlags};
+        use rustix::io::Errno;
+        let fail = |path: &Path, e: Errno| LevelError {
+            path: path.to_path_buf(),
+            source: e.into(),
+        };
+        if create {
+            create_project_root(project_root)?;
+        }
+        let mut level =
+            match rustix::fs::openat(CWD, project_root, Self::dir_flags(), Mode::empty()) {
+                Ok(fd) => std::fs::File::from(fd),
+                Err(e) if e == Errno::NOENT && !create => return Ok(None),
+                Err(e) => return Err(fail(project_root, e)),
+            };
+        let mut shown = project_root.to_path_buf();
+        let flags = Self::dir_flags() | OFlags::NOFOLLOW;
+        for name in FFI_CACHE_COMPONENTS {
+            shown.push(name);
+            match rustix::fs::openat(&level, name, flags, Mode::empty()) {
+                Ok(fd) => {
+                    level = std::fs::File::from(fd);
+                    continue;
+                }
+                Err(e) if e == Errno::NOENT && create => {}
+                Err(e) if e == Errno::NOENT => return Ok(None),
+                Err(e) => return Err(fail(&shown, e)),
+            }
+            match rustix::fs::mkdirat(&level, name, Mode::RWXU) {
+                Ok(()) => {}
+                Err(e) if e == Errno::EXIST => {}
+                Err(e) => return Err(fail(&shown, e)),
+            }
+            level = rustix::fs::openat(&level, name, flags, Mode::empty())
+                .map(std::fs::File::from)
+                .map_err(|e| fail(&shown, e))?;
+        }
+        Ok(Some(Self { dir: level }))
+    }
+
+    /// Replace the entry `name` with a new owner-only file holding `contents`.
+    ///
+    /// The bytes go to a temporary sibling ([`temp_name`]) created exclusively
+    /// and never through a link; a rename then replaces the entry `name`
+    /// itself, so a link planted there is replaced, never written through, and
+    /// an existing artifact never keeps a wider mode than [`PRIVATE_FILE_MODE`].
+    fn replace(&self, name: &str, contents: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        use rustix::fs::{AtFlags, Mode, OFlags};
+        use rustix::io::Errno;
+        let temp = temp_name(name);
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mode = Mode::RUSR | Mode::WUSR;
+        let fd = match rustix::fs::openat(&self.dir, temp.as_str(), flags, mode) {
+            Ok(fd) => fd,
+            // Left by a dead process that ran under this pid: the name is this call's alone.
+            Err(e) if e == Errno::EXIST => {
+                rustix::fs::unlinkat(&self.dir, temp.as_str(), AtFlags::empty())?;
+                rustix::fs::openat(&self.dir, temp.as_str(), flags, mode)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let written = std::fs::File::from(fd)
+            .write_all(contents.as_bytes())
+            .and_then(|()| {
+                rustix::fs::renameat(&self.dir, temp.as_str(), &self.dir, name).map_err(Into::into)
+            });
+        if written.is_err() {
+            let _ = rustix::fs::unlinkat(&self.dir, temp.as_str(), AtFlags::empty());
+        }
+        written
+    }
+
+    /// Remove the entry `name`, never through a link; an absent entry is fine.
+    fn remove(&self, name: &str) -> std::io::Result<()> {
+        use rustix::io::Errno;
+        match rustix::fs::unlinkat(&self.dir, name, rustix::fs::AtFlags::empty()) {
+            Ok(()) => Ok(()),
+            Err(e) if e == Errno::NOENT => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl CacheDir {
+    /// The cache beneath `project_root`; `None` when a level is absent and `create` is off.
+    ///
+    /// Each level is inspected without following a link, and created first
+    /// when absent and `create`; a link (a Windows junction included) or a
+    /// level that is not a directory is refused.
+    fn open(project_root: &Path, create: bool) -> Result<Option<Self>, LevelError> {
+        use std::io::ErrorKind;
+        if create {
+            create_project_root(project_root)?;
+        }
+        let mut level = project_root.to_path_buf();
+        for name in FFI_CACHE_COMPONENTS {
+            level.push(name);
+            let fail = |source: std::io::Error| LevelError {
+                path: level.clone(),
+                source,
+            };
+            match std::fs::symlink_metadata(&level) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound && create => {
+                    match std::fs::create_dir(&level) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                        Err(e) => return Err(fail(e)),
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(fail(e)),
+            }
+            let meta = std::fs::symlink_metadata(&level).map_err(fail)?;
+            if !meta.file_type().is_dir() {
+                return Err(fail(ErrorKind::NotADirectory.into()));
+            }
+        }
+        Ok(Some(Self { dir: level }))
+    }
+
+    /// Replace the entry `name` with a new file holding `contents`, through a temporary sibling and a rename.
+    fn replace(&self, name: &str, contents: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let temp = self.dir.join(temp_name(name));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let written = file
+            .write_all(contents.as_bytes())
+            .and_then(|()| std::fs::rename(&temp, self.dir.join(name)));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written
+    }
+
+    /// Remove the entry `name`; an absent entry is fine.
+    fn remove(&self, name: &str) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// The FFI cache path relative to its project root, built one component at a time.
@@ -633,9 +811,14 @@ impl FfiCache {
     /// other six artifacts are debug/watch projections the loader never
     /// trusts.
     ///
+    /// Each level of the cache is opened, or created owner-only, beneath the
+    /// project root without following a link (see [`CacheDir`]).
+    ///
     /// # Errors
     ///
-    /// `IPE-F4412` naming the first path that could not be written.
+    /// `IPE-F4412` naming a cache level that is a link or not a directory, or
+    /// the first path that could not be written; a wire-defect diagnostic when
+    /// the cache is not anchored at a project root.
     pub fn write_package(
         &self,
         pkg: &PkgInfo,
@@ -645,55 +828,77 @@ impl FfiCache {
             path: path.to_string_lossy().into_owned(),
             detail: e.to_string(),
         };
-        create_private_dirs(&self.root).map_err(|e| io_err(&self.root, &e))?;
-        let paths = self.artifact_paths(&slugify(pkg.name()));
+        let level_err = |e: LevelError| io_err(&e.path, &e.source);
+        let dir = CacheDir::open(self.project_root()?, true)
+            .map_err(level_err)?
+            .ok_or_else(|| io_err(&self.root, &std::io::ErrorKind::NotFound.into()))?;
+        let slug = slugify(pkg.name());
+        let names = ArtifactNames::for_slug(&slug);
+        let paths = self.artifact_paths(&slug);
         let iface = crate::interface::crate_interface(pkg);
         let consumer_json = emit_consumer_json(pkg, &iface, self)?;
-        let writes: [(&Path, String); 7] = [
+        let writes: [(&str, &Path, String); 7] = [
             (
+                &names.ipei,
                 &paths.ipei,
                 crate::emit::emit_ipei(pkg, &iface.transparent_types),
             ),
-            (&paths.kernel_json, crate::emit::emit_kernel_json(pkg)),
-            (&paths.bindings, crate::bindings::emit_bindings(pkg)),
-            (&paths.coverage, emit_coverage(pkg, &iface.skipped)),
-            (&paths.interface, iface.source),
-            (&paths.consumer, consumer_json),
-            (&paths.pkg_json, inspection_json.to_owned()),
+            (
+                &names.kernel_json,
+                &paths.kernel_json,
+                crate::emit::emit_kernel_json(pkg),
+            ),
+            (
+                &names.bindings,
+                &paths.bindings,
+                crate::bindings::emit_bindings(pkg),
+            ),
+            (
+                &names.coverage,
+                &paths.coverage,
+                emit_coverage(pkg, &iface.skipped),
+            ),
+            (&names.interface, &paths.interface, iface.source),
+            (&names.consumer, &paths.consumer, consumer_json),
+            (&names.pkg_json, &paths.pkg_json, inspection_json.to_owned()),
         ];
-        for (path, contents) in &writes {
-            replace_private_file(path, contents).map_err(|e| io_err(path, &e))?;
+        for (name, path, contents) in &writes {
+            dir.replace(name, contents).map_err(|e| io_err(path, &e))?;
         }
         Ok(paths)
     }
 
-    /// Delete a slug's four artifacts (`ipe remove`). Already-absent files
-    /// are fine — removal is idempotent.
+    /// Delete a slug's artifacts (`ipe rust remove`), never through a link.
+    /// Already-absent files, or an absent cache, are fine — removal is
+    /// idempotent.
     ///
     /// # Errors
     ///
-    /// `IPE-F4412` naming the first path that exists but cannot be deleted.
+    /// `IPE-F4412` naming a cache level that is a link or not a directory, or
+    /// the first artifact that exists but cannot be deleted; a wire-defect
+    /// diagnostic when the cache is not anchored at a project root.
     pub fn remove_package(&self, slug: &str) -> Result<(), Diagnostic> {
+        let io_err = |path: &Path, e: &std::io::Error| Diagnostic::ArtifactIo {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        };
+        let Some(dir) =
+            CacheDir::open(self.project_root()?, false).map_err(|e| io_err(&e.path, &e.source))?
+        else {
+            return Ok(());
+        };
+        let names = ArtifactNames::for_slug(slug);
         let paths = self.artifact_paths(slug);
-        for path in [
-            &paths.ipei,
-            &paths.kernel_json,
-            &paths.bindings,
-            &paths.coverage,
-            &paths.interface,
-            &paths.consumer,
-            &paths.pkg_json,
+        for (name, path) in [
+            (&names.ipei, &paths.ipei),
+            (&names.kernel_json, &paths.kernel_json),
+            (&names.bindings, &paths.bindings),
+            (&names.coverage, &paths.coverage),
+            (&names.interface, &paths.interface),
+            (&names.consumer, &paths.consumer),
+            (&names.pkg_json, &paths.pkg_json),
         ] {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(Diagnostic::ArtifactIo {
-                        path: path.to_string_lossy().into_owned(),
-                        detail: e.to_string(),
-                    });
-                }
-            }
+            dir.remove(name).map_err(|e| io_err(path, &e))?;
         }
         Ok(())
     }
@@ -2281,15 +2486,31 @@ mod tests {
     #[cfg(unix)]
     const GROUP_OR_OTHER: u32 = 0o077;
 
-    /// Whether the entry at `path`, not followed, grants nothing to its group or to others.
+    /// Whether the entry at `path`, not followed, grants no permission bit outside `allowed`.
+    ///
+    /// `allowed` is an owner-only mode, so a pass also means nothing is
+    /// granted to the entry's group or to others.
     #[cfg(unix)]
-    fn owner_only(path: &Path) -> bool {
+    fn within(path: &Path, allowed: u32) -> bool {
         use std::os::unix::fs::PermissionsExt as _;
+        const PERMISSION_BITS: u32 = 0o7777;
         let mode = std::fs::symlink_metadata(path)
             .expect("stat")
             .permissions()
             .mode();
-        mode & GROUP_OR_OTHER == 0
+        mode & PERMISSION_BITS & !allowed == 0
+    }
+
+    /// Whether the directory at `path`, not followed, is within [`PRIVATE_DIR_MODE`].
+    #[cfg(unix)]
+    fn private_dir(path: &Path) -> bool {
+        within(path, PRIVATE_DIR_MODE)
+    }
+
+    /// Whether the artifact at `path`, not followed, is within [`PRIVATE_FILE_MODE`].
+    #[cfg(unix)]
+    fn owner_only(path: &Path) -> bool {
+        within(path, PRIVATE_FILE_MODE)
     }
 
     #[cfg(unix)]
@@ -2316,7 +2537,7 @@ mod tests {
         let mut level = tmp.clone();
         for component in FFI_CACHE_COMPONENTS {
             level.push(component);
-            assert!(owner_only(&level), "{} is owner-only", level.display());
+            assert!(private_dir(&level), "{} is owner-only", level.display());
         }
         for artifact in every_artifact(&paths) {
             assert!(owner_only(artifact), "{} is owner-only", artifact.display());
@@ -2349,6 +2570,154 @@ mod tests {
             "nothing is written through the planted link"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A fresh scratch directory named for `tag` and this process.
+    #[cfg(unix)]
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = ipe_test_temp::temp_root().join(format!("ipe-ffi-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// The entry names under `dir`, sorted; empty when `dir` is absent.
+    #[cfg(unix)]
+    fn names_under(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .map(|entry| {
+                        entry
+                            .expect("list entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_cache_level_never_redirects_a_write_or_a_removal() {
+        use std::os::unix::fs::symlink;
+        let pkg = semver_pkg();
+        let names = ArtifactNames::for_slug(&slugify(pkg.name()));
+        for (index, linked) in FFI_CACHE_COMPONENTS.iter().enumerate() {
+            let root = scratch_dir(&format!("linked-level-root-{index}"));
+            let outside = scratch_dir(&format!("linked-level-outside-{index}"));
+            let mut level = root.clone();
+            for component in FFI_CACHE_COMPONENTS.iter().take(index) {
+                level.push(component);
+                std::fs::create_dir(&level).expect("create a real level");
+            }
+            let mut target = outside.clone();
+            for component in FFI_CACHE_COMPONENTS.iter().skip(index.saturating_add(1)) {
+                target.push(component);
+            }
+            std::fs::create_dir_all(&target).expect("the rest of the chain, outside");
+            symlink(&outside, level.join(linked)).expect("plant a link at one level");
+            let cache = FfiCache::at_project_root(&root);
+
+            let refused = cache.write_package(&pkg, &semver_json());
+            assert!(
+                matches!(refused, Err(Diagnostic::ArtifactIo { .. })),
+                "level {linked}: {refused:?}"
+            );
+            assert!(
+                names_under(&target).is_empty(),
+                "level {linked}: nothing is written through the link"
+            );
+
+            std::fs::write(target.join(&names.pkg_json), "kept").expect("an outside file");
+            let refused = cache.remove_package(&slugify(pkg.name()));
+            assert!(
+                matches!(refused, Err(Diagnostic::ArtifactIo { .. })),
+                "level {linked}: {refused:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(target.join(&names.pkg_json)).expect("read outside"),
+                "kept",
+                "level {linked}: nothing is removed through the link"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_level_that_is_a_file_refuses_the_write() {
+        let root = scratch_dir("file-level");
+        std::fs::write(root.join(CACHE_NAMESPACE_DIR), "").expect("a file where a level belongs");
+        let refused = FfiCache::at_project_root(&root).write_package(&semver_pkg(), &semver_json());
+        assert!(
+            matches!(refused, Err(Diagnostic::ArtifactIo { .. })),
+            "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// How many temporary names past the current one a leftover is planted at.
+    #[cfg(unix)]
+    const PLANTED_TEMPS: u64 = 256;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_at_a_temporary_name_is_replaced_never_written_through() {
+        use std::os::unix::fs::symlink;
+        let root = scratch_dir("stale-temp");
+        let outside = root.join("outside.txt");
+        std::fs::write(&outside, "kept").expect("write link target");
+        let cache = FfiCache::at_project_root(&root);
+        let pkg = semver_pkg();
+        let paths = cache.write_package(&pkg, &semver_json()).expect("writes");
+        let probe = temp_name("probe");
+        let current: u64 = probe
+            .rsplit('.')
+            .nth(1)
+            .and_then(|n| n.parse().ok())
+            .expect("the temporary name carries its counter");
+        let names = ArtifactNames::for_slug(&slugify(pkg.name()));
+        let every = [
+            &names.ipei,
+            &names.kernel_json,
+            &names.bindings,
+            &names.coverage,
+            &names.interface,
+            &names.consumer,
+            &names.pkg_json,
+        ];
+        let pid = std::process::id();
+        for name in every {
+            for next in 1..=PLANTED_TEMPS {
+                let temp = format!("{name}.{pid}.{}.tmp", current.saturating_add(next));
+                symlink(&outside, cache.root().join(temp)).expect("plant a leftover link");
+            }
+        }
+        cache
+            .write_package(&pkg, &semver_json())
+            .expect("a leftover at a temporary name does not block the write");
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read link target"),
+            "kept",
+            "nothing is written through a leftover link"
+        );
+        for artifact in every_artifact(&paths) {
+            assert!(
+                std::fs::symlink_metadata(artifact)
+                    .expect("stat")
+                    .file_type()
+                    .is_file(),
+                "{} is a regular file",
+                artifact.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
