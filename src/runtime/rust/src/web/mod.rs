@@ -739,6 +739,9 @@ pub struct SessionEntry<Model, Msg> {
     /// The resident bytes this session holds against the byte budget,
     /// returned when the entry drops.
     pub(crate) charge: budget::Charge,
+    /// The session's in-flight Cmd budget, shared with its driver: a Cmd holds
+    /// one of its units from its start until its Msg is queued.
+    pub(crate) cmds: Arc<budget::SessionCmds>,
 }
 
 #[cfg(feature = "web")]
@@ -767,6 +770,26 @@ impl<Model: RetainedBytes, Msg: RetainedBytes> SessionEntry<Model, Msg> {
 
 #[cfg(feature = "web")]
 impl<Model, Msg> SessionEntry<Model, Msg> {
+    /// Whether nothing on its way to this session's `update` would be lost were it evicted now.
+    ///
+    /// No Cmd holds a unit of its budget, no input taken off its queues is
+    /// still on its way to starting its Cmds, and its Msg, event and entry
+    /// queues are empty. A session whose driver is gone has nothing left to
+    /// deliver. Judged under the entry's lock, the lock the driver takes an
+    /// input under, so a taken input is either still queued or in its turn.
+    #[must_use]
+    pub fn is_quiescent(&self) -> bool {
+        fn drained<T>(tx: &Sender<T>) -> bool {
+            tx.capacity() == tx.max_capacity()
+        }
+        self.msg_tx.is_closed()
+            || (self.cmds.used().get() == 0
+                && !self.cmds.in_turn()
+                && drained(&self.msg_tx)
+                && drained(&self.event_tx)
+                && drained(&self.enter_tx))
+    }
+
     /// The credential section a checkpoint of this session carries.
     ///
     /// Armed, the session's bound set encoded by
@@ -1032,13 +1055,18 @@ enum Checkpoint {
     Stored,
     /// The session was closed; the write is undone.
     Closed,
+    /// Another handle holds the sid; nothing was written.
+    Displaced,
 }
 
-/// Write session `sid` through to the store, unless it was closed meanwhile.
+/// Write session `sid` through to the store, unless it was closed or
+/// displaced meanwhile.
 ///
 /// The closer is read after the write: a [`close_session`] that flipped it
 /// before this read has its delete repeated here, and one that flips it after
-/// deletes this write itself. A closed session is never stored again.
+/// deletes this write itself. A closed session is never stored again. A
+/// displaced handle wrote nothing and deletes nothing: the sid is another
+/// handle's.
 #[cfg(feature = "web")]
 async fn checkpoint<Model, Msg>(
     store: &Arc<dyn store::SessionStore<Model, Msg>>,
@@ -1049,7 +1077,9 @@ where
     Model: Send + 'static,
     Msg: Send + 'static,
 {
-    store.set(sid, Arc::clone(entry)).await;
+    if store.set(sid, Arc::clone(entry)).await == store::Installed::Displaced {
+        return Checkpoint::Displaced;
+    }
     let closed = entry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2680,8 +2710,50 @@ where
     }
     match checkpoint(store, sid, &strong).await {
         Checkpoint::Stored => EntryCommit::Entered(entered.model, entered.cmd),
-        Checkpoint::Closed => EntryCommit::SessionGone,
+        Checkpoint::Closed | Checkpoint::Displaced => EntryCommit::SessionGone,
     }
+}
+
+/// What [`take_input`] took off one session queue.
+#[cfg(feature = "web")]
+enum Taken<T> {
+    /// The next input, and the turn that keeps the session from eviction
+    /// until the input's Cmds hold their own units.
+    Input(T, budget::Turn),
+    /// The queue's senders are gone.
+    Closed,
+    /// The session is gone.
+    Gone,
+}
+
+/// Take the next input off `rx`, beginning its turn under the session's lock.
+///
+/// An eviction judges quiescence under the same lock, so it sees the input
+/// either still queued or in its turn, never neither.
+#[cfg(feature = "web")]
+async fn take_input<Model, Msg, T>(
+    entry: &Weak<Mutex<SessionEntry<Model, Msg>>>,
+    cmds: &Arc<budget::SessionCmds>,
+    rx: &mut Receiver<T>,
+) -> Taken<T> {
+    std::future::poll_fn(|cx| {
+        let Some(strong) = entry.upgrade() else {
+            return std::task::Poll::Ready(Taken::Gone);
+        };
+        let held = strong
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = match rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                std::task::Poll::Ready(Taken::Input(item, cmds.begin_turn()))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Taken::Closed),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        };
+        drop(held);
+        taken
+    })
+    .await
 }
 
 /// The per-session driver: folds each Msg through `update`, diffs the new view
@@ -2797,20 +2869,24 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     // disabled and the liveness tick ends the driver.
     let mut events_open = true;
     loop {
-        let (msg, queued) = tokio::select! {
-            maybe = msg_rx.recv() => match maybe {
-                Some(m) => (m, None),
-                None => break,
+        // Each input is taken with its turn, held until the Cmds it produced
+        // hold their own units: dropped at the end of the iteration, after
+        // `run_cmd`, or on the way out.
+        let (msg, queued, _turn) = tokio::select! {
+            taken = take_input(&entry, &cmds, &mut msg_rx) => match taken {
+                Taken::Input(m, turn) => (m, None, turn),
+                Taken::Closed | Taken::Gone => break,
             },
-            maybe = event_rx.recv(), if events_open => match maybe {
-                Some(QueuedEvent { msg, charge }) => (msg, Some(charge)),
-                None => {
+            taken = take_input(&entry, &cmds, &mut event_rx), if events_open => match taken {
+                Taken::Input(QueuedEvent { msg, charge }, turn) => (msg, Some(charge), turn),
+                Taken::Closed => {
                     events_open = false;
                     continue;
                 }
+                Taken::Gone => break,
             },
-            maybe = enter_rx.recv() => {
-                let Some(request) = maybe else {
+            taken = take_input(&entry, &cmds, &mut enter_rx) => {
+                let Taken::Input(request, turn) = taken else {
                     break;
                 };
                 // Re-prove the credentials before the entry runs; a refused
@@ -2830,6 +2906,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                     run_cmd(cmd, &msg_tx, &scope, &cmds);
                     sub_runtime.reconcile(subs(next));
                 });
+                drop(turn);
                 revocation.rearm(&scope);
                 continue;
             }
@@ -2982,8 +3059,8 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // alive. `strong` is dropped at the end of this iteration (block scope),
         // before the next select! park — never held across the await loop.
         // A session a request closed meanwhile is not stored again, and its
-        // Cmd never runs.
-        if checkpoint(&store, &sid, &strong).await == Checkpoint::Closed {
+        // Cmd never runs; nor is one another handle displaced.
+        if checkpoint(&store, &sid, &strong).await != Checkpoint::Stored {
             break;
         }
 
@@ -5076,6 +5153,7 @@ mod handlers {
             debug_cursor: None,
             liveness: SessionLiveness::new(scope.clone()),
             charge,
+            cmds: Arc::clone(&cmds),
         };
         // The first model is charged before the store, the driver or the
         // cookie learn of the session: a refused one runs no Cmd.
@@ -5097,9 +5175,15 @@ mod handlers {
         let view = st.view.clone();
         let subs = st.subs.clone();
         let route_entry = st.route_entry.clone();
+        // The session's first turn: from before the store holds it until its
+        // seed Cmd holds its own unit.
+        let birth = cmds.begin_turn();
         let commit = tokio::spawn(async move {
             let sid = owner.sid();
-            store.set(sid, entry.clone()).await;
+            if store.set(sid, entry.clone()).await == store::Installed::Displaced {
+                drop(owner);
+                return store::Installed::Displaced;
+            }
             tokio::spawn(drive_session(
                 Arc::downgrade(&entry),
                 msg_rx,
@@ -5118,18 +5202,24 @@ mod handlers {
             ));
             // Fire the entry Cmd into the loop (batched after init's on a miss).
             pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope, &cmds));
+            drop(birth);
             drop(owner);
+            store::Installed::Held
         });
-        if let Err(failed) = commit.await {
-            return match failed.try_into_panic() {
-                Ok(payload) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    crate::core::panic_500_body(&*payload),
-                )
-                    .into_response(),
-                Err(_) => entry_unavailable(),
-            };
+        match commit.await {
+            Ok(store::Installed::Held) => {}
+            Ok(store::Installed::Displaced) => return entry_unavailable(),
+            Err(failed) => {
+                return match failed.try_into_panic() {
+                    Ok(payload) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        crate::core::panic_500_body(&*payload),
+                    )
+                        .into_response(),
+                    Err(_) => entry_unavailable(),
+                };
+            }
         }
 
         #[cfg(feature = "debugger")]
@@ -7549,6 +7639,7 @@ mod reload_push_tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }))
     }
 
@@ -7558,8 +7649,14 @@ mod reload_push_tests {
     async fn push_reload_to_web_sessions_sends_one_frame_per_web_session() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store_impl.set("with_sse", handle_with(Some(sse_tx))).await;
-        store_impl.set("without_sse", handle_with(None)).await;
+        assert_eq!(
+            store_impl.set("with_sse", handle_with(Some(sse_tx))).await,
+            crate::web::Installed::Held
+        );
+        assert_eq!(
+            store_impl.set("without_sse", handle_with(None)).await,
+            crate::web::Installed::Held
+        );
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
         push_reload_to_web_sessions(&store).await;
@@ -7583,7 +7680,10 @@ mod reload_push_tests {
     async fn reload_push_skipped_on_release_under_env_dev() {
         let store_impl: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store_impl.set("s", handle_with(Some(sse_tx))).await;
+        assert_eq!(
+            store_impl.set("s", handle_with(Some(sse_tx))).await,
+            crate::web::Installed::Held
+        );
         let store: Arc<dyn SessionStore<(), ()>> = Arc::new(store_impl);
 
         maybe_push_reload_with(&store, None).await;
@@ -7660,6 +7760,7 @@ mod hot_appearance_push_tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }))
     }
 
@@ -7700,9 +7801,12 @@ mod hot_appearance_push_tests {
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
             let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
             // A non-initial Model, to prove the re-render uses the CURRENT Model.
-            store_impl
-                .set("live", session_with_current_view(7, Some(sse_tx)))
-                .await;
+            assert_eq!(
+                store_impl
+                    .set("live", session_with_current_view(7, Some(sse_tx)))
+                    .await,
+                crate::web::Installed::Held
+            );
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -7765,7 +7869,10 @@ mod hot_appearance_push_tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .rendered
                 .epoch();
-            store_impl.set("live", handle.clone()).await;
+            assert_eq!(
+                store_impl.set("live", handle.clone()).await,
+                crate::web::Installed::Held
+            );
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -7813,9 +7920,12 @@ mod hot_appearance_push_tests {
 
             let store_impl: MemoryStore<i64, ()> = MemoryStore::new(Duration::from_secs(60));
             let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-            store_impl
-                .set("live", session_with_current_view(3, Some(sse_tx)))
-                .await;
+            assert_eq!(
+                store_impl
+                    .set("live", session_with_current_view(3, Some(sse_tx)))
+                    .await,
+                crate::web::Installed::Held
+            );
             let store: Arc<dyn SessionStore<i64, ()>> = Arc::new(store_impl);
             let view: Arc<fn(i64) -> Html<()>> = Arc::new(app_view);
 
@@ -9496,6 +9606,7 @@ mod sse_reconnect_reconcile_tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }));
         Fixture {
             entry,
@@ -10276,6 +10387,7 @@ mod watch_status_handler_tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }))
     }
 
@@ -10359,9 +10471,12 @@ mod watch_status_handler_tests {
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store
-            .set("live-session", make_session_handle(Some(sse_tx)))
-            .await;
+        assert_eq!(
+            store
+                .set("live-session", make_session_handle(Some(sse_tx)))
+                .await,
+            crate::web::Installed::Held
+        );
         let state = make_state(store);
         let router = make_router(state);
 
@@ -10479,9 +10594,12 @@ mod watch_status_handler_tests {
     async fn no_sse_event_emitted_when_route_absent() {
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store
-            .set("session", make_session_handle(Some(sse_tx)))
-            .await;
+        assert_eq!(
+            store
+                .set("session", make_session_handle(Some(sse_tx)))
+                .await,
+            crate::web::Installed::Held
+        );
         // Route not mounted — production scenario.
         let prod_router: Router = Router::new();
         let req = Request::builder()
@@ -10510,7 +10628,10 @@ mod watch_status_handler_tests {
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store.set("sess", make_session_handle(Some(sse_tx))).await;
+        assert_eq!(
+            store.set("sess", make_session_handle(Some(sse_tx))).await,
+            crate::web::Installed::Held
+        );
         let state = make_state(store);
         let watch_build_status = state.watch_build_status.clone();
         let router = make_router(state);
@@ -10673,7 +10794,10 @@ mod watch_status_handler_tests {
 
         let store = Arc::new(TestStore::new(Duration::from_secs(60)));
         let (sse_tx, mut sse_rx) = sse::channel().expect("the default SSE buffer resolves");
-        store.set("s", make_session_handle(Some(sse_tx))).await;
+        assert_eq!(
+            store.set("s", make_session_handle(Some(sse_tx))).await,
+            crate::web::Installed::Held
+        );
         let state = make_state(store);
         let watch_build_status = state.watch_build_status.clone();
         let router = make_router(state);
@@ -14875,7 +14999,7 @@ mod route_entry_cmd_tests {
 
     /// A flood of cookieless GETs never holds more resident bytes than the
     /// budget, and every mint is served: each one past the budget evicts the
-    /// oldest unconnected session first, so one session stays resident.
+    /// oldest unconnected settled session first, so one session stays resident.
     #[test]
     fn budget_flood_stays_within_the_budget() {
         run(false, || async {
@@ -14897,6 +15021,15 @@ mod route_entry_cmd_tests {
                     process.used().get() <= limit.get(),
                     "resident bytes stay in budget"
                 );
+                // A session whose `init` and entry Cmds are still on their way
+                // is not evictable; let both land and the driver's turn end
+                // before the next mint.
+                assert!(
+                    settled(&store, &sid, 2)
+                        .await
+                        .is_some_and(|m| m.log.len() == 2)
+                );
+                assert!(quiescent(&store, &sid).await, "the session settles");
                 minted.push(sid);
             }
             assert_eq!(
@@ -14908,6 +15041,220 @@ mod route_entry_cmd_tests {
             assert!(
                 store.get(&newest).await.is_some(),
                 "the newest session stays"
+            );
+        });
+    }
+
+    #[cfg(feature = "db")]
+    thread_local! {
+        /// The gate the next [`held_init`] Cmd waits on before its Msg is built.
+        static HELD_GATE: std::cell::RefCell<Option<Arc<tokio::sync::Semaphore>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// An `init` whose Cmd yields `held` only once [`HELD_GATE`] lets it through.
+    #[cfg(feature = "db")]
+    fn held_init(_req: WebReq) -> (Model, IpeCmd<Msg>) {
+        let gate = HELD_GATE.with(|g| g.borrow().clone());
+        let cmd = crate::tea::perform_for_test(
+            move || {
+                Box::pin(async move {
+                    if let Some(gate) = gate {
+                        let _released = gate.acquire().await;
+                    }
+                    Msg::Loaded("held".to_owned())
+                })
+            },
+            Msg::Loaded("refused".to_owned()),
+        );
+        (
+            Model {
+                page: Page::Home,
+                log: Vec::new(),
+            },
+            cmd,
+        )
+    }
+
+    /// Byte pressure never evicts a SQLite-stored session whose Cmd is still
+    /// running: the live handle stays, and the Cmd's Msg reaches its model
+    /// once the Cmd finishes.
+    #[cfg(feature = "db")]
+    #[test]
+    #[allow(clippy::expect_used)] // test: the temp store opens and the page stores its session
+    fn eviction_keeps_a_session_with_a_cmd_in_flight() {
+        run(false, || async {
+            let path = crate::scratch_core::test_temp_root()
+                .join(format!("ipetest_inflight_evict_{}.db", std::process::id()));
+            let p = path.to_str().expect("a UTF-8 temp path").to_owned();
+            let _ = std::fs::remove_file(p.as_str());
+            let store: Store = Arc::new(
+                store::SqliteStore::<Model, Msg>::new(
+                    p.as_str(),
+                    Duration::from_secs(60),
+                    [7u8; 32],
+                )
+                .await
+                .expect("the temp SQLite store opens"),
+            );
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            HELD_GATE.with(|g| *g.borrow_mut() = Some(Arc::clone(&gate)));
+            let mut state = fixture_state(store.clone(), Arc::new(AtomicUsize::new(0)));
+            state.init = Arc::new(held_init);
+            let app = build_web_router(state, false)
+                .map(crate::server::behind_listener)
+                .expect("the fixture route table and base are well-formed");
+            let (status, _, sid, _) = get_via(app, "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let entered = settled(&store, &sid, 1)
+                .await
+                .expect("the page stored its session");
+            assert_eq!(entered.log, vec!["enter:home".to_owned()]);
+            let live = Arc::downgrade(&handle_of(&store, &sid).await.expect("the session is live"));
+
+            let _ = store
+                .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
+                .await;
+            let kept = live.upgrade();
+            assert!(
+                kept.as_ref().is_some_and(|h| store.holds(&sid, h)),
+                "a session with a Cmd in flight is never evicted"
+            );
+            drop(kept);
+
+            gate.add_permits(1);
+            let done = settled(&store, &sid, 2)
+                .await
+                .expect("the session is still live");
+            assert_eq!(
+                count(&done, "held"),
+                1,
+                "the Cmd's Msg reached the model: {done:?}"
+            );
+            HELD_GATE.with(|g| *g.borrow_mut() = None);
+            drop(store);
+            let _ = std::fs::remove_file(p.as_str());
+        });
+    }
+
+    /// A memory store whose `set` of a model `pause` matches waits, once the
+    /// handle is installed, for the test's release, so a test evicts between
+    /// a write and the Cmds the writer starts after it.
+    struct PausedAfterInstall {
+        inner: MemoryStore<Model, Msg>,
+        pause: fn(&Model) -> bool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl PausedAfterInstall {
+        fn new(pause: fn(&Model) -> bool) -> Self {
+            Self {
+                inner: MemoryStore::new(Duration::from_secs(60)),
+                pause,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore<Model, Msg> for PausedAfterInstall {
+        async fn get(&self, sid: &str) -> Option<SessionHandle<Model, Msg>> {
+            self.inner.get(sid).await
+        }
+        fn admission(&self) -> &store::SidAdmission {
+            self.inner.admission()
+        }
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
+            let paused = (self.pause)(&handle.lock().unwrap_or_else(|e| e.into_inner()).model);
+            let installed = self.inner.set(sid, handle).await;
+            if paused {
+                self.entered.notify_one();
+                if let Ok(permit) = self.release.acquire().await {
+                    permit.forget();
+                }
+            }
+            installed
+        }
+        async fn delete(&self, sid: &str) {
+            self.inner.delete(sid).await;
+        }
+        async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>> {
+            self.inner.web_sessions().await
+        }
+        async fn evict_unconnected(&self, need: crate::retained::Bytes) -> crate::retained::Bytes {
+            self.inner.evict_unconnected(need).await
+        }
+        fn holds(&self, sid: &str, handle: &store::SessionHandle<Model, Msg>) -> bool {
+            self.inner.holds(sid, handle)
+        }
+    }
+
+    /// Byte pressure while a new session's first write is in progress never
+    /// evicts it before its `init` and entry Cmds have started: both Msgs
+    /// reach the model.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the spawned request answers
+    fn eviction_never_takes_a_new_session_before_its_cmds_start() {
+        run(false, || async {
+            let paused = Arc::new(PausedAfterInstall::new(|m| m.log.is_empty()));
+            let store: Store = paused.clone();
+            let app = router(store.clone());
+            let request = tokio::spawn(async move { get_via(app, "/", None).await });
+            paused.entered.notified().await;
+            let _ = store
+                .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
+                .await;
+            paused.release.add_permits(1);
+            let (status, _, sid, _) = request.await.expect("the page answers");
+            assert_eq!(status, StatusCode::OK);
+            let m = settled(&store, &sid, 2).await;
+            assert_eq!(
+                m.map(|m| (count(&m, "init"), count(&m, "enter:home"))),
+                Some((1, 1)),
+                "the session stayed resident until its Cmds started"
+            );
+        });
+    }
+
+    /// The fixture `update`, whose second Msg starts one more Cmd.
+    fn chaining_update(msg: Msg, model: Model) -> (Model, IpeCmd<Msg>) {
+        let (next, _) = update(msg, model);
+        let cmd = if next.log.len() == 2 {
+            load("chained".to_owned())
+        } else {
+            IpeCmd::None
+        };
+        (next, cmd)
+    }
+
+    /// Byte pressure while the driver writes the model an `update` produced
+    /// never evicts the session before that update's Cmd has started: the
+    /// Cmd's Msg reaches the model.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the fixture route table and base are well-formed
+    fn eviction_never_takes_a_session_mid_update() {
+        run(false, || async {
+            let paused = Arc::new(PausedAfterInstall::new(|m| m.log.len() == 2));
+            let store: Store = paused.clone();
+            let mut state = fixture_state(store.clone(), Arc::new(AtomicUsize::new(0)));
+            state.update = Arc::new(chaining_update);
+            let app = build_web_router(state, false)
+                .map(crate::server::behind_listener)
+                .expect("the fixture route table and base are well-formed");
+            let (status, _, sid, _) = get_via(app, "/", None).await;
+            assert_eq!(status, StatusCode::OK);
+            paused.entered.notified().await;
+            let _ = store
+                .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
+                .await;
+            paused.release.add_permits(1);
+            let m = settled(&store, &sid, 3).await;
+            assert_eq!(
+                m.map(|m| count(&m, "chained")),
+                Some(1),
+                "the session stayed resident until its update's Cmd started"
             );
         });
     }
@@ -14956,8 +15303,8 @@ mod route_entry_cmd_tests {
         fn admission(&self) -> &store::SidAdmission {
             self.0.admission()
         }
-        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-            self.0.set(sid, handle).await;
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
+            self.0.set(sid, handle).await
         }
         async fn delete(&self, sid: &str) {
             self.0.delete(sid).await;
@@ -15297,6 +15644,20 @@ mod route_entry_cmd_tests {
         model_of(store, sid).await
     }
 
+    /// Wait (bounded) until the session has nothing on its way to `update`.
+    async fn quiescent(store: &Store, sid: &str) -> bool {
+        for _ in 0..200 {
+            if handle_of(store, sid)
+                .await
+                .is_some_and(|h| h.lock().unwrap_or_else(|e| e.into_inner()).is_quiescent())
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     fn count(model: &Model, label: &str) -> usize {
         model.log.iter().filter(|l| l.as_str() == label).count()
     }
@@ -15383,8 +15744,8 @@ mod route_entry_cmd_tests {
                 store::Rejoin::Miss
             }
         }
-        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-            self.live.set(sid, handle).await;
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
+            self.live.set(sid, handle).await
         }
         async fn delete(&self, sid: &str) {
             self.live.delete(sid).await;
@@ -15868,8 +16229,8 @@ mod route_entry_cmd_tests {
             tokio::task::yield_now().await;
             rejoin
         }
-        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-            self.inner.set(sid, handle).await;
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
+            self.inner.set(sid, handle).await
         }
         async fn delete(&self, sid: &str) {
             self.inner.delete(sid).await;
@@ -15968,12 +16329,12 @@ mod route_entry_cmd_tests {
         ) -> store::Rejoin<Model, Msg> {
             self.inner.get_reconstructing(claim, make_init).await
         }
-        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
             self.entered.notify_one();
             if let Ok(permit) = self.release.acquire().await {
                 permit.forget();
             }
-            self.inner.set(sid, handle).await;
+            self.inner.set(sid, handle).await
         }
         async fn delete(&self, sid: &str) {
             self.inner.delete(sid).await;
@@ -16047,11 +16408,11 @@ mod route_entry_cmd_tests {
         ) -> store::Rejoin<Model, Msg> {
             self.inner.get_reconstructing(claim, make_init).await
         }
-        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
+        async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> crate::web::Installed {
             if self.armed.swap(false, Ordering::SeqCst) {
                 panic!("the first commit unwinds mid-publish");
             }
-            self.inner.set(sid, handle).await;
+            self.inner.set(sid, handle).await
         }
         async fn delete(&self, sid: &str) {
             self.inner.delete(sid).await;
@@ -16240,8 +16601,9 @@ mod route_entry_cmd_tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }));
-        store.set(&sid, entry).await;
+        assert_eq!(store.set(&sid, entry).await, crate::web::Installed::Held);
         (sid, enter_rx)
     }
 
@@ -17708,8 +18070,12 @@ mod web_revocation_tests {
         fn admission(&self) -> &store::SidAdmission {
             self.inner.admission()
         }
-        async fn set(&self, sid: &str, handle: store::SessionHandle<Model, Msg>) {
-            self.inner.set(sid, handle).await;
+        async fn set(
+            &self,
+            sid: &str,
+            handle: store::SessionHandle<Model, Msg>,
+        ) -> crate::web::Installed {
+            self.inner.set(sid, handle).await
         }
         async fn delete(&self, sid: &str) {
             let closed = self
@@ -17832,8 +18198,12 @@ mod web_revocation_tests {
         fn admission(&self) -> &store::SidAdmission {
             self.inner.admission()
         }
-        async fn set(&self, sid: &str, handle: store::SessionHandle<Model, Msg>) {
-            self.inner.set(sid, handle).await;
+        async fn set(
+            &self,
+            sid: &str,
+            handle: store::SessionHandle<Model, Msg>,
+        ) -> crate::web::Installed {
+            let installed = self.inner.set(sid, handle).await;
             let armed = self
                 .subject
                 .lock()
@@ -17842,6 +18212,7 @@ mod web_revocation_tests {
             if let Some(subject) = armed {
                 assert!(crate::revocation::revoke_subject_unannounced(subject).is_ok());
             }
+            installed
         }
         async fn delete(&self, sid: &str) {
             self.inner.delete(sid).await;
