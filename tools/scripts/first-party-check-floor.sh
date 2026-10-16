@@ -29,6 +29,9 @@ if [ ! -x "$IPE_BIN" ]; then
   echo "ERROR: ipe binary not at '$IPE_BIN' — build it: cargo build --release -p ipe (or set IPE_BIN)." >&2; exit 2
 fi
 
+# Each example is checked from its own root (cwd = the project root), so the binary must resolve from any directory.
+IPE_BIN="$(cd "$(dirname "$IPE_BIN")" && pwd)/$(basename "$IPE_BIN")"
+
 echo "=== Ipê first-party ipe-check floor (repo: $REPO · ipe: $IPE_BIN) ==="
 
 # Capture the producer's output AND exit status up front: a `while read < <(…)`
@@ -49,7 +52,7 @@ while IFS= read -r dir; do
   checked=$((checked + 1))
   # `ipe type-check` type-checks the source graph reachable from the entry; it emits
   # no Rust and runs no cargo, so the floor stays fast and deterministic.
-  if timeout 120 "$IPE_BIN" type-check "$dir/src/Main.ipe" >/tmp/first-party-check.$$.log 2>&1; then
+  if ( cd "$dir" && timeout 120 "$IPE_BIN" type-check src/Main.ipe ) >/tmp/first-party-check.$$.log 2>&1; then
     printf '  ok    %s\n' "$dir"
   else
     printf '  FAIL  %s\n' "$dir"
