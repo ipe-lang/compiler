@@ -1101,13 +1101,15 @@ unitPageOf uid state =
 -- queue no longer lists it. A busy decision records the epoch whose process
 -- runs it: slot ownership is tied to process lifetime, so one owned by
 -- another epoch is idle. `DecisionNotSaved` is the notice of the last
--- decision that was not saved; the next decision started, or the next queue
--- load that succeeds, replaces it, so a reload clears it as its text advises.
+-- decision that was not saved, with the queue's latest load ticket when it
+-- was raised; the next decision started, or a queue load started after it
+-- that succeeds, replaces it, so a reload clears it as its text advises,
+-- and a load that read the queue before the failure was known does not.
 type DecisionSlot
     = DecisionIdle
     | DecisionSaving Uid Epoch
     | DecisionRefreshing Uid Epoch
-    | DecisionNotSaved SaveFailure
+    | DecisionNotSaved SaveFailure LoadTicket
 
 
 -- The decision on `uid` and the process `epoch` runs it in, while that
@@ -1132,7 +1134,7 @@ busyOwnedBy epoch slot =
         DecisionIdle ->
             Nothing
 
-        DecisionNotSaved _ ->
+        DecisionNotSaved _ _ ->
             Nothing
 
 
@@ -1159,7 +1161,7 @@ ownedSlot epoch slot =
 
         Nothing ->
             case slot of
-                DecisionNotSaved _ ->
+                DecisionNotSaved _ _ ->
                     slot
 
                 DecisionIdle ->
@@ -1185,12 +1187,12 @@ decisionWritten epoch uid slot =
 
 
 -- The decision on `uid` run by process `epoch` was not saved, for
--- `failure`. A result for any other uid or from any other process leaves
--- the slot.
-decisionNotSaved : Epoch -> Uid -> SaveFailure -> DecisionSlot -> DecisionSlot
-decisionNotSaved epoch uid failure slot =
+-- `failure`, while `latest` is the queue's latest load. A result for any
+-- other uid or from any other process leaves the slot.
+decisionNotSaved : Epoch -> Uid -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
+decisionNotSaved epoch uid failure latest slot =
     if isSaving epoch uid slot then
-        DecisionNotSaved failure
+        DecisionNotSaved failure latest
 
     else
         slot
@@ -1208,37 +1210,44 @@ isSaving epoch uid slot =
         DecisionIdle ->
             False
 
-        DecisionNotSaved _ ->
+        DecisionNotSaved _ _ ->
             False
 
 
--- A decision refused before it started, for `failure`: the notice replaces
--- an idle slot or an older notice, never a busy decision of process `epoch`.
-decisionRefused : Epoch -> SaveFailure -> DecisionSlot -> DecisionSlot
-decisionRefused epoch failure slot =
+-- A decision refused before it started, for `failure`, while `latest` is
+-- the queue's latest load: the notice replaces an idle slot or an older
+-- notice, never a busy decision of process `epoch`.
+decisionRefused : Epoch -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
+decisionRefused epoch failure latest slot =
     case busyOwnedBy epoch slot of
         Just _ ->
             slot
 
         Nothing ->
-            DecisionNotSaved failure
+            DecisionNotSaved failure latest
 
 
--- The current queue load settled with `result`. The reloaded queue no
--- longer lists a refreshing decision's row, or failed and lists no row, so
--- the decision is done either way; a load that succeeds also clears the
--- not-saved notice, the reload its text advises. A decision still saving
--- stays: its row is re-proved at the write, and its own result settles it.
-queueSettled : Result e a -> DecisionSlot -> DecisionSlot
-queueSettled result slot =
+-- The current queue load `load` settled with `result`. The reloaded queue
+-- no longer lists a refreshing decision's row, or failed and lists no row,
+-- so the decision is done either way; a load started after the not-saved
+-- notice that succeeds also clears it, the reload its text advises, while
+-- a load started before it read the queue before the failure was known
+-- and leaves it. A decision still saving stays: its row is re-proved at
+-- the write, and its own result settles it.
+queueSettled : LoadTicket -> Result e a -> DecisionSlot -> DecisionSlot
+queueSettled load result slot =
     case slot of
         DecisionRefreshing _ _ ->
             DecisionIdle
 
-        DecisionNotSaved _ ->
+        DecisionNotSaved _ raisedAt ->
             case result of
                 Ok _ ->
-                    DecisionIdle
+                    if ticketNumber load > ticketNumber raisedAt then
+                        DecisionIdle
+
+                    else
+                        slot
 
                 Err _ ->
                     slot
@@ -1274,7 +1283,7 @@ pendingText uid slot =
         DecisionIdle ->
             Nothing
 
-        DecisionNotSaved _ ->
+        DecisionNotSaved _ _ ->
             Nothing
 
 
@@ -1282,7 +1291,7 @@ pendingText uid slot =
 notSavedOf : DecisionSlot -> Maybe SaveFailure
 notSavedOf slot =
     case slot of
-        DecisionNotSaved failure ->
+        DecisionNotSaved failure _ ->
             Just failure
 
         DecisionIdle ->

@@ -229,7 +229,7 @@ update settings msg model =
             if Queue.isCurrentLoad load model.queueLoad then
                 let
                     loaded =
-                        { model | queueState = Queue.stateFromResult result, refusingUid = Nothing, decision = Queue.queueSettled result model.decision }
+                        { model | queueState = Queue.stateFromResult result, refusingUid = Nothing, decision = Queue.queueSettled load result model.decision }
                 in
                 viewAfterLoad settings { loaded | selected = clampIndex model.selected (List.length (queueList loaded)) }
 
@@ -270,7 +270,7 @@ update settings msg model =
                     ( { model | decision = Queue.decisionWritten epoch uid model.decision, queueLoad = load }, drainAndReload settings model attested written load )
 
                 Err e ->
-                    ( { model | decision = Queue.decisionNotSaved epoch uid (Queue.saveFailureOf e) model.decision }, Cmd.none )
+                    ( { model | decision = Queue.decisionNotSaved epoch uid (Queue.saveFailureOf e) model.queueLoad model.decision }, Cmd.none )
 
         Navigated page ->
             enterPage settings page model
@@ -509,12 +509,12 @@ pageRefusal model uid =
 saveDecision : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model target uid decision =
     if model.page /= QueuePage then
-        ( { model | decision = Queue.decisionRefused settings.epoch SaveOffQueue model.decision }, Cmd.none )
+        ( { model | decision = Queue.decisionRefused settings.epoch SaveOffQueue model.queueLoad model.decision }, Cmd.none )
 
     else
         case settings.key of
             ReadOnly ->
-                ( { model | decision = Queue.decisionRefused settings.epoch SaveReadOnly model.decision }, Cmd.none )
+                ( { model | decision = Queue.decisionRefused settings.epoch SaveReadOnly model.queueLoad model.decision }, Cmd.none )
 
             Signing _ ->
                 case Queue.startDecision settings.epoch uid model.decision of

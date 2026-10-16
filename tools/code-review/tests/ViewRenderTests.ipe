@@ -556,7 +556,7 @@ decisionErrorFixedText loaded =
             cardModel loaded
     in
     List.all
-        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decision = DecisionNotSaved failure }))
+        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decision = DecisionNotSaved failure Queue.firstTicket }))
         [ SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
         && not (has "Decision save failed: " (page card))
 

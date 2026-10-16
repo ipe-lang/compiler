@@ -327,8 +327,8 @@ decisionsSingleFlight settings a b =
         == Just ua
         && refusing.refuseDraft
         == "needs a test"
-        && settled.decision
-        == DecisionNotSaved SaveFailed
+        && Queue.notSavedOf settled.decision
+        == Just SaveFailed
         && next.decision
         == DecisionSaving ua settings.epoch
         && lateOther.decision
@@ -397,8 +397,8 @@ foreignDecisionIsIdle settings otherEpoch a b =
         == Nothing
         && foreignResult.decision
         == DecisionSaving ua settings.epoch
-        && ownResult.decision
-        == DecisionNotSaved SaveFailed
+        && Queue.notSavedOf ownResult.decision
+        == Just SaveFailed
 
 
 -- A source read left in flight by another process is `NoneSelected`: a
@@ -489,10 +489,10 @@ decisionOffQueueHoldsNoSlot settings a b =
         savingThenOff =
             after settings [ ApproveUnit ua ] { onQueue | page = HistoryPage }
     in
-    onUnitPage.decision
-        == DecisionNotSaved SaveOffQueue
-        && onHistory.decision
-        == DecisionNotSaved SaveOffQueue
+    Queue.notSavedOf onUnitPage.decision
+        == Just SaveOffQueue
+        && Queue.notSavedOf onHistory.decision
+        == Just SaveOffQueue
         && onQueue.decision
         == DecisionSaving ua settings.epoch
         && backOnQueue.decision
@@ -585,19 +585,19 @@ saveFailureRendered settings a b =
         movedPage =
             page moved
     in
-    busy.decision
-        == DecisionNotSaved SaveContended
+    Queue.notSavedOf busy.decision
+        == Just SaveContended
         && String.contains "the index or review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
         && not (String.contains "[5]" busyPage)
         && not (String.contains busyText busyPage)
-        && other.decision
-        == DecisionNotSaved SaveFailed
+        && Queue.notSavedOf other.decision
+        == Just SaveFailed
         && String.contains (Queue.saveFailureText SaveFailed) otherPage
         && not (String.contains "Unexpected" otherPage)
         && not (String.contains otherText otherPage)
-        && moved.decision
-        == DecisionNotSaved SaveFailed
+        && Queue.notSavedOf moved.decision
+        == Just SaveFailed
         && String.contains (Queue.saveFailureText SaveFailed) movedPage
         && not (String.contains (Error.message LibDb.headMoved) movedPage)
 
@@ -611,8 +611,8 @@ readOnlySaveRefused settings a b =
         refused =
             after { settings | key = ReadOnly } [ ApproveUnit a.unit.uid ] (queueModel [ a, b ] (ViewShown a))
     in
-    refused.decision
-        == DecisionNotSaved SaveReadOnly
+    Queue.notSavedOf refused.decision
+        == Just SaveReadOnly
         && String.contains (Error.message ReviewKey.readOnlyError) (page refused)
 
 
@@ -733,16 +733,56 @@ notSavedClearedByReload settings a b =
         banner =
             "Decision save failed: " ++ Queue.saveFailureText SaveFailed
     in
-    failed.decision
-        == DecisionNotSaved SaveFailed
+    Queue.notSavedOf failed.decision
+        == Just SaveFailed
         && String.contains banner (page failed)
-        && reloading.decision
-        == DecisionNotSaved SaveFailed
+        && Queue.notSavedOf reloading.decision
+        == Just SaveFailed
         && reloaded.decision
         == DecisionIdle
         && not (String.contains banner (page reloaded))
-        && reloadFailed.decision
-        == DecisionNotSaved SaveFailed
+        && Queue.notSavedOf reloadFailed.decision
+        == Just SaveFailed
+
+
+-- Only a reload started after the failure clears its notice: a queue load
+-- started while the decision was saving, by a page entry or a reconnect,
+-- read the queue before the failure was known, so its result keeps the
+-- notice, and the reload after it clears it. Red if a load that predates
+-- the failure wipes the notice before the reviewer saw why the decision
+-- was not saved.
+notSavedOutlivesOlderLoad : Settings.AppSettings -> Index.UnitView -> Index.UnitView -> Bool
+notSavedOutlivesOlderLoad settings a b =
+    let
+        ua =
+            a.unit.uid
+
+        enteredWhileSaving =
+            after settings [ ApproveUnit ua, Navigated QueuePage ] (queueModel [ a, b ] (ViewShown a))
+
+        failed =
+            after settings [ DecisionSaved ua settings.epoch (Err (Error.conflict "boom")) ] enteredWhileSaving
+
+        olderLoaded =
+            after settings [ PendingLoaded enteredWhileSaving.queueLoad (Ok (queuePageOf [ a, b ])) ] failed
+
+        reloading =
+            after settings [ Navigated QueuePage ] olderLoaded
+
+        reloaded =
+            after settings [ PendingLoaded reloading.queueLoad (Ok (queuePageOf [ a, b ])) ] reloading
+
+        banner =
+            "Decision save failed: " ++ Queue.saveFailureText SaveFailed
+    in
+    Queue.notSavedOf failed.decision
+        == Just SaveFailed
+        && Queue.notSavedOf olderLoaded.decision
+        == Just SaveFailed
+        && String.contains banner (page olderLoaded)
+        && reloaded.decision
+        == DecisionIdle
+        && not (String.contains banner (page reloaded))
 
 
 -- The written-decision checks, on a decision really written through
@@ -780,6 +820,7 @@ checks =
             , ( "a failed save is a typed case whose banner holds no error text", saveFailureRendered settings a b )
             , ( "a decision on a read-only server is refused before it takes the slot", readOnlySaveRefused settings a b )
             , ( "a not-saved notice is cleared by the reload it advises", notSavedClearedByReload settings a b )
+            , ( "a queue load started before a failed save keeps its notice", notSavedOutlivesOlderLoad settings a b )
             ]
         )
         |> Task.andThen (\rows -> writtenChecks |> Task.map (\written -> rows ++ written))
