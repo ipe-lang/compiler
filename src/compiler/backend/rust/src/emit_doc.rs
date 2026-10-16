@@ -2120,11 +2120,11 @@ mod tests {
     use ipe_ir::once_closure::MovedCapture;
 
     use super::build_doc;
+    use crate::EmitCtx;
     use crate::doc::{ChainOperand, Doc, whitespace_normalize};
     use crate::emit_expr::{InfixOp, emit_expr_at};
     use crate::emit_types::GenericScope;
     use crate::render::{RenderConfig, render};
-    use crate::{DbDriver, EmitCtx};
 
     /// A minimal one-module `Program` whose interner carries a handful of value
     /// identifiers (`a`, `b`, `c`, `x`) so `Expr::Var` fixtures resolve. The

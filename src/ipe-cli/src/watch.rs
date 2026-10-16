@@ -734,15 +734,17 @@ fn watch_emit_settings(
         hot_appearance,
         ..crate::BuildOptions::default()
     };
-    match resolved.manifest.as_deref() {
-        Some(manifest) => crate::driver::manifest_emit_settings(
-            manifest,
-            &resolved.blame_path,
-            &options,
-            crate::delivery::HostIntent::Served,
-        ),
-        None => crate::driver::loose_emit_settings(ipe_backend_rust::DbDriver::Sqlite, &options),
-    }
+    resolved.manifest.as_deref().map_or_else(
+        || crate::driver::loose_emit_settings(ipe_backend_rust::DbDriver::Sqlite, &options),
+        |manifest| {
+            crate::driver::manifest_emit_settings(
+                manifest,
+                &resolved.blame_path,
+                &options,
+                crate::delivery::HostIntent::Served,
+            )
+        },
+    )
 }
 
 /// The floor every watch rebuild's crate carries: the development marker.
@@ -1313,6 +1315,7 @@ fn run_inner(
                     schedule_resolve_retry(&evt_tx);
                 }
 
+                let settings = watch_emit_settings(&resolved, opts.debugger, opts.hot_appearance);
                 let mut sources = resolved.sources;
                 let mut discovered = resolved.discovered;
                 let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
@@ -1376,7 +1379,7 @@ fn run_inner(
                         runtime_dep: Some(ipe_backend_rust::RuntimeDep {
                             root: runtime_dep_root.clone(),
                         }),
-                        ..watch_emit_settings(&resolved, opts.debugger, opts.hot_appearance)
+                        ..settings
                     },
                 });
 

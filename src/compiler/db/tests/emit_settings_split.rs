@@ -7,7 +7,7 @@
 //! only one of them would make a split build diverge from a single-file one.
 
 use ipe_backend_rust::{
-    BuildIntent, CrateName, DbDriver, EmitHost, EmitSettings, MountBase, WebViewWindow,
+    BuildIntent, CrateName, DbDriver, EmitHost, EmitSettings, MountBase, RuntimeDep, WebViewWindow,
 };
 use ipe_db::{BuildConfig, IpeDatabase, ModuleOrigin, SourceFile, SourceRoot};
 
@@ -140,6 +140,8 @@ fn split_root(db: &IpeDatabase, lib: SourceFile, main: SourceFile) -> SourceRoot
     SourceRoot::new(db, files)
 }
 
+/// Dependency-model settings: the debugger module lives only in the linked
+/// runtime crate, so both the plain and the debugger build link one.
 fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
     EmitSettings {
         db_driver: DbDriver::Sqlite,
@@ -148,7 +150,9 @@ fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
         wasm_public_env: Vec::new(),
         mount_base: MountBase::root(),
         wasm_hydrate_mode: false,
-        runtime_dep: None,
+        runtime_dep: Some(RuntimeDep {
+            root: std::path::PathBuf::from("/ipe-runtime"),
+        }),
         debugger,
         crate_name: CrateName::SingleFile,
         hot_appearance: false,

@@ -542,7 +542,7 @@ mod tests {
     use ipe_ir::{IrType, Program};
 
     use super::model_schema_tag;
-    use crate::{DbDriver, EmitCtx};
+    use crate::EmitCtx;
 
     /// An `EmitCtx` over an empty program — enough for hashing types whose
     /// leaves are builtins (no user enums to resolve).

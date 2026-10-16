@@ -1318,8 +1318,8 @@ mod schema_tag_tests {
     use ipe_intern::Interner;
     use ipe_ir::{Callee, Expr, Func, FuncId, IrType, KernelFn, ModPath, Module, Program, UiCtor};
 
+    use crate::EmitCtx;
     use crate::emit_types::GenericScope;
-    use crate::{DbDriver, EmitCtx};
 
     fn fn_item(interner: &mut Interner, id: u32, name: &str) -> DResult<Func> {
         Ok(Func {

@@ -169,7 +169,7 @@ fn single_file_crate_name() -> ipe_backend_rust::CrateName {
 /// `runtime_dep` stay `None` here: the compile core fills both once it has
 /// resolved them.
 #[must_use]
-pub(crate) fn loose_emit_settings(
+pub fn loose_emit_settings(
     db_driver: ipe_backend_rust::DbDriver,
     options: &BuildOptions,
 ) -> ipe_backend_rust::EmitSettings {
@@ -198,7 +198,7 @@ pub(crate) fn loose_emit_settings(
 /// `runtime_dep` stay `None` here: the compile core fills both once it has
 /// resolved them.
 #[must_use]
-pub(crate) fn manifest_emit_settings(
+pub fn manifest_emit_settings(
     manifest: &project::ProjectManifest,
     manifest_path: &Path,
     options: &BuildOptions,

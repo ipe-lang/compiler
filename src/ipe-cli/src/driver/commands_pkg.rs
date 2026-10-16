@@ -181,7 +181,7 @@ pub fn classify_desktop_shape(
 }
 
 /// The desktop app shape a classified `main` shape packages as.
-pub(crate) const fn desktop_app_shape(shape: delivery::Shape) -> pack::desktop::AppShape {
+pub const fn desktop_app_shape(shape: delivery::Shape) -> pack::desktop::AppShape {
     match shape {
         delivery::Shape::Web => pack::desktop::AppShape::WebView,
         delivery::Shape::Tui | delivery::Shape::Cli => pack::desktop::AppShape::Terminal,
@@ -305,6 +305,7 @@ impl GatedDesktop<'_> {
     ///
     /// # Errors
     /// Build/emit errors from the underlying compile.
+    #[cfg(test)]
     pub fn emit(&self, out: OutTarget<'_>) -> Result<EmittedCrate, CliError> {
         self.assembler.emit_desktop(out, self.webview)
     }
