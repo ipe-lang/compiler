@@ -531,7 +531,7 @@ impl<'a> PinnedCarve<'a> {
     }
 
     /// The directories pinned, shallowest first.
-    #[cfg(any(target_os = "freebsd", test))]
+    #[cfg(test)]
     #[must_use]
     pub fn pins(&self) -> &[CanonicalPath] {
         &self.pins

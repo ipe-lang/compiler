@@ -17,6 +17,9 @@ fn entry_at<'g>(&mut self, entry: &'g Path) -> Result<(), JailPathError> {
     let meta = std::fs::symlink_metadata(entry);
     let again = HeldDir::open_root(entry)?;
     let present = entry.exists();
+    let real = CanonicalPath::resolve(entry)?;
+    let again_real = entry.canonicalize();
+    let listed = entry.read_dir();
     Ok(())
 }
 

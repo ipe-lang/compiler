@@ -16,7 +16,7 @@
 use std::path::Path;
 
 /// The tokens of a path-based filesystem query.
-const FORBIDDEN: [&str; 9] = [
+const FORBIDDEN: [&str; 13] = [
     "fs::",
     "File::open",
     "rustix::",
@@ -26,6 +26,10 @@ const FORBIDDEN: [&str; 9] = [
     ".is_file(",
     ".exists(",
     ".try_exists(",
+    "canonicalize(",
+    ".read_dir(",
+    "open_user_named",
+    "RegularFile::open(",
 ];
 
 /// The one path open the parse may make.
@@ -33,6 +37,12 @@ const PATH_OPEN: &str = "open_root(";
 
 /// The functions that make it, each exactly once, in source order.
 const PATH_OPEN_SITES: [&str; 3] = ["walk", "target", "prove_named"];
+
+/// The one path resolution the parse may make.
+const PATH_RESOLVE: &str = "CanonicalPath::resolve(";
+
+/// The functions that make it, each exactly once, in source order.
+const PATH_RESOLVE_SITES: [&str; 2] = ["target", "proven"];
 
 /// One match in the scanned code: the token, the function it is in, its line.
 #[derive(Debug)]
@@ -47,6 +57,7 @@ struct Hit {
 struct Findings {
     forbidden: Vec<Hit>,
     path_opens: Vec<Hit>,
+    path_resolves: Vec<Hit>,
 }
 
 impl Findings {
@@ -70,6 +81,16 @@ impl Findings {
         if sites != PATH_OPEN_SITES {
             found.push(format!(
                 "`{PATH_OPEN}` is called from {sites:?}, not exactly {PATH_OPEN_SITES:?}"
+            ));
+        }
+        let resolves: Vec<&str> = self
+            .path_resolves
+            .iter()
+            .map(|hit| hit.function.as_str())
+            .collect();
+        if resolves != PATH_RESOLVE_SITES {
+            found.push(format!(
+                "`{PATH_RESOLVE}` is called from {resolves:?}, not exactly {PATH_RESOLVE_SITES:?}"
             ));
         }
         found
@@ -252,6 +273,10 @@ fn scan(source: &str) -> Option<Findings> {
             .into_iter()
             .map(|(_, hit)| hit)
             .collect(),
+        path_resolves: hits(&code, PATH_RESOLVE)
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .collect(),
     })
 }
 
@@ -294,6 +319,8 @@ fn the_scan_refuses_the_control_fixture() {
             ("fs::", "entry_at"),
             ("symlink_metadata", "entry_at"),
             (".exists(", "entry_at"),
+            ("canonicalize(", "entry_at"),
+            (".read_dir(", "entry_at"),
         ],
         "each refused form in code is found, and none in a comment, string, or test"
     );
@@ -303,9 +330,15 @@ fn the_scan_refuses_the_control_fixture() {
         .map(|hit| hit.function.as_str())
         .collect();
     assert_eq!(sites, ["walk", "entry_at"]);
+    let resolves: Vec<&str> = findings
+        .path_resolves
+        .iter()
+        .map(|hit| hit.function.as_str())
+        .collect();
+    assert_eq!(resolves, ["entry_at"]);
     assert_eq!(
         findings.violations().len(),
-        4,
+        7,
         "{:?}",
         findings.violations()
     );
