@@ -31,7 +31,7 @@ pub fn fill_entropy(buf: &mut [u8]) -> Result<(), EntropyError> {
     getrandom::getrandom(buf).map_err(|_| EntropyError)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

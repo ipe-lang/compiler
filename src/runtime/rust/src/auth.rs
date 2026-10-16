@@ -3472,8 +3472,8 @@ fn header(raw: &str) -> bool { HeaderValue::from_str(raw).is_ok() }
         assert_eq!(
             text_reads(include_str!("auth.rs")),
             [
-                "auth_sign_token",
-                "auth_sign_token",
+                "sign_token_with",
+                "sign_token_with",
                 "test_auth_sign_token_payload_keys_sorted",
                 "tampered_cap_fails_signature_verification",
                 "verified_time_claims_are_the_numbers_the_checks_read",

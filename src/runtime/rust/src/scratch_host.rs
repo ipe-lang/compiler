@@ -38,7 +38,7 @@ pub fn profile_dir() -> Result<HomeDir, HomeRefusal> {
     super::system::home_dir()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
