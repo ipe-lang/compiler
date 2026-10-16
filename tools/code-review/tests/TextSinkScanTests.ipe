@@ -123,8 +123,15 @@ type Mode
     | BlockBrace Int
 
 
-type alias Lexing =
-    { mode : Mode, atColumnZero : Bool, nameWord : Bool, name : String, tokens : List Token, broken : Bool }
+-- What the lexer knows besides its mode: whether it is at column 0,
+-- whether the word it is reading names a declaration, the declaration it
+-- is in, and whether a literal broke.
+type alias Meta =
+    { atColumnZero : Bool, nameWord : Bool, name : String, broken : Bool }
+
+
+type alias Lexer =
+    ( Mode, Meta, List Token )
 
 
 type alias Lexed =
@@ -133,20 +140,16 @@ type alias Lexed =
 
 lex : String -> Lexed
 lex text =
-    let
-        ended =
-            finish (String.foldl lexStep { mode = Code, atColumnZero = True, nameWord = False, name = "", tokens = [], broken = False } text)
-    in
-    { tokens = ended.tokens, broken = ended.broken }
+    case finish (String.foldl lexStep ( Code, { atColumnZero = True, nameWord = False, name = "", broken = False }, [] ) text) of
+        ( _, meta, toks ) ->
+            { tokens = toks, broken = meta.broken }
 
 
-lexStep : Char -> Lexing -> Lexing
-lexStep c lexing =
-    let
-        stepped =
-            advance c lexing
-    in
-    { stepped | atColumnZero = c == '\n' }
+lexStep : Char -> Lexer -> Lexer
+lexStep c lexer =
+    case advance c lexer of
+        ( mode, meta, toks ) ->
+            ( mode, { meta | atColumnZero = c == '\n' }, toks )
 
 
 wordChar : Char -> Bool
@@ -154,274 +157,272 @@ wordChar c =
     (Char.isAlphaNum c && Char.toCode c < 128) || c == '_' || c == '.'
 
 
-advance : Char -> Lexing -> Lexing
-advance c lexing =
-    case lexing.mode of
+broke : Meta -> List Token -> Lexer
+broke meta toks =
+    ( Code, { meta | broken = True }, toks )
+
+
+advance : Char -> Lexer -> Lexer
+advance c ( mode, meta, toks ) =
+    case mode of
         Code ->
-            codeChar c lexing
+            codeChar c meta toks
 
         InWord chars ->
             if wordChar c then
-                { lexing | mode = InWord (chars ++ [ c ]) }
+                ( InWord (chars ++ [ c ]), meta, toks )
 
             else
-                codeChar c (endWord chars lexing)
+                case endWord chars meta toks of
+                    ( _, ended, endedToks ) ->
+                        codeChar c ended endedToks
 
         CodeDash ->
             if c == '-' then
-                { lexing | mode = LineComment }
+                ( LineComment, meta, toks )
 
             else
-                codeChar c (punctuation '-' lexing)
+                codeChar c meta (toks ++ [ punctuationToken '-' meta ])
 
         CodeBrace ->
             if c == '-' then
-                { lexing | mode = Block 1 }
+                ( Block 1, meta, toks )
 
             else
-                codeChar c (punctuation '{' lexing)
+                codeChar c meta (toks ++ [ punctuationToken '{' meta ])
 
         OneQuote ->
             if c == '"' then
-                { lexing | mode = TwoQuotes }
+                ( TwoQuotes, meta, toks )
 
             else
-                stringChar c lexing
+                stringChar c meta toks
 
         TwoQuotes ->
             if c == '"' then
-                { lexing | mode = Triple 0 }
+                ( Triple 0, meta, toks )
 
             else
-                codeChar c (stringEnd lexing)
+                codeChar c meta (toks ++ [ stringToken meta ])
 
         InString ->
-            stringChar c lexing
+            stringChar c meta toks
 
         StringEscape ->
-            { lexing | mode = InString }
+            ( InString, meta, toks )
 
         Triple closing ->
             if c == '"' then
                 if closing == 2 then
-                    stringEnd lexing
+                    ( Code, meta, toks ++ [ stringToken meta ] )
 
                 else
-                    { lexing | mode = Triple (closing + 1) }
+                    ( Triple (closing + 1), meta, toks )
 
             else if c == '\\' then
-                { lexing | mode = TripleEscape }
+                ( TripleEscape, meta, toks )
 
             else
-                { lexing | mode = Triple 0 }
+                ( Triple 0, meta, toks )
 
         TripleEscape ->
-            { lexing | mode = Triple 0 }
+            ( Triple 0, meta, toks )
 
         CharOpen ->
             if c == '\\' then
-                { lexing | mode = CharEscape }
+                ( CharEscape, meta, toks )
 
             else if c == '\'' || c == '\n' then
-                { lexing | mode = Code, broken = True }
+                broke meta toks
 
             else
-                { lexing | mode = CharBody }
+                ( CharBody, meta, toks )
 
         CharEscape ->
-            { lexing | mode = CharEscapeBody }
+            ( CharEscapeBody, meta, toks )
 
         CharEscapeBody ->
             if c == '\'' then
-                charEnd lexing
+                ( Code, meta, toks ++ [ punctuationToken '\'' meta ] )
 
             else if c == '\n' then
-                { lexing | mode = Code, broken = True }
+                broke meta toks
 
             else
-                lexing
+                ( CharEscapeBody, meta, toks )
 
         CharBody ->
             if c == '\'' then
-                charEnd lexing
+                ( Code, meta, toks ++ [ punctuationToken '\'' meta ] )
 
             else
-                { lexing | mode = Code, broken = True }
+                broke meta toks
 
         LineComment ->
             if c == '\n' then
-                { lexing | mode = Code }
+                ( Code, meta, toks )
 
             else
-                lexing
+                ( LineComment, meta, toks )
 
         Block depth ->
-            blockChar depth c lexing
+            blockChar depth c meta toks
 
         BlockDash depth ->
             if c == '}' then
                 if depth == 1 then
-                    { lexing | mode = Code }
+                    ( Code, meta, toks )
 
                 else
-                    { lexing | mode = Block (depth - 1) }
+                    ( Block (depth - 1), meta, toks )
 
             else
-                blockChar depth c lexing
+                blockChar depth c meta toks
 
         BlockBrace depth ->
             if c == '-' then
-                { lexing | mode = Block (depth + 1) }
+                ( Block (depth + 1), meta, toks )
 
             else
-                blockChar depth c lexing
+                blockChar depth c meta toks
 
 
-codeChar : Char -> Lexing -> Lexing
-codeChar c lexing =
+codeChar : Char -> Meta -> List Token -> Lexer
+codeChar c meta toks =
     if wordChar c then
-        { lexing | mode = InWord [ c ], nameWord = lexing.atColumnZero && Char.isLower c }
+        ( InWord [ c ], { meta | nameWord = meta.atColumnZero && Char.isLower c }, toks )
 
     else if c == '-' then
-        { lexing | mode = CodeDash }
+        ( CodeDash, meta, toks )
 
     else if c == '{' then
-        { lexing | mode = CodeBrace }
+        ( CodeBrace, meta, toks )
 
     else if c == '"' then
-        { lexing | mode = OneQuote }
+        ( OneQuote, meta, toks )
 
     else if c == '\'' then
-        { lexing | mode = CharOpen }
+        ( CharOpen, meta, toks )
 
     else if c == ' ' || c == '\n' || c == '\t' || c == '\r' then
-        { lexing | mode = Code }
+        ( Code, meta, toks )
 
     else
-        punctuation c lexing
+        ( Code, meta, toks ++ [ punctuationToken c meta ] )
 
 
-stringChar : Char -> Lexing -> Lexing
-stringChar c lexing =
+stringChar : Char -> Meta -> List Token -> Lexer
+stringChar c meta toks =
     if c == '\\' then
-        { lexing | mode = StringEscape }
+        ( StringEscape, meta, toks )
 
     else if c == '"' then
-        stringEnd lexing
+        ( Code, meta, toks ++ [ stringToken meta ] )
 
     else if c == '\n' then
-        { lexing | mode = Code, broken = True }
+        broke meta toks
 
     else
-        { lexing | mode = InString }
+        ( InString, meta, toks )
 
 
-blockChar : Int -> Char -> Lexing -> Lexing
-blockChar depth c lexing =
+blockChar : Int -> Char -> Meta -> List Token -> Lexer
+blockChar depth c meta toks =
     if c == '-' then
-        { lexing | mode = BlockDash depth }
+        ( BlockDash depth, meta, toks )
 
     else if c == '{' then
-        { lexing | mode = BlockBrace depth }
+        ( BlockBrace depth, meta, toks )
 
     else
-        { lexing | mode = Block depth }
+        ( Block depth, meta, toks )
 
 
-pushed : Kind -> String -> Lexing -> Lexing
-pushed kind text lexing =
-    { lexing | mode = Code, tokens = lexing.tokens ++ [ { kind = kind, text = text, name = lexing.name } ] }
-
-
-endWord : List Char -> Lexing -> Lexing
-endWord chars lexing =
+endWord : List Char -> Meta -> List Token -> Lexer
+endWord chars meta toks =
     let
         text =
             String.fromList chars
 
         named =
-            if lexing.nameWord then
-                { lexing | name = text, nameWord = False }
+            if meta.nameWord then
+                { meta | name = text, nameWord = False }
 
             else
-                lexing
+                meta
     in
-    pushed WordToken text named
+    ( Code, named, toks ++ [ { kind = WordToken, text = text, name = named.name } ] )
 
 
-punctuation : Char -> Lexing -> Lexing
-punctuation c lexing =
-    pushed Punctuation (String.fromChar c) lexing
+punctuationToken : Char -> Meta -> Token
+punctuationToken c meta =
+    { kind = Punctuation, text = String.fromChar c, name = meta.name }
 
 
-stringEnd : Lexing -> Lexing
-stringEnd lexing =
-    pushed StringToken "" lexing
+stringToken : Meta -> Token
+stringToken meta =
+    { kind = StringToken, text = "", name = meta.name }
 
 
-charEnd : Lexing -> Lexing
-charEnd lexing =
-    pushed Punctuation "'" lexing
-
-
--- The lexing at the end of a module: a word or a lone `-` or `{` is closed,
--- and any literal or block comment still open breaks it.
-finish : Lexing -> Lexing
-finish lexing =
-    case lexing.mode of
+-- The lexer at the end of a module: a word, a lone `-` or `{`, or an empty
+-- string literal is closed, and any other literal or block comment still
+-- open breaks it.
+finish : Lexer -> Lexer
+finish ( mode, meta, toks ) =
+    case mode of
         Code ->
-            lexing
+            ( mode, meta, toks )
 
         LineComment ->
-            lexing
+            ( mode, meta, toks )
 
         InWord chars ->
-            endWord chars lexing
+            endWord chars meta toks
 
         CodeDash ->
-            punctuation '-' lexing
+            ( Code, meta, toks ++ [ punctuationToken '-' meta ] )
 
         CodeBrace ->
-            punctuation '{' lexing
+            ( Code, meta, toks ++ [ punctuationToken '{' meta ] )
 
         TwoQuotes ->
-            stringEnd lexing
+            ( Code, meta, toks ++ [ stringToken meta ] )
 
         OneQuote ->
-            { lexing | broken = True }
+            broke meta toks
 
         InString ->
-            { lexing | broken = True }
+            broke meta toks
 
         StringEscape ->
-            { lexing | broken = True }
+            broke meta toks
 
         Triple _ ->
-            { lexing | broken = True }
+            broke meta toks
 
         TripleEscape ->
-            { lexing | broken = True }
+            broke meta toks
 
         CharOpen ->
-            { lexing | broken = True }
+            broke meta toks
 
         CharEscape ->
-            { lexing | broken = True }
+            broke meta toks
 
         CharEscapeBody ->
-            { lexing | broken = True }
+            broke meta toks
 
         CharBody ->
-            { lexing | broken = True }
+            broke meta toks
 
         Block _ ->
-            { lexing | broken = True }
+            broke meta toks
 
         BlockDash _ ->
-            { lexing | broken = True }
+            broke meta toks
 
         BlockBrace _ ->
-            { lexing | broken = True }
+            broke meta toks
 
 
 
@@ -703,12 +704,18 @@ importLineViolations rel line next =
                 []
 
 
-scanViolations : List ( String, String ) -> List Violation
-scanViolations sources =
-    let
-        lexedSources =
-            List.map (\( rel, text ) -> ( rel, text, lex text )) sources
-    in
+-- A module of `src`: its path relative to `src`, its text, and its tokens.
+type alias Source =
+    ( String, String, Lexed )
+
+
+lexSource : ( String, String ) -> Source
+lexSource ( rel, text ) =
+    ( rel, text, lex text )
+
+
+scanViolations : List Source -> List Violation
+scanViolations lexedSources =
     List.concatMap (\( rel, _, lexed ) -> tokenViolations rel lexed) lexedSources
         ++ multisetViolations StrayHtmlText "Html.text" sanctionedHtmlText (List.concatMap (\( rel, _, lexed ) -> sitesOf htmlTextNames rel lexed) lexedSources)
         ++ multisetViolations FlattenedText "SafeText.toString" admittedFlattening (List.concatMap (\( rel, _, lexed ) -> sitesOf flattenNames rel lexed) lexedSources)
@@ -719,13 +726,18 @@ scanViolations sources =
 -- ── the real tree ───────────────────────────────────────────────────────
 
 
+lexedTree : Task.Task Error (List Source)
+lexedTree =
+    srcSources |> Task.map (List.map lexSource)
+
+
 realTreeClean : Task.Task Error Bool
 realTreeClean =
-    srcSources |> Task.map (\sources -> List.isEmpty (scanViolations sources) && List.length sources > 1)
+    lexedTree |> Task.map (\sources -> List.isEmpty (scanViolations sources) && List.length sources > 1)
 
 
 -- True when `sources` breaks `rule` and no other rule.
-caughtBy : Rule -> List ( String, String ) -> Bool
+caughtBy : Rule -> List Source -> Bool
 caughtBy rule sources =
     let
         found =
@@ -735,12 +747,12 @@ caughtBy rule sources =
 
 
 -- True when `sources` breaks `rule`, whatever else it breaks.
-breaks : Rule -> List ( String, String ) -> Bool
+breaks : Rule -> List Source -> Bool
 breaks rule sources =
     List.any (\v -> v.rule == rule) (scanViolations sources)
 
 
-clean : List ( String, String ) -> Bool
+clean : List Source -> Bool
 clean sources =
     List.isEmpty (scanViolations sources)
 
@@ -750,7 +762,7 @@ clean sources =
 -- seeing a way untrusted text reaches a page flattened or unmarked.
 scanRefusesEvasions : Task.Task Error Bool
 scanRefusesEvasions =
-    srcSources
+    lexedTree
         |> Task.map
             (\sources ->
                 let
@@ -778,7 +790,7 @@ scanRefusesEvasions =
                     && caughtBy FlattenedText (inView "shown =\n    Maybe.map SafeText.toString")
                     && caughtBy FlattenedText (inView "shown x =\n    Lib.SafeText.toString x")
                     && caughtBy FlattenedText (inQueue "shown x =\n    SafeText.toString x")
-                    && caughtBy FlattenedText (List.filter (\( rel, _ ) -> rel /= "Lib/Links.ipe") sources)
+                    && caughtBy FlattenedText (List.filter (\( rel, _, _ ) -> rel /= "Lib/Links.ipe") sources)
                     && breaks ComputedUiText (inView "shown e =\n    Ui.text (Error.message e)")
                     && breaks ErrorTextUnrendered (inView "shown e =\n    Ui.text (Error.message e)")
                     && caughtBy ErrorTextUnrendered (inQueue "shown e =\n    SafeText.literal (Error.toString e)")
@@ -802,28 +814,30 @@ scanRefusesEvasions =
             )
 
 
-appendTo : String -> String -> List ( String, String ) -> List ( String, String )
+-- The tree with module `rel` grown by `extra`, that module lexed again
+-- whole.
+appendTo : String -> String -> List Source -> List Source
 appendTo rel extra sources =
     List.map
-        (\( name, text ) ->
+        (\( name, text, tokens ) ->
             if name == rel then
-                ( name, text ++ "\n\n" ++ extra ++ "\n" )
+                lexSource ( name, text ++ "\n\n" ++ extra ++ "\n" )
 
             else
-                ( name, text )
+                ( name, text, tokens )
         )
         sources
 
 
-prependTo : String -> String -> List ( String, String ) -> List ( String, String )
+prependTo : String -> String -> List Source -> List Source
 prependTo rel extra sources =
     List.map
-        (\( name, text ) ->
+        (\( name, text, tokens ) ->
             if name == rel then
-                ( name, extra ++ "\n" ++ text )
+                lexSource ( name, extra ++ "\n" ++ text )
 
             else
-                ( name, text )
+                ( name, text, tokens )
         )
         sources
 

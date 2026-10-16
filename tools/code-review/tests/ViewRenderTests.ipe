@@ -1050,6 +1050,14 @@ refusalChecks =
 
 
 -- ── untrusted text reaches a page only through the one sink ─────────
+-- The page states that show a load failure.
+type FailureSlot
+    = QueueSlot
+    | HistorySlot
+    | UnitSlot
+    | SourceSlot
+
+
 -- A load failure renders its case's fixed text inside a byte-order element,
 -- with none of the error's bytes; a computed text with untrusted parts (an
 -- unreadable file's stored path, the index file's name) keeps its escapes and
@@ -1091,22 +1099,43 @@ untrustedSinkChecks loaded =
         viewFailed failure =
             page { card | selectedView = ViewFailed loaded.unit.uid failure }
 
-        slots =
-            [ { prefix = "Queue failed to load: ", render = queueFailed }
-            , { prefix = "History load failed: ", render = historyFailed }
-            , { prefix = "Unit load failed: ", render = unitFailed }
-            , { prefix = "Source load failed: ", render = viewFailed }
-            ]
+        render slot failure =
+            case slot of
+                QueueSlot ->
+                    queueFailed failure
+
+                HistorySlot ->
+                    historyFailed failure
+
+                UnitSlot ->
+                    unitFailed failure
+
+                SourceSlot ->
+                    viewFailed failure
+
+        prefixOf slot =
+            case slot of
+                QueueSlot ->
+                    "Queue failed to load: "
+
+                HistorySlot ->
+                    "History load failed: "
+
+                UnitSlot ->
+                    "Unit load failed: "
+
+                SourceSlot ->
+                    "Source load failed: "
 
         everyCase =
             [ LoadContended, LoadPastLimit, LoadFailed ]
 
         slotRefuses slot =
-            fixedInByteOrder slot.prefix hostileFailure (slot.render hostileFailure)
-                && noErrorBytes (slot.render hostileFailure)
-                && fixedInByteOrder slot.prefix terminalFailure (slot.render terminalFailure)
-                && noErrorBytes (slot.render terminalFailure)
-                && List.all (\failure -> fixedInByteOrder slot.prefix failure (slot.render failure)) everyCase
+            fixedInByteOrder (prefixOf slot) hostileFailure (render slot hostileFailure)
+                && noErrorBytes (render slot hostileFailure)
+                && fixedInByteOrder (prefixOf slot) terminalFailure (render slot terminalFailure)
+                && noErrorBytes (render slot terminalFailure)
+                && List.all (\failure -> fixedInByteOrder (prefixOf slot) failure (render slot failure)) everyCase
 
         unreadable stored =
             { loaded | view = Unreadable (NoFile stored) }
@@ -1135,7 +1164,7 @@ untrustedSinkChecks loaded =
         titleOf html =
             String.split "</title>" html |> List.head |> Maybe.withDefault html
     in
-    [ ( "every load failure slot renders its case's fixed text in byte order and none of a hostile error's bytes", List.all slotRefuses slots )
+    [ ( "every load failure slot renders its case's fixed text in byte order and none of a hostile error's bytes", List.all slotRefuses [ QueueSlot, HistorySlot, UnitSlot, SourceSlot ] )
     , ( "a hostile error and a benign one fail the queue load with the same fixed text", queueFailed hostileFailure == queueFailed LoadFailed && hostileFailure == LoadFailed )
     , ( "an unreadable file's hostile stored path keeps its escapes and byte order on the queue card and the unit page"
       , has unreadablePrefix hostileUnreadableCard
