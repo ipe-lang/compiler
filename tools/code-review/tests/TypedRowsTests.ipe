@@ -70,7 +70,7 @@ routeUidRefusedNotQueried =
         && entryRefused ("../" ++ String.repeat 61 "a")
         && entryRefused (String.repeat 64 "F")
         && entryAccepted (uid "u-a")
-        && Queue.unitPageStatusText UnitIdRefused
+        && Maybe.map SafeText.toString (Queue.unitPageStatusText UnitIdRefused)
         == Just "This address does not name a unit."
 
 

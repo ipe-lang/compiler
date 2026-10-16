@@ -1,0 +1,870 @@
+module TextSinkScanTests exposing (checks)
+
+import Ipe.ByteSize as ByteSize
+import Ipe.Char as Char
+import Ipe.Error as Error
+import Ipe.File as File
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Path as Path exposing (Path)
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.System as System
+import Ipe.Task as Task
+import TestSupport exposing (check)
+
+
+-- ── the source scan ─────────────────────────────────────────────────────
+--
+-- Untrusted text reaches a page only as `SafeText`, through the view's one
+-- sink, which keeps every escape marked and draws in byte order. In `src`:
+-- every `Ui.text` takes a string literal written at that call; `Html.text`
+-- appears only in the renderers that draw a `SafeText`'s parts or a
+-- source's tokens; `SafeText.toString`, which drops the escape marks and the
+-- byte order, appears only at the listed sites and never in the view; an
+-- error's text in the view or the queue goes through
+-- `SafeText.renderForeign`; and the modules these names come from are
+-- imported under their own name, exposing none of them bare, so no other
+-- spelling reaches a sink.
+--
+-- The scan lexes each module once: string, triple-quoted string and char
+-- literals, line comments and nested block comments are read as Ipê reads
+-- them, so a `--` or a `"` inside a literal hides no code and code inside a
+-- comment is no site. A token is a maximal run of `[A-Za-z0-9_.]`, a string
+-- literal, or one punctuation character, so `Ui.texts` is not `Ui.text`. A
+-- literal or comment left open at the end of a module is a violation.
+
+
+-- The modules of `src`, each by its path relative to `src` with its text.
+-- A file past `fileCeiling`, a module past `moduleByteCeiling`, or one that
+-- cannot be read fails the read.
+srcSources : Task.Task Error (List ( String, String ))
+srcSources =
+    do
+        cwd <- System.cwd ()
+        root <- Task.fromResult (Path.fromString (cwd ++ "/src"))
+        files <- File.walk root
+        bounded <- Task.fromResult (withinFileCeiling files)
+        Task.sequence (List.map (readSource (Path.toString root ++ "/")) (List.filter (\path -> String.endsWith ".ipe" (Path.toString path)) bounded))
+
+
+fileCeiling : Int
+fileCeiling =
+    64
+
+
+moduleByteCeiling : ByteSize.ByteSize
+moduleByteCeiling =
+    ByteSize.kib 512
+
+
+withinFileCeiling : List a -> Result Error (List a)
+withinFileCeiling files =
+    if List.length files > fileCeiling then
+        Err (Error.limitExceeded ("src holds more than " ++ String.fromInt fileCeiling ++ " files"))
+
+    else
+        Ok files
+
+
+readSource : String -> Path -> Task.Task Error ( String, String )
+readSource prefix path =
+    let
+        file =
+            Path.toString path
+    in
+    if String.startsWith prefix file then
+        File.readFileLimit path moduleByteCeiling
+            |> Task.map (\text -> ( String.dropLeft (String.length prefix) file, text ))
+
+    else
+        Task.fail (Error.unexpected (file ++ " is not under src"))
+
+
+
+-- ── the lexer ───────────────────────────────────────────────────────────
+
+
+type Kind
+    = WordToken
+    | StringToken
+    | Punctuation
+
+
+-- A token, with the top-level declaration it sits in: the last column-0
+-- lowercase word before it.
+type alias Token =
+    { kind : Kind, text : String, name : String }
+
+
+-- Where the lexer is: in code, a word, after a `-` or a `{` in code, after
+-- one or two `"`, in a string or after its `\`, in a triple-quoted string
+-- after that many closing `"` or after its `\`, in a char literal after its
+-- `'`, after its `\`, inside an escape, or after its one character, in a
+-- line comment, or in a block comment that deep, after its `-` or `{`.
+type Mode
+    = Code
+    | InWord (List Char)
+    | CodeDash
+    | CodeBrace
+    | OneQuote
+    | TwoQuotes
+    | InString
+    | StringEscape
+    | Triple Int
+    | TripleEscape
+    | CharOpen
+    | CharEscape
+    | CharEscapeBody
+    | CharBody
+    | LineComment
+    | Block Int
+    | BlockDash Int
+    | BlockBrace Int
+
+
+type alias Lexing =
+    { mode : Mode, atColumnZero : Bool, nameWord : Bool, name : String, tokens : List Token, broken : Bool }
+
+
+type alias Lexed =
+    { tokens : List Token, broken : Bool }
+
+
+lex : String -> Lexed
+lex text =
+    let
+        ended =
+            finish (String.foldl lexStep { mode = Code, atColumnZero = True, nameWord = False, name = "", tokens = [], broken = False } text)
+    in
+    { tokens = ended.tokens, broken = ended.broken }
+
+
+lexStep : Char -> Lexing -> Lexing
+lexStep c lexing =
+    let
+        stepped =
+            advance c lexing
+    in
+    { stepped | atColumnZero = c == '\n' }
+
+
+wordChar : Char -> Bool
+wordChar c =
+    (Char.isAlphaNum c && Char.toCode c < 128) || c == '_' || c == '.'
+
+
+advance : Char -> Lexing -> Lexing
+advance c lexing =
+    case lexing.mode of
+        Code ->
+            codeChar c lexing
+
+        InWord chars ->
+            if wordChar c then
+                { lexing | mode = InWord (chars ++ [ c ]) }
+
+            else
+                codeChar c (endWord chars lexing)
+
+        CodeDash ->
+            if c == '-' then
+                { lexing | mode = LineComment }
+
+            else
+                codeChar c (punctuation '-' lexing)
+
+        CodeBrace ->
+            if c == '-' then
+                { lexing | mode = Block 1 }
+
+            else
+                codeChar c (punctuation '{' lexing)
+
+        OneQuote ->
+            if c == '"' then
+                { lexing | mode = TwoQuotes }
+
+            else
+                stringChar c lexing
+
+        TwoQuotes ->
+            if c == '"' then
+                { lexing | mode = Triple 0 }
+
+            else
+                codeChar c (stringEnd lexing)
+
+        InString ->
+            stringChar c lexing
+
+        StringEscape ->
+            { lexing | mode = InString }
+
+        Triple closing ->
+            if c == '"' then
+                if closing == 2 then
+                    stringEnd lexing
+
+                else
+                    { lexing | mode = Triple (closing + 1) }
+
+            else if c == '\\' then
+                { lexing | mode = TripleEscape }
+
+            else
+                { lexing | mode = Triple 0 }
+
+        TripleEscape ->
+            { lexing | mode = Triple 0 }
+
+        CharOpen ->
+            if c == '\\' then
+                { lexing | mode = CharEscape }
+
+            else if c == '\'' || c == '\n' then
+                { lexing | mode = Code, broken = True }
+
+            else
+                { lexing | mode = CharBody }
+
+        CharEscape ->
+            { lexing | mode = CharEscapeBody }
+
+        CharEscapeBody ->
+            if c == '\'' then
+                charEnd lexing
+
+            else if c == '\n' then
+                { lexing | mode = Code, broken = True }
+
+            else
+                lexing
+
+        CharBody ->
+            if c == '\'' then
+                charEnd lexing
+
+            else
+                { lexing | mode = Code, broken = True }
+
+        LineComment ->
+            if c == '\n' then
+                { lexing | mode = Code }
+
+            else
+                lexing
+
+        Block depth ->
+            blockChar depth c lexing
+
+        BlockDash depth ->
+            if c == '}' then
+                if depth == 1 then
+                    { lexing | mode = Code }
+
+                else
+                    { lexing | mode = Block (depth - 1) }
+
+            else
+                blockChar depth c lexing
+
+        BlockBrace depth ->
+            if c == '-' then
+                { lexing | mode = Block (depth + 1) }
+
+            else
+                blockChar depth c lexing
+
+
+codeChar : Char -> Lexing -> Lexing
+codeChar c lexing =
+    if wordChar c then
+        { lexing | mode = InWord [ c ], nameWord = lexing.atColumnZero && Char.isLower c }
+
+    else if c == '-' then
+        { lexing | mode = CodeDash }
+
+    else if c == '{' then
+        { lexing | mode = CodeBrace }
+
+    else if c == '"' then
+        { lexing | mode = OneQuote }
+
+    else if c == '\'' then
+        { lexing | mode = CharOpen }
+
+    else if c == ' ' || c == '\n' || c == '\t' || c == '\r' then
+        { lexing | mode = Code }
+
+    else
+        punctuation c lexing
+
+
+stringChar : Char -> Lexing -> Lexing
+stringChar c lexing =
+    if c == '\\' then
+        { lexing | mode = StringEscape }
+
+    else if c == '"' then
+        stringEnd lexing
+
+    else if c == '\n' then
+        { lexing | mode = Code, broken = True }
+
+    else
+        { lexing | mode = InString }
+
+
+blockChar : Int -> Char -> Lexing -> Lexing
+blockChar depth c lexing =
+    if c == '-' then
+        { lexing | mode = BlockDash depth }
+
+    else if c == '{' then
+        { lexing | mode = BlockBrace depth }
+
+    else
+        { lexing | mode = Block depth }
+
+
+pushed : Kind -> String -> Lexing -> Lexing
+pushed kind text lexing =
+    { lexing | mode = Code, tokens = lexing.tokens ++ [ { kind = kind, text = text, name = lexing.name } ] }
+
+
+endWord : List Char -> Lexing -> Lexing
+endWord chars lexing =
+    let
+        text =
+            String.fromList chars
+
+        named =
+            if lexing.nameWord then
+                { lexing | name = text, nameWord = False }
+
+            else
+                lexing
+    in
+    pushed WordToken text named
+
+
+punctuation : Char -> Lexing -> Lexing
+punctuation c lexing =
+    pushed Punctuation (String.fromChar c) lexing
+
+
+stringEnd : Lexing -> Lexing
+stringEnd lexing =
+    pushed StringToken "" lexing
+
+
+charEnd : Lexing -> Lexing
+charEnd lexing =
+    pushed Punctuation "'" lexing
+
+
+-- The lexing at the end of a module: a word or a lone `-` or `{` is closed,
+-- and any literal or block comment still open breaks it.
+finish : Lexing -> Lexing
+finish lexing =
+    case lexing.mode of
+        Code ->
+            lexing
+
+        LineComment ->
+            lexing
+
+        InWord chars ->
+            endWord chars lexing
+
+        CodeDash ->
+            punctuation '-' lexing
+
+        CodeBrace ->
+            punctuation '{' lexing
+
+        TwoQuotes ->
+            stringEnd lexing
+
+        OneQuote ->
+            { lexing | broken = True }
+
+        InString ->
+            { lexing | broken = True }
+
+        StringEscape ->
+            { lexing | broken = True }
+
+        Triple _ ->
+            { lexing | broken = True }
+
+        TripleEscape ->
+            { lexing | broken = True }
+
+        CharOpen ->
+            { lexing | broken = True }
+
+        CharEscape ->
+            { lexing | broken = True }
+
+        CharEscapeBody ->
+            { lexing | broken = True }
+
+        CharBody ->
+            { lexing | broken = True }
+
+        Block _ ->
+            { lexing | broken = True }
+
+        BlockDash _ ->
+            { lexing | broken = True }
+
+        BlockBrace _ ->
+            { lexing | broken = True }
+
+
+
+-- ── the rules ───────────────────────────────────────────────────────────
+
+
+-- The property each violation breaks: a `Ui.text` of computed text, an
+-- `Html.text` outside the sanctioned renderers, a `SafeText.toString` at a
+-- site not listed, an error's text not rendered as foreign, an import that
+-- opens another spelling, and a module that does not lex.
+type Rule
+    = ComputedUiText
+    | StrayHtmlText
+    | FlattenedText
+    | ErrorTextUnrendered
+    | ImportSpelling
+    | Unlexed
+
+
+type alias Violation =
+    { rule : Rule, why : String }
+
+
+uiTextNames : List String
+uiTextNames =
+    [ "Ui.text", "Ipe.Ui.text" ]
+
+
+htmlTextNames : List String
+htmlTextNames =
+    [ "Html.text", "Ipe.Html.text" ]
+
+
+flattenNames : List String
+flattenNames =
+    [ "SafeText.toString", "Lib.SafeText.toString" ]
+
+
+errorTextNames : List String
+errorTextNames =
+    [ "Error.toString", "Error.message", "Ipe.Error.toString", "Ipe.Error.message" ]
+
+
+-- The renderers that draw a `SafeText`'s parts and a source's tokens, each
+-- once per `Html.text` it holds.
+sanctionedHtmlText : List String
+sanctionedHtmlText =
+    [ "Lib/View.ipe:segmentHtml"
+    , "Lib/View.ipe:segmentHtml"
+    , "Lib/View.ipe:partHtml"
+    , "Lib/View.ipe:gutterHtml"
+    , "Lib/View.ipe:codeChildren"
+    , "Lib/View.ipe:pieceHtml"
+    , "Lib/View.ipe:pieceHtml"
+    ]
+
+
+-- Each site that flattens a `SafeText`, once per call it holds: dedup and
+-- grouping keys, refusal texts bound for a terminal or an error, and none
+-- in the view.
+admittedFlattening : List String
+admittedFlattening =
+    [ "Lib/Index.ipe:noTaggedPath"
+    , "Lib/Index.ipe:probeRepos"
+    , "Lib/Index.ipe:rootMismatch"
+    , "Lib/Links.ipe:linkKey"
+    , "Lib/Queue.ipe:nameKey"
+    , "Lib/Queue.ipe:nameKey"
+    , "Lib/Queue.ipe:placeKey"
+    , "Lib/RepoPath.ipe:reposToError"
+    , "Lib/RepoPath.ipe:rootRefusal"
+    , "Lib/RepoPath.ipe:toError"
+    , "Lib/Settings.ipe:rootsRefusal"
+    , "Lib/Settings.ipe:useRefusal"
+    , "Main.ipe:requireLoopbackBind"
+    , "Main.ipe:requireSettings"
+    ]
+
+
+-- Each guarded module, the one name it must be imported as, and the names
+-- an import of it must not expose bare.
+guardedImports : List { moduleName : String, qualifier : String, hidden : List String }
+guardedImports =
+    [ { moduleName = "Lib.SafeText", qualifier = "SafeText", hidden = [ "toString" ] }
+    , { moduleName = "Ipe.Error", qualifier = "Error", hidden = [ "toString", "message" ] }
+    , { moduleName = "Ipe.Ui", qualifier = "Ui", hidden = [ "text" ] }
+    , { moduleName = "Ipe.Html", qualifier = "Html", hidden = [ "text" ] }
+    ]
+
+
+type alias Neighbours =
+    { before2 : Maybe Token, before : Maybe Token, token : Token, after : Maybe Token }
+
+
+neighbours : List Token -> List Neighbours
+neighbours tokens =
+    let
+        shifted =
+            List.map Just tokens
+
+        before =
+            Nothing :: shifted
+
+        before2 =
+            Nothing :: Nothing :: shifted
+
+        after =
+            List.drop 1 shifted ++ [ Nothing ]
+    in
+    List.map3 (\b2 ( b, t ) a -> { before2 = b2, before = b, token = t, after = a }) before2 (List.map2 (\b t -> ( b, t )) before tokens) after
+
+
+isWord : List String -> Token -> Bool
+isWord names token =
+    token.kind == WordToken && List.member token.text names
+
+
+kindIs : Kind -> Maybe Token -> Bool
+kindIs kind token =
+    Maybe.map (\t -> t.kind == kind) token == Just True
+
+
+textIs : Kind -> String -> Maybe Token -> Bool
+textIs kind text token =
+    Maybe.map (\t -> t.kind == kind && t.text == text) token == Just True
+
+
+site : String -> Token -> String
+site rel token =
+    rel ++ ":" ++ token.name
+
+
+-- The violations of one module that hold at a single token.
+tokenViolations : String -> Lexed -> List Violation
+tokenViolations rel lexed =
+    let
+        around =
+            neighbours lexed.tokens
+
+        guardedErrors =
+            rel == "Lib/View.ipe" || rel == "Lib/Queue.ipe"
+
+        computed =
+            List.filter (\n -> isWord uiTextNames n.token && not (kindIs StringToken n.after)) around
+
+        unrendered =
+            List.filter (\n -> guardedErrors && isWord errorTextNames n.token && not (textIs Punctuation "(" n.before && textIs WordToken "SafeText.renderForeign" n.before2)) around
+
+        unlexed =
+            if lexed.broken then
+                [ { rule = Unlexed, why = rel ++ " leaves a literal or block comment open" } ]
+
+            else
+                []
+    in
+    List.map (\n -> { rule = ComputedUiText, why = site rel n.token ++ " draws computed text with " ++ n.token.text }) computed
+        ++ List.map (\n -> { rule = ErrorTextUnrendered, why = site rel n.token ++ " shows " ++ n.token.text ++ " not rendered as foreign" }) unrendered
+        ++ unlexed
+
+
+-- The sites of one module where a token in `names` sits.
+sitesOf : List String -> String -> Lexed -> List String
+sitesOf names rel lexed =
+    List.map (site rel) (List.filter (isWord names) lexed.tokens)
+
+
+-- The sites found and the sites listed, as multisets: each extra site and
+-- each listed site no source holds is a violation.
+multisetViolations : Rule -> String -> List String -> List String -> List Violation
+multisetViolations rule what listed found =
+    let
+        extra =
+            removeEach listed found
+
+        missing =
+            removeEach found listed
+    in
+    List.map (\s -> { rule = rule, why = what ++ " at " ++ s ++ ", which is not listed" }) extra
+        ++ List.map (\s -> { rule = rule, why = "the listed " ++ what ++ " at " ++ s ++ " is not in the source" }) missing
+
+
+-- `items` with one occurrence of each of `removals` taken out.
+removeEach : List String -> List String -> List String
+removeEach removals items =
+    List.foldl removeOne items removals
+
+
+removeOne : String -> List String -> List String
+removeOne item items =
+    let
+        dropped =
+            List.foldl
+                (\x acc ->
+                    if not acc.done && x == item then
+                        { acc | done = True }
+
+                    else
+                        { acc | kept = acc.kept ++ [ x ] }
+                )
+                { done = False, kept = [] }
+                items
+    in
+    dropped.kept
+
+
+-- The import violations of a module: each import of a guarded module read
+-- from its line, and an import continued on an indented next line is one,
+-- since its exposing list is not on the line read.
+importViolations : String -> String -> List Violation
+importViolations rel text =
+    let
+        lines =
+            String.lines text
+    in
+    List.concat (List.map2 (importLineViolations rel) lines (List.drop 1 lines ++ [ "" ]))
+
+
+importLineViolations : String -> String -> String -> List Violation
+importLineViolations rel line next =
+    let
+        words =
+            String.words line
+
+        moduleName =
+            Maybe.withDefault "" (List.head (List.drop 1 words))
+
+        pairs =
+            List.map2 (\a b -> ( a, b )) words (List.drop 1 words)
+
+        qualifier =
+            Maybe.withDefault moduleName (Maybe.map (\( _, b ) -> b) (List.find (\( a, _ ) -> a == "as") pairs))
+
+        exposedText =
+            Maybe.map String.trim (List.head (List.drop 1 (String.split "exposing" line)))
+
+        exposedNames =
+            Maybe.withDefault [] (Maybe.map (\e -> String.words (String.map (\c -> if wordChar c then c else ' ') e)) exposedText)
+
+        compact =
+            Maybe.map (String.replace " " "") exposedText
+
+        continued =
+            String.startsWith " " next || String.startsWith "\t" next
+
+        opensAll =
+            continued
+                || (case compact of
+                        Just e ->
+                            e == "(..)" || String.startsWith "(..," e || String.contains ",..," e || String.endsWith ",..)" e || not (String.endsWith ")" e)
+
+                        Nothing ->
+                            False
+                   )
+
+        refusals guard =
+            (if qualifier /= guard.qualifier then
+                [ rel ++ " imports " ++ moduleName ++ " as " ++ qualifier ++ ", not " ++ guard.qualifier ]
+
+             else
+                []
+            )
+                ++ (if opensAll then
+                        [ rel ++ " imports " ++ moduleName ++ " exposing everything or across lines" ]
+
+                    else
+                        []
+                   )
+                ++ List.map (\n -> rel ++ " imports " ++ moduleName ++ " exposing " ++ n) (List.filter (\n -> List.member n guard.hidden) exposedNames)
+    in
+    if not (String.startsWith "import " line) then
+        []
+
+    else
+        case List.find (\guard -> guard.moduleName == moduleName) guardedImports of
+            Just guard ->
+                List.map (\why -> { rule = ImportSpelling, why = why }) (refusals guard)
+
+            Nothing ->
+                []
+
+
+scanViolations : List ( String, String ) -> List Violation
+scanViolations sources =
+    let
+        lexedSources =
+            List.map (\( rel, text ) -> ( rel, text, lex text )) sources
+    in
+    List.concatMap (\( rel, _, lexed ) -> tokenViolations rel lexed) lexedSources
+        ++ multisetViolations StrayHtmlText "Html.text" sanctionedHtmlText (List.concatMap (\( rel, _, lexed ) -> sitesOf htmlTextNames rel lexed) lexedSources)
+        ++ multisetViolations FlattenedText "SafeText.toString" admittedFlattening (List.concatMap (\( rel, _, lexed ) -> sitesOf flattenNames rel lexed) lexedSources)
+        ++ List.concatMap (\( rel, text, _ ) -> importViolations rel text) lexedSources
+
+
+
+-- ── the real tree ───────────────────────────────────────────────────────
+
+
+realTreeClean : Task.Task Error Bool
+realTreeClean =
+    srcSources |> Task.map (\sources -> List.isEmpty (scanViolations sources) && List.length sources > 1)
+
+
+-- True when `sources` breaks `rule` and no other rule.
+caughtBy : Rule -> List ( String, String ) -> Bool
+caughtBy rule sources =
+    let
+        found =
+            scanViolations sources
+    in
+    not (List.isEmpty found) && List.all (\v -> v.rule == rule) found
+
+
+-- True when `sources` breaks `rule`, whatever else it breaks.
+breaks : Rule -> List ( String, String ) -> Bool
+breaks rule sources =
+    List.any (\v -> v.rule == rule) (scanViolations sources)
+
+
+clean : List ( String, String ) -> Bool
+clean sources =
+    List.isEmpty (scanViolations sources)
+
+
+-- Each way around the scan is a violation of its own rule, beside a clean
+-- form that differs from it by the evasion alone. Red if the scan stops
+-- seeing a way untrusted text reaches a page flattened or unmarked.
+scanRefusesEvasions : Task.Task Error Bool
+scanRefusesEvasions =
+    srcSources
+        |> Task.map
+            (\sources ->
+                let
+                    inView extra =
+                        appendTo "Lib/View.ipe" extra sources
+
+                    inQueue extra =
+                        appendTo "Lib/Queue.ipe" extra sources
+                in
+                clean sources
+                    && breaks ComputedUiText (inView "shown x =\n    Ui.text (SafeText.toString x)")
+                    && breaks FlattenedText (inView "shown x =\n    Ui.text (SafeText.toString x)")
+                    && caughtBy ComputedUiText (inView "shown label =\n    Ui.text label")
+                    && caughtBy ComputedUiText (inView "shown label =\n    Ipe.Ui.text label")
+                    && caughtBy ComputedUiText (inView "shown =\n    List.map Ui.text")
+                    && clean (inView "shown =\n    Ui.text \"a fixed label\"")
+                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Lib.SafeText as T" (inQueue "shown x =\n    T.toString x"))
+                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Lib.SafeText exposing (toString)" sources)
+                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui exposing (text)" sources)
+                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Html as Html exposing (..)" sources)
+                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Ipe.Error as Error exposing (Error, message)" sources)
+                    && caughtBy ImportSpelling (prependTo "Lib/Queue.ipe" "import Ipe.Error as Error exposing (Error," sources)
+                    && caughtBy ImportSpelling (prependTo "Lib/View.ipe" "import Ipe.Ui as Ui\n    exposing (text)" sources)
+                    && clean (prependTo "Lib/Queue.ipe" "import Lib.SafeText as SafeText exposing (SafeText, Segment(..))" sources)
+                    && caughtBy FlattenedText (inView "shown =\n    Maybe.map SafeText.toString")
+                    && caughtBy FlattenedText (inView "shown x =\n    Lib.SafeText.toString x")
+                    && caughtBy FlattenedText (inQueue "shown x =\n    SafeText.toString x")
+                    && caughtBy FlattenedText (List.filter (\( rel, _ ) -> rel /= "Lib/Links.ipe") sources)
+                    && breaks ComputedUiText (inView "shown e =\n    Ui.text (Error.message e)")
+                    && breaks ErrorTextUnrendered (inView "shown e =\n    Ui.text (Error.message e)")
+                    && caughtBy ErrorTextUnrendered (inQueue "shown e =\n    SafeText.literal (Error.toString e)")
+                    && clean (inQueue "shown e =\n    SafeText.renderForeign (Error.message e)")
+                    && clean (appendTo "Lib/Db.ipe" "shown e =\n    Error.message e" sources)
+                    && caughtBy StrayHtmlText (inView "shown x =\n    Html.text x")
+                    && caughtBy StrayHtmlText (appendTo "Lib/Links.ipe" "shown x =\n    Ipe.Html.text x" sources)
+                    && caughtBy FlattenedText (inView "shown x =\n    ( \"--\", SafeText.toString x )")
+                    && caughtBy FlattenedText (inView "shown x =\n    ( \"{-\", SafeText.toString x )")
+                    && caughtBy FlattenedText (inView "shown x =\n    ( '\"', SafeText.toString x )")
+                    && caughtBy FlattenedText (inView "shown x =\n    ( '\\'', SafeText.toString x )")
+                    && caughtBy ComputedUiText (inView "shown x =\n    ( \"a \\\" -- b\", Ui.text x )")
+                    && caughtBy ComputedUiText (inView "shown x =\n    {- {- -} -} Ui.text x")
+                    && clean (inView "shown x =\n    {- {- -} Ui.text x -} x")
+                    && clean (inView "shown x =\n    -- Ui.text x\n    x")
+                    && clean (inView "shown x =\n    \"\"\"a \" -- Ui.text x \"\"\"")
+                    && clean (inView "shown x =\n    Ui.texts x\n\n\nother x =\n    myUi.text x")
+                    && caughtBy Unlexed (inView "shown x =\n    \"open")
+                    && caughtBy Unlexed (inView "shown x =\n    {- open")
+                    && caughtBy Unlexed (inView "shown x =\n    \"\"\"open")
+            )
+
+
+appendTo : String -> String -> List ( String, String ) -> List ( String, String )
+appendTo rel extra sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, text ++ "\n\n" ++ extra ++ "\n" )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+prependTo : String -> String -> List ( String, String ) -> List ( String, String )
+prependTo rel extra sources =
+    List.map
+        (\( name, text ) ->
+            if name == rel then
+                ( name, extra ++ "\n" ++ text )
+
+            else
+                ( name, text )
+        )
+        sources
+
+
+
+-- ── scanner self-tests ──────────────────────────────────────────────────
+
+
+-- A site is keyed by the last column-0 lowercase word above it, a literal
+-- is one token whatever it holds, and a comment is none. Red if the lexer
+-- reads code inside a literal or a comment, or a literal as code.
+lexerReadsLiterals : Bool
+lexerReadsLiterals =
+    let
+        kinds text =
+            List.map (\t -> t.kind) (lex text).tokens
+    in
+    sitesOf flattenNames "M.ipe" (lex "first x =\n    SafeText.toString x\n\n\nsecond x =\n    SafeText.toString x\n")
+        == [ "M.ipe:first", "M.ipe:second" ]
+        && kinds "\"a -- b {- c\" x"
+        == [ StringToken, WordToken ]
+        && kinds "\"\"\"a\n\"b\"\n\"\"\" x"
+        == [ StringToken, WordToken ]
+        && kinds "'\"' x '\\'' y"
+        == [ Punctuation, WordToken, Punctuation, WordToken ]
+        && kinds "a {- b {- c -} d -} e -- f\ng"
+        == [ WordToken, WordToken, WordToken ]
+        && kinds "a - b"
+        == [ WordToken, Punctuation, WordToken ]
+        && not (lex "a b").broken
+        && (lex "a 'bc' d").broken
+        && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) ""))
+        == Nothing
+        && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling ""))
+        /= Nothing
+
+
+checks : Task.Task Error (List ( String, Bool ))
+checks =
+    Task.sequence
+        [ check "untrusted text reaches a page only through the one sink: the source scan finds no violation" realTreeClean
+        , check "each way around the text sink scan is a violation of its own rule" scanRefusesEvasions
+        , Task.succeed ( "the text sink scan lexes literals and comments as Ipê reads them", lexerReadsLiterals )
+        ]
