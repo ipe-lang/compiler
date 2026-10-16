@@ -1226,11 +1226,14 @@ openRefusalMembership =
     " NOT EXISTS (SELECT 1 FROM reviewed r WHERE r.uid = u.uid COLLATE BINARY AND r.body_hash = u.digest COLLATE BINARY)"
 
 
--- The first `size` open refusals under a bound tag, by path.
+-- The first `size` open refusals under a bound tag: every acknowledgeable
+-- one before any blocking one, each by path. A blocking row leaves the open
+-- set only when the tree is fixed, so listing it first would let enough of
+-- them keep an acknowledgeable file off the page for good.
 loadRefusalPage : Db.Db -> BoundTags -> PageSize -> Task.Task Error (List RefusalRow)
 loadRefusalPage conn bound size =
     Db.queryDecode conn
-        (refusalColumns ++ openRefusalMembership ++ " AND" ++ bound.sql ++ " ORDER BY u.path COLLATE BINARY, u.uid COLLATE BINARY LIMIT ?")
+        (refusalColumns ++ openRefusalMembership ++ " AND" ++ bound.sql ++ " ORDER BY u.digest IS NULL, u.path COLLATE BINARY, u.uid COLLATE BINARY LIMIT ?")
         (bound.params ++ [ SqlInt (PageSize.toInt size) ])
         refusalRowDecoder
 
