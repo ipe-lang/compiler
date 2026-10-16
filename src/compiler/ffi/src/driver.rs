@@ -479,6 +479,51 @@ pub const FFI_CACHE_COMPONENTS: [&str; 4] = [CACHE_NAMESPACE_DIR, CACHE_SUBDIR, 
 /// Windows verbatim root `/` is no separator, so the text would name one entry.
 pub const FFI_CACHE_REL: &str = ".ipe/cache/ffi/rust";
 
+/// Permission bits of each FFI cache directory [`FfiCache::write_package`] creates on Unix: its owner's only.
+///
+/// The cache's bindings compile unsandboxed into the consumer crate, so no
+/// other user may list, plant, or replace an entry in it.
+pub const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Permission bits of each FFI cache artifact [`FfiCache::write_package`] writes on Unix: its owner's only.
+pub const PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// Create `dir` and every missing ancestor, each new level owner-only on Unix.
+///
+/// A level that already exists keeps its mode; the loader's owner rule judges it.
+fn create_private_dirs(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, PRIVATE_DIR_MODE);
+    builder.create(dir)
+}
+
+/// Replace the entry at `path` with a new owner-only file holding `contents`.
+///
+/// The bytes go to a temporary sibling created exclusively, which refuses a
+/// link planted at its name, then a rename replaces the entry at `path`
+/// itself: a link planted there is replaced, never written through, and an
+/// existing artifact never keeps a wider mode than [`PRIVATE_FILE_MODE`].
+fn replace_private_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".{}.tmp", std::process::id()));
+    let temp = PathBuf::from(temp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, PRIVATE_FILE_MODE);
+    let mut file = options.open(&temp)?;
+    let written = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
 /// The FFI cache path relative to its project root, built one component at a time.
 fn cache_rel() -> PathBuf {
     FFI_CACHE_COMPONENTS.iter().collect()
@@ -600,7 +645,7 @@ impl FfiCache {
             path: path.to_string_lossy().into_owned(),
             detail: e.to_string(),
         };
-        std::fs::create_dir_all(&self.root).map_err(|e| io_err(&self.root, &e))?;
+        create_private_dirs(&self.root).map_err(|e| io_err(&self.root, &e))?;
         let paths = self.artifact_paths(&slugify(pkg.name()));
         let iface = crate::interface::crate_interface(pkg);
         let consumer_json = emit_consumer_json(pkg, &iface, self)?;
@@ -617,7 +662,7 @@ impl FfiCache {
             (&paths.pkg_json, inspection_json.to_owned()),
         ];
         for (path, contents) in &writes {
-            std::fs::write(path, contents).map_err(|e| io_err(path, &e))?;
+            replace_private_file(path, contents).map_err(|e| io_err(path, &e))?;
         }
         Ok(paths)
     }
@@ -2216,6 +2261,90 @@ mod tests {
     /// its project root need not exist.
     fn registry_cache() -> FfiCache {
         FfiCache::at_project_root(Path::new("/nonexistent-ipe-project"))
+    }
+
+    /// Every artifact path of `paths`, the seven `write_package` writes.
+    #[cfg(unix)]
+    fn every_artifact(paths: &ArtifactPaths) -> [&Path; 7] {
+        [
+            &paths.ipei,
+            &paths.kernel_json,
+            &paths.bindings,
+            &paths.coverage,
+            &paths.interface,
+            &paths.consumer,
+            &paths.pkg_json,
+        ]
+    }
+
+    /// Whether the entry at `path`, not followed, grants nothing to its group or to others.
+    #[cfg(unix)]
+    fn owner_only(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::symlink_metadata(path)
+            .expect("stat")
+            .permissions()
+            .mode();
+        mode & 0o077 == 0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_package_creates_owner_only_directories_and_artifacts() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        assert_eq!(
+            PRIVATE_DIR_MODE & 0o077,
+            0,
+            "the directory mode is owner-only"
+        );
+        assert_eq!(
+            PRIVATE_FILE_MODE & 0o077,
+            0,
+            "the artifact mode is owner-only"
+        );
+        let tmp =
+            ipe_test_temp::temp_root().join(format!("ipe-ffi-cache-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("scratch project root");
+        let cache = FfiCache::at_project_root(&tmp);
+        let pkg = semver_pkg();
+        let paths = cache.write_package(&pkg, &semver_json()).expect("writes");
+        let mut level = tmp.clone();
+        for component in FFI_CACHE_COMPONENTS {
+            level.push(component);
+            assert!(owner_only(&level), "{} is owner-only", level.display());
+        }
+        for artifact in every_artifact(&paths) {
+            assert!(owner_only(artifact), "{} is owner-only", artifact.display());
+        }
+
+        std::fs::set_permissions(&paths.bindings, std::fs::Permissions::from_mode(0o644))
+            .expect("widen an existing artifact");
+        assert!(
+            !owner_only(&paths.bindings),
+            "control: the widened artifact is not owner-only"
+        );
+        let outside = tmp.join("outside.json");
+        std::fs::write(&outside, "kept").expect("write link target");
+        std::fs::remove_file(&paths.pkg_json).expect("remove artifact");
+        symlink(&outside, &paths.pkg_json).expect("plant symlink");
+        cache.write_package(&pkg, &semver_json()).expect("rewrites");
+        for artifact in every_artifact(&paths) {
+            assert!(owner_only(artifact), "{} is owner-only", artifact.display());
+        }
+        assert!(
+            std::fs::symlink_metadata(&paths.pkg_json)
+                .expect("stat")
+                .file_type()
+                .is_file(),
+            "the planted link is replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read link target"),
+            "kept",
+            "nothing is written through the planted link"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

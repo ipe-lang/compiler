@@ -1593,6 +1593,10 @@ refusing to load the FFI cache at `{path}`: its ownership cannot be verified on 
 
 refusing to load the FFI cache: `{path}` is a symbolic link, which could redirect the cache to files another user controls. Replace it with a real directory or file, or remove it
 
+## ffi-cache-escapes
+
+refusing to load the FFI cache: `{path}` is a symbolic link or not a directory, so the cache path could lead to files another user controls. Replace it with a real directory, or remove it
+
 ## ffi-cache-not-regular
 
 refusing to load the FFI cache: `{path}` is not a regular file. Remove it and re-run `ipe rust add` for the crate
