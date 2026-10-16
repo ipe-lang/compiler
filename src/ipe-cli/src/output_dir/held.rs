@@ -402,6 +402,9 @@ impl HeldDir {
     /// The entry is opened without following a link and without blocking,
     /// proven regular on its own handle, and read at most one byte past
     /// `cap` ([`ipe_fs_open::HeldDir::open_regular`], then [`read_proven`]).
+    /// `name` is looked up as the file system matches names, case-insensitively
+    /// on a case-insensitive volume: only a name taken from [`HeldDir::list_names`]
+    /// is the on-disk spelling.
     ///
     /// # Errors
     /// [`CliError::SourceRefused`] for a link, a non-regular entry, or a denied
@@ -2736,6 +2739,48 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the read returns without blocking on the FIFO");
         assert!(refused, "a FIFO is not a regular file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Content that is not UTF-8 is an invalid-data read error, never lossily decoded.
+    #[test]
+    fn read_file_capped_refuses_content_that_is_not_utf8() {
+        let base = scratch("read_not_utf8");
+        std::fs::write(base.join("Main.ipe"), b"module \xff").expect("plant source");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, path }) if source.kind() == io::ErrorKind::InvalidData && path.ends_with("Main.ipe")),
+            "non-UTF-8 content is refused, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An absent entry is a not-found read error naming the entry.
+    #[test]
+    fn read_file_capped_reports_an_absent_entry_as_not_found() {
+        let base = scratch("read_absent");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, path }) if source.kind() == io::ErrorKind::NotFound && path.ends_with("Main.ipe")),
+            "an absent entry is not found, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held directory removed before its listing is refused, never listed as empty.
+    #[cfg(unix)]
+    #[test]
+    fn list_names_refuses_a_removed_directory() {
+        let base = scratch("list_removed");
+        let gone = base.join("gone");
+        std::fs::create_dir(&gone).expect("make dir");
+        let held = held_at(&gone);
+        std::fs::remove_dir(&gone).expect("remove the held dir");
+        let listing = held.list_names(entry_cap(8));
+        assert!(
+            matches!(&listing, Err(CliError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
+            "a removed directory is refused, got {listing:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
