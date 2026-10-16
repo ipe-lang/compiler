@@ -1098,3 +1098,49 @@ fn row_poly_map_update_cargo_builds_and_runs() {
         "bump via HOF apply: n incremented (1→2) and label preserved (\"a\")"
     );
 }
+
+/// An unannotated cross-module relay (`relay r = greet r`) over a row-poly
+/// `greet : { r | name : String } -> String` is promoted with the row variable
+/// quantified, but no row parameter carries it. Lowering that row tail to a
+/// flat `RecName` struct emits `lib_relay(r: RecName)` called with
+/// `RecAgeName` (E0308), so the foreign row variable must reject with
+/// IPE-L0131 and emit no Rust.
+#[test]
+fn unannotated_relay_of_row_poly_fn_is_ipe_l0131() {
+    let name = "row_poly_unannotated_relay_neg";
+    let src = crate::support::scratch_root().join(format!("{name}_src"));
+    let out = crate::support::scratch_root().join(format!("{name}_out"));
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&src).expect("create fixture dir");
+    std::fs::write(
+        src.join("Lib.ipe"),
+        "module Lib exposing (relay)\n\n\n\
+         greet : { r | name : String } -> String\n\
+         greet rec =\n    rec.name\n\n\n\
+         relay r =\n    greet r\n",
+    )
+    .expect("write Lib.ipe");
+    std::fs::write(
+        src.join("Main.ipe"),
+        "module Main exposing (main)\n\n\
+         import Lib\n\
+         import Ipe.Io as Io\n\n\n\
+         main =\n    Io.println (Lib.relay { name = \"Ada\", age = 1 })\n",
+    )
+    .expect("write Main.ipe");
+
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let res = ipe::build_loose_file(&src.join("Main.ipe"), &out, &runtime);
+    let err = res.expect_err("an unannotated relay of a row-poly fn must be rejected");
+    assert_eq!(
+        diag_code(&err),
+        Some(ipe_diagnostics::IPE_L0131),
+        "a foreign row variable must be IPE-L0131 (else `lib_relay(r: RecName)` \
+         is E0308 at the `RecAgeName` call); err = {err}"
+    );
+    assert!(
+        !out.join("src").join("main.rs").exists(),
+        "{name}: no Rust must be emitted on a rejection"
+    );
+}
