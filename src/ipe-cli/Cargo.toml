@@ -43,6 +43,12 @@ signing = ["dep:sigstore", "dep:sigstore_protobuf_specs", "dep:pki_types"]
 # fallback.
 wasi_run = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
+# `RootFixture` and `build_fixture`: the one way a test reaches a project, by
+# writing a real project tree and resolving it through `ProjectRoot::resolve`.
+# Only test targets enable it (the `ipe` dev-dependency below); no dependency
+# and no shipped binary does.
+test-fixtures = []
+
 [dependencies]
 ipe_stdlib = { path = "../stdlib" }
 ipe_docs = { path = "../ipe-docs" }
@@ -199,6 +205,8 @@ cap-primitives = "3.4.6"
 win32job = "2"
 
 [dev-dependencies]
+# Turns on `test-fixtures` for this package's own test targets.
+ipe = { path = ".", features = ["test-fixtures"] }
 ipe-test-temp = { path = "../../tools/test-temp" }
 # Build + run plumbing shared by the golden E2E tests (tests/support/mod.rs).
 # `cargo build --message-format=json` parsing that locates the produced binary
