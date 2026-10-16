@@ -107,10 +107,10 @@ identifier fails closed with no DDL produced.
 
 ## `Row`
 
-A row read back from the database: every column keyed by its name, values
-as strings (the `Db.findWhere` representation). The typed `read*` helpers
-parse a column back into its Ipê type; the raw-column escape (`fromColumns`)
-stores rows in this form.
+A row read back from the database: every column keyed by its name, each
+cell its text form, `Nothing` for SQL `NULL` (the `Db.findWhere`
+representation). The typed `read*` helpers parse a column back into its Ipê
+type; the raw-column escape (`fromColumns`) stores rows in this form.
 
 ## `validSqlIdent`
 
@@ -224,8 +224,8 @@ fromColumns : String -> List Column -> Result Error (Draft Row)
 ```
 
 `fromColumns table columns` — the raw-column escape: build a `Draft Row`
-for a dynamic or non-codec table, whose rows are the untyped
-`Dict String String` the DB layer returns. The draft's codec is the row codec
+for a dynamic or non-codec table, whose rows are the untyped `Row` cell maps
+the DB layer returns. The draft's codec is the row codec
 derived from `columns` (`rowCodec`), so the same codec-driven CRUD applies once
 the draft is classified: writes bind each declared column, reads decode back
 into a `Row`, and the typed `read*` helpers parse a column into its Ipê type.
@@ -240,16 +240,14 @@ rowCodec : List Column -> Codec Row
 ```
 
 `rowCodec columns` — the `Codec Row` a raw-column store uses: a record
-codec over `Dict String String` whose `Shape` is `SRecord` naming each
-declared column. Every column is carried as nullable text (`CNull CText`) at
-the JSON layer, because a `Row` cell is already the string form the DB layer
-returns and accepts (the same lossless-string basis the `read*` helpers parse
-from); the DDL still uses each column's declared `ColType` (held on the
-store's frozen columns), so a raw store creates its table with real types
-while its rows stay untyped strings. The encoder emits the declared columns as
-a JSON object; the decoder reads that object back into a `Row`, where a `Row`
-cannot express SQL `NULL`, so a `NULL` cell reads as the empty string — the
-untyped `Row` representation, never a codec-typed field.
+codec over `Row` whose `Shape` is `SRecord` naming each declared column.
+Every column is carried as nullable text (`CNull CText`) at the JSON layer,
+because a `Row` cell is already the text form the DB layer returns and
+accepts (the same lossless-string basis the `read*` helpers parse from); the
+DDL still uses each column's declared `ColType` (held on the store's frozen
+columns), so a raw store creates its table with real types while its rows stay
+untyped text. The encoder emits the declared columns as a JSON object; the
+decoder reads that object back into a `Row`, a SQL `NULL` cell as `Nothing`.
 
 ## `public`
 
@@ -650,7 +648,7 @@ name, the columns, and the specs it names always belong to one schema.
 readText : String -> Row -> Result Error String
 ```
 
-Read a column as a `String`. A missing column is a typed `Err`.
+Read a column as a `String`. A missing or `NULL` column is a typed `Err`.
 
 ## `readInt`
 
@@ -658,7 +656,8 @@ Read a column as a `String`. A missing column is a typed `Err`.
 readInt : String -> Row -> Result Error Int
 ```
 
-Read a column as an `Int`. A missing or non-integer column is a typed `Err`.
+Read a column as an `Int`. A missing, `NULL` or non-integer column is a
+typed `Err`.
 
 ## `readBool`
 
@@ -667,8 +666,8 @@ readBool : String -> Row -> Result Error Bool
 ```
 
 Read a column as a `Bool`. The stored form is SQLite's `0` / `1` integer
-convention (and the literals `true` / `false`); anything else is a typed
-`Err`.
+convention (and the literals `true` / `false`); anything else, a `NULL` and a
+missing column included, is a typed `Err`.
 
 ## `readFloat`
 
@@ -676,8 +675,8 @@ convention (and the literals `true` / `false`); anything else is a typed
 readFloat : String -> Row -> Result Error Float
 ```
 
-Read a column as a `Float`. A missing or non-numeric column is a typed
-`Err`.
+Read a column as a `Float`. A missing, `NULL` or non-numeric column is a
+typed `Err`.
 
 ## `insert`
 
@@ -754,10 +753,8 @@ typed `Err` before any SQL is sent:
 * a row whose key value is `NULL` (a `NULL` key never conflicts, so the row
   would be duplicated).
 
-A raw-column (`fromColumns`) row has no absent cell at this boundary:
-`rowCodec` writes a missing cell as the empty string, so a `Row` without its
-key cell is upserted under the key `""` (and overwrites a row already keyed
-`""`). Give every `Row` its key cell.
+A raw-column (`fromColumns`) row without its key cell binds the key as SQL
+`NULL`, so it is refused as a `NULL` key above.
 
 On conflict, every non-key column the row supplies is overwritten; `serial` /
 `defaultNow` / `touchOnUpdate` columns are omitted from the write and keep
@@ -850,8 +847,7 @@ allOn : Connection mode -> Store a -> Task Error (List a)
 
 `allOn conn store` — read every row from an external connection and decode
 each through the store's codec. The external counterpart to `all`.
-Unlike `all`, a SQL `NULL` cell reaches the codec as the empty string on
-this path, so a `Maybe String` field reads `NULL` as `Just ""`.
+As with `all`, a SQL `NULL` cell reaches the codec as `Nothing`.
 
 ## `getOn`
 
@@ -864,8 +860,7 @@ getOn : Connection mode -> Store a -> SqlValue -> Task Error (Maybe a)
 store's codec. The external counterpart to `get`; keys on the store's
 validated `pk`, binds the value as a parameter, and fails closed for a store
 with no primary key.
-Unlike `get`, a SQL `NULL` cell reaches the codec as the empty string on
-this path, so a `Maybe String` field reads `NULL` as `Just ""`.
+As with `get`, a SQL `NULL` cell reaches the codec as `Nothing`.
 
 ## `findWhereOn`
 
@@ -876,8 +871,7 @@ findWhereOn : Connection mode -> Store a -> SqlFragment -> Task Error (List a)
 `findWhereOn conn store cond` — read the rows matching `cond` from an
 external connection and decode each through the store's codec. The external
 counterpart to `findWhere`; the same audited `SqlFragment` barrier applies.
-Unlike `findWhere`, a SQL `NULL` cell reaches the codec as the empty string on
-this path, so a `Maybe String` field reads `NULL` as `Just ""`.
+As with `findWhere`, a SQL `NULL` cell reaches the codec as `Nothing`.
 
 ## `update`
 
@@ -1866,9 +1860,8 @@ a1.keyB [AND filters]`) through `Db.findJoin` (or `Db.findJoinOrdered` when
 both aliases, every projected column) is re-validated at the runtime boundary,
 and every filter value is a bound parameter. A poisoned join (a filter naming
 an unknown column) fails closed with the typed `Err`; a row that does not
-decode to its side's type is a typed `Err`. Unlike the single-store reads, a
-SQL `NULL` cell reaches each side's codec as the empty string, so a
-`Maybe String` field reads `NULL` as `Just ""`.
+decode to its side's type is a typed `Err`. As with the single-store reads, a
+SQL `NULL` cell reaches each side's codec as `Nothing`.
 
 Example:
 
@@ -1884,7 +1877,7 @@ joinToMaybe : Db -> Joined a b -> Task Error (Maybe ( a, b ))
 
 `joinToMaybe conn joined` — run the join and decode the FIRST matched pair,
 or `Nothing`. As with `joinToList`, a SQL `NULL` cell reaches each side's
-codec as the empty string, so a `Maybe String` field reads `NULL` as `Just ""`.
+codec as `Nothing`.
 
 Example:
 
@@ -2103,7 +2096,9 @@ for every matched join row. Lowers to ONE parameterized statement
 (`SELECT proj … FROM ta AS a0, tb AS a1 WHERE …`) through `Db.findProjection`:
 every projected identifier is re-validated at the runtime boundary, and every
 filter value is a bound parameter. A poisoned projection (an inherited filter
-naming an unknown column) fails closed with the typed `Err`.
+naming an unknown column) fails closed with the typed `Err`, and so does a
+projected cell that is SQL `NULL` (the per-column decode names its output
+column), never an empty string.
 
 The `Select` argument must be a `Store.select` projection expression: the
 compiler reads the projected shape and each column's type from it and emits the

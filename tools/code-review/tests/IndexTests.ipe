@@ -21,9 +21,9 @@ import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
+import Lib.Drawn as Drawn exposing (Mode(..), SourceRow(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Drawn as Drawn exposing (Mode(..), SourceRow(..))
 import Lib.Index as Index exposing (Body(..), Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
@@ -1570,7 +1570,6 @@ unjudgedUnitFailsSnapshot =
         Task.succeed (intact && maybeContains "the index's unit counts do not add up" message)
 
 
-
 -- A refusal whose path the tag condition cannot judge (a NULL path in a
 -- table rebuilt without the schema's NOT NULL) is in neither refusal count,
 -- and the snapshot read fails rather than report totals that hide it. Red
@@ -1589,6 +1588,7 @@ unjudgedRefusalFailsSnapshot =
         message <- probeMessage (indexConn |> Task.andThen snapshotOn |> Task.map (\_ -> ()))
         cleanupIndex at.indexDb at.repo
         Task.succeed (intact && maybeContains "the index's refusal counts do not add up" message)
+
 
 checks : Task.Task Error (List ( String, Bool ))
 checks =

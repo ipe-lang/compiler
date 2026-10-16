@@ -10539,14 +10539,6 @@ fn join_right_alias() -> String {
     "a1".to_string()
 }
 
-/// The IR element type of a projection reference — a `(String, String)` tuple of
-/// `(alias, column)`. Used to type the `selectNamed` projection list literal.
-/// The IR type of a projection `Row` — the `Dict String String` cell map the DB
-/// projection layer returns. Types the emitted decode's `row` binder.
-fn row_ir_type() -> IrType {
-    IrType::Dict(Box::new(IrType::Str), Box::new(IrType::Str))
-}
-
 /// The IR type of the `Error` channel — the fixed error side of every
 /// `Result Error _` the emitted decode threads.
 const fn error_ir_type() -> IrType {
@@ -14587,6 +14579,34 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// The IR type of a projection `Row`, read off the `Ipe.Db.Store` reader's own annotation.
+    ///
+    /// The text reader is `projectionReadText : Int -> Row -> Result Error String`,
+    /// so its second parameter is the `Row` alias the readers consume, already
+    /// expanded by resolution. Deriving the decode's binder type from it keeps the
+    /// emitted lambda and the stdlib reader on one definition of `Row`.
+    fn projection_row_ir_type(&self) -> DResult<IrType> {
+        let id = self.store_named_func_id(ProjColKind::Text.reader())?;
+        let idx = usize::try_from(id.as_raw()).unwrap_or(usize::MAX);
+        let Some(canon::Def::Typed {
+            ty: canon::Type::Lambda(_, rest),
+            ..
+        }) = self.m.defs.get(idx)
+        else {
+            return Err(bug(
+                "ipe_lower::projection_row_ir_type",
+                "Store projection reader has no `Int -> Row -> ...` annotation",
+            ));
+        };
+        let canon::Type::Lambda(row, _) = rest.as_ref() else {
+            return Err(bug(
+                "ipe_lower::projection_row_ir_type",
+                "Store projection reader annotation takes no `Row`",
+            ));
+        };
+        self.ir_type_from_canon(row, &[])
+    }
+
     /// Look up the `FuncId` of a named `Ipe.Db.Store` helper by its exact identity.
     ///
     /// Keyed on `(Ipe.Db.Store, helper)` (e.g. `"neqByNamed"`), so a same-named
@@ -15704,6 +15724,7 @@ impl<'a> Lowerer<'a> {
     /// only through the (kept) `Store` helpers, so the emitted decode pulls no
     /// binding the whole-program reachability pass could have pruned.
     fn projection_decode_lambda(&self, cols: &[ProjectedColumn]) -> DResult<(Expr, IrType)> {
+        let row_ty = self.projection_row_ir_type()?;
         let row_binder = self.fresh_projection_decode_binder()?;
         // `projectionRead<kind> i row` — read the cell at output position `i`.
         let read_at = |i: usize, col: &ProjectedColumn, row: Symbol| -> DResult<Expr> {
@@ -15749,7 +15770,7 @@ impl<'a> Lowerer<'a> {
                     let r = self.fresh_projection_decode_binder()?;
                     let read = read_at(i, col, r)?;
                     call_args.push(Expr::Lambda {
-                        params: vec![(r, row_ir_type())],
+                        params: vec![(r, row_ty.clone())],
                         ret: IrType::Result(
                             Box::new(error_ir_type()),
                             Box::new(col.kind.value_ir_type()),
@@ -15769,7 +15790,7 @@ impl<'a> Lowerer<'a> {
         };
         let result_ty = IrType::Result(Box::new(error_ir_type()), Box::new(value_ty.clone()));
         let lambda = Expr::Lambda {
-            params: vec![(row_binder, row_ir_type())],
+            params: vec![(row_binder, row_ty)],
             ret: result_ty,
             body: Box::new(body),
         };

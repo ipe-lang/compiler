@@ -478,6 +478,21 @@ pub fn json_decode_string<E: From<String> + 'static>() -> Decoder<E, String> {
         vec![],
     )
 }
+/// The `i64` an integral float denotes, or `None` when it is fractional or out of range.
+///
+/// Both bounds are *strict* because f64 cannot distinguish a boundary from its
+/// out-of-range neighbour: `i64::MAX as f64` rounds up to `2^63` and
+/// `i64::MIN-1` rounds down to `i64::MIN as f64`, so `<=`/`>=` would admit an
+/// out-of-range integer and let `f as i64` saturate to the limit — a silent
+/// wrong value. An exact `i64::MIN`/`i64::MAX` arrives as an integer through
+/// `Number::as_i64`; this only admits the open interval. `NaN` and the
+/// infinities fail every comparison and the `fract` test, so they are `None`.
+/// The JSON `Int` decoder and the Db row's float-cell text share it, so a row
+/// cell reads the same through either path.
+pub(crate) fn integral_i64(f: f64) -> Option<i64> {
+    (f.fract() == 0.0 && f > (i64::MIN as f64) && f < (i64::MAX as f64)).then_some(f as i64)
+}
+
 pub fn json_decode_int<E: From<String> + 'static>() -> Decoder<E, i64> {
     Decoder::new(
         // Parse-don't-validate: an integer decoder yields an integer or a typed
@@ -490,22 +505,11 @@ pub fn json_decode_int<E: From<String> + 'static>() -> Decoder<E, i64> {
         Box::new(|v| match v {
             JsonVal::Number(n) => match n.as_i64() {
                 Some(i) => decode_ok(i),
-                // `1.0` is stored as a float; recover it when it is integral and
-                // representable, rejecting `1.5` and out-of-range values. Both
-                // bounds are *strict* because f64 cannot distinguish a boundary
-                // from its out-of-range neighbour: `i64::MAX as f64` rounds up
-                // to `2^63` and `i64::MIN-1` rounds down to `i64::MIN as f64`,
-                // so `<=`/`>=` would admit an out-of-range integer and let
-                // `f as i64` saturate to the limit — a silent wrong value. An
-                // exact `i64::MIN`/`i64::MAX` arrives as an integer through
-                // `as_i64` above; this fallback only admits the open interval.
-                None => match n.as_f64() {
-                    Some(f)
-                        if f.fract() == 0.0 && f > (i64::MIN as f64) && f < (i64::MAX as f64) =>
-                    {
-                        decode_ok(f as i64)
-                    }
-                    _ => decode_err_str("expected int, got a non-integer number".into()),
+                // `1.0` is stored as a float; recover it through `integral_i64`,
+                // rejecting `1.5` and out-of-range values.
+                None => match n.as_f64().and_then(integral_i64) {
+                    Some(i) => decode_ok(i),
+                    None => decode_err_str("expected int, got a non-integer number".into()),
                 },
             },
             _ => decode_err_str("expected int".into()),

@@ -73,12 +73,12 @@ pub(crate) fn lib_seed_and_count() -> IpeTask<i64> {
                                                 task_map(
                                                     {
                                                         let __ipe_fn: Box<
-                                                            dyn Fn(Vec<HashMap<String, String>>) -> i64
+                                                            dyn Fn(Vec<HashMap<String, IpeMaybe<String>>>) -> i64
                                                                 + Send
                                                                 + Sync
                                                                 + 'static,
                                                         > = Box::new(
-                                                            move |rows: Vec<HashMap<String, String>>| -> i64 {
+                                                            move |rows: Vec<HashMap<String, IpeMaybe<String>>>| -> i64 {
                                                                 list_length(rows)
                                                             },
                                                         );

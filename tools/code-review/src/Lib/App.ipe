@@ -27,9 +27,10 @@ type Page
 -- handler as its first argument. `selectedView` is the session's one source
 -- read slot, read by the queue card and the unit page alike, and `decision`
 -- its one decision slot, so a second read or decision in flight has no
--- representation. `standing` is the unit page's read of where its shown
--- body stands in the review log. `decisionError` is why the last decision
--- was not saved, a typed case that never holds an error's text.
+-- representation; the slot also holds the notice of a decision that was not
+-- saved, a typed case that never holds an error's text, so a notice and a
+-- busy decision are never both shown. `standing` is the unit page's read of
+-- where its shown body stands in the review log.
 type alias Model =
     { page : Page
     , queueState : Queue.QueueState
@@ -37,7 +38,6 @@ type alias Model =
     , refusingUid : Maybe Uid
     , refuseDraft : String
     , refuseError : Maybe Error
-    , decisionError : Maybe Queue.SaveFailure
     , queueLoad : Queue.LoadTicket
     , history : Queue.HistoryState
     , historyLoad : Queue.LoadTicket
@@ -81,7 +81,6 @@ initialModel =
     , refusingUid = Nothing
     , refuseDraft = ""
     , refuseError = Nothing
-    , decisionError = Nothing
     , queueLoad = Queue.firstTicket
     , history = HistoryLoading
     , historyLoad = Queue.firstTicket
@@ -138,7 +137,9 @@ unitPageState raw model =
 
 -- A page entered, with the Cmd that loads its data: the one entry path, run
 -- on every URL entry (first request, reload, link, back and forward,
--- reconnect) through `onNavigate`, and by the header buttons. The queue page
+-- reconnect) through `onNavigate`, and by the header buttons. The entry
+-- adopts the decision slot for this process, so a busy decision another
+-- process left behind shows no pending state. The queue page
 -- reloads the queue; any other page loads the queue too while it is not
 -- loaded, since the header shows its progress on every page. History shows
 -- no source, so it clears the source slot; a read in flight stays recorded.
@@ -146,7 +147,7 @@ enterPage : Settings.AppSettings -> Page -> Model -> ( Model, Cmd Msg )
 enterPage settings page model =
     let
         entered =
-            { model | page = page }
+            { model | page = page, decision = Queue.ownedSlot settings.epoch model.decision }
     in
     case page of
         QueuePage ->
@@ -228,7 +229,7 @@ update settings msg model =
             if Queue.isCurrentLoad load model.queueLoad then
                 let
                     loaded =
-                        { model | queueState = Queue.stateFromResult result, refusingUid = Nothing }
+                        { model | queueState = Queue.stateFromResult result, refusingUid = Nothing, decision = Queue.queueSettled load result model.decision }
                 in
                 viewAfterLoad settings { loaded | selected = clampIndex model.selected (List.length (queueList loaded)) }
 
@@ -260,20 +261,16 @@ update settings msg model =
             submitRefuse settings model OnRefusal uid
 
         DecisionSaved uid epoch result ->
-            let
-                settled =
-                    { model | decision = Queue.decisionSettled epoch uid model.decision }
-            in
             case result of
                 Ok ( attested, written ) ->
                     let
                         load =
-                            Queue.nextTicket settled.queueLoad
+                            Queue.nextTicket model.queueLoad
                     in
-                    ( { settled | decisionError = Nothing, queueLoad = load }, drainAndReload settings settled attested written load )
+                    ( { model | decision = Queue.decisionWritten epoch uid model.decision, queueLoad = load }, drainAndReload settings model attested written load )
 
                 Err e ->
-                    ( { settled | decisionError = Just (Queue.saveFailureOf e) }, Cmd.none )
+                    ( { model | decision = Queue.decisionNotSaved epoch uid (Queue.saveFailureOf e) model.queueLoad model.decision }, Cmd.none )
 
         Navigated page ->
             enterPage settings page model
@@ -507,17 +504,17 @@ pageRefusal model uid =
 -- or `Queue.decideRefusal` on a listed unreviewable file's digest, each
 -- re-proved before writing. A decision asked off the queue page is
 -- refused before it takes the slot, and so is one asked on a server with no
--- signing key; one asked while another is saving starts nothing. Each says
--- why.
+-- signing key, each with a notice saying why; one asked while another is
+-- busy starts nothing, and that decision's pending state stays shown.
 saveDecision : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> LibDb.Decision -> ( Model, Cmd Msg )
 saveDecision settings model target uid decision =
     if model.page /= QueuePage then
-        ( { model | decisionError = Just SaveOffQueue }, Cmd.none )
+        ( { model | decision = Queue.decisionRefused settings.epoch SaveOffQueue model.queueLoad model.decision }, Cmd.none )
 
     else
         case settings.key of
             ReadOnly ->
-                ( { model | decisionError = Just SaveReadOnly }, Cmd.none )
+                ( { model | decision = Queue.decisionRefused settings.epoch SaveReadOnly model.queueLoad model.decision }, Cmd.none )
 
             Signing _ ->
                 case Queue.startDecision settings.epoch uid model.decision of
@@ -527,14 +524,14 @@ saveDecision settings model target uid decision =
                         )
 
                     Nothing ->
-                        ( { model | decisionError = Just SaveInFlight }, Cmd.none )
+                        ( model, Cmd.none )
 
 
 -- The refusal panel's refusal of a decision submitted while another is
--- saving, worded as the queue banner words it.
+-- busy.
 decisionBusy : Error
 decisionBusy =
-    Error.conflict (Queue.saveFailureText SaveInFlight)
+    Error.conflict Queue.decisionBusyText
 
 
 decisionTask : Settings.AppSettings -> Model -> DecisionTarget -> Uid -> LibDb.Decision -> Task.Task Error ( Index.Attested, Index.Written )

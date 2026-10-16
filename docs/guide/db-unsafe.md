@@ -20,17 +20,22 @@ hatches two distinct axes:
   No validator makes arbitrary SQL safe — the caller asserts the text is safe. The
   safe default is parameterised binds and the validated `Sql.*` combinators.
 - **The type-safety axis.** The `unsafeGet*` family (`unsafeGetString`,
-  `unsafeGetInt`, `unsafeGetBool`, `unsafeGetField`) reads a column by string key
-  with no decode proof, bypassing the typed row codec. No SQL is issued, so there
-  is no injection risk on this axis — but the caller asserts the column's runtime
-  type matches the read. The safe default is `Db.queryDecode`'s row codec.
+  `unsafeGetInt`, `unsafeGetBool`, `unsafeGetField`) reads a field of a payload
+  `Dict String String` (a request or message field map) by string key with no
+  decode proof. No SQL is issued, so there is no injection risk on this axis — but
+  the caller asserts the field's runtime type matches the read. A database row is
+  not a payload map: every raw read returns `Dict String (Maybe String)`, with SQL
+  `NULL` as `Nothing`, and `Ipe.Db.Store`'s `readText` / `readInt` / `readFloat` /
+  `readBool` parse one cell, a `NULL` or missing column as a typed `Err`. The safe
+  default is `Db.queryDecode`'s row codec.
 
 ```ipe
 import Ipe.Db.Unsafe exposing (unsafeQuery)
 
 -- The query TEXT is caller-authored verbatim; only the binds are parameterised.
 -- The caller now owns the injection invariant `Db.queryDecode` would have held.
-rows : Task Error (List (Dict String String))
+-- Each row maps a column to its cell text, `Nothing` for SQL `NULL`.
+rows : Task Error (List (Dict String (Maybe String)))
 rows =
     unsafeQuery conn "SELECT * FROM audit WHERE ts > ?" [ SqlString cutoff ]
 ```

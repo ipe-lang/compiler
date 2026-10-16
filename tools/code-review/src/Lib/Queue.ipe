@@ -1,4 +1,4 @@
-module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SaveFailure(..), SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decideRefusal, decisionSettled, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, saveFailureOf, saveFailureText, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
+module Lib.Queue exposing (DecisionSlot(..), HistoryPage, HistoryRow, HistoryState(..), LoadTicket, Place(..), Progress, QueuePage, QueueState(..), QueuedUnit, ResyncBound, SaveFailure(..), SelectedView(..), Standing(..), StandingRead(..), UnitLabel, UnitPageState(..), chainBanner, clearView, decidableSource, decide, decideRefusal, decisionBusyText, decisionNotSaved, decisionRefused, decisionWritten, drainThenLoad, entryUid, firstTicket, historyStateFromResult, historyStatusText, isCurrentLoad, loadHistoryPage, loadPage, loadStanding, makeResyncBound, notSavedOf, ownedSlot, pendingText, nextTicket, loadUnitView, pageHeaderText, queueLabels, queueSettled, queueStatusText, refusalReasonText, reloadView, resyncBound, resyncPageCeiling, resyncReviewed, resyncReviewedWithin, saveFailureOf, saveFailureText, selectView, selectedViewOf, selectedViewStatusText, sourceStatusText, standingArrived, standingFor, standingOf, startDecision, stateFromResult, unitLabel, unitPageEntry, unitPageOf, unitPageStatusText, viewArrived)
 
 import Ipe.ByteSize as ByteSize
 import Ipe.Db as Db exposing (DbFailure(..))
@@ -664,16 +664,16 @@ decideRefusal key settings db uid digest decision =
 -- Why a decision was not saved, as the model holds it. Each case is decided
 -- from the failure's type, never its text, and renders a fixed text of this
 -- tool's own, so no error's text reaches the model or the page. A decision
--- asked while another is saving, asked off the queue page, or asked on a
--- server with no signing key is refused before it starts. `SaveContended`:
+-- asked off the queue page, or asked on a server with no signing key, is
+-- refused before it starts; one asked while another is busy starts nothing
+-- and leaves that decision's pending state shown. `SaveContended`:
 -- a database the save reads or writes was busy (locked past its busy
 -- timeout, or no connection free in time) — the index, read to re-prove the
 -- shown source, or the review database, written with the decision; a busy
 -- failure does not say which. `SaveFailed`: every other failure, the closed
 -- default, whose cause the reviewer recovers from by reloading.
 type SaveFailure
-    = SaveInFlight
-    | SaveOffQueue
+    = SaveOffQueue
     | SaveReadOnly
     | SaveContended
     | SaveFailed
@@ -757,13 +757,16 @@ saveFailureOfDb failure =
             SaveFailed
 
 
+-- Why a refusal draft submitted while a decision is busy stays open.
+decisionBusyText : String
+decisionBusyText =
+    "a decision is still being saved; try again once it settles"
+
+
 -- The fixed text each case renders.
 saveFailureText : SaveFailure -> String
 saveFailureText failure =
     case failure of
-        SaveInFlight ->
-            "a decision is still being saved; try again once it settles"
-
         SaveOffQueue ->
             "decisions are made on the queue page"
 
@@ -1090,46 +1093,215 @@ unitPageOf uid state =
             UnitLoading
 
 
--- The session's one decision slot. A decision re-reads its source to re-prove
--- it, so at most one is in flight: a decision asked while one is saving
--- starts nothing. A saving decision records the epoch whose process runs it:
--- slot ownership is tied to process lifetime, so one owned by another epoch
--- is idle.
+-- The session's one decision slot, and what the reviewer sees of it. A
+-- decision re-reads its source to re-prove it, so at most one is in flight:
+-- a decision asked while one is busy starts nothing. Busy is two cases: the
+-- decision is saving, or it is saved and the queue reload that drops its row
+-- is still running, so the row's controls stay withheld until the reloaded
+-- queue no longer lists it. A busy decision records the epoch whose process
+-- runs it: slot ownership is tied to process lifetime, so one owned by
+-- another epoch is idle. `DecisionNotSaved` is the notice of the last
+-- decision that was not saved, with the queue's latest load ticket when it
+-- was raised; the next decision started, or a queue load started after it
+-- that succeeds, replaces it, so a reload clears it as its text advises,
+-- and a load that read the queue before the failure was known does not.
 type DecisionSlot
     = DecisionIdle
     | DecisionSaving Uid Epoch
+    | DecisionRefreshing Uid Epoch
+    | DecisionNotSaved SaveFailure LoadTicket
+
+
+-- The decision on `uid` and the process `epoch` runs it in, while that
+-- process has it busy.
+busyOwnedBy : Epoch -> DecisionSlot -> Maybe Uid
+busyOwnedBy epoch slot =
+    case slot of
+        DecisionSaving uid owner ->
+            if owner == epoch then
+                Just uid
+
+            else
+                Nothing
+
+        DecisionRefreshing uid owner ->
+            if owner == epoch then
+                Just uid
+
+            else
+                Nothing
+
+        DecisionIdle ->
+            Nothing
+
+        DecisionNotSaved _ _ ->
+            Nothing
 
 
 -- The slot holding a decision on `uid` run by process `epoch`; Nothing
--- while another decision of that process is saving.
+-- while another decision of that process is busy. Starting a decision drops
+-- the last one's not-saved notice.
 startDecision : Epoch -> Uid -> DecisionSlot -> Maybe DecisionSlot
 startDecision epoch uid slot =
-    case slot of
-        DecisionIdle ->
+    case busyOwnedBy epoch slot of
+        Just _ ->
+            Nothing
+
+        Nothing ->
             Just (DecisionSaving uid epoch)
 
-        DecisionSaving _ owner ->
-            if owner == epoch then
-                Nothing
 
-            else
-                Just (DecisionSaving uid epoch)
+-- The slot as this process `epoch` owns it: a busy decision another process
+-- left behind, whose completion died with it, is idle.
+ownedSlot : Epoch -> DecisionSlot -> DecisionSlot
+ownedSlot epoch slot =
+    case busyOwnedBy epoch slot of
+        Just _ ->
+            slot
+
+        Nothing ->
+            case slot of
+                DecisionNotSaved _ _ ->
+                    slot
+
+                DecisionIdle ->
+                    slot
+
+                DecisionSaving _ _ ->
+                    DecisionIdle
+
+                DecisionRefreshing _ _ ->
+                    DecisionIdle
 
 
--- The decision on `uid` run by process `epoch` settled; a result for any
+-- The decision on `uid` run by process `epoch` was written: it stays busy
+-- until the queue reload that follows settles. A result for any other uid
+-- or from any other process leaves the slot.
+decisionWritten : Epoch -> Uid -> DecisionSlot -> DecisionSlot
+decisionWritten epoch uid slot =
+    if isSaving epoch uid slot then
+        DecisionRefreshing uid epoch
+
+    else
+        slot
+
+
+-- The decision on `uid` run by process `epoch` was not saved, for
+-- `failure`, while `latest` is the queue's latest load. A result for any
 -- other uid or from any other process leaves the slot.
-decisionSettled : Epoch -> Uid -> DecisionSlot -> DecisionSlot
-decisionSettled epoch uid slot =
+decisionNotSaved : Epoch -> Uid -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
+decisionNotSaved epoch uid failure latest slot =
+    if isSaving epoch uid slot then
+        DecisionNotSaved failure latest
+
+    else
+        slot
+
+
+isSaving : Epoch -> Uid -> DecisionSlot -> Bool
+isSaving epoch uid slot =
     case slot of
         DecisionSaving saving owner ->
-            if saving == uid && owner == epoch then
-                DecisionIdle
+            saving == uid && owner == epoch
 
-            else
-                slot
+        DecisionRefreshing _ _ ->
+            False
 
         DecisionIdle ->
+            False
+
+        DecisionNotSaved _ _ ->
+            False
+
+
+-- A decision refused before it started, for `failure`, while `latest` is
+-- the queue's latest load: the notice replaces an idle slot or an older
+-- notice, never a busy decision of process `epoch`.
+decisionRefused : Epoch -> SaveFailure -> LoadTicket -> DecisionSlot -> DecisionSlot
+decisionRefused epoch failure latest slot =
+    case busyOwnedBy epoch slot of
+        Just _ ->
+            slot
+
+        Nothing ->
+            DecisionNotSaved failure latest
+
+
+-- The current queue load `load` settled with `result`. The reloaded queue
+-- no longer lists a refreshing decision's row, or failed and lists no row,
+-- so the decision is done either way; a load started after the not-saved
+-- notice that succeeds also clears it, the reload its text advises, while
+-- a load started before it read the queue before the failure was known
+-- and leaves it. A decision still saving stays: its row is re-proved at
+-- the write, and its own result settles it.
+queueSettled : LoadTicket -> Result e a -> DecisionSlot -> DecisionSlot
+queueSettled load result slot =
+    case slot of
+        DecisionRefreshing _ _ ->
             DecisionIdle
+
+        DecisionNotSaved _ raisedAt ->
+            case result of
+                Ok _ ->
+                    if ticketNumber load > ticketNumber raisedAt then
+                        DecisionIdle
+
+                    else
+                        slot
+
+                Err _ ->
+                    slot
+
+        DecisionSaving _ _ ->
+            slot
+
+        DecisionIdle ->
+            slot
+
+
+-- What a row's decision controls show while a decision is busy, in place of
+-- the controls: the row being decided says how far it got, and any other
+-- row says what it waits on. Nothing when no decision is busy, where the
+-- row offers its controls.
+pendingText : Uid -> DecisionSlot -> Maybe String
+pendingText uid slot =
+    case slot of
+        DecisionSaving busy _ ->
+            if busy == uid then
+                Just "Saving the decision…"
+
+            else
+                Just "Another decision is saving…"
+
+        DecisionRefreshing busy _ ->
+            if busy == uid then
+                Just "Decision saved; refreshing the queue…"
+
+            else
+                Just "Refreshing the queue after a decision…"
+
+        DecisionIdle ->
+            Nothing
+
+        DecisionNotSaved _ _ ->
+            Nothing
+
+
+-- The not-saved notice the slot holds, if any.
+notSavedOf : DecisionSlot -> Maybe SaveFailure
+notSavedOf slot =
+    case slot of
+        DecisionNotSaved failure _ ->
+            Just failure
+
+        DecisionIdle ->
+            Nothing
+
+        DecisionSaving _ _ ->
+            Nothing
+
+        DecisionRefreshing _ _ ->
+            Nothing
 
 
 -- The one-line text for a unit page that has no unit to show; Nothing once
