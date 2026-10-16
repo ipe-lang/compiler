@@ -35,6 +35,117 @@ impl Symbol {
     }
 }
 
+/// Declares [`SynthStem`], its `ALL` table and its `text` from one list.
+///
+/// One list feeds the enum, `ALL` and the `text` match, so no variant can be
+/// missing from `ALL`.
+macro_rules! synth_stems {
+    ($($(#[$meta:meta])* $variant:ident => $text:literal,)+) => {
+        /// The closed set of stems every compiler-synthesized binder is spelled from.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub enum SynthStem {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl SynthStem {
+            /// Every variant, once, in declaration order.
+            pub const ALL: [Self; [$(Self::$variant),+].len()] = [$(Self::$variant),+];
+
+            /// The stem's spelling, a prefix of every name minted from it.
+            #[must_use]
+            pub const fn text(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text,)+
+                }
+            }
+        }
+    };
+}
+
+synth_stems! {
+    /// The parameter of a `>>` or `<<` desugaring.
+    Compose => "compose_",
+    /// The record parameter of a derived record codec.
+    CodecRecord => "codec_rec_",
+    /// The binder of a codec encoder or decoder projection.
+    CodecProjection => "codec_r_",
+    /// An eta-expansion parameter.
+    Eta => "eta_",
+    /// A closure capture.
+    Cap => "cap_",
+    /// A lowered call argument.
+    Arg => "arg_",
+    /// A wildcard-typed parameter.
+    AnyParam => "anyp_",
+    /// A wildcard-typed pattern binder.
+    AnyWild => "anyw_",
+    /// A projection decoder binder.
+    ProjDecode => "projdec_",
+    /// A destructuring thunk.
+    DestrThunk => "destr_thunk_",
+    /// A nested constructor pattern binder.
+    NestedCons => "ncons_",
+    /// A nested string-literal pattern binder.
+    NestedStrLit => "nstrlit_",
+    /// A tuple element binder.
+    TupleElem => "telem_",
+}
+
+/// Every [`SynthStem`] spelling, in `SynthStem::ALL` order.
+const SYNTH_STEM_TEXTS: [&str; SynthStem::ALL.len()] = {
+    let mut out = [""; SynthStem::ALL.len()];
+    let mut slots: &mut [&str] = &mut out;
+    let mut stems: &[SynthStem] = &SynthStem::ALL;
+    while let ([slot, rest_slots @ ..], [stem, rest_stems @ ..]) = (slots, stems) {
+        *slot = stem.text();
+        slots = rest_slots;
+        stems = rest_stems;
+    }
+    out
+};
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if one synthesized-binder stem is a prefix of another [ledger #boundary]
+const _: () = assert!(stems_prefix_free(&SYNTH_STEM_TEXTS));
+
+/// Whether `prefix` is a byte prefix of `of`.
+const fn is_byte_prefix(prefix: &[u8], of: &[u8]) -> bool {
+    let (mut p, mut o) = (prefix, of);
+    loop {
+        match (p, o) {
+            ([], _) => return true,
+            ([_, ..], []) => return false,
+            ([a, p_rest @ ..], [b, o_rest @ ..]) => {
+                if *a != *b {
+                    return false;
+                }
+                p = p_rest;
+                o = o_rest;
+            }
+        }
+    }
+}
+
+/// Whether no stem in `stems` is a byte prefix of another.
+///
+/// A stem listed twice is a prefix of its copy, so a duplicate is refused.
+#[must_use]
+pub const fn stems_prefix_free(stems: &[&str]) -> bool {
+    let mut rest = stems;
+    while let [head, tail @ ..] = rest {
+        let mut others = tail;
+        while let [other, more @ ..] = others {
+            if is_byte_prefix(head.as_bytes(), other.as_bytes())
+                || is_byte_prefix(other.as_bytes(), head.as_bytes())
+            {
+                return false;
+            }
+            others = more;
+        }
+        rest = tail;
+    }
+    true
+}
+
 #[derive(Default)]
 pub struct Interner {
     /// One shared `Arc<str>` per unique string, stored in BOTH `map` (as the
@@ -467,6 +578,22 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn stems_prefix_free_refuses_an_overlap() {
+        assert!(!stems_prefix_free(&["eta_", "eta_x"]));
+        assert!(!stems_prefix_free(&["eta_x", "eta_"]));
+        assert!(!stems_prefix_free(&["a_", "a_"]));
+        assert!(stems_prefix_free(&["codec_r_", "codec_rec_"]));
+        assert!(stems_prefix_free(&SYNTH_STEM_TEXTS));
+        let listed: BTreeSet<&str> = SynthStem::ALL.iter().map(|s| s.text()).collect();
+        assert_eq!(listed.len(), SynthStem::ALL.len());
+        assert_eq!(SYNTH_STEM_TEXTS.len(), SynthStem::ALL.len());
+        for (stem, text) in SynthStem::ALL.iter().zip(SYNTH_STEM_TEXTS) {
+            assert_eq!(stem.text(), text);
+        }
+    }
+
     #[test]
     fn intern_dedups_and_resolves() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();

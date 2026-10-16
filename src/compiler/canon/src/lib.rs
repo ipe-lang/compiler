@@ -197,7 +197,7 @@ pub fn canonicalise_module_in_project(
 mod tests {
     use super::*;
     use ast::{Def, Expr, Expr_, Pattern_};
-    use ipe_diagnostics::{Diagnostic, NameError, StdlibReach};
+    use ipe_diagnostics::{Diagnostic, NameError, Span, StdlibReach};
     use ipe_intern::Symbol;
 
     const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
@@ -5028,5 +5028,192 @@ mod tests {
                 "`Task.{removed_name}` must produce IPE-N0036 RemovedSurface; got: {diag:?}"
             );
         }
+    }
+
+    /// A program and its compose expression, rendered for a site `(lo, hi)`.
+    struct ComposeSite {
+        source: String,
+        lo: u32,
+        hi: u32,
+    }
+
+    /// Render `render(lo, hi)` until the expression it returns sits at `lo..hi`.
+    ///
+    /// The source spells names from the site's own offsets, so the offsets are
+    /// computed from the rendered text rather than taken on faith.
+    fn converge_site(render: impl Fn(u32, u32) -> (String, String)) -> Result<ComposeSite, String> {
+        let (mut lo, mut hi) = (0_u32, 0_u32);
+        for _ in 0..8 {
+            let (source, expr) = render(lo, hi);
+            let at = source
+                .find(&format!("= {expr}\n"))
+                .ok_or_else(|| format!("expression `{expr}` not found in the source"))?;
+            let start = at.checked_add(2).ok_or("offset overflow")?;
+            let end = start.checked_add(expr.len()).ok_or("offset overflow")?;
+            let next = (
+                u32::try_from(start).map_err(|e| e.to_string())?,
+                u32::try_from(end).map_err(|e| e.to_string())?,
+            );
+            if next == (lo, hi) {
+                return Ok(ComposeSite { source, lo, hi });
+            }
+            (lo, hi) = next;
+        }
+        Err("site offsets did not converge within 8 rounds".to_owned())
+    }
+
+    /// The canonical compose lambda bound by `apply`: its span, parameter and
+    /// the operand applied first.
+    fn compose_of_apply(m: &ast::Module, i: &Interner) -> Result<(Span, Symbol, Expr_), String> {
+        let def = find_def(m, i, "apply").ok_or("no `apply` def")?;
+        let (Def::Typed { body, .. } | Def::Untyped { body, .. }) = def;
+        let Expr_::Lambda(params, outer) = &body.value else {
+            return Err(format!("`apply` body is not a lambda: {:?}", body.value));
+        };
+        let [param] = params.as_slice() else {
+            return Err("the compose lambda takes exactly one parameter".to_owned());
+        };
+        let Pattern_::PVar(param) = param.value else {
+            return Err("the compose parameter is not a variable".to_owned());
+        };
+        let (_, outer_args) = as_call(outer).ok_or("outer node is not a call")?;
+        let [inner] = outer_args else {
+            return Err("outer call takes one argument".to_owned());
+        };
+        let (first, inner_args) = as_call(inner).ok_or("inner node is not a call")?;
+        let [arg] = inner_args else {
+            return Err("inner call takes one argument".to_owned());
+        };
+        if !matches!(arg.value, Expr_::VarLocal(s) if s == param) {
+            return Err(format!(
+                "inner argument is not the parameter: {:?}",
+                arg.value
+            ));
+        }
+        Ok((body.span, param, first.clone()))
+    }
+
+    fn compose_module(src: &str) -> Result<(ast::Module, Interner), String> {
+        canon_src(src).ok_or_else(|| format!("must parse and canonicalise:\n{src}"))
+    }
+
+    const INC: &str = "inc : Int -> Int\ninc n =\n    n + 1\n";
+
+    #[test]
+    fn compose_param_avoids_a_same_named_local() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("{name} >> inc");
+            let source = format!(
+                "module Main exposing (apply)\n{INC}apply : (Int -> Int) -> Int -> Int\napply {name} = {expr}\n"
+            );
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, first) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        let user = i
+            .lookup(&format!("compose_{}_{}", site.lo, site.hi))
+            .ok_or("the user's local is interned")?;
+        assert_ne!(
+            param, user,
+            "the parameter must not capture the user's local"
+        );
+        assert_eq!(
+            i.resolve(param),
+            Some(format!("compose_{}_{}_1", site.lo, site.hi).as_str())
+        );
+        assert!(
+            matches!(first, Expr_::VarLocal(s) if s == user),
+            "the operand stays the user's local: {first:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_param_skips_every_taken_suffix() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("{name} >> {name}_1");
+            let source = format!(
+                "module Main exposing (apply)\napply : (Int -> Int) -> (Int -> Int) -> Int -> Int\napply {name} {name}_1 = {expr}\n"
+            );
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, first) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        assert_eq!(
+            i.resolve(param),
+            Some(format!("compose_{}_{}_2", site.lo, site.hi).as_str())
+        );
+        let user = i
+            .lookup(&format!("compose_{}_{}", site.lo, site.hi))
+            .ok_or("the user's local is interned")?;
+        assert!(
+            matches!(first, Expr_::VarLocal(s) if s == user),
+            "the operand stays the user's local: {first:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_param_avoids_a_top_level_name() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("{name} >> inc");
+            let source = format!(
+                "module Main exposing (apply)\n{INC}{name} : Int -> Int\n{name} n =\n    n + 2\napply : Int -> Int\napply = {expr}\n"
+            );
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, first) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        let top = format!("compose_{}_{}", site.lo, site.hi);
+        assert_ne!(
+            i.resolve(param),
+            Some(top.as_str()),
+            "parameter must not shadow the top-level name"
+        );
+        assert!(
+            matches!(&first, Expr_::VarTopLevel { name, .. } if i.resolve(*name) == Some(top.as_str())),
+            "the operand stays the top-level binding: {first:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_param_keeps_the_span_name_when_free() -> Result<(), String> {
+        let site = converge_site(|_, _| {
+            let expr = "inc >> inc".to_owned();
+            let source =
+                format!("module Main exposing (apply)\n{INC}apply : Int -> Int\napply = {expr}\n");
+            (source, expr)
+        })?;
+        let (m, i) = compose_module(&site.source)?;
+        let (span, param, _) = compose_of_apply(&m, &i)?;
+        assert_eq!(
+            (span.lo, span.hi),
+            (site.lo, site.hi),
+            "lambda span is the operator site"
+        );
+        assert_eq!(
+            i.resolve(param),
+            Some(format!("compose_{}_{}", site.lo, site.hi).as_str())
+        );
+        Ok(())
     }
 }
