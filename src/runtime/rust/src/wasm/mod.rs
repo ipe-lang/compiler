@@ -1100,10 +1100,10 @@ where
                 run_cmd(app, c);
             }
         }
-        IpeCmd::Perform(thunk) => {
+        IpeCmd::Perform(body) => {
             let app = Rc::clone(app);
             wasm_bindgen_futures::spawn_local(async move {
-                let msg = thunk().await;
+                let msg = body.run().await;
                 enqueue(&app, msg);
             });
         }

@@ -330,6 +330,8 @@ pub use driver::{
     run_upgrade, runtime_dep_from_env, select_non_overlapping, verify_capabilities,
     watch_banner_enabled,
 };
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use project_root::fixture::{RootFixture, build_fixture, build_fixture_with_options};
 // Crate-internal driver items reached as `crate::…` by sibling modules
 // (`watch`, `pkg`, …). Kept `pub(crate)` so no originally-private helper widens
 // to public API; the block above re-exports the genuine public surface as `pub`.
