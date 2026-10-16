@@ -442,8 +442,8 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       cargo line, `cargo <verb> --release --locked --features ipe/wasi_run
       --target "$TARGET" -p ipe -p ipe-ffi-inspector` (`check` in ci.yml,
       `build` in release.yml).  A FreeBSD job's first two steps are exactly
-      its checkout and the FreeBSD VM step (`usesh: true`, `prepare: pkg
-      install -y rust`), whose `run` is exactly the cargo line without
+      its checkout and the FreeBSD VM step (`prepare: pkg install -y
+      rust`), whose `run` is exactly the cargo line without
       `--target` in ci.yml and opens with it in release.yml.  ci.yml's jobs
       run nothing else.  Each pinned step is compared key for key both ways,
       typed (`1` is not `true`, nor `'1'`), a `name` that is a literal string
@@ -490,6 +490,32 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       artifact under a shipped name.  LIMIT: a release run takes the local
       actions from the tag's checked-out tree, so a tag off main carries
       composite text that CI never verified.
+  24. Every `with:` key is an input its pinned action declares, spelled
+      byte-exactly.  Each step of a workflow and of every local action it
+      reaches is read: a remote `owner/repo[/path]@<sha>` is checked against
+      the record `action-metadata/<owner>/<repo>/<sha>.json` (owner and repo
+      case-folded), which holds the raw git objects of the pinned commit,
+      its trees down the subpath and its one `action.yml`/`action.yaml`;
+      every object is re-hashed (`sha1("<type> <len>\\0" + data)`) and the
+      walk from the pinned commit id is re-run, so a record not content-
+      addressed to its pin is refused, as is one holding an object the walk
+      does not reach, a key out of its schema, or one past its ceilings.
+      A local action is checked against its own `inputs`; `docker://` takes
+      only `args` and `entrypoint`.  Refused: a key not declared (GitHub only
+      warns, and the setting does nothing), a case variant of a declared
+      input or two keys fold-equal, a non-string key, a required input with
+      no default left out, a deprecated input passed, a pin with no record,
+      a record no pin uses, and a `SCRIPT_ACTIONS` row naming an input its
+      action does not declare.  Records are written only by the maintainer
+      tool `python3 .github/ci/action_metadata.py --write`, which fetches
+      the pinned objects and proves them with the same walk.
+      LIMIT: the pinned commit is read from the repository's fork network,
+      so an impostor commit pushed to a fork resolves under the upstream
+      name; the record proves the bytes at the pin, not who published them.
+      LIMIT: an input declared but unread by the action's code (a
+      deprecated-and-ignored one not marked `deprecationMessage`) is
+      admitted.  LIMIT: git object ids are SHA-1 without collision
+      detection here; a crafted collision under the pinned id is not seen.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -541,6 +567,7 @@ import drift_assertion  # noqa: E402  # the one drift-assertion parser, shared w
 import cargo_invocation  # noqa: E402  # the one cargo-invocation reader, checks 15 and 16
 import check_required_set  # noqa: E402  # owns the admin-read environment's name
 import claims_table  # noqa: E402  # the one reader of test-claims.yml, check 20
+import action_metadata  # noqa: E402  # proven declared inputs of every pinned action, check 24
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Both extensions: a workflow (or, for check 6, a local composite action) is a
@@ -625,7 +652,7 @@ RUSTC_WIRING_TEXT_RE = re.compile(
 # Check 7 — a third-party input is identified by content, never by a movable
 # name: an action by its full commit SHA (a tag or branch can be re-pointed
 # upstream), a docker image by its sha256 digest.
-PINNED_REMOTE_USES_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?@[0-9a-f]{40}\Z")
+PINNED_REMOTE_USES_RE = action_metadata.PINNED_REMOTE_USES_RE
 PINNED_DOCKER_USES_RE = re.compile(r"docker://[^\s@]+@sha256:[0-9a-f]{64}\Z")
 PINNED_IMAGE_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
 # Every spelling of a runner file-command target: the variables naming the
@@ -1152,6 +1179,14 @@ class ErrorKind(enum.Enum):
     PERMISSIONS_FORGING = "permissions-forging"
     WRITE_GRANT_UNLISTED = "write-grant-unlisted"
     WRITE_GRANT_ROW_STALE = "write-grant-row-stale"
+    ACTION_METADATA_MISSING = "action-metadata-missing"
+    ACTION_METADATA_UNPROVEN = "action-metadata-unproven"
+    ACTION_METADATA_STALE = "action-metadata-stale"
+    ACTION_METADATA_MALFORMED = "action-metadata-malformed"
+    ACTION_INPUT_UNDECLARED = "action-input-undeclared"
+    ACTION_INPUT_CASE_VARIANT = "action-input-case-variant"
+    ACTION_INPUT_REQUIRED_MISSING = "action-input-required-missing"
+    ACTION_INPUT_DEPRECATED = "action-input-deprecated"
 
 
 @dataclass(frozen=True)
@@ -1891,7 +1926,7 @@ class ScriptAction:
 # inline decider runs is refused.
 SCRIPT_ACTIONS: dict[str, ScriptAction] = {
     "vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc": ScriptAction(
-        inputs=frozenset({"usesh", "synctime", "prepare", "run"}),
+        inputs=frozenset({"sync-time", "prepare", "run"}),
         why=(
             "the pinned `index.js` runs `with.run` through `execSSH(runCmd, sshConfig)` with `ignoreReturn` "
             "false: a non-zero ssh exit throws, and `main` ends in `core.setFailed` plus `process.exit(1)`; "
@@ -5530,6 +5565,7 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
 MAINTAINER_TOOLS: frozenset[tuple[str, Argv]] = frozenset({
     ("check_required_set.py", ("--write",)),
     ("check_required_set.py", ("--render-put",)),
+    ("action_metadata.py", ("--write",)),
 })
 
 
@@ -6203,6 +6239,15 @@ class LocalActions:
         self._folded: dict[str, str] = {}
         self._closed: set[str] = set()
 
+    def resolved(self) -> list[LocalAction]:
+        """Every local action this pass resolved and loaded, by id."""
+        return [a for _, a in sorted(self._by_id.items()) if a is not None]
+
+    def lookup(self, uses: str | None) -> LocalAction | None:
+        """The already-resolved action behind a local `uses:`, or None."""
+        rel = _local_action_path(uses)
+        return None if rel is None else self._by_id.get(rel)
+
     def disk_dir(self, rel: str) -> str:
         # `root` is the `.github` directory; the repository root is its parent.
         return os.path.join(os.path.dirname(self.root), rel)
@@ -6418,8 +6463,9 @@ def _job_sub_env_scopes(job_raw: dict, loc: str, errors: list[str]) -> list[tupl
     return scopes
 
 
-def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> None:
+def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
     """Checks 6 and 7 over every step of every workflow and reachable local action.
+    Returns the resolved local actions, the traversal check 24 reads.
 
     No job wraps or replaces rustc, and only `main` saves the dependency
     cache. Refused:
@@ -6632,7 +6678,199 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> None:
     own = list(dict.fromkeys(errors[start:]))
     del errors[start:]
     errors.extend(own)
+    return actions
 
+
+
+# Check 24: what each `action_metadata` refusal kind is as a typed refusal.
+_METADATA_REFUSAL_KIND: dict[action_metadata.RefusalKind, ErrorKind] = {
+    action_metadata.RefusalKind.MALFORMED: ErrorKind.ACTION_METADATA_MALFORMED,
+    action_metadata.RefusalKind.UNPROVEN: ErrorKind.ACTION_METADATA_UNPROVEN,
+}
+ACTION_METADATA_DIR = action_metadata.RECORDS_DIR
+# A `docker://` step runs an image, not an action: no metadata declares an
+# input, and the runner reads only `args` and `entrypoint`.
+_DOCKER_STEP_INPUTS = action_metadata.ActionInputs(frozenset(), frozenset(), frozenset(), docker=True)
+
+
+def _action_steps(wfs: WorkflowSet, actions: LocalActions) -> list[tuple[str, str, Step]]:
+    """(file, location, step) for every workflow step and every step of a
+    local action check 6 resolved: the one traversal checks 6 and 24 share.
+    Shape refusals are check 6's and are not repeated here."""
+    out: list[tuple[str, str, Step]] = []
+    for wf in wfs.workflows:
+        for job in wf.jobs:
+            for st in _typed_steps(job.raw, "", []):
+                out.append((wf.fname, f"job {job.job_id!r} step {st.label!r}", st))
+    for action in actions.resolved():
+        for st in action.steps:
+            out.append((f"{action.display}/action.yml", f"step {st.label!r}", st))
+    return out
+
+
+def remote_pins(root: str = REPO_ROOT) -> set[action_metadata.RemotePin]:
+    """Every pinned remote action a workflow or reachable local action
+    `uses:`, read through check 6's traversal (`action_metadata.py --write`
+    enumerates the records to fetch from it)."""
+    scratch: list[str] = []
+    wfs = WorkflowSet.load(root)
+    actions = check_workflow_steps(wfs, scratch)
+    pins: set[action_metadata.RemotePin] = set()
+    for _, _, st in _action_steps(wfs, actions):
+        if st.uses is not None and PINNED_REMOTE_USES_RE.match(st.uses):
+            pin = action_metadata.RemotePin.parse(st.uses)
+            if isinstance(pin, action_metadata.RemotePin):
+                pins.add(pin)
+    return pins
+
+
+def _check_with_keys(
+    fname: str, loc: str, uses: str, with_: dict, inputs: action_metadata.ActionInputs, refuse
+) -> None:
+    """One step's `with:` against its action's proven inputs: every key a
+    string spelled byte-exactly as a declared input (or `args`/`entrypoint`
+    on a docker action), no two keys folding equal, every required input
+    with no default present, and no deprecated input passed."""
+    admitted = inputs.declared | (action_metadata.DOCKER_IMPLICIT_INPUTS if inputs.docker else frozenset())
+    by_fold: dict[str, str] = {}
+    keys: set[str] = set()
+    for k in with_:
+        if not isinstance(k, str):
+            refuse(ErrorKind.ACTION_INPUT_UNDECLARED, fname, f"{loc} with:", f"key {k!r} is not a string and names no input; refused")
+            continue
+        keys.add(k)
+        twin = by_fold.setdefault(k.casefold(), k)
+        if twin != k:
+            refuse(
+                ErrorKind.ACTION_INPUT_CASE_VARIANT, fname, f"{loc} with:",
+                f"keys {twin!r} and {k!r} fold equal; GitHub reads them as one input; refused",
+            )
+        if k in admitted:
+            continue
+        spelled = sorted(d for d in admitted if d.casefold() == k.casefold())
+        if spelled:
+            refuse(
+                ErrorKind.ACTION_INPUT_CASE_VARIANT, fname, f"{loc} with.{k}",
+                f"is a case variant of the declared input {spelled[0]!r}; spell it byte-exactly; refused",
+            )
+        else:
+            refuse(
+                ErrorKind.ACTION_INPUT_UNDECLARED, fname, f"{loc} with.{k}",
+                f"is not an input {uses!r} declares (declared: {sorted(admitted)}); GitHub only warns and the "
+                "setting does nothing; refused",
+            )
+    for name in sorted(inputs.required_no_default - keys):
+        refuse(
+            ErrorKind.ACTION_INPUT_REQUIRED_MISSING, fname, f"{loc} with:",
+            f"omits {name!r}, an input {uses!r} requires with no default (GitHub does not enforce it); refused",
+        )
+    for name in sorted(inputs.deprecated.intersection(keys)):
+        refuse(
+            ErrorKind.ACTION_INPUT_DEPRECATED, fname, f"{loc} with.{name}",
+            f"is deprecated by {uses!r} (its metadata carries a `deprecationMessage`); refused",
+        )
+
+
+def check_action_inputs(
+    wfs: WorkflowSet,
+    actions: LocalActions,
+    errors: list[str],
+    records_dir: str = ACTION_METADATA_DIR,
+    script_actions: dict[str, ScriptAction] | None = None,
+) -> None:
+    """Check 24 (see the module docstring)."""
+    rows = SCRIPT_ACTIONS if script_actions is None else script_actions
+    shown_dir = os.path.relpath(records_dir, os.path.dirname(os.path.dirname(os.path.dirname(records_dir))))
+
+    def refuse(kind: ErrorKind, fname: str, path: str, detail: str) -> None:
+        errors.append(ManifestError(kind, fname, path, detail).render())
+
+    steps = _action_steps(wfs, actions)
+    step_uses = {st.uses for _, _, st in steps if st.uses}
+    pins: dict[str, action_metadata.RemotePin] = {}
+    paths_by_key: dict[action_metadata.RecordKey, set[tuple[str, ...]]] = {}
+    for uses in sorted(step_uses | set(rows)):
+        if not PINNED_REMOTE_USES_RE.match(uses):
+            continue  # not content-pinned: refused by check 7 (a row, by check 1c)
+        pin = action_metadata.RemotePin.parse(uses)
+        if isinstance(pin, action_metadata.Refusal):
+            refuse(ErrorKind.ACTION_METADATA_MALFORMED, "workflows", f"uses: {uses}", f"{pin.detail}; refused")
+            continue
+        pins[uses] = pin
+        if uses in step_uses:
+            paths_by_key.setdefault(pin.key, set()).add(pin.path)
+
+    on_disk, misnamed = action_metadata.scan_records(records_dir)
+    for r in misnamed:
+        refuse(ErrorKind.ACTION_METADATA_MALFORMED, shown_dir, "", f"{r.detail}; refused")
+    proven: dict[action_metadata.RecordKey, dict[tuple[str, ...], action_metadata.ActionInputs]] = {}
+    for key, paths in sorted(paths_by_key.items()):
+        where = "/".join(key)
+        path = on_disk.get(key)
+        if path is None:
+            refuse(
+                ErrorKind.ACTION_METADATA_MISSING, shown_dir, where,
+                f"no record proves the inputs of this pin; run `{action_metadata.WRITE_COMMAND}` and commit the "
+                "record; refused",
+            )
+            continue
+        record = action_metadata.ActionRecord.load(path)
+        got = record if isinstance(record, action_metadata.Refusal) else action_metadata.prove(key[2], paths, record)
+        if isinstance(got, action_metadata.Refusal):
+            refuse(
+                _METADATA_REFUSAL_KIND[got.kind], shown_dir, where,
+                f"{got.detail}; regenerate with `{action_metadata.WRITE_COMMAND}`, never by hand; refused",
+            )
+            continue
+        proven[key] = got
+    for key in sorted(set(on_disk) - set(paths_by_key)):
+        refuse(
+            ErrorKind.ACTION_METADATA_STALE, shown_dir, "/".join(key),
+            f"no step uses this pin; remove the record (`{action_metadata.WRITE_COMMAND}` deletes it)",
+        )
+
+    for uses, row in sorted(rows.items()):
+        pin = pins.get(uses)
+        declared = None if pin is None else proven.get(pin.key, {}).get(pin.path)
+        if declared is None:
+            refuse(
+                ErrorKind.SCRIPT_ACTION_ROW_INVALID, "verify-manifest.py", "SCRIPT_ACTIONS",
+                f"{uses!r} has no proven input set to admit inputs from; refused",
+            )
+        elif not row.inputs <= declared.declared:
+            refuse(
+                ErrorKind.SCRIPT_ACTION_ROW_INVALID, "verify-manifest.py", "SCRIPT_ACTIONS",
+                f"{uses!r} admits {sorted(row.inputs - declared.declared)}, which the pinned action does not "
+                f"declare (it declares {sorted(declared.declared)}); refused",
+            )
+
+    for fname, loc, st in steps:
+        with_ = st.raw.get("with", {})
+        if not isinstance(with_, dict):
+            continue  # refused by check 6
+        uses = st.uses
+        if uses is None:
+            if "with" in st.raw:
+                refuse(ErrorKind.ACTION_INPUT_UNDECLARED, fname, loc, "passes `with:` but runs no action; refused")
+            continue
+        inputs: action_metadata.ActionInputs | None
+        if uses.startswith("docker://"):
+            inputs = _DOCKER_STEP_INPUTS
+        elif uses.startswith("./"):
+            local = actions.lookup(uses)
+            if local is None:
+                continue  # unresolved: refused by check 6
+            parsed = action_metadata.ActionInputs.from_doc(local.doc)
+            if isinstance(parsed, action_metadata.Refusal):
+                refuse(ErrorKind.ACTION_METADATA_MALFORMED, f"{local.display}/action.yml", "inputs:", f"{parsed.detail}; refused")
+                continue
+            inputs = parsed
+        else:
+            pin = pins.get(uses)
+            inputs = None if pin is None else proven.get(pin.key, {}).get(pin.path)
+            if inputs is None:
+                continue  # unpinned (check 7) or its record refused above
+        _check_with_keys(fname, loc, uses, with_, inputs, refuse)
 
 
 def check_ci_suites_required(wfs: WorkflowSet, entries: list[dict], errors: list[str]) -> None:
@@ -6978,7 +7216,7 @@ _VM_ACTION_RE = re.compile(r"vmactions/freebsd-vm@[0-9a-f]{40}")
 _RUST_CACHE_PIN_RE = re.compile(r"Swatinem/rust-cache@[0-9a-f]{40}")
 _DTOLNAY_PIN_RE = re.compile(r"dtolnay/rust-toolchain@[0-9a-f]{40}")
 # The FreeBSD VM step's inputs but `run`.
-_VM_PRELUDE = {"usesh": True, "prepare": "pkg install -y rust"}
+_VM_PRELUDE = {"prepare": "pkg install -y rust"}
 # A matrix `os` or `target`: a runner label or a target triple, nothing a
 # shell or an expression can read as syntax.
 _MATRIX_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -7754,7 +7992,7 @@ def main() -> int:
     check_deterministic_set(workflows, errors)
 
     # ---- 6+7. rustc wiring + cache saves; pinned CI inputs + env-file writes ----
-    check_workflow_steps(workflows, errors)
+    local_actions = check_workflow_steps(workflows, errors)
 
     # ---- 8. merge queue: gate producers trigger on it; its runs stay secret-free ----
     check_merge_queue(
@@ -7823,6 +8061,9 @@ def main() -> int:
 
     # ---- 23. ci.yml checks exactly the targets release.yml builds ----
     check_release_target_parity(workflows, errors)
+
+    # ---- 24. every `with:` key is an input its pinned action declares ----
+    check_action_inputs(workflows, local_actions, errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:
