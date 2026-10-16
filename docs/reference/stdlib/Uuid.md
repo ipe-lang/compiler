@@ -20,6 +20,7 @@ v4 : () -> Task Error String
 
 `v4 ()` — generate a random UUID (version 4) as a canonical
 lowercase hyphenated string (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`).
+Fails with an `Unavailable` error when the OS random source is unavailable.
 
 ## `v7`
 
@@ -30,6 +31,7 @@ v7 : () -> Task Error String
 `v7 ()` — generate a time-ordered UUID (version 7) as a canonical
 lowercase hyphenated string. Monotonically increasing within a
 millisecond on the same node.
+Fails with an `Unavailable` error when the OS random source is unavailable.
 
 ## `parse`
 

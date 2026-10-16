@@ -64,7 +64,8 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
 /// crate-private accessor, the ban proofs, the one blocking-pool start, the one
-/// process exit, the one app serve site and its test fixture, the non-Unicode
+/// process exit, the one app serve site and its test fixture, the one OS
+/// entropy source, the non-Unicode
 /// environ probe test, and the
 /// audited lossy-UTF-8 sites that render bytes already refused or never parsed.
 const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
@@ -75,8 +76,9 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/db/src/clippy_paths_resolve.rs", 40),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
-    ("src/runtime/rust/src/clippy_paths_resolve.rs", 15),
+    ("src/runtime/rust/src/clippy_paths_resolve.rs", 17),
     ("src/runtime/rust/src/core.rs", 1),
+    ("src/runtime/rust/src/entropy.rs", 1),
     ("src/runtime/rust/src/csv.rs", 1),
     ("src/runtime/rust/src/dom/form.rs", 1),
     ("src/runtime/rust/src/email.rs", 1),
