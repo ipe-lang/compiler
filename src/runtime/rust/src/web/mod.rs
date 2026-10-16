@@ -36,6 +36,9 @@ mod mint_proof;
 // Every byte a session keeps resident is charged against a nested byte budget.
 #[cfg(feature = "web")]
 mod budget;
+// Every `Perform` Cmd a session starts holds one unit of its nested Cmd budget.
+#[cfg(feature = "web")]
+mod cmd_admission;
 pub mod style_inject;
 // Custom-element (`CustomElement.node`) registration glue + SRI-pinned author-JS serving.
 // The generator lives at the crate top level (`crate::widget_assets`) so the
@@ -679,6 +682,15 @@ pub struct QueuedEvent<Msg> {
 /// How many browser events one session's driver queue holds.
 #[cfg(feature = "web")]
 const EVENT_QUEUE_CAP: usize = 1024;
+
+/// How many Msgs one session's driver queue holds (Cmd results, refusals,
+/// subscription deliveries).
+#[cfg(feature = "web")]
+const MSG_QUEUE_CAP: usize = 1024;
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's admitted Cmds could outnumber the Msg queue slots their results land in [ledger #boundary]
+#[cfg(feature = "web")]
+const _: () = assert!(budget::SESSION_CMD_CEILING.get() <= MSG_QUEUE_CAP as u64);
 
 /// Per-session live state behind an `Arc<Mutex<…>>`. `rendered` is advanced by
 /// every commit; `sse_tx` is filled when the browser attaches the SSE channel;
@@ -2398,21 +2410,29 @@ impl SessionOwner {
     }
 }
 
-/// Fire a `Cmd`: None/Batch recurse; Perform spawns the composed task→Msg thunk
-/// and pushes the result back into the per-session loop.
+/// Fire a `Cmd`: None/Batch recurse; Perform starts the composed task→Msg body
+/// under one of the session's Cmd units and pushes the result back into the
+/// per-session loop.
 ///
 /// The spawned task runs inside `scope` across every poll, so a credential the
-/// task admits binds to the session that dispatched it.
+/// task admits binds to the session that dispatched it. A Perform past the
+/// session's [`budget::SESSION_CMD_CEILING`] is never started: its own
+/// decoder turns a `LimitExceeded` error into the Msg the session receives.
 ///
 /// The session's credentials are re-proved at dispatch, with no await between
 /// the check and the effects: a revocation that returned while the caller
 /// awaited its SSE send or checkpoint write drops the whole Cmd.
 #[cfg(feature = "web")]
-fn run_cmd<Msg: Send + 'static>(cmd: IpeCmd<Msg>, tx: &Sender<Msg>, scope: &pubsub::SessionScope) {
+fn run_cmd<Msg: Send + 'static>(
+    cmd: IpeCmd<Msg>,
+    tx: &Sender<Msg>,
+    scope: &pubsub::SessionScope,
+    cmds: &budget::SessionCmds,
+) {
     if recheck_scope(scope, None) == Standing::Revoked {
         return;
     }
-    dispatch_cmd(cmd, tx, scope);
+    dispatch_cmd(cmd, tx, scope, cmds);
 }
 
 /// Fire a `Cmd` whose session [`run_cmd`] just re-proved.
@@ -2421,28 +2441,31 @@ fn dispatch_cmd<Msg: Send + 'static>(
     cmd: IpeCmd<Msg>,
     tx: &Sender<Msg>,
     scope: &pubsub::SessionScope,
+    cmds: &budget::SessionCmds,
 ) {
     match cmd {
         IpeCmd::None => {}
         IpeCmd::Batch(items) => {
             for c in items {
-                dispatch_cmd(c, tx, scope);
+                dispatch_cmd(c, tx, scope, cmds);
             }
         }
-        IpeCmd::Perform(body) => {
-            let tx = tx.clone();
-            tokio::spawn(scope.clone().scoped(async move {
-                let m = body.run().await;
-                // Bounded send: drop the Msg and warn if the session queue is
-                // full (a stalled driver or a burst of fast Perform tasks).
-                if tx.send(m).await.is_err() {
-                    crate::system::emit_runtime_log(
-                        "live",
-                        "run_cmd: session msg channel closed; dropping Perform result",
-                    );
-                }
-            }));
-        }
+        IpeCmd::Perform(body) => match cmd_admission::admit(body, cmds) {
+            cmd_admission::Admit::Run(cmd) => {
+                let tx = tx.clone();
+                tokio::spawn(scope.clone().scoped(async move {
+                    // Bounded send: the Msg waits for queue room, and is
+                    // dropped with a warn once the session queue is closed.
+                    if cmd.finish(&tx).await.is_err() {
+                        crate::system::emit_runtime_log(
+                            "live",
+                            "run_cmd: session msg channel closed; dropping Perform result",
+                        );
+                    }
+                }));
+            }
+            cmd_admission::Admit::Refused(msg) => cmd_admission::deliver_refusal(msg, tx, cmds),
+        },
         IpeCmd::Publish(thunk) => {
             // Inject this session's sid as the broadcast origin (
             // liveApp.Publish sets Origin = session.sid). Fire-and-forget.
@@ -2607,6 +2630,8 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     route_entry: RouteEntry<Model, Msg>,
     store: Arc<dyn store::SessionStore<Model, Msg>>,
     scope: pubsub::SessionScope,
+    // The session's in-flight Cmd budget, shared with the page handler's seed Cmd.
+    cmds: Arc<budget::SessionCmds>,
     // Subscribed by the page handler before the session's first credential was
     // admitted, so no revocation between that admission and this start is missed.
     mut revocation: RevocationWatch,
@@ -2718,7 +2743,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                         EntryCommit::SessionGone => break,
                     };
                 pubsub::with_session(&scope, || {
-                    run_cmd(cmd, &msg_tx, &scope);
+                    run_cmd(cmd, &msg_tx, &scope, &cmds);
                     sub_runtime.reconcile(subs(next));
                 });
                 revocation.rearm(&scope);
@@ -2878,7 +2903,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         }
 
         pubsub::with_session(&scope, || {
-            run_cmd(cmd, &msg_tx, &scope);
+            run_cmd(cmd, &msg_tx, &scope, &cmds);
             sub_runtime.reconcile(subs(next.clone()));
         });
         revocation.rearm(&scope);
@@ -4938,11 +4963,12 @@ mod handlers {
         let rendered = Rendered::first(keys, tree);
         let page = PageRender::current(&rendered);
 
-        // Bounded per-session Msg queue: cap at 1024 to prevent a fast
-        // client from growing the queue without bound (per-session memory DoS).
-        // On overflow events are dropped with a warn (see event_handler).
-        // 1024 is far above any legitimate burst of user-driven events.
-        let (msg_tx, msg_rx) = mpsc::channel::<Msg>(1024);
+        // Bounded per-session Msg queue: a fast client cannot grow it without
+        // bound (per-session memory DoS). On overflow events are dropped with a
+        // warn (see event_handler). The cap is far above any legitimate burst of
+        // user-driven events, and at least the session's Cmd ceiling.
+        let (msg_tx, msg_rx) = mpsc::channel::<Msg>(MSG_QUEUE_CAP);
+        let cmds = Arc::new(budget::SessionCmds::new());
         let (event_tx, event_rx) = mpsc::channel::<QueuedEvent<Msg>>(EVENT_QUEUE_CAP);
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         #[cfg(feature = "debugger")]
@@ -5001,11 +5027,12 @@ mod handlers {
                 route_entry,
                 store.clone(),
                 scope.clone(),
+                Arc::clone(&cmds),
                 revocation,
                 slot,
             ));
             // Fire the entry Cmd into the loop (batched after init's on a miss).
-            pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope));
+            pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope, &cmds));
             drop(owner);
         });
         if let Err(failed) = commit.await {
@@ -17374,8 +17401,9 @@ mod web_revocation_tests {
                 .scope
                 .clone();
             let msg_tx = msg_tx_of(&handle);
+            let budget = crate::web::budget::SessionCmds::new();
             let cmds = REVOKED_CMDS.load(Ordering::Relaxed);
-            run_cmd(revoked_cmd(), &msg_tx, &scope);
+            run_cmd(revoked_cmd(), &msg_tx, &scope, &budget);
             settle().await;
             let live = REVOKED_CMDS.load(Ordering::Relaxed);
             assert_eq!(live, cmds + 1, "a standing session dispatches its Cmd");
@@ -17386,6 +17414,7 @@ mod web_revocation_tests {
                 IpeCmd::Batch(vec![revoked_cmd(), revoked_cmd()]),
                 &msg_tx,
                 &scope,
+                &budget,
             );
             settle().await;
             assert_eq!(
@@ -17939,9 +17968,40 @@ mod web_revocation_tests {
             spawns, scoped,
             "every task `dispatch_cmd` spawns is session-scoped"
         );
+        assert!(
+            body.contains("IpeCmd::Perform(body)=>matchcmd_admission::admit(body,cmds){")
+                && body.contains("cmd_admission::Admit::Run(cmd)=>"),
+            "`dispatch_cmd` starts a Perform only under an admitted Cmd unit: {body}"
+        );
+        let web_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web");
+        let mut pending = vec![web_dir];
+        let mut destructures = Vec::new();
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+            for path in entries.map(|e| e.path()) {
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    let stripped: String = production_only(&code_only(&text))
+                        .split_whitespace()
+                        .collect();
+                    destructures.extend(
+                        stripped
+                            .matches("IpeCmd::Perform(")
+                            .map(|_| path.file_name().map(std::ffi::OsStr::to_os_string)),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            destructures,
+            vec![Some(std::ffi::OsString::from("mod.rs"))],
+            "`IpeCmd::Perform` is taken apart at one production site in `web/`"
+        );
         let gate = sole_body(&code, &bodies, "run_cmd");
         let recheck = gate.find("ifrecheck_scope(scope,None)==Standing::Revoked{return;}");
-        let dispatch = gate.find("dispatch_cmd(cmd,tx,scope)");
+        let dispatch = gate.find("dispatch_cmd(cmd,tx,scope,cmds)");
         assert!(
             recheck.is_some_and(|r| dispatch.is_some_and(|d| r < d)) && !gate.contains("spawn"),
             "`run_cmd` re-proves the session before it dispatches: {gate}"

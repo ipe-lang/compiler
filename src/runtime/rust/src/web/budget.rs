@@ -326,6 +326,8 @@ pub struct SessionCmds {
     budget: Arc<Budget<Cmds>>,
     /// Whether this session's first refusal has been logged yet.
     warned: AtomicBool,
+    /// Whether this session's first dropped refusal has been logged yet.
+    dropped_warned: AtomicBool,
 }
 
 impl SessionCmds {
@@ -346,6 +348,7 @@ impl SessionCmds {
         Self {
             budget: Budget::session(process, session),
             warned: AtomicBool::new(false),
+            dropped_warned: AtomicBool::new(false),
         }
     }
 
@@ -375,6 +378,11 @@ impl SessionCmds {
         let process_first =
             why == OverBudget::Process && !PROCESS_CMDS_WARNED.swap(true, Ordering::AcqRel);
         session_first || process_first
+    }
+
+    /// Whether this is the session's first refusal its full queue dropped.
+    pub(crate) fn first_dropped_refusal(&self) -> bool {
+        !self.dropped_warned.swap(true, Ordering::AcqRel)
     }
 }
 
