@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -17,6 +17,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Tuple as Tuple
+import Lib.Drawn as Drawn exposing (DrawnSource, SourceRow(..))
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
@@ -1986,7 +1987,7 @@ viewOf conn roots row =
 
                                     Ok covered ->
                                         File.readFileLimit path sourceCeiling
-                                            |> Task.map (classifyView row.uid stored covered)
+                                            |> Task.map (classifyView row.uid (langOf row.lang) stored covered)
                                             |> Task.onError (\_ -> unreadableAt row.path path)
 
 
@@ -2083,14 +2084,17 @@ readFailureText failure =
 
 
 -- The one judgement of a unit's view, in precedence order: a body past the
--- line ceiling, a range outside `text`, a view past the byte ceiling, then
--- the attestation compare. The rows drawn and the text hashed come from one
--- `bodyRows` list, joined by `bodyText`. `ShownSource` is built only here, so
--- holding one proves the view is within both ceilings and re-hashes to
--- `stored`. An oversized view is never hashed: re-indexing cannot make it
+-- line ceiling, a range outside `text`, a view past the byte ceiling, a view
+-- whose drawing takes more elements than the element ceiling, then the
+-- attestation compare. The rows drawn and the text hashed come from one
+-- `bodyRows` list, joined by `bodyText`, and the rows are drawn here once, in
+-- `lang`: coloured when that fits the element ceiling, else as plain text.
+-- `ShownSource` is built only here, so holding one proves the view is within
+-- every ceiling, re-hashes to `stored`, and carries the drawing that was
+-- counted. An oversized view is never hashed: re-indexing cannot make it
 -- shown.
-classifyView : Uid -> String -> Body -> String -> SourceView
-classifyView uid stored body text =
+classifyView : Uid -> Highlight.Lang -> String -> Body -> String -> SourceView
+classifyView uid lang stored body text =
     let
         lines =
             viewLines text
@@ -2115,11 +2119,44 @@ classifyView uid stored body text =
                     if size > ByteSize.toBytes viewByteCeiling then
                         TooLarge (ViewBytes { size = ByteSize.bytes size })
 
-                    else if bodyAttest body view == stored then
-                        Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored })
-
                     else
-                        Stale Drifted
+                        case fittingDrawing lang rows of
+                            Err over ->
+                                TooLarge over
+
+                            Ok drawn ->
+                                if bodyAttest body view == stored then
+                                    Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored, drawn = drawn })
+
+                                else
+                                    Stale Drifted
+
+
+-- The rows drawn coloured when that takes at most `viewNodeCeiling`
+-- elements, else drawn plain when that does; past both, the plain drawing's
+-- count, the fewest elements the view can be drawn in.
+fittingDrawing : Highlight.Lang -> List SourceRow -> Result Oversize DrawnSource
+fittingDrawing lang rows =
+    let
+        colored =
+            Drawn.highlighted lang rows
+    in
+    if Drawn.elements colored <= viewNodeCeiling then
+        Ok colored
+
+    else
+        let
+            uncolored =
+                Drawn.plain lang rows
+
+            nodes =
+                Drawn.elements uncolored
+        in
+        if nodes <= viewNodeCeiling then
+            Ok uncolored
+
+        else
+            Err (ViewNodes { nodes = nodes })
 
 
 -- A line range past the line ceiling, or a file unit whose file is: the
@@ -2166,6 +2203,47 @@ viewLineCeiling =
 viewByteCeiling : ByteSize
 viewByteCeiling =
     ByteSize.kib 256
+
+
+-- The most elements a shown view's drawing may take. The session's model and
+-- its one charged tree are refused past `runtimeSessionCeiling`;
+-- `viewNodeCeiling` elements at `elementResidentBytes` each, plus
+-- `viewReserve` for every copy of the view's text, fit three quarters of it.
+-- The last quarter holds the page outside the view and the error of the
+-- per-element cost, which is estimated, not measured:
+-- 2048 * 3 KiB + 5 MiB = 11 MiB <= 12 MiB. The relation is checked by a test,
+-- and the ceiling can rise as the runtime's cost per element falls.
+viewNodeCeiling : Int
+viewNodeCeiling =
+    2048
+
+
+-- The runtime's per-session memory ceiling, mirrored from `SESSION_CEILING`
+-- in `src/runtime/rust/src/web/budget.rs`; a test reads that line and fails
+-- when the two differ.
+runtimeSessionCeiling : ByteSize
+runtimeSessionCeiling =
+    ByteSize.mib 16
+
+
+-- What one drawn element holds resident in the runtime's session tree: the
+-- element, its attributes (each slot as large as the app's message, held
+-- inline, the `Vec` grown to four slots by the element id the runtime adds),
+-- and one text child.
+elementResidentBytes : ByteSize
+elementResidentBytes =
+    ByteSize.kib 3
+
+
+-- What a shown view holds besides its counted elements, at most
+-- `viewByteCeiling` bytes of text and `viewLineCeiling` lines: the text in
+-- the rows and again whole in the model, the drawing's escaped characters
+-- at four bytes each with up to as much again of spare capacity, and the
+-- tree's escape spelling, six bytes for one source byte; sixteen copies in
+-- all, plus each line's row, string and line number.
+viewReserve : ByteSize
+viewReserve =
+    ByteSize.mib 5
 
 
 -- The largest source file a unit is sliced from; a bigger file under the root
@@ -2293,11 +2371,12 @@ hashDigits attested =
             other
 
 
--- Source text proved within both view ceilings and equal to its attestation:
--- the drawn rows and the text they join to. Opaque: built only by
--- `classifyView`, so holding one means the bytes were measured and re-hashed.
+-- Source text proved within every view ceiling and equal to its
+-- attestation: the rows, the text they join to, and their drawing whose
+-- elements were counted. Opaque: built only by `classifyView`, so holding one
+-- means the bytes were measured, the drawing counted and the text re-hashed.
 type ShownSource
-    = ShownSource { uid : Uid, rows : List SourceRow, text : String, hash : String }
+    = ShownSource { uid : Uid, rows : List SourceRow, text : String, hash : String, drawn : DrawnSource }
 
 
 shownText : ShownSource -> String
@@ -2314,6 +2393,15 @@ shownRows shown =
     case shown of
         ShownSource s ->
             s.rows
+
+
+-- The shown view's drawing, the one `classifyView` counted against
+-- `viewNodeCeiling`; the page draws it and never lexes the rows again.
+shownDrawn : ShownSource -> DrawnSource
+shownDrawn shown =
+    case shown of
+        ShownSource s ->
+            s.drawn
 
 
 shownHash : ShownSource -> String
@@ -2746,6 +2834,7 @@ type Oversize
     = SpanLines { lines : Int }
     | ViewBytes { size : ByteSize }
     | ChildSpans { atLeast : Int }
+    | ViewNodes { nodes : Int }
 
 
 -- What a unit's attestation covers: a span unit its line range (1-based,
@@ -2754,13 +2843,6 @@ type Oversize
 type Body
     = LineRange Int Int
     | Residual (List ( Int, Int ))
-
-
--- One row of a view: a source line with its 1-based number, or the marker
--- standing for one run of lines child units cover.
-type SourceRow
-    = Numbered Int String
-    | Covered
 
 
 -- What the unit page may show of a unit's source: the verified view, a

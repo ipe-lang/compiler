@@ -23,7 +23,8 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Body(..), Oversize(..), SourceRow(..), SourceView(..), StaleReason(..))
+import Lib.Drawn as Drawn exposing (Mode(..), SourceRow(..))
+import Lib.Index as Index exposing (Body(..), Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
@@ -408,7 +409,7 @@ classifyRefusesPastLineCeiling =
         text =
             xLines past
     in
-    case Index.classifyView (uid "u-a") (Index.attest text) (LineRange 1 past) text of
+    case Index.classifyView (uid "u-a") Rust (Index.attest text) (LineRange 1 past) text of
         TooLarge (SpanLines o) ->
             o.lines == past
 
@@ -416,6 +417,9 @@ classifyRefusesPastLineCeiling =
             False
 
         TooLarge (ChildSpans _) ->
+            False
+
+        TooLarge (ViewNodes _) ->
             False
 
         Shown _ ->
@@ -426,6 +430,177 @@ classifyRefusesPastLineCeiling =
 
         Unreadable _ ->
             False
+
+
+-- One Rust line of `count` escapes, each after an `a`: drawn plain it is
+-- the view, its line run, gutter and code block, and one element per escape.
+escapeLine : Int -> String
+escapeLine count =
+    String.repeat count ("a" ++ String.fromChar (Char.fromCode 8238))
+
+
+classifyLine : String -> SourceView
+classifyLine line =
+    Index.classifyView (uid "u-n") Rust (Index.attest line) (LineRange 1 1) line
+
+
+-- The element count a view past the element ceiling was withheld with.
+nodesOver : SourceView -> Maybe Int
+nodesOver view =
+    case view of
+        TooLarge (ViewNodes o) ->
+            Just o.nodes
+
+        TooLarge (SpanLines _) ->
+            Nothing
+
+        TooLarge (ViewBytes _) ->
+            Nothing
+
+        TooLarge (ChildSpans _) ->
+            Nothing
+
+        Shown _ ->
+            Nothing
+
+        Stale _ ->
+            Nothing
+
+        Unreadable _ ->
+            Nothing
+
+
+-- The elements and mode of a shown view's drawing.
+drawnShape : SourceView -> Maybe ( Int, Mode )
+drawnShape view =
+    Maybe.map (\shown -> ( Drawn.elements (Index.shownDrawn shown), Drawn.mode (Index.shownDrawn shown) )) (shownOf view)
+
+
+-- The control for `viewPastNodeCeilingWithheld`: a line drawn in exactly
+-- `viewNodeCeiling` elements, too many to highlight, is shown plain with
+-- that count. Red if the ceiling is compared with `<`.
+viewAtNodeCeilingShown : Bool
+viewAtNodeCeilingShown =
+    drawnShape (classifyLine (escapeLine (Index.viewNodeCeiling - 4)))
+        == Just ( Index.viewNodeCeiling, Unhighlighted )
+
+
+-- One element past the ceiling, with one line and a few KiB, under the line
+-- and byte ceilings, is withheld with its exact element count. Red if the
+-- element check is removed.
+viewPastNodeCeilingWithheld : Bool
+viewPastNodeCeilingWithheld =
+    let
+        line =
+            escapeLine (Index.viewNodeCeiling - 3)
+    in
+    nodesOver (classifyLine line)
+        == Just (Index.viewNodeCeiling + 1)
+        && String.length line
+        < ByteSize.toBytes Index.viewByteCeiling
+
+
+-- A line of 3000 keywords takes more elements coloured than the ceiling and
+-- four plain, so it is shown plain; a short line is shown coloured. Red if
+-- the plain drawing is not tried, or tried first.
+plainFallbackWhenColorsTooMany : Bool
+plainFallbackWhenColorsTooMany =
+    let
+        keywords =
+            String.repeat 3000 "fn "
+    in
+    Drawn.elements (Drawn.highlighted Rust [ Numbered 1 keywords ])
+        > Index.viewNodeCeiling
+        && drawnShape (classifyLine keywords)
+        == Just ( 4, Unhighlighted )
+        && Maybe.map (\( _, drawnMode ) -> drawnMode) (drawnShape (classifyLine "fn x() {}"))
+        == Just Highlighted
+
+
+-- A 6.8 KB line of one token per byte, and a 129 KiB one, are shown plain
+-- or withheld, never coloured past the ceiling; a 129 KiB line of escapes
+-- is withheld by its element count. Red if the element check is removed.
+longTokenLinesNeverHighlighted : Bool
+longTokenLinesNeverHighlighted =
+    let
+        withinCeiling view =
+            case drawnShape view of
+                Just ( count, Unhighlighted ) ->
+                    count <= Index.viewNodeCeiling
+
+                Just ( _, Highlighted ) ->
+                    False
+
+                Nothing ->
+                    False
+
+        escapes =
+            escapeLine 33024
+    in
+    withinCeiling (classifyLine (String.repeat 3400 "1 "))
+        && withinCeiling (classifyLine (String.repeat 66048 "1 "))
+        && nodesOver (classifyLine escapes)
+        == Just 33028
+        && 4
+        * 33024
+        < ByteSize.toBytes Index.viewByteCeiling
+
+
+-- A view past the element ceiling under a wrong hash is too large, not
+-- drifted: it is counted before it is hashed.
+nodeOversizeRanksBeforeDrift : Bool
+nodeOversizeRanksBeforeDrift =
+    let
+        line =
+            escapeLine Index.viewNodeCeiling
+    in
+    nodesOver (Index.classifyView (uid "u-n") Rust (Index.attest "another view") (LineRange 1 1) line)
+        == Just (Index.viewNodeCeiling + 4)
+
+
+-- The relation the element ceiling is chosen by: its elements at the cost
+-- of one, plus the reserve, fit three quarters of the runtime's session
+-- ceiling, and the reserve holds the largest view's text sixteen times over
+-- with 128 bytes for each of its lines. Red if a ceiling or a cost moves
+-- without the other.
+nodeCeilingFitsSessionCeiling : Bool
+nodeCeilingFitsSessionCeiling =
+    0
+        < Index.viewNodeCeiling
+        && Index.viewNodeCeiling
+        * ByteSize.toBytes Index.elementResidentBytes
+        + ByteSize.toBytes Index.viewReserve
+        <= ByteSize.toBytes Index.runtimeSessionCeiling
+        // 4
+        * 3
+        && 16
+        * ByteSize.toBytes Index.viewByteCeiling
+        + 128
+        * Index.viewLineCeiling
+        <= ByteSize.toBytes Index.viewReserve
+
+
+-- The session ceiling the element ceiling is sized under is the runtime's:
+-- the runtime's budget source declares `SESSION_CEILING` as the same whole
+-- number of MiB. Red when either side changes alone.
+sessionCeilingMirrorsRuntime : Task.Task Error Bool
+sessionCeilingMirrorsRuntime =
+    let
+        mib =
+            1024 * 1024
+
+        ceiling =
+            ByteSize.toBytes Index.runtimeSessionCeiling
+    in
+    do
+        cwd <- System.cwd ()
+        path <- Task.fromResult (Path.fromString (repoFile cwd "src/runtime/rust/src/web/budget.rs"))
+        source <- File.readFileLimit path (ByteSize.kib 256)
+        Task.succeed
+            (modBy mib ceiling
+                == 0
+                && String.contains ("\npub const SESSION_CEILING: Bytes = Bytes::mib(" ++ String.fromInt (ceiling // mib) ++ ");\n") source
+            )
 
 
 -- Both ceilings are positive, and the byte ceiling is within the read
@@ -458,7 +633,7 @@ shownLinesAreAttestedLines =
             String.join "\n" span
 
         drawn text first last =
-            Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-x") (Index.attest text) (LineRange first last) file))
+            Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-x") Rust (Index.attest text) (LineRange first last) file))
     in
     span
         == [ "a\r", "b", "", "" ]
@@ -466,7 +641,7 @@ shownLinesAreAttestedLines =
         == Just [ Numbered 1 "a\r", Numbered 2 "b", Numbered 3 "", Numbered 4 "" ]
         && drawn "b\n" 2 3
         == Just [ Numbered 2 "b", Numbered 3 "" ]
-        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") (Index.attest viewB) (LineRange 1 2) fixtureMainIpe))
+        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") Rust (Index.attest viewB) (LineRange 1 2) fixtureMainIpe))
         == Just [ Numbered 1 "module Main exposing (main)", Numbered 2 "" ]
 
 
@@ -674,7 +849,7 @@ residualVectorHolds v =
         && (String.isEmpty v.residual || String.startsWith "\n" v.residual)
         && Index.attestResidual v.residual
         == v.hash
-        && shownTextOf (Index.classifyView (uid "u-file") v.hash (Residual spans) v.src)
+        && shownTextOf (Index.classifyView (uid "u-file") Rust v.hash (Residual spans) v.src)
         == Just v.residual
 
 
@@ -1191,7 +1366,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceRow", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "shortHash", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "elementResidentBytes", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1456,6 +1631,13 @@ checks =
         , Task.succeed ( "classifying a span past the line ceiling withholds it", classifyRefusesPastLineCeiling )
         , Task.succeed ( "the view ceilings are positive and within the read ceiling", viewCeilingsWellFormed )
         , Task.succeed ( "the drawn lines are the attested lines", shownLinesAreAttestedLines )
+        , Task.succeed ( "a view drawn in exactly the element ceiling is shown", viewAtNodeCeilingShown )
+        , Task.succeed ( "a view one element past the element ceiling is withheld, counted in elements", viewPastNodeCeilingWithheld )
+        , Task.succeed ( "a view too many elements to highlight is shown plain, a small one highlighted", plainFallbackWhenColorsTooMany )
+        , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is withheld", longTokenLinesNeverHighlighted )
+        , Task.succeed ( "a view past the element ceiling is too large, never drifted", nodeOversizeRanksBeforeDrift )
+        , Task.succeed ( "the element ceiling, at the cost per element, fits three quarters of the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
+        , check "the mirrored session ceiling is the runtime's" sessionCeilingMirrorsRuntime
         , check "roots agreeing with the recorded repositories pass the startup check" reposProbeAccepts
         , check "a missing or oversized recorded repository set refuses startup" reposProbeRefusesSetShape
         , check "a bound, recorded or nested tag the index disagrees on refuses startup" reposProbeRefusesDisagreement

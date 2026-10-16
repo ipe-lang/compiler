@@ -3057,6 +3057,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "include_dir",
+ "ipe",
  "ipe-runtime-rust",
  "ipe-test-temp",
  "ipe_backend",

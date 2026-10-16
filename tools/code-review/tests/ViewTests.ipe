@@ -24,14 +24,15 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), LeadingMark(..), LineEnds(..), Token(..))
-import Lib.Index as Index exposing (SourceRow(..), SourceView(..), StaleReason(..))
+import Lib.Drawn as Drawn exposing (Code(..), Hue(..), LayoutNote(..), Part(..), Piece(..), RowLine(..), Run(..), SourceRow(..))
+import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
-import Lib.View as View exposing (LayoutNote(..), RowLine(..))
+import Lib.View as View
 import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains)
 
 
@@ -329,7 +330,7 @@ hugeLineRows lang =
         src =
             String.repeat 32768 "a1 \"s\"; "
     in
-    case View.rowLines lang [ Numbered 1 src ] of
+    case Drawn.rowLines lang [ Numbered 1 src ] of
         [ TokenLine 1 toks ] ->
             String.length src == 262144 && String.concat (List.map rawText toks) == src
 
@@ -366,15 +367,15 @@ multiLineStrings =
         && not (hasComment (Highlight.tokenize Ipe "\"\"\"a\n-- b\"\"\" c"))
         && reassembles Rust "\"a\n// b\" c"
         && reassembles Ipe "\"\"\"a\n-- b\"\"\" c"
-        && not (List.any hasComment (List.map rowTokens (View.rowLines Rust [ Numbered 1 "\"a", Numbered 2 "// b\" c" ])))
-        && not (List.any hasComment (List.map rowTokens (View.rowLines Ipe [ Numbered 1 "\"\"\"a", Numbered 2 "-- b\"\"\" c" ])))
+        && not (List.any hasComment (List.map rowTokens (Drawn.rowLines Rust [ Numbered 1 "\"a", Numbered 2 "// b\" c" ])))
+        && not (List.any hasComment (List.map rowTokens (Drawn.rowLines Ipe [ Numbered 1 "\"\"\"a", Numbered 2 "-- b\"\"\" c" ])))
 
 
 -- A block comment open at a row's end carries into the next row; a covered
 -- run between them starts the next row afresh.
 blockCarry : Bool
 blockCarry =
-    case View.rowLines Ipe [ Numbered 1 "{- a", Numbered 2 "b -} x" ] of
+    case Drawn.rowLines Ipe [ Numbered 1 "{- a", Numbered 2 "b -} x" ] of
         [ TokenLine 1 first, TokenLine 2 second ] ->
             first
                 == [ Comment "{- a" ]
@@ -388,7 +389,7 @@ blockCarry =
 
 coveredResets : Bool
 coveredResets =
-    case View.rowLines Ipe [ Numbered 1 "{- a", Covered, Numbered 3 "b -} x" ] of
+    case Drawn.rowLines Ipe [ Numbered 1 "{- a", Covered, Numbered 3 "b -} x" ] of
         [ _, CoveredLine, TokenLine 3 third ] ->
             not (List.any (isComment "b -}") third)
 
@@ -402,7 +403,7 @@ tabDrawsAsTab : Bool
 tabDrawsAsTab =
     let
         html =
-            Html.render (View.lineHtml (Highlight.tokenize Rust ("a\tb" ++ codeText 8238)))
+            codeOf (Drawn.highlighted Rust [ Numbered 1 ("a\tb" ++ codeText 8238) ])
     in
     String.contains "\t" html
         && not (String.contains "\\t" html)
@@ -465,15 +466,31 @@ hugeResidual =
 -- text in shell, where `cd /x\r` names another directory than `cd /x`.
 crlfByLanguage : Bool
 crlfByLanguage =
-    case ( View.rowLines Rust [ Numbered 1 "fn x\r" ], View.rowLines Shell [ Numbered 1 "cd /x\r" ] ) of
+    case ( Drawn.rowLines Rust [ Numbered 1 "fn x\r" ], Drawn.rowLines Shell [ Numbered 1 "cd /x\r" ] ) of
         ( [ TokenLine 1 rust ], [ TokenLine 1 shell ] ) ->
             rust
                 == [ Keyword "fn", Plain " ", Ident "x" ]
                 && List.member (Plain "\r") shell
-                && String.contains "data-review-escape" (Html.render (View.lineHtml shell))
+                && String.contains "data-review-escape" (codeOf (Drawn.highlighted Shell [ Numbered 1 "cd /x\r" ]))
 
         _ ->
             False
+
+
+-- The rendered code blocks of a drawing, in order.
+codeOf : Drawn.DrawnSource -> String
+codeOf drawn =
+    String.concat (List.map partCode (Drawn.parts drawn))
+
+
+partCode : Part -> String
+partCode part =
+    case part of
+        LineRun _ code ->
+            Html.render (View.codeHtml code)
+
+        CoveredRun ->
+            ""
 
 
 -- The text of rendered markup: every character outside a tag, in order.
@@ -507,7 +524,7 @@ sourceCopiesAsWritten : Bool
 sourceCopiesAsWritten =
     let
         code =
-            Html.render (View.codeHtml (List.map rowTokens (View.rowLines Rust [ Numbered 1 "fn a() {", Numbered 2 "\tlet  x = 1;", Numbered 3 "}" ])))
+            codeOf (Drawn.highlighted Rust [ Numbered 1 "fn a() {", Numbered 2 "\tlet  x = 1;", Numbered 3 "}" ])
 
         gutter =
             Html.render (View.gutterHtml [ 1, 2, 3 ])
@@ -524,6 +541,110 @@ sourceCopiesAsWritten =
         && not (String.contains "user-select:none" code)
 
 
+-- How often `needle` occurs in `text`.
+occurrences : String -> String -> Int
+occurrences needle text =
+    List.length (String.split needle text) - 1
+
+
+-- The elements opened in rendered markup: each `<` that is not a `</`. The
+-- fixtures hold no `<` in text, which the markup escapes anyway.
+openedElements : String -> Int
+openedElements html =
+    occurrences "<" html - occurrences "</" html
+
+
+-- The fixture table the element count is checked over: plain text,
+-- keywords and other colours, tabs, escapes, mixed-direction text and its
+-- controls, a covered run, an empty line, in every language.
+drawnFixtures : List (List SourceRow)
+drawnFixtures =
+    [ [ Numbered 1 "hello world" ]
+    , [ Numbered 1 "fn main() { let x = 1; }", Numbered 2 "// done", Numbered 3 "\"s\" 2.5" ]
+    , [ Numbered 1 "\tlet\tx = 2;", Numbered 2 "\t\t" ]
+    , [ Numbered 1 ("a" ++ codeText 8238 ++ codeText 8238 ++ "b" ++ codeText 7 ++ "\t" ++ codeText 8203) ]
+    , [ Numbered 1 ("let " ++ codeText 1488 ++ codeText 1489 ++ " = " ++ codeText 8294 ++ "1" ++ codeText 8297 ++ " // " ++ codeText 1490) ]
+    , [ Numbered 1 "fn a", Covered, Numbered 5 "fn b", Covered ]
+    , [ Numbered 1 "", Numbered 2 "x", Numbered 3 "" ]
+    , [ Covered ]
+    , []
+    ]
+
+
+-- Each drawing renders exactly the elements `Drawn.elements` counts, in
+-- both modes and every language, and plain draws no more than coloured.
+-- Red if the drawing adds an element the count does not.
+drawnCountIsRenderedCount : Bool
+drawnCountIsRenderedCount =
+    let
+        agrees drawn =
+            openedElements (Html.render (View.drawnHtml drawn)) == Drawn.elements drawn
+
+        both lang rows =
+            agrees (Drawn.highlighted lang rows)
+                && agrees (Drawn.plain lang rows)
+                && Drawn.elements (Drawn.plain lang rows)
+                <= Drawn.elements (Drawn.highlighted lang rows)
+    in
+    List.all (\lang -> List.all (both lang) drawnFixtures) [ Rust, Ipe, Shell, Unknown ]
+        && Drawn.elements (Drawn.highlighted Rust [ Numbered 1 "fn x" ])
+        == 6
+
+
+-- Fifty adjacent escapes draw as one marked element holding all fifty
+-- spellings, coloured and plain. Red if escapes are drawn one element each.
+escapeRunIsOneElement : Bool
+escapeRunIsOneElement =
+    let
+        rows =
+            [ Numbered 1 ("a" ++ String.repeat 50 (codeText 8238) ++ "b") ]
+
+        oneMarked html =
+            occurrences "data-review-escape" html == 1 && occurrences "\\u{202e}" html == 50
+    in
+    oneMarked (codeOf (Drawn.highlighted Rust rows)) && oneMarked (codeOf (Drawn.plain Rust rows))
+
+
+-- An identifier, a space and an identifier share the code block's colour,
+-- so the line is one run drawn without an element of its own: the line's
+-- element is its only span. Red if each token draws its own span.
+sameColourTokensShareOneElement : Bool
+sameColourTokensShareOneElement =
+    let
+        rows =
+            [ Numbered 1 "a b" ]
+    in
+    Drawn.parts (Drawn.highlighted Rust rows)
+        == [ LineRun [ 1 ] (ColoredLines [ [ Run TextHue [ Chars "a b" ] ] ]) ]
+        && occurrences "<span" (codeOf (Drawn.highlighted Rust rows))
+        == 1
+        && occurrences "<span" (codeOf (Drawn.highlighted Rust [ Numbered 1 "fn fn" ]))
+        == 3
+        && Drawn.parts (Drawn.plain Rust rows)
+        == [ LineRun [ 1 ] (PlainText [ Chars "a b" ]) ]
+
+
+-- A line holding U+202E and U+2066 draws in byte order by its code block:
+-- the block carries `displayOrderCss`, and no line, run or escape element
+-- inside it sets `unicode-bidi` again. Red if the override moves off the
+-- block, or back onto each element.
+codeBlockHoldsDisplayOrder : Bool
+codeBlockHoldsDisplayOrder =
+    let
+        rows =
+            [ Numbered 1 ("let s = \"" ++ codeText 8238 ++ "x\"; // " ++ codeText 8294 ++ "y") ]
+
+        inOrder html =
+            String.startsWith ("<code style=\"" ++ View.codeCss ++ "\">") html
+                && String.contains View.displayOrderCss View.codeCss
+                && occurrences "unicode-bidi" html
+                == 1
+                && occurrences "data-review-escape" html
+                == 2
+    in
+    inOrder (codeOf (Drawn.highlighted Rust rows)) && inOrder (codeOf (Drawn.plain Rust rows))
+
+
 -- A tab, a CRLF line end in Rust and a byte-order mark opening a Rust file
 -- are layout: drawn as columns or not at all, each noted for the file. Every
 -- other hazard, and each of those where its language reads it as text,
@@ -535,33 +656,43 @@ layoutOnlyWhereLanguageReadsIt =
             codeText 65279
 
         drawn lang rows =
-            Html.render (View.codeHtml (List.map rowTokens (View.rowLines lang rows)))
+            codeOf (Drawn.highlighted lang rows)
+
+        plainDrawn lang rows =
+            codeOf (Drawn.plain lang rows)
 
         escapes raw html =
             String.contains "data-review-escape" html && not (String.contains raw html)
 
+        layoutRows =
+            [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "\tfn y\r" ]
+
         layout =
-            drawn Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "\tfn y\r" ]
+            drawn Rust layoutRows ++ plainDrawn Rust layoutRows
     in
     not (String.contains "data-review-escape" layout)
         && not (String.contains mark layout)
         && not (String.contains "\r" layout)
-        && markupText layout
+        && markupText (drawn Rust layoutRows)
         == "fn x\n\tfn y"
-        && View.layoutNotes Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "fn y" ]
+        && markupText (plainDrawn Rust layoutRows)
+        == "fn x\n\tfn y"
+        && Drawn.layoutNotes Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "fn y" ]
         == [ ByteOrderMark, CrlfLineEnds ]
-        && View.layoutNotes Rust [ Numbered 1 "fn x", Numbered 2 "fn y" ]
+        && Drawn.layoutNotes Rust [ Numbered 1 "fn x", Numbered 2 "fn y" ]
         == []
         && List.all (\code -> escapes (codeText code) (drawn Rust [ Numbered 1 ("a" ++ codeText code ++ "b") ])) [ 7, 27, 127, 133, 155, 8203, 8238, 8294, 65279 ]
+        && List.all (\code -> escapes (codeText code) (plainDrawn Rust [ Numbered 1 ("a" ++ codeText code ++ "b") ])) [ 7, 27, 127, 133, 155, 8203, 8238, 8294, 65279 ]
+        && escapes "\r" (plainDrawn Shell [ Numbered 1 "cd /x\r" ])
         && escapes mark (drawn Rust [ Numbered 2 (mark ++ "fn x") ])
         && escapes mark (drawn Shell [ Numbered 1 (mark ++ "echo x") ])
         && escapes mark (drawn Ipe [ Numbered 1 (mark ++ "x = 1") ])
         && escapes mark (drawn Unknown [ Numbered 1 (mark ++ "x") ])
         && escapes "\r" (drawn Shell [ Numbered 1 "cd /x\r" ])
         && escapes "\r" (drawn Rust [ Numbered 1 "a\rb" ])
-        && View.layoutNotes Shell [ Numbered 1 (mark ++ "cd /x\r") ]
+        && Drawn.layoutNotes Shell [ Numbered 1 (mark ++ "cd /x\r") ]
         == []
-        && View.layoutNotes Rust [ Numbered 2 (mark ++ "fn x") ]
+        && Drawn.layoutNotes Rust [ Numbered 2 (mark ++ "fn x") ]
         == []
 
 
@@ -580,19 +711,19 @@ layoutDecidesWhatIsHidden =
         hiding =
             { lineEnds = CrlfIsOneBreak, leadingMark = MarkSkipped }
     in
-    View.layoutLine hiding 1 line
+    Drawn.layoutLine hiding 1 line
         == "x"
-        && View.layoutLine { lineEnds = CrIsText, leadingMark = MarkIsText } 1 line
+        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkIsText } 1 line
         == line
-        && View.layoutLine { lineEnds = CrIsText, leadingMark = MarkSkipped } 1 line
+        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkSkipped } 1 line
         == "x\r"
-        && View.layoutLine { lineEnds = CrlfIsOneBreak, leadingMark = MarkIsText } 1 line
+        && Drawn.layoutLine { lineEnds = CrlfIsOneBreak, leadingMark = MarkIsText } 1 line
         == mark
         ++ "x"
-        && View.layoutLine hiding 2 line
+        && Drawn.layoutLine hiding 2 line
         == mark
         ++ "x"
-        && View.layoutLine hiding 1 "a\rb"
+        && Drawn.layoutLine hiding 1 "a\rb"
         == "a\rb"
 
 
@@ -611,7 +742,7 @@ rawPrefixedStrings =
 
 rawRowCloses : Bool
 rawRowCloses =
-    case View.rowLines Rust [ Numbered 1 "let s = br\"\\\";", Numbered 2 "fn x" ] of
+    case Drawn.rowLines Rust [ Numbered 1 "let s = br\"\\\";", Numbered 2 "fn x" ] of
         [ _, TokenLine 2 second ] ->
             second == [ Keyword "fn", Plain " ", Ident "x" ]
 
@@ -624,7 +755,7 @@ rawRowCloses =
 -- may follow tabs. A `<<<` here-string is no heredoc, so its quote carries.
 heredocBodies : Bool
 heredocBodies =
-    case View.rowLines Shell [ Numbered 1 "cat <<EOF", Numbered 2 "don't", Numbered 3 "EOF", Numbered 4 "rm -rf x" ] of
+    case Drawn.rowLines Shell [ Numbered 1 "cat <<EOF", Numbered 2 "don't", Numbered 3 "EOF", Numbered 4 "rm -rf x" ] of
         [ _, _, _, TokenLine 4 fourth ] ->
             fourth
                 == [ Ident "rm", Plain " ", Plain "-", Ident "rf", Plain " ", Ident "x" ]
@@ -638,7 +769,7 @@ heredocBodies =
 
 heredocTabs : Bool
 heredocTabs =
-    case View.rowLines Shell [ Numbered 1 "cat <<-'END'", Numbered 2 "it's", Numbered 3 "\tEND", Numbered 4 "rm x" ] of
+    case Drawn.rowLines Shell [ Numbered 1 "cat <<-'END'", Numbered 2 "it's", Numbered 3 "\tEND", Numbered 4 "rm x" ] of
         [ _, _, _, TokenLine 4 fourth ] ->
             fourth == [ Ident "rm", Plain " ", Ident "x" ]
 
@@ -648,7 +779,7 @@ heredocTabs =
 
 hereStringCarries : Bool
 hereStringCarries =
-    case View.rowLines Shell [ Numbered 1 "cat <<<'a", Numbered 2 "b' c" ] of
+    case Drawn.rowLines Shell [ Numbered 1 "cat <<<'a", Numbered 2 "b' c" ] of
         [ _, TokenLine 2 second ] ->
             List.take 1 second == [ Str "b'" ]
 
@@ -814,6 +945,10 @@ checks =
         , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
         , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
         , Task.succeed ( "a run of source lines copies as the source spells it, line numbers apart", sourceCopiesAsWritten )
+        , Task.succeed ( "a drawing renders exactly the elements it counts, in both modes and every language", drawnCountIsRenderedCount )
+        , Task.succeed ( "a run of fifty escapes draws as one marked element", escapeRunIsOneElement )
+        , Task.succeed ( "tokens of one colour draw as one run, the text colour without an element", sameColourTokensShareOneElement )
+        , Task.succeed ( "the code block alone carries the byte-order override", codeBlockHoldsDisplayOrder )
         , Task.succeed ( "only a tab, a Rust CRLF end and a Rust leading byte-order mark are layout; every other hazard draws escaped", layoutOnlyWhereLanguageReadsIt )
         , Task.succeed ( "a layout hides a \\r or a leading mark only where its grammar reads it as layout", layoutDecidesWhatIsHidden )
         , Task.succeed ( "a Rust br or cr string is raw", rawPrefixedStrings )

@@ -24,6 +24,12 @@ use crate::package_manifest::{PACKAGE_IPE, parse_package_manifest_source};
 use crate::project::{IPE_TOML, ProjectManifest, parse_entry};
 use crate::text;
 
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixture;
+mod tree;
+
+pub use tree::{DEFAULT_NAME, ScratchRoot, SourceTree, TreeRefusal};
+
 /// The directory holding a project's modules.
 const SRC_DIR: &str = "src";
 /// The directory holding a project's test modules.

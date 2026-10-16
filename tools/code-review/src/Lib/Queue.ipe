@@ -1182,6 +1182,9 @@ sourceStatusText view =
         TooLarge (ChildSpans o) ->
             Just ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")
 
+        TooLarge (ViewNodes o) ->
+            Just ("This unit's source draws as " ++ String.fromInt o.nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling." ++ notShownRemedy)
+
 
 -- What a reviewer can do about a view past a ceiling.
 notShownRemedy : String
