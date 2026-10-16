@@ -10,9 +10,24 @@
 use crate::model::{Lang, RepoTag};
 use crate::walk::{DiskRefusal, NameRefusal, ReadRefusal};
 
-/// Why a listed entry has no units; the `refusals.reason` column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Unreviewable {
+/// Declares [`Unreviewable`] and its [`Unreviewable::ALL`] from one variant
+/// list, so no reason can exist without being listed in `ALL`.
+macro_rules! unreviewable {
+    ($($(#[doc = $doc:literal])+ $variant:ident,)+) => {
+        /// Why a listed entry has no units; the `refusals.reason` column.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum Unreviewable {
+            $($(#[doc = $doc])+ $variant,)+
+        }
+
+        impl Unreviewable {
+            /// Every reason, in declaration order.
+            pub const ALL: [Self; [$(Unreviewable::$variant),+].len()] = [$(Self::$variant),+];
+        }
+    };
+}
+
+unreviewable! {
     /// The bytes read (at most the text ceiling) are not UTF-8.
     NotUtf8,
     /// The file is past the text ceiling and within the hash ceiling.
@@ -40,36 +55,6 @@ pub enum Unreviewable {
 }
 
 impl Unreviewable {
-    /// Every reason, built from an exhaustive match so a new variant fails the
-    /// build until it is listed here too.
-    pub const ALL: [Self; 12] = match Self::NotUtf8 {
-        Self::NotUtf8
-        | Self::TooLarge
-        | Self::SymlinkEntry
-        | Self::GitlinkEntry
-        | Self::UnknownMode
-        | Self::PastHashCeiling
-        | Self::NonUtf8Name
-        | Self::NotRepoRelative
-        | Self::NestedRepository
-        | Self::NotRegular
-        | Self::Unreadable
-        | Self::Replaced => [
-            Self::NotUtf8,
-            Self::TooLarge,
-            Self::SymlinkEntry,
-            Self::GitlinkEntry,
-            Self::UnknownMode,
-            Self::PastHashCeiling,
-            Self::NonUtf8Name,
-            Self::NotRepoRelative,
-            Self::NestedRepository,
-            Self::NotRegular,
-            Self::Unreadable,
-            Self::Replaced,
-        ],
-    };
-
     /// The stored spelling of the reason.
     pub const fn tag(self) -> &'static str {
         match self {
