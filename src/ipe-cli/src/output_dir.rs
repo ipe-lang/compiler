@@ -79,59 +79,78 @@ pub const CACHE_NAMESPACE_DIR: &str = ipe_ffi::driver::CACHE_NAMESPACE_DIR;
 /// The package cache entry inside [`CACHE_NAMESPACE_DIR`].
 pub const PACKAGES_SUBDIR: &str = "packages";
 
-/// Declares [`ReservedName`], its [`ReservedName::ALL`], its directory names and
-/// its version-control kinds from one row list, so no variant lacks a name or a slot.
-macro_rules! closed_reserved_names {
-    ($($doc:literal, $variant:ident, $dir:expr, $vcs:expr;)+) => {
-        /// A directory name no output may sit under, whichever project it belongs to.
-        ///
-        /// Matched per path component as a case-folding volume may open it
-        /// ([`ipe_fs_open::may_open_as`]), fail closed on a case-sensitive one.
-        /// The set is closed: one row list declares every variant, its
-        /// directory name and its slot in `ALL`.
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        pub enum ReservedName {
-            $(
-                #[doc = $doc]
-                $variant,
-            )+
-        }
-
-        impl ReservedName {
-            /// Every reserved name, once each, in declaration order.
-            const ALL: [Self; Self::COUNT] = [$(Self::$variant),+];
-
-            const COUNT: usize = [$(Self::$variant),+].len();
-
-            /// The reserved directory name.
-            #[must_use]
-            pub const fn dir_name(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $dir,)+
-                }
-            }
-
-            /// The version-control system whose metadata the name holds, if any.
-            const fn vcs(self) -> Option<VcsKind> {
-                match self {
-                    $(Self::$variant => $vcs,)+
-                }
-            }
-        }
-    };
+/// A directory name no output may sit under, whichever project it belongs to.
+///
+/// Matched per path component as a case-folding volume may open it
+/// ([`ipe_fs_open::may_open_as`]), fail closed on a case-sensitive one.
+/// The set is closed: every variant has a directory name and a version-control
+/// kind through an exhaustive `match`, and a build-time check ties
+/// [`ReservedName::ALL`] to the declaration order, so none lacks a slot.
+/// `CacheNamespace` stays the last variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedName {
+    /// Git metadata (`.git`).
+    Git,
+    /// Mercurial metadata (`.hg`).
+    Mercurial,
+    /// Jujutsu metadata (`.jj`).
+    Jujutsu,
+    /// Darcs metadata (`_darcs`).
+    Darcs,
+    /// An ipe cache namespace ([`CACHE_NAMESPACE_DIR`]).
+    ///
+    /// `ipe clean` and the FFI binding regeneration delete its contents by name
+    /// alone, in whichever project holds it, so nothing ipe writes elsewhere may
+    /// live there.
+    CacheNamespace,
 }
 
-closed_reserved_names! {
-    "Git metadata (`.git`).", Git, VcsKind::Git.entry_name(), Some(VcsKind::Git);
-    "Mercurial metadata (`.hg`).", Mercurial, VcsKind::Mercurial.entry_name(), Some(VcsKind::Mercurial);
-    "Jujutsu metadata (`.jj`).", Jujutsu, VcsKind::Jujutsu.entry_name(), Some(VcsKind::Jujutsu);
-    "Darcs metadata (`_darcs`).", Darcs, VcsKind::Darcs.entry_name(), Some(VcsKind::Darcs);
-    "An ipe cache namespace ([`CACHE_NAMESPACE_DIR`]).\n\n\
-     `ipe clean` and the FFI binding regeneration delete its contents by name \
-     alone, in whichever project holds it, so nothing ipe writes elsewhere may \
-     live there.",
-    CacheNamespace, CACHE_NAMESPACE_DIR, None;
+impl ReservedName {
+    /// Every reserved name, once each, in declaration order.
+    const ALL: [Self; Self::CacheNamespace as usize + 1] = [
+        Self::Git,
+        Self::Mercurial,
+        Self::Jujutsu,
+        Self::Darcs,
+        Self::CacheNamespace,
+    ];
+
+    /// The reserved directory name.
+    #[must_use]
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            Self::Git => VcsKind::Git.entry_name(),
+            Self::Mercurial => VcsKind::Mercurial.entry_name(),
+            Self::Jujutsu => VcsKind::Jujutsu.entry_name(),
+            Self::Darcs => VcsKind::Darcs.entry_name(),
+            Self::CacheNamespace => CACHE_NAMESPACE_DIR,
+        }
+    }
+
+    /// The version-control system whose metadata the name holds, if any.
+    const fn vcs(self) -> Option<VcsKind> {
+        match self {
+            Self::Git => Some(VcsKind::Git),
+            Self::Mercurial => Some(VcsKind::Mercurial),
+            Self::Jujutsu => Some(VcsKind::Jujutsu),
+            Self::Darcs => Some(VcsKind::Darcs),
+            Self::CacheNamespace => None,
+        }
+    }
 }
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `ALL` drifts from the variant order [ledger #boundary]
+const _: () = assert!({
+    let mut rest = ReservedName::ALL.as_slice();
+    let mut slot = 0;
+    let mut in_order = true;
+    while let [head, tail @ ..] = rest {
+        in_order = in_order && *head as usize == slot;
+        slot += 1;
+        rest = tail;
+    }
+    in_order
+});
 
 impl ReservedName {
     /// The reserved name a case-folding volume may open `component` as

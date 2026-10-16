@@ -150,9 +150,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// A fresh fixture directory `<temp>/ipe-test-temp-<tag>-<pid>`.
-    #[allow(clippy::disallowed_methods)] // the fixture sits beside the root under proof
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ipe-test-temp-{tag}-{}", std::process::id()));
+        let dir = super::temp_root().join(format!("ipe-test-temp-{tag}-{}", std::process::id()));
         if dir.symlink_metadata().is_ok() {
             fs::remove_dir_all(&dir).expect("clear stale fixture");
         }
