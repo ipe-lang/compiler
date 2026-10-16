@@ -799,6 +799,7 @@ unitPageStatesDistinct =
             , TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 })
             , TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
             , TooLarge (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
+            , TooLarge (ViewNodes { nodes = Index.viewNodeCeiling + 1 })
             ]
 
         sourceTexts =
@@ -1614,7 +1615,7 @@ reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
 reviewWritesGoThroughWriteTransaction =
     let
         others =
-            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
     in
     do
         cwd <- System.cwd ()
