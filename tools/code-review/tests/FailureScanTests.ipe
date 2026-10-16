@@ -270,11 +270,18 @@ type BlockScan
 
 isHeader : String -> String -> Bool
 isHeader name line =
-    let
-        lineTokens =
-            tokens line
-    in
-    String.startsWith "type " line && (List.take 2 lineTokens == [ "type", name ] || List.take 3 lineTokens == [ "type", "alias", name ])
+    if String.startsWith "type " line then
+        declares name (tokens line)
+
+    else
+        False
+
+
+-- True when `lineTokens`, the tokens of a `type` line, open the declaration
+-- of `name`.
+declares : String -> List String -> Bool
+declares name lineTokens =
+    List.take 2 lineTokens == [ "type", name ] || List.take 3 lineTokens == [ "type", "alias", name ]
 
 
 -- The code of `line`, its trailing comment dropped.
@@ -283,9 +290,20 @@ codeOf line =
     Maybe.withDefault "" (List.head (String.split "--" line))
 
 
-typeBlock : String -> String -> Result String (List String)
-typeBlock name text =
-    case List.foldl (blockStep name) Seeking (String.lines text) of
+-- The declaration of `name` in `scanned`, read from its first header on.
+typeBlock : String -> ScanModule -> Result String (List String)
+typeBlock name scanned =
+    case List.find (\header -> declares name header.tokens) scanned.headers of
+        Just header ->
+            blockFrom name (List.drop header.at scanned.lines)
+
+        Nothing ->
+            Err ("type " ++ name ++ " is not declared")
+
+
+blockFrom : String -> List String -> Result String (List String)
+blockFrom name lines =
+    case List.foldl (blockStep name) Seeking lines of
         Seeking ->
             Err ("type " ++ name ++ " is not declared")
 
@@ -385,6 +403,15 @@ importsOf text =
 
 importOf : String -> Maybe Import
 importOf line =
+    if String.startsWith "import " line then
+        importFrom line
+
+    else
+        Nothing
+
+
+importFrom : String -> Maybe Import
+importFrom line =
     let
         words =
             String.words line
@@ -392,15 +419,46 @@ importOf line =
         pairs =
             List.map2 (\a b -> ( a, b )) words (List.drop 1 words)
     in
-    if String.startsWith "import " line then
-        Maybe.map
-            (\moduleName ->
-                { moduleName = moduleName
-                , qualifier = Maybe.withDefault moduleName (Maybe.map (\( _, b ) -> b) (List.find (\( a, _ ) -> a == "as") pairs))
-                , exposed = Maybe.withDefault [] (Maybe.map tokens (List.head (List.drop 1 (String.split "exposing" line))))
-                }
-            )
-            (List.head (List.drop 1 words))
+    Maybe.map
+        (\moduleName ->
+            { moduleName = moduleName
+            , qualifier = Maybe.withDefault moduleName (Maybe.map (\( _, b ) -> b) (List.find (\( a, _ ) -> a == "as") pairs))
+            , exposed = Maybe.withDefault [] (Maybe.map tokens (List.head (List.drop 1 (String.split "exposing" line))))
+            }
+        )
+        (List.head (List.drop 1 words))
+
+
+-- A module of `src` as the type walk reads it, split and lexed once: its
+-- lines, its imports, and each line opening with `type ` by its position
+-- and tokens. Each visit reads the index, never the text.
+type alias ScanModule =
+    { rel : String, lines : List String, imports : List Import, headers : List Header }
+
+
+type alias Header =
+    { at : Int, tokens : List String }
+
+
+indexModule : ( String, String ) -> ScanModule
+indexModule source =
+    case source of
+        ( rel, text ) ->
+            let
+                lines =
+                    String.lines text
+            in
+            { rel = rel
+            , lines = lines
+            , imports = List.filterMap importOf lines
+            , headers = List.filterMap (\header -> header) (List.indexedMap headerAt lines)
+            }
+
+
+headerAt : Int -> String -> Maybe Header
+headerAt at line =
+    if String.startsWith "type " line then
+        Just { at = at, tokens = tokens line }
 
     else
         Nothing
@@ -409,9 +467,12 @@ importOf line =
 -- Where the type `token` names in module `rel` is declared: `Ok Nothing`
 -- for a leaf, `Ok (Just ( file, name ))` for a declaration to walk, and
 -- `Err` for a name that resolves to neither.
-resolve : String -> String -> String -> Result String (Maybe ( String, String ))
-resolve rel text token =
+resolve : ScanModule -> String -> Result String (Maybe ( String, String ))
+resolve scanned token =
     let
+        rel =
+            scanned.rel
+
         segments =
             List.reverse (String.split "." token)
 
@@ -422,13 +483,13 @@ resolve rel text token =
             String.join "." (List.reverse (List.drop 1 segments))
 
         imports =
-            importsOf text
+            scanned.imports
 
         unresolved =
             Err (rel ++ ": " ++ token ++ " resolves to no declaration or leaf")
     in
     if String.isEmpty qualifier then
-        if List.any (isHeader token) (String.lines text) then
+        if List.any (\header -> declares token header.tokens) scanned.headers then
             Ok (Just ( rel, token ))
 
         else
@@ -468,28 +529,32 @@ type alias Visit =
     { next : List ( String, String ), violations : List String }
 
 
-visitType : List ( String, String ) -> ( String, String ) -> Visit
-visitType sources key =
+visitType : List ScanModule -> ( String, String ) -> Visit
+visitType modules key =
     case key of
         ( rel, name ) ->
-            case List.find (\( file, _ ) -> file == rel) sources of
-                Just ( _, text ) ->
-                    visitBlock rel name text
+            case List.find (\scanned -> scanned.rel == rel) modules of
+                Just scanned ->
+                    visitBlock scanned name
 
                 Nothing ->
                     { next = [], violations = [ rel ++ " is not a module of src" ] }
 
 
-visitBlock : String -> String -> String -> Visit
-visitBlock rel name text =
-    case typeBlock name text of
+visitBlock : ScanModule -> String -> Visit
+visitBlock scanned name =
+    let
+        rel =
+            scanned.rel
+    in
+    case typeBlock name scanned of
         Ok block ->
             let
                 refs =
                     typeRefs block
 
                 resolved =
-                    List.map (resolve rel text) (List.filter (\token -> token /= "Error") refs)
+                    List.map (resolve scanned) (List.filter (\token -> token /= "Error") refs)
 
                 namesError =
                     if List.member "Error" refs then
@@ -529,16 +594,20 @@ type alias Walk =
 
 
 -- Every declaration reachable from the app's `Model` and `Msg`, one round
--- per distance from them; past `reachCeiling` declarations the walk stops
--- and is a violation.
+-- per distance from them, over each module indexed once. A round with an
+-- empty frontier is the fixed point and changes nothing; past
+-- `reachCeiling` declarations the walk stops and is a violation.
 reachViolations : List ( String, String ) -> List String
 reachViolations sources =
     let
+        modules =
+            List.map indexModule sources
+
         start =
             { seen = [], frontier = [ ( "Lib/App.ipe", "Model" ), ( "Lib/App.ipe", "Msg" ) ], violations = [] }
 
         walked =
-            List.foldl (\_ walk -> walkRound sources walk) start (List.range 1 (reachCeiling + 1))
+            List.foldl (\_ walk -> walkRound modules walk) start (List.range 1 (reachCeiling + 1))
 
         unfinished =
             if List.isEmpty walked.frontier then
@@ -557,9 +626,12 @@ reachViolations sources =
     walked.violations ++ unfinished ++ tooMany
 
 
-walkRound : List ( String, String ) -> Walk -> Walk
-walkRound sources walk =
-    if List.length walk.seen > reachCeiling then
+walkRound : List ScanModule -> Walk -> Walk
+walkRound modules walk =
+    if List.isEmpty walk.frontier then
+        walk
+
+    else if List.length walk.seen > reachCeiling then
         { walk | frontier = [] }
 
     else
@@ -568,7 +640,7 @@ walkRound sources walk =
                 List.filter (\key -> not (List.member key walk.seen)) (List.unique walk.frontier)
 
             visits =
-                List.map (visitType sources) fresh
+                List.map (visitType modules) fresh
         in
         { seen = walk.seen ++ fresh
         , frontier = List.concatMap (\visit -> visit.next) visits
@@ -683,8 +755,10 @@ reachFlags sources =
 
 -- A state holding an error, a message carrying one, a type in another
 -- module holding one, a name that resolves nowhere, a missing `Model`, a
--- declaration continued past a blank line, and a walk past its ceiling are
--- each violations; a field named `refuseError` holding a typed case is not.
+-- declaration continued past a blank line, and a walk past its ceiling, by
+-- one declaration or more, are each violations; a field named `refuseError`
+-- holding a typed case, and a walk of exactly `reachCeiling` declarations,
+-- are not.
 -- Red if the walk misses a path an error could reach a page by.
 typeWalkRefuses : Bool
 typeWalkRefuses =
@@ -698,11 +772,14 @@ typeWalkRefuses =
         && reachFlags (appOnly "type Msg\n    = Reload\n")
         && reachFlags (appOnly "type alias Model =\n    { n : Int }\n\n\ntype Msg\n    = Reload\n\n    | Failed Error\n")
         && reachFlags (appOnly (chainedModel (reachCeiling + 2)))
+        && reachFlags (appOnly (chainedModel (reachCeiling - 2)))
+        && List.isEmpty (reachViolations (appOnly (chainedModel (reachCeiling - 3))))
         && List.isEmpty (reachViolations (appOnly "type alias Model =\n    { refuseError : Maybe RefuseFailure }\n\n\ntype Msg\n    = Reload\n\n\ntype RefuseFailure\n    = DraftWhileSaving\n"))
         && List.isEmpty (reachViolations (appOnly (chainedModel 8)))
 
 
--- A `Model` reaching `depth` declarations, each naming the next.
+-- A `Model` and `Msg` reaching `depth + 1` more declarations, each naming
+-- the next: `depth + 3` in all.
 chainedModel : Int -> String
 chainedModel depth =
     let
