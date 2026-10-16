@@ -745,6 +745,8 @@ messages! {
     package_manifest_name_required = "package-manifest-name-required";
     /// `package.ipe`'s source root does not exist.
     package_manifest_src_root_missing = "package-manifest-src-root-missing";
+    /// `package.ipe` spells `sourceRoot`, which a project root no longer honours.
+    package_manifest_source_root_removed = "package-manifest-source-root-removed";
     /// `package.ipe` with no top-level `package` binding.
     package_manifest_no_package_binding = "package-manifest-no-package-binding";
     /// `ipe add`/`ipe remove` found no top-level `package` binding to edit.

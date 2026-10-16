@@ -215,8 +215,10 @@ impl ProjectRoot {
     /// [`CliError::NoSrcDir`] when `src` is absent or a link;
     /// [`CliError::EntryMissing`], [`CliError::EntryEscapes`],
     /// [`CliError::ExposedModuleMissing`] or [`CliError::NoDefaultEntry`] when
-    /// what the project builds is not all present under `src/`; the manifest's
-    /// own refusals; [`CliError::Io`] on another failure.
+    /// what the project builds is not all present under `src/`;
+    /// [`CliError::Usage`] when `package.ipe` names a `sourceRoot` other than
+    /// `src`, or for the manifest's own refusals; [`CliError::Io`] on another
+    /// failure.
     pub fn resolve(arg: RootArg) -> Result<Self, CliError> {
         let RootArg { dir: path } = arg;
         let fs_root = ipe_fs_open::HeldDir::open_root(&path)
@@ -246,7 +248,12 @@ impl ProjectRoot {
             Err(CliError::OutputRefused(OutputRefusal::NotADirectory(_))) => None,
             Err(other) => return Err(other),
         };
-        let (manifest, _spelled) = parse_package_manifest_source(&source, &path.join(PACKAGE_IPE))?;
+        let (manifest, spelled) = parse_package_manifest_source(&source, &path.join(PACKAGE_IPE))?;
+        if spelled != SRC_DIR {
+            return Err(CliError::Usage(
+                text::msg::package_manifest_source_root_removed(),
+            ));
+        }
         let entries = entry_set(&src, &manifest, &path)?;
         Ok(Self {
             dir,
@@ -380,7 +387,14 @@ fn read_manifest(root: &ipe_fs_open::HeldDir, dir: &Path) -> Result<String, CliE
                 Some(FileKind::Regular | FileKind::Symlink) => {
                     Err(CliError::Usage(text::msg::legacy_toml_hint()))
                 }
-                _ => Err(no_manifest()),
+                Some(
+                    FileKind::Dir
+                    | FileKind::Fifo
+                    | FileKind::Socket
+                    | FileKind::Device
+                    | FileKind::Other,
+                )
+                | None => Err(no_manifest()),
             }
         }
         Err(OpenRefusal::Link) => Err(CliError::SymlinkInSource {
@@ -762,6 +776,77 @@ mod tests {
         let err = resolve_err(s.path());
         assert!(matches!(&err, CliError::ExposedModuleMissing { module } if module == "Geo.Point"));
         assert!(err.to_string().contains("IPE-E0009"));
+    }
+
+    #[test]
+    fn a_source_root_other_than_src_is_refused_with_the_teaching_hint() {
+        let s = app("source-root");
+        s.write(PACKAGE_IPE, &manifest_with(", sourceRoot = \"app\""));
+        s.write("app/Main.ipe", MODULE);
+        let err = resolve_err(s.path());
+        assert_eq!(
+            err.to_string(),
+            CliError::Usage(text::msg::package_manifest_source_root_removed()).to_string()
+        );
+        assert!(err.to_string().contains("must live in `src/`"));
+    }
+
+    #[test]
+    fn each_project_refusal_renders_the_code_the_diagnostics_table_defines() {
+        let p = PathBuf::from("/p");
+        let cases = [
+            (
+                CliError::NoManifest { dir: p.clone() },
+                ipe_diagnostics::IPE_E0004,
+            ),
+            (
+                CliError::NoSrcDir { root: p.clone() },
+                ipe_diagnostics::IPE_E0005,
+            ),
+            (
+                CliError::EntryMissing {
+                    entry: "Cli/Main.ipe".to_owned(),
+                },
+                ipe_diagnostics::IPE_E0006,
+            ),
+            (
+                CliError::NoDefaultEntry { root: p.clone() },
+                ipe_diagnostics::IPE_E0007,
+            ),
+            (
+                CliError::EntryEscapes {
+                    entry: "Cli/Main.ipe".to_owned(),
+                    path: p.join("src/Cli"),
+                },
+                ipe_diagnostics::IPE_E0008,
+            ),
+            (
+                CliError::ExposedModuleMissing {
+                    module: "Shapes".to_owned(),
+                },
+                ipe_diagnostics::IPE_E0009,
+            ),
+            (
+                CliError::SymlinkInSource {
+                    path: p.join("src/Main.ipe"),
+                },
+                ipe_diagnostics::IPE_E0010,
+            ),
+            (
+                CliError::FileOutsideRoot {
+                    arg: p.join("other/Main.ipe"),
+                    root: p.clone(),
+                },
+                ipe_diagnostics::IPE_E0011,
+            ),
+        ];
+        for (err, code) in cases {
+            let shown = err.to_string();
+            assert!(
+                shown.starts_with(&format!("error[{}]: ", code.as_str())),
+                "{shown}"
+            );
+        }
     }
 
     #[test]

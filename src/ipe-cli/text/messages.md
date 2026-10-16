@@ -272,6 +272,10 @@ package.ipe: missing a `name = "…"` field — a package must be named
 
 package.ipe: the source root directory does not exist
 
+## package-manifest-source-root-removed
+
+package.ipe: `sourceRoot` is not a package field. For security reasons, source files must live in `src/`. Move your `*.ipe` sources there (`package.ipe` stays at the project root).
+
 ## package-manifest-no-package-binding
 
 package.ipe: no top-level `package = …` binding found
