@@ -84,6 +84,16 @@ class Refusal:
 RecordKey = tuple[str, str, str]
 
 
+def fold_input_name(name: str) -> str:
+    """The one spelling two input names share when GitHub reads them as one
+    input: the runner matches a `with:` key to an input ignoring case (.NET
+    `OrdinalIgnoreCase`, an invariant upper-casing) and hands it to the
+    action as `INPUT_<name with spaces as _, upper-cased>`. Upper-casing
+    first folds `ı` with `i` as the runner does; `casefold` after it folds
+    at least as much as the runner, so a collision is never missed."""
+    return name.replace(" ", "_").upper().casefold()
+
+
 @dataclasses.dataclass(frozen=True)
 class RemotePin:
     """A pinned remote `uses:` parsed once: owner, repo, subpath segments,
@@ -153,8 +163,9 @@ class ActionRecord:
             return out
 
         try:
-            doc = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
-        except (UnicodeDecodeError, ValueError) as e:
+            text = raw.decode("utf-8")
+            doc = json.loads(text, object_pairs_hook=unique)
+        except (UnicodeDecodeError, ValueError, RecursionError) as e:
             return bad(f"is not strict JSON: {e}")
         if not isinstance(doc, dict) or set(doc) != {"objects"}:
             return bad("top-level keys must be exactly {'objects'}")
@@ -181,6 +192,8 @@ class ActionRecord:
             if len(data) > OBJECT_CEILING:
                 return bad(f"object {oid} exceeds the {OBJECT_CEILING}-byte object ceiling")
             out[oid] = GitObject(otype, data)
+        if serialise(out) != text:
+            return bad(f"is not the canonical text `{WRITE_COMMAND}` writes; regenerate it, never edit by hand")
         return ActionRecord(out)
 
 
@@ -281,7 +294,7 @@ class ActionInputs:
                 return bad(f"input name {name!r} is not a string")
             if not (spec is None or isinstance(spec, dict)):
                 return bad(f"input {name!r} is not a mapping or null")
-            other = folded.setdefault(name.casefold(), name)
+            other = folded.setdefault(fold_input_name(name), name)
             if other != name:
                 return bad(f"inputs {other!r} and {name!r} fold equal; GitHub reads them as one")
             declared.add(name)

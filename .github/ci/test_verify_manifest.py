@@ -7499,6 +7499,26 @@ class TestActionInputs(unittest.TestCase):
                 self.step(f"vendor/vm@{pin.sha}", "run: echo\n")
                 self.assertRefused("ACTION_METADATA_MALFORMED", needle)
 
+    def test_record_nested_past_the_recursion_limit_refused(self) -> None:
+        pin = _PinObjects()
+        depth = 100_000
+        self.record(pin, text='{"objects": ' + "[" * depth + "]" * depth + "}")
+        self.step(f"vendor/vm@{pin.sha}", "run: echo\n")
+        self.assertRefused("ACTION_METADATA_MALFORMED", "strict JSON")
+
+    def test_record_not_in_its_canonical_text_refused(self) -> None:
+        pin = _PinObjects()
+        good = pin.text()
+        b64 = _AM.base64.b64encode(b"A").decode("ascii")
+        pin.put("blob", b"A")
+        padded = pin.text().replace(f'"{b64}"', '"QR=="', 1)
+        self.assertNotEqual(b64, "QR==")
+        for text in (json.dumps(json.loads(good)), good.rstrip("\n"), good.replace("  ", "   "), padded):
+            with self.subTest(text=text[:40]):
+                self.record(pin, text=text)
+                self.step(f"vendor/vm@{pin.sha}", "run: echo\n")
+                self.assertRefused("ACTION_METADATA_MALFORMED", "canonical text")
+
     def test_record_over_the_file_ceiling_refused(self) -> None:
         pin = _PinObjects()
         self.record(pin, text=" " * (_AM.RECORD_CEILING + 1))
@@ -7614,6 +7634,8 @@ class TestActionInputs(unittest.TestCase):
             ("inputs:\n  a: 1\nruns:\n  using: node20\n", "not a mapping or null"),
             ("inputs:\n  a:\n    required: 'true'\nruns:\n  using: node20\n", "not a bool"),
             ("- a\n", "is not a mapping"),
+            ("inputs:\n  input: {}\n  \u0131nput: {}\nruns:\n  using: node20\n", "fold equal"),
+            ("inputs:\n  a b: {}\n  a_b: {}\nruns:\n  using: node20\n", "fold equal"),
         ):
             with self.subTest(needle=needle):
                 self.proven_step("run: echo\n", _PinObjects(yml))
@@ -7627,6 +7649,18 @@ class TestActionInputs(unittest.TestCase):
         self.assertEqual(self.errors(), [])
         self.step(f"vendor/vm/sub/gone@{pin.sha}", "run: echo\n")
         self.assertRefused("ACTION_METADATA_UNPROVEN", "segment 'gone' is not a directory at the pin")
+
+    def test_subpath_segment_must_be_a_tree_entry(self) -> None:
+        for mode in (b"120000", b"160000", b"100644"):
+            with self.subTest(mode=mode):
+                pin = _PinObjects()
+                leaf = next(o for o, obj in pin.objects.items() if obj.type == "tree")  # type: ignore[attr-defined]
+                del pin.objects[pin.sha]
+                root = pin.put("tree", _tree((mode, "sub", leaf)))
+                pin.sha = pin.put("commit", b"tree " + root.encode("ascii") + b"\n\nmsg\n")
+                self.proven_step("run: echo\n", pin, "/sub")
+                self.assertRefused("ACTION_METADATA_UNPROVEN", "segment 'sub' is not a directory at the pin")
+                os.remove(os.path.join(self.records, "vendor", "vm", f"{pin.sha}.json"))
 
     def test_dot_segment_in_a_pin_refused(self) -> None:
         self.assertIsInstance(_AM.RemotePin.parse("vendor/vm/..@" + "0" * 40), _AM.Refusal)

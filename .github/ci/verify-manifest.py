@@ -499,7 +499,8 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       every object is re-hashed (`sha1("<type> <len>\\0" + data)`) and the
       walk from the pinned commit id is re-run, so a record not content-
       addressed to its pin is refused, as is one holding an object the walk
-      does not reach, a key out of its schema, or one past its ceilings.
+      does not reach, a key out of its schema, text other than the
+      canonical form `--write` emits, or one past its ceilings.
       A local action is checked against its own `inputs`; `docker://` takes
       only `args` and `entrypoint`.  Refused: a key not declared (GitHub only
       warns, and the setting does nothing), a case variant of a declared
@@ -6739,7 +6740,7 @@ def _check_with_keys(
             refuse(ErrorKind.ACTION_INPUT_UNDECLARED, fname, f"{loc} with:", f"key {k!r} is not a string and names no input; refused")
             continue
         keys.add(k)
-        twin = by_fold.setdefault(k.casefold(), k)
+        twin = by_fold.setdefault(action_metadata.fold_input_name(k), k)
         if twin != k:
             refuse(
                 ErrorKind.ACTION_INPUT_CASE_VARIANT, fname, f"{loc} with:",
@@ -6747,7 +6748,7 @@ def _check_with_keys(
             )
         if k in admitted:
             continue
-        spelled = sorted(d for d in admitted if d.casefold() == k.casefold())
+        spelled = sorted(d for d in admitted if action_metadata.fold_input_name(d) == action_metadata.fold_input_name(k))
         if spelled:
             refuse(
                 ErrorKind.ACTION_INPUT_CASE_VARIANT, fname, f"{loc} with.{k}",
