@@ -1,4 +1,4 @@
-module Lib.Uid exposing (Uid, decoder, parse, toSql, toString)
+module Lib.Uid exposing (Uid, decoder, isLowerHex, parse, toSql, toString)
 
 -- A unit's ipe-index id: exactly 64 lowercase hex digits, the blake3 hex
 -- form `unit_uid` writes. Opaque: built only by `parse` and `decoder`, so a
@@ -33,7 +33,8 @@ parse raw =
         Err (Error.invalidInput "a unit id is exactly 64 lowercase hex digits")
 
 
--- `0`-`9` or `a`-`f`, ASCII only.
+-- `0`-`9` or `a`-`f`, ASCII only: the one lowercase-hex digit test of this
+-- tool, for a unit id and every other hex digest it parses.
 isLowerHex : Char -> Bool
 isLowerHex c =
     let
