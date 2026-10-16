@@ -12,7 +12,7 @@
 //
 // wasm32: every function in THIS file is individually `cfg(not(target_arch =
 // "wasm32"))` (a stated M4 exclusion, same class as the M0 floor's
-// crypto-feature exclusion: untested getrandom-js support across the whole
+// crypto-feature exclusion: untested browser entropy support across the whole
 // RustCrypto stack, and no browser-bundle reason to pull
 // `aes-gcm`/`chacha20poly1305`/`pbkdf2` for symmetric AEAD that isn't in the M4
 // scope). `Ipe.Crypto.aesGcmEncrypt`/friends therefore stay UNTAGGED in the
@@ -98,7 +98,7 @@ fn aead_read_key(name: &str, key: &str) -> Result<Vec<u8>, String> {
 
 // Crypto.aesGcmEncrypt : Key -> String -> Result Error String  (typed key)
 #[cfg(not(target_arch = "wasm32"))]
-pub fn crypto_aes_gcm_encrypt_key<E: From<String>>(
+pub fn crypto_aes_gcm_encrypt_key<E: From<String> + FromUnavailable>(
     key: Key,
     plaintext: String,
 ) -> IpeResult<E, String> {
@@ -119,14 +119,23 @@ pub fn crypto_aes_gcm_decrypt_key<E: From<String>>(
 // runtime API and not a kernel: the raw-String-key path cannot be reached from Ipê
 // source or from outside this crate, so no caller can supply untyped key material.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn crypto_aes_gcm_encrypt<E: From<String>>(
+pub(crate) fn crypto_aes_gcm_encrypt<E: From<String> + FromUnavailable>(
     key: String,
     plaintext: String,
 ) -> IpeResult<E, String> {
-    use aes_gcm::{
-        Aes256Gcm, KeyInit, Nonce,
-        aead::{Aead, OsRng, rand_core::RngCore},
-    };
+    crypto_aes_gcm_encrypt_with(crate::entropy::fill_entropy, key, plaintext)
+}
+
+/// [`crypto_aes_gcm_encrypt`] drawing its 12-byte nonce from `fill`.
+///
+/// A refused draw produces no ciphertext and fails with kind `Unavailable`.
+#[cfg(not(target_arch = "wasm32"))]
+fn crypto_aes_gcm_encrypt_with<E: From<String> + FromUnavailable>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
+    key: String,
+    plaintext: String,
+) -> IpeResult<E, String> {
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
     use base64::{Engine, engine::general_purpose::STANDARD};
     let k = match aead_read_key("Crypto.aesGcmEncrypt", &key) {
         Ok(k) => k,
@@ -139,7 +148,11 @@ pub(crate) fn crypto_aes_gcm_encrypt<E: From<String>>(
         Err(e) => return IpeResult::Err(format!("Crypto.aesGcmEncrypt: {}", e).into()),
     };
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    if fill(&mut nonce_bytes).is_err() {
+        return IpeResult::Err(E::from_unavailable(
+            "Crypto.aesGcmEncrypt: the OS random source is unavailable".to_owned(),
+        ));
+    }
     let nonce = Nonce::from_slice(&nonce_bytes);
     match cipher.encrypt(nonce, plaintext.as_bytes()) {
         Ok(ct) => {
@@ -201,7 +214,7 @@ pub(crate) fn crypto_aes_gcm_decrypt<E: From<String>>(
 
 // Crypto.chacha20Encrypt : Key -> String -> Result Error String  (typed key)
 #[cfg(not(target_arch = "wasm32"))]
-pub fn crypto_chacha20_encrypt_key<E: From<String>>(
+pub fn crypto_chacha20_encrypt_key<E: From<String> + FromUnavailable>(
     key: Key,
     plaintext: String,
 ) -> IpeResult<E, String> {
@@ -220,15 +233,24 @@ pub fn crypto_chacha20_decrypt_key<E: From<String>>(
 // Internal String-keyed ChaCha20-Poly1305 core — `pub(crate)`, reached only through
 // the typed `crypto_chacha20_encrypt_key` wrapper. No bare-String-key path escapes the crate.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn crypto_chacha20_encrypt<E: From<String>>(
+pub(crate) fn crypto_chacha20_encrypt<E: From<String> + FromUnavailable>(
+    key: String,
+    plaintext: String,
+) -> IpeResult<E, String> {
+    crypto_chacha20_encrypt_with(crate::entropy::fill_entropy, key, plaintext)
+}
+
+/// [`crypto_chacha20_encrypt`] drawing its 12-byte nonce from `fill`.
+///
+/// A refused draw produces no ciphertext and fails with kind `Unavailable`.
+#[cfg(not(target_arch = "wasm32"))]
+fn crypto_chacha20_encrypt_with<E: From<String> + FromUnavailable>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
     key: String,
     plaintext: String,
 ) -> IpeResult<E, String> {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use chacha20poly1305::{
-        ChaCha20Poly1305, KeyInit, Nonce,
-        aead::{Aead, OsRng, rand_core::RngCore},
-    };
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
     let k = match aead_read_key("Crypto.chacha20Encrypt", &key) {
         Ok(k) => k,
         Err(e) => return IpeResult::Err(e.into()),
@@ -238,7 +260,11 @@ pub(crate) fn crypto_chacha20_encrypt<E: From<String>>(
         Err(e) => return IpeResult::Err(format!("Crypto.chacha20Encrypt: {}", e).into()),
     };
     let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
+    if fill(&mut nonce_bytes).is_err() {
+        return IpeResult::Err(E::from_unavailable(
+            "Crypto.chacha20Encrypt: the OS random source is unavailable".to_owned(),
+        ));
+    }
     let nonce = Nonce::from_slice(&nonce_bytes);
     match cipher.encrypt(nonce, plaintext.as_bytes()) {
         Ok(ct) => {
@@ -391,5 +417,48 @@ mod tests_heavy_hashes {
     #[test]
     fn test_md5_empty() {
         assert_eq!(crypto_md5(String::new()), EMPTY_MD5);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::entropy::EntropyError;
+    use crate::{IpeError, IpeErrorKind};
+
+    /// The base64 form of a 32-byte all-zero key, which `aead_read_key` accepts.
+    fn key() -> String {
+        format!("{}=", "A".repeat(43))
+    }
+
+    fn is_unavailable(r: &IpeResult<IpeError, String>) -> bool {
+        matches!(
+            r,
+            IpeResult::Err(IpeError::Error(IpeErrorKind::Unavailable, _))
+        )
+    }
+
+    /// An AES-GCM encryption without entropy yields no ciphertext and kind
+    /// `Unavailable`.
+    #[test]
+    fn aes_gcm_encrypt_refuses_without_entropy() {
+        let refused: IpeResult<IpeError, String> =
+            crypto_aes_gcm_encrypt_with(|_| Err(EntropyError), key(), "msg".to_string());
+        assert!(is_unavailable(&refused), "{refused:?}");
+        let sealed: IpeResult<IpeError, String> =
+            crypto_aes_gcm_encrypt_with(|_| Ok(()), key(), "msg".to_string());
+        assert!(matches!(sealed, IpeResult::Ok(_)), "{sealed:?}");
+    }
+
+    /// A ChaCha20-Poly1305 encryption without entropy yields no ciphertext and
+    /// kind `Unavailable`.
+    #[test]
+    fn chacha20_encrypt_refuses_without_entropy() {
+        let refused: IpeResult<IpeError, String> =
+            crypto_chacha20_encrypt_with(|_| Err(EntropyError), key(), "msg".to_string());
+        assert!(is_unavailable(&refused), "{refused:?}");
+        let sealed: IpeResult<IpeError, String> =
+            crypto_chacha20_encrypt_with(|_| Ok(()), key(), "msg".to_string());
+        assert!(matches!(sealed, IpeResult::Ok(_)), "{sealed:?}");
     }
 }

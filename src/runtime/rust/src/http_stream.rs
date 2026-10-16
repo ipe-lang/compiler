@@ -145,7 +145,7 @@ impl serde::de::Visitor<'_> for StreamIdVisitor {
 /// `Unavailable` at once.
 fn mint_with<S, L>(mut source: S, live: L) -> Result<StreamKey, IpeError>
 where
-    S: FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+    S: FnMut(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError>,
     L: Fn(StreamKey) -> bool,
 {
     for _ in 0..MINT_ATTEMPTS {
@@ -162,8 +162,8 @@ where
 }
 
 /// The OS CSPRNG, the production key source.
-fn os_entropy(buf: &mut [u8; 16]) -> Result<(), getrandom::Error> {
-    getrandom::getrandom(buf)
+fn os_entropy(buf: &mut [u8; 16]) -> Result<(), crate::entropy::EntropyError> {
+    crate::entropy::fill_entropy(buf)
 }
 
 /// `Ipe.Http.Stream.ChunkEvent` — one incremental event on a stream.
@@ -490,7 +490,7 @@ impl<V> StreamRegistry<V> {
     /// Parks `value` under a freshly minted handle.
     fn open<S>(&mut self, value: V, source: S) -> Result<IpeStreamId, IpeError>
     where
-        S: FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+        S: FnMut(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError>,
     {
         // Every live stream holds a permit, so the table is never full here
         // unless the permit count and the table drift: refuse then, fail closed.
@@ -1032,7 +1032,7 @@ mod tests {
     use tokio::time::Instant;
 
     /// A deterministic key source: the n-th draw is the key `n`.
-    fn counting_source() -> impl FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error> {
+    fn counting_source() -> impl FnMut(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError> {
         let mut next: u128 = 0;
         move |buf: &mut [u8; 16]| {
             next += 1;
@@ -1202,7 +1202,7 @@ mod tests {
     /// Parks an empty stream in a local registry.
     fn park_local(
         reg: &mut StreamRegistry<FakeConn>,
-        source: &mut impl FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+        source: &mut impl FnMut(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError>,
     ) -> IpeStreamId {
         let permit = reg.reserve().unwrap();
         let body = scripted(Vec::new());
@@ -2013,7 +2013,7 @@ mod tests {
 
     #[test]
     fn mint_entropy_failure_is_unavailable() {
-        let broken = |_: &mut [u8; 16]| Err(getrandom::Error::UNSUPPORTED);
+        let broken = |_: &mut [u8; 16]| Err(crate::entropy::EntropyError);
         let minted = mint_with(broken, |_| false);
         assert!(matches!(&minted, Err(e) if kind(e) == IpeErrorKind::Unavailable));
         let Err(e) = minted else { return };
@@ -2023,7 +2023,7 @@ mod tests {
     /// Fills `reg` to the cap with parked streams keyed `1..=CLIENT_STREAMS_MAX`.
     fn fill(
         reg: &mut StreamRegistry<()>,
-        source: &mut impl FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+        source: &mut impl FnMut(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError>,
     ) {
         for _ in 0..CLIENT_STREAMS_MAX {
             assert!(reg.open((), &mut *source).is_ok());

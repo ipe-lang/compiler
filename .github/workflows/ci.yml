@@ -509,7 +509,6 @@ jobs:
       - name: Check in FreeBSD VM
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
-          usesh: true
           prepare: pkg install -y rust
           run: cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
 

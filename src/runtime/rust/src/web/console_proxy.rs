@@ -155,7 +155,7 @@ pub(crate) fn spawn_console(
     child_collects: bool,
 ) -> Option<super::push_exporter::IngestToken> {
     let bin = console_bin_path()?;
-    let Some(token) = super::push_exporter::IngestToken::mint() else {
+    let Ok(token) = super::push_exporter::IngestToken::mint() else {
         crate::system::emit_runtime_log(
             "console",
             "OS entropy source unavailable for the ingest token; falling back to in-process console",

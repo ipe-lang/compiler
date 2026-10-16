@@ -1286,8 +1286,8 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) uses_regex: bool,
     /// `true` when the program reaches an `Ipe.Uuid` kernel. The `uuid` runtime
     /// feature — the `uuid` crate plus the `uuid_kernel.rs` module — is selected
-    /// under [`Self::reaches_uuid`]: this flag unioned with the `server` and `web`
-    /// surfaces, whose runtime modules mint session/CSRF ids via `uuid::new_v4`.
+    /// under [`Self::reaches_uuid`]: this flag unioned with the `jwt` surface and
+    /// the `server` and `web` surfaces, which imply the feature.
     pub(crate) uses_uuid: bool,
     /// `true` when the program reaches an `Ipe.Random` kernel. The `random`
     /// runtime feature gates the `random.rs` module declaration; this flag alone
@@ -2886,12 +2886,13 @@ impl<'a> EmitCtx<'a> {
     /// Reached directly by an `Ipe.Uuid` kernel ([`Self::uses_uuid`]), OR
     /// transitively by:
     /// - the `server` ([`Self::uses_server`]) and `web` ([`Self::uses_web`] /
-    ///   [`Self::uses_webview`]) surfaces, whose runtime modules mint session ids /
-    ///   CSRF tokens via `uuid::new_v4` directly. Web implies server, but both are
-    ///   listed for locality.
+    ///   [`Self::uses_webview`]) surfaces, which imply the runtime `uuid` feature;
+    ///   their session ids and CSRF tokens draw through `entropy::fill_entropy`
+    ///   and name no `uuid` item. Web implies server, but both are listed for
+    ///   locality.
     /// - the `jwt` / `auth` surface ([`Self::reaches_jwt`]): `auth.rs` is compiled
-    ///   under `#[cfg(feature = "jwt")]` and calls `uuid::Uuid::new_v4()` to mint
-    ///   per-session `jti` ids in `auth_sign_token`. The `uuid` dep is optional in
+    ///   under `#[cfg(feature = "jwt")]` and builds per-session `jti` ids in
+    ///   `auth_sign_token` with `uuid::Builder`. The `uuid` dep is optional in
     ///   the runtime crate; without this gate a jwt-only program (no server/web)
     ///   fails with E0433 at cargo build despite `ipe` exit 0.
     ///

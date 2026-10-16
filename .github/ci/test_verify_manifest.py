@@ -7,7 +7,9 @@ merge-queue safety check (check 8), release-only skip-as-pass check
 Check 7 covers content-pinned `uses:`/images, the hash-checked pip shape, and
 env-file writes only through `github-env.sh`; its cases sit in
 `TestPinnedInputsAndEnvFileWrites` and `TestGithubEnvHelper`. Check 8's sit in
-`TestMergeQueueSafety`.
+`TestMergeQueueSafety`. Check 24 (every `with:` key an input its pinned action
+declares, proven from the pinned commit's git objects) sits in
+`TestActionInputs`.
 
 Each rejection the guard is supposed to make (a rustc wrapper or replacement
 set by an env key at any scope, by a `$GITHUB_ENV` write or by free text; a
@@ -1576,7 +1578,7 @@ class TestTypedExpressionAndShellReads(unittest.TestCase):
             _ci(
                 f"steps:\n  - name: V\n    uses: vmactions/freebsd-vm@{_PINNED_SHA}\n"
                 "    env:\n      TAG: ${{ github.head_ref }}\n"
-                f"    with:\n      usesh: true\n      envs: 'TAG'\n{with_}"
+                f"    with:\n      envs: 'TAG'\n{with_}"
             ),
         )
 
@@ -6516,7 +6518,6 @@ jobs:
       - uses: actions/checkout@0000000000000000000000000000000000000000
       - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
         with:
-          usesh: true
           prepare: pkg install -y rust
           run: |
             cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
@@ -6572,7 +6573,6 @@ jobs:
           ref: ${{ needs.resolve-tag.outputs.tag }}
       - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
         with:
-          usesh: true
           prepare: pkg install -y rust
           run: |
             cargo build --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
@@ -6781,7 +6781,8 @@ class TestReleaseTargetParity(unittest.TestCase):
             self.swap(_RT_CI, "pkg install -y rust", "pkg install -y rust-nightly"),
         )
         self.assertRefused(
-            "ci.yml job 'release-targets-freebsd' step 2.with.usesh is", self.swap(_RT_CI, "usesh: true", "usesh: false")
+            "ci.yml job 'release-targets-freebsd' step 2.with has keys",
+            self.swap(_RT_CI, "          prepare: pkg install -y rust\n", "          usesh: true\n          prepare: pkg install -y rust\n"),
         )
         self.assertRefused(
             "FreeBSD VM action",
@@ -6879,7 +6880,7 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("ci.yml job 'release-targets-run' step 3.env has keys", ci)
 
     def test_vm_input_drift_refused(self) -> None:
-        ci = self.swap(_RT_CI, "          usesh: true\n          prepare: pkg install -y rust\n", "          usesh: true\n          release: '13.2'\n          prepare: pkg install -y rust\n")
+        ci = self.swap(_RT_CI, "          prepare: pkg install -y rust\n", "          release: '13.2'\n          prepare: pkg install -y rust\n")
         self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with has keys", ci)
 
     def test_job_key_drift_refused(self) -> None:
@@ -7073,8 +7074,8 @@ class TestReleaseTargetParity(unittest.TestCase):
         for line in ('CARGO_INCREMENTAL: "0"', "CARGO_INCREMENTAL: '0'"):
             with self.subTest(line=line):
                 self.assertEqual(self.errors(self.swap(_RT_CI, "  CARGO_INCREMENTAL: '0'\n", f"  {line}\n")), [])
-        usesh = self.swap(_RT_CI, "usesh: true", "usesh: 'true'")
-        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.usesh is 'true', which must be exactly True", usesh)
+        fail_fast = self.swap(_RT_CI, "fail-fast: false", "fail-fast: 'false'")
+        self.assertRefused("a boolean `fail-fast`", fail_fast)
 
     def test_matrix_values_equal_only_as_typed_text(self) -> None:
         for value, needle in (
@@ -7301,6 +7302,463 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("release.yml job 'build' step 5 runs under `shell: None`", release=release)
         action = self.swap(_RT_ACTION, "      shell: bash\n      run: |\n", "      shell: pwsh\n      run: |\n")
         self.assertRefused("rust-toolchain-pinned step 1 runs under `shell: 'pwsh'`", action=action)
+
+
+action_metadata = sys.modules["action_metadata"]
+_AM = action_metadata
+_VM_DECL = """\
+name: vm
+inputs:
+  sync-time:
+    description: sync
+  run:
+    description: run
+  token:
+    required: true
+    default: ${{ github.token }}
+  usesh:
+    deprecationMessage: ignored
+runs:
+  using: node20
+  main: index.js
+"""
+
+
+def _tree(*entries: tuple[bytes, str, str]) -> bytes:
+    """A git tree object body from (mode, name, object id) entries."""
+    return b"".join(mode + b" " + name.encode("utf-8") + b"\0" + bytes.fromhex(oid) for mode, name, oid in entries)
+
+
+class _PinObjects:
+    """The git objects of one synthetic pinned commit: its root tree, the
+    trees down `subpath`, and the action metadata blob."""
+
+    def __init__(
+        self, yml: str | bytes = _VM_DECL, subpath: tuple[str, ...] = (), fname: str = "action.yml",
+        leaf_extra: tuple[tuple[bytes, str, str], ...] = (), mode: bytes = b"100644",
+        commit_head: bytes | None = None,
+    ) -> None:
+        self.objects: dict[str, object] = {}
+        blob = self.put("blob", yml if isinstance(yml, bytes) else yml.encode("utf-8"))
+        tid = self.put("tree", _tree((mode, fname, blob), *leaf_extra))
+        for seg in reversed(subpath):
+            tid = self.put("tree", _tree((b"40000", seg, tid)))
+        head = commit_head if commit_head is not None else b"tree " + tid.encode("ascii") + b"\n"
+        self.sha = self.put("commit", head + b"author a <a@a> 0 +0000\n\nmsg\n")
+
+    def put(self, otype: str, data: bytes) -> str:
+        oid = _AM.object_id(otype, data)
+        self.objects[oid] = _AM.GitObject(otype, data)
+        return oid
+
+    def text(self) -> str:
+        return _AM.serialise(self.objects)  # type: ignore[arg-type]
+
+
+class TestActionInputs(unittest.TestCase):
+    """Check 24: every `with:` key is an input its pinned action declares,
+    proven from the content-addressed objects of the pinned commit; every
+    record is refused unless it re-hashes and re-walks to exactly that pin."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fx = WorkflowFixture(os.path.join(self._tmp.name, "repo"))
+        self.records = os.path.join(self._tmp.name, "ci", "action-metadata")
+
+    def record(self, pin: _PinObjects, owner: str = "vendor", repo: str = "vm", text: str | None = None) -> str:
+        path = os.path.join(self.records, owner, repo, f"{pin.sha}.json")
+        _write(path, pin.text() if text is None else text)
+        return path
+
+    def step(self, uses: str, with_: str = "") -> None:
+        body = f"        with:\n{textwrap.indent(with_, '          ')}" if with_ else ""
+        self.fx.workflow(
+            "ci.yml",
+            f"on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: {uses}\n{body}",
+        )
+
+    def errors(self, script_actions: dict | None = None) -> list[str]:
+        scratch: list[str] = []
+        wfs = _load(self.fx.root, scratch)
+        actions = check_workflow_steps(wfs, scratch)
+        errors: list[str] = []
+        verify_manifest.check_action_inputs(
+            wfs, actions, errors, records_dir=self.records, script_actions={} if script_actions is None else script_actions
+        )
+        return errors
+
+    def assertRefused(self, kind: str, *needles: str, script_actions: dict | None = None) -> None:
+        errors = self.errors(script_actions)
+        hits = [e for e in errors if e.endswith(f"[{kind}]") and all(n in e for n in needles)]
+        self.assertTrue(hits, (kind, needles, errors))
+
+    def proven_step(self, with_: str, pin: _PinObjects | None = None, path: str = "") -> _PinObjects:
+        pin = pin or _PinObjects()
+        self.record(pin)
+        self.step(f"vendor/vm{path}@{pin.sha}", with_)
+        return pin
+
+    # ---- step `with:` keys against the proven inputs ----
+
+    def test_declared_keys_pass(self) -> None:
+        self.proven_step("sync-time: false\nrun: echo\n")
+        self.assertEqual(self.errors(), [])
+
+    def test_undeclared_key_refused_naming_the_declared_inputs(self) -> None:
+        self.proven_step("synctime: false\n")
+        self.assertRefused("ACTION_INPUT_UNDECLARED", "with.synctime", "declared: ['run', 'sync-time', 'token', 'usesh']")
+
+    def test_case_variant_refused_naming_the_declared_spelling(self) -> None:
+        self.proven_step("Sync-Time: false\n")
+        self.assertRefused("ACTION_INPUT_CASE_VARIANT", "with.Sync-Time", "'sync-time'")
+
+    def test_fold_equal_key_pair_refused(self) -> None:
+        self.proven_step("sync-time: false\nSYNC-TIME: false\n")
+        self.assertRefused("ACTION_INPUT_CASE_VARIANT", "fold equal")
+
+    def test_required_input_without_default_must_be_passed(self) -> None:
+        yml = _VM_DECL.replace("    default: ${{ github.token }}\n", "")
+        self.proven_step("run: echo\n", _PinObjects(yml))
+        self.assertRefused("ACTION_INPUT_REQUIRED_MISSING", "'token'")
+        self.proven_step("run: echo\ntoken: x\n", _PinObjects(yml))
+        self.assertEqual(self.errors(), [])
+
+    def test_required_input_with_default_may_be_left_out(self) -> None:
+        self.proven_step("run: echo\n")
+        self.assertEqual(self.errors(), [])
+
+    def test_deprecated_input_refused(self) -> None:
+        self.proven_step("usesh: true\n")
+        self.assertRefused("ACTION_INPUT_DEPRECATED", "with.usesh")
+
+    def test_non_string_key_refused(self) -> None:
+        self.proven_step("1: x\n")
+        self.assertRefused("ACTION_INPUT_UNDECLARED", "is not a string")
+
+    def test_with_on_a_run_step_refused(self) -> None:
+        self.fx.workflow(
+            "ci.yml", "on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n        with:\n          a: b\n"
+        )
+        self.assertRefused("ACTION_INPUT_UNDECLARED", "runs no action")
+
+    # ---- records: presence, staleness, names ----
+
+    def test_missing_record_refused_naming_the_write_command(self) -> None:
+        self.step(f"vendor/vm@{_PinObjects().sha}", "run: echo\n")
+        self.assertRefused("ACTION_METADATA_MISSING", "vendor/vm/", "python3 .github/ci/action_metadata.py --write")
+
+    def test_record_lookup_folds_owner_and_repo(self) -> None:
+        pin = _PinObjects()
+        self.record(pin)
+        self.step(f"Vendor/VM@{pin.sha}", "run: echo\n")
+        self.assertEqual(self.errors(), [])
+
+    def test_stale_record_refused(self) -> None:
+        self.proven_step("run: echo\n")
+        self.record(_PinObjects(_VM_DECL + "# other\n"))
+        self.assertRefused("ACTION_METADATA_STALE", "no step uses this pin")
+
+    def test_misnamed_record_paths_refused(self) -> None:
+        pin = self.proven_step("run: echo\n")
+        for rel in (f"Vendor/vm/{pin.sha}.json", f"vendor/VM/{pin.sha}.json", "vendor/vm/short.json",
+                    f"vendor/vm/{pin.sha.upper()}.json", "vendor/stray.json", "stray.txt"):
+            with self.subTest(rel=rel):
+                bad = os.path.join(self.records, rel)
+                _write(bad, pin.text())
+                self.assertRefused("ACTION_METADATA_MALFORMED", "is not")
+                os.remove(bad)
+                for d in (os.path.dirname(bad), os.path.dirname(os.path.dirname(bad))):
+                    if d.startswith(self.records + os.sep) and not os.listdir(d):
+                        os.rmdir(d)
+        link = os.path.join(self.records, "vendor", "vm", "f" * 40 + ".json")
+        os.symlink(os.path.join(self.records, "vendor", "vm", f"{pin.sha}.json"), link)
+        self.assertRefused("ACTION_METADATA_MALFORMED", "record file")
+
+    # ---- records: strict decode ----
+
+    def test_record_outside_its_schema_refused(self) -> None:
+        pin = _PinObjects()
+        good = pin.text()
+        oid = next(iter(pin.objects))
+        for text, needle in (
+            ('{"objects": {}, "objects": {}}', "duplicate key"),
+            ('{"objects": {}, "extra": 1}', "exactly {'objects'}"),
+            (good.replace('"base64"', '"b64"', 1), "exactly `type` and `base64`"),
+            (good.replace('"blob"', '"tag"', 1), "want commit, tree or blob"),
+            (json.dumps({"objects": {oid: {"type": "blob", "base64": "!!!"}}}), "strict base64"),
+            (json.dumps({"objects": {oid.upper(): {"type": "blob", "base64": ""}}}), "40 lowercase hex"),
+            (json.dumps({"objects": {f"{i:040x}": {"type": "blob", "base64": ""} for i in range(_AM.OBJECTS_CEILING + 1)}}),
+             "ceiling"),
+            (json.dumps({"objects": {oid: {"type": "blob", "base64": "A" * (_AM.OBJECT_CEILING * 2)}}}), "ceiling"),
+            ("[]", "exactly {'objects'}"),
+            ("{", "strict JSON"),
+        ):
+            with self.subTest(needle=needle, text=text[:60]):
+                self.record(pin, text=text)
+                self.step(f"vendor/vm@{pin.sha}", "run: echo\n")
+                self.assertRefused("ACTION_METADATA_MALFORMED", needle)
+
+    def test_record_nested_past_the_recursion_limit_refused(self) -> None:
+        pin = _PinObjects()
+        depth = 100_000
+        self.record(pin, text='{"objects": ' + "[" * depth + "]" * depth + "}")
+        self.step(f"vendor/vm@{pin.sha}", "run: echo\n")
+        self.assertRefused("ACTION_METADATA_MALFORMED", "strict JSON")
+
+    def test_record_not_in_its_canonical_text_refused(self) -> None:
+        pin = _PinObjects()
+        good = pin.text()
+        b64 = _AM.base64.b64encode(b"A").decode("ascii")
+        pin.put("blob", b"A")
+        padded = pin.text().replace(f'"{b64}"', '"QR=="', 1)
+        self.assertNotEqual(b64, "QR==")
+        for text in (json.dumps(json.loads(good)), good.rstrip("\n"), good.replace("  ", "   "), padded):
+            with self.subTest(text=text[:40]):
+                self.record(pin, text=text)
+                self.step(f"vendor/vm@{pin.sha}", "run: echo\n")
+                self.assertRefused("ACTION_METADATA_MALFORMED", "canonical text")
+
+    def test_record_over_the_file_ceiling_refused(self) -> None:
+        pin = _PinObjects()
+        self.record(pin, text=" " * (_AM.RECORD_CEILING + 1))
+        self.step(f"vendor/vm@{pin.sha}", "run: echo\n")
+        self.assertRefused("ACTION_METADATA_MALFORMED", f"exceeds {_AM.RECORD_CEILING} bytes")
+
+    def test_serialised_record_round_trips_through_the_proof(self) -> None:
+        pin = _PinObjects(subpath=("a", "b"))
+        record = _AM.ActionRecord.parse(pin.text().encode("utf-8"))
+        self.assertIsInstance(record, _AM.ActionRecord)
+        assert isinstance(record, _AM.ActionRecord)
+        self.assertEqual(record.objects, pin.objects)
+        proven = _AM.prove(pin.sha, [("a", "b")], record)
+        self.assertIsInstance(proven, dict)
+        assert isinstance(proven, dict)
+        self.assertEqual(proven[("a", "b")].declared, frozenset({"sync-time", "run", "token", "usesh"}))
+
+    # ---- records: content-addressed proof ----
+
+    def test_flipped_byte_in_any_object_refused(self) -> None:
+        for otype in ("blob", "tree", "commit"):
+            with self.subTest(otype=otype):
+                pin = _PinObjects()
+                oid = next(o for o, obj in pin.objects.items() if obj.type == otype)  # type: ignore[attr-defined]
+                obj = pin.objects[oid]
+                flipped = bytes([obj.data[0] ^ 1]) + obj.data[1:]  # type: ignore[attr-defined]
+                pin.objects[oid] = _AM.GitObject(otype, flipped)
+                self.proven_step("run: echo\n", pin)
+                self.assertRefused("ACTION_METADATA_UNPROVEN", "does not hash to its id")
+                os.remove(os.path.join(self.records, "vendor", "vm", f"{pin.sha}.json"))
+
+    def test_object_stored_under_another_type_refused(self) -> None:
+        pin = _PinObjects()
+        blob = next(o for o, obj in pin.objects.items() if obj.type == "blob")  # type: ignore[attr-defined]
+        data = pin.objects.pop(blob).data  # type: ignore[attr-defined]
+        pin.put("tree", data)
+        self.proven_step("run: echo\n", pin)
+        self.assertRefused("ACTION_METADATA_UNPROVEN", "does not hold")
+
+    def test_extra_object_refused(self) -> None:
+        pin = _PinObjects()
+        pin.put("blob", b"unreached")
+        self.proven_step("run: echo\n", pin)
+        self.assertRefused("ACTION_METADATA_UNPROVEN", "no walk reads")
+
+    def test_missing_object_refused(self) -> None:
+        pin = _PinObjects()
+        blob = next(o for o, obj in pin.objects.items() if obj.type == "blob")  # type: ignore[attr-defined]
+        del pin.objects[blob]
+        self.proven_step("run: echo\n", pin)
+        self.assertRefused("ACTION_METADATA_UNPROVEN", f"needs blob {blob}")
+
+    def test_commit_without_a_tree_first_line_refused(self) -> None:
+        for head in (b"parent " + b"0" * 40 + b"\n", b"tree " + b"Z" * 40 + b"\n", b"tree 00\n"):
+            with self.subTest(head=head):
+                self.proven_step("run: echo\n", _PinObjects(commit_head=head))
+                self.assertRefused("ACTION_METADATA_UNPROVEN", "`tree <40-hex>`")
+
+    def test_malformed_tree_refused(self) -> None:
+        for data, needle in (
+            (b"100644 action.yml\0" + b"\x01" * 5, "truncated in its object id"),
+            (b"100644", "before its mode ends"),
+            (b"100644 action.yml", "before its name ends"),
+            (b"10x644 action.yml\0" + b"\x01" * 20, "not octal"),
+            (b"100644 \0" + b"\x01" * 20, "empty name"),
+            (b"100644 a\0" + b"\x01" * 20 + b"100644 a\0" + b"\x01" * 20, "twice"),
+        ):
+            with self.subTest(needle=needle):
+                pin = _PinObjects()
+                pin.objects = {}
+                tid = pin.put("tree", data)
+                pin.sha = pin.put("commit", b"tree " + tid.encode("ascii") + b"\n\nmsg\n")
+                self.proven_step("run: echo\n", pin)
+                self.assertRefused("ACTION_METADATA_UNPROVEN", needle)
+
+    def test_action_file_must_be_exactly_one_regular_file(self) -> None:
+        other = _AM.object_id("blob", _VM_DECL.encode("utf-8"))
+        for pin, needle in (
+            (_PinObjects(leaf_extra=((b"100644", "action.yaml", other),)), "both action.yml and action.yaml"),
+            (_PinObjects(fname="README.md"), "neither action.yml nor action.yaml"),
+            (_PinObjects(mode=b"120000"), "not a regular file"),
+            (_PinObjects(mode=b"40000"), "not a regular file"),
+        ):
+            with self.subTest(needle=needle):
+                if needle.startswith("neither"):
+                    blob = next(o for o, obj in pin.objects.items() if obj.type == "blob")  # type: ignore[attr-defined]
+                    del pin.objects[blob]
+                self.proven_step("run: echo\n", pin)
+                self.assertRefused("ACTION_METADATA_UNPROVEN", needle)
+                os.remove(os.path.join(self.records, "vendor", "vm", f"{pin.sha}.json"))
+
+    def test_action_yaml_spelling_is_read(self) -> None:
+        self.proven_step("run: echo\n", _PinObjects(fname="action.yaml"))
+        self.assertEqual(self.errors(), [])
+
+    def test_action_metadata_outside_strict_yaml_refused(self) -> None:
+        for yml, needle in (
+            (_VM_DECL.replace("  run:\n    description: run\n", "  run: &a\n    description: run\n  other: *a\n"), "strict YAML"),
+            (_VM_DECL + "inputs: {}\n", "strict YAML"),
+            (b"inputs: \xff\n", "is not UTF-8"),
+        ):
+            with self.subTest(needle=needle):
+                self.proven_step("run: echo\n", _PinObjects(yml))
+                self.assertRefused("ACTION_METADATA_UNPROVEN", needle)
+                for f in os.listdir(os.path.join(self.records, "vendor", "vm")):
+                    os.remove(os.path.join(self.records, "vendor", "vm", f))
+
+    def test_action_metadata_outside_its_shape_refused(self) -> None:
+        for yml, needle in (
+            (_VM_DECL.replace("  run:\n    description: run\n", "  Sync-Time:\n    description: twin\n"), "fold equal"),
+            (_VM_DECL.replace("  using: node20\n", ""), "`runs.using` string"),
+            ("inputs: []\nruns:\n  using: node20\n", "`inputs` is not a mapping"),
+            ("inputs:\n  a: 1\nruns:\n  using: node20\n", "not a mapping or null"),
+            ("inputs:\n  a:\n    required: 'true'\nruns:\n  using: node20\n", "not a bool"),
+            ("- a\n", "is not a mapping"),
+            ("inputs:\n  input: {}\n  \u0131nput: {}\nruns:\n  using: node20\n", "fold equal"),
+            ("inputs:\n  a b: {}\n  a_b: {}\nruns:\n  using: node20\n", "fold equal"),
+        ):
+            with self.subTest(needle=needle):
+                self.proven_step("run: echo\n", _PinObjects(yml))
+                self.assertRefused("ACTION_METADATA_UNPROVEN", needle)
+                for f in os.listdir(os.path.join(self.records, "vendor", "vm")):
+                    os.remove(os.path.join(self.records, "vendor", "vm", f))
+
+    def test_subpath_walks_to_its_own_metadata(self) -> None:
+        pin = _PinObjects(subpath=("sub", "dir"))
+        self.proven_step("run: echo\n", pin, "/sub/dir")
+        self.assertEqual(self.errors(), [])
+        self.step(f"vendor/vm/sub/gone@{pin.sha}", "run: echo\n")
+        self.assertRefused("ACTION_METADATA_UNPROVEN", "segment 'gone' is not a directory at the pin")
+
+    def test_subpath_segment_must_be_a_tree_entry(self) -> None:
+        for mode in (b"120000", b"160000", b"100644"):
+            with self.subTest(mode=mode):
+                pin = _PinObjects()
+                leaf = next(o for o, obj in pin.objects.items() if obj.type == "tree")  # type: ignore[attr-defined]
+                del pin.objects[pin.sha]
+                root = pin.put("tree", _tree((mode, "sub", leaf)))
+                pin.sha = pin.put("commit", b"tree " + root.encode("ascii") + b"\n\nmsg\n")
+                self.proven_step("run: echo\n", pin, "/sub")
+                self.assertRefused("ACTION_METADATA_UNPROVEN", "segment 'sub' is not a directory at the pin")
+                os.remove(os.path.join(self.records, "vendor", "vm", f"{pin.sha}.json"))
+
+    def test_dot_segment_in_a_pin_refused(self) -> None:
+        self.assertIsInstance(_AM.RemotePin.parse("vendor/vm/..@" + "0" * 40), _AM.Refusal)
+        self.assertIsInstance(_AM.RemotePin.parse("vendor/vm/a//b@" + "0" * 40), _AM.Refusal)
+        self.assertIsInstance(_AM.RemotePin.parse("vendor/vm@v1"), _AM.Refusal)
+        pin = _AM.RemotePin.parse("Vendor/VM/a/b@" + "0" * 40)
+        self.assertEqual(pin, _AM.RemotePin("Vendor", "VM", ("a", "b"), "0" * 40))
+        self.assertEqual(pin.key, ("vendor", "vm", "0" * 40))  # type: ignore[union-attr]
+
+    # ---- local and docker actions ----
+
+    def test_local_composite_inputs_checked(self) -> None:
+        self.fx.composite(
+            "act",
+            "name: act\ninputs:\n  target:\n    required: true\n  opt:\n    description: o\n"
+            "runs:\n  using: composite\n  steps:\n    - run: echo\n      shell: bash\n",
+        )
+        self.step("./.github/actions/act", "target: x\nopt: y\n")
+        self.assertEqual(self.errors(), [])
+        self.step("./.github/actions/act", "target: x\ntraget: y\n")
+        self.assertRefused("ACTION_INPUT_UNDECLARED", "with.traget")
+        self.step("./.github/actions/act", "opt: y\n")
+        self.assertRefused("ACTION_INPUT_REQUIRED_MISSING", "'target'")
+
+    def test_local_composite_step_inputs_checked_against_their_pin(self) -> None:
+        pin = _PinObjects()
+        self.record(pin)
+        self.fx.composite(
+            "act",
+            f"name: act\nruns:\n  using: composite\n  steps:\n    - uses: vendor/vm@{pin.sha}\n      with:\n        synctime: false\n",
+        )
+        self.step("./.github/actions/act")
+        self.assertRefused("ACTION_INPUT_UNDECLARED", "act/action.yml", "with.synctime")
+
+    def test_docker_image_step_takes_only_args_and_entrypoint(self) -> None:
+        self.step("docker://alpine@sha256:" + "0" * 64, "args: x\nentrypoint: /bin/sh\n")
+        self.assertEqual(self.errors(), [])
+        self.step("docker://alpine@sha256:" + "0" * 64, "image: x\n")
+        self.assertRefused("ACTION_INPUT_UNDECLARED", "with.image")
+
+    def test_docker_action_admits_args_and_entrypoint(self) -> None:
+        yml = "inputs:\n  a:\n    description: a\nruns:\n  using: docker\n  image: Dockerfile\n"
+        self.proven_step("a: x\nargs: y\nentrypoint: z\n", _PinObjects(yml))
+        self.assertEqual(self.errors(), [])
+        self.proven_step("args: y\n", _PinObjects(_VM_DECL))
+        self.assertRefused("ACTION_INPUT_UNDECLARED", "with.args")
+
+    # ---- `SCRIPT_ACTIONS` rows name declared inputs ----
+
+    def test_script_action_row_must_name_declared_inputs(self) -> None:
+        pin = self.proven_step("run: echo\n")
+        uses = f"vendor/vm@{pin.sha}"
+        ok = verify_manifest.ScriptAction(frozenset({"sync-time", "run"}), "why")
+        self.assertEqual(self.errors({uses: ok}), [])
+        bad = verify_manifest.ScriptAction(frozenset({"synctime", "run"}), "why")
+        self.assertRefused("SCRIPT_ACTION_ROW_INVALID", "['synctime']", script_actions={uses: bad})
+        unused = f"vendor/other@{'1' * 40}"
+        self.assertRefused("SCRIPT_ACTION_ROW_INVALID", "no proven input set", script_actions={uses: ok, unused: ok})
+
+    # ---- the write tool's boundary ----
+
+    def test_fetch_argv_refuses_out_of_grammar_input(self) -> None:
+        sha = "a" * 40
+        for owner, repo, s in (("-o", "r", sha), ("o", "..", sha), ("o/x", "r", sha), ("o", "r?", sha),
+                               ("o", "r", sha.upper()), ("o", "r", "a" * 39), ("", "r", sha)):
+            with self.subTest(owner=owner, repo=repo, sha=s):
+                self.assertIsInstance(_AM.fetch_argv(owner, repo, s), _AM.Refusal)
+        argv = _AM.fetch_argv("o", "r", sha)
+        self.assertIsInstance(argv, list)
+        assert isinstance(argv, list)
+        self.assertEqual(argv[-2:], ["https://github.com/o/r.git", sha])
+        self.assertIn("credential.helper=", argv)
+
+    def test_git_env_drops_inherited_git_settings(self) -> None:
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/x", "GIT_CONFIG_PARAMETERS": "'a.b=c'"}):
+            env = _AM._git_env()
+        self.assertNotIn("GIT_DIR", env)
+        self.assertNotIn("GIT_CONFIG_PARAMETERS", env)
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_write_tool_takes_only_its_one_flag(self) -> None:
+        for argv in ([], ["--write", "x"], ["--help"]):
+            with self.subTest(argv=argv), mock.patch("sys.stderr"):
+                self.assertNotEqual(_AM.main(argv), 0)
+
+    # ---- the live tree ----
+
+    def test_live_tree_every_with_key_declared(self) -> None:
+        errors: list[str] = []
+        wfs = _load(verify_manifest.REPO_ROOT, errors)
+        actions = check_workflow_steps(wfs, errors)
+        verify_manifest.check_action_inputs(wfs, actions, errors)
+        self.assertEqual(errors, [])
+
+    def test_live_records_cover_exactly_the_live_pins(self) -> None:
+        found, refusals = _AM.scan_records()
+        self.assertEqual(refusals, [])
+        self.assertEqual(set(found), {p.key for p in verify_manifest.remote_pins()})
 
 
 class TestModuleConstantsDefinedOnce(unittest.TestCase):
@@ -8191,6 +8649,7 @@ class TestToolInvocationsClosed(unittest.TestCase):
             ("python3 .github/ci/verify-manifest.py --help", "TOOL_ARGV_UNLISTED"),
             ("python3 .github/ci/check_required_set.py --write", "MAINTAINER_TOOL_IN_WORKFLOW"),
             ("python3 .github/ci/check_required_set.py --render-put rs.json", "MAINTAINER_TOOL_IN_WORKFLOW"),
+            ("python3 .github/ci/action_metadata.py --write", "MAINTAINER_TOOL_IN_WORKFLOW"),
             ("python3 .github/ci/strict_yaml.py", "TOOL_UNLISTED"),
             ("python3 .github/ci/new.py", "TOOL_UNLISTED"),
             ("python3 .github/ci/e2e_shard.py --plan --extra", "TOOL_ARGV_UNLISTED"),

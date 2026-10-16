@@ -142,7 +142,7 @@ impl std::fmt::Debug for StreamTicket {
 /// `Unavailable` at once.
 fn mint_with<S, L>(mut source: S, live: L) -> Result<StreamTicket, IpeError>
 where
-    S: FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>,
+    S: FnMut(&mut [u8; 16]) -> Result<(), crate::entropy::EntropyError>,
     L: Fn(StreamTicket) -> bool,
 {
     for _ in 0..MINT_ATTEMPTS {
@@ -159,8 +159,8 @@ where
 }
 
 /// The OS CSPRNG, the production ticket source.
-fn os_entropy(buf: &mut [u8; 16]) -> Result<(), getrandom::Error> {
-    getrandom::getrandom(buf)
+fn os_entropy(buf: &mut [u8; 16]) -> Result<(), crate::entropy::EntropyError> {
+    crate::entropy::fill_entropy(buf)
 }
 
 /// A request's stream table: open while its handler runs, served once its
@@ -708,7 +708,7 @@ mod tests {
             matches!(&colliding, Err(e) if crate::ipe_error_message(e.clone()) == MINT_EXHAUSTED)
         );
 
-        let broken = |_: &mut [u8; 16]| Err(getrandom::Error::UNSUPPORTED);
+        let broken = |_: &mut [u8; 16]| Err(crate::entropy::EntropyError);
         let dead = mint_with(broken, |_| false).map(|_| ());
         assert!(
             matches!(&dead, Err(e) if crate::ipe_error_kind(e.clone()) == IpeErrorKind::Unavailable)
