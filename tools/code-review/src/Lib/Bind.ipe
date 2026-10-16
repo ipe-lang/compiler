@@ -1,4 +1,4 @@
-module Lib.Bind exposing (BindRefusal(..), Loopback, loopbackAddress, parseBind, refusalText)
+module Lib.Bind exposing (BindRefusal(..), Loopback, acceptedSpellings, loopbackAddress, parseBind, refusalText)
 
 -- The listen address of the review server, proved loopback before anything
 -- else starts. The server is unauthenticated: any host that could reach a
@@ -14,6 +14,7 @@ module Lib.Bind exposing (BindRefusal(..), Loopback, loopbackAddress, parseBind,
 -- 127/8 address, another spelling of `::1`), never by admitting an exposed
 -- one.
 
+import Ipe.List as List
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Lib.SafeText as SafeText exposing (SafeText)
@@ -53,17 +54,30 @@ parseBind value =
 
 parseSetBind : String -> Result BindRefusal Loopback
 parseSetBind raw =
-    if raw == ipv4Text then
-        Ok Ipv4Loopback
+    case List.find (\( spelling, _ ) -> spelling == raw) acceptedBinds of
+        Just ( _, proof ) ->
+            Ok proof
 
-    else if raw == ipv6Text then
-        Ok Ipv6Loopback
+        Nothing ->
+            if String.isEmpty raw then
+                Err EmptyBind
 
-    else if String.isEmpty raw then
-        Err EmptyBind
+            else
+                Err (NotLoopback raw)
 
-    else
-        Err (NotLoopback raw)
+
+-- Every accepted spelling with the proof it gives. The parser, the refusal's
+-- problem and its remedy all read this one list, so the text names exactly
+-- the values the parser accepts.
+acceptedBinds : List ( String, Loopback )
+acceptedBinds =
+    [ ( ipv4Text, Ipv4Loopback ), ( ipv6Text, Ipv6Loopback ) ]
+
+
+-- The set values `parseBind` accepts, in the order the refusal names them.
+acceptedSpellings : List String
+acceptedSpellings =
+    List.map (\( spelling, _ ) -> spelling) acceptedBinds
 
 
 ipv4Text : String
@@ -97,10 +111,11 @@ echoMaxChars =
     64
 
 
--- The startup refusal: the variable, what is wrong with its value, and the
--- one remedy. A refused value is shown capped at `echoMaxChars` and
--- escaped, so it can neither flood nor forge the operator's terminal; an
--- unreadable value is never shown.
+-- The startup refusal: the variable, what is wrong with its value (it is not
+-- one of the accepted spellings, which are listed), and the one remedy. A
+-- refused value is shown capped at `echoMaxChars` and escaped, so it can
+-- neither flood nor forge the operator's terminal; an unreadable value is
+-- never shown.
 refusalText : BindRefusal -> SafeText
 refusalText refusal =
     SafeText.concat [ problemText refusal, SafeText.literal remedyText ]
@@ -117,7 +132,7 @@ problemText refusal =
                 [ SafeText.literal "IPE_HTTP_BIND is "
                 , SafeText.quoted (String.left echoMaxChars raw)
                 , cutMark raw
-                , SafeText.literal ", which is not a loopback address"
+                , SafeText.literal (", which is not one of the accepted loopback spellings (" ++ String.join ", " acceptedSpellings ++ ")")
                 ]
 
         UnreadableBind ->
@@ -136,4 +151,4 @@ cutMark raw =
 
 remedyText : String
 remedyText =
-    "; code-review serves an unauthenticated review page, so it listens on loopback only. Unset IPE_HTTP_BIND (the server then binds 127.0.0.1), or set it to 127.0.0.1 or ::1, and reach it from another machine through an SSH tunnel, e.g. ssh -L 8000:127.0.0.1:8000 <host> (use the listening port if IPE_SERVER_PORT sets another)"
+    "; code-review serves an unauthenticated review page, so it listens on loopback only. Unset IPE_HTTP_BIND (the server then binds " ++ ipv4Text ++ "), or set it to " ++ String.join " or " acceptedSpellings ++ ", and reach it from another machine through an SSH tunnel, e.g. ssh -L 8000:127.0.0.1:8000 <host> (use the listening port if IPE_SERVER_PORT sets another)"
