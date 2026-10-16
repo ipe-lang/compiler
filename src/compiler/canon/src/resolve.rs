@@ -12,11 +12,11 @@ use ipe_diagnostics::{
     ModulePlacementRejection, NameError, ParseError, SealRejection, SortedNames, Span, StdlibReach,
     TypeError,
 };
-use ipe_intern::{Interner, Symbol};
+use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
 use ipe_syntax as src;
+use ipe_syntax::BinOp;
 use ipe_syntax::fixity::{OperatorModule, PARSER_OPERATOR_MODULE};
-use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
 use crate::env::{
@@ -3736,10 +3736,9 @@ fn derive_record_codec(
         leaves.push((*fname, enc, dec));
     }
 
-    // The record parameter of the encoder lambda, a fresh name that cannot alias
-    // a field or a user binding. Its span seeds a unique name per record.
-    let name_span = sg.fresh();
-    let rec_param = interner.intern(&format!("codec_rec_{}", name_span.lo))?;
+    // The record parameter of the encoder lambda. Its span seeds a unique name
+    // per record, and `mint_site_binder` keeps it apart from every visible binding.
+    let rec_param = mint_site_binder(SiteBinder::CodecRecord(sg.fresh()), env, interner)?;
 
     // enc = \rec -> Encode.object [ (key, leafEnc rec.field), … ]
     let mut pairs = Vec::with_capacity(leaves.len());
@@ -4035,10 +4034,8 @@ fn project_codec_enc_dec(
     let ctor_name = ctor.name;
     let ctor_index = ctor.index;
 
-    let mut make_projection = |proj_field: Symbol, run_unit: bool| -> canon::Expr {
-        let binder = interner
-            .intern(&format!("codec_r_{}", sg.fresh().lo))
-            .unwrap_or(proj_field);
+    let mut make_projection = |proj_field: Symbol, run_unit: bool| -> DResult<canon::Expr> {
+        let binder = mint_site_binder(SiteBinder::CodecProjection(sg.fresh()), env, interner)?;
         let access = Located::new(
             sg.fresh(),
             canon::Expr_::Access(
@@ -4067,17 +4064,17 @@ fn project_codec_enc_dec(
                 args: vec![Located::new(sg.fresh(), canon::Pattern_::PVar(binder))],
             },
         );
-        Located::new(
+        Ok(Located::new(
             sg.fresh(),
             canon::Expr_::Case(
                 Box::new(Located::new(sg.fresh(), codec.clone())),
                 vec![canon::CaseBranch { pat, body }],
             ),
-        )
+        ))
     };
 
-    let enc = make_projection(enc_field, false);
-    let dec = make_projection(mkdec_field, true);
+    let enc = make_projection(enc_field, false)?;
+    let dec = make_projection(mkdec_field, true)?;
     Ok((enc, dec))
 }
 
@@ -5979,22 +5976,12 @@ fn canonicalise_binops(
     Ok(tree.value)
 }
 
-/// Precedence-climbing core. Consumes all operators from `ops`, pairing each
-/// with the next operand from `operands`, and folds them into `left` according
-/// to precedence and associativity.
+/// Folds the chain `left0 ops[0] operands[0] …` into one tree by
+/// [`ipe_syntax::fixity::climb`], the precedence climbing the formatter's
+/// operator grouping is checked against.
 ///
-/// Call-stack depth is O(1) in chain length: a `pending` heap-stack holds
-/// reduce-deferred `(left, op, prec)` frames so no native frame is opened per
-/// operator. Shares the heap-work-stack discipline of
-/// `module_classify::walk_expr`.
-///
-/// Reduce predicate (reproduces the recursive semantics byte-for-byte):
-/// - Left/non-assoc: reduce when a pending op is at least as tight as the
-///   incoming one (`top_prec >= prec`), restricting its right subtree to
-///   strictly-higher precedence.
-/// - Right-assoc: reduce only when the pending op is strictly tighter
-///   (`top_prec > prec`), leaving equal-precedence ops on the stack so they
-///   nest rightward.
+/// Each operator pairs with the operand after it; a count mismatch is a
+/// [`Diagnostic::CompilerBug`].
 fn climb_binops(
     left0: canon::Expr,
     operands: &mut VecDeque<canon::Expr>,
@@ -6003,45 +5990,21 @@ fn climb_binops(
     env: &Env,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
-    // Pending frames: left operand + operator + its precedence, awaiting their
-    // right subtree once higher-precedence operators to the right are reduced.
-    let mut pending: Vec<(canon::Expr, Located<BinOp>, u8)> = Vec::new();
-    let mut left = left0;
-    while let Some(&op) = ops.front() {
-        let op_fixity = op.value.fixity();
-        let prec = op_fixity.prec();
-        // Reduce any pending frame whose operator binds at least as tightly as
-        // the incoming `op` (left/non-assoc) or strictly tighter (right-assoc).
-        while let Some(&(_, _, top_prec)) = pending.last() {
-            let should_reduce = match op_fixity.assoc() {
-                Assoc::Left | Assoc::None => top_prec >= prec,
-                Assoc::Right => top_prec > prec,
-            };
-            if !should_reduce {
-                break;
-            }
-            let (l, top_op, _) = pending.pop().ok_or_else(|| Diagnostic::CompilerBug {
-                where_: "ipe_canon::climb_binops",
-                detail: "pending stack empty after last() confirmed non-empty".to_owned(),
-            })?;
-            left = combine_binop(l, top_op, left, basics, env, interner)?;
-        }
-        ops.pop_front();
-        let next = operands
-            .pop_front()
-            .ok_or_else(|| Diagnostic::CompilerBug {
-                where_: "ipe_canon::climb_binops",
-                detail: "operator without a right operand".to_owned(),
-            })?;
-        pending.push((left, op, prec));
-        left = next;
+    if operands.len() != ops.len() {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::climb_binops",
+            detail: "operator without a right operand".to_owned(),
+        });
     }
-    // Drain remaining pending frames right-to-left (rightmost operator was
-    // pushed last; LIFO pop folds left correctly).
-    while let Some((l, op, _)) = pending.pop() {
-        left = combine_binop(l, op, left, basics, env, interner)?;
-    }
-    Ok(left)
+    ipe_syntax::fixity::climb(
+        left0,
+        ops.drain(..).zip(operands.drain(..)),
+        |l, op, r| combine_binop(l, op, r, basics, env, interner),
+        || Diagnostic::CompilerBug {
+            where_: "ipe_canon::climb_binops",
+            detail: "pending stack empty after last() confirmed non-empty".to_owned(),
+        },
+    )
 }
 
 /// Resolve an interned `Symbol` to its text, or fail closed with a
@@ -6064,6 +6027,76 @@ fn resolve_or_bug<'a>(
             where_,
             detail: "interned symbol did not resolve".to_owned(),
         })
+}
+
+/// A binder the compiler wraps around user sub-expressions, with its site.
+#[derive(Clone, Copy, Debug)]
+enum SiteBinder {
+    /// The parameter of a `>>` or `<<` desugaring over the operator's span.
+    Compose(Span),
+    /// The record parameter of a derived record codec.
+    CodecRecord(Span),
+    /// The binder of a codec encoder or decoder projection.
+    CodecProjection(Span),
+}
+
+impl SiteBinder {
+    /// The site's preferred name: its stem and site offsets.
+    fn base_name(self) -> String {
+        match self {
+            Self::Compose(site) => {
+                format!("{}{}_{}", SynthStem::Compose.text(), site.lo, site.hi)
+            }
+            Self::CodecRecord(site) => format!("{}{}", SynthStem::CodecRecord.text(), site.lo),
+            Self::CodecProjection(site) => {
+                format!("{}{}", SynthStem::CodecProjection.text(), site.lo)
+            }
+        }
+    }
+}
+
+/// Mint a binder for a desugaring that wraps user sub-expressions.
+///
+/// The name is the site's base name, or `<base>_<k>` for the smallest
+/// `k >= 1` when the base name is bound at the site. A base name and a
+/// suffixed name of one stem differ in their count of numeric components, so
+/// a suffixed name never equals another site's base name.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] when no free name exists within the bound
+/// the visible bindings imply (unreachable: each taken candidate is a
+/// distinct bound name), or when the interner is full.
+fn mint_site_binder(site: SiteBinder, env: &Env, interner: &mut Interner) -> DResult<Symbol> {
+    let taken = |interner: &Interner, name: &str| {
+        interner.lookup(name).is_some_and(|sym| {
+            env.vars.contains_key(&sym)
+                || !matches!(env.module_scope.expr.resolve(sym), Resolved::Missing)
+        })
+    };
+    let base = site.base_name();
+    if !taken(interner, &base) {
+        return interner.intern(&base);
+    }
+    let ceiling = env
+        .vars
+        .len()
+        .checked_add(env.module_scope.expr.names().count())
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "canon.mint_site_binder",
+            detail: "visible binding count overflows usize".to_owned(),
+        })?;
+    for k in 1..=ceiling {
+        let candidate = format!("{base}_{k}");
+        if !taken(interner, &candidate) {
+            return interner.intern(&candidate);
+        }
+    }
+    Err(Diagnostic::CompilerBug {
+        where_: "canon.mint_site_binder",
+        detail: format!("no free binder for `{base}` within {ceiling} candidates"),
+    })
 }
 
 /// Build a single resolved binary-operation node.
@@ -6137,14 +6170,10 @@ fn combine_binop(
         // Composition operators eta-expand to a lambda over one fresh parameter:
         //   `f >> g`  ≡  `\x -> g (f x)`   (left-to-right composition)
         //   `f << g`  ≡  `\x -> f (g x)`   (right-to-left composition)
-        // The parameter name is derived from the operator's source span, so it
-        // is unique per occurrence. Its `compose_` prefix is distinct from every
-        // fresh pool the lowerer mints (`eta_`/`cap_`/`arg_`/…), so it cannot
-        // alias an eta-expansion name; a user binding the same name would be
-        // harmlessly shadowed, since this lambda's body references only the
-        // (already-resolved) `f`/`g` operands and its own parameter.
+        // The parameter is minted by `mint_site_binder`, so no binding visible
+        // here (and hence no free operand reference) shares its name.
         OpForm::Compose(direction) => {
-            let param = interner.intern(&format!("compose_{}_{}", span.lo, span.hi))?;
+            let param = mint_site_binder(SiteBinder::Compose(span), env, interner)?;
             // `>>` applies `f` (lhs) first then `g` (rhs); `<<` applies `g` (rhs)
             // first then `f` (lhs). `inner` is the first application, `outer`
             // wraps it.
@@ -7943,7 +7972,7 @@ fn chunk_to_expr(
 ///
 /// Handles four shapes:
 ///   `foo`          — bare identifier → local var (or kernel if in scope)
-///   `record.field` — field access → `Access(VarLocal(record), field)`
+///   `record.field` — field access → `Access(record, field)`, `record` resolved as a bare name
 ///   `Module.func`  — qualified name → resolved through the qualified reader;
 ///                    an unresolved one is refused
 ///   `func arg`     — single function call → `Call(resolve(func), [resolve(arg)])`
@@ -8073,15 +8102,16 @@ fn resolve_simple_interp_ref(
         if first.starts_with(char::is_uppercase) {
             return resolve_interp_qualified(s, span, env, interner);
         }
-        // Lowercase `record.field` → `Access(VarLocal(record), field)`.
+        // Lowercase `record.field` → `Access(record, field)`, the record read
+        // through `resolve_var` exactly as a bare name is: a local stays
+        // `VarLocal`, a top-level value is `VarTopLevel`, an unknown name is
+        // IPE-N0001.
         let rec_sym = interner.intern(first)?;
         let field_sym = interner.intern(rest)?;
+        let record = resolve_var(rec_sym, span, env, interner)?;
         return Ok(Located::new(
             span,
-            canon::Expr_::Access(
-                Box::new(Located::new(span, canon::Expr_::VarLocal(rec_sym))),
-                field_sym,
-            ),
+            canon::Expr_::Access(Box::new(Located::new(span, record)), field_sym),
         ));
     }
     // Bare identifier — resolve through the one canonical bare-name path

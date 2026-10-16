@@ -480,6 +480,9 @@ pub enum CliError {
         /// The module name as `package.ipe` spells it.
         module: String,
     },
+    /// A described source tree names a module that is no module path, or two paths one
+    /// case-insensitive file system would merge.
+    SourceTree(crate::project_root::TreeRefusal),
     /// A project file or directory ipe would read is a symbolic link (`IPE-E0010`).
     SymlinkInSource {
         /// The link.
@@ -789,6 +792,7 @@ impl CliError {
             Self::NoDefaultEntry { .. } => "no-default-entry",
             Self::EntryEscapes { .. } => "entry-escapes",
             Self::ExposedModuleMissing { .. } => "exposed-module-missing",
+            Self::SourceTree(_) => "source-tree",
             Self::SymlinkInSource { .. } => "symlink-in-source",
             Self::FileOutsideRoot { .. } => "file-outside-root",
             Self::OutputRefused(_) => "output-refused",
@@ -887,6 +891,7 @@ impl CliError {
             | Self::NoDefaultEntry { .. }
             | Self::EntryEscapes { .. }
             | Self::ExposedModuleMissing { .. }
+            | Self::SourceTree(_)
             | Self::SymlinkInSource { .. }
             | Self::FileOutsideRoot { .. }
             | Self::OutputRefused(_)
@@ -1216,6 +1221,7 @@ impl std::fmt::Display for CliError {
             Self::ExposedModuleMissing { module } => f.write_str(
                 &text::project_exposed_module_missing(&format!("{module:?}")),
             ),
+            Self::SourceTree(refusal) => write!(f, "{refusal}"),
             Self::SymlinkInSource { path } => {
                 f.write_str(&text::project_symlink_in_source(&path.display()))
             }

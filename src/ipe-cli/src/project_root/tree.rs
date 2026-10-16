@@ -121,9 +121,8 @@ impl SourceTree {
     /// # Errors
     /// [`CliError::ScratchUnavailable`] when the directory cannot be created;
     /// [`CliError::Resolve`] for a name that is not a package name;
-    /// [`CliError::Io`] of kind [`io::ErrorKind::InvalidInput`] carrying a
-    /// [`TreeRefusal`] for a module name that is not a dotted module name or for
-    /// two module paths one case-insensitive file system would merge;
+    /// [`CliError::SourceTree`] for a module name that is not a dotted module
+    /// name or for two module paths one case-insensitive file system would merge;
     /// [`CliError::Io`] for a file that cannot be written; otherwise every
     /// refusal of [`ProjectRoot::resolve`].
     pub fn resolve_under(&self, base: &Path) -> Result<ScratchRoot, CliError> {
@@ -162,10 +161,7 @@ impl SourceTree {
 
     /// Every module file as its path below the root and its text, all paths proven first.
     fn files(&self) -> Result<Vec<(PathBuf, &str)>, CliError> {
-        self.plan().map_err(|refusal| {
-            let path = refusal.path().to_path_buf();
-            io_error(&path, io::Error::new(io::ErrorKind::InvalidInput, refusal))
-        })
+        self.plan().map_err(CliError::SourceTree)
     }
 
     /// Every module file below the root, refusing a name that is not a dotted
@@ -201,16 +197,6 @@ pub enum TreeRefusal {
         /// The path that coincides with it.
         second: PathBuf,
     },
-}
-
-impl TreeRefusal {
-    /// The path the refusal names.
-    fn path(&self) -> &Path {
-        match self {
-            Self::NotModuleSegment { module, .. } => Path::new(module),
-            Self::Collision { second, .. } => second,
-        }
-    }
 }
 
 impl fmt::Display for TreeRefusal {
@@ -463,12 +449,18 @@ mod tests {
         ] {
             let err = refused(&tree().module(module, MODULE));
             assert!(
-                matches!(&err, CliError::Io { source, .. } if source.kind() == io::ErrorKind::InvalidInput),
+                matches!(
+                    &err,
+                    CliError::SourceTree(TreeRefusal::NotModuleSegment { .. })
+                ),
                 "{module:?}: {err}"
             );
         }
         let err = refused(&tree().test_module("../Evil", MODULE));
-        assert!(matches!(err, CliError::Io { .. }));
+        assert!(matches!(
+            err,
+            CliError::SourceTree(TreeRefusal::NotModuleSegment { .. })
+        ));
     }
 
     #[test]
@@ -523,7 +515,7 @@ mod tests {
         );
         let err = refused(&tree().module("Main", MODULE));
         assert!(
-            matches!(&err, CliError::Io { source, .. } if source.kind() == io::ErrorKind::InvalidInput),
+            matches!(&err, CliError::SourceTree(TreeRefusal::Collision { .. })),
             "{err}"
         );
     }

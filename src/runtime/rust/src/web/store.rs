@@ -185,14 +185,13 @@ fn split_checkpoint(blob: &str) -> Option<([u8; 32], CredSection, Vec<u8>)> {
     Some((tag, section, body.to_vec()))
 }
 
-/// The model and credential section a checkpoint of `handle` writes.
+/// The model and credential section a checkpoint of `entry` writes.
 ///
 /// Read under one lock, so the section belongs to the model beside it.
 #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
 fn checkpoint_parts<Model: Clone, Msg>(
-    handle: &SessionHandle<Model, Msg>,
+    entry: &SessionEntry<Model, Msg>,
 ) -> (Model, Option<Vec<u8>>) {
-    let entry = handle.lock().unwrap_or_else(PoisonError::into_inner);
     (entry.model.clone(), entry.checkpoint_section())
 }
 
@@ -573,7 +572,11 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// The handle is visible to [`get`](SessionStore::get) before the
     /// persistence I/O starts, so a claim released after `set` returns hands
     /// the next request for the sid a `Live` session, never a cold one.
-    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>);
+    ///
+    /// A handle the store no longer holds because another one was installed
+    /// under the sid writes nothing and is [`Installed::Displaced`], so one sid
+    /// never has two writers.
+    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> Installed;
     /// Drop a session.
     async fn delete(&self, sid: &str);
     /// Evict idle-expired sessions (called periodically by the eviction task).
@@ -595,11 +598,13 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     /// explicit, reviewed choice, not silently inherit a possibly-wrong one.
     async fn web_sessions(&self) -> Vec<SessionHandle<Model, Msg>>;
 
-    /// Evict the least recently seen live sessions no SSE channel holds until
-    /// their charges sum to `need`, returning the bytes they held.
+    /// Evict the least recently seen quiescent live sessions no SSE channel
+    /// holds until their charges sum to `need`, returning the bytes they held.
     ///
     /// Only THIS process's live handles are evicted: a persisted row stays,
-    /// so a later visit restores it. No default body, as with
+    /// so a later visit restores it. A session with a Cmd in flight or an
+    /// input queued is skipped, so a restored row never stands for a session
+    /// whose pending completion was dropped. No default body, as with
     /// [`web_sessions`](SessionStore::web_sessions).
     async fn evict_unconnected(&self, need: Bytes) -> Bytes;
 
@@ -611,13 +616,13 @@ pub trait SessionStore<Model, Msg>: Send + Sync {
     fn holds(&self, sid: &str, handle: &SessionHandle<Model, Msg>) -> bool;
 }
 
-/// Evict from `sessions` the least recently seen entries no SSE channel holds,
-/// oldest first, until their charges sum to `need`; returns the bytes they held.
+/// Evict from `sessions` the least recently seen evictable entries, oldest
+/// first, until their charges sum to `need`; returns the bytes they held.
 ///
-/// An entry is removed only under its own lock, while it still has no SSE
-/// channel and the map still holds that same handle: a stream attached since
-/// the snapshot keeps its session, and a session re-set meanwhile is never
-/// evicted in its place. The map lock is only ever taken inside an entry
+/// An entry is removed only under its own lock, while it is still
+/// [`evictable`] and the map still holds that same handle: a stream attached
+/// or a Cmd started since the snapshot keeps its session, and a session
+/// re-set meanwhile is never evicted in its place. The map lock is only ever taken inside an entry
 /// lock, never the other way round. The bytes return once the last holder of
 /// an evicted handle drops it.
 fn evict_unconnected_from<Model, Msg>(
@@ -632,13 +637,7 @@ fn evict_unconnected_from<Model, Msg>(
         .collect();
     let mut idle: Vec<(String, SessionHandle<Model, Msg>, Instant)> = held
         .into_iter()
-        .filter(|(_, handle, _)| {
-            handle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .sse_tx
-                .is_none()
-        })
+        .filter(|(_, handle, _)| evictable(&handle.lock().unwrap_or_else(PoisonError::into_inner)))
         .collect();
     idle.sort_by_key(|(_, _, seen)| *seen);
     let mut freed = Bytes::ZERO;
@@ -647,7 +646,7 @@ fn evict_unconnected_from<Model, Msg>(
             break;
         }
         let entry = handle.lock().unwrap_or_else(PoisonError::into_inner);
-        if entry.sse_tx.is_some() {
+        if !evictable(&entry) {
             continue;
         }
         let mut map = sessions.write().unwrap_or_else(PoisonError::into_inner);
@@ -663,6 +662,51 @@ fn evict_unconnected_from<Model, Msg>(
         drop(entry);
     }
     freed
+}
+
+/// Whether an eviction may take `entry`: no SSE channel holds it and nothing
+/// on its way to its `update` would be lost.
+fn evictable<Model, Msg>(entry: &SessionEntry<Model, Msg>) -> bool {
+    entry.sse_tx.is_none() && entry.is_quiescent()
+}
+
+/// What a [`SessionStore::set`] did with the handle it was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a displaced handle's driver stops writing its session"]
+pub enum Installed {
+    /// The store holds the handle under its sid and writes its checkpoint.
+    Held,
+    /// Another live handle holds the sid; nothing was written.
+    Displaced,
+}
+
+/// Put `handle` under `sid` unless `sessions` holds another handle there, and
+/// read what its checkpoint writes.
+///
+/// Judged and written under `handle`'s lock with the map lock inside it, the
+/// order an eviction takes them in, so a driver whose session was evicted and
+/// then restored under a second handle never replaces that handle. A vacant
+/// slot takes the handle back: a session evicted while its driver still ran
+/// is alive. `None` when displaced.
+fn install_in<Model, Msg, Parts>(
+    sessions: &RwLock<SessionMap<Model, Msg>>,
+    sid: &str,
+    handle: &SessionHandle<Model, Msg>,
+    read: impl FnOnce(&SessionEntry<Model, Msg>) -> Parts,
+) -> Option<Parts> {
+    let entry = handle.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut map = sessions.write().unwrap_or_else(PoisonError::into_inner);
+    match map.entry(sid.to_owned()) {
+        Entry::Occupied(mut slot) if Arc::ptr_eq(&slot.get().0, handle) => {
+            slot.get_mut().1 = Instant::now();
+        }
+        Entry::Occupied(_) => return None,
+        Entry::Vacant(slot) => {
+            slot.insert((Arc::clone(handle), Instant::now()));
+        }
+    }
+    drop(map);
+    Some(read(&entry))
 }
 
 /// Whether `sessions` holds `handle` under `sid`.
@@ -715,11 +759,9 @@ impl<Model: Send + 'static, Msg: Send + 'static> SessionStore<Model, Msg>
     fn admission(&self) -> &SidAdmission {
         &self.admission
     }
-    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        self.sessions
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid.to_string(), (handle, Instant::now()));
+    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> Installed {
+        install_in(&self.sessions, sid, &handle, |_| ())
+            .map_or(Installed::Displaced, |()| Installed::Held)
     }
     async fn delete(&self, sid: &str) {
         self.sessions
@@ -942,17 +984,17 @@ where
             .and_then(|blob| decode_or_reconstruct_checkpoint(&self.schema_tag, &blob, make_init));
         decoded.map_or(Rejoin::Miss, |d| d.into_rejoin(claim))
     }
-    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let (model, section) = checkpoint_parts(&handle);
-        self.mem_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid.to_string(), (handle, Instant::now()));
+    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> Installed {
+        let Some((model, section)) = install_in(&self.mem_cache, sid, &handle, checkpoint_parts)
+        else {
+            return Installed::Displaced;
+        };
         if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let mut disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
             disk.insert(sid.to_string(), (blob, file_now_secs()));
             self.persist(&disk);
         }
+        Installed::Held
     }
     async fn delete(&self, sid: &str) {
         self.mem_cache
@@ -1260,12 +1302,11 @@ where
             .await;
         decoded.into_rejoin(claim)
     }
-    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let (model, section) = checkpoint_parts(&handle);
-        self.mem_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid.to_string(), (handle, Instant::now()));
+    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> Installed {
+        let Some((model, section)) = install_in(&self.mem_cache, sid, &handle, checkpoint_parts)
+        else {
+            return Installed::Displaced;
+        };
         if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let _ = sqlx::query(
                 "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) VALUES (?, ?, ?, ?) \
@@ -1279,6 +1320,7 @@ where
             .execute(&self.pool)
             .await;
         }
+        Installed::Held
     }
     async fn delete(&self, sid: &str) {
         self.mem_cache
@@ -1450,12 +1492,11 @@ where
             .await;
         decoded.into_rejoin(claim)
     }
-    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let (model, section) = checkpoint_parts(&handle);
-        self.mem_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid.to_string(), (handle, Instant::now()));
+    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> Installed {
+        let Some((model, section)) = install_in(&self.mem_cache, sid, &handle, checkpoint_parts)
+        else {
+            return Installed::Displaced;
+        };
         if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let _ = sqlx::query(
                 "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) \
@@ -1470,6 +1511,7 @@ where
             .execute(&self.pool)
             .await;
         }
+        Installed::Held
     }
     async fn delete(&self, sid: &str) {
         self.mem_cache
@@ -1641,12 +1683,11 @@ where
         let _: Result<(), _> = conn.expire(redis_key(sid), self.ttl_secs as i64).await;
         decoded.into_rejoin(claim)
     }
-    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) {
-        let (model, section) = checkpoint_parts(&handle);
-        self.mem_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid.to_string(), (handle, Instant::now()));
+    async fn set(&self, sid: &str, handle: SessionHandle<Model, Msg>) -> Installed {
+        let Some((model, section)) = install_in(&self.mem_cache, sid, &handle, checkpoint_parts)
+        else {
+            return Installed::Displaced;
+        };
         if let Some(blob) = encode_checkpoint(&self.schema_tag, section.as_deref(), &model) {
             let mut conn = self.conn.clone();
             // HASH per session, one key + one TTL; the tag lives INSIDE the
@@ -1665,6 +1706,7 @@ where
                 .query_async(&mut conn)
                 .await;
         }
+        Installed::Held
     }
     async fn delete(&self, sid: &str) {
         use redis::AsyncCommands;
@@ -1971,6 +2013,7 @@ mod tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }))
     }
 
@@ -2043,11 +2086,101 @@ mod tests {
         assert_eq!(process.used(), Bytes::new(200));
     }
 
+    /// Eviction skips a session with a Cmd holding a unit of its budget or a
+    /// Msg queued for its driver, and takes it once both have drained.
+    #[test]
+    #[allow(clippy::expect_used)] // test: a fresh budget admits one Cmd; an empty queue takes one Msg
+    fn evict_unconnected_skips_a_session_with_work_on_its_way() {
+        let (msg_tx, mut msg_rx) = channel::<()>(1);
+        let busy = handle();
+        busy.lock().unwrap_or_else(PoisonError::into_inner).msg_tx = msg_tx;
+        let permit = busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cmds
+            .try_permit()
+            .expect("a fresh session admits a Cmd");
+        let map: SessionMap<(), ()> =
+            HashMap::from([("busy".to_owned(), (Arc::clone(&busy), Instant::now()))]);
+        let sessions = RwLock::new(map);
+        let everything = Bytes::new(u64::MAX);
+        let _ = evict_unconnected_from(&sessions, everything);
+        assert!(
+            holds_in(&sessions, "busy", &busy),
+            "a Cmd in flight keeps its session"
+        );
+        let queued = busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .msg_tx
+            .clone();
+        queued.try_send(()).expect("the queue has room");
+        drop(permit);
+        let _ = evict_unconnected_from(&sessions, everything);
+        assert!(
+            holds_in(&sessions, "busy", &busy),
+            "a queued Msg keeps its session"
+        );
+        assert!(msg_rx.try_recv().is_ok());
+        let _ = evict_unconnected_from(&sessions, everything);
+        assert!(
+            !holds_in(&sessions, "busy", &busy),
+            "a drained session is evictable"
+        );
+    }
+
+    /// A handle whose sid another handle took never writes over it: its
+    /// checkpoint is refused, and the map and the row keep the installed one.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    #[allow(clippy::expect_used)] // test: the temp store opens
+    async fn sqlite_displaced_handle_never_overwrites_the_installed_one() {
+        let path = crate::scratch_core::test_temp_root()
+            .join(format!("ipetest_displaced_{}.db", std::process::id()));
+        let p = path.to_str().expect("a UTF-8 temp path");
+        let _ = std::fs::remove_file(p);
+        {
+            let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
+                .await
+                .expect("the temp SQLite store opens");
+            let displaced = handle_i32(1);
+            assert_eq!(s.set(SID, Arc::clone(&displaced)).await, Installed::Held);
+            let _ = s.evict_unconnected(Bytes::new(u64::MAX)).await;
+            assert!(!s.holds(SID, &displaced), "the idle session was evicted");
+            let installed = handle_i32(2);
+            assert_eq!(s.set(SID, Arc::clone(&installed)).await, Installed::Held);
+            displaced
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .model = 99;
+            assert_eq!(
+                s.set(SID, Arc::clone(&displaced)).await,
+                Installed::Displaced
+            );
+            assert!(
+                s.holds(SID, &installed),
+                "the installed handle keeps its sid"
+            );
+            assert!(!s.holds(SID, &displaced));
+        }
+        {
+            let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
+                .await
+                .expect("the temp SQLite store reopens");
+            assert_eq!(
+                restored_i32(&s, SID).await,
+                Some(2),
+                "the row holds the installed handle's checkpoint"
+            );
+        }
+        let _ = std::fs::remove_file(p);
+    }
+
     #[tokio::test]
     async fn memory_store_get_set_delete() {
         let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         assert!(s.get("a").await.is_none());
-        s.set("a", handle()).await;
+        assert_eq!(s.set("a", handle()).await, Installed::Held);
         assert!(s.get("a").await.is_some());
         s.delete("a").await;
         assert!(s.get("a").await.is_none());
@@ -2077,6 +2210,7 @@ mod tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
         }))
     }
 
@@ -2303,7 +2437,7 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            s.set(SID, handle_i32(42)).await;
+            assert_eq!(s.set(SID, handle_i32(42)).await, Installed::Held);
             // same-process get is a Web cache hit
             assert!(s.get(SID).await.is_some());
         }
@@ -2335,7 +2469,7 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), [0xAA; 32])
                 .await
                 .unwrap();
-            s.set(SID, handle_i32(42)).await;
+            assert_eq!(s.set(SID, handle_i32(42)).await, Installed::Held);
         }
         {
             // "redeploy with a changed Model": same file, different tag.
@@ -2363,7 +2497,7 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), [0xAA; 32])
                 .await
                 .unwrap();
-            s.set(SID, handle_i32(42)).await;
+            assert_eq!(s.set(SID, handle_i32(42)).await, Installed::Held);
         }
         {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), [0xAA; 32])
@@ -2392,7 +2526,7 @@ mod tests {
                     .await
                     .unwrap();
             s.delete(&sid).await;
-            s.set(&sid, handle_i32(7)).await;
+            assert_eq!(s.set(&sid, handle_i32(7)).await, Installed::Held);
         }
         {
             let s: PostgresStore<i32, ()> =
@@ -2421,7 +2555,7 @@ mod tests {
                 .await
                 .unwrap();
             s.delete(&sid).await;
-            s.set(&sid, handle_i32(9)).await;
+            assert_eq!(s.set(&sid, handle_i32(9)).await, Installed::Held);
         }
         {
             let s: RedisStore<i32, ()> = RedisStore::new(&url, Duration::from_secs(60), [0xBB; 32])
@@ -2457,7 +2591,7 @@ mod tests {
                     .await
                     .unwrap();
             s.delete(&sid).await;
-            s.set(&sid, handle_i32(7)).await;
+            assert_eq!(s.set(&sid, handle_i32(7)).await, Installed::Held);
             assert!(s.get(&sid).await.is_some());
         }
         {
@@ -2487,7 +2621,7 @@ mod tests {
                 .await
                 .unwrap();
             s.delete(&sid).await;
-            s.set(&sid, handle_i32(9)).await;
+            assert_eq!(s.set(&sid, handle_i32(9)).await, Installed::Held);
             assert!(s.get(&sid).await.is_some());
         }
         {
@@ -2509,8 +2643,8 @@ mod tests {
     async fn memory_store_web_sessions_lists_only_locally_cached_handles() {
         let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         assert!(s.web_sessions().await.is_empty());
-        s.set("a", handle()).await;
-        s.set("b", handle()).await;
+        assert_eq!(s.set("a", handle()).await, Installed::Held);
+        assert_eq!(s.set("b", handle()).await, Installed::Held);
         assert_eq!(s.web_sessions().await.len(), 2);
         s.delete("a").await;
         assert_eq!(s.web_sessions().await.len(), 1);
@@ -2540,7 +2674,7 @@ mod tests {
         .execute(&s.pool)
         .await
         .unwrap();
-        s.set("web_sid", handle_i32(42)).await;
+        assert_eq!(s.set("web_sid", handle_i32(42)).await, Installed::Held);
 
         let live = s.web_sessions().await;
         assert_eq!(
@@ -2571,7 +2705,7 @@ mod tests {
             let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
                 .await
                 .unwrap();
-            s.set(SID, handle_i32(model)).await;
+            assert_eq!(s.set(SID, handle_i32(model)).await, Installed::Held);
             // Read the raw column back and assert the format identity.
             let row: (String,) = sqlx::query_as("SELECT blob FROM ipe_sessions WHERE sid = ?")
                 .bind(SID)
@@ -2650,7 +2784,7 @@ mod tests {
                     .unwrap();
             s.delete(&sid).await;
             s.delete(&old_sid).await;
-            s.set(&sid, handle_i32(7)).await;
+            assert_eq!(s.set(&sid, handle_i32(7)).await, Installed::Held);
             sqlx::query(
                 "INSERT INTO ipe_sessions (sid, blob, last_seen, schema_tag) \
                  VALUES ($1, $2, $3, $4)",
@@ -2695,7 +2829,7 @@ mod tests {
                 .unwrap();
             s.delete(&sid).await;
             s.delete(&old_sid).await;
-            s.set(&sid, handle_i32(9)).await;
+            assert_eq!(s.set(&sid, handle_i32(9)).await, Installed::Held);
             // Garbage row: non-base64 text in the blob field.
             let mut conn = s.conn.clone();
             let _: () = redis::cmd("HSET")
@@ -2748,7 +2882,7 @@ mod tests {
         .execute(&s.pool)
         .await
         .unwrap();
-        s.set(&web_sid, handle_i32(42)).await;
+        assert_eq!(s.set(&web_sid, handle_i32(42)).await, Installed::Held);
         assert_eq!(s.web_sessions().await.len(), 1);
         s.delete(&cold_sid).await;
         s.delete(&web_sid).await;
@@ -2779,7 +2913,7 @@ mod tests {
             .query_async(&mut conn)
             .await
             .unwrap();
-        s.set(&web_sid, handle_i32(42)).await;
+        assert_eq!(s.set(&web_sid, handle_i32(42)).await, Installed::Held);
         assert_eq!(s.web_sessions().await.len(), 1);
         s.delete(&cold_sid).await;
         s.delete(&web_sid).await;
@@ -2811,7 +2945,7 @@ mod tests {
             return;
         };
         let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
-        s.set("s1", handle_i32(7)).await;
+        assert_eq!(s.set("s1", handle_i32(7)).await, Installed::Held);
         assert_eq!(
             std::fs::read_to_string(&victim).ok().as_deref(),
             Some("keep")
@@ -2845,9 +2979,12 @@ mod tests {
             .filter_map(|pair| u8::from_str_radix(pair, 16).ok())
             .collect();
         assert_eq!(raw.len(), 16, "{token}");
-        FileStore::<i32, ()>::new(p, Duration::from_secs(60), TEST_TAG)
-            .set(sid, handle.clone())
-            .await;
+        assert_eq!(
+            FileStore::<i32, ()>::new(p, Duration::from_secs(60), TEST_TAG)
+                .set(sid, handle.clone())
+                .await,
+            Installed::Held
+        );
 
         let file = std::fs::read_to_string(p).unwrap_or_default();
         let blobs: HashMap<String, (String, i64)> = serde_json::from_str(&file).unwrap_or_default();
@@ -2905,7 +3042,7 @@ mod tests {
             return;
         };
         let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
-        s.set("s1", handle_i32(7)).await;
+        assert_eq!(s.set("s1", handle_i32(7)).await, Installed::Held);
         s.delete("s1").await;
         assert_eq!(
             entries(&dir),
@@ -2919,8 +3056,8 @@ mod tests {
             return;
         };
         let s: FileStore<i32, ()> = FileStore::new(bp, Duration::from_secs(60), TEST_TAG);
-        s.set("s1", handle_i32(7)).await;
-        s.set("s2", handle_i32(8)).await;
+        assert_eq!(s.set("s1", handle_i32(7)).await, Installed::Held);
+        assert_eq!(s.set("s2", handle_i32(8)).await, Installed::Held);
         assert!(
             s.persist_failing.load(std::sync::atomic::Ordering::Relaxed),
             "the failure is recorded"
@@ -3022,7 +3159,7 @@ mod tests {
         // mutation's rename fails and the streak flag is set.
         assert!(std::fs::create_dir_all(map.join("x")).is_ok(), "block");
         let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
-        s.set("s1", handle_i32(1)).await;
+        assert_eq!(s.set("s1", handle_i32(1)).await, Installed::Held);
         assert!(
             s.persist_failing.load(std::sync::atomic::Ordering::Relaxed),
             "failure recorded"
@@ -3030,7 +3167,7 @@ mod tests {
 
         // Unblock: the rename can now land, so the next mutation succeeds.
         assert!(std::fs::remove_dir_all(&map).is_ok(), "unblock");
-        s.set("s2", handle_i32(2)).await;
+        assert_eq!(s.set("s2", handle_i32(2)).await, Installed::Held);
         assert!(
             !s.persist_failing.load(std::sync::atomic::Ordering::Relaxed),
             "streak cleared on the next success"
@@ -3051,7 +3188,7 @@ mod tests {
         let _ = std::fs::remove_file(p);
         {
             let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
-            s.set(SID, handle_i32(42)).await;
+            assert_eq!(s.set(SID, handle_i32(42)).await, Installed::Held);
             assert!(s.get(SID).await.is_some());
         }
         {
@@ -3078,7 +3215,7 @@ mod tests {
         let _ = std::fs::remove_file(p);
         {
             let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), [0xAA; 32]);
-            s.set(SID, handle_i32(42)).await;
+            assert_eq!(s.set(SID, handle_i32(42)).await, Installed::Held);
         }
         {
             // "rebuild with a changed Model": same file, different tag.
@@ -3112,8 +3249,8 @@ mod tests {
     #[tokio::test]
     async fn memory_store_ttl_eviction_and_touch() {
         let s: MemoryStore<(), ()> = MemoryStore::new(Duration::from_millis(40));
-        s.set("idle", handle()).await;
-        s.set("active", handle()).await;
+        assert_eq!(s.set("idle", handle()).await, Installed::Held);
+        assert_eq!(s.set("active", handle()).await, Installed::Held);
         std::thread::sleep(Duration::from_millis(60));
         // touch "active" so it survives the sweep
         let _ = s.get("active").await;
@@ -3401,7 +3538,7 @@ mod tests {
         let p = path.to_string_lossy().into_owned();
         let _ = std::fs::remove_file(&p);
         let s: FileStore<i32, ()> = FileStore::new(&p, Duration::from_secs(60), TEST_TAG);
-        s.set(SID, handle_i32(42)).await;
+        assert_eq!(s.set(SID, handle_i32(42)).await, Installed::Held);
         let meta = std::fs::metadata(&p);
         assert!(
             meta.is_ok(),
@@ -3510,6 +3647,7 @@ mod tests {
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
             charge: crate::web::budget::Charge::detached(),
+            cmds: Arc::new(crate::web::budget::SessionCmds::new()),
             model,
             rendered: crate::web::Rendered::first(crate::web::SessionKeys::distinct(), tree),
             tabs: crate::web::TabSeqs::default(),
@@ -3537,14 +3675,17 @@ mod tests {
         {
             // OLD binary: persist a two-field checkpoint under OLD_TAG.
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
-            s.set(
-                SID,
-                handle_model(OldModel {
-                    count: 7,
-                    name: "alice".to_string(),
-                }),
-            )
-            .await;
+            assert_eq!(
+                s.set(
+                    SID,
+                    handle_model(OldModel {
+                        count: 7,
+                        name: "alice".to_string(),
+                    }),
+                )
+                .await,
+                Installed::Held
+            );
         }
         {
             // NEW binary: three-field Model, NEW_TAG; `get_reconstructing` splices it.
@@ -3599,14 +3740,17 @@ mod tests {
         let _ = std::fs::remove_file(p);
         {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
-            s.set(
-                SID,
-                handle_model(OldModel {
-                    count: 7,
-                    name: "alice".to_string(),
-                }),
-            )
-            .await;
+            assert_eq!(
+                s.set(
+                    SID,
+                    handle_model(OldModel {
+                        count: 7,
+                        name: "alice".to_string(),
+                    }),
+                )
+                .await,
+                Installed::Held
+            );
         }
         {
             let s: FileStore<RetypedModel, ()> =
@@ -3639,14 +3783,17 @@ mod tests {
         let _ = std::fs::remove_file(p);
         {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
-            s.set(
-                SID,
-                handle_model(OldModel {
-                    count: 7,
-                    name: "alice".to_string(),
-                }),
-            )
-            .await;
+            assert_eq!(
+                s.set(
+                    SID,
+                    handle_model(OldModel {
+                        count: 7,
+                        name: "alice".to_string(),
+                    }),
+                )
+                .await,
+                Installed::Held
+            );
         }
         {
             let s: FileStore<RemovedModel, ()> =
@@ -3672,14 +3819,17 @@ mod tests {
         let _ = std::fs::remove_file(p);
         {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
-            s.set(
-                SID,
-                handle_model(OldModel {
-                    count: 7,
-                    name: "alice".to_string(),
-                }),
-            )
-            .await;
+            assert_eq!(
+                s.set(
+                    SID,
+                    handle_model(OldModel {
+                        count: 7,
+                        name: "alice".to_string(),
+                    }),
+                )
+                .await,
+                Installed::Held
+            );
         }
         {
             let s: FileStore<OldModel, ()> = FileStore::new(p, Duration::from_secs(60), OLD_TAG);
@@ -3760,14 +3910,17 @@ mod tests {
                 SqliteStore::new(p, Duration::from_secs(60), OLD_TAG)
                     .await
                     .unwrap();
-            s.set(
-                SID,
-                handle_model(OldModel {
-                    count: 7,
-                    name: "alice".to_string(),
-                }),
-            )
-            .await;
+            assert_eq!(
+                s.set(
+                    SID,
+                    handle_model(OldModel {
+                        count: 7,
+                        name: "alice".to_string(),
+                    }),
+                )
+                .await,
+                Installed::Held
+            );
         }
         {
             let s: SqliteStore<NewModel, ()> =
@@ -3840,7 +3993,7 @@ mod tests {
             matches!(reconstruct(&s, SID, &init).await, Rejoin::Miss),
             "a memory-store miss has nothing to reconstruct from"
         );
-        s.set(SID, handle()).await;
+        assert_eq!(s.set(SID, handle()).await, Installed::Held);
         assert!(
             matches!(reconstruct(&s, SID, &init).await, Rejoin::Live(_)),
             "a live memory handle is returned unchanged, never rebuilt"
@@ -3878,7 +4031,7 @@ mod tests {
             .expect("an idle sid is claimed at once");
         let mut second = s.claim(key(1));
         assert!(waits(&mut second), "a held sid's second claim waits");
-        s.set(first.key().as_str(), handle()).await;
+        assert_eq!(s.set(first.key().as_str(), handle()).await, Installed::Held);
         drop(first);
         let second = second.await.expect("a released claim passes to its waiter");
         let init = || ((), IpeCmd::<()>::None);
@@ -4062,7 +4215,7 @@ mod tests {
     async fn foreign_claim_is_miss() {
         let owner: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
         let other: MemoryStore<(), ()> = MemoryStore::new(Duration::from_secs(60));
-        owner.set(SID, handle()).await;
+        assert_eq!(owner.set(SID, handle()).await, Installed::Held);
         let foreign = other
             .claim(key_of(SID))
             .await
@@ -4089,7 +4242,7 @@ mod tests {
         let _ = std::fs::remove_file(p);
         let s: FileStore<i32, ()> = FileStore::new(p, Duration::from_secs(60), TEST_TAG);
         let other: MemoryStore<i32, ()> = MemoryStore::new(Duration::from_secs(60));
-        s.set(SID, handle_i32(7)).await;
+        assert_eq!(s.set(SID, handle_i32(7)).await, Installed::Held);
         let init = || (0, IpeCmd::<()>::None);
         let foreign = other
             .claim(key_of(SID))
@@ -4153,7 +4306,7 @@ mod tests {
     async fn assert_rejoins_live(s: &impl SessionStore<i32, ()>) {
         let other: MemoryStore<i32, ()> = MemoryStore::new(Duration::from_secs(60));
         let init = || (0, IpeCmd::<()>::None);
-        s.set(SID, handle_i32(7)).await;
+        assert_eq!(s.set(SID, handle_i32(7)).await, Installed::Held);
         let foreign = other
             .claim(key_of(SID))
             .await

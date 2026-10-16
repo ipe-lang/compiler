@@ -27,6 +27,8 @@ use crate::text;
 
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixture;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod golden;
 mod tree;
 
 pub use tree::{DEFAULT_NAME, ScratchRoot, SourceTree, TreeRefusal};

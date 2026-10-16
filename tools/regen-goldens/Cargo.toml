@@ -10,7 +10,7 @@ name = "regen-goldens"
 path = "src/main.rs"
 
 [dependencies]
-ipe = { path = "../../src/ipe-cli" }
+ipe = { path = "../../src/ipe-cli", features = ["test-fixtures"] }
 ipe_docs = { path = "../../src/ipe-docs" }
 e2e-support = { path = "../e2e-support" }
 

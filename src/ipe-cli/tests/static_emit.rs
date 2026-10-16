@@ -40,35 +40,6 @@ const fn dlmalloc_plan() -> StaticPlan {
     }
 }
 
-/// The binary cargo produces for an emitted crate, located under a target-
-/// profile dir. Cargo names it after the crate's `[package] name`, which carries
-/// a per-project identity hash (`ipe-app_<hash>`), so the artifact is NOT plain
-/// `ipe-app`; resolve the name from the manifest cargo built from rather than
-/// assume it. Falls back to `ipe-app` when the manifest is unreadable.
-fn emitted_bin_name(crate_dir: &Path) -> String {
-    let Ok(text) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) else {
-        return "ipe-app".to_owned();
-    };
-    let mut in_package = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix('[') {
-            in_package = rest.starts_with("package]");
-            continue;
-        }
-        if in_package
-            && let Some(rest) = trimmed.strip_prefix("name")
-            && let Some(rest) = rest.trim_start().strip_prefix('=')
-        {
-            let value = rest.trim().trim_matches('"');
-            if !value.is_empty() {
-                return value.to_owned();
-            }
-        }
-    }
-    "ipe-app".to_owned()
-}
-
 fn default_line(manifest: &str) -> String {
     manifest
         .lines()
@@ -610,7 +581,7 @@ fn end_to_end_static_binary_is_static_and_runs() {
     let bin = target_dir
         .join(plan.triple.as_str())
         .join("debug")
-        .join(emitted_bin_name(&out));
+        .join(ipe::emitted_bin_filename(&out).expect("the emitted manifest names its crate"));
 
     // Assert static-ness — never assume it. `ldd` exits non-zero for a
     // static binary on some platforms; the message is the contract.
@@ -686,7 +657,10 @@ fn ipe_run_static_builds_and_executes_a_static_binary() {
     let bin = target_dir
         .join("x86_64-unknown-linux-musl")
         .join("debug")
-        .join(emitted_bin_name(&out.join("rust")));
+        .join(
+            ipe::emitted_bin_filename(&out.join("rust"))
+                .expect("the emitted manifest names its crate"),
+        );
     let ldd = std::process::Command::new("ldd")
         .arg(&bin)
         .output()

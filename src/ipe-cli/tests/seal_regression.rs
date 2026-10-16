@@ -666,3 +666,78 @@ fn int_min_literal_builds() {
          4\n",
     );
 }
+
+/// Render `render(lo, hi)` until the parenthesised expression it returns sits
+/// at byte offsets `lo..hi` of the source, and return that source.
+///
+/// The program spells a name from the operator's own offsets, so the offsets
+/// are computed from the rendered text rather than written by hand.
+fn converge_compose_source(render: impl Fn(usize, usize) -> (String, String)) -> String {
+    let (mut lo, mut hi) = (0_usize, 0_usize);
+    let mut last = String::new();
+    for _ in 0..8 {
+        let (source, expr) = render(lo, hi);
+        let found = source.find(&format!("({expr})"));
+        assert!(
+            found.is_some(),
+            "expression `{expr}` not found in:\n{source}"
+        );
+        let Some(at) = found else {
+            return source;
+        };
+        let next = (at + 1, at + 1 + expr.len());
+        if next == (lo, hi) {
+            return source;
+        }
+        (lo, hi) = next;
+        last = source;
+    }
+    assert!(
+        false_marker(),
+        "compose site offsets did not converge within 8 rounds:\n{last}"
+    );
+    last
+}
+
+/// The compose program whose operand is a parameter spelled like the
+/// operator's desugared binder, with `expr` built from that spelling.
+fn compose_capture_source(expr: impl Fn(&str) -> String) -> String {
+    converge_compose_source(|lo, hi| {
+        let name = format!("compose_{lo}_{hi}");
+        let expr = expr(&name);
+        let source = format!(
+            "{HEAD}import Ipe.Io as Io\n\
+             import Ipe.String\n\
+             show : Int -> String\n\
+             show n = String.fromInt n\n\n\
+             apply : (Int -> Int) -> String\n\
+             apply {name} = ({expr}) 41\n\n\
+             main = Io.println (apply (\\n -> n + 1))\n"
+        );
+        (source, expr)
+    })
+}
+
+#[test]
+fn compose_right_operand_named_like_its_param_compiles_and_runs() {
+    let src = compose_capture_source(|name| format!("{name} >> show"));
+    assert_accepted("compose_right_operand_capture", &src, "42\n");
+}
+
+#[test]
+fn compose_left_operand_named_like_its_param_compiles_and_runs() {
+    let src = compose_capture_source(|name| format!("show << {name}"));
+    assert_accepted("compose_left_operand_capture", &src, "42\n");
+}
+
+#[test]
+fn accessor_applied_to_a_local_named_like_its_param_compiles() {
+    let src = format!(
+        "{HEAD}import Ipe.Io as Io\n\
+         import Ipe.String\n\
+         main =\n    \
+         let\n        ipe_accessor_arg = {{ x = 7 }}\n    in\n    \
+         Io.println (String.fromInt (.x ipe_accessor_arg))\n"
+    );
+    assert_accepted("accessor_param_named_local", &src, "7\n");
+}
