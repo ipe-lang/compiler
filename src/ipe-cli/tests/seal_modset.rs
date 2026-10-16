@@ -510,8 +510,8 @@ fn web_http_client_vendored_builds() {
 /// Minimal `Jwt.encodeHs256` program — no server/web surface, so no `server`/
 /// `web` feature to carry `uuid` transitively.
 ///
-/// `auth.rs` is compiled under `#[cfg(feature = "jwt")]` and calls
-/// `uuid::Uuid::new_v4()` to mint per-session `jti` ids in `auth_sign_token`.
+/// `auth.rs` is compiled under `#[cfg(feature = "jwt")]` and builds
+/// per-session `jti` ids with `uuid::Builder` in `auth_sign_token`.
 /// The `uuid` dep is optional in the runtime crate; without `"uuid"` in the
 /// emitted feature set the call fails with E0433 (`uuid` not in scope) despite
 /// `ipe` exit 0 — the SEAL breach class this test gates in BOTH emit models.
@@ -524,7 +524,7 @@ const JWT_SIGN: &str = "module Main exposing (main)\n\
             Ok _ -> Io.println \"ok\"\n";
 
 /// Under the dep-model a JWT-only program must emit a feature set that includes
-/// `uuid` (because `auth.rs` calls `uuid::Uuid::new_v4()` under the `jwt`
+/// `uuid` (because `auth.rs` names `uuid::Builder` under the `jwt`
 /// feature). Without it the emitted crate fails with E0433 at `cargo build`
 /// despite `ipe` exit 0.
 #[test]
@@ -534,13 +534,13 @@ fn jwt_sign_dep_model_builds() {
     }
     emit_and_build("jwt_sign_dep_model", JWT_SIGN).expect(
         "JWT program must cargo-build in the dep model \
-         (uuid feature must be selected — auth.rs calls uuid::Uuid::new_v4)",
+         (uuid feature must be selected — auth.rs builds ids with uuid::Builder)",
     );
 }
 
 /// Under the vendored emit model the same JWT-only program must cargo-build.
 /// `auth.rs` is compiled when the `jwt` feature is in `default = [...]`; it
-/// calls `uuid::Uuid::new_v4()`, so the `uuid` dep must be enabled. In the
+/// names `uuid::Builder`, so the `uuid` dep must be enabled. In the
 /// vendored template `uuid` is already a non-optional dep, so this test
 /// primarily validates that the `jwt` feature is in `default` (which
 /// `jwt_cargo_toml` handles) and that the dep is in scope for `auth.rs`.

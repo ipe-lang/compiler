@@ -215,17 +215,28 @@ pub(crate) struct IngestToken(String);
 const MINTED_TOKEN_BYTES: usize = 32;
 
 impl IngestToken {
-    /// A fresh token from the OS CSPRNG (`getrandom`). `None` when the entropy
-    /// source is unavailable; the caller refuses rather than run token-less.
-    pub(crate) fn mint() -> Option<Self> {
+    /// A fresh token from the runtime's OS random source.
+    ///
+    /// # Errors
+    ///
+    /// [`EntropyError`](crate::entropy::EntropyError) when the source is
+    /// unavailable; the caller refuses rather than run token-less.
+    pub(crate) fn mint() -> Result<Self, crate::entropy::EntropyError> {
+        Self::mint_with(crate::entropy::fill_entropy)
+    }
+
+    /// A token from the bytes `fill` draws.
+    fn mint_with(
+        fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
+    ) -> Result<Self, crate::entropy::EntropyError> {
         let mut buf = [0u8; MINTED_TOKEN_BYTES];
-        getrandom::getrandom(&mut buf).ok()?;
+        fill(&mut buf)?;
         let mut hex = String::with_capacity(MINTED_TOKEN_BYTES * 2);
         for byte in buf {
             hex.push(hex_digit(byte >> 4));
             hex.push(hex_digit(byte & 0x0f));
         }
-        Some(Self(hex))
+        Ok(Self(hex))
     }
 
     /// The operator-configured `IPE_INGEST_TOKEN`; `None` when unset or empty.
@@ -795,6 +806,15 @@ mod tests {
     use std::sync::Arc;
     #[cfg(feature = "web")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A host without entropy mints no ingest token.
+    #[test]
+    fn mint_refuses_without_entropy() {
+        let refused = IngestToken::mint_with(|_| Err(crate::entropy::EntropyError));
+        assert!(refused.is_err(), "a refused draw mints no token");
+        let minted = IngestToken::mint_with(|_| Ok(()));
+        assert!(minted.is_ok_and(|t| t.expose() == "0".repeat(64)));
+    }
 
     #[test]
     fn offer_without_enable_is_noop() {

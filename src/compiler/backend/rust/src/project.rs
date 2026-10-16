@@ -173,7 +173,7 @@ serde_urlencoded = "0.7"
 regex = "1"
 unicode-general-category = "1"
 base64 = "0.22"
-uuid = { version = "1", features = ["v4", "v7", "js"] }
+uuid = { version = "1" }
 hex = "0.4"
 percent-encoding = "2"
 # The wasm module set declares `url.rs` unconditionally (`pub mod url;` in
@@ -303,6 +303,7 @@ pub mod stringify;
 pub mod system;
 pub mod telemetry;
 pub mod csp;
+pub mod entropy;
 pub mod time;
 pub mod url;
 pub mod uuid_kernel;
@@ -932,10 +933,11 @@ const RUNTIME_MOD_RS_REGEX_APPEND: &str = "pub mod regex_kernel;\npub use regex_
 // ── Ipe.Uuid — v4 / v7 / parse ──────────────────────────────────────────────
 
 /// Lines appended to `ipe_runtime/mod.rs` when the program reaches the `uuid`
-/// crate — an `Ipe.Uuid` kernel, OR the `server` / `web` surfaces whose runtime
-/// modules mint session/CSRF ids via `uuid::new_v4`, OR the `jwt` / `auth` surface
-/// whose `auth.rs` calls `uuid::Uuid::new_v4()` to mint per-session `jti` ids
-/// ([`EmitCtx::reaches_uuid`]).
+/// crate — an `Ipe.Uuid` kernel, OR the `jwt` / `auth` surface whose `auth.rs`
+/// builds per-session `jti` ids with `uuid::Builder`, OR the `server` / `web`
+/// surfaces, which still imply the `uuid` feature though no module of theirs
+/// names the crate ([`EmitCtx::reaches_uuid`]). Every id draws its random bytes
+/// through `entropy::fill_entropy`.
 ///
 /// `uuid_kernel.rs` exposes the `Ipe.Uuid` kernels. Declared only on demand —
 /// behind the `uuid` runtime feature, which [`runtime_features`] selects under the

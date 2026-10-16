@@ -1,5 +1,6 @@
-use crate::csp::{EntropyError, STYLE_NONCE_BYTES, StyleNonce};
+use crate::csp::{STYLE_NONCE_BYTES, StyleNonce};
 use crate::dom::diff::{Patch, diff};
+use crate::entropy::{EntropyError, fill_entropy};
 use crate::html::{Attribute, Event, FormData, Html, RenderCtx, StampedHtml, render_stamped};
 use crate::retained::{Bytes, RetainedBytes, hash_table};
 use std::collections::{HashMap, VecDeque};
@@ -166,7 +167,7 @@ impl SessionKeys {
     /// Returns [`EntropyError`] when the OS yields no entropy; the caller
     /// refuses the session and never falls back to a fixed value.
     pub fn mint() -> Result<Self, EntropyError> {
-        Self::mint_with(|buf| getrandom::getrandom(buf).map_err(|_| EntropyError))
+        Self::mint_with(|buf| fill_entropy(buf))
     }
 
     /// Keys from two draws of `fill`: the incarnation first, then the nonce.
