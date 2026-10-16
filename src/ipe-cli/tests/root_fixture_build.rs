@@ -5,7 +5,12 @@ use std::path::PathBuf;
 use ipe::project_root::SourceTree;
 use ipe::{CliError, RootFixture, build_fixture};
 
-const MAIN: &str = "module Main exposing (main)\n\nmain =\n    1\n";
+const MAIN: &str =
+    "module Main exposing (main)\n\nimport Ipe.Io\n\nmain =\n    Io.println \"ok\"\n";
+
+const MULTI_MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io\nimport Lib\n\nmain =\n    Io.println Lib.greeting\n";
+
+const LIB: &str = "module Lib exposing (greeting)\n\ngreeting : String\ngreeting =\n    \"ok\"\n";
 
 fn out_dir(tag: &str) -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("root_fixture_{tag}"));
@@ -26,9 +31,7 @@ fn a_fixture_builds_under_the_default_package_name() {
 
 #[test]
 fn a_multi_module_fixture_builds_through_its_manifest() {
-    let tree =
-        SourceTree::main("module Main exposing (main)\n\nimport Lib\n\nmain =\n    Lib.one\n")
-            .module("Lib", "module Lib exposing (one)\n\none =\n    1\n");
+    let tree = SourceTree::main(MULTI_MAIN).module("Lib", LIB);
     let fixture = RootFixture::from_tree(&tree).expect("a two-module project resolves");
     let out = out_dir("multi");
     let runtime = e2e_support::require_runtime().into_path_buf();
