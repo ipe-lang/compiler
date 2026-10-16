@@ -3197,7 +3197,9 @@ fn pat_binds_any(pat: &Pat, params: &BTreeSet<Symbol>) -> bool {
 /// generic.
 fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
     match ty {
-        IrType::Generic(g) => *g == tv,
+        // A row generic is a variable occurrence like `Generic`: it mentions
+        // exactly its own row variable.
+        IrType::Generic(g) | IrType::RowGeneric(g) => *g == tv,
         IrType::Task(inner)
         | IrType::Maybe(inner)
         | IrType::List(inner)
@@ -3300,9 +3302,6 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
         | IrType::TuiApp
         | IrType::CliApp
         | IrType::WorkerApp => false,
-        // A row generic is a variable occurrence like `Generic`: it mentions
-        // exactly its own row variable.
-        IrType::RowGeneric(g) => *g == tv,
     }
 }
 
@@ -3487,8 +3486,10 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
 /// already draw).
 fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
     match ty {
-        // A bare occurrence of the tracked tvar is the reach itself.
-        IrType::Generic(g) => *g == tv,
+        // A bare occurrence of the tracked tvar is the reach itself; a row
+        // generic is the caller's record held by value, so its own row
+        // variable reaches it bare.
+        IrType::Generic(g) | IrType::RowGeneric(g) => *g == tv,
         // Transparent value-containers: a bare element under them is reachable.
         IrType::List(inner) | IrType::Maybe(inner) | IrType::Set(inner) => {
             ir_type_generic_reaches_bare(inner, tv)
@@ -3584,9 +3585,6 @@ fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
         | IrType::TuiApp
         | IrType::CliApp
         | IrType::WorkerApp => false,
-        // A row generic stands for the caller's record value itself, held by
-        // value: its own row variable reaches it bare.
-        IrType::RowGeneric(g) => *g == tv,
     }
 }
 
