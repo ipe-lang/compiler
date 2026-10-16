@@ -877,7 +877,8 @@ pub const MACOS_READ_ROOTS: [&str; 11] = [
 ///
 /// # Errors
 /// [`crate::JailPathError::ExposesCargoHome`] when a [`MACOS_READ_ROOTS`] entry
-/// equals or contains the cargo home; any error of [`TreeBind::granted_by`].
+/// equals or contains the cargo home; any error of [`TreeBind::granted_by`] or
+/// [`TreeBind::recheck`].
 #[cfg(any(target_os = "macos", test))]
 pub fn checked_sbpl(
     profile: &SandboxProfile,
@@ -885,6 +886,7 @@ pub fn checked_sbpl(
 ) -> Result<String, crate::JailPathError> {
     mounts.refuse_fixed_exposing(&MACOS_READ_ROOTS)?;
     let tree = TreeBind::granted_by(&profile.filesystem, mounts)?;
+    tree.recheck()?;
     Ok(sbpl_for(
         profile,
         mounts.scoped_tmp().as_path(),
@@ -1646,7 +1648,9 @@ mod freebsd_jail {
         // file permissions. Absent the mount root the untrusted build is never run —
         // fail-closed. Every planned path is a `SafeMountPath` (absolute, no
         // `..`/`.`), so it re-roots inside the jail root and nowhere else.
-        let tree = match TreeBind::granted_by(&profile.filesystem, mounts) {
+        let tree = match TreeBind::granted_by(&profile.filesystem, mounts)
+            .and_then(|tree| tree.recheck().map(|()| tree))
+        {
             Ok(tree) => tree,
             Err(e) => {
                 return JailOutcome::Unavailable {
