@@ -322,7 +322,7 @@ impl Walk {
                     if kind != FileKind::Regular {
                         return Err(io_bounded::source_refused(
                             &path,
-                            &SourceRefusal::NotRegularFile,
+                            SourceRefusal::NotRegularFile,
                         ));
                     }
                     if self.sources.contains_key(&module) {
@@ -560,7 +560,7 @@ mod tests {
     fn module_source(name: &str, imports: &[&str]) -> String {
         let imports: String = imports
             .iter()
-            .map(|import| format!("import {import}\n"))
+            .map(|import| ["import ", import, "\n"].concat())
             .collect();
         format!("module {name} exposing (x)\n\n{imports}\nx =\n    1\n")
     }
