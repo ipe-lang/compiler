@@ -13830,6 +13830,20 @@ mod emitted_router_behavior_tests {
         resp.into_body().into_data_stream()
     }
 
+    /// Whether the store drops session `sid` within 10 s.
+    ///
+    /// A close flips the closer, which ends the stream, before the store
+    /// delete runs, so the end of the stream does not order the delete.
+    async fn session_dropped(store: &Arc<Store>, sid: &str) -> bool {
+        for _ in 0..1000 {
+            if store.get(sid).await.is_none() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     /// The SSE text read until `stop` holds of it, the stream ends, or 10 s
     /// pass, and whether the stream ended.
     async fn read_sse(
@@ -13903,7 +13917,7 @@ mod emitted_router_behavior_tests {
                 "the last frame names the close:\n{text}"
             );
             assert_eq!(text.matches("event: closed").count(), 1, "{text}");
-            assert!(store.get(&sid).await.is_none(), "the session is gone");
+            assert!(session_dropped(&store, &sid).await, "the session is gone");
             drop(filler);
         });
     }
@@ -13936,7 +13950,7 @@ mod emitted_router_behavior_tests {
                 "the last frame names the close:\n{text}"
             );
             assert_eq!(text.matches("event: closed").count(), 1, "{text}");
-            assert!(store.get(&sid).await.is_none(), "the session is gone");
+            assert!(session_dropped(&store, &sid).await, "the session is gone");
         });
     }
 
