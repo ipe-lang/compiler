@@ -1151,6 +1151,7 @@ function __ipeCollectPendingBatch() {
 // best-effort fallback only when CSRF is disabled (empty token) or
 // keepalive is unsupported.
 function __ipeFlushPendingBeacon() {
+  if (__ipeEnded) return;
   var batch = __ipeCollectPendingBatch();
   var snapshot = __ipeInputsSnapshot();
   if (!batch && !snapshot) return;
@@ -1234,6 +1235,7 @@ window.addEventListener("pagehide", __ipeFlushPendingBeacon);
 //     dirty input so the server's diff can align against reality
 //     before emitting patches.
 function __ipeSend(msgName, args, handlerId, opts) {
+  if (__ipeEnded) return;
   opts = opts || {};
   if (!opts.noLoader) __ipeLoaderStart();
   __ipeClientSeq++;
@@ -1842,6 +1844,7 @@ window.__ipe_send = function(id, value, opts) {
 // there is no retry queue here. `raw` is already a JSON string, so it is
 // wrapped in a small envelope {payload: raw} the server parses.
 window.__ipePortSend = function(raw) {
+  if (__ipeEnded) return;
   if (typeof raw !== "string") return;
   var headers = {"Content-Type":"application/json"};
   if (__ipeCsrfToken) headers["X-Ipe-Csrf"] = __ipeCsrfToken;
@@ -1938,8 +1941,10 @@ function __ipeLoadNav(intent, url) {
 }
 // Reload the document where the reader is going: the target of the pending
 // navigation, otherwise the location. The reload is the newest navigation, so
-// no answer to an earlier one loads anything after it.
+// no answer to an earlier one loads anything after it. An ended session
+// reloads nothing, so its notice stays on screen.
 function __ipeReloadDocument() {
+  if (__ipeEnded) return;
   var wanted = __ipeNavWanted;
   __ipeNavIntent += 1;
   __ipeNavWanted = null;
@@ -2198,6 +2203,7 @@ function __ipeEndSession(tag) {
     __ipeBuildOkTimer = null;
   }
   __ipeEventQueue.length = 0;
+  __ipeLoaderEnd();
   __ipeStatus = "offline";
   var notice = __ipeClosedNotice(tag);
   function show() {

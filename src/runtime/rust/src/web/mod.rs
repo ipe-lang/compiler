@@ -8538,9 +8538,10 @@ mod base_path_tests {
     /// the client's own text.
     ///
     /// The frame's tag only picks a fixed notice, written through
-    /// `textContent`; every path that would reopen the stream, post or retry
-    /// an event, probe the session or reload the page returns at once on an
-    /// ended session, and a follower tab is relayed the frame.
+    /// `textContent`; every path that would reopen the stream, send, post,
+    /// beacon or retry an event, send a port message, probe the session or
+    /// reload the page returns at once on an ended session, and a follower tab
+    /// is relayed the frame.
     #[test]
     fn client_ends_a_closed_session_with_its_own_notice() {
         let js = super::CLIENT_JS;
@@ -8558,8 +8559,10 @@ mod base_path_tests {
             "the notice is the client's text, set as text"
         );
         assert!(
-            end.contains("__ipeCloseSSE();") && end.contains("__ipeEventQueue.length = 0;"),
-            "an ended session drops its stream and its queued events"
+            end.contains("__ipeCloseSSE();")
+                && end.contains("__ipeEventQueue.length = 0;")
+                && end.contains("__ipeLoaderEnd();"),
+            "an ended session drops its stream, its queued events and its loader"
         );
         let notice = body_of("__ipeClosedNotice").unwrap_or_default();
         assert!(
@@ -8578,6 +8581,9 @@ mod base_path_tests {
             "__ipeScheduleRetry",
             "__ipeDrainQueue",
             "__ipeWatchdog",
+            "__ipeSend",
+            "__ipeFlushPendingBeacon",
+            "__ipeReloadDocument",
         ] {
             let body = body_of(guarded).unwrap_or_default();
             assert!(
@@ -8591,6 +8597,78 @@ mod base_path_tests {
                 .contains("  if (__ipeEnded || __ipeProbedReload) return;\n"),
             "an ended session never probes for a reload"
         );
+        assert!(
+            js.contains("window.__ipePortSend = function(raw) {\n  if (__ipeEnded) return;\n"),
+            "an ended session sends no port message"
+        );
+        // Every network or page-load sink sits in a definition that returns
+        // first on an ended session, or in a navigation the reader starts; a
+        // new sink anywhere else is refused here.
+        let guarded_heads = [
+            "function __ipeFlushPendingBeacon(",
+            "function __ipePostEvent(",
+            "window.__ipePortSend = function(",
+            "function __ipeReloadDocument(",
+            "function __ipeOpenSSE(",
+            "function __ipeProbeSessionLost(",
+        ];
+        let reader_heads = [
+            "function __ipeLoad(",
+            "__ipeDoc.on(\"click\", function(",
+            "window.addEventListener(\"popstate\", function(",
+        ];
+        let sinks = [
+            "fetch(",
+            "sendBeacon(",
+            "new EventSource(",
+            "location.reload(",
+            "location.assign(",
+            "location.replace(",
+            "location.href =",
+            "new WebSocket(",
+            "XMLHttpRequest",
+        ];
+        let mut head = "";
+        let mut kinds = std::collections::BTreeSet::new();
+        for line in js.lines() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if !line.starts_with([' ', '}', ')']) && !line.is_empty() {
+                head = line;
+            }
+            for sink in sinks.iter().filter(|s| line.contains(**s)) {
+                kinds.insert(*sink);
+                assert!(
+                    guarded_heads
+                        .iter()
+                        .chain(reader_heads.iter())
+                        .any(|h| head.starts_with(h)),
+                    "`{line}` issues `{sink}` outside a guarded definition (under `{head}`)"
+                );
+            }
+        }
+        for sink in [
+            "fetch(",
+            "sendBeacon(",
+            "new EventSource(",
+            "location.reload(",
+        ] {
+            assert!(kinds.contains(sink), "the scan saw no `{sink}`");
+        }
+        for head in guarded_heads {
+            let at = js.find(&format!("\n{head}")).unwrap_or(js.len());
+            let rest = js.get(at..).unwrap_or_default();
+            let body = rest
+                .get(..rest.find("\n}").unwrap_or(0))
+                .unwrap_or_default();
+            assert!(
+                body.contains("  if (__ipeEnded) return;\n")
+                    || body.contains("  if (__ipeEnded || __ipeProbedReload) return;\n"),
+                "`{head}` returns first on an ended session"
+            );
+        }
         assert!(
             js.contains("  closed: function(text, relayed) {\n    __ipeEndSession(text);\n  }"),
             "the `closed` frame ends the session"
@@ -13830,6 +13908,38 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// A commit whose render history cannot mint another epoch closes the
+    /// session: its stream yields the one `closed` frame tagged `ended`, then
+    /// ends, and the session is gone.
+    #[test]
+    #[allow(clippy::expect_used)] // the page is a fixture
+    fn an_exhausted_epoch_ends_the_stream_with_a_closed_frame() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let stream = open_sse(&store, &sid).await;
+            session_of(&store, &sid)
+                .await
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rendered
+                .exhaust();
+            let click = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &click).await;
+            assert_eq!(status, StatusCode::OK, "the click itself resolves");
+            let (text, ended) = read_sse(stream, |_| false).await;
+            assert!(ended, "the stream ends:\n{text}");
+            assert!(
+                text.ends_with("event: closed\ndata: ended\n\n"),
+                "the last frame names the close:\n{text}"
+            );
+            assert_eq!(text.matches("event: closed").count(), 1, "{text}");
+            assert!(store.get(&sid).await.is_none(), "the session is gone");
+        });
+    }
+
     /// The control: the same commit under the ceiling keeps the session and
     /// its stream open, and no `closed` frame is sent.
     #[test]
@@ -17652,6 +17762,40 @@ mod web_revocation_tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             assert_eq!(seen, vec![true], "the closer is set when the delete runs");
+        });
+    }
+
+    /// A session closed twice keeps its first reason: the frame its stream
+    /// sends names the close that ended it, never a later one.
+    #[test]
+    fn a_closed_session_keeps_its_first_reason() {
+        run(false, || async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let router = make_router(&store);
+            let opened = open_session(&router, "first-reason", 7200, "").await;
+            let handle = entry_of(&store, &opened.sid).await;
+            assert!(handle.is_some(), "the page load stored a live session");
+            let Some(handle) = handle else { return };
+            let closer = handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .liveness
+                .closer
+                .subscribe();
+            let dyn_store = Arc::clone(&store) as Arc<dyn store::SessionStore<Model, Msg>>;
+            close_session(
+                &dyn_store,
+                &opened.sid,
+                Some(&handle),
+                CloseReason::OverCeiling,
+            )
+            .await;
+            close_session(&dyn_store, &opened.sid, Some(&handle), CloseReason::Revoked).await;
+            assert_eq!(
+                *closer.borrow(),
+                Liveness::Closed(CloseReason::OverCeiling),
+                "the first reason stands"
+            );
         });
     }
 
