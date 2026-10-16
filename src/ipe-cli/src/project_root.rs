@@ -28,7 +28,7 @@ use crate::text;
 pub mod fixture;
 mod tree;
 
-pub use tree::{DEFAULT_NAME, ScratchRoot, SourceTree};
+pub use tree::{DEFAULT_NAME, ScratchRoot, SourceTree, TreeRefusal};
 
 /// The directory holding a project's modules.
 const SRC_DIR: &str = "src";

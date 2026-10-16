@@ -5,15 +5,18 @@
 //! written here is therefore accepted or refused on the same terms as any
 //! project on disk: nothing builds a [`ProjectRoot`] around the resolver.
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use super::{DEFAULT_ENTRY, MODULE_EXT, ProjectRoot, RootArg, SRC_DIR, SourceDir, TESTS_DIR};
 use crate::CliError;
 use crate::package_manifest::PACKAGE_IPE;
 use crate::package_name::PackageName;
-use crate::project::parse_entry;
+use crate::project::is_module_segment;
 use crate::scratch::ScratchDir;
 
 /// The package name of a tree that is not named.
@@ -72,6 +75,9 @@ impl SourceTree {
     }
 
     /// Add one record field to `package.ipe`, spelled as in the manifest (`exposedModules = [ "A" ]`).
+    ///
+    /// Raw manifest text, so only test targets reach it.
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[must_use]
     pub fn field(mut self, field: &str) -> Self {
         self.fields.push(field.to_owned());
@@ -115,8 +121,11 @@ impl SourceTree {
     /// # Errors
     /// [`CliError::ScratchUnavailable`] when the directory cannot be created;
     /// [`CliError::Resolve`] for a name that is not a package name;
-    /// [`CliError::Io`] for a module that is not a module path or a file that
-    /// cannot be written; otherwise every refusal of [`ProjectRoot::resolve`].
+    /// [`CliError::Io`] of kind [`io::ErrorKind::InvalidInput`] carrying a
+    /// [`TreeRefusal`] for a module name that is not a dotted module name or for
+    /// two module paths one case-insensitive file system would merge;
+    /// [`CliError::Io`] for a file that cannot be written; otherwise every
+    /// refusal of [`ProjectRoot::resolve`].
     pub fn resolve_under(&self, base: &Path) -> Result<ScratchRoot, CliError> {
         let dir = ScratchDir::new_under(base, SCRATCH_LABEL)
             .map_err(|source| CliError::ScratchUnavailable { source })?;
@@ -153,39 +162,157 @@ impl SourceTree {
 
     /// Every module file as its path below the root and its text, all paths proven first.
     fn files(&self) -> Result<Vec<(PathBuf, &str)>, CliError> {
+        self.plan().map_err(|refusal| {
+            let path = refusal.path().to_path_buf();
+            io_error(&path, io::Error::new(io::ErrorKind::InvalidInput, refusal))
+        })
+    }
+
+    /// Every module file below the root, refusing a name that is not a dotted
+    /// module name and two paths one case-insensitive file system would merge.
+    fn plan(&self) -> Result<Vec<(PathBuf, &str)>, TreeRefusal> {
+        let mut claimed = FoldedPaths::default();
         self.modules
             .iter()
-            .map(|m| Ok((module_file(m.dir, &m.module)?, m.source.as_str())))
+            .map(|m| {
+                let path = module_file(m.dir, &m.module)?;
+                claimed.claim(&path)?;
+                Ok((path, m.source.as_str()))
+            })
             .collect()
     }
 }
 
-/// The file of `module` below the root, derived from its parsed path so it cannot leave `dir`.
-fn module_file(dir: SourceDir, module: &str) -> Result<PathBuf, CliError> {
-    let refused = || {
-        io_error(
-            Path::new(module),
-            io::Error::new(io::ErrorKind::InvalidInput, "not a module path"),
-        )
-    };
-    let segments =
-        parse_entry(&format!("{}{MODULE_EXT}", module.replace('.', "/"))).map_err(|_| refused())?;
-    let (leaf, parents) = segments.split_last().ok_or_else(refused)?;
+/// Why the modules of a tree have no files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeRefusal {
+    /// A `.`-separated segment of `module` is not a module segment
+    /// (`[A-Z][A-Za-z0-9_]*`, no Windows device name).
+    NotModuleSegment {
+        /// The module name as given.
+        module: String,
+        /// The refused segment.
+        segment: String,
+    },
+    /// Two module files, or two of their directories, that differ at most in ASCII case.
+    Collision {
+        /// The path claimed first.
+        first: PathBuf,
+        /// The path that coincides with it.
+        second: PathBuf,
+    },
+}
+
+impl TreeRefusal {
+    /// The path the refusal names.
+    fn path(&self) -> &Path {
+        match self {
+            Self::NotModuleSegment { module, .. } => Path::new(module),
+            Self::Collision { second, .. } => second,
+        }
+    }
+}
+
+impl fmt::Display for TreeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotModuleSegment { module, segment } => write!(
+                f,
+                "`{module}` is not a module name: `{segment}` is not a module segment"
+            ),
+            Self::Collision { first, second } => write!(
+                f,
+                "`{}` and `{}` are one path on a case-insensitive file system",
+                first.display(),
+                second.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TreeRefusal {}
+
+/// The directories and files of a tree, keyed by their ASCII case fold.
+///
+/// Module segments are ASCII, so the ASCII fold covers every fold a file
+/// system applies to them.
+#[derive(Default)]
+struct FoldedPaths {
+    dirs: BTreeMap<String, PathBuf>,
+    files: BTreeMap<String, PathBuf>,
+}
+
+impl FoldedPaths {
+    /// Claim `file` and each of its directories, refusing a repeat or a case-only clash.
+    fn claim(&mut self, file: &Path) -> Result<(), TreeRefusal> {
+        let mut dir = PathBuf::new();
+        for component in file.parent().into_iter().flat_map(Path::components) {
+            dir.push(component);
+            let first = self.dirs.entry(fold(&dir)).or_insert_with(|| dir.clone());
+            if *first != dir {
+                return Err(TreeRefusal::Collision {
+                    first: first.clone(),
+                    second: dir,
+                });
+            }
+        }
+        match self.files.entry(fold(file)) {
+            Entry::Occupied(first) => Err(TreeRefusal::Collision {
+                first: first.get().clone(),
+                second: file.to_path_buf(),
+            }),
+            Entry::Vacant(slot) => {
+                slot.insert(file.to_path_buf());
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The ASCII case fold of `path`, `/`-joined.
+fn fold(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The file of the dotted `module` below the root, built from its checked segments so it cannot leave `dir`.
+fn module_file(dir: SourceDir, module: &str) -> Result<PathBuf, TreeRefusal> {
     let mut path = PathBuf::from(match dir {
         SourceDir::Src => SRC_DIR,
         SourceDir::Tests => TESTS_DIR,
     });
-    path.extend(parents);
-    path.push(format!("{leaf}{MODULE_EXT}"));
+    let mut segments = module.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if !is_module_segment(segment) {
+            return Err(TreeRefusal::NotModuleSegment {
+                module: module.to_owned(),
+                segment: segment.to_owned(),
+            });
+        }
+        if segments.peek().is_some() {
+            path.push(segment);
+        } else {
+            path.push(format!("{segment}{MODULE_EXT}"));
+        }
+    }
     Ok(path)
 }
 
-/// Write `text` to `path`, creating its parent directories.
+/// Write `text` to a new file at `path`, creating its parent directories.
+///
+/// A file already at `path` is refused, never overwritten.
 fn write_file(path: &Path, text: &str) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
     }
-    fs::write(path, text).map_err(|source| io_error(path, source))
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .map_err(|source| io_error(path, source))
 }
 
 fn io_error(path: &Path, source: io::Error) -> CliError {
@@ -328,6 +455,11 @@ mod tests {
             "Main.",
             "C:Main",
             "Data\\List",
+            "Data/List",
+            "/Main",
+            "Con",
+            "Data.Nul",
+            "Main\0",
         ] {
             let err = refused(&tree().module(module, MODULE));
             assert!(
@@ -337,6 +469,63 @@ mod tests {
         }
         let err = refused(&tree().test_module("../Evil", MODULE));
         assert!(matches!(err, CliError::Io { .. }));
+    }
+
+    #[test]
+    fn a_module_name_is_refused_at_its_first_bad_segment() {
+        let plan = |module: &str| tree().module(module, MODULE).plan().map(drop);
+        let not_segment = |module: &str, segment: &str| {
+            Err(TreeRefusal::NotModuleSegment {
+                module: module.to_owned(),
+                segment: segment.to_owned(),
+            })
+        };
+        assert_eq!(plan("Data/List"), not_segment("Data/List", "Data/List"));
+        assert_eq!(plan("Data.List/X"), not_segment("Data.List/X", "List/X"));
+        assert_eq!(plan("Data..List"), not_segment("Data..List", ""));
+        assert_eq!(plan("Aux.Main"), not_segment("Aux.Main", "Aux"));
+        assert_eq!(plan("Data.List"), Ok(()));
+    }
+
+    #[test]
+    fn two_modules_one_case_insensitive_file_system_would_merge_are_refused() {
+        let collision = |first: &str, second: &str| {
+            Err(TreeRefusal::Collision {
+                first: PathBuf::from(first),
+                second: PathBuf::from(second),
+            })
+        };
+        let plan = |tree: SourceTree| tree.plan().map(drop);
+        assert_eq!(
+            plan(tree().module("Lib", MODULE).module("Lib", MODULE)),
+            collision("src/Lib.ipe", "src/Lib.ipe")
+        );
+        assert_eq!(
+            plan(tree().module("Lib", MODULE).module("LIB", MODULE)),
+            collision("src/Lib.ipe", "src/LIB.ipe")
+        );
+        assert_eq!(
+            plan(
+                tree()
+                    .module("Data.List", MODULE)
+                    .module("DATA.Dict", MODULE)
+            ),
+            collision("src/Data", "src/DATA")
+        );
+        assert_eq!(
+            plan(tree().test_module("Main", MODULE)),
+            Ok(()),
+            "a test module and a source module of one name are two files"
+        );
+        assert_eq!(
+            plan(tree().module("Data", MODULE).module("Data.List", MODULE)),
+            Ok(())
+        );
+        let err = refused(&tree().module("Main", MODULE));
+        assert!(
+            matches!(&err, CliError::Io { source, .. } if source.kind() == io::ErrorKind::InvalidInput),
+            "{err}"
+        );
     }
 
     #[test]
