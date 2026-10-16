@@ -680,8 +680,12 @@ pub struct QueuedEvent<Msg> {
 }
 
 /// How many browser events one session's driver queue holds.
+///
+/// The worst-case backlog one session can hold is this many events, each
+/// costing its update, render, diff, index and recharge once the driver takes
+/// it; a full queue answers `429`.
 #[cfg(feature = "web")]
-const EVENT_QUEUE_CAP: usize = 1024;
+const EVENT_QUEUE_CAP: usize = 64;
 
 /// How many Msgs one session's driver queue holds (Cmd results, refusals,
 /// subscription deliveries).
@@ -691,6 +695,10 @@ const MSG_QUEUE_CAP: usize = 1024;
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's admitted Cmds could outnumber the Msg queue slots their results land in [ledger #boundary]
 #[cfg(feature = "web")]
 const _: () = assert!(budget::SESSION_CMD_CEILING.get() <= MSG_QUEUE_CAP as u64);
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a session's browser-event backlog could outgrow its Msg queue [ledger #boundary]
+#[cfg(feature = "web")]
+const _: () = assert!(EVENT_QUEUE_CAP <= MSG_QUEUE_CAP);
 
 /// Per-session live state behind an `Arc<Mutex<…>>`. `rendered` is advanced by
 /// every commit; `sse_tx` is filled when the browser attaches the SSE channel;
@@ -5513,6 +5521,9 @@ mod handlers {
                 "live",
                 &format!("event_handler: session msg queue full or closed; dropping event ({err})"),
             );
+            // The refused event holds its charge; dropping it here releases
+            // the bytes before the 429 is answered.
+            drop(err);
             return (StatusCode::TOO_MANY_REQUESTS, "event queue full").into_response();
         }
         if let Some((tab, seq)) = replay_key {
@@ -13653,7 +13664,8 @@ mod emitted_router_behavior_tests {
     }
 
     /// A `429` leaves the tab's seq unrecorded, so the client's retry of the
-    /// same event dispatches once the queue drains.
+    /// same event dispatches once the queue drains, and it releases the
+    /// refused event's charge and queues nothing.
     #[test]
     #[allow(clippy::expect_used)] // the page and the one-slot channel are fixtures
     fn a_full_queue_does_not_record_the_seq() {
@@ -13663,12 +13675,15 @@ mod emitted_router_behavior_tests {
             let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
             let first = epoch_of(&body).expect("the page carries its render epoch");
             let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(1);
-            let charge = session_of(&store, &sid)
-                .await
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .charge
-                .budget()
+            let budget = Arc::clone(
+                session_of(&store, &sid)
+                    .await
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .charge
+                    .budget(),
+            );
+            let charge = budget
                 .try_charge(crate::retained::Bytes::new(0))
                 .expect("an empty charge fits");
             tx.try_send(QueuedEvent {
@@ -13680,15 +13695,25 @@ mod emitted_router_behavior_tests {
             capture_dispatches(&store, &sid, tx).await;
 
             let event = click_body(&plus, Some(&first), Some((TAB, 1)));
+            let held = budget.used().get();
             let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &event).await;
             assert_eq!(
                 status,
                 StatusCode::TOO_MANY_REQUESTS,
                 "a full queue answers 429"
             );
+            assert_eq!(
+                budget.used().get(),
+                held,
+                "the refused event's charge is released"
+            );
             assert!(
                 matches!(rx.try_recv().map(|queued| queued.msg), Ok(Msg::Decrement)),
                 "drain the filler"
+            );
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+                "the refused event is not queued"
             );
 
             let (status, _, reply) =
