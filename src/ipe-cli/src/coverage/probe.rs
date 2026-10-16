@@ -92,9 +92,10 @@ fn cli_error_code(err: &crate::CliError) -> Option<ipe_diagnostics::Code> {
 /// accessor/spec builder that reads its column from a `.field` at compile time
 /// ([`IPE_L0146`]), a committed-literal seal that must see its argument
 /// ([`IPE_L0151`]), a handler-wrapping kernel that must see its handler
-/// ([`IPE_L0152`]) — or the reference cannot be monomorphized because an unused
-/// binding leaves the value fully polymorphic ([`IPE_L0102`]). In each the
-/// diagnostic is provoked by the probe form, not by a gap in the symbol's own
+/// ([`IPE_L0152`]), a `Store.select` terminal that must see its `Store.select`
+/// expression at the call site ([`IPE_L0149`]) — or the reference cannot be
+/// monomorphized because an unused binding leaves the value fully polymorphic
+/// ([`IPE_L0102`]). In each the diagnostic is provoked by the probe form, not by a gap in the symbol's own
 /// lowering, so the column reports the symbol inapplicable rather than a false
 /// hole. This is exactly the "the resolver refuses to pass point-free" /
 /// "fully-polymorphic value with no determinable concrete type" case the columns'
@@ -102,12 +103,13 @@ fn cli_error_code(err: &crate::CliError) -> Option<ipe_diagnostics::Code> {
 /// class: it is a property of the program, so it stays a hole.
 #[must_use]
 pub fn is_probe_form_limitation(outcome: &StageOutcome) -> bool {
-    use ipe_diagnostics::{IPE_L0102, IPE_L0146, IPE_L0151, IPE_L0152};
+    use ipe_diagnostics::{IPE_L0102, IPE_L0146, IPE_L0149, IPE_L0151, IPE_L0152};
     matches!(
         outcome,
         StageOutcome::Failed { code: Some(code), .. }
             if *code == IPE_L0102
                 || *code == IPE_L0146
+                || *code == IPE_L0149
                 || *code == IPE_L0151
                 || *code == IPE_L0152
     )
@@ -538,6 +540,7 @@ mod tests {
         for code in [
             ipe_diagnostics::IPE_L0102,
             ipe_diagnostics::IPE_L0146,
+            ipe_diagnostics::IPE_L0149,
             ipe_diagnostics::IPE_L0151,
             ipe_diagnostics::IPE_L0152,
         ] {
