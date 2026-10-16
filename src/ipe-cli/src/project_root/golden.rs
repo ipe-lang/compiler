@@ -41,7 +41,7 @@ pub fn build_golden_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_root::RootFixture;
+    use crate::project_root::fixture::RootFixture;
 
     const REGEN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
