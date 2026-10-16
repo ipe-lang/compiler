@@ -643,9 +643,12 @@ seedManyUnits indexDb n =
                     |> Task.andThen (execIndexSchema conn)
                     |> Task.andThen
                         (\_ ->
-                            List.range 1 n
-                                |> List.map (seedOneUnit conn)
-                                |> Task.sequence
+                            Db.withTransaction conn
+                                (\tx ->
+                                    List.range 1 n
+                                        |> List.map (seedOneUnit tx)
+                                        |> Task.sequence
+                                )
                         )
             )
         |> Task.map (\_ -> ())
@@ -1206,6 +1209,20 @@ insertReviewRow db label hash =
     appendSigned db (rawRow label hash "approve" Nothing)
 
 
+-- Signed approvals for fixture units `prefix ++ i`, `i` from `from` to `to`,
+-- appended in order in one transaction: a bulk fixture commits once, never
+-- once per row, so its cost is the rows it writes and not a disk sync each.
+seedReviewRows : Db -> String -> String -> Int -> Int -> Task.Task Error ()
+seedReviewRows db prefix hash from to =
+    Db.withTransaction db
+        (\tx ->
+            List.range from to
+                |> List.map (\i -> insertReviewRow tx (prefix ++ String.fromInt i) hash)
+                |> Task.sequence
+                |> Task.map (\_ -> ())
+        )
+
+
 -- The bridge fixture plus an empty review database at `at`, with the
 -- environment pointing at both.
 seedProgressScratch : Scratch -> Task.Task Error Db
@@ -1733,9 +1750,7 @@ multiPageCopyHolds =
     do
         at <- freshScratch "ipe-index-multi-page-copy"
         db <- seedProgressScratch at
-        List.range 1 decisions
-            |> List.map (\i -> insertReviewRow db ("p-" ++ String.fromInt i) "hp")
-            |> Task.sequence
+        seedReviewRows db "p-" "hp" 1 decisions
         page <- loadPageNow Index.Start
         copied <- mirroredCount at.indexDb
         cleanupProgressScratch at
@@ -1962,9 +1977,7 @@ resyncStopsAtCeiling =
     do
         at <- freshScratch "ipe-index-progress-ceiling"
         db <- seedProgressScratch at
-        List.range 1 decisions
-            |> List.map (\i -> insertReviewRow db ("p-" ++ String.fromInt i) "hp")
-            |> Task.sequence
+        seedReviewRows db "p-" "hp" 1 decisions
         mirrorPair at.indexDb "pre" "hp"
         refusal <- resyncWithin (PageSize.toInt PageSize.pairs) 1 db
             |> Task.map (\_ -> Nothing)
@@ -2006,9 +2019,7 @@ resyncAtDeepestCeiling : Task.Task Error Bool
 resyncAtDeepestCeiling =
     let
         seed from to db =
-            List.range from to
-                |> List.map (\i -> insertReviewRow db ("d-" ++ String.fromInt i) "hd")
-                |> Task.sequence
+            seedReviewRows db "d-" "hd" from to
     in
     do
         at <- freshScratch "ipe-index-progress-deepest"
@@ -2083,9 +2094,7 @@ resyncSucceedsAtSixThousandPages =
     do
         at <- freshScratch "ipe-index-progress-6000"
         db <- seedProgressScratch at
-        List.range 1 6000
-            |> List.map (\i -> insertReviewRow db ("s-" ++ String.fromInt i) "hs")
-            |> Task.sequence
+        seedReviewRows db "s-" "hs" 1 6000
         copied <- resyncWithin 1 6000 db
         kept <- mirroredCount at.indexDb
         cleanupProgressScratch at
@@ -2100,9 +2109,7 @@ resyncRefusesSixThousandAndOnePages =
     do
         at <- freshScratch "ipe-index-progress-6001"
         db <- seedProgressScratch at
-        List.range 1 6001
-            |> List.map (\i -> insertReviewRow db ("t-" ++ String.fromInt i) "ht")
-            |> Task.sequence
+        seedReviewRows db "t-" "ht" 1 6001
         refusal <- resyncWithin 1 6000 db
             |> Task.map (\_ -> Nothing)
             |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
@@ -2123,9 +2130,7 @@ resyncSucceedsAtExactCeilingTimesPageSize =
     do
         at <- freshScratch "ipe-index-progress-exact"
         db <- seedProgressScratch at
-        List.range 1 total
-            |> List.map (\i -> insertReviewRow db ("x-" ++ String.fromInt i) "hx")
-            |> Task.sequence
+        seedReviewRows db "x-" "hx" 1 total
         copied <- resyncWithin 3 2000 db
         kept <- mirroredCount at.indexDb
         cleanupProgressScratch at
@@ -2160,9 +2165,7 @@ resyncCeilingLeavesStamp =
         stampBefore <- stampOf at.indexDb
         copyBefore <- mirroredCount at.indexDb
         decideNow db (uid "u-a") Approved
-        List.range 1 (PageSize.toInt PageSize.pairs + 1)
-            |> List.map (\i -> insertReviewRow db ("c-" ++ String.fromInt i) "hc")
-            |> Task.sequence
+        seedReviewRows db "c-" "hc" 1 (PageSize.toInt PageSize.pairs + 1)
         refusal <- resyncWithin (PageSize.toInt PageSize.pairs) 1 db
             |> Task.map (\_ -> Nothing)
             |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
