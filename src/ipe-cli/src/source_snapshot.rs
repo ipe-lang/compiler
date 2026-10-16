@@ -11,6 +11,11 @@
 //! never satisfies it. The stdlib closure is injected and the FFI catalog
 //! prepared exactly once, over the text read here; every consumer then sees
 //! these bytes and no others.
+//!
+//! The build sees `src/` and what it injects, never `tests/`: the stdlib
+//! closure and the FFI preparation run over `src/` alone, so no byte under
+//! `tests/` can add, mask or refuse a module of the build. Every `tests/`
+//! module is read, bounded and link-checked with the rest, and held apart.
 
 #![cfg_attr(
     not(test),
@@ -21,7 +26,7 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -62,6 +67,14 @@ pub struct SnapshotModule {
 }
 
 impl SnapshotModule {
+    fn new(origin: SourceOrigin, path: PathBuf, text: String) -> Self {
+        Self {
+            origin,
+            path,
+            text: Arc::from(text),
+        }
+    }
+
     /// Where the text came from.
     #[must_use]
     pub const fn origin(&self) -> SourceOrigin {
@@ -81,17 +94,25 @@ impl SnapshotModule {
     }
 }
 
+/// Ceiling on the bytes summed over every module file one snapshot reads.
+///
+/// 256 MiB is far above any real project while refusing a tree of many
+/// cap-sized files that would otherwise be held in memory at once.
+pub const SOURCE_TREE_READ_CAP: u64 = 256 * 1024 * 1024;
+
 /// The ceilings one snapshot read is held to.
 ///
 /// A directory is at depth 0 when it is `src/` or `tests/`; a directory past
-/// `depth`, a module past `modules`, a listed entry past `entries` or a file
-/// past `file_cap` bytes refuses the read.
+/// `depth`, a module past `modules`, a listed entry past `entries`, a file
+/// past `file_cap` bytes or module text past `total_bytes` summed over `src/`
+/// and `tests/` refuses the read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     depth: usize,
     modules: usize,
     entries: usize,
     file_cap: ByteCap,
+    total_bytes: u64,
 }
 
 impl Limits {
@@ -101,6 +122,7 @@ impl Limits {
         modules: MAX_DISCOVERED_MODULES,
         entries: MAX_DISCOVERY_ENTRIES,
         file_cap: io_bounded::SOURCE_CAP,
+        total_bytes: SOURCE_TREE_READ_CAP,
     };
 
     /// These limits with the directory depth ceiling `depth`.
@@ -130,6 +152,16 @@ impl Limits {
     pub const fn file_cap(self, file_cap: ByteCap) -> Self {
         Self { file_cap, ..self }
     }
+
+    /// These limits with the summed module byte ceiling `total_bytes`.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn total_bytes(self, total_bytes: u64) -> Self {
+        Self {
+            total_bytes,
+            ..self
+        }
+    }
 }
 
 /// Every module text of one build, read once from held handles.
@@ -137,25 +169,30 @@ impl Limits {
 /// Fields are private: [`SourceSnapshot::read`] is the only mint.
 pub struct SourceSnapshot {
     modules: BTreeMap<ModulePath, SnapshotModule>,
+    tests: BTreeMap<ModulePath, SnapshotModule>,
     ffi: FfiPrep,
 }
 
 impl SourceSnapshot {
     /// Read every module of `root` under `limits`, inject the stdlib closure and prepare FFI once.
     ///
-    /// `src/` is walked first, then `tests/` when present; a `tests/` module
-    /// whose path a `src/` module already has is not read. The FFI catalog is
-    /// found from the project directory.
+    /// `src/` is walked first, then `tests/` when present. The build's
+    /// modules are those of `src/` with the stdlib closure and the FFI
+    /// interfaces they reach; `tests/` modules are held apart
+    /// ([`SourceSnapshot::tests`]), so a `tests/` module never masks, adds
+    /// or refuses one of the build. The FFI catalog is found from the
+    /// project directory.
     ///
     /// # Errors
     /// [`CliError::SymlinkInSource`] for a link (on Windows, any reparse
     /// point) anywhere in the tree, including one swapped in between the
     /// listing and the read; [`CliError::DiscoveryLimitReached`] past the
-    /// depth, module or entry ceiling; [`CliError::FileTooLarge`] past the
-    /// file cap; [`CliError::DeviceNamedModule`] for a module path naming a
-    /// Windows device; [`CliError::SourceRefused`] for a module file that is
-    /// not a regular file or may not be read; [`CliError::Io`] for text that
-    /// is not UTF-8 or another failure; every refusal of [`prepare_ffi`].
+    /// depth, module, entry or summed byte ceiling; [`CliError::FileTooLarge`]
+    /// past the file cap; [`CliError::DeviceNamedModule`] for a module path
+    /// naming a Windows device; [`CliError::SourceRefused`] for a module file
+    /// that is not a regular file or may not be read; [`CliError::Io`] for
+    /// text that is not UTF-8 or another failure; every refusal of
+    /// [`prepare_ffi`].
     pub fn read(root: &ProjectRoot, limits: Limits) -> Result<Self, CliError> {
         let mut walk = Walk::new(limits);
         walk.tree(root.src(), SourceDir::Src)?;
@@ -163,43 +200,57 @@ impl SourceSnapshot {
             walk.tree(tests, SourceDir::Tests)?;
         }
         let Walk {
-            mut sources, own, ..
+            src: mut sources,
+            tests,
+            ..
         } = walk;
-        // Each step after the walk only inserts keys absent from `sources`, so a
-        // module's origin is the step that inserted it: the walk, the stdlib
-        // injection, or the FFI preparation.
-        inject_compiled_std_closure(&mut sources, &mut Vec::new());
-        let stdlib: BTreeSet<ModulePath> = sources
-            .keys()
-            .filter(|module| !own.contains_key(*module))
-            .cloned()
-            .collect();
+        let own: BTreeSet<ModulePath> = sources.keys().cloned().collect();
+        // Injection and preparation each insert only keys absent from
+        // `sources` and record what they inserted; a module's origin is the
+        // record that holds it, the walk's first.
+        let stdlib = inject_compiled_std_closure(&mut sources, &mut Vec::new());
         let ffi = prepare_ffi(&mut sources, root.path())?;
         let modules = sources
             .into_iter()
-            .map(|(module, (path, text))| {
-                let origin = match own.get(&module) {
-                    Some(dir) => SourceOrigin::Own(*dir),
-                    None if stdlib.contains(&module) => SourceOrigin::Stdlib,
-                    None => SourceOrigin::FfiInterface,
+            .filter_map(|(module, (path, text))| {
+                let origin = if own.contains(&module) {
+                    SourceOrigin::Own(SourceDir::Src)
+                } else if stdlib.contains(&module) {
+                    SourceOrigin::Stdlib
+                } else if ffi.injected.contains(&module) {
+                    SourceOrigin::FfiInterface
+                } else {
+                    // Text no step recorded inserting earns no origin and is
+                    // never compiled: an import of it resolves to nothing.
+                    return None;
                 };
-                (
-                    module,
-                    SnapshotModule {
-                        origin,
-                        path,
-                        text: Arc::from(text),
-                    },
-                )
+                Some((module, SnapshotModule::new(origin, path, text)))
             })
             .collect();
-        Ok(Self { modules, ffi })
+        let tests = tests
+            .into_iter()
+            .map(|(module, (path, text))| {
+                let held = SnapshotModule::new(SourceOrigin::Own(SourceDir::Tests), path, text);
+                (module, held)
+            })
+            .collect();
+        Ok(Self {
+            modules,
+            tests,
+            ffi,
+        })
     }
 
-    /// Every module, keyed by module path.
+    /// Every module the build sees, keyed by module path.
     #[must_use]
     pub const fn modules(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
         &self.modules
+    }
+
+    /// Every `tests/` module, keyed by module path, including one whose path a `src/` module has.
+    #[must_use]
+    pub const fn tests(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
+        &self.tests
     }
 
     /// The module `module`, when the snapshot holds it.
@@ -239,8 +290,9 @@ struct Walk {
     limits: Limits,
     examined: usize,
     read: usize,
-    sources: ModuleSources,
-    own: BTreeMap<ModulePath, SourceDir>,
+    bytes: u64,
+    src: ModuleSources,
+    tests: ModuleSources,
 }
 
 impl Walk {
@@ -249,8 +301,9 @@ impl Walk {
             limits,
             examined: 0,
             read: 0,
-            sources: ModuleSources::new(),
-            own: BTreeMap::new(),
+            bytes: 0,
+            src: ModuleSources::new(),
+            tests: ModuleSources::new(),
         }
     }
 
@@ -325,9 +378,6 @@ impl Walk {
                             SourceRefusal::NotRegularFile,
                         ));
                     }
-                    if self.sources.contains_key(&module) {
-                        continue;
-                    }
                     self.module(held, &name, path, module, dir)?;
                 }
             }
@@ -365,13 +415,43 @@ impl Walk {
         }
         #[cfg(test)]
         before_read(&path);
+        // A read never buffers past what the summed ceiling leaves; a file
+        // the remainder cannot hold is the summed refusal, not the file cap's.
+        let remaining = self.limits.total_bytes.saturating_sub(self.bytes);
+        let left = ByteCap::from_nonzero(NonZeroU64::new(remaining).unwrap_or(NonZeroU64::MIN));
+        let cap = self.limits.file_cap.min(left);
         let text = held
-            .read_file_capped(name, self.limits.file_cap)
-            .map_err(|error| link_refusal(error, &path))?;
+            .read_file_capped(name, cap)
+            .map_err(|error| match error {
+                CliError::FileTooLarge { .. } if cap < self.limits.file_cap => {
+                    self.total_refusal(&path)
+                }
+                other => link_refusal(other, &path),
+            })?;
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        if self.bytes > self.limits.total_bytes {
+            return Err(self.total_refusal(&path));
+        }
         self.read = self.read.saturating_add(1);
-        self.own.insert(module.clone(), dir);
-        self.sources.insert(module, (path, text));
+        let tree = match dir {
+            SourceDir::Src => &mut self.src,
+            SourceDir::Tests => &mut self.tests,
+        };
+        tree.insert(module, (path, text));
         Ok(())
+    }
+
+    /// The refusal of a read that would sum module text past the byte ceiling.
+    fn total_refusal(&self, path: &Path) -> CliError {
+        CliError::DiscoveryLimitReached {
+            detail: format!(
+                "source tree holds more than {} bytes of module text at `{}`",
+                self.limits.total_bytes,
+                path.display()
+            ),
+        }
     }
 }
 
@@ -446,7 +526,8 @@ impl<'s> ModuleSet<'s> {
     /// The modules `entries` builds from `snapshot`, closed under import.
     ///
     /// Programs build every module under `src/`; a library builds the reach
-    /// of its exposed modules. A `tests/` module is never a member.
+    /// of its exposed modules. A `tests/` module is never a member: the
+    /// snapshot holds `tests/` apart from the build's modules.
     ///
     /// # Errors
     /// [`CliError::EntryMissing`] or [`CliError::ExposedModuleMissing`] when an
@@ -492,26 +573,12 @@ impl<'s> ModuleSet<'s> {
             snapshot,
             members: BTreeSet::new(),
         };
-        set.close(roots, false);
+        set.close(roots);
         Ok(set)
     }
 
-    /// This set with every `tests/` module and its reach added.
-    #[must_use]
-    pub fn with_tests(mut self) -> Self {
-        let roots = self
-            .snapshot
-            .modules
-            .iter()
-            .filter(|(_, m)| m.origin == SourceOrigin::Own(SourceDir::Tests))
-            .map(|(module, _)| module)
-            .collect();
-        self.close(roots, true);
-        self
-    }
-
     /// Add `roots` and every snapshot module they import, transitively.
-    fn close(&mut self, roots: Vec<&'s ModulePath>, tests: bool) {
+    fn close(&mut self, roots: Vec<&'s ModulePath>) {
         let mut queue: VecDeque<&'s ModulePath> = roots.into();
         while let Some(module) = queue.pop_front() {
             if !self.members.insert(module) {
@@ -521,11 +588,8 @@ impl<'s> ModuleSet<'s> {
                 continue;
             };
             for import in extract_imports_from_source(entry.text()) {
-                let Some((key, imported)) = self.snapshot.modules.get_key_value(&import) else {
-                    continue;
-                };
-                if !self.members.contains(key)
-                    && (tests || imported.origin != SourceOrigin::Own(SourceDir::Tests))
+                if let Some((key, _)) = self.snapshot.modules.get_key_value(&import)
+                    && !self.members.contains(key)
                 {
                     queue.push_back(key);
                 }
@@ -606,8 +670,13 @@ mod tests {
         assert_eq!(main.path(), src(&scratch).join("Main.ipe"));
         let util_module = snapshot.module(&path("Util")).expect("Util read");
         assert_eq!(util_module.text(), util);
-        let spec_module = snapshot.module(&path("UtilSpec")).expect("UtilSpec read");
+        assert!(snapshot.module(&path("UtilSpec")).is_none());
+        let spec_module = snapshot
+            .tests()
+            .get(&path("UtilSpec"))
+            .expect("UtilSpec read");
         assert_eq!(spec_module.origin(), SourceOrigin::Own(SourceDir::Tests));
+        assert_eq!(spec_module.text(), spec);
         assert!(snapshot.ffi().injected.is_empty());
         assert!(snapshot.ffi().emit.is_none());
         assert!(format!("{snapshot:?}").contains("Main"));
@@ -906,25 +975,124 @@ mod tests {
                 .modules(MAX_DISCOVERED_MODULES)
                 .entries(MAX_DISCOVERY_ENTRIES)
                 .file_cap(io_bounded::SOURCE_CAP)
+                .total_bytes(SOURCE_TREE_READ_CAP)
         );
         assert_eq!(Limits::DEFAULT.file_cap.get(), io_bounded::SOURCE_READ_CAP);
     }
 
-    /// A `tests/` module with a `src/` module's path is masked by it, never read.
+    /// A `tests/` module with a `src/` module's path is read and held apart; the build sees `src/`'s.
     #[test]
-    fn src_module_masks_a_tests_module_of_the_same_path() {
+    fn tests_module_of_a_src_path_is_held_apart() {
         let scratch = resolve(
             &SourceTree::main(MAIN)
                 .module("Util", &module_source("Util", &[]))
                 .test_module("Util", "not ipe at all"),
         );
-        let snapshot = read(&scratch, Limits::DEFAULT.modules(2)).expect("read");
+        let snapshot = read(&scratch, Limits::DEFAULT.modules(3)).expect("read");
         let util = snapshot.module(&path("Util")).expect("Util");
         assert_eq!(util.origin(), SourceOrigin::Own(SourceDir::Src));
         assert_eq!(util.text(), module_source("Util", &[]));
+        let held = snapshot.tests().get(&path("Util")).expect("tests Util");
+        assert_eq!(held.origin(), SourceOrigin::Own(SourceDir::Tests));
+        assert_eq!(held.text(), "not ipe at all");
+        assert!(is_limit_refusal(&read(
+            &scratch,
+            Limits::DEFAULT.modules(2)
+        )));
     }
 
-    /// Programs build every `src/` module and its reach; `tests/` only joins with `with_tests`.
+    /// `tests/Main.ipe` is read beside `src/Main.ipe`, never masked by it.
+    #[test]
+    fn tests_main_is_read_beside_src_main() {
+        let spec = "module Main exposing (main)\n\nmain =\n    2\n";
+        let scratch = resolve(&SourceTree::main(MAIN).test_module("Main", spec));
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
+        assert_eq!(
+            snapshot.module(&path("Main")).map(SnapshotModule::text),
+            Some(MAIN)
+        );
+        assert_eq!(
+            snapshot
+                .tests()
+                .get(&path("Main"))
+                .map(SnapshotModule::text),
+            Some(spec)
+        );
+    }
+
+    /// A `tests/` module on a stdlib path never masks the stdlib module the build imports.
+    #[test]
+    fn tests_module_never_masks_a_stdlib_module_of_the_build() {
+        let scratch = resolve(
+            &SourceTree::main(PALETTE_MAIN)
+                .test_module("Ipe.Palette", &module_source("Ipe.Palette", &[])),
+        );
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
+        let palette = snapshot.module(&path("Ipe.Palette")).expect("injected");
+        assert_eq!(palette.origin(), SourceOrigin::Stdlib);
+        let set = ModuleSet::of(scratch.root().entries(), &snapshot).expect("module set");
+        assert!(set.contains(&path("Ipe.Palette")));
+    }
+
+    /// A stdlib import only `tests/` spells injects nothing into the build.
+    #[test]
+    fn tests_import_injects_no_stdlib_module_into_the_build() {
+        let spec = module_source("MainSpec", &["Ipe.Palette"]);
+        let scratch = resolve(&SourceTree::main(MAIN).test_module("MainSpec", &spec));
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
+        assert!(snapshot.module(&path("Ipe.Palette")).is_none());
+        let control = resolve(&SourceTree::main(PALETTE_MAIN));
+        let snapshot = read(&control, Limits::DEFAULT).expect("read");
+        assert!(snapshot.module(&path("Ipe.Palette")).is_some());
+    }
+
+    /// An asserted native call under `tests/` never reaches the build's FFI preparation.
+    #[test]
+    fn tests_asserted_call_never_reaches_the_build_ffi() {
+        let asserted = |name: &str| {
+            format!(
+                "module {name} exposing (shifted)\nimport Rust.Ffi\n\n\
+                 shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n"
+            )
+        };
+        let in_tests = resolve(&SourceTree::main(MAIN).test_module("Shift", &asserted("Shift")));
+        let snapshot = read(&in_tests, Limits::DEFAULT).expect("tests/ never reaches FFI");
+        assert!(snapshot.ffi().injected.is_empty());
+        assert!(snapshot.ffi().emit.is_none());
+        assert!(snapshot.tests().contains_key(&path("Shift")));
+        // The control: the same module under `src/` is scanned, and its call
+        // into a crate no catalog installs is refused.
+        let in_src = resolve(&SourceTree::main(MAIN).module("Shift", &asserted("Shift")));
+        assert!(matches!(
+            read(&in_src, Limits::DEFAULT),
+            Err(CliError::FfiPrep(_))
+        ));
+    }
+
+    /// The summed byte ceiling: module text summing to it is read, one byte less refuses.
+    #[test]
+    fn total_bytes_accepts_the_limit_and_refuses_one_past() {
+        let spec = module_source("MainSpec", &[]);
+        let scratch = resolve(&SourceTree::main(MAIN).test_module("MainSpec", &spec));
+        let total = u64::try_from(MAIN.len() + spec.len()).expect("small");
+        assert!(read(&scratch, Limits::DEFAULT.total_bytes(total)).is_ok());
+        assert!(is_limit_refusal(&read(
+            &scratch,
+            Limits::DEFAULT.total_bytes(total - 1)
+        )));
+        // A ceiling the first file alone passes is the summed refusal, never the file cap's.
+        let main = u64::try_from(MAIN.len()).expect("small");
+        assert!(is_limit_refusal(&read(
+            &scratch,
+            Limits::DEFAULT.total_bytes(main - 1)
+        )));
+        assert!(is_limit_refusal(&read(
+            &scratch,
+            Limits::DEFAULT.total_bytes(0)
+        )));
+    }
+
+    /// Programs build every `src/` module and its reach; no `tests/` module is a member.
     #[test]
     fn programs_build_every_src_module() {
         let scratch = resolve(
@@ -943,10 +1111,6 @@ mod tests {
         assert!(!set.contains(&path("MainSpec")));
         assert!(!set.contains(&path("Helper")));
         assert_eq!(set.members().count(), 2);
-        let with_tests = set.with_tests();
-        assert!(with_tests.contains(&path("MainSpec")));
-        assert!(with_tests.contains(&path("Helper")));
-        assert!(with_tests.contains(&path("Orphan")));
     }
 
     /// A library builds the reach of its exposed modules, nothing else.
