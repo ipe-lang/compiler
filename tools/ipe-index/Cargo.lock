@@ -360,6 +360,7 @@ dependencies = [
  "blake3",
  "clap",
  "icu_properties",
+ "libc",
  "regex",
  "rusqlite",
  "serde_json",
