@@ -1570,11 +1570,22 @@ decisionHoldsWriteLockBeforeRead =
         seedProgressScratch at
         loc <- envReview
         holder <- LibDb.openAt loc
-        other <- openFileAt WriteExisting at.reviewDb
+        other <- singleConnection (openFileAt WriteExisting at.reviewDb)
+        Db.exec other "PRAGMA busy_timeout = 0" []
         busy <- LibDb.writeTransaction holder (\_ -> writeFailsBusy other)
         free <- writeFailsBusy other
         cleanupProgressScratch at
         Task.succeed (busy && not free)
+
+
+-- `open` with its pool held to one connection, so a `PRAGMA` set on the pool
+-- is set on the connection every later transaction begins on.
+singleConnection : Task.Task Error Db -> Task.Task Error Db
+singleConnection open =
+    System.setenv "IPE_DB_MAX_CONNECTIONS" "1"
+        |> Task.andThen (\_ -> open)
+        |> Task.onError (\e -> System.unsetenv "IPE_DB_MAX_CONNECTIONS" |> Task.andThen (\_ -> Task.fail e))
+        |> Task.andThen (\db -> System.unsetenv "IPE_DB_MAX_CONNECTIONS" |> Task.map (\_ -> db))
 
 
 -- True when a write on `conn`, waiting on no busy timeout, fails.
