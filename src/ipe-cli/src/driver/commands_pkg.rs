@@ -1,5 +1,5 @@
 use super::{
-    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
+    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
     attribute_canon_errors, attribute_post_link_error, build_loose_file_into, build_project_into,
     build_source_graph, build_test_into, capabilities_including_served_widgets,
     classify_entry_shape, create_source_root, default_entry, discover_manifest, emit_machine_error,
@@ -176,17 +176,20 @@ pub fn classify_desktop_shape(
         Some(project::EntryShape::WebView) => Ok(pack::desktop::AppShape::WebView),
         Some(project::EntryShape::Terminal) => Ok(pack::desktop::AppShape::Terminal),
         Some(project::EntryShape::Program) => Ok(pack::desktop::AppShape::Program),
-        None => match classify_entry_shape(root)? {
-            delivery::Shape::Web => Ok(pack::desktop::AppShape::WebView),
-            delivery::Shape::Tui | delivery::Shape::Cli => Ok(pack::desktop::AppShape::Terminal),
-            // A `script` renders nothing and a `worker` runs a view-less loop
-            // (a server is a `script` running `Server.listen`, rendering http
-            // rather than a desktop window); all classify as a plain program so
-            // the webview gate refuses them by name.
-            delivery::Shape::Script | delivery::Shape::Worker => {
-                Ok(pack::desktop::AppShape::Program)
-            }
-        },
+        None => Ok(desktop_app_shape(classify_entry_shape(root)?)),
+    }
+}
+
+/// The desktop app shape a classified `main` shape packages as.
+pub(crate) const fn desktop_app_shape(shape: delivery::Shape) -> pack::desktop::AppShape {
+    match shape {
+        delivery::Shape::Web => pack::desktop::AppShape::WebView,
+        delivery::Shape::Tui | delivery::Shape::Cli => pack::desktop::AppShape::Terminal,
+        // A `script` renders nothing and a `worker` runs a view-less loop (a
+        // server is a `script` running `Server.listen`, rendering http rather
+        // than a desktop window); all classify as a plain program so the
+        // webview gate refuses them by name.
+        delivery::Shape::Script | delivery::Shape::Worker => pack::desktop::AppShape::Program,
     }
 }
 
@@ -272,9 +275,12 @@ struct BundleAssembler<'a> {
 /// for the wrapped assembler. The ONLY way to obtain one is
 /// [`BundleAssembler::gate_desktop`], which runs the gate first; its
 /// [`assemble`](GatedDesktop::assemble) is the sole entry to desktop assembly.
+/// It carries the webview proof the gate minted, so the packaged app is always
+/// emitted for the webview host.
 pub struct GatedDesktop<'a> {
     assembler: BundleAssembler<'a>,
     finish: NativeFinish<'a>,
+    webview: delivery::WebViewProof,
 }
 
 /// A mobile-shape gate witness: proof that [`validate_mobile_shape`] passed for
@@ -291,7 +297,16 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.assembler.assemble_desktop(os, self.finish)
+        self.assembler
+            .assemble_desktop(os, self.finish, self.webview)
+    }
+
+    /// Emit the packaged app's crate into `out` without running cargo.
+    ///
+    /// # Errors
+    /// Build/emit errors from the underlying compile.
+    pub fn emit(&self, out: OutTarget<'_>) -> Result<EmittedCrate, CliError> {
+        self.assembler.emit_desktop(out, self.webview)
     }
 }
 
@@ -338,9 +353,23 @@ impl<'a> BundleAssembler<'a> {
         root: &Path,
     ) -> Result<GatedDesktop<'a>, CliError> {
         validate_desktop_shape(manifest.default_program().and_then(|p| p.shape), root)?;
+        // The desktop packager ships the `web desktop` delivery, so the gate
+        // that admitted the shape mints its webview proof.
+        let delivery::HostIntent::WebView(webview) =
+            delivery::Delivery::web_desktop().host_intent()
+        else {
+            // `web desktop` always resolves to the webview host; were it not
+            // to, the packager refuses rather than bundle a served program.
+            return Err(CliError::Usage(crate::text::Message::relay(
+                &pack::desktop::DesktopRefusal::NotWebView {
+                    shape: pack::desktop::AppShape::Program.as_str(),
+                },
+            )));
+        };
         Ok(GatedDesktop {
             assembler: Self::new(manifest, manifest_path, BundleProfile::of(&finish)),
             finish,
+            webview,
         })
     }
 
@@ -367,6 +396,29 @@ impl<'a> BundleAssembler<'a> {
         Ok(GatedMobile(Self::new(manifest, manifest_path, profile)))
     }
 
+    /// Emit the desktop app's crate into `out` for the webview host `webview`
+    /// proves.
+    ///
+    /// # Errors
+    /// Build/emit errors from the underlying compile.
+    fn emit_desktop(
+        &self,
+        out: OutTarget<'_>,
+        webview: delivery::WebViewProof,
+    ) -> Result<EmittedCrate, CliError> {
+        let runtime_dir = resolve_vendored_runtime_dir(None, false)?;
+        build_project_into(
+            self.manifest_path,
+            out,
+            &runtime_dir,
+            &BuildOptions {
+                intent: self.profile.build_intent(),
+                ..BuildOptions::from_env()
+            },
+            delivery::HostIntent::WebView(webview),
+        )
+    }
+
     /// Emit + compile the app to a binary, generate the desktop bundle layout,
     /// and materialise (Linux) or describe (macOS/Windows) the bundle on disk.
     /// Private: reached only through a [`GatedDesktop`] witness, so the shape
@@ -379,6 +431,7 @@ impl<'a> BundleAssembler<'a> {
         &self,
         os: pack::desktop::DesktopOs,
         finish: NativeFinish<'_>,
+        webview: delivery::WebViewProof,
     ) -> Result<(), CliError> {
         use std::fmt::Write as _;
 
@@ -402,16 +455,7 @@ impl<'a> BundleAssembler<'a> {
         // (non-static) native build.
         let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
         let rust_target = EmitTarget::Area(output.area(&[OutputArea::Rust]));
-        let runtime_dir = resolve_vendored_runtime_dir(None, false)?;
-        let crate_dir = build_project_into(
-            self.manifest_path,
-            OutTarget::Proven(&rust_target),
-            &runtime_dir,
-            &BuildOptions {
-                intent: self.profile.build_intent(),
-                ..BuildOptions::from_env()
-            },
-        )?;
+        let crate_dir = self.emit_desktop(OutTarget::Proven(&rust_target), webview)?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
         // A `release web desktop` bundle carries an optimised binary and its
@@ -4482,6 +4526,76 @@ mod admission_tests {
                 Err(CliError::PackageAudit(_))
             ),
             "an entry hiding an audited capability is refused"
+        );
+    }
+
+    /// The desktop packager emits the webview app, titled by the manifest's
+    /// `delivery.desktop` window, and never the served web app.
+    #[test]
+    fn desktop_packager_emits_webview() {
+        const WEB_APP: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+
+type Msg
+    = Increment
+
+type alias Model =
+    { count : Int }
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model =
+    ( { model | count = model.count + 1 }, Cmd.none )
+
+view : Model -> Element Msg
+view _model =
+    Ui.el [ Ui.onClick Increment ] (Ui.text "+")
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Increment
+        }
+"#;
+        let tree = crate::project_root::SourceTree::main(WEB_APP)
+            .field("delivery = { desktop = { title = \"Packaged\", width = 640, height = 480 } }");
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let manifest = project::parse_manifest(&manifest_path).expect("manifest");
+        let gated = BundleAssembler::gate_desktop(
+            &manifest,
+            &manifest_path,
+            NativeFinish::Dev,
+            fixture.path(),
+        )
+        .expect("a web app passes the desktop gate");
+        let out = ipe_test_temp::temp_root()
+            .join(format!("ipe-desktop-packager-emit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        gated
+            .emit(OutTarget::Path(&out))
+            .expect("the packaged app emits");
+        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("main.rs");
+        let _ = std::fs::remove_dir_all(&out);
+        assert!(main_rs.contains("WebViewApp"), "not the webview executor");
+        assert!(
+            main_rs.contains("title: \"Packaged\".to_string(), size: (640, 480)"),
+            "not the manifest window"
         );
     }
 }

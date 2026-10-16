@@ -89,13 +89,6 @@ pub struct BuildOptions {
     /// (rustc drops the undeclared files itself, so the emitted binary is
     /// identical either way — trimming only changes what source lands on disk).
     pub tree_shake_vendored: bool,
-    /// The sanitized Cargo package name for the emitted crate, derived from
-    /// `package.ipe`'s name via
-    /// [`ipe_backend_rust::sanitize_cargo_name`]. The emitted `Cargo.toml`
-    /// carries `[package] name = "<cargo_name>"` and the built binary is
-    /// named accordingly. Empty string uses the safe `"ipe-app"` default
-    /// (single-file builds with no manifest).
-    pub cargo_name: String,
     /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed.
     /// Threaded through [`ipe_db::BuildConfig`] to
     /// [`ipe_backend_rust::RustBackend::with_debugger`], which adds the
@@ -111,20 +104,6 @@ pub struct BuildOptions {
     /// `ipe dev build` / `ipe dev run` / `ipe release` entries leave it `false` so a
     /// release artifact never carries hot-swap scaffolding. Default `false`.
     pub hot_appearance: bool,
-    /// `true` when the resolved delivery is `web desktop` (webview-native).
-    /// Threaded through [`ipe_db::BuildConfig`] and the emit fast-path to
-    /// [`ipe_backend_rust::RustBackend::with_webview_host`], forcing the
-    /// `uses_webview` signal so the emitted project selects the webview executor
-    /// and promotes `webview` to the default feature list. The webview delivery
-    /// is a resolved HOST decision (from the CLI's shape × runtime × host), not a
-    /// source entry. Default `false` (a served `web`, or any non-web shape).
-    pub webview_host: bool,
-    /// The webview-native desktop window, sourced from the manifest
-    /// `delivery.desktop` block. Threaded to
-    /// [`ipe_backend_rust::RustBackend::with_webview_window`] and consulted only
-    /// when [`Self::webview_host`]. Filled in `build_project_with_options` once
-    /// the manifest is parsed; `None` selects the built-in fallback window.
-    pub webview_window: Option<ipe_backend_rust::WebViewWindow>,
 }
 
 /// Where a build writes its emitted crate.
@@ -162,26 +141,103 @@ pub fn runtime_dep_from_env() -> bool {
     !ipe_env::var("IPE_RUNTIME_VENDORED").is_ok_and(|v| v == "1")
 }
 
-/// The emitted-crate package name for a no-manifest (single-file) build, read
-/// from `IPE_EMIT_PACKAGE_NAME` when set, empty (the `"ipe-app"` default)
-/// otherwise.
+/// The emitted-crate name of a no-manifest (single-file) build: the name
+/// `IPE_EMIT_PACKAGE_NAME` pins when set, the fixed `ipe-app` otherwise.
 ///
-/// A single-file build carries no `package.ipe`, so its emitted crate is always
-/// named `ipe-app`. When many single-file builds share ONE cargo target dir
-/// (the coverage harness driving a per-symbol emit into a warm shared dep
-/// target) that constant name makes their app-crate cargo fingerprints collide:
-/// cargo could reuse a prior probe's compiled `ipe-app` and mask a genuinely
-/// broken emit, defeating the seal the coverage sweep exists to hold. Setting a
-/// UNIQUE name per build gives each app crate its own fingerprint, so a broken
-/// emit still fails to build even against a warm target. Unset (every ordinary
-/// `ipe dev run` / `ipe dev build`), the name is empty and the emit keeps the `ipe-app`
-/// default — this lever changes nothing for a normal build.
+/// A single-file build carries no `package.ipe`, so its emitted crate is
+/// otherwise always named `ipe-app`. When many single-file builds share ONE
+/// cargo target dir (the coverage harness driving a per-symbol emit into a warm
+/// shared dep target) that constant name makes their app-crate cargo
+/// fingerprints collide: cargo could reuse a prior probe's compiled `ipe-app`
+/// and mask a genuinely broken emit, defeating the seal the coverage sweep
+/// exists to hold. Setting a UNIQUE name per build gives each app crate its own
+/// fingerprint, so a broken emit still fails to build even against a warm
+/// target. This is the one read of the variable.
+fn single_file_crate_name() -> ipe_backend_rust::CrateName {
+    ipe_env::var("IPE_EMIT_PACKAGE_NAME").ok().map_or(
+        ipe_backend_rust::CrateName::SingleFile,
+        |name| {
+            ipe_backend_rust::CrateName::Pinned(ipe_backend_rust::CargoPackageName::sanitize(&name))
+        },
+    )
+}
+
+/// The emit settings of a no-manifest build (a single file, a loose file, a
+/// test entry).
+///
+/// There is no manifest window, so the host is always served. `ffi` and
+/// `runtime_dep` stay `None` here: the compile core fills both once it has
+/// resolved them.
 #[must_use]
-pub fn single_file_cargo_name_from_env() -> String {
-    ipe_env::var("IPE_EMIT_PACKAGE_NAME")
-        .ok()
-        .map(|name| ipe_backend_rust::sanitize_cargo_name(&name))
-        .unwrap_or_default()
+pub(crate) fn loose_emit_settings(
+    db_driver: ipe_backend_rust::DbDriver,
+    options: &BuildOptions,
+) -> ipe_backend_rust::EmitSettings {
+    ipe_backend_rust::EmitSettings {
+        db_driver,
+        ffi: None,
+        target: options.target,
+        wasm_public_env: options.wasm_public_env.clone(),
+        mount_base: options.mount_base.clone(),
+        wasm_hydrate_mode: options.wasm_hydrate_mode,
+        runtime_dep: None,
+        debugger: options.debugger,
+        crate_name: single_file_crate_name(),
+        hot_appearance: options.hot_appearance,
+        host: ipe_backend_rust::EmitHost::Served,
+        intent: options.intent,
+    }
+}
+
+/// The emit settings of a manifest build, for the host `host` asks for.
+///
+/// The manifest supplies the driver, `[wasm]` settings, mount base and crate
+/// identity, and, for a webview request, the `delivery.desktop` window. This
+/// is the one constructor of [`ipe_backend_rust::EmitHost::WebView`], and it
+/// is reached only with a [`crate::delivery::WebViewProof`]. `ffi` and
+/// `runtime_dep` stay `None` here: the compile core fills both once it has
+/// resolved them.
+#[must_use]
+pub(crate) fn manifest_emit_settings(
+    manifest: &project::ProjectManifest,
+    manifest_path: &Path,
+    options: &BuildOptions,
+    host: crate::delivery::HostIntent,
+) -> ipe_backend_rust::EmitSettings {
+    // The emitted crate identity is uniquified per project so two projects
+    // that share a friendly name but live at different paths own SEPARATE
+    // slots in a shared CARGO_TARGET_DIR. The seed is the CANONICAL project
+    // directory, so the identity is stable across runs yet distinct per real
+    // project location; a symlink/`..` alias resolves to the same slot.
+    let identity = ipe_backend_rust::crate_identity(
+        &ipe_backend_rust::sanitize_cargo_name(&manifest.name),
+        &canonical_project_dir(manifest_path),
+    );
+    let host = match host {
+        crate::delivery::HostIntent::Served => ipe_backend_rust::EmitHost::Served,
+        crate::delivery::HostIntent::WebView(_) => {
+            let desktop = &manifest.delivery.desktop;
+            ipe_backend_rust::EmitHost::WebView(ipe_backend_rust::WebViewWindow {
+                title: desktop.title.clone(),
+                width: i64::from(desktop.width),
+                height: i64::from(desktop.height),
+            })
+        }
+    };
+    ipe_backend_rust::EmitSettings {
+        db_driver: manifest.driver,
+        ffi: None,
+        target: options.target,
+        wasm_public_env: manifest.wasm.public_env.to_names(),
+        mount_base: manifest.delivery.browser.base.clone(),
+        wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
+        runtime_dep: None,
+        debugger: options.debugger,
+        crate_name: ipe_backend_rust::CrateName::Identity(identity),
+        hot_appearance: options.hot_appearance,
+        host,
+        intent: options.intent,
+    }
 }
 
 /// The canonical directory that owns a project's manifest — the seed for the
@@ -299,11 +355,8 @@ impl Default for BuildOptions {
             intent: ipe_backend_rust::BuildIntent::default(),
             runtime_dep: false,
             tree_shake_vendored: false,
-            cargo_name: String::new(),
             debugger: false,
             hot_appearance: false,
-            webview_host: false,
-            webview_window: None,
         }
     }
 }
@@ -320,7 +373,6 @@ impl BuildOptions {
     pub fn from_env() -> Self {
         Self {
             runtime_dep: runtime_dep_from_env(),
-            cargo_name: single_file_cargo_name_from_env(),
             ..Self::default()
         }
     }
@@ -986,11 +1038,8 @@ pub fn compile_modules(
 /// materialising the cached [`ipe_backend::EmittedProject`] verbatim. On a
 /// miss, the full pipeline runs, and a successful
 /// result is best-effort stored for the next invocation.
-// `options` is threaded onward by value into the cache-hit / full-pipeline
-// branches below (mirroring every sibling `BuildOptions` consumer in this
-// file); a `&BuildOptions` parameter would just push the clone this struct's
-// `Vec<String>` field (`wasm_public_env`) now needs onto every call site
-// instead of the one place that actually reads it.
+// `options` is taken by value, like every sibling `BuildOptions` entry in this
+// file, so a caller hands over the options it built for this one compile.
 #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn compile_modules_observed(
     sources: BTreeMap<Vec<String>, (PathBuf, String)>,
@@ -1011,15 +1060,16 @@ pub fn compile_modules_observed(
         Ok(set) => set,
         Err(e) => return (Err(e), CacheOutcome::Miss),
     };
+    let settings = loose_emit_settings(db_driver, &options);
     compile_source_set_observed(
         source_set,
         entry_path,
         target,
         runtime_dir,
         blame_path,
-        db_driver,
+        settings,
         cache_site,
-        options,
+        &options,
     )
 }
 
@@ -1041,23 +1091,23 @@ const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(
 ///
 /// The set is compiled as given: no source is read and nothing is injected
 /// here, so what is emitted is exactly the set a caller judged.
-// `options` is threaded onward by value, as in `compile_modules_observed`.
-#[allow(
-    clippy::too_many_lines,
-    clippy::too_many_arguments,
-    clippy::needless_pass_by_value
-)]
+///
+/// `settings` is the one value every emit chain, the cache key and the salsa
+/// config read; this core fills its `ffi` and `runtime_dep` once resolved.
+/// `options` contributes only the write-time knobs (static plan, tree shaking)
+/// and the dependency-model selector.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn compile_source_set_observed(
     source_set: super::PackageSourceSet,
     entry_path: &[String],
     target: &EmitTarget,
     runtime_dir: &Path,
     blame_path: &Path,
-    db_driver: ipe_backend_rust::DbDriver,
+    settings: ipe_backend_rust::EmitSettings,
     cache_site: Option<&cache::CacheSite>,
-    options: BuildOptions,
+    options: &BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
-    if let Err(refusal) = refuse_debugger_without_runtime_dep(&options) {
+    if let Err(refusal) = refuse_debugger_without_runtime_dep(options) {
         return (Err(refusal), CacheOutcome::Miss);
     }
     let super::SourceSetParts {
@@ -1096,25 +1146,18 @@ fn compile_source_set_observed(
     } else {
         cache_site
     };
+    let settings = ipe_backend_rust::EmitSettings {
+        ffi: ffi_emit,
+        runtime_dep,
+        ..settings
+    };
+    let floor = crate::run_sandbox::EmitFloor::of(settings.intent, settings.target);
 
     // The on-disk build cache. `epoch` folds in BOTH the running
     // `ipe` binary's own content hash and the active `rustc`'s fingerprint
     // (see `cache::derive_epoch`'s doc for why this makes
     // "refuse, don't guess" structural rather than a runtime check).
-    let cache_key = cache::compute_project_key(
-        &sources,
-        &injected,
-        entry_path,
-        db_driver,
-        options.target,
-        &options.wasm_public_env,
-        &options.mount_base,
-        options.intent,
-        options.debugger,
-        options.hot_appearance,
-        options.webview_host,
-        options.webview_window.as_ref(),
-    );
+    let cache_key = cache::compute_project_key(&sources, &injected, entry_path, &settings);
     let epoch = cache_site.and_then(|_| cache::derive_epoch());
     if let (Some(site), Some(epoch)) = (cache_site, epoch.as_deref())
         && let Some(emitted) = cache::try_load(site, epoch, &cache_key)
@@ -1126,7 +1169,7 @@ fn compile_source_set_observed(
                 runtime_dir,
                 options.static_plan.as_ref(),
                 options.tree_shake_vendored,
-                crate::run_sandbox::EmitFloor::of(options.intent, options.target),
+                floor,
             ),
             CacheOutcome::Hit,
         );
@@ -1141,7 +1184,7 @@ fn compile_source_set_observed(
     // (`compute_ir_key`'s own doc explains why), so this tier can still hit
     // when the `EmittedProject` tier just missed on a `db_driver`-only edit.
     if let (Some(site), Some(epoch)) = (cache_site, epoch.as_deref()) {
-        let ir_key = cache::compute_ir_key(&sources, &injected, entry_path, options.target);
+        let ir_key = cache::compute_ir_key(&sources, &injected, entry_path, settings.target);
         let fresh_interner: std::sync::Arc<std::sync::Mutex<ipe_intern::Interner>> =
             std::sync::Arc::new(std::sync::Mutex::new(ipe_intern::Interner::new()));
         if let Some(program) = cache::try_load_ir(site, epoch, &ir_key, &fresh_interner) {
@@ -1151,7 +1194,7 @@ fn compile_source_set_observed(
             // cached IR that uses a development-only `Debug.*` escape hatch must
             // be rejected here too (IPE-L0140) — otherwise a cached dev artifact
             // could slip through a release build that hits this tier.
-            if options.intent == ipe_backend_rust::BuildIntent::Release
+            if settings.intent == ipe_backend_rust::BuildIntent::Release
                 && program.modules.iter().any(|m| m.uses_debug)
             {
                 let diag = Diagnostic::Lower {
@@ -1174,20 +1217,7 @@ fn compile_source_set_observed(
                 let guard = fresh_interner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                ipe_backend_rust::RustBackend::new(&guard)
-                    .with_db_driver(db_driver)
-                    .with_target(options.target)
-                    .with_wasm_public_env(options.wasm_public_env.clone())
-                    .with_mount_base(options.mount_base.clone())
-                    .with_wasm_hydrate_mode(options.wasm_hydrate_mode)
-                    .with_runtime_dep(runtime_dep.clone())
-                    .with_debugger(options.debugger)
-                    .with_project_name(&options.cargo_name)
-                    .with_hot_appearance(options.hot_appearance)
-                    .with_webview_host(options.webview_host)
-                    .with_webview_window(options.webview_window.clone())
-                    .with_build_intent(options.intent)
-                    .emit(&program)
+                ipe_backend_rust::RustBackend::configured(&guard, &settings).emit(&program)
             };
             if let Ok(emitted) = emit_result {
                 let written = write_emitted_project(
@@ -1196,7 +1226,7 @@ fn compile_source_set_observed(
                     runtime_dir,
                     options.static_plan.as_ref(),
                     options.tree_shake_vendored,
-                    crate::run_sandbox::EmitFloor::of(options.intent, options.target),
+                    floor,
                 );
                 // Warm the (cheaper-to-hit) EmittedProject tier for the
                 // next build too — advisory, best-effort, and rooted in the
@@ -1227,26 +1257,10 @@ fn compile_source_set_observed(
     // deterministic across runs (golden-suite-enforced).
     let db = ipe_db::IpeDatabase::new();
     let source_root = create_source_root(&db, &sources, &injected, &ffi_injected);
-    // The config input (see `ipe_db::BuildConfig`'s doc for why this
-    // is narrowed to `db_driver` rather than the full manifest shape). A
-    // fresh `BuildConfig` per one-shot invocation is fine here — unlike the
-    // clean-vs-incremental parity gate's warm sequence, this driver never
+    // One fresh `BuildConfig` per one-shot invocation: this driver never
     // re-demands `emit_project` against a second config instance.
-    let config = ipe_db::BuildConfig::new(
-        &db,
-        db_driver,
-        ffi_emit,
-        options.target,
-        options.wasm_public_env.clone(),
-        options.mount_base.clone(),
-        options.wasm_hydrate_mode,
-        options.intent,
-        runtime_dep,
-        options.debugger,
-        options.cargo_name.clone(),
-        options.hot_appearance,
-        options.webview_host,
-    );
+    let ir_target = settings.target;
+    let config = ipe_db::BuildConfig::new(&db, settings);
 
     let emitted = match compile_prepared(&db, source_root, &sources, entry_path, blame_path, config)
     {
@@ -1260,7 +1274,7 @@ fn compile_source_set_observed(
         runtime_dir,
         options.static_plan.as_ref(),
         options.tree_shake_vendored,
-        crate::run_sandbox::EmitFloor::of(options.intent, options.target),
+        floor,
     );
 
     // A writable cache root comes only from the claim the write above
@@ -1282,7 +1296,7 @@ fn compile_source_set_observed(
         if let Some(entry_file) = source_root.files(&db).get(entry_path).copied()
             && let Ok(program) = ipe_db::lower_program(&db, source_root, entry_file)
         {
-            let ir_key = cache::compute_ir_key(&sources, &injected, entry_path, options.target);
+            let ir_key = cache::compute_ir_key(&sources, &injected, entry_path, ir_target);
             cache::store_ir(
                 &root,
                 epoch,
@@ -1864,7 +1878,7 @@ pub fn compile_prepared(
     // single-entry `--target wasm` build (a distinct `[wasm].entry` module
     // takes the same role once the M6 integration wires a separate client
     // entry through).
-    if *config.target(db) == ipe_ir::Target::WasmClient {
+    if config.settings(db).target == ipe_ir::Target::WasmClient {
         let gate_result = {
             let interner = shared_interner.lock();
             ipe_canon::module_classify::check_client_reachability(linked, &linked.name, &interner)
@@ -1886,7 +1900,7 @@ pub fn compile_prepared(
     // a denied kernel anywhere would otherwise become a cargo failure — THE
     // SEAL — or a secret consumer in a public bundle). Blame via the same
     // span→file heuristic the type errors use.
-    if *config.target(db) == ipe_ir::Target::WasmClient {
+    if config.settings(db).target == ipe_ir::Target::WasmClient {
         let gate_result = {
             let interner = shared_interner.lock();
             ipe_canon::target_gate::check_wasm_client(linked, &interner)
@@ -1909,7 +1923,7 @@ pub fn compile_prepared(
     // symbol, so this refusal replaces a `cargo build --target wasm32-wasip1`
     // failure (THE SEAL). Defense in depth: even a kernel reached through a path
     // the shape gate does not model is turned back here at `ipe` time.
-    if *config.target(db) == ipe_ir::Target::WasmWasi {
+    if config.settings(db).target == ipe_ir::Target::WasmWasi {
         let gate_result = {
             let interner = shared_interner.lock();
             ipe_canon::target_gate::check_wasm_wasi(linked, &interner)
@@ -2027,14 +2041,18 @@ pub fn compile_prepared(
     // A widget-free program injects nothing under either target (byte-identical
     // emit).
     if !widget_manifest.is_empty() {
-        match config.target(db) {
+        match &config.settings(db).target {
             // Co-located WASI carries no widget surface (a `Direct` script has no
             // `Web`/DOM shape), so it shares the native (no browser bundle) arm.
             ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => {
                 inject_widget_registration(&mut emitted, &widget_manifest)?;
             }
             ipe_ir::Target::WasmClient => {
-                inject_wasm_widget_bundle(&mut emitted, &widget_manifest, config.mount_base(db))?;
+                inject_wasm_widget_bundle(
+                    &mut emitted,
+                    &widget_manifest,
+                    &config.settings(db).mount_base,
+                )?;
             }
         }
     }
@@ -2819,34 +2837,73 @@ pub fn build_project_with_options(
         OutTarget::Path(out_dir),
         runtime_dir,
         options,
+        crate::delivery::HostIntent::Served,
     )
     .map(drop)
 }
 
-/// [`build_project_with_options`] into `out`, returning the claimed crate
-/// directory.
+/// [`build_project_with_options`] for the host `host` asks for, into `out`,
+/// returning the claimed crate directory.
 ///
 /// # Errors
 /// As [`build_project`], plus [`CliError::OutputRefused`] when `out` overlaps
-/// the project or its sources.
+/// the project or its sources, and [`CliError::Usage`] when `host` asks for
+/// the webview host but the entry's `main` is not a web program.
 pub fn build_project_into(
     manifest_path: &Path,
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: &BuildOptions,
+    host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
     let manifest = project::parse_manifest(manifest_path)?;
     let (sources, discovered) = super::read_package_modules(&manifest)?;
     refuse_debugger_without_runtime_dep(options)?;
+    refuse_webview_off_web(host, &manifest, &sources)?;
     let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path)?;
-    build_from_sources(
+    build_from_sources_for(
         &manifest,
         manifest_path,
         source_set,
         out,
         runtime_dir,
         options,
+        host,
     )
+}
+
+/// Refuse a webview request whose entry `main` is not a web program.
+///
+/// The CLI's delivery resolution already pins the shape; this re-checks it
+/// against the sources the build compiles. A parse failure is left to the
+/// compile pipeline, which reports it with a blamed span and emits nothing.
+///
+/// # Errors
+/// [`CliError::Usage`] carrying the desktop packager's own refusal when the
+/// entry's shape is not `Web`; the entry-resolution errors of the manifest.
+fn refuse_webview_off_web(
+    host: crate::delivery::HostIntent,
+    manifest: &project::ProjectManifest,
+    sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
+) -> Result<(), CliError> {
+    let crate::delivery::HostIntent::WebView(_) = host else {
+        return Ok(());
+    };
+    let entry_path = manifest.resolved_entry()?;
+    let shape = match sources.get(&entry_path) {
+        None => crate::delivery::Shape::Script,
+        Some((_, source)) => {
+            let mut interner = Interner::new();
+            let Ok(module) = ipe_parse::parse_module(source, &mut interner) else {
+                return Ok(());
+            };
+            crate::delivery::Shape::from_main(ipe_canon::shape_source::classify_main_shape(
+                &module, &interner,
+            ))
+        }
+    };
+    crate::pack::desktop::require_webview(super::desktop_app_shape(shape))
+        .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))
 }
 
 /// Emit the package `source_set` of `manifest` into `out`, returning the claimed crate directory.
@@ -2866,6 +2923,31 @@ pub fn build_from_sources(
     out: OutTarget<'_>,
     runtime_dir: &Path,
     options: &BuildOptions,
+) -> Result<EmittedCrate, CliError> {
+    // An audit emits the served program it judges.
+    build_from_sources_for(
+        manifest,
+        manifest_path,
+        source_set,
+        out,
+        runtime_dir,
+        options,
+        crate::delivery::HostIntent::Served,
+    )
+}
+
+/// [`build_from_sources`] for the host `host` asks for.
+///
+/// # Errors
+/// As [`build_from_sources`].
+fn build_from_sources_for(
+    manifest: &project::ProjectManifest,
+    manifest_path: &Path,
+    source_set: super::PackageSourceSet,
+    out: OutTarget<'_>,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+    host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
     // A library package (declares `exposedModules`, has no runnable entry —
     // neither a `programs` stage nor a `src/Main.ipe`) has nothing to emit. Refuse
@@ -2891,40 +2973,7 @@ pub fn build_from_sources(
         )));
     }
 
-    // Fold in the manifest-derived fields: `[wasm] publicEnv`, hydrate mode,
-    // and the project name (sanitized to a valid Cargo package name). The
-    // caller's `options` carries no manifest-derived data — it is built before
-    // the manifest is parsed — so these three fields are completed here, the
-    // same way `manifest.driver` bypasses `options` as its own positional arg.
-    // The webview window is a manifest-derived HOST setting: read the
-    // `delivery.desktop` block only for a webview-native (`web desktop`) build.
-    let webview_window = options.webview_host.then(|| {
-        let d = &manifest.delivery.desktop;
-        ipe_backend_rust::WebViewWindow {
-            title: d.title.clone(),
-            width: i64::from(d.width),
-            height: i64::from(d.height),
-        }
-    });
-    // The emitted crate identity is uniquified per project so two projects that
-    // share a friendly name but live at different paths own SEPARATE slots in a
-    // shared CARGO_TARGET_DIR (no cross-project cargo-fingerprint thrash). The
-    // FRIENDLY name (`manifest.name`) is untouched — only this internal crate
-    // identity carries the path-derived suffix. The seed is the CANONICAL project
-    // directory so the identity is stable across runs (deterministic) yet distinct
-    // per real project location; a symlink/`..` alias resolves to the same slot.
-    let cargo_name = ipe_backend_rust::crate_identity(
-        &ipe_backend_rust::sanitize_cargo_name(&manifest.name),
-        &canonical_project_dir(manifest_path),
-    );
-    let options = BuildOptions {
-        wasm_public_env: manifest.wasm.public_env.to_names(),
-        mount_base: manifest.delivery.browser.base.clone(),
-        wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
-        cargo_name,
-        webview_window,
-        ..*options
-    };
+    let settings = manifest_emit_settings(manifest, manifest_path, options, host);
 
     // The manifest is the blame location for an import cycle (no single file
     // owns it); post-link errors are blamed on the entry file inside the core.
@@ -2936,7 +2985,7 @@ pub fn build_from_sources(
         &target,
         runtime_dir,
         manifest_path,
-        manifest.driver,
+        settings,
         cache_site.as_ref(),
         options,
     )
@@ -3433,5 +3482,69 @@ mod tests {
             ),
             "a hook swapped for a link must be refused: {after:?}"
         );
+    }
+
+    /// A webview request for a project whose `main` is not a web program is
+    /// refused with the desktop packager's own refusal, and nothing is emitted.
+    #[test]
+    fn webview_intent_on_non_web_entry_refused() {
+        const CLI_APP: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Cli as Cli
+import Ipe.Tea.Cli.Cmd
+import Ipe.Tea.Cli.Sub
+import Ipe.Ui.Cli as Ui
+import Ipe.Ui.Cli exposing (Lines)
+
+type Msg = Line String
+
+type alias Model = { lines : List String }
+
+init : () -> ( Model, Cmd Msg )
+init _unit =
+    ( { lines = [] }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model =
+    ( model, Cmd.none )
+
+view : Model -> Lines Msg
+view _model =
+    Ui.text "ok"
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.onLine Line
+
+main =
+    Cli.tea
+        { init = init, update = update, view = view
+        , subscriptions = subscriptions
+        }
+"#;
+        let fixture = crate::RootFixture::main(CLI_APP).expect("fixture");
+        let out =
+            ipe_test_temp::temp_root().join(format!("ipe-webview-off-web-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        let refused = build_project_into(
+            &fixture.manifest_path(),
+            OutTarget::Path(&out),
+            Path::new("/nonexistent-runtime-dir"),
+            &BuildOptions::default(),
+            crate::delivery::Delivery::web_desktop().host_intent(),
+        );
+        let refusal =
+            crate::pack::desktop::require_webview(crate::pack::desktop::AppShape::Terminal)
+                .expect_err("a terminal app has no webview window");
+        let expected = CliError::Usage(text::Message::relay(&refusal));
+        assert!(
+            matches!(&refused, Err(CliError::Usage(_))),
+            "not a usage refusal: {refused:?}"
+        );
+        let Err(err) = refused else {
+            return;
+        };
+        assert_eq!(err.to_string(), expected.to_string());
+        assert!(!out.exists(), "a refused build emitted output");
     }
 }

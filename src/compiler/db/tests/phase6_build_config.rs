@@ -102,18 +102,20 @@ fn emit_project_memoized_coarse_floor() {
     let root = root_of(&db, &[(&["A"], a), (&["B"], b)]);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     let emitted = ipe_db::emit_project(&db, root, b, config)
@@ -167,18 +169,20 @@ fn emit_project_config_change_does_not_retrigger_lower() {
     let root = root_of(&db, &[(&["A"], a), (&["B"], b)]);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     assert!(ipe_db::emit_project(&db, root, b, config).is_ok());
@@ -188,7 +192,9 @@ fn emit_project_config_change_does_not_retrigger_lower() {
     assert_eq!(log.executions_of("linked_program("), 1);
 
     log.clear();
-    config.set_db_driver(&mut db).to(DbDriver::Postgres);
+    let mut settings = config.settings(&db).clone();
+    settings.db_driver = DbDriver::Postgres;
+    config.set_settings(&mut db).to(settings);
     assert!(ipe_db::emit_project(&db, root, b, config).is_ok());
 
     assert_eq!(
@@ -232,18 +238,20 @@ fn emit_project_source_edit_retriggers_lower_and_emit() {
     let root = root_of(&db, &[(&["A"], a), (&["B"], b)]);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     assert!(ipe_db::emit_project(&db, root, b, config).is_ok());
@@ -269,18 +277,20 @@ fn emit_project_short_circuits_on_lower_error() {
     let root = root_of(&db, &[(&["Entry"], entry)]);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     let lower_err = ipe_db::lower_program(&db, root, entry)

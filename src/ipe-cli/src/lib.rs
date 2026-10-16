@@ -335,7 +335,7 @@ pub use driver::{
 pub use driver::{emitted_bin_filename, emitted_bin_name};
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use project_root::fixture::{
-    BuiltFixture, RootFixture, build_fixture, build_fixture_with_options,
+    BuiltFixture, RootFixture, build_fixture, build_fixture_for, build_fixture_with_options,
 };
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use project_root::golden::build_golden_dir;

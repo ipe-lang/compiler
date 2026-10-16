@@ -34,23 +34,7 @@ pub fn body_layout_budgets(
     interner: &Interner,
     program: &ipe_ir::Program,
 ) -> DResult<Vec<BodyLayoutBudget>> {
-    let ctx = EmitCtx::build(
-        interner,
-        program,
-        crate::DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        crate::MountBase::root(),
-        false,
-        None,
-        false,
-        crate::BuildIntent::Release,
-        String::new(),
-        false,
-        false,
-        None,
-    )?;
+    let ctx = EmitCtx::build(interner, program, crate::EmitSettings::unconfigured())?;
     let mut budgets = Vec::new();
     for module in &program.modules {
         for func in &module.funcs {

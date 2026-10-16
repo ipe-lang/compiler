@@ -559,23 +559,7 @@ mod tests {
         program: &Program,
         fields: BTreeMap<ipe_intern::Symbol, IrType>,
     ) -> DResult<[u8; 32]> {
-        let ctx = EmitCtx::build(
-            interner,
-            program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(interner, program, crate::EmitSettings::unconfigured())?;
         model_schema_tag(&ctx, &IrType::Record(fields))
     }
 
@@ -735,23 +719,7 @@ mod tests {
                 enum_def(home_b.clone(), boxed, vec![variant]),
             ],
         );
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
 
         let model_a = IrType::Record(BTreeMap::from([(
             field,
@@ -829,41 +797,9 @@ mod tests {
             },
         )]));
 
-        let ctx_1 = EmitCtx::build(
-            &interner,
-            &program_1,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx_1 = EmitCtx::build(&interner, &program_1, crate::EmitSettings::unconfigured())?;
         let a = model_schema_tag(&ctx_1, &model)?;
-        let ctx_2 = EmitCtx::build(
-            &interner,
-            &program_2,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx_2 = EmitCtx::build(&interner, &program_2, crate::EmitSettings::unconfigured())?;
         let b = model_schema_tag(&ctx_2, &model)?;
         assert_ne!(
             a, b,
@@ -1049,23 +985,7 @@ mod tests {
 
     /// An `EmitCtx` over an empty program, for the session-codec choice.
     fn session_ctx<'a>(interner: &'a Interner, program: &'a Program) -> DResult<EmitCtx<'a>> {
-        EmitCtx::build(
-            interner,
-            program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
+        EmitCtx::build(interner, program, crate::EmitSettings::unconfigured())
     }
 
     /// Serde `Msg` and `Model` get the `Full` codec, keyed by both tags.

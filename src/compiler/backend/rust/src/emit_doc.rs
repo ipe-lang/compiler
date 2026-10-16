@@ -468,23 +468,7 @@ pub fn native_vs_legacy_sweep(
     interner: &Interner,
     program: &ipe_ir::Program,
 ) -> DResult<(Vec<SweepDivergence>, usize, usize)> {
-    let ctx = EmitCtx::build(
-        interner,
-        program,
-        crate::DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        crate::MountBase::root(),
-        false,
-        None,
-        false,
-        crate::BuildIntent::Release,
-        String::new(),
-        false,
-        false,
-        None,
-    )?;
+    let ctx = EmitCtx::build(interner, program, crate::EmitSettings::unconfigured())?;
     let mut divergences = Vec::new();
     let mut compared = 0usize;
     let mut skipped = 0usize;
@@ -2308,19 +2292,7 @@ mod tests {
         let ctx = EmitCtx::build(
             &fx.interner,
             &fx.program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
+            crate::EmitSettings::unconfigured(),
         )
         .expect("EmitCtx::build");
         f(&ctx)
@@ -3051,24 +3023,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let scope = GenericScope::new(&[]);
         let expr = Expr::If {
             cond: Box::new(Expr::Var(cond)),
@@ -3680,24 +3636,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let expr = Expr::Lambda {
             params: vec![(x, IrType::Int)],
             ret: IrType::Int,
@@ -4081,24 +4021,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let scope = GenericScope::new(&[]);
         let expr = Expr::TaskSeq {
             effect: Box::new(Expr::Var(short_eff)),

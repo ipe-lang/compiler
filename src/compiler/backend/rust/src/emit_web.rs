@@ -1455,23 +1455,7 @@ mod schema_tag_tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
 
         // Model = { count : Int } (no `page` field → the single-page branch).
         let model = IrType::Record(BTreeMap::from([(count, IrType::Int)]));

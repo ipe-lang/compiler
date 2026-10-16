@@ -21,7 +21,6 @@ use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_ir::{IrType, ModPath, Program};
 use ipe_runtime_rust::encoding::{BundlePath, MountBase};
 
-use crate::EmitCtx;
 use crate::crate_specs;
 use crate::emit_expr::emit_func;
 use crate::emit_types::{emit_enum, emit_record_struct, emit_row_witnesses};
@@ -29,6 +28,7 @@ use crate::items::Items;
 use crate::preamble::{epilogue, preamble};
 use crate::rust_file;
 use crate::rust_file::{Partitioned, RustFileId, partition_items};
+use crate::{CrateName, EmitCtx, SINGLE_FILE_CRATE_NAME};
 
 /// The canonical emit template, embedded at compile time. The fixed
 /// runtime-bindings block (kernel wrappers) is an exact substring of it. This is
@@ -2812,12 +2812,11 @@ fn assemble_project_text(
     rust_sources: Vec<(RelPath, String)>,
 ) -> DResult<EmittedProject> {
     refuse_vendored_debugger(ctx)?;
-    // The emitted crate's package name: the caller-supplied sanitized project
-    // name, or the safe default when no name was configured.
-    let effective_name: &str = if ctx.cargo_name.is_empty() {
-        "ipe-app"
-    } else {
-        &ctx.cargo_name
+    // The emitted crate's package name, chosen by the build's `CrateName`.
+    let effective_name: &str = match &ctx.crate_name {
+        CrateName::SingleFile => SINGLE_FILE_CRATE_NAME,
+        CrateName::Pinned(name) => name.as_str(),
+        CrateName::Identity(identity) => identity.as_str(),
     };
     // Wrap once; all apply_cargo_name call sites below use this.
     let safe_name = SafeTomlString::escape(effective_name);

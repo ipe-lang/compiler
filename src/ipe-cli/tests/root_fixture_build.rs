@@ -29,6 +29,7 @@ fn a_fixture_builds_under_the_default_package_name() {
         .canonicalize()
         .expect("canonical fixture dir");
     let identity = ipe_backend_rust::crate_identity(ipe::project_root::DEFAULT_NAME, &dir);
+    let identity = identity.as_str();
     assert!(identity.starts_with("ipe-app_"), "{identity}");
     assert_eq!(
         built
