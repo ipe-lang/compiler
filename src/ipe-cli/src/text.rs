@@ -993,6 +993,22 @@ messages! {
     cli_discovery_limit_reached(detail) = "cli-discovery-limit-reached";
     /// A discovered source file names a Windows reserved device as a module segment.
     cli_device_named_module(path, segment) = "cli-device-named-module";
+    /// The project directory holds no `package.ipe`.
+    project_no_manifest(dir) = "project-no-manifest";
+    /// The project directory has no `src/` directory.
+    project_no_src_dir(root) = "project-no-src-dir";
+    /// A `programs` entry names a file `src/` does not hold.
+    project_entry_missing(entry) = "project-entry-missing";
+    /// The project declares no program, has no `src/Main.ipe`, and exposes no module.
+    project_no_default_entry(root) = "project-no-default-entry";
+    /// A `programs` entry passes through a symbolic link under `src/`.
+    project_entry_escapes(entry, path) = "project-entry-escapes";
+    /// An `exposedModules` name has no file under `src/`.
+    project_exposed_module_missing(module) = "project-exposed-module-missing";
+    /// A project file or directory ipe would read is a symbolic link.
+    project_symlink_in_source(path) = "project-symlink-in-source";
+    /// A file argument lies outside the project's `src/` and `tests/`.
+    project_file_outside_root(arg, root) = "project-file-outside-root";
     /// A locked dependency falls within an advisory's affected range.
     cli_advisory_vulnerable(package, version, severity, id, description, fixed_in) =
         "cli-advisory-vulnerable";

@@ -749,6 +749,22 @@ code! {
     IPE_E0002 = "IPE-E0002", "the host linker cannot open the build directory", "IPE-E0002";
     /// the host linker could not open one of its input files
     IPE_E0003 = "IPE-E0003", "the host linker could not open an input file", "IPE-E0003";
+    /// the project directory holds no `package.ipe`
+    IPE_E0004 = "IPE-E0004", "no package.ipe in the project directory", "IPE-E0004";
+    /// the project directory has no `src/` directory (or it is a link)
+    IPE_E0005 = "IPE-E0005", "the project has no src directory", "IPE-E0005";
+    /// a `programs` entry in `package.ipe` names a file `src/` does not hold
+    IPE_E0006 = "IPE-E0006", "a declared program entry is missing", "IPE-E0006";
+    /// the project declares no program, has no `src/Main.ipe`, and exposes no module
+    IPE_E0007 = "IPE-E0007", "the project names no entry module", "IPE-E0007";
+    /// a `programs` entry is reached through a symbolic link under `src/`
+    IPE_E0008 = "IPE-E0008", "a program entry passes through a symbolic link", "IPE-E0008";
+    /// an `exposedModules` name has no file under `src/`
+    IPE_E0009 = "IPE-E0009", "an exposed module is missing", "IPE-E0009";
+    /// a project file or directory ipe would read is a symbolic link
+    IPE_E0010 = "IPE-E0010", "a symbolic link inside the project", "IPE-E0010";
+    /// a file argument lies outside the project's `src/` and `tests/`
+    IPE_E0011 = "IPE-E0011", "a file argument outside the project sources", "IPE-E0011";
 
     // -----------------------------------------------------------------------
     // Internal (IPE-I####)

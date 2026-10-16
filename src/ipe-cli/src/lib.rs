@@ -64,6 +64,7 @@ pub mod package_name;
 pub mod pkg;
 pub mod progress;
 pub mod project;
+pub mod project_root;
 pub mod proven_dir;
 pub mod publish;
 pub mod published_version;
