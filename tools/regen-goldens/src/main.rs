@@ -6,7 +6,7 @@
 //! split files) against the stored fixture under `tests/golden/<name>/`. After
 //! any emit-changing compiler change, those stored fixtures must be rebuilt.
 //! This tool does exactly that, through the SAME emit path the golden harness
-//! asserts on ([`ipe::build`] / [`ipe::build_project`], the `ipe` library — not
+//! asserts on ([`ipe::build_golden_dir`], the `ipe` library — not
 //! a possibly-stale pre-built binary), so a regeneration is faithful by
 //! construction: on an unchanged compiler it is a no-op (`git status` stays
 //! clean).
@@ -197,22 +197,11 @@ fn regenerate_one(dir: &Path, out: &Path, runtime: &Path) -> Result<usize, Strin
     Ok(rewritten)
 }
 
-/// Run the compiler's emit path for one golden. A golden carrying a
-/// `package.ipe` or legacy `ipe.toml` manifest is a multi-module project
-/// ([`ipe::build_project`]); otherwise it is a single-file program built from
-/// `Main.ipe` ([`ipe::build`]) — exactly the two shapes the golden harness
-/// compiles.
+/// Run the compiler's emit path for one golden, through the same
+/// [`ipe::build_golden_dir`] the golden tests build through.
 fn emit_golden(dir: &Path, out: &Path, runtime: &Path) -> Result<(), String> {
-    let package_ipe = dir.join("package.ipe");
-    let ipe_toml = dir.join("ipe.toml");
-    let result = if package_ipe.is_file() {
-        ipe::build_project(&package_ipe, out, runtime)
-    } else if ipe_toml.is_file() {
-        ipe::build_project(&ipe_toml, out, runtime)
-    } else {
-        ipe::build(&dir.join("Main.ipe"), out, runtime)
-    };
-    result.map_err(|e| format!("compiler emit failed: {e:?}"))
+    ipe::build_golden_dir(dir, out, runtime, &ipe::BuildOptions::from_env())
+        .map_err(|e| format!("compiler emit failed: {e:?}"))
 }
 
 /// Overwrite `dst` with the bytes of `src` when they differ, creating parent

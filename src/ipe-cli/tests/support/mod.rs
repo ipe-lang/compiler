@@ -443,6 +443,18 @@ pub struct RunOutcome {
     pub exit_code: Option<i32>,
 }
 
+/// Emit the checked-in golden directory `golden_dir` into `out`.
+///
+/// The same `ipe::build_golden_dir` `regen-goldens` blesses with, so a test
+/// compares against bytes built by one code path.
+///
+/// # Errors
+/// As `ipe::build_golden_dir`.
+#[allow(dead_code)] // not every golden test binary builds a golden directory
+pub fn build_golden(golden_dir: &Path, out: &Path, runtime: &Path) -> Result<(), ipe::CliError> {
+    ipe::build_golden_dir(golden_dir, out, runtime, &ipe::BuildOptions::from_env())
+}
+
 /// Build the emitted project at `emitted_dir` into the shared target WITHOUT
 /// running it, returning `Ok(())` on a successful `cargo build` or `Err` with
 /// cargo's stderr. Used by SEAL goldens whose kernel is network-effectful (e.g.

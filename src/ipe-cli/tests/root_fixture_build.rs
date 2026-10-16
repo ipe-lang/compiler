@@ -23,17 +23,24 @@ fn a_fixture_builds_under_the_default_package_name() {
     let fixture = RootFixture::main(MAIN).expect("a project with a Main module resolves");
     let out = out_dir("default");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    build_fixture(&fixture, &out, &runtime).expect("the fixture builds");
-    let cargo = std::fs::read_to_string(out.join("Cargo.toml")).expect("emitted Cargo.toml");
+    let built = build_fixture(&fixture, &out, &runtime).expect("the fixture builds");
     let dir = fixture
         .path()
         .canonicalize()
         .expect("canonical fixture dir");
     let identity = ipe_backend_rust::crate_identity(ipe::project_root::DEFAULT_NAME, &dir);
     assert!(identity.starts_with("ipe-app_"), "{identity}");
-    assert!(
-        cargo.contains(&format!("name = \"{identity}\"")),
-        "the crate is named by the fixture's package name and directory: {cargo}"
+    assert_eq!(
+        built
+            .crate_name()
+            .expect("the emitted manifest names its crate"),
+        identity,
+        "the crate is named by the fixture's package name and directory"
+    );
+    let profile = out.join("target").join("debug");
+    assert_eq!(
+        built.binary_in(&profile).expect("the binary is located"),
+        profile.join(format!("{identity}{}", std::env::consts::EXE_SUFFIX))
     );
     assert!(out.join("src/main.rs").is_file());
 }

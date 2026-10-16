@@ -1,0 +1,23 @@
+module Main exposing (main)
+
+-- NEGATIVE golden: a `Select` taken as a parameter and passed to
+-- `Store.selectToList`. Its projected column types are hidden, so no
+-- per-row decode can be emitted. Rejected with IPE-L0149
+-- (`SelectArgNotProjection`).
+
+
+import Ipe.Db exposing (Db)
+import Ipe.Db.Store as Store
+import Ipe.Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Task exposing (Task)
+
+
+readSelect : Db -> Store.Select String -> Task Error (List String)
+readSelect db sel =
+    Store.selectToList db sel
+
+
+main : Task Error ()
+main =
+    Io.println "unreachable"

@@ -1,0 +1,8 @@
+direct:Austen,Herbert
+helper-arg:Dune,Emma
+pipe-list:Dune/Herbert,Emma/Austen
+pipe-maybe:Just b2
+back-pipe:b1,b2
+compose:a1,a2
+nested-pipe:Austen,Herbert
+let-join-pipe:a1,a2

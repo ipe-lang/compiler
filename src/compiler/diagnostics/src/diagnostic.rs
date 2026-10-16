@@ -1998,6 +1998,19 @@ pub enum StoreSelectProjectionDefect {
         /// Short human-readable Ipê type label for the unsupported type.
         ty: Box<str>,
     },
+    /// The `Select` argument of `Store.selectToList` / `Store.selectToMaybe` is
+    /// not a `Store.select` expression visible at the call.
+    ///
+    /// A `Select` bound to a name, taken as a parameter, or returned by a
+    /// function hides the projected column types the per-row decode is built
+    /// from.
+    SelectArgNotProjection,
+    /// `Store.selectToList` / `Store.selectToMaybe` is referenced other than as
+    /// one call holding its `Db` and its `Store.select` expression.
+    ///
+    /// A partial application or a function value has no projection visible at
+    /// the call, so no per-row decode can be built for it.
+    SelectToNotSaturated,
 }
 
 // ===========================================================================
@@ -3324,6 +3337,21 @@ fn store_select_projection_invalid_help(defect: &StoreSelectProjectionDefect) ->
              `Store.selectToList`."
         )
         .into_boxed_str(),
+        StoreSelectProjectionDefect::SelectArgNotProjection => {
+            "pass the `Store.select` expression itself, directly or through `|>`: \
+             `Store.join a .x b .y |> Store.select (\\( l, r ) -> r.name) |> \
+             Store.selectToList db`. A `Select` bound to a name, taken as a \
+             parameter, or returned by a function hides the projected column types \
+             the decode is built from."
+                .into()
+        }
+        StoreSelectProjectionDefect::SelectToNotSaturated => {
+            "call `Store.selectToList` / `Store.selectToMaybe` with its `Db` and its \
+             `Store.select` expression at one call site, directly or through `|>`. \
+             It cannot be partially applied or passed as a function value, because \
+             the per-row decode is built from the projection visible at the call."
+                .into()
+        }
     };
     vec![HelpLine::Note(note)]
 }

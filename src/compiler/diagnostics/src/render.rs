@@ -916,6 +916,16 @@ fn lower_prose(msg: &LowerError) -> String {
                      `{ty}` is not a supported scalar type."
                 )
             }
+            StoreSelectProjectionDefect::SelectArgNotProjection => {
+                "`Store.selectToList` / `Store.selectToMaybe` needs the \
+                 `Store.select` expression itself as its `Select` argument."
+                    .to_string()
+            }
+            StoreSelectProjectionDefect::SelectToNotSaturated => {
+                "`Store.selectToList` / `Store.selectToMaybe` must be called with \
+                 its `Db` and its `Store.select` expression at one call site."
+                    .to_string()
+            }
         },
     }
 }
@@ -2149,6 +2159,16 @@ fn store_select_projection_label(defect: &StoreSelectProjectionDefect) -> String
             "`Store.literal` binds a scalar SQL parameter — `{ty}` is not a \
              supported scalar (String, Int, Bool, or Float)"
         ),
+        StoreSelectProjectionDefect::SelectArgNotProjection => {
+            "this `Select` is not a `Store.select` expression at the call — its \
+             projected column types are hidden behind a name, parameter, or result"
+                .to_string()
+        }
+        StoreSelectProjectionDefect::SelectToNotSaturated => {
+            "this reference is a partial application or a function value — no \
+             `Store.select` projection is visible here to build the row decode from"
+                .to_string()
+        }
     }
 }
 
