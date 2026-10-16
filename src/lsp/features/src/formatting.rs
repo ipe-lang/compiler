@@ -14,6 +14,12 @@
 //! A declaration the range merely straddles gets no edit, so an edit never
 //! truncates one. The spliced buffer then passes the engine's own guards
 //! ([`ipe_fmt::verify_rewrite`]) or no edit is returned at all.
+//!
+//! An edit's range means what it says only where the server and the client
+//! count the same lines. A client ends a line at a lone `\r` as well as at
+//! `\n`; the position mapper and the lexer end one only at `\n`. A buffer
+//! holding a lone `\r` gets no edit, since its positions would name other
+//! text in the client.
 
 use ipe_db::{IpeDatabase, SourceFile};
 use lsp_types::{Range, TextEdit};
@@ -76,7 +82,23 @@ pub fn format_range(
 /// A parse failure, a round-trip guard tripping on a printer bug, or an
 /// output past its cap all leave the buffer untouched.
 fn engine_output(text: &str) -> Option<ipe_fmt::Formatted> {
+    if !lines_agree(text) {
+        return None;
+    }
     accepted(ipe_fmt::format_with_segments(text))
+}
+
+/// Whether an LSP client counts `text`'s lines as the position mapper does:
+/// the client also ends a line at a `\r` not followed by `\n`, the mapper
+/// only at `\n`.
+fn lines_agree(text: &str) -> bool {
+    let mut bytes = text.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == b'\r' && bytes.peek() != Some(&b'\n') {
+            return false;
+        }
+    }
+    true
 }
 
 /// The engine's verdict as an edit decision: every refusal is no edit.
@@ -617,6 +639,40 @@ mod tests {
         assert_eq!(
             apply_edits(src, &edits),
             "module Main exposing (f, g)\n\n\nf =\n      h (-5)\n\n\ng =\n    1 + 2\n"
+        );
+    }
+
+    /// A lone `\r` ends a line for the client but not for the position
+    /// mapper, so every position past it names other text in the client
+    /// buffer: neither whole-document nor range formatting returns an edit.
+    /// The same file with `\r\n` breaks still formats.
+    #[test]
+    fn lone_carriage_return_yields_no_edit() {
+        let db = IpeDatabase::new();
+        let lone = "module Main exposing (a, b)\n\n-- x\rzz\na =\n      1\n\nb =\n      2\n";
+        assert!(
+            ipe_fmt::format_source(lone).is_ok(),
+            "precondition: the engine formats it"
+        );
+        let f = file(&db, &["Main"], lone);
+        assert_eq!(format_document(&db, f, PositionEncoding::Utf16), None);
+        assert_eq!(
+            format_range(&db, f, line_range(0, 20), PositionEncoding::Utf16),
+            None
+        );
+        let last = "module Main exposing (a)\n\na =\n      1\r";
+        let f = file(&db, &["Main"], last);
+        assert_eq!(format_document(&db, f, PositionEncoding::Utf16), None);
+        let crlf = "module Main exposing (a, b)\r\n\r\na =\r\n      1\r\n\r\nb =\r\n      2\r\n";
+        let f = file(&db, &["Main"], crlf);
+        assert!(
+            format_document(&db, f, PositionEncoding::Utf16).is_some_and(|e| !e.is_empty()),
+            "control: CRLF breaks format"
+        );
+        assert!(
+            format_range(&db, f, line_range(0, 20), PositionEncoding::Utf16)
+                .is_some_and(|e| !e.is_empty()),
+            "control: CRLF breaks range-format"
         );
     }
 
