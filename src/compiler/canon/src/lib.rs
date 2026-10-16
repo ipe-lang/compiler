@@ -5216,4 +5216,108 @@ mod tests {
         );
         Ok(())
     }
+
+    /// The interpolated `{{record.field}}`'s record, from `main`'s body.
+    fn interp_record_of(body: &Expr_) -> Result<&Expr_, String> {
+        let Expr_::Call(_, args) = body else {
+            return Err(format!("not an `Interpolate` call: {body:?}"));
+        };
+        let [arg] = args.as_slice() else {
+            return Err("the interpolation call takes one argument".to_owned());
+        };
+        let Expr_::Access(record, _) = &arg.value else {
+            return Err(format!(
+                "the argument is not a field access: {:?}",
+                arg.value
+            ));
+        };
+        Ok(&record.value)
+    }
+
+    /// `{{cfg.port}}` over a top-level record reads that record, as the same
+    /// `cfg.port` does outside an interpolation, never an unbound `VarLocal`.
+    #[test]
+    fn interp_record_field_reads_a_top_level_record() -> Result<(), String> {
+        let mut i = Interner::new();
+        let body = canon_body(
+            &mut i,
+            "module Main exposing (main)\n\
+             cfg = { port = 1 }\n\
+             main =\n    \"\"\"{{cfg.port}}\"\"\"\n",
+            "main",
+        )
+        .ok_or("must parse and canonicalise")?;
+        let record = interp_record_of(&body)?;
+        assert!(
+            matches!(record, Expr_::VarTopLevel { name, .. } if i.resolve(*name) == Some("cfg")),
+            "the record is the top-level `cfg`: {record:?}"
+        );
+        Ok(())
+    }
+
+    /// `{{r.port}}` over a parameter stays the parameter.
+    #[test]
+    fn interp_record_field_keeps_a_local_record_local() -> Result<(), String> {
+        let mut i = Interner::new();
+        let body = canon_body(
+            &mut i,
+            "module Main exposing (main)\n\
+             main r =\n    \"\"\"{{r.port}}\"\"\"\n",
+            "main",
+        )
+        .ok_or("must parse and canonicalise")?;
+        let record = interp_record_of(&body)?;
+        let r = i.lookup("r").ok_or("`r` is interned")?;
+        assert!(
+            matches!(record, Expr_::VarLocal(s) if *s == r),
+            "the record is the parameter `r`: {record:?}"
+        );
+        Ok(())
+    }
+
+    /// `{{nope.port}}` over an unknown name is IPE-N0001, never an unbound
+    /// `VarLocal` that reaches `constrain` as a violated invariant.
+    #[test]
+    fn interp_record_field_of_an_unknown_name_is_a_value_not_found() {
+        let err = canon_err(
+            "module Main exposing (main)\n\
+             main =\n    \"\"\"{{nope.port}}\"\"\"\n",
+        );
+        assert!(
+            matches!(
+                &err,
+                Some(Diagnostic::Name {
+                    msg: NameError::ValueNotFound { name, .. },
+                    ..
+                }) if &**name == "nope"
+            ),
+            "an unknown interpolated record must be ValueNotFound, got {err:?}"
+        );
+    }
+
+    /// An interpolated record spelled like a compose operator's parameter,
+    /// inside that operator's operand, is an unknown name: the parameter never
+    /// binds a name the program did not bind.
+    #[test]
+    fn compose_param_never_binds_an_interpolated_record() -> Result<(), String> {
+        let site = converge_site(|lo, hi| {
+            let name = format!("compose_{lo}_{hi}");
+            let expr = format!("(\\_ -> \"\"\"{{{{{name}.x}}}}\"\"\") >> inc");
+            let source = format!("module Main exposing (apply)\n{INC}apply = {expr}\n");
+            (source, expr)
+        })?;
+        let err = canon_err(&site.source);
+        let want = format!("compose_{}_{}", site.lo, site.hi);
+        assert!(
+            matches!(
+                &err,
+                Some(Diagnostic::Name {
+                    msg: NameError::ValueNotFound { name, .. },
+                    ..
+                }) if **name == *want
+            ),
+            "`{want}` is unbound, got {err:?}"
+        );
+        Ok(())
+    }
 }

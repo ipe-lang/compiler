@@ -8006,7 +8006,7 @@ fn chunk_to_expr(
 ///
 /// Handles four shapes:
 ///   `foo`          — bare identifier → local var (or kernel if in scope)
-///   `record.field` — field access → `Access(VarLocal(record), field)`
+///   `record.field` — field access → `Access(record, field)`, `record` resolved as a bare name
 ///   `Module.func`  — qualified name → resolved through the qualified reader;
 ///                    an unresolved one is refused
 ///   `func arg`     — single function call → `Call(resolve(func), [resolve(arg)])`
@@ -8136,15 +8136,16 @@ fn resolve_simple_interp_ref(
         if first.starts_with(char::is_uppercase) {
             return resolve_interp_qualified(s, span, env, interner);
         }
-        // Lowercase `record.field` → `Access(VarLocal(record), field)`.
+        // Lowercase `record.field` → `Access(record, field)`, the record read
+        // through `resolve_var` exactly as a bare name is: a local stays
+        // `VarLocal`, a top-level value is `VarTopLevel`, an unknown name is
+        // IPE-N0001.
         let rec_sym = interner.intern(first)?;
         let field_sym = interner.intern(rest)?;
+        let record = resolve_var(rec_sym, span, env, interner)?;
         return Ok(Located::new(
             span,
-            canon::Expr_::Access(
-                Box::new(Located::new(span, canon::Expr_::VarLocal(rec_sym))),
-                field_sym,
-            ),
+            canon::Expr_::Access(Box::new(Located::new(span, record)), field_sym),
         ));
     }
     // Bare identifier — resolve through the one canonical bare-name path
