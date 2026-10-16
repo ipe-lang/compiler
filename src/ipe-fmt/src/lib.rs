@@ -1873,7 +1873,7 @@ impl<'a> Printer<'a> {
             if !outer && self.do_keyword_end(cur.span).is_some() {
                 break;
             }
-            let Some((step, rest)) = self.do_step(cur, outer) else {
+            let Some((step, rest)) = Self::do_step(cur, outer) else {
                 break;
             };
             steps.push(step);
@@ -1906,7 +1906,7 @@ impl<'a> Printer<'a> {
     ///   outermost node carries the `do` span instead, so there any
     ///   single-binding `let` over a statement binder is accepted — printing a
     ///   lone `let … in` result as a statement re-parses to the same AST.
-    fn do_step<'e>(&self, e: &'e Expr, outer: bool) -> Option<(DoStep<'e>, &'e Expr)> {
+    fn do_step<'e>(e: &'e Expr, outer: bool) -> Option<(DoStep<'e>, &'e Expr)> {
         match &e.value {
             Expr_::Call(head, args) => {
                 if !matches!(head.value, Expr_::TaskAndThen) {
