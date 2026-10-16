@@ -122,6 +122,43 @@ enum DeclKind<'a> {
     Alias(&'a ipe_syntax::TypeAlias),
 }
 
+/// Whether `expr` holds a `do` bind ([`ipe_syntax::Expr_::TaskAndThen`]).
+fn holds_do_bind(expr: &ipe_syntax::Expr) -> bool {
+    use ipe_syntax::Expr_;
+    match &expr.value {
+        Expr_::TaskAndThen => true,
+        Expr_::Call(callee, args) => holds_do_bind(callee) || args.iter().any(holds_do_bind),
+        Expr_::Case(scrutinee, arms) => {
+            holds_do_bind(scrutinee) || arms.iter().any(|(_, body)| holds_do_bind(body))
+        }
+        Expr_::Lambda(_, body) | Expr_::Access(body, _) => holds_do_bind(body),
+        Expr_::Binops(pairs, last) => {
+            pairs.iter().any(|(operand, _)| holds_do_bind(operand)) || holds_do_bind(last)
+        }
+        Expr_::Let(bindings, body) => {
+            bindings.iter().any(|b| holds_do_bind(&b.body)) || holds_do_bind(body)
+        }
+        Expr_::If(branches, otherwise) => {
+            branches
+                .iter()
+                .any(|(cond, branch)| holds_do_bind(cond) || holds_do_bind(branch))
+                || holds_do_bind(otherwise)
+        }
+        Expr_::Tuple(items) | Expr_::List(items) => items.iter().any(holds_do_bind),
+        Expr_::Record(fields) | Expr_::Update(_, fields) => {
+            fields.iter().any(|(_, value)| holds_do_bind(value))
+        }
+        Expr_::VarLocal(_)
+        | Expr_::VarQual(_, _)
+        | Expr_::Int(_)
+        | Expr_::Float(_)
+        | Expr_::Str(_)
+        | Expr_::MultilineStr { .. }
+        | Expr_::Char(_)
+        | Expr_::Unit => false,
+    }
+}
+
 /// The byte offset of the start of the source line containing `pos`.
 fn line_start(text: &str, pos: usize) -> usize {
     let pos = pos.min(text.len());
@@ -238,6 +275,13 @@ pub fn format_range(
         // The printer drops comment/doc trivia; skip any block that carries it
         // rather than silently delete a comment.
         if source_has_comment_or_doc(slice) {
+            continue;
+        }
+        // The printer has no spelling for a `do` bind (only `ipe_fmt` re-sugars
+        // it); skip the declaration rather than print what it cannot.
+        if let DeclKind::Value(v) = &block.kind
+            && holds_do_bind(&v.body)
+        {
             continue;
         }
         let formatted = format_decl(&block.kind, &interner, text);
@@ -626,6 +670,9 @@ fn push_expr(
             out.push('.');
             out.push_str(resolve(*name));
         }
+        // `format_range` skips a declaration holding a `do` bind; were one to
+        // reach here, this token fails the re-parse gate, so no edit ships.
+        ipe_syntax::Expr_::TaskAndThen => out.push_str("(<-)"),
         ipe_syntax::Expr_::Int(n) => out.push_str(&n.to_string()),
         ipe_syntax::Expr_::Float(f) => {
             // Reproduce the float from the original source when possible —
@@ -1188,6 +1235,22 @@ mod tests {
         assert!(
             ipe_db::parse(&db, f2).is_ok(),
             "edited buffer must re-parse"
+        );
+    }
+
+    /// A declaration holding a `do` bind is skipped by range formatting: the
+    /// AST printer has no spelling for the bind, and spelling it `Task.andThen`
+    /// would let an import alias retarget it.
+    #[test]
+    fn range_formatting_skips_do_bind_decl() {
+        let db = IpeDatabase::new();
+        let src = "module Main exposing (a)\n\nimport Ipe.Task as T\n\na t =\n      do\n            x <- t\n            t\n";
+        let f = file(&db, &["Main"], src);
+        let edits = format_range(&db, f, line_range(0, 9), PositionEncoding::Utf16)
+            .expect("parseable source returns Some");
+        assert!(
+            edits.is_empty(),
+            "a decl holding a `do` bind must not be reprinted, got:\n{edits:?}"
         );
     }
 

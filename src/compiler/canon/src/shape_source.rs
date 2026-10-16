@@ -313,6 +313,7 @@ fn expr_references_sink(
     match &expr.value {
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)

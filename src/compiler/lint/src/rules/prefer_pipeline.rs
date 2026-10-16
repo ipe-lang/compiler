@@ -104,6 +104,7 @@ fn walk(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>, in_binop_operand: bool) 
         Expr_::Access(base, _field) => walk(ctx, base, out, false),
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
@@ -249,6 +250,7 @@ impl SubjectKind {
             Expr_::Lambda(..) | Expr_::If(..) | Expr_::Case(..) | Expr_::Let(..) => Self::Open,
             Expr_::VarLocal(_)
             | Expr_::VarQual(_, _)
+            | Expr_::TaskAndThen
             | Expr_::Int(_)
             | Expr_::Float(_)
             | Expr_::Str(_)
