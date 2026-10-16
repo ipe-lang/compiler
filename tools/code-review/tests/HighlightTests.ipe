@@ -134,6 +134,39 @@ shellStrings =
         == ( [ Keyword "echo", Plain " ", Str "'a # b" ], [ Str "c'", Plain " ", Comment "# d" ] )
 
 
+secondLine : ( List Token, List Token ) -> List Token
+secondLine lines =
+    case lines of
+        ( _, second ) ->
+            second
+
+
+-- Shell: a `$'…'` string takes `\` escapes, so a `\'` in it closes
+-- nothing, on its line or across two; a `\$` escapes the `$`, leaving a
+-- verbatim `'…'` string.
+shellDollarStrings : Bool
+shellDollarStrings =
+    Highlight.tokenize Shell "echo $'it\\'s' # c"
+        == [ Keyword "echo", Plain " ", Str "$'it\\'s'", Plain " ", Comment "# c" ]
+        && twoLines Shell "x=$'a\\'" "b' # c"
+        == ( [ Ident "x", Plain "=", Str "$'a\\'" ], [ Str "b'", Plain " ", Comment "# c" ] )
+        && Highlight.tokenize Shell "echo \\$'a\\'"
+        == [ Keyword "echo", Plain " ", Plain "\\$", Str "'a\\'" ]
+
+
+-- Shell: a `<<` inside `((…))` or `$((…))` is a shift, so the line after it
+-- keeps its carry; a `<<` after the arithmetic closes still opens a heredoc,
+-- whose body line opens no string past itself.
+shellArithmeticShift : Bool
+shellArithmeticShift =
+    twoLines Shell "x=$((1 << 2)); echo 'a" "b' # c"
+        == ( [ Ident "x", Plain "=", Plain "$", Plain "(", Plain "(", Num "1", Plain " ", Plain "<", Plain "<", Plain " ", Num "2", Plain ")", Plain ")", Plain ";", Plain " ", Keyword "echo", Plain " ", Str "'a" ], [ Str "b'", Plain " ", Comment "# c" ] )
+        && secondLine (twoLines Shell "((n <<= (1))); echo 'a" "b' # c")
+        == [ Str "b'", Plain " ", Comment "# c" ]
+        && secondLine (twoLines Shell "cat $((1)) <<EOF" "don't")
+        == [ Ident "don", Str "'t" ]
+
+
 -- Rust: a `'"'` char literal opens no string, so the `//` after it is a
 -- comment; `//` inside a string is the string's; `--` and `#` open nothing;
 -- a lifetime's `'` is punctuation; block comments nest.
@@ -296,6 +329,8 @@ checks =
         , ( "Ipe -- in a string or after '\"' is code", ipeStrings )
         , ( "shell # is a comment; /* */, -- and $# are not", shellComments )
         , ( "shell '...' spans lines and hides #", shellStrings )
+        , ( "shell $'...' takes escapes", shellDollarStrings )
+        , ( "shell << in arithmetic is no heredoc", shellArithmeticShift )
         , ( "Rust '\"' opens no string; // in a string is the string's", rustComments )
         , ( "Rust raw and plain strings carry across lines", rustStrings )
         , ( "a language with no grammar is plain", unknownIsPlain )

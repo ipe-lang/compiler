@@ -102,6 +102,7 @@ type alias Grammar =
     , doubleQuote : DoubleQuote
     , singleQuote : SingleQuote
     , rawStrings : RawStrings
+    , dollarQuote : DollarQuote
     , bareEscape : BareEscape
     , heredocs : Heredocs
     , words : Words
@@ -187,6 +188,13 @@ type RawStrings
     | HashRawStrings
 
 
+-- Whether `$'…'` is a string with `\` escapes that may span lines (shell
+-- ANSI-C quoting, where `\'` does not close it).
+type DollarQuote
+    = NoDollarQuote
+    | DollarEscapedQuote
+
+
 -- Whether a `\` outside any string escapes the next character (shell).
 type BareEscape
     = NoBareEscape
@@ -268,6 +276,7 @@ rustGrammar =
     , doubleQuote = EscapedSpanningLines
     , singleQuote = CharLiteral
     , rawStrings = HashRawStrings
+    , dollarQuote = NoDollarQuote
     , bareEscape = NoBareEscape
     , heredocs = NoHeredocs
     , words = RustWords
@@ -277,9 +286,10 @@ rustGrammar =
 
 
 -- Shell: a `#` at the start of a word begins a line comment, `'…'` strings
--- without escapes, `"…"` strings with `\` escapes, a `\` escaping the next
--- character, heredocs. Shell has no block comment and no name path, and
--- every `\r` and leading byte-order mark is text the shell reads.
+-- without escapes, `"…"` and `$'…'` strings with `\` escapes, a `\`
+-- escaping the next character, heredocs. Shell has no block comment and
+-- no name path, and every `\r` and leading byte-order mark is text the
+-- shell reads.
 shellGrammar : Grammar
 shellGrammar =
     { lineComment = HashAtWordStart
@@ -287,6 +297,7 @@ shellGrammar =
     , doubleQuote = EscapedSpanningLines
     , singleQuote = VerbatimSpanningLines
     , rawStrings = NoRawStrings
+    , dollarQuote = DollarEscapedQuote
     , bareEscape = BackslashEscapesNext
     , heredocs = ShellHeredocs
     , words = ShellWords
@@ -306,6 +317,7 @@ ipeGrammar =
     , doubleQuote = EscapedOneLineOrTriple
     , singleQuote = CharLiteral
     , rawStrings = NoRawStrings
+    , dollarQuote = NoDollarQuote
     , bareEscape = NoBareEscape
     , heredocs = NoHeredocs
     , words = IpeWords
@@ -452,9 +464,55 @@ type HerePiece
     | NoWord
 
 
+-- Whether a shell line's scan is in code (`True` right after a `(`) or in
+-- an arithmetic `((…))` / `$((…))` this many parens deep, where `<<` is a
+-- shift, not a heredoc.
+type Parens
+    = InCode Bool
+    | InArith Int
+
+
 heredocOf : List Token -> Maybe ( String, Bool )
 heredocOf toks =
-    case List.foldl hereStep Seeking toks of
+    case List.foldl arithStep ( InCode False, Seeking ) toks of
+        ( _, scan ) ->
+            hereFound scan
+
+
+-- One token of the heredoc scan: a token inside arithmetic only moves the
+-- paren depth; any other token feeds `hereStep`.
+arithStep : Token -> ( Parens, HereScan ) -> ( Parens, HereScan )
+arithStep tok ( parens, scan ) =
+    case parens of
+        InCode afterOpen ->
+            if plainIs "(" tok then
+                if afterOpen then
+                    ( InArith 2, scan )
+
+                else
+                    ( InCode True, hereStep tok scan )
+
+            else
+                ( InCode False, hereStep tok scan )
+
+        InArith depth ->
+            if plainIs "(" tok then
+                ( InArith (depth + 1), scan )
+
+            else if plainIs ")" tok then
+                if depth <= 1 then
+                    ( InCode False, scan )
+
+                else
+                    ( InArith (depth - 1), scan )
+
+            else
+                ( InArith depth, scan )
+
+
+hereFound : HereScan -> Maybe ( String, Bool )
+hereFound scan =
+    case scan of
         HereFound delimiter stripTabs ->
             Just ( delimiter, stripTabs )
 
@@ -565,12 +623,19 @@ herePiece tok =
                 Adds s
 
 
--- A closed `'…'` string reads as its inside; a closed `"…"` one too when it
--- holds no `\`. Anything else is no delimiter.
+-- A closed `'…'` string reads as its inside; a closed `"…"` or `$'…'` one
+-- too when it holds no `\`. Anything else is no delimiter.
 quotedPiece : String -> HerePiece
 quotedPiece s =
     if String.length s < 2 then
         NoWord
+
+    else if String.startsWith "$'" s then
+        if String.length s >= 3 && String.endsWith "'" s && not (String.contains "\\" s) then
+            Adds (String.dropRight 1 (String.dropLeft 2 s))
+
+        else
+            NoWord
 
     else if String.startsWith "'" s && String.endsWith "'" s then
         Adds (String.dropRight 1 (String.dropLeft 1 s))
@@ -627,6 +692,9 @@ type Lexing
     | InStr
     | InStrEscape
     | InSingle
+    | Dollar
+    | InDollarQuote
+    | DollarQuoteEscape
     | ShellEscape
     | Pending Char
     | InLineComment
@@ -708,6 +776,26 @@ step g c ( lexing, buf, toks ) =
 
             else
                 ( InSingle, extend buf c, toks )
+
+        Dollar ->
+            if c == tickChar then
+                ( InDollarQuote, extend buf c, toks )
+
+            else
+                begin g AfterText c (toks ++ [ Plain buf ])
+
+        InDollarQuote ->
+            if c == tickChar then
+                ( Start AfterText, "", toks ++ [ Str (extend buf c) ] )
+
+            else if c == backslashChar then
+                ( DollarQuoteEscape, extend buf c, toks )
+
+            else
+                ( InDollarQuote, extend buf c, toks )
+
+        DollarQuoteEscape ->
+            ( InDollarQuote, extend buf c, toks )
 
         ShellEscape ->
             ( Start AfterText, "", toks ++ [ Plain (extend buf c) ] )
@@ -876,6 +964,9 @@ begin g gap c toks =
     else if bareEscapes g.bareEscape c then
         ( ShellEscape, String.fromChar c, toks )
 
+    else if dollarOpens g.dollarQuote c then
+        ( Dollar, "$", toks )
+
     else if rawOpens g.rawStrings c then
         ( InRawPrefix, "r", toks )
 
@@ -950,6 +1041,16 @@ bareEscapes escape c =
             c == backslashChar
 
         NoBareEscape ->
+            False
+
+
+dollarOpens : DollarQuote -> Char -> Bool
+dollarOpens quote c =
+    case quote of
+        DollarEscapedQuote ->
+            c == '$'
+
+        NoDollarQuote ->
             False
 
 
@@ -1063,6 +1164,15 @@ endLine g ( lexing, buf, toks ) =
         InSingle ->
             ( piece (Str buf) toks, InSingle )
 
+        Dollar ->
+            ( toks ++ [ Plain buf ], Start AfterSpace )
+
+        InDollarQuote ->
+            ( piece (Str buf) toks, InDollarQuote )
+
+        DollarQuoteEscape ->
+            ( piece (Str buf) toks, InDollarQuote )
+
         ShellEscape ->
             ( toks ++ [ Plain buf ], Start AfterSpace )
 
@@ -1175,6 +1285,15 @@ finish g ( lexing, buf, toks ) =
             piece (Plain buf) toks
 
         InSingle ->
+            piece (Plain buf) toks
+
+        Dollar ->
+            piece (Plain buf) toks
+
+        InDollarQuote ->
+            piece (Plain buf) toks
+
+        DollarQuoteEscape ->
             piece (Plain buf) toks
 
         ShellEscape ->
