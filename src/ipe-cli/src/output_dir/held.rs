@@ -2720,16 +2720,18 @@ mod tests {
         assert!(made.success(), "mkfifo creates the fixture");
         let (sent, received) = std::sync::mpsc::channel();
         let dir = base.clone();
-        std::thread::spawn(move || {
-            let read = held_at(&dir).read_file_capped(&name("Main.ipe"), byte_cap(64));
-            let _ = sent.send(matches!(
-                read,
-                Err(CliError::SourceRefused {
-                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
-                    ..
-                })
-            ));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let read = held_at(&dir).read_file_capped(&name("Main.ipe"), byte_cap(64));
+                let _ = sent.send(matches!(
+                    read,
+                    Err(CliError::SourceRefused {
+                        reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                        ..
+                    })
+                ));
+            })
+            .expect("spawn the reader thread");
         let refused = received
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the read returns without blocking on the FIFO");
