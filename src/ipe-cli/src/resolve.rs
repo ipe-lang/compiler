@@ -570,7 +570,10 @@ fn cache_dir(project_root: &Path, name: &PackageName, slot: CacheSlot<'_>) -> Pa
         CacheSlot::Escape(pinned) => format!(".git-{}-{}", name.as_str(), pinned.as_str()),
         CacheSlot::EscapeFetch => format!(".fetch-{}", name.as_str()),
     };
-    project_root.join(".ipe").join("packages").join(key)
+    project_root
+        .join(crate::output_dir::CACHE_NAMESPACE_DIR)
+        .join(crate::output_dir::PACKAGES_SUBDIR)
+        .join(key)
 }
 
 /// The cache directory for a locked dep, or `None` for a path escape, which is
@@ -1320,6 +1323,16 @@ mod tests {
     #[allow(clippy::expect_used)] // fixture names are literal registry names
     fn pn(raw: &str) -> PackageName {
         PackageName::parse(raw).expect("fixture package name parses")
+    }
+
+    /// A package's cache directory sits in the project's `.ipe/packages`, spelled once here.
+    #[test]
+    fn package_cache_dir_under_namespace() {
+        let root = Path::new("root");
+        assert_eq!(
+            cache_dir(root, &pn("lib"), CacheSlot::EscapeFetch),
+            root.join(".ipe").join("packages").join(".fetch-lib")
+        );
     }
 
     fn temp_dir(_tag: &str) -> PathBuf {

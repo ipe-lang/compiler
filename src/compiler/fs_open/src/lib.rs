@@ -31,7 +31,7 @@ mod name;
 pub mod prefix;
 pub mod win32_name;
 
-pub use name::{EntryName, is_one_spelled_name};
+pub use name::{EntryName, is_one_spelled_name, may_open_as};
 pub use prefix::{PlaceablePrefix, PrefixRefusal};
 
 #[cfg(unix)]

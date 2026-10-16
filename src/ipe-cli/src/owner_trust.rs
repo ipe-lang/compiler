@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use ipe_ffi::diag::Diagnostic;
+use ipe_ffi::driver::FFI_CACHE_COMPONENTS;
 
 use crate::CliError;
 use crate::text;
@@ -335,7 +336,14 @@ pub fn refuse_unverifiable_manifest(manifest: &Path) -> Result<(), CliError> {
     )))
 }
 
-/// Refuse whatever exists at `anchor/rel` on a host with no owner check.
+/// The FFI cache below `anchor`, built from [`FFI_CACHE_COMPONENTS`] one component at a time.
+fn cache_below(anchor: &Path) -> PathBuf {
+    let mut candidate = anchor.to_path_buf();
+    candidate.extend(FFI_CACHE_COMPONENTS);
+    candidate
+}
+
+/// Refuse whatever exists at the FFI cache below `anchor` on a host with no owner check.
 ///
 /// Every platform compiles this, so its refusal is exercised everywhere, not
 /// only where it is the discovery rule. A missing entry, or a path through a
@@ -343,10 +351,10 @@ pub fn refuse_unverifiable_manifest(manifest: &Path) -> Result<(), CliError> {
 ///
 /// # Errors
 ///
-/// [`CliError::TrustRefused`] when anything exists at `anchor/rel`, link or not;
+/// [`CliError::TrustRefused`] when anything exists at the cache path, link or not;
 /// [`CliError::Io`] when its presence cannot be determined.
-pub fn refuse_unverifiable_cache(anchor: &Path, rel: &str) -> Result<(), CliError> {
-    let candidate = anchor.join(rel);
+pub fn refuse_unverifiable_cache(anchor: &Path) -> Result<(), CliError> {
+    let candidate = cache_below(anchor);
     match std::fs::symlink_metadata(&candidate) {
         Ok(_) => Err(CliError::TrustRefused(TrustRefusal::FfiCacheUnverifiable(
             candidate,
@@ -379,7 +387,7 @@ mod held {
     use std::os::fd::{AsFd as _, BorrowedFd};
     use std::path::{Path, PathBuf};
 
-    use ipe_ffi::driver::CacheSource;
+    use ipe_ffi::driver::{CacheSource, FFI_CACHE_COMPONENTS};
     use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
     use rustix::io::Errno;
 
@@ -463,24 +471,24 @@ mod held {
         }
     }
 
-    /// Open the cache at `anchor/rel`, owner-checking every component below `anchor`.
+    /// Open the FFI cache below `anchor`, owner-checking every component below `anchor`.
     ///
-    /// `anchor` itself is reached by path, following links; each component of
-    /// `rel` is opened relative to the handle on its parent without following
-    /// a link, then checked on the opened handle. `None` when a component is
-    /// absent or is not a directory.
+    /// `anchor` itself is reached by path, following links; each of
+    /// [`FFI_CACHE_COMPONENTS`] is opened relative to the handle on its parent
+    /// without following a link, then checked on the opened handle. `None` when
+    /// a component is absent or is not a directory.
     ///
     /// # Errors
     ///
     /// [`CliError::TrustRefused`] when a component is a symbolic link or some user
     /// other than the invoker can write it; [`CliError::Io`] when a component
     /// cannot be opened or inspected.
-    pub fn open_cache(anchor: &Path, rel: &str) -> Result<Option<TrustedCache>, CliError> {
+    pub fn open_cache(anchor: &Path) -> Result<Option<TrustedCache>, CliError> {
         let invoker = Invoker::current();
         let mut shown = anchor.to_path_buf();
         let mut held: Option<File> = None;
         let mut breached: Option<PathBuf> = None;
-        for segment in rel.split('/') {
+        for segment in FFI_CACHE_COMPONENTS {
             shown.push(segment);
             let opened = match &held {
                 None => open_component(CWD, &shown, &shown)?,
@@ -642,13 +650,13 @@ mod unverifiable {
         }
     }
 
-    /// Refuse any entry at `anchor/rel`, since its ownership cannot be verified here.
+    /// Refuse any entry at the FFI cache below `anchor`, since its ownership cannot be verified here.
     ///
     /// # Errors
     ///
     /// As [`refuse_unverifiable_cache`].
-    pub fn open_cache(anchor: &Path, rel: &str) -> Result<Option<TrustedCache>, CliError> {
-        refuse_unverifiable_cache(anchor, rel).map(|()| None)
+    pub fn open_cache(anchor: &Path) -> Result<Option<TrustedCache>, CliError> {
+        refuse_unverifiable_cache(anchor).map(|()| None)
     }
 }
 

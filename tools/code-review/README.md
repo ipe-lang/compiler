@@ -245,15 +245,20 @@ and owns the review DB.
 
 ## Checks
 
-From this directory, run the app's tests and the formatter check:
+From this directory, type-check the app itself, then run its tests and the
+formatter check:
 
 ```bash
-ipe test            # builds and runs tests/Main.ipe, reports pass/fail
-ipe fmt --check     # lists unformatted files without rewriting them
+ipe type-check src/Main.ipe   # the shipped app's entry, refused or accepted
+ipe test                      # builds and runs tests/Main.ipe, reports pass/fail
+ipe fmt --check               # lists unformatted files without rewriting them
 ```
 
-`tests/Main.ipe` gathers every test module's checks into one run; `ipe test`
-exits non-zero on a failing check. `ipe fmt` without `--check` rewrites the
+`ipe test` compiles `tests/Main.ipe` and the modules it imports, never
+`src/Main.ipe`, so a green test run says nothing about whether the app itself
+compiles: the `ipe type-check` step is what proves it. `tests/Main.ipe` gathers
+every test module's checks into one run; `ipe test` exits non-zero on a failing
+check. `ipe fmt` without `--check` rewrites the
 files.
 
 ## Running

@@ -1662,8 +1662,8 @@ messages! {
     output_inside_ipe_owned(out, owner) = "output-inside-ipe-owned";
     /// A user-bound output inside a directory an ipe claim is turning into ipe's.
     output_inside_claim(out, owner, claim) = "output-inside-claim";
-    /// An output inside a `.git` directory.
-    output_inside_vcs(out) = "output-inside-vcs";
+    /// An output inside a version-control metadata directory.
+    output_inside_vcs(out, dir) = "output-inside-vcs";
     /// An output inside an ipe cache namespace.
     output_inside_cache_namespace(out, namespace) = "output-inside-cache-namespace";
     /// An output with a `..` that does not climb out of a plain existing directory.
