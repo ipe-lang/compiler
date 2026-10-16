@@ -10561,6 +10561,55 @@ enum SelectResultShape {
     Maybe,
 }
 
+/// The `Ipe.Db.Store` bindings whose placeholder body only ever fails, each with its intercept's shape.
+///
+/// The un-intercepted body is `Task.fail selectNotProjectionError`. Every
+/// reader of "is this a `selectTo*` binding" (the intercept, the spine
+/// collapse, the reference-site refusals and the IR backstop) derives from
+/// this one table.
+const SELECT_TO_HELPERS: [(&str, SelectResultShape); 2] = [
+    ("selectToList", SelectResultShape::List),
+    ("selectToMaybe", SelectResultShape::Maybe),
+];
+
+/// Peel a curried call spine into its head and its arguments in source order.
+///
+/// `Call(Call(h, [a]), [b])` gives `(h, [a, b])`; a non-`Call` expression is
+/// its own head with no arguments. Iterative, so the walk adds no stack depth.
+fn call_spine(e: &canon::Expr) -> (&canon::Expr, Vec<&canon::Expr>) {
+    let mut levels: Vec<&[canon::Expr]> = Vec::new();
+    let mut head = e;
+    while let canon::Expr_::Call(inner, args) = &head.value {
+        levels.push(args);
+        head = inner;
+    }
+    let args = levels.iter().rev().flat_map(|level| level.iter()).collect();
+    (head, args)
+}
+
+/// Refuse any call or function-value edge in `funcs` that targets one of `ids`.
+///
+/// The IR backstop for the `selectTo*` intercept: emitted code never reaches a
+/// placeholder body, so an edge to one is a reference both the intercept and
+/// the reference-site refusals missed. The refusal is IPE-L0149
+/// `SelectToNotSaturated` at `span`.
+fn refuse_select_to_edges(funcs: &[Func], ids: &[FuncId], span: Span) -> DResult<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut edges = BTreeSet::new();
+    for func in funcs {
+        collect_func_edges(&func.body, &mut edges);
+    }
+    if ids.iter().any(|id| edges.contains(id)) {
+        return Err(unsupported_store_select(
+            span,
+            StoreSelectProjectionDefect::SelectToNotSaturated,
+        ));
+    }
+    Ok(())
+}
+
 /// The scalar type of a projected column — the four types the DB projection layer
 /// reads a cell back as. Each names both the concrete decoded value type and the
 /// internal `Ipe.Db.Store` reader the emitted per-row decode calls at its output
@@ -11583,6 +11632,11 @@ pub struct Lowerer<'a> {
     /// Monotonic cursor into [`Self::projection_decode_binders`], mirroring
     /// [`Self::param_cursor`]'s shape exactly.
     projection_decode_cursor: Cell<usize>,
+    /// The linked `selectTo*` bindings with their intercept shapes, resolved once from [`SELECT_TO_HELPERS`].
+    ///
+    /// Empty when the program does not link `Ipe.Db.Store`. Read on every
+    /// function-headed call, so the module-home lookup is not repeated there.
+    select_to_funcs: Vec<(FuncId, SelectResultShape)>,
     /// Pre-minted, collision-free names for the destructure-thunk
     /// binding (`let destr_thunk_N = move || <value>; …`) that
     /// [`Self::build_destructure_or_decoder_thunk`] introduces when a
@@ -13882,8 +13936,18 @@ impl<'a> Lowerer<'a> {
             source_path: source_path.to_owned(),
             source_text: source_text.to_owned(),
             port_seal_enum_legal: std::cell::RefCell::new(None),
+            select_to_funcs: Vec::new(),
         };
         lowerer.seed_synthetic_prelude_enums();
+        lowerer.select_to_funcs = SELECT_TO_HELPERS
+            .iter()
+            .filter_map(|(helper, shape)| {
+                lowerer
+                    .store_named_func_id(helper)
+                    .ok()
+                    .map(|id| (id, *shape))
+            })
+            .collect();
         lowerer
     }
 
@@ -15583,12 +15647,40 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Does `id` resolve to the `Ipe.Db.Store` top-level binding named `helper`?
-    /// Used to recognise a `Store.selectToList` / `Store.selectToMaybe` call in
-    /// the intercept dispatch; the lookup is keyed on the module home, so a
-    /// same-named binding in another module never matches.
-    fn is_store_func(&self, id: FuncId, helper: &str) -> bool {
-        self.store_named_func_id(helper) == Ok(id)
+    /// The intercept's result shape when `id` is `Ipe.Db.Store.selectToList` or `selectToMaybe`.
+    ///
+    /// Keyed on the module home (resolved once through
+    /// [`Self::store_named_func_id`]), so a same-named binding in another
+    /// module never matches. A program that does not link `Ipe.Db.Store` has no
+    /// id for either name, so the answer there is `None` for every id.
+    fn select_to_shape(&self, id: FuncId) -> Option<SelectResultShape> {
+        self.select_to_funcs
+            .iter()
+            .find(|(to_id, _)| *to_id == id)
+            .map(|(_, shape)| *shape)
+    }
+
+    /// The ids of the linked `selectTo*` bindings, empty without `Ipe.Db.Store`.
+    fn select_to_ids(&self) -> Vec<FuncId> {
+        self.select_to_funcs.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// Refuse a `selectTo*` callee reached anywhere but its saturated-call intercept.
+    ///
+    /// A function value or a partial application has no `Store.select`
+    /// projection visible at the reference, so no per-row decode can be built
+    /// for it, and emitting it would run the placeholder body. IPE-L0149
+    /// `SelectToNotSaturated`; a no-op for every other callee.
+    fn reject_unintercepted_select_to(&self, callee: &Callee, span: Span) -> DResult<()> {
+        if let Callee::Func(id) = callee
+            && self.select_to_shape(*id).is_some()
+        {
+            return Err(unsupported_store_select(
+                span,
+                StoreSelectProjectionDefect::SelectToNotSaturated,
+            ));
+        }
+        Ok(())
     }
 
     /// Hand out the next globally-unique fresh binder from
@@ -15620,16 +15712,20 @@ impl<'a> Lowerer<'a> {
     /// closed (`Task.fail`). No decoder is stored in the value: the `Select` the
     /// intercept builds (`selectNamed`) carries only the `(alias, column)` list.
     /// A second argument that is not a `Store.select` expression is a fail-closed
-    /// build error (IPE-L0149).
+    /// build error (IPE-L0149 `SelectArgNotProjection`), and so is any argument
+    /// count other than two (`SelectToNotSaturated`): [`Self::lower_call`]
+    /// collapses every saturated pipe / application spine onto this intercept,
+    /// so a shorter call is a genuine partial application.
     fn lower_store_select_to(
         &self,
         args: &[canon::Expr],
         shape: SelectResultShape,
+        call_span: Span,
     ) -> DResult<Expr> {
-        let (Some(db), Some(select_arg)) = (args.first(), args.get(1)) else {
-            return Err(bug(
-                "ipe_lower::lower_store_select_to",
-                "selectTo* arity < 2",
+        let [db, select_arg] = args else {
+            return Err(unsupported_store_select(
+                call_span,
+                StoreSelectProjectionDefect::SelectToNotSaturated,
             ));
         };
         // The projected shape and column types come from the `Store.select`
@@ -15657,35 +15753,31 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Read the projected columns from a `selectToList` / `selectToMaybe`
-    /// argument that must be a `Store.select` expression. Fails closed
-    /// (IPE-L0149) when the argument is not a direct `Store.select` call — the
-    /// concrete decode can only be emitted from a projection whose shape and
-    /// column types are visible at this call site.
+    /// Read the projected columns from the `Store.select` expression a `selectTo*` call carries.
+    ///
+    /// Fails closed (IPE-L0149 `SelectArgNotProjection`) when the argument is
+    /// not a saturated `Store.select` call — the concrete decode can only be
+    /// emitted from a projection whose shape and column types are visible at
+    /// this call site. The argument is read through its whole call spine, so
+    /// `Store.select f j`, `j |> Store.select f` and `Store.select f <| j` all
+    /// name the same lambda. The caller's `lower_expr` of the same argument
+    /// collapses that same spine (`Store.select` is an accessor-intercept
+    /// placeholder in [`Self::spine_needs_saturated_call`]), so the columns read
+    /// here and the lowered `Select` come from one lambda.
     fn select_arg_projected_columns(
         &self,
         select_arg: &canon::Expr,
     ) -> DResult<Vec<ProjectedColumn>> {
-        let canon::Expr_::Call(callee, sel_args) = &select_arg.value else {
+        let (head, sel_args) = call_spine(select_arg);
+        let is_select = !sel_args.is_empty()
+            && matches!(
+                self.lower_callee(head),
+                Ok(Callee::Kernel(KernelFn::StoreSelect))
+            );
+        let (true, [lambda, _joined]) = (is_select, sel_args.as_slice()) else {
             return Err(unsupported_store_select(
                 select_arg.span,
-                StoreSelectProjectionDefect::UnsupportedProjectionBody,
-            ));
-        };
-        let is_select = matches!(
-            self.lower_callee(callee),
-            Ok(Callee::Kernel(KernelFn::StoreSelect))
-        );
-        if !is_select || sel_args.len() != 2 {
-            return Err(unsupported_store_select(
-                select_arg.span,
-                StoreSelectProjectionDefect::UnsupportedProjectionBody,
-            ));
-        }
-        let Some(lambda) = sel_args.first() else {
-            return Err(unsupported_store_select(
-                select_arg.span,
-                StoreSelectProjectionDefect::UnsupportedProjectionBody,
+                StoreSelectProjectionDefect::SelectArgNotProjection,
             ));
         };
         let (binders, body) = Self::select_lambda_parts(lambda)?;
@@ -16208,6 +16300,7 @@ impl<'a> Lowerer<'a> {
         // instantiations, for the cross-call bound propagation below.
         let mut callee_instances: std::collections::HashMap<FuncId, Vec<CalleeInstance>> =
             std::collections::HashMap::with_capacity(self.m.defs.len());
+        let select_to_ids = self.select_to_ids();
         for (idx, def) in self.m.defs.iter().enumerate() {
             // Positional id: `func_ids` was assigned from this very
             // enumeration order in `new()` under the unique-`(home, name)`
@@ -16237,6 +16330,12 @@ impl<'a> Lowerer<'a> {
             // where it is called at most once; checked on the final body so no
             // later rewrite can move one into a position that calls it again.
             crate::once_check::check_once_closures(&func.body)
+                .map_err(|d| (d, def.home().to_vec()))?;
+            // No lowered body may reference a `selectTo*` placeholder: every
+            // reference is rewritten by its intercept or refused at its source
+            // site, and this checks the result on the final body. The lowered
+            // IR carries no spans, so the refusal anchors on the def's name.
+            refuse_select_to_edges(std::slice::from_ref(&func), &select_to_ids, def.name().span)
                 .map_err(|d| (d, def.home().to_vec()))?;
             callee_instances.insert(func.id, self.callee_instances.take());
             if self.interner.resolve(func.name) == Some("main") {
@@ -22801,6 +22900,7 @@ impl<'a> Lowerer<'a> {
                 // never-defined symbol (E0425). See
                 // [`reject_point_free_store_kernel`].
                 reject_point_free_store_kernel(&callee, e.span)?;
+                self.reject_unintercepted_select_to(&callee, e.span)?;
                 reject_unsaturated_handler_kernel(&callee, e.span)?;
                 // A point-free collection kernel receives its collection later,
                 // so the element-capability gate reads the reference's arrow.
@@ -23392,7 +23492,10 @@ impl<'a> Lowerer<'a> {
         // direct function slot (`r.step |> Task.loop n s`; the partial's eta
         // parameter is typed on the direct carrier, so the stored read must be
         // converted at the kernel call itself,
-        // [`Self::coerce_kernel_fn_args`]). The collapsed spine is
+        // [`Self::coerce_kernel_fn_args`]), or a `Store.selectToList` /
+        // `Store.selectToMaybe` head (`sel |> Store.selectToList db`; the
+        // intercept reads the `Store.select` projection from the saturated
+        // call's second argument). The collapsed spine is
         // exactly the direct saturated call the programmer could have written.
         // Restricted to those spines on purpose: a GENERAL flatten reshapes
         // the call tree the downstream multi-use / last-use ownership pass reads to decide moves vs clones, mis-placing a move where
@@ -23423,7 +23526,8 @@ impl<'a> Lowerer<'a> {
     /// every spine level plus `j`. The rule is [`Self::spine_level_saturates`]:
     /// an accessor-intercept placeholder (`Store.mask`, `Store.eq`, …) or a
     /// capture-cloned handler kernel (`Stream.stream`), whose saturated-call
-    /// gate must observe every argument, and an argument of `outer` whose
+    /// gate must observe every argument, a `selectTo*` head (always — its
+    /// intercept owns every argument count), and an argument of `outer` whose
     /// carrier only the saturated call converts. Never a general currying
     /// reshape (which would disturb the ownership/last-use pass).
     fn spine_needs_saturated_call(&self, callee: &canon::Expr, outer: &[canon::Expr]) -> bool {
@@ -23433,7 +23537,19 @@ impl<'a> Lowerer<'a> {
             offset = offset.saturating_add(inner_args.len());
             head = inner;
         }
-        let Ok(Callee::Kernel(k)) = self.lower_callee(head) else {
+        let head_callee = self.lower_callee(head);
+        // A `selectTo*` head always collapses: its intercept reads the
+        // `Store.select` projection from the second argument, which a pipe
+        // supplies at the outer level (`sel |> Store.selectToList db`). The
+        // collapsed call is the direct call `Store.selectToList db sel`, and a
+        // spine still short of two arguments reaches the intercept as the
+        // partial application it is.
+        if let Ok(Callee::Func(id)) = &head_callee
+            && self.select_to_shape(*id).is_some()
+        {
+            return true;
+        }
+        let Ok(Callee::Kernel(k)) = head_callee else {
             return false;
         };
         self.spine_level_saturates(k, head, offset, outer.len(), |j| {
@@ -23460,6 +23576,24 @@ impl<'a> Lowerer<'a> {
     ) -> DResult<Intercepted> {
         if let canon::Expr_::VarKernel { .. } | canon::Expr_::VarTopLevel { .. } = &callee.value {
             let peek = self.lower_callee(callee)?;
+            // `Store.selectToList` / `Store.selectToMaybe` return the projected
+            // `row` directly. The projected shape and each column's type live in
+            // the `Store.select` expression this call's second argument must be,
+            // so the concrete per-column decode is emitted HERE, at the call
+            // site, over that known shape — never a decoder stored in the value.
+            // Keyed on the binding alone, whatever the argument count:
+            // `lower_call` has already collapsed a pipe / application spine, so
+            // a call that is still short is a partial application, refused
+            // inside the intercept.
+            let select_to = match &peek {
+                Callee::Func(id) => self.select_to_shape(*id),
+                _ => None,
+            };
+            if let Some(shape) = select_to {
+                return Ok(Intercepted::Done(
+                    self.lower_store_select_to(args, shape, call_span)?,
+                ));
+            }
             match &peek {
                 // ── Web.tea / Web.embed cfg literal (L0107 exemption) ──
                 //
@@ -23725,21 +23859,6 @@ impl<'a> Lowerer<'a> {
                 }
                 Callee::Kernel(KernelFn::StoreSelect) if args.len() == 2 => {
                     return Ok(Intercepted::Done(self.lower_store_select(args)?));
-                }
-                // `Store.selectToList` / `Store.selectToMaybe` return the projected
-                // `row` directly. The projected shape and each column's type live in
-                // the `Store.select` expression this call's second argument must be,
-                // so the concrete per-column decode is emitted HERE, at the call
-                // site, over that known shape — never a decoder stored in the value.
-                Callee::Func(id) if args.len() == 2 && self.is_store_func(*id, "selectToList") => {
-                    return Ok(Intercepted::Done(
-                        self.lower_store_select_to(args, SelectResultShape::List)?,
-                    ));
-                }
-                Callee::Func(id) if args.len() == 2 && self.is_store_func(*id, "selectToMaybe") => {
-                    return Ok(Intercepted::Done(
-                        self.lower_store_select_to(args, SelectResultShape::Maybe)?,
-                    ));
                 }
                 Callee::Kernel(KernelFn::StoreEqCol) if args.len() == 2 => {
                     return Ok(Intercepted::Done(self.lower_store_eq(&peek, args)?));
@@ -26455,6 +26574,9 @@ impl<'a> Lowerer<'a> {
         // never-defined symbol — reject instead. See
         // [`reject_point_free_store_kernel`].
         reject_point_free_store_kernel(&resolved, call_span)?;
+        // Parity twin of the reify-site refusal: a partial `selectTo*` that
+        // reaches eta-expansion has no projection to decode by.
+        self.reject_unintercepted_select_to(&resolved, call_span)?;
         reject_unsaturated_handler_kernel(&resolved, call_span)?;
         let (arg_tys, ret_ty) = self.callee_arrow(
             callee.span,
@@ -40722,5 +40844,133 @@ mod tests {
                 "rewrite_multiuse_clones pre-clone wrap"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod select_to_tests {
+    use ipe_canon::ast as canon;
+    use ipe_diagnostics::{Diagnostic, Located, LowerError, Span, StoreSelectProjectionDefect};
+    use ipe_intern::Interner;
+    use ipe_ir::{CallPin, Callee, Expr, Func, FuncId, IrType, ModPath, OnFormKind};
+
+    use super::{call_spine, refuse_select_to_edges};
+
+    fn leaf(n: i64) -> canon::Expr {
+        Located::new(Span::DUMMY, canon::Expr_::Int(n))
+    }
+
+    fn call(callee: canon::Expr, args: Vec<canon::Expr>) -> canon::Expr {
+        Located::new(Span::DUMMY, canon::Expr_::Call(Box::new(callee), args))
+    }
+
+    const fn int_of(e: &canon::Expr) -> Option<i64> {
+        match e.value {
+            canon::Expr_::Int(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    fn func_with_body(interner: &mut Interner, body: Expr) -> Func {
+        Func {
+            id: FuncId::from_raw(0),
+            name: interner.intern("caller").unwrap(),
+            home: ModPath(vec![interner.intern("Main").unwrap()]),
+            type_params: Vec::new(),
+            row_params: Vec::new(),
+            params: Vec::new(),
+            ret: IrType::Unit,
+            body,
+        }
+    }
+
+    const fn is_select_to_refusal(r: &Result<(), Diagnostic>) -> bool {
+        matches!(
+            r,
+            Err(Diagnostic::Lower {
+                msg: LowerError::StoreSelectProjectionInvalid(
+                    StoreSelectProjectionDefect::SelectToNotSaturated
+                ),
+                ..
+            })
+        )
+    }
+
+    /// A two-level spine `Call(Call(h, [1]), [2])` peels to head `h` and `[1, 2]`.
+    #[test]
+    fn call_spine_flattens_two_levels_in_source_order() {
+        let e = call(call(leaf(0), vec![leaf(1)]), vec![leaf(2)]);
+        let (head, args) = call_spine(&e);
+        assert_eq!(int_of(head), Some(0));
+        let got: Vec<_> = args.into_iter().map(int_of).collect();
+        assert_eq!(got, vec![Some(1), Some(2)]);
+    }
+
+    /// A three-level spine with a multi-argument inner level keeps source order.
+    #[test]
+    fn call_spine_flattens_three_levels_in_source_order() {
+        let e = call(
+            call(call(leaf(0), vec![leaf(1), leaf(2)]), vec![leaf(3)]),
+            vec![leaf(4)],
+        );
+        let (head, args) = call_spine(&e);
+        assert_eq!(int_of(head), Some(0));
+        let got: Vec<_> = args.into_iter().map(int_of).collect();
+        assert_eq!(got, vec![Some(1), Some(2), Some(3), Some(4)]);
+    }
+
+    /// A non-call expression is its own head with no arguments.
+    #[test]
+    fn call_spine_of_a_non_call_is_its_own_head() {
+        let e = leaf(7);
+        let (head, args) = call_spine(&e);
+        assert_eq!(int_of(head), Some(7));
+        assert!(args.is_empty());
+    }
+
+    /// A body calling a `selectTo*` id is refused with `SelectToNotSaturated`.
+    #[test]
+    fn refuse_select_to_edges_refuses_a_call_edge() {
+        let mut interner = Interner::new();
+        let select_to = FuncId::from_raw(5);
+        let body = Expr::Call {
+            callee: Callee::Func(select_to),
+            args: vec![Expr::Unit],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+        let funcs = [func_with_body(&mut interner, body)];
+        let refused = refuse_select_to_edges(&funcs, &[select_to], Span::DUMMY);
+        assert!(is_select_to_refusal(&refused), "{refused:?}");
+    }
+
+    /// A body holding a `selectTo*` id as a function value is refused too.
+    #[test]
+    fn refuse_select_to_edges_refuses_a_function_value_edge() {
+        let mut interner = Interner::new();
+        let select_to = FuncId::from_raw(5);
+        let body = Expr::FuncValue {
+            callee: Callee::Func(select_to),
+            ty: IrType::Unit,
+        };
+        let funcs = [func_with_body(&mut interner, body)];
+        let refused = refuse_select_to_edges(&funcs, &[select_to], Span::DUMMY);
+        assert!(is_select_to_refusal(&refused), "{refused:?}");
+    }
+
+    /// An edge to any other function, or no `selectTo*` ids at all, passes.
+    #[test]
+    fn refuse_select_to_edges_admits_other_edges() {
+        let mut interner = Interner::new();
+        let other = FuncId::from_raw(3);
+        let body = Expr::Call {
+            callee: Callee::Func(other),
+            args: Vec::new(),
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+        let funcs = [func_with_body(&mut interner, body)];
+        assert!(refuse_select_to_edges(&funcs, &[FuncId::from_raw(5)], Span::DUMMY).is_ok());
+        assert!(refuse_select_to_edges(&funcs, &[], Span::DUMMY).is_ok());
     }
 }

@@ -1,0 +1,254 @@
+module Main exposing (main)
+
+-- Ipe.Db.Store projection-read golden: `Store.selectToList` and
+-- `Store.selectToMaybe` return the projected rows in every call form whose
+-- `Store.select` expression is visible through the call spine. `x |> f a` is
+-- `f a x`, so each piped, back-piped, composed, and nested-pipe form must read
+-- the same rows as the direct call — never the placeholder `Err` the
+-- un-intercepted body fails with.
+--
+-- Two books join their authors on `books.author_id = authors.id`; a third
+-- book's author is absent, so the inner join yields two pairs. A second join on
+-- `books.title = authors.name` matches exactly one pair, so the fetch-one read
+-- is deterministic. Each list line is sorted before printing, since an inner
+-- join without an ordering fixes no row order.
+--
+-- The output lines assert, in order:
+--   * the direct call `Store.selectToList db (Store.select f j)` reads the
+--     projected author names;
+--   * the direct call passed as a helper argument inside a list literal reads
+--     the projected titles;
+--   * `j |> Store.select f |> Store.selectToList db` reads a two-column tuple;
+--   * `j |> Store.select f |> Store.selectToMaybe db` reads the one matching row;
+--   * `Store.selectToList db <| Store.select f j` reads the projected book ids;
+--   * `(Store.select f >> Store.selectToList db) j` reads the projected author ids;
+--   * `Store.selectToList db (j |> Store.select f)` reads the projected names;
+--   * a let-bound join piped through `Store.select` and `Store.selectToList`
+--     reads the projected foreign keys.
+--
+-- Output:
+--   direct:Austen,Herbert
+--   helper-arg:Dune,Emma
+--   pipe-list:Dune/Herbert,Emma/Austen
+--   pipe-maybe:Just b2
+--   back-pipe:b1,b2
+--   compose:a1,a2
+--   nested-pipe:Austen,Herbert
+--   let-join-pipe:a1,a2
+
+import Ipe.Codec as Codec exposing (Codec)
+import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Location as Location
+import Ipe.Db.Store as Store exposing (Store)
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+type alias Book =
+    { id : String
+    , title : String
+    , authorId : String
+    }
+
+
+type alias Author =
+    { id : String
+    , name : String
+    }
+
+
+blankBook : Book
+blankBook =
+    { id = "", title = "", authorId = "" }
+
+
+blankAuthor : Author
+blankAuthor =
+    { id = "", name = "" }
+
+
+bookCodec : Codec Book
+bookCodec =
+    Codec.auto blankBook
+
+
+authorCodec : Codec Author
+authorCodec =
+    Codec.auto blankAuthor
+
+
+booksStore : Result Error (Store Book)
+booksStore =
+    Store.fromCodec "books" bookCodec
+        |> Result.map (\s -> Store.public (Store.primaryKey .id s))
+
+
+authorsStore : Result Error (Store Author)
+authorsStore =
+    Store.fromCodec "authors" authorCodec
+        |> Result.map (\s -> Store.public (Store.primaryKey .id s))
+
+
+seedBooks : List Book
+seedBooks =
+    [ { id = "b1", title = "Dune", authorId = "a1" }
+    , { id = "b2", title = "Emma", authorId = "a2" }
+    , { id = "b3", title = "Ghost", authorId = "a9" }
+    ]
+
+
+seedAuthors : List Author
+seedAuthors =
+    [ { id = "a1", name = "Herbert" }
+    , { id = "a2", name = "Austen" }
+    , { id = "a3", name = "Emma" }
+    ]
+
+
+sortedLine : String -> List String -> String
+sortedLine label values =
+    String.concat [ label, ":", String.join "," (List.sort values) ]
+
+
+listLine : String -> Task Error (List String) -> Task Error String
+listLine label read =
+    Task.map (sortedLine label) read
+
+
+directLine : Db -> Store Book -> Store Author -> Task Error String
+directLine db books authors =
+    listLine "direct"
+        (Store.selectToList db
+            (Store.select (\( _, author ) -> author.name)
+                (Store.join books .authorId authors .id)
+            )
+        )
+
+
+pipeListLine : Db -> Store Book -> Store Author -> Task Error String
+pipeListLine db books authors =
+    Task.map
+        (\pairs -> sortedLine "pipe-list" (List.map (\( title, name ) -> String.concat [ title, "/", name ]) pairs))
+        (Store.join books .authorId authors .id
+            |> Store.select (\( book, author ) -> ( book.title, author.name ))
+            |> Store.selectToList db
+        )
+
+
+showMaybe : Maybe String -> String
+showMaybe m =
+    case m of
+        Just s ->
+            String.concat [ "Just ", s ]
+
+        Nothing ->
+            "Nothing"
+
+
+pipeMaybeLine : Db -> Store Book -> Store Author -> Task Error String
+pipeMaybeLine db books authors =
+    Task.map
+        (\m -> String.concat [ "pipe-maybe:", showMaybe m ])
+        (Store.join books .title authors .name
+            |> Store.select (\( book, _ ) -> book.id)
+            |> Store.selectToMaybe db
+        )
+
+
+backPipeLine : Db -> Store Book -> Store Author -> Task Error String
+backPipeLine db books authors =
+    listLine "back-pipe"
+        (Store.selectToList db <| Store.select (\( book, _ ) -> book.id) (Store.join books .authorId authors .id))
+
+
+composeLine : Db -> Store Book -> Store Author -> Task Error String
+composeLine db books authors =
+    listLine "compose"
+        ((Store.select (\( _, author ) -> author.id) >> Store.selectToList db)
+            (Store.join books .authorId authors .id)
+        )
+
+
+nestedPipeLine : Db -> Store Book -> Store Author -> Task Error String
+nestedPipeLine db books authors =
+    listLine "nested-pipe"
+        (Store.selectToList db
+            (Store.join books .authorId authors .id |> Store.select (\( _, author ) -> author.name))
+        )
+
+
+letJoinPipeLine : Db -> Store Book -> Store Author -> Task Error String
+letJoinPipeLine db books authors =
+    let
+        joined =
+            Store.join books .authorId authors .id
+    in
+    listLine "let-join-pipe"
+        (joined
+            |> Store.select (\( book, _ ) -> book.authorId)
+            |> Store.selectToList db
+        )
+
+
+insertBooks : Db -> Store Book -> Task Error ()
+insertBooks db store =
+    List.foldl
+        (\row acc -> Task.andThen (\_ -> Task.map (\_ -> ()) (Store.insert db store row)) acc)
+        (Task.succeed ())
+        seedBooks
+
+
+insertAuthors : Db -> Store Author -> Task Error ()
+insertAuthors db store =
+    List.foldl
+        (\row acc -> Task.andThen (\_ -> Task.map (\_ -> ()) (Store.insert db store row)) acc)
+        (Task.succeed ())
+        seedAuthors
+
+
+report : Db -> Store Book -> Store Author -> Task Error ()
+report db books authors =
+    Task.andThen
+        (\lines -> Io.println (String.join "\n" lines))
+        (Task.sequence
+            [ directLine db books authors
+            , listLine "helper-arg"
+                (Store.selectToList db
+                    (Store.select (\( book, _ ) -> book.title)
+                        (Store.join books .authorId authors .id)
+                    )
+                )
+            , pipeListLine db books authors
+            , pipeMaybeLine db books authors
+            , backPipeLine db books authors
+            , composeLine db books authors
+            , nestedPipeLine db books authors
+            , letJoinPipeLine db books authors
+            ]
+        )
+
+
+runChecks : Db -> Store Book -> Store Author -> Task Error ()
+runChecks db books authors =
+    Store.create db books
+        |> Task.andThen (\_ -> Store.create db authors)
+        |> Task.andThen (\_ -> insertBooks db books)
+        |> Task.andThen (\_ -> insertAuthors db authors)
+        |> Task.andThen (\_ -> report db books authors)
+
+
+main : Task Error ()
+main =
+    case Result.map2 (\a b -> ( a, b )) booksStore authorsStore of
+        Err e ->
+            Io.println (Error.toString e)
+
+        Ok ( books, authors ) ->
+            Task.andThen
+                (\conn -> Db.withTransaction conn (\txconn -> runChecks txconn books authors))
+                (Db.open Location.memory)
