@@ -4591,12 +4591,26 @@ main =
         gated
             .emit(OutTarget::Path(&out))
             .expect("the packaged app emits");
-        let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("main.rs");
+        // `ipe_main` sits in the entry's module file when the program has
+        // more than one home, so the whole emitted program is read.
+        let mut program = std::fs::read_to_string(out.join("src/main.rs")).expect("main.rs");
+        if let Ok(mods) = std::fs::read_dir(out.join("src/ipe_mods")) {
+            for entry in mods.flatten() {
+                program.push_str(&std::fs::read_to_string(entry.path()).expect("module file"));
+            }
+        }
         let _ = std::fs::remove_dir_all(&out);
-        assert!(main_rs.contains("WebViewApp"), "not the webview executor");
         assert!(
-            main_rs.contains("title: \"Packaged\".to_string(), size: (640, 480)"),
+            program.contains("fn ipe_main() -> ipe_runtime::tea::WebViewApp"),
+            "not the webview executor"
+        );
+        assert!(
+            program.contains("title: \"Packaged\".to_string(), size: (640, 480)"),
             "not the manifest window"
+        );
+        assert!(
+            !program.contains("ipe_runtime::tea::WebApp("),
+            "the served web app was emitted"
         );
     }
 }

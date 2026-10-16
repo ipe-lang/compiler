@@ -160,6 +160,19 @@ fn cache_entries(cache: &Path) -> usize {
     count
 }
 
+/// The emitted program under `out`: `src/main.rs` and every module file, since
+/// `ipe_main` sits in the entry's module file when the program has more than
+/// one home.
+fn program_text(out: &Path) -> Result<String, BoxError> {
+    let mut text = std::fs::read_to_string(out.join("src/main.rs"))?;
+    if let Ok(mods) = std::fs::read_dir(out.join("src/ipe_mods")) {
+        for entry in mods {
+            text.push_str(&std::fs::read_to_string(entry?.path())?);
+        }
+    }
+    Ok(text)
+}
+
 /// Run the `ipe` binary with `args`, returning its stderr on a failed exit.
 fn run_ipe(args: &[&OsStr], envs: &[(&str, &OsStr)]) -> Result<(), BoxError> {
     let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf());
@@ -236,10 +249,10 @@ fn cold_desktop_title() -> Result<(), BoxError> {
         &ipe::BuildOptions::default(),
         host,
     )?;
-    let main_rs = std::fs::read_to_string(out.join("src/main.rs"))?;
+    let program = program_text(&out)?;
     let _ = std::fs::remove_dir_all(&out);
     assert!(
-        main_rs.contains(
+        program.contains(
             "ipe_runtime::webview::WebViewWindowCfg { title: \"Cold\".to_string(), size: (500, 350) }"
         ),
         "the emit does not carry the manifest's desktop window"
