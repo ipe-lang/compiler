@@ -932,12 +932,12 @@ refusalDecodeFailsClosed =
     do
         valid <- refusalReadFailsWith "ipe-index-refusal-valid" "not-utf8" (SqlInt 3) lower
         unknown <- refusalReadFailsWith "ipe-index-refusal-unknown" "binary" (SqlInt 3) lower
-        foreign <- refusalReadFailsWith "ipe-index-refusal-foreign" "not-utf8" (SqlInt 3) (SqlString ("blake3:" ++ String.repeat 64 "a"))
+        otherScheme <- refusalReadFailsWith "ipe-index-refusal-foreign" "not-utf8" (SqlInt 3) (SqlString ("blake3:" ++ String.repeat 64 "a"))
         upper <- refusalReadFailsWith "ipe-index-refusal-upper" "not-utf8" (SqlInt 3) (SqlString ("refusal-blake3:" ++ String.repeat 64 "A"))
         blocking <- refusalReadFailsWith "ipe-index-refusal-blocking" "replaced" (SqlInt 3) lower
         undigested <- refusalReadFailsWith "ipe-index-refusal-undigested" "not-utf8" (SqlInt 3) (SqlNull (SqlString ""))
         negative <- refusalReadFailsWith "ipe-index-refusal-negative" "not-utf8" (SqlInt (0 - 1)) lower
-        Task.succeed (not valid && unknown && foreign && upper && blocking && undigested && negative)
+        Task.succeed (not valid && unknown && otherScheme && upper && blocking && undigested && negative)
 
 
 -- True when the first page's snapshot fails on a seeded index holding one
