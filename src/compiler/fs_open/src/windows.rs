@@ -20,6 +20,7 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::fs::{OpenOptions, OpenOptionsExt as _};
 
+use crate::reparse::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, hint_of_find_data};
 use crate::{EntryName, FileId, FileKind, HintedKind, OpenRefusal, PlaceablePrefix};
 
 /// `FILE_FLAG_BACKUP_SEMANTICS`: allows opening a directory handle.
@@ -30,12 +31,6 @@ const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const SHARE_NO_DELETE: u32 = 0x1 | 0x2;
 /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
 const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
-/// `FILE_ATTRIBUTE_DIRECTORY`.
-const ATTR_DIRECTORY: u32 = 0x10;
-/// `FILE_ATTRIBUTE_REPARSE_POINT`.
-const ATTR_REPARSE_POINT: u32 = 0x400;
-/// `FILE_ATTRIBUTE_DEVICE`.
-const ATTR_DEVICE: u32 = 0x40;
 /// `ERROR_REPARSE_POINT_ENCOUNTERED`: the typed refusal of a reparse point.
 const ERROR_REPARSE_POINT_ENCOUNTERED: i32 = 4395;
 /// `ERROR_SHARING_VIOLATION`: another open handle denies the access asked for.
@@ -63,33 +58,20 @@ fn refusal_of(error: &io::Error) -> OpenRefusal {
 
 /// The kind `attributes` name, before the handle's device type is consulted.
 const fn kind_of_attributes(attributes: u32) -> Option<FileKind> {
-    if attributes & ATTR_REPARSE_POINT != 0 {
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         Some(FileKind::Symlink)
-    } else if attributes & ATTR_DIRECTORY != 0 {
+    } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         Some(FileKind::Dir)
     } else {
         None
     }
 }
 
-/// The hint find-data `attributes` carry: a reparse point is a link, never a directory.
-///
-/// A directory listing of a volume holds files, directories and reparse
-/// points; an entry marked a device is another kind, and any other entry is a
-/// regular file.
-pub const fn hint_of_attributes(attributes: u32) -> HintedKind {
-    if attributes & ATTR_REPARSE_POINT != 0 {
-        HintedKind::Link
-    } else if attributes & ATTR_DIRECTORY != 0 {
-        HintedKind::Dir
-    } else if attributes & ATTR_DEVICE != 0 {
-        HintedKind::Other
-    } else {
-        HintedKind::Regular
-    }
-}
-
 /// The name and hint of one listed entry, read from the find data the listing already holds.
+///
+/// std's `FileType::is_symlink` on a listed entry is the name-surrogate bit of
+/// the find data's reparse tag, so a reparse point is split into a link and a
+/// transparent entry without opening it.
 fn hinted_entry(
     entry: io::Result<std::fs::DirEntry>,
 ) -> Result<(EntryName, HintedKind), OpenRefusal> {
@@ -99,7 +81,8 @@ fn hinted_entry(
         .metadata()
         .map_err(|e| refusal_of(&e))?
         .file_attributes();
-    Ok((name, hint_of_attributes(attributes)))
+    let name_surrogate = entry.file_type().map_err(|e| refusal_of(&e))?.is_symlink();
+    Ok((name, hint_of_find_data(attributes, name_surrogate)))
 }
 
 /// The kind and length of the object `file` holds, read from that handle.

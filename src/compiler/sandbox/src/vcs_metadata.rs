@@ -14,7 +14,10 @@
 //!
 //! Metadata is found at any depth: the parse walks the whole tree once through
 //! held directory handles, never following a link, and carves every entry whose
-//! name a [`VcsKind`] keeps its metadata under. The walk is bounded by
+//! name a [`VcsKind`] keeps its metadata under. Each entry, and each pointer
+//! file inside one, is opened once through its held parent, and every fact the
+//! carve records about it is read from that handle; the path recorded is then
+//! proven to name the held object. The walk is bounded by
 //! construction: an explicit stack no deeper than [`MAX_DEPTH`], at most
 //! [`MAX_WALK_ENTRIES`] entries listed and [`MAX_HELD_NAME_BYTES`] of names
 //! held, at most [`MAX_CARVE_ENTRIES`] carved paths, one pointer read of at most
@@ -23,18 +26,24 @@
 //! `.git`). A ceiling reached refuses the tree, since metadata past it could go
 //! uncarved.
 
+use std::ffi::OsStr;
 use std::fmt;
-use std::io::Read as _;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 
-use ipe_fs_open::{EntryCap, EntryName, FileKind, HeldDir, HintedKind, OpenRefusal};
+use ipe_fs_open::{
+    ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, HintedKind, OpenRefusal, RegularFile,
+};
 
 use crate::vcs_config::{ConfigLimits, ConfigRoots, Grants, Home, scan};
 use crate::{CanonicalPath, JailPathError, path_covers};
 
 /// The most bytes a version-control pointer file may hold.
 pub const POINTER_CAP: u64 = 4096;
+
+/// [`POINTER_CAP`] as the ceiling a pointer file is read under.
+const POINTER_BYTE_CAP: ByteCap =
+    ByteCap::from_nonzero(NonZeroU64::MIN.saturating_add(POINTER_CAP.saturating_sub(1)));
 
 /// `n` as a ceiling; a zero `n` is the smallest ceiling, one.
 const fn ceiling(n: u32) -> NonZeroU32 {
@@ -265,38 +274,35 @@ impl fmt::Display for JailArm {
     }
 }
 
-/// What an entry was when the parse classified it.
+/// What a carved entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Dir,
     File,
-    /// A symlink, fifo, socket, or device.
-    Other,
 }
 
-/// The identity of a carved entry, compared again before the jail spawns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Identity {
-    dir: bool,
-    node: Option<(u64, u64)>,
-}
-
-impl Identity {
-    /// The kind of `meta`, and its `(dev, ino)` on unix; no portable node
-    /// identity exists off unix, so the kind alone is compared there.
-    fn of(meta: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        let node = {
-            use std::os::unix::fs::MetadataExt as _;
-            Some((meta.dev(), meta.ino()))
-        };
-        #[cfg(not(unix))]
-        let node = None;
-        Self {
-            dir: meta.is_dir(),
-            node,
+impl Shape {
+    /// The shape an entry of `kind` has; `None` for a kind no carved entry is.
+    const fn of(kind: FileKind) -> Option<Self> {
+        match kind {
+            FileKind::Dir => Some(Self::Dir),
+            FileKind::Regular => Some(Self::File),
+            FileKind::Symlink
+            | FileKind::Fifo
+            | FileKind::Socket
+            | FileKind::Device
+            | FileKind::Other => None,
         }
     }
+}
+
+/// The identity of a carved entry, read from the handle the parse held it by.
+///
+/// [`WritableTree::recheck`] proves it again before the jail spawns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Identity {
+    shape: Shape,
+    id: FileId,
 }
 
 /// One path a writable tree's grant must leave read-only.
@@ -362,14 +368,16 @@ impl WritableTree {
     ///   cannot be opened or listed.
     /// - [`JailPathError::VcsWalkCrossDevice`] when a directory in the tree is
     ///   on another filesystem than its root.
+    /// - [`JailPathError::VcsWalkOpaqueReparse`] when an entry in the tree is
+    ///   a reparse point a filter driver answers for.
     /// - [`JailPathError::VcsEntryUnexpectedKind`] when an entry, or a pointer
-    ///   file inside one, is a symlink, fifo, socket, or device, or a form the
-    ///   tool never writes.
+    ///   file inside one, is a link, reparse point, fifo, socket, or device, or
+    ///   a form the tool never writes.
     /// - [`JailPathError::VcsPointerUnreadable`] when a pointer file cannot be
     ///   read, exceeds [`POINTER_CAP`], is malformed, or names a path that does
     ///   not resolve, is no directory, or covers a writable grant.
-    /// - [`JailPathError::VcsEntryChanged`] when an entry changed while it was
-    ///   read.
+    /// - [`JailPathError::VcsEntryChanged`] when a carved path no longer names
+    ///   the object the parse read through its held parent.
     /// - [`JailPathError::VcsConfig`] when a configuration the tool reads names,
     ///   or may name, code inside a writable grant, or cannot be read.
     pub fn parse(
@@ -408,6 +416,23 @@ impl WritableTree {
         })
     }
 
+    /// Prove again that every carved path names the object the parse read.
+    ///
+    /// Run just before the jail spawns, so a carved entry swapped since the
+    /// parse refuses the jail instead of leaving the swapped-in object
+    /// unprotected.
+    ///
+    /// # Errors
+    /// [`JailPathError::Moved`] when a carved path now resolves elsewhere;
+    /// [`JailPathError::VcsEntryChanged`] when the object it names is no
+    /// longer the one carved.
+    pub fn recheck(&self) -> Result<(), JailPathError> {
+        self.carve.0.iter().try_for_each(|carved| {
+            carved.path.recheck()?;
+            prove_named(&carved.path, carved.identity)
+        })
+    }
+
     /// The tree the grant covers.
     #[must_use]
     pub const fn tree(&self) -> &CanonicalPath {
@@ -424,35 +449,6 @@ impl WritableTree {
     #[must_use]
     pub const fn limits(&self) -> &WalkLimits {
         &self.limits
-    }
-
-    /// Test-only: `tree` taken with `carve` as given, for pure plan tests over
-    /// paths that need not exist.
-    #[cfg(test)]
-    #[must_use]
-    pub fn assumed(tree: CanonicalPath, carve: Vec<CanonicalPath>) -> Self {
-        let identity = Identity {
-            dir: true,
-            node: None,
-        };
-        Self {
-            tree,
-            carve: VcsCarve(
-                carve
-                    .into_iter()
-                    .map(|path| CarvePath { path, identity })
-                    .collect(),
-            ),
-            limits: WalkLimits::DEFAULT,
-        }
-    }
-
-    /// Test-only: this tree under `limits` instead of the defaults.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn under_limits(mut self, limits: WalkLimits) -> Self {
-        self.limits = limits;
-        self
     }
 }
 
@@ -589,6 +585,40 @@ fn name_bytes(name: &EntryName) -> u32 {
     u32::try_from(name.as_os_str().len()).unwrap_or(u32::MAX)
 }
 
+/// What the walk does with one listed entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Carve the metadata entry of this kind; its open refuses a link or a
+    /// reparse point of any tag.
+    Carve(VcsKind),
+    /// Enter the directory.
+    Descend,
+    /// Ask the held directory what the entry is, and enter it if a directory.
+    Settle,
+    /// Pass over an entry that holds no directory to walk.
+    Skip,
+    /// Refuse the tree: a filter driver answers for the entry, so what it
+    /// holds cannot be seen.
+    Refuse,
+}
+
+/// The step for the listed entry `name`, hinted `hint`.
+///
+/// A metadata name is carved whatever its hint, so no hint can hide it. A
+/// link is never followed. A transparent reparse point refuses, since skipping
+/// it would leave whatever metadata it holds uncarved.
+fn step_of(name: &EntryName, hint: HintedKind) -> Step {
+    if let Some(kind) = VcsKind::of_entry_name(name) {
+        return Step::Carve(kind);
+    }
+    match hint {
+        HintedKind::Dir => Step::Descend,
+        HintedKind::Unknown => Step::Settle,
+        HintedKind::Regular | HintedKind::Link | HintedKind::Other => Step::Skip,
+        HintedKind::Transparent => Step::Refuse,
+    }
+}
+
 /// One parse of a tree: its writable grants, the carve found so far, and the
 /// configuration roots of each carved entry.
 struct Carver<'g> {
@@ -652,20 +682,21 @@ impl<'g> Carver<'g> {
             };
             budget.release(&name);
             let path = top.path.join(name.as_os_str());
-            if let Some(kind) = VcsKind::of_entry_name(&name) {
-                self.entry_at(kind, &top.path, &path)?;
-                self.within_carve_ceiling(&path)?;
-                continue;
-            }
-            let is_dir = match hint {
-                HintedKind::Dir => true,
-                HintedKind::Unknown => matches!(
+            let is_dir = match step_of(&name, hint) {
+                Step::Carve(kind) => {
+                    self.entry_at(kind, &top.dir, &top.path, &name)?;
+                    self.within_carve_ceiling(&path)?;
+                    continue;
+                }
+                Step::Refuse => return Err(JailPathError::VcsWalkOpaqueReparse { path }),
+                Step::Descend => true,
+                Step::Skip => false,
+                Step::Settle => matches!(
                     top.dir
                         .kind_of(&name)
                         .map_err(|refusal| walk_unreadable(&path, refusal))?,
                     Some(FileKind::Dir)
                 ),
-                HintedKind::Regular | HintedKind::Link | HintedKind::Other => false,
             };
             if !is_dir || self.grants.iter().skip(1).any(|g| g.as_path() == path) {
                 continue;
@@ -709,118 +740,159 @@ impl<'g> Carver<'g> {
         Ok(())
     }
 
-    /// Carve `kind`'s entry `entry` in the directory `parent`, and follow the
-    /// pointer files it holds; a gitfile's `gitdir:` resolves against `parent`.
+    /// Carve `kind`'s entry `name` of the held directory `parent` at
+    /// `parent_path`, and follow the pointer files it holds.
+    ///
+    /// The entry is opened once, through `parent`, and every fact about it is
+    /// read from that handle; its path is then proven to name the held object.
+    /// A gitfile's `gitdir:` resolves against `parent_path`.
     fn entry_at(
         &mut self,
         kind: VcsKind,
-        parent: &Path,
-        entry: &Path,
+        parent: &HeldDir,
+        parent_path: &Path,
+        name: &EntryName,
     ) -> Result<(), JailPathError> {
-        let Some((shape, meta)) = classify(kind, entry)? else {
+        let entry = parent_path.join(name.as_os_str());
+        let Some(held) = open_entry(kind, parent, name, &entry)? else {
             return Ok(());
         };
-        let unexpected = || JailPathError::VcsEntryUnexpectedKind {
-            kind,
-            path: entry.to_path_buf(),
-        };
-        let root = match (kind, shape) {
-            (_, Shape::Other) | (VcsKind::Mercurial, Shape::File) => return Err(unexpected()),
-            (VcsKind::Jujutsu | VcsKind::Darcs, Shape::File) => {
-                self.add_entry(entry, &meta)?;
+        let identity = held.identity().map_err(|refusal| {
+            pointer_fault(kind, &entry, PointerFault::Unreadable(refusal.kind()))
+        })?;
+        let mut targets = Vec::new();
+        let root = match (kind, held) {
+            (VcsKind::Mercurial, Held::File(_)) => {
+                return Err(JailPathError::VcsEntryUnexpectedKind { kind, path: entry });
+            }
+            (VcsKind::Jujutsu | VcsKind::Darcs, Held::File(_)) => {
+                self.carve_entry(&entry, identity)?;
                 None
             }
-            (VcsKind::Darcs, Shape::Dir) => Some(VcsRoot::Darcs {
-                dot_darcs: self.add_entry(entry, &meta)?,
+            (VcsKind::Darcs, Held::Dir(_)) => Some(VcsRoot::Darcs {
+                dot_darcs: self.carve_entry(&entry, identity)?,
             }),
-            (VcsKind::Git, Shape::Dir) => {
+            (VcsKind::Git, Held::Dir(dir)) => {
                 // Git reads `commondir` in every gitdir, the root `.git` dir
                 // included, and takes config and hooks from the dir it names.
-                let gitdir = self.add_entry(entry, &meta)?;
-                let commondir = self.inner_pointer(kind, &entry.join("commondir"), false)?;
+                let commondir =
+                    self.inner_pointer(kind, &dir, &entry, "commondir", false, &mut targets)?;
+                let gitdir = self.carve_entry(&entry, identity)?;
                 Some(VcsRoot::Git { gitdir, commondir })
             }
-            (VcsKind::Git, Shape::File) => {
-                self.add_entry(entry, &meta)?;
-                let text = read_pointer(kind, entry, &meta)?;
-                let gitdir = text
+            (VcsKind::Git, Held::File(file)) => {
+                let text = read_pointer(kind, &entry, file)?;
+                let named = text
                     .strip_prefix("gitdir: ")
                     .and_then(one_line)
-                    .ok_or_else(|| pointer_fault(kind, entry, PointerFault::Malformed))?;
-                let gitdir = self.target(kind, entry, parent, gitdir)?;
-                let commondir =
-                    self.inner_pointer(kind, &gitdir.as_path().join("commondir"), false)?;
+                    .ok_or_else(|| pointer_fault(kind, &entry, PointerFault::Malformed))?;
+                let (gitdir, held_gitdir) =
+                    self.target(kind, &entry, parent_path, named, &mut targets)?;
+                let commondir = self.inner_pointer(
+                    kind,
+                    &held_gitdir,
+                    gitdir.as_path(),
+                    "commondir",
+                    false,
+                    &mut targets,
+                )?;
+                self.carve_entry(&entry, identity)?;
                 Some(VcsRoot::Git { gitdir, commondir })
             }
-            (VcsKind::Mercurial, Shape::Dir) => {
-                let dot_hg = self.add_entry(entry, &meta)?;
-                let shared = self.inner_pointer(kind, &entry.join("sharedpath"), false)?;
+            (VcsKind::Mercurial, Held::Dir(dir)) => {
+                let shared =
+                    self.inner_pointer(kind, &dir, &entry, "sharedpath", false, &mut targets)?;
+                let dot_hg = self.carve_entry(&entry, identity)?;
                 Some(VcsRoot::Mercurial { dot_hg, shared })
             }
-            (VcsKind::Jujutsu, Shape::Dir) => {
+            (VcsKind::Jujutsu, Held::Dir(dir)) => {
                 // Without a repository directory Jujutsu reads no configuration.
-                let dot_jj = self.add_entry(entry, &meta)?;
-                self.inner_pointer(kind, &entry.join("repo"), true)?
-                    .map(|repo| VcsRoot::Jujutsu { dot_jj, repo })
+                let repo = self.inner_pointer(kind, &dir, &entry, "repo", true, &mut targets)?;
+                let dot_jj = self.carve_entry(&entry, identity)?;
+                repo.map(|repo| VcsRoot::Jujutsu { dot_jj, repo })
             }
         };
+        for target in targets {
+            self.add(target);
+        }
         self.roots.extend(root);
         Ok(())
     }
 
-    /// Follow the optional pointer file `pointer`, whose relative path resolves
-    /// against its parent; a directory there is admitted only when `dir_ok`.
+    /// Follow the optional pointer file `name` of the held metadata directory
+    /// `dir` at `dir_path`, opened through `dir`; a relative path it names
+    /// resolves against `dir_path`.
     ///
-    /// The directory reached: the one the pointer names, the directory at
-    /// `pointer` itself, or `None` when nothing is there.
+    /// The directory reached: the one the pointer names, the directory `name`
+    /// itself when `dir_ok`, or `None` when nothing is there. An in-grant
+    /// directory the pointer names is pushed onto `targets`.
     fn inner_pointer(
-        &mut self,
+        &self,
         kind: VcsKind,
-        pointer: &Path,
+        dir: &HeldDir,
+        dir_path: &Path,
+        name: &'static str,
         dir_ok: bool,
+        targets: &mut Vec<CarvePath>,
     ) -> Result<Option<CanonicalPath>, JailPathError> {
-        let Some((shape, meta)) = classify(kind, pointer)? else {
-            return Ok(None);
-        };
-        match shape {
-            Shape::Dir if dir_ok => CanonicalPath::resolve(pointer).map(Some).map_err(|_| {
-                JailPathError::VcsEntryChanged {
-                    path: pointer.to_path_buf(),
-                }
-            }),
-            Shape::Dir | Shape::Other => Err(JailPathError::VcsEntryUnexpectedKind {
+        let pointer = dir_path.join(name);
+        let entry = EntryName::new(OsStr::new(name)).ok_or_else(|| {
+            pointer_fault(
                 kind,
-                path: pointer.to_path_buf(),
+                &pointer,
+                PointerFault::Unreadable(std::io::ErrorKind::InvalidInput),
+            )
+        })?;
+        match open_entry(kind, dir, &entry, &pointer)? {
+            None => Ok(None),
+            Some(Held::Dir(held)) if dir_ok => {
+                let id = held.id().map_err(|refusal| {
+                    pointer_fault(kind, &pointer, PointerFault::Unreadable(refusal.kind()))
+                })?;
+                let identity = Identity {
+                    shape: Shape::Dir,
+                    id,
+                };
+                proven(&pointer, identity).map(Some)
+            }
+            Some(Held::Dir(_)) => Err(JailPathError::VcsEntryUnexpectedKind {
+                kind,
+                path: pointer,
             }),
-            Shape::File => {
-                let text = read_pointer(kind, pointer, &meta)?;
+            Some(Held::File(file)) => {
+                let text = read_pointer(kind, &pointer, file)?;
                 let named = one_line(&text)
-                    .ok_or_else(|| pointer_fault(kind, pointer, PointerFault::Malformed))?;
-                let base = pointer.parent().unwrap_or(pointer);
-                self.target(kind, pointer, base, named).map(Some)
+                    .ok_or_else(|| pointer_fault(kind, &pointer, PointerFault::Malformed))?;
+                self.target(kind, &pointer, dir_path, named, targets)
+                    .map(|(target, _)| Some(target))
             }
         }
     }
 
-    /// The directory `named` (relative to `base`) that `pointer` names, carved
-    /// when it lies inside a writable grant.
+    /// The directory `named` (relative to `base`) that `pointer` names, with
+    /// the handle it is held by.
+    ///
+    /// A pointer names an absolute target outside the walk, so the target is
+    /// opened from its canonical path, and its identity read from that
+    /// handle. When it lies inside a writable grant, it is proven to be the
+    /// directory its canonical path names and pushed onto `targets`.
     fn target(
-        &mut self,
+        &self,
         kind: VcsKind,
         pointer: &Path,
         base: &Path,
         named: &str,
-    ) -> Result<CanonicalPath, JailPathError> {
+        targets: &mut Vec<CarvePath>,
+    ) -> Result<(CanonicalPath, HeldDir), JailPathError> {
         let fault = |reason| pointer_fault(kind, pointer, reason);
         let target = CanonicalPath::resolve(&base.join(named)).map_err(|e| match e {
             JailPathError::Unresolved { kind: io, .. } => fault(PointerFault::Unresolvable(io)),
             other => other,
         })?;
-        let meta = std::fs::metadata(target.as_path())
-            .map_err(|e| fault(PointerFault::Unresolvable(e.kind())))?;
-        if !meta.is_dir() {
-            return Err(fault(PointerFault::NotADirectory));
-        }
+        let held = HeldDir::open_root(target.as_path()).map_err(|refusal| match refusal {
+            OpenRefusal::NotRegular(_) => fault(PointerFault::NotADirectory),
+            other => fault(PointerFault::Unresolvable(other.kind())),
+        })?;
         if self
             .grants
             .iter()
@@ -833,46 +905,151 @@ impl<'g> Carver<'g> {
             .iter()
             .any(|grant| path_covers(grant.as_path(), target.as_path()))
         {
-            self.add(target.clone(), Identity::of(&meta));
+            let id = held
+                .id()
+                .map_err(|refusal| fault(PointerFault::Unresolvable(refusal.kind())))?;
+            let identity = Identity {
+                shape: Shape::Dir,
+                id,
+            };
+            prove_named(&target, identity)?;
+            targets.push(CarvePath {
+                path: target.clone(),
+                identity,
+            });
         }
-        Ok(target)
+        Ok((target, held))
     }
 
-    /// Carve the metadata entry `entry`, classified with `meta`, and return its
-    /// canonical path.
-    fn add_entry(
+    /// Carve the metadata entry at `entry`, held with `identity`, once its
+    /// path is proven to name the held object, and return its canonical path.
+    fn carve_entry(
         &mut self,
         entry: &Path,
-        meta: &std::fs::Metadata,
+        identity: Identity,
     ) -> Result<CanonicalPath, JailPathError> {
-        let changed = || JailPathError::VcsEntryChanged {
-            path: entry.to_path_buf(),
-        };
-        let path = CanonicalPath::resolve(entry).map_err(|_| changed())?;
-        let now = std::fs::symlink_metadata(path.as_path()).map_err(|_| changed())?;
-        let identity = Identity::of(meta);
-        if Identity::of(&now) != identity {
-            return Err(changed());
-        }
-        self.add(path.clone(), identity);
+        let path = proven(entry, identity)?;
+        self.add(CarvePath {
+            path: path.clone(),
+            identity,
+        });
         Ok(path)
     }
 
-    /// Add `path` to the carve, keeping it containment-minimal: a path under a
-    /// carved one is already covered, and a carved path under `path` is dropped.
-    fn add(&mut self, path: CanonicalPath, identity: Identity) {
+    /// Add `carved` to the carve, keeping it containment-minimal: a path under
+    /// a carved one is already covered, and a carved path under it is dropped.
+    fn add(&mut self, carved: CarvePath) {
+        let path = carved.path.as_path();
         if self
             .carve
             .0
             .iter()
-            .any(|carved| path.as_path().starts_with(carved.path.as_path()))
+            .any(|kept| path.starts_with(kept.path.as_path()))
         {
             return;
         }
         self.carve
             .0
-            .retain(|carved| !carved.path.as_path().starts_with(path.as_path()));
-        self.carve.0.push(CarvePath { path, identity });
+            .retain(|kept| !kept.path.as_path().starts_with(path));
+        self.carve.0.push(carved);
+    }
+}
+
+/// A metadata entry or pointer file, held by the one handle every fact about
+/// it is read from.
+enum Held {
+    Dir(HeldDir),
+    File(RegularFile),
+}
+
+impl Held {
+    /// The shape and identity of the held object, read from its handle.
+    fn identity(&self) -> Result<Identity, OpenRefusal> {
+        match self {
+            Self::Dir(dir) => dir.id().map(|id| Identity {
+                shape: Shape::Dir,
+                id,
+            }),
+            Self::File(file) => file.id().map(|id| Identity {
+                shape: Shape::File,
+                id,
+            }),
+        }
+    }
+}
+
+/// The entry `name` of `dir`, at `path`, opened once without following a
+/// link; `None` when absent.
+///
+/// A directory is held as a directory and a regular file as a file. A link, a
+/// reparse point of any tag, a fifo, a socket, or a device refuses.
+fn open_entry(
+    kind: VcsKind,
+    dir: &HeldDir,
+    name: &EntryName,
+    path: &Path,
+) -> Result<Option<Held>, JailPathError> {
+    let refused = |refusal: OpenRefusal| match refusal {
+        OpenRefusal::Absent => Ok(None),
+        OpenRefusal::Link | OpenRefusal::NotRegular(_) => {
+            Err(JailPathError::VcsEntryUnexpectedKind {
+                kind,
+                path: path.to_path_buf(),
+            })
+        }
+        other @ (OpenRefusal::Denied
+        | OpenRefusal::InUse
+        | OpenRefusal::TooLarge(_)
+        | OpenRefusal::TooManyEntries(_)
+        | OpenRefusal::BadName
+        | OpenRefusal::NotUtf8
+        | OpenRefusal::Io(_)) => Err(pointer_fault(
+            kind,
+            path,
+            PointerFault::Unreadable(other.kind()),
+        )),
+    };
+    match dir.child_dir(name) {
+        Ok(held) => Ok(Some(Held::Dir(held))),
+        Err(OpenRefusal::NotRegular(FileKind::Regular)) => match dir.open_regular(name) {
+            Ok(file) => Ok(Some(Held::File(file))),
+            Err(refusal) => refused(refusal),
+        },
+        Err(refusal) => refused(refusal),
+    }
+}
+
+/// `path` resolved, and proven to name the object `identity` was read from.
+fn proven(path: &Path, identity: Identity) -> Result<CanonicalPath, JailPathError> {
+    let changed = || JailPathError::VcsEntryChanged {
+        path: path.to_path_buf(),
+    };
+    let canonical = CanonicalPath::resolve(path).map_err(|_| changed())?;
+    prove_named(&canonical, identity).map_err(|_| changed())?;
+    Ok(canonical)
+}
+
+/// Prove the canonical `path` names the object `identity` was read from.
+///
+/// The parent of `path` is reopened and the entry it holds under `path`'s
+/// name must be that object, read without following a link: the path the
+/// jail mounts is the object the parse read, not one a renamed ancestor put
+/// in its place.
+fn prove_named(path: &CanonicalPath, identity: Identity) -> Result<(), JailPathError> {
+    let changed = || JailPathError::VcsEntryChanged {
+        path: path.as_path().to_path_buf(),
+    };
+    let (Some(parent), Some(name)) = (path.as_path().parent(), path.as_path().file_name()) else {
+        return Err(changed());
+    };
+    let name = EntryName::new(name).ok_or_else(changed)?;
+    let parent = HeldDir::open_root(parent).map_err(|_| changed())?;
+    let shape = parent.kind_of(&name).map_err(|_| changed())?;
+    let id = parent.entry_id(&name).map_err(|_| changed())?;
+    if shape.and_then(Shape::of) == Some(identity.shape) && id == Some(identity.id) {
+        Ok(())
+    } else {
+        Err(changed())
     }
 }
 
@@ -900,24 +1077,14 @@ fn open_child(
 }
 
 /// The filesystem a held directory lies on, compared across one walk.
-type DeviceOf = fn(&HeldDir, &Path) -> Result<Option<u64>, JailPathError>;
+type DeviceOf = fn(&HeldDir, &Path) -> Result<u64, JailPathError>;
 
-/// The device the held directory at `path` lives on (unix).
-#[cfg(unix)]
-fn device_of(dir: &HeldDir, path: &Path) -> Result<Option<u64>, JailPathError> {
-    use std::os::unix::fs::MetadataExt as _;
-    dir.handle()
-        .metadata()
-        .map(|meta| Some(meta.dev()))
-        .map_err(|e| walk_unreadable(path, OpenRefusal::Io(e.kind())))
-}
-
-/// No device is compared off unix: a Windows volume mounted in a folder is a
-/// reparse point, which the listing reports as a link and the walk never enters.
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)] // the unix twin is fallible
-const fn device_of(_dir: &HeldDir, _path: &Path) -> Result<Option<u64>, JailPathError> {
-    Ok(None)
+/// The volume the held directory at `path` lives on, read from its handle on
+/// every OS.
+fn device_of(dir: &HeldDir, path: &Path) -> Result<u64, JailPathError> {
+    dir.id()
+        .map(|id| id.volume())
+        .map_err(|refusal| walk_unreadable(path, refusal))
 }
 
 fn walk_ceiling(ceiling: WalkCeiling, at: &Path) -> JailPathError {
@@ -934,89 +1101,24 @@ fn walk_unreadable(path: &Path, refusal: OpenRefusal) -> JailPathError {
     }
 }
 
-/// What `path` is, without following a final symlink; `None` when absent.
-fn classify(
-    kind: VcsKind,
-    path: &Path,
-) -> Result<Option<(Shape, std::fs::Metadata)>, JailPathError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            let file_type = meta.file_type();
-            let shape = if file_type.is_dir() {
-                Shape::Dir
-            } else if file_type.is_file() {
-                Shape::File
-            } else {
-                Shape::Other
-            };
-            Ok(Some((shape, meta)))
-        }
-        Err(e) if is_absent(e.kind()) => Ok(None),
-        Err(e) => Err(pointer_fault(
-            kind,
-            path,
-            PointerFault::Unreadable(e.kind()),
-        )),
-    }
-}
-
-/// Whether an `lstat` error proves nothing is at the path: it is missing, or
-/// its parent is no directory.
-const fn is_absent(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-    )
-}
-
-/// The text of the regular file `path`, classified as `meta`, read through one
-/// handle that never follows a link and is proved to be that same file.
-fn read_pointer(
-    kind: VcsKind,
-    path: &Path,
-    meta: &std::fs::Metadata,
-) -> Result<String, JailPathError> {
-    let fault = |reason| pointer_fault(kind, path, reason);
-    let file = open_no_follow(path).map_err(|e| fault(PointerFault::Unreadable(e.kind())))?;
-    let held = file
-        .metadata()
-        .map_err(|e| fault(PointerFault::Unreadable(e.kind())))?;
-    if !held.is_file() || Identity::of(&held) != Identity::of(meta) {
-        return Err(JailPathError::VcsEntryChanged {
-            path: path.to_path_buf(),
-        });
-    }
-    let mut bytes = Vec::new();
-    file.take(POINTER_CAP.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| fault(PointerFault::Unreadable(e.kind())))?;
-    if u64::try_from(bytes.len())
-        .ok()
-        .is_none_or(|len| len > POINTER_CAP)
-    {
-        return Err(fault(PointerFault::OverCap));
-    }
-    String::from_utf8(bytes).map_err(|_| fault(PointerFault::NotUtf8))
-}
-
-/// `path` opened read-only without following a final symlink and without
-/// blocking on a fifo.
-#[cfg(unix)]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    Ok(std::fs::File::from(fd))
-}
-
-/// `path` opened read-only; the handle's metadata is then proved to be the
-/// regular file the parse classified.
-#[cfg(not(unix))]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
+/// The text of the held pointer file `file` at `path`, read under
+/// [`POINTER_CAP`].
+fn read_pointer(kind: VcsKind, path: &Path, file: RegularFile) -> Result<String, JailPathError> {
+    file.read_utf8(POINTER_BYTE_CAP).map_err(|refusal| {
+        let reason = match refusal {
+            OpenRefusal::TooLarge(_) => PointerFault::OverCap,
+            OpenRefusal::NotUtf8 => PointerFault::NotUtf8,
+            other @ (OpenRefusal::Absent
+            | OpenRefusal::Link
+            | OpenRefusal::NotRegular(_)
+            | OpenRefusal::Denied
+            | OpenRefusal::InUse
+            | OpenRefusal::TooManyEntries(_)
+            | OpenRefusal::BadName
+            | OpenRefusal::Io(_)) => PointerFault::Unreadable(other.kind()),
+        };
+        pointer_fault(kind, path, reason)
+    })
 }
 
 /// The one path line `text` holds: one trailing line ending allowed, no other
@@ -1045,6 +1147,41 @@ mod tests {
 
     use super::*;
     use crate::test_dir::TestDir;
+
+    impl WritableTree {
+        /// Test-only: `tree` taken with `carve` as given, for pure plan tests
+        /// over paths that need not exist.
+        ///
+        /// # Panics
+        /// When the working directory cannot be opened.
+        #[must_use]
+        pub fn assumed(tree: CanonicalPath, carve: Vec<CanonicalPath>) -> Self {
+            let id = HeldDir::open_root(Path::new(""))
+                .and_then(|dir| dir.id())
+                .expect("the working directory has an identity");
+            let identity = Identity {
+                shape: Shape::Dir,
+                id,
+            };
+            Self {
+                tree,
+                carve: VcsCarve(
+                    carve
+                        .into_iter()
+                        .map(|path| CarvePath { path, identity })
+                        .collect(),
+                ),
+                limits: WalkLimits::DEFAULT,
+            }
+        }
+
+        /// Test-only: this tree under `limits` instead of the defaults.
+        #[must_use]
+        pub const fn under_limits(mut self, limits: WalkLimits) -> Self {
+            self.limits = limits;
+            self
+        }
+    }
 
     struct Fixture {
         _dir: TestDir,
@@ -1524,10 +1661,14 @@ mod tests {
 
     /// A stand-in filesystem probe: a directory named `other-fs` lies on a
     /// device of its own.
-    #[allow(clippy::unnecessary_wraps)] // the probe it stands in for is fallible
-    fn other_fs_device(_dir: &HeldDir, path: &Path) -> Result<Option<u64>, JailPathError> {
+    fn other_fs_device(dir: &HeldDir, path: &Path) -> Result<u64, JailPathError> {
+        let device = device_of(dir, path)?;
         let other = path.file_name() == Some(std::ffi::OsStr::new("other-fs"));
-        Ok(Some(u64::from(other)))
+        Ok(if other {
+            device.wrapping_add(1)
+        } else {
+            device
+        })
     }
 
     #[test]
@@ -1599,6 +1740,177 @@ mod tests {
             let opened = open_child(&held, &entry, &fixture.tree.join(name));
             assert!(matches!(opened, Ok(None)), "{name} is skipped: {opened:?}");
         }
+    }
+
+    /// Every metadata name is carved under every hint, so no listing hint can
+    /// hide it; a transparent reparse point refuses; a link is never entered.
+    #[test]
+    fn step_of_carves_every_metadata_name_and_refuses_a_transparent_entry() {
+        let hints = [
+            HintedKind::Dir,
+            HintedKind::Regular,
+            HintedKind::Link,
+            HintedKind::Transparent,
+            HintedKind::Other,
+            HintedKind::Unknown,
+        ];
+        for kind in VcsKind::ALL {
+            let name = EntryName::new(OsStr::new(kind.entry_name())).expect("entry name");
+            assert_eq!(VcsKind::of_entry_name(&name), Some(kind));
+            for hint in hints {
+                assert_eq!(
+                    step_of(&name, hint),
+                    Step::Carve(kind),
+                    "{kind} hinted {hint:?}"
+                );
+            }
+        }
+        let plain = EntryName::new(OsStr::new("src")).expect("entry name");
+        for (hint, step) in [
+            (HintedKind::Dir, Step::Descend),
+            (HintedKind::Unknown, Step::Settle),
+            (HintedKind::Regular, Step::Skip),
+            (HintedKind::Link, Step::Skip),
+            (HintedKind::Other, Step::Skip),
+            (HintedKind::Transparent, Step::Refuse),
+        ] {
+            assert_eq!(step_of(&plain, hint), step, "src hinted {hint:?}");
+        }
+    }
+
+    /// A stand-in filesystem probe that, as the walk enters `a`, moves it to
+    /// `a-moved` and links `a` to the directory `decoy` beside the tree.
+    #[cfg(unix)]
+    fn swap_ancestor(dir: &HeldDir, path: &Path) -> Result<u64, JailPathError> {
+        if path.file_name() == Some(OsStr::new("a")) {
+            let tree = path.parent().expect("`a` lies in the tree");
+            let decoy = tree
+                .parent()
+                .expect("the tree lies in the root")
+                .join("decoy");
+            std::fs::rename(path, tree.join("a-moved")).expect("move the ancestor");
+            std::os::unix::fs::symlink(decoy, path).expect("link the ancestor to the decoy");
+        }
+        device_of(dir, path)
+    }
+
+    #[cfg(unix)]
+    fn parse_swapped(fixture: &Fixture) -> Result<WritableTree, JailPathError> {
+        WritableTree::parse_probed(
+            canonical(&fixture.tree),
+            &[&canonical(&fixture.tmp)],
+            &Home::unknown(),
+            WalkLimits::DEFAULT,
+            swap_ancestor,
+        )
+    }
+
+    /// An ancestor swapped for a link to a decoy while the walk holds it
+    /// refuses: the recorded path no longer names the entry the parse read.
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_swapped_mid_walk_refuses() {
+        let fixture = fixture("swap-ancestor");
+        let entry = fixture.tree.join("a").join(".git");
+        make_dir(&entry);
+        make_dir(&fixture.root.join("decoy").join(".git"));
+        let walked = parse_swapped(&fixture);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsEntryChanged { path }) if *path == entry
+            ),
+            "a carve naming the decoy would leave the real entry writable: {walked:?}"
+        );
+    }
+
+    /// A pointer inside an entry is opened through the held entry, so an
+    /// ancestor swapped to a decoy without the pointer cannot hide it.
+    #[cfg(unix)]
+    #[test]
+    fn an_inner_pointer_is_read_through_the_held_entry() {
+        let fixture = fixture("swap-inner");
+        let entry = fixture.tree.join("a").join(".git");
+        make_dir(&entry);
+        std::os::unix::fs::symlink(fixture.root.join("elsewhere"), entry.join("commondir"))
+            .expect("symlink");
+        make_dir(&fixture.root.join("decoy").join(".git"));
+        let walked = parse_swapped(&fixture);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsEntryUnexpectedKind { kind: VcsKind::Git, path })
+                    if *path == entry.join("commondir")
+            ),
+            "the held entry's own pointer is the one read: {walked:?}"
+        );
+    }
+
+    /// A carved entry swapped for another directory after the parse refuses
+    /// the recheck run before the jail spawns.
+    #[test]
+    fn recheck_refuses_a_carved_entry_swapped_after_the_parse() {
+        let fixture = fixture("recheck");
+        let git = fixture.tree.join(".git");
+        make_dir(&git);
+        let tree = parse(&fixture).expect("a plain gitdir parses");
+        let unchanged = tree.recheck();
+        assert!(unchanged.is_ok(), "{unchanged:?}");
+        std::fs::rename(&git, fixture.tree.join(".git-old")).expect("move the gitdir");
+        make_dir(&git);
+        let rechecked = tree.recheck();
+        assert!(
+            matches!(
+                &rechecked,
+                Err(JailPathError::VcsEntryChanged { path }) if *path == git
+            ),
+            "a swapped-in gitdir was never carved: {rechecked:?}"
+        );
+    }
+
+    /// A junction `.git` is a name-surrogate reparse point, refused like a link.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_git_entry_refuses() {
+        let fixture = fixture("junction");
+        let real = fixture.root.join("real.git");
+        make_dir(&real);
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(canonical(&fixture.tree).as_path().join(".git"))
+            .arg(canonical(&real).as_path())
+            .status()
+            .expect("run mklink");
+        assert!(made.success(), "mklink /J creates the junction fixture");
+        let walked = parse(&fixture);
+        assert!(
+            matches!(
+                &walked,
+                Err(JailPathError::VcsEntryUnexpectedKind {
+                    kind: VcsKind::Git,
+                    ..
+                })
+            ),
+            "{walked:?}"
+        );
+    }
+
+    #[test]
+    fn opaque_reparse_display_names_the_remedy_escaped() {
+        let refusal = JailPathError::VcsWalkOpaqueReparse {
+            path: PathBuf::from("/tree/a\nb\u{1b}[2J"),
+        };
+        let shown = refusal.to_string();
+        assert!(shown.contains("/tree/a\\u{a}b\\u{1b}[2J"), "{shown}");
+        assert!(
+            !shown.contains('\n') && !shown.contains('\u{1b}'),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("move the working tree to a folder no sync client manages"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Always keep"), "{shown}");
     }
 
     #[test]

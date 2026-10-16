@@ -842,6 +842,34 @@ pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
     out
 }
 
+/// Author, operator or remote text a refusal quotes, scrubbed for a log line.
+///
+/// Built only by [`RefusedText::new`], which runs [`scrub_log_controls`], so a
+/// refusal's `Display` prints it as is: every log hazard in it is already a
+/// visible escape, and no refusal can carry the raw text by mistake.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RefusedText(String);
+
+impl RefusedText {
+    /// The scrubbed form of `raw`.
+    #[must_use]
+    pub fn new(raw: &str) -> Self {
+        Self(scrub_log_controls(raw).into_owned())
+    }
+
+    /// The scrubbed text.
+    #[must_use]
+    pub const fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Display for RefusedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Append the scrubbed spelling of one character to `out`.
 fn push_scrubbed(c: char, out: &mut String) {
     use std::fmt::Write as _;
@@ -1559,7 +1587,7 @@ pub enum SpawnRefusal {
     ///
     /// Nothing was forked. Tokio panics here when the runtime was built without
     /// `enable_io`. Reachable only where panics unwind: under `panic = "abort"`
-    /// (every emitted release build) the panic aborts the process instead.
+    /// the panic aborts the process instead.
     #[cfg(all(feature = "web", unix))]
     ProbePanicked,
     /// The spawn panicked on the spawner thread, which caught it and lives on.
@@ -1567,8 +1595,8 @@ pub enum SpawnRefusal {
     /// From `spawn_hardened_tokio` the panic may follow the fork (tokio panics
     /// registering a child with a runtime missing a driver), leaving a child
     /// that only the parent-death floor bounds. Reachable only where panics
-    /// unwind: under `panic = "abort"` (every emitted release build) the panic
-    /// aborts the process, and the floor SIGTERMs any forked child.
+    /// unwind: under `panic = "abort"` the panic aborts the process, and the
+    /// floor SIGTERMs any forked child.
     SpawnPanicked,
     /// `spawn_hardened_tokio` was called outside a tokio runtime.
     #[cfg(all(feature = "web", not(target_arch = "wasm32")))]

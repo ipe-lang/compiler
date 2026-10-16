@@ -128,6 +128,13 @@ pub enum JailPathError {
         /// The directory.
         path: PathBuf,
     },
+    /// An entry inside a writable working tree is a reparse point a filter
+    /// driver answers for (a cloud placeholder), so the walk cannot see what
+    /// it holds.
+    VcsWalkOpaqueReparse {
+        /// The entry.
+        path: PathBuf,
+    },
 }
 
 /// A path shown injectively: `\` doubled, and every control, invisible, or
@@ -233,6 +240,15 @@ impl fmt::Display for JailPathError {
                 "the directory {} in the writable working tree is on another filesystem, \
                  which the jail does not search for version-control metadata; refusing to \
                  build the jail: unmount it, or run without the filesystem grant",
+                ShownPath(path)
+            ),
+            Self::VcsWalkOpaqueReparse { path } => write!(
+                f,
+                "the entry {} in the writable working tree is a placeholder a filter driver \
+                 answers for (such as a cloud-synced folder), so version-control metadata \
+                 inside it could go unprotected; refusing to build the jail: move the working \
+                 tree to a folder no sync client manages (a placeholder kept on the device \
+                 stays one), or run without the filesystem grant",
                 ShownPath(path)
             ),
         }
@@ -516,7 +532,7 @@ impl<'a> PinnedCarve<'a> {
     }
 
     /// The directories pinned, shallowest first.
-    #[cfg(any(target_os = "freebsd", test))]
+    #[cfg(test)]
     #[must_use]
     pub fn pins(&self) -> &[CanonicalPath] {
         &self.pins
@@ -729,6 +745,17 @@ impl TreeBind {
                 mounts.vcs_home(),
             )
             .map(Self::ReadWrite),
+        }
+    }
+
+    /// Prove the bound tree's carve again just before the jail spawns; an unbound tree carves nothing.
+    ///
+    /// # Errors
+    /// Any error of [`WritableTree::recheck`].
+    pub fn recheck(&self) -> Result<(), JailPathError> {
+        match self {
+            Self::ReadWrite(tree) => tree.recheck(),
+            Self::Unbound => Ok(()),
         }
     }
 
