@@ -638,12 +638,12 @@ historyStateTextsDistinct =
             ShownProven
     in
     List.all identity
-        [ Queue.historyStatusText HistoryLoading == Just "Loading history…"
-        , Queue.historyStatusText (HistoryFailed LoadFailed) == Just ("History load failed: " ++ Failure.loadFailureText LoadFailed)
-        , Queue.historyStatusText (HistoryLoaded { rows = [], at = HistoryStart, next = Nothing, log = log }) == Just "No reviews yet."
-        , Queue.historyStatusText (HistoryLoaded { rows = [], at = later, next = Nothing, log = log }) == Just "No more reviews."
-        , Queue.historyStatusText (HistoryLoaded { rows = [ row ], at = HistoryStart, next = Nothing, log = log }) == Nothing
-        , Queue.historyStatusText (HistoryLoaded { rows = [ row ], at = later, next = Just later, log = log }) == Nothing
+        [ Maybe.map SafeText.toString (Queue.historyStatusText HistoryLoading) == Just "Loading history…"
+        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryFailed LoadFailed)) == Just ("History load failed: " ++ Failure.loadFailureText LoadFailed)
+        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [], at = HistoryStart, next = Nothing, log = log })) == Just "No reviews yet."
+        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [], at = later, next = Nothing, log = log })) == Just "No more reviews."
+        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [ row ], at = HistoryStart, next = Nothing, log = log })) == Nothing
+        , Maybe.map SafeText.toString (Queue.historyStatusText (HistoryLoaded { rows = [ row ], at = later, next = Just later, log = log })) == Nothing
         ]
 
 
@@ -1504,7 +1504,7 @@ keyCheckMismatchMessageIsSecretFreeIn base =
                 [ testKeyHex, String.toUpper testKeyHex, otherKeyHex, String.toUpper otherKeyHex ] ++ Maybe.withDefault [] (Maybe.map List.singleton stored)
 
             rendered =
-                Maybe.withDefault "" startup :: Maybe.withDefault "" decision :: Maybe.withDefault "" (Queue.chainBanner ShownKeyMismatch) :: []
+                Maybe.withDefault "" startup :: Maybe.withDefault "" decision :: Maybe.withDefault "" (Maybe.map SafeText.toString (Queue.chainBanner ShownKeyMismatch)) :: []
 
             clean text =
                 not (String.isEmpty text) && not (List.any (\secret -> String.contains secret text) secrets)
