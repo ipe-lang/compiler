@@ -93,6 +93,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::NoDefaultEntry { .. }
         | CliError::EntryEscapes { .. }
         | CliError::ExposedModuleMissing { .. }
+        | CliError::SourceTree(_)
         | CliError::SymlinkInSource { .. }
         | CliError::FileOutsideRoot { .. } => LoadError::Refused(detail),
         CliError::FileTooLarge { .. }
@@ -329,6 +330,10 @@ mod tests {
             CliError::ExposedModuleMissing {
                 module: "Shapes".to_owned(),
             },
+            CliError::SourceTree(crate::project_root::TreeRefusal::NotModuleSegment {
+                module: "main".to_owned(),
+                segment: "main".to_owned(),
+            }),
             CliError::SymlinkInSource {
                 path: root.join("src/Main.ipe"),
             },

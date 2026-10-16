@@ -3345,8 +3345,9 @@ fn exec_program(program: &Path, args: &[std::ffi::OsString]) -> Result<(), CliEr
     }
 }
 
-/// Read the emitted crate IDENTITY from an emitted project's `Cargo.toml`
-/// `[package] name` so `ipe dev run` / `ipe release run` / `ipe test` locate the correct
+/// Read the emitted crate identity from an emitted project's `Cargo.toml`.
+///
+/// The `[package] name` lets `ipe dev run` / `ipe release run` / `ipe test` locate the correct
 /// built binary — cargo names the binary artifact after the crate, so this is
 /// the per-project path-uniquified identity (`<friendly>_<hash>`), NOT the
 /// user-facing friendly name. The name must be a quoted plain file name
@@ -3410,8 +3411,9 @@ fn emitted_package_name(manifest: &str) -> Option<&str> {
     None
 }
 
-/// The on-disk filename cargo gives the emitted crate's executable, ready to
-/// join onto a target-profile directory. It is [`emitted_bin_name`] (the crate
+/// The on-disk filename cargo gives the emitted crate's executable.
+///
+/// Ready to join onto a target-profile directory. It is [`emitted_bin_name`] (the crate
 /// identity) plus the host's executable extension: `.exe` on Windows, empty
 /// elsewhere. Locating the built artifact by the bare identity misses the file
 /// on Windows, where cargo appends `.exe`; every caller that resolves a built
