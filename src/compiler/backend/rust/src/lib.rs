@@ -1225,7 +1225,7 @@ pub(crate) struct EmitCtx<'a> {
     ///
     /// * declares `pub mod config_decode; pub use config_decode::*;` in the
     ///   emitted `ipe_runtime/mod.rs`;
-    /// * adds the `toml` + `serde_yaml` dependencies to the emitted `Cargo.toml`.
+    /// * adds the TOML and YAML parser dependencies to the emitted `Cargo.toml`.
     ///
     /// The JSON-backed `Config.*` combinators (`string` / `field` / `map` / …)
     /// emit into the `json` module, so a program that only decodes
@@ -1286,8 +1286,8 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) uses_regex: bool,
     /// `true` when the program reaches an `Ipe.Uuid` kernel. The `uuid` runtime
     /// feature — the `uuid` crate plus the `uuid_kernel.rs` module — is selected
-    /// under [`Self::reaches_uuid`]: this flag unioned with the `server` and `web`
-    /// surfaces, whose runtime modules mint session/CSRF ids via `uuid::new_v4`.
+    /// under [`Self::reaches_uuid`]: this flag unioned with the `jwt` surface and
+    /// the `server` and `web` surfaces, which imply the feature.
     pub(crate) uses_uuid: bool,
     /// `true` when the program reaches an `Ipe.Random` kernel. The `random`
     /// runtime feature gates the `random.rs` module declaration; this flag alone
@@ -2241,7 +2241,7 @@ impl<'a> EmitCtx<'a> {
         let uses_http = program.modules.iter().any(|m| m.uses_http);
 
         // detect Ipe.Config TOML/YAML decoder usage (gates `config_decode` +
-        // `toml` + `serde_yaml`).
+        // the TOML and YAML parser crates).
         let uses_config = program.modules.iter().any(|m| m.uses_config);
 
         // detect Ipe.Compression usage (gates `compression` + `flate2` + `zstd`).
@@ -2886,12 +2886,13 @@ impl<'a> EmitCtx<'a> {
     /// Reached directly by an `Ipe.Uuid` kernel ([`Self::uses_uuid`]), OR
     /// transitively by:
     /// - the `server` ([`Self::uses_server`]) and `web` ([`Self::uses_web`] /
-    ///   [`Self::uses_webview`]) surfaces, whose runtime modules mint session ids /
-    ///   CSRF tokens via `uuid::new_v4` directly. Web implies server, but both are
-    ///   listed for locality.
+    ///   [`Self::uses_webview`]) surfaces, which imply the runtime `uuid` feature;
+    ///   their session ids and CSRF tokens draw through `entropy::fill_entropy`
+    ///   and name no `uuid` item. Web implies server, but both are listed for
+    ///   locality.
     /// - the `jwt` / `auth` surface ([`Self::reaches_jwt`]): `auth.rs` is compiled
-    ///   under `#[cfg(feature = "jwt")]` and calls `uuid::Uuid::new_v4()` to mint
-    ///   per-session `jti` ids in `auth_sign_token`. The `uuid` dep is optional in
+    ///   under `#[cfg(feature = "jwt")]` and builds per-session `jti` ids in
+    ///   `auth_sign_token` with `uuid::Builder`. The `uuid` dep is optional in
     ///   the runtime crate; without this gate a jwt-only program (no server/web)
     ///   fails with E0433 at cargo build despite `ipe` exit 0.
     ///
@@ -4001,6 +4002,7 @@ fn collect_type_feature_requirements(ty: &IrType, out: &mut BTreeSet<ipe_ir::Run
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -4307,7 +4309,7 @@ fn collect_record_shapes(
         | IrType::UrlRelative
         // `Dsn` + the external `Connection`/markers + the runtime-config
         // `Setting`/markers are opaque wrappers — no shape.
-        | IrType::Dsn | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
+        | IrType::Dsn | IrType::DbLocation | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
         | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
         // Process-run-with cfg + Cache config / stats + Csv document fold to
         // nominal runtime structs — no structural record shape to synthesise.
@@ -4485,6 +4487,7 @@ fn type_reaches_enum(
         | IrType::UrlRelative
         // `Dsn` is a monomorphic opaque wrapper — no reachable enum edge.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection | IrType::ConnReadOnly | IrType::ConnReadWrite
         | IrType::Setting | IrType::ShapeWeb | IrType::ShapeWebView | IrType::ShapeTerminal
         // Process-run-with cfg + Cache config / stats + Csv document are
@@ -4600,6 +4603,7 @@ fn contains_generic(ty: &IrType) -> bool {
         | IrType::UrlRelative
         // `Dsn` is a monomorphic opaque wrapper — no generic parameters.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -4748,6 +4752,7 @@ fn collect_generics(ty: &IrType, out: &mut Vec<Symbol>) {
         | IrType::UrlRelative
         // `Dsn` is a monomorphic opaque wrapper — no generics to collect.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -5051,6 +5056,7 @@ fn match_template(
         | IrType::UrlRelative
         // `Dsn` is a monomorphic opaque leaf — must equal exactly.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite

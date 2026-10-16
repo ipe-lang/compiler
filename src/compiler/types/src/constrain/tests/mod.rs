@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod registry_phase_c_tests {
     use super::super::{
-        Builder, Builtins, Content, Diagnostic, Feature, LowerError, Ty, UnionFind,
+        Builder, Builtins, Content, Diagnostic, Feature, LowerError, Ty, UnionFind, UntypedDef,
     };
     use ipe_diagnostics::Span;
     use ipe_intern::Interner;
@@ -1439,6 +1439,10 @@ mod registry_phase_c_tests {
             K::ColorDeuteranopia,
             K::ColorTritanopia,
             K::ColorSimulate,
+            // Ipe.Db.Location — the typed location `Db.open` takes (Ipê-new).
+            K::DbLocationFile,
+            K::DbLocationMemory,
+            K::DbLocationDsn,
         ]
     };
 
@@ -1968,7 +1972,13 @@ mod registry_phase_c_tests {
             },
         };
         let shared = builder.flex().expect("mint the binding's shared var");
-        builder.untyped.insert((vec![dep], name), shared);
+        builder.untyped.insert(
+            (vec![dep], name),
+            UntypedDef {
+                var: shared,
+                name_span: Span::DUMMY,
+            },
+        );
         builder
             .constrain_def(&def)
             .expect("an Int literal def constrains");

@@ -1,0 +1,34 @@
+// Control fixture for `vcs_metadata_handle_scan.rs`: a parse that queries a
+// path. Its refused forms in code must turn the scan red; the same forms in a
+// comment, a string, or the test module must not.
+
+// std::fs::metadata(path) in a line comment is not code.
+/* entry.exists() in a block /* nested */ comment is not code. */
+
+fn walk(&mut self) -> Result<(), JailPathError> {
+    let root = HeldDir::open_root(root_path)?;
+    let note = "std::fs::symlink_metadata(path) in a string is not code";
+    let raw = r#"rustix::fs::open in a "raw" string is not code"#;
+    let quote = '"';
+    Ok(())
+}
+
+fn entry_at<'g>(&mut self, entry: &'g Path) -> Result<(), JailPathError> {
+    let meta = std::fs::symlink_metadata(entry);
+    let again = HeldDir::open_root(entry)?;
+    let present = entry.exists();
+    let real = CanonicalPath::resolve(entry)?;
+    let again_real = entry.canonicalize();
+    let listed = entry.read_dir();
+    let stored = entry.read_link();
+    let linked = entry.is_symlink();
+    use std::fs as filesystem;
+    use rustix as sys;
+    Ok(())
+}
+
+mod tests {
+    fn helper() {
+        let _ = std::fs::metadata("");
+    }
+}

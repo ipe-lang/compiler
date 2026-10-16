@@ -23,14 +23,17 @@ use ipe_diagnostics::{
     MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
 use ipe_intern::{Interner, Symbol};
-use ipe_ir::free_vars::{pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee};
+use ipe_ir::free_vars::{
+    mentions_free, pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee,
+};
 use ipe_ir::let_inline::{inlined_let_body, let_value_is_inlined};
 use ipe_ir::once_closure::{CaptureScope, ClosureKind};
 use ipe_ir::{
     AppSurface, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef, EnumPayloadTable, Expr,
     Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind, Pat, Program, RowParam,
-    RuntimeModule, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant, fun_value_arc_promotable,
-    ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde, is_dispatch_free, is_irrefutable,
+    RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain, Variant,
+    fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde,
+    is_dispatch_free, is_irrefutable,
 };
 use ipe_kernels::FnSlotCarrier;
 use ipe_types::{
@@ -1558,103 +1561,20 @@ fn canon_collect_free_locals(
 //   `rewrite_multiuse_clones` — DFS rewrite; `remaining` starts at the count,
 //       decrements per occurrence; last occurrence (remaining==1) stays bare.
 
-/// Returns `true` when `expr` references `sym` as a live (non-shadowed) local
-/// at any depth, treating nested lambdas as transparent — descending into their
-/// bodies unless one of their parameters re-binds `sym`.
+/// Will a `move` closure whose body is `expr` capture `sym` from the enclosing scope?
 ///
-/// Used to decide whether a `move` closure whose body is `expr` will capture
-/// `sym` from the enclosing scope: if this returns `true`, the outer `move`
-/// closure moves `sym` in.
+/// `expr` is a closure body or a whole closure node; on a node, a parameter
+/// named `sym` shadows the outer binding, so that closure captures nothing of it.
+///
+/// A `move` closure captures by value every free local its body mentions, in
+/// any position and whatever the emitted form there (a borrow, a `.clone()`,
+/// a record-update base), and a nested closure that captures `sym` makes the
+/// outer one capture it too. That is exactly "`sym` occurs free in `expr`",
+/// so this is [`ipe_ir::free_vars::mentions_free`]: every capture consumer
+/// reads the one free-variable walk and none can skip a sub-expression the
+/// others visit.
 fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
-    match expr {
-        Expr::Var(s) | Expr::CloneVar(s) => *s == sym,
-        // Nested lambda: descend unless it shadows `sym` via a parameter.
-        // A nested `move` closure that captures `sym` causes the outer closure
-        // to capture `sym` too.
-        Expr::Lambda { params, body, .. }
-        | Expr::SharedLambda { params, body, .. }
-        | Expr::OnceLambda { params, body, .. } => {
-            if params.iter().any(|(s, _)| *s == sym) {
-                false // sym shadowed by inner lambda param
-            } else {
-                lambda_body_refs_sym(sym, body)
-            }
-        }
-        Expr::Let { name, value, body } => {
-            lambda_body_refs_sym(sym, value)
-                || if *name == sym {
-                    false
-                } else {
-                    lambda_body_refs_sym(sym, body)
-                }
-        }
-        Expr::Destructure {
-            binder,
-            value,
-            body,
-        } => {
-            lambda_body_refs_sym(sym, value)
-                || if pat_binds_symbol(binder, sym) {
-                    false
-                } else {
-                    lambda_body_refs_sym(sym, body)
-                }
-        }
-        Expr::Match(m) => {
-            lambda_body_refs_sym(sym, m.scrutinee())
-                || m.arms().iter().any(|arm| {
-                    !pat_binds_symbol(&arm.pat, sym) && lambda_body_refs_sym(sym, &arm.body)
-                })
-        }
-        Expr::TailLoop { params, body } => {
-            if params.iter().any(|(s, _)| *s == sym) {
-                false
-            } else {
-                lambda_body_refs_sym(sym, body)
-            }
-        }
-        Expr::BinOp { lhs, rhs, .. } => {
-            lambda_body_refs_sym(sym, lhs) || lambda_body_refs_sym(sym, rhs)
-        }
-        Expr::If { cond, then_, else_ } => {
-            lambda_body_refs_sym(sym, cond)
-                || lambda_body_refs_sym(sym, then_)
-                || lambda_body_refs_sym(sym, else_)
-        }
-        Expr::Call { args, .. } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        Expr::Apply { func, args } => {
-            lambda_body_refs_sym(sym, func) || args.iter().any(|a| lambda_body_refs_sym(sym, a))
-        }
-        Expr::Tuple(items) => items.iter().any(|e| lambda_body_refs_sym(sym, e)),
-        Expr::List { items, .. } => items.iter().any(|e| lambda_body_refs_sym(sym, e)),
-        Expr::Cons { head, tail } => {
-            lambda_body_refs_sym(sym, head) || lambda_body_refs_sym(sym, tail)
-        }
-        Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
-            lambda_body_refs_sym(sym, list)
-        }
-        Expr::Record { fields, .. } => fields.iter().any(|(_, e)| lambda_body_refs_sym(sym, e)),
-        // Update.record is wrapped in `.clone()` by emit_update (borrow, not move).
-        // Only the field value expressions are consuming captures.
-        Expr::Update { fields, .. } => fields.iter().any(|(_, e)| lambda_body_refs_sym(sym, e)),
-        Expr::Ctor { args, .. } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        Expr::TaskSeq { effect, rest } => {
-            lambda_body_refs_sym(sym, effect) || lambda_body_refs_sym(sym, rest)
-        }
-        Expr::TailRecur { args } => args.iter().any(|a| lambda_body_refs_sym(sym, a)),
-        // `Access.record` is borrowed by the emitted `(record).field.clone()` —
-        // a borrow of `record`, not a move.  The lambda still needs to capture
-        // `sym` if `sym` is the record expression, so we recurse.
-        Expr::Access { record, .. } => lambda_body_refs_sym(sym, record),
-        Expr::Int(_)
-        | Expr::Bool(_)
-        | Expr::Float(_)
-        | Expr::Str(_)
-        | Expr::CustomElementRef { .. }
-        | Expr::Char(_)
-        | Expr::Unit
-        | Expr::FuncValue { .. } => false,
-    }
+    mentions_free(sym, expr)
 }
 
 // ── Shared (Arc) capture rewrite, E0507 fix ──────────────────────────────────
@@ -1696,14 +1616,10 @@ fn lambda_body_refs_sym(sym: Symbol, expr: &Expr) -> bool {
 ///
 /// `scope` is where `expr` itself sits; every closure the backend emits steps
 /// it through [`CaptureScope::enter_boundary`], the `move |_|` around a
-/// `TaskSeq` continuation included. Mirrors [`lambda_body_refs_sym`]'s
-/// shadowing discipline exactly, generalised from a boolean "does it occur" to
-/// "where does it occur, possibly more than once". `Expr::Update.record` is
-/// walked too (unlike `lambda_body_refs_sym`, which treats it as borrow-only
-/// for a DIFFERENT question) -- a false positive here only costs an unneeded
-/// (but harmless) `Arc`/`.clone()`, whereas a false negative would leave a
-/// real E0507/E0382 unfixed, so this walker is deliberately the more
-/// conservative of the two.
+/// `TaskSeq` continuation included. It visits every sub-expression and
+/// honours every binder exactly as [`ipe_ir::free_vars::mentions_free`] does,
+/// answering "in which scopes does `sym` occur, possibly more than once"
+/// rather than "does it occur".
 #[allow(clippy::too_many_lines)] // exhaustive IR match; every arm is structurally required
 fn collect_capture_scopes(
     sym: Symbol,
@@ -2706,15 +2622,16 @@ fn find_first_varlocal_span(sym: Symbol, body: &canon::Expr) -> Option<Span> {
 /// * `Destructure { binder binds sym, body }` — skip `body`.
 /// * `Match` arm whose pattern binds `sym` — skip that arm's body.
 /// * `TailLoop` whose params include `sym` — skip `body`.
-/// * `Lambda` — counted as 0 or 1 via `lambda_body_refs_sym`; do NOT recurse
-///   further (inner uses are the Lambda's own business).
+/// * `Lambda` — counted as 0 or 1 via `lambda_body_refs_sym` on the closure
+///   node, so a parameter re-binding `sym` counts 0; do NOT recurse further
+///   (inner uses are the Lambda's own business).
 fn count_var_uses(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         // A pre-pass `CloneVar` at the outer scope counts like a bare `Var`.
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_var_uses(sym, value);
             let in_body = if *name == sym {
@@ -3280,7 +3197,9 @@ fn pat_binds_any(pat: &Pat, params: &BTreeSet<Symbol>) -> bool {
 /// generic.
 fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
     match ty {
-        IrType::Generic(g) => *g == tv,
+        // A row generic is a variable occurrence like `Generic`: it mentions
+        // exactly its own row variable.
+        IrType::Generic(g) | IrType::RowGeneric(g) => *g == tv,
         IrType::Task(inner)
         | IrType::Maybe(inner)
         | IrType::List(inner)
@@ -3345,6 +3264,7 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
         | IrType::UrlRelative
         // `Dsn` is non-parametric — mentions no type var.
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -3381,10 +3301,7 @@ fn ir_type_mentions_generic(ty: &IrType, tv: Symbol) -> bool {
         | IrType::WebApp
         | IrType::TuiApp
         | IrType::CliApp
-        | IrType::WorkerApp
-        // A row variable is a distinct row generic (`R{n}`), never the ordinary
-        // `T{n}` type variable this predicate tracks.
-        | IrType::RowGeneric(_) => false,
+        | IrType::WorkerApp => false,
     }
 }
 
@@ -3514,6 +3431,7 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -3543,6 +3461,8 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
         | IrType::TuiApp
         | IrType::CliApp
         | IrType::WorkerApp
+        // A row generic is a leaf like `Generic`, never itself a carrier; a
+        // carrier holding one is answered by the `is_carrier` test above.
         | IrType::RowGeneric(_) => false,
     }
 }
@@ -3566,8 +3486,10 @@ fn ir_type_generic_in_carrier(ty: &IrType, tv: Symbol, is_carrier: fn(&IrType) -
 /// already draw).
 fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
     match ty {
-        // A bare occurrence of the tracked tvar is the reach itself.
-        IrType::Generic(g) => *g == tv,
+        // A bare occurrence of the tracked tvar is the reach itself; a row
+        // generic is the caller's record held by value, so its own row
+        // variable reaches it bare.
+        IrType::Generic(g) | IrType::RowGeneric(g) => *g == tv,
         // Transparent value-containers: a bare element under them is reachable.
         IrType::List(inner) | IrType::Maybe(inner) | IrType::Set(inner) => {
             ir_type_generic_reaches_bare(inner, tv)
@@ -3633,6 +3555,7 @@ fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -3661,8 +3584,7 @@ fn ir_type_generic_reaches_bare(ty: &IrType, tv: Symbol) -> bool {
         | IrType::WebApp
         | IrType::TuiApp
         | IrType::CliApp
-        | IrType::WorkerApp
-        | IrType::RowGeneric(_) => false,
+        | IrType::WorkerApp => false,
     }
 }
 
@@ -4196,7 +4118,7 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(a, out);
             }
         }
-        Pat::Tuple(items) | Pat::Or(items) => {
+        Pat::Tuple(items) => {
             for item in items {
                 collect_ir_pat_syms(item, out);
             }
@@ -4214,7 +4136,8 @@ fn collect_ir_pat_syms(pat: &Pat, out: &mut BTreeSet<Symbol>) {
                 collect_ir_pat_syms(t, out);
             }
         }
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
     }
 }
 
@@ -4790,7 +4713,8 @@ fn arg_forwarded_binders(arg: &Expr, out: &mut Vec<Symbol>) {
 fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
     match pat {
         Pat::Var(s) => out.push(*s),
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => {}
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {}
         Pat::Alias(inner, s) => {
             out.push(*s);
             pat_binder_syms(inner, out);
@@ -4811,13 +4735,6 @@ fn pat_binder_syms(pat: &Pat, out: &mut Vec<Symbol>) {
             }
             if let Some(p) = rest.as_deref() {
                 pat_binder_syms(p, out);
-            }
-        }
-        // Every alternative of an or-pattern binds the same names, so walking
-        // one alternative surfaces the complete binder set.
-        Pat::Or(alts) => {
-            if let Some(first) = alts.first() {
-                pat_binder_syms(first, out);
             }
         }
     }
@@ -5712,9 +5629,9 @@ fn align_param_slot(
 fn count_fn_value_uses(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_fn_value_uses(sym, value);
             let in_body = if *name == sym {
@@ -5896,10 +5813,8 @@ fn fn_value_move_walk(
         }
         // A lambda captures `sym` by move at construction; the whole lambda is
         // one consuming read of `sym` at this point.
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => {
-            if lambda_body_refs_sym(sym, body) {
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            if lambda_body_refs_sym(sym, expr) {
                 state.read(true);
             }
         }
@@ -6252,9 +6167,9 @@ fn reject_fn_value_reuse(
 fn count_value_consumes(sym: Symbol, copy_fields: &BTreeSet<Symbol>, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_value_consumes(sym, copy_fields, value);
             let in_body = if *name == sym {
@@ -6624,10 +6539,8 @@ fn nonclone_move_walk(sym: Symbol, expr: &Expr, state: &mut NonCloneMoveState<'_
                 state.read_whole(true);
             }
         }
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => {
-            if lambda_body_refs_sym(sym, body) {
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            if lambda_body_refs_sym(sym, expr) {
                 state.read_whole(true);
             }
         }
@@ -6902,9 +6815,9 @@ fn sym_is_bare_update_base(sym: Symbol, expr: &Expr) -> bool {
 fn count_var_uses_update_aware(sym: Symbol, expr: &Expr) -> usize {
     match expr {
         Expr::Var(s) | Expr::CloneVar(s) => usize::from(*s == sym),
-        Expr::Lambda { body, .. }
-        | Expr::SharedLambda { body, .. }
-        | Expr::OnceLambda { body, .. } => usize::from(lambda_body_refs_sym(sym, body)),
+        Expr::Lambda { .. } | Expr::SharedLambda { .. } | Expr::OnceLambda { .. } => {
+            usize::from(lambda_body_refs_sym(sym, expr))
+        }
         Expr::Let { name, value, body } => {
             let in_value = count_var_uses_update_aware(sym, value);
             let in_body = if *name == sym {
@@ -7748,6 +7661,7 @@ fn carrier_shape(ty: &IrType) -> CarrierShape<'_> {
         | IrType::Url
         | IrType::UrlRelative
         | IrType::Dsn
+        | IrType::DbLocation
         | IrType::Connection
         | IrType::ConnReadOnly
         | IrType::ConnReadWrite
@@ -8163,6 +8077,7 @@ const fn tag_carrier(tag: ipe_kernels::BuiltinTag) -> TagCarrier {
         | BuiltinTag::Url
         | BuiltinTag::UrlRelative
         | BuiltinTag::Dsn
+        | BuiltinTag::DbLocation
         | BuiltinTag::Connection
         | BuiltinTag::ConnReadOnly
         | BuiltinTag::ConnReadWrite
@@ -8894,37 +8809,6 @@ fn owned_slice_refusal(own: SliceOwnership, prefix: &[Pat], span: Span) -> DResu
     match own {
         SliceOwnership::BorrowClone => Ok(()),
         SliceOwnership::OwnedMove => slice_element_alias_refusal(prefix, span),
-    }
-}
-
-/// Refuse (IPE-L0116) a binding or-pattern over an owned list view.
-///
-/// An owned list view moves each binder out of one view shape, so every
-/// alternative would have to bind each name at the same position of the view;
-/// the owned rendering supports alternatives that bind nothing.
-fn owned_or_refusal(alts: &[Pat], span: Span) -> DResult<()> {
-    let owned = alts.iter().any(holds_owned_slice_head);
-    if owned && alts.iter().any(clone_class::pat_binds_any_name) {
-        return Err(unsupported(span, Feature::NestedCtorDiscrimination));
-    }
-    Ok(())
-}
-
-/// Is `pat` an owned-move slice head, directly or under an alias or or-pattern?
-fn holds_owned_slice_head(pat: &Pat) -> bool {
-    match pat {
-        Pat::Slice { own, .. } => *own == SliceOwnership::OwnedMove,
-        Pat::Alias(inner, _) => holds_owned_slice_head(inner),
-        Pat::Or(alts) => alts.iter().any(holds_owned_slice_head),
-        Pat::Var(_)
-        | Pat::Wildcard
-        | Pat::Int(_)
-        | Pat::Bool(_)
-        | Pat::Char(_)
-        | Pat::Str(_)
-        | Pat::Ctor { .. }
-        | Pat::Tuple(_)
-        | Pat::Record(_) => false,
     }
 }
 
@@ -10117,8 +10001,14 @@ fn collect_pat_ir_type_refs(pat: &Pat, enums: &mut BTreeSet<(ModPath, Symbol)>) 
                 collect_pat_ir_type_refs(p, enums);
             }
         }
-        Pat::Tuple(ps) | Pat::Or(ps) => {
+        Pat::Tuple(ps) => {
             for p in ps {
+                collect_pat_ir_type_refs(p, enums);
+            }
+        }
+        // Each constructor alternative names its enum, so every one is walked.
+        Pat::Or(alts) => {
+            for p in alts.as_slice() {
                 collect_pat_ir_type_refs(p, enums);
             }
         }
@@ -10447,7 +10337,11 @@ fn pat_matches_sqlvalue(pat: &Pat, enums: &[Symbol]) -> bool {
             (home.0.is_empty() && enums.contains(ty))
                 || args.iter().any(|p| pat_matches_sqlvalue(p, enums))
         }
-        Pat::Tuple(ps) | Pat::Or(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
+        Pat::Tuple(ps) => ps.iter().any(|p| pat_matches_sqlvalue(p, enums)),
+        Pat::Or(alts) => alts
+            .as_slice()
+            .iter()
+            .any(|p| pat_matches_sqlvalue(p, enums)),
         Pat::Record(fields) => fields.iter().any(|(_, p)| pat_matches_sqlvalue(p, enums)),
         Pat::Slice { prefix, rest, .. } => {
             prefix.iter().any(|p| pat_matches_sqlvalue(p, enums))
@@ -10575,7 +10469,7 @@ pub fn capabilities_reached_from(
 /// yet, carrying the offending node's source `span`. This is the
 /// "not supported yet" channel (`IPE-L01##`), distinct from [`bug`] ("the
 /// compiler is broken"): the input is valid Ipê the supported subset has not reached.
-const fn unsupported(span: Span, feature: Feature) -> Diagnostic {
+pub const fn unsupported(span: Span, feature: Feature) -> Diagnostic {
     Diagnostic::Lower {
         span,
         msg: LowerError::Unsupported(feature),
@@ -10643,14 +10537,6 @@ fn join_left_alias() -> String {
 /// [`join_left_alias`].
 fn join_right_alias() -> String {
     "a1".to_string()
-}
-
-/// The IR element type of a projection reference — a `(String, String)` tuple of
-/// `(alias, column)`. Used to type the `selectNamed` projection list literal.
-/// The IR type of a projection `Row` — the `Dict String String` cell map the DB
-/// projection layer returns. Types the emitted decode's `row` binder.
-fn row_ir_type() -> IrType {
-    IrType::Dict(Box::new(IrType::Str), Box::new(IrType::Str))
 }
 
 /// The IR type of the `Error` channel — the fixed error side of every
@@ -11151,6 +11037,7 @@ const fn ir_type_label(ty: &IrType) -> &'static str {
         IrType::Url => "Url",
         IrType::UrlRelative => "Url.Relative",
         IrType::Dsn => "Dsn",
+        IrType::DbLocation => "DbLocation",
         IrType::Connection => "Connection",
         IrType::ConnReadOnly => "ReadOnly",
         IrType::ConnReadWrite => "ReadWrite",
@@ -11181,7 +11068,10 @@ const fn ir_type_label(ty: &IrType) -> &'static str {
 fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
     match pat {
         Pat::Var(s) => *s == target,
-        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) => false,
+        // A `SharedAlts` alternative is binder-free.
+        Pat::Wildcard | Pat::Int(_) | Pat::Bool(_) | Pat::Char(_) | Pat::Str(_) | Pat::Or(_) => {
+            false
+        }
         Pat::Alias(inner, s) => *s == target || pat_binds_symbol(inner, target),
         Pat::Ctor { args, .. } => args.iter().any(|p| pat_binds_symbol(p, target)),
         Pat::Tuple(elems) => elems.iter().any(|p| pat_binds_symbol(p, target)),
@@ -11190,9 +11080,6 @@ fn pat_binds_symbol(pat: &Pat, target: Symbol) -> bool {
             prefix.iter().any(|p| pat_binds_symbol(p, target))
                 || rest.as_deref().is_some_and(|p| pat_binds_symbol(p, target))
         }
-        // Every alternative of an or-pattern binds the same names, so it binds
-        // `target` iff any (equivalently, the first) alternative does.
-        Pat::Or(alts) => alts.iter().any(|p| pat_binds_symbol(p, target)),
     }
 }
 
@@ -11750,6 +11637,26 @@ pub struct Lowerer<'a> {
     /// builder recorded.  Interior mutability so `lower_def` can update it through
     /// the shared `&self` reference that the lowering walk uses.
     current_home: std::cell::RefCell<Vec<Symbol>>,
+    /// Name of the def currently being lowered, set beside [`Self::current_home`].
+    ///
+    /// Together they key the def in [`Self::var_owners`]. Before the first
+    /// def it is the wildcard marker, which names no binding, so every
+    /// generic is foreign to it.
+    current_name: Cell<Symbol>,
+    /// The one index of every solver variable a binding emits as its own generic.
+    ///
+    /// Built once from [`SolvedTypes::poly_var_map`] through
+    /// [`ipe_types::generic_var_owners`], the same index the type checker's
+    /// untyped-binding refusal reads; [`Self::var_owner`] consults it so a
+    /// variable another binding keeps generic is never read as free here.
+    var_owners: ipe_types::GenericVarOwners,
+    /// Every typed def whose annotation returns the wildcard `any` after its
+    /// parameter patterns, keyed `(home, name)`: its parameter count and its
+    /// body's span (see [`Self::any_return_slot_var`]).
+    any_return_defs: BTreeMap<(Vec<Symbol>, Symbol), (usize, Span)>,
+    /// Whether the type being lowered is the current def's emitted signature
+    /// or a type inside its body (see [`ReadSite`]).
+    read_site: Cell<ReadSite>,
     /// Reverse map from solver-tagged union-find representative to annotation
     /// variable symbol for the def currently being lowered.  Populated by
     /// [`Self::lower_def`] from [`SolvedTypes::poly_var_map`] before recursing
@@ -11765,6 +11672,11 @@ pub struct Lowerer<'a> {
     /// the Rust emitted for polymorphic functions such as
     /// `view : (Msg -> parentMsg) -> Counter -> Html parentMsg`.
     current_poly_tvars: std::cell::RefCell<BTreeMap<ipe_types::SolverVar, Symbol>>,
+    /// Which [`Self::current_poly_tvars`] symbols name a signature row variable.
+    ///
+    /// Installed and restored together with `current_poly_tvars` by
+    /// [`Self::with_poly_tvars`], so the two can never describe different defs.
+    current_row_params: std::cell::RefCell<BTreeSet<Symbol>>,
     /// Whether the function (def or lambda) currently being lowered has a Task
     /// return type. Set to `true` when `lower_def` / `lower_lambda` detects that
     /// the inferred return type is `IrType::Task(_)`; reset to `false` on entry to
@@ -13495,6 +13407,57 @@ fn mapper_wrap_eta_demand(body: &canon::Expr, home: &[Symbol], types: &SolvedTyp
     total
 }
 
+/// Who emits a type variable as a Rust generic, seen from the def being lowered.
+///
+/// Three distinct states, never folded into an `Option`: a lenient lowering
+/// default (`()` in a message slot, `JsonVal`, a `()` call pin) is consistent
+/// only for [`VarOwner::Unowned`]. A variable another binding keeps generic
+/// would otherwise be read two ways in two emitted functions, and the call
+/// between them would not type-check under cargo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VarOwner {
+    /// The current def's own generic, emitted as this type parameter.
+    Here(Symbol),
+    /// Another binding's generic: `owner` emits it as its type parameter `sym`.
+    Elsewhere {
+        /// The binding that keeps the variable generic.
+        owner: (Vec<Symbol>, Symbol),
+        /// The owner's name for the variable.
+        sym: Symbol,
+    },
+    /// No binding keeps the variable generic.
+    Unowned,
+}
+
+/// Whether the annotation `ty`, past `params` parameter arrows, is the wildcard `any`.
+fn canon_returns_wildcard(ty: &canon::Type, params: usize) -> bool {
+    let mut cur = ty;
+    for _ in 0..params {
+        let canon::Type::Lambda(_, rest) = cur else {
+            return false;
+        };
+        cur = rest;
+    }
+    matches!(cur, canon::Type::Wildcard)
+}
+
+/// Where a type variable is read while lowering the current def.
+///
+/// A variable another binding keeps generic is unsound to read only in the
+/// current def's emitted signature: the owner reaches it there by calling the
+/// def with its own generic, so the def's lenient reading (`()`, `JsonVal`)
+/// disagrees with the owner's at the call. Inside a body the def meets such a
+/// variable only as a caller of the owner (a same-module untyped owner shares
+/// its one variable with every use), and the call instantiates the owner's
+/// generic at the def's own reading, so a body read keeps the lenient default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadSite {
+    /// The current def's parameter and return types.
+    Signature,
+    /// A type inside the current def's body.
+    Body,
+}
+
 /// The one symbol that stands for the wildcard `any` in lowered types.
 ///
 /// Minted fresh per lowering through [`Interner::fresh_symbols`], so no
@@ -13639,6 +13602,22 @@ impl<'a> Lowerer<'a> {
             // modules get distinct ids after link::link merges them.
             func_ids.insert((def.home().to_vec(), def.name().value), id);
         }
+        let any_return_defs = m
+            .defs
+            .iter()
+            .filter_map(|def| match def {
+                canon::Def::Typed {
+                    home,
+                    name,
+                    patterns,
+                    body,
+                    ty,
+                    ..
+                } => canon_returns_wildcard(ty, patterns.len())
+                    .then(|| ((home.clone(), name.value), (patterns.len(), body.span))),
+                canon::Def::Untyped { .. } => None,
+            })
+            .collect();
 
         let mut enum_variants = BTreeMap::new();
         let mut ctor_arity = BTreeMap::new();
@@ -13872,7 +13851,15 @@ impl<'a> Lowerer<'a> {
             tuple_elem_binders,
             tuple_elem_cursor: Cell::new(0),
             current_home: std::cell::RefCell::new(Vec::new()),
+            current_name: Cell::new(wildcard_marker.symbol()),
+            read_site: Cell::new(ReadSite::Body),
+            any_return_defs,
+            var_owners: ipe_types::generic_var_owners(
+                &types.poly_var_map,
+                &types.msg_defaulted_vars,
+            ),
             current_poly_tvars: std::cell::RefCell::new(BTreeMap::new()),
+            current_row_params: std::cell::RefCell::new(BTreeSet::new()),
             fn_is_async: Cell::new(false),
             promotable_fn_binders: std::cell::RefCell::new(BTreeSet::new()),
             deferred_fun_captures: std::cell::RefCell::new(BTreeMap::new()),
@@ -14178,6 +14165,7 @@ impl<'a> Lowerer<'a> {
             | IrType::Url
             | IrType::UrlRelative
             | IrType::Dsn
+            | IrType::DbLocation
             | IrType::Connection
             | IrType::ConnReadOnly
             | IrType::ConnReadWrite
@@ -14589,6 +14577,34 @@ impl<'a> Lowerer<'a> {
             variant: ids.compare_variant,
             args: vec![op_eq, Expr::Str(column), sql_value],
         })
+    }
+
+    /// The IR type of a projection `Row`, read off the `Ipe.Db.Store` reader's own annotation.
+    ///
+    /// The text reader is `projectionReadText : Int -> Row -> Result Error String`,
+    /// so its second parameter is the `Row` alias the readers consume, already
+    /// expanded by resolution. Deriving the decode's binder type from it keeps the
+    /// emitted lambda and the stdlib reader on one definition of `Row`.
+    fn projection_row_ir_type(&self) -> DResult<IrType> {
+        let id = self.store_named_func_id(ProjColKind::Text.reader())?;
+        let idx = usize::try_from(id.as_raw()).unwrap_or(usize::MAX);
+        let Some(canon::Def::Typed {
+            ty: canon::Type::Lambda(_, rest),
+            ..
+        }) = self.m.defs.get(idx)
+        else {
+            return Err(bug(
+                "ipe_lower::projection_row_ir_type",
+                "Store projection reader has no `Int -> Row -> ...` annotation",
+            ));
+        };
+        let canon::Type::Lambda(row, _) = rest.as_ref() else {
+            return Err(bug(
+                "ipe_lower::projection_row_ir_type",
+                "Store projection reader annotation takes no `Row`",
+            ));
+        };
+        self.ir_type_from_canon(row, &[])
     }
 
     /// Look up the `FuncId` of a named `Ipe.Db.Store` helper by its exact identity.
@@ -15708,6 +15724,7 @@ impl<'a> Lowerer<'a> {
     /// only through the (kept) `Store` helpers, so the emitted decode pulls no
     /// binding the whole-program reachability pass could have pruned.
     fn projection_decode_lambda(&self, cols: &[ProjectedColumn]) -> DResult<(Expr, IrType)> {
+        let row_ty = self.projection_row_ir_type()?;
         let row_binder = self.fresh_projection_decode_binder()?;
         // `projectionRead<kind> i row` — read the cell at output position `i`.
         let read_at = |i: usize, col: &ProjectedColumn, row: Symbol| -> DResult<Expr> {
@@ -15753,7 +15770,7 @@ impl<'a> Lowerer<'a> {
                     let r = self.fresh_projection_decode_binder()?;
                     let read = read_at(i, col, r)?;
                     call_args.push(Expr::Lambda {
-                        params: vec![(r, row_ir_type())],
+                        params: vec![(r, row_ty.clone())],
                         ret: IrType::Result(
                             Box::new(error_ir_type()),
                             Box::new(col.kind.value_ir_type()),
@@ -15773,7 +15790,7 @@ impl<'a> Lowerer<'a> {
         };
         let result_ty = IrType::Result(Box::new(error_ir_type()), Box::new(value_ty.clone()));
         let lambda = Expr::Lambda {
-            params: vec![(row_binder, row_ir_type())],
+            params: vec![(row_binder, row_ty)],
             ret: result_ty,
             body: Box::new(body),
         };
@@ -17426,6 +17443,7 @@ impl<'a> Lowerer<'a> {
         // Track the current def's home so every `region_ty(span)` lookup uses the
         // correct `(home, span)` key, matching what the constraint builder wrote.
         *self.current_home.borrow_mut() = def.home().to_vec();
+        self.current_name.set(def.name().value);
         // Deferred fn-capture signals are a per-def contract between the capture
         // classifier and the binder sites; a def that errored out mid-lowering
         // must not leak its signals into the next def.
@@ -17622,27 +17640,12 @@ impl<'a> Lowerer<'a> {
                 // block (next) so that the `ir_type_from_ty(body_ty)` call in
                 // the any-ret fix (after the installation) already runs with the
                 // correct current_poly_tvars.
-                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> =
-                    if let IrType::Generic(sym) = &ret {
-                        if *sym == self.wildcard_marker {
-                            self.types
-                                .regions
-                                .get(&(def.home().to_vec(), body.span))
-                                .and_then(|body_ty| {
-                                    let Ty::Con { args, .. } = body_ty else {
-                                        return None;
-                                    };
-                                    let Some(Ty::Var(uv)) = args.first() else {
-                                        return None;
-                                    };
-                                    ipe_types::SolverVar::from_raw(*uv).map(|uv| (uv, *sym))
-                                })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                let any_ui_msg_injection: Option<(ipe_types::SolverVar, Symbol)> = (ret
+                    == IrType::Generic(self.wildcard_marker))
+                .then(|| self.any_return_slot_var(&(def.home().to_vec(), name)))
+                .flatten()
+                .and_then(|(_, uv)| ipe_types::SolverVar::from_raw(uv))
+                .map(|uv| (uv, self.wildcard_marker));
                 // Install the binding's generic type-variable map so
                 // `ir_type_from_ty_ui_msg` can distinguish a `Ty::Var` that is an
                 // enclosing generic (→ `IrType::Generic`) from one that is a
@@ -17719,78 +17722,85 @@ impl<'a> Lowerer<'a> {
                 // Everything that resolves a `Ty` against the def's generics —
                 // the return, the body, the parameter prologues — runs inside
                 // one scope, so an early exit cannot leak the map.
-                let scoped = self.with_poly_tvars(Some(poly), || -> DResult<(IrType, Expr)> {
-                    let ret = if ret_is_any_wildcard {
-                        // The body's region type is the concrete return type.
-                        let body_ty = self
-                            .types
-                            .regions
-                            .get(&(def.home().to_vec(), body.span))
-                            .ok_or_else(|| {
-                                bug(
-                                    "ipe_lower::lower_def",
-                                    "no region type for body of `any`-annotated binding",
-                                )
-                            })?;
-                        self.ir_type_from_ty(body_ty, sig_span)?
-                    } else {
-                        // A nested `any` in return position (e.g. `foo : X -> List any`)
-                        // is not covered by the bare-wildcard region substitution above.
-                        // Freshen every wildcard-marker generic in the return type so each
-                        // occurrence becomes a distinct fresh symbol — the same treatment
-                        // `split_typed_sig` applies to param-position `any`s.
-                        //
-                        // A wildcard `any` promises one concrete type per position. Each
-                        // `any` freshens to its own distinct symbol, so a return `any` and a
-                        // param `any` never denote the same type — the only thing that can
-                        // determine a return `any` is the body pinning it to a concrete
-                        // value, handled by the region substitution above. Reaching here with
-                        // a freshened return `any` means the body did not pin it: it would
-                        // surface as a type parameter appearing only in the result, which no
-                        // call site can fix. Reject it rather than emit Rust no caller can
-                        // satisfy.
-                        let mut ret_any_mints: Vec<Symbol> = Vec::new();
-                        let freshened_ret = self.freshen_any_generics(ret, &mut ret_any_mints)?;
-                        if !ret_any_mints.is_empty() {
-                            return Err(Diagnostic::Lower {
-                                span: sig_span,
-                                msg: LowerError::UndeterminableReturnAny,
-                            });
-                        }
-                        any_syms_minted.extend(ret_any_mints);
-                        freshened_ret
-                    };
-                    // A tuple-destructuring parameter binds its synthetic name to the
-                    // tuple, then the body opens it with a `Destructure`. Fold the
-                    // prologue OUTERMOST-first (reverse) so the first parameter's
-                    // destructure is the outermost binding, matching source order.
-                    // Save/set/restore fn_is_async so nested lambdas/defs see the
-                    // correct async context for their own scope.
-                    let prev_async = self.fn_is_async.get();
-                    self.fn_is_async.set(matches!(ret, IrType::Task(_)));
-                    // Params are promotable fn binders for the body's capture
-                    // classifier (an inner lambda capturing a pure-`Fun` param
-                    // defers to the param loop below instead of IPE-L0126); a name
-                    // bound inside a destructuring param shadows instead.
-                    let param_scope = param_binder_scope(params.iter().map(|(s, _)| *s), patterns);
-                    let mut row_vars = BTreeSet::new();
-                    canon_sig_collect_arg_row_vars(ty, &mut row_vars);
-                    let body_result = self
-                        .reject_generic_app_entries_in(body, &row_vars)
-                        .and_then(|()| {
-                            self.with_binders(&param_scope, || {
-                                self.with_param_binders(&params, patterns, || {
-                                    self.lower_returned_body(body, &ret)
+                let row_param_vars: BTreeSet<Symbol> = row_params.iter().map(|rp| rp.var).collect();
+                let scoped = self.with_poly_tvars(
+                    Some(poly),
+                    row_param_vars,
+                    || -> DResult<(IrType, Expr)> {
+                        let ret = if ret_is_any_wildcard {
+                            // The body's region type is the concrete return type.
+                            let body_ty = self
+                                .types
+                                .regions
+                                .get(&(def.home().to_vec(), body.span))
+                                .ok_or_else(|| {
+                                    bug(
+                                        "ipe_lower::lower_def",
+                                        "no region type for body of `any`-annotated binding",
+                                    )
+                                })?;
+                            self.signature_ir_type(body_ty, sig_span)?
+                        } else {
+                            // A nested `any` in return position (e.g. `foo : X -> List any`)
+                            // is not covered by the bare-wildcard region substitution above.
+                            // Freshen every wildcard-marker generic in the return type so each
+                            // occurrence becomes a distinct fresh symbol — the same treatment
+                            // `split_typed_sig` applies to param-position `any`s.
+                            //
+                            // A wildcard `any` promises one concrete type per position. Each
+                            // `any` freshens to its own distinct symbol, so a return `any` and a
+                            // param `any` never denote the same type — the only thing that can
+                            // determine a return `any` is the body pinning it to a concrete
+                            // value, handled by the region substitution above. Reaching here with
+                            // a freshened return `any` means the body did not pin it: it would
+                            // surface as a type parameter appearing only in the result, which no
+                            // call site can fix. Reject it rather than emit Rust no caller can
+                            // satisfy.
+                            let mut ret_any_mints: Vec<Symbol> = Vec::new();
+                            let freshened_ret =
+                                self.freshen_any_generics(ret, &mut ret_any_mints)?;
+                            if !ret_any_mints.is_empty() {
+                                return Err(Diagnostic::Lower {
+                                    span: sig_span,
+                                    msg: LowerError::UndeterminableReturnAny,
+                                });
+                            }
+                            any_syms_minted.extend(ret_any_mints);
+                            freshened_ret
+                        };
+                        // A tuple-destructuring parameter binds its synthetic name to the
+                        // tuple, then the body opens it with a `Destructure`. Fold the
+                        // prologue OUTERMOST-first (reverse) so the first parameter's
+                        // destructure is the outermost binding, matching source order.
+                        // Save/set/restore fn_is_async so nested lambdas/defs see the
+                        // correct async context for their own scope.
+                        let prev_async = self.fn_is_async.get();
+                        self.fn_is_async.set(matches!(ret, IrType::Task(_)));
+                        // Params are promotable fn binders for the body's capture
+                        // classifier (an inner lambda capturing a pure-`Fun` param
+                        // defers to the param loop below instead of IPE-L0126); a name
+                        // bound inside a destructuring param shadows instead.
+                        let param_scope =
+                            param_binder_scope(params.iter().map(|(s, _)| *s), patterns);
+                        let mut row_vars = BTreeSet::new();
+                        canon_sig_collect_arg_row_vars(ty, &mut row_vars);
+                        let body_result = self
+                            .reject_generic_app_entries_in(body, &row_vars)
+                            .and_then(|()| {
+                                self.with_binders(&param_scope, || {
+                                    self.with_param_binders(&params, patterns, || {
+                                        self.lower_returned_body(body, &ret)
+                                    })
                                 })
-                            })
-                        });
-                    self.fn_is_async.set(prev_async);
-                    // The prologue binders' types mention the def's own generics, so
-                    // they resolve before those generics go out of scope.
-                    let folded =
-                        body_result.and_then(|b| self.fold_param_prologues(prologue, b, body))?;
-                    Ok((ret, folded))
-                });
+                            });
+                        self.fn_is_async.set(prev_async);
+                        // The prologue binders' types mention the def's own generics, so
+                        // they resolve before those generics go out of scope.
+                        let folded = body_result
+                            .and_then(|b| self.fold_param_prologues(prologue, b, body))?;
+                        Ok((ret, folded))
+                    },
+                );
                 let (mut ret, mut lowered_body) = scoped?;
                 // Param-position wildcard-`any` region substitution — the SEAL
                 // dual of the return substitution above. A bare-`any` parameter
@@ -18195,8 +18205,10 @@ impl<'a> Lowerer<'a> {
                     // unsound `any`-shaped parameters — fail-closed by design
                     // (Divergence D1: an ambiguous instantiation the reference
                     // erasure-accepts is rejected here, strictly safer).
-                    let scoped =
-                        self.with_poly_tvars(scope_poly, || -> DResult<UnannotatedFnParts> {
+                    let scoped = self.with_poly_tvars(
+                        scope_poly,
+                        BTreeSet::new(),
+                        || -> DResult<UnannotatedFnParts> {
                             let (params, prologue, ret) =
                                 self.split_unannotated_sig(solved_ty, patterns, sig_span)?;
                             // Save/set/restore fn_is_async (same rationale as Typed path).
@@ -18220,7 +18232,8 @@ impl<'a> Lowerer<'a> {
                             let folded = body_result
                                 .and_then(|b| self.fold_param_prologues(prologue, b, body))?;
                             Ok((params, ret, folded))
-                        });
+                        },
+                    );
                     let (params, ret, mut lowered_body) = scoped?;
                     // Same move-ownership discipline as the Typed path above —
                     // one `apply_param_move_ownership` per param (see that call
@@ -18250,9 +18263,11 @@ impl<'a> Lowerer<'a> {
                         body: lowered_body,
                     });
                 }
-                let (ret, lowered_body) =
-                    self.with_poly_tvars(scope_poly, || -> DResult<(IrType, Expr)> {
-                        let ret = self.ir_type_from_ty(solved_ty, sig_span)?;
+                let (ret, lowered_body) = self.with_poly_tvars(
+                    scope_poly,
+                    BTreeSet::new(),
+                    || -> DResult<(IrType, Expr)> {
+                        let ret = self.signature_ir_type(solved_ty, sig_span)?;
                         // Save/set/restore fn_is_async for the 0-param (value-binding) path.
                         let prev_async = self.fn_is_async.get();
                         self.fn_is_async.set(matches!(ret, IrType::Task(_)));
@@ -18261,7 +18276,8 @@ impl<'a> Lowerer<'a> {
                             .and_then(|()| self.lower_returned_body(body, &ret));
                         self.fn_is_async.set(prev_async);
                         Ok((ret, lowered_body?))
-                    })?;
+                    },
+                )?;
                 // Zero-param generalized value bindings (no value restriction,
                 // e.g. `empty = []` used at two element types cross-module)
                 // take the identical `params: []` path the backend already
@@ -18401,7 +18417,7 @@ impl<'a> Lowerer<'a> {
                     "solved type has fewer arrows than parameters",
                 ));
             };
-            let ir_ty = self.ir_type_from_ty(arg, span)?;
+            let ir_ty = self.signature_ir_type(arg, span)?;
             let (param, maybe_prologue) = self.lower_param(pat, ir_ty)?;
             params.push(param);
             if let Some(p) = maybe_prologue {
@@ -18409,7 +18425,7 @@ impl<'a> Lowerer<'a> {
             }
             cur = rest.as_ref();
         }
-        Ok((params, prologue, self.ir_type_from_ty(cur, span)?))
+        Ok((params, prologue, self.signature_ir_type(cur, span)?))
     }
 
     /// Split a typed binding's arrow annotation into one [`IrType`] per
@@ -18984,6 +19000,9 @@ impl<'a> Lowerer<'a> {
                 // `Dsn` is `Ipe.Db.Dsn`'s opaque validated connection descriptor.
                 // Backed by `ipe_runtime::dsn::Dsn`.
                 "Dsn" => Ok(IrType::Dsn),
+                // `DbLocation` is `Ipe.Db.Location`'s opaque typed location.
+                // Backed by `ipe_runtime::db::DbLocation`.
+                "DbLocation" => Ok(IrType::DbLocation),
                 // `Connection mode` is `Ipe.Db`'s external-connection handle. The
                 // phantom access mode is erased here — the argument is dropped, so
                 // both `Connection ReadOnly` and `Connection ReadWrite` lower to the
@@ -19887,6 +19906,12 @@ impl<'a> Lowerer<'a> {
     /// first use site through [`Self::binder_ir_type`]. A capture is a use, so a
     /// capture whose type does not resolve refuses rather than going
     /// unclassified.
+    ///
+    /// A capture holding a row value ([`IrType::RowGeneric`]) refuses with
+    /// IPE-L0131: a row value is emittable only as the direct receiver of a
+    /// field read, and a captured read is a `CloneVar` receiver the witness
+    /// getter does not route — the escape the row-containment guard refuses
+    /// after the body, reported here before the capture is classified.
     fn captured_locals_at(
         &self,
         lambda_param_pats: &[&canon::Pattern],
@@ -19899,7 +19924,16 @@ impl<'a> Lowerer<'a> {
         let mut free: BTreeMap<Symbol, Span> = BTreeMap::new();
         canon_collect_free_locals(&mut free, &outer_bound, canon_body);
         free.into_iter()
-            .map(|(sym, span)| Ok((sym, span, self.used_binder_ir_type(span)?)))
+            .map(|(sym, span)| {
+                let binder_ty = self.used_binder_ir_type(span)?;
+                let holds_row = ir_type_holds(binder_ty.classified(), &self.enum_payloads, &|t| {
+                    matches!(t, IrType::RowGeneric(_))
+                });
+                if holds_row {
+                    return Err(unsupported(span, Feature::RowPolyRecordAnnotation));
+                }
+                Ok((sym, span, binder_ty))
+            })
             .collect()
     }
 
@@ -20028,20 +20062,24 @@ impl<'a> Lowerer<'a> {
 
     /// Run `f` with `poly` installed as the enclosing def's generic type-variable map.
     ///
-    /// The previous map is restored once `f` returns, whatever path `f` exits
+    /// `row_params` names which of those generics are signature row
+    /// variables. Both are restored once `f` returns, whatever path `f` exits
     /// by, so a definition's generics can never stay in scope for the next
-    /// definition. `None` leaves the current map untouched.
+    /// definition. `None` leaves both untouched.
     fn with_poly_tvars<T>(
         &self,
         poly: Option<BTreeMap<ipe_types::SolverVar, Symbol>>,
+        row_params: BTreeSet<Symbol>,
         f: impl FnOnce() -> T,
     ) -> T {
         let Some(poly) = poly else {
             return f();
         };
         let saved = self.current_poly_tvars.replace(poly);
+        let saved_rows = self.current_row_params.replace(row_params);
         let out = f();
         self.current_poly_tvars.replace(saved);
+        self.current_row_params.replace(saved_rows);
         out
     }
 
@@ -20562,6 +20600,75 @@ impl<'a> Lowerer<'a> {
         self.current_poly_tvars.borrow().get(&key).copied()
     }
 
+    /// Which binding, if any, emits the type variable `raw` as its own generic.
+    ///
+    /// The current def's generics (`current_poly_tvars`) answer first; every
+    /// other variable is looked up in the one ownership index
+    /// ([`Self::var_owners`]), never re-derived. A variable read by a def that
+    /// does not own it, while another binding emits it as a Rust generic, is
+    /// [`VarOwner::Elsewhere`], so no lenient default can give it a second
+    /// reading in a second emitted function.
+    fn var_owner(&self, raw: u32) -> VarOwner {
+        if let Some(sym) = self.poly_tvar_symbol(raw) {
+            return VarOwner::Here(sym);
+        }
+        let Some(var) = ipe_types::SolverVar::from_raw(raw) else {
+            return VarOwner::Unowned;
+        };
+        let binding = (self.current_home.borrow().clone(), self.current_name.get());
+        self.var_owners
+            .foreign_to(var, &binding)
+            .map_or(VarOwner::Unowned, |(owner, sym)| VarOwner::Elsewhere {
+                owner: owner.clone(),
+                sym,
+            })
+    }
+
+    /// Lower `ty` as part of the current def's emitted signature ([`ReadSite::Signature`]).
+    fn signature_ir_type(&self, ty: &Ty, span: Span) -> DResult<IrType> {
+        let saved = self.read_site.replace(ReadSite::Signature);
+        let out = self.ir_type_from_ty(ty, span);
+        self.read_site.set(saved);
+        out
+    }
+
+    /// Lower the type variable `raw` by its owner: the current def's generic,
+    /// a refusal for another binding's generic read in the current def's
+    /// signature, or `lenient` for a free one or a body read (see [`ReadSite`]).
+    fn ir_type_from_owned_var(
+        &self,
+        raw: u32,
+        span: Span,
+        lenient: impl FnOnce() -> DResult<IrType>,
+    ) -> DResult<IrType> {
+        match (self.var_owner(raw), self.read_site.get()) {
+            (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => Ok(IrType::Generic(sym)),
+            (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+                Err(self.foreign_type_variable(&owner, sym, span))
+            }
+            (VarOwner::Elsewhere { .. }, ReadSite::Body)
+            | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => lenient(),
+        }
+    }
+
+    /// The IPE-L0102 refusal of a def reading `owner`'s generic `sym` at `span`.
+    fn foreign_type_variable(
+        &self,
+        owner: &(Vec<Symbol>, Symbol),
+        sym: Symbol,
+        span: Span,
+    ) -> Diagnostic {
+        let name = |s: Symbol| -> Box<str> { self.interner.resolve(s).unwrap_or("_").into() };
+        Diagnostic::Lower {
+            span,
+            msg: LowerError::ForeignTypeVariable {
+                helper: name(self.current_name.get()),
+                owner: name(owner.1),
+                var: name(sym),
+            },
+        }
+    }
+
     // The match has one arm per Ipê builtin type — each arm adds ~5-10 lines;
     // pushing past clippy's 100-line ceiling is unavoidable without splitting on
     // an arbitrary boundary. The allow is narrow: only this function.
@@ -20650,6 +20757,9 @@ impl<'a> Lowerer<'a> {
                 // `Dsn` is `Ipe.Db.Dsn`'s opaque validated connection descriptor.
                 // Backed by `ipe_runtime::dsn::Dsn`.
                 "Dsn" => Ok(IrType::Dsn),
+                // `DbLocation` is `Ipe.Db.Location`'s opaque typed location.
+                // Backed by `ipe_runtime::db::DbLocation`.
+                "DbLocation" => Ok(IrType::DbLocation),
                 // `Connection mode` is `Ipe.Db`'s external-connection handle. The
                 // phantom access mode is erased here — the argument is dropped, so
                 // both `Connection ReadOnly` and `Connection ReadWrite` lower to the
@@ -21319,11 +21429,16 @@ impl<'a> Lowerer<'a> {
                     .collect::<DResult<Vec<_>>>()?;
                 Ok(IrType::Tuple(lowered))
             }
-            // A record type (closed or open): lower each field type, keyed by
-            // field name. The RowTail is a solver artefact — the IR type is
-            // always a flat field map. Open fields not present in the resolved
-            // `Ty` are simply absent from the IR (the optional-field mechanism
-            // works through the open row var at type-check time, not at codegen).
+            // A record type: the row tail decides first, before any nominal
+            // shape fold can name the fields.
+            //  - open over the def's own signature row variable → that row
+            //    parameter's generic (`R{n}`): the value is whatever record the
+            //    caller passed, never a struct synthesised from the fields the
+            //    body happens to read;
+            //  - open over any other quantified variable → no row parameter
+            //    carries it, so it has no lowering (IPE-L0131);
+            //  - open over an unquantified variable, or closed → the flat field
+            //    map below, keyed by field name.
             //
             // Special case: detect the canonical 6-field `HttpRequest` record —
             // `body`, `headers`, `method`, `redirects`, `timeout`, `url` —
@@ -21331,7 +21446,19 @@ impl<'a> Lowerer<'a> {
             // so call sites that pass the value to `http_stream_open` /
             // `http_request` kernels see the correct runtime type, rather than a
             // backend-synthesised struct with an auto-generated name.
-            Ty::Record(fields, _tail) => {
+            Ty::Record(fields, tail) => {
+                match tail {
+                    RowTail::Open(raw) => match self.poly_tvar_symbol(*raw) {
+                        Some(sym) if self.current_row_params.borrow().contains(&sym) => {
+                            return Ok(IrType::RowGeneric(sym));
+                        }
+                        Some(_) => {
+                            return Err(unsupported(span, Feature::RowPolyRecordAnnotation));
+                        }
+                        None => {}
+                    },
+                    RowTail::Closed => {}
+                }
                 // `BTreeMap<Symbol, _>` iterates in Symbol-integer order (intern
                 // assignment order), NOT in alphabetical order.  Collect
                 // (name, type) pairs, then let the shared
@@ -21459,10 +21586,11 @@ impl<'a> Lowerer<'a> {
             // violation, so it surfaces as a `Diagnostic::Lower` with the span
             // — never a `CompilerBug` for well-typed input.
             // [IPE-L0102, feature: polymorphism]
-            Ty::Var(v) => self.poly_tvar_symbol(*v).map_or_else(
-                || Err(unsupported(span, Feature::Polymorphism)),
-                |sym| Ok(IrType::Generic(sym)),
-            ),
+            //
+            // A variable another binding keeps generic is refused by name
+            // (`ForeignTypeVariable`), never as the bare polymorphism gap.
+            Ty::Var(v) => self
+                .ir_type_from_owned_var(*v, span, || Err(unsupported(span, Feature::Polymorphism))),
             // An unpinned wildcard names no generic of the enclosing def.
             Ty::Wildcard => Err(unsupported(span, Feature::Polymorphism)),
         }
@@ -21506,11 +21634,10 @@ impl<'a> Lowerer<'a> {
             // before it recurses into the body, and restored afterward) maps
             // tagged uf_rep → annotation var symbol for the current enclosing
             // function.
-            // An empty map (unannotated or non-polymorphic context) always falls
-            // through to `IrType::Unit`.
-            Ty::Var(v) => self
-                .poly_tvar_symbol(*v)
-                .map_or(Ok(IrType::Unit), |sym| Ok(IrType::Generic(sym))),
+            // A variable no binding keeps generic falls through to
+            // `IrType::Unit`; one another binding keeps generic is refused,
+            // since that binding emits it as its own Rust generic.
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Unit)),
             // A wildcard names no enclosing generic: a message-free subtree.
             Ty::Wildcard => Ok(IrType::Unit),
             // All other forms delegate to the strict helper — a concrete `Msg`
@@ -21556,10 +21683,9 @@ impl<'a> Lowerer<'a> {
             // The key difference: an unresolved `Ty::Var` in a JSON context
             // is `JsonVal` — UNLESS it's the enclosing polymorphic binding's
             // own generic (see the SEAL-fix doc comment above), in which case
-            // it must render as that binding's Rust generic instead.
-            Ty::Var(v) => self
-                .poly_tvar_symbol(*v)
-                .map_or(Ok(IrType::Json), |sym| Ok(IrType::Generic(sym))),
+            // it must render as that binding's Rust generic instead, or
+            // another binding's generic, which is refused.
+            Ty::Var(v) => self.ir_type_from_owned_var(*v, span, || Ok(IrType::Json)),
             Ty::Wildcard => Ok(IrType::Json),
             // Recursively handle compound types so embedded `Ty::Var`s also
             // map to `IrType::Json`.
@@ -21613,11 +21739,26 @@ impl<'a> Lowerer<'a> {
                         // gating the 5th attempt: the
                         // `result_and_map_fn_payload` positive-path
                         // fixture). One defaulting policy, both sides.
+                        // Another binding's generic read in the def's signature
+                        // is refused here too, never defaulted.
                         let err_ty = args.first().ok_or_else(result_arg_bug)?;
-                        let err = if matches!(err_ty, Ty::Var(_) | Ty::Wildcard) {
-                            IrType::Error
-                        } else {
-                            self.ir_type_from_ty_json(err_ty, span)?
+                        let err = match err_ty {
+                            Ty::Var(raw) => match (self.var_owner(*raw), self.read_site.get()) {
+                                (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+                                    return Err(self.foreign_type_variable(&owner, sym, span));
+                                }
+                                (VarOwner::Elsewhere { .. }, ReadSite::Body)
+                                | (
+                                    VarOwner::Here(_) | VarOwner::Unowned,
+                                    ReadSite::Signature | ReadSite::Body,
+                                ) => IrType::Error,
+                            },
+                            Ty::Wildcard => IrType::Error,
+                            Ty::Unit
+                            | Ty::Fun(..)
+                            | Ty::Con { .. }
+                            | Ty::Tuple(_)
+                            | Ty::Record(..) => self.ir_type_from_ty_json(err_ty, span)?,
                         };
                         let ok = self
                             .ir_type_from_ty_json(args.get(1).ok_or_else(result_arg_bug)?, span)?;
@@ -23901,9 +24042,15 @@ impl<'a> Lowerer<'a> {
     ///
     /// A free var bound by the enclosing signature returns `false`: rustc binds
     /// it through the function's own generic, so no pin is needed OR wanted.
+    /// A var another binding keeps generic is free here too: a pin sits in a
+    /// body, where the def meets that var only as a caller of its owner and
+    /// reads it as `()` at every occurrence ([`ReadSite::Body`]).
     fn ty_is_unbound_free(&self, ty: &Ty) -> bool {
         match ty {
-            Ty::Var(raw) => self.poly_tvar_symbol(*raw).is_none(),
+            Ty::Var(raw) => match self.var_owner(*raw) {
+                VarOwner::Here(_) => false,
+                VarOwner::Elsewhere { .. } | VarOwner::Unowned => true,
+            },
             Ty::Wildcard => true,
             Ty::Unit | Ty::Fun(..) | Ty::Con { .. } | Ty::Tuple(_) | Ty::Record(..) => false,
         }
@@ -23932,8 +24079,9 @@ impl<'a> Lowerer<'a> {
         };
         let msg_only =
             ipe_types::ui_msg_only_vars(declared, &ipe_types::ui_msg_carrier_syms(self.interner));
+        let any_slot = self.any_return_slot_pin(&key, inst);
         if msg_only.is_empty() {
-            return CallPin::None;
+            return any_slot.map_or(CallPin::None, |sym| CallPin::MsgUnit(BTreeSet::from([sym])));
         }
         let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
         match_signature_template(declared, inst, &mut subst, self.interner);
@@ -23956,12 +24104,58 @@ impl<'a> Lowerer<'a> {
                     },
                 )
             })
+            .chain(any_slot)
             .collect();
         if pinned.is_empty() {
             CallPin::None
         } else {
             CallPin::MsgUnit(pinned)
         }
+    }
+
+    /// The solved type of the any-return def `key`'s body and the variable in
+    /// its first type argument, when the body solved to a constructor over a
+    /// bare variable (`Html v`, `List v`).
+    ///
+    /// The one detection behind both readings of that variable: the def's own
+    /// lowering names it by the wildcard marker (its return generic), and each
+    /// caller pins the marker by its own instantiation
+    /// ([`Self::any_return_slot_pin`]).
+    fn any_return_slot_var(&self, key: &(Vec<Symbol>, Symbol)) -> Option<(&Ty, u32)> {
+        let (_, body_span) = self.any_return_defs.get(key)?;
+        let body_ty = self.types.regions.get(&(key.0.clone(), *body_span))?;
+        let Ty::Con { args, .. } = body_ty else {
+            return None;
+        };
+        let Some(Ty::Var(uv)) = args.first() else {
+            return None;
+        };
+        Some((body_ty, *uv))
+    }
+
+    /// The wildcard marker, when the callee `key` returns `any` over a body
+    /// variable ([`Self::any_return_slot_var`]) that the use's instantiation
+    /// `inst` leaves free.
+    ///
+    /// The callee's lowering makes that variable its return generic, which no
+    /// argument determines; the use's own node type lowered it to its lenient
+    /// reading (`()`), so the pin names `()` there.
+    fn any_return_slot_pin(&self, key: &(Vec<Symbol>, Symbol), inst: &Ty) -> Option<Symbol> {
+        let (body_ty, uv) = self.any_return_slot_var(key)?;
+        let (arity, _) = self.any_return_defs.get(key)?;
+        let mut inst_ret = inst;
+        for _ in 0..*arity {
+            let Ty::Fun(_, rest) = inst_ret else {
+                return None;
+            };
+            inst_ret = rest;
+        }
+        let mut subst: BTreeMap<u32, Ty> = BTreeMap::new();
+        match_signature_template(body_ty, inst_ret, &mut subst, self.interner);
+        subst
+            .get(&uv)
+            .is_some_and(|ty| self.ty_is_unbound_free(ty))
+            .then_some(self.wildcard_marker)
     }
 
     /// The turbofish pin for a polymorphic kernel whose free result type
@@ -27084,6 +27278,8 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::MathNan
                 | KernelFn::DictEmpty
                 | KernelFn::SetEmpty
+                // ── `Ipe.Db.Location.memory : DbLocation` — arity 0 ─────────
+                | KernelFn::DbLocationMemory
                 // ── Bytes arity-0 ────────────────────────────────────────────
                 | KernelFn::BytesEmpty
                 // ── JsonEnc arity-0 ────────────────────────────────────
@@ -27367,6 +27563,10 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::DbConnect
                 // `DbClose : Db -> Task Error ()` — takes the pool handle
                 | KernelFn::DbClose
+                // `DbOpen : DbLocation -> Task Error Db`
+                | KernelFn::DbOpen
+                // `Ipe.Db.Location.dsn : Dsn -> DbLocation`
+                | KernelFn::DbLocationDsn
                 // `DbDefaultMigration : String -> Migration` — pure record builder
                 | KernelFn::DbDefaultMigration
                 // ── Ipe.Db.Dsn arity-1 ───────────────────────────────
@@ -27707,8 +27907,9 @@ impl<'a> Lowerer<'a> {
                 | KernelFn::HttpWithUrl
                 | KernelFn::HttpWithRedirects
                 // ── Db arity-2 ───────────────────────────────────────
-                // `DbOpen : String -> String -> Task Error Db`
-                | KernelFn::DbOpen
+                // `Ipe.Db.Location.file`'s kernel : `Int -> Path -> Result
+                //   Error DbLocation` (mode tag, path)
+                | KernelFn::DbLocationFile
                 // `DbExecRaw : Db -> String -> Task Error Int`
                 | KernelFn::DbExecRaw
                 // `unsafeExecRawOn : Connection ReadWrite -> String
@@ -30144,6 +30345,10 @@ impl<'a> Lowerer<'a> {
                     ("Db.Dsn", "user") => Ok(Callee::Kernel(KernelFn::DsnUser)),
                     ("Db.Dsn", "tlsTag") => Ok(Callee::Kernel(KernelFn::DsnTlsTag)),
                     ("Db.Dsn", "redacted") => Ok(Callee::Kernel(KernelFn::DsnRedacted)),
+                    // Ipe.Db.Location — the typed location `Db.open` takes.
+                    ("Db.Location", "file") => Ok(Callee::Kernel(KernelFn::DbLocationFile)),
+                    ("Db.Location", "memory") => Ok(Callee::Kernel(KernelFn::DbLocationMemory)),
+                    ("Db.Location", "dsn") => Ok(Callee::Kernel(KernelFn::DbLocationDsn)),
                     // External Connection — connect a parsed `Dsn`, close it, and
                     // the `Ipe.Db.Unsafe`-homed raw exec hatch.
                     ("Db.Dsn", "open") => Ok(Callee::Kernel(KernelFn::DbConnOpen)),
@@ -31019,18 +31224,14 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
                 Err(unsupported(p.span, Feature::NestedCtorDiscrimination))
             }
-            // A nested or-pattern inside a constructor payload (`Wrap (Red |
-            // Green)`) lowers each alternative through this same payload lowerer
-            // into a [`Pat::Or`]; the backend renders `Wrap(Red | Green)`, which
-            // Rust accepts. Bindings shared across the alternatives (proved in
-            // canon/types) resolve directly, with the body emitted once.
-            canon::Pattern_::POr(alts) => {
-                let lowered = alts
-                    .iter()
-                    .map(|a| self.lower_payload_pat(a))
-                    .collect::<DResult<Vec<_>>>()?;
-                Ok(Pat::Or(lowered))
-            }
+            // `or_split` lifts every nested or-pattern to whole case-arm heads
+            // before lowering, so none survives in a constructor payload.
+            canon::Pattern_::POr(_) => Err(Diagnostic::CompilerBug {
+                where_: "lower.lower_payload_pat",
+                detail: "an or-pattern survived inside a constructor payload; \
+                         or_split lifts every nested or-pattern to the arm head"
+                    .to_owned(),
+            }),
         }
     }
 
@@ -32467,9 +32668,12 @@ impl<'a> Lowerer<'a> {
         // survived to `Match::new_flat` and ICE'd on well-typed source.
         let branches = live;
 
+        // A native or-pattern head discriminates on each of its alternatives,
+        // so a constructor-alternative head counts as constructor-headed.
         let all_ctor = branches
             .iter()
-            .all(|br| matches!(br.pat.value, canon::Pattern_::PCtor { .. }));
+            .flat_map(|br| crate::or_split::head_alternatives(&br.pat))
+            .all(|p| matches!(p.value, canon::Pattern_::PCtor { .. }));
 
         let arms = branches
             .iter()
@@ -32613,9 +32817,11 @@ impl<'a> Lowerer<'a> {
             // The scrutinee's enum is one this module declared (the type checker
             // pinned the constructor's union), so it is always in
             // `enum_variants` — the *true* variant set handed to `Match::new`.
-            let canon::Pattern_::PCtor {
+            let Some(canon::Pattern_::PCtor {
                 home, type_name, ..
-            } = &first.pat.value
+            }) = crate::or_split::head_alternatives(&first.pat)
+                .first()
+                .map(|p| &p.value)
             else {
                 return Err(bug(
                     "ipe_lower::lower_case",
@@ -32658,10 +32864,9 @@ impl<'a> Lowerer<'a> {
                         .as_deref()
                         .is_some_and(Self::arm_has_dispatch_needing_alias)
             }
-            // An or-pattern carries a dispatch-needing alias iff any alternative
-            // does — recurse into every alternative.
-            Pat::Or(alts) => alts.iter().any(Self::arm_has_dispatch_needing_alias),
-            Pat::Var(_)
+            // A `SharedAlts` alternative holds no alias.
+            Pat::Or(_)
+            | Pat::Var(_)
             | Pat::Wildcard
             | Pat::Int(_)
             | Pat::Bool(_)
@@ -32806,19 +33011,23 @@ impl<'a> Lowerer<'a> {
             canon::Pattern_::PList(_) | canon::Pattern_::PCons(_, _) => {
                 self.lower_list_arm_pat(p, ty_span)
             }
-            // An or-pattern `p1 | p2 | …` lowers each alternative through this
-            // same arm lowerer into a single [`Pat::Or`]. The backend renders it
-            // as the native Rust or-pattern `p1 | p2 | …` with the arm body
-            // emitted ONCE — every alternative binds the same names (proved in
-            // canon/types), so a single body reads those binders whichever
-            // alternative matched. No body duplication.
+            // An or-pattern arm head that `or_split` kept native: binder-free
+            // constructor or Int/Char/Bool alternatives, rendered as the native
+            // Rust or-pattern `p1 | p2 | …` with the arm body emitted once.
             canon::Pattern_::POr(alts) => {
                 let lowered = alts
                     .iter()
                     .map(|a| self.lower_arm_pat(a, ty_span))
                     .collect::<DResult<Vec<_>>>()?;
-                owned_or_refusal(&lowered, p.span)?;
-                Ok(Pat::Or(lowered))
+                SharedAlts::new(lowered)
+                    .map(Pat::Or)
+                    .ok_or_else(|| Diagnostic::CompilerBug {
+                        where_: "lower.lower_arm_pat",
+                        detail: "an or-pattern arm head holds an alternative other than a \
+                                 binder-free constructor or an Int/Char/Bool literal; \
+                                 or_split splits every such arm"
+                            .to_owned(),
+                    })
             }
         }
     }
@@ -33717,7 +33926,7 @@ mod tests {
         const BARE_VAR: u32 = 7;
         with_binder_type_lowerer(|lowerer, generic| {
             let poly = BTreeMap::from([(ipe_types::SolverVar::from_var(BARE_VAR), generic)]);
-            lowerer.with_poly_tvars(Some(poly), || {
+            lowerer.with_poly_tvars(Some(poly), BTreeSet::new(), || {
                 assert_eq!(
                     lowerer.poly_tvar_symbol(ipe_types::tag_solver_var(BARE_VAR)),
                     Some(generic),
@@ -33734,6 +33943,349 @@ mod tests {
                     "a symbol raw in a msg slot stays message-free, got {msg_slot:?}"
                 );
             });
+        });
+    }
+
+    /// The bare solver variable the row-tail tests quantify as a signature row variable.
+    const ROW_VAR: u32 = 11;
+
+    /// Run `check` against a lowerer whose interner already holds `names`, in order.
+    fn with_named_lowerer(names: &[&str], check: impl FnOnce(&Lowerer<'_>, &[ipe_intern::Symbol])) {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let syms: Vec<ipe_intern::Symbol> =
+            names.iter().map(|n| interner.intern(n).unwrap()).collect();
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        check(&lowerer, &syms);
+    }
+
+    /// A nullary built-in `Ty::Con` named `name`.
+    const fn builtin_leaf(name: ipe_intern::Symbol) -> Ty {
+        Ty::Con {
+            module: Vec::new(),
+            name,
+            args: Vec::new(),
+        }
+    }
+
+    /// An open record over [`ROW_VAR`] carrying `fields`.
+    fn row_open_record(fields: Vec<(ipe_intern::Symbol, Ty)>) -> Ty {
+        Ty::Record(
+            fields.into_iter().collect(),
+            ipe_types::RowTail::Open(ipe_types::tag_solver_var(ROW_VAR)),
+        )
+    }
+
+    /// The generic map that quantifies [`ROW_VAR`] as `row`.
+    fn row_poly(row: ipe_intern::Symbol) -> BTreeMap<ipe_types::SolverVar, ipe_intern::Symbol> {
+        BTreeMap::from([(ipe_types::SolverVar::from_var(ROW_VAR), row)])
+    }
+
+    /// Whether `result` is the row-polymorphic-annotation refusal (`IPE-L0131`).
+    const fn is_row_poly_refusal(result: &ipe_diagnostics::DResult<super::IrType>) -> bool {
+        matches!(
+            result,
+            Err(ipe_diagnostics::Diagnostic::Lower {
+                msg: ipe_diagnostics::LowerError::Unsupported(
+                    ipe_diagnostics::Feature::RowPolyRecordAnnotation
+                ),
+                ..
+            })
+        )
+    }
+
+    /// A record open over the def's own signature row variable lowers to that row generic.
+    ///
+    /// The same record outside any generic scope keeps the flat field map.
+    #[test]
+    fn ir_type_lowers_poly_row_tail_to_row_generic() {
+        with_named_lowerer(&["r", "x", "Int"], |lowerer, syms| {
+            let [r, x, int] = syms else { return };
+            let ty = row_open_record(vec![(*x, builtin_leaf(*int))]);
+            let span = Span::new(0, 1);
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty(&ty, span),
+                    Ok(super::IrType::Record(_))
+                ),
+                "an unquantified open tail keeps the flat field map"
+            );
+            lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::from([*r]), || {
+                assert_eq!(
+                    lowerer.ir_type_from_ty(&ty, span),
+                    Ok(super::IrType::RowGeneric(*r)),
+                    "the def's own row variable lowers to its row generic"
+                );
+            });
+        });
+    }
+
+    /// A record open over a quantified variable no row parameter carries is refused.
+    ///
+    /// The refusal is the typed `IPE-L0131`, never a compiler bug and never a
+    /// struct synthesised from the fields the body reads.
+    #[test]
+    fn ir_type_refuses_foreign_poly_row_tail() {
+        with_named_lowerer(&["r", "x", "Int"], |lowerer, syms| {
+            let [r, x, int] = syms else { return };
+            let ty = row_open_record(vec![(*x, builtin_leaf(*int))]);
+            lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::new(), || {
+                let lowered = lowerer.ir_type_from_ty(&ty, Span::new(0, 1));
+                assert!(
+                    is_row_poly_refusal(&lowered),
+                    "a foreign quantified row tail must be IPE-L0131, got {lowered:?}"
+                );
+            });
+        });
+    }
+
+    /// A row generic reaches its own row variable bare, and no other variable.
+    #[test]
+    fn row_generic_reaches_its_own_tvar() {
+        with_named_lowerer(&["r", "s"], |_, syms| {
+            let [r, s] = syms else { return };
+            let row = super::IrType::RowGeneric(*r);
+            assert!(
+                super::ir_type_generic_reaches_bare(&row, *r),
+                "a row generic holds its own row variable by value"
+            );
+            assert!(
+                !super::ir_type_generic_reaches_bare(&row, *s),
+                "a row generic never reaches another variable"
+            );
+            assert!(
+                super::ir_type_mentions_generic(&row, *r),
+                "a row generic mentions its own row variable"
+            );
+            assert!(
+                !super::ir_type_mentions_generic(&row, *s),
+                "a row generic mentions no other variable"
+            );
+        });
+    }
+
+    /// An open row whose visible fields match the `HttpRequest` shape is the row generic, never folded.
+    ///
+    /// The caller's record carries more fields than the six the body reads, so
+    /// folding it to the runtime `HttpRequest` would drop them; the closed
+    /// record of the same six fields still folds.
+    #[test]
+    fn http_request_shaped_open_row_is_not_folded() {
+        let names = [
+            "r",
+            "body",
+            "headers",
+            "method",
+            "redirects",
+            "timeout",
+            "url",
+            "String",
+            "Int",
+            "List",
+            "HttpMethod",
+            "RedirectPolicy",
+        ];
+        with_named_lowerer(&names, |lowerer, syms| {
+            let [
+                r,
+                body,
+                headers,
+                method,
+                redirects,
+                timeout,
+                url,
+                string,
+                int,
+                list,
+                http_method,
+                redirect_policy,
+            ] = syms
+            else {
+                return;
+            };
+            let header_list = Ty::Con {
+                module: vec![],
+                name: *list,
+                args: vec![Ty::Tuple(vec![
+                    builtin_leaf(*string),
+                    builtin_leaf(*string),
+                ])],
+            };
+            let fields = vec![
+                (*body, builtin_leaf(*string)),
+                (*headers, header_list),
+                (*method, builtin_leaf(*http_method)),
+                (*redirects, builtin_leaf(*redirect_policy)),
+                (*timeout, builtin_leaf(*int)),
+                (*url, builtin_leaf(*string)),
+            ];
+            let span = Span::new(0, 1);
+            let closed = Ty::Record(fields.iter().cloned().collect(), ipe_types::RowTail::Closed);
+            assert_eq!(
+                lowerer.ir_type_from_ty(&closed, span),
+                Ok(super::IrType::HttpRequest),
+                "the closed six-field record is the runtime HttpRequest"
+            );
+            let open = row_open_record(fields);
+            lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::from([*r]), || {
+                assert_eq!(
+                    lowerer.ir_type_from_ty(&open, span),
+                    Ok(super::IrType::RowGeneric(*r)),
+                    "an open row over the def's row variable is never folded to HttpRequest"
+                );
+            });
+        });
+    }
+
+    /// Run `check` against a lowerer reading `chip` while `row` owns the solver variable `5`.
+    ///
+    /// `withheld` lists `row`'s generics the type checker message-defaulted,
+    /// which the ownership index excludes.
+    fn with_foreign_var_lowerer(withheld: &[&str], check: impl FnOnce(&Lowerer<'_>)) {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let chip = interner.intern("chip").unwrap();
+        let row = interner.intern("row").unwrap();
+        let msg = interner.intern("msg").unwrap();
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let mut types = empty_solved_types();
+        types.poly_var_map.insert(
+            (Vec::new(), row),
+            BTreeMap::from([(ipe_types::SolverVar::from_var(5), msg)]),
+        );
+        let withheld: BTreeSet<_> = withheld
+            .iter()
+            .map(|w| interner.intern(w).unwrap())
+            .collect();
+        types.msg_defaulted_vars.insert((Vec::new(), row), withheld);
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        lowerer.current_name.set(chip);
+        check(&lowerer);
+    }
+
+    /// A variable another binding keeps generic reads as free in a body, so a call pin there is `()`.
+    ///
+    /// A body meets such a variable only as a caller of its owner and reads it
+    /// as `()` at every occurrence; the def's own generics are never free.
+    #[test]
+    fn foreign_generic_var_is_unbound_free_in_a_body() {
+        with_foreign_var_lowerer(&[], |lowerer| {
+            let foreign = Ty::Var(ipe_types::tag_solver_var(5));
+            assert!(
+                matches!(
+                    lowerer.var_owner(ipe_types::tag_solver_var(5)),
+                    super::VarOwner::Elsewhere { .. }
+                ),
+                "`row`'s generic is foreign to `chip`"
+            );
+            assert!(
+                lowerer.ty_is_unbound_free(&foreign),
+                "a caller reads its owner's generic leniently"
+            );
+            assert!(
+                lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(6))),
+                "a variable no binding owns stays free"
+            );
+        });
+    }
+
+    /// A foreign generic in a JSON position of the def's signature is refused, never defaulted to `JsonVal`.
+    ///
+    /// The same read inside the body keeps `JsonVal`.
+    #[test]
+    fn foreign_generic_var_in_a_signature_json_slot_is_refused() {
+        with_foreign_var_lowerer(&[], |lowerer| {
+            let span = Span::new(3, 4);
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(5)), span),
+                    Ok(super::IrType::Json)
+                ),
+                "a body read of a foreign generic stays `JsonVal`"
+            );
+            lowerer.read_site.set(super::ReadSite::Signature);
+            let res = lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(5)), span);
+            assert!(
+                matches!(
+                    &res,
+                    Err(super::Diagnostic::Lower {
+                        span: s,
+                        msg: super::LowerError::ForeignTypeVariable { helper, owner, var },
+                    }) if *s == span && &**helper == "chip" && &**owner == "row" && &**var == "msg"
+                ),
+                "expected ForeignTypeVariable(chip, row, msg), got {res:?}"
+            );
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty_json(&Ty::Var(ipe_types::tag_solver_var(6)), span),
+                    Ok(super::IrType::Json)
+                ),
+                "a variable no binding owns stays `JsonVal`"
+            );
+        });
+    }
+
+    /// Control: a generic the owner message-defaulted is in no binding's index, so it stays free.
+    #[test]
+    fn message_defaulted_owner_var_stays_unbound_free() {
+        with_foreign_var_lowerer(&["msg"], |lowerer| {
+            assert_eq!(
+                lowerer.var_owner(ipe_types::tag_solver_var(5)),
+                super::VarOwner::Unowned
+            );
+            assert!(lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(5))));
         });
     }
 
@@ -37595,6 +38147,7 @@ mod tests {
             | ipe_ir::IrType::Url
             | ipe_ir::IrType::UrlRelative
             | ipe_ir::IrType::Dsn
+            | ipe_ir::IrType::DbLocation
             | ipe_ir::IrType::Connection
             | ipe_ir::IrType::ConnReadOnly
             | ipe_ir::IrType::ConnReadWrite
@@ -39381,47 +39934,6 @@ mod tests {
         );
     }
 
-    /// A binding or-pattern over an owned list view is refused with IPE-L0116; one binding nothing is accepted.
-    #[test]
-    fn owned_or_pattern_binding_fails_closed() {
-        use ipe_diagnostics::Feature;
-        use ipe_ir::{Pat, SliceOwnership};
-
-        use super::{owned_or_refusal, unsupported};
-
-        let mut fx = OwnFixture::new();
-        let x = fx.sym("x");
-        let span = Span::new(17, 23);
-        let slice = |own, prefix: Vec<Pat>| Pat::Slice {
-            prefix,
-            rest: None,
-            own,
-            elem: ipe_ir::IrType::Task(Box::new(ipe_ir::IrType::Int)),
-        };
-        let binding = [
-            slice(SliceOwnership::OwnedMove, vec![Pat::Var(x)]),
-            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard, Pat::Var(x)]),
-        ];
-        assert_eq!(
-            owned_or_refusal(&binding, span),
-            Err(unsupported(span, Feature::NestedCtorDiscrimination))
-        );
-        let unbound = [
-            slice(SliceOwnership::OwnedMove, vec![]),
-            slice(SliceOwnership::OwnedMove, vec![Pat::Wildcard]),
-        ];
-        assert_eq!(owned_or_refusal(&unbound, span), Ok(()));
-        // A borrowed view copies each binder out, so a binding or-pattern stays accepted.
-        let borrowed = [
-            slice(SliceOwnership::BorrowClone, vec![Pat::Var(x)]),
-            slice(
-                SliceOwnership::BorrowClone,
-                vec![Pat::Wildcard, Pat::Var(x)],
-            ),
-        ];
-        assert_eq!(owned_or_refusal(&borrowed, span), Ok(()));
-    }
-
     /// A binding nested list in a constructor payload over a non-`Clone` element is refused with IPE-L0116.
     #[test]
     fn nested_owned_cons_in_ctor_payload_fails_closed() {
@@ -39903,6 +40415,333 @@ mod tests {
                     "`{shape}` over {item:?} is reported as holding an Arc function"
                 );
             }
+        }
+    }
+
+    /// The capture predicate is the free-variable walk, at every capture site and binder.
+    ///
+    /// One fixture per `Expr` shape with `card` as its only possible capture
+    /// site: `lambda_body_refs_sym` and `mentions_free` must both agree with
+    /// `free_vars(e).contains(&card)` and with the pinned verdict. The
+    /// record-update base and the match guard are capture sites a `move`
+    /// closure captures whatever their emitted form.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one fixture per `Expr` shape
+    fn mentions_free_agrees_with_free_vars() {
+        use ipe_ir::free_vars::{free_vars, mentions_free};
+        use ipe_ir::{
+            Arm, BinOp, CallPin, Callee, Expr, FuncId, IrType, Match, ModPath, OnFormKind, Pat,
+        };
+
+        use ipe_intern::Symbol;
+
+        use super::lambda_body_refs_sym;
+
+        let mut interner = Interner::new();
+        let card = interner.intern("card").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let flavor = interner.intern("flavor").expect("intern");
+        let ty = interner.intern("Card").expect("intern");
+        let var = || Expr::Var(card);
+        let update = |record: Expr| Expr::Update {
+            record: Box::new(record),
+            fields: vec![(flavor, Expr::Int(1))],
+        };
+        let access = |record: Expr| Expr::Access {
+            record: Box::new(record),
+            field: flavor,
+            field_ty: IrType::Int,
+        };
+        let lambda = |param: Symbol, body: Expr| Expr::Lambda {
+            params: vec![(param, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(body),
+        };
+        let flat = |scrutinee: Expr, arms: Vec<Arm>| {
+            Expr::Match(Match::new_flat(scrutinee, arms).expect("catch-all arm is exhaustive"))
+        };
+        let call = |args: Vec<Expr>| Expr::Call {
+            callee: Callee::Func(FuncId::from_raw(0)),
+            args,
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        };
+
+        let cases: Vec<(&str, Expr, bool)> = vec![
+            ("var", var(), true),
+            ("clone var", Expr::CloneVar(card), true),
+            ("literal", Expr::Int(0), false),
+            ("update base", update(var()), true),
+            (
+                "update field",
+                Expr::Update {
+                    record: Box::new(Expr::Var(x)),
+                    fields: vec![(flavor, var())],
+                },
+                true,
+            ),
+            (
+                "update base access chain",
+                update(access(access(var()))),
+                true,
+            ),
+            ("nested update base", update(update(var())), true),
+            ("access", access(var()), true),
+            (
+                "record field",
+                Expr::Record {
+                    fields: vec![(flavor, var())],
+                    ty: None,
+                },
+                true,
+            ),
+            (
+                "ctor arg",
+                Expr::Ctor {
+                    home: ModPath(vec![ty]),
+                    ty,
+                    variant: ty,
+                    args: vec![var()],
+                },
+                true,
+            ),
+            ("call arg", call(vec![Expr::Unit, var()]), true),
+            (
+                "apply callee",
+                Expr::Apply {
+                    func: Box::new(var()),
+                    args: vec![Expr::Unit],
+                },
+                true,
+            ),
+            (
+                "binop",
+                Expr::BinOp {
+                    op: BinOp::IntAdd,
+                    lhs: Box::new(Expr::Int(1)),
+                    rhs: Box::new(var()),
+                },
+                true,
+            ),
+            (
+                "if branch",
+                Expr::If {
+                    cond: Box::new(Expr::Bool(true)),
+                    then_: Box::new(Expr::Unit),
+                    else_: Box::new(update(var())),
+                },
+                true,
+            ),
+            ("tuple", Expr::Tuple(vec![Expr::Unit, var()]), true),
+            (
+                "list",
+                Expr::List {
+                    elem: IrType::Int,
+                    items: vec![var()],
+                },
+                true,
+            ),
+            (
+                "cons tail",
+                Expr::Cons {
+                    head: Box::new(Expr::Int(1)),
+                    tail: Box::new(var()),
+                },
+                true,
+            ),
+            (
+                "list index",
+                Expr::ListIndexClone {
+                    list: Box::new(var()),
+                    index: 0,
+                    elem: IrType::Int,
+                },
+                true,
+            ),
+            (
+                "list len check",
+                Expr::ListLenCheck {
+                    list: Box::new(var()),
+                    len: 1,
+                    exact: true,
+                },
+                true,
+            ),
+            (
+                "match scrutinee",
+                flat(var(), vec![Arm::new(Pat::Wildcard, Expr::Unit)]),
+                true,
+            ),
+            (
+                "match guard",
+                flat(
+                    Expr::Bool(true),
+                    vec![
+                        Arm {
+                            pat: Pat::Bool(true),
+                            body: Expr::Unit,
+                            guard: Some(update(var())),
+                        },
+                        Arm::new(Pat::Wildcard, Expr::Unit),
+                    ],
+                ),
+                true,
+            ),
+            (
+                "match arm shadows",
+                flat(Expr::Unit, vec![Arm::new(Pat::Var(card), update(var()))]),
+                false,
+            ),
+            (
+                "task seq rest",
+                Expr::TaskSeq {
+                    effect: Box::new(Expr::Unit),
+                    rest: Box::new(update(var())),
+                },
+                true,
+            ),
+            ("nested lambda", lambda(x, update(var())), true),
+            ("lambda param shadows", lambda(card, update(var())), false),
+            (
+                "let value",
+                Expr::Let {
+                    name: x,
+                    value: Box::new(update(var())),
+                    body: Box::new(Expr::Unit),
+                },
+                true,
+            ),
+            (
+                "let shadows body",
+                Expr::Let {
+                    name: card,
+                    value: Box::new(Expr::Unit),
+                    body: Box::new(update(var())),
+                },
+                false,
+            ),
+            (
+                "destructure shadows body",
+                Expr::Destructure {
+                    binder: Pat::Tuple(vec![Pat::Var(card), Pat::Wildcard]),
+                    value: Box::new(Expr::Unit),
+                    body: Box::new(var()),
+                },
+                false,
+            ),
+            (
+                "tail loop shadows",
+                Expr::TailLoop {
+                    params: vec![(card, IrType::Int)],
+                    body: Box::new(var()),
+                },
+                false,
+            ),
+            (
+                "tail recur arg",
+                Expr::TailRecur { args: vec![var()] },
+                true,
+            ),
+        ];
+
+        for (label, expr, captures) in &cases {
+            let free = free_vars(expr).contains(&card);
+            assert_eq!(free, *captures, "{label}: free_vars verdict");
+            assert_eq!(mentions_free(card, expr), free, "{label}: mentions_free");
+            assert_eq!(
+                lambda_body_refs_sym(card, expr),
+                free,
+                "{label}: lambda_body_refs_sym"
+            );
+            assert!(
+                !mentions_free(ty, expr),
+                "{label}: an absent symbol is never free"
+            );
+        }
+    }
+
+    /// A closure whose parameter re-binds `card` captures nothing of the outer `card`.
+    ///
+    /// Every capture counter and move walk asks the closure node, not its bare
+    /// body, so the shadowing closure is neither a use nor a move of the outer
+    /// binding: no spurious pre-clone, and no false IPE-L0135 for a non-`Clone`
+    /// value read after it. A closure that does capture `card` stays one
+    /// consuming use.
+    #[test]
+    fn a_closure_whose_param_shadows_sym_captures_nothing() {
+        use ipe_ir::{EnumPayloadTable, Expr, IrType, ModPath};
+
+        use super::clone_class::rewrite_multiuse_clones;
+        use super::{
+            CloneEnv, count_fn_value_uses, count_value_consumes, count_var_uses,
+            count_var_uses_update_aware, fn_value_use_after_consume, nonclone_read_after_move,
+        };
+
+        let mut interner = Interner::new();
+        let card = interner.intern("card").expect("intern");
+        let x = interner.intern("x").expect("intern");
+        let main = interner.intern("Main").expect("intern");
+        let wrap = interner.intern("Wrap").expect("intern");
+        let closure_over = |param| Expr::Lambda {
+            params: vec![(param, IrType::Int)],
+            ret: IrType::Int,
+            body: Box::new(Expr::Var(card)),
+        };
+        let then_read = |param| Expr::Tuple(vec![closure_over(param), Expr::Var(card)]);
+
+        let no_copy = BTreeSet::new();
+        let transparent = BTreeSet::new();
+        let payloads = EnumPayloadTable::new();
+        let env = CloneEnv {
+            interner: &interner,
+            transparent_ffi: &transparent,
+            payloads: &payloads,
+        };
+        let wrap_task = IrType::Enum {
+            home: ModPath(vec![main]),
+            name: wrap,
+            args: vec![IrType::Task(Box::new(IrType::Int))],
+        };
+
+        for (param, uses) in [(card, 0_usize), (x, 1)] {
+            let closure = closure_over(param);
+            assert_eq!(count_var_uses(card, &closure), uses, "count_var_uses");
+            assert_eq!(
+                count_var_uses_update_aware(card, &closure),
+                uses,
+                "count_var_uses_update_aware"
+            );
+            assert_eq!(
+                count_fn_value_uses(card, &closure),
+                uses,
+                "count_fn_value_uses"
+            );
+            assert_eq!(
+                count_value_consumes(card, &no_copy, &closure),
+                uses,
+                "count_value_consumes"
+            );
+
+            let captures = uses == 1;
+            assert_eq!(
+                fn_value_use_after_consume(card, &then_read(param), &payloads),
+                captures,
+                "fn_value_use_after_consume"
+            );
+            assert_eq!(
+                nonclone_read_after_move(env, card, &wrap_task, &then_read(param)),
+                captures,
+                "nonclone_read_after_move"
+            );
+
+            let mut remaining = 2;
+            let rewritten = rewrite_multiuse_clones(card, &mut remaining, closure_over(param));
+            assert_eq!(remaining, 2 - uses, "rewrite_multiuse_clones slot");
+            assert_eq!(
+                matches!(rewritten, Expr::Let { .. }),
+                captures,
+                "rewrite_multiuse_clones pre-clone wrap"
+            );
         }
     }
 }

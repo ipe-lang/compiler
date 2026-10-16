@@ -13,7 +13,8 @@
 // Regular (`//`) comments, not inner docs (`//!`): this file is `include!`d
 // after other items, where an inner doc is an illegal mid-file attribute.
 
-use super::super::home_core::{HOME_VAR, HomeDir, HomeRefusal};
+use super::super::home_core::{HOME_VAR, HomeDir, HomeRefusal, prefix_refusal};
+use super::super::path_core::Regime;
 
 /// Platform-independent `(raw env value, expected home)` rows.
 ///
@@ -93,6 +94,41 @@ const HOME_REFUSAL_PLATFORM_CASES: &[(Option<&str>, HomeRefusal)] = &[
     (Some(r"\\.\pipe\x"), HomeRefusal::WindowsDeviceOrVerbatim),
     (Some(r"\\?\UNC\srv\s"), HomeRefusal::WindowsDeviceOrVerbatim),
 ];
+
+/// `(home value, refusal)` rows for the volume prefix, read under the Windows regime on every host.
+///
+/// A verbatim, device-namespace, or UNC prefix names no local profile; a plain
+/// drive, a root-relative path, and a Unix path carry no refused prefix.
+const HOME_PREFIX_WINDOWS_CASES: &[(&str, Option<HomeRefusal>)] = &[
+    (r"\\srv\share\u", Some(HomeRefusal::WindowsUnc)),
+    ("//srv/share/u", Some(HomeRefusal::WindowsUnc)),
+    (
+        r"\\?\C:\Users\u",
+        Some(HomeRefusal::WindowsDeviceOrVerbatim),
+    ),
+    (r"\\.\pipe\x", Some(HomeRefusal::WindowsDeviceOrVerbatim)),
+    (r"\\?\UNC\srv\s", Some(HomeRefusal::WindowsDeviceOrVerbatim)),
+    (r"C:\Users\u", None),
+    ("C:/Users/u", None),
+    (r"\Users\u", None),
+    ("/home/u", None),
+];
+
+/// Under the Windows regime each prefix row earns exactly its refusal, on every host.
+#[test]
+fn home_refuses_unc_and_device_under_windows_regime() {
+    for (raw, expected) in HOME_PREFIX_WINDOWS_CASES {
+        assert_eq!(prefix_refusal(raw, Regime::Windows), *expected, "{raw:?}");
+    }
+}
+
+/// Under the Unix regime no path has a volume, so no prefix row is refused for one.
+#[test]
+fn home_refuses_no_prefix_under_unix_regime() {
+    for (raw, _) in HOME_PREFIX_WINDOWS_CASES {
+        assert_eq!(prefix_refusal(raw, Regime::Unix), None, "{raw:?}");
+    }
+}
 
 /// Each refused row earns exactly its refusal, whose message names the home
 /// variable and a reason no other refusal shares.

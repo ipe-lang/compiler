@@ -27,9 +27,11 @@ module TestSupport exposing
     , execIndexSchema
     , seedIndexDb
     , insertUnitRows
+    , insertUnboundUnit
     , setIndexEnv
     , envSettings
     , envReview
+    , optionalEnv
     , envAppSettings
     , loadFirstPage
     , indexConn
@@ -100,6 +102,7 @@ module TestSupport exposing
     , rawKeyCheckFor
     , isRefusal
     , refusedWith
+    , openFileAt
     )
 
 import Ipe.ByteSize as ByteSize
@@ -108,6 +111,7 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
+import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
@@ -282,6 +286,9 @@ viewTag view =
         TooLarge (ChildSpans o) ->
             "too large spans " ++ String.fromInt o.atLeast
 
+        TooLarge (ViewNodes o) ->
+            "too large nodes " ++ String.fromInt o.nodes
+
 
 shownTextOf : Index.SourceView -> Maybe String
 shownTextOf view =
@@ -346,7 +353,7 @@ unitViewTag unit units =
 execIndex : String -> String -> List SqlValue -> Task.Task Error ()
 execIndex indexDb sql params =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting indexDb
         Db.exec conn sql params
         Task.succeed ()
 
@@ -357,7 +364,7 @@ execIndex indexDb sql params =
 execIndexUnchecked : String -> String -> List SqlValue -> Task.Task Error ()
 execIndexUnchecked indexDb sql params =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting indexDb
         Db.withTransaction conn
             (\tx ->
                 do
@@ -463,7 +470,7 @@ execIndexSchema conn statements =
 
 seedIndexDb : String -> Task.Task Error ()
 seedIndexDb indexDb =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+    openFileAt CreateIfMissing indexDb
         |> Task.andThen
             (\conn ->
                 System.cwd ()
@@ -476,6 +483,13 @@ seedIndexDb indexDb =
 
 insertUnitRows : Db -> Task.Task Error Int
 insertUnitRows conn =
+    Db.exec conn "INSERT INTO repos (tag, outer, prefix) VALUES ('ipe', NULL, NULL)" []
+        |> Task.andThen (\_ -> insertUnits conn)
+
+
+-- The two fixture units, both under the `ipe` repository, and their queue rows.
+insertUnits : Db -> Task.Task Error Int
+insertUnits conn =
     Db.exec conn
         "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
         [ Uid.toSql (uid "u-a")
@@ -527,6 +541,31 @@ insertUnitRows conn =
             )
 
 
+-- One open unit under the unbound tag `ext`.
+insertUnboundUnit : String -> Task.Task Error ()
+insertUnboundUnit indexDb =
+    execIndex indexDb
+        "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+        [ Uid.toSql (uid "u-ext")
+        , SqlString "ext:src/Lib.rs"
+        , SqlString "fn"
+        , SqlString "answer"
+        , SqlString "Ext.answer"
+        , SqlInt 3
+        , SqlInt 6
+        , SqlString "internal"
+        , SqlNull (SqlString "")
+        , SqlString (Index.attest viewA)
+        , SqlString "shaE"
+        ]
+        |> Task.andThen
+            (\_ ->
+                execIndex indexDb
+                    "INSERT INTO change_queue VALUES (?,?,?,?,?,?)"
+                    [ Uid.toSql (uid "u-ext"), SqlString "new", SqlNull (SqlString ""), SqlString (Index.attest viewA), SqlString "shaE", SqlInt 4 ]
+            )
+
+
 -- The settings a server resolves once at startup, here parsed from the
 -- current `IPE_INDEX_*` environment the way `main` reads and parses it. A test
 -- that calls a request-time function resolves them once and passes them in;
@@ -536,14 +575,26 @@ envSettings =
     do
         rawDb <- System.getenv "IPE_INDEX_DB"
         rawRoot <- System.getenv "IPE_INDEX_ROOT"
-        Settings.parseIndexSettings rawDb rawRoot
+        rawRepos <- optionalEnv "IPE_INDEX_REPOS"
+        Settings.parseIndexSettings rawDb rawRoot rawRepos
 
 
 -- The review store location a server resolves once at startup, here parsed
 -- from the current `IPE_REVIEW_DB` the way `main` reads and parses it.
-envReview : Task.Task Error Settings.DbLocation
+envReview : Task.Task Error Settings.ReviewFile
 envReview =
-    Settings.parseReviewDb (System.getenvOr "IPE_REVIEW_DB" "review.db")
+    optionalEnv "IPE_REVIEW_DB"
+        |> Task.andThen (Settings.valueOr "IPE_REVIEW_DB" "review.db")
+        |> Task.andThen Settings.parseReviewDb
+
+
+-- An optional variable read the way `main` reads one: unset, set, or set
+-- but unreadable, never folded into one another.
+optionalEnv : String -> Task.Task Error Settings.EnvValue
+optionalEnv key =
+    Task.onError
+        (\e -> Task.succeed (Settings.envFailure e))
+        (System.getenv key |> Task.map Settings.EnvSet)
 
 
 -- Every setting a server resolves once at startup, from the current
@@ -604,6 +655,7 @@ setIndexEnv : String -> String -> Task.Task Error ()
 setIndexEnv indexDb repo =
     System.setenv "IPE_INDEX_DB" indexDb
         |> Task.andThen (\_ -> System.setenv "IPE_INDEX_ROOT" repo)
+        |> Task.andThen (\_ -> System.unsetenv "IPE_INDEX_REPOS")
 
 
 -- One first-page unit with the change the index recorded for its current
@@ -624,7 +676,7 @@ loadFirstPage =
     do
         settings <- envSettings
         conn <- Index.readConnection settings
-        snap <- Index.readSnapshot ReadOnly conn Index.Start
+        snap <- Index.readSnapshot ReadOnly settings.roots conn Index.Start
         entries <- Task.sequence (List.map (pageEntry conn settings.roots) snap.rows)
         Task.succeed { units = entries, total = snap.open }
 
@@ -754,7 +806,7 @@ modifiedFrom change =
 mirroredCount : String -> Task.Task Error Int
 mirroredCount indexDb =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+        conn <- openFileAt ReadExisting indexDb
         rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM reviewed" [] totalDecoder
         case rows of
             [ n ] ->
@@ -773,7 +825,7 @@ totalDecoder =
 -- The head stamped on the index's `reviewed` copy, Nothing when unstamped.
 stampOf : String -> Task.Task Error (Maybe String)
 stampOf indexDb =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+    openFileAt ReadExisting indexDb
         |> Task.andThen Index.readStamp
 
 
@@ -1197,7 +1249,7 @@ refusedFor reason refusal =
 migratedReviewAt : String -> Task.Task Error Db
 migratedReviewAt path =
     do
-        loc <- Settings.parseDbLocation "IPE_REVIEW_DB" path
+        loc <- Settings.parseReviewDb path
         key <- testReviewKey
         LibDb.probe key loc
         LibDb.openAt loc
@@ -1268,12 +1320,21 @@ reverifyShown unit found =
             Task.fail (Error.conflict ("fixture unit " ++ Uid.toString unit ++ " is not in the index"))
 
 
--- A test file path opened read-only through the app's read URL builder, so
--- every write on it fails without a key conflict.
+-- A test file path opened read-only through the location the app builds
+-- for the index, so every write on it fails without a key conflict.
 openReadOnlyAt : String -> Task.Task Error Db
 openReadOnlyAt path =
-    Settings.parseDbLocation "IPE_INDEX_DB" path
-        |> Task.andThen (\loc -> Db.open "sqlite" (Settings.indexReadUrl loc))
+    Settings.parseIndexDb path
+        |> Task.andThen (\loc -> Db.open loc.read)
+
+
+-- A test fixture's database file opened in `mode`.
+openFileAt : Mode -> String -> Task.Task Error Db
+openFileAt mode file =
+    Path.fromString file
+        |> Result.andThen (Location.file mode)
+        |> Task.fromResult
+        |> Task.andThen Db.open
 
 
 -- The vectors file beside this package: `tools/ipe-index/tests`, reached from

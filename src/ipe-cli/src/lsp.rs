@@ -85,9 +85,16 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::ThreadRefused { .. }
         | CliError::ChildPipeUnread(..)
         | CliError::Interrupted => LoadError::Io(detail),
-        CliError::SourceRefused { .. } | CliError::DeviceNamedModule { .. } => {
-            LoadError::Refused(detail)
-        }
+        CliError::SourceRefused { .. }
+        | CliError::DeviceNamedModule { .. }
+        | CliError::NoManifest { .. }
+        | CliError::NoSrcDir { .. }
+        | CliError::EntryMissing { .. }
+        | CliError::NoDefaultEntry { .. }
+        | CliError::EntryEscapes { .. }
+        | CliError::ExposedModuleMissing { .. }
+        | CliError::SymlinkInSource { .. }
+        | CliError::FileOutsideRoot { .. } => LoadError::Refused(detail),
         CliError::FileTooLarge { .. }
         | CliError::FmtOutputTooLarge { .. }
         | CliError::DiscoveryLimitReached { .. }
@@ -306,6 +313,34 @@ mod tests {
             load_error(&refused, filesystem),
             LoadError::Refused(refused.to_string())
         );
+        let root = PathBuf::from("/p");
+        for project in [
+            CliError::NoManifest { dir: root.clone() },
+            CliError::NoSrcDir { root: root.clone() },
+            CliError::EntryMissing {
+                entry: "Cli/Main.ipe".to_owned(),
+            },
+            CliError::NoDefaultEntry { root: root.clone() },
+            CliError::EntryEscapes {
+                entry: "Cli/Main.ipe".to_owned(),
+                path: root.join("src/Cli"),
+            },
+            CliError::ExposedModuleMissing {
+                module: "Shapes".to_owned(),
+            },
+            CliError::SymlinkInSource {
+                path: root.join("src/Main.ipe"),
+            },
+            CliError::FileOutsideRoot {
+                arg: root.join("other/Main.ipe"),
+                root: root.clone(),
+            },
+        ] {
+            assert_eq!(
+                load_error(&project, filesystem),
+                LoadError::Refused(project.to_string())
+            );
+        }
         for lifted_by in [LimitSource::Buffer, LimitSource::Filesystem] {
             for limit in [&too_large, &too_deep] {
                 assert_eq!(
@@ -572,11 +607,11 @@ mod tests {
         );
     }
 
-    /// Make every component of `root/rel` a directory only its owner may write.
+    /// Make every one of `components` below `root` a directory only its owner may write.
     #[allow(clippy::expect_used)] // test fixture: a failed mkdir IS the failure
-    fn private_chain(root: &Path, rel: &str) -> PathBuf {
+    fn private_chain(root: &Path, components: &[&str]) -> PathBuf {
         let mut dir = root.to_path_buf();
-        for segment in rel.split('/') {
+        for segment in components {
             dir.push(segment);
             fs::create_dir_all(&dir).expect("create cache component");
             #[cfg(unix)]
@@ -593,7 +628,7 @@ mod tests {
         let main = dir.join("Main.ipe");
         let text = "module Main exposing (main)\n\nmain = 0\n";
         fs::write(&main, text).expect("write Main.ipe");
-        let cache = private_chain(&dir, ipe_ffi::driver::FFI_CACHE_REL);
+        let cache = private_chain(&dir, &ipe_ffi::driver::FFI_CACHE_COMPONENTS);
         fs::write(cache.join("x.consumer.json"), "{ not json").expect("write artifact");
         let loaded = DriverLoader.load(None, &main, Some(text));
         let _ = fs::remove_dir_all(&dir);

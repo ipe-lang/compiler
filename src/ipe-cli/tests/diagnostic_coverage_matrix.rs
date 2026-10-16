@@ -216,11 +216,6 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
     (
         "refusal-tested",
-        "IPE-T0011",
-        "redundant case branch not yet reached by any constant assertion or wire literal",
-    ),
-    (
-        "refusal-tested",
         "IPE-T0019",
         "or-pattern variable binding not yet reached by any constant assertion or wire literal",
     ),

@@ -173,7 +173,7 @@ serde_urlencoded = "0.7"
 regex = "1"
 unicode-general-category = "1"
 base64 = "0.22"
-uuid = { version = "1", features = ["v4", "v7", "js"] }
+uuid = { version = "1" }
 hex = "0.4"
 percent-encoding = "2"
 # The wasm module set declares `url.rs` unconditionally (`pub mod url;` in
@@ -278,6 +278,7 @@ pub mod ffi_polyfills;
 pub mod file;
 pub mod http_header;
 pub mod http_client;
+pub mod inbound_authority;
 pub mod io;
 pub mod json;
 pub mod seal_codec;
@@ -302,6 +303,7 @@ pub mod stringify;
 pub mod system;
 pub mod telemetry;
 pub mod csp;
+pub mod entropy;
 pub mod time;
 pub mod url;
 pub mod uuid_kernel;
@@ -833,7 +835,7 @@ const RUNTIME_MOD_RS_URL_APPEND: &str = "pub mod url;\npub use url::*;\n";
 /// `config_decode.rs` (the `Config.decodeToml` / `decodeYaml` / `decodeJson` /
 /// `loadFromFile` front-ends plus the `nullable` / `maybe` / `dict`
 /// combinators) is vendored into every emitted crate but declared only on
-/// demand — it is the sole consumer of the `toml` and `serde_yaml` crates,
+/// demand — it is the sole consumer of the TOML and YAML parser crates,
 /// which [`config_cargo_toml`] adds under the same condition. It is a leaf
 /// module (no other runtime surface calls into it), so it is declared exactly
 /// when the program reaches it directly, and never forced on transitively. The
@@ -931,10 +933,11 @@ const RUNTIME_MOD_RS_REGEX_APPEND: &str = "pub mod regex_kernel;\npub use regex_
 // ── Ipe.Uuid — v4 / v7 / parse ──────────────────────────────────────────────
 
 /// Lines appended to `ipe_runtime/mod.rs` when the program reaches the `uuid`
-/// crate — an `Ipe.Uuid` kernel, OR the `server` / `web` surfaces whose runtime
-/// modules mint session/CSRF ids via `uuid::new_v4`, OR the `jwt` / `auth` surface
-/// whose `auth.rs` calls `uuid::Uuid::new_v4()` to mint per-session `jti` ids
-/// ([`EmitCtx::reaches_uuid`]).
+/// crate — an `Ipe.Uuid` kernel, OR the `jwt` / `auth` surface whose `auth.rs`
+/// builds per-session `jti` ids with `uuid::Builder`, OR the `server` / `web`
+/// surfaces, which still imply the `uuid` feature though no module of theirs
+/// names the crate ([`EmitCtx::reaches_uuid`]). Every id draws its random bytes
+/// through `entropy::fill_entropy`.
 ///
 /// `uuid_kernel.rs` exposes the `Ipe.Uuid` kernels. Declared only on demand —
 /// behind the `uuid` runtime feature, which [`runtime_features`] selects under the
@@ -1272,14 +1275,14 @@ const RUNTIME_MOD_RS_TUI_APPEND: &str = "pub mod terminal_access;\n\
 /// the render core it draws through is declared by
 /// [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (which fires for `uses_web || uses_webview`
 /// and pulls in the ONE real `web` module — server items inside stay
-/// `#[cfg(feature = "server")]`, so a webview build compiles only the render core).
+/// `#[cfg(feature = "web")]`, so a webview build compiles only the render core).
 const RUNTIME_MOD_RS_WEBVIEW_APPEND: &str = "#[cfg(feature = \"webview\")]\npub mod webview;\n\
      #[cfg(feature = \"webview\")]\npub use webview::{webview_app, WebViewWindowCfg};\n";
 
 /// The server-free render core, declared for EVERY render host (`uses_web ||
 /// uses_webview`): the ONE real `web` module (which compiles to just its
-/// render-core under `web-core` alone — every axum/SSE/session item inside is
-/// `#[cfg(feature = "server")]`) plus the pure `page_shell` scaffold
+/// render-core without `web`, `server` on or off — every axum/SSE/session item inside is
+/// `#[cfg(feature = "web")]`) plus the pure `page_shell` scaffold
 /// (`web_page_core`). The native-window `webview` backend renders through
 /// `web::dispatch` / `web::style_inject` / `web::page_shell` / `web::route` over
 /// a local IPC bridge — NO axum `server`, NO SSE, NO session store. The full
@@ -1328,7 +1331,7 @@ const RUNTIME_MOD_RS_LITERAL_TABLE_APPEND: &str = "#[cfg(any(feature = \"web-cor
 /// The `web` module itself is declared by [`RUNTIME_MOD_RS_WEB_CORE_APPEND`]
 /// (shared with the webview render host). This append layers ONLY the extra
 /// crate-root modules the SERVER surface of `web/mod.rs` reaches by absolute path
-/// under `#[cfg(feature = "server")]` — `crate::widget_assets`
+/// under `#[cfg(feature = "web")]` — `crate::widget_assets`
 /// (`pub use crate::widget_assets;`), `crate::js_port_glue` (SRI-pinned Ffi.Js
 /// port asset), and `crate::js_port` (the port session/sink) — plus the server
 /// entry re-exports. In the real runtime crate the `web` feature lists
@@ -3110,7 +3113,7 @@ fn assemble_project_text(
     } else {
         cargo_toml
     };
-    // Ipe.Config TOML/YAML decoders (`toml` + `serde_yaml`): pulled in only when
+    // Ipe.Config TOML/YAML decoders (the TOML and YAML parser crates): pulled in only when
     // the program reaches the `config_decode` runtime module (`Config.decodeToml`
     // / `decodeYaml` / `decodeJson` / `loadFromFile`, or `nullable` / `maybe` /
     // `dict`). Both crates are leaves — a JSON-only or non-Config program pulls
@@ -3420,6 +3423,7 @@ const fn is_non_serde_leaf(ty: &IrType) -> bool {
         // `Dsn` carries a `Secret` and is non-serde — a `Dsn` in a HydrationState
         // record is rejected (same posture as `Url`/`Secret`).
         | IrType::Dsn
+        | IrType::DbLocation
         // External `Connection` + phantom markers — opaque non-serde handles,
         // rejected in a HydrationState record just like `Dsn`.
         | IrType::Connection
@@ -3982,7 +3986,7 @@ fn ssrf_cargo_toml(base: &str) -> DResult<String> {
 /// Build the server-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"server"` to the `default` feature list.
-/// 2. Extending the `tokio` dependency line with the `"net"` and `"sync"`
+/// 2. Extending the `tokio` dependency line with the `"net"`, `"sync"` and `"signal"`
 ///    features (required by `server.rs`'s `TcpListener` and `mpsc` usage).
 /// 3. Appending `axum`, `tower-http` (with `timeout`), and `tower` (with
 ///    `limit`) dependency lines before `[profile.dev]` — the latter two back
@@ -4012,7 +4016,7 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         crate_specs::TOKIO.version,
     );
     let tokio_net_sync = format!(
-        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"net\", \"sync\"] }}",
+        "{} = {{ version = \"{}\", features = [\"rt\", \"rt-multi-thread\", \"macros\", \"time\", \"net\", \"sync\", \"signal\"] }}",
         crate_specs::TOKIO.name,
         crate_specs::TOKIO.version,
     );
@@ -4080,7 +4084,9 @@ fn server_cargo_toml(base: &str) -> DResult<String> {
         });
     }
 
-    // Step 2 — extend the tokio dependency line with "net" and "sync".
+    // Step 2 — extend the tokio dependency line with "net", "sync" and "signal"
+    // (the vendored `server/shutdown.rs` drains on `tokio::signal`, as the
+    // runtime's own `server` feature enables `tokio/signal`).
     let step2 = step1.replacen(&tokio_time, &tokio_net_sync, 1);
     if step2 == step1 {
         return Err(Diagnostic::CompilerBug {
@@ -4139,9 +4145,9 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     // the parent-death floor the live console-proxy relies on), so that single
     // cfg-gated declaration covers every need — adding it again would emit a
     // duplicate `rustix` key and produce invalid TOML.
-    // The `live` runtime mainline uses `tokio::signal` + `tokio::process`; the base
-    // golden emits `net`+`sync` for the HTTP server, so add the two missing features.
-    const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\"]";
+    // The `live` runtime mainline uses `tokio::process`; the server manifest emits
+    // `net`+`sync`+`signal` for the HTTP server, so add the one missing feature.
+    const TOKIO_NET_SYNC_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\"]";
     const TOKIO_LIVE_FEATURES: &str = "\"time\", \"net\", \"sync\", \"signal\", \"process\"]";
     // `db_cargo_toml` now always emits both `"sqlite"` and `"postgres"` sqlx
     // features (since `external_conn.rs` uses `sqlx::postgres` unconditionally).
@@ -4248,8 +4254,8 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
     //
     // The tui runtime uses `tokio::sync::mpsc`; add `"sync"` when it is not
     // yet present.  The base golden has only `"time"` in the tokio feature list;
-    // server_cargo_toml adds `"net", "sync"`; web_cargo_toml extends to include
-    // `"signal", "process"`.  We gate on the SMALLEST known form that lacks
+    // server_cargo_toml adds `"net", "sync", "signal"`; web_cargo_toml extends to
+    // include `"process"`.  We gate on the SMALLEST known form that lacks
     // `"sync"` and replace it with the tui-extended form.  If `"sync"` is
     // already present (because server_cargo_toml ran first) the replacen is a
     // no-op and we do NOT error — `"sync"` is idempotent to add.
@@ -4908,19 +4914,20 @@ fn url_cargo_toml(base: &str) -> DResult<String> {
     Ok(result)
 }
 
-/// Build the config-decoder-enabled `Cargo.toml` by appending the `toml` and
-/// `serde_yaml` dependencies before `[profile.dev]`.
+/// Build the config-decoder-enabled `Cargo.toml` by appending the TOML and
+/// YAML parser dependencies before `[profile.dev]`.
 ///
 /// `config_decode.rs` (the vendored `Ipe.Config` TOML/YAML front-ends) is the
 /// sole consumer of these two crates: `Config.decodeToml` parses with `toml`,
-/// `Config.decodeYaml` with `serde_yaml`, and `Config.loadFromFile` dispatches
+/// `Config.decodeYaml` with `serde-saphyr`, and `Config.loadFromFile` dispatches
 /// to either by file extension. Both are leaf dependencies (nothing else in the
 /// base manifest pulls them), so gating them here keeps a program that never
 /// touches the TOML/YAML surface — including a JSON-only `Config` program, whose
 /// combinators emit into the `json` module — free of both crates.
 ///
-/// The versions come from the [`crate_specs`] SSOT (drift-guarded against
-/// `runtime/Cargo.toml`).
+/// The versions and the YAML parser's exact feature set come from the
+/// [`crate_specs`] SSOT (drift-guarded against `runtime/Cargo.toml`); the YAML
+/// parser's default features stay off.
 ///
 /// # Errors
 ///
@@ -4928,12 +4935,17 @@ fn url_cargo_toml(base: &str) -> DResult<String> {
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn config_cargo_toml(base: &str) -> DResult<String> {
     const PROFILE_ANCHOR: &str = "[profile.dev]";
+    let yaml_features = crate_specs::SERDE_SAPHYR_FEATURES
+        .iter()
+        .map(|feature| format!("{feature:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let deps = format!(
-        "{} = \"{}\"\n{} = \"{}\"\n\n",
+        "{} = \"{}\"\n{} = {{ version = \"{}\", default-features = false, features = [{yaml_features}] }}\n\n",
         crate_specs::TOML.name,
         crate_specs::TOML.version,
-        crate_specs::SERDE_YAML.name,
-        crate_specs::SERDE_YAML.version,
+        crate_specs::SERDE_SAPHYR.name,
+        crate_specs::SERDE_SAPHYR.version,
     );
     let anchor_pos = base
         .find(PROFILE_ANCHOR)
@@ -5994,10 +6006,11 @@ mod tests {
             out.contains("server = []"),
             "manifest must declare the server feature: {out}"
         );
-        // tokio net + sync features must be added.
+        // tokio net + sync + signal features must be added (the vendored
+        // `server/shutdown.rs` uses `tokio::signal`).
         assert!(
-            out.contains(r#""net""#) && out.contains(r#""sync""#),
-            "tokio must gain net + sync features: {out}"
+            out.contains(r#""net""#) && out.contains(r#""sync""#) && out.contains(r#""signal""#),
+            "tokio must gain net + sync + signal features: {out}"
         );
         // axum + tower-http + tower deps must be present. The front-door DoS
         // ceilings need `tower-http`'s `timeout` (per-request `TimeoutLayer`)
@@ -6532,7 +6545,7 @@ mod tests {
     /// `seal_modset::cmd_publish_no_live_builds`).  The `web` module itself is
     /// declared by [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (shared with the webview
     /// render host, pushed BEFORE this append); each server-only crate-root
-    /// module rides [`RUNTIME_MOD_RS_WEB_APPEND`] under `#[cfg(feature = "server")]`.
+    /// module rides [`RUNTIME_MOD_RS_WEB_APPEND`] under `#[cfg(feature = "web")]`.
     #[test]
     fn web_mod_rs_declares_widget_assets_and_js_port_closure() {
         assert!(
@@ -6732,6 +6745,24 @@ mod tests {
         assert_eq!(default_line(&email), r#"default = ["json", "email"]"#);
         let config = config_cargo_toml(CARGO_TOML).expect("config_cargo_toml must succeed");
         assert_eq!(default_line(&config), r#"default = ["json", "config"]"#);
+    }
+
+    /// The YAML parser is pinned with default features off and exactly the
+    /// SSOT feature set, so neither `include` nor `properties` reaches an
+    /// emitted crate.
+    #[test]
+    fn config_toml_pins_the_yaml_parser_features() {
+        let config = config_cargo_toml(CARGO_TOML).expect("config_cargo_toml must succeed");
+        let yaml_line = config
+            .lines()
+            .find(|line| line.starts_with("serde-saphyr = "))
+            .expect("config_cargo_toml must add the YAML parser");
+        assert_eq!(
+            yaml_line,
+            r#"serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }"#
+        );
+        assert!(!yaml_line.contains("include"), "{yaml_line}");
+        assert!(!yaml_line.contains("properties"), "{yaml_line}");
     }
 
     /// Promotion is idempotent and refuses a manifest with no default list.

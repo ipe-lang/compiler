@@ -39,7 +39,7 @@ flate2 = { version = "1", optional = true }
 zstd = { version = "0.13", optional = true }
 csv = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }
-serde_yaml = { version = "0.9", optional = true }
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"], optional = true }
 axum = { version = "0.7", features = ["ws"], optional = true }
 tower-http = { version = "0.5", features = ["fs", "catch-panic", "timeout"], optional = true }
 # `tower` (limit + util) backs the server front-door DoS ceilings:
@@ -91,7 +91,8 @@ serde_urlencoded = { version = "0.7", optional = true }
 # Optional, behind `crypto-core` (and `secret`, which implies `crypto-core`): a
 # program that reaches neither the crypto floor nor a `Secret` drops it.
 subtle = { version = "2", optional = true }
-# OS CSPRNG for the `crypto_core` entropy pair (`Crypto.randomBytes` /
+# OS CSPRNG, called only by `entropy::fill_entropy`, the runtime's one entropy
+# source. Its draws back the `crypto_core` entropy pair (`Crypto.randomBytes` /
 # `randomToken`), `random.rs`'s seed, and every scratch name the always-present
 # `scratch_core` primitive creates (the `File.tempFile`/`tempDir` kernels, the
 # console store, atomic-replace siblings). The wasm32 target block below adds
@@ -111,10 +112,9 @@ hmac = { version = "0.12", optional = true }
 # heavy surface — optional, behind the `crypto` feature.
 sha1 = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
-# The driver features (`sqlite`/`postgres`) are activated by the `db-sqlite` /
-# `db-postgres` selectors, not enabled here — a program pulls only the driver
-# it emits. `db-postgres` also activates `sqlite` (the Live session store keeps
-# a sqlite side table even under the postgres driver — see `db_cargo_toml`).
+# The sqlx driver features (`sqlite`/`postgres`) are activated by `db`, not
+# here; the `db-sqlite` / `db-postgres` selectors pick which driver's aliases
+# the crate root compiles (see `db-postgres`).
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls"], optional = true }
 redis = { version = "0.27", features = ["tokio-comp"], optional = true }
 # `Ipe.Regex` regex kernels + `String.isUrl`, behind the `regex` feature. A
@@ -134,10 +134,12 @@ unicode-general-category = { version = "1", optional = true }
 # the crypto/db/server/email/jwt/web surfaces — those features each imply
 # `encoding`. A program that reaches none of these drops all three crates.
 base64 = { version = "0.22", optional = true }
-# `Ipe.Uuid` v4/v7/parse, behind the `uuid` feature. The `server` / `web`
-# surfaces mint session/CSRF ids via `uuid::new_v4` (they imply `uuid`); a bare
-# Program that reaches none drops the crate.
-uuid = { version = "1", features = ["v4", "v7"], optional = true }
+# `Ipe.Uuid` v4/v7/parse and the `jwt` `jti`, behind the `uuid` feature. No
+# RNG feature: ids are built with uuid's infallible builders from
+# `entropy::fill_entropy` draws, so uuid's panicking generators do not exist in
+# the build. The `server` / `web` surfaces imply `uuid`; a bare Program that
+# reaches none drops the crate.
+uuid = { version = "1", optional = true }
 hex = { version = "0.4", optional = true }
 percent-encoding = { version = "2", optional = true }
 # `chrono` (base calendar/clock) is optional, behind the `time-core` feature.
@@ -220,16 +222,15 @@ rustix = { version = "1", features = ["pty", "termios", "fs", "process", "std"] 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"], optional = true }
 
-# wasm32 floor: uuid's entropy backend needs the getrandom js shim in the
-# browser; `js` is a no-op on native targets so scoping it here keeps the
-# native feature graph identical.
+# wasm32 floor: the static wasm module set declares `uuid_kernel`, so the
+# crate is always present there. Like the native entry it carries no RNG
+# feature; its ids draw through `entropy::fill_entropy`.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-uuid = { version = "1", features = ["v4", "v7", "js"] }
+uuid = { version = "1" }
 # `Random.*` / `Crypto.randomBytes` / `Crypto.randomToken` browser substitute:
 # the `js` feature backs `getrandom()` with `crypto.getRandomValues` (the exact
-# mechanism `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q3 names). Direct dep (not just
-# transitively via uuid) so `random.rs`/`crypto.rs` can call it without pulling
-# `aes-gcm` just for its `OsRng` re-export.
+# mechanism `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q3 names). It backs
+# `entropy::fill_entropy`, the runtime's one entropy source, on every target.
 getrandom = { version = "0.2", features = ["js"] }
 # Browser sink (`wasm` module, feature `wasm-client`). Pinned exact
 # wasm-bindgen: the emitted-project glue is produced by the wasm-bindgen CLI,
@@ -344,11 +345,11 @@ encoding = ["dep:base64", "dep:hex", "dep:percent-encoding"]
 # reaches neither an `Ipe.Regex` kernel nor `String.isUrl` drops all four crates.
 regex = ["dep:regex"]
 # `Ipe.Uuid` v4/v7/parse: the `uuid` crate and the `uuid_kernel.rs` module. The
-# `server` / `web` surfaces mint session/CSRF ids via `uuid::new_v4`, so both
-# imply `uuid`; a bare Program that reaches no `Ipe.Uuid` kernel drops the crate.
+# `server` / `web` surfaces imply `uuid`; a bare Program that reaches no
+# `Ipe.Uuid` kernel drops the crate.
 uuid = ["dep:uuid"]
 # `Ipe.Random` non-cryptographic PRNG: gates the `random.rs` module, whose
-# seed draws from the always-present `getrandom`.
+# wasm seed draws from the always-present `entropy::fill_entropy`.
 random = []
 # The cryptographic floor: `crypto_core.rs` (SHA-2 hash + HMAC + RSA-gated arm +
 # constant-time compare + entropy pair + typed Key/Mac). Pulls `sha2` / `hmac` /
@@ -407,10 +408,11 @@ json = ["dep:serde_json", "serde"]
 # `tokio/net`: the `ssrf` gate resolves a Postgres host through
 # `tokio::net::lookup_host` (non-blocking, deadline-bounded).
 db = ["sqlx", "sqlx?/sqlite", "sqlx?/postgres", "tokio", "tokio/sync", "tokio/net", "dep:serde_json", "json", "serde", "encoding", "random", "time-core", "decimal", "crypto-core", "url", "secret"]
-# `db-sqlite` / `db-postgres`: config.rs alias selectors. Only the emitter ever
-# enables one, and it selects exactly one (SEAL-checked) — the standalone crate
-# links both sqlx drivers regardless (see `db`). The `compile_error!` in
-# `config.rs` guards the union as a fail-closed guard, not a user surface.
+# `db-sqlite` / `db-postgres`: driver alias selectors. `db-postgres` makes the
+# crate root compile `config_postgres.rs` as `config`; any other build compiles
+# the sqlite `config.rs`. The emitter enables exactly one, and the crate links
+# both sqlx drivers regardless (see `db`). The `compile_error!` in `mod.rs`
+# refuses the union, a fail-closed guard, not a user surface.
 db-sqlite = ["db"]
 db-postgres = ["db"]
 redis_store = ["redis", "tokio", "tokio/sync", "dep:serde_json", "json", "serde", "async-trait", "random"]
@@ -425,10 +427,10 @@ crypto = ["rsa", "bcrypt", "aes-gcm", "chacha20poly1305", "pbkdf2", "dep:sha1", 
 # `jwt.rs` signs with `crypto_core`'s HMAC/RSA (via `crypto`, which implies
 # `crypto-core`) and wraps its `Algorithm` in a `secret::Secret`, so it implies
 # `secret` (which itself implies `crypto-core`).
-# `auth.rs` (compiled under `#[cfg(feature = "jwt")]`) calls
-# `uuid::Uuid::new_v4()` to mint per-session `jti` ids — so `jwt` implies
-# `uuid`. A jwt-or-auth program that reaches no direct `Ipe.Uuid` kernel still
-# needs the crate for `auth_sign_token`'s entropy call.
+# `auth.rs` (compiled under `#[cfg(feature = "jwt")]`) builds per-session
+# `jti` ids with `uuid::Builder` from `entropy::fill_entropy` bytes — so `jwt`
+# implies `uuid`. A jwt-or-auth program that reaches no direct `Ipe.Uuid`
+# kernel still needs the crate for `auth_sign_token`'s id.
 jwt = ["json", "crypto", "secret", "dep:jsonwebtoken", "uuid"]
 compression = ["flate2", "zstd", "tokio", "random"]
 csv_kernel = ["csv", "tokio", "random"]
@@ -463,11 +465,11 @@ web-core = ["dep:serde_json", "json", "serde", "dep:serde_urlencoded", "encoding
 # must also enable `random` or the module is absent (same invariant as `async`).
 # The no-server floor is machine-checked by `tests/webview_dep_floor.rs`.
 webview = ["wry", "tao", "web-core", "tokio", "random"]
-config = ["json", "toml", "serde_yaml"]
+config = ["json", "toml", "dep:serde-saphyr"]
 # `tokio/net`+`tokio/sync`: axum binds a listener (`tokio::net`) and the
 # server/live loop uses `tokio::sync`.
 # `crypto-core`: `server.rs` constant-time compares session ids via `subtle`.
-server = ["tokio", "tokio/net", "tokio/sync", "axum", "tower-http", "tower", "futures-util", "encoding", "uuid", "random", "crypto-core"]
+server = ["tokio", "tokio/net", "tokio/sync", "tokio/signal", "axum", "tower-http", "tower", "futures-util", "encoding", "uuid", "random", "crypto-core"]
 # The reqwest-free `ssrf` module parses URLs via the `url` crate (which reqwest
 # re-exports as `reqwest::Url`); `url` is behind the `url` feature.
 # `serde`: `http_stream.rs` derives Serialize/Deserialize on its SSE event
@@ -486,7 +488,7 @@ email = ["tokio", "reqwest", "lettre", "dep:serde_json", "json", "serde", "http_
 # `http_client`. `tokio/net`: `ws_client.rs` opens the pinned TCP socket.
 # `serde`: `ws_client.rs` derives Serialize/Deserialize on its frame wire types.
 websocket_client = ["tokio", "tokio/net", "tokio/sync", "tokio-tungstenite", "futures-util", "url", "random", "serde"]
-# The session-id / CSRF-token RNG draws from the OS CSPRNG via `uuid`, so `web`
+# The session-id / CSRF-token mints draw from `entropy::fill_entropy`, so `web`
 # needs no `aes-gcm`; `subtle` (constant-time compare) and `sha2` (client-JS SRI
 # integrity hash) ride the `crypto-core` feature `web` lists below. `serde` (the
 # floor-type wire derives) + `serde_urlencoded` (typed form-record decode, whose
@@ -513,10 +515,11 @@ web = ["web-core", "widget-assets", "server", "dep:serde_json", "json", "serde",
 # at build time — the same code the server path calls, no second glue. `web`
 # implies it so the server keeps `ipe_runtime::web::widget_assets::*` unchanged.
 widget-assets = ["crypto-core", "encoding"]
-# `db-postgres` (not bare `db`) selects a concrete sqlx driver — it also pulls
-# `sqlite`, so both driver code paths compile. `jwt` + `url` cover the
-# JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
-full = ["async", "json", "jwt", "url", "db", "db-postgres", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time", "log", "regex", "uuid", "random", "decimal", "char-category"]
+# `full` names no driver selector, so it compiles the sqlite aliases the
+# runtime's own db tests open, and `full,db-postgres` is the every-feature
+# PostgreSQL build CI lints. `db` links both sqlx drivers. `jwt` + `url` cover
+# the JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
+full = ["async", "json", "jwt", "url", "db", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time", "log", "regex", "uuid", "random", "decimal", "char-category"]
 # Development-only time-travelling debugger core (recorder / re-fold / export /
 # import). NOT in `full` and NOT implied by `wasm-client` — the debugger is a
 # build-mode opt-in (`ipe dev build/run --debugger`), never a default. `ipe release`
@@ -635,6 +638,9 @@ sha2 = "0.10"
 # than by a text scanner.
 syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = "1"
+# `tests/entropy_site_inventory.rs` parses the manifests and the lockfile it
+# checks for a generator.
+toml = "0.8"
 
 # `wasm-bindgen-test` drives the headless-browser test harness (`tests/
 # wasm_*` files, `#[wasm_bindgen_test]`) — meaningless on native, so it is
@@ -650,8 +656,8 @@ proc-macro2 = "1"
 # test`/`cargo check --tests` targets, including wasm32 — `bcrypt 0.17` and
 # `proptest`'s `rand 0.9` chain both pull `getrandom 0.3` (`rand_core 0.9`),
 # which collides with the pinned `getrandom 0.2` (`features = ["js"]`) this
-# crate's own `[dependencies]` uses for the wasm entropy shim (`uuid`/
-# `crypto_random_bytes`/`random.rs`'s `lcg_init`). getrandom 0.2 and 0.3 are
+# crate's own `[dependencies]` uses for the wasm entropy shim
+# (`entropy::fill_entropy`). getrandom 0.2 and 0.3 are
 # NOT the same crate to cargo (SemVer-major difference) so cargo happily
 # resolves both into one dependency graph — but `getrandom 0.3` refuses to
 # build on `wasm32-unknown-unknown` at all without an explicit

@@ -32,6 +32,23 @@ const _STD: () = {
     let _ = ::std::thread::Scope::spawn::<fn(), ()>;
 };
 
+const _ENTROPY: () = {
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::getrandom::getrandom;
+};
+
+#[cfg(feature = "uuid")]
+const _UUID: () = {
+    #[expect(clippy::disallowed_methods)]
+    let _ = |context: ::uuid::NoContext| ::uuid::Timestamp::now(context);
+};
+
+#[cfg(all(feature = "crypto", not(target_arch = "wasm32")))]
+const _RAND_CORE: () = {
+    #[expect(clippy::disallowed_types)]
+    let _: Option<::aes_gcm::aead::OsRng> = None;
+};
+
 #[cfg(feature = "tokio")]
 const _TOKIO: () = {
     #[expect(clippy::disallowed_methods)]

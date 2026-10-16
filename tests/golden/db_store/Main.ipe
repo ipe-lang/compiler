@@ -2,6 +2,7 @@ module Main exposing (main)
 
 import Ipe.Io as Io
 import Ipe.Db as Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Dict as Dict
@@ -45,9 +46,9 @@ userColumns =
 writeUser : User -> Store.Row
 writeUser u =
     Dict.fromList
-        [ ( "id", u.id )
-        , ( "name", u.name )
-        , ( "age", String.fromInt u.age )
+        [ ( "id", Just u.id )
+        , ( "name", Just u.name )
+        , ( "age", Just (String.fromInt u.age) )
         ]
 
 
@@ -115,7 +116,7 @@ main =
                     Db.withTransaction conn
                         (\txconn -> runChecks txconn store)
                 )
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)
 
 
 runChecks : Db -> Store Store.Row -> Task Error ()

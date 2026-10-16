@@ -445,6 +445,56 @@ pub enum CliError {
         /// Why the path was rejected.
         reason: contained_path::PathEscape,
     },
+    /// The project directory holds no `package.ipe` (`IPE-E0004`).
+    ///
+    /// The project is the directory ipe was pointed at; no directory above it
+    /// is ever searched.
+    NoManifest {
+        /// The directory that holds no manifest.
+        dir: PathBuf,
+    },
+    /// The project directory has no `src/` directory, or `src` is a link (`IPE-E0005`).
+    NoSrcDir {
+        /// The project directory.
+        root: PathBuf,
+    },
+    /// A `programs` entry names a file `src/` does not hold (`IPE-E0006`).
+    EntryMissing {
+        /// The entry as `package.ipe` spells it.
+        entry: String,
+    },
+    /// The project declares no program, has no `src/Main.ipe`, and exposes no module (`IPE-E0007`).
+    NoDefaultEntry {
+        /// The project directory.
+        root: PathBuf,
+    },
+    /// A `programs` entry passes through a symbolic link under `src/` (`IPE-E0008`).
+    EntryEscapes {
+        /// The entry as `package.ipe` spells it.
+        entry: String,
+        /// The link met on the way to it.
+        path: PathBuf,
+    },
+    /// An `exposedModules` name has no file under `src/` (`IPE-E0009`).
+    ExposedModuleMissing {
+        /// The module name as `package.ipe` spells it.
+        module: String,
+    },
+    /// A project file or directory ipe would read is a symbolic link (`IPE-E0010`).
+    SymlinkInSource {
+        /// The link.
+        path: PathBuf,
+    },
+    /// A file argument names no module of the project (`IPE-E0011`).
+    ///
+    /// It lies outside the project's `src/` and `tests/` and is not its
+    /// `package.ipe`.
+    FileOutsideRoot {
+        /// The file argument.
+        arg: PathBuf,
+        /// The directory to run ipe from instead.
+        root: PathBuf,
+    },
     /// A build-output location was refused because ipe cannot prove it owns it.
     ///
     /// A symlink, a directory holding user files, or a path overlapping the
@@ -733,6 +783,14 @@ impl CliError {
             Self::Interrupted => "interrupted",
             Self::SourceRefused { .. } => "source-refused",
             Self::PathEscape { .. } => "path-escape",
+            Self::NoManifest { .. } => "no-manifest",
+            Self::NoSrcDir { .. } => "no-src-dir",
+            Self::EntryMissing { .. } => "entry-missing",
+            Self::NoDefaultEntry { .. } => "no-default-entry",
+            Self::EntryEscapes { .. } => "entry-escapes",
+            Self::ExposedModuleMissing { .. } => "exposed-module-missing",
+            Self::SymlinkInSource { .. } => "symlink-in-source",
+            Self::FileOutsideRoot { .. } => "file-outside-root",
             Self::OutputRefused(_) => "output-refused",
             Self::DiscoveryLimitReached { .. } => "discovery-limit-reached",
             Self::TrustRefused(_) => "trust-refused",
@@ -823,6 +881,14 @@ impl CliError {
             | Self::Interrupted
             | Self::SourceRefused { .. }
             | Self::PathEscape { .. }
+            | Self::NoManifest { .. }
+            | Self::NoSrcDir { .. }
+            | Self::EntryMissing { .. }
+            | Self::NoDefaultEntry { .. }
+            | Self::EntryEscapes { .. }
+            | Self::ExposedModuleMissing { .. }
+            | Self::SymlinkInSource { .. }
+            | Self::FileOutsideRoot { .. }
             | Self::OutputRefused(_)
             | Self::DiscoveryLimitReached { .. }
             | Self::TrustRefused(_)
@@ -1135,6 +1201,28 @@ impl std::fmt::Display for CliError {
                 let raw = format!("{raw:?}");
                 f.write_str(&text::cli_path_escape(&raw, reason))
             }
+            Self::NoManifest { dir } => f.write_str(&text::project_no_manifest(&dir.display())),
+            Self::NoSrcDir { root } => f.write_str(&text::project_no_src_dir(&root.display())),
+            Self::EntryMissing { entry } => {
+                f.write_str(&text::project_entry_missing(&format!("{entry:?}")))
+            }
+            Self::NoDefaultEntry { root } => {
+                f.write_str(&text::project_no_default_entry(&root.display()))
+            }
+            Self::EntryEscapes { entry, path } => f.write_str(&text::project_entry_escapes(
+                &format!("{entry:?}"),
+                &path.display(),
+            )),
+            Self::ExposedModuleMissing { module } => f.write_str(
+                &text::project_exposed_module_missing(&format!("{module:?}")),
+            ),
+            Self::SymlinkInSource { path } => {
+                f.write_str(&text::project_symlink_in_source(&path.display()))
+            }
+            Self::FileOutsideRoot { arg, root } => f.write_str(&text::project_file_outside_root(
+                &arg.display(),
+                &root.display(),
+            )),
             Self::OutputRefused(refusal) => f.write_str(&text::cli_output_refused(refusal)),
             Self::DiscoveryLimitReached { detail } => {
                 f.write_str(&text::cli_discovery_limit_reached(detail))

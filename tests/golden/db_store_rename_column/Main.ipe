@@ -28,6 +28,7 @@ module Main exposing (main)
 
 import Ipe.Codec as Codec exposing (Codec)
 import Ipe.Db as Db exposing (Db)
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Store, Order(..))
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Dict as Dict
@@ -62,16 +63,24 @@ eventsStore =
 eventRow : String -> String -> Store.Row
 eventRow label stamp =
     Dict.fromList
-        [ ( "id", "e1" )
-        , ( "label", label )
-        , ( "created_at", stamp )
-        , ( "updated_at", stamp )
+        [ ( "id", Just "e1" )
+        , ( "label", Just label )
+        , ( "created_at", Just stamp )
+        , ( "updated_at", Just stamp )
         ]
 
 
 cell : String -> Store.Row -> String
 cell name row =
-    Maybe.withDefault "?" (Dict.get name row)
+    case Dict.get name row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            "?"
 
 
 -- A DB-filled cell is the database's own value: present, and never the client's.
@@ -370,7 +379,7 @@ main =
             case petsStore of
                 Ok pets ->
                     do
-                        conn <- Db.open "sqlite" "sqlite::memory:"
+                        conn <- Db.open Location.memory
                         Db.withTransaction conn
                             (\tx ->
                                 do

@@ -215,17 +215,28 @@ pub(crate) struct IngestToken(String);
 const MINTED_TOKEN_BYTES: usize = 32;
 
 impl IngestToken {
-    /// A fresh token from the OS CSPRNG (`getrandom`). `None` when the entropy
-    /// source is unavailable; the caller refuses rather than run token-less.
-    pub(crate) fn mint() -> Option<Self> {
+    /// A fresh token from the runtime's OS random source.
+    ///
+    /// # Errors
+    ///
+    /// [`EntropyError`](crate::entropy::EntropyError) when the source is
+    /// unavailable; the caller refuses rather than run token-less.
+    pub(crate) fn mint() -> Result<Self, crate::entropy::EntropyError> {
+        Self::mint_with(crate::entropy::fill_entropy)
+    }
+
+    /// A token from the bytes `fill` draws.
+    fn mint_with(
+        fill: impl FnOnce(&mut [u8]) -> Result<(), crate::entropy::EntropyError>,
+    ) -> Result<Self, crate::entropy::EntropyError> {
         let mut buf = [0u8; MINTED_TOKEN_BYTES];
-        getrandom::getrandom(&mut buf).ok()?;
+        fill(&mut buf)?;
         let mut hex = String::with_capacity(MINTED_TOKEN_BYTES * 2);
         for byte in buf {
             hex.push(hex_digit(byte >> 4));
             hex.push(hex_digit(byte & 0x0f));
         }
-        Some(Self(hex))
+        Ok(Self(hex))
     }
 
     /// The operator-configured `IPE_INGEST_TOKEN`; `None` when unset or empty.
@@ -791,10 +802,19 @@ pub fn offer_span(ts_ms: u64, name: &str, dur_us: u64, ok: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     use std::sync::Arc;
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A host without entropy mints no ingest token.
+    #[test]
+    fn mint_refuses_without_entropy() {
+        let refused = IngestToken::mint_with(|_| Err(crate::entropy::EntropyError));
+        assert!(refused.is_err(), "a refused draw mints no token");
+        let minted = IngestToken::mint_with(|_| Ok(()));
+        assert!(minted.is_ok_and(|t| t.expose() == "0".repeat(64)));
+    }
 
     #[test]
     fn offer_without_enable_is_noop() {
@@ -1175,11 +1195,11 @@ mod tests {
     }
 
     /// Printed by the exit-funnel child once its ingest has recorded the final batch.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     const CHILD_RECEIVED: &str = "exit-funnel ingest recorded the final batch";
 
     /// How long the parent waits for the exit-funnel child before it fails the test.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     const CHILD_LIMIT: Duration = Duration::from_secs(30);
 
     /// A `System.exit` flushes the batch the exporter holds before the process ends.
@@ -1191,7 +1211,7 @@ mod tests {
     /// carry the batch to the child's ingest, which prints
     /// [`CHILD_RECEIVED`] before it answers. A child still alive after
     /// [`CHILD_LIMIT`] is killed and fails the test.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[allow(clippy::expect_used)] // test harness: a test binary that cannot re-run itself is an environment issue
     #[test]
     fn system_exit_flushes_the_exporters_before_the_process_ends() {
@@ -1248,7 +1268,7 @@ mod tests {
     /// and calls `System.exit 0` from a task on the runtime's only worker, the
     /// shape an Ipê program's exit takes. Ignored so it runs only as that
     /// test's child.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[allow(clippy::expect_used)] // test setup: a token the OS RNG cannot mint is a test environment issue
     #[ignore = "run as a child process by system_exit_flushes_the_exporters_before_the_process_ends"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1298,7 +1318,7 @@ mod tests {
     /// `want` configured and no dev surface (a Release child under any
     /// posture). Returns its port, its ingest URL and its count of admitted
     /// pushes.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     async fn release_ingest(want: String) -> (u16, String, Arc<AtomicUsize>) {
         use axum::extract::State;
         use axum::response::IntoResponse;
@@ -1335,7 +1355,7 @@ mod tests {
 
     // The console pipeline carries the token `spawn_console` minted, so the
     // child's Release ingest admits its batches.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[tokio::test]
     async fn console_pipeline_pushes_with_the_minted_token() {
         let token = IngestToken::mint().expect("entropy");
@@ -1361,7 +1381,7 @@ mod tests {
 
     // The push carries the token in `x-ipe-ingest-token`, and the Release
     // receiver admits it.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[tokio::test]
     async fn push_with_the_minted_token_is_accepted_by_a_release_ingest() {
         let token = IngestToken::mint().expect("entropy");
@@ -1377,7 +1397,7 @@ mod tests {
 
     // A missing or wrong token is a 401 the exporter surfaces as a log line,
     // never a silent drop; the line carries neither token.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "web")]
     #[tokio::test]
     async fn refused_push_is_logged_without_any_token() {
         let token = IngestToken::mint().expect("entropy");

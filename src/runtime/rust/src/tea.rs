@@ -12,12 +12,15 @@ use super::*;
 use std::future::Future;
 use std::pin::Pin;
 
-/// Ipê `Cmd msg`. Perform carries a boxed thunk producing the message (the
-/// task's success/error type is erased inside; M is concrete).
+/// Ipê `Cmd msg`.
+///
+/// Perform carries the effect's body, which either starts the effect or turns
+/// it into its failure message unstarted (the task's success/error type is
+/// erased inside; M is concrete).
 pub enum IpeCmd<M> {
     None,
     Batch(Vec<IpeCmd<M>>),
-    Perform(PerformThunk<M>),
+    Perform(Box<dyn PerformBody<M>>),
     /// pub/sub broadcast. The thunk receives the publishing session's sid (the
     /// origin), injected by the Web dispatch loop, and returns the subscriber
     /// count. Not generic over the payload type T — T is captured inside the
@@ -27,13 +30,156 @@ pub enum IpeCmd<M> {
 
 crate::stringify::show_row!("Cmd", Internals, [M] IpeCmd<M>, |_| "<Ipe.Cmd>".to_owned());
 
-/// The boxed message-producing thunk inside [`IpeCmd::Perform`]. Same
-/// cfg-split rationale as `IpeTask` (`core.rs`): wasm futures touch the DOM
-/// and are `!Send`; the native bound backs `tokio::spawn`.
+/// The future a started [`PerformBody`] resolves to its message.
+///
+/// Same cfg-split rationale as `IpeTask` (`core.rs`): wasm futures touch the
+/// DOM and are `!Send`; the native bound backs `tokio::spawn`.
 #[cfg(not(target_arch = "wasm32"))]
-pub type PerformThunk<M> = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = M> + Send>> + Send>;
+pub type PerformFuture<M> = Pin<Box<dyn Future<Output = M> + Send>>;
 #[cfg(target_arch = "wasm32")]
-pub type PerformThunk<M> = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = M>>>>;
+pub type PerformFuture<M> = Pin<Box<dyn Future<Output = M>>>;
+
+/// The effect inside [`IpeCmd::Perform`].
+///
+/// A runtime either starts it (`run`) or turns it into its failure message
+/// without starting it (`refuse`); each body is consumed by exactly one.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait PerformBody<M>: Send {
+    /// Start the effect.
+    fn run(self: Box<Self>) -> PerformFuture<M>;
+    /// The Cmd's failure message for `refusal`, without starting the effect.
+    fn refuse(self: Box<Self>, refusal: LimitRefusal) -> M;
+}
+
+/// The effect inside [`IpeCmd::Perform`] (single-threaded browser host).
+///
+/// A runtime either starts it (`run`) or turns it into its failure message
+/// without starting it (`refuse`); each body is consumed by exactly one.
+#[cfg(target_arch = "wasm32")]
+pub trait PerformBody<M> {
+    /// Start the effect.
+    fn run(self: Box<Self>) -> PerformFuture<M>;
+    /// The Cmd's failure message for `refusal`, without starting the effect.
+    fn refuse(self: Box<Self>, refusal: LimitRefusal) -> M;
+}
+
+/// A `Cmd.perform` body: the task and the decoder its result goes through.
+struct TaskPerform<E, A, F> {
+    task: IpeTask<E, A>,
+    to_msg: F,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<E, A, M, F> PerformBody<M> for TaskPerform<E, A, F>
+where
+    E: FromLimitExceeded + Send + 'static,
+    A: Send + 'static,
+    M: Send + 'static,
+    F: FnOnce(IpeResult<E, A>) -> M + Send + 'static,
+{
+    fn run(self: Box<Self>) -> PerformFuture<M> {
+        let Self { task, to_msg } = *self;
+        Box::pin(async move { to_msg(task.await) })
+    }
+
+    fn refuse(self: Box<Self>, refusal: LimitRefusal) -> M {
+        let Self { to_msg, .. } = *self;
+        to_msg(IpeResult::Err(refusal.into_error::<E>()))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<E, A, M, F> PerformBody<M> for TaskPerform<E, A, F>
+where
+    E: FromLimitExceeded + 'static,
+    A: 'static,
+    M: 'static,
+    F: FnOnce(IpeResult<E, A>) -> M + 'static,
+{
+    fn run(self: Box<Self>) -> PerformFuture<M> {
+        let Self { task, to_msg } = *self;
+        Box::pin(async move { to_msg(task.await) })
+    }
+
+    fn refuse(self: Box<Self>, refusal: LimitRefusal) -> M {
+        let Self { to_msg, .. } = *self;
+        to_msg(IpeResult::Err(refusal.into_error::<E>()))
+    }
+}
+
+/// A body whose message goes through `f`, on both the run and the refusal arm.
+struct Mapped<A, F> {
+    inner: Box<dyn PerformBody<A>>,
+    f: F,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<A, M> PerformBody<M> for Mapped<A, std::sync::Arc<dyn Fn(A) -> M + Send + Sync>>
+where
+    A: Send + 'static,
+    M: Send + 'static,
+{
+    fn run(self: Box<Self>) -> PerformFuture<M> {
+        let Self { inner, f } = *self;
+        let fut = inner.run();
+        Box::pin(async move { f(fut.await) })
+    }
+
+    fn refuse(self: Box<Self>, refusal: LimitRefusal) -> M {
+        let Self { inner, f } = *self;
+        f(inner.refuse(refusal))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<A, M> PerformBody<M> for Mapped<A, std::rc::Rc<dyn Fn(A) -> M>>
+where
+    A: 'static,
+    M: 'static,
+{
+    fn run(self: Box<Self>) -> PerformFuture<M> {
+        let Self { inner, f } = *self;
+        let fut = inner.run();
+        Box::pin(async move { f(fut.await) })
+    }
+
+    fn refuse(self: Box<Self>, refusal: LimitRefusal) -> M {
+        let Self { inner, f } = *self;
+        f(inner.refuse(refusal))
+    }
+}
+
+/// A test body: `run` starts `start`, `refuse` yields `refused`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+struct TestPerform<S, M> {
+    start: S,
+    refused: M,
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl<S, M> PerformBody<M> for TestPerform<S, M>
+where
+    S: FnOnce() -> PerformFuture<M> + Send + 'static,
+    M: Send + 'static,
+{
+    fn run(self: Box<Self>) -> PerformFuture<M> {
+        (self.start)()
+    }
+
+    fn refuse(self: Box<Self>, _refusal: LimitRefusal) -> M {
+        self.refused
+    }
+}
+
+/// A test `Perform` whose run arm calls `start` and whose refusal yields `refused`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn perform_for_test<S, M>(start: S, refused: M) -> IpeCmd<M>
+where
+    S: FnOnce() -> PerformFuture<M> + Send + 'static,
+    M: Send + 'static,
+{
+    IpeCmd::Perform(Box::new(TestPerform { start, refused }))
+}
 
 /// The future a subscription source asks the loop to run.
 #[cfg(not(target_arch = "wasm32"))]
@@ -119,45 +265,42 @@ pub fn cmd_batch<M>(list: Vec<IpeCmd<M>>) -> IpeCmd<M> {
 
 /// Cmd.perform : Task err a -> (Result err a -> msg) -> Cmd msg.
 /// Composes the task and the toMsg decoder (which receives the IpeResult) into a
-/// single message-producing thunk fired by the run loop.
+/// single body the run loop starts, or refuses unstarted with an `Err` of kind
+/// `LimitExceeded` through the same decoder.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cmd_perform<E, A, M, F>(task: IpeTask<E, A>, to_msg: F) -> IpeCmd<M>
 where
-    E: Send + 'static,
+    E: FromLimitExceeded + Send + 'static,
     A: Send + 'static,
     M: Send + 'static,
     F: FnOnce(IpeResult<E, A>) -> M + Send + 'static,
 {
-    IpeCmd::Perform(Box::new(move || {
-        Box::pin(async move { to_msg(task.await) })
-    }))
+    IpeCmd::Perform(Box::new(TaskPerform { task, to_msg }))
 }
 
 /// wasm: same composition, minus the `Send` bounds (single-threaded browser
-/// event loop; the thunk is driven by `spawn_local`).
+/// event loop; the started body is driven by `spawn_local`).
 #[cfg(target_arch = "wasm32")]
 pub fn cmd_perform<E, A, M, F>(task: IpeTask<E, A>, to_msg: F) -> IpeCmd<M>
 where
-    E: 'static,
+    E: FromLimitExceeded + 'static,
     A: 'static,
     M: 'static,
     F: FnOnce(IpeResult<E, A>) -> M + 'static,
 {
-    IpeCmd::Perform(Box::new(move || {
-        Box::pin(async move { to_msg(task.await) })
-    }))
+    IpeCmd::Perform(Box::new(TaskPerform { task, to_msg }))
 }
 
 /// Cmd.map : (a -> msg) -> Cmd a -> Cmd msg — retag every message a command
 /// would produce. Rebuilds the command tree, composing `f` over each leaf's
-/// payload: `Perform`'s produced value is fed through `f`; `Batch` maps its
+/// payload: `Perform`'s produced value (started or refused) is fed through `f`; `Batch` maps its
 /// children; `None` passes through. `Publish` carries no `M`-typed payload (its
 /// thunk yields the subscriber count `i64`; `M` is phantom there), so it is
 /// re-tagged by identity — the one leaf where `f` is not applied.
 ///
 /// `f` is shared (`Arc`) because a `Batch` fans it across children and a
-/// `Perform` thunk captures it to run later; the composition stays lazy — no
-/// message is produced until the run loop fires the thunk.
+/// `Perform` body captures it to run later; the composition stays lazy — no
+/// message is produced until the run loop starts or refuses the body.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cmd_map<A, M, F>(cmd: IpeCmd<A>, f: F) -> IpeCmd<M>
 where
@@ -182,12 +325,7 @@ where
                 .map(|c| cmd_map_arc(c, f.clone()))
                 .collect(),
         ),
-        IpeCmd::Perform(thunk) => IpeCmd::Perform(Box::new(move || {
-            Box::pin(async move {
-                let a = thunk().await;
-                f(a)
-            })
-        })),
+        IpeCmd::Perform(inner) => IpeCmd::Perform(Box::new(Mapped { inner, f })),
         IpeCmd::Publish(thunk) => IpeCmd::Publish(thunk),
     }
 }
@@ -219,12 +357,7 @@ where
                 .map(|c| cmd_map_rc(c, f.clone()))
                 .collect(),
         ),
-        IpeCmd::Perform(thunk) => IpeCmd::Perform(Box::new(move || {
-            Box::pin(async move {
-                let a = thunk().await;
-                f(a)
-            })
-        })),
+        IpeCmd::Perform(inner) => IpeCmd::Perform(Box::new(Mapped { inner, f })),
         IpeCmd::Publish(thunk) => IpeCmd::Publish(thunk),
     }
 }
@@ -973,7 +1106,7 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
                 cli_run_cmd_tracked(c, tx, outstanding);
             }
         }
-        IpeCmd::Perform(thunk) => {
+        IpeCmd::Perform(body) => {
             let tx = tx.clone();
             // A tracked Perform is counted as outstanding at spawn and delivers a
             // `PerformDone`; an untracked one (Tui) delivers a plain `Msg`.
@@ -1007,7 +1140,7 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
                         // (below) for the delivered case; the guard covers only the
                         // panic-unwind case where no event reaches the loop.
                         let mut guard = OutstandingGuard(Some(c));
-                        let msg = thunk().await;
+                        let msg = body.run().await;
                         guard.0 = None; // delivered → loop owns the decrement
                         // A send failure means the loop already exited (rx
                         // dropped); the leaked count is then unobservable, so it
@@ -1015,7 +1148,7 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
                         let _ = tx.send(CliEvent::PerformDone(msg));
                     }
                     None => {
-                        let msg = thunk().await;
+                        let msg = body.run().await;
                         let _ = tx.send(CliEvent::Msg(msg));
                     }
                 }
@@ -1398,7 +1531,7 @@ fn worker_run_cmd<M: Send + 'static>(
                 worker_run_cmd(c, tx, outstanding);
             }
         }
-        IpeCmd::Perform(thunk) => {
+        IpeCmd::Perform(body) => {
             let tx = tx.clone();
             let counter = outstanding.clone();
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1415,7 +1548,7 @@ fn worker_run_cmd<M: Send + 'static>(
                     }
                 }
                 let mut guard = OutstandingGuard(Some(counter));
-                let msg = thunk().await;
+                let msg = body.run().await;
                 guard.0 = None; // delivered → loop owns the decrement
                 let _ = tx.send(WorkerEvent::PerformDone(msg));
             });
@@ -1681,25 +1814,90 @@ mod map_tests {
 
     #[test]
     fn cmd_map_perform_retags_produced_msg() {
-        let cmd: IpeCmd<Child> = IpeCmd::Perform(Box::new(|| Box::pin(async { Child::Tick(4) })));
+        let cmd: IpeCmd<Child> =
+            perform_for_test(|| Box::pin(async { Child::Tick(4) }), Child::Tick(0));
         let mapped = cmd_map(cmd, wrap);
+        assert!(
+            matches!(mapped, IpeCmd::Perform(_)),
+            "a mapped Perform stays a Perform"
+        );
+        let IpeCmd::Perform(body) = mapped else {
+            return;
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        let got = rt.block_on(async move {
-            let IpeCmd::Perform(thunk) = mapped else {
-                panic!("expected Perform");
-            };
-            thunk().await
-        });
+        let got = rt.block_on(body.run());
         assert_eq!(got, Parent::FromChild(Child::Tick(4)));
+    }
+
+    /// The decoder a `Cmd.perform` test body feeds its task's result through.
+    fn decode(result: IpeResult<IpeError, i64>) -> Child {
+        match result {
+            IpeResult::Ok(n) => Child::Tick(n),
+            IpeResult::Err(e) => Child::Line(format!(
+                "{}: {}",
+                ipe_error_kind_name(ipe_error_kind(e.clone())),
+                ipe_error_message(e)
+            )),
+        }
+    }
+
+    /// `Cmd.map f` over a refused `Cmd.perform` yields `f` of the refusal's
+    /// `LimitExceeded` message and never starts the task; the control run
+    /// of the same shape starts it.
+    #[test]
+    fn cmd_map_maps_refusal() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_of =
+            |flag: std::sync::Arc<std::sync::atomic::AtomicBool>| -> IpeTask<IpeError, i64> {
+                Box::pin(async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    IpeResult::Ok(7)
+                })
+            };
+        let mapped = cmd_map(cmd_perform(task_of(started.clone()), decode), wrap);
+        assert!(
+            matches!(mapped, IpeCmd::Perform(_)),
+            "a mapped Perform stays a Perform"
+        );
+        let IpeCmd::Perform(body) = mapped else {
+            return;
+        };
+        let refused = body.refuse(LimitRefusal::new("over 1 command"));
+        assert_eq!(
+            refused,
+            Parent::FromChild(Child::Line("LimitExceeded: over 1 command".to_owned()))
+        );
+        assert!(
+            !started.load(std::sync::atomic::Ordering::SeqCst),
+            "a refused body never starts its task"
+        );
+
+        let control = cmd_map(cmd_perform(task_of(started.clone()), decode), wrap);
+        assert!(
+            matches!(control, IpeCmd::Perform(_)),
+            "a mapped Perform stays a Perform"
+        );
+        let IpeCmd::Perform(body) = control else {
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(rt.block_on(body.run()), Parent::FromChild(Child::Tick(7)));
+        assert!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            "a started body runs its task"
+        );
     }
 
     #[test]
     fn cmd_map_batch_and_none_recurse() {
         let cmd: IpeCmd<Child> = cmd_batch(vec![
-            IpeCmd::Perform(Box::new(|| Box::pin(async { Child::Tick(2) }))),
+            perform_for_test(|| Box::pin(async { Child::Tick(2) }), Child::Tick(0)),
             cmd_none(),
         ]);
         let mapped = cmd_map(cmd, wrap);
@@ -2081,13 +2279,7 @@ mod bounded_input_tests {
 
 // A subscription source runs inside the scopes of the loop that starts it: a
 // tracked body only while requested, a detached body past every re-evaluation.
-#[cfg(all(
-    test,
-    feature = "web-core",
-    feature = "server",
-    feature = "jwt",
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(test, feature = "web", feature = "jwt", not(target_arch = "wasm32")))]
 mod source_scope_tests {
     use super::*;
     use crate::revocation::SessionBindings;

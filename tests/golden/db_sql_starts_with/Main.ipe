@@ -1,8 +1,10 @@
 module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Unsafe
 import Ipe.Db.Sql
+import Ipe.Dict
 import Ipe.Error as Error
 import Ipe.List
 import Ipe.String
@@ -43,7 +45,7 @@ report conn label frag =
                 Io.println
                     (label
                         ++ ": "
-                        ++ String.join "," (List.map (\r -> Unsafe.unsafeGetString "name" r) found)
+                        ++ String.join "," (List.map (\r -> cellText "name" r) found)
                     )
             )
         |> Task.onError (\e -> Io.println (label ++ ": " ++ Error.toString e))
@@ -95,4 +97,19 @@ main =
                         |> Task.andThen (\_ -> Task.succeed ())
                 )
         )
-        (Db.open "sqlite" "sqlite::memory:")
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""

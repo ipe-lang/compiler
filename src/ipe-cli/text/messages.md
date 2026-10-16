@@ -272,6 +272,10 @@ package.ipe: missing a `name = "…"` field — a package must be named
 
 package.ipe: the source root directory does not exist
 
+## package-manifest-source-root-removed
+
+package.ipe: `sourceRoot` is not a package field. For security reasons, source files must live in `src/`. Move your `*.ipe` sources there (`package.ipe` stays at the project root).
+
 ## package-manifest-no-package-binding
 
 package.ipe: no top-level `package = …` binding found
@@ -793,6 +797,38 @@ output directory refused: {refusal}
 
 module-discovery walk aborted: {detail}
 
+## project-no-manifest
+
+error[IPE-E0004]: no package.ipe at {dir}; run `ipe init` there
+
+## project-no-src-dir
+
+error[IPE-E0005]: {root} has no `src/` directory (a symbolic link named `src` counts as none); create `src/` beside package.ipe and keep the modules in it
+
+## project-entry-missing
+
+error[IPE-E0006]: package.ipe declares the program entry {entry}, but `src/` holds no such file; create it, or fix the entry (it is spelled relative to `src/`)
+
+## project-no-default-entry
+
+error[IPE-E0007]: {root} names no entry module; create `src/Main.ipe`, or declare an entry in package.ipe: `programs = [ { name = "app", entry = "App.ipe" } ]`
+
+## project-entry-escapes
+
+error[IPE-E0008]: package.ipe program entry {entry} passes through the symbolic link {path}; ipe never follows a link inside a project, so replace it with the real file or directory
+
+## project-exposed-module-missing
+
+error[IPE-E0009]: package.ipe exposes the module {module}, but `src/` holds no file for it; create it, or remove it from `exposedModules`
+
+## project-symlink-in-source
+
+error[IPE-E0010]: {path} is a symbolic link; ipe never follows a link inside a project, so replace it with the real file or directory
+
+## project-file-outside-root
+
+error[IPE-E0011]: {arg} names no module of this project: a file argument must lie under `src/` or `tests/` of the current directory, or be its package.ipe; cd into {root} and run ipe there
+
 ## cli-device-named-module
 
 {path}: module segment `{segment}` is a reserved Windows device name, so this file cannot be the same module on every platform — rename it
@@ -1116,7 +1152,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-inside-vcs
 
-{out} is inside a `.git` directory — build output must stay out of version-control metadata; choose another --out
+{out} is inside a `{dir}` directory — build output must stay out of version-control metadata; choose another --out
 
 ## output-inside-cache-namespace
 
@@ -1385,11 +1421,11 @@ package.ipe: program entry {entry} does not end in `.ipe`. An entry names an Ip�
 
 ## manifest-entry-segment-invalid
 
-package.ipe: program entry {entry} has a path segment {segment} that is not a valid module name (segments must match [A-Z][A-Za-z0-9_]*)
+package.ipe: program entry {entry} has a path segment {segment} that is not a valid module name (segments must match [A-Z][A-Za-z0-9_]*). Name each directory and the file after the module it holds, e.g. `Cli/Main.ipe`.
 
 ## manifest-entry-no-module
 
-package.ipe: program entry {entry} names no module
+package.ipe: program entry {entry} names no module. An entry names a module file under `src/`, e.g. `Cli/Main.ipe`.
 
 ## manifest-base-path-too-long
 

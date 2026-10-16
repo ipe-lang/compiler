@@ -5,6 +5,7 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
+import Ipe.Db.Location exposing (Mode(..))
 import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
@@ -28,12 +29,12 @@ import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), S
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, refusedWith, logVerdictOf, insertUnboundUnit)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -557,7 +558,7 @@ deletedQueueRowLeavesUnitOpenIn base =
         Task.fromResult (Path.fromString (repo ++ "/src")) |> Task.andThen File.mkdirAll
         writeFileText (repo ++ "/src/Main.ipe") fixtureMainIpe
         seedManyUnits indexDb 3
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+        conn <- openFileAt CreateIfMissing indexDb
         Db.exec conn "UPDATE change_queue SET change = 'deleted' WHERE uid = ?" [ Uid.toSql (uid "u-page-2") ]
         setIndexEnv indexDb repo
         r <- loadFirstPage
@@ -599,7 +600,8 @@ dbSizeAndMissingDbIn base =
         setIndexEnv indexDb repo
         System.setenv "IPE_REVIEW_DB" reviewDb
         migratedReviewAt reviewDb
-        bytes <- indexConn |> Task.andThen (\conn -> Index.readSnapshot ReadOnly conn Index.Start) |> Task.map (\snap -> snap.bytes)
+        settings <- envSettings
+        bytes <- Index.readConnection settings |> Task.andThen (\conn -> Index.readSnapshot ReadOnly settings.roots conn Index.Start) |> Task.map (\snap -> snap.bytes)
         setIndexEnv (base ++ "/missing.db") repo
         result <- loadPageNow Index.Start
             |> Task.map Ok
@@ -641,7 +643,7 @@ removePageFixture indexDb reviewDb repo =
 -- the `uid` tiebreak orders them.
 seedManyUnits : String -> Int -> Task.Task Error ()
 seedManyUnits indexDb n =
-    Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=rwc")
+    openFileAt CreateIfMissing indexDb
         |> Task.andThen
             (\conn ->
                 System.cwd ()
@@ -768,7 +770,7 @@ drainKeepsRequeuedChange =
 queueRows : String -> String -> String -> Task.Task Error Int
 queueRows indexDb label hash =
     do
-        conn <- Db.open "sqlite" ("sqlite://" ++ indexDb ++ "?mode=ro")
+        conn <- openFileAt ReadExisting indexDb
         rows <- Db.findWhere conn
             "change_queue"
             (Sql.and
@@ -797,6 +799,7 @@ unitPageStatesDistinct =
             , TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 })
             , TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
             , TooLarge (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
+            , TooLarge (ViewNodes { nodes = Index.viewNodeCeiling + 1 })
             ]
 
         sourceTexts =
@@ -1026,7 +1029,7 @@ queueStateTextsDistinct =
             Error.unexpected "boom"
 
         empty =
-            { units = [], total = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven }
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0, refusalsUnbound = 0 }
 
         drained =
             { empty | total = 41000 }
@@ -1064,7 +1067,115 @@ sampleQueuedUnit =
     }
     , change = Index.New
     , changed = Nothing
+    , standing = Queue.Undecided
     }
+
+
+-- ── queue labels ────────────────────────────────────────────────────────
+--
+-- Units that share a kind and name: three at different places, two at the
+-- same path and first line, one name under two kinds, and two whose kind and
+-- name would run together without length prefixes.
+labelled : String -> String -> String -> String -> Int -> Queue.QueuedUnit
+labelled id kind qualified path line =
+    let
+        base =
+            sampleQueuedUnit.unit
+    in
+    { sampleQueuedUnit
+        | unit = { base
+            | uid = uid id
+            , kind = SafeText.renderForeign kind
+            , qualified = SafeText.renderForeign qualified
+            , path = SafeText.renderForeign path
+            , lineStart = line
+        }
+    }
+
+
+labelFixture : List Queue.QueuedUnit
+labelFixture =
+    [ labelled "u-file-a" "const" "crate::FILE" "ipe:src/a.rs" 1
+    , labelled "u-file-b" "const" "crate::FILE" "ipe:src/b.rs" 1
+    , labelled "u-file-b9" "const" "crate::FILE" "ipe:src/b.rs" 9
+    , labelled "u-regex-1" "struct" "crate::StaticRegex" "ipe:src/r.rs" 3
+    , labelled "u-regex-2" "struct" "crate::StaticRegex" "ipe:src/r.rs" 3
+    , labelled "u-tests-mod" "mod" "crate::tests" "ipe:src/a.rs" 20
+    , labelled "u-tests-fn" "fn" "crate::tests" "ipe:src/a.rs" 20
+    , labelled "u-split-1" "ab" "c" "ipe:src/s.rs" 1
+    , labelled "u-split-2" "a" "bc" "ipe:src/s.rs" 1
+    , labelled "u-main" "fn" "crate::main" "ipe:src/main.rs" 1
+    ]
+
+
+placeOf : String -> List ( Queue.QueuedUnit, Queue.UnitLabel ) -> Maybe Queue.Place
+placeOf id labels =
+    Maybe.map (\( _, label ) -> label.place) (List.head (List.filter (\( q, _ ) -> q.unit.uid == uid id) labels))
+
+
+-- No two labels of the page are equal, every label carries its unit's kind,
+-- and each unit gets only as much location as its collisions need.
+-- A row naming the current body that fails to verify keeps its reason; only
+-- the absence of any row is undecided.
+standingNotCounted : Bool
+standingNotCounted =
+    let
+        row why =
+            Just (Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
+    in
+    Queue.standingOf (row Tampered)
+        == Queue.NotCounted Tampered
+        && Queue.standingOf (row ChainBroken)
+        == Queue.NotCounted ChainBroken
+        && Queue.standingOf (row NoKey)
+        == Queue.NotCounted NoKey
+        && Queue.standingOf (row Legacy)
+        == Queue.NotCounted Legacy
+        && Queue.standingOf Nothing
+        == Queue.Undecided
+        && Queue.standingOf (row Tampered)
+        /= Queue.Undecided
+
+
+queueLabelsDistinct : Bool
+queueLabelsDistinct =
+    let
+        labels =
+            Queue.queueLabels labelFixture
+
+        only =
+            List.map (\( _, label ) -> label) labels
+
+        distinct =
+            List.all identity (List.indexedMap (\i a -> List.all identity (List.indexedMap (\j b -> i == j || a /= b) only)) only)
+
+        rs =
+            SafeText.renderForeign "ipe:src/r.rs"
+    in
+    List.length labels
+        == List.length labelFixture
+        && distinct
+        && List.all (\( q, label ) -> label.kind == q.unit.kind && label.name == q.unit.qualified) labels
+        && placeOf "u-file-a" labels
+        == Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1)
+        && placeOf "u-file-b9" labels
+        == Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9)
+        && placeOf "u-regex-1" labels
+        == Just (Queue.AtUnit rs 3 (uid "u-regex-1"))
+        && placeOf "u-regex-2" labels
+        == Just (Queue.AtUnit rs 3 (uid "u-regex-2"))
+        && placeOf "u-tests-mod" labels
+        == Just Queue.Named
+        && placeOf "u-tests-fn" labels
+        == Just Queue.Named
+        && placeOf "u-split-1" labels
+        == Just Queue.Named
+        && placeOf "u-split-2" labels
+        == Just Queue.Named
+        && placeOf "u-main" labels
+        == Just Queue.Named
+        && Queue.queueLabels []
+        == []
 
 
 -- ── review progress from the databases ──────────────────────────────────
@@ -1390,7 +1501,7 @@ refillDrainsOnlyReviewPairs =
             |> Task.sequence
         mirrorPair at.indexDb "foreign" "hf"
         copied <- resyncReviewedNow db
-        conn <- Db.open "sqlite" ("sqlite://" ++ at.indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting at.indexDb
         mirrored <- Db.queryDecode conn "SELECT uid, body_hash FROM reviewed ORDER BY uid, body_hash" [] pairDecoder
         cleanupProgressScratch at
         Task.succeed (copied == List.length pairs && mirrored == List.map (\( label, hash ) -> ( Uid.toString (uid label), hash )) pairs)
@@ -1453,7 +1564,7 @@ decisionHoldsWriteLockBeforeRead =
         seedProgressScratch at
         loc <- envReview
         holder <- LibDb.openAt loc
-        other <- Db.open "sqlite" ("sqlite://" ++ at.reviewDb ++ "?mode=rw")
+        other <- openFileAt WriteExisting at.reviewDb
         busy <- LibDb.writeTransaction holder (\_ -> writeFailsBusy other)
         free <- writeFailsBusy other
         cleanupProgressScratch at
@@ -1504,7 +1615,7 @@ reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
 reviewWritesGoThroughWriteTransaction =
     let
         others =
-            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
     in
     do
         cwd <- System.cwd ()
@@ -1870,7 +1981,7 @@ resyncStopsAtCeiling =
             |> Task.map (\_ -> Nothing)
             |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         kept <- mirroredCount at.indexDb
-        conn <- Db.open "sqlite" ("sqlite://" ++ at.indexDb ++ "?mode=rw")
+        conn <- openFileAt WriteExisting at.indexDb
         preRows <- Db.findWhere conn "reviewed" (Sql.eq (Sql.column "uid") (Sql.param (Uid.toSql (uid "pre"))))
         copied <- resyncWithin (PageSize.toInt PageSize.pairs) 2 db
         rebuilt <- mirroredCount at.indexDb
@@ -2415,6 +2526,422 @@ readOnlyRecordsAndCountsNothing =
             )
 
 
+-- Units under a tag no root binds are said in the header and the empty
+-- states, counted once, and absent when there are none. Red if they are
+-- dropped silently or said when there are none.
+unboundNoticeTexts : Bool
+unboundNoticeTexts =
+    let
+        empty =
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0, refusalsUnbound = 0 }
+
+        one =
+            { empty | unbound = 1 }
+
+        many =
+            { empty | unbound = 3, total = 41000, units = [ sampleQueuedUnit ] }
+
+        drained =
+            { many | units = [] }
+    in
+    List.all identity
+        [ Queue.pageHeaderText empty == "index.db · 4.0 KB · showing 0 of 0"
+        , Queue.queueStatusText (Loaded empty) == Just "No units queued."
+        , Queue.pageHeaderText one == "index.db · 4.0 KB · showing 0 of 0 · 1 unit in unbound repositories not shown"
+        , Queue.queueStatusText (Loaded one) == Just "No units queued. · 1 unit in unbound repositories not shown"
+        , Queue.pageHeaderText many == "index.db · 4.0 KB · showing 1 of 41000 · 3 units in unbound repositories not shown"
+        , Queue.queueStatusText (Loaded drained) == Just "No units to review on this page. · 3 units in unbound repositories not shown"
+        ]
+
+
+-- A unit under an unbound tag leaves the page, its total and its progress
+-- as they were, and is counted in the page's `unbound`, so the progress the
+-- reviewer sees can still reach its total. Red if the unbound unit is
+-- queued, or counted toward the progress total no decision can reach.
+unboundUnitLeavesProgress : Task.Task Error Bool
+unboundUnitLeavesProgress =
+    do
+        at <- freshScratch "ipe-queue-unbound-progress"
+        seedProgressScratch at
+        before <- loadPageNow Index.Start
+        insertUnboundUnit at.indexDb
+        after <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (before.unbound
+                == 0
+                && after.unbound
+                == 1
+                && after.total
+                == before.total
+                && List.length after.units
+                == List.length before.units
+                && after.progress.total
+                == before.progress.total
+                && after.progress.reviewed
+                == before.progress.reviewed
+                && consistentPage after
+                && String.endsWith " · 1 unit in unbound repositories not shown" (Queue.pageHeaderText after)
+            )
+
+
+-- A failed save's case comes from the database failure its error carries,
+-- never from its text: a busy review database is `SaveContended`; every
+-- other failure, an error whose text names a busy database and the
+-- moved-head conflict included, is `SaveFailed`. Each case renders its own
+-- text, none holding a driver code. Red if a case is read from the message
+-- or a busy database is not told apart.
+saveFailureTyped : Bool
+saveFailureTyped =
+    let
+        lockedText =
+            "database is locked [5]"
+
+        cases =
+            [ SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+
+        texts =
+            List.map Queue.saveFailureText cases
+    in
+    Queue.saveFailureOf (Error.withDetails (Database Db.Busy) (Error.unexpected lockedText))
+        == SaveContended
+        && Queue.saveFailureOf (Error.withDetails (Database Db.OtherFailure) (Error.unexpected lockedText))
+        == SaveFailed
+        && Queue.saveFailureOf (Error.unexpected lockedText)
+        == SaveFailed
+        && Queue.saveFailureOf (Error.withDetails (Custom "Busy") (Error.unavailable "busy"))
+        == SaveFailed
+        && Queue.saveFailureOf (Error.withDetails (Database Db.UniqueViolation) (Error.conflict lockedText))
+        == SaveFailed
+        && Queue.saveFailureOf LibDb.headMoved
+        == SaveFailed
+        && Set.size (Set.fromList texts)
+        == List.length cases
+        && List.all (\text -> not (String.contains "[5]" text) && not (String.contains "Unexpected" text)) texts
+
+
+-- ── unreviewable files ──────────────────────────────────────────────────
+--
+-- A file the index could not review is an open item of the queue until a
+-- decision binds its refusal digest; a decision is written only after the
+-- refusal row and the file are re-proved.
+
+
+-- One refusal row for fixture id `label` at the stored `path`, inserted
+-- under the real schema's CHECKs.
+insertRefusal : String -> String -> String -> String -> SqlValue -> SqlValue -> Task.Task Error ()
+insertRefusal indexDb label path reason size digest =
+    execIndex indexDb
+        "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', ?, ?, ?)"
+        [ Uid.toSql (uid label), SqlString path, SqlString reason, size, digest ]
+
+
+-- A well-formed refusal digest whose 64 hex digits all read `digit`.
+refusalDigestOf : String -> SqlValue
+refusalDigestOf digit =
+    SqlString ("refusal-blake3:" ++ String.repeat 64 digit)
+
+
+-- The digest the first queue page shows for refusal `label`.
+shownRefusalDigest : String -> Task.Task Error Index.RefusalDigest
+shownRefusalDigest label =
+    loadPageNow Index.Start
+        |> Task.andThen
+            (\page ->
+                case Maybe.andThen (\row -> row.digest) (List.find (\row -> row.uid == uid label) page.refusals) of
+                    Just digest ->
+                        Task.succeed digest
+
+                    Nothing ->
+                        Task.fail (Error.conflict ("refusal " ++ label ++ " is not shown with a digest"))
+            )
+
+
+-- Refusal `label` acknowledged under the test key, bound to `digest`.
+decideRefusalNow : Db -> String -> Index.RefusalDigest -> Task.Task Error ( Index.Attested, Index.Written )
+decideRefusalNow db label digest =
+    envAppSettings |> Task.andThen (\settings -> Queue.decideRefusal settings.key settings.index db (uid label) digest Approved)
+
+
+-- Every unit decided and drained, one acknowledgeable file still open: the
+-- queue does not read as empty, the file is counted in the progress total
+-- and named in the header. Red if the page's counts or its empty state leave
+-- out the index's refusals.
+openRefusalBlocksAllReviewed : Task.Task Error Bool
+openRefusalBlocksAllReviewed =
+    do
+        at <- freshScratch "ipe-index-refusal-open"
+        db <- seedProgressScratch at
+        insertRefusal at.indexDb "r-bin" "ipe:src/blob.bin" "not-utf8" (SqlInt 4) (refusalDigestOf "a")
+        decidedA <- decideNow db (uid "u-a") Approved
+        afterA <- case decidedA of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        decidedB <- decideNow db (uid "u-b") Approved
+        page <- case decidedB of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (afterA.total
+                == 1
+                && page.total
+                == 0
+                && page.refusalsOpen
+                == 1
+                && List.map (\row -> row.uid) page.refusals
+                == [ uid "r-bin" ]
+                && page.progress.total
+                == page.progress.reviewed
+                + 1
+                && Queue.queueStatusText (Loaded page)
+                == Just "No units queued, but 1 unreviewable file still open."
+                && String.contains "· 1 unreviewable file open" (Queue.pageHeaderText page)
+            )
+
+
+-- An acknowledged file leaves the open set and counts as reviewed; a new
+-- refusal digest for it (the file changed) re-opens it. Red if a decision
+-- does not bind the digest, or if membership matches the uid alone.
+acknowledgedRefusalReopensOnNewDigest : Task.Task Error Bool
+acknowledgedRefusalReopensOnNewDigest =
+    do
+        at <- freshScratch "ipe-index-refusal-ack"
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        before <- loadPageNow Index.Start
+        digest <- shownRefusalDigest "r-big"
+        decided <- decideRefusalNow db "r-big" digest
+        acked <- case decided of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        execIndex at.indexDb "UPDATE refusals SET digest = ? WHERE uid = ?" [ refusalDigestOf "b", Uid.toSql (uid "r-big") ]
+        reopened <- loadPageNow Index.Start
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed
+            (before.refusalsOpen
+                == 1
+                && acked.refusalsOpen
+                == 0
+                && List.isEmpty acked.refusals
+                && acked.progress.reviewed
+                == before.progress.reviewed
+                + 1
+                && acked.progress.total
+                == before.progress.total
+                && reopened.refusalsOpen
+                == 1
+                && rows
+                == 1
+            )
+
+
+-- A refusal decision is refused, and nothing is logged, when between the
+-- page and the decision the row turns blocking, takes another digest, or
+-- leaves the index, or when the file now reads as text; and on a server
+-- with no key. Red if any re-proof is skipped.
+refusalDecisionRefusedOnChange : Task.Task Error Bool
+refusalDecisionRefusedOnChange =
+    do
+        blocking <- refusalDecisionAfter "ipe-index-refusal-blocking" "UPDATE refusals SET reason = 'unreadable', size = NULL, digest = NULL" (Error.conflict "this file cannot be acknowledged; fix it in the tree")
+        changed <- refusalDecisionAfter "ipe-index-refusal-changed" "UPDATE refusals SET digest = 'refusal-blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'" (Error.conflict "source changed since it was shown; reload")
+        gone <- refusalDecisionAfter "ipe-index-refusal-gone" "DELETE FROM refusals" (Error.conflict "file is no longer unreviewable in the index; reload")
+        readable <- refusalDecisionAfter "ipe-index-refusal-readable" "UPDATE refusals SET reason = 'not-utf8'" (Error.conflict "file now reads as text; re-run the index")
+        shrunk <- refusalDecisionAfter "ipe-index-refusal-shrunk" "UPDATE refusals SET size = 11" (Error.conflict "file now reads as text; re-run the index")
+        readOnly <- refusalReadOnlyRefused
+        Task.succeed (blocking && changed && gone && readable && shrunk && readOnly)
+
+
+-- True when refusal `r-big`, an oversized text file shown with its digest,
+-- is refused with exactly `expected` after `sql` ran on the index, and no
+-- log row was written.
+refusalDecisionAfter : String -> String -> Error -> Task.Task Error Bool
+refusalDecisionAfter name sql expected =
+    do
+        at <- freshScratch name
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        digest <- shownRefusalDigest "r-big"
+        execIndex at.indexDb sql []
+        refused <- refusedWith expected (decideRefusalNow db "r-big" digest)
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0)
+
+
+-- A server with no key acknowledges nothing: the decision is refused with
+-- the read-only error before the index or the file is read.
+refusalReadOnlyRefused : Task.Task Error Bool
+refusalReadOnlyRefused =
+    do
+        at <- freshScratch "ipe-index-refusal-read-only"
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        digest <- shownRefusalDigest "r-big"
+        settings <- envAppSettings
+        refused <- refusedWith ReviewKey.readOnlyError (Queue.decideRefusal ReadOnly settings.index db (uid "r-big") digest Approved)
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0)
+
+
+-- A refusal under a tag no root binds is neither listed nor open, and the
+-- header says it is there. Red if the page drops it without a word.
+unboundRefusalNoticed : Task.Task Error Bool
+unboundRefusalNoticed =
+    do
+        at <- freshScratch "ipe-index-refusal-unbound"
+        _ <- seedProgressScratch at
+        insertRefusal at.indexDb "r-far" "zzz:src/blob.bin" "not-utf8" (SqlInt 4) (refusalDigestOf "a")
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (page.refusalsOpen
+                == 0
+                && List.isEmpty page.refusals
+                && page.refusalsUnbound
+                == 1
+                && String.contains "· 1 unreviewable file in unbound repositories not shown" (Queue.pageHeaderText page)
+            )
+
+
+-- A page's worth of blocking refusals sorting before an acknowledgeable one
+-- leaves the acknowledgeable one listed, all of them counted. Red if the
+-- page orders by path alone.
+acknowledgeableRefusalListedFirst : Task.Task Error Bool
+acknowledgeableRefusalListedFirst =
+    do
+        at <- freshScratch "ipe-index-refusal-order"
+        _ <- seedProgressScratch at
+        execIndex at.indexDb
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) INSERT INTO refusals (uid, path, lang, reason, size, digest) SELECT printf('%064d', i), printf('ipe:a/%03d', i), 'other', 'unreadable', NULL, NULL FROM n"
+            []
+        insertRefusal at.indexDb "r-z" "ipe:z/blob.bin" "not-utf8" (SqlInt 4) (refusalDigestOf "a")
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (page.refusalsOpen
+                == 201
+                && List.length page.refusals
+                == 200
+                && List.map (\row -> row.uid) (List.take 1 page.refusals)
+                == [ uid "r-z" ]
+            )
+
+
+-- The index's escape of a name parses back to exactly that name, and text
+-- it never writes parses to nothing: a raw character it escapes, an escape
+-- of a character it writes bare or of a leading zero, a byte of a name that
+-- is not UTF-8, a code point that is no character, an escape left open.
+-- Red if a form the index never writes resolves to a file.
+shownEscapeParsedExactly : Bool
+shownEscapeParsedExactly =
+    let
+        e =
+            String.fromList [ Char.fromCode 233 ]
+
+        backslash =
+            String.fromList [ Char.fromCode 92 ]
+
+        accepted =
+            [ ( "ipe:src/a b.rs", "ipe:src/a b.rs" )
+            , ( "ipe:src/" ++ backslash ++ "u{e9}.txt", "ipe:src/" ++ e ++ ".txt" )
+            , ( "ipe:src/" ++ backslash ++ backslash ++ "x", "ipe:src/" ++ backslash ++ "x" )
+            , ( backslash ++ "u{9}", String.fromList [ Char.fromCode 9 ] )
+            , ( backslash ++ "u{10ffff}", String.fromList [ Char.fromCode 1114111 ] )
+            ]
+
+        refused =
+            [ "ipe:src/" ++ e ++ ".txt"
+            , backslash ++ "u{41}"
+            , backslash ++ "u{20}"
+            , backslash ++ "u{5c}"
+            , backslash ++ "u{0e9}"
+            , backslash ++ "u{E9}"
+            , backslash ++ "u{}"
+            , backslash ++ "u{d800}"
+            , backslash ++ "u{110000}"
+            , backslash ++ "u{1000000}"
+            , backslash ++ "x{ff}"
+            , backslash ++ "u{e9"
+            , backslash ++ "ue9"
+            , "a" ++ backslash
+            , backslash ++ "n"
+            ]
+    in
+    List.all (\( stored, name ) -> Index.unescapeShown stored == Just name) accepted
+        && List.all (\stored -> Index.unescapeShown stored == Nothing) refused
+
+
+-- An oversized file whose name the index escapes is acknowledged at that
+-- name; the escape of a name it does not hold is refused. Red if the
+-- re-probe joins the stored form instead of the name it escapes.
+escapedRefusalAcknowledged : Task.Task Error Bool
+escapedRefusalAcknowledged =
+    do
+        at <- freshScratch "ipe-index-refusal-escaped"
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/" ++ String.fromList [ Char.fromCode 233 ] ++ ".txt") "0123456789"
+        writeFileText (at.repo ++ "/src/A.txt") "0123456789"
+        insertRefusal at.indexDb "r-e" "ipe:src/\\u{e9}.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        insertRefusal at.indexDb "r-a" "ipe:src/\\u{41}.txt" "too-large" (SqlInt 10) (refusalDigestOf "b")
+        digestE <- shownRefusalDigest "r-e"
+        digestA <- shownRefusalDigest "r-a"
+        decided <- decideRefusalNow db "r-e" digestE
+        acked <- case decided of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        refused <- refusedWith (Error.conflict "this file could not be re-probed, so it cannot be decided") (decideRefusalNow db "r-a" digestA)
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (acked.refusalsOpen == 1 && refused && rows == 1)
+
+
+-- Refusals under bound tags the index escapes, `é` (stored `\u{e9}`) and
+-- `x` + backslash + U+1D54F (stored `x\\\u{1d54f}`), are listed and
+-- counted as bound, and the first is acknowledged at its name under its
+-- tag's root. Red if refusal rows are judged bound by the raw tag: both
+-- files are then counted unbound, never listed, and no decision binds them.
+escapedTagRefusalBound : Task.Task Error Bool
+escapedTagRefusalBound =
+    do
+        at <- freshScratch "ipe-index-refusal-escaped-tag"
+        db <- seedProgressScratch at
+        first <- freshDir "ipe-index-refusal-escaped-tag-first"
+        second <- freshDir "ipe-index-refusal-escaped-tag-second"
+        writeFileText (first ++ "/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-t" "\\u{e9}:big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        insertRefusal at.indexDb "r-s" "x\\\\\\u{1d54f}:big.txt" "too-large" (SqlInt 10) (refusalDigestOf "b")
+        System.setenv "IPE_INDEX_REPOS" (String.fromList [ Char.fromCode 233 ] ++ "=" ++ first ++ "," ++ String.fromList [ 'x', Char.fromCode 92, Char.fromCode 120143 ] ++ "=" ++ second)
+        outcome <- escapedTagAcknowledged db
+            |> Task.onError (\e -> System.unsetenv "IPE_INDEX_REPOS" |> Task.andThen (\_ -> Task.fail e))
+        System.unsetenv "IPE_INDEX_REPOS"
+        cleanupProgressScratch at
+        Task.succeed outcome
+
+
+escapedTagAcknowledged : Db -> Task.Task Error Bool
+escapedTagAcknowledged db =
+    do
+        before <- loadPageNow Index.Start
+        digest <- shownRefusalDigest "r-t"
+        decided <- decideRefusalNow db "r-t" digest
+        acked <- case decided of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        Task.succeed
+            (before.refusalsOpen
+                == 2
+                && before.refusalsUnbound
+                == 0
+                && List.map (\row -> row.uid) acked.refusals
+                == [ uid "r-s" ]
+            )
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2425,6 +2952,8 @@ checks =
             , check "a refill drains only pairs read from the review table" refillDrainsOnlyReviewPairs
             , check "re-queued change survives the drain" drainKeepsRequeuedChange
             , check "unit page states are distinct" unitPageStatesDistinct
+            , Task.succeed ( "no two queue labels on a page are equal, each kind-qualified", queueLabelsDistinct )
+            , Task.succeed ( "a row for the current body that does not verify stands as not counted, never as undecided", standingNotCounted )
             , Task.succeed ( "a byte past the ceiling reads as the next whole KiB", byteCeilingTextRoundsUp )
             , check "queue pages bound to pageSize and cover the queue once" pagesCoverQueueOnce
             , check "a deleted queue row leaves its standing unit open, unrecorded" deletedQueueRowLeavesUnitOpen
@@ -2443,6 +2972,9 @@ checks =
             , Task.succeed ( "a source read's outdated response is dropped", outdatedResponseDropped epoch )
             , Task.succeed ( "a source read that predates a page reload never settles the view", outdatedReadNeverSettles epoch )
             , Task.succeed ( "queue state texts distinguish loading/empty/failed/loaded", queueStateTextsDistinct )
+            , Task.succeed ( "a failed save's case comes from its database failure, never its text", saveFailureTyped )
+            , Task.succeed ( "units under an unbound tag are said in the header and empty states", unboundNoticeTexts )
+            , check "an unbound unit leaves the page, its total and its progress as they were" unboundUnitLeavesProgress
             ]
         rest <- Task.sequence
             [ check "open units match whole decided pairs" openUnitsMatchWholePairs
@@ -2483,6 +3015,14 @@ checks =
             , check "a progress rebuild succeeds over 6,000 one-pair pages" resyncSucceedsAtSixThousandPages
             , check "a progress rebuild refuses one pair past a 6,000-page ceiling" resyncRefusesSixThousandAndOnePages
             , check "a progress rebuild succeeds at exactly ceiling times page size" resyncSucceedsAtExactCeilingTimesPageSize
+            , check "an open unreviewable file keeps the queue from reading as all reviewed" openRefusalBlocksAllReviewed
+            , check "an acknowledged file leaves the open set and a new digest re-opens it" acknowledgedRefusalReopensOnNewDigest
+            , check "a refusal decision on a changed row or file, or without a key, is refused" refusalDecisionRefusedOnChange
+            , check "a refusal under an unbound tag is said in the header, never open" unboundRefusalNoticed
+            , check "a page of blocking refusals keeps an acknowledgeable one listed" acknowledgeableRefusalListedFirst
+            , Task.succeed ( "the index's path escape parses back exactly, and nothing else parses", shownEscapeParsedExactly )
+            , check "a file at an escaped name is acknowledged at the name it escapes" escapedRefusalAcknowledged
+            , check "a refusal under an escaped bound tag is listed and acknowledged" escapedTagRefusalBound
             , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
             ]
         Task.succeed (first ++ rest)

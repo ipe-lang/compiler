@@ -378,7 +378,7 @@ impl Pattern_ {
     /// | [`Self::PTuple`] | all elements irrefutable |
     /// | [`Self::PAlias`] | inner irrefutable |
     /// | [`Self::PCtor`], [`Self::PInt`], [`Self::PBool`], [`Self::PChar`], [`Self::PStr`], [`Self::PList`], [`Self::PCons`] | `false` |
-    /// | [`Self::POr`] | all alternatives irrefutable (in practice never — a well-formed or-pattern discriminates) |
+    /// | [`Self::POr`] | any alternative irrefutable (that alternative alone matches every value) |
     #[must_use]
     pub fn is_irrefutable(&self) -> bool {
         match self {
@@ -389,7 +389,7 @@ impl Pattern_ {
             | Self::PRecord(_) => true,
             Self::PTuple(elems) => elems.iter().all(|e| e.value.is_irrefutable()),
             Self::PAlias(inner, _) => inner.value.is_irrefutable(),
-            Self::POr(alts) => alts.iter().all(|a| a.value.is_irrefutable()),
+            Self::POr(alts) => alts.iter().any(|a| a.value.is_irrefutable()),
             Self::PCtor { .. }
             | Self::PInt(_)
             | Self::PBool(_)
@@ -536,5 +536,19 @@ mod is_irrefutable_tests {
             sp(sym(3)),
         );
         assert!(over_tuple.is_irrefutable());
+    }
+
+    #[test]
+    fn is_irrefutable_or_any() {
+        let lit = || sp(Pattern_::PInt(0));
+        let binder_tuple = || {
+            sp(Pattern_::PTuple(vec![
+                sp(Pattern_::PVar(sym(1))),
+                sp(Pattern_::PAnything),
+            ]))
+        };
+        assert!(Pattern_::POr(vec![lit(), binder_tuple()]).is_irrefutable());
+        assert!(Pattern_::POr(vec![binder_tuple(), lit()]).is_irrefutable());
+        assert!(!Pattern_::POr(vec![lit(), sp(Pattern_::PBool(true))]).is_irrefutable());
     }
 }

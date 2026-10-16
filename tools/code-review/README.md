@@ -33,27 +33,29 @@ See `tools/ipe-index/README.md` for that tool.
 
 ## Configuration
 
-The app reads four environment variables: two are **required** and two are
-optional. `main` parses all four at startup, then opens and probes each
+The app reads six environment variables: two are **required** and four are
+optional. `main` parses all six at startup, then opens and probes each
 location before it listens, and exits non-zero with a message naming the
-variable if any is unset or unusable. A misconfigured run fails closed rather
+variable if any is unset or unusable. An optional variable that is set but
+cannot be read (a value that is not valid Unicode) is refused too, never taken
+for unset. A misconfigured run fails closed rather
 than serving a page that later fails, opening a wrong-path database, or
 joining a stored path outside the repo:
 
 | Variable         | Meaning                                                       |
 |------------------|---------------------------------------------------------------|
-| `IPE_INDEX_DB`   | Path or `sqlite://` URL of the `ipe-index` DB.                |
+| `IPE_INDEX_DB`   | File path of the `ipe-index` DB.                              |
 | `IPE_INDEX_ROOT` | Repo root the index's `ipe:relative` paths join to; must be an existing directory holding the indexed files, checked at startup. |
-| `IPE_REVIEW_DB`  | Optional path or `sqlite://` URL of the review DB; defaults to `review.db`. |
+| `IPE_INDEX_REPOS` | Optional roots of the other repositories the index records: `name=/absolute/path` entries joined by `,` (e.g. `ext=/srv/ext,docs=/srv/ipe/docs`). At most 65536 bytes in all, a name of at most 128 bytes, a path of at most 4096 bytes, and 64 roots counting `IPE_INDEX_ROOT`. |
+| `IPE_REVIEW_DB`  | Optional file path of the review DB; defaults to `review.db`. |
+| `IPE_HTTP_BIND` | Optional listen address: only `127.0.0.1` or `::1`, exactly; unset, the server binds `127.0.0.1`. Any other value (another address, a hostname such as `localhost`, empty, padded) refuses startup. Reach the server from another machine through an SSH tunnel. |
 | `IPE_REVIEW_MAC_KEY` | Optional key that signs every decision: exactly 64 hex characters (32 random bytes). Unset, the server is read-only. |
 
-A relative path in any of the three locations resolves against the working directory. A
-file path containing `?`, `#` or `%` is refused — pass such a location as a
-percent-encoded `sqlite://` URL. A `sqlite://` URL must carry no `?` query and
-must name a database: the app appends the open mode itself. A `sqlite:` or
-`file:` value without `//` is refused. A refused database location is reported
-by variable name only, never by value, since a mistyped URL can carry a
-password. Each refusal states one fix.
+A relative path in `IPE_INDEX_DB`, `IPE_INDEX_ROOT` or `IPE_REVIEW_DB` resolves
+against the working directory; an `IPE_INDEX_REPOS` path must be absolute. Each database value is a file path, never a URL: any byte but `:` is
+allowed in its file name, and is read literally. A refused database location is
+reported by variable name only, never by value, since a mistyped URL can carry
+a password. Each refusal states one fix.
 
 The startup probes: the index DB is opened read-only and every column a queue
 page reads from its `units`, `files` and `change_queue` tables is selected,
@@ -64,10 +66,34 @@ the variable and the resolved file, which is a plain absolute path once
 parsed.
 
 `IPE_INDEX_ROOT` binds the repo tag `ipe`, the tag of `ipe-index`'s default
-`--repo ipe:.`. A unit stored under any other tag (an index built with a second
-`--repo`) is refused rather than read from that root, so the page never shows a
-different file than the one the index recorded. A tag is the text before the
-first `:` when no `/` precedes it, matching how `ipe-index` reads it back.
+`--repo ipe:.`. Each `IPE_INDEX_REPOS` entry binds one more tag, the name before
+its first `=`, to the directory after it, for an index built with more than one
+`--repo`:
+
+```sh
+IPE_INDEX_ROOT=/srv/ipe IPE_INDEX_REPOS="ext=/srv/ext,docs=/srv/ipe/docs" ipe dev run
+```
+
+An entry is refused, naming its position, when it is empty, has no `=`, has a
+name that is not a repo tag (empty, or holding `/`, `:`, `=`, `,`, whitespace or
+a control character), or has a path that is not absolute (a single leading `/`),
+not written canonically (no `.` or `..` segment, no doubled or trailing `/`), or
+not an existing directory. Nothing is trimmed or cleaned, and Windows drive and
+UNC spellings are refused. A name bound twice (`ipe` included), two names on one
+directory, or more than 64 roots is refused too. Roots may nest: a path under a
+deeper root belongs to that root alone, so `ipe:docs/x` is refused when `docs`
+is bound to `/srv/ipe/docs`.
+
+At startup the bound tags must be exactly the repositories the index records,
+each nested under the same enclosing root as `ipe-index` recorded it from the
+files themselves: a repository the index records but no variable binds, a bound
+tag the index does not record, or a root nested otherwise than the index
+records stops startup. A tag is the text before the first `:` when no `/`
+precedes it, matching how `ipe-index` reads it back. A unit or an unreviewable
+file stored under a tag no root binds is never listed, counted in the queue or
+its progress, or read; should one appear after startup (the index rebuilt while
+the server runs), the queue header shows how many units and files it leaves
+out.
 
 Every stored `tag:relative` path is sealed with `Ipe.Path.fromString` and joined
 with `Ipe.Path.under`, so it must land strictly under its tag's root: an
@@ -218,17 +244,38 @@ to drain a decided unit: in one transaction its pair enters `reviewed`, its
 consumed `change_queue` row is deleted, and the stamp moves. The app creates
 and owns the review DB.
 
+### Unreviewable files
+
+A file the index could not read as units (not UTF-8, too large, a symbolic
+link, a submodule, an unreadable entry, …) is listed above the queue under
+**Unreviewable files** with the index's reason. Each one counts as open in the
+header and in the progress total, so the queue never reads as all reviewed
+while one is open. A file that is not UTF-8, too large, a symbolic link, a
+submodule or a git entry of unknown mode can be acknowledged or refused; the
+decision binds the index's refusal digest of the file, so a changed file is
+open again after the next `ipe-index` run. Before the decision is recorded the
+index row is read again and a content reason is re-probed: a file that now
+reads as text is refused, with "re-run the index". The other reasons say
+"Cannot be acknowledged: fix it in the tree." and offer no decision. The list
+shows up to 200 open files, every acknowledgeable one before any that cannot
+be acknowledged; the header counts them all.
+
 ## Checks
 
-From this directory, run the app's tests and the formatter check:
+From this directory, type-check the app itself, then run its tests and the
+formatter check:
 
 ```bash
-ipe test            # builds and runs tests/Main.ipe, reports pass/fail
-ipe fmt --check     # lists unformatted files without rewriting them
+ipe type-check src/Main.ipe   # the shipped app's entry, refused or accepted
+ipe test                      # builds and runs tests/Main.ipe, reports pass/fail
+ipe fmt --check               # lists unformatted files without rewriting them
 ```
 
-`tests/Main.ipe` gathers every test module's checks into one run; `ipe test`
-exits non-zero on a failing check. `ipe fmt` without `--check` rewrites the
+`ipe test` compiles `tests/Main.ipe` and the modules it imports, never
+`src/Main.ipe`, so a green test run says nothing about whether the app itself
+compiles: the `ipe type-check` step is what proves it. `tests/Main.ipe` gathers
+every test module's checks into one run; `ipe test` exits non-zero on a failing
+check. `ipe fmt` without `--check` rewrites the
 files.
 
 ## Running
@@ -243,16 +290,20 @@ IPE_INDEX_DB=../../.ipe-index/index.db IPE_INDEX_ROOT=../.. ipe dev run
 to listen on another port, e.g. `IPE_SERVER_PORT=8123 ipe dev run`, or the same
 assignment before a built binary; a value that is
 not a decimal port in `1..=65535` (empty, non-numeric, signed, `0`, or too
-large) is ignored and `8000` is used. `ipe type-check` runs a fast check with
+large) refuses startup, naming the variable. `ipe type-check` runs a fast check with
 no runtime, and `ipe dev build` compiles to a native binary.
 
-The server binds `127.0.0.1` only, so other machines cannot reach it; to
-serve it on the LAN, set `IPE_HTTP_BIND` (e.g. `IPE_HTTP_BIND=0.0.0.0`), which
-prints a startup warning.
+The review page is unauthenticated, so the server listens on loopback only:
+`127.0.0.1`, or `::1` with `IPE_HTTP_BIND=::1`. Any other `IPE_HTTP_BIND`
+value stops startup with exit status 1 before a database is opened. To review
+from another machine, tunnel to it over SSH:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 <host>    # then open http://localhost:8000 locally
+```
 
 Both are development builds: with `IPE_CONSOLE_AUTH` unset, the embedded
-console at `/_ipe/console` is open only while the server binds loopback, and on
-an exposed bind (`IPE_HTTP_BIND=0.0.0.0`) it requires the admin token. An
+console at `/_ipe/console` is open on the loopback listener. An
 `ipe release` artifact keeps the console closed until `IPE_CONSOLE_AUTH` is set.
 
 A unit's source is shown, and can be approved or refused, only when its lines

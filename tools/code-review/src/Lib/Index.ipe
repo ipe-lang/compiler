@@ -1,7 +1,8 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), ShownSource, Snapshot, SourceRow(..), SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, residualText, reverify, shortHash, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
+import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db
 import Ipe.Db.Decode
@@ -16,6 +17,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Tuple as Tuple
+import Lib.Drawn as Drawn exposing (DrawnSource, SourceRow(..))
 import Lib.Highlight as Highlight
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
@@ -60,13 +62,50 @@ type alias UnitView =
     }
 
 
--- The unit columns as they come off the DB, before the source is attached.
--- The unit page queries units directly, not through `openColumns`: a
--- decided unit is not open, but its page must still render, so it reads no
--- change.
-unitByUidSql : String
-unitByUidSql =
-    "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid = ?"
+-- The unit columns as they come off the DB, before the source is attached,
+-- for one uid under a bound tag. The unit page queries units directly, not
+-- through `openColumns`: a decided unit is not open, but its page must still
+-- render, so it reads no change. A unit under a tag `roots` does not bind is
+-- no unit here, as it is on no page.
+unitByUid : RootMap -> Uid -> ( String, List SqlValue )
+unitByUid roots uid =
+    let
+        bound =
+            boundTags roots
+    in
+    ( "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
+    , Uid.toSql uid :: bound.params
+    )
+
+
+-- The one bound-tag membership condition on a unit row `u`, with its bound
+-- parameters: the stored path's tag, the text before its first `:`, is one
+-- `roots` binds. A path with no `:` reads an empty tag, which no root binds.
+-- Every query that lists, counts or looks up units applies it, so no unit
+-- under an unbound tag is listed, counted as review work, or loaded. Tags
+-- enter only as bound parameters, compared under `BINARY`.
+type alias BoundTags =
+    { sql : String
+    , params : List SqlValue
+    }
+
+
+boundTags : RootMap -> BoundTags
+boundTags roots =
+    boundTagsAs (\tag -> tag) roots
+
+
+-- The bound-tag condition with each tag as `spell` writes it in a stored
+-- path.
+boundTagsAs : (String -> String) -> RootMap -> BoundTags
+boundTagsAs spell roots =
+    let
+        tags =
+            List.map (\( tag, _ ) -> SqlString (spell (RepoPath.tagName tag))) (RepoPath.boundRoots roots)
+    in
+    { sql = " substr(u.path, 1, instr(u.path, ':') - 1) COLLATE BINARY IN (" ++ placeholders (List.length tags) ++ ")"
+    , params = tags
+    }
 
 
 -- The unit's file row, for the language ipe-index stored for it: a primary
@@ -83,7 +122,7 @@ unitFiles =
 loadView : Db.Db -> RootMap -> Uid -> Task.Task Error (Maybe UnitView)
 loadView conn roots uid =
     do
-        rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql uid ] rowDecoder
+        rows <- queryUnit conn roots uid
         case List.head rows of
             Just row ->
                 do
@@ -93,6 +132,15 @@ loadView conn roots uid =
 
             Nothing ->
                 Task.succeed Nothing
+
+
+queryUnit : Db.Db -> RootMap -> Uid -> Task.Task Error (List RowUnit)
+queryUnit conn roots uid =
+    let
+        ( sql, params ) =
+            unitByUid roots uid
+    in
+    Db.queryDecode conn sql params rowDecoder
 
 
 -- Jump links come only from a shown view; a withheld view links nothing and
@@ -308,26 +356,192 @@ partBDecoder =
 
 -- The startup check of `IPE_INDEX_DB`: the index is opened read-only and
 -- every column a queue page reads through `openColumns` is selected, with
--- the `reviewed` copy and its `reviewed_stamp`, so a missing file, a file
--- that is not an ipe-index database, or one missing a table or a column
+-- the `reviewed` copy, its `reviewed_stamp` and the `refusals` table, so a
+-- missing file, a file that is not an ipe-index database, or one missing a
+-- table or a column (an index older than its `refusals` table among them)
 -- stops the server before it listens, naming the variable and the file.
 probe : IndexSettings -> Task.Task Error ()
 probe settings =
     (do
         conn <- readConnection settings
-        Db.queryDecode conn (openColumns ++ " LIMIT 0") [] pendingRowDecoder
+        Db.queryDecode conn (openColumns (boundTags settings.roots) ++ " LIMIT 0") (boundTags settings.roots).params pendingRowDecoder
         Db.queryDecode conn "SELECT uid, body_hash FROM reviewed LIMIT 0" [] reviewedPairDecoder
         Db.queryDecode conn "SELECT head FROM reviewed_stamp LIMIT 0" [] stampDecoder
+        Db.queryDecode conn (refusalColumns ++ " 0 = 1") [] refusalRowDecoder
         Task.succeed ()
     )
-        |> Task.onError (Settings.openFailure IndexDb settings.db)
+        |> Task.onError (Settings.openFailure IndexDb settings.db.path)
 
 
--- The startup check of `IPE_INDEX_ROOT` against the index, per configured
--- root: of the first `rootSample` distinct indexed paths under the root's
--- tag, at least one must join to a file that exists beneath it. A root
--- other than the tree the index was built from holds none of them and is
--- refused naming the variable, the first sampled path and the root; a file
+-- The startup check of the configured roots against the repositories the
+-- index records (its `repos` table), in one read: the bound tags must be
+-- exactly the recorded ones, and each bound root must nest under the same
+-- recorded outer tag at the same folded relative path, or under none, as
+-- ipe-index recorded from the files' identity. So a root bound under the
+-- wrong spelling of a nested directory, or a repository bound nowhere,
+-- stops startup instead of leaving units no reviewer can decide. An index
+-- with no units and no recorded repositories has nothing to check.
+probeRepos : IndexSettings -> Task.Task Error ()
+probeRepos settings =
+    (do
+        conn <- readConnection settings
+        Db.withTransaction conn
+            (\tx ->
+                do
+                    recorded <- Db.queryDecode tx reposSql [ SqlInt (RepoPath.maxRoots + 1) ] repoRowDecoder
+                    anyUnit <- Db.queryDecode tx anyPathSql [] storedPathDecoder
+                    Task.succeed ( recorded, anyUnit )
+            )
+    )
+        |> Task.onError (Settings.openFailure IndexDb settings.db.path)
+        |> Task.andThen
+            (\( recorded, anyUnit ) ->
+                case repoSetRefusal settings.roots recorded (not (List.isEmpty anyUnit)) of
+                    Nothing ->
+                        Task.succeed ()
+
+                    Just refusal ->
+                        Task.fail (Error.invalidInput (SafeText.toString (repoSetText refusal)))
+            )
+
+
+-- One row of the index's `repos` table: a tag, and the tag of the nearest
+-- declared root enclosing it with its relative path below that root, or
+-- neither.
+type alias RepoRow =
+    { tag : String
+    , outer : Maybe String
+    , prefix : Maybe String
+    }
+
+
+-- The recorded repositories in tag order, one past the ceiling at most, so
+-- an oversized set is seen without reading it whole.
+reposSql : String
+reposSql =
+    "SELECT tag, outer, prefix FROM repos ORDER BY tag LIMIT ?"
+
+
+repoRowDecoder : Db.Decode.Decoder RepoRow
+repoRowDecoder =
+    Db.Decode.succeed (\tag outer prefix -> { tag = tag, outer = outer, prefix = prefix })
+        |> Db.Decode.required "tag" (Db.Decode.string "tag")
+        |> Db.Decode.required "outer" (Db.Decode.nullable (Db.Decode.string "outer"))
+        |> Db.Decode.required "prefix" (Db.Decode.nullable (Db.Decode.string "prefix"))
+
+
+-- Why the configured roots disagree with the recorded repositories. A bound
+-- tag carries the setting that bound it.
+type RepoSetRefusal
+    = RepoSetTooLarge
+    | RepoSetMissing
+    | RepoNotIndexed String SafeText
+    | RepoNotBound String
+    | RepoNestingMismatch String SafeText
+
+
+-- The first disagreement, checked in order: a set past the ceiling, no
+-- set beside units, a bound tag not recorded, a recorded tag not bound, then
+-- each bound tag's nesting.
+repoSetRefusal : RootMap -> List RepoRow -> Bool -> Maybe RepoSetRefusal
+repoSetRefusal roots recorded hasUnits =
+    let
+        bound =
+            RepoPath.boundRoots roots
+
+        recordedRow tag =
+            List.find (\row -> row.tag == RepoPath.tagName tag) recorded
+
+        isBound name =
+            List.any (\( tag, _ ) -> RepoPath.tagName tag == name) bound
+
+        notIndexed =
+            List.find (\( tag, _ ) -> not (List.any (\row -> row.tag == RepoPath.tagName tag) recorded)) bound
+
+        notBound =
+            List.find (\row -> not (isBound row.tag)) recorded
+
+        misnested =
+            List.find
+                (\( tag, _ ) ->
+                    case recordedRow tag of
+                        Just row ->
+                            not (RepoPath.nestingAgrees roots tag row.outer row.prefix)
+
+                        Nothing ->
+                            True
+                )
+                bound
+    in
+    if List.length recorded > RepoPath.maxRoots then
+        Just RepoSetTooLarge
+
+    else if List.isEmpty recorded then
+        if hasUnits then
+            Just RepoSetMissing
+
+        else
+            Nothing
+
+    else
+        case notIndexed of
+            Just ( tag, root ) ->
+                Just (RepoNotIndexed (RepoPath.tagName tag) (RepoPath.rootOrigin tag root))
+
+            Nothing ->
+                case notBound of
+                    Just row ->
+                        Just (RepoNotBound row.tag)
+
+                    Nothing ->
+                        Maybe.map (\( tag, root ) -> RepoNestingMismatch (RepoPath.tagName tag) (RepoPath.rootOrigin tag root)) misnested
+
+
+-- A refusal as diagnostic text; every tag the index stored enters through
+-- `SafeText.quoted`.
+repoSetText : RepoSetRefusal -> SafeText
+repoSetText refusal =
+    case refusal of
+        RepoSetTooLarge ->
+            SafeText.concat
+                [ SafeText.literal "IPE_INDEX_DB records more than "
+                , SafeText.render (String.fromInt RepoPath.maxRoots)
+                , SafeText.literal " repositories, more than ipe-index writes; rebuild it from the repo root with `tools/scripts/ipe-index index`"
+                ]
+
+        RepoSetMissing ->
+            SafeText.literal "IPE_INDEX_DB holds units but records no repositories: it was built before ipe-index recorded them; rebuild it from the repo root with the current `tools/scripts/ipe-index index`"
+
+        RepoNotIndexed tag origin ->
+            SafeText.concat
+                [ origin
+                , SafeText.literal " binds repo tag "
+                , SafeText.quoted tag
+                , SafeText.literal ", which IPE_INDEX_DB does not record; remove the binding, or rebuild the index with that repository"
+                ]
+
+        RepoNotBound tag ->
+            SafeText.concat
+                [ SafeText.literal "IPE_INDEX_DB records repo tag "
+                , SafeText.quoted tag
+                , SafeText.literal ", which no configured root binds, so its units could never be decided; add an IPE_INDEX_REPOS entry `name=/absolute/path` for it, naming the root the index was built from"
+                ]
+
+        RepoNestingMismatch tag origin ->
+            SafeText.concat
+                [ origin
+                , SafeText.literal " nests repo tag "
+                , SafeText.quoted tag
+                , SafeText.literal " otherwise than IPE_INDEX_DB records it: a root encloses it, or sits at a path below that root, that the index does not record; set each root to the directory the index was built from"
+                ]
+
+
+-- The startup check of `IPE_INDEX_ROOT` and every `IPE_INDEX_REPOS` root
+-- against the index, per configured root: of the first `rootSample` distinct
+-- indexed paths under the root's tag, at least one must join to a file that
+-- exists beneath it. A root other than the tree the index was built from
+-- holds none of them and is refused naming the variable (the entry, for an
+-- `IPE_INDEX_REPOS` root), the first sampled path and the root; a file
 -- or two deleted since the last index run does not refuse a right root
 -- while another sampled file remains. An index holding units, none under a
 -- configured tag, is refused too: none of its units could be read. Only an
@@ -340,14 +554,17 @@ probeRoot settings =
         anyUnit <- Db.queryDecode conn anyPathSql [] storedPathDecoder
         Task.succeed ( samples, anyUnit )
     )
-        |> Task.onError (Settings.openFailure IndexDb settings.db)
+        |> Task.onError (Settings.openFailure IndexDb settings.db.path)
         |> Task.andThen (\( samples, anyUnit ) -> rootsHold settings.roots samples anyUnit)
 
 
--- One configured root with the indexed paths sampled under its tag.
+-- One configured root with the indexed paths sampled under its tag, the
+-- setting that named it, and that setting's fix.
 type alias RootSample =
     { tag : Tag
     , rootDir : Path
+    , origin : SafeText
+    , fix : SafeText
     , stored : List String
     }
 
@@ -369,7 +586,7 @@ rootSampleOf conn ( tag, root ) =
             RepoPath.tagName tag ++ ":"
     in
     Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] storedPathDecoder
-        |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, stored = stored })
+        |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, origin = RepoPath.rootOrigin tag root, fix = RepoPath.rootFixFor root, stored = stored })
 
 
 -- Succeeds when the sample is empty or any sampled path joins to a file
@@ -388,7 +605,7 @@ rootHolds roots sample =
                             Task.succeed ()
 
                         else
-                            Task.fail (rootMismatch (List.length sample.stored) first sample.rootDir)
+                            Task.fail (rootMismatch sample (List.length sample.stored) first)
                     )
 
 
@@ -427,19 +644,20 @@ presentUnder roots stored =
             Task.succeed False
 
 
-rootMismatch : Int -> String -> Path -> Error
-rootMismatch sampled first rootDir =
+rootMismatch : RootSample -> Int -> String -> Error
+rootMismatch sample sampled first =
     Error.invalidInput
         (SafeText.toString
             (SafeText.concat
-                [ SafeText.literal "IPE_INDEX_ROOT holds none of the "
+                [ sample.origin
+                , SafeText.literal " holds none of the "
                 , SafeText.render (String.fromInt sampled)
                 , SafeText.literal " indexed files checked: index path "
                 , SafeText.quoted first
                 , SafeText.literal " is not found under "
-                , SafeText.quoted (Path.toString rootDir)
+                , SafeText.quoted (Path.toString sample.rootDir)
                 , SafeText.literal "; "
-                , RepoPath.rootFix
+                , sample.fix
                 , SafeText.literal ", or re-run `tools/scripts/ipe-index index` if the indexed files have moved"
                 ]
             )
@@ -471,7 +689,7 @@ reviewedPairDecoder =
 -- runs, from settings the caller resolved once.
 readConnection : IndexSettings -> Task.Task Error Db.Db
 readConnection settings =
-    Db.open "sqlite" (Settings.indexReadUrl settings.db)
+    Db.open settings.db.read
 
 
 -- Where a page starts in the `(enqueued_at, uid)` order of `openColumns`: the
@@ -553,9 +771,9 @@ changeOf change old =
 -- which says nothing about a unit that still stands; any other kind, a
 -- missing one included, reaches `changeDecoder`, which fails the read on
 -- one this reviewer does not know.
-openColumns : String
-openColumns =
-    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ ")"
+openColumns : BoundTags -> String
+openColumns bound =
+    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
 
 
 -- The membership condition on a unit row `u`: no pair of the `reviewed`
@@ -571,16 +789,16 @@ openOrder =
 
 
 -- The page query and its bound parameters for `cursor`. Every value is a
--- bound parameter; the page bound is always the last one.
-pendingPageQuery : PageSize -> Cursor -> ( String, List SqlValue )
-pendingPageQuery size cursor =
+-- bound parameter: the bound tags first, the page bound always last.
+pendingPageQuery : BoundTags -> PageSize -> Cursor -> ( String, List SqlValue )
+pendingPageQuery bound size cursor =
     case cursor of
         Start ->
-            ( openColumns ++ openOrder, [ SqlInt (PageSize.toInt size) ] )
+            ( openColumns bound ++ openOrder, bound.params ++ [ SqlInt (PageSize.toInt size) ] )
 
         After at ->
-            ( openColumns ++ " WHERE (enqueued_at, uid) > (?, ?)" ++ openOrder
-            , [ SqlInt at.enqueuedAt, Uid.toSql at.uid, SqlInt (PageSize.toInt size) ]
+            ( openColumns bound ++ " WHERE (enqueued_at, uid) > (?, ?)" ++ openOrder
+            , bound.params ++ [ SqlInt at.enqueuedAt, Uid.toSql at.uid, SqlInt (PageSize.toInt size) ]
             )
 
 
@@ -605,11 +823,11 @@ openColumnsDecoder =
 -- of metadata. No source file is read: a unit's file is read only by
 -- `loadView`, so a unit whose file is missing still lists, and only a failed
 -- query fails the page.
-loadPendingPage : Db.Db -> PageSize -> Cursor -> Task.Task Error (List PendingRow)
-loadPendingPage conn size cursor =
+loadPendingPage : Db.Db -> BoundTags -> PageSize -> Cursor -> Task.Task Error (List PendingRow)
+loadPendingPage conn bound size cursor =
     let
         ( sql, params ) =
-            pendingPageQuery size cursor
+            pendingPageQuery bound size cursor
     in
     Db.queryDecode conn sql params pendingRowDecoder
         |> Task.map (List.map (\( row, change, at ) -> { unit = withRow row, change = change, enqueuedAt = at }))
@@ -621,21 +839,65 @@ countDecoder =
         |> Db.Decode.required "total" (Db.Decode.int "total")
 
 
--- How many units are open, counted over `openMembership` without loading
--- a row. A count query that yields no row is a failed read, never a zero.
-countPending : Db.Db -> Task.Task Error Int
-countPending conn =
+-- How many units under a bound tag are open, counted over `openMembership`
+-- without loading a row. A count query that yields no row is a failed read,
+-- never a zero.
+countPending : Db.Db -> BoundTags -> Task.Task Error Int
+countPending conn bound =
     do
-        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE" ++ openMembership) [] countDecoder
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE" ++ openMembership ++ " AND" ++ bound.sql) bound.params countDecoder
         singleInt "COUNT(*) of open units" rows
 
 
--- How many units the index holds, open or decided.
-countUnits : Db.Db -> Task.Task Error Int
-countUnits conn =
+-- How many units under a bound tag the index holds, open or decided.
+countUnits : Db.Db -> BoundTags -> Task.Task Error Int
+countUnits conn bound =
+    do
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE" ++ bound.sql) bound.params countDecoder
+        singleInt "COUNT(*) over bound units" rows
+
+
+-- How many units the index holds under a tag no root binds.
+countUnbound : Db.Db -> BoundTags -> Task.Task Error Int
+countUnbound conn bound =
+    do
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM units u WHERE NOT (" ++ bound.sql ++ ")") bound.params countDecoder
+        singleInt "COUNT(*) over unbound units" rows
+
+
+-- How many units the index holds, bound or not.
+countAll : Db.Db -> Task.Task Error Int
+countAll conn =
     do
         rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM units" [] countDecoder
         singleInt "COUNT(*) over units" rows
+
+
+-- The bound and unbound counts of one read partition every row of the
+-- index's `what` table (units, or unreviewable files): a row in neither (a
+-- path the tag condition cannot judge) or in both fails the read rather
+-- than leave a total that hides it.
+partitioned : String -> Int -> Int -> Int -> Task.Task Error ()
+partitioned what bound unbound held =
+    if bound + unbound == held then
+        Task.succeed ()
+
+    else
+        Task.fail
+            (Error.unexpected
+                ("the index's "
+                    ++ what
+                    ++ " counts do not add up: "
+                    ++ String.fromInt bound
+                    ++ " under bound repositories and "
+                    ++ String.fromInt unbound
+                    ++ " under unbound ones, of "
+                    ++ String.fromInt held
+                    ++ " "
+                    ++ what
+                    ++ "s"
+                )
+            )
 
 
 bytesDecoder : Db.Decode.Decoder Int
@@ -663,9 +925,405 @@ singleInt what rows =
             Task.fail (Error.unexpected (what ++ " did not return exactly one row"))
 
 
+-- Why ipe-index could not review a tracked file, one constructor per tag
+-- the index's `refusals.reason` column admits. `NotUtf8` and `Oversized`
+-- are content reasons: the index read or hashed the file's bytes.
+-- `SymlinkEntry`, `GitlinkEntry` and `UnknownMode` carry a digest of the
+-- staged entry. Every other reason is blocking: its row carries no digest,
+-- so no decision can bind it, and only a change to the tree closes it.
+type RefusalReason
+    = NotUtf8
+    | Oversized
+    | SymlinkEntry
+    | GitlinkEntry
+    | UnknownMode
+    | PastHashCeiling
+    | NonUtf8Name
+    | NotRepoRelative
+    | NestedRepository
+    | NotRegular
+    | UnreadableEntry
+    | ReplacedEntry
+
+
+-- Every reason, in the order of the index schema's `CHECK` list.
+refusalReasons : List RefusalReason
+refusalReasons =
+    [ NotUtf8
+    , Oversized
+    , SymlinkEntry
+    , GitlinkEntry
+    , UnknownMode
+    , PastHashCeiling
+    , NonUtf8Name
+    , NotRepoRelative
+    , NestedRepository
+    , NotRegular
+    , UnreadableEntry
+    , ReplacedEntry
+    ]
+
+
+-- The tag ipe-index stores for a reason.
+refusalTag : RefusalReason -> String
+refusalTag reason =
+    case reason of
+        NotUtf8 ->
+            "not-utf8"
+
+        Oversized ->
+            "too-large"
+
+        SymlinkEntry ->
+            "symlink-entry"
+
+        GitlinkEntry ->
+            "gitlink-entry"
+
+        UnknownMode ->
+            "unknown-mode"
+
+        PastHashCeiling ->
+            "past-hash-ceiling"
+
+        NonUtf8Name ->
+            "non-utf8-name"
+
+        NotRepoRelative ->
+            "not-repo-relative"
+
+        NestedRepository ->
+            "nested-repository"
+
+        NotRegular ->
+            "not-regular"
+
+        UnreadableEntry ->
+            "unreadable"
+
+        ReplacedEntry ->
+            "replaced"
+
+
+-- Whether a row of this reason carries a digest a decision can bind.
+ackable : RefusalReason -> Bool
+ackable reason =
+    case reason of
+        NotUtf8 ->
+            True
+
+        Oversized ->
+            True
+
+        SymlinkEntry ->
+            True
+
+        GitlinkEntry ->
+            True
+
+        UnknownMode ->
+            True
+
+        PastHashCeiling ->
+            False
+
+        NonUtf8Name ->
+            False
+
+        NotRepoRelative ->
+            False
+
+        NestedRepository ->
+            False
+
+        NotRegular ->
+            False
+
+        UnreadableEntry ->
+            False
+
+        ReplacedEntry ->
+            False
+
+
+parseRefusalReason : String -> Maybe RefusalReason
+parseRefusalReason tag =
+    List.find (\reason -> refusalTag reason == tag) refusalReasons
+
+
+-- A refusal row's digest: `refusalScheme` and 64 lowercase hex digits, the
+-- one form the index schema admits, a scheme apart from every unit hash.
+-- Opaque: built only by `parseRefusalDigest`.
+type RefusalDigest
+    = RefusalDigest String
+
+
+refusalScheme : String
+refusalScheme =
+    "refusal-blake3:"
+
+
+parseRefusalDigest : String -> Maybe RefusalDigest
+parseRefusalDigest stored =
+    let
+        digits =
+            String.dropLeft (String.length refusalScheme) stored
+    in
+    if String.startsWith refusalScheme stored && String.length digits == 64 && String.all Uid.isLowerHex digits then
+        Just (RefusalDigest stored)
+
+    else
+        Nothing
+
+
+-- The stored text of a digest: the hash a decision on its row records.
+refusalDigestText : RefusalDigest -> String
+refusalDigestText digest =
+    case digest of
+        RefusalDigest stored ->
+            stored
+
+
+-- One file the index could not review, as a queue page lists it. `path` is
+-- the index's escaped `tag:relative` form, rendered once; `digest` is
+-- Nothing exactly for a blocking reason, so a row no decision can bind has
+-- no hash to bind it to. No file byte is ever part of it.
+type alias RefusalRow =
+    { uid : Uid
+    , path : SafeText
+    , lang : String
+    , reason : RefusalReason
+    , size : Maybe Int
+    , digest : Maybe RefusalDigest
+    }
+
+
+-- A `refusals` row's columns as stored, before its reason and digest are
+-- parsed.
+type alias RawRefusal =
+    { uid : Uid
+    , path : String
+    , lang : String
+    , reason : String
+    , size : Maybe Int
+    , digest : Maybe String
+    }
+
+
+makeRawRefusal : Uid -> String -> String -> String -> Maybe Int -> Maybe String -> RawRefusal
+makeRawRefusal uid path lang reason size digest =
+    { uid = uid
+    , path = path
+    , lang = lang
+    , reason = reason
+    , size = size
+    , digest = digest
+    }
+
+
+rawRefusalDecoder : Db.Decode.Decoder RawRefusal
+rawRefusalDecoder =
+    Db.Decode.succeed makeRawRefusal
+        |> Db.Decode.required "uid" (Uid.decoder "uid")
+        |> Db.Decode.required "path" (Db.Decode.string "path")
+        |> Db.Decode.required "lang" (Db.Decode.string "lang")
+        |> Db.Decode.required "reason" (Db.Decode.string "reason")
+        |> Db.Decode.required "size" (Db.Decode.nullable (Db.Decode.int "size"))
+        |> Db.Decode.required "digest" (Db.Decode.nullable (Db.Decode.string "digest"))
+
+
+-- The one decoder of a refusal row. A reason this reviewer does not know, a
+-- digest under another scheme, a digest on a blocking reason, a missing
+-- digest on an acknowledgeable one, or a negative size fails the read, so
+-- no row reaches a page in a state the schema does not admit. The failure
+-- names the column, never the value.
+refusalRowDecoder : Db.Decode.Decoder RefusalRow
+refusalRowDecoder =
+    Db.Decode.andThen refusalRowOf rawRefusalDecoder
+
+
+refusalRowOf : RawRefusal -> Db.Decode.Decoder RefusalRow
+refusalRowOf raw =
+    case parseRefusalReason raw.reason of
+        Nothing ->
+            Db.Decode.fail "column reason: not a refusal reason this reviewer knows"
+
+        Just reason ->
+            case refusalDigestOf reason raw.digest of
+                Err fault ->
+                    Db.Decode.fail (digestFaultText fault)
+
+                Ok digest ->
+                    if negativeSize raw.size then
+                        Db.Decode.fail "column size: a negative size"
+
+                    else
+                        Db.Decode.succeed
+                            { uid = raw.uid
+                            , path = SafeText.renderForeign raw.path
+                            , lang = raw.lang
+                            , reason = reason
+                            , size = raw.size
+                            , digest = digest
+                            }
+
+
+-- Why a refusal row's digest column does not fit its reason.
+type DigestFault
+    = NotRefusalDigest
+    | DigestOnBlocking
+    | NoDigestOnAckable
+
+
+digestFaultText : DigestFault -> String
+digestFaultText fault =
+    case fault of
+        NotRefusalDigest ->
+            "column digest: not a refusal digest"
+
+        DigestOnBlocking ->
+            "column digest: a blocking reason with a digest"
+
+        NoDigestOnAckable ->
+            "column digest: an acknowledgeable reason with no digest"
+
+
+refusalDigestOf : RefusalReason -> Maybe String -> Result DigestFault (Maybe RefusalDigest)
+refusalDigestOf reason stored =
+    case stored of
+        Just text ->
+            if ackable reason then
+                case parseRefusalDigest text of
+                    Just digest ->
+                        Ok (Just digest)
+
+                    Nothing ->
+                        Err NotRefusalDigest
+
+            else
+                Err DigestOnBlocking
+
+        Nothing ->
+            if ackable reason then
+                Err NoDigestOnAckable
+
+            else
+                Ok Nothing
+
+
+negativeSize : Maybe Int -> Bool
+negativeSize size =
+    case size of
+        Just n ->
+            n < 0
+
+        Nothing ->
+            False
+
+
+refusalColumns : String
+refusalColumns =
+    "SELECT u.uid AS uid, u.path AS path, u.lang AS lang, u.reason AS reason, u.size AS size, u.digest AS digest FROM refusals u WHERE"
+
+
+-- The membership condition on a refusal row `u`: no pair of the `reviewed`
+-- copy is its (uid, digest). A blocking row's NULL digest equals no pair,
+-- so it is always open.
+openRefusalMembership : String
+openRefusalMembership =
+    " NOT EXISTS (SELECT 1 FROM reviewed r WHERE r.uid = u.uid COLLATE BINARY AND r.body_hash = u.digest COLLATE BINARY)"
+
+
+-- The bound-tag condition on a refusal row `u`. A refusal's stored path is
+-- ipe-index's `shown` escape of the whole tagged name, tag included, so
+-- each bound tag is compared as `escapeShown` writes it: a tag holding a
+-- `\\` or a character outside printable ASCII is then judged bound exactly
+-- when its row's name, read back by `unescapeShown`, has that tag, the one
+-- `RepoPath.resolve` joins it under. Its own type, so the units' condition,
+-- which compares raw tags, cannot stand in for it.
+type RefusalTags
+    = RefusalTags BoundTags
+
+
+refusalTags : RootMap -> RefusalTags
+refusalTags roots =
+    RefusalTags (boundTagsAs escapeShown roots)
+
+
+refusalCondition : RefusalTags -> BoundTags
+refusalCondition tags =
+    case tags of
+        RefusalTags bound ->
+            bound
+
+
+-- The first `size` open refusals under a bound tag: every acknowledgeable
+-- one before any blocking one, each by path. A blocking row leaves the open
+-- set only when the tree is fixed, so listing it first would let enough of
+-- them keep an acknowledgeable file off the page for good.
+loadRefusalPage : Db.Db -> RefusalTags -> PageSize -> Task.Task Error (List RefusalRow)
+loadRefusalPage conn tags size =
+    let
+        bound =
+            refusalCondition tags
+    in
+    Db.queryDecode conn
+        (refusalColumns ++ openRefusalMembership ++ " AND" ++ bound.sql ++ " ORDER BY u.digest IS NULL, u.path COLLATE BINARY, u.uid COLLATE BINARY LIMIT ?")
+        (bound.params ++ [ SqlInt (PageSize.toInt size) ])
+        refusalRowDecoder
+
+
+-- How many refusals under a bound tag are open, counted over
+-- `openRefusalMembership` without loading a row.
+countOpenRefusals : Db.Db -> RefusalTags -> Task.Task Error Int
+countOpenRefusals conn tags =
+    let
+        bound =
+            refusalCondition tags
+    in
+    do
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM refusals u WHERE" ++ openRefusalMembership ++ " AND" ++ bound.sql) bound.params countDecoder
+        singleInt "COUNT(*) of open refusals" rows
+
+
+-- How many refusals under a bound tag the index holds, open or decided.
+countRefusals : Db.Db -> RefusalTags -> Task.Task Error Int
+countRefusals conn tags =
+    let
+        bound =
+            refusalCondition tags
+    in
+    do
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM refusals u WHERE" ++ bound.sql) bound.params countDecoder
+        singleInt "COUNT(*) over bound refusals" rows
+
+
+-- How many refusals the index holds under a tag no root binds: files no
+-- page lists and no decision here can bind, said beside the unbound units.
+countUnboundRefusals : Db.Db -> RefusalTags -> Task.Task Error Int
+countUnboundRefusals conn tags =
+    let
+        bound =
+            refusalCondition tags
+    in
+    do
+        rows <- Db.queryDecode conn ("SELECT COUNT(*) AS total FROM refusals u WHERE NOT (" ++ bound.sql ++ ")") bound.params countDecoder
+        singleInt "COUNT(*) over unbound refusals" rows
+
+
+-- How many refusals the index holds, bound or not.
+countAllRefusals : Db.Db -> Task.Task Error Int
+countAllRefusals conn =
+    do
+        rows <- Db.queryDecode conn "SELECT COUNT(*) AS total FROM refusals" [] countDecoder
+        singleInt "COUNT(*) over refusals" rows
+
+
 -- Everything one queue page shows, read in one index transaction, so the
--- page rows, the open count and the unit count describe the same index
--- state and no write between two reads can make them disagree. The module
+-- page rows, the open count and the unit counts describe the same index
+-- state and no write between two reads can make them disagree. The rows,
+-- `open` and `units` count only units under a tag `roots` binds; `unbound`
+-- counts the rest, and the two must add up to every unit the index holds. The module
 -- exposes no other reader of the page, the counts or the size, so no
 -- caller can read one of them outside this transaction. `stamp` is the
 -- text stamped on the `reviewed` copy when it was last brought up to the
@@ -674,29 +1332,86 @@ singleInt what rows =
 -- copy holds, or Nothing for a copy longer than any proven log. The caller
 -- reads both against the review log's verdict, through `stampStatus` and
 -- the digest of the pairs the log walk verified, before trusting the rest.
+-- `refusals` are the first open files the index could not review under a
+-- bound tag, `refusalsOpen` how many are open and `refusalsAll` how many it
+-- holds, read in the same transaction as the units, so an unreviewable file
+-- is open review work exactly as a unit is; `refusalsUnbound` counts the
+-- unreviewable files under a tag no root binds, and the two must add up to
+-- every refusal the index holds, so none is in neither count.
 type alias Snapshot =
     { stamp : Maybe String
     , copy : Maybe SetDigest
     , rows : List PendingRow
     , open : Int
     , units : Int
+    , unbound : Int
     , bytes : Int
+    , refusals : List RefusalRow
+    , refusalsOpen : Int
+    , refusalsAll : Int
+    , refusalsUnbound : Int
     }
 
 
-readSnapshot : ReviewKey -> Db.Db -> Cursor -> Task.Task Error Snapshot
-readSnapshot key conn cursor =
+readSnapshot : ReviewKey -> RootMap -> Db.Db -> Cursor -> Task.Task Error Snapshot
+readSnapshot key roots conn cursor =
+    let
+        bound =
+            boundTags roots
+
+        refused =
+            refusalTags roots
+    in
     Db.withTransaction conn
         (\tx ->
             do
                 stamp <- readStamp tx
                 copy <- reviewedDigest key tx
-                rows <- loadPendingPage tx PageSize.queue cursor
-                open <- countPending tx
-                units <- countUnits tx
+                rows <- loadPendingPage tx bound PageSize.queue cursor
+                open <- countPending tx bound
+                units <- countUnits tx bound
+                unbound <- countUnbound tx bound
+                held <- countAll tx
+                partitioned "unit" units unbound held
+                refusals <- loadRefusalPage tx refused PageSize.queue
+                counted <- countRefusalsPartitioned tx refused
                 bytes <- dbBytes tx
-                Task.succeed { stamp = stamp, copy = copy, rows = rows, open = open, units = units, bytes = bytes }
+                Task.succeed
+                    { stamp = stamp
+                    , copy = copy
+                    , rows = rows
+                    , open = open
+                    , units = units
+                    , unbound = unbound
+                    , bytes = bytes
+                    , refusals = refusals
+                    , refusalsOpen = counted.open
+                    , refusalsAll = counted.total
+                    , refusalsUnbound = counted.unbound
+                    }
         )
+
+
+-- The refusal counts a snapshot carries: the open rows and every row under
+-- the bound tags, and the rows under any other tag.
+type alias RefusalCounts =
+    { open : Int
+    , total : Int
+    , unbound : Int
+    }
+
+
+-- The refusal counts on `tx`, failed unless the bound and unbound rows are
+-- every row the index holds.
+countRefusalsPartitioned : Db.Db -> RefusalTags -> Task.Task Error RefusalCounts
+countRefusalsPartitioned tx bound =
+    do
+        open <- countOpenRefusals tx bound
+        total <- countRefusals tx bound
+        unbound <- countUnboundRefusals tx bound
+        held <- countAllRefusals tx
+        partitioned "refusal" total unbound held
+        Task.succeed { open = open, total = total, unbound = unbound }
 
 
 -- A decided pair, as the review log stores its uid and body hash, added to
@@ -1096,7 +1811,7 @@ type Written
 drainUnit : IndexSettings -> Attested -> Written -> Task.Task Error Int
 drainUnit settings attested written =
     do
-        conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
+        conn <- Db.open settings.db.write
         Db.withTransaction conn
             (\tx ->
                 do
@@ -1185,7 +1900,7 @@ drainPair conn uid hash =
 rebuildReviewed : IndexSettings -> (Db.Db -> Task.Task Error ( Stamp, a )) -> Task.Task Error a
 rebuildReviewed settings refill =
     do
-        conn <- Db.open "sqlite" (Settings.indexWriteUrl settings.db)
+        conn <- Db.open settings.db.write
         Db.withTransaction conn
             (\tx ->
                 do
@@ -1211,9 +1926,10 @@ unitsStore =
 
 
 -- The unit's qualified name from the units table, rendered for display, if
--- the unit still exists (a decided unit whose source was deleted leaves a
--- review row but no name). The `uid` value is bound as a parameter by
--- `Store.findBy`, never interpolated into SQL text.
+-- the unit still exists, or else the escaped path of the unreviewable file
+-- the uid names (a decided unit whose source was deleted leaves a review
+-- row but no name). The `uid` value is always a bound parameter, never
+-- interpolated into SQL text.
 nameFor : Db.Db -> Uid -> Task.Task Error (Maybe SafeText)
 nameFor conn uid =
     case unitsStore of
@@ -1228,7 +1944,15 @@ nameFor conn uid =
                         Task.succeed (Maybe.map SafeText.renderForeign (Result.toMaybe (Store.readText "qualified" row)))
 
                     Nothing ->
-                        Task.succeed Nothing
+                        refusalPathFor conn uid
+
+
+-- An unreviewable file's escaped path, the label of a decision on its
+-- refusal row while the index holds the row.
+refusalPathFor : Db.Db -> Uid -> Task.Task Error (Maybe SafeText)
+refusalPathFor conn uid =
+    Db.queryDecode conn "SELECT path FROM refusals WHERE uid = ? COLLATE BINARY LIMIT 1" [ Uid.toSql uid ] storedPathDecoder
+        |> Task.map (\rows -> Maybe.map SafeText.renderForeign (List.head rows))
 
 
 -- The one verification of a unit's source. The stored hash is parsed first,
@@ -1263,7 +1987,7 @@ viewOf conn roots row =
 
                                     Ok covered ->
                                         File.readFileLimit path sourceCeiling
-                                            |> Task.map (classifyView row.uid stored covered)
+                                            |> Task.map (classifyView row.uid (langOf row.lang) stored covered)
                                             |> Task.onError (\_ -> unreadableAt row.path path)
 
 
@@ -1360,14 +2084,17 @@ readFailureText failure =
 
 
 -- The one judgement of a unit's view, in precedence order: a body past the
--- line ceiling, a range outside `text`, a view past the byte ceiling, then
--- the attestation compare. The rows drawn and the text hashed come from one
--- `bodyRows` list, joined by `bodyText`. `ShownSource` is built only here, so
--- holding one proves the view is within both ceilings and re-hashes to
--- `stored`. An oversized view is never hashed: re-indexing cannot make it
+-- line ceiling, a range outside `text`, a view past the byte ceiling, a view
+-- whose drawing takes more elements than the element ceiling, then the
+-- attestation compare. The rows drawn and the text hashed come from one
+-- `bodyRows` list, joined by `bodyText`, and the rows are drawn here once, in
+-- `lang`: coloured when that fits the element ceiling, else as plain text.
+-- `ShownSource` is built only here, so holding one proves the view is within
+-- every ceiling, re-hashes to `stored`, and carries the drawing that was
+-- counted. An oversized view is never hashed: re-indexing cannot make it
 -- shown.
-classifyView : Uid -> String -> Body -> String -> SourceView
-classifyView uid stored body text =
+classifyView : Uid -> Highlight.Lang -> String -> Body -> String -> SourceView
+classifyView uid lang stored body text =
     let
         lines =
             viewLines text
@@ -1392,11 +2119,44 @@ classifyView uid stored body text =
                     if size > ByteSize.toBytes viewByteCeiling then
                         TooLarge (ViewBytes { size = ByteSize.bytes size })
 
-                    else if bodyAttest body view == stored then
-                        Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored })
-
                     else
-                        Stale Drifted
+                        case fittingDrawing lang rows of
+                            Err over ->
+                                TooLarge over
+
+                            Ok drawn ->
+                                if bodyAttest body view == stored then
+                                    Shown (ShownSource { uid = uid, rows = rows, text = view, hash = stored, drawn = drawn })
+
+                                else
+                                    Stale Drifted
+
+
+-- The rows drawn coloured when that takes at most `viewNodeCeiling`
+-- elements, else drawn plain when that does; past both, the plain drawing's
+-- count, the fewest elements the view can be drawn in.
+fittingDrawing : Highlight.Lang -> List SourceRow -> Result Oversize DrawnSource
+fittingDrawing lang rows =
+    let
+        colored =
+            Drawn.highlighted lang rows
+    in
+    if Drawn.elements colored <= viewNodeCeiling then
+        Ok colored
+
+    else
+        let
+            uncolored =
+                Drawn.plain lang rows
+
+            nodes =
+                Drawn.elements uncolored
+        in
+        if nodes <= viewNodeCeiling then
+            Ok uncolored
+
+        else
+            Err (ViewNodes { nodes = nodes })
 
 
 -- A line range past the line ceiling, or a file unit whose file is: the
@@ -1445,6 +2205,47 @@ viewByteCeiling =
     ByteSize.kib 256
 
 
+-- The most elements a shown view's drawing may take. The session's model and
+-- its one charged tree are refused past `runtimeSessionCeiling`;
+-- `viewNodeCeiling` elements at `elementResidentBytes` each, plus
+-- `viewReserve` for every copy of the view's text, fit three quarters of it.
+-- The last quarter holds the page outside the view and the error of the
+-- per-element cost, which is estimated, not measured:
+-- 2048 * 3 KiB + 5 MiB = 11 MiB <= 12 MiB. The relation is checked by a test,
+-- and the ceiling can rise as the runtime's cost per element falls.
+viewNodeCeiling : Int
+viewNodeCeiling =
+    2048
+
+
+-- The runtime's per-session memory ceiling, mirrored from `SESSION_CEILING`
+-- in `src/runtime/rust/src/web/budget.rs`; a test reads that line and fails
+-- when the two differ.
+runtimeSessionCeiling : ByteSize
+runtimeSessionCeiling =
+    ByteSize.mib 16
+
+
+-- What one drawn element holds resident in the runtime's session tree: the
+-- element, its attributes (each slot as large as the app's message, held
+-- inline, the `Vec` grown to four slots by the element id the runtime adds),
+-- and one text child.
+elementResidentBytes : ByteSize
+elementResidentBytes =
+    ByteSize.kib 3
+
+
+-- What a shown view holds besides its counted elements, at most
+-- `viewByteCeiling` bytes of text and `viewLineCeiling` lines: the text in
+-- the rows and again whole in the model, the drawing's escaped characters
+-- at four bytes each with up to as much again of spare capacity, and the
+-- tree's escape spelling, six bytes for one source byte; sixteen copies in
+-- all, plus each line's row, string and line number.
+viewReserve : ByteSize
+viewReserve =
+    ByteSize.mib 5
+
+
 -- The largest source file a unit is sliced from; a bigger file under the root
 -- is refused rather than read whole into memory.
 sourceCeiling : ByteSize
@@ -1485,11 +2286,13 @@ langOf stored =
 
 -- A stored `body_hash`, parsed once: an attestation this app can re-prove
 -- (a line range's under `attestScheme`, a residual's under
--- `residualScheme`), or a value under any other scheme (a legacy or unknown
--- hash).
+-- `residualScheme`), an unreviewable file's digest under `refusalScheme`,
+-- which no source view re-proves, or a value under any other scheme (a
+-- legacy or unknown hash).
 type AttestedHash
     = Sha256 String
     | ResidualSha256 String
+    | RefusalBlake3 String
     | UnknownScheme String
 
 
@@ -1500,6 +2303,9 @@ parseAttested stored =
 
     else if String.startsWith residualScheme stored then
         ResidualSha256 stored
+
+    else if String.startsWith refusalScheme stored then
+        RefusalBlake3 stored
 
     else
         UnknownScheme stored
@@ -1516,6 +2322,9 @@ provable attested =
         ResidualSha256 stored ->
             Just stored
 
+        RefusalBlake3 _ ->
+            Nothing
+
         UnknownScheme _ ->
             Nothing
 
@@ -1529,6 +2338,9 @@ storedHash attested =
             stored
 
         ResidualSha256 stored ->
+            stored
+
+        RefusalBlake3 stored ->
             stored
 
         UnknownScheme stored ->
@@ -1552,15 +2364,19 @@ hashDigits attested =
         ResidualSha256 stored ->
             String.dropLeft (String.length residualScheme) stored
 
+        RefusalBlake3 stored ->
+            String.dropLeft (String.length refusalScheme) stored
+
         UnknownScheme other ->
             other
 
 
--- Source text proved within both view ceilings and equal to its attestation:
--- the drawn rows and the text they join to. Opaque: built only by
--- `classifyView`, so holding one means the bytes were measured and re-hashed.
+-- Source text proved within every view ceiling and equal to its
+-- attestation: the rows, the text they join to, and their drawing whose
+-- elements were counted. Opaque: built only by `classifyView`, so holding one
+-- means the bytes were measured, the drawing counted and the text re-hashed.
 type ShownSource
-    = ShownSource { uid : Uid, rows : List SourceRow, text : String, hash : String }
+    = ShownSource { uid : Uid, rows : List SourceRow, text : String, hash : String, drawn : DrawnSource }
 
 
 shownText : ShownSource -> String
@@ -1577,6 +2393,15 @@ shownRows shown =
     case shown of
         ShownSource s ->
             s.rows
+
+
+-- The shown view's drawing, the one `classifyView` counted against
+-- `viewNodeCeiling`; the page draws it and never lexes the rows again.
+shownDrawn : ShownSource -> DrawnSource
+shownDrawn shown =
+    case shown of
+        ShownSource s ->
+            s.drawn
 
 
 shownHash : ShownSource -> String
@@ -1620,7 +2445,7 @@ reverify settings shown =
         ShownSource s ->
             do
                 conn <- readConnection settings
-                rows <- Db.queryDecode conn unitByUidSql [ Uid.toSql s.uid ] rowDecoder
+                rows <- queryUnit conn settings.roots s.uid
                 case List.head rows of
                     Just row ->
                         viewOf conn settings.roots row
@@ -1661,6 +2486,342 @@ sourceChanged =
     Error.conflict "source changed since it was shown; reload"
 
 
+-- Re-proves an unreviewable file at decision time, the refusal row's
+-- counterpart of `reverify`: its row is re-read by uid, under a bound tag,
+-- in a fresh index read, and must still carry `digest`. A row gone, a
+-- blocking row (no digest), or another digest is a conflict. A content
+-- reason re-probes the file, which must still be refused: a not-UTF-8 file
+-- must still fail to read as text within `sourceCeiling`; an oversized one
+-- must still hold at least its recorded size, or more than `sourceCeiling`.
+-- The app has no bounded byte read to re-hash the file with, so the
+-- decision binds the index's digest, and the next index run re-hashes: a
+-- changed digest is a new, open pair.
+reverifyRefusal : IndexSettings -> Uid -> RefusalDigest -> Task.Task Error Attested
+reverifyRefusal settings uid digest =
+    let
+        bound =
+            refusalCondition (refusalTags settings.roots)
+    in
+    do
+        conn <- readConnection settings
+        rows <- Db.queryDecode conn (refusalColumns ++ " u.uid = ? AND" ++ bound.sql ++ " LIMIT 1") ([ Uid.toSql uid ] ++ bound.params) refusalWithPathDecoder
+        case List.head rows of
+            Just ( row, stored ) ->
+                confirmRefusal settings.roots digest row stored
+
+            Nothing ->
+                Task.fail (Error.conflict "file is no longer unreviewable in the index; reload")
+
+
+-- A refusal row with its stored path, the one form `RepoPath.resolve` reads.
+refusalWithPathDecoder : Db.Decode.Decoder ( RefusalRow, String )
+refusalWithPathDecoder =
+    Db.Decode.andThen
+        (\raw -> Db.Decode.map (\row -> ( row, raw.path )) (refusalRowOf raw))
+        rawRefusalDecoder
+
+
+confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> String -> Task.Task Error Attested
+confirmRefusal roots digest row stored =
+    case row.digest of
+        Nothing ->
+            Task.fail cannotAcknowledge
+
+        Just now ->
+            if refusalDigestText now == refusalDigestText digest then
+                stillRefused roots row stored
+                    |> Task.map (\_ -> Attested { uid = row.uid, hash = refusalDigestText now })
+
+            else
+                Task.fail sourceChanged
+
+
+-- The re-probe of a refusal row's reason before a decision binds it: a
+-- content reason's file must still be refused, an entry reason's digest is
+-- of the staged entry and needs no read, and a blocking reason is never
+-- decided.
+stillRefused : RootMap -> RefusalRow -> String -> Task.Task Error ()
+stillRefused roots row stored =
+    case row.reason of
+        NotUtf8 ->
+            stillUnreadable roots stored sourceCeiling
+
+        Oversized ->
+            case row.size of
+                Just size ->
+                    if size > 0 then
+                        stillUnreadable roots stored (ByteSize.bytes (atMostSourceCeiling (size - 1)))
+
+                    else
+                        Task.fail notReprobed
+
+                Nothing ->
+                    Task.fail notReprobed
+
+        SymlinkEntry ->
+            Task.succeed ()
+
+        GitlinkEntry ->
+            Task.succeed ()
+
+        UnknownMode ->
+            Task.succeed ()
+
+        PastHashCeiling ->
+            Task.fail cannotAcknowledge
+
+        NonUtf8Name ->
+            Task.fail cannotAcknowledge
+
+        NotRepoRelative ->
+            Task.fail cannotAcknowledge
+
+        NestedRepository ->
+            Task.fail cannotAcknowledge
+
+        NotRegular ->
+            Task.fail cannotAcknowledge
+
+        UnreadableEntry ->
+            Task.fail cannotAcknowledge
+
+        ReplacedEntry ->
+            Task.fail cannotAcknowledge
+
+
+atMostSourceCeiling : Int -> Int
+atMostSourceCeiling n =
+    if n < ByteSize.toBytes sourceCeiling then
+        n
+
+    else
+        ByteSize.toBytes sourceCeiling
+
+
+-- The file at `stored` exists and does not read as text within `cap`. The
+-- stored path is the index's escaped form, parsed back to the name it
+-- escapes by `unescapeShown`; a path that is not the index's escape of a
+-- name names no file this app can join, so it is never re-probed and never
+-- decided.
+stillUnreadable : RootMap -> String -> ByteSize -> Task.Task Error ()
+stillUnreadable roots stored cap =
+    case Maybe.map (RepoPath.resolve roots) (unescapeShown stored) of
+        Just (Ok path) ->
+            do
+                present <- File.exists path
+                if present then
+                    File.readFileLimit path cap
+                        |> Task.map (\_ -> False)
+                        |> Task.onError (\_ -> Task.succeed True)
+                        |> Task.andThen refusedStill
+
+                else
+                    Task.fail notReprobed
+
+        Just (Err _) ->
+            Task.fail notReprobed
+
+        Nothing ->
+            Task.fail notReprobed
+
+
+-- Where `unescapeShown` stands after the characters read so far: plain
+-- text, just past a `\`, just past `\u`, or inside `\u{..}` with the code
+-- point and the count of hex digits read; `Malformed` once the text cannot
+-- be an escape the index writes. Each carries the name read so far,
+-- reversed.
+type ShownScan
+    = ShownPlain (List Char)
+    | ShownSlash (List Char)
+    | ShownU (List Char)
+    | ShownHex (List Char) Int Int
+    | Malformed
+
+
+-- The name ipe-index's `shown` escape renders as `stored`, its exact
+-- inverse: `\\` is a backslash, `\u{h}` the character of code point `h`
+-- in lowercase hex without a leading zero, and every other character is a
+-- space or a printable ASCII character standing for itself. Anything
+-- `shown` never writes is Nothing: a raw character it would have escaped, an
+-- escape of a character it writes bare, a code point that is no character,
+-- or `\x{..}`, a byte of a name that is not UTF-8, which names no file
+-- this app can open. One pass, no recursion.
+unescapeShown : String -> Maybe String
+unescapeShown stored =
+    case String.foldl shownStep (ShownPlain []) stored of
+        ShownPlain name ->
+            Just (String.fromList (List.reverse name))
+
+        ShownSlash _ ->
+            Nothing
+
+        ShownU _ ->
+            Nothing
+
+        ShownHex _ _ _ ->
+            Nothing
+
+        Malformed ->
+            Nothing
+
+
+shownStep : Char -> ShownScan -> ShownScan
+shownStep c scan =
+    case scan of
+        ShownPlain name ->
+            if c == '\\' then
+                ShownSlash name
+
+            else if shownBare (Char.toCode c) then
+                ShownPlain (c :: name)
+
+            else
+                Malformed
+
+        ShownSlash name ->
+            if c == '\\' then
+                ShownPlain (c :: name)
+
+            else if c == 'u' then
+                ShownU name
+
+            else
+                Malformed
+
+        ShownU name ->
+            if c == '{' then
+                ShownHex name 0 0
+
+            else
+                Malformed
+
+        ShownHex name code digits ->
+            if c == '}' then
+                escapedChar name code digits
+
+            else
+                case lowerHexValue c of
+                    Just value ->
+                        if (digits == 1 && code == 0) || digits >= 6 then
+                            Malformed
+
+                        else
+                            ShownHex name (code * 16 + value) (digits + 1)
+
+                    Nothing ->
+                        Malformed
+
+        Malformed ->
+            Malformed
+
+
+-- The character a complete `\u{..}` escape names, when `shown` would have
+-- escaped it.
+escapedChar : List Char -> Int -> Int -> ShownScan
+escapedChar name code digits =
+    let
+        c =
+            Char.fromCode code
+    in
+    if digits > 0 && Char.toCode c == code && not (shownBare code) && c /= '\\' then
+        ShownPlain (c :: name)
+
+    else
+        Malformed
+
+
+-- ipe-index's `shown` escape of `text`, the one `unescapeShown` inverts:
+-- `\\` for a backslash, the character itself for a space or printable
+-- ASCII, and `\u{h}` in lowercase hex without a leading zero for any other.
+escapeShown : String -> String
+escapeShown text =
+    String.concat (List.map escapeShownChar (String.toList text))
+
+
+escapeShownChar : Char -> String
+escapeShownChar c =
+    let
+        code =
+            Char.toCode c
+    in
+    if c == '\\' then
+        "\\\\"
+
+    else if shownBare code then
+        String.fromChar c
+
+    else
+        "\\u{" ++ lowerHex code ++ "}"
+
+
+-- A code point in lowercase hex without a leading zero: at most six digits,
+-- as no code point passes 0x10ffff.
+lowerHex : Int -> String
+lowerHex code =
+    let
+        digit place written =
+            let
+                d =
+                    modBy 16 (code // place)
+            in
+            if d == 0 && written == "" then
+                written
+
+            else
+                written ++ String.slice d (d + 1) "0123456789abcdef"
+
+        digits =
+            List.foldl digit "" [ 1048576, 65536, 4096, 256, 16, 1 ]
+    in
+    if digits == "" then
+        "0"
+
+    else
+        digits
+
+
+-- A code point `shown` writes as itself: a space or printable ASCII other
+-- than the backslash.
+shownBare : Int -> Bool
+shownBare code =
+    code >= 32 && code <= 126 && code /= 92
+
+
+lowerHexValue : Char -> Maybe Int
+lowerHexValue c =
+    let
+        code =
+            Char.toCode c
+    in
+    if code >= 48 && code <= 57 then
+        Just (code - 48)
+
+    else if code >= 97 && code <= 102 then
+        Just (code - 87)
+
+    else
+        Nothing
+
+
+refusedStill : Bool -> Task.Task Error ()
+refusedStill refused =
+    if refused then
+        Task.succeed ()
+
+    else
+        Task.fail (Error.conflict "file now reads as text; re-run the index")
+
+
+cannotAcknowledge : Error
+cannotAcknowledge =
+    Error.conflict "this file cannot be acknowledged; fix it in the tree"
+
+
+notReprobed : Error
+notReprobed =
+    Error.conflict "this file could not be re-probed, so it cannot be decided"
+
+
 -- Why a unit's source is withheld instead of shown.
 type StaleReason
     = Drifted
@@ -1673,6 +2834,7 @@ type Oversize
     = SpanLines { lines : Int }
     | ViewBytes { size : ByteSize }
     | ChildSpans { atLeast : Int }
+    | ViewNodes { nodes : Int }
 
 
 -- What a unit's attestation covers: a span unit its line range (1-based,
@@ -1681,13 +2843,6 @@ type Oversize
 type Body
     = LineRange Int Int
     | Residual (List ( Int, Int ))
-
-
--- One row of a view: a source line with its 1-based number, or the marker
--- standing for one run of lines child units cover.
-type SourceRow
-    = Numbered Int String
-    | Covered
 
 
 -- What the unit page may show of a unit's source: the verified view, a

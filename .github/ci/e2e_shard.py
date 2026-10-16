@@ -52,7 +52,7 @@ HEAVY = (
     "binary(watch_sigterm) | binary(watch_integration) | binary(watch_hot_appearance)"
     " | binary(watch_bluegreen) | binary(watch_cancellation) | binary(server_e2e)"
     " | binary(live_e2e) | binary(http_e2e) | binary(g_http_live) | binary(webview_e2e)"
-    " | binary(secured_store_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)"
+    " | binary(secured_store_e2e) | binary(server_shutdown_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)"
 )
 HEAVY_SHARDS = 5
 LIGHT_SHARDS = 9

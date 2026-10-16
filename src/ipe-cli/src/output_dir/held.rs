@@ -32,12 +32,13 @@ use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use ipe_fs_open::{ByteCap, EntryName, FileId, FileKind, OpenRefusal, RegularFile};
+use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileId, FileKind, OpenRefusal, RegularFile};
 
 use super::{
     CLAIM_FILE, CLAIM_POLL, MARKER_HEADER, MARKER_READ_CAP, MARKER_TEXT, MAX_CLAIM_POLLS,
     OWNERSHIP_MARKER, OutputRefusal, Tolerated, temp_suffix, tolerated_entry,
 };
+use crate::io_bounded::{read_proven, refusal_error};
 use crate::{CliError, io_err};
 
 #[cfg(unix)]
@@ -367,6 +368,59 @@ impl HeldDir {
             )) => Ok(EntryKind::Other),
             Err(refusal) => Err(refused(&self.path.join(name.as_os_str()), refusal)),
         }
+    }
+
+    /// Every entry of this directory and its kind, listed through the held handle.
+    ///
+    /// Names keep their exact on-disk spelling (no case folding), and a link
+    /// (on Windows, any reparse point) is reported as [`FileKind::Symlink`],
+    /// never followed. The listing is [`ipe_fs_open::HeldDir::entries`].
+    ///
+    /// # Errors
+    /// [`CliError::DiscoveryLimitReached`] when the directory holds more than
+    /// `cap` entries; otherwise the source-read refusal of the listing
+    /// ([`refusal_error`]).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the source snapshot reader is its consumer")
+    )]
+    pub fn list_names(&self, cap: EntryCap) -> Result<Vec<(EntryName, FileKind)>, CliError> {
+        self.dir.entries(cap).map_err(|refusal| match refusal {
+            OpenRefusal::TooManyEntries(cap) => CliError::DiscoveryLimitReached {
+                detail: format!(
+                    "`{}` holds more than {} entries",
+                    self.path.display(),
+                    cap.get()
+                ),
+            },
+            other => refusal_error(&self.path, other),
+        })
+    }
+
+    /// The UTF-8 text of the regular file `name`, opened through the held handle under `cap`.
+    ///
+    /// The entry is opened without following a link and without blocking,
+    /// proven regular on its own handle, and read at most one byte past
+    /// `cap` ([`ipe_fs_open::HeldDir::open_regular`], then [`read_proven`]).
+    /// `name` is looked up as the file system matches names, case-insensitively
+    /// on a case-insensitive volume: only a name taken from [`HeldDir::list_names`]
+    /// is the on-disk spelling.
+    ///
+    /// # Errors
+    /// [`CliError::SourceRefused`] for a link, a non-regular entry, or a denied
+    /// open; [`CliError::FileTooLarge`] past `cap`; [`CliError::Io`] for an
+    /// absent entry, content that is not UTF-8, or another failure.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the source snapshot reader is its consumer")
+    )]
+    pub fn read_file_capped(&self, name: &EntryName, cap: ByteCap) -> Result<String, CliError> {
+        let path = self.path.join(name.as_os_str());
+        let file = self
+            .dir
+            .open_regular(name)
+            .map_err(|refusal| refusal_error(&path, refusal))?;
+        read_proven(file, &path, cap)
     }
 
     /// Open the subdirectory `name`, refusing a link or a non-directory.
@@ -929,12 +983,12 @@ impl HeldDir {
         self.replace_file(name, OsStr::new(&tmp), permissions, fill)
     }
 
-    /// Whether `name` spells the marker or the claim name, in any ASCII case.
+    /// Whether a case-folding volume may open `name` as the marker or the
+    /// claim file ([`ipe_fs_open::may_open_as`]).
     fn is_reserved(name: &OsStr) -> bool {
-        let name = name.to_string_lossy();
         [OWNERSHIP_MARKER, CLAIM_FILE]
             .into_iter()
-            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            .any(|reserved| ipe_fs_open::may_open_as(name, reserved))
     }
 
     /// Fill the new file `tmp`, then rename it over `name`; `tmp` is removed on failure.
@@ -2403,6 +2457,8 @@ mod tests {
             CLAIM_FILE,
             ".IPE-OUTPUT",
             ".Ipe-Output.Claim",
+            ".\u{131}pe-output",
+            "\u{FEFF}.ipe-output.cla\u{131}m",
         ] {
             let written = held.write_file(OsStr::new(name), None, |file| {
                 file.write_all(MARKER_TEXT.as_bytes())
@@ -2477,5 +2533,254 @@ mod tests {
                 "{refusal:?} is an I/O error of its kind, got {error:?}"
             );
         }
+    }
+
+    /// An entry name the tests know is plain.
+    fn name(spelled: &str) -> EntryName {
+        EntryName::new(OsStr::new(spelled)).expect("plain entry name")
+    }
+
+    /// A non-zero entry cap of `entries`.
+    fn entry_cap(entries: u32) -> EntryCap {
+        EntryCap::new(entries).expect("non-zero entry cap")
+    }
+
+    /// A non-zero byte cap of `bytes`.
+    fn byte_cap(bytes: u64) -> ByteCap {
+        ByteCap::new(bytes).expect("non-zero byte cap")
+    }
+
+    /// The names a listing returned, in sorted order.
+    fn listed_names(listing: &[(EntryName, FileKind)]) -> Vec<String> {
+        let mut names: Vec<String> = listing
+            .iter()
+            .map(|(entry, _)| entry.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A listing of exactly its cap is accepted; one entry past it is a discovery limit.
+    #[test]
+    fn list_names_accepts_its_cap_and_refuses_one_past() {
+        let base = scratch("list_cap");
+        for leaf in ["A.ipe", "B.ipe", "C.ipe"] {
+            std::fs::write(base.join(leaf), "module").expect("plant source");
+        }
+        let held = held_at(&base);
+        let at_cap = held
+            .list_names(entry_cap(3))
+            .expect("three entries at a cap of three");
+        assert_eq!(listed_names(&at_cap), ["A.ipe", "B.ipe", "C.ipe"]);
+        assert!(
+            at_cap.iter().all(|(_, kind)| *kind == FileKind::Regular),
+            "each entry is a regular file, got {at_cap:?}"
+        );
+        let past = held.list_names(entry_cap(2));
+        assert!(
+            matches!(&past, Err(CliError::DiscoveryLimitReached { detail }) if detail.contains("more than 2 entries")),
+            "one entry past the cap is refused, got {past:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Names keep their exact spelling: two names differing only in case stay two entries.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn list_names_keeps_case_distinct_names_apart() {
+        let base = scratch("list_case");
+        std::fs::write(base.join("Foo.ipe"), "upper").expect("plant Foo.ipe");
+        std::fs::write(base.join("foo.ipe"), "lower").expect("plant foo.ipe");
+        let held = held_at(&base);
+        let listing = held.list_names(entry_cap(2)).expect("two entries");
+        assert_eq!(listed_names(&listing), ["Foo.ipe", "foo.ipe"]);
+        assert_eq!(
+            held.read_file_capped(&name("Foo.ipe"), byte_cap(16))
+                .ok()
+                .as_deref(),
+            Some("upper")
+        );
+        assert_eq!(
+            held.read_file_capped(&name("foo.ipe"), byte_cap(16))
+                .ok()
+                .as_deref(),
+            Some("lower")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A name that differs from the on-disk name only in case does not read the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_file_capped_is_exact_case() {
+        let base = scratch("read_case");
+        std::fs::write(base.join("Foo.ipe"), "upper").expect("plant Foo.ipe");
+        let read = held_at(&base).read_file_capped(&name("foo.ipe"), byte_cap(16));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
+            "a case-folded name is absent, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A link in the listing is reported as a link, and what it points at is not listed.
+    #[cfg(unix)]
+    #[test]
+    fn list_names_reports_a_link_and_never_follows_it() {
+        let base = scratch("list_link");
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).expect("make outside");
+        std::fs::write(outside.join("Secret.ipe"), "secret").expect("plant outside source");
+        let src = base.join("src");
+        std::fs::create_dir(&src).expect("make src");
+        std::fs::write(src.join("Main.ipe"), "main").expect("plant source");
+        std::os::unix::fs::symlink(&outside, src.join("Escape")).expect("dir link");
+        std::os::unix::fs::symlink(outside.join("Secret.ipe"), src.join("Leak.ipe"))
+            .expect("file link");
+        let listing = held_at(&src).list_names(entry_cap(8)).expect("list src");
+        assert_eq!(listed_names(&listing), ["Escape", "Leak.ipe", "Main.ipe"]);
+        for (entry, kind) in &listing {
+            let expected = if entry.as_os_str() == "Main.ipe" {
+                FileKind::Regular
+            } else {
+                FileKind::Symlink
+            };
+            assert_eq!(*kind, expected, "{entry:?} is listed as what it is");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A read of exactly its cap is accepted; one byte past it is refused as too large.
+    #[test]
+    fn read_file_capped_accepts_its_cap_and_refuses_one_past() {
+        let base = scratch("read_cap");
+        std::fs::write(base.join("Main.ipe"), "12345").expect("plant source");
+        let held = held_at(&base);
+        assert_eq!(
+            held.read_file_capped(&name("Main.ipe"), byte_cap(5))
+                .ok()
+                .as_deref(),
+            Some("12345")
+        );
+        let past = held.read_file_capped(&name("Main.ipe"), byte_cap(4));
+        assert!(
+            matches!(&past, Err(CliError::FileTooLarge { max: 4, path }) if path.ends_with("Main.ipe")),
+            "one byte past the cap is refused, got {past:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A link to a regular file is refused as a link, never read through.
+    #[cfg(unix)]
+    #[test]
+    fn read_file_capped_refuses_a_link() {
+        let base = scratch("read_link");
+        std::fs::write(base.join("Target.ipe"), "secret").expect("plant target");
+        std::os::unix::fs::symlink(base.join("Target.ipe"), base.join("Main.ipe"))
+            .expect("file link");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(
+                &read,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::Symlink,
+                    ..
+                })
+            ),
+            "a link is refused as a link, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A directory at the name is refused as not a regular file.
+    #[test]
+    fn read_file_capped_refuses_a_directory() {
+        let base = scratch("read_dir");
+        std::fs::create_dir(base.join("Main.ipe")).expect("dir at the name");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(
+                &read,
+                Err(CliError::SourceRefused {
+                    reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                    ..
+                })
+            ),
+            "a directory is not a regular file, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A FIFO at the name is refused as not a regular file, and the open never blocks.
+    #[cfg(unix)]
+    #[test]
+    fn read_file_capped_refuses_a_fifo_without_blocking() {
+        let base = scratch("read_fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(base.join("Main.ipe"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo creates the fixture");
+        let (sent, received) = std::sync::mpsc::channel();
+        let dir = base.clone();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let read = held_at(&dir).read_file_capped(&name("Main.ipe"), byte_cap(64));
+                let _ = sent.send(matches!(
+                    read,
+                    Err(CliError::SourceRefused {
+                        reason: crate::io_bounded::SourceRefusal::NotRegularFile,
+                        ..
+                    })
+                ));
+            })
+            .expect("spawn the reader thread");
+        let refused = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read returns without blocking on the FIFO");
+        assert!(refused, "a FIFO is not a regular file");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Content that is not UTF-8 is an invalid-data read error, never lossily decoded.
+    #[test]
+    fn read_file_capped_refuses_content_that_is_not_utf8() {
+        let base = scratch("read_not_utf8");
+        std::fs::write(base.join("Main.ipe"), b"module \xff").expect("plant source");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, path }) if source.kind() == io::ErrorKind::InvalidData && path.ends_with("Main.ipe")),
+            "non-UTF-8 content is refused, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An absent entry is a not-found read error naming the entry.
+    #[test]
+    fn read_file_capped_reports_an_absent_entry_as_not_found() {
+        let base = scratch("read_absent");
+        let read = held_at(&base).read_file_capped(&name("Main.ipe"), byte_cap(64));
+        assert!(
+            matches!(&read, Err(CliError::Io { source, path }) if source.kind() == io::ErrorKind::NotFound && path.ends_with("Main.ipe")),
+            "an absent entry is not found, got {read:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A held directory removed before its listing is refused, never listed as empty.
+    #[cfg(unix)]
+    #[test]
+    fn list_names_refuses_a_removed_directory() {
+        let base = scratch("list_removed");
+        let gone = base.join("gone");
+        std::fs::create_dir(&gone).expect("make dir");
+        let held = held_at(&gone);
+        std::fs::remove_dir(&gone).expect("remove the held dir");
+        let listing = held.list_names(entry_cap(8));
+        assert!(
+            matches!(&listing, Err(CliError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
+            "a removed directory is refused, got {listing:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

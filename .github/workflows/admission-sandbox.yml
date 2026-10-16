@@ -383,12 +383,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run admission jail inside FreeBSD VM
-        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
-          usesh: true
-          # synctime=false skips the NTP sync that can stall the VM boot on
-          # congested GHA runners; the clock drift is irrelevant for jail proofs.
-          synctime: false
+          # `sync-time: false` passes `--sync-time off`, so the VM boot does
+          # not wait on an NTP sync (an absent key passes no flag and leaves
+          # the VM's own default); clock drift does not matter for the jail
+          # proofs.
+          sync-time: false
           prepare: |
             # Retry pkg install up to 3 times to ride out transient mirror flaps.
             i=0; until pkg install -y python3; do

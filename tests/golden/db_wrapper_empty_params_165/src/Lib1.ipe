@@ -1,7 +1,10 @@
 module Lib1 exposing (withConn, query, exec)
 
 import Ipe.Db
+import Ipe.Db.Location as Location exposing (Mode(..))
 import Ipe.Db.Unsafe
+import Ipe.Path as Path
+import Ipe.Result as Result
 import Ipe.Task as Task
 
 
@@ -27,5 +30,8 @@ exec conn queryStr args =
 
 -- Open a connection, run `f conn`, then close it.
 withConn f =
-    Db.open "sqlite" "/tmp/ipe_db_wrapper_empty_params_165_golden.db"
+    Path.fromString "/tmp/ipe_db_wrapper_empty_params_165_golden.db"
+        |> Result.andThen (Location.file CreateIfMissing)
+        |> Task.fromResult
+        |> Task.andThen (\loc -> Db.open loc)
         |> Task.andThen f

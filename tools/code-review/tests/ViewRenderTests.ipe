@@ -19,12 +19,12 @@ import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), R
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
 import Lib.View as View
-import TestSupport exposing (checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
+import TestSupport exposing (checkReporting, cleanupIndex, codeText, envAppSettings, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
 
 
 -- Every check here renders the real `View.view` to HTML, the exact string the
@@ -62,18 +62,22 @@ baseModel =
 
 queued : Index.UnitView -> Queue.QueuedUnit
 queued loaded =
-    { unit = loaded.unit, change = New, changed = Nothing }
+    { unit = loaded.unit, change = New, changed = Nothing, standing = Queue.Undecided }
 
 
 queuePage : List Queue.QueuedUnit -> Int -> Queue.Progress -> Queue.QueuePage
 queuePage units total progress =
     { units = units
     , total = total
+    , unbound = 0
     , dbName = SafeText.literal "index.db"
     , dbBytes = 2048
     , next = Nothing
     , progress = progress
     , log = ShownProven
+    , refusals = []
+    , refusalsOpen = 0
+    , refusalsUnbound = 0
     }
 
 
@@ -91,7 +95,7 @@ cardModel loaded =
 changedModel : Index.UnitView -> LibDb.VerifiedRow -> Model
 changedModel loaded old =
     { baseModel
-        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = LibDb.verifiedHash old }, changed = Just old } ] 1 { reviewed = 0, total = 1 })
+        | queueState = Loaded (queuePage [ { unit = loaded.unit, change = Modified { old = LibDb.verifiedHash old }, changed = Just old, standing = Queue.Undecided } ] 1 { reviewed = 0, total = 1 })
         , selectedView = ViewShown loaded
     }
 
@@ -279,6 +283,9 @@ oversizeCase over =
         ChildSpans { atLeast } ->
             { view = TooLarge over, reason = "holds at least " ++ String.fromInt atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling" }
 
+        ViewNodes { nodes } ->
+            { view = TooLarge over, reason = "draws as " ++ String.fromInt nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling" }
+
 
 -- Every way a source is withheld.
 withheldCases : List Withheld
@@ -292,6 +299,7 @@ withheldCases =
     , oversizeCase (SpanLines { lines = Index.viewLineCeiling + 1 })
     , oversizeCase (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
     , oversizeCase (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
+    , oversizeCase (ViewNodes { nodes = Index.viewNodeCeiling + 1 })
     ]
 
 
@@ -330,6 +338,9 @@ withheldName view =
 
         TooLarge (ChildSpans _) ->
             Just "ChildSpans"
+
+        TooLarge (ViewNodes _) ->
+            Just "ViewNodes"
 
 
 -- The constructors `type <name>` declares in `source`, read off its `=` and
@@ -535,23 +546,19 @@ refuseErrorEscaped loaded =
         && button "Confirm" plain
 
 
--- A failed decision save is shown in the queue banner, escaped.
-decisionErrorEscaped : Index.UnitView -> Bool
-decisionErrorEscaped loaded =
+-- A failed decision save shows its case's fixed text in the queue banner,
+-- and nothing when no save failed. Red if a case renders another's text or
+-- the banner shows without a failure.
+decisionErrorFixedText : Index.UnitView -> Bool
+decisionErrorFixedText loaded =
     let
         card =
             cardModel loaded
-
-        hostile =
-            page { card | decisionError = Just (Error.invalidInput hostileText) }
-
-        plain =
-            page { card | decisionError = Just (Error.invalidInput "disk full") }
     in
-    has (byteOrderOpen ++ "Decision save failed: ") hostile
-        && escapesHostile hostile
-        && has "Decision save failed: " plain
-        && has "disk full" plain
+    List.all
+        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decision = DecisionNotSaved failure Queue.firstTicket }))
+        [ SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+        && not (has "Decision save failed: " (page card))
 
 
 -- ── the address the page reports ────────────────────────────────────
@@ -666,6 +673,45 @@ seededChecks a b =
         beforeFirstCard =
             page (cardModelUnder (ShownBroken (BeforeFirst 1)) a)
 
+        twin =
+            { unit | uid = uid "u-twin", path = SafeText.renderForeign "ipe:src/twin.rs" }
+
+        twinCard =
+            page { baseModel | queueState = Loaded (queuePage [ queued a, { unit = twin, change = New, changed = Nothing, standing = Queue.Undecided } ] 2 { reviewed = 0, total = 2 }), selectedView = ViewShown a }
+
+        placeOf path =
+            path ++ ":" ++ String.fromInt unit.lineStart
+
+        historyPage =
+            page (unverifiedHistory ShownProven Legacy)
+
+        documented title html =
+            has ("<title>" ++ title ++ " · Code review</title>") html
+                && has "lang=\"en\"" html
+                && List.length (String.split "<h1" html)
+                == 2
+
+        standingPage bodyHash standing =
+            page { baseModel | page = UnitPage (Uid.toString a.unit.uid), selectedView = ViewShown a, standing = Queue.StandingShown a.unit.uid bodyHash standing }
+
+        currentHash =
+            Index.storedHash a.unit.attested
+
+        approvedPage =
+            standingPage currentHash (Queue.Decided StoredApproved)
+
+        tamperedPage =
+            standingPage currentHash (Queue.NotCounted Tampered)
+
+        undecidedPage =
+            standingPage currentHash Queue.Undecided
+
+        olderBodyPage =
+            standingPage (currentHash ++ "-older") (Queue.Decided StoredApproved)
+
+        tamperedCard =
+            page { baseModel | queueState = Loaded (queuePage [ { unit = a.unit, change = Unrecorded, changed = Nothing, standing = Queue.NotCounted Tampered } ] 1 { reviewed = 0, total = 1 }), selectedView = ViewShown a }
+
         noControl html =
             not (button "Approve" html) && not (button "Refuse" html) && not (has "a approve" html)
 
@@ -683,11 +729,49 @@ seededChecks a b =
     , ( "a hostile history name is escaped", escapesHostile (page hostileHistory) )
     , ( "a hostile unit name, unit path and history name each draw in byte order", hostileInByteOrder "" (page (cardModel hostileName)) && hostileInByteOrder "" (page (unitPageModel hostileName)) && hostileInByteOrder "" (page (cardModel hostilePath)) && hostileInByteOrder "" (page hostileHistory) )
     , ( "untrusted text draws in byte order, and text with no hazard draws no escape marker", has "unicode-bidi:bidi-override" View.displayOrderCss && has "direction:ltr" View.displayOrderCss && has "background-color:" View.escapeCss && has "border:" View.escapeCss && not (has "data-review-escape" shownCard) && has (byteOrderOpen ++ "Lib.answer") shownCard )
+    , ( "two units sharing a kind and name each show their place, a unit alone shows its kind and no place"
+    , has (placeOf "ipe:src/twin.rs") twinCard
+        && has (placeOf (SafeText.toString unit.path)) twinCard
+        && has (SafeText.toString unit.kind) shownCard
+        && not (has (placeOf (SafeText.toString unit.path)) shownCard)
+    )
+    , ( "every page has a title naming it, a language and one h1, and each unit card or history entry opens an h2"
+    , documented "Queue" shownCard
+        && documented "Queue" (page baseModel)
+        && documented "History" historyPage
+        && documented "Lib.answer" shownPage
+        && documented "Unit" (page (addressModel "not a uid"))
+        && has "<h2" shownCard
+        && has "<h2" shownPage
+        && has "<h2" historyPage
+        && not (has "<title></title>" shownCard)
+        && not (has "<h2" (page baseModel))
+    )
+    , ( "the unit page of a decided unit names its decision, a reopened unit says why its row is not counted, and an undecided one says it is not reviewed"
+    , has "Approved" approvedPage
+        && not (has "Not reviewed" approvedPage)
+        && has "signature does not verify" tamperedPage
+        && not (has "Approved" tamperedPage)
+        && has "Not reviewed" undecidedPage
+        && not (has "Approved" undecidedPage)
+        && noDecisionButtons approvedPage
+    )
+    , ( "a standing read for another body of the unit shows no decision, only that the read is running"
+    , not (has "Approved" olderBodyPage)
+        && has "Reading review status" olderBodyPage
+        && has "Reading review status" shownPage
+    )
+    , ( "a queued unit whose row for the current body does not verify says so on its card and in the rail, never as an unreviewed unit"
+    , List.length (String.split "signature does not verify" tamperedCard)
+        == 3
+        && not (has "Not reviewed" tamperedCard)
+        && has "Not reviewed" shownCard
+    )
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
     , ( "a refusal error is escaped in the open refusal panel", refuseErrorEscaped a )
-    , ( "a failed decision save is escaped in the queue banner", decisionErrorEscaped a )
+    , ( "a failed decision save shows its case's fixed text in the queue banner", decisionErrorFixedText a )
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
@@ -732,10 +816,26 @@ showsNoStateText html =
 
 
 -- ── a hostile source token ──────────────────────────────────────────────
--- The text a comment token opens with: the line's indent and the marker.
-commentLead : String
-commentLead =
-    "    // "
+-- True when `html` draws the hostile comment inside a code block, every
+-- code block opens in byte order (`displayOrderCss` on the block itself),
+-- and no element inside a block sets its own `unicode-bidi`, so none resets
+-- the block's override.
+hostileSourceInByteOrder : String -> Bool
+hostileSourceInByteOrder html =
+    let
+        blocks =
+            codeBlocks html
+    in
+    not (List.isEmpty blocks)
+        && List.any (has ("// " ++ hostileEscaped)) blocks
+        && List.all (\block -> String.startsWith ("style=\"" ++ View.codeCss ++ "\">") block && List.length (String.split "unicode-bidi" block) == 2) blocks
+        && has View.displayOrderCss View.codeCss
+
+
+-- Each `code` element of `html`, from its attributes to its close.
+codeBlocks : String -> List String
+codeBlocks html =
+    List.filterMap (\piece -> List.head (String.split "</code>" piece)) (List.drop 1 (String.split "<code " html))
 
 
 -- The fixture unit's four lines with a comment holding `hostileText`, then the
@@ -766,7 +866,7 @@ hostileSourceChecks =
             [ ( "the hostile fixture source is verified and shown", isShown loaded )
             , ( "a hostile source token is escaped on the queue page", escapesHostile (page (cardModel loaded)) )
             , ( "a hostile source token is escaped on the unit page", escapesHostile (page (unitPageModel loaded)) )
-            , ( "a hostile source token draws in byte order", hostileInByteOrder commentLead (page (cardModel loaded)) && hostileInByteOrder commentLead (page (unitPageModel loaded)) )
+            , ( "a hostile source token draws in its code block's byte order, which no element inside resets", hostileSourceInByteOrder (page (cardModel loaded)) && hostileSourceInByteOrder (page (unitPageModel loaded)) )
             , ( "source text spelling an escape draws as plain text, the real character it names as a marked escape", has (hostileEscaped ++ asciiSpelling ++ escapeMarkup "\\u{200b}") (page (cardModel loaded)) && not (has (codeText 8203) (page (cardModel loaded))) )
             , ( "a hostile source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
             ]
@@ -878,12 +978,55 @@ shortcutRootAutofocused =
         == 2
 
 
+-- ── unreviewable files ──────────────────────────────────────────────────
+--
+-- An unreviewable file's stored path is index text: it reaches the queue
+-- card and the History page escaped, and only an acknowledgeable file on a
+-- server that can sign is offered a decision. The rows are read from a
+-- seeded index, so the card renders what the decoder makes of them.
+refusalChecks : Task.Task Error (List ( String, Bool ))
+refusalChecks =
+    do
+        at <- freshScratch "ipe-view-render-refusals"
+        seedIndex at.indexDb at.repo
+        System.setenv "IPE_REVIEW_DB" at.reviewDb
+        db <- migratedReviewAt at.reviewDb
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'symlink-entry', NULL, ?)"
+            [ Uid.toSql (uid "r-link"), SqlString ("ipe:src/" ++ hostileText), SqlString ("refusal-blake3:" ++ String.repeat 64 "a") ]
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-gone"), SqlString "ipe:src/replaced.txt" ]
+        loaded <- loadPageNow Index.Start
+        settings <- envAppSettings
+        decided <- case Maybe.andThen (\row -> row.digest) (List.find (\row -> row.uid == uid "r-link") loaded.refusals) of
+            Just digest ->
+                Queue.decideRefusal settings.key settings.index db (uid "r-link") digest LibDb.Approved
+                    |> Task.map (\_ -> True)
+
+            Nothing ->
+                Task.succeed False
+        history <- loadHistoryPageNow HistoryStart
+        cleanupIndex at.indexDb at.repo
+        removeFileIfAny at.reviewDb
+        proven <- Task.succeed (page { baseModel | queueState = Loaded { loaded | log = ShownProven } })
+        unkeyed <- Task.succeed (page { baseModel | queueState = Loaded { loaded | log = ShownUnkeyed } })
+        historyHtml <- Task.succeed (page (historyModel history.rows))
+        Task.succeed
+            [ ( "an unreviewable file's hostile path is escaped on its queue card", escapesHostile proven && has "Unreviewable files" proven )
+            , ( "only the acknowledgeable file is offered Acknowledge; the blocking one says to fix it", List.length (String.split ">Acknowledge<" proven) == 2 && has "Cannot be acknowledged: fix it in the tree." proven && has "Replaced while the index read it" proven )
+            , ( "a server that cannot sign offers no acknowledgement", not (button "Acknowledge" unkeyed) && has "Cannot be acknowledged: fix it in the tree." unkeyed )
+            , ( "an acknowledged file is named on the History page, its hostile path escaped", decided && escapesHostile historyHtml )
+            ]
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
         [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b)))
         , group "hostile source fixture" hostileSourceChecks
         , group "stored decision fixture" storedChecks
+        , group "unreviewable file fixture" refusalChecks
         , Task.succeed [ ( "the shortcut root takes focus on page load", shortcutRootAutofocused ) ]
         , group "withheld constructors" (everyWithheldConstructorRendered |> Task.map (\ok -> [ ( "every withheld source constructor Lib.Index declares is rendered", ok ) ]))
         ]

@@ -81,15 +81,19 @@ pub fn csrf_enabled() -> bool {
 
 pub use crate::telemetry::frame_ancestors;
 
-/// The security headers of an `Ipe.Web` page response.
+/// The security headers of the `Ipe.Web` page response serving `page`: its
+/// policy admits the nonce `page`'s markup was stamped with.
 ///
 /// # Errors
 ///
 /// The [`crate::telemetry::FrameAncestorsRefusal`] of a refused
 /// `IPE_WEB_FRAME_ANCESTORS`: the page answers `500`.
-pub fn security_headers()
--> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
-    crate::telemetry::security_headers(crate::csp::Profile::WebPage)
+pub fn security_headers(
+    page: &crate::html::StampedHtml,
+) -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
+    crate::telemetry::security_headers(&crate::csp::Guarded::WebPage {
+        style_nonce: page.nonce().clone(),
+    })
 }
 
 /// Whether to mark cookies `Secure`: [`cookies_secure_with`] over the process.
@@ -117,18 +121,19 @@ pub const fn cookies_secure_with(dev: Option<&telemetry::DevIntent>, framed: boo
     dev.is_none() || framed
 }
 
-/// ~244 random bits (two concatenated UUIDv4s) as 64 lowercase-hex chars —
-/// comfortably above the 128-bit CSRF-token floor. Single definition shared with
-/// `server.rs`; re-exported here under the `gen_token` name the `web` surface uses.
-#[cfg(feature = "server")]
-pub use crate::server::csrf_gen_token as gen_token;
+/// A fresh 256-bit CSRF token as 64 lowercase-hex chars, or the entropy refusal.
+///
+/// Single definition shared with `server.rs`; re-exported here under the
+/// `mint_token` name the `web` surface uses.
+#[cfg(feature = "web")]
+pub use crate::server::mint_csrf_token as mint_token;
 
 /// A token "looks valid" if it is the expected 64 lowercase-hex shape — used to
 /// decide whether to reuse the browser's existing cookie token vs mint a fresh
 /// one (a malformed/forged cookie value is replaced, never trusted). Single
 /// definition shared with `server.rs`; re-exported here under the
 /// `token_is_well_formed` name the `web` surface uses.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use crate::server::csrf_token_well_formed as token_is_well_formed;
 
 /// Returns `true` iff BOTH tokens are well-formed AND compare equal in constant
@@ -136,7 +141,7 @@ pub use crate::server::csrf_token_well_formed as token_is_well_formed;
 /// not reveal the secret value because well-formedness checks only length and
 /// character class. Fail-closed: any malformed, missing, or mismatched pair
 /// returns `false`. Delegates to the shared `server::csrf_pair_valid`.
-#[cfg(feature = "server")]
+#[cfg(feature = "web")]
 pub use crate::server::csrf_pair_valid;
 
 /// The decoded value of the request cookie `name` (generic; the session
@@ -532,7 +537,7 @@ mod tests {
     }
 
     fn well_formed_tok() -> String {
-        // 64 lowercase hex chars — the exact shape gen_token() produces.
+        // 64 lowercase hex chars — the exact shape mint_token() produces.
         "a".repeat(64)
     }
 
@@ -627,22 +632,24 @@ mod tests {
         assert!(!csrf_pair_valid(&well_formed_tok(), ""));
     }
 
-    // SSOT: gen_token() produces a token that passes token_is_well_formed.
+    // SSOT: mint_token() produces a token that passes token_is_well_formed.
     #[test]
-    fn gen_token_passes_well_formed() {
-        let tok = gen_token();
+    fn mint_token_passes_well_formed() -> Result<(), crate::entropy::EntropyError> {
+        let tok = mint_token()?;
         assert!(
             token_is_well_formed(&tok),
-            "gen_token() must produce a well-formed token; got: {tok}"
+            "mint_token() must produce a well-formed token; got: {tok}"
         );
+        Ok(())
     }
 
-    // SSOT: the single gen_token/token_is_well_formed definition is shared;
-    // verify gen_token and csrf_pair_valid agree (a freshly generated pair passes).
+    // SSOT: the single mint_token/token_is_well_formed definition is shared;
+    // verify mint_token and csrf_pair_valid agree (a freshly minted pair passes).
     #[test]
-    fn gen_token_csrf_pair_valid_agree() {
-        let tok = gen_token();
+    fn mint_token_csrf_pair_valid_agree() -> Result<(), crate::entropy::EntropyError> {
+        let tok = mint_token()?;
         assert!(csrf_pair_valid(&tok, &tok));
+        Ok(())
     }
 
     // Per-app cookie name tests (dev mode: cookies_secure() is false in tests

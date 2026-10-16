@@ -1595,6 +1595,7 @@ const REGISTRY_DECL_PAIRS: [(&str, &str); REGISTRY_LEN] = {
 };
 
 /// `const`-context byte-exact string equality (`str::eq` is not `const`).
+#[must_use]
 #[allow(clippy::indexing_slicing)] // indices guarded by `i < len`; see note above
 pub const fn const_str_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());

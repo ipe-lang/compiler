@@ -1,5 +1,7 @@
-module Lib.RepoPath exposing (PathError(..), Root, RootMap, Tag, absolutize, boundRoots, describe, maxRoots, parseRoot, parseTag, resolve, rootFix, rootMap, rootPath, tagName, toError)
+module Lib.RepoPath exposing (PathError(..), ReposError(..), Root, RootMap, Tag, absolutize, boundRoots, describe, describeRepos, maxRoots, nestingAgrees, parseRepos, parseRoot, parseTag, repoNameByteCeiling, repoPathByteCeiling, reposByteCeiling, reposToError, resolve, rootFix, rootFixFor, rootMap, rootOrigin, rootPath, tagName, toError)
 
+import Ipe.Bytes as Bytes
+import Ipe.Char as Char
 import Ipe.Error as Error
 import Ipe.File as File
 import Ipe.List as List
@@ -14,10 +16,18 @@ import Lib.SafeText as SafeText exposing (SafeText)
 
 
 -- The directory the index's `tag:relative` paths are relative to: an absolute,
--- cleaned path confirmed to be a directory. Opaque — `parseRoot` is the only
--- way to build one, so no unchecked or relative root reaches a file join.
+-- cleaned path confirmed to be a directory, with the variable that named it.
+-- Opaque — `parseRoot` and `parseRepos` are the only ways to build one, so no
+-- unchecked or relative root reaches a file join.
 type Root
-    = Root Path
+    = Root RootSource Path
+
+
+-- The operator setting a root came from: `IPE_INDEX_ROOT`, or the entry of
+-- `IPE_INDEX_REPOS` at a 1-based position. A refusal about a root names it.
+type RootSource
+    = IndexRootVar
+    | IndexReposVar Int
 
 
 -- A repository tag: the `tag` of a stored `tag:relative` path. Opaque —
@@ -44,11 +54,12 @@ type alias Entry =
     }
 
 
--- One bound root and the path components of every declared root strictly
--- below it, which own the paths under them instead.
+-- One bound root, its own path components, and the path components of every
+-- declared root strictly below it, which own the paths under them instead.
 type alias Binding =
     { tag : Tag
     , root : Root
+    , segments : List String
     , deeper : List (List String)
     }
 
@@ -63,9 +74,10 @@ type RootMap
 
 
 -- Why a stored `tag:relative` index path, or a root map, was refused. Each
--- stored-path variant carries the stored path as it came off the index; the
--- path refusals also carry the `Ipe.Path` error that decided them, so the
--- rules live in `Ipe.Path` alone. `UnknownTag` is a well-formed tag the map
+-- stored-path variant carries the stored path as it came off the index and
+-- nothing else: `Ipe.Path` decides the path refusals, but its error text
+-- names the root's absolute directory, so it is dropped where the refusal is
+-- built and never reaches a page. `UnknownTag` is a well-formed tag the map
 -- does not bind; `ClaimedByDeeperRoot` is a path that lies at or under a
 -- declared root deeper than its own tag's, which owns it. `NoRoots`,
 -- `DuplicateTag`, `DuplicateRoot` (two tags on one directory, named in
@@ -73,8 +85,8 @@ type RootMap
 type PathError
     = MissingTag String
     | UnknownTag String
-    | InvalidRelative String Error
-    | NotUnderRoot String Error
+    | InvalidRelative String
+    | NotUnderRoot String
     | NoRoots
     | DuplicateTag String
     | DuplicateRoot String String
@@ -143,6 +155,7 @@ bindingOf : List Entry -> Entry -> Binding
 bindingOf entries entry =
     { tag = entry.tag
     , root = entry.root
+    , segments = entry.segments
     , deeper = List.filterMap
         (\other ->
             if strictlyBelow entry.segments other.segments then
@@ -237,7 +250,7 @@ bindingFor map tag =
 rootPath : Root -> Path
 rootPath root =
     case root of
-        Root path ->
+        Root _ path ->
             path
 
 
@@ -294,7 +307,7 @@ parseRoot raw =
                     )
             isDir <- File.isDir path |> Task.onError (\_ -> Task.succeed False)
             if isDir then
-                Task.succeed (Root path)
+                Task.succeed (Root IndexRootVar path)
 
             else
                 Task.fail
@@ -333,6 +346,310 @@ rootFix =
     SafeText.literal "set it to the repository root the index was built from (absolute, or relative to the working directory)"
 
 
+-- The variable that named `root`, for a refusal about it: `IPE_INDEX_ROOT`,
+-- or the `IPE_INDEX_REPOS` entry by position with its `name=path` text.
+rootOrigin : Tag -> Root -> SafeText
+rootOrigin tag root =
+    case root of
+        Root IndexRootVar _ ->
+            SafeText.literal "IPE_INDEX_ROOT"
+
+        Root (IndexReposVar position) path ->
+            SafeText.concat
+                [ SafeText.literal "IPE_INDEX_REPOS entry "
+                , SafeText.render (String.fromInt position)
+                , SafeText.literal " ("
+                , SafeText.quoted (tagName tag ++ "=" ++ Path.toString path)
+                , SafeText.literal ")"
+                ]
+
+
+-- The fix for a root the startup check refuses, by the variable that named it.
+rootFixFor : Root -> SafeText
+rootFixFor root =
+    case root of
+        Root IndexRootVar _ ->
+            rootFix
+
+        Root (IndexReposVar _) _ ->
+            SafeText.literal "set that entry's path to the root of the repository the index records under its name (absolute, written canonically)"
+
+
+-- The most bytes `IPE_INDEX_REPOS` may hold, checked before it is split.
+reposByteCeiling : Int
+reposByteCeiling =
+    65536
+
+
+-- The most bytes one `IPE_INDEX_REPOS` entry's name may hold.
+repoNameByteCeiling : Int
+repoNameByteCeiling =
+    128
+
+
+-- The most bytes one `IPE_INDEX_REPOS` entry's path may hold.
+repoPathByteCeiling : Int
+repoPathByteCeiling =
+    4096
+
+
+-- Why `IPE_INDEX_REPOS` was refused. Each entry refusal carries the entry's
+-- 1-based position. A name or a root the root map refuses (a repeated name,
+-- `ipe`, two names on one directory, too many roots) is a `PathError` of
+-- `rootMap`, not one of these.
+type ReposError
+    = ReposEmpty
+    | ReposUnreadable
+    | ReposTooLong
+    | EmptyEntry Int
+    | MissingSeparator Int
+    | BadName Int
+    | PathNotAbsolute Int
+    | PathNotCanonical Int
+    | PathTooLong Int
+    | PathNotDirectory Int
+
+
+-- One `IPE_INDEX_REPOS` entry once its text is parsed, before its directory
+-- is checked.
+type alias RepoEntry =
+    { position : Int
+    , tag : Tag
+    , path : Path
+    }
+
+
+-- `IPE_INDEX_REPOS` (`name=path` entries joined by `,`) parsed into its
+-- entries, refusing in this order: an empty value, a value past
+-- `reposByteCeiling` bytes (before any split), then each entry in turn. Each
+-- entry is split at its first `=`; the rest is the path, judged whole.
+-- Nothing is trimmed, cleaned or guessed: a value that is not exactly a list
+-- of canonical absolute paths under tag names is refused.
+parseRepoList : String -> Result ReposError (List RepoEntry)
+parseRepoList raw =
+    if raw == "" then
+        Err ReposEmpty
+
+    else if byteLength raw > reposByteCeiling then
+        Err ReposTooLong
+
+    else
+        String.split "," raw
+            |> List.indexedMap (\i entry -> parseRepoEntry (i + 1) entry)
+            |> Result.combine
+
+
+parseRepoEntry : Int -> String -> Result ReposError RepoEntry
+parseRepoEntry position entry =
+    if entry == "" then
+        Err (EmptyEntry position)
+
+    else
+        case String.split "=" entry of
+            name :: first :: more ->
+                parseRepoName position name
+                    |> Result.andThen (\tag -> parseRepoDir position (String.join "=" (first :: more)) |> Result.map (\path -> { position = position, tag = tag, path = path }))
+
+            _ ->
+                Err (MissingSeparator position)
+
+
+-- An entry's name: a tag `parseTag` accepts, at most `repoNameByteCeiling`
+-- bytes, holding no `=`, `,`, whitespace or control character.
+parseRepoName : Int -> String -> Result ReposError Tag
+parseRepoName position name =
+    if byteLength name > repoNameByteCeiling || String.any (\c -> c == '=' || c == ',' || isSpaceOrControl c) name then
+        Err (BadName position)
+
+    else
+        parseTag name |> Result.mapError (\_ -> BadName position)
+
+
+-- An entry's path: one leading `/` (a relative, drive, `\` or `//` spelling
+-- is not absolute here), at most `repoPathByteCeiling` bytes, and already
+-- canonical, so `Path.fromString` gives it back unchanged: no `.` or `..`
+-- segment, no doubled `/`, no trailing `/`.
+parseRepoDir : Int -> String -> Result ReposError Path
+parseRepoDir position raw =
+    if not (String.startsWith "/" raw) || String.startsWith "//" raw then
+        Err (PathNotAbsolute position)
+
+    else if byteLength raw > repoPathByteCeiling then
+        Err (PathTooLong position)
+
+    else
+        case Path.fromString raw of
+            Ok path ->
+                if Path.toString path == raw then
+                    Ok path
+
+                else
+                    Err (PathNotCanonical position)
+
+            Err _ ->
+                Err (PathNotCanonical position)
+
+
+-- A whitespace, control, or invisible formatting character: none can be
+-- told apart from its neighbours in a name an operator reads back.
+isSpaceOrControl : Char -> Bool
+isSpaceOrControl c =
+    let
+        code =
+            Char.toCode c
+    in
+    List.any (\( low, high ) -> code >= low && code <= high) invisibleRanges
+
+
+-- The code point ranges `isSpaceOrControl` refuses, inclusive: C0 controls
+-- and space, DEL with the C1 controls and no-break space, soft hyphen, the
+-- Ogham space, the general-punctuation spaces, zero-width and bidi marks,
+-- the ideographic space, and the byte-order mark.
+invisibleRanges : List ( Int, Int )
+invisibleRanges =
+    [ ( 0, 32 ), ( 127, 160 ), ( 173, 173 ), ( 5760, 5760 ), ( 8192, 8207 ), ( 8232, 8239 ), ( 8287, 8297 ), ( 12288, 12288 ), ( 65279, 65279 ) ]
+
+
+byteLength : String -> Int
+byteLength text =
+    Bytes.length (Bytes.fromString text)
+
+
+-- `IPE_INDEX_REPOS` parsed into its tagged roots, each entry's path confirmed
+-- to be an existing directory. The roots are not yet a map: `rootMap`
+-- refuses a repeated name, a shared directory, and too many roots.
+parseRepos : String -> Task.Task Error (Result ReposError (List ( Tag, Root )))
+parseRepos raw =
+    case parseRepoList raw of
+        Err e ->
+            Task.succeed (Err e)
+
+        Ok entries ->
+            Task.sequence (List.map repoRoot entries)
+                |> Task.map Result.combine
+
+
+repoRoot : RepoEntry -> Task.Task Error (Result ReposError ( Tag, Root ))
+repoRoot entry =
+    File.isDir entry.path
+        |> Task.onError (\_ -> Task.succeed False)
+        |> Task.map
+            (\isDir ->
+                if isDir then
+                    Ok ( entry.tag, Root (IndexReposVar entry.position) entry.path )
+
+                else
+                    Err (PathNotDirectory entry.position)
+            )
+
+
+-- A `IPE_INDEX_REPOS` refusal as diagnostic text. Only the offending entry
+-- of `raw` is echoed, through `SafeText.quoted`.
+describeRepos : String -> ReposError -> SafeText
+describeRepos raw err =
+    let
+        entry position problem =
+            SafeText.concat
+                [ SafeText.literal "IPE_INDEX_REPOS entry "
+                , SafeText.render (String.fromInt position)
+                , SafeText.literal " ("
+                , SafeText.quoted (Maybe.withDefault "" (List.head (List.drop (position - 1) (String.split "," raw))))
+                , SafeText.literal ") "
+                , SafeText.literal problem
+                , SafeText.literal "; "
+                , reposFix
+                ]
+
+        whole problem =
+            SafeText.concat [ SafeText.literal "IPE_INDEX_REPOS ", SafeText.literal problem, SafeText.literal "; ", reposFix ]
+    in
+    case err of
+        ReposEmpty ->
+            whole "is set but empty"
+
+        ReposUnreadable ->
+            whole "is set but is not valid Unicode"
+
+        ReposTooLong ->
+            whole ("is longer than " ++ String.fromInt reposByteCeiling ++ " bytes")
+
+        EmptyEntry position ->
+            entry position "is empty: a leading, trailing or doubled `,`"
+
+        MissingSeparator position ->
+            entry position "has no `=` between its name and its path"
+
+        BadName position ->
+            entry position ("has a name that is not a repo tag: it must be non-empty, at most " ++ String.fromInt repoNameByteCeiling ++ " bytes, and hold no `/`, `:`, `=`, `,`, whitespace or control character")
+
+        PathNotAbsolute position ->
+            entry position "has a path that is not absolute: it must start with a single `/`"
+
+        PathNotCanonical position ->
+            entry position "has a path that is not written canonically: no `.` or `..` segment, no doubled `/`, no trailing `/`"
+
+        PathTooLong position ->
+            entry position ("has a path longer than " ++ String.fromInt repoPathByteCeiling ++ " bytes")
+
+        PathNotDirectory position ->
+            entry position "has a path that is not an existing directory"
+
+
+reposFix : SafeText
+reposFix =
+    SafeText.literal "unset it, or set it to `name=/absolute/path` entries joined by `,`, one per repository the index records besides `ipe`"
+
+
+reposToError : String -> ReposError -> Error
+reposToError raw err =
+    Error.invalidInput (SafeText.toString (describeRepos raw err))
+
+
+-- Whether the nesting `IPE_INDEX_REPOS` and `IPE_INDEX_ROOT` give `tag` (the
+-- deepest bound root strictly enclosing its root, and its root's path below
+-- that one, folded as `segmentsOf` keys it) equals the nesting the index
+-- records for it: both absent, or the same outer tag and the same folded
+-- relative path. An unbound tag, or a record with only one of the two,
+-- never agrees.
+nestingAgrees : RootMap -> Tag -> Maybe String -> Maybe String -> Bool
+nestingAgrees roots tag recordedOuter recordedPrefix =
+    case bindingFor roots tag of
+        Nothing ->
+            False
+
+        Just binding ->
+            case ( enclosingOf roots binding, recordedOuter, recordedPrefix ) of
+                ( Nothing, Nothing, Nothing ) ->
+                    True
+
+                ( Just ( outer, below ), Just outerName, Just prefix ) ->
+                    tagName outer.tag == outerName && below == segmentsOf prefix
+
+                ( Nothing, Just _, _ ) ->
+                    False
+
+                ( Nothing, Nothing, Just _ ) ->
+                    False
+
+                ( Just _, Nothing, _ ) ->
+                    False
+
+                ( Just _, Just _, Nothing ) ->
+                    False
+
+
+-- The deepest bound root strictly enclosing `binding`'s, with `binding`'s
+-- path components below it.
+enclosingOf : RootMap -> Binding -> Maybe ( Binding, List String )
+enclosingOf roots binding =
+    case roots of
+        RootMap bound ->
+            List.filter (\other -> strictlyBelow other.segments binding.segments) bound
+                |> List.sortBy (\other -> 0 - List.length other.segments)
+                |> List.head
+                |> Maybe.map (\outer -> ( outer, List.drop (List.length outer.segments) binding.segments ))
+
+
 -- A stored `tag:relative` path joined under its tag's root. The prefix
 -- before the first `:` is the repo tag, parsed by `parseTag` (a stored path
 -- with no `:` or an invalid tag is `MissingTag`) and looked up in the map (an
@@ -368,12 +685,12 @@ resolve roots stored =
 joinUnder : Root -> String -> String -> Result PathError Path
 joinUnder root stored rel =
     case Path.fromString rel of
-        Err e ->
-            Err (InvalidRelative stored e)
+        Err _ ->
+            Err (InvalidRelative stored)
 
         Ok relPath ->
             Path.under (rootPath root) relPath
-                |> Result.mapError (\e -> NotUnderRoot stored e)
+                |> Result.mapError (\_ -> NotUnderRoot stored)
 
 
 -- `path`, unless a root deeper than `binding`'s owns it.
@@ -390,33 +707,30 @@ refuseIfClaimed binding stored path =
         Ok path
 
 
--- A refusal as diagnostic text. The stored path and every nested error message
--- are foreign text, so they enter only through `SafeText.quoted`/`render`.
+-- A refusal as diagnostic text: fixed text per constructor around its payload.
+-- The stored path and every tag are foreign text, so they enter only through
+-- `SafeText.quoted`/`render`.
 describe : PathError -> SafeText
 describe err =
     case err of
         MissingTag stored ->
             SafeText.concat [ SafeText.literal "index path ", SafeText.quoted stored, SafeText.literal " has no `tag:` prefix" ]
 
-        InvalidRelative stored e ->
+        InvalidRelative stored ->
             SafeText.concat
                 [ SafeText.literal "index path "
                 , SafeText.quoted stored
-                , SafeText.literal " is not a valid relative path ("
-                , SafeText.render (Error.message e)
-                , SafeText.literal ")"
+                , SafeText.literal " is not a valid relative path: it holds a NUL byte, or a `..` (however spelled) that climbs out of it"
                 ]
 
         UnknownTag stored ->
             SafeText.concat [ SafeText.literal "index path ", SafeText.quoted stored, SafeText.literal " names a repo tag no configured root binds" ]
 
-        NotUnderRoot stored e ->
+        NotUnderRoot stored ->
             SafeText.concat
                 [ SafeText.literal "index path "
                 , SafeText.quoted stored
-                , SafeText.literal " does not join to a path under its repo root ("
-                , SafeText.render (Error.message e)
-                , SafeText.literal ")"
+                , SafeText.literal " does not join to a path strictly below its repo root: it is empty, `.`, or absolute, or holds an element that may not be joined"
                 ]
 
         NoRoots ->

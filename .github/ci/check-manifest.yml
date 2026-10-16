@@ -20,6 +20,8 @@
 # or the job id when no `name:` is set). Matrix jobs report one context per leg;
 # they are covered by their `aggregator` (the single promotable context) so the
 # matrix legs are marked `internal: true` and excluded from the required set.
+# `aggregates` names job ids of the producer (never context names): exactly the
+# aggregator job's `needs:` minus `changes`, under an `if: always()` aggregator.
 #
 # `owner` is required for every `informational` entry (who watches its surface).
 # `guards` records the Security / Soundness / SEAL invariant a check protects;
@@ -70,11 +72,15 @@ checks:
       run:
         - cargo clippy -p ipe-runtime-rust --no-default-features --features db --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features db,web --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features server --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features server,web-core --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features debugger,tui --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features debugger,web --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --all-targets --features dev-posture -- -D warnings
         - cargo clippy -p ipe-runtime-rust --all-targets --features full,dev-posture -- -D warnings
         - cargo clippy -p ipe-runtime-rust --features full --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features db-postgres -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --features full,db-postgres -- -D warnings
     guards: >-
       Every runtime feature combination the emitter can select builds clean
       under clippy (SEAL); path-gated, so a skip on a non-emit PR passes.
@@ -456,18 +462,14 @@ checks:
       SEAL, and Security — the vendored-emit SEAL, the real Linux x64 build
       jail, and the browser port-glue proofs report through this verdict, so a
       red in any of them blocks a landing.
-    aggregates:
-      - e2e
-      - "seal-modset (vendored emit model)"
-      - "linux-x64-tier2 (bwrap+seccomp — the real Linux jail proof)"
-      - "browser-e2e (Ipe.Browser geo+clipboard — headless Playwright)"
+    aggregates: [test-prep, e2e, seal-modset-vendored, linux-x64-tier2, browser-e2e]
   - context: seal-slice
     disposition: gate
     producer: ci.yml
     local:
       covered-by: e2e-all
     guards: SEAL
-    aggregates: [e2e]
+    aggregates: [test-prep, e2e]
 
   # ── Heavy soundness / sanitizers — nightly-gate ───────────────────────────
   - context: asan-all
@@ -588,7 +590,7 @@ checks:
     producer: docs-pages.yml
     owner: docs
     note: GitHub Pages deploy; not a code guarantee.
-  - context: build
+  - context: playground-build
     disposition: informational
     producer: playground.yml
     owner: docs

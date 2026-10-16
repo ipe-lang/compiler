@@ -10,6 +10,61 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.6.0](https://github.com/ipe-lang/compiler/compare/ipe-v0.5.1...ipe-v0.6.0) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **db:** Db.open takes a typed DbLocation ([#3621](https://github.com/ipe-lang/compiler/issues/3621))
+
+### Features
+
+* **cli:** capture a package once into a snapshot its digest is computed over ([#3579](https://github.com/ipe-lang/compiler/issues/3579)) ([1ab1b3f](https://github.com/ipe-lang/compiler/commit/1ab1b3f8c4450597e730d57bac6f668141dbe2f8))
+* **db:** Db.open takes a typed DbLocation ([#3621](https://github.com/ipe-lang/compiler/issues/3621)) ([c7997cf](https://github.com/ipe-lang/compiler/commit/c7997cf55d896242d00b8986636ac26f4bfb5f5f))
+* **runtime:** Debug.log prints the dev view in a dev-posture build ([#3596](https://github.com/ipe-lang/compiler/issues/3596)) ([ae67c4c](https://github.com/ipe-lang/compiler/commit/ae67c4c5efe236e806c90fdcade083cce6acab5c))
+* **runtime:** measure the retained size of every shown value ([#3598](https://github.com/ipe-lang/compiler/issues/3598)) ([ba34681](https://github.com/ipe-lang/compiler/commit/ba346811e7ef84d5a4c4407a5adc8ce78e4378c3))
+* **runtime:** one typed registry for operator environment variables ([#3582](https://github.com/ipe-lang/compiler/issues/3582)) ([efd63eb](https://github.com/ipe-lang/compiler/commit/efd63eb03839f333766faa1d31b1856b0a1231c5))
+
+
+### Bug Fixes
+
+* **backend:** emitted Rust leaves the renderer through one lexing exit ([#3653](https://github.com/ipe-lang/compiler/issues/3653)) ([9e3dda5](https://github.com/ipe-lang/compiler/commit/9e3dda5e766586cb733b5d81db0867cf61c1597d))
+* bound long-lived databases, harden script bodies and ipe-ids, frame the version output ([#3592](https://github.com/ipe-lang/compiler/issues/3592)) ([381f41a](https://github.com/ipe-lang/compiler/commit/381f41ab43c2b2e6e0b359d6a5915f6c75757fca))
+* build-identical ipe fix type-check; cancel probe through every LSP lint tail ([#3613](https://github.com/ipe-lang/compiler/issues/3613)) ([2d59a5d](https://github.com/ipe-lang/compiler/commit/2d59a5d100de16f949bed1852b3181a302844668))
+* classify ceiling refusals as ErrorKind.LimitExceeded ([#3599](https://github.com/ipe-lang/compiler/issues/3599)) ([8dd392d](https://github.com/ipe-lang/compiler/commit/8dd392d48870f7e5d38da2d3572c14c3ca8f09ef))
+* **code-review:** bind the reviewed copy to the verified log and refuse repeated review pairs ([#3586](https://github.com/ipe-lang/compiler/issues/3586)) ([f46998b](https://github.com/ipe-lang/compiler/commit/f46998bf21242d41fdcf7399d3d997ecc518512a))
+* **code-review:** lex and link whole units in linear time ([#3627](https://github.com/ipe-lang/compiler/issues/3627)) ([19dce4b](https://github.com/ipe-lang/compiler/commit/19dce4b93d463e3cd269a7adb9b72ace11525dd6))
+* **code-review:** per-language grammar facts and multi-root binding via IPE_INDEX_REPOS ([#3638](https://github.com/ipe-lang/compiler/issues/3638)) ([92fcbe8](https://github.com/ipe-lang/compiler/commit/92fcbe81cb200eb58e57efd89f55e768c200b070))
+* **code-review:** typed save failures, fixed-text path refusals, loopback-only bind ([#3648](https://github.com/ipe-lang/compiler/issues/3648)) ([9516ae7](https://github.com/ipe-lang/compiler/commit/9516ae76538bbe1844e1cf8308ab205c0793eed2))
+* **code-review:** unique queue labels, decision standing, page structure, per-language lexing ([#3633](https://github.com/ipe-lang/compiler/issues/3633)) ([33c84b3](https://github.com/ipe-lang/compiler/commit/33c84b3d5c77eb0320504c6ea530bf1efe3d2942))
+* **db:** one canonical assembly builds the typed program ([#3587](https://github.com/ipe-lang/compiler/issues/3587)) ([ea431cc](https://github.com/ipe-lang/compiler/commit/ea431cc2daf7cf76510f15c51615d4def9b28f94))
+* **deps:** bump rustls to 0.23.46 for RUSTSEC-2026-0346 through 0349 ([#3634](https://github.com/ipe-lang/compiler/issues/3634)) ([b0a6915](https://github.com/ipe-lang/compiler/commit/b0a69151cbedf76fd804d404799bfdbe82e5b190))
+* doc serve Host admission and a registry-backed CSRF origin check ([#3603](https://github.com/ipe-lang/compiler/issues/3603)) ([81fe003](https://github.com/ipe-lang/compiler/commit/81fe003dedcb8812e4d7bce79c6a010a46d5bbea))
+* **emit:** pin an open message-slot generic to () at the use site ([#3625](https://github.com/ipe-lang/compiler/issues/3625)) ([4145b9e](https://github.com/ipe-lang/compiler/commit/4145b9e18172769f653e33420a2f67bbd52566f6))
+* host admission, session mint gate, login decoy cost, opener and installer refusals ([#3593](https://github.com/ipe-lang/compiler/issues/3593)) ([9ccbe40](https://github.com/ipe-lang/compiler/commit/9ccbe40b93b7f11f46abb91f49ff6d008eed562c))
+* **ipe-index:** every git entry ends as units, a typed refusal, absent or claimed ([#3663](https://github.com/ipe-lang/compiler/issues/3663)) ([283b82a](https://github.com/ipe-lang/compiler/commit/283b82aa20cb5a31f2a60d5d2ec46274e0ce5ff9))
+* **lower:** a closure captures a local it mentions only as a record-update base ([#3644](https://github.com/ipe-lang/compiler/issues/3644)) ([f8552e3](https://github.com/ipe-lang/compiler/commit/f8552e39001cc20ac2523df22a7659803001126a))
+* **lower:** a function value typed by a scheme variable reaches a kernel slot with one carrier ([#3583](https://github.com/ipe-lang/compiler/issues/3583)) ([12fbfa4](https://github.com/ipe-lang/compiler/commit/12fbfa437fca7f272d3f97f214803db645514fed))
+* **lower:** one carrier for a function value typed by a scheme variable ([#3617](https://github.com/ipe-lang/compiler/issues/3617)) ([84c4bbc](https://github.com/ipe-lang/compiler/commit/84c4bbc901b31c1b95c7090191193a4fe3951b4e))
+* **lower:** or-pattern normal form via SharedAlts ([#3640](https://github.com/ipe-lang/compiler/issues/3640)) ([743a1a6](https://github.com/ipe-lang/compiler/commit/743a1a65455c14dbb26017bafaae0de06fec9848))
+* lsp worker hold, single-read audit snapshot, code-only render leaves, one runtime log composer ([#3607](https://github.com/ipe-lang/compiler/issues/3607)) ([fe1b16f](https://github.com/ipe-lang/compiler/commit/fe1b16f21a55d8295858fb58d0620017069fa41a))
+* mirrored CI commands must be the commands CI runs; the doc lexer refuses edition-2024 reserved syntax ([#3657](https://github.com/ipe-lang/compiler/issues/3657)) ([8e582c9](https://github.com/ipe-lang/compiler/commit/8e582c9967d289d443bf53823bb10abe7b707758))
+* one fail-closed source walker, wide FileId from open handles, builtin head identity ([#3619](https://github.com/ipe-lang/compiler/issues/3619)) ([ac9d856](https://github.com/ipe-lang/compiler/commit/ac9d8560dfb81a9784e7836b7b4fb1f0970568be))
+* one solver budget; source-lambda closure kind from position ([#3612](https://github.com/ipe-lang/compiler/issues/3612)) ([7f3cd14](https://github.com/ipe-lang/compiler/commit/7f3cd14c9b818eaac33b55b2c3da58ee5212ce16))
+* refuse an untyped helper borrowing a sibling's type variable; pin closure-capture boundaries; manifest entry messages ([#3652](https://github.com/ipe-lang/compiler/issues/3652)) ([fcedd5c](https://github.com/ipe-lang/compiler/commit/fcedd5cfe4b0ac7edcfcec9e31ef60f699a4b69b))
+* **runtime:** bound what an Ipe.Web session keeps resident ([#3624](https://github.com/ipe-lang/compiler/issues/3624)) ([f05d9bc](https://github.com/ipe-lang/compiler/commit/f05d9bc2fba3a173605940677a5e67af4c5b70f3))
+* **runtime:** declared Host names fail closed; pin the SQLite write-begin site ([#3642](https://github.com/ipe-lang/compiler/issues/3642)) ([6775022](https://github.com/ipe-lang/compiler/commit/6775022efb9ec21e81df7288ec2a5b39f7131472))
+* **runtime:** flip the style policy to the per-session nonce and address every patchable element ([#3656](https://github.com/ipe-lang/compiler/issues/3656)) ([98a50f3](https://github.com/ipe-lang/compiler/commit/98a50f35cd8aa680b222cb97f7fead649d5ac98f))
+* **runtime:** one graceful shutdown owner for every served app ([#3637](https://github.com/ipe-lang/compiler/issues/3637)) ([e6be365](https://github.com/ipe-lang/compiler/commit/e6be3652b2b2b4eca09efa7a1a8f0da325f38c68))
+* **runtime:** one typed path-to-route entry; typed wasm mount refusals ([#3588](https://github.com/ipe-lang/compiler/issues/3588)) ([d3fe4eb](https://github.com/ipe-lang/compiler/commit/d3fe4ebe67137435b9d76b6514fc8ad49a709811))
+* **runtime:** stamp every session render with its own style nonce ([#3647](https://github.com/ipe-lang/compiler/issues/3647)) ([06bb3a2](https://github.com/ipe-lang/compiler/commit/06bb3a2f04576007c9789516e1533862d3b83006))
+* **runtime:** strict CSP, shared live stream per session, IMMEDIATE SQLite write transactions ([#3622](https://github.com/ipe-lang/compiler/issues/3622)) ([3f3473c](https://github.com/ipe-lang/compiler/commit/3f3473cfe9cde769d0ee44368b5d58bd5b495735))
+* **runtime:** tasks started for a caller carry its session scope; subscription sources start in their owner's scope ([#3581](https://github.com/ipe-lang/compiler/issues/3581)) ([b419fb1](https://github.com/ipe-lang/compiler/commit/b419fb12b5c3fb3e717fa638753dcba76656817f))
+* serde-saphyr YAML backend; exhaustive non-Clone predicate and boxed-field funnel ([#3611](https://github.com/ipe-lang/compiler/issues/3611)) ([5522a6c](https://github.com/ipe-lang/compiler/commit/5522a6ce644994683dbf85e61dcae021f51f35b8))
+* **server:** one canonical URL service in front of every app listener ([#3618](https://github.com/ipe-lang/compiler/issues/3618)) ([38eca27](https://github.com/ipe-lang/compiler/commit/38eca27b05d84c871098a395528f4ac5ec7f1103))
+* shared did-you-mean ranker and Fetch Metadata check before session rejoin ([#3605](https://github.com/ipe-lang/compiler/issues/3605)) ([82ed80c](https://github.com/ipe-lang/compiler/commit/82ed80ccad7395fc5f150a474ac2f8d5050bb922))
+* untyped-helper signature recheck and any-return pin; path regime as a value ([#3661](https://github.com/ipe-lang/compiler/issues/3661)) ([a051b3b](https://github.com/ipe-lang/compiler/commit/a051b3b7dd6129ecd049a918cc5ae130f3acdffc))
+
 ## [0.5.1](https://github.com/ipe-lang/compiler/compare/ipe-v0.5.0...ipe-v0.5.1) (2026-10-08)
 
 

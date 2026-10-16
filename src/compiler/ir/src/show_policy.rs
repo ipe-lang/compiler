@@ -125,6 +125,7 @@ show_leaves! {
     CRYPTO_KEY = "CryptoKey" => Redacted;
     PRINCIPAL = "Principal" => Redacted;
     DSN = "Dsn" => Redacted;
+    DB_LOCATION = "DbLocation" => Redacted;
     SQL_FRAGMENT = "SqlFragment" => Redacted;
     SERVER_REQUEST = "ServerRequest" => Redacted;
     SERVER_RESPONSE = "ServerResponse" => Redacted;
@@ -298,6 +299,7 @@ impl IrType {
             Self::Url => leaf(l::URL),
             Self::UrlRelative => leaf(l::URL_RELATIVE),
             Self::Dsn => leaf(l::DSN),
+            Self::DbLocation => leaf(l::DB_LOCATION),
             Self::Connection | Self::ConnReadOnly | Self::ConnReadWrite => leaf(l::CONNECTION),
             Self::Setting | Self::ShapeWeb | Self::ShapeWebView | Self::ShapeTerminal => {
                 leaf(l::SETTING)

@@ -36,6 +36,7 @@ module Main exposing (main)
 --   final:u1/g1/admin,u2/g1/member
 
 import Ipe.Db as Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Sql as Sql
 import Ipe.Db.Store as Store exposing (Draft, Store)
 import Ipe.Db.Store.Unsafe as StoreU
@@ -87,18 +88,18 @@ illegalDraft =
 hijackTemplate : Store.Row
 hijackTemplate =
     Dict.fromList
-        [ ( "user_id", "hijack" )
-        , ( "group_id", "hijack" )
-        , ( "role", "admin" )
+        [ ( "user_id", Just "hijack" )
+        , ( "group_id", Just "hijack" )
+        , ( "role", Just "admin" )
         ]
 
 
 newRow : Store.Row
 newRow =
     Dict.fromList
-        [ ( "user_id", "u9" )
-        , ( "group_id", "g9" )
-        , ( "role", "member" )
+        [ ( "user_id", Just "u9" )
+        , ( "group_id", Just "g9" )
+        , ( "role", Just "member" )
         ]
 
 
@@ -111,7 +112,7 @@ main =
                     Db.withTransaction conn
                         (\txconn -> runChecks txconn composite illegal)
                 )
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)
 
         ( Err e, _ ) ->
             Io.println (Error.toString e)
@@ -217,8 +218,11 @@ renderRow row =
 cell : String -> Store.Row -> String
 cell name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             s
+
+        Just Nothing ->
+            "NULL"
 
         Nothing ->
             "?"

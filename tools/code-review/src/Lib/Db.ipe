@@ -20,7 +20,7 @@ import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.SetDigest as SetDigest exposing (SetDigest)
-import Lib.Settings as Settings exposing (DbLocation, DbRole(..))
+import Lib.Settings as Settings exposing (DbRole(..), ReviewFile)
 import Lib.Uid as Uid exposing (Uid)
 import Migrations exposing (all)
 
@@ -580,7 +580,7 @@ legacyEntry row =
 -- Under a signing key the log must be bound to that key: a head's key check
 -- must verify, and a head with none is bound only when a walk proves the key
 -- signed every entry. Any other key is refused by `keyMismatchRefusal`.
-probe : ReviewKey -> DbLocation -> Task.Task Error ()
+probe : ReviewKey -> ReviewFile -> Task.Task Error ()
 probe key loc =
     do
         db <- openMigrated loc
@@ -686,18 +686,18 @@ keyMismatchRefusal =
     Error.invalidInput ("the review log was signed by a different " ++ ReviewKey.keyVar ++ ", so this key can neither verify nor record its decisions.\n  fix: start with the key that signed it.")
 
 
-openMigrated : DbLocation -> Task.Task Error Db
+openMigrated : ReviewFile -> Task.Task Error Db
 openMigrated loc =
     openAt loc
         |> Task.andThen (\db -> Task.map (\_ -> db) (migrate db))
-        |> Task.onError (Settings.openFailure ReviewDb loc)
+        |> Task.onError (Settings.openFailure ReviewDb loc.path)
 
 
-headAt : DbLocation -> Db -> Task.Task Error Index.ChainHead
+headAt : ReviewFile -> Db -> Task.Task Error Index.ChainHead
 headAt loc db =
     headRows db
-        |> Task.onError (Settings.openFailure ReviewDb loc)
-        |> Task.andThen (\rows -> Task.mapError (\_ -> Settings.brokenLog loc "its review log has no single head row") (oneHead rows))
+        |> Task.onError (Settings.openFailure ReviewDb loc.path)
+        |> Task.andThen (\rows -> Task.mapError (\_ -> Settings.brokenLog loc.path "its review log has no single head row") (oneHead rows))
 
 
 -- The triggers that keep the review log append-only, each named with the
@@ -728,7 +728,7 @@ guardDecoder =
 -- Every guard in `appendOnlyGuards` is present on its table; a file missing
 -- one is refused, since its review rows could be rewritten unseen. The MAC
 -- on every review-log row is the second, independent layer.
-requireGuards : DbLocation -> Db -> Task.Task Error ()
+requireGuards : ReviewFile -> Db -> Task.Task Error ()
 requireGuards loc db =
     do
         present <- presentGuards loc db
@@ -736,22 +736,22 @@ requireGuards loc db =
             Task.succeed ()
 
         else
-            Task.fail (Settings.brokenLog loc "its review log has lost an append-only trigger, so its decisions could be rewritten unseen")
+            Task.fail (Settings.brokenLog loc.path "its review log has lost an append-only trigger, so its decisions could be rewritten unseen")
 
 
-presentGuards : DbLocation -> Db -> Task.Task Error (List String)
+presentGuards : ReviewFile -> Db -> Task.Task Error (List String)
 presentGuards loc db =
     Db.queryDecode db "SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger'" [] guardDecoder
-        |> Task.onError (Settings.openFailure ReviewDb loc)
+        |> Task.onError (Settings.openFailure ReviewDb loc.path)
 
 
--- The review database at a parsed location, opened through the one review URL
--- builder (`Settings.reviewUrl`); no raw URL reaches the driver. It never
--- migrates: `probe` is the one migrate, run at startup, so a review file
--- deleted under a running server is never silently re-created empty.
-openAt : DbLocation -> Task.Task Error Db
+-- The review database at its parsed location, opened through the typed
+-- location startup built; no text reaches the driver. It never migrates:
+-- `probe` is the one migrate, run at startup, so a review file deleted under
+-- a running server is never silently re-created empty.
+openAt : ReviewFile -> Task.Task Error Db
 openAt loc =
-    Db.open "sqlite" (Settings.reviewUrl loc)
+    Db.open loc.open
 
 
 migrate : Db -> Task.Task Error (List String)

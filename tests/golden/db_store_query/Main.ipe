@@ -2,6 +2,7 @@ module Main exposing (main)
 
 import Ipe.Io as Io
 import Ipe.Db as Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Dict as Dict
@@ -53,9 +54,9 @@ productColumns =
 writeProduct : Product -> Store.Row
 writeProduct p =
     Dict.fromList
-        [ ( "id", p.id )
-        , ( "name", p.name )
-        , ( "qty", String.fromInt p.qty )
+        [ ( "id", Just p.id )
+        , ( "name", Just p.name )
+        , ( "qty", Just (String.fromInt p.qty) )
         ]
 
 
@@ -68,8 +69,11 @@ rowLabel row =
 cell : String -> Store.Row -> String
 cell name row =
     case Dict.get name row of
-        Just s ->
+        Just (Just s) ->
             s
+
+        Just Nothing ->
+            "NULL"
 
         Nothing ->
             "?"
@@ -106,7 +110,7 @@ main =
                     Db.withTransaction conn
                         (\txconn -> runChecks txconn store)
                 )
-                (Db.open "sqlite" "sqlite::memory:")
+                (Db.open Location.memory)
 
 
 runChecks : Db -> Store Store.Row -> Task Error ()

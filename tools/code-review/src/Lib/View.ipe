@@ -1,4 +1,4 @@
-module Lib.View exposing (RowLine(..), displayOrderCss, escapeCss, lineHtml, rowLines, view)
+module Lib.View exposing (codeCss, codeHtml, displayOrderCss, drawnHtml, escapeCss, gutterHtml, lineHtml, view)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Html as Html
@@ -12,13 +12,13 @@ import Ipe.Ui.Background as Background
 import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
 import Ipe.Ui.Input as Input
-import Lib.App as App exposing (Model, Msg(..), Page(..), queueList, selectedUnit)
+import Lib.App as App exposing (Model, Msg(..), Page(..), queueList)
 import Lib.Db as LibDb exposing (LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Drawn as Drawn exposing (Code(..), DrawnSource, Hue(..), LayoutNote(..), Mode(..), Part(..), Piece(..), Run(..))
 import Lib.Format as Format
-import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Change(..), SourceRow(..), SourceView(..))
+import Lib.Index as Index exposing (Change(..), SourceView(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -36,7 +36,7 @@ header model =
         , Border.color (Ui.rgb 60 60 72)
         , Border.widthEach { top = 0, right = 0, bottom = 1, left = 0 }
         ]
-        [ Ui.el [ Font.size 16, Font.bold, Font.color (Ui.rgb 235 235 240) ] (Ui.text "Code review")
+        [ Ui.el [ Ui.describe (Ui.descHeading 1), Font.size 16, Font.bold, Font.color (Ui.rgb 235 235 240) ] (Ui.text "Code review")
         , Ui.el [ Ui.width Ui.fill ] Ui.none
         , navButton (model.page == QueuePage) "Queue" ShowQueue
         , navButton (model.page == HistoryPage) "History" ShowHistory
@@ -126,13 +126,49 @@ view model =
         , Ui.onKeyDown KeyDown
         , Ui.htmlAttribute "tabindex" "0"
         , Ui.htmlAttribute "autofocus" ""
+        , Ui.htmlAttribute "lang" "en"
         ]
-        [ header model
+        [ Ui.html (Html.titleNode (pageTitle model))
+        , header model
         , Ui.el
-            [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.padding 24, Font.color (Ui.rgb 190 190 200) ]
+            [ Ui.describe Ui.descMain, Ui.width Ui.fill, Ui.height Ui.fill, Ui.padding 24, Font.color (Ui.rgb 190 190 200) ]
             (pageBody model)
         , urlSync model
         ]
+
+
+-- The document title: the page, then the tool. A unit page names its unit
+-- once the unit is loaded.
+pageTitle : Model -> String
+pageTitle model =
+    pageTopic model ++ " · Code review"
+
+
+pageTopic : Model -> String
+pageTopic model =
+    case model.page of
+        QueuePage ->
+            "Queue"
+
+        HistoryPage ->
+            "History"
+
+        UnitPage raw ->
+            case App.unitPageState raw model of
+                UnitLoaded loaded ->
+                    SafeText.toString loaded.unit.qualified
+
+                UnitLoading ->
+                    "Unit"
+
+                UnitNotFound ->
+                    "Unit"
+
+                UnitFailed _ ->
+                    "Unit"
+
+                UnitIdRefused ->
+                    "Unit"
 
 
 pageBody : Model -> Ui.Element Msg
@@ -145,23 +181,23 @@ pageBody model =
             historyBody model
 
         UnitPage raw ->
-            unitPageBody (App.unitPageState raw model)
+            unitPageBody model.standing (App.unitPageState raw model)
 
 
 queueBody : Model -> Ui.Element Msg
 queueBody model =
     Ui.column
         [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 12 ]
-        [ decisionErrorBanner model
+        [ notSavedBanner model
         , queueStateBody model
         ]
 
 
-decisionErrorBanner : Model -> Ui.Element Msg
-decisionErrorBanner model =
-    case model.decisionError of
-        Just err ->
-            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.concat [ SafeText.literal "Decision save failed: ", SafeText.renderForeign (Error.toString err) ]))
+notSavedBanner : Model -> Ui.Element Msg
+notSavedBanner model =
+    case Queue.notSavedOf model.decision of
+        Just failure ->
+            Ui.el [ Font.size 13, Font.color (Ui.rgb 230 120 120) ] (safeText (SafeText.concat [ SafeText.literal "Decision save failed: ", SafeText.render (Queue.saveFailureText failure) ]))
 
         Nothing ->
             Ui.none
@@ -181,6 +217,7 @@ queueStateBody model =
                     , nextPageButton page.next
                     ]
                 , chainBannerLine page.log
+                , refusalBlock model page
                 , queueUnits model
                 ]
 
@@ -189,6 +226,80 @@ queueStateBody model =
 
         Failed _ ->
             queueUnits model
+
+
+-- The open files the index could not review, listed apart from the units.
+-- Each card shows the file's escaped path, why the index refused it, its
+-- size and its digest's first characters, never a byte of the file. An
+-- acknowledgeable file on a page that records decisions offers Acknowledge
+-- and Refuse; a blocking one says only a change to the tree closes it.
+refusalBlock : Model -> Queue.QueuePage -> Ui.Element Msg
+refusalBlock model page =
+    if List.isEmpty page.refusals then
+        Ui.none
+
+    else
+        Ui.column
+            [ Ui.width Ui.fill, Ui.spacing 8 ]
+            (Ui.el [ Font.size 13, Font.bold, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Unreviewable files")
+                :: List.map (refusalCard model page.log) page.refusals
+            )
+
+
+refusalCard : Model -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalCard model shown row =
+    Ui.column
+        [ Ui.width Ui.fill
+        , Ui.padding 12
+        , Ui.spacing 6
+        , Background.color (Ui.rgb 24 24 32)
+        , Border.rounded 8
+        , Border.solid
+        , Border.width 1
+        , Border.color (Ui.rgb 165 110 60)
+        ]
+        [ Ui.row
+            [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
+            [ sectionHeading (Ui.el [ Font.size 13, Font.bold, Font.family Font.monospace, Font.color (Ui.rgb 235 235 240) ] (safeText row.path))
+            , Ui.el
+                [ Ui.paddingXY 8 3, Background.color (Ui.rgb 40 40 52), Border.rounded 4, Font.size 11, Font.bold, Font.color (Ui.rgb 220 220 230) ]
+                (Ui.text (Queue.refusalReasonText row.reason))
+            , Ui.el [ Ui.width Ui.fill ] Ui.none
+            , refusalControls model shown row
+            ]
+        , Ui.row
+            [ Ui.spacing 10, Font.size 12, Font.color (Ui.rgb 150 150 165) ]
+            [ case row.size of
+                Just size ->
+                    Ui.text (Format.byteSize size)
+
+                Nothing ->
+                    Ui.none
+            , case row.digest of
+                Just digest ->
+                    Ui.el [ Font.family Font.monospace ] (safeText (Index.shortHash (Index.refusalDigestText digest)))
+
+                Nothing ->
+                    Ui.none
+            ]
+        ]
+
+
+-- Acknowledge and Refuse for a file a decision can bind on a page that
+-- records decisions; otherwise why there is no control.
+refusalControls : Model -> LogShown -> Index.RefusalRow -> Ui.Element Msg
+refusalControls model shown row =
+    case row.digest of
+        Nothing ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text "Cannot be acknowledged: fix it in the tree.")
+
+        Just _ ->
+            case noDecisionReason shown of
+                Just why ->
+                    Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (Ui.text why)
+
+                Nothing ->
+                    decisionControls model row.uid "Acknowledge" (AckRefusal row.uid) (RefuseRefusalSubmit row.uid)
 
 
 nextPageButton : Maybe Index.Cursor -> Ui.Element Msg
@@ -214,9 +325,9 @@ queueUnits model =
                 , Ui.column
                     [ Ui.width Ui.fill, Ui.height Ui.fill, Ui.spacing 16, Ui.scrollbars ]
                     [ hintLine (recordsDecisions model)
-                    , case selectedUnit model of
-                        Just q ->
-                            unitCard model True q
+                    , case List.head (List.drop model.selected (Queue.queueLabels (queueList model))) of
+                        Just ( q, label ) ->
+                            unitCard model label q
 
                         Nothing ->
                             Ui.none
@@ -234,11 +345,11 @@ queueRail model =
         , Ui.spacing 4
         , Ui.scrollbars
         ]
-        (List.indexedMap (railItem model) (queueList model))
+        (List.indexedMap (railItem model) (Queue.queueLabels (queueList model)))
 
 
-railItem : Model -> Int -> Queue.QueuedUnit -> Ui.Element Msg
-railItem model i q =
+railItem : Model -> Int -> ( Queue.QueuedUnit, UnitLabel ) -> Ui.Element Msg
+railItem model i ( q, label ) =
     let
         selected =
             i == model.selected
@@ -263,10 +374,9 @@ railItem model i q =
         { onPress = Just (SelectUnit i)
         , label = Ui.row
             [ Ui.width Ui.fill, Ui.spacing 6, Ui.centerY ]
-            [ Ui.el
-                [ Font.size 12, Font.bold, Font.color (Ui.rgb 220 220 230) ]
-                (safeText q.unit.qualified)
+            [ labelEl 12 label
             , changeBadge q.change
+            , railStanding q.standing
             ]
         }
 
@@ -395,7 +505,7 @@ historyHeading row badge bodyHash reviewedAt =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
         [ badge
-        , Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
+        , Ui.el [ Ui.describe (Ui.descHeading 2), Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (Index.shortHash bodyHash))
@@ -440,13 +550,13 @@ nameOf row =
 
 -- The unit page shows the source of one unit with its resolved links —
 -- no decision buttons, no change state; the unit is read-only here.
-unitPageBody : Queue.UnitPageState -> Ui.Element Msg
-unitPageBody state =
+unitPageBody : Queue.StandingRead -> Queue.UnitPageState -> Ui.Element Msg
+unitPageBody standing state =
     case state of
         UnitLoaded loaded ->
             Ui.column
                 [ Ui.width Ui.fill, Ui.spacing 16, Ui.scrollbars ]
-                [ unitPageCard loaded ]
+                [ unitPageCard standing loaded ]
 
         UnitLoading ->
             unitPageStatus state
@@ -471,8 +581,8 @@ unitPageStatus state =
             Ui.none
 
 
-unitPageCard : Index.UnitView -> Ui.Element Msg
-unitPageCard loaded =
+unitPageCard : Queue.StandingRead -> Index.UnitView -> Ui.Element Msg
+unitPageCard standing loaded =
     let
         unit =
             loaded.unit
@@ -489,10 +599,10 @@ unitPageCard loaded =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText unit.qualified)
+            [ sectionHeading (labelEl 14 (Queue.unitLabel Named unit))
             , chip unit.facing
-            , chip unit.kind
             ]
+        , unitStanding (Queue.standingFor unit standing)
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (unitLocation unit))
@@ -554,6 +664,74 @@ linkEl link =
             safeText (Links.label link)
 
 
+-- Where a unit's current body stands in the review log: not reviewed,
+-- decided, or a row recorded for it that is not counted. Every standing
+-- draws its own badge, so a reopened unit never reads as a fresh one.
+standingBadge : Queue.Standing -> Ui.Element Msg
+standingBadge standing =
+    case standing of
+        Undecided ->
+            chip (SafeText.literal "Not reviewed")
+
+        Decided d ->
+            decisionBadge d
+
+        NotCounted why ->
+            unverifiedBadge why
+
+
+-- The rail names a standing only when a row exists for the current body;
+-- the change badge already marks a body no row names.
+railStanding : Queue.Standing -> Ui.Element Msg
+railStanding standing =
+    case standing of
+        Undecided ->
+            Ui.none
+
+        Decided _ ->
+            standingBadge standing
+
+        NotCounted _ ->
+            standingBadge standing
+
+
+-- The unit page's standing line: the badge with a refusal's reason, the
+-- failed read, or the read still running for the body shown.
+unitStanding : Maybe (Result Error Queue.Standing) -> Ui.Element Msg
+unitStanding read =
+    case read of
+        Just (Ok standing) ->
+            Ui.row
+                [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
+                [ standingBadge standing
+                , standingReason standing
+                ]
+
+        Just (Err e) ->
+            Ui.el
+                [ Font.size 12, Font.color (Ui.rgb 200 120 120) ]
+                (safeText (SafeText.concat [ SafeText.literal "Review status read failed: ", SafeText.renderForeign (Error.toString e) ]))
+
+        Nothing ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Reading review status…")
+
+
+standingReason : Queue.Standing -> Ui.Element Msg
+standingReason standing =
+    case standing of
+        Decided (StoredRefused r) ->
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 200 120 120) ] (safeText (LibDb.storedReasonText r))
+
+        Decided StoredApproved ->
+            Ui.none
+
+        Undecided ->
+            Ui.none
+
+        NotCounted _ ->
+            Ui.none
+
+
 decisionBadge : LibDb.StoredDecision -> Ui.Element Msg
 decisionBadge d =
     case d of
@@ -583,8 +761,8 @@ urlSync model =
         (Html.node "div" [ Attr.attribute "data-ipe-path" (currentPath model) ] [])
 
 
-unitCard : Model -> Bool -> Queue.QueuedUnit -> Ui.Element Msg
-unitCard model selected q =
+unitCard : Model -> UnitLabel -> Queue.QueuedUnit -> Ui.Element Msg
+unitCard model label q =
     let
         unit =
             q.unit
@@ -599,24 +777,16 @@ unitCard model selected q =
         , Background.color (Ui.rgb 24 24 32)
         , Border.rounded 8
         , Border.solid
-        , if selected then
-            Border.width 2
-
-        else
-            Border.width 1
-        , if selected then
-            Border.color (Ui.rgb 130 170 240)
-
-        else
-            Border.color (Ui.rgb 50 50 62)
+        , Border.width 2
+        , Border.color (Ui.rgb 130 170 240)
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText unit.qualified)
+            [ sectionHeading (labelEl 14 label)
             , changeBadge q.change
+            , standingBadge q.standing
             , changedChip q
             , chip unit.facing
-            , chip unit.kind
             , Ui.el [ Ui.width Ui.fill ] Ui.none
             , case loaded of
                 Just v ->
@@ -650,6 +820,49 @@ selectedViewStatus uid state =
 
         Nothing ->
             Ui.none
+
+
+-- A section of a page: the page's one `h1` is the tool's name in the header,
+-- and each unit card or history entry opens an `h2`.
+sectionHeading : Ui.Element Msg -> Ui.Element Msg
+sectionHeading content =
+    Ui.el [ Ui.describe (Ui.descHeading 2) ] content
+
+
+-- A unit's label: its kind, its qualified name and, when the page needs it
+-- to tell the unit apart, its location.
+labelEl : Int -> UnitLabel -> Ui.Element Msg
+labelEl size label =
+    Ui.row
+        [ Ui.spacing 6, Ui.centerY ]
+        ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (safeText label.kind)
+        , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
+        ]
+            ++ placeEls size label.place
+        )
+
+
+placeEls : Int -> Place -> List (Ui.Element Msg)
+placeEls size place =
+    case place of
+        Named ->
+            []
+
+        At path line ->
+            [ placeEl size (placeText path line) ]
+
+        AtUnit path line uid ->
+            [ placeEl size (SafeText.concat [ placeText path line, SafeText.literal " · ", SafeText.renderForeign (Uid.toString uid) ]) ]
+
+
+placeEl : Int -> SafeText -> Ui.Element Msg
+placeEl size text =
+    Ui.el [ Font.size size, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ] (safeText text)
+
+
+placeText : SafeText -> Int -> SafeText
+placeText path line =
+    SafeText.concat [ path, SafeText.literal (":" ++ String.fromInt line) ]
 
 
 -- `path · lines a-b`, from the unit's rendered path.
@@ -806,35 +1019,60 @@ decisionButtons model loaded =
 
 verifiedDecisionButtons : Model -> Index.Unit -> Ui.Element Msg
 verifiedDecisionButtons model unit =
-    if model.refusingUid == Just unit.uid then
-        refusePanel model unit.uid
+    decisionControls model unit.uid "Approve" (ApproveUnit unit.uid) (RefuseSubmit unit.uid)
+
+
+-- The one place a row's decision controls are drawn, for a queued unit and
+-- an unreviewable file alike: the open refusal panel, the pending state
+-- while a decision is busy, or the approve control (`approveLabel` sending
+-- `approve`) beside Refuse.
+decisionControls : Model -> Uid -> String -> Msg -> Msg -> Ui.Element Msg
+decisionControls model uid approveLabel approve submit =
+    if model.refusingUid == Just uid then
+        refusePanel model submit
 
     else
-        Ui.row
-            [ Ui.spacing 8 ]
-            [ Ui.button
-                [ Ui.paddingXY 10 5
-                , Background.color (Ui.rgb 46 160 67)
-                , Border.rounded 4
-                , Font.size 12
-                , Font.bold
-                , Font.color (Ui.rgb 10 20 12)
-                ]
-                { onPress = Just (ApproveUnit unit.uid), label = Ui.text "Approve" }
-            , Ui.button
-                [ Ui.paddingXY 10 5
-                , Background.color (Ui.rgb 165 60 60)
-                , Border.rounded 4
-                , Font.size 12
-                , Font.bold
-                , Font.color (Ui.rgb 245 235 235)
-                ]
-                { onPress = Just (RefuseStart unit.uid), label = Ui.text "Refuse" }
-            ]
+        case Queue.pendingText uid model.decision of
+            Just text ->
+                Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text text)
+
+            Nothing ->
+                Ui.row
+                    [ Ui.spacing 8 ]
+                    [ approveButton approveLabel approve
+                    , refuseButton "Refuse" (RefuseStart uid)
+                    ]
 
 
-refusePanel : Model -> Uid -> Ui.Element Msg
-refusePanel model uid =
+approveButton : String -> Msg -> Ui.Element Msg
+approveButton label msg =
+    Ui.button
+        [ Ui.paddingXY 10 5
+        , Background.color (Ui.rgb 46 160 67)
+        , Border.rounded 4
+        , Font.size 12
+        , Font.bold
+        , Font.color (Ui.rgb 10 20 12)
+        ]
+        { onPress = Just msg, label = Ui.text label }
+
+
+refuseButton : String -> Msg -> Ui.Element Msg
+refuseButton label msg =
+    Ui.button
+        [ Ui.paddingXY 10 5
+        , Background.color (Ui.rgb 165 60 60)
+        , Border.rounded 4
+        , Font.size 12
+        , Font.bold
+        , Font.color (Ui.rgb 245 235 235)
+        ]
+        { onPress = Just msg, label = Ui.text label }
+
+
+-- The refusal reason input with Confirm, which sends `submit`, and Cancel.
+refusePanel : Model -> Msg -> Ui.Element Msg
+refusePanel model submit =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]
         [ Input.text
@@ -852,15 +1090,7 @@ refusePanel model uid =
                 Ui.none
         , Ui.row
             [ Ui.spacing 8 ]
-            [ Ui.button
-                [ Ui.paddingXY 10 5
-                , Background.color (Ui.rgb 165 60 60)
-                , Border.rounded 4
-                , Font.size 12
-                , Font.bold
-                , Font.color (Ui.rgb 245 235 235)
-                ]
-                { onPress = Just (RefuseSubmit uid), label = Ui.text "Confirm" }
+            [ refuseButton "Confirm" submit
             , Ui.button
                 [ Ui.paddingXY 10 5
                 , Background.color (Ui.rgb 55 55 70)
@@ -888,7 +1118,7 @@ sourceBlock loaded =
             [ Ui.width Ui.fill, Ui.spacing 2 ]
             (case loaded.view of
                 Shown shown ->
-                    List.map sourceRow (rowLines loaded.unit.lang (Index.shownRows shown))
+                    shownSource (Index.shownDrawn shown)
 
                 Stale _ ->
                     withheldSource loaded.view
@@ -912,134 +1142,136 @@ withheldSource view =
             []
 
 
--- One drawn row of a shown view: a numbered source line, or the marker for
--- a run of lines other units cover, which those units' own pages show.
-sourceRow : RowLine -> Ui.Element Msg
-sourceRow row =
-    case row of
-        TokenLine n toks ->
-            numberedLine n toks
-
-        CoveredLine ->
-            Ui.el
-                [ Ui.width Ui.fill
-                , Font.family Font.monospace
-                , Font.size 12
-                , Font.color (Ui.rgb 120 120 135)
-                ]
-                (Ui.text "... lines reviewed as their own units")
+-- A shown view: the notes on its file's layout, a note when it is drawn
+-- without highlighting, then the drawing the view was proved with.
+shownSource : DrawnSource -> List (Ui.Element Msg)
+shownSource drawn =
+    List.map layoutNoteEl (Drawn.notes drawn) ++ modeNote (Drawn.mode drawn) ++ [ Ui.html (drawnHtml drawn) ]
 
 
--- A shown row with its tokens: a numbered line, or a covered run.
-type RowLine
-    = TokenLine Int (List Token)
-    | CoveredLine
+modeNote : Mode -> List (Ui.Element Msg)
+modeNote drawnMode =
+    case drawnMode of
+        Highlighted ->
+            []
+
+        Unhighlighted ->
+            [ Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text "Shown without highlighting: highlighted, this unit would draw past the review ceiling.") ]
 
 
--- The rows of a shown view with each line's tokens. A run of numbered rows
--- is lexed as one text, a line's open lexeme (a block comment, a string that
--- spans lines) carried into the next row, so a comment or string reads the
--- same whatever line it starts on; a covered run starts afresh. Linear in
--- the rows' text.
-rowLines : Highlight.Lang -> List SourceRow -> List RowLine
-rowLines lang rows =
-    case List.foldl (rowLineStep lang) ( Highlight.lineStart, [] ) rows of
-        ( _, lines ) ->
-            lines
+layoutNoteEl : LayoutNote -> Ui.Element Msg
+layoutNoteEl note =
+    Ui.el [ Font.size 12, Font.color (Ui.rgb 150 150 165) ] (Ui.text (layoutNoteText note))
 
 
-rowLineStep : Highlight.Lang -> SourceRow -> ( Highlight.Carry, List RowLine ) -> ( Highlight.Carry, List RowLine )
-rowLineStep lang row ( carry, lines ) =
-    case row of
-        Numbered n line ->
-            case Highlight.lexLine lang carry (withoutLineEnd lang line) of
-                ( toks, next ) ->
-                    ( next, lines ++ [ TokenLine n toks ] )
+layoutNoteText : LayoutNote -> String
+layoutNoteText note =
+    case note of
+        ByteOrderMark ->
+            "The file starts with a byte-order mark (U+FEFF), which the compiler skips; it is not drawn."
 
-        Covered ->
-            ( Highlight.lineStart, lines ++ [ CoveredLine ] )
+        CrlfLineEnds ->
+            "The file's lines end in CRLF; each \\r before a line break is not drawn."
 
 
--- A line without the `\r` of a CRLF ending, in a language that reads CRLF
--- as one line break (Rust, Ipê). In shell and other text that `\r` is part
--- of the line (`cd dir\r` names another directory), so it stays, drawn as
--- the escape every other hazard is.
-withoutLineEnd : Highlight.Lang -> String -> String
-withoutLineEnd lang line =
-    if crlfIsLineBreak lang && String.endsWith "\r" line then
-        String.dropRight 1 line
-
-    else
-        line
+-- A shown view's drawing: each run of numbered lines as one block of text
+-- beside its gutter, and a marker for each run of lines other units cover,
+-- which those units' own pages show. It draws exactly the elements
+-- `Drawn.elements` counts, each in markup with its style inline.
+drawnHtml : DrawnSource -> Html.Html msg
+drawnHtml drawn =
+    Html.div [ Attr.style "display:flex;flex-direction:column;gap:2px" ] (List.map partHtml (Drawn.parts drawn))
 
 
-crlfIsLineBreak : Highlight.Lang -> Bool
-crlfIsLineBreak lang =
-    case lang of
-        Rust ->
-            True
+partHtml : Part -> Html.Html msg
+partHtml part =
+    case part of
+        LineRun numbers code ->
+            Html.div [ Attr.style "display:flex;gap:8px;font-family:monospace;font-size:12px" ] [ gutterHtml numbers, codeHtml code ]
 
-        Ipe ->
-            True
-
-        Shell ->
-            False
-
-        Unknown ->
-            False
+        CoveredRun ->
+            Html.div [ Attr.style "font-family:monospace;font-size:12px;color:rgb(120,120,135)" ] [ Html.text "... lines reviewed as their own units" ]
 
 
-numberedLine : Int -> List Token -> Ui.Element Msg
-numberedLine n toks =
-    Ui.row
-        [ Ui.width Ui.fill, Ui.spacing 8 ]
-        [ Ui.el
-            [ Ui.width (Ui.px 40)
-            , Font.family Font.monospace
-            , Font.size 12
-            , Font.color (Ui.rgb 120 120 135)
-            , Ui.alignRight
-            ]
-            (Ui.text (String.fromInt n))
-        , Ui.el
-            [ Ui.width Ui.fill
-            , Font.family Font.monospace
-            , Font.size 12
-            ]
-            (Ui.html (lineHtml toks))
+-- The line numbers of a run, one per line, outside the copied text.
+gutterHtml : List Int -> Html.Html msg
+gutterHtml numbers =
+    Html.div
+        [ Attr.style "white-space:pre;text-align:right;user-select:none;flex:none;width:40px;color:rgb(120,120,135)"
+        , Attr.attribute "aria-hidden" "true"
         ]
+        [ Html.text (String.join "\n" (List.map String.fromInt numbers)) ]
+
+
+-- A run's lines as one block whose text is the lines joined by newlines, so
+-- copying it gives the source as written: its spaces and tabs kept, a
+-- coloured run one line element per line. The block draws its text in byte
+-- order (`displayOrderCss`); the override holds for every inline element
+-- inside it, so no line, run or escape element carries it again.
+codeHtml : Code -> Html.Html msg
+codeHtml code =
+    Html.node "code" [ Attr.style codeCss ] (codeChildren code)
+
+
+codeCss : String
+codeCss =
+    "display:block;flex:1;white-space:pre;color:#cdcdd7;" ++ displayOrderCss
+
+
+codeChildren : Code -> List (Html.Html msg)
+codeChildren code =
+    case code of
+        ColoredLines lines ->
+            List.intersperse (Html.text "\n") (List.map lineHtml lines)
+
+        PlainText pieces ->
+            List.map pieceHtml pieces
 
 
 -- One source line as a single run of inline text, so it copies as the
--- source spells it: each token an inline span in its color, its text drawn
--- through the untrusted-text sink, and each tab drawn as the tab it is.
-lineHtml : List Token -> Html.Html msg
-lineHtml toks =
-    Html.span [ Attr.style "white-space:pre" ] (List.map tokenHtml toks)
+-- source spells it: each run not in the block's own colour an inline span in
+-- its colour, its text drawn as the untrusted-text sink split it.
+lineHtml : List Run -> Html.Html msg
+lineHtml runs =
+    Html.span [ Attr.style "white-space:pre" ] (List.concatMap runHtml runs)
 
 
-tokenHtml : Token -> Html.Html msg
-tokenHtml tok =
-    Html.span [ Attr.style (tokenCss tok) ] (List.intersperse (Html.text "\t") (List.map safeTextHtml (Highlight.tokenRuns tok)))
+runHtml : Run -> List (Html.Html msg)
+runHtml run =
+    case run of
+        Run TextHue pieces ->
+            List.map pieceHtml pieces
+
+        Run hue pieces ->
+            [ Html.span [ Attr.style (hueCss hue) ] (List.map pieceHtml pieces) ]
 
 
-tokenCss : Token -> String
-tokenCss tok =
-    case tok of
-        Keyword _ ->
+-- Text as itself; a run of escapes as one marked element holding each
+-- escape's spelling in order.
+pieceHtml : Piece -> Html.Html msg
+pieceHtml piece =
+    case piece of
+        Chars s ->
+            Html.text s
+
+        Escapes cs ->
+            Html.span [ Attr.attribute "data-review-escape" "true", Attr.style escapeCss ] [ Html.text (String.concat (List.map SafeText.escapeSpelling cs)) ]
+
+
+hueCss : Hue -> String
+hueCss hue =
+    case hue of
+        KeywordHue ->
             "color:#c792ea"
 
-        Str _ ->
+        StringHue ->
             "color:#98c379"
 
-        Comment _ ->
+        CommentHue ->
             "color:#6e6e7d"
 
-        Num _ ->
+        NumberHue ->
             "color:#d19a66"
 
-        Ident _ ->
-            "color:#cdcdd7"
-
-        Plain _ ->
+        TextHue ->
             "color:#cdcdd7"

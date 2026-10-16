@@ -24,7 +24,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::entropy::EntropyError;
 use crate::redact::{Redacted, redacting_debug};
+use crate::system::RefusedText;
 
 /// Ipe.Http.Server.Request — opaque parsed request handle.
 // camelCase field names are required because accessor kernels (server_body,
@@ -1851,6 +1853,7 @@ pub(crate) enum StaticRequest {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum StaticRefusal {
     /// The strict core refused the path text itself.
+    #[cfg(any(test, feature = "web"))]
     Malformed(crate::encoding::DecodeRefusal),
     /// A decoded segment is not a plain name under the serving regime.
     Segment(crate::path_core::RelPathRefusal),
@@ -1874,6 +1877,7 @@ pub(crate) enum StaticRefusal {
 /// # Errors
 ///
 /// The [`StaticRefusal`] of the first boundary that refused the path.
+#[cfg(any(test, feature = "web"))]
 pub(crate) fn static_request(
     uri_path: &str,
     root: &std::path::Path,
@@ -1884,7 +1888,7 @@ pub(crate) fn static_request(
     static_request_of(&decoded, root, regime)
 }
 
-/// [`static_request`] over a path already decoded.
+/// `static_request` over a path already decoded.
 ///
 /// # Errors
 ///
@@ -1948,7 +1952,7 @@ pub(crate) fn strict_serve_dir(
 /// [`strict_serve_dir`] under an explicit `regime`, so any host proves the
 /// Windows refusals.
 ///
-/// A request path [`static_request`] refuses is answered a bare 404 that never
+/// A request path `static_request` refuses is answered a bare 404 that never
 /// echoes the path, whether or not the entry exists. Every answer carries the
 /// response security headers.
 fn strict_serve_dir_with(
@@ -2189,10 +2193,10 @@ fn to_axum_response(r: ServerResponse, streams: RequestStreams) -> axum::respons
 }
 
 /// The security headers of a handler response or a static file: the
-/// [`crate::csp::Profile::Response`] policy.
+/// [`crate::csp::Guarded::Response`] policy.
 fn response_security_headers()
 -> Result<Vec<(&'static str, String)>, crate::telemetry::FrameAncestorsRefusal> {
-    crate::telemetry::security_headers(crate::csp::Profile::Response)
+    crate::telemetry::security_headers(&crate::csp::Guarded::Response)
 }
 
 /// [`to_axum_response`] over the outcome of reading the security headers.
@@ -2362,33 +2366,81 @@ enum RouteCause {
     Method,
 }
 
+impl RouteCause {
+    /// Whether a declared ceiling refused the route: a larger bound would
+    /// admit the same text.
+    const fn is_ceiling(&self) -> bool {
+        use crate::encoding::{
+            DecodeRefusal as D, EncodeRefusal as E, MountBaseRefusal as M,
+            RouteSegmentRefusal as S, ServerPatternRefusal as P,
+        };
+        match self {
+            Self::Pattern(
+                P::TooManyParams { .. }
+                | P::Render(E::TooLong { .. })
+                | P::Segment(S::Decode(D::TooLong { .. })),
+            )
+            | Self::Prefix(M::TooLong { .. }) => true,
+            Self::Pattern(
+                P::NotAbsolute
+                | P::CatchAll
+                | P::MidSegmentSigil { .. }
+                | P::Segment(
+                    S::Decode(D::MalformedEscape { .. } | D::InvalidUtf8 { .. }) | S::ParamName(_),
+                )
+                | P::Render(E::Empty | E::Dot),
+            )
+            | Self::Prefix(
+                M::NoLeadingSlash
+                | M::TrailingSlash
+                | M::EmptySegment
+                | M::DotSegment
+                | M::Reserved { .. },
+            )
+            | Self::Method => false,
+        }
+    }
+}
+
 /// A route refused at listen, named by its method and path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EndpointRefusal {
-    method: String,
-    path: String,
+    /// The route as [`quoted_endpoint`] quotes it.
+    endpoint: RefusedText,
     cause: RouteCause,
 }
 
 /// How many characters of a refused path a listen error quotes.
 const PATH_EXCERPT_CHARS: usize = 64;
 
-/// `METHOD path` for a listen error: control characters scrubbed and the path
-/// cut to [`PATH_EXCERPT_CHARS`] characters.
-fn quoted_endpoint(method: &str, path: &str) -> String {
-    let mut chars = path.chars();
-    let head: String = chars.by_ref().take(PATH_EXCERPT_CHARS).collect();
-    let more = if chars.next().is_some() { "…" } else { "" };
-    format!(
-        "{} {}{more}",
-        crate::system::scrub_log_controls(method),
-        crate::system::scrub_log_controls(&head)
-    )
+/// How many characters of a refused method a listen error quotes: every HTTP
+/// method the server serves is shorter.
+const METHOD_EXCERPT_CHARS: usize = 16;
+
+/// The first `max` characters of `text`, ending in `…` when it is longer.
+fn excerpt(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let mut head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        head.push('…');
+    }
+    head
+}
+
+/// `METHOD path` for a listen error: log hazards escaped, the method cut to
+/// [`METHOD_EXCERPT_CHARS`] and the path to [`PATH_EXCERPT_CHARS`]
+/// characters.
+fn quoted_endpoint(method: &str, path: &str) -> RefusedText {
+    RefusedText::new(&format!(
+        "{} {}",
+        excerpt(method, METHOD_EXCERPT_CHARS),
+        excerpt(path, PATH_EXCERPT_CHARS)
+    ))
 }
 
 impl std::fmt::Display for EndpointRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let endpoint = quoted_endpoint(&self.method, &self.path);
+        let endpoint = &self.endpoint;
         match &self.cause {
             RouteCause::Pattern(refusal) => write!(
                 f,
@@ -2407,6 +2459,75 @@ impl std::fmt::Display for EndpointRefusal {
     }
 }
 
+/// Why `Server.listen` refused its route set before it bound a port.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ServerStartRefusal {
+    /// A route's path, mount prefix or method does not parse.
+    Route(EndpointRefusal),
+    /// Two handlers claim one route shape with an overlapping method.
+    Overlap {
+        earlier: RefusedText,
+        later: RefusedText,
+    },
+    /// Two mounts serve one prefix.
+    SharedPrefix {
+        earlier: RefusedText,
+        later: RefusedText,
+    },
+    /// A second `Server.mountApp` Web app on one server.
+    #[cfg(feature = "web")]
+    SecondMount,
+    /// The router refused an insert every listen check admitted.
+    RouterRejected { endpoint: RefusedText },
+}
+
+impl std::fmt::Display for ServerStartRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Route(refusal) => write!(f, "{refusal}"),
+            Self::Overlap { earlier, later } => write!(
+                f,
+                "Server.listen: endpoint `{earlier}` conflicts with `{later}` — two handlers may \
+                 not claim the same path with an overlapping method; give each endpoint a \
+                 distinct path or method"
+            ),
+            Self::SharedPrefix { earlier, later } => write!(
+                f,
+                "Server.listen: mount `{earlier}` and mount `{later}` serve one prefix — two \
+                 mounts may not share a prefix; give each mount its own prefix (a prefix nested \
+                 under another is served by the longer one)"
+            ),
+            #[cfg(feature = "web")]
+            Self::SecondMount => f.write_str(
+                "Server.mountApp: at most one Web app may be mounted per server (the embedded \
+                 app's cookie/CSRF/asset paths are scoped through one process-wide base path); \
+                 mount a single Web app, or serve additional apps as separate servers",
+            ),
+            Self::RouterRejected { endpoint } => write!(
+                f,
+                "Server.listen: the router refused to register endpoint `{endpoint}` beside the \
+                 routes before it, although every listen check admitted the route set"
+            ),
+        }
+    }
+}
+
+impl ServerStartRefusal {
+    /// The error `Server.listen` fails with, of the kind this refusal is.
+    fn into_ipe_error(self) -> IpeError {
+        let message = self.to_string();
+        match self {
+            Self::Route(refusal) if refusal.cause.is_ceiling() => IpeError::limit_exceeded(message),
+            Self::Route(_) => IpeError::invalid_input(message),
+            Self::Overlap { .. } | Self::SharedPrefix { .. } | Self::RouterRejected { .. } => {
+                IpeError::conflict(message)
+            }
+            #[cfg(feature = "web")]
+            Self::SecondMount => IpeError::conflict(message),
+        }
+    }
+}
+
 /// Parse every route once, in declaration order: a handler's path into a
 /// [`crate::encoding::ServerPattern`] and its method into an
 /// [`EndpointMethod`], a mount's prefix into a
@@ -2420,8 +2541,7 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
         .into_iter()
         .map(|r| {
             let refuse = |cause| EndpointRefusal {
-                method: r.method.to_uppercase(),
-                path: r.path.clone(),
+                endpoint: quoted_endpoint(&r.method.to_uppercase(), &r.path),
                 cause,
             };
             let pattern = || {
@@ -2452,8 +2572,14 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
         .collect()
 }
 
-/// The first two handlers that claim one route with an overlapping method,
-/// as a listen error.
+impl ParsedRoute {
+    /// This route as a listen error quotes it.
+    fn endpoint(&self) -> RefusedText {
+        quoted_endpoint(&self.method.to_uppercase(), &self.path)
+    }
+}
+
+/// The first two handlers that claim one route with an overlapping method.
 ///
 /// The router keys a handler by its pattern's router spelling, which two
 /// patterns share exactly when they have one shape
@@ -2461,7 +2587,7 @@ fn parse_routes(routes: Vec<ServerRoute>) -> Result<Vec<ParsedRoute>, EndpointRe
 /// spelling merge into one route, and only an overlapping method makes that
 /// merge a conflict. So this check refuses exactly the handler sets the
 /// router could not register, before any insert.
-fn endpoint_conflict(routes: &[ParsedRoute]) -> Option<String> {
+fn endpoint_conflict(routes: &[ParsedRoute]) -> Option<ServerStartRefusal> {
     let mut seen: HashMap<&str, Vec<(EndpointMethod, &ParsedRoute)>> = HashMap::new();
     for route in routes {
         let ParsedTarget::Handler(method, pattern, _) = &route.target else {
@@ -2470,52 +2596,64 @@ fn endpoint_conflict(routes: &[ParsedRoute]) -> Option<String> {
         let method = *method;
         let claims = seen.entry(pattern.router_path()).or_default();
         if let Some((_, earlier)) = claims.iter().find(|(m, _)| m.overlaps(method)) {
-            return Some(format!(
-                "Server.listen: endpoint `{}` conflicts with `{}` — two handlers may not claim \
-                 the same path with an overlapping method; give each endpoint a distinct path or \
-                 method",
-                quoted_endpoint(&earlier.method.to_uppercase(), &earlier.path),
-                quoted_endpoint(&route.method.to_uppercase(), &route.path),
-            ));
+            return Some(ServerStartRefusal::Overlap {
+                earlier: earlier.endpoint(),
+                later: route.endpoint(),
+            });
         }
         claims.push((method, route));
     }
     None
 }
 
-/// The first two mounts that serve one prefix, as a listen error.
+/// The first two mounts that serve one prefix.
 ///
 /// Mounts are matched by longest prefix ([`MountTable`]), which picks one
 /// mount for every path only when no two prefixes are equal.
-fn mount_conflict(routes: &[ParsedRoute]) -> Option<String> {
+fn mount_conflict(routes: &[ParsedRoute]) -> Option<ServerStartRefusal> {
     let mut seen: HashMap<&crate::encoding::MountBase, &ParsedRoute> = HashMap::new();
     for route in routes {
         let Some(base) = route.target.mount_base() else {
             continue;
         };
         if let Some(earlier) = seen.insert(base, route) {
-            return Some(format!(
-                "Server.listen: mount `{}` and mount `{}` serve one prefix — two mounts may not \
-                 share a prefix; give each mount its own prefix (a prefix nested under another \
-                 is served by the longer one)",
-                quoted_endpoint(&earlier.method.to_uppercase(), &earlier.path),
-                quoted_endpoint(&route.method.to_uppercase(), &route.path),
-            ));
+            return Some(ServerStartRefusal::SharedPrefix {
+                earlier: earlier.endpoint(),
+                later: route.endpoint(),
+            });
         }
     }
     None
 }
 
-/// The typed error for the per-insert `catch_unwind` backstop: a router
-/// insert panicked on a conflict the pre-check did not model. Fail closed
-/// with the offending endpoint named.
-fn conflict_at(method: &str, path: &str) -> String {
-    format!(
-        "Server.listen: endpoint `{}` conflicts with a route already registered on the server — \
-         two endpoints may not claim the same path or a path nested under another; give each \
-         endpoint a distinct path",
-        quoted_endpoint(method, path)
-    )
+// The router reports a refused insert only by panicking, and a panicking
+// handler is answered 500 by `CatchPanicLayer`: both rest on catching an
+// unwind.
+#[cfg(panic = "abort")]
+compile_error!(
+    "`server` catches router-insert and handler panics to answer them as typed refusals; a \
+     `panic = \"abort\"` build cannot catch them"
+);
+
+/// Register `mr` at the router spelling `path`.
+///
+/// The listen checks refuse, before any insert, every route set the router
+/// could not register; this is the backstop behind them. The router reports a
+/// refused insert only by panicking, so the panic is caught and answered as
+/// [`ServerStartRefusal::RouterRejected`] naming `endpoint`, never as a
+/// refusal whose cause it may not be.
+///
+/// # Errors
+///
+/// `RouterRejected` when the router panics on the insert.
+fn insert_endpoint(
+    app: axum::Router,
+    path: &str,
+    mr: axum::routing::MethodRouter,
+    endpoint: RefusedText,
+) -> Result<axum::Router, ServerStartRefusal> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || app.route(path, mr)))
+        .map_err(|_| ServerStartRefusal::RouterRejected { endpoint })
 }
 
 /// An app listener's [`ListenHost`](crate::app_config::ListenHost) whose
@@ -2540,6 +2678,8 @@ impl RecordedHost {
     }
 }
 
+pub(crate) mod shutdown;
+
 /// A bound app listener and the Host admission every request on it is judged
 /// by.
 ///
@@ -2552,25 +2692,62 @@ pub(crate) struct AppListener {
     tag: &'static str,
 }
 
+/// Why an app listener does not bind.
+#[derive(Debug)]
+pub(crate) enum AppBindError {
+    /// The declared host list is refused; no socket was opened.
+    Admission(crate::env_grammar::EnvRefusal),
+    /// The socket's own bind error.
+    Bind(std::io::Error),
+}
+
+/// The DNS names every app listener of this process admits, judged once.
+///
+/// Fixed by the first call, which [`crate::env_registry::startup_check`] makes,
+/// so a later environment write cannot widen a running app's admission.
+///
+/// # Errors
+///
+/// The refusal of a malformed `IPE_HTTP_ALLOWED_HOSTS`, naming the variable
+/// and never the value.
+pub(crate) fn declared_names()
+-> Result<&'static crate::inbound_authority::DeclaredNames, &'static crate::env_grammar::EnvRefusal>
+{
+    type Judged = Result<crate::inbound_authority::DeclaredNames, crate::env_grammar::EnvRefusal>;
+    static NAMES: std::sync::OnceLock<Judged> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| crate::env_registry::listen::ALLOWED_HOSTS.read())
+        .as_ref()
+}
+
+/// Fixes [`declared_names`] for the process.
+pub(crate) fn fix_declared_names() {
+    let _ = declared_names();
+}
+
 /// Bind an app listener on `host` and `port`, then log where it listens, which
 /// hosts it admits and, for an exposed host, who exposed it.
 ///
 /// The one app bind site: `Server.listen` and `serve_web` both bind through
-/// it, so neither keeps a `TcpListener::bind` of its own.
+/// it, so neither keeps a `TcpListener::bind` of its own, and neither admits a
+/// DNS name `IPE_HTTP_ALLOWED_HOSTS` does not declare.
 ///
 /// # Errors
 ///
-/// The bind's own error, for the caller to word.
+/// [`AppBindError::Admission`] for a refused host list, before any socket
+/// opens; [`AppBindError::Bind`] with the bind's own error, for the caller to
+/// word.
 pub(crate) async fn bind_app_listener(
     tag: &'static str,
     host: RecordedHost,
     port: u16,
-) -> std::io::Result<AppListener> {
+) -> Result<AppListener, AppBindError> {
+    let names = declared_names().map_err(|refusal| AppBindError::Admission(refusal.clone()))?;
     let addr = host.addr(port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let admission = crate::inbound_authority::HostAdmission::new(
-        crate::inbound_authority::DeclaredNames::none(),
-    );
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(AppBindError::Bind)?;
+    let admission = crate::inbound_authority::HostAdmission::new(names.clone());
     for line in startup_lines(addr, host.0, admission.names()) {
         crate::system::emit_runtime_log(tag, &line);
     }
@@ -2582,12 +2759,19 @@ pub(crate) async fn bind_app_listener(
 }
 
 /// Serve `router` on `app`, judging every request's target authority against
-/// the listener's Host admission before routing, until `shutdown` resolves.
+/// the listener's Host admission before routing, until the armed shutdown
+/// owner drains it; then close every owned pool.
 ///
 /// The one app serve site. The admission wraps the router as a service, never
 /// through `Router::layer` (which runs after routing), so an unrouted path and
 /// the fallback are refused alike and a refused request reaches no handler,
 /// session or concurrency permit.
+///
+/// Its only success is [`shutdown::Stopped`]: after the first signal the
+/// in-flight requests and long-lived tasks get what is left of the grace, every
+/// other serve site sharing the owner drains too, the exporters flush, and
+/// every owned pool closes under its deadline. A signal
+/// that arrived before the serve skips accepting altogether.
 ///
 /// # Errors
 ///
@@ -2596,23 +2780,47 @@ pub(crate) async fn bind_app_listener(
 pub(crate) async fn serve_app(
     app: AppListener,
     router: axum::Router,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()> {
+    armed: shutdown::Armed,
+) -> std::io::Result<shutdown::Stopped> {
     use axum::ServiceExt as _;
     use tower::Layer as _;
-    let AppListener {
-        listener,
-        admission,
-        tag,
-    } = app;
-    let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
-        .layer(CanonicalUrl::new(router));
-    axum::serve(
-        listener,
-        svc.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
+    if !armed.is_draining() {
+        // This site counts as live while it serves, so a sibling site sharing
+        // the owner closes the shared pools only after this one has drained.
+        let serving = armed.drain().hold();
+        let AppListener {
+            listener,
+            admission,
+            tag,
+        } = app;
+        let svc = crate::inbound_authority::HostAdmissionLayer::new(admission, tag)
+            .layer(CanonicalUrl::new(router));
+        let mut stop = armed.drain();
+        let serve = std::future::IntoFuture::into_future(
+            axum::serve(
+                listener,
+                svc.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { stop.wait().await }),
+        );
+        tokio::pin!(serve);
+        let mut drain = armed.drain();
+        tokio::select! {
+            biased;
+            served = serve.as_mut() => served?,
+            () = drain.wait() => {
+                if let Ok(served) = tokio::time::timeout(armed.remaining_grace(), serve.as_mut()).await {
+                    served?;
+                }
+            }
+        }
+        drop(serving);
+    }
+    armed.settle_live().await;
+    #[cfg(all(feature = "web", feature = "http_client"))]
+    crate::web::flush_exporters().await;
+    let closed = shutdown::close_owned_pools(&armed).await;
+    Ok(shutdown::Stopped::after(closed))
 }
 
 /// Serve a test upstream `router` on `listener` with no Host admission.
@@ -2691,11 +2899,15 @@ fn startup_lines(
 }
 
 /// The startup line naming which hosts an app listener admits; it counts the
-/// declared names and never echoes one.
+/// declared names and never echoes one, and with none names the variable that
+/// declares them.
 fn admission_line(names: &crate::inbound_authority::DeclaredNames) -> String {
     const ADMITTED: &str = "host admission: IP literals and localhost";
     if names.is_empty() {
-        ADMITTED.to_owned()
+        format!(
+            "{ADMITTED}; set {}=<name> to serve a DNS name",
+            crate::env_registry::listen::ALLOWED_HOSTS.name()
+        )
     } else {
         format!("{ADMITTED}, and {} declared name(s)", names.len())
     }
@@ -2733,24 +2945,27 @@ pub(crate) fn exposure_warning(host: crate::app_config::ListenHost) -> Option<[S
     ])
 }
 
-pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
+pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
     port: i64,
     routes: Vec<ServerRoute>,
 ) -> IpeTask<E, ()> {
     Box::pin(async move {
+        let refuse = |refusal: ServerStartRefusal| -> IpeResult<E, ()> {
+            IpeResult::Err(E::from_ipe_error(refusal.into_ipe_error()))
+        };
         // Every endpoint path is parsed once before any insert or bind: a
         // pattern the router could misread, or one no request could reach,
         // refuses the whole route set. The router sees only the rendered
         // spelling, never the author's text.
         let routes = match parse_routes(routes) {
             Ok(routes) => routes,
-            Err(refusal) => return IpeResult::Err(refusal.to_string().into()),
+            Err(refusal) => return refuse(ServerStartRefusal::Route(refusal)),
         };
         // Fail-closed endpoint-conflict gate (see `endpoint_conflict`): refuse an
         // overlapping handler set with a typed error before any router insert,
         // so a router conflict can never panic the listener task.
-        if let Some(msg) = endpoint_conflict(&routes).or_else(|| mount_conflict(&routes)) {
-            return IpeResult::Err(msg.into());
+        if let Some(refusal) = endpoint_conflict(&routes).or_else(|| mount_conflict(&routes)) {
+            return refuse(refusal);
         }
         // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
         // (env) > the app's `Host.bind` setting > `127.0.0.1`. A present
@@ -2802,21 +3017,13 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                         .fallback_service(strict_serve_dir(std::path::PathBuf::from(dir)));
                     mounts.push((base, files));
                 }
-                // The insert is wrapped so a matchit conflict `endpoint_conflict`
-                // did not model becomes a typed error rather than an escaped panic
-                // (defence in depth; the check is total over handler sets).
                 ParsedTarget::Handler(method, pattern, h) => {
+                    let endpoint = quoted_endpoint(&r.method.to_uppercase(), &r.path);
                     let path = pattern.router_path().to_owned();
                     let mr = method_router(method, pattern, h);
-                    app = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        app.route(&path, mr)
-                    })) {
+                    app = match insert_endpoint(app, &path, mr, endpoint) {
                         Ok(next) => next,
-                        Err(_) => {
-                            return IpeResult::Err(
-                                conflict_at(&r.method.to_uppercase(), &r.path).into(),
-                            );
-                        }
+                        Err(refusal) => return refuse(refusal),
                     };
                 }
                 // `Server.mountApp`: build the embedded web app's router for its
@@ -2826,14 +3033,7 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
                 #[cfg(feature = "web")]
                 ParsedTarget::MountWeb(base, cell) => {
                     if web_mounted {
-                        return IpeResult::Err(
-                            "Server.mountApp: at most one Web app may be mounted per server \
-                             (the embedded app's cookie/CSRF/asset paths are scoped through one \
-                             process-wide base path); mount a single Web app, or serve additional \
-                             apps as separate servers"
-                                .to_string()
-                                .into(),
-                        );
+                        return refuse(ServerStartRefusal::SecondMount);
                     }
                     let builder = cell
                         .lock()
@@ -2898,12 +3098,35 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
             }
         };
         let port = resolved.port.get();
+        let grace = match shutdown::shutdown_grace() {
+            Ok(grace) => grace,
+            Err(refusal) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                    "Server.listen: {refusal}"
+                ))));
+            }
+        };
+        // Armed before the bind, so no accepted connection precedes the owner.
+        let armed = match shutdown::arm(shutdown::ShutdownPlan::server(), grace) {
+            Ok(armed) => armed,
+            Err(e) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::io(format!(
+                    "Server.listen: shutdown signals: {}",
+                    crate::system::scrub_log_controls(&e.to_string())
+                ))));
+            }
+        };
         // Recorded before the bind, so no dev surface outlives an exposed listener.
         let host = RecordedHost::record(host);
         let addr = host.addr(port);
         let listener = match bind_app_listener("http.server", host, port).await {
             Ok(l) => l,
-            Err(e) => {
+            Err(AppBindError::Admission(refusal)) => {
+                return IpeResult::Err(E::from_ipe_error(IpeError::invalid_input(format!(
+                    "Server.listen: {refusal}"
+                ))));
+            }
+            Err(AppBindError::Bind(e)) => {
                 return IpeResult::Err(E::from_ipe_error(resolved.bind_refusal(
                     "Server.listen",
                     addr,
@@ -2913,8 +3136,8 @@ pub fn server_listen<E: From<String> + crate::FromIpeError + Send + 'static>(
         };
         // `serve_app` serves with connect-info, so each request carries the peer
         // `SocketAddr` (`ServerRequest.remoteAddr`, per-IP rate limiting).
-        match serve_app(listener, app, std::future::pending()).await {
-            Ok(()) => ok_res(()),
+        match serve_app(listener, app, armed).await {
+            Ok(shutdown::Stopped { .. }) => ok_res(()),
             Err(e) => IpeResult::Err(E::from_ipe_error(IpeError::io(format!(
                 "Server.listen: serve: {}",
                 crate::system::scrub_log_controls(&e.to_string())
@@ -3420,12 +3643,31 @@ pub(crate) fn channel_unsettled(gate: &mut Option<ChannelGate>) -> bool {
     gate.as_mut().is_some_and(|gate| gate.settle().is_err())
 }
 
+/// The close frame a WebSocket sends when the server stops serving it.
+fn ws_away_close() -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Close(Some(axum::extract::ws::CloseFrame {
+        code: axum::extract::ws::close_code::AWAY,
+        reason: "server shutting down".into(),
+    }))
+}
+
 /// The close frame a gated WebSocket sends once its credentials no longer hold.
 fn ws_denied_close() -> axum::extract::ws::Message {
     axum::extract::ws::Message::Close(Some(axum::extract::ws::CloseFrame {
         code: axum::extract::ws::close_code::POLICY,
         reason: CHANNEL_DENIED_REASON.into(),
     }))
+}
+
+/// Send the close `frame`, waiting at most [`shutdown::WS_CLOSE_DEADLINE`]: a
+/// peer that stops reading never holds the socket's loop, its `onClose` or its
+/// registry slot past the deadline.
+async fn ws_send_close<S>(socket: &mut S, frame: axum::extract::ws::Message)
+where
+    S: futures_util::Sink<axum::extract::ws::Message> + Unpin,
+{
+    use futures_util::SinkExt;
+    let _ = tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE, socket.send(frame)).await;
 }
 
 tokio::task_local! {
@@ -3460,6 +3702,10 @@ fn ws_max_message_bytes(max_message_bytes: i64) -> usize {
 /// joined and a revocation whose coalesced recheck is due; it also ends on a
 /// coalesced revocation and at the earliest deadline. A denial sends close
 /// code 1008 and ends the loop.
+///
+/// The drain counts the socket until `onClose` returns. Once it drains, the
+/// socket sends close code 1001 and ends the loop. Every close frame goes
+/// through [`ws_send_close`], under [`shutdown::WS_CLOSE_DEADLINE`].
 async fn ws_loop<E, S>(
     mut socket: S,
     cfg: WsServerCfg<E>,
@@ -3467,6 +3713,7 @@ async fn ws_loop<E, S>(
     ceilings: WsCeilings,
     credentials: ChannelCredentials,
     mut gate: Option<ChannelGate>,
+    mut drain: shutdown::Drain,
 ) where
     E: From<String> + Send + 'static,
     S: futures_util::Stream<Item = Result<axum::extract::ws::Message, axum::Error>>
@@ -3486,9 +3733,13 @@ async fn ws_loop<E, S>(
     // A credential revoked between the upgrade and now opens nothing: no
     // registration, no `onConnect`.
     if channel_refuses(&mut gate) {
-        let _ = socket.send(ws_denied_close()).await;
+        ws_send_close(&mut socket, ws_denied_close()).await;
         return;
     }
+    let Some(_live) = drain.hold() else {
+        ws_send_close(&mut socket, ws_away_close()).await;
+        return;
+    };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<WsOut>(ceilings.send_buffer);
     // Live-peer ceiling, application-layer defense in depth: the upgrade gate in
     // `server_web_socket_upgrade` is the primary check, but under high
@@ -3507,7 +3758,7 @@ async fn ws_loop<E, S>(
         // guard dropped here — never held across the awaits below.
     };
     if !admitted {
-        let _ = socket.send(Message::Close(None)).await;
+        ws_send_close(&mut socket, Message::Close(None)).await;
         return;
     }
     let _ = credentials
@@ -3522,23 +3773,27 @@ async fn ws_loop<E, S>(
     heartbeat.tick().await; // consume the immediate first tick
     loop {
         if channel_unsettled(&mut gate) {
-            let _ = socket.send(ws_denied_close()).await;
+            ws_send_close(&mut socket, ws_denied_close()).await;
             break;
         }
         tokio::select! {
             biased;
             () = channel_denial(&mut gate) => {
-                let _ = socket.send(ws_denied_close()).await;
+                ws_send_close(&mut socket, ws_denied_close()).await;
+                break;
+            },
+            () = drain.wait() => {
+                ws_send_close(&mut socket, ws_away_close()).await;
                 break;
             },
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Text(t))) => {
                     if t.len() > max_bytes {
-                        let _ = socket.send(Message::Close(None)).await;
+                        ws_send_close(&mut socket, Message::Close(None)).await;
                         break;
                     }
                     if channel_refuses(&mut gate) {
-                        let _ = socket.send(ws_denied_close()).await;
+                        ws_send_close(&mut socket, ws_denied_close()).await;
                         break;
                     }
                     let _ = credentials
@@ -3547,11 +3802,11 @@ async fn ws_loop<E, S>(
                 }
                 Some(Ok(Message::Binary(b))) => {
                     if b.len() > max_bytes {
-                        let _ = socket.send(Message::Close(None)).await;
+                        ws_send_close(&mut socket, Message::Close(None)).await;
                         break;
                     }
                     if channel_refuses(&mut gate) {
-                        let _ = socket.send(ws_denied_close()).await;
+                        ws_send_close(&mut socket, ws_denied_close()).await;
                         break;
                     }
                     // Convert binary frame bytes to String via UTF-8 (lossy): Ipê's
@@ -3582,12 +3837,12 @@ async fn ws_loop<E, S>(
             outgoing = rx.recv() => match outgoing {
                 Some(WsOut::Text(s)) => { if socket.send(Message::Text(s)).await.is_err() { break; } }
                 Some(WsOut::Binary(b)) => { if socket.send(Message::Binary(b)).await.is_err() { break; } }
-                Some(WsOut::Close) => { let _ = socket.send(Message::Close(None)).await; break; }
+                Some(WsOut::Close) => { ws_send_close(&mut socket, Message::Close(None)).await; break; }
                 None => break,
             },
             _ = heartbeat.tick() => {
                 if channel_refuses(&mut gate) {
-                    let _ = socket.send(ws_denied_close()).await;
+                    ws_send_close(&mut socket, ws_denied_close()).await;
                     break;
                 }
                 // Send a Ping frame; if the peer has gone away the send will
@@ -3786,8 +4041,9 @@ pub fn server_web_socket_upgrade<E: From<String> + Send + 'static>(
                 // the limit holds even before `ws_loop`'s in-loop check runs.
                 let max_bytes = ws_max_message_bytes(cfg.maxMessageBytes);
                 let up = up.max_message_size(max_bytes).max_frame_size(max_bytes);
+                let drain = shutdown::drain();
                 let resp = up.on_upgrade(move |socket| {
-                    ws_loop(socket, cfg, id, ceilings, credentials, gate)
+                    ws_loop(socket, cfg, id, ceilings, credentials, gate, drain)
                 });
                 let _ = WS_RESPONSE.try_with(|c| c.set(Some(resp)));
                 // Sentinel — method_router returns WS_RESPONSE instead of this.
@@ -4535,16 +4791,28 @@ const fn cookie_secure_floor_with(dev: Option<&crate::telemetry::DevIntent>) -> 
     dev.is_none()
 }
 
-/// 64 lowercase-hex chars (two concatenated UUIDv4s, ~244 combined random
-/// bits — comfortably above the 128-bit CSRF-token floor). `uuid::Uuid::new_v4`
-/// draws from the OS CSPRNG, the approved security-bearing-randomness source
-/// per `random.rs`. Re-exported from `web/csrf.rs` as `gen_token`.
-pub fn csrf_gen_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
+/// The number of random bytes in a CSRF token (256 bits, 64 hex chars).
+const CSRF_TOKEN_BYTES: usize = 32;
+
+/// A fresh CSRF token: 256 bits from the OS CSPRNG as 64 lowercase-hex chars.
+///
+/// Re-exported from `web/csrf.rs` as `mint_token`.
+///
+/// # Errors
+///
+/// [`EntropyError`] when the OS random source refuses the draw; there is no
+/// fallback token.
+pub fn mint_csrf_token() -> Result<String, EntropyError> {
+    mint_csrf_token_with(crate::entropy::fill_entropy)
+}
+
+/// [`mint_csrf_token`] drawing its bytes from `fill`.
+pub(crate) fn mint_csrf_token_with(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), EntropyError>,
+) -> Result<String, EntropyError> {
+    let mut bytes = [0_u8; CSRF_TOKEN_BYTES];
+    fill(&mut bytes)?;
+    Ok(hex::encode(bytes))
 }
 
 /// A token "looks valid" if it is the expected 64 lowercase-hex shape — used
@@ -4627,6 +4895,20 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
+    middleware_with_csrf_minting(h, mint_csrf_token)
+}
+
+/// [`middleware_with_csrf`] minting a missing token through `mint`.
+///
+/// An unsafe method is judged before any mint. A safe request reuses a
+/// well-formed cookie token and mints only without one; a refused mint answers
+/// 503 with `Retry-After` and never reaches the handler.
+fn middleware_with_csrf_minting<E, H, M>(h: H, mint: M) -> ServerHandler<E>
+where
+    E: Send + 'static,
+    H: IntoServerHandler<E>,
+    M: Fn() -> Result<String, EntropyError> + Send + Sync + 'static,
+{
     let h = h.into_server_handler();
     Arc::new(move |req: ServerRequest| {
         let safe = matches!(
@@ -4635,29 +4917,28 @@ where
         );
         let cookie_name = csrf_cookie_name();
         let existing = req.cookies.get(cookie_name.text()).cloned();
-        let token = existing
-            .clone()
-            .filter(|t| csrf_token_well_formed(t))
-            .unwrap_or_else(csrf_gen_token);
         if !safe {
-            let cookie_tok = existing.unwrap_or_default();
-            let header_tok = header_ci(&req.headers, "x-csrf-token")
-                .unwrap_or("")
-                .to_string();
-            if !csrf_pair_valid(&cookie_tok, &header_tok) {
+            let cookie_tok = existing.as_deref().unwrap_or_default();
+            let header_tok = header_ci(&req.headers, "x-csrf-token").unwrap_or("");
+            if !csrf_pair_valid(cookie_tok, header_tok) {
                 return Box::pin(async move {
                     ok_res(plain_resp(403, "csrf token invalid or missing", &[]))
                 });
             }
         }
+        let reused = existing.filter(|t| csrf_token_well_formed(t));
+        let Ok(token) = reused.map_or_else(&mint, Ok) else {
+            return Box::pin(async move {
+                ok_res(plain_resp(
+                    503,
+                    "service unavailable",
+                    &[("retry-after", "1")],
+                ))
+            });
+        };
         // Capture the request-scoped TLS signal HERE — before `req` is moved
-        // into `h(req)` below. `ServerRequest` is not `Clone`-cheap-by-design
-        // (it owns the full body/headers/cookies maps) and the wrapped
-        // handler legitimately needs to consume it, so there is no request
-        // left to inspect once `task` is awaited. `bool` is `Copy`, so this
-        // one-line snapshot is the entire adaptation needed versus the
-        // session-cookie fix (which reads `headers` at cookie-set time
-        // because `page_response` runs BEFORE the request is handed off).
+        // into `h(req)` below: the wrapped handler consumes the request, so
+        // nothing is left to inspect once `task` is awaited.
         let is_https = request_is_https(&req.headers);
         let task = h(req);
         Box::pin(async move {
@@ -4921,6 +5202,125 @@ mod tests {
     use super::*;
     use std::future::ready;
 
+    #[tokio::test]
+    async fn a_request_stuck_past_the_grace_still_stops_within_its_bound() {
+        use tokio::io::AsyncWriteExt as _;
+        let grace = std::time::Duration::from_millis(200);
+        let (armed, signals) = shutdown::tests::armed_with(
+            shutdown::ShutdownPlan::bare("test"),
+            grace,
+            Arc::new(std::sync::atomic::AtomicI32::new(0)),
+        );
+        let host = RecordedHost::record(crate::app_config::ListenHost::Loopback(
+            crate::app_config::LoopbackIp::DEFAULT,
+        ));
+        let app = bind_app_listener("test", host, 0)
+            .await
+            .expect("a loopback port binds");
+        let port = app.listener.local_addr().expect("a bound port").port();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entering = Arc::clone(&entered);
+        let router = axum::Router::new().route(
+            "/stuck",
+            axum::routing::get(move || {
+                let entering = Arc::clone(&entering);
+                async move {
+                    entering.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let served = tokio::spawn(serve_app(app, router, armed));
+        let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("the app accepts");
+        let request = format!("GET /stuck HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the handler runs");
+        let signalled = std::time::Instant::now();
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        #[cfg(feature = "db")]
+        let close = shutdown::POOLS_CLOSE_BOUND;
+        #[cfg(not(feature = "db"))]
+        let close = std::time::Duration::ZERO;
+        let bound = grace + close + std::time::Duration::from_secs(2);
+        let stopped = tokio::time::timeout(bound, served)
+            .await
+            .expect("a stuck request never holds the stop past its bound");
+        assert!(matches!(stopped, Ok(Ok(shutdown::Stopped { .. }))));
+        assert!(signalled.elapsed() < bound);
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_site_that_drains_first_waits_for_its_sibling_before_closing_pools() {
+        use tokio::io::AsyncWriteExt as _;
+        let budget = std::time::Duration::from_secs(5);
+        let (idle_site, busy_site, signals) =
+            shutdown::tests::armed_pair(std::time::Duration::from_secs(30));
+        let bind = || {
+            bind_app_listener(
+                "test",
+                RecordedHost::record(crate::app_config::ListenHost::Loopback(
+                    crate::app_config::LoopbackIp::DEFAULT,
+                )),
+                0,
+            )
+        };
+        let idle_app = bind().await.expect("a loopback port binds");
+        let busy_app = bind().await.expect("a loopback port binds");
+        let port = busy_app.listener.local_addr().expect("a bound port").port();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entering, released) = (Arc::clone(&entered), Arc::clone(&release));
+        let router = axum::Router::new().route(
+            "/held",
+            axum::routing::get(move || {
+                let (entering, released) = (Arc::clone(&entering), Arc::clone(&released));
+                async move {
+                    entering.notify_one();
+                    released.notified().await;
+                    "done"
+                }
+            }),
+        );
+        let idle = tokio::spawn(serve_app(idle_app, axum::Router::new(), idle_site));
+        let busy = tokio::spawn(serve_app(busy_app, router, busy_site));
+        let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("the app accepts");
+        let request =
+            format!("GET /held HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("the request is sent");
+        tokio::time::timeout(budget, entered.notified())
+            .await
+            .expect("the handler runs");
+        assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !idle.is_finished(),
+            "an idle site closes the shared pools while a sibling still serves a request"
+        );
+        release.notify_one();
+        let busy = tokio::time::timeout(budget, busy)
+            .await
+            .expect("the busy site stops");
+        assert!(matches!(busy, Ok(Ok(shutdown::Stopped { .. }))));
+        let idle = tokio::time::timeout(budget, idle)
+            .await
+            .expect("the idle site stops");
+        assert!(matches!(idle, Ok(Ok(shutdown::Stopped { .. }))));
+        drop(client);
+    }
+
     /// `Ipe.Http.Server` resolves through the shared resolver under its own
     /// operator var: an operator value wins over the source port, and a
     /// supervisor relocation wins over both.
@@ -5083,7 +5483,7 @@ mod tests {
             parse_routes(set.iter().map(|(m, p)| handler_route(m, p)).collect())
                 .expect("the table's routes parse")
         };
-        let verdict = endpoint_conflict(&routes());
+        let verdict = endpoint_conflict(&routes()).map(|r| r.to_string());
         let inserted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut app = axum::Router::new();
             for route in routes() {
@@ -5166,7 +5566,8 @@ mod tests {
             assert!(
                 refused
                     .as_ref()
-                    .is_some_and(|r| r.cause == RouteCause::Method && r.path == path),
+                    .is_some_and(|r| r.cause == RouteCause::Method
+                        && r.endpoint == quoted_endpoint(&method.to_uppercase(), path)),
                 "{method:?}"
             );
             assert!(
@@ -5209,22 +5610,27 @@ mod tests {
         }
     }
 
-    /// Prove the refusal at listen: a conflicting handler set returns its
-    /// typed error before binding.
+    /// Prove the refusal at listen: a conflicting handler set returns a typed
+    /// `Conflict` before binding, never the `Unexpected` catch-all.
     #[tokio::test]
     async fn listen_refuses_a_conflicting_handler_set_before_bind() {
         let routes = vec![handler_route("GET", "/a/:x"), handler_route("GET", "/a/:y")];
-        let listened: IpeResult<String, ()> =
+        let listened: IpeResult<crate::IpeError, ()> =
             tokio::time::timeout(std::time::Duration::from_secs(10), server_listen(0, routes))
                 .await
                 .expect("a refused route set must return before binding, not serve");
-        let IpeResult::Err(msg) = listened else {
+        let IpeResult::Err(error) = listened else {
             assert!(
                 matches!(listened, IpeResult::Err(_)),
                 "a conflict must refuse"
             );
             return;
         };
+        assert_eq!(
+            crate::ipe_error_kind(error.clone()),
+            crate::IpeErrorKind::Conflict
+        );
+        let msg = crate::ipe_error_message(error);
         assert!(
             msg.starts_with("Server.listen: endpoint `GET /a/:x` conflicts with `GET /a/:y`"),
             "{msg}"
@@ -5259,23 +5665,30 @@ mod tests {
             "/{}",
             "a".repeat(crate::encoding::MAX_URL_COMPONENT_LEN.get())
         );
-        for (bad, cause) in [
-            ("/:", "has no name"),
-            ("/:a/:a", "appears twice"),
-            ("/*rest", "catch-all"),
-            ("/a/%zz", "malformed percent-escape"),
-            ("/a:b", "byte 1"),
-            ("api", "starts with `/`"),
-            (over_cap.as_str(), "component longer than"),
+        let too_many: String = (0..=crate::encoding::MAX_SERVER_PARAMS)
+            .map(|i| format!("/:p{i}"))
+            .collect();
+        let malformed = crate::IpeErrorKind::InvalidInput;
+        let ceiling = crate::IpeErrorKind::LimitExceeded;
+        for (bad, cause, kind) in [
+            ("/:", "has no name", malformed),
+            ("/:a/:a", "appears twice", malformed),
+            ("/*rest", "catch-all", malformed),
+            ("/a/%zz", "malformed percent-escape", malformed),
+            ("/a:b", "byte 1", malformed),
+            ("api", "starts with `/`", malformed),
+            (over_cap.as_str(), "component longer than", ceiling),
+            (too_many.as_str(), "parameters", ceiling),
         ] {
             let routes = vec![get_route("/ok"), get_route(bad)];
             assert!(
-                parse_routes(routes.clone()).is_err_and(|r| r.path == bad),
+                parse_routes(routes.clone())
+                    .is_err_and(|r| r.endpoint == quoted_endpoint("GET", bad)),
                 "{cause}: the refusal names the endpoint"
             );
             // A listener that got past the refusal would bind and serve
             // forever; the timeout turns that regression into a failure.
-            let listened: IpeResult<String, ()> =
+            let listened: IpeResult<crate::IpeError, ()> =
                 tokio::time::timeout(std::time::Duration::from_secs(10), server_listen(0, routes))
                     .await
                     .expect("a refused route set must return before binding, not serve");
@@ -5283,9 +5696,11 @@ mod tests {
                 matches!(listened, IpeResult::Err(_)),
                 "{cause}: a malformed path must refuse the listener"
             );
-            let IpeResult::Err(msg) = listened else {
+            let IpeResult::Err(error) = listened else {
                 return;
             };
+            assert_eq!(crate::ipe_error_kind(error.clone()), kind, "{cause}");
+            let msg = crate::ipe_error_message(error);
             assert!(
                 msg.starts_with("Server.listen: endpoint `GET ")
                     && msg.contains("is not a well-formed route path")
@@ -5349,13 +5764,196 @@ mod tests {
             .expect("the prefixes parse")
         };
         for pair in [["/a", "/a"], ["/", ""], ["", ""]] {
-            let msg = mount_conflict(&mounts(&pair)).unwrap_or_default();
+            let msg = mount_conflict(&mounts(&pair))
+                .map(|r| r.to_string())
+                .unwrap_or_default();
             assert!(msg.contains("serve one prefix"), "{pair:?}: {msg}");
         }
         assert_eq!(
             mount_conflict(&mounts(&["/", "/billing", "/billing/admin"])),
             None
         );
+        let shared = mount_conflict(&mounts(&["/a", "/a"])).map(ServerStartRefusal::into_ipe_error);
+        assert_eq!(
+            shared.map(crate::ipe_error_kind),
+            Some(crate::IpeErrorKind::Conflict)
+        );
+    }
+
+    /// `/:p0/:p1/…` with `n` parameters.
+    fn params_path(n: usize) -> String {
+        (0..n).map(|i| format!("/:p{i}")).collect()
+    }
+
+    /// The parameter ceiling is the router's: a pattern at
+    /// [`crate::encoding::MAX_SERVER_PARAMS`] parses and registers, and the
+    /// router itself refuses (by panicking) one parameter more, which the
+    /// parse refuses first as a typed ceiling.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the at-cap pattern parses
+    fn max_server_params_matches_the_router() {
+        let cap = crate::encoding::MAX_SERVER_PARAMS;
+        let at_cap = params_path(cap);
+        let pattern = crate::encoding::ServerPattern::parse(&at_cap).expect("at the cap parses");
+        let path = pattern.router_path().to_owned();
+        let mr = method_router(EndpointMethod::Get, pattern, name_echo());
+        assert!(
+            insert_endpoint(
+                axum::Router::new(),
+                &path,
+                mr,
+                quoted_endpoint("GET", &at_cap)
+            )
+            .is_ok()
+        );
+        let past_cap = params_path(cap.saturating_add(1));
+        assert_eq!(
+            crate::encoding::ServerPattern::parse(&past_cap).err(),
+            Some(crate::encoding::ServerPatternRefusal::TooManyParams { cap })
+        );
+        let router_refuses = std::panic::catch_unwind(|| {
+            axum::Router::<()>::new().route(&past_cap, axum::routing::get(|| async {}))
+        })
+        .is_err();
+        assert!(router_refuses, "the router admits `{past_cap}`");
+    }
+
+    /// Prove the backstop's refusal: an insert the router rejects is answered
+    /// as its own typed `Conflict` naming the endpoint, never relabelled as a
+    /// handler conflict whose cause it may not be.
+    #[test]
+    #[allow(clippy::expect_used)] // test: the fixed pattern parses
+    fn a_router_rejected_insert_is_its_own_refusal() {
+        let pattern = || crate::encoding::ServerPattern::parse("/a").expect("parses");
+        let mr = || method_router(EndpointMethod::Get, pattern(), name_echo());
+        let app = insert_endpoint(
+            axum::Router::new(),
+            "/a",
+            mr(),
+            quoted_endpoint("GET", "/a"),
+        )
+        .expect("the first insert registers");
+        let refused = insert_endpoint(app, "/a", mr(), quoted_endpoint("GET", "/a")).err();
+        assert_eq!(
+            refused,
+            Some(ServerStartRefusal::RouterRejected {
+                endpoint: quoted_endpoint("GET", "/a")
+            })
+        );
+        let Some(refused) = refused else {
+            return;
+        };
+        let error = refused.into_ipe_error();
+        assert_eq!(
+            crate::ipe_error_kind(error.clone()),
+            crate::IpeErrorKind::Conflict
+        );
+        let msg = crate::ipe_error_message(error);
+        assert!(
+            msg.contains("`GET /a`") && !msg.contains("conflicts"),
+            "{msg}"
+        );
+    }
+
+    /// Prove the refusal of log hazards: a refused endpoint's quoted text has
+    /// every control, bidi and escape character as a visible escape, so a
+    /// path cannot forge a log record or drive a terminal.
+    #[test]
+    fn a_refused_endpoint_is_quoted_scrubbed() {
+        for (raw, escaped) in [
+            ("/a\nGET /b", "\\n"),
+            ("/a\u{1b}[2J", "\\u{1b}"),
+            ("/a\u{202e}b", "\\u{202e}"),
+            ("/a\\n", "\\\\n"),
+        ] {
+            // A trailing catch-all makes every path a refused one.
+            let refused = parse_routes(vec![get_route(&format!("{raw}/*rest"))]).err();
+            let msg = refused.map(|r| r.to_string()).unwrap_or_default();
+            assert!(
+                msg.contains(escaped) && !msg.contains('\n') && !msg.contains('\u{1b}'),
+                "{raw:?}: {msg:?}"
+            );
+            assert!(!msg.contains('\u{202e}'), "{raw:?}: {msg:?}");
+        }
+        assert_eq!(RefusedText::new("a\tb").as_str(), "a\\tb");
+    }
+
+    /// Prove the bound on a refused method: a method of any length is quoted
+    /// as a short excerpt, so a refusal's size never follows its input.
+    #[test]
+    fn a_refused_method_is_quoted_as_an_excerpt() {
+        let method = "X".repeat(10_000);
+        let refused = parse_routes(vec![handler_route(&method, "/ok")]).err();
+        assert_eq!(
+            refused.as_ref().map(|r| r.cause.clone()),
+            Some(RouteCause::Method)
+        );
+        let msg = refused.map(|r| r.to_string()).unwrap_or_default();
+        let quoted = format!("`{} /ok`", excerpt(&method, METHOD_EXCERPT_CHARS));
+        assert!(msg.contains(&quoted), "{msg:.200}");
+        assert!(msg.len() < 400, "{msg:.200}");
+        assert_eq!(excerpt("CONNECT", METHOD_EXCERPT_CHARS), "CONNECT");
+    }
+
+    /// Every listen refusal fails with the kind it is, never `Unexpected`.
+    #[test]
+    fn every_start_refusal_has_its_own_kind() {
+        use crate::IpeErrorKind as K;
+        use crate::encoding::{MountBaseRefusal, ServerPatternRefusal};
+        let text = || RefusedText::new("GET /a");
+        let route = |cause| {
+            ServerStartRefusal::Route(EndpointRefusal {
+                endpoint: text(),
+                cause,
+            })
+        };
+        let too_many = ServerPatternRefusal::TooManyParams {
+            cap: crate::encoding::MAX_SERVER_PARAMS,
+        };
+        let cases = [
+            (route(RouteCause::Method), K::InvalidInput),
+            (
+                route(RouteCause::Pattern(ServerPatternRefusal::NotAbsolute)),
+                K::InvalidInput,
+            ),
+            (route(RouteCause::Pattern(too_many)), K::LimitExceeded),
+            (
+                route(RouteCause::Prefix(MountBaseRefusal::TooLong { len: 1 })),
+                K::LimitExceeded,
+            ),
+            (
+                route(RouteCause::Prefix(MountBaseRefusal::NoLeadingSlash)),
+                K::InvalidInput,
+            ),
+            (
+                ServerStartRefusal::Overlap {
+                    earlier: text(),
+                    later: text(),
+                },
+                K::Conflict,
+            ),
+            (
+                ServerStartRefusal::SharedPrefix {
+                    earlier: text(),
+                    later: text(),
+                },
+                K::Conflict,
+            ),
+            (
+                ServerStartRefusal::RouterRejected { endpoint: text() },
+                K::Conflict,
+            ),
+            #[cfg(feature = "web")]
+            (ServerStartRefusal::SecondMount, K::Conflict),
+        ];
+        for (refusal, kind) in cases {
+            let shown = refusal.to_string();
+            assert_eq!(
+                crate::ipe_error_kind(refusal.into_ipe_error()),
+                kind,
+                "{shown}"
+            );
+        }
     }
 
     /// An endpoint registers under its rendered spelling behind the
@@ -5462,7 +6060,9 @@ mod tests {
         use crate::app_config::{ExposedBy, ListenHost, LoopbackIp};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let none = crate::inbound_authority::DeclaredNames::none();
-        let admission = "host admission: IP literals and localhost".to_owned();
+        let admission = "host admission: IP literals and localhost; set \
+                         IPE_HTTP_ALLOWED_HOSTS=<name> to serve a DNS name"
+            .to_owned();
         let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
         assert_eq!(
             startup_lines(loopback, ListenHost::Loopback(LoopbackIp::DEFAULT), &none),
@@ -6301,7 +6901,11 @@ mod tests {
         let seen = |name: &'static str, runs: Arc<AtomicUsize>| {
             move |uri: axum::http::Uri, strict: Option<axum::Extension<StrictUrl>>| async move {
                 runs.fetch_add(1, Ordering::SeqCst);
+                // The spelling is a web-tier fact; a server-only build sees the parse alone.
+                #[cfg(feature = "web")]
                 let spelling = strict.map(|axum::Extension(s)| s.spelling());
+                #[cfg(not(feature = "web"))]
+                let spelling = strict.map(|_| "parsed");
                 format!("{name} {uri} {spelling:?}")
             }
         };
@@ -6433,6 +7037,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "web")]
     #[tokio::test]
     async fn canonical_url_routes_every_spelling_of_a_path_as_its_canonical_one() {
         for (uri, want) in [
@@ -7344,8 +7949,8 @@ mod tests {
     /// The `content-security-policy` the `Response` profile sends under this
     /// process's framing configuration.
     fn response_policy() -> String {
-        crate::csp::ContentSecurityPolicy::for_profile(
-            crate::csp::Profile::Response,
+        crate::csp::ContentSecurityPolicy::for_guard(
+            &crate::csp::Guarded::Response,
             crate::telemetry::frame_ancestors(),
         )
         .header_value()
@@ -8448,6 +9053,76 @@ mod tests {
         }
     }
 
+    /// A CSRF mint is drawn only for a safe request with no well-formed
+    /// cookie, and a refused mint answers 503 without reaching the handler.
+    #[tokio::test]
+    async fn csrf_mint_failure_is_503() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let mint_calls = Arc::clone(&mints);
+        let h = middleware_with_csrf_minting::<String, _, _>(
+            move |_req: ServerRequest| {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ok_res::<String, _>(server_text("ok".into()))))
+                    as IpeTask<String, ServerResponse>
+            },
+            move || {
+                mint_calls.fetch_add(1, Ordering::SeqCst);
+                Err(EntropyError)
+            },
+        );
+        let got = h(mk_req("GET", HashMap::new(), HashMap::new())).await;
+        assert!(matches!(&got, IpeResult::Ok(r) if r.status == 503));
+        let IpeResult::Ok(resp) = got else { return };
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("retry-after") && v == "1"),
+            "a refused mint asks the client to retry"
+        );
+        assert!(resp.cookies.is_empty(), "a refused mint sets no cookie");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the handler never runs");
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+
+        let got = h(mk_req("POST", HashMap::new(), HashMap::new())).await;
+        assert!(matches!(&got, IpeResult::Ok(r) if r.status == 403));
+        assert_eq!(
+            mints.load(Ordering::SeqCst),
+            1,
+            "an unsafe method never mints"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut cookies = HashMap::new();
+        cookies.insert(csrf_cookie_name().text().to_owned(), "e".repeat(64));
+        let got = h(mk_req("GET", cookies, HashMap::new())).await;
+        assert!(matches!(&got, IpeResult::Ok(r) if r.status == 200));
+        assert_eq!(
+            mints.load(Ordering::SeqCst),
+            1,
+            "a well-formed cookie is reused"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A minted CSRF token is the 64 lowercase-hex rendering of its 32 drawn
+    /// bytes, and a refused draw yields no token.
+    #[test]
+    fn csrf_token_renders_its_draw_and_refuses_without_entropy() {
+        let tok = mint_csrf_token_with(|buf| {
+            buf.fill(0xa5);
+            Ok(())
+        });
+        assert_eq!(tok, Ok("a5".repeat(32)));
+        assert!(tok.as_deref().is_ok_and(csrf_token_well_formed));
+        assert_eq!(
+            mint_csrf_token_with(|_| Err(EntropyError)),
+            Err(EntropyError)
+        );
+    }
+
     #[tokio::test]
     async fn csrf_post_without_header_rejected() {
         let mut cookies = HashMap::new();
@@ -8714,6 +9389,56 @@ mod tests {
         crate::system::locked_remove_var("IPE_HTTP_BIND");
     }
 
+    /// A real `Server.listen` admits a name `IPE_HTTP_ALLOWED_HOSTS` declares,
+    /// and still refuses a name below it with 421.
+    #[tokio::test]
+    async fn dev_posture_pin_declared_name_admits_on_listen() {
+        crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "review.example.com");
+        let (port, task) = spawn_listen().unwrap();
+        let declared = format!("review.example.com:{port}");
+        let resp = raw_exchange(port, &get_with_host("/", &declared))
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&resp), 200, "{resp}");
+        let below = format!("x.review.example.com:{port}");
+        let resp = raw_exchange(port, &get_with_host("/", &below))
+            .await
+            .unwrap();
+        assert_eq!(raw_status(&resp), 421, "{resp}");
+        assert!(resp.contains("host_not_admitted"), "{resp}");
+        task.abort();
+        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// A malformed `IPE_HTTP_ALLOWED_HOSTS` refuses `Server.listen` before its
+    /// socket opens, naming the variable and never the value. The port is
+    /// held, so a bind attempted first would answer its own address-in-use
+    /// refusal instead of the host list's.
+    #[tokio::test]
+    async fn listen_refuses_a_malformed_allowed_hosts_before_binding() {
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        crate::system::locked_set_var("IPE_HTTP_ALLOWED_HOSTS", "hidden.example:80");
+        crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
+        crate::system::locked_remove_var(crate::env_registry::listen::SERVER_PORT.name());
+        crate::system::locked_remove_var(crate::LISTEN_PORT_RELOCATION_ENV);
+        let route = server_get::<String, _>("/".to_owned(), |_req: ServerRequest| {
+            Box::pin(ready(ok_res::<String, _>(server_text("ok".to_owned()))))
+                as IpeTask<String, ServerResponse>
+        });
+        let outcome = server_listen::<String>(i64::from(port), vec![route]).await;
+        drop(held);
+        crate::system::locked_remove_var("IPE_HTTP_ALLOWED_HOSTS");
+        crate::system::locked_remove_var("IPE_HTTP_BIND");
+        assert!(matches!(outcome, IpeResult::Err(_)), "{outcome:?}");
+        let IpeResult::Err(message) = outcome else {
+            return;
+        };
+        assert!(message.contains("IPE_HTTP_ALLOWED_HOSTS"), "{message}");
+        assert!(!message.contains("hidden"), "{message}");
+    }
+
     /// A real `Server.listen` refuses a malformed URL with 400 whether or not
     /// a route would match it, and routes another spelling of `/api` to
     /// `/api`, its handler reading the canonical path.
@@ -8764,6 +9489,91 @@ mod tests {
         assert!(resp.contains("host_not_admitted"), "{resp}");
         task.abort();
         crate::system::locked_remove_var("IPE_HTTP_BIND");
+    }
+
+    /// A socket whose peer never takes a frame.
+    struct StalledSocket;
+
+    impl futures_util::Stream for StalledSocket {
+        type Item = Result<axum::extract::ws::Message, axum::Error>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures_util::Sink<axum::extract::ws::Message> for StalledSocket {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: axum::extract::ws::Message,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Whether `ws_loop` over a [`StalledSocket`] ends within twice the
+    /// close deadline, under `max_connections` and `drain`.
+    async fn stalled_loop_ends(max_connections: usize, drain: shutdown::Drain) -> bool {
+        let ceilings = WsCeilings {
+            send_buffer: 16,
+            max_connections,
+            heartbeat_secs: 30,
+        };
+        let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let served = ws_loop(
+            StalledSocket,
+            ws_server_default_cfg::<String>(),
+            id,
+            ceilings,
+            ChannelCredentials::of_request(),
+            None,
+            drain,
+        );
+        tokio::time::timeout(shutdown::WS_CLOSE_DEADLINE * 2, served)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_the_full_drain_refuses_ends_within_its_close_deadline() {
+        assert!(
+            stalled_loop_ends(usize::MAX, shutdown::tests::full_drain()).await,
+            "an uncounted socket's close frame never outlives its deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_over_the_peer_ceiling_ends_within_its_close_deadline() {
+        assert!(
+            stalled_loop_ends(0, shutdown::Drain::never()).await,
+            "a refused peer's close frame never outlives its deadline"
+        );
     }
 
     // ── authenticated routes (fail-closed) ────────────────────────────
@@ -9306,6 +10116,8 @@ mod tests {
             delivered: tokio::sync::mpsc::UnboundedReceiver<String>,
             /// One unit per `onConnect` run.
             connected: tokio::sync::mpsc::UnboundedReceiver<()>,
+            /// One unit per `onClose` run.
+            closed: tokio::sync::mpsc::UnboundedReceiver<()>,
         }
 
         /// What the served socket's `onMessage` does with a text before it
@@ -9327,13 +10139,28 @@ mod tests {
             gate: Option<ChannelGate>,
             on_message: OnMessage,
         ) -> WsPeer {
+            spawn_ws_draining(credentials, gate, on_message, shutdown::Drain::never())
+        }
+
+        /// [`spawn_ws`] whose loop ends when `drain` drains.
+        fn spawn_ws_draining(
+            credentials: ChannelCredentials,
+            gate: Option<ChannelGate>,
+            on_message: OnMessage,
+            drain: shutdown::Drain,
+        ) -> WsPeer {
             let (to_server, inbound) = tokio::sync::mpsc::unbounded_channel();
             let (outbound, from_server) = tokio::sync::mpsc::unbounded_channel();
             let (seen, delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
             let (connected_tx, connected) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (closed_tx, closed) = tokio::sync::mpsc::unbounded_channel::<()>();
             let cfg = WsServerCfg {
                 onConnect: Arc::new(move |_: WsHandle| {
                     let _ = connected_tx.send(());
+                    Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
+                }),
+                onClose: Arc::new(move |_: WsHandle| {
+                    let _ = closed_tx.send(());
                     Box::pin(async { ok_res(()) }) as IpeTask<String, ()>
                 }),
                 onMessage: Arc::new(move |_: WsHandle, text: String| {
@@ -9366,13 +10193,14 @@ mod tests {
             };
             let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let socket = MemSocket { inbound, outbound };
-            tokio::spawn(ws_loop(socket, cfg, id, ceilings, credentials, gate));
+            tokio::spawn(ws_loop(socket, cfg, id, ceilings, credentials, gate, drain));
             WsPeer {
                 id,
                 to_server,
                 from_server,
                 delivered,
                 connected,
+                closed,
             }
         }
 
@@ -9972,6 +10800,38 @@ mod tests {
                 peer.delivered.try_recv().is_err(),
                 "a binary frame after the revocation never reaches the handler"
             );
+        }
+
+        #[tokio::test]
+        async fn a_draining_socket_closes_going_away_and_runs_on_close() {
+            let exited = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let (armed, signals) = shutdown::tests::armed_with(
+                shutdown::ShutdownPlan::bare("test"),
+                std::time::Duration::from_secs(5),
+                exited,
+            );
+            let mut peer = spawn_ws_draining(
+                ChannelCredentials::of_request(),
+                None,
+                OnMessage::Report,
+                armed.drain(),
+            );
+            let opened = tokio::time::timeout(RECHECK_COALESCE, peer.connected.recv()).await;
+            assert!(matches!(opened, Ok(Some(()))), "the socket must connect");
+            assert!(signals.send(shutdown::Signal::Terminate).await.is_ok());
+            let frame = next_frame(&mut peer, shutdown::WS_CLOSE_DEADLINE).await;
+            assert!(
+                matches!(
+                    frame,
+                    Some(axum::extract::ws::Message::Close(Some(ref close)))
+                        if close.code == axum::extract::ws::close_code::AWAY
+                ),
+                "a draining socket closes 1001: {frame:?}"
+            );
+            let closed = tokio::time::timeout(RECHECK_COALESCE, peer.closed.recv()).await;
+            assert!(matches!(closed, Ok(Some(()))), "onClose runs on the drain");
+            armed.settle_live().await;
+            assert_eq!(armed.live_count(), 0, "the socket's live count clears");
         }
 
         #[tokio::test(start_paused = true)]

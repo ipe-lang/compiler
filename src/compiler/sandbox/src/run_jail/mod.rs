@@ -353,6 +353,7 @@ fn jail_argv_unproven<'fd>(
     payload: &[OsString],
 ) -> Result<JailArgv<'fd>, JailPathError> {
     let tree = crate::mounts::TreeBind::granted_by(&profile.filesystem, mounts)?;
+    tree.recheck()?;
     let scoped_tmp = mounts.scoped_tmp();
     let mut argv: Vec<OsString> = Vec::new();
 

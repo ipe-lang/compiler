@@ -1,6 +1,7 @@
 module Main exposing (main)
 import Ipe.Io as Io
 import Ipe.Db
+import Ipe.Db.Location as Location
 import Ipe.Db.Unsafe
 import Ipe.Dict
 import Ipe.List
@@ -36,14 +37,40 @@ main =
                                         Maybe.withDefault Dict.empty (List.head rows)
 
                                     name =
-                                        Unsafe.unsafeGetString "name" row
+                                        cellText "name" row
 
                                     score =
-                                        Unsafe.unsafeGetInt "score" row
+                                        cellInt "score" row
                                 in
                                 Io.println (name ++ ":" ++ String.fromInt score)
                             )
                             (Db.findByConditions txconn "items" (Dict.fromList [ ( "name", "apple" ) ]))
                 )
         )
-        (Db.open "sqlite" "sqlite::memory:")
+        (Db.open Location.memory)
+
+
+-- The text of column `key` in a raw Db row: a SQL `NULL` cell reads as `NULL`,
+-- a missing column as the empty string.
+cellText : String -> Dict String (Maybe String) -> String
+cellText key row =
+    case Dict.get key row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            ""
+
+
+-- The integer in column `key` of a raw Db row, `0` when the cell is not one.
+cellInt : String -> Dict String (Maybe String) -> Int
+cellInt key row =
+    case String.toInt (cellText key row) of
+        Just n ->
+            n
+
+        Nothing ->
+            0

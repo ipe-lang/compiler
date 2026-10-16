@@ -591,8 +591,9 @@ static HAND_TABLE: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_YAML_MAX_BYTES",
-        default: Cow::Borrowed("16777216 (16 MiB)"),
-        purpose: "Maximum YAML source size (bytes) that `Config.loadYaml` will parse. \
+        default: Cow::Borrowed("4194304 (4 MiB)"),
+        purpose: "Maximum YAML source size (bytes) that `Config.decodeYaml` will parse, \
+                  including a `.yaml`/`.yml` file read by `Config.loadFromFile`. \
                   A separate ceiling from `IPE_CONFIG_MAX_BYTES`.",
         subsystem: Subsystem::Config,
         class: Class::Tunable,
@@ -1059,11 +1060,13 @@ static HAND_TABLE: &[EnvVar] = &[
     },
     EnvVar {
         name: "IPE_WEB_FRAME_ANCESTORS",
-        default: Cow::Borrowed("unset (no embedding allowed)"),
+        default: Cow::Borrowed("unset (same-origin embedding only)"),
         purpose: "Space-separated `frame-ancestors` sources of the default \
                   `Content-Security-Policy` sent on HTML responses, e.g. \
-                  `https://app.example.com`. Enables embedding this app in a \
-                  third-party iframe; also sets `SameSite=None; Secure` on session \
+                  `https://app.example.com`. Unset, only the app's own origin \
+                  may frame it (`frame-ancestors 'self'` and \
+                  `X-Frame-Options: SAMEORIGIN`). Set, it enables embedding \
+                  this app in a third-party iframe; also sets `SameSite=None; Secure` on session \
                   cookies. A value holding a control or non-ASCII byte, a `;` or `,`, \
                   or only whitespace refuses to start the server.",
         subsystem: Subsystem::Web,
@@ -1153,9 +1156,10 @@ static HAND_TABLE: &[EnvVar] = &[
     EnvVar {
         name: "IPE_WEB_SHUTDOWN_GRACE_MS",
         default: Cow::Borrowed("1500"),
-        purpose: "Grace period (ms) between receiving SIGTERM and closing active \
-                  connections. Allows in-flight requests to complete. Set to `0` for \
-                  immediate shutdown.",
+        purpose: "Grace period (ms) a served app (`Http.Server` or `Ipe.Web`) gives \
+                  in-flight requests and live streams after the first SIGTERM or \
+                  SIGINT, before it closes its connections and database pools. Set \
+                  to `0` for immediate shutdown.",
         subsystem: Subsystem::Web,
         class: Class::Tunable,
     },
@@ -1397,6 +1401,27 @@ mod tests {
         assert!(
             entry.is_some_and(|v| v.default.starts_with(&expected)),
             "IPE_FILE_READ_MAX default must start with {expected:?}: {entry:?}"
+        );
+    }
+
+    /// The documented `IPE_WEB_FRAME_ANCESTORS` default is the policy the
+    /// runtime serves when the variable is unset: same-origin framing only.
+    #[test]
+    fn frame_ancestors_default_matches_runtime() {
+        use ipe_runtime_rust::csp::{ContentSecurityPolicy, Guarded};
+        let served = ContentSecurityPolicy::for_guard(&Guarded::Response, None).header_value();
+        assert!(
+            served.ends_with("frame-ancestors 'self'"),
+            "an unset framing policy must serve same-origin framing: {served}"
+        );
+        let entry = ENV_VARS
+            .iter()
+            .find(|v| v.name == ipe_runtime_rust::telemetry::FRAME_ANCESTORS_ENV);
+        assert!(
+            entry.is_some_and(|v| v.default.contains("same-origin")
+                && v.purpose.contains("frame-ancestors 'self'")
+                && v.purpose.contains("X-Frame-Options: SAMEORIGIN")),
+            "IPE_WEB_FRAME_ANCESTORS must document the same-origin default: {entry:?}"
         );
     }
 

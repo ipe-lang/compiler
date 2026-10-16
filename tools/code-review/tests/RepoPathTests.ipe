@@ -5,6 +5,7 @@ import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
+import Ipe.Db.Location exposing (Mode(..))
 import Ipe.Db.Sql as Sql
 import Ipe.Dict as Dict
 import Ipe.Error as Error
@@ -23,15 +24,15 @@ import Ipe.Time.Timestamp as Timestamp
 import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
-import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
+import Lib.RepoPath as RepoPath exposing (PathError(..), ReposError(..), Root, RootMap)
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
 
 
 -- ── guard the path resolver ─────────────────────────────────────────────
@@ -59,7 +60,7 @@ traversalPathsRejectedIn base =
                         unitViewTag (uid "u-esc") r.units
                 in
                 String.startsWith "unreadable: " tag
-                    && String.contains "escapes its root via `..`" tag
+                    && String.contains "is not a valid relative path" tag
                     && String.contains "ipe:a/../../escape" tag
             )
         |> Task.andThen (\ok -> removeFileIfAny (base ++ "/index.db") |> Task.map (\_ -> ok))
@@ -67,7 +68,7 @@ traversalPathsRejectedIn base =
 
 seedTraversalDb : String -> Task.Task Error ()
 seedTraversalDb base =
-    Db.open "sqlite" ("sqlite://" ++ base ++ "/index.db?mode=rwc")
+    openFileAt CreateIfMissing (base ++ "/index.db")
         |> Task.andThen
             (\conn ->
                 System.cwd ()
@@ -113,13 +114,13 @@ refusalName err =
         MissingTag _ ->
             "missing-tag"
 
-        InvalidRelative _ _ ->
+        InvalidRelative _ ->
             "invalid"
 
         UnknownTag _ ->
             "unknown-tag"
 
-        NotUnderRoot _ _ ->
+        NotUnderRoot _ ->
             "not-under-root"
 
         NoRoots ->
@@ -148,8 +149,7 @@ refusedAs expected result =
             refusalName err == expected
 
 
--- A refusal whose caller-facing message carries `fragment` from the
--- `Ipe.Path` error that decided it.
+-- A refusal whose caller-facing message carries `fragment` of its fixed text.
 refusalNames : String -> Result PathError Path.Path -> Bool
 refusalNames fragment result =
     case result of
@@ -238,8 +238,8 @@ storedPathRefusals =
                 , refusedAs "missing-tag" (RepoPath.resolve root "src/Main.ipe")
                 , refusedAs "missing-tag" (RepoPath.resolve root "")
                 , refusedAs "missing-tag" (RepoPath.resolve root ":src/Main.ipe")
-                , refusalNames "Ipe.Path.under" (RepoPath.resolve root "ipe:/etc/passwd")
-                , refusalNames "escapes its root" (RepoPath.resolve root "ipe:../x")
+                , refusalNames "strictly below its repo root" (RepoPath.resolve root "ipe:/etc/passwd")
+                , refusalNames "is not a valid relative path" (RepoPath.resolve root "ipe:../x")
                 , resolvesTo (base ++ "/src/Main.ipe") (RepoPath.resolve root "ipe:src/Main.ipe")
                 , resolvesTo (base ++ "/src/Main.ipe") (RepoPath.resolve root "ipe:./src//Main.ipe/")
                 , resolvesTo (base ++ "/a:b") (RepoPath.resolve root "ipe:a:b")
@@ -286,6 +286,56 @@ unknownTagRefused =
             (refusedAs "unknown-tag" (RepoPath.resolve roots "other:src/x.ipe")
                 && refusedAs "unknown-tag" (RepoPath.resolve roots "Ipe:package.ipe")
                 && refusalNames "names a repo tag" (RepoPath.resolve roots "other:src/x.ipe")
+            )
+
+
+-- A refused stored path reaches the page as fixed text chosen by its
+-- constructor around the quoted stored path, and nothing else: no `Ipe.Path`
+-- refusal text and none of the root's absolute directory, which the page
+-- never shows. Red if a path refusal carries the error that decided it into
+-- the page text. The accepted join is the control that the root is the
+-- absolute directory the refusals must not name.
+pathRefusalPageTextFixed : Task.Task Error Bool
+pathRefusalPageTextFixed =
+    do
+        base <- freshRootBase
+        root <- RepoPath.parseRoot (base ++ "/a")
+        roots <- mapOf [ ( "ipe", root ) ]
+        let
+            rootText =
+                Path.toString (RepoPath.rootPath root)
+
+            pageText err =
+                SafeText.toString (Index.readFailureText (PathRefused err))
+
+            fixed expected stored =
+                case RepoPath.resolve roots stored of
+                    Ok _ ->
+                        False
+
+                    Err err ->
+                        refusalName err
+                            == refusalName expected
+                            && pageText err
+                            == describeText expected
+                            && String.contains (SafeText.toString (SafeText.quoted stored)) (pageText err)
+                            && not (String.contains rootText (pageText err))
+                            && not (String.contains base (pageText err))
+                            && not (String.contains "Ipe.Path" (pageText err))
+        in
+        Task.succeed
+            (String.startsWith "/" rootText
+                && String.length base > 1
+                && resolvesTo (rootText ++ "/src/x.ipe") (RepoPath.resolve roots "ipe:src/x.ipe")
+                && List.all identity
+                    [ fixed (InvalidRelative "ipe:../x") "ipe:../x"
+                    , fixed (InvalidRelative "ipe:a/../../escape") "ipe:a/../../escape"
+                    , fixed (InvalidRelative "ipe:a\0b") "ipe:a\0b"
+                    , fixed (NotUnderRoot "ipe:/etc/passwd") "ipe:/etc/passwd"
+                    , fixed (NotUnderRoot "ipe:") "ipe:"
+                    , fixed (NotUnderRoot "ipe:.") "ipe:."
+                    , fixed (NotUnderRoot "ipe:a/..") "ipe:a/.."
+                    ]
             )
 
 
@@ -489,8 +539,8 @@ rootRefusalEscapesEnv =
 -- The same refusal with every foreign field replaced: the `case` names every
 -- `PathError` constructor, so a new one cannot join `allPathErrors` without an
 -- arm here.
-withForeign : String -> Error -> PathError -> PathError
-withForeign stored e err =
+withForeign : String -> PathError -> PathError
+withForeign stored err =
     case err of
         MissingTag _ ->
             MissingTag stored
@@ -498,11 +548,11 @@ withForeign stored e err =
         UnknownTag _ ->
             UnknownTag stored
 
-        InvalidRelative _ _ ->
-            InvalidRelative stored e
+        InvalidRelative _ ->
+            InvalidRelative stored
 
-        NotUnderRoot _ _ ->
-            NotUnderRoot stored e
+        NotUnderRoot _ ->
+            NotUnderRoot stored
 
         NoRoots ->
             NoRoots
@@ -522,14 +572,10 @@ withForeign stored e err =
 
 allPathErrors : List PathError
 allPathErrors =
-    let
-        e =
-            Error.unexpected ""
-    in
     [ MissingTag ""
     , UnknownTag ""
-    , InvalidRelative "" e
-    , NotUnderRoot "" e
+    , InvalidRelative ""
+    , NotUnderRoot ""
     , NoRoots
     , DuplicateTag ""
     , DuplicateRoot "" ""
@@ -538,17 +584,14 @@ allPathErrors =
     ]
 
 
--- Every `PathError`, fed a hazard-bearing stored path and a hazard-bearing
--- nested error, describes itself (and converts to an `Error`) free of hazards;
--- so do the refusals `resolve` builds from hazard-bearing stored paths.
+-- Every `PathError`, fed a hazard-bearing stored path, describes itself (and
+-- converts to an `Error`) free of hazards; so do the refusals `resolve`
+-- builds from hazard-bearing stored paths.
 diagnosticsNeverRaw : Task.Task Error Bool
 diagnosticsNeverRaw =
     let
         hazards =
             codeText 27 ++ "]0;pwn" ++ codeText 7 ++ "\r\n" ++ codeText 8238 ++ codeText 133 ++ codeText 8233
-
-        nested =
-            Error.invalidInput hazards
 
         clean err =
             noHazard (describeText err) && noHazard (Error.message (RepoPath.toError err))
@@ -570,7 +613,7 @@ diagnosticsNeverRaw =
         Task.succeed
             (List.length allPathErrors
                 == 9
-                && List.all (\err -> clean (withForeign hazards nested err)) allPathErrors
+                && List.all (\err -> clean (withForeign hazards err)) allPathErrors
                 && List.all
                     (resolvedClean roots)
                     [ hazards
@@ -913,6 +956,245 @@ relativeRootLoadsQueueIn base =
         Task.succeed (checkUnits r.total r.units)
 
 
+-- ── IPE_INDEX_REPOS ──────────────────────────────────────────────────────────
+--
+-- `IPE_INDEX_REPOS` binds every repository besides `ipe`, one `name=/path`
+-- entry each. Every malformed value is refused at startup by its own
+-- `ReposError`, naming the entry and echoing it only quoted.
+-- The kind of a `ReposError`, one name per variant.
+reposErrorName : ReposError -> String
+reposErrorName err =
+    case err of
+        ReposEmpty ->
+            "empty"
+
+        ReposUnreadable ->
+            "unreadable"
+
+        ReposTooLong ->
+            "too-long"
+
+        EmptyEntry _ ->
+            "empty-entry"
+
+        MissingSeparator _ ->
+            "missing-separator"
+
+        BadName _ ->
+            "bad-name"
+
+        PathNotAbsolute _ ->
+            "not-absolute"
+
+        PathNotCanonical _ ->
+            "not-canonical"
+
+        PathTooLong _ ->
+            "path-too-long"
+
+        PathNotDirectory _ ->
+            "not-directory"
+
+
+-- `raw` is refused as `expected`, and its text names the entry at `position`
+-- (0 for a refusal of the whole value).
+reposRefusedAs : String -> String -> Int -> Task.Task Error Bool
+reposRefusedAs raw expected position =
+    RepoPath.parseRepos raw
+        |> Task.map
+            (\result ->
+                case result of
+                    Ok _ ->
+                        False
+
+                    Err err ->
+                        let
+                            text =
+                                SafeText.toString (RepoPath.describeRepos raw err)
+                        in
+                        reposErrorName err
+                            == expected
+                            && String.startsWith "IPE_INDEX_REPOS " text
+                            && noHazard text
+                            && (position
+                                == 0
+                                || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
+                            )
+            )
+
+
+-- `raw` parses, binding exactly the tags `names` in order.
+reposAccepted : String -> List String -> Task.Task Error Bool
+reposAccepted raw names =
+    RepoPath.parseRepos raw
+        |> Task.map
+            (\result ->
+                case result of
+                    Ok bound ->
+                        List.map (\( tag, _ ) -> RepoPath.tagName tag) bound == names
+
+                    Err _ ->
+                        False
+            )
+
+
+-- Unset, `IPE_INDEX_REPOS` binds nothing: the map holds `ipe` alone, and a
+-- stored path under any other tag is refused as unbound.
+reposUnsetBindsIpeOnly : Task.Task Error Bool
+reposUnsetBindsIpeOnly =
+    do
+        base <- freshDir "ipe-repos-unset"
+        settings <- Settings.parseIndexSettings (base ++ "/index.db") base Settings.EnvUnset
+        Task.succeed
+            (List.map (\( tag, _ ) -> RepoPath.tagName tag) (RepoPath.boundRoots settings.roots)
+                == [ "ipe" ]
+                && not (refused (RepoPath.resolve settings.roots "ipe:src/x"))
+                && refusedAs "unknown-tag" (RepoPath.resolve settings.roots "ext:src/x")
+            )
+
+
+-- The whole value and each entry are refused by their own kind, one byte
+-- past each ceiling refused and the ceiling itself accepted, naming the
+-- entry. Red if any malformed spelling reaches the directory check or binds.
+reposEntriesRefused : Task.Task Error Bool
+reposEntriesRefused =
+    do
+        base <- freshDir "ipe-repos-entries"
+        makeDir (base ++ "/ext")
+        writeFileText (base ++ "/file") "not a directory\n"
+        results <- Task.sequence (reposEntryCases base)
+        Task.succeed (List.length results == 31 && List.all identity results)
+
+
+-- Each refusal case of `reposEntriesRefused`, under scratch directory `base`
+-- holding the directory `ext` and the file `file`.
+reposEntryCases : String -> List (Task.Task Error Bool)
+reposEntryCases base =
+    let
+        ext =
+            base ++ "/ext"
+
+        longName =
+            String.repeat (RepoPath.repoNameByteCeiling + 1) "n"
+
+        ceilingName =
+            String.repeat RepoPath.repoNameByteCeiling "n"
+    in
+    [ reposRefusedAs "" "empty" 0
+    , reposRefusedAs ("a=/" ++ String.repeat (RepoPath.reposByteCeiling - 2) "x") "too-long" 0
+    , reposRefusedAs ("a=/" ++ String.repeat (RepoPath.reposByteCeiling - 3) "x") "path-too-long" 1
+    , reposRefusedAs ("a=" ++ ext ++ ",,b=" ++ ext) "empty-entry" 2
+    , reposRefusedAs (",a=" ++ ext) "empty-entry" 1
+    , reposRefusedAs ("a=" ++ ext ++ ",") "empty-entry" 2
+    , reposRefusedAs "ext" "missing-separator" 1
+    , reposRefusedAs ("a=" ++ ext ++ "," ++ ext) "missing-separator" 2
+    , reposRefusedAs ("=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a/b=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a:b=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a b=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a\tb=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a" ++ codeText 27 ++ "]0;x=" ++ ext) "bad-name" 1
+    , reposRefusedAs ("a" ++ codeText 8203 ++ "b=" ++ ext) "bad-name" 1
+    , reposRefusedAs (longName ++ "=" ++ ext) "bad-name" 1
+    , reposAccepted (ceilingName ++ "=" ++ ext) [ ceilingName ]
+    , reposRefusedAs "a=rel" "not-absolute" 1
+    , reposRefusedAs "a=C:\\x" "not-absolute" 1
+    , reposRefusedAs "a=C:/x" "not-absolute" 1
+    , reposRefusedAs "a=\\\\srv\\share" "not-absolute" 1
+    , reposRefusedAs "a=//srv/share" "not-absolute" 1
+    , reposRefusedAs "a=/a/./b" "not-canonical" 1
+    , reposRefusedAs "a=/a/../b" "not-canonical" 1
+    , reposRefusedAs "a=/a//b" "not-canonical" 1
+    , reposRefusedAs "a=/a/" "not-canonical" 1
+    , reposRefusedAs ("a=/" ++ String.repeat RepoPath.repoPathByteCeiling "x") "path-too-long" 1
+    , reposRefusedAs ("a=/" ++ String.repeat (RepoPath.repoPathByteCeiling - 1) "x") "not-directory" 1
+    , reposRefusedAs ("a=" ++ base ++ "/missing") "not-directory" 1
+    , reposRefusedAs ("a=" ++ ext ++ ",b=" ++ base ++ "/file") "not-directory" 2
+    , reposAccepted ("ext=" ++ ext ++ ",docs=" ++ base) [ "ext", "docs" ]
+    ]
+
+
+-- An entry's refusal and its root's origin name `IPE_INDEX_REPOS` and the
+-- entry's position, and `IPE_INDEX_ROOT`'s root names that variable. Red if
+-- a root from either variable is described as the other.
+reposRootsNameTheirEntry : Task.Task Error Bool
+reposRootsNameTheirEntry =
+    do
+        base <- freshDir "ipe-repos-origin"
+        makeDir (base ++ "/ext")
+        makeDir (base ++ "/docs")
+        settings <- Settings.parseIndexSettings (base ++ "/index.db") base (Settings.EnvSet ("ext=" ++ base ++ "/ext,docs=" ++ base ++ "/docs"))
+        let
+            origins =
+                List.map (\( tag, root ) -> ( RepoPath.tagName tag, SafeText.toString (RepoPath.rootOrigin tag root) )) (RepoPath.boundRoots settings.roots)
+        in
+        Task.succeed
+            (List.member ( "ipe", "IPE_INDEX_ROOT" ) origins
+                && List.any (\( name, origin ) -> name == "ext" && String.startsWith "IPE_INDEX_REPOS entry 1 (" origin) origins
+                && List.any (\( name, origin ) -> name == "docs" && String.startsWith "IPE_INDEX_REPOS entry 2 (" origin) origins
+                && List.length origins
+                == 3
+            )
+
+
+-- `count` entries `t0=base/d0`, `t1=base/d1`, ... joined by `,`.
+numberedEntries : String -> Int -> String
+numberedEntries base count =
+    String.join "," (List.map (\i -> "t" ++ String.fromInt i ++ "=" ++ base ++ "/d" ++ String.fromInt i) (List.range 0 (count - 1)))
+
+
+-- The startup refusal of `IPE_INDEX_REPOS` value `raw` beside
+-- `IPE_INDEX_ROOT` `root`, if any.
+reposSettingsRefusal : String -> String -> Task.Task Error (Maybe String)
+reposSettingsRefusal root raw =
+    probeMessage (Settings.parseIndexSettings (root ++ "/index.db") root (Settings.EnvSet raw) |> Task.map (\_ -> ()))
+
+
+-- The root map refuses what no entry can say alone: an `ipe=` entry (bound
+-- by `IPE_INDEX_ROOT`), a repeated name, and a directory another tag already
+-- binds, `IPE_INDEX_ROOT`'s included. Red if a second binding of a name or
+-- directory decides by order.
+reposMapRefusals : Task.Task Error Bool
+reposMapRefusals =
+    do
+        base <- freshDir "ipe-repos-map"
+        makeDir (base ++ "/a")
+        makeDir (base ++ "/b")
+        ipeAgain <- reposSettingsRefusal base ("ipe=" ++ base ++ "/a")
+        nameTwice <- reposSettingsRefusal base ("ext=" ++ base ++ "/a,ext=" ++ base ++ "/b")
+        rootAgain <- reposSettingsRefusal base ("ext=" ++ base)
+        dirTwice <- reposSettingsRefusal base ("ext=" ++ base ++ "/a,docs=" ++ base ++ "/a")
+        Task.succeed
+            (maybeContains "IPE_INDEX_ROOT and IPE_INDEX_REPOS" ipeAgain
+                && maybeContains "is bound to more than one root" ipeAgain
+                && maybeContains "\"ipe\"" ipeAgain
+                && maybeContains "is bound to more than one root" nameTwice
+                && maybeContains "\"ext\"" nameTwice
+                && maybeContains "are bound to one directory" rootAgain
+                && maybeContains "are bound to one directory" dirTwice
+            )
+
+
+-- `IPE_INDEX_ROOT` and `IPE_INDEX_REPOS` together bind at most the number
+-- in the shared vector file: one fewer extra entry than that is accepted,
+-- one more refused. Red if the extra entries are counted apart from `ipe`.
+reposCeilingCountsIpe : Task.Task Error Bool
+reposCeilingCountsIpe =
+    do
+        limit <- maxReposVector
+        base <- freshDir "ipe-repos-ceiling"
+        Task.sequence (List.map (\i -> makeDir (base ++ "/d" ++ String.fromInt i)) (List.range 0 (limit - 1))) |> Task.map (\_ -> ())
+        atCeiling <- reposSettingsRefusal base (numberedEntries base (limit - 1))
+        overCeiling <- reposSettingsRefusal base (numberedEntries base limit)
+        Task.succeed
+            (RepoPath.maxRoots
+                == limit
+                && atCeiling
+                == Nothing
+                && maybeContains "repository roots are configured" overCeiling
+            )
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -925,6 +1207,7 @@ checks =
         , check "empty and duplicate-tag root maps refused" rootMapRefusals
         , check "root refusal escapes the env value" rootRefusalEscapesEnv
         , check "every path refusal describes itself without raw hazards" diagnosticsNeverRaw
+        , check "a path refusal's page text is fixed and names no root" pathRefusalPageTextFixed
         , Task.succeed ( "describe escapes the stored path", describeEscapesStoredPath )
         , check "blank, missing and non-directory roots refused" badRootsRefused
         , check "relative root loads the queue" relativeRootLoadsQueue
@@ -938,4 +1221,9 @@ checks =
         , check "root ceiling matches the shared ipe-index vector" tooManyRootsRefused
         , check "case and separator variants of a deeper root are claimed" caseAndSeparatorVariantsClaimed
         , check "roots differing only in case refused as one directory" caseVariantRootsRefused
+        , check "an unset IPE_INDEX_REPOS binds ipe alone" reposUnsetBindsIpeOnly
+        , check "each malformed IPE_INDEX_REPOS value or entry refused by its kind" reposEntriesRefused
+        , check "every root names the variable and entry that bound it" reposRootsNameTheirEntry
+        , check "ipe, a repeated name, or a bound directory in IPE_INDEX_REPOS refused" reposMapRefusals
+        , check "the root ceiling counts IPE_INDEX_ROOT beside IPE_INDEX_REPOS" reposCeilingCountsIpe
         ]

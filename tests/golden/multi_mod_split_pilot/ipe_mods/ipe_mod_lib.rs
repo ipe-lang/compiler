@@ -32,7 +32,7 @@ pub(crate) fn lib_label(status: LibStatus) -> String {
 pub(crate) fn lib_seed_and_count() -> IpeTask<i64> {
     let _ipe_recursion_guard = crate::recursion_guard();
     task_and_then(
-        db_open("sqlite".to_string(), "sqlite::memory:".to_string()),
+        db_open(db_location_memory()),
         Box::new(move |conn: Db| -> IpeTask<i64> {
             db_with_transaction(conn.clone(), {
                 let __ipe_fn: Box<dyn Fn(Db) -> IpeTask<i64> + Send + Sync + 'static> =
@@ -73,12 +73,12 @@ pub(crate) fn lib_seed_and_count() -> IpeTask<i64> {
                                                 task_map(
                                                     {
                                                         let __ipe_fn: Box<
-                                                            dyn Fn(Vec<HashMap<String, String>>) -> i64
+                                                            dyn Fn(Vec<HashMap<String, IpeMaybe<String>>>) -> i64
                                                                 + Send
                                                                 + Sync
                                                                 + 'static,
                                                         > = Box::new(
-                                                            move |rows: Vec<HashMap<String, String>>| -> i64 {
+                                                            move |rows: Vec<HashMap<String, IpeMaybe<String>>>| -> i64 {
                                                                 list_length(rows)
                                                             },
                                                         );

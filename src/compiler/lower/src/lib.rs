@@ -23,6 +23,7 @@
 mod capabilities;
 mod lower;
 mod once_check;
+mod or_split;
 
 /// Whole-program capability inference: the exact security-capability set a
 /// lowered program exercises. Consumed by `ipe capabilities` (SP1) and, ahead,
@@ -84,6 +85,10 @@ pub fn lower(
     // cross-module misattribution lives inside `Lowerer::run`, at the
     // `lower_def` boundary.
     let homeless = |d: Diagnostic| (d, Vec::<ipe_intern::Symbol>::new());
+    // Establish the or-pattern normal form first: every pool count and
+    // lowering walk below reads the split module.
+    let normalized = or_split::normalize(m)?;
+    let m: &canon::Module = &normalized;
     // Eta-expansion synthesises fresh closure parameters that must not capture
     // any name free in the supplied arguments. Mint the pool up front through the
     // one `&mut Interner` the entry point owns, so the lowering walk itself stays

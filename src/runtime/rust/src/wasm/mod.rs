@@ -37,7 +37,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::core::{IpeResult, IpeTask};
 use crate::dom::{HandlerIndex, WebReq, build_index, diff::Patch, diff::diff};
-use crate::html::{FormData, Html, assign_ipe_ids, render_html};
+use crate::html::{FormData, Html, RenderCtx, assign_ipe_ids, render_html};
 use crate::tea::{IpeCmd, IpeSub};
 use crate::web::route::MountRefusal;
 
@@ -469,7 +469,7 @@ where
     // diff-and-replace on the first real update, never white-screens.
     {
         use crate::dom::diff::diff;
-        let self_patches = diff(&tree, &tree);
+        let self_patches = diff(&tree, &tree, &RenderCtx::Unstamped);
         if !self_patches.is_empty() {
             console_warn(&format!(
                 "hydration-mismatch: self-diff produced {} patch(es) — \
@@ -708,7 +708,7 @@ where
 
     let mut new_tree = (app.view)(new_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree);
+    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
     apply_patches(&patches);
     *app.index.borrow_mut() = build_index(&new_tree);
     *app.tree.borrow_mut() = new_tree;
@@ -1059,7 +1059,7 @@ where
     if !scrub_active {
         let mut new_tree = (app.view)(model);
         assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-        let patches = diff(&app.tree.borrow(), &new_tree);
+        let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
         apply_patches(&patches);
         *app.index.borrow_mut() = build_index(&new_tree);
         *app.tree.borrow_mut() = new_tree;
@@ -1100,10 +1100,10 @@ where
                 run_cmd(app, c);
             }
         }
-        IpeCmd::Perform(thunk) => {
+        IpeCmd::Perform(body) => {
             let app = Rc::clone(app);
             wasm_bindgen_futures::spawn_local(async move {
-                let msg = thunk().await;
+                let msg = body.run().await;
                 enqueue(&app, msg);
             });
         }
@@ -1149,7 +1149,7 @@ where
     Msg: Clone + 'static,
 {
     use crate::dom::{build_index, diff::diff};
-    use crate::html::assign_ipe_ids;
+    use crate::html::{RenderCtx, assign_ipe_ids};
 
     let render_model = match step {
         None => {
@@ -1177,7 +1177,7 @@ where
 
     let mut new_tree = (app.view)(render_model);
     assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
-    let patches = diff(&app.tree.borrow(), &new_tree);
+    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
     apply_patches(&patches);
     *app.index.borrow_mut() = build_index(&new_tree);
     *app.tree.borrow_mut() = new_tree;

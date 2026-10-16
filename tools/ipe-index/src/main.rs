@@ -8,6 +8,7 @@ mod extractor_digest;
 mod model;
 mod pipeline;
 mod query;
+mod refusal;
 mod repo_set;
 mod static_re;
 mod store;
@@ -171,20 +172,64 @@ enum Cmd {
     },
 }
 
-/// The text of an admitted file, or `None` (reported when worth a line) when
-/// [`walk::read_owned`] refuses it.
-fn read_capped(
+/// How an admitted file ends once read: its text, a refusal row, or no row.
+///
+/// A refusal worth a line is echoed on stderr; the row is the record.
+fn read_outcome(
     repo: &repo_set::DeclaredRoot,
     rel: &str,
     claimed: &[&repo_set::DeclaredRoot],
-) -> Option<String> {
-    walk::read_owned(repo.root(), rel, claimed)
-        .inspect_err(|refusal| {
-            if refusal.is_reported() {
-                eprintln!("ipe-index: not reading {}: {refusal}", walk::shown(rel));
-            }
-        })
-        .ok()
+    budget: &mut walk::HashBudget,
+) -> refusal::Outcome {
+    let read = walk::read_owned(repo.root(), rel, claimed, budget);
+    if let Err(refusal) = &read
+        && refusal.is_reported()
+    {
+        eprintln!("ipe-index: not reading {}: {refusal}", walk::shown(rel));
+    }
+    refusal::classify(read)
+}
+
+/// The refusal row of the walked file `file` refused as `refused`.
+fn refused_file(file: &walk::Tracked, refused: refusal::Refused) -> refusal::RefusedEntry {
+    refusal::RefusedEntry {
+        name: file.path.as_bytes().to_vec(),
+        lang: file.lang,
+        refused,
+    }
+}
+
+/// Checks a run's rows before commit and counts them.
+///
+/// No path may be both indexed and refused, and every count is read from the
+/// rows the run is about to commit.
+fn checked_tally(store: &store::Store) -> Result<store::Tally> {
+    store.check_refusals_disjoint()?;
+    store.tally()
+}
+
+/// Prints a run's summary from its committed rows.
+fn print_summary(tally: &store::Tally) {
+    eprintln!(
+        "ipe-index: indexed {} files, {} units; {} unreviewable ({} ackable, {} blocking)",
+        tally.files,
+        tally.units,
+        tally.ackable.saturating_add(tally.blocking),
+        tally.ackable,
+        tally.blocking
+    );
+    for (path, reason) in &tally.blocking_rows {
+        eprintln!("ipe-index:   blocking {path}: {reason}");
+    }
+    let listed = i64::try_from(tally.blocking_rows.len()).unwrap_or(i64::MAX);
+    let more = tally.blocking.saturating_sub(listed);
+    if more > 0 {
+        eprintln!("ipe-index:   +{more} more");
+    }
+    eprintln!(
+        "ipe-index: {} other-language files without units",
+        tally.unextracted
+    );
 }
 
 /// Default repo set: this repo (`ipe:.`).
@@ -282,11 +327,12 @@ fn reconcile_queue(
 /// The queue is never reseeded from empty: a unit whose body is unchanged
 /// keeps whatever row it had, or none if the review app drained it. Only a
 /// store with no previous units (a first index) queues every unit as `new`.
-/// A failure anywhere rolls back to the previous index and queue.
+/// A failure anywhere, a path both indexed and refused included, rolls back
+/// to the previous index and queue. The counts are read from the rows.
 fn rebuild(
     store: &store::Store,
     ingest: impl FnOnce(&store::Store) -> Result<HashMap<String, String>>,
-) -> Result<()> {
+) -> Result<store::Tally> {
     store.begin()?;
     let built = (|| {
         let before = store.snapshot_all()?;
@@ -296,10 +342,14 @@ fn rebuild(
         reconcile_queue(store, &before, &after, &shas, diff::now_millis())?;
         // Resolution passes over the merged store (tagged paths). Best-effort across tags.
         store.resolve_calls()?;
-        query::resolve_edges(store, ".")
+        query::resolve_edges(store, ".")?;
+        checked_tally(store)
     })();
     match built {
-        Ok(()) => store.commit(),
+        Ok(tally) => {
+            store.commit()?;
+            Ok(tally)
+        }
         Err(e) => {
             // The build error is the one worth reporting; a failed rollback
             // still leaves the transaction uncommitted.
@@ -323,35 +373,39 @@ fn index_set(repos: &repo_set::RepoSet, db: &str) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let store = store::Store::open(db)?;
-    let mut total_files = 0usize;
-    rebuild(&store, |store| {
+    let mut budget = walk::HashBudget::new();
+    let tally = rebuild(&store, |store| {
         store.record_repos(&repos.recorded())?;
         let mut shas = HashMap::new();
         for repo in repos.iter() {
             let claimed = repos.claimed_in(repo);
-            let files = walk::tracked(repo, &claimed)?;
+            let (files, refused) = walk::tracked(repo, &claimed)?;
+            for entry in &refused {
+                store.put_refusal(repo.tag(), entry)?;
+            }
             let sha = head_sha_or_empty(repo.root_str());
             for f in &files {
-                let Some(src) = read_capped(repo, &f.path, &claimed) else {
-                    continue;
-                };
-                // Store every path prefixed with the repo tag so multiple repos
-                // never collide (each has Cargo.toml, README.md, scripts/*, tools/*).
-                ingest_file(store, &repo.tag().tagged(&f.path), f.lang, &src, &sha)?;
+                match read_outcome(repo, &f.path, &claimed, &mut budget) {
+                    // Store every path prefixed with the repo tag so multiple repos
+                    // never collide (each has Cargo.toml, README.md, scripts/*, tools/*).
+                    refusal::Outcome::Ingested(src) => {
+                        ingest_file(store, &repo.tag().tagged(&f.path), f.lang, &src, &sha)?;
+                    }
+                    refusal::Outcome::Refused(refused) => {
+                        store.put_refusal(repo.tag(), &refused_file(f, refused))?;
+                    }
+                    refusal::Outcome::Absent | refusal::Outcome::Claimed => {}
+                }
             }
             // Per-repo HEAD sha the index was last built at.
             if !sha.is_empty() {
                 store.set_meta(&repo.tag().last_sha_key(), &sha)?;
             }
             shas.insert(repo.tag().as_str().to_string(), sha);
-            total_files += files.len();
         }
         Ok(shas)
     })?;
-    eprintln!(
-        "ipe-index: indexed {total_files} files across {} repo(s)",
-        repos.iter().len()
-    );
+    print_summary(&tally);
     Ok(())
 }
 
@@ -399,9 +453,13 @@ enum FileWork<'a> {
     },
 }
 
+/// The refusal rows one root's walk recorded.
+type WalkRefusals<'a> = (&'a model::RepoTag, Vec<refusal::RefusedEntry>);
+
 /// What an `update` does: judge each path, or rebuild the whole index.
 enum UpdatePlan<'a> {
-    Incremental(Vec<FileWork<'a>>),
+    /// The paths to judge, and the refusal rows of every root's listing.
+    Incremental(Vec<FileWork<'a>>, Vec<WalkRefusals<'a>>),
     Full(FullReason),
 }
 
@@ -435,11 +493,14 @@ fn plan_update<'a>(
         return Ok(UpdatePlan::Full(FullReason::NoStamps));
     };
     let mut work = Vec::new();
+    let mut refusals = Vec::new();
     for repo in walks {
-        for file in walk::tracked(repo.root, &repo.claimed)? {
+        let (files, refused) = walk::tracked(repo.root, &repo.claimed)?;
+        for file in files {
             let stored = stamps.remove(&repo.root.tag().tagged(&file.path));
             work.push(FileWork::Listed { repo, file, stored });
         }
+        refusals.push((repo.root.tag(), refused));
     }
     let mut gone: Vec<String> = stamps.into_keys().collect();
     gone.sort();
@@ -448,22 +509,35 @@ fn plan_update<'a>(
         let repo = walks.iter().find(|w| w.root.tag().as_str() == tag);
         FileWork::Gone { tagged, repo }
     }));
-    Ok(UpdatePlan::Incremental(work))
+    Ok(UpdatePlan::Incremental(work, refusals))
 }
 
 /// Applies one path's work; returns whether its rows changed.
 ///
-/// A listed file is read under the same ceiling as `index`. Equal stamps skip
-/// it. A file that cannot be read (absent by now, over the ceiling, not UTF-8,
-/// refused on disk) takes the delete branch, never the skip: its old units
-/// must not stay open, or hidden, under bytes the tree no longer holds.
-fn apply_work(store: &store::Store, work: &FileWork<'_>, now: i64) -> Result<bool> {
+/// A listed file is read under the same ceilings as `index` and classified
+/// afresh. Equal stamps skip it. A refused file gets its refusal row this
+/// run, and its old rows, if any, take the delete branch, never the skip: its
+/// old units must not stay open, or hidden, under bytes the tree no longer
+/// holds. A file gone by now, or claimed, takes the delete branch too.
+fn apply_work(
+    store: &store::Store,
+    work: &FileWork<'_>,
+    now: i64,
+    budget: &mut walk::HashBudget,
+) -> Result<bool> {
     let (tagged, sha, fresh) = match work {
         FileWork::Gone { tagged, repo } => {
             (tagged.clone(), repo.map_or("", |r| r.sha.as_str()), None)
         }
         FileWork::Listed { repo, file, stored } => {
-            let src = read_capped(repo.root, &file.path, &repo.claimed);
+            let src = match read_outcome(repo.root, &file.path, &repo.claimed, budget) {
+                refusal::Outcome::Ingested(src) => Some(src),
+                refusal::Outcome::Refused(refused) => {
+                    store.put_refusal(repo.root.tag(), &refused_file(file, refused))?;
+                    None
+                }
+                refusal::Outcome::Absent | refusal::Outcome::Claimed => None,
+            };
             let unchanged = match (&src, stored) {
                 (Some(src), Some(stored)) => store::FileStamp::of_bytes(src.as_bytes()) == *stored,
                 (None, None) => true,
@@ -508,17 +582,25 @@ fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
         .collect();
     let store = store::Store::open(db)?;
     store.begin()?;
-    let applied = (|| -> Result<Result<usize, FullReason>> {
-        let work = match plan_update(&store, &repos, &walks)? {
+    let applied = (|| -> Result<Result<(usize, store::Tally), FullReason>> {
+        let (work, refusals) = match plan_update(&store, &repos, &walks)? {
             UpdatePlan::Full(reason) => return Ok(Err(reason)),
-            UpdatePlan::Incremental(work) => work,
+            UpdatePlan::Incremental(work, refusals) => (work, refusals),
         };
+        // Refusal rows carry no stamp, so every run records them afresh.
+        store.clear_refusals()?;
+        for (tag, refused) in &refusals {
+            for entry in refused {
+                store.put_refusal(tag, entry)?;
+            }
+        }
         // One timestamp per run so its events order stably (`enqueued_at` is
         // a tiebreaker in `pending`'s ORDER BY).
         let now = diff::now_millis();
+        let mut budget = walk::HashBudget::new();
         let mut changed = 0usize;
         for item in &work {
-            if apply_work(&store, item, now)? {
+            if apply_work(&store, item, now, &mut budget)? {
                 changed += 1;
             }
         }
@@ -529,7 +611,7 @@ fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
         }
         store.resolve_calls()?;
         query::resolve_edges(&store, ".")?;
-        Ok(Ok(changed))
+        Ok(Ok((changed, checked_tally(&store)?)))
     })();
     let outcome = match applied {
         Ok(outcome) => outcome,
@@ -541,12 +623,13 @@ fn cmd_update(repo_specs: &[String], db: &str) -> Result<()> {
         }
     };
     match outcome {
-        Ok(changed) => {
+        Ok((changed, tally)) => {
             store.commit()?;
             eprintln!(
                 "ipe-index: updated {changed} changed path(s) across {} repo(s)",
                 repos.iter().len()
             );
+            print_summary(&tally);
             Ok(())
         }
         Err(reason) => {
@@ -937,6 +1020,212 @@ mod tests {
         assert!(s.schema_is_current().unwrap());
     }
 
+    /// `(path, reason, size, digest)` of every refusal row at `db`, by path.
+    #[cfg(unix)]
+    fn refusal_rows(db: &str) -> Vec<RefusalRow> {
+        let s = store::Store::open(db).unwrap();
+        let mut st = s
+            .conn
+            .prepare("SELECT path, reason, size, digest FROM refusals ORDER BY path")
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    /// A stored refusal row: `(path, reason, size, digest)`.
+    #[cfg(unix)]
+    type RefusalRow = (String, String, Option<i64>, Option<String>);
+
+    /// The row a file at `path` refused for `reason` over `bytes` must have.
+    #[cfg(unix)]
+    fn content_row(path: &str, reason: refusal::ContentReason, bytes: &[u8]) -> RefusalRow {
+        let refused = refusal::Refused::content(
+            reason,
+            u64::try_from(bytes.len()).unwrap(),
+            &blake3::hash(bytes),
+        );
+        (
+            path.to_string(),
+            refused.reason().tag().to_string(),
+            Some(i64::try_from(bytes.len()).unwrap()),
+            refused.digest().map(|d| d.as_str().to_string()),
+        )
+    }
+
+    // T1: a tracked binary script becomes one `not-utf8` row whose digest
+    // covers its bytes, with no `files` row and no units.
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_file_is_a_refusal_row_not_a_silent_skip() {
+        let fx = walk::fixture::Fixture::new("index-binary");
+        fx.write("ok.rs", "fn a() {}\n");
+        let bytes = b"#!/bin/sh\necho \xff\n";
+        std::fs::write(fx.0.join("tool.sh"), bytes).unwrap();
+        fx.commit("one");
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&[format!("ipe:{}", fx.root())], &db).unwrap();
+        assert_eq!(stored_files(&db), ["ipe:ok.rs"]);
+        assert_eq!(
+            refusal_rows(&db),
+            [content_row(
+                "ipe:tool.sh",
+                refusal::ContentReason::NotUtf8,
+                bytes
+            )]
+        );
+        let s = store::Store::open(&db).unwrap();
+        let units: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM units WHERE path = 'ipe:tool.sh'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(units, 0);
+        let lang: String = s
+            .conn
+            .query_row("SELECT lang FROM refusals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lang, "sh");
+    }
+
+    // T5: a run that would commit a path both indexed and refused fails, and
+    // the previous index stands.
+    #[test]
+    fn a_path_both_indexed_and_refused_rolls_the_rebuild_back() {
+        let s = store::Store::open(":memory:").unwrap();
+        rebuild_from(&s, &[(PATH, BASE)], "s1");
+        let alpha = uid_of(&s, "fn", "alpha");
+        let body = body_of(&s, &alpha);
+        let units = s.count("units").unwrap();
+        let forged = rebuild(&s, |st| {
+            ingest_file(st, PATH, model::Lang::Rust, CHILD_EDIT, "s2")?;
+            st.put_refusal(
+                &model::RepoTag::parse("ipe").unwrap(),
+                &refusal::RefusedEntry {
+                    name: b"tools/x/src/lib.rs".to_vec(),
+                    lang: model::Lang::Rust,
+                    refused: refusal::Refused::blocking(refusal::Blocking::Replaced, None),
+                },
+            )?;
+            Ok(HashMap::from([("ipe".to_string(), "s2".to_string())]))
+        });
+        let err = forged.err().map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("both indexed and refused")),
+            "{err:?}"
+        );
+        assert_eq!(s.count("units").unwrap(), units);
+        assert_eq!(s.count("refusals").unwrap(), 0);
+        assert_eq!(body_of(&s, &alpha), body);
+    }
+
+    // T6: the summary counts are the rows: a mixed tree's tally equals what
+    // the tables hold, and each entry ends in exactly one of them.
+    #[cfg(unix)]
+    #[test]
+    fn the_summary_counts_are_read_from_the_rows() {
+        let fx = walk::fixture::Fixture::new("index-tally");
+        fx.write("ok.rs", "fn a() {}\n");
+        fx.write("notes.md", "# notes\n");
+        std::fs::write(fx.0.join("bin.sh"), b"echo \xff\n").unwrap();
+        let over = usize::try_from(walk::MAX_FILE_BYTES).unwrap() + 1;
+        fx.write("big.rs", &"/".repeat(over));
+        std::fs::write(fx.0.join("img.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::os::unix::fs::symlink("ok.rs", fx.0.join("leak.rs")).unwrap();
+        fx.commit("one");
+        fx.write("nested/x.rs", "fn x() {}\n");
+        fx.init_nested("nested");
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&[format!("ipe:{}", fx.root())], &db).unwrap();
+        let s = store::Store::open(&db).unwrap();
+        let tally = s.tally().unwrap();
+        let count = |sql: &str| -> i64 { s.conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(tally.files, count("SELECT COUNT(*) FROM files"));
+        assert_eq!(tally.units, count("SELECT COUNT(*) FROM units"));
+        assert_eq!(
+            tally.ackable,
+            count("SELECT COUNT(*) FROM refusals WHERE digest IS NOT NULL")
+        );
+        assert_eq!(
+            tally.blocking,
+            count("SELECT COUNT(*) FROM refusals WHERE digest IS NULL")
+        );
+        assert_eq!(stored_files(&db), ["ipe:notes.md", "ipe:ok.rs"]);
+        assert_eq!((tally.files, tally.ackable, tally.blocking), (2, 4, 1));
+        assert_eq!(
+            tally.blocking_rows,
+            [("ipe:nested/".to_string(), "nested-repository".to_string())]
+        );
+        let reasons: Vec<(String, String, String)> = s
+            .conn
+            .prepare("SELECT path, lang, reason FROM refusals ORDER BY path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let want = [
+            ("ipe:big.rs", "rs", "too-large"),
+            ("ipe:bin.sh", "sh", "not-utf8"),
+            ("ipe:img.png", "other", "not-utf8"),
+            ("ipe:leak.rs", "rs", "symlink-entry"),
+            ("ipe:nested/", "other", "nested-repository"),
+        ]
+        .map(|(p, l, r)| (p.to_string(), l.to_string(), r.to_string()));
+        assert_eq!(reasons, want);
+    }
+
+    // T4: an index stamped with the previous version is rebuilt by `update`,
+    // never reused, and the rebuild records the refusals it lacked.
+    #[cfg(unix)]
+    #[test]
+    fn update_on_a_v10_store_rebuilds_with_refusals() {
+        let fx = walk::fixture::Fixture::new("update-v10");
+        fx.write("a.rs", "fn a() {}\n");
+        std::fs::write(fx.0.join("bin.sh"), b"echo \xff\n").unwrap();
+        fx.commit("one");
+        let specs = [format!("ipe:{}", fx.root())];
+        let db = fx.path(".git/ipe-index.db");
+        cmd_index(&specs, &db).unwrap();
+        {
+            let s = store::Store::open(&db).unwrap();
+            s.conn.execute_batch("DROP TABLE refusals").unwrap();
+            s.set_meta("schema_version", "10").unwrap();
+        }
+        let repos = parse_repos(&specs).unwrap();
+        let walks: Vec<RepoWalk<'_>> = repos
+            .iter()
+            .map(|root| RepoWalk {
+                root,
+                claimed: repos.claimed_in(root),
+                sha: String::new(),
+            })
+            .collect();
+        {
+            let s = store::Store::open(&db).unwrap();
+            assert!(matches!(
+                plan_update(&s, &repos, &walks).unwrap(),
+                UpdatePlan::Full(FullReason::SchemaVersion)
+            ));
+        }
+        update_then_compare(&fx, &specs, &db);
+        assert_eq!(
+            refusal_rows(&db),
+            [content_row(
+                "ipe:bin.sh",
+                refusal::ContentReason::NotUtf8,
+                b"echo \xff\n"
+            )]
+        );
+        let s = store::Store::open(&db).unwrap();
+        assert!(s.schema_is_current().unwrap());
+    }
+
     /// The stored file paths of the index at `db`, sorted.
     #[cfg(unix)]
     fn stored_files(db: &str) -> Vec<String> {
@@ -1033,6 +1322,8 @@ mod tests {
             "SELECT 'site|' || caller_uid || '|' || path || '|' || exact || '|' \
              || COALESCE(local, '') FROM call_sites ORDER BY 1",
             "SELECT 'call|' || caller_uid || '|' || callee_uid FROM callgraph ORDER BY 1",
+            "SELECT 'refusal|' || uid || '|' || path || '|' || lang || '|' || reason || '|' \
+             || COALESCE(size, '') || '|' || COALESCE(digest, '') FROM refusals ORDER BY uid",
         ] {
             let mut st = s.conn.prepare(sql).unwrap();
             let got: Vec<String> = st
@@ -1216,6 +1507,18 @@ mod tests {
         std::fs::write(fx.0.join("bin.rs"), b"fn bin() {}\n\xff\n").unwrap();
         update_then_compare(&fx, &specs, &db);
         assert_eq!(stored_files(&db), ["ipe:a.rs"]);
+        let big = std::fs::read(fx.0.join("big.rs")).unwrap();
+        assert_eq!(
+            refusal_rows(&db),
+            [
+                content_row("ipe:big.rs", refusal::ContentReason::TooLarge, &big),
+                content_row(
+                    "ipe:bin.rs",
+                    refusal::ContentReason::NotUtf8,
+                    b"fn bin() {}\n\xff\n"
+                ),
+            ]
+        );
         let s = store::Store::open(&db).unwrap();
         let left: i64 = s
             .conn
@@ -1252,7 +1555,7 @@ mod tests {
             .collect();
         let plan_of = |s: &store::Store| match plan_update(s, &repos, &walks).unwrap() {
             UpdatePlan::Full(reason) => Some(reason),
-            UpdatePlan::Incremental(_) => None,
+            UpdatePlan::Incremental(..) => None,
         };
         {
             let s = store::Store::open(&db).unwrap();
@@ -1271,7 +1574,7 @@ mod tests {
         fx.write("a.rs", "fn a() {}\n\nfn b() {}\n");
         update_then_compare(&fx, &specs, &db);
         let s = store::Store::open(&db).unwrap();
-        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("10"));
+        assert_eq!(s.get_meta("schema_version").unwrap().as_deref(), Some("11"));
         assert!(s.stamps().unwrap().is_some_and(|st| st.len() == 1));
         assert_eq!(plan_of(&s), None);
     }

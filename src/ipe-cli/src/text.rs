@@ -745,6 +745,8 @@ messages! {
     package_manifest_name_required = "package-manifest-name-required";
     /// `package.ipe`'s source root does not exist.
     package_manifest_src_root_missing = "package-manifest-src-root-missing";
+    /// `package.ipe` spells `sourceRoot`, which a project root no longer honours.
+    package_manifest_source_root_removed = "package-manifest-source-root-removed";
     /// `package.ipe` with no top-level `package` binding.
     package_manifest_no_package_binding = "package-manifest-no-package-binding";
     /// `ipe add`/`ipe remove` found no top-level `package` binding to edit.
@@ -993,6 +995,22 @@ messages! {
     cli_discovery_limit_reached(detail) = "cli-discovery-limit-reached";
     /// A discovered source file names a Windows reserved device as a module segment.
     cli_device_named_module(path, segment) = "cli-device-named-module";
+    /// The project directory holds no `package.ipe`.
+    project_no_manifest(dir) = "project-no-manifest";
+    /// The project directory has no `src/` directory.
+    project_no_src_dir(root) = "project-no-src-dir";
+    /// A `programs` entry names a file `src/` does not hold.
+    project_entry_missing(entry) = "project-entry-missing";
+    /// The project declares no program, has no `src/Main.ipe`, and exposes no module.
+    project_no_default_entry(root) = "project-no-default-entry";
+    /// A `programs` entry passes through a symbolic link under `src/`.
+    project_entry_escapes(entry, path) = "project-entry-escapes";
+    /// An `exposedModules` name has no file under `src/`.
+    project_exposed_module_missing(module) = "project-exposed-module-missing";
+    /// A project file or directory ipe would read is a symbolic link.
+    project_symlink_in_source(path) = "project-symlink-in-source";
+    /// A file argument lies outside the project's `src/` and `tests/`.
+    project_file_outside_root(arg, root) = "project-file-outside-root";
     /// A locked dependency falls within an advisory's affected range.
     cli_advisory_vulnerable(package, version, severity, id, description, fixed_in) =
         "cli-advisory-vulnerable";
@@ -1662,8 +1680,8 @@ messages! {
     output_inside_ipe_owned(out, owner) = "output-inside-ipe-owned";
     /// A user-bound output inside a directory an ipe claim is turning into ipe's.
     output_inside_claim(out, owner, claim) = "output-inside-claim";
-    /// An output inside a `.git` directory.
-    output_inside_vcs(out) = "output-inside-vcs";
+    /// An output inside a version-control metadata directory.
+    output_inside_vcs(out, dir) = "output-inside-vcs";
     /// An output inside an ipe cache namespace.
     output_inside_cache_namespace(out, namespace) = "output-inside-cache-namespace";
     /// An output with a `..` that does not climb out of a plain existing directory.

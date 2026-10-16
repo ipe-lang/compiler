@@ -395,6 +395,7 @@ shown_leaves! {
     "CryptoKey" => Redacted(Withhold);
     "Principal" => Redacted(Reveal);
     "Dsn" => Redacted(Reveal);
+    "DbLocation" => Redacted(Reveal);
     "SqlFragment" => Redacted(Reveal);
     "ServerRequest" => Redacted(Reveal);
     "ServerResponse" => Redacted(Reveal);
