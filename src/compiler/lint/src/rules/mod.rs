@@ -203,11 +203,15 @@ pub fn run_all<P: CancelProbe>(ctx: &Ctx<'_>, probe: &P) -> Result<Vec<Finding>,
 /// spanned on the `<-` token, with the lambda zero-width and the task after it,
 /// and a restamped `do` block carries the `do` keyword's span. Rules that
 /// reason about how a call reads test this before treating a `Call` node as
-/// source.
+/// source. A `do` bind is refused by its [`Expr_::TaskAndThen`] head first, so
+/// the span shape is a second, independent check.
 pub fn is_source_call(expr: &Expr) -> bool {
     let Expr_::Call(callee, args) = &expr.value else {
         return false;
     };
+    if matches!(callee.value, Expr_::TaskAndThen) {
+        return false;
+    }
     if callee.span.lo < expr.span.lo || callee.span.hi <= callee.span.lo {
         return false;
     }
