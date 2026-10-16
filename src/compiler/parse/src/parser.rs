@@ -2517,7 +2517,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.desugar_do(do_tok.span, stmts)
+        Self::desugar_do(do_tok.span, stmts)
     }
 
     /// Parse one `do`-block statement. A leading lowercase name (or `_`) directly
@@ -2573,7 +2573,7 @@ impl<'a> Parser<'a> {
     /// instead. A `do` that ends in a bare run has a Task step and passes this
     /// purely structural gate; whether that final expression is genuinely
     /// effectful is a type-level question left to the lowering gates.
-    fn desugar_do(&mut self, do_span: Span, stmts: Vec<DoStmt>) -> DResult<Expr> {
+    fn desugar_do(do_span: Span, stmts: Vec<DoStmt>) -> DResult<Expr> {
         // Stepless-do gate: a Task step is any `<-` bind or any bare run,
         // the trailing run included. The gate is purely structural because
         // the parser cannot see types; a `do` with no step is pure code.
