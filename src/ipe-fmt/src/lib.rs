@@ -1906,7 +1906,7 @@ impl<'a> Printer<'a> {
     ///   outermost node carries the `do` span instead, so there any
     ///   single-binding `let` over a statement binder is accepted — printing a
     ///   lone `let … in` result as a statement re-parses to the same AST.
-    fn do_step<'e>(e: &'e Expr, outer: bool) -> Option<(DoStep<'e>, &'e Expr)> {
+    fn do_step(e: &Expr, outer: bool) -> Option<(DoStep<'_>, &Expr)> {
         match &e.value {
             Expr_::Call(head, args) => {
                 if !matches!(head.value, Expr_::TaskAndThen) {
