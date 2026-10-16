@@ -115,6 +115,7 @@ queuePageOf units =
     , log = LibDb.ShownProven
     , refusals = []
     , refusalsOpen = 0
+    , refusalsUnbound = 0
     }
 
 

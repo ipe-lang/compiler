@@ -1028,7 +1028,7 @@ queueStateTextsDistinct =
             Error.unexpected "boom"
 
         empty =
-            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0 }
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0, refusalsUnbound = 0 }
 
         drained =
             { empty | total = 41000 }
@@ -2532,7 +2532,7 @@ unboundNoticeTexts : Bool
 unboundNoticeTexts =
     let
         empty =
-            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0 }
+            { units = [], total = 0, unbound = 0, dbName = SafeText.renderForeign "index.db", dbBytes = 4096, next = Nothing, progress = { reviewed = 0, total = 0 }, log = ShownProven, refusals = [], refusalsOpen = 0, refusalsUnbound = 0 }
 
         one =
             { empty | unbound = 1 }
@@ -2788,6 +2788,94 @@ refusalReadOnlyRefused =
         Task.succeed (refused && rows == 0)
 
 
+-- A refusal under a tag no root binds is neither listed nor open, and the
+-- header says it is there. Red if the page drops it without a word.
+unboundRefusalNoticed : Task.Task Error Bool
+unboundRefusalNoticed =
+    do
+        at <- freshScratch "ipe-index-refusal-unbound"
+        _ <- seedProgressScratch at
+        insertRefusal at.indexDb "r-far" "zzz:src/blob.bin" "not-utf8" (SqlInt 4) (refusalDigestOf "a")
+        page <- loadPageNow Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (page.refusalsOpen
+                == 0
+                && List.isEmpty page.refusals
+                && page.refusalsUnbound
+                == 1
+                && String.contains "· 1 unreviewable file in unbound repositories not shown" (Queue.pageHeaderText page)
+            )
+
+
+-- The index's escape of a name parses back to exactly that name, and text
+-- it never writes parses to nothing: a raw character it escapes, an escape
+-- of a character it writes bare or of a leading zero, a byte of a name that
+-- is not UTF-8, a code point that is no character, an escape left open.
+-- Red if a form the index never writes resolves to a file.
+shownEscapeParsedExactly : Bool
+shownEscapeParsedExactly =
+    let
+        e =
+            String.fromList [ Char.fromCode 233 ]
+
+        backslash =
+            String.fromList [ Char.fromCode 92 ]
+
+        accepted =
+            [ ( "ipe:src/a b.rs", "ipe:src/a b.rs" )
+            , ( "ipe:src/" ++ backslash ++ "u{e9}.txt", "ipe:src/" ++ e ++ ".txt" )
+            , ( "ipe:src/" ++ backslash ++ backslash ++ "x", "ipe:src/" ++ backslash ++ "x" )
+            , ( backslash ++ "u{9}", String.fromList [ Char.fromCode 9 ] )
+            , ( backslash ++ "u{10ffff}", String.fromList [ Char.fromCode 1114111 ] )
+            ]
+
+        refused =
+            [ "ipe:src/" ++ e ++ ".txt"
+            , backslash ++ "u{41}"
+            , backslash ++ "u{20}"
+            , backslash ++ "u{5c}"
+            , backslash ++ "u{0e9}"
+            , backslash ++ "u{E9}"
+            , backslash ++ "u{}"
+            , backslash ++ "u{d800}"
+            , backslash ++ "u{110000}"
+            , backslash ++ "u{1000000}"
+            , backslash ++ "x{ff}"
+            , backslash ++ "u{e9"
+            , backslash ++ "ue9"
+            , "a" ++ backslash
+            , backslash ++ "n"
+            ]
+    in
+    List.all (\( stored, name ) -> Index.unescapeShown stored == Just name) accepted
+        && List.all (\stored -> Index.unescapeShown stored == Nothing) refused
+
+
+-- An oversized file whose name the index escapes is acknowledged at that
+-- name; the escape of a name it does not hold is refused. Red if the
+-- re-probe joins the stored form instead of the name it escapes.
+escapedRefusalAcknowledged : Task.Task Error Bool
+escapedRefusalAcknowledged =
+    do
+        at <- freshScratch "ipe-index-refusal-escaped"
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/" ++ String.fromList [ Char.fromCode 233 ] ++ ".txt") "0123456789"
+        writeFileText (at.repo ++ "/src/A.txt") "0123456789"
+        insertRefusal at.indexDb "r-e" "ipe:src/\\u{e9}.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        insertRefusal at.indexDb "r-a" "ipe:src/\\u{41}.txt" "too-large" (SqlInt 10) (refusalDigestOf "b")
+        digestE <- shownRefusalDigest "r-e"
+        digestA <- shownRefusalDigest "r-a"
+        decided <- decideRefusalNow db "r-e" digestE
+        acked <- case decided of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        refused <- refusedWith (Error.conflict "this file could not be re-probed, so it cannot be decided") (decideRefusalNow db "r-a" digestA)
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (acked.refusalsOpen == 1 && refused && rows == 1)
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2864,6 +2952,9 @@ checks =
             , check "an open unreviewable file keeps the queue from reading as all reviewed" openRefusalBlocksAllReviewed
             , check "an acknowledged file leaves the open set and a new digest re-opens it" acknowledgedRefusalReopensOnNewDigest
             , check "a refusal decision on a changed row or file, or without a key, is refused" refusalDecisionRefusedOnChange
+            , check "a refusal under an unbound tag is said in the header, never open" unboundRefusalNoticed
+            , Task.succeed ( "the index's path escape parses back exactly, and nothing else parses", shownEscapeParsedExactly )
+            , check "a file at an escaped name is acknowledged at the name it escapes" escapedRefusalAcknowledged
             , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
             ]
         Task.succeed (first ++ rest)
