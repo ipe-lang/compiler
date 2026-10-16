@@ -19,7 +19,7 @@ import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), R
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Links exposing (Hidden(..), Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SaveFailure(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
@@ -556,8 +556,8 @@ decisionErrorFixedText loaded =
             cardModel loaded
     in
     List.all
-        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decisionError = Just failure }))
-        [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+        (\failure -> has ("Decision save failed: " ++ Queue.saveFailureText failure) (page { card | decision = DecisionNotSaved failure }))
+        [ SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
         && not (has "Decision save failed: " (page card))
 
 
