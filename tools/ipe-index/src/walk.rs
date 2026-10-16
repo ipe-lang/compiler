@@ -93,13 +93,14 @@ impl Tracked {
     }
 }
 
-/// Build-output / VCS / generated path segments the index must NEVER touch, even
+/// Build-output / VCS / generated path segments the untracked walk skips, even
 /// when `.gitignore` hygiene is imperfect. The `--others` walk only respects
 /// `.gitignore`, so a crate that forgot to ignore its `target/` would otherwise
 /// flood the index with build artifacts (deps/fingerprints/rlibs) — defeating
 /// the bounded-memory guarantee that is this tool's whole reason to exist.
 /// Matched as a WHOLE path segment and case-sensitively, so legitimate source
-/// dirs are never hit.
+/// dirs are never hit. A tracked path is never skipped by name: a committed
+/// `src/target/x.sh` is content under review like any other.
 const SKIP_SEGMENTS: &[&str] = &[
     "target",
     "node_modules",
@@ -436,8 +437,8 @@ pub type Listed = Result<String, Refusal>;
 ///
 /// The stages of an unmerged path are one entry, refused for the first stage
 /// that is not a regular file. An object field that is not a full lowercase
-/// id fails the listing, since a refusal digest is taken over it. Paths under a
-/// build-output segment are dropped silently.
+/// id fails the listing, since a refusal digest is taken over it. Every
+/// tracked entry is kept, under a build-output segment too.
 pub fn parse_staged(out: &[u8]) -> Result<Vec<Listed>, WalkError> {
     let listing = Listing::Staged;
     let mut entries: Vec<(&[u8], Mode, Oid)> = Vec::new();
@@ -475,10 +476,9 @@ pub fn parse_staged(out: &[u8]) -> Result<Vec<Listed>, WalkError> {
     }
     Ok(entries
         .into_iter()
-        .filter_map(|(name, mode, oid)| match path_of(name) {
-            Err(refusal) => Some(Err(refusal.into())),
-            Ok(path) if !is_indexable(&path) => None,
-            Ok(path) => Some(mode.refusal(&path, oid).map_or(Ok(path), Err)),
+        .map(|(name, mode, oid)| match path_of(name) {
+            Err(refusal) => Err(refusal.into()),
+            Ok(path) => mode.refusal(&path, oid).map_or(Ok(path), Err),
         })
         .collect())
 }
@@ -859,11 +859,29 @@ pub fn read_owned(
         OnDisk::Claimed(tag) => return Err(ReadRefusal::Claimed(tag)),
         OnDisk::Refused(found) => return Err(ReadRefusal::NotRegular(found)),
     };
-    let file = File::open(root.join(&rel)).map_err(|e| match e.kind() {
+    let file = open_held(&root.join(&rel)).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => ReadRefusal::Absent,
         kind => ReadRefusal::Io(kind),
     })?;
     read_held(file, seen, budget)
+}
+
+/// Opens `path` for [`read_held`] without following a link at the leaf and
+/// without blocking: a FIFO or device swapped in after the no-follow check
+/// opens at once and is then refused by the handle check, never waited on.
+#[cfg(unix)]
+fn open_held(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+}
+
+/// Opens `path` for [`read_held`].
+#[cfg(not(unix))]
+fn open_held(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 /// Reads an opened file that must be the regular file `seen` names, capped.
@@ -1114,8 +1132,10 @@ mod tests {
         );
     }
 
+    // A tracked path is content under review wherever it sits: a build-output
+    // segment skips only untracked paths.
     #[test]
-    fn skips_build_output_dirs() {
+    fn keeps_tracked_paths_under_build_output_dirs() {
         let out = staged(&[
             ("100644", "runtime/src/path.rs"),
             ("100644", "tools/ipe-index/target/release/deps/foo.rs"),
@@ -1130,9 +1150,20 @@ mod tests {
         let listed = parse_staged(&out).unwrap();
         assert_eq!(
             admitted(&listed),
-            ["runtime/src/path.rs", "crates/ipe_lower/src/compile.rs"]
+            [
+                "runtime/src/path.rs",
+                "tools/ipe-index/target/release/deps/foo.rs",
+                "tools/ipe-index/target/debug/build/bar/out/baz.rs",
+                "web/node_modules/pkg/index.ts",
+                "examples/01/ipe-out/main.rs",
+                "crates/ipe_lower/src/compile.rs",
+            ]
         );
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 6);
+        assert_eq!(
+            admitted(&parse_untracked(b"target/x.rs\0a/incremental/y.rs\0ok.rs\0").unwrap()),
+            ["ok.rs"]
+        );
     }
 
     #[test]
@@ -1512,6 +1543,59 @@ mod tests {
             })
         );
         assert_eq!(low.left, 1024 * 1024);
+        std::fs::write(fx.0.join("mid2.rs"), vec![b'n'; mid]).unwrap();
+        let mut two = HashBudget::with_left(4 * 1024 * 1024);
+        assert!(matches!(
+            read_owned(&fx.0, "mid.rs", &[], &mut two),
+            Err(ReadRefusal::TooLarge { .. })
+        ));
+        assert_eq!(
+            read_owned(&fx.0, "mid2.rs", &[], &mut two),
+            Err(ReadRefusal::PastHashCeiling {
+                at_least: u64::try_from(mid).unwrap()
+            })
+        );
+        assert_eq!(two.left, 1024 * 1024);
+    }
+
+    // A FIFO put where the no-follow check saw a file is opened without
+    // waiting for a writer and refused by the handle check.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_after_the_check_is_refused_without_blocking() {
+        let fx = Fixture::new("fifo-swap");
+        let at = fx.0.join("a.rs");
+        std::fs::write(&at, "fn a() {}").unwrap();
+        let seen = FileId::of(&std::fs::symlink_metadata(&at).unwrap());
+        std::fs::remove_file(&at).unwrap();
+        assert!(Command::new("mkfifo").arg(&at).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let opener = std::thread::Builder::new().spawn(move || {
+            let read = open_held(&at)
+                .map_err(|e| ReadRefusal::Io(e.kind()))
+                .and_then(|file| read_held(file, seen, &mut HashBudget::new()));
+            let _ = tx.send(read);
+        });
+        assert!(opener.is_ok());
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(Err(ReadRefusal::Replaced))
+        );
+    }
+
+    // A file holding more bytes than its metadata reports is refused, never
+    // read past the length it was checked at.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_longer_than_its_reported_length_is_replaced() {
+        let at = Path::new("/proc/self/status");
+        let md = std::fs::metadata(at).unwrap();
+        assert!(md.is_file() && md.len() == 0);
+        let file = File::open(at).unwrap();
+        assert_eq!(
+            read_held(file, FileId::of(&md), &mut HashBudget::new()),
+            Err(ReadRefusal::Replaced)
+        );
     }
 
     // A binary file is refused with the digest of the bytes read.

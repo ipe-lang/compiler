@@ -165,24 +165,27 @@ file carries a content stamp (`blake3:` and the hex digest of the bytes its
 units were extracted from), and `update` compares it with the file on disk, so
 uncommitted edits, deletions and new untracked files are picked up exactly as a
 fresh `index` would see them. A path that `update` no longer lists, or can no
-longer read (gone, refused, over the read ceiling), leaves the index. Calls are
+longer read (gone, refused, over the read ceiling), loses its `files` row and
+units; a refused one gets its `refusals` row instead. Calls are
 resolved over the whole index after every `index` and `update`, so the
 callgraph is the same whatever order files were read in and whichever files
 `update` re-extracted. Both run in one transaction: a failed run leaves the
 previous index and queue in place.
 
-**What the walk indexes:** every regular file git tracks, plus the untracked
-files `.gitignore` does not exclude, read from NUL-separated git listings
+**What the walk indexes:** every regular file git tracks (a tracked path under
+`target/`, `node_modules/` or another build-output directory included), plus
+the untracked files `.gitignore` does not exclude outside those directories, read from NUL-separated git listings
 (`git ls-files -z -s`, `git ls-files -z --others`), so a newline in a name never
 splits it. The walk refuses, and names on stderr as `ipe-index: not indexing
 …`, any entry git records as a symbolic link (mode 120000) or a submodule
 (160000), an untracked nested repository, any name that is not UTF-8, and any
 path that is not a regular file on disk, checked without following links at the
 file and at every directory above it. Every read (indexing and `rename-symbol`)
-repeats that check, reads from the handle it opened only if it is the file the
-check saw, and stops at the 2 MB read ceiling. A file that becomes a link drops
-out of the index on the next `update`. A tracked `leak.rs -> /etc/passwd` never reaches the index or the
-review app:
+repeats that check, opens without following a link and without waiting on a
+FIFO, reads from the handle it opened only if it is the file the check saw, and
+stops at the 2 MB read ceiling. A file that becomes a link drops
+out of the index on the next `update`. A tracked `leak.rs -> /etc/passwd` is a `symlink-entry` refusal;
+its target is never read:
 
 ```bash
 ln -s /etc/passwd leak.rs && git add leak.rs
