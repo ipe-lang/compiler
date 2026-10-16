@@ -29,16 +29,13 @@ use crate::remote_ingest::{
 };
 use crate::text;
 
-/// The project-relative FFI cache directory.
-const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
-
 /// The project manifest that bounds the upward cache-discovery walk.
-const PROJECT_MANIFEST: &str = "package.ipe";
+const PROJECT_MANIFEST: &str = crate::package_manifest::PACKAGE_IPE;
 
 /// The legacy TOML manifest name the `ipe rust install` text inspector reads
 /// for `[rust.dependencies]` / `[rust.wrapper]`, pending the ergonomic Rust-FFI
 /// work that lifts those bindings out of a `package.ipe`.
-const PROJECT_MANIFEST_TOML: &str = "ipe.toml";
+const PROJECT_MANIFEST_TOML: &str = crate::project::IPE_TOML;
 
 /// The most entries one source-tree read lists, across every level, before it is refused.
 const TREE_ENTRY_CAP: EntryCap = EntryCap::from_nonzero(NonZeroU32::MIN.saturating_add(65_535));
@@ -53,7 +50,7 @@ fn absent_as_none<T>(result: Result<T, OpenRefusal>, path: &Path) -> Result<Opti
 }
 
 /// `dir` joined with each of `below`.
-fn joined(dir: &Path, below: &[&str]) -> PathBuf {
+pub(crate) fn joined(dir: &Path, below: &[&str]) -> PathBuf {
     below
         .iter()
         .fold(dir.to_path_buf(), |path, name| path.join(name))
@@ -315,7 +312,7 @@ pub fn find_cache_root(start: &Path) -> Result<Option<TrustedCache>, CliError> {
         start.parent()
     };
     while let Some(d) = dir {
-        if let Some(cache) = owner_trust::open_cache(d, CACHE_REL)? {
+        if let Some(cache) = owner_trust::open_cache(d)? {
             return Ok(Some(cache));
         }
         // Stop at the project root: do not walk above the nearest package.ipe.
@@ -4235,6 +4232,9 @@ pub(crate) fn rust_wrapper_header_accepted_by_ffi_reader(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The project-relative FFI cache directory.
+    const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
+
     #[test]
     fn ffi_proc_cap_override_refuses_zero_and_overflow() {
         use ipe_sandbox::run_jail::{ProcCap, ProcCapError};
@@ -6691,9 +6691,8 @@ version = \"1\"
         let outside = root.join("outside.rs");
         std::fs::write(&outside, "pub fn elsewhere() {}\n").expect("write link target");
         std::fs::write(cache.join("real_bindings.rs"), "pub fn f() {}\n").expect("write binding");
-        let cache_rel: Vec<&str> = ipe_ffi::driver::FFI_CACHE_REL.split('/').collect();
         let held = || {
-            open_project_dir(&root, &cache_rel)
+            open_project_dir(&root, &ipe_ffi::driver::FFI_CACHE_COMPONENTS)
                 .expect("open cache")
                 .expect("cache present")
         };

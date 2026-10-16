@@ -46,6 +46,9 @@
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 
+use ipe_canon::const_str_eq;
+use ipe_sandbox::VcsKind;
+
 use crate::{CliError, io_err, text};
 
 pub(crate) mod held;
@@ -71,16 +74,29 @@ const MAX_CLAIM_POLLS: u32 = 200;
 const _: () = assert!(MAX_CLAIM_POLLS > 0);
 
 /// The per-project namespace directory ipe keeps its caches in.
-pub const CACHE_NAMESPACE_DIR: &str = ".ipe";
+pub const CACHE_NAMESPACE_DIR: &str = ipe_ffi::driver::CACHE_NAMESPACE_DIR;
+
+/// The package cache entry inside [`CACHE_NAMESPACE_DIR`].
+pub const PACKAGES_SUBDIR: &str = "packages";
 
 /// A directory name no output may sit under, whichever project it belongs to.
 ///
-/// Matched per path component, ASCII case-insensitively (fail closed on a
-/// case-insensitive filesystem).
+/// Matched per path component as a case-folding volume may open it
+/// ([`ipe_fs_open::may_open_as`]), fail closed on a case-sensitive one.
+/// The set is closed: every variant has a directory name and a version-control
+/// kind through an exhaustive `match`, and a build-time check ties
+/// [`ReservedName::ALL`] to the declaration order, so none lacks a slot.
+/// `CacheNamespace` stays the last variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservedName {
-    /// Version-control metadata (`.git`).
-    Vcs,
+    /// Git metadata (`.git`).
+    Git,
+    /// Mercurial metadata (`.hg`).
+    Mercurial,
+    /// Jujutsu metadata (`.jj`).
+    Jujutsu,
+    /// Darcs metadata (`_darcs`).
+    Darcs,
     /// An ipe cache namespace ([`CACHE_NAMESPACE_DIR`]).
     ///
     /// `ipe clean` and the FFI binding regeneration delete its contents by name
@@ -90,26 +106,238 @@ pub enum ReservedName {
 }
 
 impl ReservedName {
-    /// Every reserved name.
-    const ALL: [Self; 2] = [Self::Vcs, Self::CacheNamespace];
+    /// Every reserved name, once each, in declaration order.
+    const ALL: [Self; Self::CacheNamespace as usize + 1] = [
+        Self::Git,
+        Self::Mercurial,
+        Self::Jujutsu,
+        Self::Darcs,
+        Self::CacheNamespace,
+    ];
 
     /// The reserved directory name.
     #[must_use]
     pub const fn dir_name(self) -> &'static str {
         match self {
-            Self::Vcs => ".git",
+            Self::Git => VcsKind::Git.entry_name(),
+            Self::Mercurial => VcsKind::Mercurial.entry_name(),
+            Self::Jujutsu => VcsKind::Jujutsu.entry_name(),
+            Self::Darcs => VcsKind::Darcs.entry_name(),
             Self::CacheNamespace => CACHE_NAMESPACE_DIR,
         }
     }
 
-    /// The reserved name `component` spells, in any ASCII case.
-    fn of(component: &std::ffi::OsStr) -> Option<Self> {
-        let name = component.to_string_lossy();
-        Self::ALL
-            .into_iter()
-            .find(|reserved| name.eq_ignore_ascii_case(reserved.dir_name()))
+    /// The version-control system whose metadata the name holds, if any.
+    const fn vcs(self) -> Option<VcsKind> {
+        match self {
+            Self::Git => Some(VcsKind::Git),
+            Self::Mercurial => Some(VcsKind::Mercurial),
+            Self::Jujutsu => Some(VcsKind::Jujutsu),
+            Self::Darcs => Some(VcsKind::Darcs),
+            Self::CacheNamespace => None,
+        }
     }
 }
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `ALL` drifts from the variant order [ledger #boundary]
+const _: () = assert!({
+    let mut rest = ReservedName::ALL.as_slice();
+    let mut slot = 0;
+    let mut in_order = true;
+    while let [head, tail @ ..] = rest {
+        in_order = in_order && *head as usize == slot;
+        slot += 1;
+        rest = tail;
+    }
+    in_order
+});
+
+impl ReservedName {
+    /// The reserved name a case-folding volume may open `component` as
+    /// ([`ipe_fs_open::may_open_as`]).
+    fn of(component: &std::ffi::OsStr) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reserved| ipe_fs_open::may_open_as(component, reserved.dir_name()))
+    }
+}
+
+/// Whether no two reserved names are equal in any ASCII case.
+const fn reserved_names_distinct() -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        let mut others = rest;
+        while let [other, tail @ ..] = others {
+            if row
+                .dir_name()
+                .as_bytes()
+                .eq_ignore_ascii_case(other.dir_name().as_bytes())
+            {
+                return false;
+            }
+            others = tail;
+        }
+        rows = rest;
+    }
+    true
+}
+
+/// Whether every reserved name is one plain path component on every platform.
+///
+/// Non-empty, neither `.` nor `..`, ASCII, and free of `/`, `\`, `:` and NUL.
+const fn reserved_names_plain() -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        let name = row.dir_name().as_bytes();
+        if matches!(name, [] | [b'.'] | [b'.', b'.']) {
+            return false;
+        }
+        let mut bytes = name;
+        while let [byte, tail @ ..] = bytes {
+            if !byte.is_ascii() || matches!(*byte, b'/' | b'\\' | b':' | 0) {
+                return false;
+            }
+            bytes = tail;
+        }
+        rows = rest;
+    }
+    true
+}
+
+/// Whether every version-control kind has a reserved row named as the kind names its metadata.
+///
+/// A row that claims a kind under any other name fails too.
+const fn every_vcs_kind_reserved() -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        if let Some(kind) = row.vcs()
+            && !const_str_eq(row.dir_name(), kind.entry_name())
+        {
+            return false;
+        }
+        rows = rest;
+    }
+    let mut kinds: &[VcsKind] = &VcsKind::ALL;
+    while let [kind, rest @ ..] = kinds {
+        if !reserves_vcs_kind(*kind) {
+            return false;
+        }
+        kinds = rest;
+    }
+    true
+}
+
+/// Whether some reserved row names `kind` and its metadata entry.
+const fn reserves_vcs_kind(kind: VcsKind) -> bool {
+    let mut rows: &[ReservedName] = &ReservedName::ALL;
+    while let [row, rest @ ..] = rows {
+        if let Some(named) = row.vcs()
+            && const_str_eq(named.entry_name(), kind.entry_name())
+            && const_str_eq(row.dir_name(), kind.entry_name())
+        {
+            return true;
+        }
+        rows = rest;
+    }
+    false
+}
+
+/// Whether `names` holds `name`, byte for byte.
+const fn lists_name(names: &[&str], name: &str) -> bool {
+    let mut rest = names;
+    while let [listed, tail @ ..] = rest {
+        if const_str_eq(listed, name) {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if two reserved names collide in any ASCII case [ledger #boundary]
+const _: () = assert!(reserved_names_distinct());
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a reserved name is not one plain path component [ledger #boundary]
+const _: () = assert!(reserved_names_plain());
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a version-control kind has no reserved row [ledger #boundary]
+const _: () = assert!(every_vcs_kind_reserved());
+// The watcher cannot import this crate, so its copies of the layout names are asserted equal here.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the watcher's excluded directories or manifest name drift from the project layout [ledger #boundary]
+const _: () = assert!(
+    lists_name(ipe_watch::scope::EXCLUDED_DIR_NAMES, CACHE_NAMESPACE_DIR)
+        && lists_name(
+            ipe_watch::scope::EXCLUDED_DIR_NAMES,
+            crate::cache::CACHE_DIR_NAME
+        )
+        && lists_name(ipe_watch::scope::EXCLUDED_DIR_NAMES, DEFAULT_OUTPUT_DIR)
+        && const_str_eq(
+            ipe_watch::scope::MANIFEST_FILE,
+            crate::package_manifest::PACKAGE_IPE
+        )
+);
+
+/// Whether `a` and `b` hold the same names in the same order, byte for byte.
+#[cfg(test)]
+const fn same_names(a: &[&str], b: &[&str]) -> bool {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_tail @ ..], [y, b_tail @ ..]) if const_str_eq(x, y) => {
+                a = a_tail;
+                b = b_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `a` and `b` hold the same component paths in the same order, component by component.
+#[cfg(test)]
+const fn same_markers(a: &[&[&str]], b: &[&[&str]]) -> bool {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            ([x, a_tail @ ..], [y, b_tail @ ..]) if same_names(x, y) => {
+                a = a_tail;
+                b = b_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `names` are the [`ReservedName::ALL`] directory names, in order.
+#[cfg(test)]
+const fn reserved_names_are(names: &[&str]) -> bool {
+    let (mut rows, mut names): (&[ReservedName], &[&str]) = (&ReservedName::ALL, names);
+    loop {
+        match (rows, names) {
+            ([], []) => return true,
+            ([row, rows_tail @ ..], [name, names_tail @ ..])
+                if const_str_eq(row.dir_name(), name) =>
+            {
+                rows = rows_tail;
+                names = names_tail;
+            }
+            _ => return false,
+        }
+    }
+}
+
+// The test temp root cannot import this crate, so its copies of the project markers and reserved names are asserted equal here.
+#[cfg(test)]
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the test BUILD if the temp-root proof's markers or reserved names drift from the project layout [ledger #boundary]
+const _: () = assert!(
+    same_markers(
+        &ipe_test_temp::PROJECT_MARKERS,
+        &[
+            &[crate::package_manifest::PACKAGE_IPE],
+            &[crate::project::IPE_TOML],
+            &ipe_ffi::driver::FFI_CACHE_COMPONENTS,
+        ]
+    ) && reserved_names_are(&ipe_test_temp::RESERVED_COMPONENTS)
+);
 
 /// The first line of every [`OWNERSHIP_MARKER`].
 ///
@@ -302,8 +530,12 @@ impl std::fmt::Display for OutputRefusal {
             }
             Self::InsideReservedDir {
                 out,
-                reserved: ReservedName::Vcs,
-            } => text::output_inside_vcs(&out.display()),
+                reserved:
+                    reserved @ (ReservedName::Git
+                    | ReservedName::Mercurial
+                    | ReservedName::Jujutsu
+                    | ReservedName::Darcs),
+            } => text::output_inside_vcs(&out.display(), &reserved.dir_name()),
             Self::InsideReservedDir {
                 out,
                 reserved: ReservedName::CacheNamespace,
@@ -3266,13 +3498,142 @@ mod tests {
             matches!(
                 refused(&result),
                 Some(OutputRefusal::InsideReservedDir {
-                    reserved: ReservedName::Vcs,
+                    reserved: ReservedName::Git,
                     ..
                 })
             ),
             "--out under .git must be refused, got {result:?}"
         );
         assert!(!raw.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The reserved set, spelled out once, so a row dropped from the list is seen.
+    #[test]
+    fn reserved_names_pin() {
+        let names: std::collections::BTreeSet<&str> = ReservedName::ALL
+            .into_iter()
+            .map(ReservedName::dir_name)
+            .collect();
+        let pinned = std::collections::BTreeSet::from([".git", ".hg", ".jj", "_darcs", ".ipe"]);
+        assert_eq!(names, pinned);
+        assert_eq!(
+            ReservedName::ALL.len(),
+            pinned.len(),
+            "no name is listed twice"
+        );
+    }
+
+    /// `name` with its letters alternately upper- and lower-cased, starting upper.
+    fn mixed_case(name: &str) -> String {
+        name.chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i.is_multiple_of(2) {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect()
+    }
+
+    /// `name` as a Unicode-folding volume still opens it: led by a byte-order
+    /// mark HFS+ ignores, with `s`, `i` and `k` swapped for the long s, the
+    /// dotless i and the Kelvin sign.
+    fn unicode_folded(name: &str) -> String {
+        std::iter::once('\u{FEFF}')
+            .chain(name.chars().map(|c| match c {
+                's' => '\u{17F}',
+                'i' => '\u{131}',
+                'k' => '\u{212A}',
+                other => other,
+            }))
+            .collect()
+    }
+
+    /// Every reserved name refuses an output, in any case or Unicode fold, as
+    /// the last or an inner component.
+    #[test]
+    fn every_reserved_name_refuses_output() {
+        let base = scratch("every_reserved");
+        let proj = project(&base);
+        let elsewhere = base.join("elsewhere");
+        for reserved in ReservedName::ALL {
+            let name = reserved.dir_name();
+            for spelled in [
+                name.to_owned(),
+                name.to_ascii_uppercase(),
+                mixed_case(name),
+                unicode_folded(name),
+                unicode_folded(&name.to_ascii_uppercase()),
+            ] {
+                for target in [
+                    elsewhere.join(spelled.as_str()),
+                    elsewhere.join(spelled.as_str()).join("out"),
+                ] {
+                    let result = check_disjoint(&target, &proj).map(|_| ());
+                    assert!(
+                        matches!(
+                            refused(&result),
+                            Some(OutputRefusal::InsideReservedDir { reserved: got, .. })
+                                if *got == reserved
+                        ),
+                        "output at {} must be refused as {reserved:?}, got {result:?}",
+                        target.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            check_disjoint(&elsewhere.join("out"), &proj).is_ok(),
+            "the same base with no reserved component is admitted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Each version-control refusal names its own directory, not another system's.
+    #[test]
+    fn reserved_dir_refusal_names_the_dir() {
+        for reserved in ReservedName::ALL {
+            let shown = OutputRefusal::InsideReservedDir {
+                out: PathBuf::from("o"),
+                reserved,
+            }
+            .to_string();
+            let name = format!("`{}`", reserved.dir_name());
+            assert!(
+                shown.contains(&name),
+                "{reserved:?} refusal must name {name}, got {shown:?}"
+            );
+            for other in ReservedName::ALL.into_iter().filter(|o| *o != reserved) {
+                let other = format!("`{}`", other.dir_name());
+                assert!(
+                    !shown.contains(&other),
+                    "{reserved:?} refusal must not name {other}, got {shown:?}"
+                );
+            }
+        }
+    }
+
+    /// A name that only resembles a reserved one is admitted: the match is per whole component.
+    #[test]
+    fn near_reserved_names_admit() {
+        let base = scratch("near_reserved");
+        let proj = project(&base);
+        for name in [".gitx", ".ipe-cache", "ipe", ".i pe", "git", "_darcsx"] {
+            assert_eq!(
+                ReservedName::of(std::ffi::OsStr::new(name)),
+                None,
+                "{name:?} is not reserved"
+            );
+            let target = base.join("elsewhere").join(name).join("out");
+            let result = check_disjoint(&target, &proj).map(|_| ());
+            assert!(
+                result.is_ok(),
+                "output under {name:?} is admitted, got {result:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

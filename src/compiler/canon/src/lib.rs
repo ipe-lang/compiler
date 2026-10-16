@@ -32,7 +32,7 @@ use ipe_intern::{Interner, Symbol};
 
 pub use env::{
     CtorHome, Env, ModuleCatalog, STDLIB_MODULE_QUALIFIERS, VarHome, bare_import_binds,
-    kernel_import_binds_last_segment, stdlib_canonical_qualifier,
+    const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
     ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,

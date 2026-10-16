@@ -3360,6 +3360,7 @@ dependencies = [
  "ipe-test-temp",
  "rustix 0.38.44",
  "syn 3.0.6",
+ "unicode-normalization",
  "winapi-util",
 ]
 

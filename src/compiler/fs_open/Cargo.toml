@@ -19,6 +19,9 @@ e2e-support = { path = "../../../tools/e2e-support" }
 # The public-surface scan reads this crate's own syntax tree. The version and
 # features the workspace already builds, so no new package compiles.
 syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
+# The reserved-name match pins its spelling rule against the normalization
+# tables. The version the workspace already builds, so no new package compiles.
+unicode-normalization = "0.1.25"
 
 [lints]
 workspace = true

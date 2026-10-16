@@ -44,7 +44,10 @@ enum Proof {
 
 /// The entries ipe writes in the `.ipe/` namespace: its build caches and the
 /// fetched package sources.
-const CACHE_NAMESPACE_ENTRIES: &[&str] = &["cache", "packages"];
+const CACHE_NAMESPACE_ENTRIES: &[&str] = &[
+    ipe_ffi::driver::CACHE_SUBDIR,
+    crate::output_dir::PACKAGES_SUBDIR,
+];
 
 /// The deletion allowlist — nothing outside it is ever a candidate.
 const GENERATED_DIRS: &[Generated] = &[
@@ -381,9 +384,17 @@ mod tests {
         proof: Proof::Marker,
     };
     const DOT_IPE: &Generated = &Generated {
-        name: ".ipe",
+        name: crate::output_dir::CACHE_NAMESPACE_DIR,
         proof: Proof::Namespace(CACHE_NAMESPACE_ENTRIES),
     };
+
+    /// The allowlist built from the layout constants spells the layout ipe writes.
+    #[test]
+    fn clean_entries_follow_layout() {
+        assert_eq!(CACHE_NAMESPACE_ENTRIES, ["cache", "packages"]);
+        let names: Vec<&str> = GENERATED_DIRS.iter().map(|g| g.name).collect();
+        assert_eq!(names, ["out", ".ipe"]);
+    }
 
     /// `remove_generated_dir` deletes an ipe-owned output directory and reports it.
     #[test]
