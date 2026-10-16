@@ -2619,6 +2619,175 @@ saveFailureTyped =
         && List.all (\text -> not (String.contains "[5]" text) && not (String.contains "Unexpected" text)) texts
 
 
+-- ── unreviewable files ──────────────────────────────────────────────────
+--
+-- A file the index could not review is an open item of the queue until a
+-- decision binds its refusal digest; a decision is written only after the
+-- refusal row and the file are re-proved.
+
+
+-- One refusal row for fixture id `label` at the stored `path`, inserted
+-- under the real schema's CHECKs.
+insertRefusal : String -> String -> String -> String -> SqlValue -> SqlValue -> Task.Task Error ()
+insertRefusal indexDb label path reason size digest =
+    execIndex indexDb
+        "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', ?, ?, ?)"
+        [ Uid.toSql (uid label), SqlString path, SqlString reason, size, digest ]
+
+
+-- A well-formed refusal digest whose 64 hex digits all read `digit`.
+refusalDigestOf : String -> SqlValue
+refusalDigestOf digit =
+    SqlString ("refusal-blake3:" ++ String.repeat 64 digit)
+
+
+-- The digest the first queue page shows for refusal `label`.
+shownRefusalDigest : String -> Task.Task Error Index.RefusalDigest
+shownRefusalDigest label =
+    loadPageNow Index.Start
+        |> Task.andThen
+            (\page ->
+                case Maybe.andThen (\row -> row.digest) (List.find (\row -> row.uid == uid label) page.refusals) of
+                    Just digest ->
+                        Task.succeed digest
+
+                    Nothing ->
+                        Task.fail (Error.conflict ("refusal " ++ label ++ " is not shown with a digest"))
+            )
+
+
+-- Refusal `label` acknowledged under the test key, bound to `digest`.
+decideRefusalNow : Db -> String -> Index.RefusalDigest -> Task.Task Error ( Index.Attested, Index.Written )
+decideRefusalNow db label digest =
+    envAppSettings |> Task.andThen (\settings -> Queue.decideRefusal settings.key settings.index db (uid label) digest Approved)
+
+
+-- Every unit decided and drained, one acknowledgeable file still open: the
+-- queue does not read as empty, the file is counted in the progress total
+-- and named in the header. Red if the page's counts or its empty state leave
+-- out the index's refusals.
+openRefusalBlocksAllReviewed : Task.Task Error Bool
+openRefusalBlocksAllReviewed =
+    do
+        at <- freshScratch "ipe-index-refusal-open"
+        db <- seedProgressScratch at
+        insertRefusal at.indexDb "r-bin" "ipe:src/blob.bin" "not-utf8" (SqlInt 4) (refusalDigestOf "a")
+        decidedA <- decideNow db (uid "u-a") Approved
+        afterA <- case decidedA of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        decidedB <- decideNow db (uid "u-b") Approved
+        page <- case decidedB of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        cleanupProgressScratch at
+        Task.succeed
+            (afterA.total
+                == 1
+                && page.total
+                == 0
+                && page.refusalsOpen
+                == 1
+                && List.map (\row -> row.uid) page.refusals
+                == [ uid "r-bin" ]
+                && page.progress.total
+                == page.progress.reviewed
+                + 1
+                && Queue.queueStatusText (Loaded page)
+                == Just "No units queued, but 1 unreviewable file still open."
+                && String.contains "· 1 unreviewable file open" (Queue.pageHeaderText page)
+            )
+
+
+-- An acknowledged file leaves the open set and counts as reviewed; a new
+-- refusal digest for it (the file changed) re-opens it. Red if a decision
+-- does not bind the digest, or if membership matches the uid alone.
+acknowledgedRefusalReopensOnNewDigest : Task.Task Error Bool
+acknowledgedRefusalReopensOnNewDigest =
+    do
+        at <- freshScratch "ipe-index-refusal-ack"
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        before <- loadPageNow Index.Start
+        digest <- shownRefusalDigest "r-big"
+        decided <- decideRefusalNow db "r-big" digest
+        acked <- case decided of
+            ( attested, written ) ->
+                drainThenLoadNow attested written Index.Start
+        execIndex at.indexDb "UPDATE refusals SET digest = ? WHERE uid = ?" [ refusalDigestOf "b", Uid.toSql (uid "r-big") ]
+        reopened <- loadPageNow Index.Start
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed
+            (before.refusalsOpen
+                == 1
+                && acked.refusalsOpen
+                == 0
+                && List.isEmpty acked.refusals
+                && acked.progress.reviewed
+                == before.progress.reviewed
+                + 1
+                && acked.progress.total
+                == before.progress.total
+                && reopened.refusalsOpen
+                == 1
+                && rows
+                == 1
+            )
+
+
+-- A refusal decision is refused, and nothing is logged, when between the
+-- page and the decision the row turns blocking, takes another digest, or
+-- leaves the index, or when the file now reads as text; and on a server
+-- with no key. Red if any re-proof is skipped.
+refusalDecisionRefusedOnChange : Task.Task Error Bool
+refusalDecisionRefusedOnChange =
+    do
+        blocking <- refusalDecisionAfter "ipe-index-refusal-blocking" "UPDATE refusals SET reason = 'unreadable', size = NULL, digest = NULL" (Error.conflict "this file cannot be acknowledged; fix it in the tree")
+        changed <- refusalDecisionAfter "ipe-index-refusal-changed" "UPDATE refusals SET digest = 'refusal-blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'" (Error.conflict "source changed since it was shown; reload")
+        gone <- refusalDecisionAfter "ipe-index-refusal-gone" "DELETE FROM refusals" (Error.conflict "file is no longer unreviewable in the index; reload")
+        readable <- refusalDecisionAfter "ipe-index-refusal-readable" "UPDATE refusals SET reason = 'not-utf8'" (Error.conflict "file now reads as text; re-run the index")
+        shrunk <- refusalDecisionAfter "ipe-index-refusal-shrunk" "UPDATE refusals SET size = 11" (Error.conflict "file now reads as text; re-run the index")
+        readOnly <- refusalReadOnlyRefused
+        Task.succeed (blocking && changed && gone && readable && shrunk && readOnly)
+
+
+-- True when refusal `r-big`, an oversized text file shown with its digest,
+-- is refused with exactly `expected` after `sql` ran on the index, and no
+-- log row was written.
+refusalDecisionAfter : String -> String -> Error -> Task.Task Error Bool
+refusalDecisionAfter name sql expected =
+    do
+        at <- freshScratch name
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        digest <- shownRefusalDigest "r-big"
+        execIndex at.indexDb sql []
+        refused <- refusedWith expected (decideRefusalNow db "r-big" digest)
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0)
+
+
+-- A server with no key acknowledges nothing: the decision is refused with
+-- the read-only error before the index or the file is read.
+refusalReadOnlyRefused : Task.Task Error Bool
+refusalReadOnlyRefused =
+    do
+        at <- freshScratch "ipe-index-refusal-read-only"
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        digest <- shownRefusalDigest "r-big"
+        settings <- envAppSettings
+        refused <- refusedWith ReviewKey.readOnlyError (Queue.decideRefusal ReadOnly settings.index db (uid "r-big") digest Approved)
+        rows <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0)
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     do
@@ -2692,6 +2861,9 @@ checks =
             , check "a progress rebuild succeeds over 6,000 one-pair pages" resyncSucceedsAtSixThousandPages
             , check "a progress rebuild refuses one pair past a 6,000-page ceiling" resyncRefusesSixThousandAndOnePages
             , check "a progress rebuild succeeds at exactly ceiling times page size" resyncSucceedsAtExactCeilingTimesPageSize
+            , check "an open unreviewable file keeps the queue from reading as all reviewed" openRefusalBlocksAllReviewed
+            , check "an acknowledged file leaves the open set and a new digest re-opens it" acknowledgedRefusalReopensOnNewDigest
+            , check "a refusal decision on a changed row or file, or without a key, is refused" refusalDecisionRefusedOnChange
             , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
             ]
         Task.succeed (first ++ rest)
