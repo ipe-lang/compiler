@@ -141,7 +141,7 @@ pub(super) fn mount_overlay() -> Option<Rc<OverlayState>> {
     match result {
         Ok(state) => Some(Rc::new(state)),
         Err(refusal) => {
-            super::console_warn(&format!("debugger-overlay mount failed: {refusal}"));
+            super::console_warn_refusal("DebuggerOverlayMountFailed", &refusal);
             None
         }
     }

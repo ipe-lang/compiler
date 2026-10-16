@@ -4352,11 +4352,7 @@ impl std::fmt::Display for StartupRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RouteTable(refusal) => write!(f, "{refusal}"),
-            Self::SessionStore(e) => write!(
-                f,
-                "session store misconfigured: {}",
-                crate::system::scrub_log_controls(&e.to_string())
-            ),
+            Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
             Self::BasePath { base, refusal } => {
                 write!(f, "web base path `{base}` is malformed: {refusal}")
             }
@@ -14614,15 +14610,33 @@ mod emitted_router_behavior_tests {
     /// reaches the startup error or the log.
     #[test]
     fn store_refusal_display_is_scrubbed() {
-        let cause = StartupRefusal::SessionStore(store::StoreConfigError(
-            "bad\n[ipe.live] forged\u{1b}[31m\u{202e}".to_string(),
-        ));
+        let cause = StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+            backend: "postgres",
+            cause: crate::system::RefusedText::new("bad\n[ipe.live] forged\u{1b}[31m\u{202e}"),
+        });
         let shown = cause.to_string();
         assert!(
             !shown.chars().any(crate::system::is_log_hazard),
             "a raw control survived: {shown:?}"
         );
         assert_eq!(shown.lines().count(), 1, "{shown:?}");
+    }
+
+    /// A store refusal's cause is scrubbed once, where the refusal is built: a
+    /// `\` in it renders as `\\`, never re-escaped to `\\\\` on its way to the
+    /// startup error.
+    #[test]
+    fn store_refusal_scrubs_the_cause_once() {
+        let cause = StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+            backend: "postgres",
+            cause: crate::system::RefusedText::new("host a\\b"),
+        });
+        assert_eq!(
+            cause.to_string(),
+            "session store misconfigured: IPE_WEB_STORE=postgres refused at connect \
+             (host a\\\\b); fix the connection URL or the server, or set \
+             IPE_WEB_STORE=file|memory"
+        );
     }
 
     /// A mounted routed app whose table holds a malformed pattern answers every
@@ -14727,10 +14741,10 @@ mod emitted_router_behavior_tests {
                 crate::web::route::check_route_table(&malformed_routes())
                     .expect_err("the table is malformed"),
             ),
-            StartupRefusal::SessionStore(store::StoreConfigError(
-                "IPE_WEB_STORE=postgres refused at connect (postgres://user:hunter2@db.internal/app)"
-                    .to_string(),
-            )),
+            StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+                backend: "postgres",
+                cause: crate::system::RefusedText::new("postgres://user:hunter2@db.internal/app"),
+            }),
             parse_route_base("/%zz").expect_err("the base is malformed"),
             StartupRefusal::FrameAncestors(
                 crate::telemetry::FrameAncestors::parse("https://a.example\r\n")

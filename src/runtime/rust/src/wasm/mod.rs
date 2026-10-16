@@ -60,6 +60,22 @@ fn console_fatal(class: &str, detail: &str) {
     web_sys::console::error_1(&JsValue::from_str(&line));
 }
 
+/// [`console_fatal`] for a mount refusal, whose `Display` is already scrubbed:
+/// the line is built by [`crate::web::route::console_refusal_line`], which
+/// scrubs only the class.
+fn console_fatal_refusal(class: &str, refusal: &MountRefusal) {
+    let line = crate::web::route::console_refusal_line(class, refusal);
+    web_sys::console::error_1(&JsValue::from_str(&line));
+}
+
+/// The warning-level sibling of [`console_fatal_refusal`], for a refusal the
+/// app survives.
+#[cfg(feature = "debugger")]
+fn console_warn_refusal(class: &str, refusal: &MountRefusal) {
+    let line = crate::web::route::console_refusal_line(class, refusal);
+    web_sys::console::warn_1(&JsValue::from_str(&line));
+}
+
 /// Shared non-fatal diagnostic sink — reused by `ws_client.rs`'s
 /// `web_socket_connect_with` (browser platform limitations that degrade
 /// rather than fail, e.g. unsettable custom headers), and by the emitted
@@ -113,7 +129,7 @@ where
         match mount_app(init, update, view, subscriptions) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("MountFailed", &e.to_string());
+                console_fatal_refusal("MountFailed", &e);
                 IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
@@ -156,7 +172,7 @@ where
         match adopt_app(model, update, view, subscriptions) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("AdoptFailed", &e.to_string());
+                console_fatal_refusal("AdoptFailed", &e);
                 IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }
@@ -218,7 +234,7 @@ where
         ) {
             Ok(()) => IpeResult::Ok(()),
             Err(e) => {
-                console_fatal("MountFailed", &e.to_string());
+                console_fatal_refusal("MountFailed", &e);
                 IpeResult::Err(E::from_ipe_error(e.into()))
             }
         }

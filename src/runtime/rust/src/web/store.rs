@@ -1158,11 +1158,11 @@ impl StoreOpenError {
 
 /// The fail-closed startup error for a `backend` store a policy gate refused.
 #[cfg(feature = "db")]
-fn store_refused_error(backend: &str, refused: &StoreOpenError) -> StoreConfigError {
-    StoreConfigError(format!(
-        "IPE_WEB_STORE={backend} refused at connect ({refused}); fix the connection URL \
-         or the server, or set IPE_WEB_STORE=file|memory"
-    ))
+fn store_refused_error(backend: &'static str, refused: &StoreOpenError) -> StoreConfigError {
+    StoreConfigError::Refused {
+        backend,
+        cause: crate::system::RefusedText::new(&refused.to_string()),
+    }
 }
 
 /// The `[ipe.live]` message logged when a persistent `backend` store falls back
@@ -1762,14 +1762,43 @@ enum StoreBackend {
     Redis,
 }
 
-/// A requested backend this build cannot serve — a fail-closed startup error,
-/// carrying the operator-facing message.
+/// A requested backend this build cannot serve — a fail-closed startup error.
+///
+/// The only text it quotes from outside the runtime, a connect refusal's
+/// cause, is held as [`crate::system::RefusedText`], so its `Display` is safe
+/// for a log line as is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoreConfigError(pub String);
+pub enum StoreConfigError {
+    /// `IPE_WEB_STORE` names a backend this build was compiled without.
+    FeatureAbsent {
+        /// The requested backend, as `IPE_WEB_STORE` spells it.
+        backend: &'static str,
+        /// The cargo feature that backend needs.
+        feature: &'static str,
+    },
+    /// A connect-time policy gate refused the persistent backend.
+    Refused {
+        /// The requested backend, as `IPE_WEB_STORE` spells it.
+        backend: &'static str,
+        /// The gate's credential-free report.
+        cause: crate::system::RefusedText,
+    },
+}
 
 impl std::fmt::Display for StoreConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::FeatureAbsent { backend, feature } => write!(
+                f,
+                "IPE_WEB_STORE={backend} requested but this build has no `{feature}` feature; \
+                 build with `{feature}` or set IPE_WEB_STORE=file|memory"
+            ),
+            Self::Refused { backend, cause } => write!(
+                f,
+                "IPE_WEB_STORE={backend} refused at connect ({cause}); fix the connection URL \
+                 or the server, or set IPE_WEB_STORE=file|memory"
+            ),
+        }
     }
 }
 
@@ -1793,34 +1822,30 @@ impl StoreBackend {
                 if cfg!(feature = "db") {
                     Ok(StoreBackend::Sqlite)
                 } else {
-                    Err(StoreConfigError(
-                        "IPE_WEB_STORE=sqlite requested but this build has no `db` \
-                         feature; build with `db` or set IPE_WEB_STORE=file|memory"
-                            .to_string(),
-                    ))
+                    Err(StoreConfigError::FeatureAbsent {
+                        backend: "sqlite",
+                        feature: "db",
+                    })
                 }
             }
             "postgres" => {
                 if cfg!(feature = "db") {
                     Ok(StoreBackend::Postgres)
                 } else {
-                    Err(StoreConfigError(
-                        "IPE_WEB_STORE=postgres requested but this build has no `db` \
-                         feature; build with `db` or set IPE_WEB_STORE=file|memory"
-                            .to_string(),
-                    ))
+                    Err(StoreConfigError::FeatureAbsent {
+                        backend: "postgres",
+                        feature: "db",
+                    })
                 }
             }
             "redis" => {
                 if cfg!(feature = "redis_store") {
                     Ok(StoreBackend::Redis)
                 } else {
-                    Err(StoreConfigError(
-                        "IPE_WEB_STORE=redis requested but this build has no \
-                         `redis_store` feature; build with `redis_store` or set \
-                         IPE_WEB_STORE=file|memory"
-                            .to_string(),
-                    ))
+                    Err(StoreConfigError::FeatureAbsent {
+                        backend: "redis",
+                        feature: "redis_store",
+                    })
                 }
             }
             _ => Ok(StoreBackend::Memory),
@@ -2287,7 +2312,18 @@ mod tests {
                 refused.is_some(),
                 "{url:?} must refuse startup, not fall back to memory"
             );
-            if let Some(StoreConfigError(msg)) = refused {
+            if let Some(refused) = refused {
+                assert!(
+                    matches!(
+                        refused,
+                        StoreConfigError::Refused {
+                            backend: "postgres",
+                            ..
+                        }
+                    ),
+                    "{refused:?}"
+                );
+                let msg = refused.to_string();
                 assert!(msg.contains("refused"), "unexpected refusal: {msg}");
                 assert!(!msg.contains("s3cr3t-pw"), "password leaked: {msg}");
                 assert!(!msg.contains("admin"), "user leaked: {msg}");
@@ -3490,12 +3526,18 @@ mod tests {
             err.is_some(),
             "a sqlite request without `db` must fail closed, not serve a store"
         );
-        if let Some(StoreConfigError(msg)) = err {
-            assert!(
-                msg.contains("sqlite") && msg.contains("db"),
-                "the error must name the missing feature: {msg:?}"
-            );
-        }
+        assert_eq!(
+            err,
+            Some(StoreConfigError::FeatureAbsent {
+                backend: "sqlite",
+                feature: "db"
+            })
+        );
+        let msg = err.map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            msg.contains("sqlite") && msg.contains("`db`"),
+            "the error must name the missing feature: {msg:?}"
+        );
     }
 
     /// The dev path is untouched: `file` always parses to a real `FileStore`,
