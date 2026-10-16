@@ -40,7 +40,9 @@ pub const MAX_SESSIONS: CeilingKey = CeilingKey::new(
         purpose: "Maximum concurrent web sessions; a new or returning session past it \
                   answers 503. Independently, the measured state of all sessions together \
                   (model, rendered view, render history, queued browser events) is \
-                  capped at 512 MiB, and of one session at 16 MiB. Read once, at \
+                  capped at 512 MiB, and of one session at 16 MiB. One session runs at \
+                  most 64 commands at once; the next is refused with a `LimitExceeded` \
+                  error delivered to the program, and the session stays live. Read once, at \
                   process start; a value that is not a positive decimal integer (`0` \
                   included) refuses the program before its first line, naming the \
                   variable.",
@@ -87,6 +89,25 @@ mod tests {
         }
         for admitted in [Some("1"), Some("50000"), None] {
             assert!(judged(admitted).is_empty(), "{admitted:?} must admit");
+        }
+    }
+
+    /// The purpose text states the figures the web budgets enforce.
+    #[cfg(feature = "web")]
+    #[test]
+    fn max_sessions_purpose_states_the_budget_figures() {
+        use crate::web::budget::{SESSION_BUDGET, SESSION_CEILING, SESSION_CMD_CEILING};
+        let mib = |bytes: crate::retained::Bytes| format!("{} MiB", bytes.get() / (1024 * 1024));
+        let purpose = MAX_SESSIONS.entry().purpose();
+        for figure in [
+            mib(SESSION_BUDGET),
+            mib(SESSION_CEILING),
+            format!("at most {} commands at once", SESSION_CMD_CEILING.get()),
+        ] {
+            assert!(
+                purpose.contains(&figure),
+                "{figure:?} missing from {purpose:?}"
+            );
         }
     }
 

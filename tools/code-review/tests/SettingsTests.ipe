@@ -1438,6 +1438,49 @@ bindRefusalNamesRemedy =
         && String.contains "\"\\u{1b}[31m\"" escaped
 
 
+-- The rule a refused value is told it broke: it is not one of the accepted
+-- spellings, which the text lists.
+bindRule : String
+bindRule =
+    "which is not one of the accepted loopback spellings (127.0.0.1, ::1)"
+
+
+-- A refusal states the accepted-spelling rule, never a claim about loopback
+-- addresses in general: `127.0.0.2` is a loopback address the parser does not
+-- read, so it is told the spellings, not that it is no loopback address. The
+-- same text refuses an exposed address.
+bindRefusalStatesRule : Bool
+bindRefusalStatesRule =
+    let
+        loopbackOther =
+            bindRefusalShown (NotLoopback "127.0.0.2")
+
+        exposed =
+            bindRefusalShown (NotLoopback "0.0.0.0")
+    in
+    String.contains ("IPE_HTTP_BIND is \"127.0.0.2\", " ++ bindRule) loopbackOther
+        && String.contains ("IPE_HTTP_BIND is \"0.0.0.0\", " ++ bindRule) exposed
+        && not (String.contains "not a loopback address" loopbackOther)
+        && not (String.contains "not a loopback address" exposed)
+
+
+-- The text cannot drift from the parser: there are exactly the two accepted
+-- spellings, each is accepted as itself, and each appears in the refusal's
+-- problem and its remedy, which lists them as `127.0.0.1 or ::1`.
+bindRefusalListsAcceptedSpellings : Bool
+bindRefusalListsAcceptedSpellings =
+    let
+        shown =
+            bindRefusalShown (NotLoopback "0.0.0.0")
+    in
+    Bind.acceptedSpellings
+        == [ "127.0.0.1", "::1" ]
+        && List.all (\spelling -> bindParsed (Settings.EnvSet spelling) == Ok spelling) Bind.acceptedSpellings
+        && List.all (\spelling -> String.contains spelling shown) Bind.acceptedSpellings
+        && String.contains ("(" ++ String.join ", " Bind.acceptedSpellings ++ ")") shown
+        && String.contains ("set it to " ++ String.join " or " Bind.acceptedSpellings ++ ",") shown
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -1465,4 +1508,6 @@ checks =
         , Task.succeed ( "every other bind spelling is refused as not loopback, naming the value read", bindRefusesOtherValues )
         , Task.succeed ( "an empty bind is refused as empty and an unreadable one as unreadable", bindRefusesEmptyAndUnreadable )
         , Task.succeed ( "a bind refusal names the variable, both accepted values and the SSH tunnel, echoing capped and escaped", bindRefusalNamesRemedy )
+        , Task.succeed ( "a bind refusal states the accepted-spelling rule for 127.0.0.2 and 0.0.0.0, never that the value is no loopback address", bindRefusalStatesRule )
+        , Task.succeed ( "a bind refusal lists exactly the spellings the parser accepts, each accepted as itself", bindRefusalListsAcceptedSpellings )
         ]
