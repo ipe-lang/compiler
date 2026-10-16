@@ -15,7 +15,7 @@ use crate::LimitRefusal;
 use crate::tea::{PerformBody, PerformFuture};
 
 /// What [`admit`] made of one `Perform` body.
-pub(crate) enum Admit<M> {
+pub enum Admit<M> {
     /// The body started under a held permit.
     Run(AdmittedCmd<M>),
     /// The body's failure Msg; the effect never started.
@@ -23,13 +23,13 @@ pub(crate) enum Admit<M> {
 }
 
 /// A started `Perform` body and the permit it holds until its Msg is handed over.
-pub(crate) struct AdmittedCmd<M> {
+pub struct AdmittedCmd<M> {
     fut: PerformFuture<M>,
     permit: CmdPermit,
 }
 
 /// Start `body` under one of the session's Cmd units, or refuse it unstarted.
-pub(crate) fn admit<M>(body: Box<dyn PerformBody<M>>, cmds: &SessionCmds) -> Admit<M> {
+pub fn admit<M>(body: Box<dyn PerformBody<M>>, cmds: &SessionCmds) -> Admit<M> {
     match cmds.try_permit() {
         Ok(permit) => Admit::Run(AdmittedCmd {
             fut: body.run(),
@@ -76,7 +76,7 @@ impl<M: Send> AdmittedCmd<M> {
     /// # Errors
     ///
     /// The Msg back when the session queue is closed; the unit returns then too.
-    pub(crate) async fn finish(self, tx: &Sender<M>) -> Result<(), SendError<M>> {
+    pub async fn finish(self, tx: &Sender<M>) -> Result<(), SendError<M>> {
         let Self { fut, permit } = self;
         let msg = fut.await;
         let sent = tx.send(msg).await;
@@ -90,7 +90,7 @@ impl<M: Send> AdmittedCmd<M> {
 /// A full or closed queue drops the Msg: awaiting room would stall the driver
 /// on its own queue, and a sender task per refusal would make refusals an
 /// unbounded task count. The effect was never started either way.
-pub(crate) fn deliver_refusal<M>(msg: M, tx: &Sender<M>, cmds: &SessionCmds) {
+pub fn deliver_refusal<M>(msg: M, tx: &Sender<M>, cmds: &SessionCmds) {
     if let Ok(slot) = tx.try_reserve() {
         slot.send(msg);
     } else if cmds.first_dropped_refusal() {
