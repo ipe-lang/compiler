@@ -2,13 +2,13 @@ module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
+import Ipe.Result exposing (Result(..))
 import Ipe.Server.Http as Server
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.Result exposing (Result(..))
 import Lib.App as App exposing (Model, Msg(..), Page(..))
 import Lib.Bind as Bind
 import Lib.Db as LibDb

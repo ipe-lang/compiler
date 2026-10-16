@@ -2598,7 +2598,7 @@ saveFailureTyped =
             "database is locked [5]"
 
         cases =
-            [ SaveInFlight, SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
+            [ SaveOffQueue, SaveReadOnly, SaveContended, SaveFailed ]
 
         texts =
             List.map Queue.saveFailureText cases
