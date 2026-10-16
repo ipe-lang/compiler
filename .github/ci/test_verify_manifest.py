@@ -60,6 +60,14 @@ check_ci_suites_required = verify_manifest.check_ci_suites_required
 check_feature_coverage = verify_manifest.check_feature_coverage
 check_release_target_parity = verify_manifest.check_release_target_parity
 
+def _load(root: str, errors: list[str]) -> verify_manifest.WorkflowSet:
+    """The typed workflow load `main` runs once, its refusals recorded as
+    `main` records them, for a check under test to consume."""
+    wfs = verify_manifest.WorkflowSet.load(root)
+    errors.extend(wfs.rendered())
+    return wfs
+
+
 with open(os.path.join(HERE, "github-env-allowlist.txt")) as _f:
     VALID_ENV_ALLOWLIST = _f.read()
 
@@ -109,7 +117,7 @@ class WorkflowFixture:
 
     def errors(self) -> list[str]:
         errors: list[str] = []
-        check_workflow_steps(errors, root=self.root)
+        check_workflow_steps(_load(self.root, errors), errors)
         return errors
 
 
@@ -941,7 +949,7 @@ class TestRustcWiringClosure(unittest.TestCase):
             "    steps:\n      - run: cargo build\n"
             "    steps:\n      - run: RUSTC_WRAPPER=evil cargo build\n",
         )
-        self.assertRefused("ci.yml is not valid YAML", "duplicate key")
+        self.assertRefused("ci.yml: is not valid YAML", "duplicate key", "[YAML_INVALID]")
 
     def test_merge_key_workflow_is_refused(self) -> None:
         self.fx.workflow(
@@ -950,7 +958,7 @@ class TestRustcWiringClosure(unittest.TestCase):
             "name: ci\non: push\njobs:\n  clippy:\n"
             "    <<: *base\n    steps:\n      - run: cargo build\n",
         )
-        self.assertRefused("ci.yml is not valid YAML")
+        self.assertRefused("ci.yml: is not valid YAML", "[YAML_INVALID]")
 
     def test_anchor_alias_workflow_is_refused(self) -> None:
         self.fx.workflow(
@@ -958,7 +966,7 @@ class TestRustcWiringClosure(unittest.TestCase):
             "name: ci\non: push\njobs:\n  clippy: &clippy\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - run: cargo build\n  clippy2: *clippy\n",
         )
-        self.assertRefused("ci.yml is not valid YAML")
+        self.assertRefused("ci.yml: is not valid YAML", "[YAML_INVALID]")
 
 
 class TestRustCacheSavesMainOnly(unittest.TestCase):
@@ -1020,7 +1028,7 @@ class TestRustCacheSavesMainOnly(unittest.TestCase):
 
     def test_live_workflows_all_save_main_only(self) -> None:
         errors: list[str] = []
-        check_workflow_steps(errors, root=os.path.dirname(HERE))
+        check_workflow_steps(_load(os.path.dirname(HERE), errors), errors)
         self.assertFalse([e for e in errors if "rust-cache" in e], errors)
 
 
@@ -1877,11 +1885,14 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
     def test_pure_tool_runs_pass(self) -> None:
         for run in (
             "python3 .github/ci/verify-manifest.py",
-            "python3 .github/ci/verify-manifest.py -v --strict",
             "bash .github/ci/artifact-guard.sh",
             ".github/ci/artifact-guard.sh",
         ):
             self.job_accepted(f"- uses: {_CHECKOUT}\n" + _run("Verify", run))
+
+    def test_unlisted_tool_argv_is_no_tool_run(self) -> None:
+        for run in ("python3 .github/ci/verify-manifest.py -v --strict", "python3 .github/ci/rerun_policy.py --x"):
+            self.job_refused(f"- uses: {_CHECKOUT}\n" + _run("Verify", run), "step 'Verify'", "closed pre-tool shapes")
 
     # ---- env is one allowlist ------------------------------------------
 
@@ -2366,7 +2377,7 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
             self.assertNotIn("continue-on-error", masking.job)
         verdict = vm.ROLE_MASKING[vm.ToolRole.VERDICT]
         self.assertEqual(verdict.step | verdict.job, frozenset())
-        self.assertEqual(vm.TOOL_ROLES.get("verify-manifest.py", vm.ToolRole.VERDICT), vm.ToolRole.VERDICT)
+        self.assertIs(vm.tool_role("verify-manifest.py", ()), vm.ToolRole.VERDICT)
 
     def test_step_scoped_event_keys_are_refused_outside_one_step(self) -> None:
         for key in ("MERGE_GROUP_BASE_SHA", "RUN_ID"):
@@ -2378,10 +2389,19 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
 
     def test_lane_tool_roles_are_pinned(self) -> None:
         vm = verify_manifest
-        self.assertEqual(vm.TOOL_ROLES["change_class.py"], vm.ToolRole.ADVISORY)
-        self.assertEqual(vm.TOOL_ROLES["rerun_policy.py"], vm.ToolRole.OUTPUT)
-        for verdict in ("prose_guard.py", "e2e_shard.py", "nightly_green.py", "check_required_set.py"):
-            self.assertEqual(vm.TOOL_ROLES.get(verdict, vm.ToolRole.VERDICT), vm.ToolRole.VERDICT, verdict)
+        self.assertIs(vm.tool_role("change_class.py", ("--code",)), vm.ToolRole.ADVISORY)
+        self.assertIs(vm.tool_role("rerun_policy.py", ("--decide",)), vm.ToolRole.OUTPUT)
+        self.assertIs(vm.tool_role("rerun_policy.py", ("--lint",)), vm.ToolRole.VERDICT)
+        for verdict, argv in (("prose_guard.py", ()), ("e2e_shard.py", ("--plan",)),
+                              ("nightly_green.py", ("--verdict",)), ("check_required_set.py", ("--fetch",))):
+            self.assertIs(vm.tool_role(verdict, argv), vm.ToolRole.VERDICT, verdict)
+        self.assertTrue(vm.maintainer_tool("check_required_set.py", ("--render-put", "/tmp/rs.json")))
+        self.assertFalse(vm.maintainer_tool("check_required_set.py", ("--fetch",)))
+        for name, argv in (("verify-manifest.py", ("--help",)), ("check_required_set.py", ("--write",)),
+                           ("strict_yaml.py", ()), ("new.py", ())):
+            self.assertIsNone(vm.tool_role(name, argv), (name, argv))
+        for name, argv in vm.MAINTAINER_TOOLS:
+            self.assertNotIn(argv, vm.TOOL_INVOCATIONS.get(name, {}), name)
 
     def test_advisory_classifier_admits_no_job_if_or_step_if(self) -> None:
         run = "python3 .github/ci/change_class.py --code"
@@ -2392,7 +2412,7 @@ class TestToolOrderingAndClosedShells(unittest.TestCase):
     def test_live_masked_tool_jobs_parse_as_output_jobs(self) -> None:
         vm = verify_manifest
         errors: list[str] = []
-        wfs = {wf.fname: wf for wf in vm._load_workflows(vm.REPO_ROOT, errors)}
+        wfs = {wf.fname: wf for wf in _load(vm.REPO_ROOT, errors).workflows}
         self.assertEqual(errors, [])
         for fname, job_id, masking in (
             ("ci.yml", "cancel-on-cheap-red", {"if"}),
@@ -2582,6 +2602,13 @@ _ENV_MAIN_ONLY = {
 _POLICIES_MAIN = {"total_count": 1, "branch_policies": [{"id": 1, "name": "main", "type": "branch"}]}
 
 
+def crs_put_keys() -> tuple[str, ...]:
+    """`check_required_set.PUT_KEYS`, imported from this directory."""
+    import check_required_set  # noqa: PLC0415
+
+    return check_required_set.PUT_KEYS
+
+
 class TestSsotOutputTools(unittest.TestCase):
     """The SSOT-publishing tools fail closed on a malformed SSOT: exit 1 and
     write no output, so a consumer keeps its fail-safe default."""
@@ -2767,6 +2794,66 @@ class TestSsotOutputTools(unittest.TestCase):
             with self.subTest(content=content):
                 self.put("rs.json", content)
                 self.assertFailsClosed("check_required_set.py", "--live", os.path.join(self.dir, "rs.json"))
+
+    # ---- --render-put: the one ruleset PUT body ------------------------
+
+    def _render_put(self, rs: object) -> tuple[int, str, str]:
+        self.put("rs.json", json.dumps(rs).encode())
+        return self.run_tool("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+
+    def test_render_put_refuses_an_unparsed_live_body(self) -> None:
+        self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n")
+        self.put("required-set.json", _RS_A)
+        for label, rs in (
+            ("unexamined top-level key", _ruleset(frob=1)),
+            ("a bypass actor", _ruleset(bypass_actors=[{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}])),
+            ("no bypass_actors", {k: v for k, v in _ruleset().items() if k != "bypass_actors"}),
+            ("disabled", _ruleset(enforcement="disabled")),
+            ("unexamined rule type", _ruleset(rules=_ruleset()["rules"] + [{"type": "update"}])),
+            ("malformed pair", _ruleset(checks=[{"context": "a"}])),
+            ("not an object", []),
+        ):
+            with self.subTest(label=label):
+                self.put("rs.json", json.dumps(rs).encode())
+                self.assertFailsClosed("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+        for content in (None, b"", b"{"):
+            with self.subTest(content=content):
+                self.put("rs.json", content)
+                self.assertFailsClosed("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+
+    def test_render_put_refuses_a_required_set_off_the_manifest(self) -> None:
+        self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n- context: b\n  disposition: gate\n")
+        for label, content in (("missing context", _RS_A), ("extra context", json.dumps(
+            [{"context": c, "integration_id": 15368} for c in ("a", "b", "c")]).encode())):
+            with self.subTest(label=label):
+                self.put("required-set.json", content)
+                self.put("rs.json", json.dumps(_ruleset()).encode())
+                self.assertFailsClosed("check_required_set.py", "--render-put", os.path.join(self.dir, "rs.json"))
+
+    def test_render_put_applies_the_required_set_to_a_drifted_body(self) -> None:
+        self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n- context: b\n  disposition: gate\n")
+        want = [{"context": "a", "integration_id": 15368}, {"context": "b", "integration_id": 15368}]
+        self.put("required-set.json", json.dumps(want).encode())
+        for label, live in (
+            ("missing context", [_PAIR_A]),
+            ("extra context", [*want, {"context": "z", "integration_id": 15368}]),
+            ("other integration", [{"context": "a", "integration_id": 1}]),
+            ("already applied", want),
+        ):
+            with self.subTest(label=label):
+                rc, stdout, stderr = self._render_put(_ruleset(checks=live))
+                self.assertEqual(rc, 0, stderr)
+                body = json.loads(stdout)
+                self.assertEqual(tuple(body), crs_put_keys())
+                status = [r for r in body["rules"] if r["type"] == "required_status_checks"]
+                self.assertEqual(len(status), 1)
+                self.assertEqual(status[0]["parameters"]["required_status_checks"], want)
+                # Every rule but the status rule is the live one, unchanged.
+                self.assertEqual([r for r in body["rules"] if r["type"] != "required_status_checks"],
+                                 [r for r in _ruleset()["rules"] if r["type"] != "required_status_checks"])
+                # The body, re-read as the GET returns it, passes `--live`.
+                self.put("rs.json", json.dumps({**body, "id": 22326541}).encode())
+                self.assertEqual(self.run_tool("check_required_set.py", "--live", os.path.join(self.dir, "rs.json"))[0], 0)
 
     def test_check_required_set_fetch_needs_its_environment(self) -> None:
         self.put("check-manifest.yml", b"checks:\n- context: a\n  disposition: gate\n")
@@ -3191,17 +3278,15 @@ class TestDeterministicSetMasking(unittest.TestCase):
                 "name: ci\non: push\njobs:\n"
                 "  clippy:\n    runs-on: ubuntu-latest\n" + textwrap.indent(job_extra, "    ")
                 + "    steps:\n      - name: Run clippy\n        run: cargo clippy\n"
-                + textwrap.indent(step_extra, "        "),
+                + textwrap.indent(step_extra, "        ")
+                + f"  {vm.CANCEL_WATCHER_JOB_ID}:\n    name: cancel\n    needs: [clippy]\n"
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: echo cancel\n",
             )
-            jobs = [
-                vm.Job("ci.yml", "clippy", ["clippy"], []),
-                vm.Job("ci.yml", vm.CANCEL_WATCHER_JOB_ID, ["cancel"], ["clippy"]),
-            ]
             errors: list[str] = []
-            with mock.patch.object(vm, "REPO_ROOT", tmp), mock.patch.object(
-                vm, "load_deterministic_checks", lambda errs: [("clippy", "Run clippy")]
+            with mock.patch.object(
+                vm, "load_deterministic_checks", lambda errs, root: [("clippy", "Run clippy")]
             ):
-                vm.check_deterministic_set(jobs, errors)
+                vm.check_deterministic_set(_load(tmp, errors), errors)
             return errors
 
     def test_unmasked_check_and_a_path_filter_if_pass(self) -> None:
@@ -3275,7 +3360,7 @@ class TestMergeQueueSafety(unittest.TestCase):
     def errors(self, content: str, *, gates: set[str] | None = None) -> list[str]:
         self.fx.workflow("gate.yml", content)
         errors: list[str] = []
-        check_merge_queue({"gate.yml"} if gates is None else gates, errors, root=self.fx.root)
+        check_merge_queue(_load(self.fx.root, errors), {"gate.yml"} if gates is None else gates, errors)
         return errors
 
     def assertRefused(self, content: str, needle: str, **kw: object) -> None:
@@ -3342,7 +3427,7 @@ class TestMergeQueueSafety(unittest.TestCase):
     def admin_errors(self, fname: str, content: str) -> list[str]:
         self.fx.workflow(fname, content)
         errors: list[str] = []
-        check_merge_queue(set(), errors, root=self.fx.root)
+        check_merge_queue(_load(self.fx.root, errors), set(), errors)
         return errors
 
     def assertAdminRefused(self, fname: str, content: str, needle: str) -> None:
@@ -3607,7 +3692,7 @@ class TestReleaseOnlySkipAsPass(unittest.TestCase):
     def errors(self, content: str, *, gates: set[str] | None = None) -> list[str]:
         self.fx.workflow("gate.yml", content)
         errors: list[str] = []
-        check_release_only_skips({"heavy (linux)"} if gates is None else gates, errors, root=self.fx.root)
+        check_release_only_skips(_load(self.fx.root, errors), {"heavy (linux)"} if gates is None else gates, errors)
         return errors
 
     def assertRefused(self, content: str, needle: str) -> None:
@@ -3801,7 +3886,7 @@ class TestFastGateFirst(unittest.TestCase):
     def errors(self, content: str, *, gates: set[str] = _FG_GATES) -> list[str]:
         _write(os.path.join(self.root, "workflows", "ci.yml"), content)
         errors: list[str] = []
-        check_fast_gate_first(gates, errors, root=self.root)
+        check_fast_gate_first(_load(self.root, errors), gates, errors)
         return errors
 
     def assertRefused(self, content: str, needle: str, **kw: object) -> None:
@@ -3813,7 +3898,7 @@ class TestFastGateFirst(unittest.TestCase):
 
     def test_repo_ci_yml_passes(self) -> None:
         errors: list[str] = []
-        check_fast_gate_first(_FG_GATES, errors)
+        check_fast_gate_first(_load(verify_manifest.REPO_ROOT, errors), _FG_GATES, errors)
         self.assertEqual(errors, [])
 
     def test_heavy_shard_missing_a_fast_gate_refused(self) -> None:
@@ -3882,15 +3967,17 @@ class TestFastGateFirst(unittest.TestCase):
         bad = _FG_OK.replace(
             "needs: [test-prep, fmt, clippy, manifest-lock-consistency, panic-scan]", "needs: {a: b}"
         )
-        self.assertRefused(bad, "'test-run' has a malformed `needs:`")
+        self.assertRefused(bad, "job 'test-run' needs:")
+        self.assertRefused(bad, "[NEEDS_NOT_LIST]")
 
     def test_unreadable_workflow_refused(self) -> None:
-        self.assertRefused("jobs: [", "cannot read")
+        self.assertRefused("jobs: [", "[YAML_INVALID]")
+        self.assertRefused("jobs: [", "check 10: ci.yml is not a loaded workflow")
 
     def test_missing_workflow_refused(self) -> None:
         errors: list[str] = []
-        check_fast_gate_first(_FG_GATES, errors, root=self.root)
-        self.assertTrue(any("cannot read" in e for e in errors), errors)
+        check_fast_gate_first(_load(self.root, errors), _FG_GATES, errors)
+        self.assertTrue(any("check 10: ci.yml is not a loaded workflow" in e for e in errors), errors)
 
 
 # A head-free pull_request_target + merge_group workflow: the shape
@@ -4021,7 +4108,7 @@ class TestPhaseRouting(unittest.TestCase):
     def errors(self, content: str, *, gates: frozenset[str] = _PH_GATES) -> list[str]:
         _write(os.path.join(self.root, "workflows", "ci.yml"), content)
         errors: list[str] = []
-        check_phase_routing(set(gates), errors, root=self.root)
+        check_phase_routing(_load(self.root, errors), set(gates), errors)
         return errors
 
     def assertRefused(self, old: str, new: str, needle: str, **kw: object) -> None:
@@ -4037,7 +4124,7 @@ class TestPhaseRouting(unittest.TestCase):
             str(e["context"]) for e in verify_manifest.load_manifest()["checks"] if e.get("disposition") == "gate"
         }
         errors: list[str] = []
-        check_phase_routing(gates, errors)
+        check_phase_routing(_load(verify_manifest.REPO_ROOT, errors), gates, errors)
         self.assertEqual(errors, [])
 
     def test_workflow_outside_the_merge_queue_is_not_routed(self) -> None:
@@ -4277,7 +4364,7 @@ class TestPhaseRouting(unittest.TestCase):
         any other spelling still trips it."""
         _write(os.path.join(self.root, "workflows", "ci.yml"), _PH_OK)
         errors: list[str] = []
-        check_merge_queue(set(), errors, root=self.root)
+        check_merge_queue(_load(self.root, errors), set(), errors)
         self.assertEqual(errors, [])
         bad = _PH_OK.replace(
             "needs.changes.outputs.cheap == 'true'\n    steps:\n      - run: echo fmt",
@@ -4287,7 +4374,7 @@ class TestPhaseRouting(unittest.TestCase):
         self.assertNotEqual(bad, _PH_OK)
         _write(os.path.join(self.root, "workflows", "ci.yml"), bad)
         errors = []
-        check_merge_queue(set(), errors, root=self.root)
+        check_merge_queue(_load(self.root, errors), set(), errors)
         self.assertTrue(any("without `&& github.event_name != 'merge_group'`" in e for e in errors), errors)
 
 
@@ -4403,7 +4490,7 @@ class TestPullRequestTarget(unittest.TestCase):
     def errors(self, content: str) -> list[str]:
         self.fx.workflow("prt.yml", content)
         errors: list[str] = []
-        check_pull_request_target(errors, root=self.fx.root)
+        check_pull_request_target(_load(self.fx.root, errors), errors)
         return errors
 
     def assertRefused(self, content: str, needle: str) -> None:
@@ -4516,7 +4603,7 @@ class TestPullRequestTarget(unittest.TestCase):
         self.assertRefused(bad, "interpolates")
 
     def test_whitespace_normalised_token_admitted(self) -> None:
-        self.assertEqual(self.errors(_PRT_OK.replace("${{ github.token }}", "${{   github.token\t}}")), [])
+        self.assertEqual(self.errors(_PRT_OK.replace("${{ github.token }}", "${{   github.token   }}")), [])
 
     def test_missing_permissions_refused(self) -> None:
         bad = _PRT_OK.replace("permissions:\n  contents: read\n  pull-requests: read\n", "")
@@ -4550,7 +4637,7 @@ class TestPullRequestTarget(unittest.TestCase):
 
     def test_live_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_pull_request_target(errors)
+        check_pull_request_target(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_live_trust_root_diff_is_head_free_under_both_triggers(self) -> None:
@@ -4559,7 +4646,7 @@ class TestPullRequestTarget(unittest.TestCase):
         self.assertIn("pull_request_target", live)
         self.assertEqual(self.errors(live), [])
         errors: list[str] = []
-        check_merge_queue({"prt.yml"}, errors, root=self.fx.root)
+        check_merge_queue(_load(self.fx.root, errors), {"prt.yml"}, errors)
         self.assertEqual(errors, [])
 
 
@@ -4610,7 +4697,7 @@ class TestHeadFreeExemption(unittest.TestCase):
     def test_live_workspaces(self) -> None:
         vm = verify_manifest
         errors: list[str] = []
-        wfs = {wf.fname: wf.workspace for wf in vm._load_workflows(vm.REPO_ROOT, errors)}
+        wfs = {wf.fname: wf.workspace for wf in _load(vm.REPO_ROOT, errors).workflows}
         self.assertEqual(errors, [])
         self.assertEqual(sorted(f for f, w in wfs.items() if w is vm.Workspace.NONE), ["trust-root-diff.yml"])
         self.assertIs(wfs["ci.yml"], vm.Workspace.CHECKOUT)
@@ -4811,7 +4898,7 @@ class TestPushConcurrency(unittest.TestCase):
             _write(os.path.join(self.root, "workflows", n), c)
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.LATEST_WINS_PUSH_GROUPS, {}, clear=True):
-            check_push_concurrency(errors, root=self.root)
+            check_push_concurrency(_load(self.root, errors), errors)
         return errors
 
     def group(self, group: str) -> list[str]:
@@ -4889,13 +4976,13 @@ class TestPushConcurrency(unittest.TestCase):
         _write(os.path.join(self.root, "workflows", "w.yml"), _PUSH_WF.replace("GROUP", "pages"))
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.LATEST_WINS_PUSH_GROUPS, {"w.yml": "r", "gone.yml": "r"}, clear=True):
-            check_push_concurrency(errors, root=self.root)
+            check_push_concurrency(_load(self.root, errors), errors)
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("gone.yml", errors[0])
 
     def test_live_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_push_concurrency(errors)
+        check_push_concurrency(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_every_live_exemption_carries_a_reason(self) -> None:
@@ -4933,7 +5020,7 @@ class TestMergeGroupConcurrency(unittest.TestCase):
         _write(os.path.join(self.root, "workflows", "w.yml"), content)
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.LATEST_WINS_PUSH_GROUPS, {}, clear=True):
-            check_push_concurrency(errors, root=self.root)
+            check_push_concurrency(_load(self.root, errors), errors)
         return errors
 
     def site(self, group: str, cancel: str) -> list[str]:
@@ -5192,6 +5279,10 @@ class TestDependabotPrBudget(unittest.TestCase):
 _IB_OK = """\
 on: pull_request
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo classify
   build-tools:
     runs-on: ubuntu-latest
     steps:
@@ -5246,7 +5337,7 @@ class TestOneIpeBuild(unittest.TestCase):
             _write(os.path.join(self.repo, rel), text)
         _write(os.path.join(self.root, "workflows", "ci.yml"), content)
         errors: list[str] = []
-        check_one_ipe_build(errors, root=self.root, tracked=sorted(self.files))
+        check_one_ipe_build(_load(self.root, errors), errors, tracked=sorted(self.files))
         return errors
 
     def with_consumer_step(self, run: str, extra: str = "") -> str:
@@ -5266,7 +5357,7 @@ class TestOneIpeBuild(unittest.TestCase):
 
     def test_repo_ci_yml_passes(self) -> None:
         errors: list[str] = []
-        check_one_ipe_build(errors)
+        check_one_ipe_build(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_second_ipe_build_refused_in_every_spelling(self) -> None:
@@ -5426,7 +5517,8 @@ class TestOneIpeBuild(unittest.TestCase):
         self.assertRefused(bad, "does not upload 'ci-ipe-release'")
 
     def test_unreadable_workflow_refused(self) -> None:
-        self.assertRefused("jobs: [1]\n", "has no `jobs:` mapping")
+        self.assertRefused("jobs: [1]\n", "[JOBS_NOT_MAPPING]")
+        self.assertRefused("jobs: [1]\n", "check 15: ci.yml is not a loaded workflow")
 
 
 
@@ -5464,6 +5556,10 @@ _SC_FILES = {
 _SC_WF = """\
 on: pull_request
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo classify
   asan:
     needs: changes
     if: needs.changes.outputs.emit != 'false' || github.event_name != 'pull_request'
@@ -5491,7 +5587,7 @@ class TestScopedPackageCoverage(unittest.TestCase):
         _write(os.path.join(self.repo, ".github", "workflows", "ci.yml"), wf)
         errors: list[str] = []
         with mock.patch.dict(verify_manifest.change_class.SCOPES, {"emit": scope}):
-            check_scoped_package_coverage(errors, root=os.path.join(self.repo, ".github"), tracked=sorted(self.files))
+            check_scoped_package_coverage(_load(os.path.join(self.repo, ".github"), errors), errors, tracked=sorted(self.files))
         return errors
 
     def assertRefused(self, needle: str, **kw: object) -> None:
@@ -5503,7 +5599,7 @@ class TestScopedPackageCoverage(unittest.TestCase):
 
     def test_repo_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_scoped_package_coverage(errors)
+        check_scoped_package_coverage(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_uncovered_path_dependency_refused(self) -> None:
@@ -5625,7 +5721,7 @@ class TestDriftSeesUntracked(unittest.TestCase):
         _write(os.path.join(self.root, "workflows", "ci.yml"), wf)
         _write(os.path.join(self.root, "ci", "check-manifest.yml"), manifest)
         errors: list[str] = []
-        check_drift_sees_untracked(errors, root=self.root)
+        check_drift_sees_untracked(_load(self.root, errors), errors)
         return errors
 
     def test_valid_passes(self) -> None:
@@ -5633,7 +5729,7 @@ class TestDriftSeesUntracked(unittest.TestCase):
 
     def test_repo_passes(self) -> None:
         errors: list[str] = []
-        check_drift_sees_untracked(errors)
+        check_drift_sees_untracked(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_workflow_git_diff_exit_code_refused_in_every_spelling(self) -> None:
@@ -5696,7 +5792,7 @@ class TestDriftSeesUntracked(unittest.TestCase):
             self.assertTrue(any(path in e for e in errors), (path, errors))
 
     def test_unreadable_inputs_refused(self) -> None:
-        self.assertTrue(any("check 17: cannot read" in e for e in self.errors(wf="jobs: [\n")))
+        self.assertTrue(any("[YAML_INVALID]" in e for e in self.errors(wf="jobs: [\n")))
         self.assertTrue(any("no `checks:` list" in e for e in self.errors(manifest="checks: 1\n")))
 
 
@@ -5865,7 +5961,7 @@ class TestTestClaims(unittest.TestCase):
             _write(os.path.join(self.repo, rel), text)
         _write(os.path.join(self.root, "workflows", "ci.yml"), ci)
         errors: list[str] = []
-        check_test_claims(errors, root=self.root)
+        check_test_claims(_load(self.root, errors), errors)
         return errors
 
     def assertRefused(self, ci: str, needle: str) -> None:
@@ -5877,7 +5973,7 @@ class TestTestClaims(unittest.TestCase):
 
     def test_repo_passes(self) -> None:
         errors: list[str] = []
-        check_test_claims(errors)
+        check_test_claims(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_all_features_satisfies_the_cell(self) -> None:
@@ -6098,16 +6194,16 @@ class TestTestClaims(unittest.TestCase):
         self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="renamed"), "has no manifest entry produced by ci.yml")
 
     def test_owner_aggregated_by_required_gate_passes(self) -> None:
-        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - leg\n"
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - wasm\n"
         self.assertEqual(self.errors(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg")), [])
 
     def test_owner_aggregated_by_unrequired_gate_refused(self) -> None:
-        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - leg\n"
+        self.files[".github/ci/check-manifest.yml"] = _TC_MANIFEST + "    aggregates:\n      - wasm\n"
         self.files[".github/ci/required-set.json"] = json.dumps([{"context": "other", "integration_id": 15368}])
         self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg"), "blocks nothing")
 
     def test_owner_aggregated_by_advisory_refused(self) -> None:
-        manifest = _TC_MANIFEST.replace("gate", "advisory") + "    aggregates:\n      - leg\n"
+        manifest = _TC_MANIFEST.replace("gate", "advisory") + "    aggregates:\n      - wasm\n"
         self.files[".github/ci/check-manifest.yml"] = manifest
         self.assertRefused(_tc_ci(_TC_PIN + _TC_CLAIM % _TC_RUN, name="leg"), "blocks nothing")
 
@@ -6153,7 +6249,7 @@ class TestCiSuitesRequired(unittest.TestCase):
         wf = _SUITE_WF.replace("JOB_KEYS", job_keys).replace("STEP_KEYS", step_keys).replace("RUN", run)
         _write(os.path.join(self.root, "workflows", "w.yml"), wf)
         errors: list[str] = []
-        check_ci_suites_required(_SUITE_GATE if entries is None else entries, errors, root=self.root)
+        check_ci_suites_required(_load(self.root, errors), _SUITE_GATE if entries is None else entries, errors)
         return errors
 
     def assertRefused(self, errors: list[str]) -> None:
@@ -6189,7 +6285,7 @@ class TestCiSuitesRequired(unittest.TestCase):
 
     def test_live_tree_runs_every_suite(self) -> None:
         errors: list[str] = []
-        check_ci_suites_required(verify_manifest.load_manifest()["checks"], errors)
+        check_ci_suites_required(_load(verify_manifest.REPO_ROOT, errors), verify_manifest.load_manifest()["checks"], errors)
         self.assertEqual(errors, [])
 
 _FC_CI = """\
@@ -6238,9 +6334,7 @@ class TestFeatureCoverage(unittest.TestCase):
             _write(os.path.join(self.repo, rel), text)
         _write(os.path.join(self.root, "workflows", "ci.yml"), ci)
         errors: list[str] = []
-        check_feature_coverage(
-            _FC_ENTRIES if entries is None else entries, errors, root=self.root, tracked=sorted(self.files)
-        )
+        check_feature_coverage(_load(self.root, errors), _FC_ENTRIES if entries is None else entries, errors, tracked=sorted(self.files))
         return errors
 
     def assertRefused(self, ci: str, needle: str) -> None:
@@ -6255,7 +6349,7 @@ class TestFeatureCoverage(unittest.TestCase):
 
     def test_repo_passes(self) -> None:
         errors: list[str] = []
-        check_feature_coverage(verify_manifest.load_manifest()["checks"], errors)
+        check_feature_coverage(_load(verify_manifest.REPO_ROOT, errors), verify_manifest.load_manifest()["checks"], errors)
         self.assertEqual(errors, [])
 
     def test_uncovered_feature_refused(self) -> None:
@@ -6531,7 +6625,7 @@ class TestReleaseTargetParity(unittest.TestCase):
             if toolchain is not None:
                 _write(os.path.join(root, "actions", "release-target-toolchain", "action.yml"), toolchain)
             errors: list[str] = []
-            check_release_target_parity(errors, root=root)
+            check_release_target_parity(_load(root, errors), errors)
             return errors
 
     def assertRefused(
@@ -6600,7 +6694,7 @@ class TestReleaseTargetParity(unittest.TestCase):
 
     def test_repo_workflows_pass(self) -> None:
         errors: list[str] = []
-        check_release_target_parity(errors)
+        check_release_target_parity(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
     def test_target_missing_from_ci_refused(self) -> None:
@@ -7228,6 +7322,948 @@ class TestModuleConstantsDefinedOnce(unittest.TestCase):
                         twice.append(f"{t.id} (lines {seen[t.id]} and {node.lineno})")
                     seen.setdefault(t.id, node.lineno)
         self.assertEqual(twice, [])
+
+
+_TL_OK = """\
+name: ok
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+  c:
+    needs: [a, b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo c
+"""
+
+
+class TestTypedWorkflowLoad(unittest.TestCase):
+    """The one workflow load (`WorkflowSet.load`) parses each workflow into
+    typed jobs and typed `needs:` once, refusing every other shape with its
+    own `ErrorKind`; no check downstream of it raises on any shape."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def load(self, text: str) -> verify_manifest.WorkflowSet:
+        _write(os.path.join(self.root, "workflows", "w.yml"), text)
+        return verify_manifest.WorkflowSet.load(self.root)
+
+    def every_check(self, wfs: verify_manifest.WorkflowSet) -> list[str]:
+        """Every check that consumes the load, as `main` runs it: an
+        exception from any of them fails the test (a crash is no verdict)."""
+        vm = verify_manifest
+        errors = list(wfs.rendered())
+        vm.check_permissions(wfs, errors, {})
+        vm.check_deterministic_set(wfs, errors)
+        vm.check_workflow_steps(wfs, errors)
+        vm.check_merge_queue(wfs, {"w.yml"}, errors)
+        vm.check_release_only_skips(wfs, {"a"}, errors)
+        vm.check_fast_gate_first(wfs, {"a"}, errors)
+        vm.check_phase_routing(wfs, {"a"}, errors)
+        vm.check_pull_request_target(wfs, errors)
+        vm.check_push_concurrency(wfs, errors)
+        vm.check_one_ipe_build(wfs, errors, tracked=[])
+        vm.check_ci_suites_required(wfs, [], errors)
+        vm.check_release_target_parity(wfs, errors)
+        vm.produced_contexts(wfs.jobs())
+        return errors
+
+    def assertRefusedWith(self, text: str, kind: str) -> None:
+        wfs = self.load(text)
+        rendered = wfs.rendered()
+        self.assertTrue(any(f"[{kind}]" in e for e in rendered), (kind, rendered))
+        self.assertTrue(any(f"[{kind}]" in e for e in self.every_check(wfs)), kind)
+
+    def test_well_formed_workflow_loads_typed(self) -> None:
+        wfs = self.load(_TL_OK)
+        self.assertEqual(wfs.rendered(), [])
+        wf = wfs.get("w.yml")
+        assert wf is not None
+        self.assertEqual({j.job_id: j.needs for j in wf.jobs}, {"a": (), "b": ("a",), "c": ("a", "b")})
+        self.assertEqual([e for e in self.every_check(wfs) if "[" in e and e.endswith("]")], [])
+
+    def test_document_not_a_mapping_refused(self) -> None:
+        for text in ("- a\n- b\n", "just a scalar\n", ""):
+            with self.subTest(text=text):
+                self.assertRefusedWith(text, "DOCUMENT_NOT_MAPPING")
+                self.assertIsNone(self.load(text).get("w.yml"))
+
+    def test_invalid_yaml_refused(self) -> None:
+        self.assertRefusedWith("jobs: [\n", "YAML_INVALID")
+
+    def test_jobs_as_a_list_refused(self) -> None:
+        self.assertRefusedWith(_TL_OK.split("jobs:")[0] + "jobs:\n  - a\n", "JOBS_NOT_MAPPING")
+
+    def test_job_not_a_mapping_refused(self) -> None:
+        self.assertRefusedWith(_TL_OK + "  d: 1\n", "JOB_NOT_MAPPING")
+
+    def test_each_malformed_needs_has_its_own_kind(self) -> None:
+        for value, kind in (
+            ("''", "NEEDS_EMPTY_STRING"),
+            ("false", "NEEDS_BOOL"),
+            ("0", "NEEDS_NUMBER"),
+            ("[]", "NEEDS_EMPTY_LIST"),
+            ("null", "NEEDS_NULL"),
+            ("{a: b}", "NEEDS_NOT_LIST"),
+            ("[1]", "NEEDS_MEMBER_NOT_STRING"),
+            ("['']", "NEEDS_MEMBER_EMPTY"),
+            ("[a, a]", "NEEDS_DUPLICATE"),
+            ("[a, nope]", "NEEDS_UNKNOWN"),
+            ("nope", "NEEDS_UNKNOWN"),
+        ):
+            with self.subTest(needs=value):
+                bad = _TL_OK.replace("needs: [a, b]", f"needs: {value}")
+                self.assertNotEqual(bad, _TL_OK)
+                self.assertRefusedWith(bad, kind)
+
+    def test_malformed_needs_is_never_read_as_no_needs(self) -> None:
+        # The refused job keeps no needs a downstream check could trust, and
+        # the refusal stays on record for `main`.
+        wfs = self.load(_TL_OK.replace("needs: [a, b]", "needs: false"))
+        self.assertEqual(len(wfs.refusals), 1)
+        self.assertIs(wfs.refusals[0].kind, verify_manifest.ErrorKind.NEEDS_BOOL)
+
+    def test_malformed_permissions_refused(self) -> None:
+        self.assertRefusedWith(_TL_OK.replace("contents: read", "contents: bogus"), "PERMISSIONS_MALFORMED")
+        self.assertRefusedWith(_TL_OK.replace("  contents: read\n", "  - read\n"), "PERMISSIONS_MALFORMED")
+
+    def test_missing_workflow_permissions_refused(self) -> None:
+        wfs = self.load(_TL_OK.replace("permissions:\n  contents: read\n", ""))
+        self.assertEqual(wfs.rendered(), [])
+        self.assertTrue(any("[PERMISSIONS_MISSING]" in e for e in self.every_check(wfs)))
+
+    def test_live_tree_loads_clean(self) -> None:
+        wfs = verify_manifest.WorkflowSet.load(verify_manifest.REPO_ROOT)
+        self.assertEqual(wfs.rendered(), [])
+        errors: list[str] = []
+        verify_manifest.check_permissions(wfs, errors)
+        self.assertEqual(errors, [])
+
+    def test_yaml_is_loaded_only_at_admitted_sites(self) -> None:
+        """A second load of a workflow file is a second parser that can
+        disagree with the first; each YAML load lives at one admitted site."""
+        import ast  # noqa: PLC0415
+
+        admitted = {
+            ("verify-manifest.py", "WorkflowSet.load"): 1,
+            ("verify-manifest.py", "read_manifest"): 1,
+            ("verify-manifest.py", "_read_action"): 1,
+            ("verify-manifest.py", "_dependabot_doc"): 1,
+        }
+        found: dict[tuple[str, str], int] = {}
+        with open(MODULE_PATH, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        def visit(node: ast.AST, scope: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                inner = scope
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    inner = f"{scope}.{child.name}" if scope else child.name
+                if isinstance(child, ast.Call):
+                    fn = child.func
+                    name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
+                    if name in ("safe_load", "load", "full_load", "unsafe_load", "load_all", "safe_load_all") and (
+                        not isinstance(fn, ast.Attribute)
+                        or (isinstance(fn.value, ast.Name) and fn.value.id in ("yaml", "strict_yaml"))
+                    ):
+                        key = ("verify-manifest.py", scope)
+                        found[key] = found.get(key, 0) + 1
+                visit(child, inner)
+
+        visit(tree, "")
+        self.assertEqual(found, admitted)
+
+
+_MR_CI = """\
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo classify
+  a:
+    name: alpha
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo a
+  b:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo b
+  verdict:
+    if: always()
+    needs: [changes, a, b]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo verdict
+"""
+
+_MR_OTHER = """\
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  o:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo o
+"""
+
+
+def _mr_entries() -> list[dict]:
+    return [
+        {"context": "verdict", "disposition": "gate", "producer": "ci.yml", "aggregates": ["a", "b"]},
+        {"context": "changes", "disposition": "gate", "producer": "ci.yml"},
+        {"context": "o", "disposition": "informational", "producer": "other.yml", "owner": "x"},
+    ]
+
+
+class _ManifestFixture(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, entries: list | None = None, ci: str = _MR_CI, other: str = _MR_OTHER,
+               extra: dict[str, str] | None = None) -> list[str]:
+        for name, text in {"ci.yml": ci, "other.yml": other, **(extra or {})}.items():
+            _write(os.path.join(self.root, "workflows", name), text)
+        errors: list[str] = []
+        wfs = _load(self.root, errors)
+        verify_manifest.check_manifest_references(wfs, _mr_entries() if entries is None else entries, errors)
+        verify_manifest.check_context_stems(wfs, errors)
+        return errors
+
+    def assertKind(self, kind: str, **kw: object) -> list[str]:
+        errors = self.errors(**kw)  # type: ignore[arg-type]
+        self.assertTrue(any(e.endswith(f"[{kind}]") for e in errors), (kind, errors))
+        return errors
+
+    def with_entry(self, ctx: str, **fields: object) -> list[dict]:
+        entries = _mr_entries()
+        for e in entries:
+            if e["context"] == ctx:
+                e.update(fields)
+                for k in [k for k, v in fields.items() if v is None]:
+                    del e[k]
+        return entries
+
+
+class TestManifestReferencesExist(_ManifestFixture):
+    """A manifest entry names the workflow that really produces its context,
+    a context that exists (or, for `delete`, one that no longer does), and
+    job ids of its producer in `aggregates:`."""
+
+    def test_consistent_manifest_passes(self) -> None:
+        self.assertEqual(self.errors(), [])
+
+    def test_producer_naming_another_existing_workflow_refused(self) -> None:
+        self.assertKind("PRODUCER_MISMATCH", entries=self.with_entry("verdict", producer="other.yml"))
+
+    def test_producer_naming_no_workflow_refused(self) -> None:
+        self.assertKind("PRODUCER_UNKNOWN", entries=self.with_entry("changes", producer="nope.yml"))
+
+    def test_informational_context_nothing_produces_refused(self) -> None:
+        entries = [*_mr_entries(), {"context": "ghost", "disposition": "informational", "producer": "other.yml", "owner": "x"}]
+        self.assertKind("CONTEXT_NOT_PRODUCED", entries=entries)
+
+    def test_internal_entry_is_exempt_from_existence(self) -> None:
+        entries = [*_mr_entries(), {"context": "ghost", "disposition": "informational", "producer": "other.yml",
+                                    "owner": "x", "internal": True}]
+        self.assertEqual(self.errors(entries=entries), [])
+
+    def test_delete_entry_still_produced_refused(self) -> None:
+        self.assertKind("DELETE_STILL_PRODUCED", entries=self.with_entry("o", disposition="delete", producer=None))
+
+    def test_delete_entry_no_longer_produced_passes(self) -> None:
+        entries = [*_mr_entries(), {"context": "gone", "disposition": "delete"}]
+        self.assertEqual(self.errors(entries=entries), [])
+
+    def test_unknown_job_in_aggregates_refused(self) -> None:
+        errors = self.assertKind("AGGREGATE_UNKNOWN_JOB", entries=self.with_entry("verdict", aggregates=["a", "b", "nope"]))
+        self.assertTrue(any("'nope'" in e for e in errors), errors)
+
+    def test_context_name_in_aggregates_refused(self) -> None:
+        self.assertKind("AGGREGATE_IS_CONTEXT", entries=self.with_entry("verdict", aggregates=["alpha", "b"]))
+
+    def test_malformed_aggregates_refused(self) -> None:
+        for bad in ("a", [], ["a", "a"], [1]):
+            with self.subTest(aggregates=bad):
+                self.assertKind("ENTRY_MALFORMED", entries=self.with_entry("verdict", aggregates=bad))
+
+    def test_live_manifest_references_hold(self) -> None:
+        errors: list[str] = []
+        wfs = _load(verify_manifest.REPO_ROOT, errors)
+        verify_manifest.check_manifest_references(wfs, verify_manifest.load_manifest()["checks"], errors)
+        self.assertEqual(errors, [])
+
+
+class TestAggregatesBound(_ManifestFixture):
+    """`aggregates:` is exactly the aggregator's `needs:` minus `changes`, in
+    both directions, and the aggregator runs under `if: always()`."""
+
+    def test_aggregator_needs_one_extra_job_refused(self) -> None:
+        ci = _MR_CI.replace("needs: [changes, a, b]", "needs: [changes, a, b, c]") + (
+            "  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo c\n"
+        )
+        entries = [*_mr_entries(), {"context": "c", "disposition": "gate", "producer": "ci.yml"}]
+        errors = self.assertKind("AGGREGATES_NEEDS_MISMATCH", ci=ci, entries=entries)
+        self.assertTrue(any("only in needs: ['c']" in e for e in errors), errors)
+
+    def test_aggregates_naming_a_job_the_aggregator_does_not_need_refused(self) -> None:
+        ci = _MR_CI.replace("needs: [changes, a, b]", "needs: [changes, a]")
+        errors = self.assertKind("AGGREGATES_NEEDS_MISMATCH", ci=ci)
+        self.assertTrue(any("only in aggregates: ['b']" in e for e in errors), errors)
+
+    def test_aggregates_missing_a_needed_job_refused(self) -> None:
+        errors = self.assertKind("AGGREGATES_NEEDS_MISMATCH", entries=self.with_entry("verdict", aggregates=["a"]))
+        self.assertTrue(any("only in needs: ['b']" in e for e in errors), errors)
+
+    def test_aggregator_not_always_refused(self) -> None:
+        for guard in ("if: success()\n    ", "if: \"!cancelled()\"\n    ", ""):
+            with self.subTest(guard=guard):
+                ci = _MR_CI.replace("if: always()\n    ", guard)
+                self.assertKind("AGGREGATOR_NOT_ALWAYS", ci=ci)
+
+
+_CS_MATRIX = """\
+  build-m:
+    name: build (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [x]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo m
+"""
+
+
+class TestContextUniqueAllWorkflows(_ManifestFixture):
+    """A context stem (the name without its ` (…)` matrix suffix) names one
+    job across every workflow, plumbing included."""
+
+    def test_plumbing_job_named_like_a_gate_refused(self) -> None:
+        self.assertTrue(verify_manifest.Workflow("release.yml", {}, "", [], verify_manifest.Workspace.NONE, None).is_plumbing)
+        plumbing = _MR_OTHER.replace("  o:\n", "  shadow:\n    name: verdict\n")
+        errors = self.assertKind("CONTEXT_STEM_SHARED", extra={"release.yml": plumbing})
+        self.assertTrue(any(e.endswith("[CONTEXT_DUPLICATE]") for e in errors), errors)
+
+    def test_matrix_build_beside_a_plain_build_refused(self) -> None:
+        other = _MR_OTHER.replace("  o:\n", "  build:\n") + _CS_MATRIX
+        entries = self.with_entry("o", context="build")
+        self.assertKind("CONTEXT_STEM_SHARED", other=other, entries=entries)
+
+    def test_one_stem_in_two_workflows_refused(self) -> None:
+        other = _MR_OTHER + _CS_MATRIX
+        ci = _MR_CI + _CS_MATRIX.replace("build-m", "build-n").replace("os: [x]", "os: [y]")
+        self.assertKind("CONTEXT_STEM_SHARED", other=other, ci=ci)
+
+    def test_suffixed_legs_of_one_workflow_admitted(self) -> None:
+        # The install-smoke shape: two jobs, every context suffixed.
+        other = _MR_OTHER + _CS_MATRIX + _CS_MATRIX.replace("build-m", "build-n").replace("os: [x]", "os: [y]")
+        errors = self.errors(other=other)
+        self.assertFalse([e for e in errors if "CONTEXT_" in e], errors)
+
+    def test_live_context_stems_unique(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_context_stems(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
+
+
+_RG_VERDICT = "python3 .github/ci/verify-manifest.py"
+_RG_CHANGES = """\
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      cheap: ${{ steps.c.outputs.cheap }}
+      tests: ${{ steps.c.outputs.tests }}
+      code: ${{ steps.c.outputs.code }}
+      release_only: ${{ steps.c.outputs.release_only }}
+    steps:
+      - id: c
+        run: python3 .github/ci/release_only.py
+        continue-on-error: true
+"""
+
+
+def _rg_job(jid: str, steps: str, guard: str | None = None, needs: str | None = "[changes]", extra: str = "") -> str:
+    out = f"  {jid}:\n"
+    if guard is not None:
+        out += f"    if: {guard}\n"
+    if needs is not None:
+        out += f"    needs: {needs}\n"
+    out += "    runs-on: ubuntu-latest\n" + extra + "    steps:\n"
+    return out + "".join(f"      {ln}\n" for ln in steps.splitlines())
+
+
+def _rg_wf(jobs: str, changes: bool = True) -> str:
+    head = "name: g\non: pull_request\npermissions:\n  contents: read\njobs:\n"
+    return head + (_RG_CHANGES if changes else "") + jobs
+
+
+_RG_DECIDE = f"- run: {_RG_VERDICT}\n"
+
+
+class _GuardFixture(unittest.TestCase):
+    """One workflow `g.yml` whose job `g` reports the required context `g`."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, wf: str, entries: list | None = None, inline: dict | None = None,
+               skips: dict | None = None, actions: dict | None = None, env_rows: dict | None = None) -> list[str]:
+        _write(os.path.join(self.root, "workflows", "g.yml"), wf)
+        errors: list[str] = []
+        wfs = _load(self.root, errors)
+        raw = entries if entries is not None else [{"context": "g", "disposition": "gate", "producer": "g.yml"}]
+        typed = [e for e in (verify_manifest.ManifestEntry.parse(r) for r in raw)
+                 if isinstance(e, verify_manifest.ManifestEntry)]
+        verify_manifest.check_required_guards(
+            wfs, typed, raw, errors, inline or {}, skips or {}, actions or {}, env_rows=env_rows or {}
+        )
+        return errors
+
+    def kinds(self, wf: str, **kw: object) -> set[str]:
+        return {e.rsplit("[", 1)[-1].rstrip("]") for e in self.errors(wf, **kw)}  # type: ignore[arg-type]
+
+    def assertRefused(self, kind: str, wf: str, **kw: object) -> None:
+        self.assertIn(kind, self.kinds(wf, **kw), (kind, self.errors(wf, **kw)))  # type: ignore[arg-type]
+
+    def assertPasses(self, wf: str, **kw: object) -> None:
+        self.assertEqual(self.errors(wf, **kw), [])  # type: ignore[arg-type]
+
+
+_RG_UNADMITTED_JOB_GUARDS = (
+    "github.actor == 'x'",
+    "github.event.pull_request.author_association == 'OWNER'",
+    "contains(github.event.pull_request.labels.*.name, 's')",
+    "false",
+    "true",
+    "success()",
+    "needs.changes.outputs.cheap == 'true' && github.ref == 'refs/heads/main'",
+    "always()",
+    "\"${{ needs.changes.outputs.cheap == 'true' }} \"",
+    "needs.changes.outputs.code == 'true'",
+    "needs.changes.outputs.cheap == 'true' || github.actor == 'x'",
+    "needs.changes.outputs.cheap == 'true' && needs.changes.outputs.nope == 'true'",
+)
+
+
+class TestRequiredJobGuardClosed(_GuardFixture):
+    """T2: a required job, and every job in its `needs` closure, runs under a
+    closed `JobGuard` — never one that can skip it, which reports as pass."""
+
+    def test_unadmitted_guard_on_the_required_job_refused(self) -> None:
+        for guard in _RG_UNADMITTED_JOB_GUARDS:
+            for changes in (True, False):
+                with self.subTest(guard=guard, changes=changes):
+                    needs = "[changes]" if changes else None
+                    wf = _rg_wf(_rg_job("g", _RG_DECIDE, guard, needs), changes)
+                    self.assertRefused("JOB_GUARD_UNADMITTED", wf)
+
+    def test_unadmitted_guard_in_the_needs_closure_refused(self) -> None:
+        for guard in _RG_UNADMITTED_JOB_GUARDS:
+            for changes in (True, False):
+                with self.subTest(guard=guard, changes=changes):
+                    needs = "[changes]" if changes else None
+                    prep = _rg_job("prep", "- run: echo prep\n", guard, needs)
+                    deep = _rg_job("deep", "- run: echo deep\n", None, "[prep]")
+                    g = _rg_job("g", _RG_DECIDE, None, "[deep]")
+                    errors = self.errors(_rg_wf(prep + deep + g, changes))
+                    self.assertTrue(any("job 'prep'" in e and e.endswith("[JOB_GUARD_UNADMITTED]") for e in errors), errors)
+
+    def test_admitted_guards_pass(self) -> None:
+        for guard in (
+            None,
+            "needs.changes.outputs.cheap == 'true'",
+            "needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'",
+            "(needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true') "
+            "|| needs.changes.outputs.release_only == 'true'",
+            "${{ needs.changes.outputs.cheap == 'true' }}",
+            "github.event_name == 'pull_request'",
+        ):
+            with self.subTest(guard=guard):
+                self.assertPasses(_rg_wf(_rg_job("g", _RG_DECIDE, guard)))
+
+    def test_phase_guard_without_needing_changes_refused(self) -> None:
+        wf = _rg_wf(_rg_job("g", _RG_DECIDE, "needs.changes.outputs.cheap == 'true'", None))
+        self.assertRefused("JOB_GUARD_UNADMITTED", wf)
+
+    def test_always_admitted_only_on_a_phase_verdict(self) -> None:
+        a = _rg_job("a", _RG_DECIDE)
+        pv = ("- uses: ./.github/actions/phase-verdict\n  with:\n"
+              "    results: changes=${{ needs.changes.result }} a=${{ needs.a.result }}\n")
+        entries = [{"context": "g", "disposition": "gate", "producer": "g.yml", "aggregates": ["a"]}]
+        self.assertPasses(_rg_wf(a + _rg_job("g", pv, "always()", "[changes, a]")), entries=entries)
+        partial = pv.replace(" a=${{ needs.a.result }}", "")
+        self.assertRefused("JOB_GUARD_UNADMITTED", _rg_wf(a + _rg_job("g", partial, "always()", "[changes, a]")),
+                           entries=entries)
+
+    def test_informational_job_is_not_held(self) -> None:
+        entries = [{"context": "g", "disposition": "informational", "producer": "g.yml", "owner": "x"}]
+        self.assertPasses(_rg_wf(_rg_job("g", "- run: true\n", "github.actor == 'x'")), entries=entries)
+
+
+_RG_CLASSIFY = "- id: cls\n  run: python3 .github/ci/change_class.py --code\n  continue-on-error: true\n"
+
+
+class TestRequiredStepGuardClosed(_GuardFixture):
+    """T3: every step of a required job runs under a closed `StepGuard`, and
+    the decider only under one whose absent input means run."""
+
+    def test_event_guarded_decider_refused(self) -> None:
+        for coe in ("", "  continue-on-error: true\n"):
+            with self.subTest(coe=coe):
+                steps = f"- run: {_RG_VERDICT}\n  if: github.event_name == 'workflow_dispatch'\n{coe}"
+                kinds = self.kinds(_rg_wf(_rg_job("g", steps)))
+                self.assertIn("STEP_GUARD_UNADMITTED", kinds)
+                self.assertIn("NO_DECIDER", kinds)
+
+    def test_classifier_run_written_as_true_refused(self) -> None:
+        steps = (_RG_CLASSIFY + f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code == 'true'\n"
+                 "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n")
+        self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps)))
+
+    def test_unpaired_classifier_guard_refused(self) -> None:
+        run = f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code != 'false'\n"
+        noop = "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n"
+        self.assertRefused("CLASSIFIER_UNPAIRED", _rg_wf(_rg_job("g", _RG_CLASSIFY + run)))
+        self.assertRefused("CLASSIFIER_UNPAIRED", _rg_wf(_rg_job("g", _RG_CLASSIFY + noop + _RG_DECIDE)))
+        self.assertPasses(_rg_wf(_rg_job("g", _RG_CLASSIFY + run + noop)))
+
+    def test_classifier_ref_not_an_earlier_change_class_step_refused(self) -> None:
+        run = f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code != 'false'\n"
+        noop = "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n"
+        for steps in (
+            run + noop + _RG_CLASSIFY,
+            "- id: cls\n  run: echo code=true\n" + run + noop,
+            _RG_CLASSIFY.replace("--code", "--panic-scan") + run + noop,
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps)))
+
+    def test_prep_succeeded_admitted_off_the_decider_only(self) -> None:
+        prep = _rg_job("prep", _RG_DECIDE)
+        guarded = "  if: needs.prep.result == 'success'\n"
+        ok = _rg_job("g", _RG_DECIDE + "- run: echo extra\n" + guarded, None, "[changes, prep]")
+        self.assertPasses(_rg_wf(prep + ok))
+        bad = _rg_job("g", _RG_DECIDE.rstrip("\n") + "\n" + guarded, None, "[changes, prep]")
+        self.assertRefused("NO_DECIDER", _rg_wf(prep + bad))
+        unneeded = _rg_job("g", _RG_DECIDE + "- run: echo extra\n" + guarded, None, "[changes]")
+        self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(prep + unneeded))
+
+    def test_anchor_shapes_pass(self) -> None:
+        # panic-scan: classifier pair; wasm-floor: release-only pair over a
+        # phase-with-disjunct job; seal-slice: a prep-gated non-decider.
+        panic = _RG_CLASSIFY + (f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code != 'false'\n"
+                                "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n")
+        wasm = (f"- run: {_RG_VERDICT}\n  if: needs.changes.outputs.release_only != 'true'\n"
+                "- run: echo release-only\n  if: needs.changes.outputs.release_only == 'true'\n"
+                "- run: echo cleanup\n  if: always()\n")
+        guard = "needs.changes.outputs.tests == 'true' || needs.changes.outputs.release_only == 'true'"
+        for steps, g in ((panic, None), (wasm, guard)):
+            with self.subTest(steps=steps):
+                self.assertPasses(_rg_wf(_rg_job("g", steps, g)))
+
+    def test_release_only_step_guard_without_needing_changes_refused(self) -> None:
+        steps = f"- run: {_RG_VERDICT}\n  if: needs.changes.outputs.release_only != 'true'\n"
+        self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps, None, None)))
+
+    def test_always_is_never_the_decider_guard(self) -> None:
+        self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", f"- run: {_RG_VERDICT}\n  if: always()\n")))
+
+
+class TestRequiredJobHoldsDecider(_GuardFixture):
+    """T5: a job reporting a required context holds a decider; the inline
+    and known-skip tables are closed and refuse a stale row."""
+
+    def test_no_decider_refused(self) -> None:
+        for steps in (
+            "- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n- run: true\n",
+            "- run: python3 .github/ci/deterministic_checks_output.py\n",
+            "- run: python3 .github/ci/release_only.py\n",
+            f"- run: {_RG_VERDICT}\n  continue-on-error: true\n",
+            f"- run: {_RG_VERDICT} --help\n",
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", steps)))
+
+    def test_inline_decider_row(self) -> None:
+        steps = "- name: Run it\n  run: ./x.sh\n"
+        self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", steps)))
+        self.assertPasses(_rg_wf(_rg_job("g", steps)), inline={("g.yml", "g"): "Run it"})
+        unnamed = "- run: |\n    ./x.sh\n"
+        self.assertPasses(_rg_wf(_rg_job("g", unnamed)), inline={("g.yml", "g"): "./x.sh"})
+        for bad in (
+            steps + "  continue-on-error: true\n",
+            steps + "  if: always()\n",
+        ):
+            with self.subTest(bad=bad):
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", bad)), inline={("g.yml", "g"): "Run it"})
+        self.assertRefused(
+            "INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", steps + "  continue-on-error: false\n")),
+            inline={("g.yml", "g"): "Run it"},
+        )
+
+    def test_inline_decider_action_bound_to_script_actions_row(self) -> None:
+        pin = "vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        row = {pin: verify_manifest.ScriptAction(frozenset({"run", "prepare"}), "fails on a failed script")}
+        inline = {("g.yml", "g"): "Run it"}
+
+        def step(uses: str, with_: str = "  with:\n    run: ./x.sh\n") -> str:
+            return f"- name: Run it\n  uses: {uses}\n" + with_
+
+        self.assertPasses(_rg_wf(_rg_job("g", step(pin))), inline=inline, actions=row)
+        self.assertPasses(
+            _rg_wf(_rg_job("g", step(pin, "  with:\n    prepare: x\n    run: ./x.sh\n"))), inline=inline, actions=row
+        )
+        for bad in (
+            step(pin),
+            step("vendor/vm@0000000000000000000000000000000000000000"),
+            step("vendor/vm@v1"),
+            step("other/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+        ):
+            with self.subTest(uses=bad, actions={}):
+                self.assertRefused("INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", bad)), inline=inline,
+                                   actions=({} if bad == step(pin) else row))
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", bad)), inline=inline,
+                                   actions=({} if bad == step(pin) else row))
+        for with_ in (
+            "",
+            "  with:\n    prepare: x\n",
+            "  with:\n    run: ./x.sh\n    debug-on-error: true\n",
+            "  with:\n    run: ./x.sh\n  continue-on-error: false\n",
+        ):
+            with self.subTest(with_=with_):
+                self.assertRefused("INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", step(pin, with_))),
+                                   inline=inline, actions=row)
+
+    def test_inline_decider_row_binds_exactly_one_step(self) -> None:
+        one = "- name: Run it\n  run: ./x.sh\n"
+        self.assertPasses(_rg_wf(_rg_job("g", one)), inline={("g.yml", "g"): "Run it"})
+        two = one + "- name: Run it\n  run: ./y.sh\n  if: always()\n"
+        self.assertRefused("DECIDER_ROW_AMBIGUOUS", _rg_wf(_rg_job("g", two)), inline={("g.yml", "g"): "Run it"})
+
+    def test_script_actions_row_rules(self) -> None:
+        pin = "vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        wf = _rg_wf(_rg_job("g", f"- name: Run it\n  uses: {pin}\n  with:\n    run: ./x.sh\n"))
+        inline = {("g.yml", "g"): "Run it"}
+        ok = verify_manifest.ScriptAction(frozenset({"run"}), "fails on a failed script")
+        self.assertPasses(wf, inline=inline, actions={pin: ok})
+        self.assertRefused("SCRIPT_ACTION_ROW_INVALID", wf, inline=inline,
+                           actions={pin: verify_manifest.ScriptAction(frozenset({"run"}), " ")})
+        self.assertRefused("SCRIPT_ACTION_ROW_INVALID", wf, inline=inline, actions={pin: ok, "vendor/vm@v1": ok})
+        self.assertRefused(
+            "SCRIPT_ACTION_ROW_INVALID", wf, inline=inline,
+            actions={pin: ok, "vendor/other@3d3c42e5aac5ba805825da76410c181273ba90b1": ok},
+        )
+
+    def test_live_script_actions_admit_no_failure_swallowing_input(self) -> None:
+        self.assertTrue(verify_manifest.SCRIPT_ACTIONS)
+        for uses, row in verify_manifest.SCRIPT_ACTIONS.items():
+            with self.subTest(uses=uses):
+                self.assertRegex(uses, verify_manifest.PINNED_REMOTE_USES_RE)
+                self.assertIn("run", row.inputs)
+                self.assertNotIn("debug-on-error", row.inputs)
+                self.assertTrue(row.why.strip())
+
+    def test_stale_inline_decider_row_refused(self) -> None:
+        wf = _rg_wf(_rg_job("g", _RG_DECIDE + "- name: Run it\n  run: ./x.sh\n") + _rg_job("o", "- run: true\n"))
+        for row in ({("g.yml", "g"): "Run it"}, {("g.yml", "o"): "x"}, {("g.yml", "g"): "Missing"}):
+            with self.subTest(row=row):
+                self.assertRefused("DECIDER_ROW_STALE", wf, inline=row)
+        wf = _rg_wf(_rg_job("g", "- name: Run it\n  run: ./x.sh\n"))
+        self.assertRefused("DECIDER_ROW_STALE", wf, inline={("g.yml", "g"): "Missing"})
+
+    def test_job_level_continue_on_error_refused_on_every_held_job(self) -> None:
+        mask_values = ("true", "false", "${{ matrix.experimental }}", "${{ github.event_name == 'push' }}")
+        prep = _rg_job("p", _RG_DECIDE)
+        self.assertPasses(_rg_wf(_rg_job("g", _RG_DECIDE)))
+        self.assertPasses(_rg_wf(prep + _rg_job("g", _RG_DECIDE, needs="[changes, p]")))
+        for value in mask_values:
+            coe = f"    continue-on-error: {value}\n"
+            with self.subTest(job="reporting", value=value):
+                self.assertRefused("JOB_MASKED", _rg_wf(_rg_job("g", _RG_DECIDE, extra=coe)))
+            with self.subTest(job="needed", value=value):
+                wf = _rg_wf(_rg_job("p", _RG_DECIDE, extra=coe) + _rg_job("g", _RG_DECIDE, needs="[changes, p]"))
+                self.assertRefused("JOB_MASKED", wf)
+            with self.subTest(job="inline", value=value):
+                wf = _rg_wf(_rg_job("g", "- name: Run it\n  run: ./x.sh\n", extra=coe))
+                self.assertRefused("JOB_MASKED", wf, inline={("g.yml", "g"): "Run it"})
+            with self.subTest(job="known-skip", value=value):
+                skipping = "- id: probe\n  run: echo available=false\n- run: ./x.sh\n  if: steps.probe.outputs.available == 'true'\n"
+                self.assertRefused("JOB_MASKED", _rg_wf(_rg_job("g", skipping, extra=coe)),
+                                   skips={("g.yml", "g"): "no runner"})
+        info = [{"context": "g", "disposition": "gate", "producer": "g.yml"},
+                {"context": "o", "disposition": "informational", "producer": "g.yml"}]
+        self.assertPasses(
+            _rg_wf(_rg_job("g", _RG_DECIDE) + _rg_job("o", "- run: ./x.sh\n", extra="    continue-on-error: true\n")),
+            entries=info,
+        )
+
+    def test_known_skip_row(self) -> None:
+        skipping = "- id: probe\n  run: echo available=false\n- run: ./x.sh\n  if: steps.probe.outputs.available == 'true'\n"
+        wf = _rg_wf(_rg_job("g", skipping))
+        self.assertRefused("STEP_GUARD_UNADMITTED", wf)
+        self.assertPasses(wf, skips={("g.yml", "g"): "no runner"})
+        self.assertRefused("KNOWN_SKIP_ROW_STALE", _rg_wf(_rg_job("g", _RG_DECIDE)), skips={("g.yml", "g"): "x"})
+        self.assertRefused("KNOWN_SKIP_ROW_STALE", wf, skips={("g.yml", "o"): "x"})
+        # The row never exempts the job guard.
+        self.assertRefused("JOB_GUARD_UNADMITTED", _rg_wf(_rg_job("g", skipping, "github.actor == 'x'")),
+                           skips={("g.yml", "g"): "no runner"})
+
+    def test_inline_decider_empty_script_refused(self) -> None:
+        pin = "vendor/vm@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        row = {pin: verify_manifest.ScriptAction(frozenset({"run"}), "fails on a failed script")}
+        inline = {("g.yml", "g"): "Run it"}
+        self.assertPasses(_rg_wf(_rg_job("g", "- name: Run it\n  run: ./x.sh\n")), inline=inline)
+        for steps in (
+            "- name: Run it\n  run: ''\n",
+            "- name: Run it\n  run: '  # nothing'\n",
+            f"- name: Run it\n  uses: {pin}\n  with:\n    run: ''\n",
+            f"- name: Run it\n  uses: {pin}\n  with:\n    run: '# nothing'\n",
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("INLINE_DECIDER_UNADMITTED", _rg_wf(_rg_job("g", steps)), inline=inline,
+                                   actions=row)
+                self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", steps)), inline=inline, actions=row)
+
+    def test_live_required_jobs_hold_closed_guards_and_deciders(self) -> None:
+        errors: list[str] = []
+        wfs = _load(verify_manifest.REPO_ROOT, errors)
+        raw = verify_manifest.load_manifest()["checks"]
+        typed = verify_manifest.check_manifest_references(wfs, raw, [])
+        verify_manifest.check_required_guards(wfs, typed, raw, errors)
+        self.assertEqual(errors, [])
+
+
+_RG_MIRROR_A = "bash tools/a.sh"
+_RG_MIRROR_B = "bash tools/b.sh"
+
+
+class TestMirroredStepSound(_GuardFixture):
+    """A step running a command a `local:` block mirrors fails when that
+    command fails, and runs it as its local twin does: every command bash
+    reads in it is a mirrored line (no `set +e`, `trap`, `exit`, separator,
+    or comment continuation hiding another), several commands run under a
+    shell that stops at the first failure, and its env is closed."""
+
+    ENTRIES = [{
+        "context": "g", "disposition": "gate", "producer": "g.yml",
+        "local": {"tier": "quick", "run": [_RG_MIRROR_A, _RG_MIRROR_B]},
+    }]
+    ENV: dict = {}
+
+    def step(self, script: str, extra: str = "") -> str:
+        body = "".join(f"    {ln}\n" for ln in script.splitlines())
+        return "- name: Lint\n  run: |\n" + body + extra
+
+    def wf(self, script: str, extra: str = "", job_extra: str = "") -> str:
+        return _rg_wf(_rg_job("g", self.step(script, extra), extra=job_extra))
+
+    def test_sound_mirrored_steps_decide(self) -> None:
+        for script, extra in (
+            (_RG_MIRROR_A, ""),
+            (f"{_RG_MIRROR_A}\n{_RG_MIRROR_B}", ""),
+            (f"# self-test first\n{_RG_MIRROR_A}\n\n{_RG_MIRROR_B}", ""),
+            (f"{_RG_MIRROR_A}\n{_RG_MIRROR_B}", "  shell: bash\n"),
+            (_RG_MIRROR_A, "  shell: pwsh\n"),
+            (_RG_MIRROR_A, "  env:\n    IPE_E2E: '1'\n"),
+        ):
+            with self.subTest(script=script, extra=extra):
+                rows = {"IPE_E2E": frozenset({"1"})} if "env:" in extra else self.ENV
+                self.assertPasses(self.wf(script, extra), entries=self.ENTRIES, env_rows=rows)
+
+    def test_unmirrored_line_refused(self) -> None:
+        for script in (
+            f"set +e\n{_RG_MIRROR_A}\n{_RG_MIRROR_B}\ntrue",
+            f"trap 'exit 0' EXIT\n{_RG_MIRROR_A}\n{_RG_MIRROR_B}",
+            f"exit 0\n{_RG_MIRROR_A}",
+            f"{_RG_MIRROR_A}\necho done",
+        ):
+            with self.subTest(script=script):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(script), entries=self.ENTRIES,
+                                   env_rows=self.ENV)
+                self.assertRefused("NO_DECIDER", self.wf(script), entries=self.ENTRIES, env_rows=self.ENV)
+
+    def test_line_hidden_from_the_mirror_refused(self) -> None:
+        for script in (
+            # The mirror joins a comment's trailing backslash; bash does not.
+            f"{_RG_MIRROR_A} # self-test \\\ntrap 'exit 0' EXIT\n{_RG_MIRROR_B}",
+            # A quote across lines: the mirror skips both lines, bash runs `exit 0`.
+            f"{_RG_MIRROR_A}\necho \"\n\"; exit 0",
+            f"{_RG_MIRROR_A}; true",
+            f"{_RG_MIRROR_A} > /dev/null",
+            f"({_RG_MIRROR_A})",
+        ):
+            with self.subTest(script=script):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(script), entries=self.ENTRIES,
+                                   env_rows=self.ENV)
+
+    def test_several_commands_under_a_non_stopping_shell_refused(self) -> None:
+        both = f"{_RG_MIRROR_A}\n{_RG_MIRROR_B}"
+        for extra, job_extra in (
+            ("  shell: pwsh\n", ""),
+            ("  shell: powershell\n", ""),
+            ("", "    defaults:\n      run:\n        shell: pwsh\n"),
+        ):
+            with self.subTest(extra=extra, job_extra=job_extra):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(both, extra, job_extra),
+                                   entries=self.ENTRIES, env_rows=self.ENV)
+        windows = self.wf(both).replace("runs-on: ubuntu-latest", "runs-on: windows-latest")
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", windows, entries=self.ENTRIES, env_rows=self.ENV)
+        self.assertPasses(self.wf(both, "  shell: bash\n").replace("ubuntu-latest", "windows-latest"),
+                          entries=self.ENTRIES, env_rows=self.ENV)
+
+    def test_unadmitted_env_refused(self) -> None:
+        for extra, job_extra in (
+            ("  env:\n    CARGO_ALIAS_CLIPPY: check\n", ""),
+            ("  env:\n    RUSTFLAGS: --cap-lints=allow\n", ""),
+            ("  env:\n    IPE_E2E: '0'\n", ""),
+            ("", "    env:\n      CARGO_ALIAS_CLIPPY: check\n"),
+        ):
+            with self.subTest(extra=extra, job_extra=job_extra):
+                self.assertRefused("MIRRORED_STEP_UNADMITTED", self.wf(_RG_MIRROR_A, extra, job_extra),
+                                   entries=self.ENTRIES, env_rows=self.ENV)
+        wf_env = self.wf(_RG_MIRROR_A).replace("permissions:", "env:\n  CARGO_ALIAS_CLIPPY: check\npermissions:")
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", wf_env, entries=self.ENTRIES, env_rows=self.ENV)
+
+    def test_masked_mirrored_step_refused_beside_another_decider(self) -> None:
+        steps = f"- run: {_RG_MIRROR_A}\n- run: {_RG_MIRROR_B} || true\n"
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", _rg_wf(_rg_job("g", steps)), entries=self.ENTRIES,
+                           env_rows=self.ENV)
+        coe = f"- run: {_RG_MIRROR_A}\n- run: {_RG_MIRROR_B}\n  continue-on-error: true\n"
+        self.assertRefused("MIRRORED_STEP_UNADMITTED", _rg_wf(_rg_job("g", coe)), entries=self.ENTRIES,
+                           env_rows=self.ENV)
+
+    def test_stale_env_row_refused(self) -> None:
+        wf = self.wf(_RG_MIRROR_A, "  env:\n    IPE_E2E: '1'\n")
+        self.assertPasses(wf, entries=self.ENTRIES, env_rows={"IPE_E2E": frozenset({"1"})})
+        for rows in (
+            {"IPE_E2E": frozenset({"1", "0"})},
+            {"IPE_E2E": frozenset({"1"}), "CARGO_TERM_COLOR": frozenset({"always"})},
+        ):
+            with self.subTest(rows=rows):
+                self.assertRefused("MIRRORED_ENV_ROW_STALE", wf, entries=self.ENTRIES, env_rows=rows)
+
+
+class TestToolInvocationsClosed(unittest.TestCase):
+    """T4: every `.github/ci` tool a workflow runs is a listed (tool, argv)
+    pair; a maintainer-only invocation never runs in CI; a row no step runs
+    is stale."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, run: str, table: dict | None = None, stale: bool = False) -> list[str]:
+        _write(os.path.join(self.root, "workflows", "g.yml"), _rg_wf(_rg_job("g", f"- run: {run}\n", None, None), False))
+        errors: list[str] = []
+        verify_manifest.check_tool_invocations(_load(self.root, errors), errors, table, stale)
+        return errors
+
+    def assertKind(self, kind: str, run: str, **kw: object) -> None:
+        errors = self.errors(run, **kw)  # type: ignore[arg-type]
+        self.assertTrue(any(e.endswith(f"[{kind}]") for e in errors), (kind, errors))
+
+    def test_refusals(self) -> None:
+        for run, kind in (
+            ("python3 .github/ci/verify-manifest.py --help", "TOOL_ARGV_UNLISTED"),
+            ("python3 .github/ci/check_required_set.py --write", "MAINTAINER_TOOL_IN_WORKFLOW"),
+            ("python3 .github/ci/check_required_set.py --render-put rs.json", "MAINTAINER_TOOL_IN_WORKFLOW"),
+            ("python3 .github/ci/strict_yaml.py", "TOOL_UNLISTED"),
+            ("python3 .github/ci/new.py", "TOOL_UNLISTED"),
+            ("python3 .github/ci/e2e_shard.py --plan --extra", "TOOL_ARGV_UNLISTED"),
+        ):
+            with self.subTest(run=run):
+                self.assertKind(kind, run)
+
+    def test_listed_invocation_passes_and_stale_row_refused(self) -> None:
+        self.assertEqual(self.errors("python3 .github/ci/e2e_shard.py --plan"), [])
+        V = verify_manifest.ToolRole.VERDICT
+        table = {"e2e_shard.py": {("--plan",): V, ("--lint",): V}}
+        self.assertKind("TOOL_ROW_STALE", "python3 .github/ci/e2e_shard.py --plan", table=table, stale=True)
+        self.assertEqual(self.errors("python3 .github/ci/e2e_shard.py --plan",
+                                     table={"e2e_shard.py": {("--plan",): V}}, stale=True), [])
+
+    def test_live_tool_invocations_listed_and_no_row_stale(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_tool_invocations(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
+
+
+class TestNoForgingToken(unittest.TestCase):
+    """T8: no token can write a commit status or a check run (a forged
+    required context); every other write grant is a reviewed row."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+
+    def errors(self, text: str, fname: str = "w.yml", grants: dict | None = None) -> list[str]:
+        _write(os.path.join(self.root, "workflows", fname), text)
+        errors: list[str] = []
+        verify_manifest.check_permissions(_load(self.root, errors), errors, {} if grants is None else grants)
+        return errors
+
+    def assertKind(self, kind: str, text: str, **kw: object) -> None:
+        errors = self.errors(text, **kw)  # type: ignore[arg-type]
+        self.assertTrue(any(e.endswith(f"[{kind}]") for e in errors), (kind, errors))
+
+    def test_forging_grants_refused_at_every_level(self) -> None:
+        for scope in ("statuses", "checks"):
+            top = _TL_OK.replace("  contents: read\n", f"  contents: read\n  {scope}: write\n")
+            job = _TL_OK.replace("  a:\n", f"  a:\n    permissions:\n      {scope}: write\n")
+            for text, fname in ((top, "w.yml"), (job, "w.yml"), (top, "release.yml")):
+                with self.subTest(scope=scope, fname=fname, text=text):
+                    grants = {(fname, None, scope): "x", (fname, "a", scope): "x"}
+                    self.assertKind("PERMISSIONS_FORGING", text, fname=fname, grants=grants)
+        for text in (
+            _TL_OK.replace("permissions:\n  contents: read\n", "permissions: write-all\n"),
+            _TL_OK.replace("  a:\n", "  a:\n    permissions: write-all\n"),
+        ):
+            with self.subTest(text=text):
+                errors = self.errors(text)
+                self.assertTrue(any("is `write-all`" in e and e.endswith("[PERMISSIONS_FORGING]") for e in errors), errors)
+
+    def test_unlisted_write_grant_refused_and_listed_admitted(self) -> None:
+        text = _TL_OK.replace("  contents: read\n", "  contents: write\n")
+        self.assertKind("WRITE_GRANT_UNLISTED", text)
+        self.assertEqual(self.errors(text, grants={("w.yml", None, "contents"): "why"}), [])
+        # A row binds its level: a workflow-level row does not admit a job grant.
+        job = _TL_OK.replace("  a:\n", "  a:\n    permissions:\n      contents: write\n")
+        self.assertKind("WRITE_GRANT_UNLISTED", job, grants={("w.yml", None, "contents"): "why"})
+
+    def test_stale_write_grant_row_refused(self) -> None:
+        for row in (("w.yml", None, "contents"), ("w.yml", "a", "actions"), ("gone.yml", None, "pages")):
+            with self.subTest(row=row):
+                self.assertKind("WRITE_GRANT_ROW_STALE", _TL_OK, grants={row: "why"})
+
+    def test_live_grants_are_the_table(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_permissions(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
 
 
 class TestBrowserE2eRunScriptParity(unittest.TestCase):
