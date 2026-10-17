@@ -2812,13 +2812,8 @@ fn assemble_project_text(
     rust_sources: Vec<(RelPath, String)>,
 ) -> DResult<EmittedProject> {
     refuse_vendored_debugger(ctx)?;
-    // The emitted crate's package name: the caller-supplied sanitized project
-    // name, or the safe default when no name was configured.
-    let effective_name: &str = if ctx.cargo_name.is_empty() {
-        "ipe-app"
-    } else {
-        &ctx.cargo_name
-    };
+    // The emitted crate's package name, chosen by the build's `CrateName`.
+    let effective_name = ctx.crate_name.as_str();
     // Wrap once; all apply_cargo_name call sites below use this.
     let safe_name = SafeTomlString::escape(effective_name);
 

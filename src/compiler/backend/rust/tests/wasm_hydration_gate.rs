@@ -131,7 +131,7 @@ fn hydrate_program(interner: &mut Interner, fields: Vec<IrType>) -> DResult<Prog
 }
 
 /// Build the wasm-hydrate-mode `RustBackend`.
-fn hydrate_backend(interner: &Interner) -> RustBackend<'_> {
+const fn hydrate_backend(interner: &Interner) -> RustBackend<'_> {
     RustBackend::new(interner)
         .with_target(ipe_ir::Target::WasmClient)
         .with_wasm_hydrate_mode(true)

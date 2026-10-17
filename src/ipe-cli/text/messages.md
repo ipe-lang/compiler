@@ -204,6 +204,10 @@ ipe package publish: expected a single <path> argument
 
 directory supplied but no package.ipe found inside it
 
+## webview-needs-manifest
+
+a `web desktop` build needs a project: its desktop window comes from `delivery.desktop` in `package.ipe`, and this entry file has none
+
 ## legacy-toml-hint
 
 no package.ipe in this directory (found a legacy ipe.toml — package.ipe is the project manifest the toolchain reads)

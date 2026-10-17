@@ -73,32 +73,9 @@ pub struct Synced {
 
 /// Every field of a [`BuildConfig`], as the driver resolved it for one sync.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // mirrors the `BuildConfig` input field for field
 pub struct BuildConfigFields {
-    /// See [`BuildConfig::db_driver`].
-    pub db_driver: ipe_backend_rust::DbDriver,
-    /// See [`BuildConfig::ffi`].
-    pub ffi: Option<ipe_backend_rust::FfiEmit>,
-    /// See [`BuildConfig::target`].
-    pub target: ipe_ir::Target,
-    /// See [`BuildConfig::wasm_public_env`].
-    pub wasm_public_env: Vec<String>,
-    /// See [`BuildConfig::mount_base`].
-    pub mount_base: ipe_backend_rust::MountBase,
-    /// See [`BuildConfig::wasm_hydrate_mode`].
-    pub wasm_hydrate_mode: bool,
-    /// See [`BuildConfig::intent`].
-    pub intent: ipe_backend_rust::BuildIntent,
-    /// See [`BuildConfig::runtime_dep`].
-    pub runtime_dep: Option<ipe_backend_rust::RuntimeDep>,
-    /// See [`BuildConfig::debugger`].
-    pub debugger: bool,
-    /// See [`BuildConfig::cargo_name`].
-    pub cargo_name: String,
-    /// See [`BuildConfig::hot_appearance`].
-    pub hot_appearance: bool,
-    /// See [`BuildConfig::webview_host`].
-    pub webview_host: bool,
+    /// See [`BuildConfig::settings`].
+    pub settings: ipe_backend_rust::EmitSettings,
 }
 
 /// A database generation plus the handles derived from it.
@@ -175,75 +152,15 @@ impl LongLivedDb {
     /// cold one would not hold.
     pub fn sync_config(&mut self, fields: BuildConfigFields) -> BuildConfig {
         use salsa::Setter as _;
-        let BuildConfigFields {
-            db_driver,
-            ffi,
-            target,
-            wasm_public_env,
-            mount_base,
-            wasm_hydrate_mode,
-            intent,
-            runtime_dep,
-            debugger,
-            cargo_name,
-            hot_appearance,
-            webview_host,
-        } = fields;
+        let BuildConfigFields { settings } = fields;
         let Some(config) = self.config else {
-            let config = BuildConfig::new(
-                &self.db,
-                db_driver,
-                ffi,
-                target,
-                wasm_public_env,
-                mount_base,
-                wasm_hydrate_mode,
-                intent,
-                runtime_dep,
-                debugger,
-                cargo_name,
-                hot_appearance,
-                webview_host,
-            );
+            let config = BuildConfig::new(&self.db, settings);
             self.config = Some(config);
             return config;
         };
         let db = &mut self.db;
-        if *config.db_driver(db) != db_driver {
-            config.set_db_driver(db).to(db_driver);
-        }
-        if *config.ffi(db) != ffi {
-            config.set_ffi(db).to(ffi);
-        }
-        if *config.target(db) != target {
-            config.set_target(db).to(target);
-        }
-        if *config.wasm_public_env(db) != wasm_public_env {
-            config.set_wasm_public_env(db).to(wasm_public_env);
-        }
-        if *config.mount_base(db) != mount_base {
-            config.set_mount_base(db).to(mount_base);
-        }
-        if *config.wasm_hydrate_mode(db) != wasm_hydrate_mode {
-            config.set_wasm_hydrate_mode(db).to(wasm_hydrate_mode);
-        }
-        if *config.intent(db) != intent {
-            config.set_intent(db).to(intent);
-        }
-        if *config.runtime_dep(db) != runtime_dep {
-            config.set_runtime_dep(db).to(runtime_dep);
-        }
-        if *config.debugger(db) != debugger {
-            config.set_debugger(db).to(debugger);
-        }
-        if *config.cargo_name(db) != cargo_name {
-            config.set_cargo_name(db).to(cargo_name);
-        }
-        if *config.hot_appearance(db) != hot_appearance {
-            config.set_hot_appearance(db).to(hot_appearance);
-        }
-        if *config.webview_host(db) != webview_host {
-            config.set_webview_host(db).to(webview_host);
+        if *config.settings(db) != settings {
+            config.set_settings(db).to(settings);
         }
         config
     }
@@ -554,63 +471,66 @@ mod tests {
         assert!(owner.resets() >= 2, "resets: {}", owner.resets());
     }
 
-    fn fields(cargo_name: &str) -> BuildConfigFields {
+    fn fields(crate_name: ipe_backend_rust::CrateName) -> BuildConfigFields {
         BuildConfigFields {
-            db_driver: ipe_backend_rust::DbDriver::Sqlite,
-            ffi: None,
-            target: ipe_ir::Target::Native,
-            wasm_public_env: Vec::new(),
-            mount_base: ipe_backend_rust::MountBase::root(),
-            wasm_hydrate_mode: false,
-            intent: ipe_backend_rust::BuildIntent::Development,
-            runtime_dep: None,
-            debugger: false,
-            cargo_name: cargo_name.to_owned(),
-            hot_appearance: false,
-            webview_host: false,
+            settings: ipe_backend_rust::EmitSettings {
+                db_driver: ipe_backend_rust::DbDriver::Sqlite,
+                ffi: None,
+                target: ipe_ir::Target::Native,
+                wasm_public_env: Vec::new(),
+                mount_base: ipe_backend_rust::MountBase::root(),
+                wasm_hydrate_mode: false,
+                runtime_dep: None,
+                debugger: false,
+                crate_name,
+                hot_appearance: false,
+                host: ipe_backend_rust::EmitHost::Served,
+                intent: ipe_backend_rust::BuildIntent::Development,
+            },
         }
+    }
+
+    fn pinned(name: &str) -> ipe_backend_rust::CrateName {
+        ipe_backend_rust::CrateName::Pinned(ipe_backend_rust::CargoPackageName::sanitize(name))
     }
 
     #[test]
     fn warm_config_holds_every_resolved_field() {
         let mut owner = LongLivedDb::with_ceiling(SMALL);
         owner.sync(&one("Main", "main = 1"));
-        let first = owner.sync_config(fields("first"));
+        let first = owner.sync_config(fields(pinned("first")));
         // Every field differs from the first sync's, so each set is pinned.
         let changed = BuildConfigFields {
-            db_driver: ipe_backend_rust::DbDriver::Postgres,
-            ffi: Some(ipe_backend_rust::FfiEmit::default()),
-            target: ipe_ir::Target::WasmClient,
-            wasm_public_env: vec!["PUBLIC_KEY".to_owned()],
-            mount_base: ipe_backend_rust::MountBase::parse("/app")
-                .unwrap_or_else(|_| ipe_backend_rust::MountBase::root()),
-            wasm_hydrate_mode: true,
-            intent: ipe_backend_rust::BuildIntent::Release,
-            runtime_dep: Some(ipe_backend_rust::RuntimeDep {
-                root: std::path::PathBuf::from("/runtime"),
-            }),
-            debugger: true,
-            cargo_name: "second".to_owned(),
-            hot_appearance: true,
-            webview_host: true,
+            settings: ipe_backend_rust::EmitSettings {
+                db_driver: ipe_backend_rust::DbDriver::Postgres,
+                ffi: Some(ipe_backend_rust::FfiEmit::default()),
+                target: ipe_ir::Target::WasmClient,
+                wasm_public_env: vec!["PUBLIC_KEY".to_owned()],
+                mount_base: ipe_backend_rust::MountBase::parse("/app")
+                    .unwrap_or_else(|_| ipe_backend_rust::MountBase::root()),
+                wasm_hydrate_mode: true,
+                runtime_dep: Some(ipe_backend_rust::RuntimeDep {
+                    root: std::path::PathBuf::from("/runtime"),
+                }),
+                debugger: true,
+                crate_name: pinned("second"),
+                hot_appearance: true,
+                host: ipe_backend_rust::EmitHost::WebView(ipe_backend_rust::WebViewWindow {
+                    title: "Second".to_owned(),
+                    width: 640,
+                    height: 480,
+                }),
+                intent: ipe_backend_rust::BuildIntent::Release,
+            },
         };
-        assert_ne!(changed.mount_base, ipe_backend_rust::MountBase::root());
+        assert_ne!(
+            changed.settings.mount_base,
+            ipe_backend_rust::MountBase::root()
+        );
         let second = owner.sync_config(changed.clone());
         assert!(first == second, "a warm sync keeps the one config handle");
-        let db = owner.db();
         let held = BuildConfigFields {
-            db_driver: *second.db_driver(db),
-            ffi: second.ffi(db).clone(),
-            target: *second.target(db),
-            wasm_public_env: second.wasm_public_env(db).clone(),
-            mount_base: second.mount_base(db).clone(),
-            wasm_hydrate_mode: *second.wasm_hydrate_mode(db),
-            intent: *second.intent(db),
-            runtime_dep: second.runtime_dep(db).clone(),
-            debugger: *second.debugger(db),
-            cargo_name: second.cargo_name(db).clone(),
-            hot_appearance: *second.hot_appearance(db),
-            webview_host: *second.webview_host(db),
+            settings: second.settings(owner.db()).clone(),
         };
         assert_eq!(held, changed, "a warm config holds what a cold one would");
     }
@@ -620,7 +540,7 @@ mod tests {
         let mut owner = LongLivedDb::with_ceiling(SMALL);
         owner.sync(&one("Main", "main = 1"));
         assert!(owner.config().is_none());
-        let installed = owner.sync_config(fields(""));
+        let installed = owner.sync_config(fields(ipe_backend_rust::CrateName::SingleFile));
         assert!(owner.config() == Some(installed));
         let mut generations = (0..=SMALL.inputs.saturating_mul(2))
             .map(|round| owner.sync(&one(&format!("M{round}"), "x = 1")).generation);
