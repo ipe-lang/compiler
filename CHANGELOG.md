@@ -10,6 +10,48 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.7.0](https://github.com/ipe-lang/compiler/compare/ipe-v0.6.0...ipe-v0.7.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **db:** Ipe.Db.Store.Row, Db.findWhere / findByConditions / findOneByField / findManyByField / getById / findWhereOn / getByIdOn / findJoin* / findProjection* and Unsafe.unsafeQuery rows are now Dict String (Maybe String): a SQL NULL cell is Nothing, never "". A raw-column store row with an absent column now binds NULL instead of "", so an upsert with an absent key column is refused.
+
+### Features
+
+* **cli:** list and read a held source directory, and build root fixtures through ProjectRoot::resolve ([#3681](https://github.com/ipe-lang/compiler/issues/3681)) ([20c199e](https://github.com/ipe-lang/compiler/commit/20c199e4fb19cc0702cf995b1a2ba0636fd8d9fa))
+* **cli:** resolve one typed project root and refuse a root it would not honour ([#3677](https://github.com/ipe-lang/compiler/issues/3677)) ([54450d1](https://github.com/ipe-lang/compiler/commit/54450d16e422faeffca6eb08ce096c09195114f4))
+* **code-review:** unreviewable files are open, acknowledgeable queue items ([#3670](https://github.com/ipe-lang/compiler/issues/3670)) ([d513bf4](https://github.com/ipe-lang/compiler/commit/d513bf409396df4555aafe804df679986f2d8e62))
+
+
+### Bug Fixes
+
+* **canon:** a do bind resolves Task by module identity ([#3711](https://github.com/ipe-lang/compiler/issues/3711)) ([7b77c66](https://github.com/ipe-lang/compiler/commit/7b77c669665e8b9e04d5595e86fdd6b6d474207f))
+* **canon:** mint compose and codec binders apart from every visible binding ([#3700](https://github.com/ipe-lang/compiler/issues/3700)) ([2302b60](https://github.com/ipe-lang/compiler/commit/2302b6064b81b343625f5f6366b8067f5c2f2f78))
+* **ci:** refuse every with: key its pinned action does not declare ([#3667](https://github.com/ipe-lang/compiler/issues/3667)) ([4f5715b](https://github.com/ipe-lang/compiler/commit/4f5715bb452caf70bd412fe30dd67a3de696e78f))
+* **cli:** one fixture builder for goldens and tests, typed source-tree refusal ([#3702](https://github.com/ipe-lang/compiler/issues/3702)) ([5a63568](https://github.com/ipe-lang/compiler/commit/5a6356850112b1ba5ca6661c81440e6e7edba64f))
+* **cli:** trust the FFI cache directory it holds and read project sources through the held root ([#3693](https://github.com/ipe-lang/compiler/issues/3693)) ([dcd0ace](https://github.com/ipe-lang/compiler/commit/dcd0ace38b8e8398c417d889f6a291ed670fc808))
+* **code-review:** a decision shows its pending state and a reload clears only older not-saved notices ([#3689](https://github.com/ipe-lang/compiler/issues/3689)) ([e93687a](https://github.com/ipe-lang/compiler/commit/e93687a78c4463f26595744cc7de7f5575aa8550))
+* **code-review:** a unit too large to draw is withheld with a typed notice instead of closing the session ([#3680](https://github.com/ipe-lang/compiler/issues/3680)) ([3594d8c](https://github.com/ipe-lang/compiler/commit/3594d8c46c4c5568dffbf8233a5f5c50c223448f))
+* **code-review:** page failures and decision refusals are typed cases with fixed texts ([#3697](https://github.com/ipe-lang/compiler/issues/3697)) ([fcb7a9a](https://github.com/ipe-lang/compiler/commit/fcb7a9ad57c1a5f668b4b67a0b9d6f38cefd8ff4))
+* **code-review:** shell $'...' strings take escapes and &lt;&lt; in arithmetic is a shift ([#3692](https://github.com/ipe-lang/compiler/issues/3692)) ([4806402](https://github.com/ipe-lang/compiler/commit/48064020b038da50a3917cc140bf8d51b9fdbd02))
+* **code-review:** the bind refusal names the spellings it accepts ([#3682](https://github.com/ipe-lang/compiler/issues/3682)) ([5ce356c](https://github.com/ipe-lang/compiler/commit/5ce356c1eeecfdfe0a0fe022251dca31b4be9630))
+* **db:** raw Db reads keep SQL NULL as a Maybe String cell ([#3688](https://github.com/ipe-lang/compiler/issues/3688)) ([f06df0e](https://github.com/ipe-lang/compiler/commit/f06df0e1844ee367a72a681ecff125cc22f81adf))
+* **lower:** a signature row variable has one lowering ([#3671](https://github.com/ipe-lang/compiler/issues/3671)) ([488732d](https://github.com/ipe-lang/compiler/commit/488732d39ace8cefbb05fef9e204779b6bacd4e0))
+* **lower:** lower only ground types outside a def scope ([#3712](https://github.com/ipe-lang/compiler/issues/3712)) ([b3ae497](https://github.com/ipe-lang/compiler/commit/b3ae497d2394193044cfef65d4c936f7e831e768))
+* **lower:** Store.select piped into selectToList lowers like the direct call ([#3698](https://github.com/ipe-lang/compiler/issues/3698)) ([80f509f](https://github.com/ipe-lang/compiler/commit/80f509f1ff51f692b4bd63a6402139501c1bbf0e))
+* **runtime:** a closed session ends its stream with one closed frame and every client sink stops ([#3696](https://github.com/ipe-lang/compiler/issues/3696)) ([0cd11b0](https://github.com/ipe-lang/compiler/commit/0cd11b086d2f4fdb3ba087e4790d5d35016ebd5a))
+* **runtime:** a web session starts at most 64 commands at once ([#3679](https://github.com/ipe-lang/compiler/issues/3679)) ([b5714dc](https://github.com/ipe-lang/compiler/commit/b5714dcecd3aeef287d2ceb2ed6a745624fab39d))
+* **runtime:** an eviction never takes a session with input on its way ([#3704](https://github.com/ipe-lang/compiler/issues/3704)) ([97f60ef](https://github.com/ipe-lang/compiler/commit/97f60ef71368d917bff76650d8f9535e171b7afb))
+* **runtime:** draw every random mint from one fallible entropy source ([#3669](https://github.com/ipe-lang/compiler/issues/3669)) ([b56430f](https://github.com/ipe-lang/compiler/commit/b56430ff850c05d26d39cfbc905d4917f572412d))
+* **runtime:** Server.listen refusals are typed, of their own kind ([#3678](https://github.com/ipe-lang/compiler/issues/3678)) ([33bb58f](https://github.com/ipe-lang/compiler/commit/33bb58f7939e14ad4cfd39a9403499f668079ca7))
+* **sandbox:** read every carved VCS entry through one held handle ([#3675](https://github.com/ipe-lang/compiler/issues/3675)) ([19ebaf8](https://github.com/ipe-lang/compiler/commit/19ebaf8c5a062d9624d5878779e822f4ad5fa7cb))
+
+
+### Performance Improvements
+
+* **code-review:** queue tests seed rows in one transaction and probe the write lock without waiting ([#3710](https://github.com/ipe-lang/compiler/issues/3710)) ([af304b9](https://github.com/ipe-lang/compiler/commit/af304b928ce94fa421139a13494cd73afdacb4ae))
+
 ## [0.6.0](https://github.com/ipe-lang/compiler/compare/ipe-v0.5.1...ipe-v0.6.0) (2026-10-16)
 
 
