@@ -11,6 +11,10 @@ use core::fmt::Write as _;
 use ipe_intern::rust_str_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
+/// The function-value carrier decider lives in the IR so lowering and emit
+/// share one definition.
+pub use ipe_ir::wants_arc_ctor;
+
 /// Emit an `Expr` in TAIL/STATEMENT context — the interior of a `TailLoop`'s
 /// `loop { … }`. Every path ends in either a `return <expr>;` (a leaf
 /// tail position) or a `continue;` (a `TailRecur` jump), so the `loop` types as
@@ -272,48 +276,6 @@ pub fn emit_apply(
 /// `ty` is the value's `Fun` IR type; [`render_type`] renders it as the typed
 /// smart-pointer.  Kept `#[inline(never)]` for the same frame-size reason as
 /// the neighbouring helpers.
-/// Does a function value / lambda of IR type `ty` fill one of the runtime's
-/// `Arc<dyn Fn + Send + Sync>` callback slots (so it must be boxed with
-/// `Arc::new`, not `Box::new`)? The shapes:
-///   • `ServerHandler<E>`: `Fn(ServerRequest) -> IpeTask<E, ServerResponse>`
-///   • `WsServerCfg` callbacks, `-> IpeTask<E, ()>`:
-///       - `Fn(WsHandle)`           (onConnect / onClose)
-///       - `Fn(WsHandle, String)`   (onMessage)
-///       - `Fn(WsHandle, Error)`    (onError — 2nd param is the error type,
-///         NOT String; its setter `ws_server_with_on_error` takes `Arc<…>`)
-///
-/// This MUST dispatch on the `IrType` STRUCTURE, never on the rendered type
-/// string. `render_type` renders `ServerHandler<E>` as the type-ALIAS name
-/// `"ServerHandler<IpeError>"` — NOT the expanded `"Arc<dyn Fn…>"` — so a
-/// `starts_with("Arc<")` string test silently misclassifies every handler shape
-/// as `Box` and reintroduces the E0308 seal break for inline
-/// `Server.post path (\req -> …)` handler lambdas (the regression this shared
-/// helper closes). The param patterns are kept in LOCK-STEP with `render_type`'s
-/// WS/ServerHandler Arc arms (`emit_types.rs`) — a shape rendered as `Arc<…>`
-/// there but boxed with `Box::new` here (or vice-versa) is an E0308. Both
-/// `emit_func_value` and `emit_lambda` route through here so the two emit paths
-/// can never drift.
-pub fn wants_arc_ctor(ty: &IrType) -> bool {
-    // A promoted `SharedFun` slot renders `Arc<dyn Fn>` (`render_type`), so its
-    // value must be built with `Arc::new`, not `Box::new` — the two carriers are
-    // distinct Rust types and mixing them is an E0308.
-    if matches!(ty, IrType::SharedFun(_, _)) {
-        return true;
-    }
-    matches!(ty,
-        IrType::Fun(params, ret)
-            if (matches!(params.as_slice(), [IrType::ServerRequest])
-                && matches!(ret.as_ref(), IrType::Task(inner)
-                    if matches!(inner.as_ref(), IrType::ServerResponse)))
-               || (matches!(
-                    params.as_slice(),
-                    [IrType::WebSocketServer]
-                        | [IrType::WebSocketServer, IrType::Str | IrType::Error]
-                ) && matches!(ret.as_ref(), IrType::Task(inner)
-                    if matches!(inner.as_ref(), IrType::Unit)))
-    )
-}
-
 #[inline(never)]
 pub fn emit_func_value(
     ctx: &EmitCtx,
