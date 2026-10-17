@@ -1,0 +1,14 @@
+module Main exposing (main, getX)
+
+import Ipe.Io as Io
+
+
+-- An exposed, unannotated getter no definition calls. Its argument's row is
+-- free: no binding quantifies it and no caller fixes it, so it lowers as its
+-- zero-extension instance (`{ x : Int }`). The program is accepted.
+getX r =
+    r.x + 1
+
+
+main =
+    Io.println "ok"
