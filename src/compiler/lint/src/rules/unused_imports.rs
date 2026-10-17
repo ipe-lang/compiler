@@ -9,6 +9,9 @@
 //!    appears in `VarQual` and as the qualifier of a `TType` annotation.
 //! 2. Explicitly exposed names: `import Foo exposing (bar, Baz, Shape(Circle))`
 //!    binds each name, and each listed constructor, unqualified.
+//! 3. The `do` bind: a `do` statement sequences through the
+//!    [`ipe_canon::DO_BIND_MODULE`] import by identity, whatever alias that
+//!    import carries, so a `do` uses it.
 //!
 //! Every uncertain case counts as a use, so the rule never flags an import that
 //! might be needed: an `exposing (..)` wildcard, an exposed `Type(..)` (its
@@ -26,7 +29,9 @@
 
 use std::collections::HashSet;
 
-use ipe_canon::{QualifierForm, import_qualifier_forms, stdlib_canonical_qualifier};
+use ipe_canon::{
+    DO_BIND_MODULE, QualifierForm, import_qualifier_forms, stdlib_canonical_qualifier,
+};
 use ipe_diagnostics::Span;
 use ipe_intern::{Interner, Symbol};
 use ipe_syntax::{
@@ -55,9 +60,13 @@ pub fn check(ctx: &Ctx) -> Vec<Finding> {
         .imports
         .iter()
         .filter(|import| {
-            !is_used(ctx.interner, import, &|q| qualifiers.contains(q), &|s| {
-                uses.unqualified.contains(&s)
-            })
+            !is_used(
+                ctx.interner,
+                import,
+                uses.do_bind,
+                &|q| qualifiers.contains(q),
+                &|s| uses.unqualified.contains(&s),
+            )
         })
         .map(|import| finding(ctx, import))
         .collect()
@@ -96,11 +105,17 @@ pub fn any_referenced(
         return true;
     };
     imports.iter().any(|import| {
-        is_used(import_interner, import, &|q| qualifiers.contains(q), &|s| {
-            import_interner
-                .resolve(s)
-                .is_none_or(|t| unqualified.contains(t))
-        })
+        is_used(
+            import_interner,
+            import,
+            uses.do_bind,
+            &|q| qualifiers.contains(q),
+            &|s| {
+                import_interner
+                    .resolve(s)
+                    .is_none_or(|t| unqualified.contains(t))
+            },
+        )
     })
 }
 
@@ -139,14 +154,19 @@ fn finding(ctx: &Ctx, import: &Import) -> Finding {
 /// Fail-closed: an unresolvable symbol, a wildcard, or an exposed `Type(..)`
 /// all count as used.
 ///
-/// `qualifier_used` answers for a qualifier spelling, `name_used` for an
-/// unqualified name symbol of `interner`.
+/// `do_bind` says whether the module holds a `do` bind, `qualifier_used`
+/// answers for a qualifier spelling, `name_used` for an unqualified name
+/// symbol of `interner`.
 fn is_used(
     interner: &Interner,
     import: &Import,
+    do_bind: bool,
     qualifier_used: &impl Fn(&str) -> bool,
     name_used: &impl Fn(Symbol) -> bool,
 ) -> bool {
+    if do_bind && imports_do_module(interner, import) {
+        return true;
+    }
     let Exposing::List(items) = &import.exposing.value else {
         return true;
     };
@@ -158,6 +178,20 @@ fn is_used(
     }
     import_qualifier_texts(interner, import)
         .is_none_or(|texts| texts.iter().any(|text| qualifier_used(text.as_str())))
+}
+
+/// Whether `import` names [`DO_BIND_MODULE`], the module a `do` bind
+/// sequences through by identity.
+///
+/// Fail-closed: an unresolvable segment counts as a match.
+fn imports_do_module(interner: &Interner, import: &Import) -> bool {
+    import.name.value.len() == DO_BIND_MODULE.len()
+        && import
+            .name
+            .value
+            .iter()
+            .zip(DO_BIND_MODULE)
+            .all(|(s, want)| interner.resolve(*s).is_none_or(|text| text == *want))
 }
 
 /// Whether one exposed item may be referenced unqualified.
@@ -232,6 +266,8 @@ pub fn removal_range(text: &str, import: &Import) -> Option<(usize, usize)> {
 struct Uses {
     /// Qualifier symbols of `VarQual` and qualified `TType` references.
     qualifiers: HashSet<Symbol>,
+    /// Whether some `do` statement binds through the [`DO_BIND_MODULE`] import.
+    do_bind: bool,
     /// Unqualified names: values, binders, constructors, types, operators and
     /// re-exports.
     unqualified: HashSet<Symbol>,
@@ -293,6 +329,7 @@ impl Uses {
             Expr_::VarQual(qualifier, _) => {
                 self.qualifiers.insert(*qualifier);
             }
+            Expr_::TaskAndThen => self.do_bind = true,
             Expr_::Call(callee, args) => {
                 self.expr(callee);
                 for arg in args {

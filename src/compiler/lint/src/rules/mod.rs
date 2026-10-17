@@ -199,15 +199,19 @@ pub fn run_all<P: CancelProbe>(ctx: &Ctx<'_>, probe: &P) -> Result<Vec<Finding>,
 ///
 /// The parser spans a source call from its callee through its last argument,
 /// with every child in source order inside it. Desugared calls break that
-/// shape: a `do`-block `x <- task` becomes `Task.andThen (\x -> rest) task`
+/// shape: a `do`-block `x <- task` becomes the `Task.andThen` bind call
 /// spanned on the `<-` token, with the lambda zero-width and the task after it,
 /// and a restamped `do` block carries the `do` keyword's span. Rules that
 /// reason about how a call reads test this before treating a `Call` node as
-/// source.
+/// source. A `do` bind is refused by its [`Expr_::TaskAndThen`] head first, so
+/// the span shape is a second, independent check.
 pub fn is_source_call(expr: &Expr) -> bool {
     let Expr_::Call(callee, args) = &expr.value else {
         return false;
     };
+    if matches!(callee.value, Expr_::TaskAndThen) {
+        return false;
+    }
     if callee.span.lo < expr.span.lo || callee.span.hi <= callee.span.lo {
         return false;
     }
@@ -294,6 +298,7 @@ fn visit_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)

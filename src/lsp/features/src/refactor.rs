@@ -357,6 +357,7 @@ fn find_case_or_if(expr: &Expr, byte: u32) -> Option<&Expr> {
         Expr_::Access(inner, _) => find_case_or_if(inner, byte),
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)

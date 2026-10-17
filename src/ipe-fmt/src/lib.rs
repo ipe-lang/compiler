@@ -2022,7 +2022,7 @@ impl<'a> Printer<'a> {
             if !outer && self.do_keyword_end(cur.span).is_some() {
                 break;
             }
-            let Some((step, rest)) = self.do_step(cur, outer) else {
+            let Some((step, rest)) = Self::do_step(cur, outer) else {
                 break;
             };
             steps.push(step);
@@ -2046,8 +2046,8 @@ impl<'a> Printer<'a> {
     ///
     /// Returns the statement with the rest of the chain. The shapes mirror the
     /// parser's `desugar_do` span discipline:
-    /// - bind `p <- t` is `Task.andThen (\p -> rest) t` with a zero-width
-    ///   lambda span (no written lambda is zero-width);
+    /// - bind `p <- t` is a call of the [`Expr_::TaskAndThen`] identity node
+    ///   on `(\p -> rest)` and `t` (no written call has that head);
     /// - bare run `t` is `let _ = t in rest` whose `_` carries `t`'s own span
     ///   (a written `let _ =` is rejected by the parser);
     /// - pure `p = v` is `let p = v in rest` stamped with the `=` span, which
@@ -2055,12 +2055,12 @@ impl<'a> Printer<'a> {
     ///   outermost node carries the `do` span instead, so there any
     ///   single-binding `let` over a statement binder is accepted — printing a
     ///   lone `let … in` result as a statement re-parses to the same AST.
-    fn do_step<'e>(&self, e: &'e Expr, outer: bool) -> Option<(DoStep<'e>, &'e Expr)> {
+    fn do_step(e: &Expr, outer: bool) -> Option<(DoStep<'_>, &Expr)> {
         match &e.value {
             Expr_::Call(head, args) => {
-                let Expr_::VarQual(module, name) = &head.value else {
+                if !matches!(head.value, Expr_::TaskAndThen) {
                     return None;
-                };
+                }
                 let [lam, task] = args.as_slice() else {
                     return None;
                 };
@@ -2070,11 +2070,7 @@ impl<'a> Printer<'a> {
                 let [pat] = params.as_slice() else {
                     return None;
                 };
-                let synthetic = lam.span.lo == lam.span.hi
-                    && self.sym(*module) == "Task"
-                    && self.sym(*name) == "andThen";
-                (synthetic && is_do_binder(&pat.value))
-                    .then_some((DoStep::Bind(pat, task), cont.as_ref()))
+                is_do_binder(&pat.value).then_some((DoStep::Bind(pat, task), cont.as_ref()))
             }
             Expr_::Let(bindings, cont) => {
                 let [b] = bindings.as_slice() else {
@@ -2160,6 +2156,11 @@ impl<'a> Printer<'a> {
         match &e.value {
             Expr_::VarLocal(s) => self.sym(*s),
             Expr_::VarQual(q, n) => format!("{}.{}", self.sym(*q), self.sym(*n)),
+            // The `do` bind has no source spelling: it prints as statements
+            // through `do_view`. Reached only by the source-free equivalence
+            // projection, where it prints as a token no written callee shares,
+            // so a `do` never compares equal to a spelled `Task.andThen` call.
+            Expr_::TaskAndThen => "(<-)".to_owned(),
             Expr_::Int(n) => n.to_string(),
             Expr_::Float(f) => format_float(*f),
             Expr_::Str(s) => format!("\"{}\"", escape_str_body(s)),

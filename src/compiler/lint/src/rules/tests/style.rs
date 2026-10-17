@@ -161,9 +161,7 @@ fn desugared_do_bind_is_not_a_source_call() {
         let Expr_::Call(callee, _) = &expr.value else {
             return;
         };
-        if let Expr_::VarQual(_, name) = &callee.value
-            && ctx.text(*name) == "andThen"
-        {
+        if matches!(callee.value, Expr_::TaskAndThen) {
             and_then_calls += 1;
             assert!(!is_source_call(expr), "synthetic bind is not source");
         } else if is_source_call(expr) {
@@ -175,6 +173,38 @@ fn desugared_do_bind_is_not_a_source_call() {
         source_calls.contains(&"Db.query conn q".to_owned()),
         "{source_calls:?}"
     );
+}
+
+/// A `do` bind is never a source call even when its spans read like one: the
+/// [`Expr_::TaskAndThen`] head refuses it before the span-shape check.
+#[test]
+fn do_bind_head_is_not_a_source_call_whatever_its_spans() {
+    use ipe_diagnostics::{Located, Span};
+    use ipe_syntax::Pattern_;
+
+    let at = |lo: u32, hi: u32, e: Expr_| Located::new(Span::new(lo, hi), e);
+    let mut interner = Interner::new();
+    let Ok(x) = interner.intern("x") else {
+        return;
+    };
+    let lam = at(
+        3,
+        6,
+        Expr_::Lambda(
+            vec![Located::new(Span::new(3, 4), Pattern_::PVar(x))],
+            Box::new(at(5, 6, Expr_::VarLocal(x))),
+        ),
+    );
+    let task = at(7, 8, Expr_::VarLocal(x));
+    let spelled = |head: Expr_| {
+        at(
+            0,
+            8,
+            Expr_::Call(Box::new(at(0, 2, head)), vec![lam.clone(), task.clone()]),
+        )
+    };
+    assert!(is_source_call(&spelled(Expr_::VarLocal(x))));
+    assert!(!is_source_call(&spelled(Expr_::TaskAndThen)));
 }
 
 // ── multiline-lambda-arg ─────────────────────────────────────────────────────

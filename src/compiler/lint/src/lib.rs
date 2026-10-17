@@ -1642,6 +1642,31 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
+    /// A `do`-only module body: the bind names no qualifier at all.
+    const DO_ONLY_BODY: &str = "main t =\n    do\n        a <- t\n        t\n";
+
+    /// A `do` bind uses the `Ipe.Task` import by identity, plain or aliased:
+    /// removing it would break the build, so it is never flagged.
+    #[test]
+    fn do_bind_uses_the_task_import_under_any_alias() {
+        for import in ["import Ipe.Task", "import Ipe.Task as T"] {
+            let src = format!("module Main exposing (main)\n\n{import}\n\n{DO_ONLY_BODY}");
+            let found = unused_imports(&src);
+            assert!(found.is_empty(), "`{import}` + `do`: {found:?}");
+        }
+    }
+
+    /// A `do` bind is no use of a non-`Ipe.Task` import spelled `Task`: the bind
+    /// never sequences through it, so that import stays flagged.
+    #[test]
+    fn do_bind_is_no_use_of_an_import_aliased_task() {
+        let src = format!(
+            "module Main exposing (main)\n\nimport Ipe.Json.Decode as Task\n\n{DO_ONLY_BODY}"
+        );
+        let found = unused_imports(&src);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
     /// A dotted qualifier in type position is a use too.
     #[test]
     fn dotted_type_qualifier_is_a_use() {

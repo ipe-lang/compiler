@@ -2480,8 +2480,9 @@ impl<'a> Parser<'a> {
     /// - `⟦e ; rest⟧       = Task.andThen (\_ -> ⟦rest⟧) e`
     /// - `⟦e⟧              = e`
     ///
-    /// Because the desugar names `Task.andThen`, the enclosing module must have
-    /// `Ipe.Task` in scope as `Task` (the usual `import Ipe.Task as Task`).
+    /// `Task.andThen` here is the [`Expr_::TaskAndThen`] identity node, not a
+    /// spelling: the canonicaliser binds it to the kernel and requires an
+    /// `import Ipe.Task` under any alias.
     fn parse_do(&mut self, threshold: u32, depth: u32) -> DResult<Expr> {
         if depth > MAX_DEPTH {
             return Err(self.too_deep(Construct::Expression));
@@ -2516,7 +2517,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.desugar_do(do_tok.span, stmts)
+        Self::desugar_do(do_tok.span, stmts)
     }
 
     /// Parse one `do`-block statement. A leading lowercase name (or `_`) directly
@@ -2572,7 +2573,7 @@ impl<'a> Parser<'a> {
     /// instead. A `do` that ends in a bare run has a Task step and passes this
     /// purely structural gate; whether that final expression is genuinely
     /// effectful is a type-level question left to the lowering gates.
-    fn desugar_do(&mut self, do_span: Span, stmts: Vec<DoStmt>) -> DResult<Expr> {
+    fn desugar_do(do_span: Span, stmts: Vec<DoStmt>) -> DResult<Expr> {
         // Stepless-do gate: a Task step is any `<-` bind or any bare run,
         // the trailing run included. The gate is purely structural because
         // the parser cannot see types; a `do` with no step is pure code.
@@ -2610,7 +2611,7 @@ impl<'a> Parser<'a> {
                     // call/callee get the full operator span. Distinct, so the
                     // post-order parent `Call` cannot overwrite the lambda arrow.
                     let lam_span = Span::new(op_span.lo, op_span.lo);
-                    self.task_and_then(pat, lam_span, op_span, acc, task)?
+                    Self::task_and_then(pat, lam_span, op_span, acc, task)
                 }
                 DoStmt::Run(task) => {
                     // A bare run — "run this effect, discard its result, continue"
@@ -2655,26 +2656,24 @@ impl<'a> Parser<'a> {
         Ok(Located::new(do_span, acc.value))
     }
 
-    /// Build `Task.andThen (\pat -> cont) task`. The lambda carries `lam_span`
-    /// and the call/callee carry `call_span` — distinct, and neither an
-    /// operand's — so the type checker's post-order `(home, span)` region map
-    /// records the lambda's arrow without the parent call overwriting it.
+    /// Build `Task.andThen (\pat -> cont) task`.
+    ///
+    /// The callee is the [`Expr_::TaskAndThen`] identity node, never a
+    /// `Task.andThen` spelling an import alias could retarget. The lambda
+    /// carries `lam_span` and the call/callee carry `call_span` — distinct, and
+    /// neither an operand's — so the type checker's post-order `(home, span)`
+    /// region map records the lambda's arrow without the parent call
+    /// overwriting it.
     fn task_and_then(
-        &mut self,
         pat: Pattern,
         lam_span: Span,
         call_span: Span,
         cont: Expr,
         task: Expr,
-    ) -> DResult<Expr> {
-        let task_mod = self.interner.intern("Task")?;
-        let and_then = self.interner.intern("andThen")?;
-        let callee = Located::new(call_span, Expr_::VarQual(task_mod, and_then));
+    ) -> Expr {
+        let callee = Located::new(call_span, Expr_::TaskAndThen);
         let lam = Located::new(lam_span, Expr_::Lambda(vec![pat], Box::new(cont)));
-        Ok(Located::new(
-            call_span,
-            Expr_::Call(Box::new(callee), vec![lam, task]),
-        ))
+        Located::new(call_span, Expr_::Call(Box::new(callee), vec![lam, task]))
     }
 
     // ---- patterns ---------------------------------------------------------
