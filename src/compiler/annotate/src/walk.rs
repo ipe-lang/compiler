@@ -513,7 +513,8 @@ fn push_syn_expr(out: &mut Vec<Raw>, expr: &ipe_syntax::Expr, interner: &Interne
         | ipe_syntax::Expr_::Char(_) => {
             Raw::push(out, expr.span, TokenClass::StringLit, None);
         }
-        ipe_syntax::Expr_::Unit => {}
+        // A `do` bind's callee spans the `<-` operator: no name to colour.
+        ipe_syntax::Expr_::TaskAndThen | ipe_syntax::Expr_::Unit => {}
         ipe_syntax::Expr_::Call(f, args) => {
             push_syn_expr(out, f, interner);
             for a in args {

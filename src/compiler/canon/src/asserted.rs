@@ -456,6 +456,7 @@ fn find_asserted_use(
             .find_map(|(_, e)| find_asserted_use(e, interner)),
         Expr_::VarLocal(_)
         | Expr_::VarQual(..)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)

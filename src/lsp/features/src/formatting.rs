@@ -397,6 +397,43 @@ mod tests {
         }
     }
 
+    /// A declaration holding a `do` bind reformats as a `do` block: the engine
+    /// re-sugars the bind, so the edit never spells it `Task.andThen` (which
+    /// an import alias could retarget) and the edited buffer still binds
+    /// through the `do` identity node.
+    #[test]
+    fn range_formatting_keeps_a_do_bind_a_do() {
+        let db = IpeDatabase::new();
+        let src = "module Main exposing (a)\n\nimport Ipe.Task as T\n\na t =\n      do\n            x <- t\n            t\n";
+        let f = file(&db, &["Main"], src);
+        let edits = format_range(&db, f, line_range(0, 9), PositionEncoding::Utf16)
+            .expect("parseable source returns Some");
+        assert!(!edits.is_empty(), "the over-indented decl reformats");
+        let result = apply_edits(src, &edits);
+        assert!(
+            result.contains("do\n") && result.contains("x <- t"),
+            "the bind stays a `do` statement, got:\n{result}"
+        );
+        assert!(!result.contains("andThen"), "{result}");
+        let mut interner = ipe_intern::Interner::new();
+        let module = ipe_parse::parse_module(&result, &mut interner).expect("edited buffer parses");
+        let body = &module
+            .values
+            .first()
+            .expect("the decl survives")
+            .value
+            .body
+            .value;
+        assert!(
+            matches!(
+                body,
+                ipe_syntax::Expr_::Call(callee, _)
+                    if matches!(callee.value, ipe_syntax::Expr_::TaskAndThen)
+            ),
+            "{body:?}"
+        );
+    }
+
     /// Two over-indented declarations, no comments. Lines (0-based):
     /// 0 `module Main exposing (a, b)` · 1 blank · 2 `a : Int` · 3 `a =` ·
     /// 4 `      1` · 5 blank · 6 `b : Int` · 7 `b =` · 8 `      2`.
