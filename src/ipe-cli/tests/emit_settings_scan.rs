@@ -28,6 +28,24 @@ const GUARDED: &[(&str, &str)] = &[
     ("RustBackend", "configured"),
     ("EmitHost", "WebView"),
     ("HostIntent", "Served"),
+    ("Delivery", "web_desktop"),
+];
+
+/// The backend's per-field setters. A setter applied to a configured backend
+/// would override one setting behind the settings value, so none is called
+/// from the scanned trees, as a method or by path.
+const SETTERS: &[&str] = &[
+    "with_project_name",
+    "with_runtime_dep",
+    "with_debugger",
+    "with_build_intent",
+    "with_hot_appearance",
+    "with_target",
+    "with_db_driver",
+    "with_ffi",
+    "with_wasm_public_env",
+    "with_mount_base",
+    "with_wasm_hydrate_mode",
 ];
 
 /// The webview proof: any construction of it counts.
@@ -35,7 +53,7 @@ const PROOF: &str = "WebViewProof";
 
 /// Names that may not be renamed, aliased or have their members imported, since
 /// a second name would hide a site from the scan.
-const OWNERS: &[&str] = &["RustBackend", "EmitHost", "HostIntent", PROOF];
+const OWNERS: &[&str] = &["RustBackend", "EmitHost", "HostIntent", "Delivery", PROOF];
 
 /// Each admitted site: what is spelled, the file, the function, and how often.
 const ADMITTED: &[(&str, &str, &str, usize)] = &[
@@ -116,6 +134,12 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "HostIntent::Served",
         "src/ipe-cli/src/watch.rs",
         "watch_emit_settings",
+        1,
+    ),
+    (
+        "Delivery::web_desktop",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "gate_desktop",
         1,
     ),
 ];
@@ -228,7 +252,9 @@ impl Scan {
         } else {
             owner.to_owned()
         };
-        if GUARDED.iter().any(|(o, m)| *o == owner && *m == member) {
+        if GUARDED.iter().any(|(o, m)| *o == owner && *m == member)
+            || (owner == "RustBackend" && SETTERS.contains(&member))
+        {
             self.hit(format!("{owner}::{member}"));
         }
     }
@@ -263,6 +289,11 @@ impl Scan {
                     }
                     if name == PROOF {
                         self.hit(PROOF.to_owned());
+                    }
+                    if previous.last().is_some_and(|dot| dot == ".")
+                        && SETTERS.contains(&name.as_str())
+                    {
+                        self.hit(format!(".{name}"));
                     }
                     previous.push(name);
                 }
@@ -332,15 +363,36 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
         if self.in_pattern == 0 {
-            let names: Vec<String> = expr
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
+            // `<Owner>::member` and `<Owner as Trait>::member` name `Owner`
+            // through the qualified self type, ahead of the path's own
+            // segments.
+            let (owner, skip) = expr.qself.as_ref().map_or((None, 0), |qself| {
+                (
+                    Some(type_name(&qself.ty).unwrap_or_default()),
+                    qself.position,
+                )
+            });
+            let names: Vec<String> = owner
+                .into_iter()
+                .chain(
+                    expr.path
+                        .segments
+                        .iter()
+                        .skip(skip)
+                        .map(|segment| segment.ident.to_string()),
+                )
                 .collect();
             self.segments(&names);
         }
         visit::visit_expr_path(self, expr);
+    }
+
+    fn visit_expr_method_call(&mut self, expr: &'ast syn::ExprMethodCall) {
+        let name = expr.method.to_string();
+        if SETTERS.contains(&name.as_str()) {
+            self.hit(format!(".{name}"));
+        }
+        visit::visit_expr_method_call(self, expr);
     }
 
     fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
@@ -528,8 +580,7 @@ fn emit_settings_reach_only_admitted_sites() -> Result<(), String> {
     Ok(())
 }
 
-/// Each guarded spelling planted outside its admitted site is refused, and
-/// patterns and test code are out of scope.
+/// Each guarded spelling planted outside its admitted site is refused.
 #[test]
 fn a_planted_site_is_refused() -> Result<(), String> {
     let db = "src/compiler/db/src/lib.rs";
@@ -573,13 +624,49 @@ fn a_planted_site_is_refused() -> Result<(), String> {
         (pipeline, "use crate::delivery::HostIntent::Served;\n"),
         (pipeline, "use crate::delivery::HostIntent as H;\n"),
         (pipeline, "type H = crate::delivery::HostIntent;\n"),
+        (db, "fn other() { <RustBackend>::configured(&i, &s); }\n"),
+        (
+            db,
+            "fn other() { <ipe_backend_rust::RustBackend as Clone>::new(&i); }\n",
+        ),
+        (
+            db,
+            "fn emit_project() { RustBackend::configured(&i, &s).with_debugger(true); }\n",
+        ),
+        (db, "fn other() { RustBackend::with_ffi(b, None); }\n"),
+        (db, "fn other() { m!(b.with_project_name(n)); }\n"),
+        (
+            "src/ipe-cli/src/driver/commands_pkg.rs",
+            "fn other() { Delivery::web_desktop().host_intent(); }\n",
+        ),
+        (pipeline, "use crate::delivery::Delivery as D;\n"),
     ];
+    // An empty source at `rel` already misses each admitted row there; a
+    // breach counts only by a refusal that baseline does not carry.
+    let mut missed = Vec::new();
     for (rel, source) in breaches {
-        assert!(
-            !planted(rel, source)?.is_empty(),
-            "refused in {rel}:\n{source}"
-        );
+        let baseline = planted(rel, "")?;
+        if planted(rel, source)?
+            .iter()
+            .all(|refusal| baseline.contains(refusal))
+        {
+            missed.push(format!("{rel}: {source}"));
+        }
     }
+    assert!(
+        missed.is_empty(),
+        "each planted breach is refused; admitted:\n{}",
+        missed.join("")
+    );
+    Ok(())
+}
+
+/// Each guarded spelling at its admitted site, and every pattern or test
+/// item, is out of scope.
+#[test]
+fn an_admitted_site_is_not_refused() -> Result<(), String> {
+    let pipeline = "src/ipe-cli/src/driver/build_pipeline.rs";
+    let delivery = "src/ipe-cli/src/delivery.rs";
     let admitted = [
         (
             pipeline,
@@ -593,6 +680,11 @@ fn a_planted_site_is_refused() -> Result<(), String> {
             delivery,
             "impl Delivery { const fn host_intent(self) -> HostIntent { \
              if w { HostIntent::WebView(WebViewProof(())) } else { HostIntent::Served } } }\n",
+        ),
+        (
+            "src/ipe-cli/src/driver/commands_pkg.rs",
+            "fn gate_desktop() { let HostIntent::WebView(p) = Delivery::web_desktop().host_intent() \
+             else { return }; }\n",
         ),
     ];
     for (rel, source) in admitted {
