@@ -15,8 +15,8 @@ use ipe_diagnostics::{
 use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_kernels::{AppSurface, BuiltinRow, BuiltinType, SealClass, StdlibKernel, WebCapability};
 use ipe_syntax as src;
+use ipe_syntax::BinOp;
 use ipe_syntax::fixity::{OperatorModule, PARSER_OPERATOR_MODULE};
-use ipe_syntax::{Assoc, BinOp};
 
 use crate::ast as canon;
 use crate::env::{
@@ -5976,22 +5976,12 @@ fn canonicalise_binops(
     Ok(tree.value)
 }
 
-/// Precedence-climbing core. Consumes all operators from `ops`, pairing each
-/// with the next operand from `operands`, and folds them into `left` according
-/// to precedence and associativity.
+/// Folds the chain `left0 ops[0] operands[0] …` into one tree by
+/// [`ipe_syntax::fixity::climb`], the precedence climbing the formatter's
+/// operator grouping is checked against.
 ///
-/// Call-stack depth is O(1) in chain length: a `pending` heap-stack holds
-/// reduce-deferred `(left, op, prec)` frames so no native frame is opened per
-/// operator. Shares the heap-work-stack discipline of
-/// `module_classify::walk_expr`.
-///
-/// Reduce predicate (reproduces the recursive semantics byte-for-byte):
-/// - Left/non-assoc: reduce when a pending op is at least as tight as the
-///   incoming one (`top_prec >= prec`), restricting its right subtree to
-///   strictly-higher precedence.
-/// - Right-assoc: reduce only when the pending op is strictly tighter
-///   (`top_prec > prec`), leaving equal-precedence ops on the stack so they
-///   nest rightward.
+/// Each operator pairs with the operand after it; a count mismatch is a
+/// [`Diagnostic::CompilerBug`].
 fn climb_binops(
     left0: canon::Expr,
     operands: &mut VecDeque<canon::Expr>,
@@ -6000,45 +5990,21 @@ fn climb_binops(
     env: &Env,
     interner: &mut Interner,
 ) -> DResult<canon::Expr> {
-    // Pending frames: left operand + operator + its precedence, awaiting their
-    // right subtree once higher-precedence operators to the right are reduced.
-    let mut pending: Vec<(canon::Expr, Located<BinOp>, u8)> = Vec::new();
-    let mut left = left0;
-    while let Some(&op) = ops.front() {
-        let op_fixity = op.value.fixity();
-        let prec = op_fixity.prec();
-        // Reduce any pending frame whose operator binds at least as tightly as
-        // the incoming `op` (left/non-assoc) or strictly tighter (right-assoc).
-        while let Some(&(_, _, top_prec)) = pending.last() {
-            let should_reduce = match op_fixity.assoc() {
-                Assoc::Left | Assoc::None => top_prec >= prec,
-                Assoc::Right => top_prec > prec,
-            };
-            if !should_reduce {
-                break;
-            }
-            let (l, top_op, _) = pending.pop().ok_or_else(|| Diagnostic::CompilerBug {
-                where_: "ipe_canon::climb_binops",
-                detail: "pending stack empty after last() confirmed non-empty".to_owned(),
-            })?;
-            left = combine_binop(l, top_op, left, basics, env, interner)?;
-        }
-        ops.pop_front();
-        let next = operands
-            .pop_front()
-            .ok_or_else(|| Diagnostic::CompilerBug {
-                where_: "ipe_canon::climb_binops",
-                detail: "operator without a right operand".to_owned(),
-            })?;
-        pending.push((left, op, prec));
-        left = next;
+    if operands.len() != ops.len() {
+        return Err(Diagnostic::CompilerBug {
+            where_: "ipe_canon::climb_binops",
+            detail: "operator without a right operand".to_owned(),
+        });
     }
-    // Drain remaining pending frames right-to-left (rightmost operator was
-    // pushed last; LIFO pop folds left correctly).
-    while let Some((l, op, _)) = pending.pop() {
-        left = combine_binop(l, op, left, basics, env, interner)?;
-    }
-    Ok(left)
+    ipe_syntax::fixity::climb(
+        left0,
+        ops.drain(..).zip(operands.drain(..)),
+        |l, op, r| combine_binop(l, op, r, basics, env, interner),
+        || Diagnostic::CompilerBug {
+            where_: "ipe_canon::climb_binops",
+            detail: "pending stack empty after last() confirmed non-empty".to_owned(),
+        },
+    )
 }
 
 /// Resolve an interned `Symbol` to its text, or fail closed with a

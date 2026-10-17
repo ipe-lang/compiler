@@ -502,26 +502,26 @@ historyStateFromResult result =
 
 -- The one-line text for a History state that has no rows to show; Nothing
 -- for a loaded page that holds rows.
-historyStatusText : HistoryState -> Maybe String
+historyStatusText : HistoryState -> Maybe SafeText
 historyStatusText state =
     case state of
         HistoryLoading ->
-            Just "Loading history…"
+            Just (SafeText.literal "Loading history…")
 
         HistoryFailed failure ->
-            Just ("History load failed: " ++ Failure.loadFailureText failure)
+            Just (SafeText.literal ("History load failed: " ++ Failure.loadFailureText failure))
 
         HistoryLoaded page ->
             if List.isEmpty page.rows then
                 case page.at of
                     HistoryStart ->
-                        Just "No reviews yet."
+                        Just (SafeText.literal "No reviews yet.")
 
                     HistoryAfter _ _ ->
-                        Just "No more reviews."
+                        Just (SafeText.literal "No more reviews.")
 
                     HistoryLegacyAfter _ _ _ ->
-                        Just "No more reviews."
+                        Just (SafeText.literal "No more reviews.")
 
             else
                 Nothing
@@ -592,23 +592,23 @@ stillBehind =
 -- The banner a page shows when the review log is not proven under the
 -- server's key: where it breaks, or that another key signed it; Nothing for a
 -- proven log and for a server with no key.
-chainBanner : LogShown -> Maybe String
+chainBanner : LogShown -> Maybe SafeText
 chainBanner shown =
     case shown of
         ShownBroken (BreaksAt n) ->
-            Just ("The review log's chain breaks at entry " ++ String.fromInt n ++ ": a decision was removed, reordered or replaced outside this tool.")
+            Just (SafeText.literal ("The review log's chain breaks at entry " ++ String.fromInt n ++ ": a decision was removed, reordered or replaced outside this tool."))
 
         ShownBroken (PastHead n) ->
-            Just ("The review log holds " ++ pastHeadText n ++ " past its head: a decision was added outside this tool.")
+            Just (SafeText.literal ("The review log holds " ++ pastHeadText n ++ " past its head: a decision was added outside this tool."))
 
         ShownBroken (BeforeFirst n) ->
-            Just ("The review log holds " ++ pastHeadText n ++ " before its first: a decision was added outside this tool.")
+            Just (SafeText.literal ("The review log holds " ++ pastHeadText n ++ " before its first: a decision was added outside this tool."))
 
         ShownBroken (RepeatsAt n) ->
-            Just ("The review log's entry " ++ String.fromInt n ++ " decides a pair an earlier entry decided: a decision was added outside this tool.")
+            Just (SafeText.literal ("The review log's entry " ++ String.fromInt n ++ " decides a pair an earlier entry decided: a decision was added outside this tool."))
 
         ShownKeyMismatch ->
-            Just ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts.")
+            Just (SafeText.literal ("The review log was signed by a different " ++ ReviewKey.keyVar ++ ": no decision in it counts."))
 
         ShownProven ->
             Nothing
@@ -894,7 +894,7 @@ decidableSource uid state =
 
 -- The one-line text in place of the selected unit's source while it has no
 -- loaded view; Nothing once the view of `uid` is loaded.
-selectedViewStatusText : Uid -> SelectedView -> Maybe String
+selectedViewStatusText : Uid -> SelectedView -> Maybe SafeText
 selectedViewStatusText uid state =
     case state of
         ViewShown shown ->
@@ -902,19 +902,19 @@ selectedViewStatusText uid state =
                 Nothing
 
             else
-                Just "Loading source…"
+                Just (SafeText.literal "Loading source…")
 
         ViewLoading _ ->
-            Just "Loading source…"
+            Just (SafeText.literal "Loading source…")
 
         NoneSelected ->
-            Just "Loading source…"
+            Just (SafeText.literal "Loading source…")
 
         ViewMissing _ ->
-            Just "This unit is no longer in the index."
+            Just (SafeText.literal "This unit is no longer in the index.")
 
         ViewFailed _ failure ->
-            Just ("Source load failed: " ++ Failure.loadFailureText failure)
+            Just (SafeText.literal ("Source load failed: " ++ Failure.loadFailureText failure))
 
 
 -- The unit page: loading, the unit with its source and links, no such unit,
@@ -1145,22 +1145,22 @@ queueSettled load result slot =
 -- the controls: the row being decided says how far it got, and any other
 -- row says what it waits on. Nothing when no decision is busy, where the
 -- row offers its controls.
-pendingText : Uid -> DecisionSlot -> Maybe String
+pendingText : Uid -> DecisionSlot -> Maybe SafeText
 pendingText uid slot =
     case slot of
         DecisionSaving busy _ ->
             if busy == uid then
-                Just "Saving the decision…"
+                Just (SafeText.literal "Saving the decision…")
 
             else
-                Just "Another decision is saving…"
+                Just (SafeText.literal "Another decision is saving…")
 
         DecisionRefreshing busy _ ->
             if busy == uid then
-                Just "Decision saved; refreshing the queue…"
+                Just (SafeText.literal "Decision saved; refreshing the queue…")
 
             else
-                Just "Refreshing the queue after a decision…"
+                Just (SafeText.literal "Refreshing the queue after a decision…")
 
         DecisionIdle ->
             Nothing
@@ -1188,20 +1188,20 @@ notSavedOf slot =
 
 -- The one-line text for a unit page that has no unit to show; Nothing once
 -- the unit is loaded.
-unitPageStatusText : UnitPageState -> Maybe String
+unitPageStatusText : UnitPageState -> Maybe SafeText
 unitPageStatusText state =
     case state of
         UnitLoading ->
-            Just "Loading unit…"
+            Just (SafeText.literal "Loading unit…")
 
         UnitNotFound ->
-            Just "No unit with this id is in the index."
+            Just (SafeText.literal "No unit with this id is in the index.")
 
         UnitFailed failure ->
-            Just ("Unit load failed: " ++ Failure.loadFailureText failure)
+            Just (SafeText.literal ("Unit load failed: " ++ Failure.loadFailureText failure))
 
         UnitIdRefused ->
-            Just "This address does not name a unit."
+            Just (SafeText.literal "This address does not name a unit.")
 
         UnitLoaded _ ->
             Nothing
@@ -1209,35 +1209,35 @@ unitPageStatusText state =
 
 -- Why a unit's source is withheld, in place of the source and the decision
 -- buttons; Nothing only for a verified view.
-sourceStatusText : Index.SourceView -> Maybe String
+sourceStatusText : Index.SourceView -> Maybe SafeText
 sourceStatusText view =
     case view of
         Shown _ ->
             Nothing
 
         Stale Drifted ->
-            Just "Source changed since it was indexed; re-run `ipe-index index` to review it."
+            Just (SafeText.literal "Source changed since it was indexed; re-run `ipe-index index` to review it.")
 
         Stale (RangeOutOfFile r) ->
-            Just ("The file now has " ++ String.fromInt r.lineCount ++ " lines, fewer than this unit's range; re-run `ipe-index index` to review it.")
+            Just (SafeText.literal ("The file now has " ++ String.fromInt r.lineCount ++ " lines, fewer than this unit's range; re-run `ipe-index index` to review it."))
 
         Stale UnverifiableHash ->
-            Just "This unit's hash predates source attestation; re-run `ipe-index index` to verify it."
+            Just (SafeText.literal "This unit's hash predates source attestation; re-run `ipe-index index` to verify it.")
 
         Unreadable failure ->
-            Just ("Source unreadable: " ++ SafeText.toString (Index.readFailureText failure))
+            Just (SafeText.concat [ SafeText.literal "Source unreadable: ", Index.readFailureText failure ])
 
         TooLarge (SpanLines o) ->
-            Just ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)
+            Just (SafeText.literal ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy))
 
         TooLarge (ViewBytes o) ->
-            Just ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)
+            Just (SafeText.literal ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy))
 
         TooLarge (ChildSpans o) ->
-            Just ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")
+            Just (SafeText.literal ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it."))
 
         TooLarge (ViewNodes o) ->
-            Just ("This unit's source draws as " ++ String.fromInt o.nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling." ++ notShownRemedy)
+            Just (SafeText.literal ("This unit's source draws as " ++ String.fromInt o.nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling." ++ notShownRemedy))
 
 
 -- What a reviewer can do about a view past a ceiling.
@@ -1276,24 +1276,24 @@ stateFromResult result =
 
 -- The one-line text for a state that has no unit list to show; Nothing for a
 -- loaded page that holds units.
-queueStatusText : QueueState -> Maybe String
+queueStatusText : QueueState -> Maybe SafeText
 queueStatusText state =
     case state of
         Loading ->
-            Just "Loading queue…"
+            Just (SafeText.literal "Loading queue…")
 
         Failed failure ->
-            Just ("Queue failed to load: " ++ Failure.loadFailureText failure)
+            Just (SafeText.literal ("Queue failed to load: " ++ Failure.loadFailureText failure))
 
         Loaded page ->
             if page.total == 0 && page.refusalsOpen > 0 then
-                Just ("No units queued, but" ++ refusalsWord page.refusalsOpen ++ " still open." ++ unboundNotice page)
+                Just (SafeText.literal ("No units queued, but" ++ refusalsWord page.refusalsOpen ++ " still open." ++ unboundNotice page))
 
             else if page.total == 0 then
-                Just ("No units queued." ++ unboundNotice page)
+                Just (SafeText.literal ("No units queued." ++ unboundNotice page))
 
             else if List.isEmpty page.units then
-                Just ("No units to review on this page." ++ unboundNotice page)
+                Just (SafeText.literal ("No units to review on this page." ++ unboundNotice page))
 
             else
                 Nothing
@@ -1302,18 +1302,22 @@ queueStatusText state =
 -- The queue header: database name, size, how many of the open units this
 -- page shows, how many unreviewable files are open, and how many units it
 -- leaves out as unbound.
-pageHeaderText : QueuePage -> String
+pageHeaderText : QueuePage -> SafeText
 pageHeaderText page =
-    String.concat
-        [ SafeText.toString page.dbName
-        , " · "
-        , Format.byteSize page.dbBytes
-        , " · showing "
-        , String.fromInt (List.length page.units)
-        , " of "
-        , String.fromInt page.total
-        , refusalsNotice page
-        , unboundNotice page
+    SafeText.concat
+        [ page.dbName
+        , SafeText.literal
+            (String.concat
+                [ " · "
+                , Format.byteSize page.dbBytes
+                , " · showing "
+                , String.fromInt (List.length page.units)
+                , " of "
+                , String.fromInt page.total
+                , refusalsNotice page
+                , unboundNotice page
+                ]
+            )
         ]
 
 
@@ -1340,44 +1344,44 @@ refusalsWord count =
 
 
 -- The fixed text naming why the index could not review a file.
-refusalReasonText : Index.RefusalReason -> String
+refusalReasonText : Index.RefusalReason -> SafeText
 refusalReasonText reason =
     case reason of
         NotUtf8 ->
-            "Not UTF-8 text"
+            SafeText.literal "Not UTF-8 text"
 
         Oversized ->
-            "Larger than the index reads as source"
+            SafeText.literal "Larger than the index reads as source"
 
         SymlinkEntry ->
-            "A symbolic link"
+            SafeText.literal "A symbolic link"
 
         GitlinkEntry ->
-            "A submodule (gitlink) entry"
+            SafeText.literal "A submodule (gitlink) entry"
 
         UnknownMode ->
-            "A git entry of unknown mode"
+            SafeText.literal "A git entry of unknown mode"
 
         PastHashCeiling ->
-            "Too large to hash"
+            SafeText.literal "Too large to hash"
 
         NonUtf8Name ->
-            "Its name is not UTF-8"
+            SafeText.literal "Its name is not UTF-8"
 
         NotRepoRelative ->
-            "Its path is not inside the repository"
+            SafeText.literal "Its path is not inside the repository"
 
         NestedRepository ->
-            "Inside a nested repository"
+            SafeText.literal "Inside a nested repository"
 
         NotRegular ->
-            "Not a regular file"
+            SafeText.literal "Not a regular file"
 
         UnreadableEntry ->
-            "Could not be read"
+            SafeText.literal "Could not be read"
 
         ReplacedEntry ->
-            "Replaced while the index read it"
+            SafeText.literal "Replaced while the index read it"
 
 
 -- " unit" for one, " units" for any other count.

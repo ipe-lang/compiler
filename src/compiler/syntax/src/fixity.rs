@@ -3,6 +3,11 @@
 //! The parser records an operator chain flat, each operator one [`BinOp`];
 //! name resolution re-associates the chain from [`BinOp::fixity`]. The set is
 //! closed: an operator text outside it has no [`BinOp`], so it has no fixity.
+//! [`climb`] is the one precedence climbing, and [`chain_groups`] is the
+//! grouping the formatter lays a chain out by; a test pins that every group is
+//! a subtree [`climb`] builds.
+
+use ipe_diagnostics::Located;
 
 /// Operator associativity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +147,173 @@ impl BinOp {
     }
 }
 
+/// One precedence group of a flat operator chain.
+///
+/// Operand `i` sits left of operator `i`; operator `i` sits between operands
+/// `i` and `i + 1`. A group spans operands `lo..=hi`, splits at every operator
+/// of its minimum precedence, and each maximal run of tighter operators
+/// between two splits is one child group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainGroup {
+    lo: usize,
+    hi: usize,
+    splits: Vec<usize>,
+    children: Vec<usize>,
+}
+
+impl ChainGroup {
+    /// The index of the group's first operand.
+    #[must_use]
+    pub const fn lo(&self) -> usize {
+        self.lo
+    }
+
+    /// The index of the group's last operand.
+    #[must_use]
+    pub const fn hi(&self) -> usize {
+        self.hi
+    }
+
+    /// The operator indices the group splits at, left to right.
+    #[must_use]
+    pub fn splits(&self) -> &[usize] {
+        &self.splits
+    }
+
+    /// The child groups' indices in [`ChainGroups::groups`], left to right.
+    #[must_use]
+    pub fn children(&self) -> &[usize] {
+        &self.children
+    }
+}
+
+/// The precedence group tree of one operator chain; group `0` is the root.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChainGroups {
+    groups: Vec<ChainGroup>,
+}
+
+impl ChainGroups {
+    /// Every group; a child always sits after its parent.
+    #[must_use]
+    pub fn groups(&self) -> &[ChainGroup] {
+        &self.groups
+    }
+
+    /// The root group, or `None` for a chain with no operator.
+    #[must_use]
+    pub fn root(&self) -> Option<&ChainGroup> {
+        self.groups.first()
+    }
+
+    /// The group at `index`.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&ChainGroup> {
+        self.groups.get(index)
+    }
+}
+
+/// The precedence group tree of the chain whose operators are `ops`.
+///
+/// Built iteratively from a work list. Each operator is a split of exactly
+/// one group, so the work is linear in `ops.len()` times the number of
+/// distinct precedences.
+#[must_use]
+pub fn chain_groups(ops: &[BinOp]) -> ChainGroups {
+    let mut groups: Vec<ChainGroup> = Vec::new();
+    if ops.is_empty() {
+        return ChainGroups { groups };
+    }
+    groups.push(ChainGroup {
+        lo: 0,
+        hi: ops.len(),
+        splits: Vec::new(),
+        children: Vec::new(),
+    });
+    let mut work: Vec<usize> = vec![0];
+    while let Some(index) = work.pop() {
+        let Some(group) = groups.get(index) else {
+            continue;
+        };
+        let (lo, hi) = (group.lo, group.hi);
+        let range = ops.get(lo..hi).unwrap_or_default();
+        let Some(min) = range.iter().map(|op| op.fixity().prec()).min() else {
+            continue;
+        };
+        let splits: Vec<usize> = range
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.fixity().prec() == min)
+            .map(|(offset, _)| lo + offset)
+            .collect();
+        let mut children = Vec::new();
+        let mut start = lo;
+        for end in splits.iter().copied().chain(std::iter::once(hi)) {
+            if end > start {
+                children.push(groups.len());
+                work.push(groups.len());
+                groups.push(ChainGroup {
+                    lo: start,
+                    hi: end,
+                    splits: Vec::new(),
+                    children: Vec::new(),
+                });
+            }
+            start = end + 1;
+        }
+        if let Some(group) = groups.get_mut(index) {
+            group.splits = splits;
+            group.children = children;
+        }
+    }
+    ChainGroups { groups }
+}
+
+/// Folds `first rest…` into one tree by precedence climbing.
+///
+/// Call-stack depth is O(1) in chain length: a `pending` heap-stack holds
+/// reduce-deferred `(left, op, prec)` frames, so no native frame is opened per
+/// operator. A left- or non-associative operator reduces a pending operator at
+/// least as tight (`top_prec >= prec`); a right-associative one reduces only a
+/// strictly tighter one (`top_prec > prec`), so equal precedences nest
+/// rightward.
+///
+/// # Errors
+///
+/// Whatever `combine` returns, or `bug()` if the pending stack breaks its
+/// invariant.
+pub fn climb<T, E>(
+    first: T,
+    rest: impl Iterator<Item = (Located<BinOp>, T)>,
+    mut combine: impl FnMut(T, Located<BinOp>, T) -> Result<T, E>,
+    bug: impl Fn() -> E,
+) -> Result<T, E> {
+    let mut pending: Vec<(T, Located<BinOp>, u8)> = Vec::new();
+    let mut left = first;
+    for (op, next) in rest {
+        let op_fixity = op.value.fixity();
+        let prec = op_fixity.prec();
+        while let Some(&(_, _, top_prec)) = pending.last() {
+            let should_reduce = match op_fixity.assoc() {
+                Assoc::Left | Assoc::None => top_prec >= prec,
+                Assoc::Right => top_prec > prec,
+            };
+            if !should_reduce {
+                break;
+            }
+            let (l, top_op, _) = pending.pop().ok_or_else(&bug)?;
+            left = combine(l, top_op, left)?;
+        }
+        pending.push((left, op, prec));
+        left = next;
+    }
+    // The rightmost operator was pushed last, so LIFO pops fold correctly.
+    while let Some((l, op, _)) = pending.pop() {
+        left = combine(l, op, left)?;
+    }
+    Ok(left)
+}
+
 /// A compiled-source stdlib module an operator desugars into a call to.
 ///
 /// Its path segments and its dotted name are built from one list by
@@ -229,7 +401,11 @@ const _: () = assert!(
 
 #[cfg(test)]
 mod tests {
-    use super::{Assoc, BinOp, PARSER_OPERATOR_MODULE, closed_set_round_trips};
+    use ipe_diagnostics::{Located, Span};
+
+    use super::{
+        Assoc, BinOp, PARSER_OPERATOR_MODULE, chain_groups, climb, closed_set_round_trips,
+    };
 
     #[test]
     fn core_operator_fixities() {
@@ -285,5 +461,83 @@ mod tests {
     fn parser_operator_module_segments_spell_its_dotted_name() {
         assert_eq!(PARSER_OPERATOR_MODULE.segments(), ["Ipe", "Parser"]);
         assert_eq!(PARSER_OPERATOR_MODULE.dotted(), "Ipe.Parser");
+    }
+
+    /// Every chain of one to three operators over [`BinOp::ALL`].
+    fn chains_up_to_three() -> Vec<Vec<BinOp>> {
+        let mut chains: Vec<Vec<BinOp>> = Vec::new();
+        let mut last: Vec<Vec<BinOp>> = vec![Vec::new()];
+        for _ in 0..3 {
+            let next: Vec<Vec<BinOp>> = last
+                .iter()
+                .flat_map(|chain| {
+                    BinOp::ALL.iter().map(move |op| {
+                        let mut longer = chain.clone();
+                        longer.push(*op);
+                        longer
+                    })
+                })
+                .collect();
+            chains.extend(next.iter().cloned());
+            last = next;
+        }
+        chains
+    }
+
+    /// Every group's operand range is the range of a subtree `climb` builds.
+    #[test]
+    fn groups_are_climb_subtrees() {
+        let chains = chains_up_to_three();
+        assert_eq!(chains.len(), 21 + 21 * 21 + 21 * 21 * 21);
+        for ops in &chains {
+            let mut subtrees: Vec<(usize, usize)> = Vec::new();
+            let leaves = ops
+                .iter()
+                .enumerate()
+                .map(|(i, op)| (Located::new(Span::new(0, 0), *op), (i + 1, i + 1)));
+            let tree = climb(
+                (0, 0),
+                leaves,
+                |l: (usize, usize), _, r: (usize, usize)| {
+                    subtrees.push((l.0, r.1));
+                    Ok::<_, ()>((l.0, r.1))
+                },
+                || (),
+            );
+            assert_eq!(tree, Ok((0, ops.len())), "{ops:?}");
+            let groups = chain_groups(ops);
+            let mut split_count = 0;
+            for group in groups.groups() {
+                split_count += group.splits().len();
+                assert!(
+                    subtrees.contains(&(group.lo(), group.hi())),
+                    "{ops:?}: group {}..={} is not a climb subtree of {subtrees:?}",
+                    group.lo(),
+                    group.hi()
+                );
+            }
+            assert_eq!(
+                split_count,
+                ops.len(),
+                "{ops:?}: each operator splits one group"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_groups_split_at_the_loosest_operator() {
+        let groups = chain_groups(&[BinOp::And, BinOp::Gt, BinOp::Add, BinOp::And]);
+        let root = groups.root();
+        assert!(root.is_some());
+        let Some(root) = root else { return };
+        assert_eq!((root.lo(), root.hi(), root.splits()), (0, 4, &[0, 3][..]));
+        let children: Vec<(usize, usize)> = root
+            .children()
+            .iter()
+            .filter_map(|i| groups.get(*i))
+            .map(|g| (g.lo(), g.hi()))
+            .collect();
+        assert_eq!(children, [(1, 3)]);
+        assert!(chain_groups(&[]).root().is_none());
     }
 }

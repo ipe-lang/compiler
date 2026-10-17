@@ -769,7 +769,7 @@ seededChecks a b =
     , documented "Queue" shownCard
         && documented "Queue" (page baseModel)
         && documented "History" historyPage
-        && documented "Lib.answer" shownPage
+        && documented "Unit" shownPage
         && documented "Unit" (page (addressModel "not a uid"))
         && has "<h2" shownCard
         && has "<h2" shownPage
@@ -1049,10 +1049,150 @@ refusalChecks =
             ]
 
 
+-- ── untrusted text reaches a page only through the one sink ─────────
+-- The page states that show a load failure.
+type FailureSlot
+    = QueueSlot
+    | HistorySlot
+    | UnitSlot
+    | SourceSlot
+
+
+-- A load failure renders its case's fixed text inside a byte-order element,
+-- with none of the error's bytes; a computed text with untrusted parts (an
+-- unreadable file's stored path, the index file's name) keeps its escapes and
+-- its byte order; the document title holds only this tool's words. Each
+-- refusal renders beside the benign form through the same path.
+untrustedSinkChecks : Index.UnitView -> List ( String, Bool )
+untrustedSinkChecks loaded =
+    let
+        hostileFailure =
+            Failure.loadFailureOf (Error.unexpected hostileText)
+
+        terminalFailure =
+            Failure.loadFailureOf (Error.unexpected (codeText 27 ++ "[2J" ++ codeText 8238))
+
+        noErrorBytes html =
+            not (has "<script" html)
+                && not (has "&lt;script" html)
+                && not (has "alert(1)" html)
+                && not (has (codeText 8238) html)
+                && not (has (codeText 27) html)
+                && not (has "[2J" html)
+                && not (has "data-review-escape" html)
+
+        fixedInByteOrder prefix failure html =
+            has (byteOrderOpen ++ Html.escapeHtml (prefix ++ Failure.loadFailureText failure)) html
+
+        queueFailed failure =
+            page { baseModel | queueState = Failed failure }
+
+        historyFailed failure =
+            page { baseModel | page = HistoryPage, history = HistoryFailed failure }
+
+        unitFailed failure =
+            page { baseModel | page = UnitPage (Uid.toString loaded.unit.uid), selectedView = ViewFailed loaded.unit.uid failure }
+
+        card =
+            cardModel loaded
+
+        viewFailed failure =
+            page { card | selectedView = ViewFailed loaded.unit.uid failure }
+
+        render slot failure =
+            case slot of
+                QueueSlot ->
+                    queueFailed failure
+
+                HistorySlot ->
+                    historyFailed failure
+
+                UnitSlot ->
+                    unitFailed failure
+
+                SourceSlot ->
+                    viewFailed failure
+
+        prefixOf slot =
+            case slot of
+                QueueSlot ->
+                    "Queue failed to load: "
+
+                HistorySlot ->
+                    "History load failed: "
+
+                UnitSlot ->
+                    "Unit load failed: "
+
+                SourceSlot ->
+                    "Source load failed: "
+
+        everyCase =
+            [ LoadContended, LoadPastLimit, LoadFailed ]
+
+        slotRefuses slot =
+            fixedInByteOrder (prefixOf slot) hostileFailure (render slot hostileFailure)
+                && noErrorBytes (render slot hostileFailure)
+                && fixedInByteOrder (prefixOf slot) terminalFailure (render slot terminalFailure)
+                && noErrorBytes (render slot terminalFailure)
+                && List.all (\failure -> fixedInByteOrder (prefixOf slot) failure (render slot failure)) everyCase
+
+        unreadable stored =
+            { loaded | view = Unreadable (NoFile stored) }
+
+        unreadablePrefix =
+            byteOrderOpen ++ Html.escapeHtml "Source unreadable: index path "
+
+        hostileUnreadableCard =
+            page (cardModel (unreadable hostileText))
+
+        hostileUnreadablePage =
+            page (unitPageModel (unreadable hostileText))
+
+        benignUnreadableCard =
+            page (cardModel (unreadable "ipe:gone.rs"))
+
+        headerModel name =
+            { baseModel | queueState = Loaded (queuePage [] 0 { reviewed = 0, total = 0 } |> (\shown -> { shown | dbName = name })) }
+
+        unit =
+            loaded.unit
+
+        hostileName =
+            { loaded | unit = { unit | qualified = SafeText.renderForeign hostileText } }
+
+        titleOf html =
+            String.split "</title>" html |> List.head |> Maybe.withDefault html
+    in
+    [ ( "every load failure slot renders its case's fixed text in byte order and none of a hostile error's bytes", List.all slotRefuses [ QueueSlot, HistorySlot, UnitSlot, SourceSlot ] )
+    , ( "a hostile error and a benign one fail the queue load with the same fixed text", queueFailed hostileFailure == queueFailed LoadFailed && hostileFailure == LoadFailed )
+    , ( "an unreadable file's hostile stored path keeps its escapes and byte order on the queue card and the unit page"
+      , has unreadablePrefix hostileUnreadableCard
+            && escapesHostile hostileUnreadableCard
+            && has unreadablePrefix hostileUnreadablePage
+            && escapesHostile hostileUnreadablePage
+            && has (unreadablePrefix ++ Html.escapeHtml "\"ipe:gone.rs\"") benignUnreadableCard
+            && not (has "data-review-escape" benignUnreadableCard)
+      )
+    , ( "a hostile index file name keeps its escapes and byte order in the queue header"
+      , hostileInByteOrder "" (page (headerModel (SafeText.renderForeign hostileText)))
+            && has (byteOrderOpen ++ "index.db · ") (page (headerModel (SafeText.literal "index.db")))
+      )
+    , ( "a unit page's title names the page, never the unit, so a hostile unit name leaves no bytes in the title"
+      , has "<title>Unit · Code review</title>" (page (unitPageModel hostileName))
+            && not (has "script" (titleOf (page (unitPageModel hostileName))))
+            && not (has (codeText 8238) (titleOf (page (unitPageModel hostileName))))
+            && escapesHostile (page (unitPageModel hostileName))
+            && has "<title>Queue · Code review</title>" (page (cardModel hostileName))
+            && not (has "script" (titleOf (page (cardModel hostileName))))
+      )
+    ]
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
-        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b)))
+        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a)))
         , group "hostile source fixture" hostileSourceChecks
         , group "stored decision fixture" storedChecks
         , group "unreviewable file fixture" refusalChecks
