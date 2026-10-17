@@ -30,6 +30,7 @@ use crate::IrType;
 /// the backend's `emit_func_value` and `emit_lambda` route through here so the
 /// two emit paths can never drift, and the IR's borrow analysis reads the same
 /// decider when it builds a function-value adapter.
+#[must_use]
 pub fn wants_arc_ctor(ty: &IrType) -> bool {
     // A promoted `SharedFun` slot renders `Arc<dyn Fn>` (`render_type`), so its
     // value must be built with `Arc::new`, not `Box::new` — the two carriers are

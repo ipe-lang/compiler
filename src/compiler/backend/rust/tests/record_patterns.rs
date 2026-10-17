@@ -140,7 +140,7 @@ fn getx_program(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, rec)],
+        params: vec![ipe_ir::Param::owned(par, rec)],
         ret: IrType::Int,
         body: Expr::Destructure {
             binder: Pat::Record(vec![(x, Pat::Var(x)), (y, Pat::Wildcard)]),
@@ -230,7 +230,7 @@ fn nested_tuple_in_record_field_renders_recursively() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, p_rec)],
+        params: vec![ipe_ir::Param::owned(par, p_rec)],
         ret: IrType::Int,
         body: Expr::Destructure {
             binder: Pat::Record(vec![
@@ -282,7 +282,7 @@ fn record_pattern_with_unknown_shape_fails_fast() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(par, IrType::Int)],
         ret: IrType::Int,
         body: Expr::Destructure {
             binder: Pat::Record(vec![(x, Pat::Var(x))]),

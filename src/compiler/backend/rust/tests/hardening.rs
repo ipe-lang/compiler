@@ -115,7 +115,7 @@ fn reserved_names_are_mangled_in_emitted_output() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(param, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(param, IrType::Int)],
         ret: IrType::Int,
         body: Expr::Var(param),
     };
@@ -230,7 +230,7 @@ fn empty_intended_symbol_is_rejected() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(empty, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(empty, IrType::Int)],
         ret: IrType::Int,
         body: Expr::Int(0),
     };
@@ -424,7 +424,7 @@ fn let_if_and_extended_binops_emit_total_rust() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(n, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(n, IrType::Int)],
         ret: IrType::Int,
         body,
     };
@@ -464,7 +464,7 @@ fn tuple_type_and_expr_emit_as_rust_tuples() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(n, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(n, IrType::Int)],
         ret: IrType::Tuple(vec![IrType::Int, IrType::Int]),
         body: Expr::Tuple(vec![Expr::Var(n), Expr::Int(1)]),
     };
@@ -575,7 +575,7 @@ fn malformed_char_pattern_fails_closed_not_invalid_rust() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w_sym,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -659,7 +659,7 @@ fn valid_char_pattern_emits_char_literal() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w_sym,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -1017,7 +1017,7 @@ fn list_case_fn(name: Symbol, xs: Symbol, elem: IrType, arms: Vec<Arm>) -> DResu
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(xs, IrType::List(Box::new(elem)))],
+        params: vec![ipe_ir::Param::owned(xs, IrType::List(Box::new(elem)))],
         ret: IrType::Int,
         body: Expr::Match(Match::new_flat(Expr::Var(xs), arms)?),
     })
@@ -1307,7 +1307,10 @@ fn list_index_clone_proves_its_element_clone() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(xs, IrType::List(Box::new(IrType::Int)))],
+        params: vec![ipe_ir::Param::owned(
+            xs,
+            IrType::List(Box::new(IrType::Int)),
+        )],
         ret: IrType::Int,
         body: Expr::ListIndexClone {
             list: Box::new(Expr::Var(xs)),

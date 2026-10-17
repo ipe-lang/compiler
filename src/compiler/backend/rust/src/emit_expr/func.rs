@@ -751,7 +751,7 @@ pub fn tea_update_model_param(func: &ipe_ir::Func) -> Option<Symbol> {
     if !matches!(second, IrType::Cmd(_)) {
         return None;
     }
-    func.params.last().map(|(sym, _)| *sym)
+    func.params.last().map(|p| p.sym)
 }
 
 /// Whether `func` is a TEA `subscriptions` function — `Model -> Sub Msg`. The
@@ -819,6 +819,7 @@ pub fn emit_init_hot_for_func(
               through helpers without clarifying the single straight-line flow"
 )]
 pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<String> {
+    ctx.verify_borrows(func)?;
     let name = ctx.func_name(func.id)?.to_owned();
 
     // ── Entry-point Task.run elision ──────────────────────────────────────────
@@ -886,8 +887,8 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
     let row_binder_syms: Vec<Symbol> = func
         .params
         .iter()
-        .filter(|(_, ty)| matches!(ty, IrType::RowGeneric(_)))
-        .map(|(sym, _)| *sym)
+        .filter(|ipe_ir::Param { ty, .. }| matches!(ty, IrType::RowGeneric(_)))
+        .map(|p| p.sym)
         .collect();
     let generics = GenericScope::with_rows(&scope_syms, &row_syms, &row_binder_syms);
 
@@ -903,7 +904,7 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
     let impl_fn_params = impl_fn_param_indices(func);
 
     let mut params = Vec::with_capacity(func.params.len());
-    for (i, (param, ty)) in func.params.iter().enumerate() {
+    for (i, ipe_ir::Param { sym: param, ty, .. }) in func.params.iter().enumerate() {
         let rendered = if impl_fn_params.contains(&i) {
             impl_fn_generic_name(i)
         } else {
@@ -1430,7 +1431,11 @@ pub fn render_fn_generics(
     // admits too, and forwarding the param into a runtime `Arc<dyn Fn + Send +
     // Sync>` slot still type-checks.
     for &idx in impl_fn_params {
-        let Some((_, IrType::Fun(params, ret))) = func.params.get(idx) else {
+        let Some(ipe_ir::Param {
+            ty: IrType::Fun(params, ret),
+            ..
+        }) = func.params.get(idx)
+        else {
             return Err(Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::render_fn_generics",
                 detail: "impl-Fn param index did not point at an IrType::Fun".to_owned(),
@@ -1515,7 +1520,7 @@ pub fn impl_fn_generic_name(idx: usize) -> String {
 pub fn type_var_in_fn_param(func: &Func, sym: Symbol) -> bool {
     func.params
         .iter()
-        .any(|(_, ty)| ty_mentions_var_under_fn(ty, sym, false))
+        .any(|ipe_ir::Param { ty, .. }| ty_mentions_var_under_fn(ty, sym, false))
 }
 
 /// `true` if the type variable `sym` is the message parameter of a `Ipe.Ui` /

@@ -2620,7 +2620,7 @@ mod tests {
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(msg_param, IrType::Generic(msg_param))],
+                    params: vec![ipe_ir::Param::owned(msg_param, IrType::Generic(msg_param))],
                     ret: IrType::Unit,
                     body,
                 }],

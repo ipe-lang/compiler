@@ -244,7 +244,7 @@ fn a_function_with_parameters_is_not_wrapped() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(x, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(x, IrType::Int)],
         ret: IrType::Int,
         body: Expr::Var(x),
     };

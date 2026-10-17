@@ -3541,7 +3541,7 @@ fn hydration_projection_param_ty<'p>(
             if ctx.interner.resolve(func.name) != Some(ipe_ir::HYDRATION_PROJECTION_NAME) {
                 continue;
             }
-            return func.params.first().map(|(_, ty)| ty);
+            return func.params.first().map(|ipe_ir::Param { ty, .. }| ty);
         }
     }
     None
