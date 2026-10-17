@@ -276,6 +276,13 @@ pub enum Expr_ {
     VarLocal(Symbol),
     /// A qualified name reference `Qualifier.name`.
     VarQual(Symbol, Symbol),
+    /// The `Ipe.Task` bind a `do` statement `p <- task` desugars to.
+    ///
+    /// Named by identity, not by a qualifier spelling: the canonicaliser
+    /// resolves it to the `Task.andThen` kernel whatever spelling the module's
+    /// imports give `Task`, so an alias can never retarget `do`. Only the
+    /// parser builds it; no source text spells it.
+    TaskAndThen,
     /// An integer literal.
     Int(i64),
     /// A floating-point literal `1.5`, `3.0`, `1.5e3`, `2e-2`. The carried
