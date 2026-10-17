@@ -2,9 +2,11 @@
 //!
 //! Parses a `.ipe` source string into an [`ipe_syntax::Module`] via
 //! [`ipe_parse::parse_module`] and pretty-prints it in canonical (elm-format
-//! style) form. The single public entry point is [`format_source`]; the CLI
-//! `ipe fmt` command and the LSP formatting provider both drive it, so one
-//! engine — comment-preserving and semantics-guarded — serves both.
+//! style) form. [`format_source`] formats a whole file; the CLI `ipe fmt`
+//! command and the LSP formatting provider both drive it, so one engine —
+//! comment-preserving and semantics-guarded — serves both. LSP range
+//! formatting takes [`format_with_segments`], splices the declarations it
+//! wants, and proves the result with [`verify_rewrite`], the same guards.
 //!
 //! The engine is path-agnostic: it works on a bare source string and reports a
 //! typed [`FmtError`]. A caller that knows the file (the CLI) attaches the path
@@ -13,6 +15,7 @@
 use std::cell::Cell;
 use std::fmt;
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use ipe_diagnostics::{Diagnostic, Located, TokenKind, render};
 use ipe_intern::Interner;
@@ -399,57 +402,164 @@ fn skip_block_comment_body(mut rest: &str) -> &str {
 /// the same AST (a formatter bug — caught rather than written);
 /// [`FmtError::Limit`] if the output would pass [`OutputCap::for_input`].
 pub fn format_source(src: &str) -> Result<String, FmtError> {
+    format_with_segments(src).map(|formatted| formatted.text)
+}
+
+/// [`format_source`], with where each top-level declaration sits in the input
+/// and in the output.
+///
+/// The text is exactly what [`format_source`] returns, behind the same guards.
+/// A caller that formats part of a file (LSP range formatting) splices the
+/// output of the declarations it wants into the source, then proves the result
+/// with [`verify_rewrite`].
+///
+/// # Errors
+/// As [`format_source`].
+pub fn format_with_segments(src: &str) -> Result<Formatted, FmtError> {
     format_guarded(src, OutputCap::for_input(src.len()), render_module)
+}
+
+/// Check that `edited`, a rewrite of `original`, is a faithful print of it.
+///
+/// These are the guards [`format_source`] runs on its own output: `edited`
+/// fits the cap for `original`, carries exactly its comments and re-parses to
+/// its AST. A caller that builds a rewrite from formatted pieces runs this on
+/// the whole result, so one engine judges every formatted text.
+///
+/// # Errors
+/// [`FmtError::Parse`] if `original` does not parse; [`FmtError::RoundTrip`]
+/// if `edited` loses, adds or alters a comment, or does not re-parse to the
+/// same AST; [`FmtError::Limit`] if `edited` passes
+/// [`OutputCap::for_input`] of `original`.
+pub fn verify_rewrite(original: &str, edited: &str) -> Result<(), FmtError> {
+    let mut interner = Interner::new();
+    let module = parse_input(original, &mut interner)?;
+    let input = lex_input(original)?;
+    verify(
+        &module,
+        &interner,
+        &input.comments,
+        edited,
+        OutputCap::for_input(original.len()),
+    )
+}
+
+/// A module's formatted text and where each declaration sits in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Formatted {
+    /// The formatted module, as [`format_source`] returns it.
+    pub text: String,
+    /// One segment per top-level declaration, in source order.
+    pub decls: Vec<DeclSegment>,
+}
+
+/// One top-level declaration's bytes in the input and in the output.
+///
+/// Both ranges hold the declaration's leading comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclSegment {
+    /// Its source bytes: from the line start of its first leading comment (or
+    /// of its first token) to the end of its last token.
+    pub input: Range<usize>,
+    /// Its bytes in [`Formatted::text`], up to its last character and without
+    /// the newline after it.
+    pub output: Range<usize>,
 }
 
 /// [`format_source`] under an explicit `cap`, so a test drives the refusal
 /// with a small input.
 #[cfg(test)]
 fn format_source_capped(src: &str, cap: OutputCap) -> Result<String, FmtError> {
-    format_guarded(src, cap, render_module)
+    format_guarded(src, cap, render_module).map(|formatted| formatted.text)
 }
 
 /// The printer's rendering of a whole module: what [`format_source`] writes.
-fn render_module(printer: &Printer<'_>, module: &Module) -> String {
-    printer.module(module)
+fn render_module(printer: &Printer<'_>, module: &Module) -> Formatted {
+    printer.formatted(module)
+}
+
+/// A renderer's result, whose text the guards inspect.
+trait Rendering {
+    fn text(&self) -> &str;
+}
+
+impl Rendering for String {
+    fn text(&self) -> &str {
+        self
+    }
+}
+
+impl Rendering for Formatted {
+    fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// `src` parsed for formatting; a parse failure is [`FmtError::Parse`].
+fn parse_input(src: &str, interner: &mut Interner) -> Result<Module, FmtError> {
+    ipe_parse::parse_module(src, interner).map_err(|diag| FmtError::Parse {
+        src: src.to_owned(),
+        diag,
+    })
+}
+
+/// The trivia of a source that parsed.
+fn lex_input(src: &str) -> Result<Trivia, FmtError> {
+    scan_trivia(src).ok_or_else(|| FmtError::RoundTrip {
+        detail: "source parsed but did not lex".to_owned(),
+    })
 }
 
 /// Print `src` with `render`, then refuse the output unless it fits `cap`,
 /// carries the input's comments and re-parses to the input's AST.
 ///
-/// [`format_source`] renders with [`Printer::module`]; a test passes a faulty
-/// renderer to drive each refusal through the same guards.
-fn format_guarded(
+/// [`format_source`] renders with [`Printer::formatted`]; a test passes a
+/// faulty renderer to drive each refusal through the same guards.
+fn format_guarded<R: Rendering>(
     src: &str,
     cap: OutputCap,
-    render: impl FnOnce(&Printer<'_>, &Module) -> String,
-) -> Result<String, FmtError> {
+    render: impl FnOnce(&Printer<'_>, &Module) -> R,
+) -> Result<R, FmtError> {
     let mut interner = Interner::new();
-    let module = ipe_parse::parse_module(src, &mut interner).map_err(|diag| FmtError::Parse {
-        src: src.to_owned(),
-        diag,
-    })?;
-    let input = scan_trivia(src).ok_or_else(|| FmtError::RoundTrip {
-        detail: "source parsed but did not lex".to_owned(),
-    })?;
+    let module = parse_input(src, &mut interner)?;
+    let input = lex_input(src)?;
     let printer = Printer::new(&interner, &input, Some(src), cap);
-    let out = render(&printer, &module);
+    let rendered = render(&printer, &module);
 
-    // Output guard: the formatted text fits the cap, and no pad was refused
-    // its bytes on the way (a refused pad rendered empty, so the text alone
-    // under-counts). It fires first so an over-cap output is never lexed,
+    // A refused pad rendered empty, so the text alone under-counts: the
+    // budget's verdict comes before any guard reads the text.
+    if printer.pads.exceeded() {
+        return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
+    }
+    verify(&module, &interner, &input.comments, rendered.text(), cap)?;
+    Ok(rendered)
+}
+
+/// Refuse `out` as a print of `module` unless it fits `cap`, carries exactly
+/// `input_comments` and re-parses to `module`'s AST.
+///
+/// The one set of output guards: [`format_guarded`] runs it on the printer's
+/// output and [`verify_rewrite`] on a caller's spliced rewrite.
+fn verify(
+    module: &Module,
+    interner: &Interner,
+    input_comments: &[Comment],
+    out: &str,
+    cap: OutputCap,
+) -> Result<(), FmtError> {
+    // Output guard: it fires first so an over-cap output is never lexed,
     // re-parsed or returned.
-    if printer.pads.exceeded() || !cap.admits(&out) {
+    if !cap.admits(out) {
         return Err(FmtError::Limit(FmtLimit::OutputBytes { cap }));
     }
 
-    // Comment guard: the formatted output carries exactly the input's comments.
-    // It fires BEFORE the AST equivalence check so a comment bug surfaces as a
-    // clear comment message rather than an AST mismatch.
-    let output = scan_trivia(&out).ok_or_else(|| FmtError::RoundTrip {
+    // Comment guard: the output carries exactly the input's comments. It fires
+    // BEFORE the AST equivalence check so a comment bug surfaces as a clear
+    // comment message rather than an AST mismatch.
+    let output = scan_trivia(out).ok_or_else(|| FmtError::RoundTrip {
         detail: "formatted output did not lex".to_owned(),
     })?;
-    let input_count = input.comments.len();
+    let input_count = input_comments.len();
     let output_count = output.comments.len();
     if output_count < input_count {
         return Err(FmtError::RoundTrip {
@@ -458,7 +568,7 @@ fn format_guarded(
             ),
         });
     }
-    if comment_multiset(&input.comments) != comment_multiset(&output.comments) {
+    if comment_multiset(input_comments) != comment_multiset(&output.comments) {
         return Err(FmtError::RoundTrip {
             detail: format!(
                 "formatter changed comments: input had {input_count}, output has {output_count}"
@@ -466,11 +576,11 @@ fn format_guarded(
         });
     }
 
-    // Semantics guard: the formatted output must re-parse to the same AST.
+    // Semantics guard: the output must re-parse to the same AST.
     let mut verify_interner = Interner::new();
-    match ipe_parse::parse_module(&out, &mut verify_interner) {
+    match ipe_parse::parse_module(out, &mut verify_interner) {
         Ok(reparsed) => {
-            if !modules_equivalent(&module, &interner, &reparsed, &verify_interner, cap)? {
+            if !modules_equivalent(module, interner, &reparsed, &verify_interner, cap)? {
                 return Err(FmtError::RoundTrip {
                     detail: "formatted output parsed to a different AST".to_owned(),
                 });
@@ -482,7 +592,7 @@ fn format_guarded(
             });
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Format `src` WITHOUT the round-trip guards. Test-only: lets a test
@@ -491,13 +601,8 @@ fn format_guarded(
 #[cfg(test)]
 pub(crate) fn format_source_unchecked(src: &str) -> Result<String, FmtError> {
     let mut interner = Interner::new();
-    let module = ipe_parse::parse_module(src, &mut interner).map_err(|diag| FmtError::Parse {
-        src: src.to_owned(),
-        diag,
-    })?;
-    let input = scan_trivia(src).ok_or_else(|| FmtError::RoundTrip {
-        detail: "source parsed but did not lex".to_owned(),
-    })?;
+    let module = parse_input(src, &mut interner)?;
+    let input = lex_input(src)?;
     Ok(Printer::new(
         &interner,
         &input,
@@ -1057,6 +1162,12 @@ impl<'a> Printer<'a> {
 
     /// Render a whole module.
     fn module(&self, m: &Module) -> String {
+        self.formatted(m).text
+    }
+
+    /// Render a whole module, recording where each declaration sits in the
+    /// input and in the output.
+    fn formatted(&self, m: &Module) -> Formatted {
         // Destructured field by field, with no `..`: a new kind of top-level
         // declaration is a build error here until it is printed, never a
         // silently dropped declaration.
@@ -1120,8 +1231,10 @@ impl<'a> Printer<'a> {
         // Declarations in source order, each preceded by two blank lines
         // (elm-format's top-level spacing). Unions / aliases / values /
         // foreign declarations interleave by their span order.
+        let mut segments: Vec<DeclSegment> = Vec::new();
         for decl in &decls {
             out.push_str("\n\n");
+            let item_start = out.len();
             // Leading comments: those anchored at the declaration's first
             // token, or at a head token before its name (`type`, `alias`, a
             // signature's name). Nothing depends on where the previous
@@ -1138,6 +1251,13 @@ impl<'a> Printer<'a> {
             push_comment_lines(&mut item, missed);
             item.push_str(&body);
             out.push_str(&item);
+            if let Some(input) = self.decl_input(start, owned_from(start), owner_end(start)) {
+                let end = item_start.saturating_add(item.trim_end_matches('\n').len());
+                segments.push(DeclSegment {
+                    input,
+                    output: item_start..end,
+                });
+            }
             out.push('\n');
         }
 
@@ -1156,7 +1276,36 @@ impl<'a> Printer<'a> {
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        out
+        Formatted {
+            text: out,
+            decls: segments,
+        }
+    }
+
+    /// The source bytes of the declaration whose first token starts at
+    /// `start` and whose comments are `owned`: from the line start of its
+    /// first comment or token to the end of its last token before
+    /// `owner_end`.
+    ///
+    /// `None` without a source (the equivalence guard's projection), where no
+    /// input position exists.
+    fn decl_input(
+        &self,
+        start: usize,
+        owned: &[Comment],
+        owner_end: usize,
+    ) -> Option<Range<usize>> {
+        let src = self.src?;
+        let first = owned.iter().map(|c| c.start).fold(start, usize::min);
+        let line = src.get(..first)?.rfind('\n').map_or(0, |nl| nl + 1);
+        let lo = if src.get(line..first)?.chars().all(|c| c == ' ' || c == '\t') {
+            line
+        } else {
+            first
+        };
+        let last = self.code.partition_point(|t| t.lo < owner_end);
+        let hi = last.checked_sub(1).and_then(|i| self.code.get(i))?.hi;
+        (lo < hi).then_some(lo..hi)
     }
 
     fn exposing(&self, e: &Exposing) -> String {
@@ -4274,5 +4423,98 @@ mod tests {
             assert_eq!(out.matches("-- inner").count(), 1, "{out}");
             assert_eq!(format_source(&out).expect("second pass"), out);
         }
+    }
+
+    /// `src` with each segment's input replaced by its output, last first.
+    fn splice_all(src: &str, formatted: &Formatted) -> String {
+        let mut segments = formatted.decls.clone();
+        segments.sort_by_key(|segment| std::cmp::Reverse(segment.input.start));
+        let mut edited = src.to_owned();
+        for segment in segments {
+            let new = formatted.text.get(segment.output).expect("output in text");
+            edited.replace_range(segment.input, new);
+        }
+        edited
+    }
+
+    /// Each segment's output is its declaration's formatted text, leading
+    /// comment included, and its input is that declaration's source bytes.
+    #[test]
+    fn format_with_segments_maps_each_declaration() {
+        let src = "module M exposing (a, b)\n\na : Int\na =\n      1\n\n-- about b\nb = 2\n";
+        let formatted = format_with_segments(src).expect("formats");
+        assert_eq!(formatted.text, format_source(src).expect("formats"));
+        let texts: Vec<(&str, &str)> = formatted
+            .decls
+            .iter()
+            .map(|segment| {
+                (
+                    src.get(segment.input.clone()).expect("input in source"),
+                    formatted
+                        .text
+                        .get(segment.output.clone())
+                        .expect("output in text"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("a : Int\na =\n      1", "a : Int\na =\n    1"),
+                ("-- about b\nb = 2", "-- about b\nb =\n    2"),
+            ]
+        );
+        let edited = splice_all(src, &formatted);
+        assert!(
+            verify_rewrite(src, &edited).is_ok(),
+            "the spliced segments verify"
+        );
+    }
+
+    /// `verify_rewrite` accepts a faithful rewrite and refuses one that drops
+    /// a comment, changes the program, or does not parse.
+    #[test]
+    fn verify_rewrite_refuses_an_unfaithful_rewrite() {
+        let src = "module M exposing (x)\n\n\n-- about x\nx =\n    1\n";
+        assert!(
+            verify_rewrite(src, src).is_ok(),
+            "an identical rewrite verifies"
+        );
+        let detail = |edited: &str| match verify_rewrite(src, edited) {
+            Err(FmtError::RoundTrip { detail }) => detail,
+            other => format!("not a refusal: {other:?}"),
+        };
+        let dropped = detail(&src.replace("-- about x\n", ""));
+        assert!(
+            dropped.starts_with("formatter dropped comments"),
+            "{dropped}"
+        );
+        assert_eq!(
+            detail(&src.replace("    1", "    2")),
+            "formatted output parsed to a different AST"
+        );
+        let unparsed = detail(&src.replace("    1", "    1 +"));
+        assert!(
+            unparsed.starts_with("formatted output did not re-parse"),
+            "{unparsed}"
+        );
+        assert!(matches!(
+            verify_rewrite("not ipe @@@@", src),
+            Err(FmtError::Parse { .. })
+        ));
+    }
+
+    /// An operator printed as `?`, the text a symbol the printer cannot
+    /// resolve renders, is refused rather than written.
+    #[test]
+    fn format_guards_refuse_an_unresolved_operator_print() {
+        let src = "module M exposing (x)\n\n\nx =\n    1 + 2\n";
+        assert_eq!(format_source(src).expect("formats"), src);
+        let unknown = refusal(src, |p, m| p.module(m).replace(" + ", " ? "));
+        assert!(
+            unknown.starts_with("formatted output"),
+            "a `?` operator is refused: {unknown}"
+        );
+        assert!(verify_rewrite(src, &src.replace(" + ", " ? ")).is_err());
     }
 }

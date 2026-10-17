@@ -24,7 +24,19 @@ A `do` block must contain at least one `<-` bind or bare-run step. A block
 whose every statement is a `=` pure-let binding is rejected at compile time
 (`IPE-P0065`); use `let … in` for an all-pure block.
 
+## Import
+
+A module that writes `do` must import `Ipe.Task`, under any spelling:
+`import Ipe.Task`, `import Ipe.Task as T`, or `import Ipe.Task exposing (..)`.
+Every `<-` sequences through `Ipe.Task`'s `andThen`, whatever name the import
+gives the module, so an alias never changes what `do` means and another module
+aliased `Task` never stands in for it. Without the import each `<-` is
+`IPE-N0034`: "`<-` comes from `Ipe.Task`, which you haven't imported yet."
+
 ## Example
+
+    import Ipe.Io as Io
+    import Ipe.Task
 
     greet : Task Error ()
     greet =
