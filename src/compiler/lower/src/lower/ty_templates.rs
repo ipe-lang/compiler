@@ -10,16 +10,35 @@ use ipe_types::{ConHead, EmittedHeads, HeadIdentity, Ty, paired_ty_children};
 
 use super::is_opaque_boxed_wrapper;
 
+/// A solved [`Ty`] proven ground: no type variable, wildcard, or open row tail at any depth.
+///
+/// The field is private, so the only way to hold one is [`Self::new`], which
+/// admits exactly what [`ipe_types::ty_is_ground`] admits. A ground type reads
+/// no def scope when lowered (no generic map, row parameter, or read site), so
+/// it has one lowering in every scope; a pass that runs outside any def takes
+/// this view and cannot lower a scope-dependent type.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GroundTy<'a>(&'a Ty);
+
+impl<'a> GroundTy<'a> {
+    /// The ground view of `ty`, or `None` when it carries a variable or an open row.
+    pub(super) fn new(ty: &'a Ty) -> Option<Self> {
+        ipe_types::ty_is_ground(ty).then_some(Self(ty))
+    }
+
+    /// The proven-ground type.
+    pub(super) const fn ty(self) -> &'a Ty {
+        self.0
+    }
+}
+
 /// Whether a type variable appears in this solved [`Ty`], reading record fields only.
 ///
 /// A record's row tail is deliberately not consulted, so this is NOT a
 /// groundness judgment (that is [`ipe_types::ty_is_ground`]). It serves the
-/// reads whose consumer itself works on fields only: record-shape collection
-/// must agree with `ir_type_from_ty`, which lowers a record's fields (a
-/// residual flexible row lowers as its zero-extension instance), and a
-/// row-polymorphic record update is emitted through its field trait whatever
-/// the tail. A variable-bearing record reaches the backend through a
-/// signature, where the variable still has a source [`Symbol`] to name it.
+/// one read whose consumer itself works on fields only: a row-polymorphic
+/// record update is emitted through its field trait whatever the tail, so its
+/// gate asks only whether a field carries a variable.
 pub(super) fn ty_fields_mention_var(ty: &Ty) -> bool {
     match ty {
         Ty::Var(_) | Ty::Wildcard => true,

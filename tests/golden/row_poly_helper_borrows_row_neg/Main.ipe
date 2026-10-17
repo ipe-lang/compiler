@@ -1,0 +1,22 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+
+
+-- Refused: `helper` has no signature, so its one type is shared by every use
+-- in this module. `greet` calls it under its own row variable `r`, so
+-- `helper`'s argument row is `greet`'s `r` without `helper` being generic over
+-- it. `greet` emits `r` as its own Rust generic; `helper` has no parameter for
+-- it, so the call between the two emitted functions could not type-check.
+-- `ipe` refuses `helper` at its name (IPE-L0102).
+helper rec =
+    rec.name
+
+
+greet : { r | name : String } -> String
+greet rec =
+    helper rec
+
+
+main =
+    Io.println (greet { name = "Ada", age = 36 })
