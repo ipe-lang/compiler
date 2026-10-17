@@ -102,9 +102,8 @@ mod engine {
     use crate::threads::{self, ThreadRole};
     use crate::{CliError, Path};
     use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
-    use wasmtime_wasi::p2::WasiCtxBuilder;
-    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-    use wasmtime_wasi::{DirPerms, FilePerms, I32Exit};
+    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+    use wasmtime_wasi::{DirPerms, FilePerms, I32Exit, WasiCtxBuilder};
 
     /// The store's host data: the WASI context PLUS the address-space limiter.
     /// Both live in the store so the resource bound is enforced by the same
@@ -265,13 +264,13 @@ mod engine {
             })?;
 
         let mut linker: Linker<HostState> = Linker::new(&engine);
-        preview1::add_to_linker_sync(&mut linker, |s: &mut HostState| &mut s.wasi).map_err(
-            |e| CliError::WasiRunFailed {
+        p1::add_to_linker_sync(&mut linker, |s: &mut HostState| &mut s.wasi).map_err(|e| {
+            CliError::WasiRunFailed {
                 detail: crate::style::TerminalSafe::sanitize(&format!(
                     "could not wire the WASI preview1 imports: {e}"
                 )),
-            },
-        )?;
+            }
+        })?;
 
         let wasi = build_ctx(working_tree, args)?;
         // Address-space ceiling: linear memory may not grow past the context's
