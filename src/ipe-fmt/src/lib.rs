@@ -3280,11 +3280,20 @@ struct Pad<'b> {
 impl fmt::Display for Pad<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.budget.charge(self.col.0) {
-            write!(f, "{:width$}", "", width = self.col.0)?;
+            let mut left = self.col.0;
+            while left > 0 {
+                let chunk = left.min(SPACES.len());
+                f.write_str(SPACES.get(..chunk).unwrap_or(""))?;
+                left -= chunk;
+            }
         }
         Ok(())
     }
 }
+
+/// One write of spaces. A `{:width$}` argument is a `u16` at run time and
+/// panics past 65535, so a column an input decides is written in chunks.
+const SPACES: &str = "                                                                ";
 
 /// Whether `s`, placed at column `col`, fits within [`MAX_WIDTH`]. A multi-line
 /// `s` never "fits" as a single line.
@@ -4205,6 +4214,18 @@ mod tests {
         assert!(budget.exceeded());
         assert_eq!(format!("{}", budget.pad(Col::ZERO)), "");
         assert!(budget.exceeded());
+    }
+
+    /// A column past `u16::MAX` renders in full: the pad never hands a
+    /// runtime width to the formatter, which panics there.
+    #[test]
+    fn pad_past_u16_max_renders_every_space() {
+        let budget = PadBudget::new(OutputCap(1 << 20));
+        let rendered = format!("{}", budget.pad(Col(70_000)));
+        assert_eq!(rendered.len(), 70_000);
+        assert!(rendered.bytes().all(|b| b == b' '));
+        assert!(!budget.exceeded());
+        assert_eq!(SPACES.len(), 64);
     }
 
     /// A rewind gives back what was charged since its mark, and an exceeded
