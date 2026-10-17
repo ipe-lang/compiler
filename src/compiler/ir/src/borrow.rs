@@ -77,7 +77,11 @@ const EMIT_RENDERS_BORROWED: bool = false;
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PassTable {
     slots: BTreeMap<FuncId, Vec<ParamPass>>,
-    /// The number of `Borrowed` entries in `slots`.
+    /// Ids carried by more than one function, so no single slot list
+    /// describes them, each with whether any of those functions borrows.
+    ambiguous: BTreeMap<FuncId, bool>,
+    /// The number of `Borrowed` entries in `slots` and in the functions
+    /// behind `ambiguous`.
     borrowed: usize,
 }
 
@@ -89,11 +93,24 @@ impl PassTable {
     }
 
     /// The passes `funcs` carry.
+    ///
+    /// An id two functions share has no slot ([`Self::pass`] is `None`, so an
+    /// argument passed to it consumes) and borrows when any of them borrows.
     #[must_use]
     pub fn of_funcs<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Self {
         let mut table = Self::default();
         for f in funcs {
-            table.insert(f.id, f.params.iter().map(Param::pass).collect());
+            let slots: Vec<ParamPass> = f.params.iter().map(Param::pass).collect();
+            let borrows = slots.contains(&ParamPass::Borrowed);
+            table.borrowed = table.borrowed.saturating_add(count_borrowed(&slots));
+            if let Some(any) = table.ambiguous.get_mut(&f.id) {
+                *any |= borrows;
+            } else if let Some(first) = table.slots.remove(&f.id) {
+                let first_borrows = first.contains(&ParamPass::Borrowed);
+                table.ambiguous.insert(f.id, borrows || first_borrows);
+            } else {
+                table.slots.insert(f.id, slots);
+            }
         }
         table
     }
@@ -116,12 +133,21 @@ impl PassTable {
         self.slots.get(&id).and_then(|s| s.get(idx)).copied()
     }
 
+    /// The number of parameter slots function `id` has, or `None` when no
+    /// single function carries `id`.
+    #[must_use]
+    pub fn arity(&self, id: FuncId) -> Option<usize> {
+        self.slots.get(&id).map(Vec::len)
+    }
+
     /// Whether function `id` takes any parameter by reference.
     #[must_use]
     pub fn borrows_any(&self, id: FuncId) -> bool {
-        self.slots
-            .get(&id)
-            .is_some_and(|s| s.contains(&ParamPass::Borrowed))
+        self.ambiguous.get(&id).copied().unwrap_or(false)
+            || self
+                .slots
+                .get(&id)
+                .is_some_and(|s| s.contains(&ParamPass::Borrowed))
     }
 
     /// The number of `Borrowed` slots in the table.
@@ -130,21 +156,26 @@ impl PassTable {
         self.borrowed
     }
 
-    fn demote(&mut self, id: FuncId, idx: usize) {
+    /// Demote slot `idx` of function `id`; `true` when it was `Borrowed`.
+    fn demote(&mut self, id: FuncId, idx: usize) -> bool {
         if let Some(slot) = self.slots.get_mut(&id).and_then(|s| s.get_mut(idx))
             && *slot == ParamPass::Borrowed
         {
             *slot = ParamPass::Owned;
             self.borrowed = self.borrowed.saturating_sub(1);
+            return true;
         }
+        false
     }
 
-    /// Demote every slot of function `id`.
-    fn demote_func(&mut self, id: FuncId) {
+    /// Demote every slot of function `id`; `true` when any was `Borrowed`.
+    fn demote_func(&mut self, id: FuncId) -> bool {
         let len = self.slots.get(&id).map_or(0, Vec::len);
+        let mut changed = false;
         for idx in 0..len {
-            self.demote(id, idx);
+            changed |= self.demote(id, idx);
         }
+        changed
     }
 }
 
@@ -264,10 +295,17 @@ pub fn analyze(
         }
     }
     let rounds = table.borrowed_count().saturating_add(1);
-    fixpoint(&funcs, table, &program_payloads(program), rounds)
+    fixpoint(&funcs, table, &program_payloads(program), rounds).map(|(plan, _)| plan)
 }
 
-/// Iterate demotion rounds until none demotes, refusing past `max_rounds`.
+/// Iterate demotion rounds until none demotes, refusing past `max_rounds`;
+/// also returns the number of function bodies walked.
+///
+/// The first round walks every function. A walk's verdict depends on the
+/// table only through the slots of the functions it calls, so a later round
+/// walks only the callers of a function whose slots the previous round
+/// demoted, and the whole fixpoint walks each body once plus once per
+/// demoted callee.
 ///
 /// A function named as a first-class value keeps every slot `Owned` (no
 /// by-value adapter exists for a borrowing function), and a body past the
@@ -278,33 +316,52 @@ fn fixpoint(
     mut table: PassTable,
     payloads: &EnumPayloadTable,
     max_rounds: usize,
-) -> Result<BorrowPlan, Diagnostic> {
+) -> Result<(BorrowPlan, usize), Diagnostic> {
+    let mut callers: BTreeMap<FuncId, BTreeSet<FuncId>> = BTreeMap::new();
+    let mut dirty: BTreeSet<FuncId> = funcs.iter().map(|f| f.id).collect();
+    let mut walks: usize = 0;
     for _ in 0..max_rounds {
-        let before = table.borrowed_count();
         let mut demoted: Vec<(FuncId, usize)> = Vec::new();
         let mut values: BTreeSet<FuncId> = BTreeSet::new();
         let mut too_deep = false;
-        for func in funcs {
+        for func in funcs.iter().filter(|f| dirty.contains(&f.id)) {
+            walks = walks.saturating_add(1);
             let mut walk = Walk::tracking_borrowed(func, &table, payloads);
             walk.expr(&func.body, Pos::Other, false, 0);
             too_deep |= walk.too_deep;
             demoted.extend(walk.demoted.into_iter().map(|idx| (func.id, idx)));
             values.extend(walk.func_values);
+            for callee in walk.callees {
+                callers.entry(callee).or_default().insert(func.id);
+            }
         }
+        let mut changed: BTreeSet<FuncId> = BTreeSet::new();
         if too_deep {
             for func in funcs {
-                table.demote_func(func.id);
+                if table.demote_func(func.id) {
+                    changed.insert(func.id);
+                }
             }
         }
         for (id, idx) in demoted {
-            table.demote(id, idx);
+            if table.demote(id, idx) {
+                changed.insert(id);
+            }
         }
         for id in values {
-            table.demote_func(id);
+            if table.demote_func(id) {
+                changed.insert(id);
+            }
         }
-        if table.borrowed_count() == before {
-            return Ok(BorrowPlan { table });
+        if changed.is_empty() {
+            return Ok((BorrowPlan { table }, walks));
         }
+        dirty = changed
+            .iter()
+            .filter_map(|id| callers.get(id))
+            .flatten()
+            .copied()
+            .collect();
     }
     Err(Diagnostic::CompilerBug {
         where_: "ipe_ir::borrow::analyze",
@@ -430,6 +487,8 @@ struct Walk<'a> {
     borrowing_value: Option<FuncId>,
     /// Every user function named as a first-class value.
     func_values: Vec<FuncId>,
+    /// Every user function called directly.
+    callees: BTreeSet<FuncId>,
     too_deep: bool,
 }
 
@@ -470,6 +529,7 @@ impl<'a> Walk<'a> {
             demoted,
             borrowing_value: None,
             func_values: Vec::new(),
+            callees: BTreeSet::new(),
             too_deep: false,
         }
     }
@@ -548,11 +608,19 @@ impl<'a> Walk<'a> {
                 self.expr(record, Pos::AccessBase { moves }, deferred, next);
             }
             Expr::Call { callee, args, .. } => match callee {
-                Callee::Func(id) => {
+                // Only a call that fills every slot of one known callee
+                // passes an argument straight into a slot; any other shape
+                // consumes its arguments.
+                Callee::Func(id) if self.table.arity(*id) == Some(args.len()) => {
+                    self.callees.insert(*id);
                     for (idx, arg) in args.iter().enumerate() {
                         let pos = Pos::FuncArg { callee: *id, idx };
                         self.expr(arg, pos, deferred, next);
                     }
+                }
+                Callee::Func(id) => {
+                    self.callees.insert(*id);
+                    self.all(args, deferred, next);
                 }
                 Callee::Kernel(_) | Callee::Ffi { .. } => self.all(args, true, next),
             },
@@ -755,7 +823,8 @@ fn collect_binders(func: &Func, expr: &Expr, out: &mut BTreeSet<Symbol>, depth: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BinOp, CallPin, KernelFn, ModPath, Module, OnFormKind};
+    use crate::once_closure::MovedCapture;
+    use crate::{Arm, BinOp, CallPin, KernelFn, Match, ModPath, Module, OnFormKind, Pat};
     use ipe_diagnostics::DResult;
     use ipe_intern::Interner;
 
@@ -1319,6 +1388,306 @@ mod tests {
             out,
             Err(Diagnostic::CompilerBug { where_: "test", .. })
         ));
+        Ok(())
+    }
+
+    /// Every position that consumes the value placed there, one body per
+    /// shape, each around the only occurrence of `p`.
+    fn value_consuming_bodies(p: Symbol, x: Symbol) -> DResult<Vec<(&'static str, Expr)>> {
+        let var = || Box::new(Expr::Var(p));
+        let int = || Box::new(Expr::Int(0));
+        Ok(vec![
+            ("clone return", Expr::CloneVar(p)),
+            (
+                "let alias",
+                Expr::Let {
+                    name: x,
+                    value: var(),
+                    body: int(),
+                },
+            ),
+            (
+                "destructure value",
+                Expr::Destructure {
+                    binder: Pat::Wildcard,
+                    value: var(),
+                    body: int(),
+                },
+            ),
+            (
+                "match scrutinee",
+                Expr::Match(Match::new(
+                    Expr::Var(p),
+                    vec![Arm::new(
+                        Pat::Ctor {
+                            home: ModPath(vec![]),
+                            ty: x,
+                            variant: x,
+                            args: vec![],
+                        },
+                        Expr::Int(0),
+                    )],
+                    &[x],
+                )?),
+            ),
+            (
+                "if condition",
+                Expr::If {
+                    cond: var(),
+                    then_: int(),
+                    else_: int(),
+                },
+            ),
+            (
+                "update base",
+                Expr::Update {
+                    record: var(),
+                    fields: vec![],
+                },
+            ),
+            (
+                "record field",
+                Expr::Record {
+                    fields: vec![(x, Expr::Var(p))],
+                    ty: None,
+                },
+            ),
+            (
+                "constructor argument",
+                Expr::Ctor {
+                    home: ModPath(vec![]),
+                    ty: x,
+                    variant: x,
+                    args: vec![Expr::Var(p)],
+                },
+            ),
+            (
+                "list item",
+                Expr::List {
+                    elem: IrType::Str,
+                    items: vec![Expr::Var(p)],
+                },
+            ),
+            (
+                "cons head",
+                Expr::Cons {
+                    head: var(),
+                    tail: Box::new(Expr::List {
+                        elem: IrType::Str,
+                        items: vec![],
+                    }),
+                },
+            ),
+            (
+                "list index",
+                Expr::ListIndexClone {
+                    list: var(),
+                    index: 0,
+                    elem: IrType::Str,
+                },
+            ),
+        ])
+    }
+
+    /// The remaining consuming positions: a list shape check, calls, deferred
+    /// reads and loops, one body per shape.
+    fn deferring_bodies(p: Symbol, x: Symbol) -> Vec<(&'static str, Expr)> {
+        let own_loop = |recur: Vec<Expr>| Expr::TailLoop {
+            params: vec![(p, IrType::Str)],
+            body: Box::new(Expr::If {
+                cond: Box::new(Expr::Bool(true)),
+                then_: Box::new(read(p, x)),
+                else_: Box::new(Expr::TailRecur { args: recur }),
+            }),
+        };
+        vec![
+            (
+                "list length check",
+                Expr::ListLenCheck {
+                    list: Box::new(Expr::Var(p)),
+                    len: 0,
+                    exact: true,
+                },
+            ),
+            (
+                "apply argument",
+                Expr::Apply {
+                    func: Box::new(Expr::Var(x)),
+                    args: vec![Expr::Var(p)],
+                },
+            ),
+            (
+                "ffi argument",
+                call(
+                    Callee::Ffi {
+                        ident: x,
+                        asserted: false,
+                    },
+                    vec![read(p, x)],
+                ),
+            ),
+            (
+                "task continuation",
+                Expr::TaskSeq {
+                    effect: Box::new(Expr::Unit),
+                    rest: Box::new(read(p, x)),
+                },
+            ),
+            (
+                "shared closure",
+                Expr::SharedLambda {
+                    params: vec![],
+                    ret: IrType::Int,
+                    body: Box::new(read(p, x)),
+                },
+            ),
+            (
+                "once closure",
+                Expr::OnceLambda {
+                    params: vec![],
+                    ret: IrType::Int,
+                    body: Box::new(read(p, x)),
+                    capture: MovedCapture {
+                        name: p,
+                        lo: 0,
+                        hi: 0,
+                    },
+                },
+            ),
+            (
+                "foreign loop",
+                Expr::TailLoop {
+                    params: vec![(x, IrType::Str)],
+                    body: Box::new(read(p, x)),
+                },
+            ),
+            ("short tail recursion", own_loop(vec![])),
+            (
+                "long tail recursion",
+                own_loop(vec![Expr::Var(p), Expr::Int(0)]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_consuming_position_is_owned() -> DResult<()> {
+        let mut interner = Interner::new();
+        let (name, p, x) = (
+            interner.intern("f")?,
+            interner.intern("p")?,
+            interner.intern("x")?,
+        );
+        let mut bodies = value_consuming_bodies(p, x)?;
+        bodies.extend(deferring_bodies(p, x));
+        for (shape, body) in bodies {
+            let params = vec![Param::owned(p, IrType::Str)];
+            let prog = program(vec![func(F, name, params, body.clone())]);
+            let plan = analyze(&prog, |_| true)?;
+            assert_eq!(
+                plan.table().pass(F, 0),
+                Some(ParamPass::Owned),
+                "{shape}: the analysis borrows a consumed param"
+            );
+            let f = func(F, name, vec![borrowed(p, IrType::Str)], body);
+            let table = PassTable::of_funcs([&f]);
+            assert!(
+                matches!(
+                    verify(&f, &table, &EnumPayloadTable::new()),
+                    Err(BorrowViolation::NonReadUse { .. })
+                ),
+                "{shape}: verify accepts a consumed borrowed param"
+            );
+        }
+        Ok(())
+    }
+
+    /// `f(p) = g(p)` against a `g` with two read-only parameters.
+    #[test]
+    fn a_call_short_of_its_callee_arity_consumes_its_arguments() -> DResult<()> {
+        let mut interner = Interner::new();
+        let (fname, gname) = (interner.intern("f")?, interner.intern("g")?);
+        let (p, first, second, x) = (
+            interner.intern("p")?,
+            interner.intern("a")?,
+            interner.intern("b")?,
+            interner.intern("x")?,
+        );
+        let g_body = Expr::Tuple(vec![read(first, x), read(second, x)]);
+        let g_params = vec![
+            Param::owned(first, IrType::Str),
+            Param::owned(second, IrType::Str),
+        ];
+        let pair = func(G, gname, g_params, g_body);
+        let f_body = call(Callee::Func(G), vec![Expr::Var(p)]);
+        let forwarder = func(F, fname, vec![Param::owned(p, IrType::Str)], f_body.clone());
+        let plan = analyze(&program(vec![forwarder, pair.clone()]), |_| true)?;
+        assert_eq!(plan.table().pass(G, 0), Some(ParamPass::Borrowed));
+        assert_eq!(plan.table().pass(F, 0), Some(ParamPass::Owned));
+
+        let g_borrowing = func(
+            G,
+            gname,
+            vec![borrowed(first, IrType::Str), borrowed(second, IrType::Str)],
+            pair.body,
+        );
+        let f_borrowing = func(F, fname, vec![borrowed(p, IrType::Str)], f_body);
+        let table = PassTable::of_funcs([&f_borrowing, &g_borrowing]);
+        assert!(matches!(
+            verify(&f_borrowing, &table, &EnumPayloadTable::new()),
+            Err(BorrowViolation::NonReadUse { func: F, .. })
+        ));
+        Ok(())
+    }
+
+    /// A carried table whose id two functions share answers no slot for it,
+    /// so an argument passed under that id consumes.
+    #[test]
+    fn a_repeated_id_in_a_carried_table_has_no_slot() -> DResult<()> {
+        let mut interner = Interner::new();
+        let (fname, gname) = (interner.intern("f")?, interner.intern("g")?);
+        let (p, q, x) = (
+            interner.intern("p")?,
+            interner.intern("q")?,
+            interner.intern("x")?,
+        );
+        let owning = func(G, gname, vec![Param::owned(q, IrType::Str)], Expr::Var(q));
+        let borrowing = func(G, gname, vec![borrowed(q, IrType::Str)], read(q, x));
+        let caller_body = call(Callee::Func(G), vec![Expr::Var(p)]);
+        let caller = func(F, fname, vec![borrowed(p, IrType::Str)], caller_body);
+        for order in [[&owning, &borrowing], [&borrowing, &owning]] {
+            let [first, second] = order;
+            let table = PassTable::of_funcs([first, second, &caller]);
+            assert_eq!(table.pass(G, 0), None);
+            assert!(table.borrows_any(G));
+            assert!(matches!(
+                verify(&caller, &table, &EnumPayloadTable::new()),
+                Err(BorrowViolation::NonReadUse { func: F, .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_fixpoint_rewalks_only_callers_of_a_demoted_function() -> DResult<()> {
+        let mut interner = Interner::new();
+        let n: u32 = 32;
+        let funcs = chain(&mut interner, n)?;
+        let refs: Vec<&Func> = funcs.iter().collect();
+        let mut table = PassTable::default();
+        for f in &funcs {
+            table.insert(f.id, vec![ParamPass::Borrowed]);
+        }
+        let rounds = table.borrowed_count().saturating_add(1);
+        let (plan, walks) = fixpoint(&refs, table, &EnumPayloadTable::new(), rounds)?;
+        assert_eq!(plan.table().borrowed_count(), 0);
+        let len = usize::try_from(n).map_err(|_| Diagnostic::CompilerBug {
+            where_: "test",
+            detail: "chain length".to_owned(),
+        })?;
+        assert!(
+            walks < len.saturating_mul(2),
+            "{walks} body walks for a {len}-function chain"
+        );
         Ok(())
     }
 }

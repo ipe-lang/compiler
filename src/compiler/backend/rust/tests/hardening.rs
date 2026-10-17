@@ -1335,3 +1335,81 @@ fn list_index_clone_proves_its_element_clone() -> DResult<()> {
     );
     Ok(())
 }
+
+/// Set the pass of every parameter of `json` (a serialized [`Program`]) to
+/// `pass`, returning how many it rewrote.
+fn forge_passes(json: &mut serde_json::Value, pass: &str) -> usize {
+    let mut rewritten = 0_usize;
+    let modules = json
+        .get_mut("modules")
+        .and_then(serde_json::Value::as_array_mut);
+    for module in modules.into_iter().flatten() {
+        let funcs = module
+            .get_mut("funcs")
+            .and_then(serde_json::Value::as_array_mut);
+        for func in funcs.into_iter().flatten() {
+            let params = func
+                .get_mut("params")
+                .and_then(serde_json::Value::as_array_mut);
+            for param in params.into_iter().flatten() {
+                if let Some(slot) = param.get_mut("pass") {
+                    *slot = serde_json::Value::String(pass.to_owned());
+                    rewritten = rewritten.saturating_add(1);
+                }
+            }
+        }
+    }
+    rewritten
+}
+
+/// A `Borrowed` pass forged through deserialization, on a parameter its body
+/// returns by value, is refused at emit rather than rendered as a reference.
+#[test]
+fn a_forged_borrowed_param_is_refused_at_emit() -> DResult<()> {
+    let bug = |detail: String| Diagnostic::CompilerBug {
+        where_: "hardening test",
+        detail,
+    };
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Interner::new()));
+    let (main_mod, name, param) = {
+        let mut interner = shared.lock().map_err(|e| bug(e.to_string()))?;
+        (
+            interner.intern("Main")?,
+            interner.intern("keep")?,
+            interner.intern("s")?,
+        )
+    };
+    let returning = Func {
+        id: FuncId::from_raw(0),
+        name,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![ipe_ir::Param::owned(param, IrType::Str)],
+        ret: IrType::Str,
+        body: Expr::Var(param),
+    };
+    let honest = program(main_mod, vec![], vec![returning]);
+    let forged: Program = {
+        let _guard = ipe_intern::SerdeInternerGuard::install(std::sync::Arc::clone(&shared));
+        let mut json = serde_json::to_value(&honest).map_err(|e| bug(e.to_string()))?;
+        assert_eq!(forge_passes(&mut json, "Borrowed"), 1);
+        serde_json::from_value(json).map_err(|e| bug(e.to_string()))?
+    };
+    let (accepted, refused) = {
+        let interner = shared.lock().map_err(|e| bug(e.to_string()))?;
+        (emit(&interner, &honest), emit(&interner, &forged))
+    };
+    accepted?;
+    assert!(
+        matches!(
+            refused,
+            Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::emit_func",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    Ok(())
+}
