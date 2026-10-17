@@ -162,6 +162,10 @@ fn every_repo_ipe_file_is_a_meaning_preserving_fixed_point() {
             let msg = format!("{rel}: format_source rejected a file the parser accepted");
             ipe_fmt::format_source(&src).expect(&msg)
         };
+        assert!(
+            ipe_fmt::verify_rewrite(&src, &once).is_ok(),
+            "{rel}: the print does not parse to the source's AST"
+        );
         let twice = {
             let msg = format!("{rel}: the second format pass rejected the first pass's output");
             ipe_fmt::format_source(&once).expect(&msg)
