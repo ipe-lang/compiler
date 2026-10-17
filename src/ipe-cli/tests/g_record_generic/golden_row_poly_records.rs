@@ -1172,6 +1172,7 @@ fn free_unused_row_is_accepted() {
 /// helper, the owner, and the variable (else the helper's signature names a
 /// generic it never declares).
 #[test]
+#[allow(clippy::panic)] // a build that is not the expected refusal is the test failure
 fn helper_borrowing_a_signature_row_is_ipe_l0102() {
     use ipe_diagnostics::{Diagnostic, LowerError};
 
@@ -1182,13 +1183,12 @@ fn helper_borrowing_a_signature_row_is_ipe_l0102() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
     let built = ipe::build(&entry, &out, &runtime);
-    let Err(ipe::CliError::Pipeline { diag, .. }) = &built else {
-        assert!(
-            matches!(built, Err(ipe::CliError::Pipeline { .. })),
+    let diag = match &built {
+        Err(ipe::CliError::Pipeline { diag, .. }) => diag,
+        other => panic!(
             "{name}: a helper borrowing another def's row must be refused with a \
-             pipeline diagnostic, got: {built:?}"
-        );
-        return;
+             pipeline diagnostic, got: {other:?}"
+        ),
     };
     assert_eq!(
         diag.code(),
