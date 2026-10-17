@@ -164,6 +164,26 @@ fn web_desktop_host() -> Result<ipe::delivery::HostIntent, BoxError> {
     .map_err(|e| -> BoxError { format!("web desktop does not resolve: {e}").into() })
 }
 
+/// The whole emitted Ipê-side Rust tree: `src/main.rs` plus every
+/// `src/ipe_mods/*.rs` a project build splits its modules into.
+fn emitted_source(out_dir: &std::path::Path) -> std::io::Result<String> {
+    let src = out_dir.join("src");
+    let mut combined = std::fs::read_to_string(src.join("main.rs"))?;
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(src.join("ipe_mods"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    files.sort();
+    for path in files {
+        combined.push('\n');
+        combined.push_str(&std::fs::read_to_string(&path)?);
+    }
+    Ok(combined)
+}
+
 /// Compile a `Web.tea` program string under a webview host, build the emitted
 /// Rust project, and return the path to the compiled binary.
 fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::PathBuf, BoxError> {
@@ -210,9 +230,10 @@ fn compile_and_build_with_files(
     )
     .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
-    let main_rs = std::fs::read_to_string(out_dir.join("src/main.rs"))
-        .map_err(|e| -> BoxError { format!("{test_name}: cannot read main.rs: {e}").into() })?;
-    if !main_rs.contains("WebViewApp") || !main_rs.contains("\"Counter\"") {
+    let emitted = emitted_source(&out_dir).map_err(|e| -> BoxError {
+        format!("{test_name}: cannot read emitted source: {e}").into()
+    })?;
+    if !emitted.contains("WebViewApp") || !emitted.contains("\"Counter\"") {
         return Err(format!(
             "{test_name}: the emit is not a webview app titled from the manifest window"
         )

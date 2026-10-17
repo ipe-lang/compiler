@@ -168,6 +168,8 @@ const DIAGNOSTIC_AND_FEATURE_LITERAL: &str = "a compiler diagnostic's text, neve
      pinned crate feature name quoted into an emitted manifest, where a `str`'s `Debug` escapes \
      are TOML basic-string escapes";
 const SERDE_REFUSAL: &str = "a serde error carrying a path-refusal diagnostic, never emitted";
+const CACHE_KEY: &str = "bytes folded into a build-cache key from non-secret emit settings, never \
+     emitted";
 
 /// Every backend function that renders through `Debug`, with its exact count, so
 /// a new site anywhere (a new function, or one more in a listed function) fails
@@ -262,6 +264,12 @@ const DEBUG_SITES: &[DebugSite] = &[
         func: "hash_ty",
         count: 2,
         why: SCHEMA_HASH,
+    },
+    DebugSite {
+        file: "rust/src/emit_settings.rs",
+        func: "fold_key",
+        count: 2,
+        why: CACHE_KEY,
     },
     DebugSite {
         file: "rust/src/lib.rs",
