@@ -1789,6 +1789,89 @@ mod tests {
         );
     }
 
+    /// One settings value per field, each differing from [`key_settings`] in
+    /// that field alone. The destructure stops the build when a field is added
+    /// without a flip here.
+    fn single_field_flips() -> Vec<(&'static str, ipe_backend_rust::EmitSettings)> {
+        use ipe_backend_rust::{
+            BuildIntent, CargoPackageName, CrateName, EmitHost, EmitSettings, FfiEmit, RuntimeDep,
+            WebViewWindow,
+        };
+        fn flip(
+            field: &'static str,
+            edit: impl FnOnce(&mut EmitSettings),
+        ) -> (&'static str, EmitSettings) {
+            let mut settings = key_settings();
+            edit(&mut settings);
+            (field, settings)
+        }
+        let EmitSettings {
+            db_driver: _,
+            ffi: _,
+            target: _,
+            wasm_public_env: _,
+            mount_base: _,
+            wasm_hydrate_mode: _,
+            runtime_dep: _,
+            debugger: _,
+            crate_name: _,
+            hot_appearance: _,
+            host: _,
+            intent: _,
+        } = key_settings();
+        let mount_base = MountBase::parse("/app").expect("`/app` is a mount base");
+        let window = WebViewWindow {
+            title: "W".to_owned(),
+            width: 1,
+            height: 2,
+        };
+        vec![
+            flip("db_driver", |s| s.db_driver = DbDriver::Postgres),
+            flip("ffi", |s| s.ffi = Some(FfiEmit::default())),
+            flip("target", |s| s.target = ipe_ir::Target::WasmClient),
+            flip("wasm_public_env", |s| {
+                s.wasm_public_env = vec!["API".to_owned()];
+            }),
+            flip("mount_base", |s| s.mount_base = mount_base),
+            flip("wasm_hydrate_mode", |s| s.wasm_hydrate_mode = true),
+            flip("runtime_dep", |s| {
+                s.runtime_dep = Some(RuntimeDep {
+                    root: std::path::PathBuf::from("/runtime"),
+                });
+            }),
+            flip("debugger", |s| s.debugger = true),
+            flip("crate_name", |s| {
+                s.crate_name = CrateName::Pinned(CargoPackageName::sanitize("probe"));
+            }),
+            flip("hot_appearance", |s| s.hot_appearance = true),
+            flip("host", |s| s.host = EmitHost::WebView(window)),
+            flip("intent", |s| s.intent = BuildIntent::Release),
+        ]
+    }
+
+    /// Flipping any one settings field changes the key, and no two single
+    /// flips share a key: no field is left out of the fold, and no two fields
+    /// fold to the same bytes.
+    #[test]
+    fn key_changes_with_every_field() {
+        let (sources, injected) = sample_sources();
+        let key = |settings: &ipe_backend_rust::EmitSettings| {
+            compute_project_key(&sources, &injected, &entry(), settings)
+        };
+        let flips = single_field_flips();
+        let mut keys = vec![("base", key(&key_settings()))];
+        for (field, settings) in &flips {
+            let flipped = key(settings);
+            let collision = keys.iter().find(|(_, seen)| *seen == flipped);
+            assert!(
+                collision.is_none(),
+                "flipping `{field}` keys the same entry as {collision:?}"
+            );
+            keys.push((*field, flipped));
+        }
+        assert_eq!(keys.len(), 13, "every field is flipped once");
+    }
+
     /// Two settings whose field bytes concatenate to the same stream still
     /// fold to different keys: every field is tagged and length-framed.
     #[test]

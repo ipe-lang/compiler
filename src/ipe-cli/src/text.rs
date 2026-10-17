@@ -707,6 +707,8 @@ messages! {
     publish_single_path = "publish-single-path";
     /// `ipe dev watch`/`ipe dev build` given a directory with no manifest inside it.
     watch_dir_no_manifest = "watch-dir-no-manifest";
+    /// A `web desktop` build of an entry file with no `package.ipe`.
+    webview_needs_manifest = "webview-needs-manifest";
     /// `ipe diff` misuse.
     diff_usage = "diff-usage";
     /// `ipe init --shape` without its value.

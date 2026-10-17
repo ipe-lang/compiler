@@ -932,11 +932,12 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 /// Emit the program at `entry_path` into `target`, returning the claimed crate directory.
 ///
 /// The manifest project is emitted for `host` when one was found, else the
-/// entry with its sibling files. A loose file has no manifest window, so it is
-/// always emitted for the served host.
+/// entry with its sibling files for the served host. A loose file has no
+/// manifest window, so a webview request for one is refused, never served.
 ///
 /// # Errors
-/// As [`build_project_into`] and [`build_loose_file_into`].
+/// [`CliError::Usage`] for a webview `host` with no manifest; otherwise as
+/// [`build_project_into`] and [`build_loose_file_into`].
 fn emit_into(
     entry_path: &Path,
     manifest: Option<&Path>,
@@ -948,7 +949,10 @@ fn emit_into(
     let out = OutTarget::Proven(target);
     match manifest {
         Some(m) => build_project_into(m, out, runtime_dir, &options, host),
-        None => build_loose_file_into(entry_path, out, runtime_dir, options),
+        None => match host {
+            HostIntent::Served => build_loose_file_into(entry_path, out, runtime_dir, options),
+            HostIntent::WebView(_) => Err(CliError::Usage(text::msg::webview_needs_manifest())),
+        },
     }
 }
 
@@ -5382,5 +5386,55 @@ mod progress_chunk_tests {
             RELAY_INTERRUPT_RETRIES.saturating_add(2),
             "one byte, the bounded retries, then the refused read"
         );
+    }
+}
+
+#[cfg(test)]
+mod loose_host_tests {
+    //! A loose entry file has no manifest window, so a webview request for one
+    //! is refused before anything is read or written, never emitted served.
+
+    use super::emit_into;
+    use crate::delivery::Delivery;
+    use crate::output_dir::{EmitTarget, OwnedDir};
+    use crate::{BuildOptions, CliError, text};
+
+    /// A `web desktop` request for an entry with no manifest is the typed
+    /// usage refusal, and the claimed crate directory stays empty.
+    #[test]
+    fn webview_loose_entry_refused() {
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-loose-webview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch base");
+        let entry = base.join("Main.ipe");
+        std::fs::write(&entry, "module Main exposing (main)\n\nmain =\n    1\n")
+            .expect("write entry");
+        let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+        let crate_path = crate_dir.path().to_path_buf();
+        let names = || -> Vec<std::ffi::OsString> {
+            let mut names: Vec<_> = std::fs::read_dir(&crate_path)
+                .expect("list crate")
+                .map(|entry| entry.expect("crate entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let claimed = names();
+        let result = emit_into(
+            &entry,
+            None,
+            &EmitTarget::Claimed(crate_dir),
+            &base,
+            BuildOptions::default(),
+            Delivery::web_desktop().host_intent(),
+        );
+        let after = names();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(&result, Err(CliError::Usage(m)) if *m == text::msg::webview_needs_manifest()),
+            "a loose webview request was not refused"
+        );
+        assert_eq!(after, claimed, "the refused request wrote into the crate");
     }
 }
