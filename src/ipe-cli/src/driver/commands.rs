@@ -6,7 +6,7 @@ use super::{
     compile_prepared, create_source_root, emit_machine_error, emit_permissions,
     find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
     io_err, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
-    runtime_dep_from_env, single_file_cargo_name_from_env,
+    runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -16,6 +16,7 @@ use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
 };
 use crate::contained_path::ResolvedPath;
+use crate::delivery::HostIntent;
 use crate::loose_file::LooseFileError;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::style::TerminalSafe;
@@ -472,8 +473,8 @@ pub fn classify_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliErro
 /// resolve the `[runtime] [host]` tail, and gate `--static`.
 ///
 /// This is the one place the CLI turns the delivery grammar into a validated
-/// [`delivery::Delivery`], from which `is_webview_native()` drives the backend
-/// `webview_host` signal and the packager routing. Every refusal is a
+/// [`delivery::Delivery`], from which [`delivery::Delivery::host_intent`]
+/// drives the emit host and the packager routing. Every refusal is a
 /// pedagogical [`delivery::DeliveryError`], surfaced as a usage error.
 ///
 /// # Errors
@@ -759,7 +760,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // `[shape]` cross-check, the `[runtime] [host]` tail, and the `--static`
     // gate. Runs after the static-plan check so a flag contradiction fires
     // before the entry file is read. A webview-native `web desktop` drives
-    // `webview_host` below.
+    // the emit host below.
     let delivery = resolve_delivery(
         &entry_path,
         &args.delivery,
@@ -866,32 +867,24 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         // build keeps the full tree so rustc, not the driver, drops the unreached
         // files. Only `ipe release eject` sets this.
         tree_shake_vendored: false,
-        // Manifest projects overwrite this from `package.ipe` in
-        // build_project_with_options; a single-file (no-manifest) build keeps
-        // this value, defaulting to `ipe-app` unless `IPE_EMIT_PACKAGE_NAME`
-        // names a unique per-build crate (the shared-target coverage harness).
-        cargo_name: single_file_cargo_name_from_env(),
         debugger: args.debugger,
         // `ipe dev build` never emits appearance hot-swap scaffolding — that is a
         // `ipe dev watch`-only dev affordance. A release artifact stays clean.
         hot_appearance: false,
-        // A webview-native `web desktop` delivery links the system webview and
-        // selects the webview executor; every other delivery does not.
-        webview_host: delivery.is_webview_native(),
-        // Filled from the manifest `delivery.desktop` in
-        // build_project_with_options once the manifest is parsed.
-        webview_window: None,
     };
 
     // No manifest found: compile entry + all sibling .ipe files in the same
     // directory. Byte-identical to `build` when the directory holds only the
     // entry file (regression-covered by the golden suite).
+    // A webview-native `web desktop` delivery links the system webview and
+    // selects the webview executor; every other delivery is served.
     let crate_dir = emit_into(
         &entry_path,
         manifest.as_deref(),
         &EmitTarget::Area(rust_area),
         &runtime_dir,
         options,
+        delivery.host_intent(),
     )?;
 
     let native_artifact = match compile_target {
@@ -938,22 +931,28 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
 /// Emit the program at `entry_path` into `target`, returning the claimed crate directory.
 ///
-/// The manifest project is emitted when one was found, else the entry with
-/// its sibling files.
+/// The manifest project is emitted for `host` when one was found, else the
+/// entry with its sibling files for the served host. A loose file has no
+/// manifest window, so a webview request for one is refused, never served.
 ///
 /// # Errors
-/// As [`build_project_into`] and [`build_loose_file_into`].
+/// [`CliError::Usage`] for a webview `host` with no manifest; otherwise as
+/// [`build_project_into`] and [`build_loose_file_into`].
 fn emit_into(
     entry_path: &Path,
     manifest: Option<&Path>,
     target: &EmitTarget,
     runtime_dir: &Path,
     options: BuildOptions,
+    host: HostIntent,
 ) -> Result<EmittedCrate, CliError> {
     let out = OutTarget::Proven(target);
     match manifest {
-        Some(m) => build_project_into(m, out, runtime_dir, &options),
-        None => build_loose_file_into(entry_path, out, runtime_dir, options),
+        Some(m) => build_project_into(m, out, runtime_dir, &options, host),
+        None => match host {
+            HostIntent::Served => build_loose_file_into(entry_path, out, runtime_dir, options),
+            HostIntent::WebView(_) => Err(CliError::Usage(text::msg::webview_needs_manifest())),
+        },
     }
 }
 
@@ -1338,6 +1337,8 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
         &EmitTarget::Claimed(target.owned().clone()),
         &runtime_dir,
         options,
+        // An ejected tree is the served program.
+        HostIntent::Served,
     )
     .map(drop)?;
     // From here on the tree is the user's: ipe drops its ownership marker so no
@@ -1681,15 +1682,10 @@ pub fn release_pipeline(
                 intent: verb.intent(),
                 runtime_dep,
                 tree_shake_vendored: false,
-                cargo_name: String::new(),
                 // The debugger is never enabled on a release build.
                 debugger: false,
                 // A release build never carries appearance hot-swap scaffolding.
                 hot_appearance: false,
-                // Set from the resolved delivery; a webview-native `web desktop` is wired
-                // where the classified shape is known (build_project_with_options).
-                webview_host: false,
-                webview_window: None,
             };
             let crate_dir = emit_into(
                 &entry_path,
@@ -1697,6 +1693,7 @@ pub fn release_pipeline(
                 &EmitTarget::Area(rust_area),
                 &runtime_dir,
                 options,
+                bundle_delivery_resolved.host_intent(),
             )?;
             bundle_wasm(crate_dir.dir())?;
             if show_progress {
@@ -1760,12 +1757,15 @@ pub fn release_pipeline(
             tree_shake_vendored: false,
             ..BuildOptions::default()
         };
+        // A desktop host returned through the bundler above, so this static
+        // artifact is the served program.
         let crate_dir = emit_into(
             &entry_path,
             manifest.as_deref(),
             &EmitTarget::Area(rust_area),
             &runtime_dir,
             options,
+            HostIntent::Served,
         )?;
 
         let app_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
@@ -1863,12 +1863,15 @@ pub fn release_pipeline(
         tree_shake_vendored: false,
         ..BuildOptions::default()
     };
+    // A desktop host returned through the bundler above, so this static
+    // artifact is the served program.
     let app_dir = emit_into(
         &entry_path,
         manifest.as_deref(),
         &EmitTarget::Area(app_area),
         &runtime_dir,
         options,
+        HostIntent::Served,
     )?;
 
     // The build directory is resolved once, before cargo runs, and the app
@@ -2906,7 +2909,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
 
     // Resolve the delivery grammar (shape cross-check, runtime/host, `--static`
     // gate) against the shape `main` pins — same as `ipe dev build`. A webview-native
-    // `web desktop` drives `webview_host` below. Runs after the static-plan check
+    // `web desktop` drives the emit host below. Runs after the static-plan check
     // so a flag contradiction fires before the entry file is read.
     let delivery = resolve_delivery(
         &entry_path,
@@ -3026,32 +3029,24 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
         // `ipe dev run` builds and executes; it never tree-shakes the vendored tree
         // (only `ipe release eject` does).
         tree_shake_vendored: false,
-        // Manifest projects overwrite this from `package.ipe` in
-        // build_project_with_options; a single-file (no-manifest) run keeps this
-        // value, defaulting to `ipe-app` unless `IPE_EMIT_PACKAGE_NAME` names a
-        // unique per-build crate (the shared-target coverage harness).
-        cargo_name: single_file_cargo_name_from_env(),
         debugger,
         // `ipe dev run` never emits appearance hot-swap scaffolding — that is a
         // `ipe dev watch`-only dev affordance.
         hot_appearance: false,
-        // A webview-native `web desktop` delivery links the system webview and
-        // selects the webview executor; every other delivery does not.
-        webview_host: delivery.is_webview_native(),
-        // Filled from the manifest `delivery.desktop` in
-        // build_project_with_options once the manifest is parsed.
-        webview_window: None,
     };
 
     // Nothing is created in the Rust area until the emit writes its crate.
     let out_dir = rust_area.path()?;
 
+    // A webview-native `web desktop` delivery links the system webview and
+    // selects the webview executor; every other delivery is served.
     let crate_dir = emit_into(
         &entry_path,
         manifest.as_deref(),
         &EmitTarget::Area(rust_area),
         &runtime_dir,
         options,
+        delivery.host_intent(),
     )?;
 
     // Post-emit routing per compile target:
@@ -3438,7 +3433,7 @@ pub fn emitted_bin_filename(crate_dir: &Path) -> Result<String, CliError> {
 /// single-file default.
 fn friendly_artifact_name(manifest: Option<&project::ProjectManifest>) -> String {
     manifest.map_or_else(
-        || "ipe-app".to_owned(),
+        || ipe_backend_rust::SINGLE_FILE_CRATE_NAME.to_owned(),
         |m| ipe_backend_rust::sanitize_cargo_name(&m.name),
     )
 }
@@ -4219,18 +4214,20 @@ pub fn front_check_entry(entry: &Path) -> Result<(), CliError> {
     let graph = build_source_graph(entry)?;
     let config = ipe_db::BuildConfig::new(
         &graph.db,
-        ipe_backend_rust::DbDriver::default(),
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
     compile_prepared(
         &graph.db,
@@ -5389,5 +5386,55 @@ mod progress_chunk_tests {
             RELAY_INTERRUPT_RETRIES.saturating_add(2),
             "one byte, the bounded retries, then the refused read"
         );
+    }
+}
+
+#[cfg(test)]
+mod loose_host_tests {
+    //! A loose entry file has no manifest window, so a webview request for one
+    //! is refused before anything is read or written, never emitted served.
+
+    use super::emit_into;
+    use crate::delivery::Delivery;
+    use crate::output_dir::{EmitTarget, OwnedDir};
+    use crate::{BuildOptions, CliError, text};
+
+    /// A `web desktop` request for an entry with no manifest is the typed
+    /// usage refusal, and the claimed crate directory stays empty.
+    #[test]
+    fn webview_loose_entry_refused() {
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-loose-webview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch base");
+        let entry = base.join("Main.ipe");
+        std::fs::write(&entry, "module Main exposing (main)\n\nmain =\n    1\n")
+            .expect("write entry");
+        let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+        let crate_path = crate_dir.path().to_path_buf();
+        let names = || -> Vec<std::ffi::OsString> {
+            let mut names: Vec<_> = std::fs::read_dir(&crate_path)
+                .expect("list crate")
+                .map(|entry| entry.expect("crate entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let claimed = names();
+        let result = emit_into(
+            &entry,
+            None,
+            &EmitTarget::Claimed(crate_dir),
+            &base,
+            BuildOptions::default(),
+            Delivery::web_desktop().host_intent(),
+        );
+        let after = names();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            matches!(&result, Err(CliError::Usage(m)) if *m == text::msg::webview_needs_manifest()),
+            "a loose webview request was not refused"
+        );
+        assert_eq!(after, claimed, "the refused request wrote into the crate");
     }
 }

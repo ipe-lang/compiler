@@ -53,14 +53,13 @@
 //! there is no ambiguity between e.g. `[["AB"], ["C"]]` and `[["A"], ["BC"]]`:
 //!
 //! - the entry module path,
-//! - the SQL driver ([`ipe_backend_rust::DbDriver`]),
+//! - every emit setting ([`ipe_backend_rust::EmitSettings`], folded by
+//!   [`ipe_backend_rust::EmitSettings::fold_key`] as tagged, length-framed
+//!   records),
 //! - every in-scope module's path, trust origin (injected stdlib vs. user
 //!   source — the module-IDENTITY axis the design doc's cache-key-
 //!   completeness note calls out: an add/delete/rename of a module MUST
 //!   yield a different key, never a stale hit), and full source text,
-//! - every emit-shape build flag (target, production, `--debugger`,
-//!   hot-appearance, the webview host and window),
-//! - the mount base every emitted browser shell URL is built from.
 //!
 //! `blame_path` (diagnostic-only) and the vendored runtime tree are
 //! deliberately NOT part of the key: neither affects [`EmittedProject`]'s
@@ -111,11 +110,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ipe_backend::EmittedProject;
-use ipe_backend_rust::DbDriver;
 use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind, HeldDir, OpenRefusal, RegularFile};
 use ipe_intern::{Interner, SerdeInternerGuard};
 use ipe_ir::Program;
-use ipe_runtime_rust::encoding::MountBase;
 
 use crate::output_dir::OwnedDir;
 use crate::remote_ingest::{IngestLimit, LocalRefusal, LocalSource, PACKAGE_SOURCE, TreeCeiling};
@@ -126,7 +123,7 @@ use sha2::{Digest, Sha256};
 /// Domain-separation tag for the content-address hash — bumped whenever the
 /// key's ingredient set changes shape (never for a value change within the
 /// same shape; that is what the hash itself captures).
-const KEY_TAG: &[u8] = b"ipec-build-cache-key-v2";
+const KEY_TAG: &[u8] = b"ipec-build-cache-key-v3";
 
 /// Domain-separation tag for the version-epoch hash.
 const EPOCH_TAG: &[u8] = b"ipec-build-cache-epoch-v1";
@@ -742,95 +739,24 @@ fn extended(names: &[EntryName], name: EntryName) -> Vec<EntryName> {
 /// deliberately unhashed, matching [`ipe_db::SourceFile`]'s own input shape
 /// (module path + text + origin; never the on-disk path).
 #[must_use]
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)] // a content-address key over every independent emit-affecting input
 pub fn compute_project_key(
     sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
     injected: &BTreeSet<Vec<String>>,
     entry_path: &[String],
-    db_driver: DbDriver,
-    target: ipe_ir::Target,
-    wasm_public_env: &[String],
-    mount_base: &MountBase,
-    intent: ipe_backend_rust::BuildIntent,
-    debugger: bool,
-    hot_appearance: bool,
-    webview_host: bool,
-    webview_window: Option<&ipe_backend_rust::WebViewWindow>,
+    settings: &ipe_backend_rust::EmitSettings,
 ) -> String {
     let mut hasher = Sha256::new();
     update_len_prefixed(&mut hasher, KEY_TAG);
-    // The target changes the emitted manifest/entry shape — a native-keyed
-    // entry must never serve a wasm build (or vice versa).
-    update_len_prefixed(&mut hasher, format!("{target:?}").as_bytes());
-
-    // The dev-only appearance hot-swap flag changes the emitted view (style
-    // literals routed through a `LiteralTable`), so a flag-on emit must never be
-    // served from a flag-off cache entry, or vice versa. Keying on it keeps the
-    // two disjoint; for a program with no hoist-eligible literal the emitted
-    // bytes are identical either way and the extra bit only costs a cold entry.
-    hasher.update([u8::from(hot_appearance)]);
-
-    // The webview-native (`web desktop`) delivery emits a different executor and
-    // default-feature set than a served `web`, so a webview emit must never be
-    // served from a served-`web` cache entry (or vice versa). Keying on it keeps
-    // the two disjoint; for a non-web program the emitted bytes are identical
-    // either way and the extra bit only costs a cold entry.
-    hasher.update([u8::from(webview_host)]);
-
-    // The webview desktop window (title / size) is emitted as literals into the
-    // executor, so a window change must invalidate a stale cache entry. Absence
-    // folds a distinct marker from any present window.
-    match webview_window {
-        Some(w) => {
-            hasher.update([1u8]);
-            update_len_prefixed(&mut hasher, w.title.as_bytes());
-            hasher.update(w.width.to_le_bytes());
-            hasher.update(w.height.to_le_bytes());
-        }
-        None => hasher.update([0u8]),
-    }
-
-    // The build intent changes the emitted crate: a Development emit carries
-    // the runtime `dev-posture` feature (the console's loopback dev default),
-    // and a Release emit rejects any `Debug.*` use (IPE-L0140). Keying on it
-    // keeps the two builds' cache entries disjoint, so a dev-cached project is
-    // never served to a release build, and vice versa.
-    hasher.update([match intent {
-        ipe_backend_rust::BuildIntent::Development => 0u8,
-        ipe_backend_rust::BuildIntent::Release => 1u8,
-    }]);
-
-    // `--debugger` changes the emitted crate: the runtime `debugger` feature,
-    // the cli/worker entry's session-codec argument and the serde derives the
-    // typed session log needs. A debugger build must never be served a plain
-    // cached project (it would fail cargo on the entry's arity), or vice versa.
-    hasher.update([u8::from(debugger)]);
+    // Every emit setting, through the same exhaustive destructure the backend
+    // configures from: a setting that changes the emitted bytes keys its own
+    // entry, and a new setting is keyed the moment it exists.
+    settings.fold_key(&mut |bytes: &[u8]| hasher.update(bytes));
 
     let entry_len = u64::try_from(entry_path.len()).unwrap_or(u64::MAX);
     hasher.update(entry_len.to_le_bytes());
     for segment in entry_path {
         update_str(&mut hasher, segment);
     }
-
-    let driver_tag: u8 = match db_driver {
-        DbDriver::Sqlite => 0,
-        DbDriver::Postgres => 1,
-    };
-    hasher.update([driver_tag]);
-
-    // `[wasm] publicEnv` only affects the final emit stage (the generated
-    // `env_public.rs`), the same class of input `db_driver` is — see this
-    // fn's sibling [`compute_ir_key`], which deliberately excludes both.
-    let public_env_len = u64::try_from(wasm_public_env.len()).unwrap_or(u64::MAX);
-    hasher.update(public_env_len.to_le_bytes());
-    for name in wasm_public_env {
-        update_str(&mut hasher, name);
-    }
-
-    // The mount base reaches only the emitted shell (`www/index.html`,
-    // `www/boot.js`), the same final-emit class as `[wasm] publicEnv`: an entry
-    // built for `/app` must never serve a root build, or vice versa.
-    update_str(&mut hasher, mount_base.prefix());
 
     // `BTreeMap` iteration is already sorted by key — deterministic across
     // runs and independent of insertion order.
@@ -1440,6 +1366,8 @@ pub fn store_ir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ipe_backend_rust::DbDriver;
+    use ipe_runtime_rust::encoding::MountBase;
 
     #[test]
     fn the_epoch_hash_input_is_the_verbatim_output() {
@@ -1670,107 +1598,55 @@ mod tests {
         vec!["Main".to_owned()]
     }
 
+    /// The settings every key test starts from: a native development build.
+    fn key_settings() -> ipe_backend_rust::EmitSettings {
+        ipe_backend_rust::EmitSettings {
+            db_driver: DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        }
+    }
+
     #[test]
     fn key_is_deterministic() {
         let (sources, injected) = sample_sources();
-        let a = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
-        let b = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let a = compute_project_key(&sources, &injected, &entry(), &key_settings());
+        let b = compute_project_key(&sources, &injected, &entry(), &key_settings());
         assert_eq!(a, b, "same inputs must hash to the same key");
     }
 
     #[test]
     fn key_changes_with_source_text() {
         let (mut sources, injected) = sample_sources();
-        let base = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let base = compute_project_key(&sources, &injected, &entry(), &key_settings());
         if let Some(main) = sources.get_mut(&vec!["Main".to_owned()]) {
             main.1.push_str("\n-- comment\n");
         }
-        let edited = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let edited = compute_project_key(&sources, &injected, &entry(), &key_settings());
         assert_ne!(base, edited, "a body edit must change the key");
     }
 
     #[test]
     fn key_changes_with_db_driver() {
         let (sources, injected) = sample_sources();
-        let sqlite = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let sqlite = compute_project_key(&sources, &injected, &entry(), &key_settings());
         let postgres = compute_project_key(
             &sources,
             &injected,
             &entry(),
-            DbDriver::Postgres,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
+            &ipe_backend_rust::EmitSettings {
+                db_driver: DbDriver::Postgres,
+                ..key_settings()
+            },
         );
         assert_ne!(sqlite, postgres, "the SQL driver is part of the key");
     }
@@ -1781,33 +1657,15 @@ mod tests {
     #[test]
     fn key_changes_with_build_intent() {
         let (sources, injected) = sample_sources();
-        let dev = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let dev = compute_project_key(&sources, &injected, &entry(), &key_settings());
         let prod = compute_project_key(
             &sources,
             &injected,
             &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Release,
-            false,
-            false,
-            false,
-            None,
+            &ipe_backend_rust::EmitSettings {
+                intent: ipe_backend_rust::BuildIntent::Release,
+                ..key_settings()
+            },
         );
         assert_ne!(dev, prod, "the build intent is part of the key");
     }
@@ -1822,15 +1680,10 @@ mod tests {
                 &sources,
                 &injected,
                 &entry(),
-                DbDriver::Sqlite,
-                ipe_ir::Target::Native,
-                &[],
-                &MountBase::root(),
-                ipe_backend_rust::BuildIntent::Development,
-                debugger,
-                false,
-                false,
-                None,
+                &ipe_backend_rust::EmitSettings {
+                    debugger,
+                    ..key_settings()
+                },
             )
         };
         assert_ne!(
@@ -1846,33 +1699,15 @@ mod tests {
     #[test]
     fn key_changes_with_hot_appearance() {
         let (sources, injected) = sample_sources();
-        let off = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let off = compute_project_key(&sources, &injected, &entry(), &key_settings());
         let on = compute_project_key(
             &sources,
             &injected,
             &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            true,
-            false,
-            None,
+            &ipe_backend_rust::EmitSettings {
+                hot_appearance: true,
+                ..key_settings()
+            },
         );
         assert_ne!(off, on, "the hot-appearance flag is part of the key");
     }
@@ -1889,32 +1724,194 @@ mod tests {
             width: 1600,
             ..small.clone()
         };
-        let key = |w: Option<&ipe_backend_rust::WebViewWindow>| {
+        let key = |host: ipe_backend_rust::EmitHost| {
             compute_project_key(
                 &sources,
                 &injected,
                 &entry(),
-                DbDriver::Sqlite,
-                ipe_ir::Target::Native,
-                &[],
-                &MountBase::root(),
-                ipe_backend_rust::BuildIntent::Development,
-                false,
-                false,
-                true,
-                w,
+                &ipe_backend_rust::EmitSettings {
+                    host,
+                    ..key_settings()
+                },
             )
         };
         assert_ne!(
-            key(None),
-            key(Some(&small)),
-            "an explicit window must differ from the fallback"
+            key(ipe_backend_rust::EmitHost::Served),
+            key(ipe_backend_rust::EmitHost::WebView(small.clone())),
+            "a webview host must differ from the served host"
         );
         assert_ne!(
-            key(Some(&small)),
-            key(Some(&large)),
+            key(ipe_backend_rust::EmitHost::WebView(small)),
+            key(ipe_backend_rust::EmitHost::WebView(large)),
             "a window size change must invalidate the cache entry"
         );
+    }
+
+    /// The crate name and the hydrate mode reach the emitted `Cargo.toml` and
+    /// wasm entry, so each keys its own entry.
+    #[test]
+    fn key_changes_with_crate_name_and_hydrate() {
+        let (sources, injected) = sample_sources();
+        let key = |settings: &ipe_backend_rust::EmitSettings| {
+            compute_project_key(&sources, &injected, &entry(), settings)
+        };
+        let base = key_settings();
+        let pinned = ipe_backend_rust::EmitSettings {
+            crate_name: ipe_backend_rust::CrateName::Pinned(
+                ipe_backend_rust::CargoPackageName::sanitize("probe-a"),
+            ),
+            ..key_settings()
+        };
+        let other = ipe_backend_rust::EmitSettings {
+            crate_name: ipe_backend_rust::CrateName::Pinned(
+                ipe_backend_rust::CargoPackageName::sanitize("probe-b"),
+            ),
+            ..key_settings()
+        };
+        let hydrate = ipe_backend_rust::EmitSettings {
+            wasm_hydrate_mode: true,
+            ..key_settings()
+        };
+        assert_ne!(
+            key(&base),
+            key(&pinned),
+            "the crate name is part of the key"
+        );
+        assert_ne!(
+            key(&pinned),
+            key(&other),
+            "each crate name keys its own entry"
+        );
+        assert_ne!(
+            key(&base),
+            key(&hydrate),
+            "the hydrate mode is part of the key"
+        );
+    }
+
+    /// One settings value per field, each differing from [`key_settings`] in
+    /// that field alone. The destructure stops the build when a field is added
+    /// without a flip here.
+    fn single_field_flips() -> Vec<(&'static str, ipe_backend_rust::EmitSettings)> {
+        use ipe_backend_rust::{
+            BuildIntent, CargoPackageName, CrateName, EmitHost, EmitSettings, FfiEmit, RuntimeDep,
+            WebViewWindow,
+        };
+        fn flip(
+            field: &'static str,
+            edit: impl FnOnce(&mut EmitSettings),
+        ) -> (&'static str, EmitSettings) {
+            let mut settings = key_settings();
+            edit(&mut settings);
+            (field, settings)
+        }
+        let EmitSettings {
+            db_driver: _,
+            ffi: _,
+            target: _,
+            wasm_public_env: _,
+            mount_base: _,
+            wasm_hydrate_mode: _,
+            runtime_dep: _,
+            debugger: _,
+            crate_name: _,
+            hot_appearance: _,
+            host: _,
+            intent: _,
+        } = key_settings();
+        let mount_base = MountBase::parse("/app").expect("`/app` is a mount base");
+        let window = WebViewWindow {
+            title: "W".to_owned(),
+            width: 1,
+            height: 2,
+        };
+        vec![
+            flip("db_driver", |s| s.db_driver = DbDriver::Postgres),
+            flip("ffi", |s| s.ffi = Some(FfiEmit::default())),
+            flip("target", |s| s.target = ipe_ir::Target::WasmClient),
+            flip("wasm_public_env", |s| {
+                s.wasm_public_env = vec!["API".to_owned()];
+            }),
+            flip("mount_base", |s| s.mount_base = mount_base),
+            flip("wasm_hydrate_mode", |s| s.wasm_hydrate_mode = true),
+            flip("runtime_dep", |s| {
+                s.runtime_dep = Some(RuntimeDep {
+                    root: std::path::PathBuf::from("/runtime"),
+                });
+            }),
+            flip("debugger", |s| s.debugger = true),
+            flip("crate_name", |s| {
+                s.crate_name = CrateName::Pinned(CargoPackageName::sanitize("probe"));
+            }),
+            flip("hot_appearance", |s| s.hot_appearance = true),
+            flip("host", |s| s.host = EmitHost::WebView(window)),
+            flip("intent", |s| s.intent = BuildIntent::Release),
+        ]
+    }
+
+    /// Flipping any one settings field changes the key, and no two single
+    /// flips share a key: no field is left out of the fold, and no two fields
+    /// fold to the same bytes.
+    #[test]
+    fn key_changes_with_every_field() {
+        let (sources, injected) = sample_sources();
+        let key = |settings: &ipe_backend_rust::EmitSettings| {
+            compute_project_key(&sources, &injected, &entry(), settings)
+        };
+        let flips = single_field_flips();
+        let mut keys = vec![("base", key(&key_settings()))];
+        for (field, settings) in &flips {
+            let flipped = key(settings);
+            let collision = keys.iter().find(|(_, seen)| *seen == flipped);
+            assert!(
+                collision.is_none(),
+                "flipping `{field}` keys the same entry as {collision:?}"
+            );
+            keys.push((*field, flipped));
+        }
+        assert_eq!(keys.len(), 13, "every field is flipped once");
+    }
+
+    /// Two settings whose field bytes concatenate to the same stream still
+    /// fold to different keys: every field is tagged and length-framed.
+    #[test]
+    fn fold_key_frames_fields() {
+        let (sources, injected) = sample_sources();
+        let key = |settings: &ipe_backend_rust::EmitSettings| {
+            compute_project_key(&sources, &injected, &entry(), settings)
+        };
+        let joined = ipe_backend_rust::EmitSettings {
+            wasm_public_env: vec!["AB".to_owned()],
+            ..key_settings()
+        };
+        let split = ipe_backend_rust::EmitSettings {
+            wasm_public_env: vec!["A".to_owned(), "B".to_owned()],
+            ..key_settings()
+        };
+        assert_ne!(key(&joined), key(&split), "list entries are framed");
+
+        let window = |title: &str| {
+            ipe_backend_rust::EmitHost::WebView(ipe_backend_rust::WebViewWindow {
+                title: title.to_owned(),
+                width: 1,
+                height: 2,
+            })
+        };
+        let short_title = ipe_backend_rust::EmitSettings {
+            host: window("A"),
+            ..key_settings()
+        };
+        let long_title = ipe_backend_rust::EmitSettings {
+            host: window("AB"),
+            ..key_settings()
+        };
+        assert_ne!(key(&short_title), key(&long_title), "strings are framed");
+
+        let mut stream = Vec::new();
+        joined.fold_key(&mut |bytes: &[u8]| stream.extend_from_slice(bytes));
+        let mut other = Vec::new();
+        split.fold_key(&mut |bytes: &[u8]| other.extend_from_slice(bytes));
+        assert_ne!(stream, other, "the folded streams differ");
     }
 
     /// `[wasm] publicEnv` only affects the final emit stage (the generated
@@ -1925,33 +1922,15 @@ mod tests {
     #[test]
     fn key_changes_with_wasm_public_env() {
         let (sources, injected) = sample_sources();
-        let empty_allowlist = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let empty_allowlist = compute_project_key(&sources, &injected, &entry(), &key_settings());
         let with_allowlist = compute_project_key(
             &sources,
             &injected,
             &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &["API_BASE_URL".to_owned()],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
+            &ipe_backend_rust::EmitSettings {
+                wasm_public_env: ["API_BASE_URL".to_owned()].to_vec(),
+                ..key_settings()
+            },
         );
         assert_ne!(
             empty_allowlist, with_allowlist,
@@ -1969,15 +1948,11 @@ mod tests {
                 &sources,
                 &injected,
                 &entry(),
-                DbDriver::Sqlite,
-                ipe_ir::Target::WasmClient,
-                &[],
-                base,
-                ipe_backend_rust::BuildIntent::Development,
-                false,
-                false,
-                false,
-                None,
+                &ipe_backend_rust::EmitSettings {
+                    target: ipe_ir::Target::WasmClient,
+                    mount_base: base.clone(),
+                    ..key_settings()
+                },
             )
         };
         let Ok(app) = MountBase::parse("/app") else {
@@ -1998,54 +1973,15 @@ mod tests {
     #[test]
     fn key_changes_with_entry_path() {
         let (sources, injected) = sample_sources();
-        let a = compute_project_key(
-            &sources,
-            &injected,
-            &["Main".to_owned()],
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
-        let b = compute_project_key(
-            &sources,
-            &injected,
-            &["Other".to_owned()],
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let a = compute_project_key(&sources, &injected, &["Main".to_owned()], &key_settings());
+        let b = compute_project_key(&sources, &injected, &["Other".to_owned()], &key_settings());
         assert_ne!(a, b, "the entry module path is part of the key");
     }
 
     #[test]
     fn key_changes_with_module_add_and_remove() {
         let (sources, injected) = sample_sources();
-        let base = compute_project_key(
-            &sources,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let base = compute_project_key(&sources, &injected, &entry(), &key_settings());
 
         let mut added = sources.clone();
         added.insert(
@@ -2055,40 +1991,15 @@ mod tests {
                 "module Extra exposing (y)\ny = 2\n".to_owned(),
             ),
         );
-        let with_extra = compute_project_key(
-            &added,
-            &injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let with_extra = compute_project_key(&added, &injected, &entry(), &key_settings());
         assert_ne!(base, with_extra, "adding a module must change the key");
 
         let mut removed = sources;
         removed.remove(&vec!["Ipe".to_owned(), "Basics".to_owned()]);
         let mut injected_without = injected;
         injected_without.remove(&vec!["Ipe".to_owned(), "Basics".to_owned()]);
-        let without_basics = compute_project_key(
-            &removed,
-            &injected_without,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let without_basics =
+            compute_project_key(&removed, &injected_without, &entry(), &key_settings());
         assert_ne!(
             base, without_basics,
             "removing a module must change the key"
@@ -2106,34 +2017,8 @@ mod tests {
         let (sources, _injected) = sample_sources();
         let no_injection: BTreeSet<Vec<String>> = BTreeSet::new();
         let all_injected: BTreeSet<Vec<String>> = sources.keys().cloned().collect();
-        let a = compute_project_key(
-            &sources,
-            &no_injection,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
-        let b = compute_project_key(
-            &sources,
-            &all_injected,
-            &entry(),
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let a = compute_project_key(&sources, &no_injection, &entry(), &key_settings());
+        let b = compute_project_key(&sources, &all_injected, &entry(), &key_settings());
         assert_ne!(a, b, "the trust-origin flag is part of the key");
     }
 
@@ -2152,34 +2037,8 @@ mod tests {
             (PathBuf::from("x"), String::new()),
         );
         let empty: BTreeSet<Vec<String>> = BTreeSet::new();
-        let a = compute_project_key(
-            &left,
-            &empty,
-            &[],
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
-        let b = compute_project_key(
-            &right,
-            &empty,
-            &[],
-            DbDriver::Sqlite,
-            ipe_ir::Target::Native,
-            &[],
-            &MountBase::root(),
-            ipe_backend_rust::BuildIntent::Development,
-            false,
-            false,
-            false,
-            None,
-        );
+        let a = compute_project_key(&left, &empty, &[], &key_settings());
+        let b = compute_project_key(&right, &empty, &[], &key_settings());
         assert_ne!(a, b, "differently-segmented module paths must not collide");
     }
 

@@ -15,7 +15,6 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use ipe_backend_rust::DbDriver;
 use ipe_db::{BuildConfig, IpeDatabase, ModuleOrigin, SourceFile, SourceRoot};
 
 /// A shared, poison-safe log of executed-query debug keys.
@@ -91,18 +90,20 @@ fn body_edit_reexecutes_only_the_edited_module_file() {
     let root = root_of(&db, &[(&["Lib"], lib), (&["Main"], main)]);
     let config = BuildConfig::new(
         &db,
-        DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        ipe_backend_rust::MountBase::root(),
-        false,
-        ipe_backend_rust::BuildIntent::Development,
-        None,
-        false,
-        String::new(),
-        false,
-        false,
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: ipe_backend_rust::MountBase::root(),
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served,
+            intent: ipe_backend_rust::BuildIntent::Development,
+        },
     );
 
     // Warm the session: demand the top-level manifest once. On a genuine
