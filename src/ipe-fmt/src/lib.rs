@@ -4689,6 +4689,15 @@ mod tests {
             "        && String.length base\n        > 1\n",
         );
         assert_eq!(fixed_point(&split_at_gt), LAYOUT_B);
+        let regrouped = LAYOUT_B.replace(
+            "String.startsWith \"/\" rootText\n        && String.length base > 1",
+            "(String.startsWith \"/\" rootText\n        && String.length base)\n        > 1",
+        );
+        assert_ne!(regrouped, LAYOUT_B, "precondition: the rewrite applies");
+        assert!(
+            verify_rewrite(LAYOUT_B, &regrouped).is_err(),
+            "a print that regroups the chain is refused"
+        );
     }
 
     /// A multi-line tuple element of a list keeps its continuation lines at
@@ -4711,5 +4720,18 @@ mod tests {
     fn triple_quote_in_comment_keeps_the_layout() {
         let src = "module X exposing (x)\n\n\na : { p : Int, q : Int }\na =\n    { p =\n        -- see \"\"\"\n        1\n    , q = 2\n    }\n";
         assert_eq!(fixed_point(src), src);
+    }
+
+    const BAD_A: &str = "module X exposing (x)\n\n\na : Int -> { x : Int, p : { r : Int, t : Int }, y : Int }\na n =\n    { x = 1\n    , p = { r = n - 1 + (n - 2)\n    , t = n + 3\n    }\n    , y = 2\n    }\n";
+    const BAD_C: &str = "module X exposing (x)\n\n\nc : List ( String, Bool )\nc =\n    [ ( \"one\"\n    , True\n        && False\n        && True\n    )\n    , ( \"two\"\n    , True\n        && False\n        && True\n    )\n    ]\n";
+    const BAD_D: &str = "module X exposing (x)\n\n\nd : Bool -> List String\nd x =\n    (if x then\n        [ \"a\" ]\n\n    else\n        []\n    )\n        ++ (if x then\n            [ \"b\" ]\n\n        else\n            []\n        )\n";
+
+    /// The prints the level-counted printer produced for A, C and D format
+    /// back to the layouts they were printed from.
+    #[test]
+    fn earlier_misprints_format_to_their_layout() {
+        assert_eq!(fixed_point(BAD_A), LAYOUT_A);
+        assert_eq!(fixed_point(BAD_C), LAYOUT_C);
+        assert_eq!(fixed_point(BAD_D), LAYOUT_D);
     }
 }
