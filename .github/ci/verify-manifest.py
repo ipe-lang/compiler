@@ -45,7 +45,10 @@ Checks performed
       and every step `if:` a closed `StepGuard` (none; `always()`;
       release-only run/no-op; a classifier output's `!= 'false'` run form
       paired with its `== 'false'` no-op, read from an earlier
-      `change_class.py` step of that scope; a needed job's success). A
+      `change_class.py` step of that scope; a needed job's success; on a
+      step that saves a cache, `github.ref == 'refs/heads/main'` conjoined
+      with at most a classifier run form and an earlier `actions/cache`
+      step's `cache-hit != 'true'` — a skipped save decides nothing). A
       reporting job holds a decider under a guard whose absent input means
       run: a VERDICT `TOOL_INVOCATIONS` row, the phase verdict, a command a
       `local:` block mirrors, or the one script step its `INLINE_DECIDERS`
@@ -98,9 +101,12 @@ Checks performed
      `rustc-wrapper` config spelling), or assembling its target through a
      GitHub Actions expression function (`format(`, `join(`, `toJSON(`, or
      `fromJSON(` over a literal; any letter case) instead of naming it
-     literally; and a `Swatinem/rust-cache` step whose `with.save-if` is not
-     exactly `RUST_CACHE_SAVE_IF`, so only `main` writes the dependency cache
-     and a pull request run restores it without evicting it. Every workflow,
+     literally; and a step running a `CACHE_WRITERS` action that is not held
+     to saving only on `main` (an input pinned to `MAIN_ONLY_EXPR` /
+     `OFF_MAIN_EXPR`, a caching input absent, or an `if:` conjoining
+     `github.ref == DEFAULT_BRANCH_REF`), or a subpath of a listed repo no
+     row models, so every other ref restores `main`'s caches without
+     evicting them. Every workflow,
      manifest, and local action is loaded through `strict_yaml` (see that
      module), so a duplicate mapping key, a `<<` merge key, an anchor/alias,
      or an explicit tag — each legal to a plain YAML loader but resolved
@@ -506,8 +512,12 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       warns, and the setting does nothing), a case variant of a declared
       input or two keys fold-equal, a non-string key, a required input with
       no default left out, a deprecated input passed, a pin with no record,
-      a record no pin uses, and a `SCRIPT_ACTIONS` row naming an input its
-      action does not declare.  Records are written only by the maintainer
+      a record no pin uses, a `SCRIPT_ACTIONS` or `CACHE_WRITERS` row naming
+      an input its action does not declare, and a pinned action declaring an
+      input whose folded name contains `cache` that no `CACHE_WRITERS` row
+      covers (an unmodelled cache writer).  LIMIT: a `run:` step saving
+      through the cache service, or an action that caches with no input
+      naming it, is not modelled.  Records are written only by the maintainer
       tool `python3 .github/ci/action_metadata.py --write`, which fetches
       the pinned objects and proves them with the same walk.
       LIMIT: the pinned commit is read from the repository's fork network,
@@ -591,10 +601,16 @@ HEAVY_SHARD_ARTIFACT = "nextest-archive"
 _STATUS_FN = re.compile(r"\b(always|failure|cancelled)\s*\(", re.IGNORECASE)
 CANCEL_WATCHER_JOB_ID = "cancel-on-cheap-red"
 
-# The dependency cache is written from `main` only: a pull request run
-# restores it and never evicts it with a branch-local save.
+# Caches are saved from `main` only. A cache saved under any other ref (a
+# pull request, a merge group, a tag) is readable by no later run of another
+# ref, and it evicts the ones `main` saved from the shared budget; every
+# other ref restores `main`'s caches and saves none. SSOT: the ref and the
+# two expressions every cache-writing step is pinned to.
+DEFAULT_BRANCH_REF = "refs/heads/main"
+MAIN_ONLY_EXPR = "${{ github.ref == '" + DEFAULT_BRANCH_REF + "' }}"
+OFF_MAIN_EXPR = "${{ github.ref != '" + DEFAULT_BRANCH_REF + "' }}"
 RUST_CACHE_REPO = "Swatinem/rust-cache"
-RUST_CACHE_SAVE_IF = "${{ github.ref == 'refs/heads/main' }}"
+RUST_CACHE_SAVE_IF = MAIN_ONLY_EXPR
 # mold is installed only by the local composite, which pins the release digest.
 RAW_MOLD_ACTION_REPO = "rui314/setup-mold"
 MOLD_COMPOSITE_USES = "./.github/actions/mold"
@@ -1188,6 +1204,8 @@ class ErrorKind(enum.Enum):
     ACTION_INPUT_CASE_VARIANT = "action-input-case-variant"
     ACTION_INPUT_REQUIRED_MISSING = "action-input-required-missing"
     ACTION_INPUT_DEPRECATED = "action-input-deprecated"
+    CACHE_WRITER_UNMODELLED = "cache-writer-unmodelled"
+    CACHE_WRITER_ROW_INVALID = "cache-writer-row-invalid"
 
 
 @dataclass(frozen=True)
@@ -1828,6 +1846,7 @@ class StepGuardKind(enum.Enum):
     CLASSIFIER_RUN = "classifier-run"
     CLASSIFIER_NOOP = "classifier-noop"
     PREP_SUCCEEDED = "prep-succeeded"
+    MAIN_SAVE = "main-save"
 
 
 # The guards a decider step may run under: each runs the step whenever its
@@ -1845,13 +1864,19 @@ class StepGuard:
     `needs.changes.outputs.release_only != 'true'` / `== 'true'`.
     `CLASSIFIER_RUN`/`CLASSIFIER_NOOP`: `steps.<ref>.outputs.<scope> !=
     'false'` / `== 'false'`, so an absent classifier output means run.
-    `PREP_SUCCEEDED`: `needs.<ref>.result == 'success'`. Where `ref` must
-    point, and the pairing rules, are checked by `check_required_guards`.
+    `PREP_SUCCEEDED`: `needs.<ref>.result == 'success'`. `MAIN_SAVE`:
+    `github.ref == 'refs/heads/main'` conjoined with at most one
+    `CLASSIFIER_RUN` term (`ref`, `scope`) and at most one
+    `steps.<hit>.outputs.cache-hit != 'true'`, admitted only on a step that
+    saves a cache (a `CACHE_WRITERS` row with `main_if`), which decides
+    nothing. Where `ref` and `hit` must point, and the pairing rules, are
+    checked by `check_required_guards`.
     """
 
     kind: StepGuardKind
     ref: str | None = None
     scope: str | None = None
+    hit: str | None = None
 
     @staticmethod
     def parse(raw: object) -> StepGuard | str:
@@ -1874,6 +1899,27 @@ class StepGuard:
         path = _ref_compare(e, "==", "success")
         if path is not None and len(path) == 3 and path[0] == "needs" and path[2] == "result":
             return StepGuard(StepGuardKind.PREP_SUCCEEDED, path[1])
+        terms = _flatten(e, "&&")
+        main = [t for t in terms if _ref_compare(t, "==", DEFAULT_BRANCH_REF) == ("github", "ref")]
+        if len(main) == 1:
+            run: tuple[str, ...] | None = None
+            hit: tuple[str, ...] | None = None
+            for t in terms:
+                if t is main[0]:
+                    continue
+                p = _ref_compare(t, "!=", "false")
+                if run is None and p is not None and len(p) == 4 and p[0] == "steps" and p[2] == "outputs":
+                    run = p
+                    continue
+                p = _ref_compare(t, "!=", "true")
+                if hit is None and p is not None and len(p) == 4 and p[0] == "steps" and p[2:] == ("outputs", "cache-hit"):
+                    hit = p
+                    continue
+                return f"`if:` {raw!r} is not an admitted step guard"
+            return StepGuard(
+                StepGuardKind.MAIN_SAVE, None if run is None else run[1], None if run is None else run[3],
+                None if hit is None else hit[1],
+            )
         return f"`if:` {raw!r} is not an admitted step guard"
 
 
@@ -1928,7 +1974,7 @@ class ScriptAction:
 # inline decider runs is refused.
 SCRIPT_ACTIONS: dict[str, ScriptAction] = {
     "vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc": ScriptAction(
-        inputs=frozenset({"sync-time", "prepare", "run"}),
+        inputs=frozenset({"sync-time", "disable-cache", "prepare", "run"}),
         why=(
             "the pinned `index.js` runs `with.run` through `execSSH(runCmd, sshConfig)` with `ignoreReturn` "
             "false: a non-zero ssh exit throws, and `main` ends in `core.setFailed` plus `process.exit(1)`; "
@@ -2252,13 +2298,16 @@ def check_required_guards(
                 refuse(ErrorKind.STEP_GUARD_UNADMITTED, fname, spath, f"{g} — a skipped step reports as passing; refused")
                 guards.append(None)
                 continue
-            why = _step_guard_context(g, wj, steps[:i])
+            why = _step_guard_context(g, wj, st, steps[:i])
             if why is not None:
                 refuse(ErrorKind.STEP_GUARD_UNADMITTED, fname, spath, f"{why}; refused")
                 guards.append(None)
                 continue
             guards.append(g)
-        run_scopes = {(g.ref, g.scope) for g in guards if g is not None and g.kind is StepGuardKind.CLASSIFIER_RUN}
+        run_scopes = {
+            (g.ref, g.scope) for g in guards
+            if g is not None and (g.kind is StepGuardKind.CLASSIFIER_RUN or (g.kind is StepGuardKind.MAIN_SAVE and g.scope))
+        }
         noop_scopes = {(g.ref, g.scope) for g in guards if g is not None and g.kind is StepGuardKind.CLASSIFIER_NOOP}
         for ref, scope in sorted(run_scopes ^ noop_scopes):
             refuse(
@@ -2367,13 +2416,23 @@ def _is_phase_verdict(wj: WorkflowJob) -> bool:
     return False
 
 
-def _step_guard_context(g: StepGuard, wj: WorkflowJob, earlier: list[Step]) -> str | None:
+def _step_guard_context(g: StepGuard, wj: WorkflowJob, st: Step, earlier: list[Step]) -> str | None:
     """Why a parsed step guard does not fit where it stands, or None."""
+    if g.kind is StepGuardKind.MAIN_SAVE:
+        row = cache_writer(st.uses)
+        if not isinstance(row, CacheWriter) or not row.main_if:
+            return "skips the step off `main`, which is admitted only on a step that saves a cache"
+        if g.hit is not None and not any(
+            e.raw.get("id") == g.hit and uses_action(e.uses, "actions/cache") for e in earlier
+        ):
+            return f"reads `steps.{g.hit}.outputs.cache-hit`, but no earlier step {g.hit!r} runs `actions/cache`"
+        if g.ref is None:
+            return None
     if g.kind in (StepGuardKind.RELEASE_ONLY_RUN, StepGuardKind.RELEASE_ONLY_NOOP) and CLASSIFIER_JOB not in wj.needs:
         return f"reads `{CLASSIFIER_JOB}` outputs but the job does not need it"
     if g.kind is StepGuardKind.PREP_SUCCEEDED and g.ref not in wj.needs:
         return f"reads `needs.{g.ref}.result` but the job does not need {g.ref!r}"
-    if g.kind in (StepGuardKind.CLASSIFIER_RUN, StepGuardKind.CLASSIFIER_NOOP):
+    if g.kind in (StepGuardKind.CLASSIFIER_RUN, StepGuardKind.CLASSIFIER_NOOP, StepGuardKind.MAIN_SAVE):
         flag = "--" + str(g.scope).replace("_", "-")
         for st in earlier:
             if st.raw.get("id") != g.ref:
@@ -5399,24 +5458,101 @@ def _uses_repo(st: Step, owner_repo: str) -> bool:
     return uses_action(st.uses, owner_repo)
 
 
-def _refuse_rust_cache_save(st: Step, loc: str, errors: list[str]) -> None:
-    """Rule (a): a `Swatinem/rust-cache` step saves only on `main` — its
-    `with.save-if` is exactly `RUST_CACHE_SAVE_IF`. Absent, the action saves
-    from every ref, so pull request runs evict the `main` cache they restore."""
+@dataclass(frozen=True)
+class CacheWriter:
+    """How one remote action is held to saving only on `main`: each of
+    `inputs` is `with:` text the step passes exactly (`None`: the step must
+    not pass it), and `main_if` requires the step's `if:` to conjoin
+    `github.ref == DEFAULT_BRANCH_REF` at its top level."""
+
+    name: str
+    inputs: tuple[tuple[str, str | None], ...] = ()
+    main_if: bool = False
+
+
+# Every remote action that can save a cache, keyed by (`owner/repo`,
+# subpath) case-folded; subpath `""` is the action at the repo root and `"*"`
+# any subpath. A `uses:` of a listed repo at a subpath no row names is
+# refused (check 6), and a pinned action declaring an input whose name
+# contains `cache` that no row covers is refused (check 24): an unmodelled
+# cache writer fails closed.
+CACHE_WRITERS: dict[tuple[str, str], CacheWriter] = {
+    # Saves from every ref unless `save-if` says otherwise.
+    ("swatinem/rust-cache", "*"): CacheWriter(RUST_CACHE_REPO, (("save-if", RUST_CACHE_SAVE_IF),)),
+    # `disable-cache` turns off both the restore and the save of the VM
+    # image and apt cache; the action has no save-only switch.
+    ("vmactions/freebsd-vm", "*"): CacheWriter("vmactions/freebsd-vm", (("disable-cache", OFF_MAIN_EXPR),)),
+    # Restores, then saves in a post step on a miss.
+    ("actions/cache", ""): CacheWriter("actions/cache", main_if=True),
+    ("actions/cache", "save"): CacheWriter("actions/cache/save", main_if=True),
+    ("actions/cache", "restore"): CacheWriter("actions/cache/restore"),
+    # `package-manager-cache` defaults to on: it caches whenever the root
+    # `package.json` names a `packageManager`.
+    ("actions/setup-node", "*"): CacheWriter("actions/setup-node", (("cache", None), ("package-manager-cache", "false"))),
+    ("actions/setup-python", "*"): CacheWriter("actions/setup-python", (("cache", None),)),
+}
+# `owner/repo` and the subpath (empty at the root) of a remote `uses:`.
+USES_SUBPATH_RE = re.compile(r"([^/@]+/[^/@]+)(?:/([^@]*))?(?:@|$)")
+
+
+def cache_writer(uses: object) -> CacheWriter | str | None:
+    """The `CACHE_WRITERS` row a `uses:` runs under, a refusal when its repo
+    is listed but its subpath is not, or None for an action no row lists
+    (and for a local or `docker://` step)."""
+    if not isinstance(uses, str) or uses.startswith(("./", "docker://")):
+        return None
+    m = USES_SUBPATH_RE.match(uses.casefold())
+    if m is None:
+        return None
+    repo, sub = m[1], m[2] or ""
+    row = CACHE_WRITERS.get((repo, sub)) or CACHE_WRITERS.get((repo, "*"))
+    if row is not None:
+        return row
+    if any(r == repo for r, _ in CACHE_WRITERS):
+        return f"runs {uses!r}, a subpath of {repo!r} no `CACHE_WRITERS` row models"
+    return None
+
+
+def _main_conjunct(raw: object) -> str | None:
+    """Why the `if:` `raw` does not skip its step off `main` — it must
+    conjoin `github.ref == DEFAULT_BRANCH_REF` at its top level — or None."""
+    if raw is None:
+        return "has no `if:`"
+    e = _one_condition(raw)
+    if isinstance(e, str):
+        return f"`if:` {e}"
+    if any(_ref_compare(c, "==", DEFAULT_BRANCH_REF) == ("github", "ref") for c in _flatten(e, "&&")):
+        return None
+    return f"`if:` {raw!r} does not conjoin `github.ref == '{DEFAULT_BRANCH_REF}'` at its top level"
+
+
+def _refuse_cache_save(st: Step, loc: str, errors: list[str]) -> None:
+    """Rule (a): a step running a `CACHE_WRITERS` action saves only on
+    `main`. Left to its defaults, such an action saves from every ref, and a
+    cache saved off `main` no later run reads while it evicts `main`'s."""
+    row = cache_writer(st.uses)
+    if row is None:
+        return
+    if isinstance(row, str):
+        errors.append(f"{loc} {row}; refused")
+        return
     w = st.raw.get("with")
-    got = w.get("save-if") if isinstance(w, dict) else None
-    if got != RUST_CACHE_SAVE_IF:
-        errors.append(
-            f"{loc} uses {RUST_CACHE_REPO} with save-if {got!r} — it must be exactly "
-            f"{RUST_CACHE_SAVE_IF!r}, so only main writes the cache; refused"
-        )
+    for key, want in row.inputs:
+        got = w.get(key) if isinstance(w, dict) else None
+        if got != want:
+            must = "absent" if want is None else f"exactly {want!r}"
+            errors.append(
+                f"{loc} uses {row.name} with {key} {got!r} — it must be {must}, so only main writes the cache; refused"
+            )
+    why = _main_conjunct(st.raw.get("if")) if row.main_if else None
+    if why is not None:
+        errors.append(f"{loc} uses {row.name}, which saves a cache, but its {why}, so only main writes the cache; refused")
 
 
 def _audit_step(st: Step, loc: str, policy: StepPolicy, errors: list[str]) -> None:
     """Rules (a)/(b)/(c)/(e)/(f)/(g)/(j) for one step."""
     _refuse_unpinned_uses(st, loc, errors)
-    if _uses_repo(st, RUST_CACHE_REPO):
-        _refuse_rust_cache_save(st, loc, errors)
+    _refuse_cache_save(st, loc, errors)
     if _uses_repo(st, RAW_MOLD_ACTION_REPO):
         errors.append(
             f"{loc} runs the raw {RAW_MOLD_ACTION_REPO} action directly — use "
@@ -6469,11 +6605,12 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
     """Checks 6 and 7 over every step of every workflow and reachable local action.
     Returns the resolved local actions, the traversal check 24 reads.
 
-    No job wraps or replaces rustc, and only `main` saves the dependency
+    No job wraps or replaces rustc, and only `main` saves a
     cache. Refused:
-      (a) a `Swatinem/rust-cache` step (case-folded, any ref or subpath) in a
-          workflow or reachable local action whose `with.save-if` is not
-          exactly `RUST_CACHE_SAVE_IF`;
+      (a) a step (in a workflow or reachable local action) running a
+          `CACHE_WRITERS` action (case-folded, any ref) that its row does not
+          hold to saving only on `main`, or a subpath of a listed repo that
+          no row models;
       (b) an `env:` key naming a wrapper var or a rustc-replacing var
           (`RUSTC`, `CARGO_BUILD_RUSTC`) (case-folded) at workflow, job,
           container, service, or step scope, in a workflow or any reachable
@@ -6872,7 +7009,34 @@ def check_action_inputs(
             inputs = None if pin is None else proven.get(pin.key, {}).get(pin.path)
             if inputs is None:
                 continue  # unpinned (check 7) or its record refused above
+            _check_cache_writer(fname, loc, uses, inputs, refuse)
         _check_with_keys(fname, loc, uses, with_, inputs, refuse)
+
+
+def _check_cache_writer(fname: str, loc: str, uses: str, inputs: action_metadata.ActionInputs, refuse) -> None:
+    """A pinned remote action against `CACHE_WRITERS`: one declaring an
+    input whose folded name contains `cache` must have a row (check 6 holds
+    the step to it), and a row must name only inputs the action declares,
+    or the rule it states pins nothing."""
+    row = cache_writer(uses)
+    if isinstance(row, str):
+        return  # refused by check 6
+    if row is None:
+        cachey = sorted(d for d in inputs.declared if "cache" in action_metadata.fold_input_name(d))
+        if cachey:
+            refuse(
+                ErrorKind.CACHE_WRITER_UNMODELLED, fname, loc,
+                f"runs {uses!r}, which declares the cache inputs {cachey} but has no `CACHE_WRITERS` row holding "
+                "it to saving only on main; refused",
+            )
+        return
+    missing = sorted(k for k, _ in row.inputs if k not in inputs.declared)
+    if missing:
+        refuse(
+            ErrorKind.CACHE_WRITER_ROW_INVALID, "verify-manifest.py", "CACHE_WRITERS",
+            f"the {row.name!r} row pins {missing}, which {uses!r} does not declare (it declares "
+            f"{sorted(inputs.declared)}); refused",
+        )
 
 
 def check_ci_suites_required(wfs: WorkflowSet, entries: list[dict], errors: list[str]) -> None:
@@ -7218,7 +7382,7 @@ _VM_ACTION_RE = re.compile(r"vmactions/freebsd-vm@[0-9a-f]{40}")
 _RUST_CACHE_PIN_RE = re.compile(r"Swatinem/rust-cache@[0-9a-f]{40}")
 _DTOLNAY_PIN_RE = re.compile(r"dtolnay/rust-toolchain@[0-9a-f]{40}")
 # The FreeBSD VM step's inputs but `run`.
-_VM_PRELUDE = {"prepare": "pkg install -y rust"}
+_VM_PRELUDE = {"disable-cache": OFF_MAIN_EXPR, "prepare": "pkg install -y rust"}
 # A matrix `os` or `target`: a runner label or a target triple, nothing a
 # shell or an expression can read as syntax.
 _MATRIX_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
