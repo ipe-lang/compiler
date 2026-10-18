@@ -224,7 +224,8 @@ impl Interner {
     /// Mint `count` fresh symbols whose resolved strings are guaranteed to be
     /// distinct from one another *and* from every user identifier.
     ///
-    /// Each name is `<prefix><n>` for the smallest run of `n` (from `0`) whose
+    /// Each name is `<stem><n>`, with `<stem>` the [`SynthStem::text`] of
+    /// `stem`, for the smallest run of `n` (from `0`) whose
     /// candidate does not collide, so the result can never alias a user
     /// identifier nor a previously minted fresh symbol of the same pool. The
     /// lowerer uses this for eta-expansion parameter names, which must not
@@ -250,7 +251,8 @@ impl Interner {
     /// exhausted before `count` fresh names are found, or when [`Self::intern`]
     /// itself reports the symbol table full — both unreachable for any real
     /// program.
-    pub fn fresh_symbols(&mut self, prefix: &str, count: usize) -> DResult<Vec<Symbol>> {
+    pub fn fresh_symbols(&mut self, stem: SynthStem, count: usize) -> DResult<Vec<Symbol>> {
+        let prefix = stem.text();
         let mut out = Vec::with_capacity(count);
         let mut n: u32 = 0;
         while out.len() < count {
@@ -397,7 +399,7 @@ thread_local! {
 /// — never leading, trailing, or doubled.
 ///
 /// This single grammar also covers every non-lexer-scanned shape a
-/// `Symbol` is ever built from: [`Interner::fresh_symbols`]' `<prefix><n>`
+/// `Symbol` is ever built from: [`Interner::fresh_symbols`]' `<stem><n>`
 /// pools (`eta_0`, `cap_3`, …), `ipe_types`' single-letter-plus-digit
 /// type-variable mint (`a`, `a1`, `z12`, …), and the handful of hardcoded
 /// compiler-internal qualifier aliases that embed a literal dot (`"Db.
@@ -629,7 +631,7 @@ mod tests {
     #[test]
     fn fresh_symbols_are_distinct_and_named_in_order() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
-        let pool = i.fresh_symbols("eta_", 3)?;
+        let pool = i.fresh_symbols(SynthStem::Eta, 3)?;
         let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(
             names,
@@ -643,11 +645,47 @@ mod tests {
     }
 
     #[test]
+    fn every_stem_mints_its_pinned_spelling() -> ipe_diagnostics::DResult<()> {
+        let pinned = [
+            (SynthStem::Compose, "compose_0"),
+            (SynthStem::CodecRecord, "codec_rec_0"),
+            (SynthStem::CodecProjection, "codec_r_0"),
+            (SynthStem::Eta, "eta_0"),
+            (SynthStem::Cap, "cap_0"),
+            (SynthStem::Arg, "arg_0"),
+            (SynthStem::AnyParam, "anyp_0"),
+            (SynthStem::AnyWild, "anyw_0"),
+            (SynthStem::ProjDecode, "projdec_0"),
+            (SynthStem::DestrThunk, "destr_thunk_0"),
+            (SynthStem::NestedCons, "ncons_0"),
+            (SynthStem::NestedStrLit, "nstrlit_0"),
+            (SynthStem::TupleElem, "telem_0"),
+        ];
+        let covered: Vec<SynthStem> = pinned.iter().map(|&(stem, _)| stem).collect();
+        assert_eq!(
+            covered,
+            SynthStem::ALL,
+            "every stem has one pinned spelling"
+        );
+        for (stem, spelling) in pinned {
+            let mut i = Interner::new();
+            let pool = i.fresh_symbols(stem, 1)?;
+            let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
+            assert_eq!(
+                names,
+                vec![Some(spelling)],
+                "{stem:?} mints from its own text"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fresh_symbols_skip_already_interned_collisions() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
         // A user identifier that would collide with the first candidate.
         let user = i.intern("eta_0")?;
-        let pool = i.fresh_symbols("eta_", 2)?;
+        let pool = i.fresh_symbols(SynthStem::Eta, 2)?;
         // The minted names step over the pre-existing `eta_0`.
         let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(names, vec![Some("eta_1"), Some("eta_2")]);
@@ -661,7 +699,7 @@ mod tests {
     #[test]
     fn fresh_symbols_zero_count_is_empty() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
-        assert!(i.fresh_symbols("eta_", 0)?.is_empty());
+        assert!(i.fresh_symbols(SynthStem::Eta, 0)?.is_empty());
         Ok(())
     }
 
@@ -674,8 +712,8 @@ mod tests {
     fn fresh_symbols_avoid_set_is_stable_across_rebuilds() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
         i.set_fresh_avoid(BTreeSet::new());
-        let run1 = i.fresh_symbols("eta_", 2)?;
-        let run2 = i.fresh_symbols("eta_", 2)?;
+        let run1 = i.fresh_symbols(SynthStem::Eta, 2)?;
+        let run2 = i.fresh_symbols(SynthStem::Eta, 2)?;
         assert_eq!(run1, run2, "warm re-mint returns the same symbols");
         let names: Vec<Option<&str>> = run2.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(names, vec![Some("eta_0"), Some("eta_1")]);
@@ -688,7 +726,7 @@ mod tests {
         let mut i = Interner::new();
         let user = i.intern("eta_0")?;
         i.set_fresh_avoid(BTreeSet::from(["eta_0".to_owned()]));
-        let pool = i.fresh_symbols("eta_", 2)?;
+        let pool = i.fresh_symbols(SynthStem::Eta, 2)?;
         let names: Vec<Option<&str>> = pool.iter().map(|&s| i.resolve(s)).collect();
         assert_eq!(names, vec![Some("eta_1"), Some("eta_2")]);
         assert!(
@@ -705,7 +743,7 @@ mod tests {
     fn fresh_symbols_avoid_set_is_per_build_not_sticky() -> ipe_diagnostics::DResult<()> {
         let mut i = Interner::new();
         i.set_fresh_avoid(BTreeSet::from(["eta_0".to_owned()]));
-        let run1 = i.fresh_symbols("eta_", 1)?;
+        let run1 = i.fresh_symbols(SynthStem::Eta, 1)?;
         assert_eq!(
             run1.first().and_then(|&s| i.resolve(s)),
             Some("eta_1"),
@@ -713,7 +751,7 @@ mod tests {
         );
         // Next build: the program no longer names `eta_0`.
         i.set_fresh_avoid(BTreeSet::new());
-        let run2 = i.fresh_symbols("eta_", 1)?;
+        let run2 = i.fresh_symbols(SynthStem::Eta, 1)?;
         assert_eq!(
             run2.first().and_then(|&s| i.resolve(s)),
             Some("eta_0"),
