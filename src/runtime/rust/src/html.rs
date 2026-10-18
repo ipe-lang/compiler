@@ -1578,6 +1578,7 @@ fn closure_bytes<F: ?Sized>(f: &F) -> Option<Bytes> {
 /// One builder for the element bound in this module and the render history
 /// in `dom::dispatch`, so the two modules' tests measure the same shape.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod drawn_shape {
     use super::{Attribute, Event, Html, assign_ipe_ids};
 
