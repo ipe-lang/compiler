@@ -739,8 +739,8 @@ pub fn emit_task_loop_call(
         });
     }
     let path = ctx.enum_name(home, *name)?;
-    let continue_ident = ctx.emit_ident(*continue_sym)?;
-    let done_ident = ctx.emit_ident(*done_sym)?;
+    let continue_ident = ctx.emit_member_ident(*continue_sym)?;
+    let done_ident = ctx.emit_member_ident(*done_sym)?;
     let ceiling_s = emit_expr_at(ctx, ceiling, indent, child, generics)?;
     let init_s = emit_expr_at(ctx, init, indent, child, generics)?;
     let step_s = emit_expr_at(ctx, step, indent, child, generics)?;
@@ -2054,7 +2054,7 @@ pub fn stream_handler_capture_prologue(ctx: &EmitCtx, handler: &Expr) -> DResult
     collect_free_vars(handler, &mut captured);
     let mut prologue = String::new();
     for sym in captured {
-        let id = ctx.emit_ident(sym)?;
+        let id = ctx.emit_local_ident(sym)?;
         write!(prologue, "let {id} = {id}.clone(); ").map_err(|_| Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::stream_handler_capture_prologue",
             detail: "writing capture-clone prologue failed".to_owned(),
@@ -2492,7 +2492,7 @@ pub fn render_hoisted_clone_prefix(
 ) -> DResult<String> {
     let mut prefix = String::new();
     for &(name, value) in hoisted {
-        let name_s = ctx.emit_ident(name)?;
+        let name_s = ctx.emit_local_ident(name)?;
         let value_s = emit_expr_at(ctx, value, indent, child, generics)?;
         write!(prefix, "let {name_s} = {value_s}; ").map_err(|e| Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::render_hoisted_clone_prefix",

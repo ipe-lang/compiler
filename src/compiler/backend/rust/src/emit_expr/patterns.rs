@@ -576,7 +576,7 @@ where
     F: FnMut(&Pat, &mut ArmSink) -> DResult<String>,
 {
     let (path, subs) = if let Some(runtime) = ctx.builtin_runtime_enum(ctor.home, ctor.ty) {
-        let path = format!("{runtime}::{}", ctx.emit_ident(ctor.variant)?);
+        let path = format!("{runtime}::{}", ctx.emit_member_ident(ctor.variant)?);
         let mut subs = Vec::with_capacity(ctor.args.len());
         for sub in ctor.args {
             subs.push(plain(sub, sink)?);
@@ -586,7 +586,7 @@ where
         let path = format!(
             "{}::{}",
             ctx.enum_name(ctor.home, ctor.ty)?,
-            ctx.emit_ident(ctor.variant)?
+            ctx.emit_member_ident(ctor.variant)?
         );
         if ctor.args.is_empty() {
             return Ok(path);
@@ -655,7 +655,7 @@ fn render_boxed_sub(
     match (BoxedSub::of(sub), access) {
         (BoxedSub::Ignore, _) => Ok("_".to_owned()),
         (BoxedSub::Bind(name), FieldAccess::ByValue | FieldAccess::ByRef) => {
-            let binder = ctx.emit_ident(name)?;
+            let binder = ctx.emit_local_ident(name)?;
             let src = unboxed_read(access, &binder);
             sink.push_stmt(&format!("let {binder} = {src};"));
             sink.unboxed.insert(name);
@@ -757,7 +757,7 @@ pub fn str_binder_rebinds(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
 pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResult<()> {
     match pat {
         Pat::Var(s) => {
-            let name = ctx.emit_ident(*s)?;
+            let name = ctx.emit_local_ident(*s)?;
             write!(out, "let {name} = {name}.to_string(); ").map_err(|e| {
                 Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::str_binder_rebinds",
@@ -767,7 +767,7 @@ pub fn collect_str_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResul
             Ok(())
         }
         Pat::Alias(inner, name) => {
-            let n = ctx.emit_ident(*name)?;
+            let n = ctx.emit_local_ident(*name)?;
             write!(out, "let {n} = {n}.to_string(); ").map_err(|e| Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::str_binder_rebinds",
                 detail: format!("writing rebind binder failed: {e}"),
@@ -854,12 +854,12 @@ fn borrow_list_head(ctx: &EmitCtx, pat: &Pat, moves: bool, sink: &mut ArmSink) -
         // (`(x :: rest) as whole ->`): the matched value IS the list.
         Pat::Var(name) => {
             rebind_to_vec(ctx, *name, &mut sink.prelude)?;
-            ctx.emit_ident(*name)
+            ctx.emit_local_ident(*name)
         }
         Pat::Alias(inner, name) => {
             rebind_to_vec(ctx, *name, &mut sink.prelude)?;
             let inner = borrow_list_head(ctx, inner, moves, sink)?;
-            Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
+            Ok(format!("{} @ {inner}", ctx.emit_local_ident(*name)?))
         }
         // A `SharedAlts` alternative is binder-free, so it contributes no rebinds.
         Pat::Or(alts) => {
@@ -904,7 +904,7 @@ fn push_view_rest(
     tail: &str,
     prelude: &mut String,
 ) -> DResult<()> {
-    let name = ctx.emit_ident(name)?;
+    let name = ctx.emit_local_ident(name)?;
     write!(
         prelude,
         "let {name} = ipe_runtime::list::ipe_list_view_rest({slots}, {tail}); "
@@ -1093,7 +1093,7 @@ fn owned_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> {
         Pat::Record(fields) => render_record_with(ctx, fields, |p| owned_elem(ctx, p, sink)),
         Pat::Alias(inner, name) => {
             let inner = owned_elem(ctx, inner, sink)?;
-            Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
+            Ok(format!("{} @ {inner}", ctx.emit_local_ident(*name)?))
         }
         Pat::Or(alts) => {
             render_or_alternatives(alts.as_slice(), sink, &mut |p: &Pat, s: &mut ArmSink| {
@@ -1134,12 +1134,12 @@ fn borrow_elem(ctx: &EmitCtx, pat: &Pat, sink: &mut ArmSink) -> DResult<String> 
     match pat {
         Pat::Var(name) => {
             rebind_clone(ctx, *name, &mut sink.prelude)?;
-            ctx.emit_ident(*name)
+            ctx.emit_local_ident(*name)
         }
         Pat::Alias(inner, name) => {
             rebind_clone(ctx, *name, &mut sink.prelude)?;
             let inner = borrow_elem(ctx, inner, sink)?;
-            Ok(format!("{} @ {inner}", ctx.emit_ident(*name)?))
+            Ok(format!("{} @ {inner}", ctx.emit_local_ident(*name)?))
         }
         Pat::Tuple(elems) => {
             let mut subs = Vec::with_capacity(elems.len());
@@ -1210,7 +1210,7 @@ pub fn collect_list_rebinds(ctx: &EmitCtx, pat: &Pat, out: &mut String) -> DResu
 /// Emit `let <name> = <name>.clone();` — rebind a slice ELEMENT binder (`&T`) to
 /// the owned `T` the arm body expects.
 pub fn rebind_clone(ctx: &EmitCtx, sym: Symbol, out: &mut String) -> DResult<()> {
-    let name = ctx.emit_ident(sym)?;
+    let name = ctx.emit_local_ident(sym)?;
     write!(out, "let {name} = {name}.clone(); ").map_err(|e| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::list_binder_rebinds",
         detail: format!("writing element rebind failed: {e}"),
@@ -1220,7 +1220,7 @@ pub fn rebind_clone(ctx: &EmitCtx, sym: Symbol, out: &mut String) -> DResult<()>
 /// Emit `let <name> = <name>.to_vec();` — rebind a slice REST / whole-list binder
 /// (`&[T]`) to the owned `Vec<T>` the arm body expects.
 pub fn rebind_to_vec(ctx: &EmitCtx, sym: Symbol, out: &mut String) -> DResult<()> {
-    let name = ctx.emit_ident(sym)?;
+    let name = ctx.emit_local_ident(sym)?;
     write!(out, "let {name} = {name}.to_vec(); ").map_err(|e| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::list_binder_rebinds",
         detail: format!("writing rest rebind failed: {e}"),
@@ -1244,7 +1244,7 @@ pub fn rebind_to_vec(ctx: &EmitCtx, sym: Symbol, out: &mut String) -> DResult<()
 /// panics, and every fallible lookup is surfaced as a [`Diagnostic`].
 pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
     match pat {
-        Pat::Var(sym) => ctx.emit_ident(*sym),
+        Pat::Var(sym) => ctx.emit_local_ident(*sym),
         Pat::Wildcard => Ok("_".to_owned()),
         // Literal leaves render as Rust literals. Int renders through
         // `int_pattern` (unsuffixed, unparenthesised: a pattern is never a
@@ -1287,7 +1287,7 @@ pub fn render_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
         // through `emit_binding_stmts`, which intercepts every alias — at any
         // nesting depth — before it can reach this renderer.
         Pat::Alias(inner, name) => {
-            let name = ctx.emit_ident(*name)?;
+            let name = ctx.emit_local_ident(*name)?;
             let inner = render_pat(ctx, inner)?;
             Ok(format!("{name} @ {inner}"))
         }
@@ -1607,7 +1607,7 @@ pub fn push_binding_stmts(
         // shape from a CLONE so the whole binding and the sub-bindings never
         // both move the same value.
         Pat::Alias(inner, name) => {
-            let name = ctx.emit_ident(*name)?;
+            let name = ctx.emit_local_ident(*name)?;
             out.push(format!("let {name} = {src};"));
             if !binds_any(inner) {
                 return Ok(());
@@ -1657,7 +1657,7 @@ pub fn push_binding_stmts(
 /// `lower_rest_pat` gates the rest), so the renderer is total over them.
 pub fn render_rest_pat(ctx: &EmitCtx, pat: &Pat) -> DResult<String> {
     match pat {
-        Pat::Var(s) => Ok(format!("{} @ ..", ctx.emit_ident(*s)?)),
+        Pat::Var(s) => Ok(format!("{} @ ..", ctx.emit_local_ident(*s)?)),
         // A wildcard ignores the tail (`..`). No other rest shape is produced by
         // the lowerer, so the catch-all stays total — a bare `..` ignores the
         // tail rather than mis-rendering.
@@ -1702,14 +1702,14 @@ where
 
     let mut parts = Vec::with_capacity(fields.len());
     for (sym, field_pat) in fields {
-        let field_ident = ctx.emit_ident(*sym)?;
+        let field_ident = ctx.emit_member_ident(*sym)?;
         let rendered = sub(field_pat)?;
         // Field-pun shorthand: `Rec { x, .. }` instead of `Rec { x: x, .. }`
         // (the latter trips rustc's `non_shorthand_field_patterns` lint). Only
         // when the sub-pattern is a variable whose emitted name equals the
         // field's emitted name.
         if let Pat::Var(var) = field_pat
-            && ctx.emit_ident(*var)? == field_ident
+            && ctx.emit_local_ident(*var)? == field_ident
         {
             parts.push(field_ident);
         } else {

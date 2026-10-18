@@ -189,6 +189,32 @@ pub fn mangle_reserved(name: String) -> String {
     }
 }
 
+/// The prefix that moves a `__`-leading user local out of the backend temporary namespace.
+pub const USER_LOCAL_ESCAPE: &str = "__u";
+
+/// The Rust spelling of a user local binder: a parameter, a `let` or pattern binder, a closure parameter.
+///
+/// The backend mints its own locals (`__ipe_bind_0`, `__ipe_box_0`, `__tco_0`,
+/// ...) with a leading `__`, and the lexer admits a user identifier spelled the
+/// same, so a verbatim user local could be shadowed by a temporary. A user
+/// identifier that starts with `__` is therefore emitted as
+/// [`USER_LOCAL_ESCAPE`] followed by the identifier, so its image starts with
+/// `__u__`, which no backend temporary does; every other identifier passes
+/// through. [`mangle_reserved`] then applies to the result.
+///
+/// The fold is injective: the escaped class gains one fixed prefix, the
+/// pass-through class never starts with `__`, and the escaped image always
+/// does, so the two images are disjoint. A keyword stem never starts with
+/// `__`, so the escape and the keyword mangle touch disjoint inputs.
+#[must_use]
+pub fn local_ident(name: &str) -> String {
+    if name.starts_with("__") {
+        mangle_reserved(format!("{USER_LOCAL_ESCAPE}{name}"))
+    } else {
+        mangle_reserved(name.to_owned())
+    }
+}
+
 /// The Rust enum/type name for a user type: `enum_name(["Main"], "Msg")` →
 /// `MainMsg`. Mirrors `unionToRustTypeDef`'s `codegenName`. A name colliding
 /// with a Rust keyword (e.g. a bare `type Self`) is mangled by
@@ -601,5 +627,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every user identifier the local fold must keep apart.
+    ///
+    /// Includes the spellings of the backend's own temporaries and of the
+    /// escape itself, and each Rust keyword with leading and trailing `_`.
+    fn local_ident_inputs() -> Vec<String> {
+        let mut inputs: Vec<String> = [
+            "_",
+            "_x",
+            "__",
+            "___",
+            "__u",
+            "__u_",
+            "__u__",
+            "__u__x",
+            "__u__u__x",
+            "u__x",
+            "__x",
+            "x",
+            "x__",
+            "__ipe_bind_0",
+            "__ipe_box_0",
+            "__ipe_arm_alias_0",
+            "__ipe_li_7",
+            "__ipe_rec",
+            "__ipe_upd_0",
+            "__tco_0",
+            "__sg0",
+            "__ui_f0",
+            "__req",
+            "__model",
+            "__update_shared",
+            "count",
+            "match_x",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        for kw in ipe_intern::RUST_KEYWORDS {
+            inputs.push((*kw).to_owned());
+            inputs.push(format!("{kw}_"));
+            inputs.push(format!("{kw}__"));
+            inputs.push(format!("_{kw}"));
+            inputs.push(format!("__{kw}"));
+            inputs.push(format!("__{kw}_"));
+        }
+        inputs.sort();
+        inputs.dedup();
+        inputs
+    }
+
+    /// `local_ident` sends no two distinct user identifiers to one Rust name.
+    #[test]
+    fn local_ident_is_injective() {
+        use std::collections::BTreeMap;
+
+        let mut images: BTreeMap<String, String> = BTreeMap::new();
+        for input in local_ident_inputs() {
+            let out = super::local_ident(&input);
+            if let Some(prev) = images.insert(out.clone(), input.clone()) {
+                assert!(
+                    false_marker(),
+                    "local_ident not injective: {prev:?} and {input:?} both fold to {out:?}"
+                );
+            }
+        }
+    }
+
+    /// No user local folds into the backend temporary namespace.
+    ///
+    /// Every image either does not start with `__` or starts with the escaped
+    /// `__u__`, so it is never `__ipe_…` nor any other backend temporary.
+    #[test]
+    fn local_ident_is_disjoint_from_backend_temporaries() {
+        for input in local_ident_inputs() {
+            let out = super::local_ident(&input);
+            assert!(
+                !out.starts_with("__") || out.starts_with("__u__"),
+                "{input:?} folds to {out:?}, inside the backend temporary namespace"
+            );
+            assert!(
+                !out.starts_with("__ipe_"),
+                "{input:?} folds to the temporary {out:?}"
+            );
+        }
+        assert_eq!(super::local_ident("__ipe_bind_0"), "__u__ipe_bind_0");
+        assert_eq!(super::local_ident("count"), "count");
+        assert_eq!(super::local_ident("match"), "match_");
+        assert_eq!(super::local_ident("_x"), "_x");
     }
 }

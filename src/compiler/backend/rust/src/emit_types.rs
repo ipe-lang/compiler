@@ -983,7 +983,7 @@ fn emit_enum_variant_lines_and_arms(
         // the original Ipê name so a variant like `Type` still displays as
         // "Type", not "Type_". For non-keyword variants the two coincide, so the
         // golden stays byte-identical.
-        let vn = ctx.emit_ident(variant.name)?;
+        let vn = ctx.emit_member_ident(variant.name)?;
         let display = ctx.resolve_ident(variant.name)?.to_owned();
         if variant.fields.is_empty() {
             variant_lines.push(format!("    {vn},"));
@@ -1182,7 +1182,7 @@ fn emit_enum_clone_impl(
     };
     let mut clone_arms = Vec::with_capacity(def.variants.len());
     for variant in &def.variants {
-        let vn = ctx.emit_ident(variant.name)?;
+        let vn = ctx.emit_member_ident(variant.name)?;
         if variant.fields.is_empty() {
             clone_arms.push(format!("            {name}::{vn} => {name}::{vn},"));
         } else {

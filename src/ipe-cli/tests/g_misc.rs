@@ -24,6 +24,8 @@ mod golden_attribute_home_disambiguation_179;
 mod golden_aud14_duplicate_qualifier;
 #[path = "g_misc/golden_auth_error.rs"]
 mod golden_auth_error;
+#[path = "g_misc/golden_backend_temp_capture.rs"]
+mod golden_backend_temp_capture;
 #[path = "g_misc/golden_bare_ui_arity_fill.rs"]
 mod golden_bare_ui_arity_fill;
 #[path = "g_misc/golden_basics.rs"]
