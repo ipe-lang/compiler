@@ -130,7 +130,7 @@ pub fn comment_multiset(comments: &[Comment]) -> Vec<CommentKey<'_>> {
 #[derive(Clone, Default)]
 pub struct Run<'a>(Vec<&'a Comment>);
 
-impl<'a> Run<'a> {
+impl Run<'_> {
     /// Whether the run holds no comment.
     pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
