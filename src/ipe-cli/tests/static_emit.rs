@@ -19,6 +19,7 @@ mod support;
 use support::repo_root;
 
 /// The hello program as a project in a private scratch tree.
+#[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
 fn hello_project() -> RootFixture {
     RootFixture::main(
         "module Main exposing (main)\n\
