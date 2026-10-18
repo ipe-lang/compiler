@@ -51,7 +51,8 @@ fn emits_byte_identical_main_rs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(&golden, &out, &runtime);
+    let built =
+        crate::support::build_golden(crate::support::golden_dir_of(&golden), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     crate::support::assert_emitted_project_matches_golden_dir(
