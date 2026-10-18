@@ -8094,6 +8094,18 @@ class TestAggregatesBound(_ManifestFixture):
         errors = self.assertKind("AGGREGATES_NEEDS_MISMATCH", entries=self.with_entry("verdict", aggregates=["a"]))
         self.assertTrue(any("only in needs: ['b']" in e for e in errors), errors)
 
+    def test_live_seal_slice_without_its_cover_aggregate_refused(self) -> None:
+        # `seal-slice` needs the cover proof job; a manifest that drops it from
+        # `aggregates:` no longer states the same fact as the workflow.
+        wfs = _load(verify_manifest.REPO_ROOT, [])
+        entries = json.loads(json.dumps(verify_manifest.load_manifest()["checks"]))
+        (seal,) = [e for e in entries if e.get("context") == "seal-slice"]
+        self.assertIn("seal-slice-cover", seal["aggregates"])
+        seal["aggregates"] = [a for a in seal["aggregates"] if a != "seal-slice-cover"]
+        errors: list[str] = []
+        verify_manifest.check_manifest_references(wfs, entries, errors)
+        self.assertTrue(any("only in needs: ['seal-slice-cover']" in e for e in errors), errors)
+
     def test_aggregator_not_always_refused(self) -> None:
         for guard in ("if: success()\n    ", "if: \"!cancelled()\"\n    ", ""):
             with self.subTest(guard=guard):

@@ -1898,6 +1898,7 @@ INLINE_DECIDERS: dict[tuple[str, str], str] = {
     ("ci.yml", "release-targets-freebsd"): "Check in FreeBSD VM",
     ("ci.yml", "release-targets-run"): "Check ipe + ipe-ffi-inspector",
     ("ci.yml", "seal-modset-vendored"): "Run seal_modset under the vendored emit model",
+    ("ci.yml", "seal-slice-cover"): "Prove the e2e shards partition the archived test set",
     ("ci.yml", "seal-smoke-run"): "Emit + build + run (examples/shapes/non-tea/hello-world)",
     ("ci.yml", "shapes-examples"): "Check + emit + build every first-party shape",
     ("ci.yml", "test-run"): (

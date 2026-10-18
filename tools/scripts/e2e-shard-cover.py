@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Prove the e2e shard plan partitions the run's own nextest archive exactly.
 
-`seal-slice` runs this with $E2E_PLAN, the `changes` job's `e2e_plan` output:
-the same plan every `e2e` shard read its selection from. It lists the archive
+`seal-slice-cover` runs this with $E2E_PLAN, the `changes` job's `e2e_plan`
+output: the same plan every `e2e` shard reads its selection from. It lists the archive
 in full and once per plan entry, and exits 0 only when every archived test is
 selected by exactly one shard and no shard selects a test outside the archive,
 so "the e2e shards run every archived test" is checked on every run, never
