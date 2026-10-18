@@ -24,11 +24,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("match_arm_clone_relay")
-        .join("Main.ipe")
 }
 
 /// ipe-0: the compiler accepts the program AND relays `name` across the
@@ -36,13 +35,13 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i222_match_arm_ipec_accepts_and_relays() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i222_match_arm_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for match_arm_clone_relay: {:?}",
@@ -69,13 +68,13 @@ fn i222_match_arm_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i222_match_arm_clone_relay_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed: {:?}",

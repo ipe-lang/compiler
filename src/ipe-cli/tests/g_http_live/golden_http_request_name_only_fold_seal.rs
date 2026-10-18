@@ -52,7 +52,7 @@ fn built_main_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<
     let entry = fixture_entry(root);
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime);
     let main_rs = if built.is_ok() {
         std::fs::read_to_string(out.join("src").join("main.rs")).ok()
     } else {
@@ -130,7 +130,7 @@ fn http_request_name_only_fold_seal_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let entry = fixture_entry(&root);
     let _ = std::fs::remove_dir_all(&out);
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "http_request_name_only_fold_seal: must be accepted, got: {built:?}"

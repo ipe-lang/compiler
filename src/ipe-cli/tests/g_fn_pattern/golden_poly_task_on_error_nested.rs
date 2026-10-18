@@ -47,16 +47,15 @@ fn repo_root() -> PathBuf {
 #[test]
 fn poly_task_on_error_nested_green() {
     let root = repo_root();
-    let entry = root
+    let golden = root
         .join("tests")
         .join("golden")
-        .join("poly_task_on_error_nested")
-        .join("Main.ipe");
+        .join("poly_task_on_error_nested");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("poly_task_on_error_nested");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for poly_task_on_error_nested: {:?}",

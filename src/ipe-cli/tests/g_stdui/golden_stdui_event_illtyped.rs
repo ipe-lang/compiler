@@ -45,7 +45,7 @@ fn run_ipec(fixture: &str, out_suffix: &str) -> Result<(), CliError> {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out, &runtime)
+    crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime)
 }
 
 /// NEGATIVE gate: `Event.onInput` with a `Bool -> msg`

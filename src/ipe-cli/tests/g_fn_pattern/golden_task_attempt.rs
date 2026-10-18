@@ -25,14 +25,13 @@ fn task_attempt_ipec_cargo_and_run_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("task_attempt");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_task_attempt_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiling a program that calls Task.attempt must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for task_attempt: {:?}",

@@ -59,7 +59,7 @@ fn css_length_color_ssot_emits_byte_identical() {
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = ipe::build(&entry, &out, &rt);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_length_color_ssot: {:?}",
@@ -86,7 +86,7 @@ fn css_length_color_ssot_e2e_output_matches_native_table() {
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = ipe::build(&entry, &out, &rt);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_length_color_ssot E2E: {:?}",

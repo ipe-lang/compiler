@@ -37,7 +37,7 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Assert that `ipe::build(fixture)` SUCCEEDS (exit-0 from the lowerer).
+/// Assert that `support::build_golden(fixture)` SUCCEEDS (exit-0 from the lowerer).
 /// Runs without `IPE_E2E` so the compile check is always fast.
 #[test]
 fn list_filter_partial_app_compiles() {
@@ -51,7 +51,7 @@ fn list_filter_partial_app_compiles() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for list_filter_partial_app: {:?}",
@@ -68,7 +68,8 @@ fn list_filter_partial_app_compiles() {
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 
-        let built = ipe::build(&entry, &e2e_out, &runtime);
+        let built =
+            crate::support::build_golden(crate::support::golden_dir_of(&entry), &e2e_out, &runtime);
         assert!(
             built.is_ok(),
             "ipe dev build must succeed for list_filter_partial_app (E2E leg): {:?}",

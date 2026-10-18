@@ -110,7 +110,7 @@ fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -601,7 +601,7 @@ fn db_sql_decimal_accepts_decimal() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "`SqlDecimal (Decimal.fromMinor 5 314159)` must type-check and emit; got: {:?}",
@@ -623,7 +623,7 @@ fn db_sql_decimal_rejects_raw_string() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let err = ipe::build(&entry, &out, &runtime)
+    let err = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime)
         .map_err(|e| e.to_string())
         .expect_err(
             "`SqlDecimal \"1.5\"` must be rejected: the ctor takes a native `Decimal`, not a `String`",
@@ -662,7 +662,7 @@ fn db_poly_params_compiles() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // Core assertion: `ipe::build` succeeds — no IPE-T0001 for any param-list shape.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "IPE-T0001 regression: `Db.exec` with `List Int` / `List String` / mixed \

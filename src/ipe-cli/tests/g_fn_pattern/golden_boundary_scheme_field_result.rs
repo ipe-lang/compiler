@@ -76,19 +76,19 @@ fn repo_root() -> PathBuf {
 #[test]
 fn class1_field_result_ipec_accepts_and_emits_concrete_getter() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("boundary_scheme_field_result")
-        .join("src")
-        .join("Main.ipe");
+    let fixture = crate::root_fixture::src_golden(
+        &root
+            .join("tests")
+            .join("golden")
+            .join("boundary_scheme_field_result"),
+    );
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("class1_boundary_scheme_field_result_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::root_fixture::build(&fixture, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for boundary_scheme_field_result: {:?}",
@@ -134,18 +134,18 @@ fn class1_field_result_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("boundary_scheme_field_result")
-        .join("src")
-        .join("Main.ipe");
+    let fixture = crate::root_fixture::src_golden(
+        &root
+            .join("tests")
+            .join("golden")
+            .join("boundary_scheme_field_result"),
+    );
     let out = crate::support::scratch_root().join("ipec_class1_boundary_scheme_field_result_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::root_fixture::build(&fixture, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for boundary_scheme_field_result: {:?}",

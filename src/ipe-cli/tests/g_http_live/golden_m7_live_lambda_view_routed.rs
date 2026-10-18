@@ -59,20 +59,14 @@ fn out_dir() -> PathBuf {
     crate::support::scratch_root().join("m7_live_lambda_view_routed_out")
 }
 
-/// Compile the fixture into `out`. `tag` names a private source dir so parallel callers never share
-/// the `Main.ipe` staging path.
+/// Compile the fixture into `out`; each call writes its own fixture project.
 #[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
-fn compile(tag: &str, out: &Path) -> Result<(), ipe::CliError> {
-    let ipe_dir =
-        crate::support::scratch_root().join(format!("m7_live_lambda_view_routed_{tag}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).expect("the fixture scratch dir must be writable");
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, LIVE_LAMBDA_VIEW_ROUTED)
-        .expect("the fixture scratch dir must be writable");
+fn compile(out: &Path) -> Result<(), ipe::CliError> {
+    let project =
+        ipe::RootFixture::main(LIVE_LAMBDA_VIEW_ROUTED).expect("the fixture project resolves");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime)
+    ipe::build_fixture(&project, out, &runtime).map(drop)
 }
 
 /// The lambda-view routed app must be ipe-0 AND emit `web_app_routed` with
@@ -80,7 +74,7 @@ fn compile(tag: &str, out: &Path) -> Result<(), ipe::CliError> {
 /// `routes`/`notFound`.
 #[test]
 fn lambda_view_routed_app_emits_web_app_routed() {
-    let result = compile("main", &out_dir());
+    let result = compile(&out_dir());
     assert!(
         result.is_ok(),
         "#108 hole 2: lambda-view routed app must be ipe-0, got: {:?}",
@@ -111,7 +105,7 @@ fn lambda_view_routed_app_cargo_builds() {
     // re-emitting into `out_dir()` in parallel cannot delete rustc's working
     // directory mid-build.
     let out = crate::support::scratch_root().join("m7_live_lambda_view_routed_e2e_out");
-    let result = compile("e2e", &out);
+    let result = compile(&out);
     assert!(
         result.is_ok(),
         "lambda-view routed app must be ipe-0, got: {:?}",

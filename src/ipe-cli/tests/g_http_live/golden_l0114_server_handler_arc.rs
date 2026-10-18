@@ -55,7 +55,7 @@ fn server_handler_lambda_boxes_with_arc_not_box() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for the server-handler fixture: {:?}",
@@ -106,7 +106,7 @@ fn ws_on_error_callback_boxes_with_arc_not_box() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for the WS onError fixture: {:?}",

@@ -179,15 +179,11 @@ main =
 /// Compile `source` through the ipe pipeline (no cargo).
 #[allow(clippy::expect_used)] // a failed scratch setup is the test failure
 fn compile_src(test_name: &str, source: &str) -> Result<(), ipe::CliError> {
-    let ipe_dir = crate::support::scratch_root().join(format!("live_routed_empty_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).expect("scratch setup must succeed");
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, source).expect("scratch setup must succeed");
+    let project = ipe::RootFixture::main(source).expect("the fixture project resolves");
     let out = crate::support::scratch_root().join(format!("live_routed_empty_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out, &runtime)
+    ipe::build_fixture(&project, &out, &runtime).map(drop)
 }
 
 fn repo_root() -> PathBuf {
@@ -208,7 +204,7 @@ fn run_ipec(fixture: &str, out_suffix: &str) -> Result<(), CliError> {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out, &runtime)
+    crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime)
 }
 
 /// R1: Routed Model (`page : Page`), `routes = []`, `notFound = 5` (Int).
@@ -369,7 +365,8 @@ fn routed_empty_routes_is_refused() {
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m7_live_routed_empty_routes_refused");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let result = ipe::build(&entry, &out, &runtime);
+    let result =
+        crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         matches!(&result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0159"),
         "a routed app with an empty table must be refused with IPE-L0159, got: {result:?}",

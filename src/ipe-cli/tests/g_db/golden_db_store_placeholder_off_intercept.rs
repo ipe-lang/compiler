@@ -29,17 +29,10 @@ const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-/// Write `source` as `src/Main.ipe` under a fresh scratch dir keyed by `name`.
-fn write_single(name: &str, source: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("store-placeholder-off-intercept")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).ok()?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
+/// A project fixture whose only module `Main` holds `source`.
+#[allow(clippy::expect_used)] // a fixture-setup failure must fail the test loudly
+fn write_single(source: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(source).expect("the fixture project resolves")
 }
 
 /// The scratch output dir for `name`, cleared.
@@ -54,10 +47,10 @@ fn out_dir(name: &str) -> PathBuf {
 /// Assert `source` is refused with IPE-L0146 naming `kernel`, and emits nothing.
 #[track_caller]
 fn assert_refused(name: &str, source: &str, kernel: &str) {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
+    let fixture = write_single(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
+    match ipe::build_fixture(&fixture, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => {
             assert_eq!(
                 diag.code(),
@@ -75,7 +68,7 @@ fn assert_refused(name: &str, source: &str, kernel: &str) {
                 "{name}: expected the off-intercept refusal naming `{kernel}`, got {diag:?}"
             );
         }
-        Ok(()) => assert!(
+        Ok(_) => assert!(
             false_marker(),
             "{name}: ipe ACCEPTED `{kernel}` outside `Store.select` (exit 0) — the \
              emitted crate names a never-defined `store_*` placeholder and would \
