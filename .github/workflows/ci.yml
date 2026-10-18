@@ -509,6 +509,9 @@ jobs:
       - name: Check in FreeBSD VM
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
+          # The VM image and apt cache are saved only on `main`; off it the action
+          # neither saves nor restores (verify-manifest check 6).
+          disable-cache: ${{ github.ref != 'refs/heads/main' }}
           prepare: pkg install -y rust
           run: cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
 
@@ -2071,6 +2074,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
+          # No package-manager cache: this step never writes one (verify-manifest check 6).
+          package-manager-cache: "false"
       - name: Install Playwright + Chromium
         working-directory: tools/scripts/browser-e2e
         run: |

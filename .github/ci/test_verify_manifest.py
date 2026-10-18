@@ -13,7 +13,7 @@ declares, proven from the pinned commit's git objects) sits in
 
 Each rejection the guard is supposed to make (a rustc wrapper or replacement
 set by an env key at any scope, by a `$GITHUB_ENV` write or by free text; a
-`Swatinem/rust-cache` step that saves from a ref other than `main`; a local
+`CACHE_WRITERS` step that saves from a ref other than `main`; a local
 action that cannot be resolved or audited) gets its own fixture tree and its
 own test, per PRINCIPLES.md "Prove the refusals": a
 guard no test drives is a guard one edit away from silently vanishing. One
@@ -1034,6 +1034,132 @@ class TestRustCacheSavesMainOnly(unittest.TestCase):
         self.assertFalse([e for e in errors if "rust-cache" in e], errors)
 
 
+_SHA40 = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+_MAIN = "github.ref == 'refs/heads/main'"
+
+
+class TestCacheWritersSaveMainOnly(unittest.TestCase):
+    """Check 6: every step running a `CACHE_WRITERS` action saves only on
+    `main` — an input pinned to the main-only expression, a caching input
+    absent, or an `if:` conjoining `github.ref == 'refs/heads/main'` — and
+    a subpath of a listed repo no row models is refused."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.fx = WorkflowFixture(self._tmpdir.name)
+
+    def step(self, uses: str, with_: str | None = None, if_: str | None = None) -> None:
+        step = f"steps:\n  - uses: {uses}@{_SHA40}\n"
+        if if_ is not None:
+            step += f"    if: {if_}\n"
+        if with_ is not None:
+            step += "    with:\n" + textwrap.indent(with_, "      ")
+        self.fx.workflow("ci.yml", _ci(step))
+
+    def refusals(self) -> list[str]:
+        return [e for e in self.fx.errors() if "only main writes the cache" in e or "no `CACHE_WRITERS` row" in e]
+
+    def assertOneRefusal(self) -> None:
+        self.assertEqual(len(self.refusals()), 1, self.fx.errors())
+
+    def test_freebsd_vm_disables_its_cache_off_main(self) -> None:
+        self.step("vmactions/freebsd-vm", "disable-cache: ${{ github.ref != 'refs/heads/main' }}\n")
+        self.assertEqual(self.fx.errors(), [])
+        for with_ in (None, "run: x\n", "disable-cache: true\n", "disable-cache: ${{ github.ref == 'refs/heads/main' }}\n"):
+            with self.subTest(with_=with_):
+                self.step("vmactions/freebsd-vm", with_)
+                self.assertOneRefusal()
+
+    def test_combined_and_save_need_the_main_conjunct(self) -> None:
+        for uses in ("actions/cache", "actions/cache/save", "Actions/Cache/SAVE"):
+            for if_ in (_MAIN, f"${{{{ {_MAIN} }}}}", f"{_MAIN} && steps.c.outputs.cache-hit != 'true'"):
+                with self.subTest(uses=uses, if_=if_):
+                    self.step(uses, if_=if_)
+                    self.assertEqual(self.fx.errors(), [])
+            for if_ in (
+                None,
+                "steps.c.outputs.cache-hit != 'true'",
+                f"{_MAIN} || steps.c.outputs.x != 'false'",
+                "github.ref != 'refs/heads/main'",
+                "github.ref == 'refs/heads/dev'",
+                "${{ 'refs/heads/main' == github.ref }}",
+                f'"${{{{ {_MAIN} }}}} "',
+            ):
+                with self.subTest(uses=uses, if_=if_):
+                    self.step(uses, if_=if_)
+                    self.assertOneRefusal()
+
+    def test_restore_runs_anywhere(self) -> None:
+        self.step("actions/cache/restore", "path: x\nkey: k\n")
+        self.assertEqual(self.fx.errors(), [])
+
+    def test_unmodelled_subpath_of_a_listed_repo_is_refused(self) -> None:
+        for uses in ("actions/cache/other", "actions/cache/save/inner"):
+            with self.subTest(uses=uses):
+                self.step(uses, if_=_MAIN)
+                (e,) = self.refusals()
+                self.assertIn("no `CACHE_WRITERS` row models", e)
+
+    def test_setup_node_package_manager_cache_off(self) -> None:
+        self.step("actions/setup-node", "package-manager-cache: \"false\"\n")
+        self.assertEqual(self.fx.errors(), [])
+        for with_ in (None, "package-manager-cache: true\n", "package-manager-cache: false\n",
+                      "package-manager-cache: \"false\"\ncache: npm\n"):
+            with self.subTest(with_=with_):
+                self.step("actions/setup-node", with_)
+                self.assertOneRefusal()
+
+    def test_setup_python_passes_no_cache(self) -> None:
+        self.step("actions/setup-python", "python-version: '3.12'\n")
+        self.assertEqual(self.fx.errors(), [])
+        self.step("actions/setup-python", "cache: pip\n")
+        self.assertOneRefusal()
+
+    def test_cache_save_inside_local_composite_is_refused(self) -> None:
+        self.fx.composite("c", f"runs:\n  using: composite\n  steps:\n    - uses: actions/cache/save@{_SHA40}\n")
+        self.fx.workflow("ci.yml", _ci("steps:\n  - uses: ./.github/actions/c\n"))
+        (e,) = self.refusals()
+        self.assertIn("./.github/actions/c/action.yml", e)
+
+    def test_save_under_a_default_ref_trigger_refused(self) -> None:
+        saving = (
+            f"steps:\n  - uses: actions/cache/save@{_SHA40}\n    if: {_MAIN}\n",
+            f"steps:\n  - uses: Swatinem/rust-cache@{_SHA40}\n    with:\n      save-if: ${{{{ {_MAIN} }}}}\n",
+            f"steps:\n  - uses: vmactions/freebsd-vm@{_SHA40}\n    with:\n"
+            "      disable-cache: ${{ github.ref != 'refs/heads/main' }}\n",
+            "steps:\n  - uses: ./.github/actions/c\n",
+        )
+        self.fx.composite("c", "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/d\n")
+        self.fx.composite("d", f"runs:\n  using: composite\n  steps:\n    - uses: actions/cache/save@{_SHA40}\n      if: {_MAIN}\n")
+        for on in ("pull_request_target", "workflow_run", "[push, issue_comment]", "7"):
+            for body in saving:
+                with self.subTest(on=on, body=body):
+                    self.fx.workflow("ci.yml", _ci(body).replace("on: push\n", f"on: {on}\n"))
+                    hits = [e for e in self.fx.errors() if "the workflow also runs on" in e]
+                    self.assertEqual(len(hits), 1, self.fx.errors())
+        for on in ("push", "[pull_request, merge_group, schedule, workflow_dispatch, release]"):
+            for body in saving:
+                with self.subTest(on=on, body=body):
+                    self.fx.workflow("ci.yml", _ci(body).replace("on: push\n", f"on: {on}\n"))
+                    self.assertEqual(self.fx.errors(), [])
+
+    def test_non_saving_step_under_a_default_ref_trigger_passes(self) -> None:
+        for body in (
+            f"steps:\n  - uses: actions/cache/restore@{_SHA40}\n    with:\n      path: x\n      key: k\n",
+            f"steps:\n  - uses: actions/setup-python@{_SHA40}\n",
+            f"steps:\n  - uses: actions/setup-node@{_SHA40}\n    with:\n      package-manager-cache: \"false\"\n",
+        ):
+            with self.subTest(body=body):
+                self.fx.workflow("ci.yml", _ci(body).replace("on: push\n", "on: pull_request_target\n"))
+                self.assertEqual(self.fx.errors(), [])
+
+    def test_live_workflows_all_save_main_only(self) -> None:
+        errors: list[str] = []
+        check_workflow_steps(_load(os.path.dirname(HERE), errors), errors)
+        self.assertFalse([e for e in errors if "writes the cache" in e or "CACHE_WRITERS" in e], errors)
+
+
 _HELPER_CALL = 'bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh"'
 _REQS = '"$GITHUB_WORKSPACE/.github/ci/requirements.txt"'
 _PINNED_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -1578,7 +1704,7 @@ class TestTypedExpressionAndShellReads(unittest.TestCase):
             _ci(
                 f"steps:\n  - name: V\n    uses: vmactions/freebsd-vm@{_PINNED_SHA}\n"
                 "    env:\n      TAG: ${{ github.head_ref }}\n"
-                f"    with:\n      envs: 'TAG'\n{with_}"
+                f"    with:\n      envs: 'TAG'\n      disable-cache: ${{{{ github.ref != 'refs/heads/main' }}}}\n{with_}"
             ),
         )
 
@@ -6518,6 +6644,7 @@ jobs:
       - uses: actions/checkout@0000000000000000000000000000000000000000
       - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
         with:
+          disable-cache: ${{ github.ref != 'refs/heads/main' }}
           prepare: pkg install -y rust
           run: |
             cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
@@ -6573,6 +6700,7 @@ jobs:
           ref: ${{ needs.resolve-tag.outputs.tag }}
       - uses: vmactions/freebsd-vm@0000000000000000000000000000000000000000
         with:
+          disable-cache: ${{ github.ref != 'refs/heads/main' }}
           prepare: pkg install -y rust
           run: |
             cargo build --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
@@ -6779,6 +6907,14 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused(
             "ci.yml job 'release-targets-freebsd' step 2.with.prepare is",
             self.swap(_RT_CI, "pkg install -y rust", "pkg install -y rust-nightly"),
+        )
+        self.assertRefused(
+            "ci.yml job 'release-targets-freebsd' step 2.with.disable-cache is",
+            self.swap(_RT_CI, "disable-cache: ${{ github.ref != 'refs/heads/main' }}", "disable-cache: false"),
+        )
+        self.assertRefused(
+            "ci.yml job 'release-targets-freebsd' step 2.with has keys",
+            self.swap(_RT_CI, "          disable-cache: ${{ github.ref != 'refs/heads/main' }}\n", ""),
         )
         self.assertRefused(
             "ci.yml job 'release-targets-freebsd' step 2.with has keys",
@@ -7365,6 +7501,12 @@ class TestActionInputs(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.fx = WorkflowFixture(os.path.join(self._tmp.name, "repo"))
         self.records = os.path.join(self._tmp.name, "ci", "action-metadata")
+        # The fixture actions (`vendor/vm`, at the root and the two subpaths
+        # the walk tests use) are classified as saving no cache.
+        free = {("vendor/vm", ""), ("vendor/vm", "sub/dir"), ("vendor/vm", "sub/gone")}
+        patch = mock.patch.object(verify_manifest, "CACHE_FREE", verify_manifest.CACHE_FREE | free)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def record(self, pin: _PinObjects, owner: str = "vendor", repo: str = "vm", text: str | None = None) -> str:
         path = os.path.join(self.records, owner, repo, f"{pin.sha}.json")
@@ -7441,6 +7583,48 @@ class TestActionInputs(unittest.TestCase):
             "ci.yml", "on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n        with:\n          a: b\n"
         )
         self.assertRefused("ACTION_INPUT_UNDECLARED", "runs no action")
+
+    # ---- cache writers: every cache-declaring action is modelled ----
+
+    def test_unmodelled_cache_input_refused(self) -> None:
+        for name in ("cache-dir", "Save-Cache", "nocache"):
+            with self.subTest(name=name):
+                yml = _VM_DECL.replace("inputs:\n", f"inputs:\n  {name}:\n    description: c\n")
+                self.proven_step("run: echo\n", _PinObjects(yml))
+                self.assertRefused("CACHE_WRITER_UNMODELLED", "'vendor/vm@", f"[{name!r}]")
+
+    def test_modelled_cache_action_passes(self) -> None:
+        yml = _VM_DECL.replace("inputs:\n", "inputs:\n  cache-dir:\n    description: c\n")
+        row = verify_manifest.CacheWriter("vendor/vm", (("cache-dir", None),))
+        with mock.patch.dict(verify_manifest.CACHE_WRITERS, {("vendor/vm", "*"): row}):
+            self.proven_step("run: echo\n", _PinObjects(yml))
+            self.assertEqual(self.errors(), [])
+
+    def test_unclassified_action_refused(self) -> None:
+        with mock.patch.object(verify_manifest, "CACHE_FREE", frozenset()):
+            self.proven_step("run: echo\n")
+            self.assertRefused("CACHE_WRITER_UNMODELLED", "'vendor/vm@", "`CACHE_FREE`")
+        # A row classifies one subpath, not its siblings.
+        self.proven_step("run: echo\n", _PinObjects(subpath=("sub", "other")), "/sub/other")
+        self.assertRefused("CACHE_WRITER_UNMODELLED", "'vendor/vm/sub/other@", "`CACHE_FREE`")
+
+    def test_cache_free_action_declaring_a_cache_input_refused(self) -> None:
+        yml = _VM_DECL.replace("inputs:\n", "inputs:\n  cache-dir:\n    description: c\n")
+        self.proven_step("run: echo\n", _PinObjects(yml))
+        self.assertRefused("CACHE_WRITER_UNMODELLED", "'vendor/vm@", "['cache-dir']")
+
+    def test_cache_writer_row_naming_an_undeclared_input_refused(self) -> None:
+        row = verify_manifest.CacheWriter("vendor/vm", (("save-if", None),))
+        with mock.patch.dict(verify_manifest.CACHE_WRITERS, {("vendor/vm", "*"): row}):
+            self.proven_step("run: echo\n")
+            self.assertRefused("CACHE_WRITER_ROW_INVALID", "CACHE_WRITERS", "['save-if']")
+
+    def test_live_cache_writers_modelled(self) -> None:
+        errors: list[str] = []
+        wfs = _load(os.path.dirname(HERE), errors)
+        actions = check_workflow_steps(wfs, errors)
+        verify_manifest.check_action_inputs(wfs, actions, errors)
+        self.assertFalse([e for e in errors if "CACHE_WRITER" in e], errors)
 
     # ---- records: presence, staleness, names ----
 
@@ -8360,6 +8544,52 @@ class TestRequiredStepGuardClosed(_GuardFixture):
 
     def test_always_is_never_the_decider_guard(self) -> None:
         self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", f"- run: {_RG_VERDICT}\n  if: always()\n")))
+
+
+    # ---- a cache save skipped off `main` ----
+
+    def _save(self, if_: str, uses: str = "actions/cache/save") -> str:
+        return f"- uses: {uses}@{_SHA40}\n  if: {if_}\n"
+
+    _RESTORE = f"- id: c\n  uses: actions/cache/restore@{_SHA40}\n"
+    _HIT = "steps.c.outputs.cache-hit != 'true'"
+
+    def test_main_only_save_admitted(self) -> None:
+        run = f"- run: {_RG_VERDICT}\n  if: steps.cls.outputs.code != 'false'\n"
+        noop = "- run: echo skip\n  if: steps.cls.outputs.code == 'false'\n"
+        for steps in (
+            self._RESTORE + _RG_DECIDE + self._save(f"{_MAIN} && {self._HIT}"),
+            _RG_DECIDE + self._save(_MAIN, "actions/cache"),
+            _RG_CLASSIFY + self._RESTORE + run + noop
+            + self._save(f"{_MAIN} && steps.cls.outputs.code != 'false' && {self._HIT}"),
+        ):
+            with self.subTest(steps=steps):
+                self.assertPasses(_rg_wf(_rg_job("g", steps)))
+
+    def test_main_only_guard_refused_off_a_cache_save(self) -> None:
+        for steps in (
+            _RG_DECIDE + f"- run: echo x\n  if: {_MAIN}\n",
+            _RG_DECIDE + self._save(_MAIN, "actions/cache/restore"),
+            _RG_DECIDE + self._save(_MAIN, "actions/checkout"),
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps)))
+
+    def test_main_only_guard_on_the_decider_refused(self) -> None:
+        self.assertRefused("NO_DECIDER", _rg_wf(_rg_job("g", f"- run: {_RG_VERDICT}\n  if: {_MAIN}\n")))
+
+    def test_main_only_save_with_a_stray_or_misplaced_term_refused(self) -> None:
+        for steps in (
+            self._RESTORE + _RG_DECIDE + self._save(f"{_MAIN} && github.actor == 'x'"),
+            self._RESTORE + _RG_DECIDE + self._save(f"{_MAIN} || {self._HIT}"),
+            self._RESTORE + _RG_DECIDE + self._save(f"{_MAIN} && {self._HIT} && {self._HIT}"),
+            self._RESTORE + _RG_DECIDE + self._save(f"{_MAIN} && {_MAIN}"),
+            _RG_DECIDE + self._save(f"{_MAIN} && {self._HIT}") + self._RESTORE,
+            "- id: c\n  run: echo cache-hit=true\n" + _RG_DECIDE + self._save(f"{_MAIN} && {self._HIT}"),
+            self._RESTORE + _RG_DECIDE + self._save(f"{_MAIN} && steps.cls.outputs.code != 'false'"),
+        ):
+            with self.subTest(steps=steps):
+                self.assertRefused("STEP_GUARD_UNADMITTED", _rg_wf(_rg_job("g", steps)))
 
 
 class TestRequiredJobHoldsDecider(_GuardFixture):

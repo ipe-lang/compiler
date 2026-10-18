@@ -385,6 +385,9 @@ jobs:
       - name: Run admission jail inside FreeBSD VM
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
+          # The VM image and apt cache are saved only on `main`; off it the action
+          # neither saves nor restores (verify-manifest check 6).
+          disable-cache: ${{ github.ref != 'refs/heads/main' }}
           # `sync-time: false` passes `--sync-time off`, so the VM boot does
           # not wait on an NTP sync (an absent key passes no flag and leaves
           # the VM's own default); clock drift does not matter for the jail
