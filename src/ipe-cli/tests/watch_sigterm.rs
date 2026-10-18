@@ -67,18 +67,23 @@ fn server_fixture(body: &str) -> String {
 /// milliseconds without ever paying a dependency compile.
 const RED_BUILD_SOURCE: &str = "module Main exposing (main)\n\nmain = definitelyNotBound\n";
 
-fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
+/// A fresh, absent output directory for one scenario, beside its project fixture.
+fn fresh_out_dir(tag: &str) -> Result<PathBuf, BoxError> {
     let base = crate::support::scratch_root().join(format!(
         "watch_sigterm_{tag}_{}_{}",
         std::process::id(),
         Instant::now().elapsed().as_nanos()
     ));
-    let ipe_dir = base.join("ipe");
-    let out_dir = base.join("out");
     let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&ipe_dir)
-        .map_err(|e| -> BoxError { format!("mkdir {}: {e}", ipe_dir.display()).into() })?;
-    Ok((ipe_dir, out_dir))
+    std::fs::create_dir_all(&base)
+        .map_err(|e| -> BoxError { format!("mkdir {}: {e}", base.display()).into() })?;
+    Ok(base.join("out"))
+}
+
+/// `source` as the `Main` module of a project fixture, resolved the way production resolves it.
+fn project_fixture(source: &str) -> Result<ipe::RootFixture, BoxError> {
+    ipe::RootFixture::main(source)
+        .map_err(|e| -> BoxError { format!("write the project fixture: {e}").into() })
 }
 
 /// Pre-compile the server fixture's cargo dependencies into the shared target
@@ -248,7 +253,7 @@ fn wait_for_child_of(ipe_pid: u32, timeout: Duration) -> Option<u32> {
 /// is discarded.
 #[cfg(target_os = "linux")]
 fn spawn_ipe_watch(
-    entry: &Path,
+    project_dir: &Path,
     out_dir: &Path,
     port: u16,
     capture_stderr: bool,
@@ -257,7 +262,7 @@ fn spawn_ipe_watch(
     let mut cmd = std::process::Command::new(support::ipe_bin());
     cmd.arg("dev")
         .arg("watch")
-        .arg(entry)
+        .arg(project_dir)
         .arg("--out")
         .arg(out_dir)
         .arg("--runtime")
@@ -361,12 +366,11 @@ fn watch_shuts_down_the_supervised_child_on_sigterm_to_only_the_ipe_process() ->
     // runs; it just takes longer.
     let _ = try_warm(DEP_WARM_BUDGET);
 
-    let (ipe_dir, out_dir) = fresh_dirs("term_reaps_child")?;
-    std::fs::write(ipe_dir.join("Main.ipe"), server_fixture("v1"))
-        .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })?;
+    let out_dir = fresh_out_dir("term_reaps_child")?;
+    let fixture = project_fixture(&server_fixture("v1"))?;
 
     let port = 19159;
-    let mut ipe_proc = spawn_ipe_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, false)?;
+    let mut ipe_proc = spawn_ipe_watch(fixture.path(), &out_dir, port, false)?;
 
     if !wait_for_body(port, "v1", WATCH_SERVE_BUDGET) {
         let _ = ipe_proc.kill();
@@ -421,13 +425,12 @@ fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&host_sigterm))
         .map_err(|e| -> BoxError { format!("host handler registration: {e}").into() })?;
 
-    let (ipe_dir, out_dir) = fresh_dirs("spawn_no_forwarder")?;
+    let out_dir = fresh_out_dir("spawn_no_forwarder")?;
     // Red-build source: parses (so setup succeeds) but never compiles green,
     // so no cargo build ever starts — the loop just stays alive.
-    std::fs::write(ipe_dir.join("Main.ipe"), RED_BUILD_SOURCE)
-        .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })?;
+    let fixture = project_fixture(RED_BUILD_SOURCE)?;
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
-    let opts = ipe::watch::WatchOptions::new(ipe_dir.join("Main.ipe"), out_dir, runtime_dir);
+    let opts = ipe::watch::WatchOptions::new(fixture.path().to_path_buf(), out_dir, runtime_dir);
     let (join, handle) = ipe::watch::spawn(opts)
         .map_err(|e| -> BoxError { format!("spawn the watch session: {e}").into() })?;
 
@@ -492,12 +495,11 @@ fn double_sigterm_during_teardown_ends_the_process_and_every_transfer_group() ->
     // runs; it just takes longer.
     let _ = try_warm(DEP_WARM_BUDGET);
 
-    let (ipe_dir, out_dir) = fresh_dirs("double_term")?;
-    std::fs::write(ipe_dir.join("Main.ipe"), server_fixture("v1"))
-        .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })?;
+    let out_dir = fresh_out_dir("double_term")?;
+    let fixture = project_fixture(&server_fixture("v1"))?;
 
     let port = 19158;
-    let mut ipe_proc = spawn_ipe_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, true)?;
+    let mut ipe_proc = spawn_ipe_watch(fixture.path(), &out_dir, port, true)?;
 
     if !wait_for_body(port, "v1", WATCH_SERVE_BUDGET) {
         let _ = ipe_proc.kill();

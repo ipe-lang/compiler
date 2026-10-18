@@ -77,14 +77,6 @@ fn in_seal_child(test: &str, target_dir: &Path) -> bool {
     false
 }
 
-#[allow(clippy::expect_used)] // test helper: a failed scratch-dir setup IS the failure
-fn write_entry(dir: &Path, source: &str) -> PathBuf {
-    std::fs::create_dir_all(dir).expect("mkdir scratch");
-    let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).expect("write entry");
-    entry
-}
-
 fn wasi_options() -> BuildOptions {
     BuildOptions {
         target: ipe_ir::Target::WasmWasi,
@@ -291,7 +283,7 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
     }
 
     let dir = scratch("wasi_seal_user_path");
-    let entry = write_entry(&dir.join("srcdir"), DIRECT_FLOOR_SOURCE);
+    let fixture = wasi_fixture(DIRECT_FLOOR_SOURCE);
     let out = dir.join("out");
 
     // Forward CI's warm shared target so the emitted crate's deps reuse
@@ -303,7 +295,7 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
         let args = vec![
             "dev".to_owned(),
             "build".to_owned(),
-            entry.to_string_lossy().into_owned(),
+            fixture.path().to_string_lossy().into_owned(),
             "--out".to_owned(),
             out.to_string_lossy().into_owned(),
             "--target".to_owned(),
@@ -333,13 +325,13 @@ fn ipe_build_target_wasi_user_path_cargo_builds() {
 #[test]
 fn ipe_build_target_wasi_refuses_non_viable_shape_fail_closed() {
     let dir = scratch("wasi_seal_user_refusal");
-    let entry = write_entry(&dir.join("srcdir"), WEB_TEA_SOURCE);
+    let fixture = wasi_fixture(WEB_TEA_SOURCE);
     let out = dir.join("out");
 
     let args = vec![
         "dev".to_owned(),
         "build".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        fixture.path().to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
         "--target".to_owned(),
@@ -381,7 +373,7 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
     }
 
     let dir = scratch("wasi_run_exec");
-    let entry = write_entry(&dir.join("srcdir"), DIRECT_FLOOR_SOURCE);
+    let fixture = wasi_fixture(DIRECT_FLOOR_SOURCE);
     let out = dir.join("out");
 
     let target_dir = e2e_support::child_shared_target_from_env()
@@ -390,7 +382,7 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
         let args = vec![
             "dev".to_owned(),
             "run".to_owned(),
-            entry.to_string_lossy().into_owned(),
+            fixture.path().to_string_lossy().into_owned(),
             "--out".to_owned(),
             out.to_string_lossy().into_owned(),
             "--target".to_owned(),
@@ -416,13 +408,13 @@ fn ipe_run_target_wasi_executes_under_wasmtime() {
 #[test]
 fn ipe_run_target_wasi_refuses_non_viable_shape_fail_closed() {
     let dir = scratch("wasi_run_refuse_shape");
-    let entry = write_entry(&dir.join("srcdir"), WEB_TEA_SOURCE);
+    let fixture = wasi_fixture(WEB_TEA_SOURCE);
     let out = dir.join("out");
 
     let args = vec![
         "dev".to_owned(),
         "run".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        fixture.path().to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
         "--target".to_owned(),
@@ -456,13 +448,13 @@ fn ipe_run_target_wasi_refuses_non_viable_shape_fail_closed() {
 #[test]
 fn ipe_build_target_wasi_refuses_live_server_fail_closed() {
     let dir = scratch("wasi_seal_server_refusal");
-    let entry = write_entry(&dir.join("srcdir"), SERVER_SHAPE_SOURCE);
+    let fixture = wasi_fixture(SERVER_SHAPE_SOURCE);
     let out = dir.join("out");
 
     let args = vec![
         "dev".to_owned(),
         "build".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        fixture.path().to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
         "--target".to_owned(),
@@ -501,13 +493,13 @@ fn ipe_build_target_wasi_refuses_live_server_fail_closed() {
 #[test]
 fn ipe_run_target_wasi_refuses_live_server_fail_closed() {
     let dir = scratch("wasi_run_server_refusal");
-    let entry = write_entry(&dir.join("srcdir"), SERVER_SHAPE_SOURCE);
+    let fixture = wasi_fixture(SERVER_SHAPE_SOURCE);
     let out = dir.join("out");
 
     let args = vec![
         "dev".to_owned(),
         "run".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        fixture.path().to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
         "--target".to_owned(),
@@ -540,13 +532,13 @@ fn ipe_run_target_wasi_refuses_live_server_fail_closed() {
 #[test]
 fn ipe_run_target_wasi_feature_off_is_typed_refusal() {
     let dir = scratch("wasi_run_feature_off");
-    let entry = write_entry(&dir.join("srcdir"), DIRECT_FLOOR_SOURCE);
+    let fixture = wasi_fixture(DIRECT_FLOOR_SOURCE);
     let out = dir.join("out");
 
     let args = vec![
         "dev".to_owned(),
         "run".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        fixture.path().to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
         "--target".to_owned(),
@@ -582,13 +574,13 @@ fn ipe_run_target_wasi_feature_off_is_typed_refusal() {
 #[test]
 fn ipe_run_target_wasi_server_feature_off_is_typed_refusal() {
     let dir = scratch("wasi_run_server_feature_off");
-    let entry = write_entry(&dir.join("srcdir"), SERVER_SHAPE_SOURCE);
+    let fixture = wasi_fixture(SERVER_SHAPE_SOURCE);
     let out = dir.join("out");
 
     let args = vec![
         "dev".to_owned(),
         "run".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        fixture.path().to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
         "--target".to_owned(),

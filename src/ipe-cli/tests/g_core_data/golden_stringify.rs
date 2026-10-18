@@ -23,11 +23,11 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 
 fn compile_golden(name: &str) -> PathBuf {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
+    let golden = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
     out
 }
@@ -51,11 +51,11 @@ fn tostring_scalars_run() {
 #[test]
 fn tostring_record_and_adt_are_refused() {
     let root = repo_root();
-    let entry = golden_dir(&root, "m_tostring_composite").join("Main.ipe");
+    let golden = golden_dir(&root, "m_tostring_composite");
     let out = crate::support::scratch_root().join("ipec_m_tostring_composite_refused");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let code = match ipe::build(&entry, &out, &runtime) {
+    let code = match crate::support::build_golden(&golden, &out, &runtime) {
         Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
     };
@@ -72,11 +72,11 @@ fn tostring_record_and_adt_are_refused() {
 #[test]
 fn log_info_with_scalar_attrs_compiles() {
     let root = repo_root();
-    let entry = golden_dir(&root, "m_log_with").join("Main.ipe");
+    let golden = golden_dir(&root, "m_log_with");
     let out = crate::support::scratch_root().join("ipec_m_log_with_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "Log.infoWith with String attrs must compile: {:?}",
@@ -90,11 +90,11 @@ fn log_info_with_scalar_attrs_compiles() {
 #[test]
 fn tostring_on_function_is_rejected_at_typecheck() {
     let root = repo_root();
-    let entry = golden_dir(&root, "m_tostring_fn_rejected").join("Main.ipe");
+    let golden = golden_dir(&root, "m_tostring_fn_rejected");
     let out = crate::support::scratch_root().join("ipec_m_tostring_fn_rejected_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_err(),
         "interpolating a function MUST fail at ipec type-check (interpolable obligation), \

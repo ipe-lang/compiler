@@ -62,6 +62,40 @@ mod tests {
         assert!(!out.join("src").join("main.rs").exists());
     }
 
+    /// A golden with a `package.ipe` is built from its `src/` root; one without
+    /// that root is refused by the build, so no checked-in golden may be one.
+    #[test]
+    fn every_golden_manifest_has_a_source_root() {
+        let goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("golden");
+        let entries = std::fs::read_dir(&goldens).expect("read tests/golden");
+        let mut scanned = 0_usize;
+        let mut offenders = Vec::new();
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            scanned += 1;
+            if dir.join(PACKAGE_IPE).is_file() && !dir.join("src").is_dir() {
+                offenders.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        assert!(
+            scanned > 100,
+            "scanned only {scanned} golden directories under {}: the scan is not reading the golden tree",
+            goldens.display()
+        );
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "golden directories with a `package.ipe` and no `src/` root: {offenders:?}"
+        );
+    }
+
     #[test]
     fn the_regen_tool_and_the_golden_tests_build_through_this_function() {
         for (who, source) in [("regen-goldens", REGEN), ("tests/support", TEST_SUPPORT)] {
