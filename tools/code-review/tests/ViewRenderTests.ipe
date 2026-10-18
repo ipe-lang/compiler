@@ -688,9 +688,10 @@ hrefCeilingIsExact loaded =
 
 
 -- A unit holding the most links, each named by a hostile qualified name of a
--- full read window, draws at most `Index.linkElements` per link, every name cut
--- with its marker, and holds no more link bytes than the links' share of the
--- queue label ceiling.
+-- full read window, draws at most `Index.linkElements` for each link past the
+-- first (the first also opens the links row, page chrome), every name cut with
+-- its marker, and holds no more link bytes than the links' share of the queue
+-- label ceiling.
 maxLinksFitBudget : Index.UnitView -> List ( String, Bool )
 maxLinksFitBudget loaded =
     let
@@ -703,7 +704,7 @@ maxLinksFitBudget loaded =
             elementsOf (page (view (withLinks linkSet loaded)))
 
         delta view =
-            drawnOn view links - drawnOn view []
+            drawnOn view links - drawnOn view (List.take 1 links)
 
         cuts view =
             List.length (String.split "data-review-cut" (page (view (withLinks links loaded))))
@@ -713,10 +714,10 @@ maxLinksFitBudget loaded =
             List.sum (List.map (\l -> Label.byteCount (Lib.Links.label l)) links)
     in
     [ ( "a card of the most hostile links draws no more than linkElements per link and draws every link cut"
-      , delta cardModel <= Lib.Links.linkCeiling * Index.linkElements && cuts cardModel >= Lib.Links.linkCeiling
+      , delta cardModel <= (Lib.Links.linkCeiling - 1) * Index.linkElements && cuts cardModel >= Lib.Links.linkCeiling
       )
     , ( "a unit page of the most hostile links draws no more than linkElements per link and draws every link cut"
-      , delta unitPageModel <= Lib.Links.linkCeiling * Index.linkElements && cuts unitPageModel >= Lib.Links.linkCeiling
+      , delta unitPageModel <= (Lib.Links.linkCeiling - 1) * Index.linkElements && cuts unitPageModel >= Lib.Links.linkCeiling
       )
     , ( "the most hostile links hold no more bytes than their share of the queue label ceiling"
       , linkBytes > 0 && linkBytes <= Lib.Links.linkCeiling * Lib.Links.linkByteCeiling

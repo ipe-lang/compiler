@@ -103,10 +103,13 @@ type Reach
     | Capped
 
 
--- The most links a page shows.
+-- The most links a page shows. Each costs the queue page `Index.linkElements`
+-- drawn elements and `linkByteCeiling` bytes twice over, so the count is set
+-- where the page still fits its quarter of the session ceiling; a test
+-- checks the relation.
 linkCeiling : Int
 linkCeiling =
-    100
+    64
 
 
 -- The most distinct qualified names one page looks up for its references.
