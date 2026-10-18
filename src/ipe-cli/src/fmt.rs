@@ -299,12 +299,12 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
             src,
             diag: Box::new(diag),
         },
-        FmtError::RoundTrip { detail } => CliError::Pipeline {
+        FmtError::RoundTrip(fault) => CliError::Pipeline {
             file: file.to_path_buf(),
             src: String::new(),
             diag: Box::new(Diagnostic::CompilerBug {
                 where_: "ipe fmt",
-                detail,
+                detail: fault.to_string(),
             }),
         },
         FmtError::Limit(FmtLimit::OutputBytes { cap }) => CliError::FmtOutputTooLarge {
