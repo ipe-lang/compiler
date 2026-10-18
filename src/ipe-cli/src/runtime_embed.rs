@@ -273,21 +273,42 @@ impl BundledRuntime {
 /// Why the embedded runtime cannot be bundled, cached so every use fails alike.
 #[derive(Debug, Clone)]
 enum BundleFault {
-    /// An embedded file is not UTF-8.
-    NotUtf8(String),
-    /// The embedded manifest does not parse.
-    Manifest(String),
+    /// The embedded file at this bundle-relative path is not UTF-8.
+    NotUtf8(PathBuf),
+    /// The embedded manifest cannot be stamped.
+    Manifest(ManifestFault),
+}
+
+/// Why the embedded runtime manifest cannot be stamped for bundling.
+#[derive(Debug, Clone)]
+pub enum ManifestFault {
+    /// The manifest is not TOML.
+    Unparsable(toml_edit::TomlError),
+    /// The manifest has no `[package]` table.
+    NoPackageTable,
+    /// The bundle has no UTF-8 root manifest.
+    NoUtf8Manifest,
+}
+
+impl std::fmt::Display for ManifestFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unparsable(e) => write!(f, "the manifest is not TOML: {e}"),
+            Self::NoPackageTable => f.write_str("the manifest has no `[package]` table"),
+            Self::NoUtf8Manifest => f.write_str("the bundle has no UTF-8 root manifest"),
+        }
+    }
 }
 
 impl BundleFault {
     /// The error this fault surfaces as.
     fn to_error(&self) -> CliError {
         match self {
-            Self::NotUtf8(detail) => CliError::RuntimeMaterializeFailed {
-                detail: detail.clone(),
+            Self::NotUtf8(rel) => CliError::RuntimeMaterializeFailed {
+                detail: format!("embedded runtime file {} is not valid UTF-8", rel.display()),
             },
-            Self::Manifest(detail) => CliError::BundledManifest {
-                detail: detail.clone(),
+            Self::Manifest(fault) => CliError::BundledManifest {
+                fault: fault.clone(),
             },
         }
     }
@@ -315,11 +336,11 @@ pub fn stamped_version(role: BundleRole, digest: RuntimeDigest) -> String {
 fn prepare_bundled_manifest(manifest: &str, version: &str) -> Result<String, BundleFault> {
     let mut doc = manifest
         .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| BundleFault::Manifest(e.to_string()))?;
+        .map_err(|e| BundleFault::Manifest(ManifestFault::Unparsable(e)))?;
     let package = doc
         .get_mut("package")
         .and_then(toml_edit::Item::as_table_like_mut)
-        .ok_or_else(|| BundleFault::Manifest("no `[package]` table".to_owned()))?;
+        .ok_or(BundleFault::Manifest(ManifestFault::NoPackageTable))?;
     package.insert("version", toml_edit::value(version));
     doc.remove("dev-dependencies");
     if let Some(targets) = doc
@@ -379,7 +400,7 @@ pub fn bundled_runtime(role: BundleRole) -> Result<&'static BundledRuntime, CliE
         let manifest = RUNTIME_CRATE
             .get_file(MANIFEST)
             .and_then(|file| std::str::from_utf8(file.contents()).ok())
-            .ok_or_else(|| BundleFault::Manifest("no UTF-8 root manifest".to_owned()))?;
+            .ok_or(BundleFault::Manifest(ManifestFault::NoUtf8Manifest))?;
         let stamped = prepare_bundled_manifest(manifest, &stamped_version(role, *digest))?;
         files.insert(PathBuf::from(MANIFEST), stamped);
         Ok(BundledRuntime {
@@ -420,12 +441,8 @@ fn collect_dir_text_from_embedded(
             include_dir::DirEntry::File(file) => {
                 let name = file.path().file_name().unwrap_or_default();
                 let rel = prefix.join(name);
-                let text = std::str::from_utf8(file.contents()).map_err(|_| {
-                    BundleFault::NotUtf8(format!(
-                        "embedded runtime file {} is not valid UTF-8",
-                        rel.display()
-                    ))
-                })?;
+                let text = std::str::from_utf8(file.contents())
+                    .map_err(|_| BundleFault::NotUtf8(rel.clone()))?;
                 let text = if at_root && name == std::ffi::OsStr::new(MANIFEST) {
                     prepare_bundled_manifest(text, COMPILER_VERSION)?
                 } else {
@@ -950,11 +967,11 @@ mod tests {
     fn an_unparsable_manifest_is_a_typed_fault() {
         assert!(matches!(
             prepare_bundled_manifest("[package\n", "1.0.0"),
-            Err(BundleFault::Manifest(_))
+            Err(BundleFault::Manifest(ManifestFault::Unparsable(_)))
         ));
         assert!(matches!(
             prepare_bundled_manifest("[dependencies]\n", "1.0.0"),
-            Err(BundleFault::Manifest(_))
+            Err(BundleFault::Manifest(ManifestFault::NoPackageTable))
         ));
     }
 }

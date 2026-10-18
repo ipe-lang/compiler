@@ -725,7 +725,7 @@ the shared test build directory in the per-user cache
 
 ## cli-test-target-busy
 
-another `ipe test` held the test build directory {path} for longer than {wall}; wait for it to finish, or set `CARGO_TARGET_DIR` to build elsewhere
+another `ipe test` held the test build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe test` is running, or set `CARGO_TARGET_DIR` to build elsewhere
 
 ## cli-bundled-manifest
 

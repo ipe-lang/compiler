@@ -179,7 +179,7 @@ pub enum CliError {
     /// the build stops rather than link a runtime whose identity is unknown.
     BundledManifest {
         /// Why the manifest could not be prepared.
-        detail: String,
+        fault: crate::runtime_embed::ManifestFault,
     },
     /// Another `ipe test` held the shared test build directory past the wall.
     TestTargetBusy {
@@ -1200,7 +1200,7 @@ impl std::fmt::Display for CliError {
                 let d = Diagnostic::TargetDirUnlinkable { detail };
                 f.write_str(&render(&d, "", ""))
             }
-            Self::BundledManifest { detail } => f.write_str(&text::cli_bundled_manifest(detail)),
+            Self::BundledManifest { fault } => f.write_str(&text::cli_bundled_manifest(fault)),
             Self::TestTargetBusy { path, wall } => f.write_str(&text::cli_test_target_busy(
                 path,
                 &remote_ingest::IngestLimit::Time(wall.limit()),

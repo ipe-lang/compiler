@@ -440,13 +440,13 @@ impl LinkableTargetDir {
     ///
     /// The directory comes from [`Self::resolve_scratch`]. A shared scratch
     /// directory first prunes its stale siblings ([`prune_scratch_siblings`]).
-    /// The lock is then held ([`TargetLock::acquire`] under
+    /// The lock is then held ([`TargetLock`] under
     /// [`crate::cargo_step::CARGO_BUILD_WALL`]) for as long as the returned
     /// [`ScratchTarget`] lives, pinned directory or not.
     ///
     /// # Errors
     /// The refusals of [`TargetDirSources::gather`], [`Self::resolve_scratch`],
-    /// [`prune_scratch_siblings`] and [`TargetLock::acquire`]; [`CliError::Io`]
+    /// [`prune_scratch_siblings`] and [`TargetLock`]; [`CliError::Io`]
     /// when the directory cannot be created.
     pub fn for_scratch(
         cargo: &Path,
@@ -459,24 +459,21 @@ impl LinkableTargetDir {
     }
 
     /// Prune `dir`'s stale siblings when it is the shared scratch directory, then lock it within `wall`.
+    ///
+    /// Every attempt at the lock brings the directory into being again
+    /// ([`DirPrep`]): the shared one is re-proven private, so one a pruner
+    /// removed is recreated owner-only, never with the default mode.
     fn lock_scratch(
         dir: Self,
         wall: crate::remote_ingest::LocalWall,
     ) -> Result<ScratchTarget, CliError> {
-        std::fs::create_dir_all(&dir.path).map_err(|e| crate::io_err(&dir.path, e))?;
-        let shared_root = match dir.origin {
-            TargetDirOrigin::ScratchCache => dir.path.parent(),
-            TargetDirOrigin::Embedder
-            | TargetDirOrigin::Env
-            | TargetDirOrigin::IpeHomePin
-            | TargetDirOrigin::CargoConfigPin
-            | TargetDirOrigin::CrateLocal
-            | TargetDirOrigin::UserCache => None,
-        };
-        if let Some(root) = shared_root {
+        let prep = DirPrep::of(dir.origin);
+        prep.apply(&dir.path)
+            .map_err(|e| crate::io_err(&dir.path, e))?;
+        if let (DirPrep::Private, Some(root)) = (prep, dir.path.parent()) {
             prune_scratch_siblings(root, &dir.path, SCRATCH_RETENTION)?;
         }
-        let lock = TargetLock::acquire(&dir.path, wall)?;
+        let lock = TargetLock::acquire_in(&dir.path, prep, wall)?;
         Ok(ScratchTarget { dir, lock })
     }
 
@@ -592,56 +589,197 @@ pub fn scratch_cache_target(cache_base: &Path) -> PathBuf {
     user_cache_root(cache_base).join(format!("{SCRATCH_PREFIX}{key}"))
 }
 
-/// Whether an existing entry of kind `kind` owned by `owner` may serve as the
-/// shared scratch build directory of the effective user `euid`.
+/// The owner and permission bits of an entry, and the effective user.
 ///
-/// Only a real directory (never a link) owned by the effective user is shared;
-/// on a host without user ids both are `None` and only the kind decides.
+/// All three are `None` on a host without user ids, where only an entry's
+/// kind decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Access {
+    /// The entry's owner.
+    pub owner: Option<u32>,
+    /// The entry's permission bits.
+    pub mode: Option<u32>,
+    /// The effective user of this process.
+    pub euid: Option<u32>,
+}
+
+impl Access {
+    /// The access the entry `meta` describes grants, judged for this process.
+    #[cfg(unix)]
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            owner: Some(meta.uid()),
+            mode: Some(meta.mode() & 0o7777),
+            euid: Some(rustix::process::geteuid().as_raw()),
+        }
+    }
+
+    /// The access the entry `meta` describes grants: none known on this host.
+    #[cfg(not(unix))]
+    const fn of(_meta: &std::fs::Metadata) -> Self {
+        Self {
+            owner: None,
+            mode: None,
+            euid: None,
+        }
+    }
+
+    /// Whether the entry belongs to the effective user.
+    #[must_use]
+    pub fn owned(self) -> bool {
+        self.owner == self.euid
+    }
+
+    /// Whether no permission bit in `bits` is set.
+    fn lacks(self, bits: u32) -> bool {
+        self.mode.is_none_or(|mode| mode & bits == 0)
+    }
+}
+
+/// Whether an entry of kind `kind` may serve as the shared scratch build
+/// directory of the effective user.
+///
+/// Only a real directory (never a link) that the effective user owns and no
+/// other user may enter, so no other user reads or writes a build in it.
 #[must_use]
-pub fn is_private_dir(kind: ipe_fs_open::FileKind, owner: Option<u32>, euid: Option<u32>) -> bool {
-    kind == ipe_fs_open::FileKind::Dir && owner == euid
+pub fn is_private_dir(kind: ipe_fs_open::FileKind, access: Access) -> bool {
+    kind == ipe_fs_open::FileKind::Dir && access.owned() && access.lacks(0o077)
 }
 
-/// The owner of the entry `meta` describes, and the effective user.
-#[cfg(unix)]
-fn owners(meta: &std::fs::Metadata) -> (Option<u32>, Option<u32>) {
-    use std::os::unix::fs::MetadataExt as _;
-    (Some(meta.uid()), Some(rustix::process::geteuid().as_raw()))
+/// Whether a directory of kind `kind` may hold the shared scratch build directory.
+///
+/// Only a directory the effective user owns and no other user may write, so no
+/// other user can rename the scratch directory away and plant one in its place.
+#[must_use]
+pub fn is_private_root(kind: ipe_fs_open::FileKind, access: Access) -> bool {
+    kind == ipe_fs_open::FileKind::Dir && access.owned() && access.lacks(0o022)
 }
 
-/// The owner of the entry `meta` describes, and the effective user: none on this host.
-#[cfg(not(unix))]
-const fn owners(_meta: &std::fs::Metadata) -> (Option<u32>, Option<u32>) {
-    (None, None)
+/// Whether a prune may judge a sibling of kind `kind`: a real directory of the
+/// effective user, never another user's, whose lock this process cannot take.
+#[must_use]
+pub fn is_prunable(kind: ipe_fs_open::FileKind, access: Access) -> bool {
+    kind == ipe_fs_open::FileKind::Dir && access.owned()
 }
 
 /// The shared scratch build directory under `cache_base`, created owner-only
-/// when absent; `None` when it cannot be created or is not a private directory.
-///
-/// The directory is read through a handle opened without following a link,
-/// so its kind and owner are the entry's own, never a link target's.
+/// when absent; `None` when it cannot be created or is not private
+/// ([`ensure_private_scratch`]).
 fn prepare_scratch_cache(cache_base: &Path) -> Option<PathBuf> {
     let path = scratch_cache_target(cache_base);
-    let root = user_cache_root(cache_base);
-    std::fs::create_dir_all(&root).ok()?;
+    ensure_private_scratch(&path).ok().map(|()| path)
+}
+
+/// Create the shared scratch build directory `path` owner-only when absent,
+/// then prove it an [`is_private_dir`] under an [`is_private_root`].
+///
+/// Both are read through handles opened without following a final link, so
+/// the kind, owner and mode are the entries' own. The directory is created
+/// only once its parent is proven.
+///
+/// # Errors
+/// The I/O error of a creation or a read; `PermissionDenied` when either
+/// directory is not private; `NotFound` when the directory vanished.
+fn ensure_private_scratch(path: &Path) -> std::io::Result<()> {
+    let refused = || std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    let root = path.parent().ok_or_else(invalid)?;
+    let name = path
+        .file_name()
+        .and_then(ipe_fs_open::EntryName::new)
+        .ok_or_else(invalid)?;
     let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o755);
+    }
+    builder.create(root)?;
+    let parent =
+        ipe_fs_open::HeldDir::open_root(root).map_err(ipe_fs_open::OpenRefusal::into_io)?;
+    let root_kind =
+        ipe_fs_open::kind_of_file(parent.handle()).map_err(ipe_fs_open::OpenRefusal::into_io)?;
+    #[cfg(unix)]
+    drop_shared_write(parent.handle(), Access::of(&parent.handle().metadata()?))?;
+    if !is_private_root(root_kind, Access::of(&parent.handle().metadata()?)) {
+        return Err(refused());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
-    match builder.create(&path) {
+    match builder.create(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return None,
+        Err(e) => return Err(e),
     }
-    let name = ipe_fs_open::EntryName::new(path.file_name()?)?;
-    let parent = ipe_fs_open::HeldDir::open_root(&root).ok()?;
-    let kind = parent.kind_of(&name).ok()??;
-    let held = parent.child_dir(&name).ok()?;
-    let meta = held.handle().metadata().ok()?;
-    let (owner, euid) = owners(&meta);
-    is_private_dir(kind, owner, euid).then_some(path)
+    let kind = parent
+        .kind_of(&name)
+        .map_err(ipe_fs_open::OpenRefusal::into_io)?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    let held = parent
+        .child_dir(&name)
+        .map_err(ipe_fs_open::OpenRefusal::into_io)?;
+    if is_private_dir(kind, Access::of(&held.handle().metadata()?)) {
+        Ok(())
+    } else {
+        Err(refused())
+    }
+}
+
+/// Clear the group and other write bits of the effective user's own directory
+/// `dir`, the cache root a group-writable umask created.
+///
+/// Another user's directory is left as it is, and refused by [`is_private_root`].
+///
+/// # Errors
+/// The I/O error of the mode change.
+#[cfg(unix)]
+fn drop_shared_write(dir: &std::fs::File, access: Access) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    match access.mode {
+        Some(mode) if access.owned() && mode & 0o022 != 0 => {
+            dir.set_permissions(std::fs::Permissions::from_mode(mode & !0o022))
+        }
+        Some(_) | None => Ok(()),
+    }
+}
+
+/// How a run brings its build directory into being before each attempt at its lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirPrep {
+    /// Created as needed, the directory a pin or the crate names.
+    Plain,
+    /// Created owner-only and proven private ([`ensure_private_scratch`]).
+    Private,
+}
+
+impl DirPrep {
+    /// The preparation of a build directory from `origin`.
+    const fn of(origin: TargetDirOrigin) -> Self {
+        match origin {
+            TargetDirOrigin::ScratchCache => Self::Private,
+            TargetDirOrigin::Embedder
+            | TargetDirOrigin::Env
+            | TargetDirOrigin::IpeHomePin
+            | TargetDirOrigin::CargoConfigPin
+            | TargetDirOrigin::CrateLocal
+            | TargetDirOrigin::UserCache => Self::Plain,
+        }
+    }
+
+    /// Bring `dir` into being.
+    fn apply(self, dir: &Path) -> std::io::Result<()> {
+        match self {
+            Self::Plain => std::fs::create_dir_all(dir),
+            Self::Private => ensure_private_scratch(dir),
+        }
+    }
 }
 
 /// A build directory an `ipe test` run holds the lock of.
@@ -679,24 +817,42 @@ pub struct TargetLock {
 }
 
 impl TargetLock {
+    /// Lock `dir`'s [`TEST_LOCK_FILE`], creating `dir` as needed, waiting up to
+    /// `wall` for another holder.
+    ///
+    /// # Errors
+    /// The refusals of [`Self::acquire_in`].
+    #[cfg(test)]
+    pub fn acquire(dir: &Path, wall: crate::remote_ingest::LocalWall) -> Result<Self, CliError> {
+        Self::acquire_in(dir, DirPrep::Plain, wall)
+    }
+
     /// Lock `dir`'s [`TEST_LOCK_FILE`], waiting up to `wall` for another holder.
     ///
-    /// The file is created without following a link, and after the lock is held
-    /// its name must still name the locked file: one a pruner unlinked meanwhile
-    /// is dropped and the lock taken again, at most [`LOCK_ATTEMPTS`] times. The
-    /// file's mtime is then set to now, the directory's last-use stamp.
+    /// Each attempt first brings `dir` into being through `prep`, then opens
+    /// the file without following a link ([`open_lock_file`]). After the lock
+    /// is held, `dir`'s name must still name the locked file: one a pruner
+    /// unlinked meanwhile, or whose directory it removed, is dropped and the
+    /// lock taken again, at most [`LOCK_ATTEMPTS`] times. The file's mtime is
+    /// then set to now, the directory's last-use stamp.
     ///
     /// # Errors
     /// [`CliError::TestTargetBusy`] when another holder keeps the lock past
-    /// `wall`, or the file keeps being replaced; [`CliError::Io`] when the file
-    /// cannot be opened, is not a regular file, or cannot be locked.
-    pub fn acquire(dir: &Path, wall: crate::remote_ingest::LocalWall) -> Result<Self, CliError> {
-        Self::acquire_with(dir, wall, || {})
+    /// `wall`, or the file keeps being replaced; [`CliError::Io`] when `dir`
+    /// cannot be prepared, or the file cannot be opened, is not a regular file
+    /// of the effective user named once, or cannot be locked.
+    fn acquire_in(
+        dir: &Path,
+        prep: DirPrep,
+        wall: crate::remote_ingest::LocalWall,
+    ) -> Result<Self, CliError> {
+        Self::acquire_with(dir, prep, wall, || {})
     }
 
-    /// [`Self::acquire`], calling `between` after each open and before its lock.
+    /// [`Self::acquire_in`], calling `between` after each open and before its lock.
     fn acquire_with(
         dir: &Path,
+        prep: DirPrep,
         wall: crate::remote_ingest::LocalWall,
         mut between: impl FnMut(),
     ) -> Result<Self, CliError> {
@@ -705,20 +861,29 @@ impl TargetLock {
             path: TerminalSafe::sanitize(&path.to_string_lossy()),
             wall,
         };
-        let name = ipe_fs_open::EntryName::new(std::ffi::OsStr::new(TEST_LOCK_FILE))
+        let name = lock_entry_name()
             .ok_or_else(|| crate::io_err(&path, std::io::ErrorKind::InvalidInput.into()))?;
         let deadline = std::time::Instant::now()
             .checked_add(std::time::Duration::from_secs(wall.secs()))
             .ok_or_else(busy)?;
         for _ in 0..LOCK_ATTEMPTS {
-            let file = open_lock_file(&path)?;
+            prep.apply(dir).map_err(|e| crate::io_err(dir, e))?;
+            let file = match open_lock_file(&path, LockOpen::OpenOrCreate) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(crate::io_err(&path, e)),
+            };
             between();
             lock_until(&file, &path, deadline).map_err(|e| e.unwrap_or_else(busy))?;
             let held = ipe_fs_open::FileId::of_file(&file)
                 .map_err(|refusal| crate::io_err(&path, refusal.into_io()))?;
-            let named = ipe_fs_open::HeldDir::open_root(dir)
+            let named = match ipe_fs_open::HeldDir::open_root(dir)
                 .and_then(|parent| parent.entry_id(&name))
-                .map_err(|refusal| crate::io_err(dir, refusal.into_io()))?;
+            {
+                Ok(named) => named,
+                Err(ipe_fs_open::OpenRefusal::Absent) => continue,
+                Err(refusal) => return Err(crate::io_err(dir, refusal.into_io())),
+            };
             if named == Some(held) {
                 file.set_modified(std::time::SystemTime::now())
                     .map_err(|e| crate::io_err(&path, e))?;
@@ -727,6 +892,11 @@ impl TargetLock {
         }
         Err(busy())
     }
+}
+
+/// [`TEST_LOCK_FILE`] as an entry name.
+fn lock_entry_name() -> Option<ipe_fs_open::EntryName> {
+    ipe_fs_open::EntryName::new(std::ffi::OsStr::new(TEST_LOCK_FILE))
 }
 
 /// Poll `file`'s exclusive lock until it is held or `deadline` passes.
@@ -751,25 +921,49 @@ fn lock_until(
     }
 }
 
-/// Open (creating owner-only) the lock file at `path`, never through a link,
-/// and prove it a regular file on the opened handle.
-fn open_lock_file(path: &Path) -> Result<std::fs::File, CliError> {
-    let file = open_no_follow(path).map_err(|e| crate::io_err(path, e))?;
-    match ipe_fs_open::kind_of_file(&file) {
-        Ok(ipe_fs_open::FileKind::Regular) => Ok(file),
-        Ok(_) => Err(crate::io_err(
-            path,
-            std::io::Error::from(std::io::ErrorKind::InvalidInput),
-        )),
-        Err(refusal) => Err(crate::io_err(path, refusal.into_io())),
-    }
+/// Whether an open of a lock file may create it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockOpen {
+    /// Open the file, creating it owner-only when absent.
+    OpenOrCreate,
+    /// Open the file only when it exists.
+    Existing,
+    /// Create the file owner-only, refusing one that exists.
+    CreateNew,
 }
 
-/// Open `path` to read and write, creating it owner-only, never following a final link.
+/// Open the lock file at `path` as `how` says, never through a link, and prove
+/// on the opened handle that it is a regular file of the effective user that
+/// no other entry names.
+///
+/// # Errors
+/// The open's I/O error (`NotFound` when `path`'s directory or, for
+/// [`LockOpen::Existing`], the file is absent); `InvalidInput` for a
+/// non-regular or hard-linked file; `PermissionDenied` for another user's.
+fn open_lock_file(path: &Path, how: LockOpen) -> std::io::Result<std::fs::File> {
+    let file = open_no_follow(path, how)?;
+    let kind = ipe_fs_open::kind_of_file(&file).map_err(ipe_fs_open::OpenRefusal::into_io)?;
+    let links = ipe_fs_open::link_count(&file).map_err(ipe_fs_open::OpenRefusal::into_io)?;
+    if kind != ipe_fs_open::FileKind::Regular || links != 1 {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    if !Access::of(&file.metadata()?).owned() {
+        return Err(std::io::ErrorKind::PermissionDenied.into());
+    }
+    Ok(file)
+}
+
+/// Open `path` to read and write as `how` says, creating owner-only, never
+/// following a final link.
 #[cfg(unix)]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_no_follow(path: &Path, how: LockOpen) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
-    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let create = match how {
+        LockOpen::OpenOrCreate => OFlags::CREATE,
+        LockOpen::Existing => OFlags::empty(),
+        LockOpen::CreateNew => OFlags::CREATE | OFlags::EXCL,
+    };
+    let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC | create;
     let fd = rustix::fs::open(path, flags, Mode::RUSR | Mode::WUSR)?;
     Ok(std::fs::File::from(fd))
 }
@@ -778,24 +972,34 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-/// Open `path` to read and write, creating it, never following a final reparse point.
+/// Open `path` to read and write as `how` says, never following a final reparse point.
 #[cfg(windows)]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_no_follow(path: &Path, how: LockOpen) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
+    let mut options = std::fs::OpenOptions::new();
+    options
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    match how {
+        LockOpen::OpenOrCreate => {
+            options.create(true).truncate(false);
+        }
+        LockOpen::Existing => {}
+        LockOpen::CreateNew => {
+            options.create_new(true);
+        }
+    }
+    options.open(path)
 }
 
-/// Remove every shared scratch build directory under `root` but `keep` that no
-/// run has used within `retention` and no run holds now.
+/// Remove every shared scratch build directory under `root` but `keep` that
+/// the effective user owns, no run has used within `retention`, and no run
+/// holds now.
 ///
-/// A directory is removed only while this process holds its lock, so a run
-/// waiting on it re-checks the lock file's identity and starts afresh.
+/// Another user's directory is never judged, so it can neither be removed nor
+/// stop a prune. A directory is removed only while this process holds its
+/// lock ([`prune_if_stale`]).
 ///
 /// # Errors
 /// [`CliError::Io`] when `root` cannot be listed (more than
@@ -806,11 +1010,8 @@ pub fn prune_scratch_siblings(
     keep: &Path,
     retention: std::time::Duration,
 ) -> Result<(), CliError> {
-    let cap = ipe_fs_open::EntryCap::from_nonzero(
-        std::num::NonZeroU32::new(SCRATCH_SIBLING_CAP).unwrap_or(std::num::NonZeroU32::MIN),
-    );
     let entries = ipe_fs_open::HeldDir::open_root(root)
-        .and_then(|dir| dir.entries(cap))
+        .and_then(|dir| dir.entries(sibling_cap()))
         .map_err(|refusal| crate::io_err(root, refusal.into_io()))?;
     let now = std::time::SystemTime::now();
     for (name, kind) in entries {
@@ -822,37 +1023,197 @@ pub fn prune_scratch_siblings(
         if !is_scratch || kind != ipe_fs_open::FileKind::Dir || sibling == keep {
             continue;
         }
-        prune_if_stale(&sibling, now, retention)?;
+        let access = match std::fs::symlink_metadata(&sibling) {
+            Ok(meta) => Access::of(&meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(crate::io_err(&sibling, e)),
+        };
+        if is_prunable(kind, access) {
+            prune_if_stale(&sibling, now, retention)?;
+        }
     }
     Ok(())
 }
 
-/// Remove the scratch build directory `dir` when its lock is older than
-/// `retention` at `now` and free.
+/// The last use a prune judged a scratch build directory by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastUse {
+    /// Its lock file's mtime.
+    Locked(std::time::SystemTime),
+    /// Its own mtime: no run ever made its lock file.
+    Unlocked,
+}
+
+/// Remove the scratch build directory `dir` when its last use is older than
+/// `retention` at `now` and its lock is free.
+///
+/// # Errors
+/// The refusals of [`prune_if_stale_with`].
 fn prune_if_stale(
     dir: &Path,
     now: std::time::SystemTime,
     retention: std::time::Duration,
 ) -> Result<(), CliError> {
+    prune_if_stale_with(dir, now, retention, || {})
+}
+
+/// [`prune_if_stale`], calling `between` after the staleness is judged and
+/// before the lock file is opened.
+///
+/// The judgement is re-read under the lock: the held file must still be the
+/// one `dir` names and its mtime the one judged, so a run that took and freed
+/// the lock since the judgement keeps its directory. The lock file is never
+/// created over one a run made meanwhile, and a directory a concurrent pruner
+/// removed, or a run re-entered, is left alone.
+///
+/// # Errors
+/// [`CliError::Io`] when a stat, the lock, or the removal fails.
+fn prune_if_stale_with(
+    dir: &Path,
+    now: std::time::SystemTime,
+    retention: std::time::Duration,
+    between: impl FnOnce(),
+) -> Result<(), CliError> {
     let lock_path = dir.join(TEST_LOCK_FILE);
+    let is_stale =
+        |at: std::time::SystemTime| now.duration_since(at).is_ok_and(|age| age > retention);
     let last_use = match std::fs::symlink_metadata(&lock_path) {
-        Ok(meta) => meta.modified().map_err(|e| crate::io_err(&lock_path, e))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::symlink_metadata(dir)
-            .and_then(|meta| meta.modified())
-            .map_err(|e| crate::io_err(dir, e))?,
+        Ok(meta) => LastUse::Locked(meta.modified().map_err(|e| crate::io_err(&lock_path, e))?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(dir) {
+                Ok(meta) if is_stale(meta.modified().map_err(|e| crate::io_err(dir, e))?) => {
+                    LastUse::Unlocked
+                }
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(crate::io_err(dir, e)),
+            }
+        }
         Err(e) => return Err(crate::io_err(&lock_path, e)),
     };
-    let stale = now
-        .duration_since(last_use)
-        .is_ok_and(|age| age > retention);
-    if !stale {
+    if let LastUse::Locked(at) = last_use
+        && !is_stale(at)
+    {
         return Ok(());
     }
-    let lock = open_lock_file(&lock_path)?;
+    between();
+    let how = match last_use {
+        LastUse::Locked(_) => LockOpen::Existing,
+        LastUse::Unlocked => LockOpen::CreateNew,
+    };
+    let lock = match open_lock_file(&lock_path, how) {
+        Ok(lock) => lock,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(crate::io_err(&lock_path, e)),
+    };
+    let judged = match last_use {
+        LastUse::Locked(at) => at,
+        LastUse::Unlocked => lock
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map_err(|e| crate::io_err(&lock_path, e))?,
+    };
     match lock.try_lock() {
-        Ok(()) => std::fs::remove_dir_all(dir).map_err(|e| crate::io_err(dir, e)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
-        Err(std::fs::TryLockError::Error(e)) => Err(crate::io_err(&lock_path, e)),
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::Error(e)) => return Err(crate::io_err(&lock_path, e)),
+    }
+    if !still_judged(dir, &lock, judged)? {
+        return Ok(());
+    }
+    remove_locked_dir(dir, || {})
+}
+
+/// Remove the scratch build directory `dir` whose lock this process holds,
+/// calling `after_contents` once everything but the lock file is gone.
+///
+/// The lock file is unlinked last, so a run that opens it meanwhile waits on
+/// the held lock until nothing is left to remove under it, then finds the
+/// name gone and starts afresh. A run that makes a new lock file after the
+/// unlink keeps the directory: the final removal of a non-empty directory is
+/// no error, and nothing else is removed after it.
+///
+/// # Errors
+/// [`CliError::Io`] when `dir` cannot be listed (more than
+/// [`SCRATCH_SIBLING_CAP`] entries included) or an entry cannot be removed.
+fn remove_locked_dir(dir: &Path, after_contents: impl FnOnce()) -> Result<(), CliError> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let entries =
+        match ipe_fs_open::HeldDir::open_root(dir).and_then(|held| held.entries(sibling_cap())) {
+            Ok(entries) => entries,
+            Err(ipe_fs_open::OpenRefusal::Absent) => return Ok(()),
+            Err(refusal) => return Err(crate::io_err(dir, refusal.into_io())),
+        };
+    for (name, kind) in entries {
+        if name.as_os_str() == TEST_LOCK_FILE {
+            continue;
+        }
+        let entry = dir.join(name.as_os_str());
+        let removed = match kind {
+            ipe_fs_open::FileKind::Dir => std::fs::remove_dir_all(&entry),
+            ipe_fs_open::FileKind::Regular
+            | ipe_fs_open::FileKind::Symlink
+            | ipe_fs_open::FileKind::Fifo
+            | ipe_fs_open::FileKind::Socket
+            | ipe_fs_open::FileKind::Device
+            | ipe_fs_open::FileKind::Other => std::fs::remove_file(&entry),
+        };
+        match removed {
+            Ok(()) => {}
+            Err(e) if gone(&e) => {}
+            Err(e) => return Err(crate::io_err(&entry, e)),
+        }
+    }
+    after_contents();
+    let lock_path = dir.join(TEST_LOCK_FILE);
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => {}
+        Err(e) if gone(&e) => {}
+        Err(e) => return Err(crate::io_err(&lock_path, e)),
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if gone(&e) || e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        Err(e) => Err(crate::io_err(dir, e)),
+    }
+}
+
+/// The most entries a prune lists in one directory: [`SCRATCH_SIBLING_CAP`].
+fn sibling_cap() -> ipe_fs_open::EntryCap {
+    ipe_fs_open::EntryCap::from_nonzero(
+        std::num::NonZeroU32::new(SCRATCH_SIBLING_CAP).unwrap_or(std::num::NonZeroU32::MIN),
+    )
+}
+
+/// Whether the held lock file `lock` is still the one `dir` names, last used at `judged`.
+///
+/// # Errors
+/// [`CliError::Io`] when the handle or `dir` cannot be read.
+fn still_judged(
+    dir: &Path,
+    lock: &std::fs::File,
+    judged: std::time::SystemTime,
+) -> Result<bool, CliError> {
+    let lock_path = dir.join(TEST_LOCK_FILE);
+    let name = lock_entry_name()
+        .ok_or_else(|| crate::io_err(&lock_path, std::io::ErrorKind::InvalidInput.into()))?;
+    let held_at = lock
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .map_err(|e| crate::io_err(&lock_path, e))?;
+    let held = ipe_fs_open::FileId::of_file(lock)
+        .map_err(|refusal| crate::io_err(&lock_path, refusal.into_io()))?;
+    match ipe_fs_open::HeldDir::open_root(dir).and_then(|parent| parent.entry_id(&name)) {
+        Ok(named) => Ok(held_at == judged && named == Some(held)),
+        Err(ipe_fs_open::OpenRefusal::Absent) => Ok(false),
+        Err(refusal) => Err(crate::io_err(dir, refusal.into_io())),
     }
 }
 
@@ -1312,16 +1673,339 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
         }
 
+        /// The access of an entry `owner` owns with `mode`, seen by `euid`.
+        const fn access(owner: Option<u32>, mode: Option<u32>, euid: Option<u32>) -> Access {
+            Access { owner, mode, euid }
+        }
+
         #[test]
         fn only_a_real_directory_of_the_effective_user_is_shared() {
             use ipe_fs_open::FileKind;
-            assert!(is_private_dir(FileKind::Dir, Some(1000), Some(1000)));
-            assert!(is_private_dir(FileKind::Dir, None, None));
-            assert!(!is_private_dir(FileKind::Dir, Some(0), Some(1000)));
-            assert!(!is_private_dir(FileKind::Dir, None, Some(1000)));
-            assert!(!is_private_dir(FileKind::Symlink, Some(1000), Some(1000)));
-            assert!(!is_private_dir(FileKind::Regular, Some(1000), Some(1000)));
-            assert!(!is_private_dir(FileKind::Other, None, None));
+            let mine = access(Some(1000), Some(0o700), Some(1000));
+            assert!(is_private_dir(FileKind::Dir, mine));
+            assert!(is_private_dir(FileKind::Dir, access(None, None, None)));
+            assert!(!is_private_dir(
+                FileKind::Dir,
+                access(Some(0), Some(0o700), Some(1000))
+            ));
+            assert!(!is_private_dir(
+                FileKind::Dir,
+                access(None, None, Some(1000))
+            ));
+            assert!(!is_private_dir(FileKind::Symlink, mine));
+            assert!(!is_private_dir(FileKind::Regular, mine));
+            assert!(!is_private_dir(FileKind::Other, access(None, None, None)));
+        }
+
+        #[test]
+        fn a_directory_another_user_may_enter_is_never_shared() {
+            use ipe_fs_open::FileKind;
+            for mode in [0o710, 0o701, 0o750, 0o755, 0o770, 0o777, 0o1777] {
+                assert!(
+                    !is_private_dir(FileKind::Dir, access(Some(7), Some(mode), Some(7))),
+                    "mode {mode:o} is shared with another user"
+                );
+            }
+            assert!(is_private_dir(
+                FileKind::Dir,
+                access(Some(7), Some(0o700), Some(7))
+            ));
+        }
+
+        #[test]
+        fn only_a_root_no_other_user_may_write_holds_the_shared_dir() {
+            use ipe_fs_open::FileKind;
+            for mode in [0o700, 0o750, 0o755] {
+                assert!(is_private_root(
+                    FileKind::Dir,
+                    access(Some(7), Some(mode), Some(7))
+                ));
+            }
+            for mode in [0o770, 0o757, 0o777, 0o1777] {
+                assert!(
+                    !is_private_root(FileKind::Dir, access(Some(7), Some(mode), Some(7))),
+                    "mode {mode:o} lets another user replace the shared dir"
+                );
+            }
+            assert!(!is_private_root(
+                FileKind::Dir,
+                access(Some(0), Some(0o755), Some(7))
+            ));
+            assert!(!is_private_root(
+                FileKind::Symlink,
+                access(Some(7), Some(0o755), Some(7))
+            ));
+        }
+
+        #[test]
+        fn a_prune_judges_only_a_directory_of_the_effective_user() {
+            use ipe_fs_open::FileKind;
+            assert!(is_prunable(
+                FileKind::Dir,
+                access(Some(7), Some(0o755), Some(7))
+            ));
+            assert!(is_prunable(FileKind::Dir, access(None, None, None)));
+            assert!(!is_prunable(
+                FileKind::Dir,
+                access(Some(0), Some(0o700), Some(7))
+            ));
+            assert!(!is_prunable(
+                FileKind::Symlink,
+                access(Some(7), Some(0o700), Some(7))
+            ));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_shared_path_other_users_may_enter_falls_to_the_crate_local_dir() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let base = temp("open-mode");
+            let crate_dir = base.join("crate");
+            let shared = scratch_cache_target(&base);
+            ensure_private_scratch(&shared).expect("shared dir");
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777))
+                .expect("open the shared dir");
+            let resolved = LinkableTargetDir::resolve_scratch(LINKER, &crate_dir, &cache(&base))
+                .expect("resolves");
+            assert_eq!(resolved.origin(), TargetDirOrigin::CrateLocal);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_shared_root_of_the_user_loses_its_shared_write_before_use() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let base = temp("open-root");
+            let crate_dir = base.join("crate");
+            let root = user_cache_root(&base);
+            std::fs::create_dir_all(&root).expect("cache root");
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o1777))
+                .expect("open the cache root");
+            let resolved = LinkableTargetDir::resolve_scratch(LINKER, &crate_dir, &cache(&base))
+                .expect("resolves");
+            assert_eq!(resolved.origin(), TargetDirOrigin::ScratchCache);
+            let mode = std::fs::symlink_metadata(&root)
+                .expect("cache root")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o022,
+                0,
+                "no other user may write the root: {mode:o}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_shared_dir_opened_after_resolution_is_refused_at_its_lock() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let base = temp("opened-late");
+            let crate_dir = base.join("crate");
+            let resolved = LinkableTargetDir::resolve_scratch(LINKER, &crate_dir, &cache(&base))
+                .expect("resolves");
+            assert_eq!(resolved.origin(), TargetDirOrigin::ScratchCache);
+            std::fs::set_permissions(resolved.path(), std::fs::Permissions::from_mode(0o755))
+                .expect("open the shared dir");
+            let locked = LinkableTargetDir::lock_scratch(
+                resolved,
+                crate::remote_ingest::LocalWall::of_secs::<1>(),
+            );
+            assert!(
+                matches!(locked, Err(CliError::Io { .. })),
+                "the shared dir is re-proven at its lock: {locked:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_pruned_shared_dir_is_recreated_owner_only_by_its_waiter() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let base = temp("recreated");
+            let shared = scratch_cache_target(&base);
+            ensure_private_scratch(&shared).expect("private dir");
+            let mut opens = 0_u32;
+            let held = TargetLock::acquire_with(
+                &shared,
+                DirPrep::Private,
+                crate::remote_ingest::LocalWall::of_secs::<1>(),
+                || {
+                    opens += 1;
+                    if opens == 1 {
+                        std::fs::remove_dir_all(&shared).expect("pruned");
+                    }
+                },
+            )
+            .expect("the waiter takes the recreated dir");
+            assert_eq!(opens, 2, "one retry after the removal");
+            let mode = std::fs::symlink_metadata(&shared)
+                .expect("recreated")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "recreated owner-only: {mode:o}");
+            drop(held);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn the_lock_file_is_created_owner_only() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let base = temp("lock-mode");
+            let held = TargetLock::acquire(&base, crate::remote_ingest::LocalWall::of_secs::<1>())
+                .expect("locks");
+            let mode = std::fs::symlink_metadata(base.join(TEST_LOCK_FILE))
+                .expect("lock file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "no other user may open the lock: {mode:o}");
+            drop(held);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_hard_linked_lock_file_is_refused_and_left_untouched() {
+            let base = temp("linked-lock");
+            let victim = base.join("victim");
+            std::fs::write(&victim, "kept").expect("victim");
+            age(&victim, OLD);
+            let before = std::fs::metadata(&victim)
+                .and_then(|meta| meta.modified())
+                .expect("mtime");
+            std::fs::hard_link(&victim, base.join(TEST_LOCK_FILE)).expect("planted link");
+            let held = TargetLock::acquire(&base, crate::remote_ingest::LocalWall::of_secs::<1>());
+            assert!(
+                matches!(held, Err(CliError::Io { .. })),
+                "a lock file another entry names is refused: {held:?}"
+            );
+            let after = std::fs::metadata(&victim)
+                .and_then(|meta| meta.modified())
+                .expect("mtime");
+            assert_eq!(before, after, "the linked file's stamp is never written");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_busy_refusal_names_the_lock_and_its_removal() {
+            let path = std::path::Path::new("/cache/ipe/t/scratch-0/.ipe-test.lock");
+            let shown = CliError::TestTargetBusy {
+                path: TerminalSafe::sanitize(&path.to_string_lossy()),
+                wall: crate::remote_ingest::LocalWall::of_secs::<1>(),
+            }
+            .to_string();
+            assert!(shown.contains(".ipe-test.lock"), "{shown}");
+            assert!(shown.contains("remove"), "{shown}");
+        }
+
+        #[test]
+        fn a_lock_taken_and_freed_after_the_staleness_check_keeps_its_dir() {
+            let base = temp("prune-retaken");
+            let root = user_cache_root(&base);
+            let old = sibling(&root, "scratch-old", OLD);
+            prune_if_stale_with(
+                &old,
+                std::time::SystemTime::now(),
+                SCRATCH_RETENTION,
+                || {
+                    drop(
+                        TargetLock::acquire(&old, crate::remote_ingest::LocalWall::of_secs::<1>())
+                            .expect("a run takes the lock"),
+                    );
+                },
+            )
+            .expect("prunes");
+            assert!(old.exists(), "a dir used since the check is kept");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_lockless_dir_a_run_enters_after_the_staleness_check_is_kept() {
+            let base = temp("prune-entered");
+            let root = user_cache_root(&base);
+            let dir = root.join("scratch-lockless");
+            std::fs::create_dir_all(&dir).expect("dir");
+            let then = std::time::SystemTime::now()
+                .checked_sub(OLD)
+                .expect("representable");
+            std::fs::File::open(&dir)
+                .and_then(|handle| handle.set_modified(then))
+                .expect("age the dir");
+            prune_if_stale_with(
+                &dir,
+                std::time::SystemTime::now(),
+                SCRATCH_RETENTION,
+                || {
+                    drop(
+                        TargetLock::acquire(&dir, crate::remote_ingest::LocalWall::of_secs::<1>())
+                            .expect("a run takes and frees the lock"),
+                    );
+                },
+            )
+            .expect("prunes");
+            assert!(dir.exists(), "a dir a run entered is kept");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_pruned_dir_loses_its_lock_file_only_after_its_contents() {
+            let base = temp("prune-order");
+            let root = user_cache_root(&base);
+            let old = sibling(&root, "scratch-old", OLD);
+            std::fs::write(old.join("debug").join("unit.rlib"), "unit").expect("unit");
+            std::fs::write(old.join("ipe-test-run-1"), "runner").expect("runner");
+            let lock_path = old.join(TEST_LOCK_FILE);
+            let mut seen = None;
+            remove_locked_dir(&old, || {
+                let left = std::fs::read_dir(&old)
+                    .expect("dir kept")
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>();
+                seen = Some((left, lock_path.is_file()));
+            })
+            .expect("removes");
+            let (left, locked) = seen.expect("called once");
+            assert_eq!(left, vec![std::ffi::OsString::from(TEST_LOCK_FILE)]);
+            assert!(locked, "the lock file is the last entry left");
+            assert!(!old.exists(), "the dir is removed");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn an_entry_made_after_the_contents_went_keeps_the_dir() {
+            let base = temp("prune-reentered");
+            let root = user_cache_root(&base);
+            let old = sibling(&root, "scratch-old", OLD);
+            let late = old.join("late");
+            let removed = remove_locked_dir(&old, || {
+                std::fs::write(&late, "").expect("a run's late entry");
+            });
+            assert!(removed.is_ok(), "{removed:?}");
+            assert!(
+                late.exists(),
+                "nothing made after the contents went is removed"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_dir_another_pruner_removed_is_no_error() {
+            let base = temp("prune-raced");
+            let root = user_cache_root(&base);
+            let old = sibling(&root, "scratch-old", OLD);
+            let pruned = prune_if_stale_with(
+                &old,
+                std::time::SystemTime::now(),
+                SCRATCH_RETENTION,
+                || {
+                    std::fs::remove_dir_all(&old).expect("the other pruner");
+                },
+            );
+            assert!(pruned.is_ok(), "{pruned:?}");
+            assert!(!old.exists(), "the lock file is never recreated");
+            let _ = std::fs::remove_dir_all(&base);
         }
 
         #[test]
@@ -1488,6 +2172,7 @@ mod tests {
             let mut opens = 0_u32;
             let held = TargetLock::acquire_with(
                 &base,
+                DirPrep::Plain,
                 crate::remote_ingest::LocalWall::of_secs::<1>(),
                 || {
                     opens += 1;
@@ -1515,6 +2200,7 @@ mod tests {
             let lock_path = base.join(TEST_LOCK_FILE);
             let held = TargetLock::acquire_with(
                 &base,
+                DirPrep::Plain,
                 crate::remote_ingest::LocalWall::of_secs::<1>(),
                 || {
                     std::fs::remove_file(&lock_path).expect("unlink");
