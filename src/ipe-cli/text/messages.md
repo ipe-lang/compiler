@@ -719,6 +719,19 @@ the project's build directory
 
 the per-user build cache the compiler would build in instead
 
+## cli-target-dir-scratch-cache
+
+the shared test build directory in the per-user cache
+
+## cli-test-target-busy
+
+another `ipe test` held the test build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe test` is running, or set `CARGO_TARGET_DIR` to build elsewhere
+
+## cli-bundled-manifest
+
+could not prepare the bundled runtime manifest: {detail}
+  the build was stopped rather than link a runtime of unknown identity
+
 ## cli-target-dir-sysroot
 
 the Rust toolchain at

@@ -25,6 +25,9 @@ pub enum CrateName {
     /// A manifest project: the sanitized name joined with the project's
     /// canonical-path digest, built only by [`crate::crate_identity`].
     Identity(CrateIdentity),
+    /// The `ipe test` runner: the fixed `ipe-test` name, never read from the
+    /// environment.
+    Test,
 }
 
 impl CrateName {
@@ -35,12 +38,16 @@ impl CrateName {
             Self::SingleFile => SINGLE_FILE_CRATE_NAME,
             Self::Pinned(name) => name.as_str(),
             Self::Identity(identity) => identity.as_str(),
+            Self::Test => TEST_CRATE_NAME,
         }
     }
 }
 
 /// The crate name of a single-file build with no pinned name.
 pub const SINGLE_FILE_CRATE_NAME: &str = "ipe-app";
+
+/// The crate name of the `ipe test` runner.
+pub const TEST_CRATE_NAME: &str = "ipe-test";
 
 /// How the emitted program is hosted.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -186,6 +193,7 @@ impl EmitSettings {
                 payload.push(2);
                 push_framed(&mut payload, identity.as_str().as_bytes());
             }
+            CrateName::Test => payload.push(3),
         }
         emit_field(sink, FieldTag::CrateName, &payload);
 

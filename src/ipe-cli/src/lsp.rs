@@ -119,6 +119,8 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::EmittedBuildFailed { .. }
         | CliError::CargoBuildTimedOut { .. }
         | CliError::TargetDirUnlinkable { .. }
+        | CliError::BundledManifest { .. }
+        | CliError::TestTargetBusy { .. }
         | CliError::UnknownCode { .. }
         | CliError::DocNotFound { .. }
         | CliError::StaticRefusal(_)
