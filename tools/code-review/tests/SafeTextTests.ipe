@@ -25,7 +25,7 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Label as Label exposing (Label, LabelPart(..))
+import Lib.Label as Label exposing (ColumnExtent(..), Label, LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
@@ -507,6 +507,45 @@ wholeOnlyWithinWindow =
         == Nothing
 
 
+-- A column's extent names why its window falls short: a window of
+-- `windowChars` characters short of the column's bytes is cut at the
+-- window; a shorter window short of them was cut at a NUL byte; a window
+-- holding more bytes than the column, or wider than the window, is a BLOB's
+-- hex spelling. Red if a NUL cut reads as a long column, or a hex spelling
+-- as text.
+extentNamesItsCause : Bool
+extentNamesItsCause =
+    let
+        at =
+            String.repeat Label.windowChars "a"
+    in
+    List.map (\column -> extentName (Label.extent column))
+        [ Label.columnOf "ipe:src/Main.ipe"
+        , Label.columnOf (at ++ "a")
+        , { shown = "ipe:src/Ma", bytes = 17 }
+        , { shown = "6970653a", bytes = 4 }
+        , { shown = String.repeat Label.windowChars "6c", bytes = 2 * Label.windowChars }
+        , { shown = at, bytes = Label.windowChars + 1 }
+        ]
+        == [ "whole ipe:src/Main.ipe", "window", "nul", "not text", "not text", "window" ]
+
+
+extentName : ColumnExtent -> String
+extentName found =
+    case found of
+        WholeColumn text ->
+            "whole " ++ text
+
+        CutAtWindow ->
+            "window"
+
+        CutAtNul ->
+            "nul"
+
+        NotTextCell ->
+            "not text"
+
+
 droppedBytes : Label -> Maybe Int
 droppedBytes label =
     case List.head (List.reverse (Label.parts label)) of
@@ -543,4 +582,5 @@ checks =
         , Task.succeed ( "a quoted label escapes its quote and backslash", quotedLabelEscapesQuotes )
         , Task.succeed ( "a hazard-dense quoted label draws at most the element ceiling", quotedLabelBounded )
         , Task.succeed ( "a column is whole only within the window", wholeOnlyWithinWindow )
+        , Task.succeed ( "a column's extent names why its window falls short", extentNamesItsCause )
         ]

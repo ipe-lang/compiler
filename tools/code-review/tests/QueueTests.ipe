@@ -793,6 +793,8 @@ unitPageStatesDistinct =
             , Unreadable (CannotRead (quotedLabelOf "ipe:dir.rs"))
             , Unreadable (PathRefused (UnknownTag (quotedLabelOf "other:a.rs")))
             , Unreadable (PathPastWindow (quotedLabelOf (String.repeat (Label.windowChars + 1) "a")))
+            , Unreadable (PathHoldsNul (quotedLabelOf "ipe:src/Ma"))
+            , Unreadable (PathNotText (quotedLabelOf "69"))
             , TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 })
             , TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
             , TooLarge (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
@@ -1057,7 +1059,6 @@ sampleQueuedUnit =
     , facing = labelOf "internal"
     , purpose = Nothing
     , attested = Index.UnknownScheme "hash-sample"
-    , updatedSha = "sha-sample"
     }
     , change = Index.New
     , changed = Nothing

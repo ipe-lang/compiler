@@ -19,7 +19,7 @@ import Ipe.Tuple as Tuple
 import Lib.Drawn as Drawn exposing (DrawnSource, SourceRow(..))
 import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Highlight as Highlight
-import Lib.Label as Label exposing (Label, LabelPiece(..))
+import Lib.Label as Label exposing (ColumnExtent(..), Label, LabelPiece(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (PathError, Root, RootMap, Tag)
@@ -36,8 +36,8 @@ import Lib.Uid as Uid exposing (Uid)
 -- `facing`; `purpose`) is a `Label`, read through a bounded window and
 -- parsed once in `withRow`, so no index text reaches a page raw or
 -- unbounded; `lang` is the language ipe-index stores for the unit's file,
--- parsed for highlighting. `attested` is the stored body hash,
--- parsed once.
+-- read through the same window and parsed for highlighting. `attested` is
+-- the stored body hash, read whole or not at all, parsed once.
 type alias Unit =
     { uid : Uid
     , path : Label
@@ -50,7 +50,6 @@ type alias Unit =
     , facing : Label
     , purpose : Maybe Label
     , attested : AttestedHash
-    , updatedSha : String
     }
 
 
@@ -75,7 +74,7 @@ unitByUid roots uid =
         bound =
             boundTags roots
     in
-    ( "SELECT u.uid, u.line_start, u.line_end, u.body_hash, u.updated_sha, f.lang, " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
+    ( "SELECT u.uid, u.line_start, u.line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
     , Uid.toSql uid :: bound.params
     )
 
@@ -267,14 +266,15 @@ qualifiedDecoder =
         |> Db.Decode.required "uid" (Db.Decode.string "uid")
 
 
--- The columns every unit row carries into a `Unit` besides its labels.
+-- The columns every unit row carries into a `Unit` besides its labels:
+-- `bodyHash` is the whole stored hash (a row whose window does not hold all
+-- of it fails the read), and `lang` the window of the file's language.
 type alias RowCore =
     { uid : Uid
     , lineStart : Int
     , lineEnd : Int
     , bodyHash : String
-    , updatedSha : String
-    , lang : Maybe String
+    , lang : Maybe Label.Column
     }
 
 
@@ -346,6 +346,28 @@ nullableColumnDecoder col =
         )
 
 
+-- A windowed column the app acts on: its whole text, or the read fails
+-- naming the column and how its window fell short, never the value.
+wholeColumnDecoder : String -> Db.Decode.Decoder String
+wholeColumnDecoder col =
+    Db.Decode.andThen
+        (\column ->
+            case Label.extent column of
+                WholeColumn text ->
+                    Db.Decode.succeed text
+
+                CutAtWindow ->
+                    Db.Decode.fail (col ++ " is longer than the " ++ String.fromInt Label.windowChars ++ " characters the index read returns")
+
+                CutAtNul ->
+                    Db.Decode.fail (col ++ " holds a NUL byte, where the index read stops")
+
+                NotTextCell ->
+                    Db.Decode.fail (col ++ " is not stored as text")
+        )
+        (columnDecoder col)
+
+
 shownDecoder : Db.Decode.Decoder RowShown
 shownDecoder =
     Db.Decode.map2
@@ -358,13 +380,14 @@ shownDecoder =
 
 coreDecoder : Db.Decode.Decoder RowCore
 coreDecoder =
-    Db.Decode.succeed (\uid lineStart lineEnd bodyHash updatedSha lang -> { uid = uid, lineStart = lineStart, lineEnd = lineEnd, bodyHash = bodyHash, updatedSha = updatedSha, lang = lang })
-        |> Db.Decode.required "uid" (Uid.decoder "uid")
-        |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
-        |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
-        |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
-        |> Db.Decode.required "updated_sha" (Db.Decode.string "updated_sha")
-        |> Db.Decode.required "lang" (Db.Decode.nullable (Db.Decode.string "lang"))
+    Db.Decode.map3 (\( uid, lineStart, lineEnd ) bodyHash lang -> { uid = uid, lineStart = lineStart, lineEnd = lineEnd, bodyHash = bodyHash, lang = lang })
+        (Db.Decode.succeed (\uid lineStart lineEnd -> ( uid, lineStart, lineEnd ))
+            |> Db.Decode.required "uid" (Uid.decoder "uid")
+            |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
+            |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
+        )
+        (wholeColumnDecoder "body_hash")
+        (nullableColumnDecoder "lang")
 
 
 -- The startup check of `IPE_INDEX_DB`: the index is opened read-only and
@@ -402,7 +425,7 @@ probeRepos settings =
             (\tx ->
                 do
                     recorded <- Db.queryDecode tx reposSql [ SqlInt (RepoPath.maxRoots + 1) ] repoRowDecoder
-                    anyUnit <- Db.queryDecode tx anyPathSql [] storedPathDecoder
+                    anyUnit <- Db.queryDecode tx anyUnitSql [] anyUnitDecoder
                     Task.succeed ( recorded, anyUnit )
             )
     )
@@ -564,25 +587,26 @@ probeRoot settings =
     (do
         conn <- readConnection settings
         samples <- Task.sequence (List.map (rootSampleOf conn) (RepoPath.boundRoots settings.roots))
-        anyUnit <- Db.queryDecode conn anyPathSql [] storedPathDecoder
+        anyUnit <- Db.queryDecode conn anyUnitSql [] anyUnitDecoder
         Task.succeed ( samples, anyUnit )
     )
         |> Task.onError (Settings.openFailure IndexDb settings.db.path)
         |> Task.andThen (\( samples, anyUnit ) -> rootsHold settings.roots samples anyUnit)
 
 
--- One configured root with the indexed paths sampled under its tag, the
--- setting that named it, and that setting's fix.
+-- One configured root with the indexed paths sampled under its tag, each
+-- read as a bounded window, the setting that named it, and that setting's
+-- fix.
 type alias RootSample =
     { tag : Tag
     , rootDir : Path
     , origin : SafeText
     , fix : SafeText
-    , stored : List String
+    , stored : List Label.Column
     }
 
 
-rootsHold : RootMap -> List RootSample -> List String -> Task.Task Error ()
+rootsHold : RootMap -> List RootSample -> List Int -> Task.Task Error ()
 rootsHold roots samples anyUnit =
     if List.all (\sample -> List.isEmpty sample.stored) samples && not (List.isEmpty anyUnit) then
         Task.fail (noTaggedPath (List.map (\sample -> sample.tag) samples))
@@ -598,12 +622,13 @@ rootSampleOf conn ( tag, root ) =
         prefix =
             RepoPath.tagName tag ++ ":"
     in
-    Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] storedPathDecoder
+    Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] (columnDecoder "path")
         |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, origin = RepoPath.rootOrigin tag root, fix = RepoPath.rootFixFor root, stored = stored })
 
 
 -- Succeeds when the sample is empty or any sampled path joins to a file
--- that exists; a path the map refuses counts as absent.
+-- that exists; a path the map refuses, or whose window does not hold all of
+-- it, counts as absent.
 rootHolds : RootMap -> RootSample -> Task.Task Error ()
 rootHolds roots sample =
     case List.head sample.stored of
@@ -628,50 +653,65 @@ rootSample =
     16
 
 
--- The distinct paths under one tag: the stored path starts with `tag:`,
--- compared by `substr`, so no character of the tag is a pattern.
+-- The distinct paths under one tag, each as its window and byte length:
+-- the stored path starts with `tag:`, compared by `substr`, so no character
+-- of the tag is a pattern.
 taggedPathsSql : String
 taggedPathsSql =
-    "SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?"
+    "SELECT " ++ shownColumn "path" "path" ++ " FROM (SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?) ORDER BY path"
 
 
-anyPathSql : String
-anyPathSql =
-    "SELECT path FROM units LIMIT 1"
+-- Whether the index holds any unit, read without any of its columns.
+anyUnitSql : String
+anyUnitSql =
+    "SELECT 1 AS one FROM units LIMIT 1"
 
 
-storedPathDecoder : Db.Decode.Decoder String
-storedPathDecoder =
-    Db.Decode.succeed (\path -> path)
-        |> Db.Decode.required "path" (Db.Decode.string "path")
+anyUnitDecoder : Db.Decode.Decoder Int
+anyUnitDecoder =
+    Db.Decode.succeed (\one -> one)
+        |> Db.Decode.required "one" (Db.Decode.int "one")
 
 
--- Whether `stored` joins under its root to something that exists.
-presentUnder : RootMap -> String -> Task.Task Error Bool
+-- Whether `stored` is a whole path that joins under its root to something
+-- that exists.
+presentUnder : RootMap -> Label.Column -> Task.Task Error Bool
 presentUnder roots stored =
-    case RepoPath.resolve roots stored of
-        Ok path ->
+    case Maybe.map (RepoPath.resolve roots) (Label.whole stored) of
+        Just (Ok path) ->
             File.exists path |> Task.onError (\_ -> Task.succeed False)
 
-        Err _ ->
+        Just (Err _) ->
+            Task.succeed False
+
+        Nothing ->
             Task.succeed False
 
 
-rootMismatch : RootSample -> Int -> String -> Error
+-- The refusal naming the first sampled path as its bounded quoted label.
+rootMismatch : RootSample -> Int -> Label.Column -> Error
 rootMismatch sample sampled first =
     Error.invalidInput
         (SafeText.toString
-            (SafeText.concat
-                [ sample.origin
-                , SafeText.literal " holds none of the "
-                , SafeText.render (String.fromInt sampled)
-                , SafeText.literal " indexed files checked: index path "
-                , SafeText.quoted first
-                , SafeText.literal " is not found under "
-                , SafeText.quoted (Path.toString sample.rootDir)
-                , SafeText.literal "; "
-                , sample.fix
-                , SafeText.literal ", or re-run `tools/scripts/ipe-index index` if the indexed files have moved"
+            (Label.piecesText
+                [ ToolText
+                    (SafeText.concat
+                        [ sample.origin
+                        , SafeText.literal " holds none of the "
+                        , SafeText.render (String.fromInt sampled)
+                        , SafeText.literal " indexed files checked: index path \""
+                        ]
+                    )
+                , IndexedLabel (storedPathLabel first)
+                , ToolText
+                    (SafeText.concat
+                        [ SafeText.literal "\" is not found under "
+                        , SafeText.quoted (Path.toString sample.rootDir)
+                        , SafeText.literal "; "
+                        , sample.fix
+                        , SafeText.literal ", or re-run `tools/scripts/ipe-index index` if the indexed files have moved"
+                        ]
+                    )
                 ]
             )
         )
@@ -786,7 +826,7 @@ changeOf change old =
 -- one this reviewer does not know.
 openColumns : BoundTags -> String
 openColumns bound =
-    "SELECT uid, line_start, line_end, body_hash, updated_sha, lang, " ++ unitShownSelect ++ ", change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.line_start AS line_start, u.line_end AS line_end, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, " ++ unitShownColumns ++ ", q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
+    "SELECT uid, line_start, line_end, body_hash_shown, body_hash_bytes, lang_shown, lang_bytes, " ++ unitShownSelect ++ ", change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.line_start AS line_start, u.line_end AS line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ ", q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
 
 
 -- The membership condition on a unit row `u`: no pair of the `reviewed`
@@ -1960,7 +2000,8 @@ refusalPathFor conn uid =
 
 -- The one verification of a unit's source. The stored hash is parsed first,
 -- so an unknown scheme refuses before any read; then a stored path longer
--- than its window is refused, so no prefix is ever joined; then the stored
+-- than its window, cut at a NUL byte or not stored as text is refused under
+-- that cause, so no prefix is ever joined; then the stored
 -- path is resolved, a span past the line ceiling is withheld before any
 -- read, a file unit's child spans are read on `conn`, the file is read and
 -- `classifyView` judges the view. Every per-unit cause (refused path,
@@ -1973,11 +2014,17 @@ viewOf conn roots row columns =
             Task.succeed (Stale UnverifiableHash)
 
         Just stored ->
-            case Label.whole columns.path of
-                Nothing ->
+            case Label.extent columns.path of
+                CutAtWindow ->
                     Task.succeed (Unreadable (PathPastWindow (storedPathLabel columns.path)))
 
-                Just storedPath ->
+                CutAtNul ->
+                    Task.succeed (Unreadable (PathHoldsNul (storedPathLabel columns.path)))
+
+                NotTextCell ->
+                    Task.succeed (Unreadable (PathNotText (storedPathLabel columns.path)))
+
+                WholeColumn storedPath ->
                     case RepoPath.resolve roots storedPath of
                         Err refusal ->
                             Task.succeed (Unreadable (PathRefused refusal))
@@ -2093,6 +2140,12 @@ readFailureText failure =
                     , SafeText.literal " characters the index read returns, so it is never joined; re-run `ipe-index index` from a checkout with shorter paths"
                     ]
                 )
+
+        PathHoldsNul stored ->
+            storedPathText stored (SafeText.literal "holds a NUL byte, where the index read stops, so it is never joined; re-run `ipe-index index` so the path is stored as the file's name")
+
+        PathNotText stored ->
+            storedPathText stored (SafeText.literal "is not stored as text, so it is never joined; re-run `ipe-index index` so the path is stored as the file's name")
 
         NoFile stored ->
             storedPathText stored (SafeText.literal "names no file under the repository root; re-run `ipe-index index` if the file was moved or deleted")
@@ -2419,15 +2472,15 @@ withRow row shown =
     , facing = Label.parse Label.labelCap shown.facing
     , purpose = Maybe.map (Label.parse Label.purposeCap) shown.purpose
     , attested = parseAttested row.bodyHash
-    , updatedSha = row.updatedSha
     }
 
 
--- A stored file language parsed for highlighting; a unit with no file row
--- reads as `Unknown`, shown as escaped plain text.
-langOf : Maybe String -> Highlight.Lang
+-- A stored file language parsed for highlighting; a unit with no file row,
+-- or whose language the window does not hold whole, reads as `Unknown`,
+-- shown as escaped plain text.
+langOf : Maybe Label.Column -> Highlight.Lang
 langOf stored =
-    case stored of
+    case Maybe.andThen Label.whole stored of
         Just lang ->
             Highlight.langFor lang
 
@@ -2990,13 +3043,17 @@ type SourceView
 
 
 -- Why a unit's file was not read: its stored path was refused before any
--- read, it is longer than the window the index read returns (so no prefix of
--- it is ever joined), nothing is at the joined path, or what is there did
--- not read as text within `sourceCeiling`. Each case but a refusal names the
--- stored path as a quoted label; a refusal's `PathError` names it itself.
+-- read; the index read did not return all of it (it is longer than the
+-- window, it holds a NUL byte where the read stops, or it is not stored as
+-- text), so no part of it is ever joined; nothing is at the joined path; or
+-- what is there did not read as text within `sourceCeiling`. Each case but a
+-- refusal names the stored path as a quoted label; a refusal's `PathError`
+-- names it itself.
 type ReadFailure
     = PathRefused PathError
     | PathPastWindow Label
+    | PathHoldsNul Label
+    | PathNotText Label
     | NoFile Label
     | CannotRead Label
 

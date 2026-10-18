@@ -33,7 +33,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid, insertUnboundUnit, labelText)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid, insertUnboundUnit, labelText, piecesShown)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -191,17 +191,83 @@ pathPastWindowRefused =
                         + Label.markerByteCeiling
                         && List.length (Label.parts stored)
                         <= Label.elementCeiling
-                        && not (pastWindow failure)
+                        && not (windowFailure failure)
 
                 _ ->
                     False
             )
 
 
-pastWindow : ReadFailure -> Bool
-pastWindow failure =
+-- A stored path cut at a NUL byte inside the read window is refused before
+-- any join or read under that cause, never as a path past the window, and is
+-- named by a bounded label. Red if the NUL cut is misreported as a long path
+-- or the cut prefix reaches `resolve` or the read.
+pathCutAtNulRefused : Task.Task Error Bool
+pathCutAtNulRefused =
+    do
+        at <- freshScratch "ipe-index-path-nul"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET path = 'ipe:src/Ma' || char(0) || 'in.ipe' WHERE uid = ?" [ Uid.toSql (uid "u-b") ]
+        cut <- loadUnitNow (uid "u-b")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (case Maybe.map .view cut of
+                Just (Unreadable (PathHoldsNul stored)) ->
+                    Label.byteCount stored
+                        <= Label.capBytes Label.labelCap
+                        + Label.markerByteCeiling
+                        && List.any isCut (Label.parts stored)
+                        && String.contains "holds a NUL byte" (piecesShown (Index.readFailureText (PathHoldsNul stored)))
+
+                _ ->
+                    False
+            )
+
+
+-- A stored body hash longer than the read window fails the unit's read,
+-- never parsed from its prefix, and the failure never repeats the stored
+-- value. Red if a cut hash reaches `parseAttested` or the review lookup.
+bodyHashPastWindowFailsRead : Task.Task Error Bool
+bodyHashPastWindowFailsRead =
+    do
+        at <- freshScratch "ipe-index-hash-past-window"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET body_hash = 'sha256:' || replace(hex(zeroblob(3000)), '0', 'a') WHERE uid = ?" [ Uid.toSql (uid "u-b") ]
+        failed <- probeMessage (loadUnitNow (uid "u-b") |> Task.map (\_ -> ()))
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (failed
+                /= Nothing
+                && not (maybeContains (String.repeat 64 "a") failed)
+            )
+
+
+isCut : LabelPart -> Bool
+isCut part =
+    case part of
+        LabelCut _ _ ->
+            True
+
+        LabelText _ ->
+            False
+
+        LabelEscapes _ ->
+            False
+
+
+-- Whether a read failure is the index read not returning the whole path.
+windowFailure : ReadFailure -> Bool
+windowFailure failure =
     case failure of
         PathPastWindow _ ->
+            True
+
+        PathHoldsNul _ ->
+            True
+
+        PathNotText _ ->
             True
 
         PathRefused _ ->
@@ -1775,6 +1841,8 @@ checks =
         , check "source file past the read ceiling refused" oversizedSourceRefused
         , check "an unreadable file renders a typed reason, never the OS error" unreadableReasonsTyped
         , check "a stored path past the read window is refused before the join" pathPastWindowRefused
+        , check "a stored path cut at a NUL byte is refused under that cause" pathCutAtNulRefused
+        , check "a stored body hash past the read window fails the unit's read" bodyHashPastWindowFailsRead
         , check "view and attestation match the shared ipe-index vectors" viewHashVectors
         , check "a file unit's residual matches the shared ipe-index vectors" residualVectors
         , check "a file unit shows and attests its residual, never its whole range" fileUnitShowsResidual

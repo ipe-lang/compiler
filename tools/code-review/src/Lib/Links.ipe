@@ -786,41 +786,37 @@ isUrl token =
     String.startsWith "http://" token || String.startsWith "https://" token
 
 
--- One pass over the word: leading punctuation is dropped, and a run of
--- punctuation is held back until a later character shows it is not trailing.
+-- The word without its leading and trailing punctuation: one pass finds
+-- the first and the last character that is not punctuation, and the word is
+-- cut between them once, so the cost is linear in the word.
 trimPunct : String -> String
 trimPunct token =
-    case String.foldl trimStep Leading token of
-        Leading ->
+    case (String.foldl trimStep { at = 0, kept = Nothing } token).kept of
+        Just ( start, end ) ->
+            String.slice start end token
+
+        Nothing ->
             ""
 
-        Kept text _ ->
-            text
 
-
--- Where `trimPunct` is: in the leading punctuation, or past it with the text
--- kept and the punctuation run read since.
-type Trim
-    = Leading
-    | Kept String String
+-- Where `trimPunct` is: the index of the next character, and the span from
+-- the first to just past the latest character that is not punctuation.
+type alias Trim =
+    { at : Int, kept : Maybe ( Int, Int ) }
 
 
 trimStep : Char -> Trim -> Trim
 trimStep c trim =
-    case trim of
-        Leading ->
-            if isPunct c then
-                Leading
+    if isPunct c then
+        { trim | at = trim.at + 1 }
 
-            else
-                Kept (String.fromChar c) ""
+    else
+        case trim.kept of
+            Just ( start, _ ) ->
+                { at = trim.at + 1, kept = Just ( start, trim.at + 1 ) }
 
-        Kept text held ->
-            if isPunct c then
-                Kept text (String.append held (String.fromChar c))
-
-            else
-                Kept (String.append (String.append text held) (String.fromChar c)) ""
+            Nothing ->
+                { at = trim.at + 1, kept = Just ( trim.at, trim.at + 1 ) }
 
 
 -- Char literals for quote/backslash escapes crash the formatter (IPE-I0001
