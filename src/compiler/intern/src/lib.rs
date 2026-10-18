@@ -369,9 +369,10 @@ impl Interner {
 // `Interner::intern` accepts ANY string by design (it is a pure append-only
 // table with no opinion about identifier shapes — see its own doc). The
 // backend, however, trusts an interned string VERBATIM when emitting Rust
-// identifiers (`ipe_backend_rust`'s `resolve_ident`/`emit_ident` do not
-// sanitise; `naming::mangle_reserved` only appends `_` on an EXACT keyword
-// match). A cache file is written by a previous, possibly-compromised or
+// identifiers (`ipe_backend_rust`'s `resolve_ident`, `emit_local_ident` and
+// `emit_member_ident` do not sanitise; `naming::local_ident` only prefixes a
+// `__`-leading local and `naming::mangle_reserved` only appends `_` on an
+// EXACT keyword match). A cache file is written by a previous, possibly-compromised or
 // tampered, process — so a poisoned entry containing e.g. `"x; std::process
 // ::exit(1); //"` as a `Symbol`'s text could splice arbitrary Rust source
 // into the next build's emitted `main.rs`, reached the moment `cargo build`

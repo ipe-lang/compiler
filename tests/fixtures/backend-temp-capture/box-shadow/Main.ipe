@@ -1,0 +1,27 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+-- A pattern binder spelled like the backend's boxed-field temporary, beside a
+-- destructure of the boxed self-edge field that mints `__ipe_box_0`. Both
+-- binders must stay distinct, so the program builds and prints `42`.
+
+
+type Tree
+    = Leaf
+    | Node ( Tree, Int ) Int
+
+
+weigh : Tree -> Int
+weigh t =
+    case t of
+        Leaf ->
+            0
+
+        Node ( _, x ) __ipe_box_0 ->
+            x * 10 + __ipe_box_0
+
+
+main =
+    Io.println (String.fromInt (weigh (Node ( Leaf, 4 ) 2)))

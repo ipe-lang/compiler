@@ -83,7 +83,7 @@ pub fn emit_expr_tail(
             ))
         }
         Expr::Let { name, value, body } => {
-            let n = ctx.emit_ident(*name)?;
+            let n = ctx.emit_local_ident(*name)?;
             let v = emit_expr_at(ctx, value, indent, child, generics)?;
             let b = emit_expr_tail(ctx, body, indent, child, generics, loop_params)?;
             Ok(format!("{pad}let {n} = {v};\n{b}"))
@@ -131,7 +131,7 @@ pub fn emit_expr_tail(
             }
             let mut writes = String::new();
             for (idx, (name, _ty)) in loop_params.iter().enumerate() {
-                let n = ctx.emit_ident(*name)?;
+                let n = ctx.emit_local_ident(*name)?;
                 writeln!(writes, "{pad}{n} = __tco_{idx};").map_err(|e| {
                     Diagnostic::CompilerBug {
                         where_: "ipe_backend_rust::emit_expr_tail",
@@ -221,7 +221,7 @@ pub fn emit_apply(
         let child = depth + 1;
         let mut bindings = String::new();
         for ((param, ty), arg) in params.iter().zip(args.iter()) {
-            let p = ctx.emit_ident(*param)?;
+            let p = ctx.emit_local_ident(*param)?;
             let t = render_type(ctx, ty, generics)?;
             let a = emit_expr_at(ctx, arg, indent, child, generics)?;
             // write! to String is infallible (String::write_fmt delegates to push_str).
@@ -323,7 +323,7 @@ pub fn emit_lambda_unboxed(
     for (param, ty) in params {
         parts.push(format!(
             "{}: {}",
-            ctx.emit_ident(*param)?,
+            ctx.emit_local_ident(*param)?,
             render_type(ctx, ty, generics)?
         ));
     }
@@ -910,7 +910,7 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
         } else {
             render_type(ctx, ty, generics)?
         };
-        params.push(format!("{}: {rendered}", ctx.emit_ident(*param)?));
+        params.push(format!("{}: {rendered}", ctx.emit_local_ident(*param)?));
     }
     let ret = render_type(ctx, ret_ty, generics)?;
 
@@ -998,7 +998,7 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
             } => {
                 let mut shadows = String::new();
                 for (param, _ty) in loop_params {
-                    let p = ctx.emit_ident(*param)?;
+                    let p = ctx.emit_local_ident(*param)?;
                     write!(shadows, "let mut {p} = {p};\n    ").map_err(|e| {
                         Diagnostic::CompilerBug {
                             where_: "ipe_backend_rust::emit_func",

@@ -3593,11 +3593,21 @@ impl<'a> EmitCtx<'a> {
         }
     }
 
-    /// Resolve a symbol to the Rust identifier to emit for it: checked for
-    /// emptiness ([`Self::resolve_ident`]) and then mangled if it collides with
-    /// a Rust keyword ([`naming::mangle_reserved`]). Used for every emitted
-    /// value/variant/param name.
-    pub(crate) fn emit_ident(&self, sym: Symbol) -> DResult<String> {
+    /// The Rust identifier for a local binder and every read of it.
+    ///
+    /// A local is a parameter, a `let` or pattern binder, or a closure
+    /// parameter. Spelled by [`naming::local_ident`], whose image is disjoint
+    /// from the backend's `__ipe_` temporaries, so no temporary can shadow a
+    /// user local. A binder and its references must both come through here.
+    pub(crate) fn emit_local_ident(&self, sym: Symbol) -> DResult<String> {
+        Ok(naming::local_ident(self.resolve_ident(sym)?))
+    }
+
+    /// The Rust identifier for a member name: a record field or an enum variant.
+    ///
+    /// Only keyword-mangled ([`naming::mangle_reserved`]), never escaped: a
+    /// field ident is also its serde key, and a variant ident its serde tag.
+    pub(crate) fn emit_member_ident(&self, sym: Symbol) -> DResult<String> {
         Ok(naming::mangle_reserved(self.resolve_ident(sym)?.to_owned()))
     }
 

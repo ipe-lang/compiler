@@ -898,7 +898,7 @@ fn emit_route_render(
                 ctor: ctx.resolve_ident(*variant)?.into(),
             }));
         };
-        let path = format!("{enum_s}::{}", ctx.emit_ident(*variant)?);
+        let path = format!("{enum_s}::{}", ctx.emit_member_ident(*variant)?);
         let mut binds = Vec::with_capacity(fields.len());
         let mut render_args = Vec::with_capacity(fields.len());
         for (i, field_ty) in fields.iter().enumerate() {
