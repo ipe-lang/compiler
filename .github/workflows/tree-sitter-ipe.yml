@@ -45,9 +45,13 @@ jobs:
       - uses: ./.github/actions/rust-toolchain-pinned
         if: steps.classify.outputs.grammar != 'false'
 
-      - name: Cache the tree-sitter CLI
+      # Every run restores the CLI; only `main` saves it: a cache saved under
+      # any other ref is one no later run reads, and it evicts the ones `main`
+      # wrote (verify-manifest check 6).
+      - name: Restore the tree-sitter CLI
+        id: ts-cli
         if: steps.classify.outputs.grammar != 'false'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/tree-sitter
           key: tree-sitter-cli-0.27.0
@@ -59,6 +63,13 @@ jobs:
             cargo install tree-sitter-cli --version ^0.27.0 --locked
           fi
           tree-sitter --version
+
+      - name: Save the tree-sitter CLI
+        if: github.ref == 'refs/heads/main' && steps.classify.outputs.grammar != 'false' && steps.ts-cli.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/tree-sitter
+          key: ${{ steps.ts-cli.outputs.cache-primary-key }}
 
       - name: Generate the parser
         if: steps.classify.outputs.grammar != 'false'

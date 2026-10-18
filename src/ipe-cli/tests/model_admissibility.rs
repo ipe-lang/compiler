@@ -14,22 +14,18 @@
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// Compile `source` through `ipe::build`, returning the pipeline result. The
+/// Compile `source` through `ipe::build_fixture`, returning the pipeline result. The
 /// emitted project is written to a per-test temp dir; `cargo` is never invoked.
 fn compile(test_name: &str, source: &str) -> Result<Result<(), ipe::CliError>, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("model_adm_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir)?;
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, source)?;
+    let fixture = ipe::RootFixture::main(source)
+        .map_err(|e| -> BoxError { format!("{test_name}: fixture: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("model_adm_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    Ok(ipe::build(&entry, &out_dir, &runtime))
+    Ok(ipe::build_fixture(&fixture, &out_dir, &runtime).map(drop))
 }
 
 /// Assert compilation failed with the given diagnostic code.
@@ -59,23 +55,21 @@ fn compile_with_widget_file(
     test_name: &str,
     source: &str,
 ) -> Result<Result<(), ipe::CliError>, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("model_adm_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(ipe_dir.join("js"))?;
+    let fixture = ipe::RootFixture::main(source)
+        .map_err(|e| -> BoxError { format!("{test_name}: fixture: {e}").into() })?;
+    let js = fixture.path().join("src").join("js");
+    std::fs::create_dir_all(&js)?;
     std::fs::write(
-        ipe_dir.join("js").join("x.js"),
+        js.join("x.js"),
         "export function mount(host, emit) { return {}; }\n",
     )?;
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, source)?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("model_adm_{test_name}_out"));
     let _ = std::fs::remove_dir_all(&out_dir);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    Ok(ipe::build(&entry, &out_dir, &runtime))
+    Ok(ipe::build_fixture(&fixture, &out_dir, &runtime).map(drop))
 }
 
 /// Assert compilation with a present widget file failed with the given code.

@@ -7,7 +7,7 @@
 //! ## Architecture
 //!
 //! 1. A minimal Ipe.Web counter program is written to a temp dir.
-//! 2. `ipe::build_with_options` compiles it with the dev-loop intent
+//! 2. `ipe::build_fixture_with_options` compiles it with the dev-loop intent
 //!    (parse → canon → types → lower → emit Rust).
 //! 3. `e2e_support::build_rust_binary` runs `cargo build` on the emitted project —
 //!    the shared Cargo target (`~/.cargo/config.toml`) lets axum/tokio/serde
@@ -351,16 +351,9 @@ fn dev_loop_options() -> ipe::BuildOptions {
 ///
 /// Returns an error on any pipeline or Cargo build failure.
 fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("live_e2e_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).map_err(|e| -> BoxError {
-        format!("{test_name}: cannot create ipe source dir: {e}").into()
+    let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
+        format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
-
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, ipe_source)
-        .map_err(|e| -> BoxError { format!("{test_name}: cannot write Main.ipe: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("live_e2e_{test_name}_emitted"));
@@ -368,7 +361,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<PathBuf, BoxEr
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    ipe::build_with_options(&entry, &out_dir, &runtime, dev_loop_options())
+    ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &dev_loop_options())
         .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)

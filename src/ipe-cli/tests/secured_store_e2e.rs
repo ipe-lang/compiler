@@ -429,14 +429,9 @@ main =
 /// Returns an error on any pipeline or Cargo build failure.
 fn compile_and_build(test_name: &str) -> Result<PathBuf, BoxError> {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let ipe_dir = scratch.join(format!("secured_store_e2e_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).map_err(|e| -> BoxError {
-        format!("{test_name}: cannot create source dir: {e}").into()
+    let fixture = ipe::RootFixture::main(PROGRAM).map_err(|e| -> BoxError {
+        format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, PROGRAM)
-        .map_err(|e| -> BoxError { format!("{test_name}: cannot write Main.ipe: {e}").into() })?;
 
     let out_dir = scratch.join(format!("secured_store_e2e_{test_name}_emitted"));
     let _ = std::fs::remove_dir_all(&out_dir);
@@ -445,7 +440,7 @@ fn compile_and_build(test_name: &str) -> Result<PathBuf, BoxError> {
         intent: ipe_backend_rust::BuildIntent::Development,
         ..ipe::BuildOptions::from_env()
     };
-    ipe::build_with_options(&entry, &out_dir, &runtime, options)
+    ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options)
         .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
         .map_err(|e| -> BoxError { format!("{test_name}: cargo build failed: {e}").into() })?;

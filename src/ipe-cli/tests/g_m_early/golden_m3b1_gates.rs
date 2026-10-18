@@ -41,7 +41,7 @@ fn build_ok(fixture: &str, out_suffix: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "fixture {fixture}: tuple-pattern shape must now build cleanly, got {built:?}"

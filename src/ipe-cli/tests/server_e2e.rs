@@ -96,16 +96,9 @@ fn compile_and_build_as(
     ipe_source: &str,
     intent: ipe_backend_rust::BuildIntent,
 ) -> Result<PathBuf, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("server_e2e_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).map_err(|e| -> BoxError {
-        format!("{test_name}: cannot create ipe source dir: {e}").into()
+    let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
+        format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
-
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, ipe_source)
-        .map_err(|e| -> BoxError { format!("{test_name}: cannot write Main.ipe: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("server_e2e_{test_name}_emitted"));
@@ -117,7 +110,7 @@ fn compile_and_build_as(
         intent,
         ..ipe::BuildOptions::from_env()
     };
-    ipe::build_with_options(&entry, &out_dir, &runtime, options)
+    ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &options)
         .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)

@@ -18,6 +18,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ipe::RootFixture;
+use ipe::project_root::SourceTree;
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
 /// Seed the project's FFI cache with an inspection for a crate `kw`: `foreign`
@@ -68,16 +70,26 @@ const MAIN_IPE: &str = "module Main exposing (main)\n\
     \x20       Ok n -> Io.println (\"shift \" ++ String.fromInt n)\n\
     \x20       Err _ -> Io.println \"err shift\"\n";
 
-fn write_project(dir: &Path) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    if !seed_ffi_cache(dir) {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), MAIN_IPE).is_ok()
+/// The fixture's declared foreign crate: an FFI fixture is filtered by its
+/// declared `rustDependencies`, so it names the crate it binds.
+const KW_DEPENDENCY: &str = "rustDependencies = [ rustDep \"kw\" \"=0.1.0\" ]";
+
+/// A project fixture whose `Main` holds `main_ipe`, declaring `kw`, with its FFI cache seeded.
+fn ffi_fixture(main_ipe: &str) -> RootFixture {
+    let fixture = RootFixture::from_tree(&SourceTree::main(main_ipe).field(KW_DEPENDENCY))
+        .expect("the fixture project must be written and resolved");
+    assert!(
+        seed_ffi_cache(fixture.path()),
+        "must seed the fixture project's FFI cache"
+    );
+    fixture
+}
+
+/// A fresh scratch directory `name` for files that sit outside the project.
+fn scratch(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    dir
 }
 
 /// Read one emitted file, failing with a directory listing when absent.
@@ -113,16 +125,10 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 fn unlexable_foreign_names_are_skipped_and_the_import_builds() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_unlexable_name");
-    assert!(
-        write_project(&tmp),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_unlexable_name_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("a crate with unlexable foreign names must still import, got: {err}")
     }
 
@@ -131,8 +137,6 @@ fn unlexable_foreign_names_are_skipped_and_the_import_builds() {
         !forwarders.contains('\u{d1}'),
         "the non-ASCII foreign type reached the forwarder module:\n{forwarders}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// SEAL proof under `IPE_E2E=1`: the emitted crate builds against a REAL
@@ -146,19 +150,14 @@ fn unlexable_foreign_names_emitted_crate_builds_and_runs() {
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_unlexable_name_e2e");
-    assert!(
-        write_project(&tmp),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_unlexable_name_e2e_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("a crate with unlexable foreign names must still import, got: {err}")
     }
 
+    let tmp = scratch("ipec_ffi_unlexable_name_e2e");
     let kw_dir = tmp.join("kw");
     fs::create_dir_all(kw_dir.join("src")).expect("mkdir kw");
     fs::write(
