@@ -9012,5 +9012,214 @@ class TestBrowserE2eRunScriptParity(unittest.TestCase):
         self.assertEqual(served_apps, built)
 
 
+class TestMergeGroupTestWatchers(unittest.TestCase):
+    """The merge-group fail-fast watchers are exactly the jobs generated from
+    `deterministic-checks.json`'s `test_watchers`, each in its pinned shape;
+    every reshaping that could cancel a run on anything but a proven test red
+    of its own producer, or outside the merge queue, is refused."""
+
+    CI = os.path.join(verify_manifest.REPO_ROOT, "workflows", "ci.yml")
+    SSOT = os.path.join(verify_manifest.REPO_ROOT, "ci", "deterministic-checks.json")
+    WATCHER = verify_manifest.TEST_WATCHER_PREFIX + "e2e"
+
+    def setUp(self) -> None:
+        with open(self.CI) as f:
+            self.ci = f.read()
+        with open(self.SSOT) as f:
+            self.ssot = json.load(f)
+
+    # A scratch tree holds ci.yml alone, so check 0 finds the other workflows'
+    # grant rows stale and check 11 (handed no gate contexts) finds no tests
+    # job aggregated by a required verdict: the unmutated copy's only errors,
+    # dropped from every mutant's.
+    NOISE = ("[WRITE_GRANT_ROW_STALE]", "is aggregated by no required phase verdict")
+
+    def run_checks(self, ci: str, ssot: object, *, also: bool = False) -> list[str]:
+        """`check_test_watchers` over a scratch tree holding `ci` and `ssot`;
+        with `also`, checks 0 (permissions), 8 and 11 too, less `NOISE` that
+        names no ci.yml grant."""
+        return [
+            e for e in self._run(ci, ssot, also)
+            if not any(n in e for n in self.NOISE) or e.startswith("ci.yml: job")
+        ]
+
+    def _run(self, ci: str, ssot: object, also: bool) -> list[str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            _write(os.path.join(tmp, "workflows", "ci.yml"), ci)
+            _write(
+                os.path.join(tmp, "ci", "deterministic-checks.json"),
+                ssot if isinstance(ssot, str) else json.dumps(ssot),
+            )
+            errors: list[str] = []
+            wfs = _load(tmp, errors)
+            self.assertEqual(errors, [], "the scratch ci.yml must load clean")
+            verify_manifest.check_test_watchers(wfs, errors)
+            if also:
+                verify_manifest.check_permissions(wfs, errors)
+                verify_manifest.check_merge_queue(wfs, set(), errors)
+                verify_manifest.check_phase_routing(wfs, set(), errors)
+            return errors
+
+    def block(self, watcher: str | None = None) -> str:
+        """One watcher job's text, up to the blank line that ends it."""
+        head = f"\n  {watcher or self.WATCHER}:\n"
+        start = self.ci.index(head) + 1
+        return self.ci[start : self.ci.index("\n\n", start) + 1]
+
+    def mutate(self, old: str, new: str) -> str:
+        block = self.block()
+        self.assertEqual(block.count(old), 1, old)
+        return self.ci.replace(block, block.replace(old, new))
+
+    def assertRefused(self, errors: list[str], *needles: str) -> None:
+        for needle in needles:
+            self.assertTrue(any(needle in e for e in errors), f"{needle!r} not in {errors}")
+
+    def test_live_tree_is_clean(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_test_watchers(_load(verify_manifest.REPO_ROOT, errors), errors)
+        self.assertEqual(errors, [])
+
+    def test_live_watcher_set_is_the_ssot(self) -> None:
+        wfs = verify_manifest.WorkflowSet.load(verify_manifest.REPO_ROOT)
+        ids = {j.job_id for j in wfs.get("ci.yml").jobs if j.job_id.startswith(verify_manifest.TEST_WATCHER_PREFIX)}
+        self.assertEqual(ids, {verify_manifest.TEST_WATCHER_PREFIX + p for p in self.ssot["test_watchers"]})
+
+    def test_scratch_copy_is_clean(self) -> None:
+        raw = self._run(self.ci, self.ssot, True)
+        self.assertTrue(raw, "the scratch tree's known noise is present")
+        self.assertEqual(self.run_checks(self.ci, self.ssot, also=True), [])
+
+    def test_missing_watcher_refused(self) -> None:
+        errors = self.run_checks(self.ci.replace(self.block(), ""), self.ssot)
+        self.assertRefused(errors, f"test watcher {self.WATCHER!r} is missing")
+
+    def test_watcher_not_in_generated_set_refused(self) -> None:
+        ssot = dict(self.ssot, test_watchers=[p for p in self.ssot["test_watchers"] if p != "e2e"])
+        errors = self.run_checks(self.ci, ssot, also=True)
+        self.assertRefused(errors, f"job {self.WATCHER!r} is not a generated test watcher", "[WRITE_GRANT_UNLISTED]")
+
+    def test_watcher_outside_ci_yml_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _write(os.path.join(tmp, "workflows", "ci.yml"), self.ci)
+            _write(
+                os.path.join(tmp, "workflows", "other.yml"),
+                "name: o\non: push\npermissions: {}\njobs:\n"
+                f"  {self.WATCHER}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+            )
+            _write(os.path.join(tmp, "ci", "deterministic-checks.json"), json.dumps(self.ssot))
+            errors: list[str] = []
+            verify_manifest.check_test_watchers(_load(tmp, errors), errors)
+        self.assertRefused(errors, "test watchers live only in ci.yml")
+
+    def test_extra_permission_refused(self) -> None:
+        ci = self.mutate("      contents: read\n", "      contents: read\n      pull-requests: write\n")
+        errors = self.run_checks(ci, self.ssot, also=True)
+        self.assertRefused(errors, "`permissions:` must be exactly", "[WRITE_GRANT_UNLISTED]")
+
+    def test_extra_job_key_refused(self) -> None:
+        ci = self.mutate("    runs-on: ubuntu-latest\n", "    runs-on: ubuntu-latest\n    continue-on-error: true\n")
+        self.assertRefused(self.run_checks(ci, self.ssot), "carries keys")
+
+    def test_not_merge_group_only_refused(self) -> None:
+        for cond in ("failure()", "failure() && needs.changes.outputs.tests == 'true'", "always() && needs.changes.outputs.merge_group == 'true'"):
+            with self.subTest(cond=cond):
+                ci = self.mutate(f"    if: {verify_manifest.TEST_WATCHER_IF}\n", f"    if: {cond}\n")
+                errors = self.run_checks(ci, self.ssot, also=True)
+                self.assertRefused(
+                    errors, "`if:` must be exactly",
+                    f"job {self.WATCHER!r} holds a write scope in a merge_group workflow",
+                )
+
+    def test_if_without_failure_refused(self) -> None:
+        ci = self.mutate(f"    if: {verify_manifest.TEST_WATCHER_IF}\n", "    if: needs.changes.outputs.merge_group == 'true'\n")
+        errors = self.run_checks(ci, self.ssot, also=True)
+        self.assertRefused(errors, "`if:` must be exactly", "routes by event outside the phase markers")
+
+    def test_merge_group_marker_read_outside_a_watcher_refused(self) -> None:
+        ci = self.ci.replace(f"\n  {self.WATCHER}:\n", "\n  watch-e2e:\n", 1)
+        errors = self.run_checks(ci, self.ssot, also=True)
+        self.assertRefused(errors, "routes by event outside the phase markers", "holds a write scope in a merge_group workflow")
+
+    def test_marker_output_drift_refused(self) -> None:
+        old = "      merge_group: ${{ github.event_name == 'merge_group' }}\n"
+        self.assertEqual(self.ci.count(old), 1)
+        for value in ("${{ true }}", "${{ github.event_name != 'pull_request' }}"):
+            with self.subTest(value=value):
+                errors = self.run_checks(self.ci.replace(old, f"      merge_group: {value}\n"), self.ssot)
+                self.assertRefused(errors, "`changes` output 'merge_group' must be exactly")
+
+    def test_needs_drift_refused(self) -> None:
+        ci = self.mutate("    needs: [changes, e2e]\n", "    needs: [changes, e2e, test-run]\n")
+        self.assertRefused(self.run_checks(ci, self.ssot), "`needs:` must be exactly")
+
+    def test_cancel_on_an_unproven_red_refused(self) -> None:
+        gate = f"        if: {verify_manifest.TEST_WATCHER_CANCEL_IF}\n"
+        for old, new in (
+            (gate, ""),
+            (gate, "        if: steps.proof.outputs.cancel != 'false'\n"),
+            (gate, "        if: always()\n"),
+            ("--proven-test-red\n", "--decide\n"),
+            ("        id: proof\n", "        id: proof\n        continue-on-error: true\n"),
+            ("          PRODUCER: 'e2e'\n", "          PRODUCER: 'test-run'\n"),
+        ):
+            with self.subTest(old=old, new=new):
+                self.assertRefused(self.run_checks(self.mutate(old, new), self.ssot), "must be exactly the")
+
+    def test_extra_step_refused(self) -> None:
+        ci = self.mutate("    steps:\n", "    steps:\n      - run: gh run cancel \"$GITHUB_RUN_ID\"\n")
+        self.assertRefused(self.run_checks(ci, self.ssot), "exactly three steps")
+
+    def test_unpinned_checkout_refused(self) -> None:
+        for old, new in (
+            ("            .github/ci/rerun_policy.py\n", "            .github/ci/\n"),
+            ("persist-credentials: false", "persist-credentials: true"),
+        ):
+            with self.subTest(new=new):
+                self.assertRefused(self.run_checks(self.mutate(old, new), self.ssot), "step 1 must be the pinned sparse checkout")
+
+    def test_leg_rule_must_pick_only_the_producer(self) -> None:
+        ci = self.ci + "  impostor:\n    name: e2e (impostor)\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n"
+        self.assertRefused(self.run_checks(ci, self.ssot), "the leg rule over 'e2e' picks")
+
+    def test_producer_must_be_a_tests_phase_job(self) -> None:
+        ssot = dict(self.ssot, test_watchers=[*self.ssot["test_watchers"], "fmt"])
+        self.assertRefused(self.run_checks(self.ci, ssot), "'fmt' is not a tests-phase job", "'cancel-on-test-red-fmt' is missing")
+        ssot = dict(self.ssot, test_watchers=[*self.ssot["test_watchers"], "no-such-job"])
+        self.assertRefused(self.run_checks(self.ci, ssot), "'no-such-job' is not a ci.yml producer job")
+
+    def test_malformed_ssot_refused(self) -> None:
+        for bad, needle in (
+            ([], "must be a non-empty list"),
+            ("e2e", "must be a non-empty list"),
+            (["e2e", "e2e"], "more than once"),
+            (["e2e", 3], "is not a job id"),
+            (["e2e "], "is not a job id"),
+            (["${{ x }}"], "is not a job id"),
+        ):
+            with self.subTest(bad=bad):
+                self.assertRefused(self.run_checks(self.ci, dict(self.ssot, test_watchers=bad)), needle)
+        self.assertRefused(self.run_checks(self.ci, dict(self.ssot, extra=[])), "top level must be an object")
+
+    def test_absent_list_admits_no_watcher(self) -> None:
+        ssot = {k: v for k, v in self.ssot.items() if k != "test_watchers"}
+        self.assertRefused(self.run_checks(self.ci, ssot), f"job {self.WATCHER!r} is not a generated test watcher")
+
+    def test_grants_derive_from_the_ssot(self) -> None:
+        self.assertEqual(
+            set(verify_manifest.test_watcher_grants(self.ssot["test_watchers"])),
+            {("ci.yml", verify_manifest.TEST_WATCHER_PREFIX + p, "actions") for p in self.ssot["test_watchers"]},
+        )
+        self.assertFalse(any(jid and jid.startswith(verify_manifest.TEST_WATCHER_PREFIX) for _, jid, _ in verify_manifest.WRITE_GRANTS))
+
+    def test_proof_reads_the_producer_context(self) -> None:
+        """A named producer's watcher passes its context name, the name the
+        job listing reports, never the job id."""
+        self.assertIn(
+            "PRODUCER: 'seal-modset (vendored emit model)'",
+            self.block(verify_manifest.TEST_WATCHER_PREFIX + "seal-modset-vendored"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

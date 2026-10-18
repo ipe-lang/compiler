@@ -95,6 +95,9 @@ jobs:
       cheap: ${{ github.event_name != 'push' }}
       tests: ${{ github.event_name != 'pull_request' && github.event_name != 'push' }}
       post_merge: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+      # The merge-group fail-fast watchers' event marker (they alone read it;
+      # verify-manifest pins its expression).
+      merge_group: ${{ github.event_name == 'merge_group' }}
       # An unset output (classifier crash) reads as `true`: absent proof, run.
       wasm: ${{ steps.classify.outputs.wasm != 'false' }}
       code: ${{ steps.classify.outputs.code != 'false' }}
@@ -2030,6 +2033,301 @@ jobs:
           fi
           echo "a deterministic check step failed on PR run $RUN_ID — cancelling the rest of the run so the heavy tier stops consuming runners."
           gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  # Merge-group fail-fast: one watcher per heavy tests-phase producer listed
+  # in `.github/ci/deterministic-checks.json` (`test_watchers`). A watcher
+  # starts only when a need failed on a merge-group run, and cancels the run
+  # only when `rerun_policy.py --proven-test-red` proves a failed leg of its
+  # producer is a test that ran and failed with no infrastructure signature
+  # (log and annotations both read, every page of the attempt's job listing).
+  # An unknown, crash, infra-only or unreadable red never cancels: the run
+  # completes and reports every red it reaches. A cancelled run concludes
+  # every phase verdict `failure` (the verdict fails on a cancelled need), so
+  # the queue sees a red, never a missing context. Under fail-fast a second,
+  # unrelated red in the same entry may go unreported until the next entry.
+  #
+  # `ci/verify-manifest.py` generates each watcher's exact job from the SSOT
+  # and refuses a missing, unlisted or reshaped one (an extra permission, an
+  # `if:` without `failure()` or the merge-group marker, a cancel not gated
+  # on the proof's exact `true`).
+  cancel-on-test-red-windows-test:
+    runs-on: ubuntu-latest
+    needs: [changes, windows-test]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'windows-test'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-wasi-run:
+    runs-on: ubuntu-latest
+    needs: [changes, wasi-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'wasi-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-test-run:
+    runs-on: ubuntu-latest
+    needs: [changes, test-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'test-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-e2e:
+    runs-on: ubuntu-latest
+    needs: [changes, e2e]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'e2e'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-runtime-full-features-run:
+    runs-on: ubuntu-latest
+    needs: [changes, runtime-full-features-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'runtime-full-features-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-runtime-feature-combos-run:
+    runs-on: ubuntu-latest
+    needs: [changes, runtime-feature-combos-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'runtime-feature-combos-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-seal-modset-vendored:
+    runs-on: ubuntu-latest
+    needs: [changes, seal-modset-vendored]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'seal-modset (vendored emit model)'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-linux-x64-tier2:
+    runs-on: ubuntu-latest
+    needs: [changes, linux-x64-tier2]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'linux-x64-tier2 (bwrap+seccomp — the real Linux jail proof)'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-release-targets-run:
+    runs-on: ubuntu-latest
+    needs: [changes, release-targets-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'release-targets-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
 
   # Headless-browser behaviour gate for Ipe.Browser.Geolocation +
   # Ipe.Browser.Clipboard — the three flows a raw TcpStream HTTP test cannot

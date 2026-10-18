@@ -87,7 +87,18 @@ Checks performed
      consumed by ci.yml's `cancel-on-cheap-red` watcher — is well-formed (exact keys, non-empty strings with
      no surrounding whitespace, no duplicate job), its job set equals the
      watcher's `needs:`, and each pair's step is a `name:` of that job's steps
-     in ci.yml.
+     in ci.yml.  Its `test_watchers` list (ci.yml tests-phase job ids, unique)
+     generates the merge-group fail-fast watchers: ci.yml holds exactly one
+     job `cancel-on-test-red-<id>` per listed producer and no other job of
+     that prefix anywhere, each exactly `expected_test_watcher_steps`' shape —
+     `needs: [changes, <id>]`, `if:` exactly `TEST_WATCHER_IF` (`failure()`
+     and the `changes` merge-group marker), `actions: write` and
+     `contents: read` only, a pinned sparse checkout of `rerun_policy.py`, the
+     `--proven-test-red` proof step naming the producer's context, and a
+     cancel step gated on the proof's exact `true`.  The classifier's leg
+     rule over each producer's context picks exactly that producer's
+     contexts, and `changes` publishes the marker as
+     `MERGE_GROUP_OUTPUT_VALUE`.  Their write grants derive from the list.
   6. rustc wiring and cache hygiene: no job wraps or replaces rustc, so
      every build compiles with the pinned toolchain's own rustc and no cache
      stands between the source and the artifact a gate vouches for. Every
@@ -182,7 +193,8 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
      `permissions:` value with no `write` scope.  A job-level `write` scope is
      admitted only on a job whose `if:` has no `||` and has, among its
      `&&`-conjuncts at parenthesis depth 0, exactly
-     `github.event_name == 'pull_request'`.  A bare
+     `github.event_name == 'pull_request'`, or on a generated test watcher
+     (check 5) whose `if:` is exactly `TEST_WATCHER_IF`.  A bare
      `github.event_name != 'pull_request'` full-tier test (either operand
      order) must be followed by `&& github.event_name != 'merge_group'`, so a
      merge-group run takes the PR tier rather than silently running the full
@@ -241,7 +253,9 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       (`needs.changes.outputs.<phase> == 'true'`, or `github.event_name ==
       'pull_request'` for a PR-only job), plus on a cheap job at most the
       `|| needs.changes.outputs.release_only == 'true'` disjunct; no other
-      conjunct names the event.  A job needs only jobs that run on every event
+      conjunct names the event or reads the merge-group marker, which only a
+      generated test watcher (check 5) reads, through its exact
+      `TEST_WATCHER_IF`, and which places it in a merge-group-only phase.  A job needs only jobs that run on every event
       it runs on, and never a verdict.  A skipped required check reads as
       passing, so a tests or post_merge work job never reports a `gate`
       context: it reports through a phase verdict, a job whose `if:` is
@@ -583,6 +597,7 @@ import cargo_invocation  # noqa: E402  # the one cargo-invocation reader, checks
 import check_required_set  # noqa: E402  # owns the admin-read environment's name
 import claims_table  # noqa: E402  # the one reader of test-claims.yml, check 20
 import action_metadata  # noqa: E402  # proven declared inputs of every pinned action, check 24
+import rerun_policy  # noqa: E402  # the job-name leg rule the merge-group test watchers apply
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Both extensions: a workflow (or, for check 6, a local composite action) is a
@@ -604,6 +619,27 @@ HEAVY_SHARD_ANCHORS = ("test-run", "e2e")
 HEAVY_SHARD_ARTIFACT = "nextest-archive"
 _STATUS_FN = re.compile(r"\b(always|failure|cancelled)\s*\(", re.IGNORECASE)
 CANCEL_WATCHER_JOB_ID = "cancel-on-cheap-red"
+# Merge-group fail-fast: `deterministic-checks.json`'s `test_watchers` lists
+# the heavy tests-phase producers (ci.yml job ids). Each gets exactly one
+# generated watcher job, `TEST_WATCHER_PREFIX + <id>`, whose whole shape
+# `expected_test_watcher` pins: it starts only on a red need of a merge-group
+# run and cancels only when `rerun_policy.py --proven-test-red` proves a
+# failed leg of its producer is a test red.
+TEST_WATCHERS_KEY = "test_watchers"
+TEST_WATCHER_WORKFLOW = "ci.yml"
+TEST_WATCHER_PREFIX = "cancel-on-test-red-"
+MERGE_GROUP_OUTPUT = "merge_group"
+MERGE_GROUP_OUTPUT_VALUE = "${{ github.event_name == 'merge_group' }}"
+TEST_WATCHER_IF = f"failure() && needs.changes.outputs.{MERGE_GROUP_OUTPUT} == 'true'"
+TEST_WATCHER_PERMISSIONS = {"actions": "write", "contents": "read"}
+TEST_WATCHER_CHECKOUT_WITH = {
+    "persist-credentials": False,
+    "sparse-checkout": ".github/ci/rerun_policy.py\n",
+    "sparse-checkout-cone-mode": False,
+}
+TEST_WATCHER_PROOF_ID = "proof"
+TEST_WATCHER_CANCEL_IF = f"steps.{TEST_WATCHER_PROOF_ID}.outputs.cancel == 'true'"
+TEST_WATCHER_PRODUCER_MARKER = "needs.changes.outputs.tests == 'true'"
 
 # Caches are saved from `main` only. A cache saved under any other ref (a
 # pull request, a merge group, a tag) is readable by no later run of another
@@ -953,8 +989,11 @@ def load_deterministic_checks(
     except (OSError, ValueError) as e:
         errors.append(f"cannot read {where}: {e}")
         return None
-    if not isinstance(doc, dict) or set(doc) != {"about", "checks"}:
-        errors.append(f"{where}: top level must be an object with exactly the keys 'about' and 'checks'")
+    if not isinstance(doc, dict) or not {"about", "checks"} <= set(doc) <= {"about", "checks", TEST_WATCHERS_KEY}:
+        errors.append(
+            f"{where}: top level must be an object with the keys 'about' and 'checks' "
+            f"and at most {TEST_WATCHERS_KEY!r}"
+        )
         return None
     checks = doc["checks"]
     if not isinstance(checks, list) or not checks:
@@ -1080,6 +1119,199 @@ def check_deterministic_set(wfs: WorkflowSet, errors: list[str]) -> None:
             f"{CANCEL_WATCHER_JOB_ID!r} needs {sorted(extra)} but they are "
             f"missing from {DETERMINISTIC_CHECKS_FILE}"
         )
+
+
+def load_test_watchers(errors: list[str], root: str = REPO_ROOT) -> list[str] | None:
+    """`deterministic-checks.json`'s `test_watchers`: the ci.yml job ids each
+    owning one merge-group test watcher, or None (with the reason recorded)
+    when the file or the list is malformed. An absent key is no watchers: no
+    run is ever cancelled, the conservative outcome."""
+    if load_deterministic_checks(errors, root) is None:
+        return None
+    where = os.path.join(root, "ci", "deterministic-checks.json")
+    with open(where) as f:
+        doc = json.load(f)
+    if TEST_WATCHERS_KEY not in doc:
+        return []
+    ids = doc[TEST_WATCHERS_KEY]
+    if not isinstance(ids, list) or not ids:
+        errors.append(f"{where}: {TEST_WATCHERS_KEY!r} must be a non-empty list of ci.yml job ids")
+        return None
+    out: list[str] = []
+    for i, jid in enumerate(ids):
+        if not isinstance(jid, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", jid):
+            errors.append(f"{where}: {TEST_WATCHERS_KEY}[{i}] = {jid!r} is not a job id")
+            return None
+        if jid in out:
+            errors.append(f"{where}: {TEST_WATCHERS_KEY} lists {jid!r} more than once")
+            return None
+        out.append(jid)
+    return out
+
+
+def test_watcher_grants(producers: list[str]) -> dict[tuple[str, str | None, str], str]:
+    """The `WRITE_GRANTS` rows the generated test watchers hold."""
+    return {
+        (TEST_WATCHER_WORKFLOW, TEST_WATCHER_PREFIX + p, "actions"): (
+            f"cancels a merge-group run once a {p!r} test red is proven"
+        )
+        for p in producers
+    }
+
+
+def is_test_watcher(fname: str, wj: WorkflowJob) -> bool:
+    """Whether a job carries the test-watcher id and the exact merge-group-only
+    `if:`. Checks 8 and 11 admit exactly this shape; `check_test_watchers`
+    holds every such job to the generated set and its whole pinned shape."""
+    return (
+        fname == TEST_WATCHER_WORKFLOW
+        and wj.job_id.startswith(TEST_WATCHER_PREFIX)
+        and wj.raw.get("if") == TEST_WATCHER_IF
+    )
+
+
+def expected_test_watcher_steps(producer_context: str) -> list[dict]:
+    """The proof and cancel steps of a test watcher, as YAML loads them; the
+    leading pinned checkout is compared apart (its pin moves)."""
+    return [
+        {
+            "name": "Prove a test red",
+            "id": TEST_WATCHER_PROOF_ID,
+            "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "REPO": "${{ github.repository }}",
+                "RUN_ID": "${{ github.run_id }}",
+                "RUN_ATTEMPT": "${{ github.run_attempt }}",
+                "PRODUCER": producer_context,
+            },
+            "run": "python3 .github/ci/rerun_policy.py --proven-test-red",
+        },
+        {
+            "name": "Cancel the run on a proven test red",
+            "if": TEST_WATCHER_CANCEL_IF,
+            "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "REPO": "${{ github.repository }}",
+                "RUN_ID": "${{ github.run_id }}",
+            },
+            "run": (
+                'gh run cancel "$RUN_ID" --repo "$REPO" || '
+                'echo "::warning::gh run cancel failed for run $RUN_ID."'
+            ),
+        },
+    ]
+
+
+def check_test_watchers(wfs: WorkflowSet, errors: list[str]) -> None:
+    """The merge-group test watchers are exactly the jobs generated from
+    `test_watchers`: one per listed producer, none other, each in its pinned
+    shape — `needs: [changes, <producer>]`, `if:` exactly `TEST_WATCHER_IF`,
+    `actions: write` + `contents: read` only, a sparse checkout of the
+    classifier, the proof step, and a cancel step gated on the proof's exact
+    `true`. Each producer is a tests-phase ci.yml job whose failed legs the
+    classifier's leg rule picks out exactly, and `changes` publishes the
+    merge-group marker the watchers read."""
+    where = f"{DETERMINISTIC_CHECKS_FILE} {TEST_WATCHERS_KEY}"
+    producers = load_test_watchers(errors, wfs.root)
+    if producers is None:
+        return
+    wf = wfs.get(TEST_WATCHER_WORKFLOW)
+    for other in wfs.workflows:
+        if other.fname == TEST_WATCHER_WORKFLOW:
+            continue
+        for wj in other.jobs:
+            if wj.job_id.startswith(TEST_WATCHER_PREFIX):
+                errors.append(
+                    f"{other.fname}: job {wj.job_id!r} is named as a test watcher; "
+                    f"test watchers live only in {TEST_WATCHER_WORKFLOW}"
+                )
+    if wf is None:
+        if producers:
+            errors.append(f"{where}: {TEST_WATCHER_WORKFLOW} is absent")
+        return
+    by_id = {j.job_id: j for j in wf.jobs}
+    expected = {TEST_WATCHER_PREFIX + p: p for p in producers}
+    for jid in sorted(set(by_id) - set(expected)):
+        if jid.startswith(TEST_WATCHER_PREFIX):
+            errors.append(
+                f"{TEST_WATCHER_WORKFLOW}: job {jid!r} is not a generated test watcher — "
+                f"its producer is not listed in {where}; refused"
+            )
+    if producers:
+        changes = by_id.get("changes")
+        outputs = changes.raw.get("outputs") if changes is not None else None
+        got = outputs.get(MERGE_GROUP_OUTPUT) if isinstance(outputs, dict) else None
+        if got != MERGE_GROUP_OUTPUT_VALUE:
+            errors.append(
+                f"{TEST_WATCHER_WORKFLOW}: `changes` output {MERGE_GROUP_OUTPUT!r} must be exactly "
+                f"{MERGE_GROUP_OUTPUT_VALUE!r} (the test watchers' marker), got {got!r}"
+            )
+    contexts = [c for j in wf.jobs for c in j.contexts]
+    for watcher_id, producer_id in expected.items():
+        loc = f"{TEST_WATCHER_WORKFLOW}: test watcher {watcher_id!r}"
+        producer = by_id.get(producer_id)
+        if producer is None or producer_id.startswith(TEST_WATCHER_PREFIX):
+            errors.append(f"{where}: {producer_id!r} is not a ci.yml producer job")
+            continue
+        conjuncts = _top_level_conjuncts(str(producer.raw.get("if", "")))
+        if conjuncts is None or TEST_WATCHER_PRODUCER_MARKER not in conjuncts:
+            errors.append(
+                f"{where}: {producer_id!r} is not a tests-phase job (its `if:` lacks "
+                f"{TEST_WATCHER_PRODUCER_MARKER!r} at the top level)"
+            )
+        base = str(producer.raw.get("name", producer_id))
+        if "${{" in base or base != base.strip() or not base.isprintable():
+            errors.append(f"{where}: {producer_id!r} has a templated or unprintable context base {base!r}")
+            continue
+        legs = {c for c in contexts if rerun_policy.is_leg_of(c, base)}
+        if legs != set(producer.contexts):
+            errors.append(
+                f"{where}: the leg rule over {base!r} picks {sorted(legs)}, not exactly "
+                f"{producer_id!r}'s own contexts {sorted(producer.contexts)} — another job's red "
+                "could cancel the run"
+            )
+        wj = by_id.get(watcher_id)
+        if wj is None:
+            errors.append(f"{loc} is missing; {where} lists {producer_id!r}")
+            continue
+        job = wj.raw
+        keys = set(job)
+        if keys != {"runs-on", "needs", "if", "permissions", "steps"}:
+            errors.append(f"{loc} carries keys {sorted(keys)}; exactly runs-on, needs, if, permissions, steps")
+        if job.get("runs-on") != "ubuntu-latest":
+            errors.append(f"{loc} `runs-on:` must be `ubuntu-latest`")
+        if job.get("needs") != ["changes", producer_id]:
+            errors.append(f"{loc} `needs:` must be exactly [changes, {producer_id}], got {job.get('needs')!r}")
+        if job.get("if") != TEST_WATCHER_IF:
+            errors.append(
+                f"{loc} `if:` must be exactly {TEST_WATCHER_IF!r} — `failure()` and the "
+                f"merge-group marker, nothing else; got {job.get('if')!r}"
+            )
+        if job.get("permissions") != TEST_WATCHER_PERMISSIONS:
+            errors.append(
+                f"{loc} `permissions:` must be exactly {TEST_WATCHER_PERMISSIONS!r}, "
+                f"got {job.get('permissions')!r}"
+            )
+        steps = job.get("steps")
+        if not isinstance(steps, list) or len(steps) != 3 or not all(isinstance(s, dict) for s in steps):
+            errors.append(f"{loc} must have exactly three steps: the checkout, the proof, the cancel")
+            continue
+        checkout = steps[0]
+        if (
+            set(checkout) != {"uses", "with"}
+            or not isinstance(checkout.get("uses"), str)
+            or not _CHECKOUT_PIN.fullmatch(checkout["uses"])
+            or checkout.get("with") != TEST_WATCHER_CHECKOUT_WITH
+        ):
+            errors.append(f"{loc} step 1 must be the pinned sparse checkout of `.github/ci/rerun_policy.py`")
+        proof, cancel = expected_test_watcher_steps(base)
+        if steps[1] != proof:
+            errors.append(f"{loc} step 2 must be exactly the proof step {proof!r}, got {steps[1]!r}")
+        if steps[2] != cancel:
+            errors.append(
+                f"{loc} step 3 must be exactly the cancel step gated on {TEST_WATCHER_CANCEL_IF!r} "
+                f"(no cancel on an unproven red), got {steps[2]!r}"
+            )
 
 
 def _refuse_shape(loc: str, what: str, expected: str, got: object, errors: list[str]) -> None:
@@ -1492,7 +1724,10 @@ def check_permissions(
     may write); no `permissions:` value, workflow or job level, is
     `write-all` or grants a `FORGING_SCOPES` write; and every other write
     grant is a `WRITE_GRANTS` row, every row one some workflow grants."""
-    grants = WRITE_GRANTS if grants is None else grants
+    if grants is None:
+        # The watcher rows derive from the SSOT; a malformed one yields none,
+        # and `check_test_watchers` records why.
+        grants = {**WRITE_GRANTS, **test_watcher_grants(load_test_watchers([], wfs.root) or [])}
     seen: set[tuple[str, str | None, str]] = set()
     for wf in wfs.workflows:
         if "permissions" not in wf.doc:
@@ -2752,12 +2987,15 @@ def check_merge_queue(wfs: WorkflowSet, gate_producers: set[str], errors: list[s
             jid, job = wj.job_id, wj.raw
             if "permissions" not in job or not _grants_write(job["permissions"]):
                 continue
+            if is_test_watcher(fname, wj):
+                continue
             conjuncts = _top_level_conjuncts(str(job.get("if", "")))
             if conjuncts is None or _PR_ONLY not in conjuncts:
                 errors.append(
                     f"{fname}: job {str(jid)!r} holds a write scope in a merge_group "
                     "workflow; its `if:` must be a conjunction requiring "
-                    "`github.event_name == 'pull_request'` at the top level"
+                    "`github.event_name == 'pull_request'` at the top level (or be a "
+                    f"generated test watcher whose `if:` is exactly {TEST_WATCHER_IF!r})"
                 )
         # The canonical phase outputs are pinned by check 11; they exclude the
         # merge queue from no phase by accident.
@@ -2994,6 +3232,8 @@ _AGGREGATOR_KEYS = frozenset({"name", "runs-on", "needs", "if", "steps", "timeou
 _EVENTS = frozenset({"pull_request", "merge_group", "push", "schedule", "workflow_dispatch"})
 # A PR-only job (`_PR_ONLY` conjunct): the cheap phase's narrowest member.
 _PR_PHASE = "pull_request_only"
+# A generated test watcher (`is_test_watcher`): runs on merge-group runs only.
+_MERGE_GROUP_PHASE = "merge_group_only"
 
 
 def _phase_events(phase: str | None) -> frozenset[str]:
@@ -3002,6 +3242,8 @@ def _phase_events(phase: str | None) -> frozenset[str]:
         return _EVENTS
     if phase == _PR_PHASE:
         return frozenset({"pull_request"})
+    if phase == _MERGE_GROUP_PHASE:
+        return frozenset({"merge_group"})
     return _EVENTS - frozenset(PHASE_EXCLUDES[phase])
 
 
@@ -3053,7 +3295,7 @@ def _job_phase(where: str, wj: WorkflowJob, errors: list[str]) -> tuple[bool, st
             phases.append(m.group(1))
         elif c == _PR_ONLY:
             phases.append(_PR_PHASE)
-        elif _EVENT_NAME.search(c) or re.search(r"outputs\.(cheap|tests|post_merge)\b", c):
+        elif _EVENT_NAME.search(c) or re.search(r"outputs\.(cheap|tests|post_merge|merge_group)\b", c):
             errors.append(f"check 11: {where} `if:` conjunct {c!r} routes by event outside the phase markers")
             return False, None
     if len(phases) != 1:
@@ -3161,6 +3403,9 @@ def check_phase_routing(wfs: WorkflowSet, gate_contexts: set[str], errors: list[
             if any(isinstance(s, dict) and s.get("uses") == PHASE_VERDICT_ACTION for s in job.get("steps") or []):
                 aggregators.append(jid)
                 _check_aggregator(where, wf, wj, errors)
+                continue
+            if is_test_watcher(fname, wj):
+                phases[jid] = _MERGE_GROUP_PHASE
                 continue
             ok, phase = _job_phase(where, wj, errors)
             if not ok:
@@ -5744,7 +5989,7 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "test_local_gate.py": _SELF_TEST,
     "test_cargo_invocation.py": _SELF_TEST,
     "test_claims_table.py": _SELF_TEST,
-    "rerun_policy.py": {("--lint",): _V, ("--decide",): _O},
+    "rerun_policy.py": {("--lint",): _V, ("--decide",): _O, ("--proven-test-red",): _O},
     "nightly_green.py": {("--lint",): _V, ("--verdict",): _V},
     "check_required_set.py": {(): _V, ("--fetch",): _V, ("--fetch-admin",): _V},
     "manifest-lock-consistency.sh": {(): _V},
@@ -5978,6 +6223,10 @@ TOOL_ENV_ALLOWLIST: dict[str, frozenset[EnvScope]] = {
     # the id of the run a `workflow_run` event names.
     "MERGE_GROUP_BASE_SHA": frozenset({EnvScope.STEP}),
     "RUN_ID": frozenset({EnvScope.STEP}),
+    # The run attempt whose job listing a merge-group test watcher reads, and
+    # the producer context whose failed legs it classifies.
+    "RUN_ATTEMPT": frozenset({EnvScope.STEP}),
+    "PRODUCER": frozenset({EnvScope.STEP}),
     "CARGO_TERM_COLOR": frozenset({EnvScope.WORKFLOW}),
     "CARGO_INCREMENTAL": frozenset({EnvScope.WORKFLOW}),
 }
@@ -8223,6 +8472,7 @@ def main() -> int:
 
     # ---- 5. ci/deterministic-checks.json vs the watcher + ci.yml steps ----
     check_deterministic_set(workflows, errors)
+    check_test_watchers(workflows, errors)
 
     # ---- 6+7. rustc wiring + cache saves; pinned CI inputs + env-file writes ----
     local_actions = check_workflow_steps(workflows, errors)

@@ -19,6 +19,14 @@ Modes:
             $RUN_ID (attempt 1) in $REPO is infra-only, `rerun=false`
             otherwise, and exit 0; the workflow reruns only on the exact word
             `true`. An unwritable $GITHUB_OUTPUT exits 1 with no output set.
+  --proven-test-red
+            write `cancel=true` to $GITHUB_OUTPUT iff some failed leg of the
+            job $PRODUCER names, in attempt $RUN_ATTEMPT of run $RUN_ID, is a
+            proven test red (`proven_test_red`), `cancel=false` otherwise,
+            and exit 0. ci.yml's merge-group fail-fast watchers cancel the
+            run only on the exact word `true`, so an unknown, infra-only, or
+            unreadable red never cancels. An unwritable $GITHUB_OUTPUT exits
+            1 with no output set.
   --lint    fail unless the signature table, the retry ban, and
             rerun-failed-once.yml's wiring all hold. artifact-guard runs it.
 """
@@ -30,7 +38,7 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import IO
 from dataclasses import dataclass
 
@@ -66,6 +74,18 @@ TEST_FAILURE_MARKERS: tuple[str, ...] = (
     r"\bFLAKY \d+/\d+ \[",
 )
 
+# A test that ran and failed: nextest's `FAIL` status line or libtest's
+# summary, each with a sample line it must match. The merge-group fail-fast
+# watchers cancel a run only on one of these. A timeout, a signal, or a leak
+# is a crash: it vetoes a rerun (TEST_FAILURE_MARKERS) but proves no test
+# red, since a starved or killed runner produces it too. Every sample also
+# matches a veto marker, so a red the watcher cancels on is one the rerun
+# policy would never retry.
+PROVEN_TEST_RED_MARKERS: tuple[tuple[str, str], ...] = (
+    (r"(?<![\w-])FAIL \[ *\d+(?:\.\d+)?s\]", "        FAIL [  12.881s] ipe::emit broken_case"),
+    (r"test result: FAILED\.", "test result: FAILED. 3 passed; 1 failed; 0 ignored"),
+)
+
 MAX_LINE_CHARS = 4096
 MAX_LOG_LINES = 2_000_000
 MAX_LOG_CHARS = 256 * 1024 * 1024
@@ -74,6 +94,7 @@ GH_TIMEOUT_S = 180
 
 _SIGNATURE_RES = tuple((sid, re.compile(p)) for sid, p in SIGNATURES)
 _MARKER_RES = tuple(re.compile(p) for p in TEST_FAILURE_MARKERS)
+_PROVEN_RES = tuple(re.compile(p) for p, _ in PROVEN_TEST_RED_MARKERS)
 
 # Terminal control sequences (ci.yml sets `CARGO_TERM_COLOR: always`, so nextest
 # and cargo wrap `FAIL` / `error` in SGR codes). They are removed before any
@@ -98,6 +119,8 @@ class Evidence:
 
     infra: frozenset[str]
     test_failure: bool
+    # A `PROVEN_TEST_RED_MARKERS` line was seen (implies `test_failure`).
+    test_red: bool = False
 
     @property
     def infra_only(self) -> bool:
@@ -108,6 +131,7 @@ def scan(lines: Iterable[str]) -> Evidence:
     """Classify a job's log/annotation lines. Too many lines is a refusal."""
     infra: set[str] = set()
     test_failure = False
+    test_red = False
     for count, raw in enumerate(lines, start=1):
         if count > MAX_LOG_LINES:
             raise PolicyError(f"log exceeds {MAX_LOG_LINES} lines")
@@ -118,7 +142,9 @@ def scan(lines: Iterable[str]) -> Evidence:
                     infra.add(sid)
         if not test_failure and any(rx.search(line) for rx in _MARKER_RES):
             test_failure = True
-    return Evidence(frozenset(infra), test_failure)
+        if not test_red and any(rx.search(line) for rx in _PROVEN_RES):
+            test_red = True
+    return Evidence(frozenset(infra), test_failure or test_red, test_red)
 
 
 def decide(evidence: list[Evidence | None]) -> bool:
@@ -130,6 +156,20 @@ def decide(evidence: list[Evidence | None]) -> bool:
     if not evidence or len(evidence) > MAX_FAILED_JOBS:
         return False
     return all(e is not None and e.infra_only for e in evidence)
+
+
+def proven_test_red(log: Evidence | None, notes: Evidence | None) -> bool:
+    """A failed job is a proven test red iff its log AND its annotations were
+    read, its log shows a test that ran and failed (`test_red`), and neither
+    source carries an infrastructure signature.
+
+    `None` is a source that could not be read: it proves nothing, so the
+    answer is no. A crash, an empty or garbled log, or a test failure beside
+    an infra signature is no proof either.
+    """
+    if log is None or notes is None:
+        return False
+    return log.test_red and not log.infra and not notes.infra
 
 
 # A job concluding one of these needs no proof; EVERY other conclusion — a
@@ -155,6 +195,36 @@ def failed_job_ids(text: str) -> list[int]:
     if len(parsed) != len(ids):
         raise PolicyError("job listing has an empty job id")
     return [i for i, raw in zip(parsed, ids) if raw in failed]
+
+
+JOB_ROWS_JQ = '.jobs[] | "\\(.id)\\t\\(.conclusion)\\t\\(.name)"'
+
+
+def failed_jobs_named(text: str) -> list[tuple[int, str]]:
+    """Parse one `<id> TAB <conclusion> TAB <name>` line per job; return
+    (id, name) of every job that did not pass. Same refusals as
+    `failed_job_ids`, plus an empty name."""
+    rows: list[tuple[str, str]] = []
+    failed: set[str] = set()
+    for line in text.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) != 3 or not re.fullmatch(r"[a-z_]+", parts[1]) or not parts[2]:
+            raise PolicyError(f"job listing has a malformed line {line!r}")
+        job_id, conclusion, name = parts
+        rows.append((job_id, name))
+        if conclusion not in PASSED_CONCLUSIONS:
+            failed.add(job_id)
+    parsed = parse_job_ids("\n".join(i for i, _ in rows))
+    if len(parsed) != len(rows):
+        raise PolicyError("job listing has an empty job id")
+    return [(i, name) for i, (raw, name) in zip(parsed, rows) if raw in failed]
+
+
+def is_leg_of(name: str, producer: str) -> bool:
+    """Whether the job named `name` in a run listing is `producer` or one of
+    its matrix legs (`producer (<values>)`). ci/verify-manifest.py proves
+    this rule picks exactly a watched producer's contexts out of ci.yml."""
+    return name == producer or (name.startswith(producer + " (") and name.endswith(")"))
 
 
 def parse_job_ids(text: str) -> list[int]:
@@ -218,16 +288,7 @@ def _gh_text(args: list[str]) -> str:
 
 
 def _job_evidence(repo: str, job_id: int) -> Evidence | None:
-    try:
-        log = scan(_gh_lines([f"repos/{repo}/actions/jobs/{job_id}/logs"]))
-    except (PolicyError, OSError, subprocess.SubprocessError):
-        log = None
-    try:
-        notes = scan(
-            _gh_lines([f"repos/{repo}/check-runs/{job_id}/annotations", "--paginate", "--jq", ".[].message"])
-        )
-    except (PolicyError, OSError, subprocess.SubprocessError):
-        notes = None
+    log, notes = _job_sources(repo, job_id)
     if log is None and notes is None:
         return None
     parts = [e for e in (log, notes) if e is not None]
@@ -258,6 +319,54 @@ def run_decide(repo: str, run_id: str) -> bool:
     return decide([_job_evidence(repo, j) for j in ids])
 
 
+def _job_sources(repo: str, job_id: int) -> tuple[Evidence | None, Evidence | None]:
+    """The scanned log and annotations of one job, each None when unreadable."""
+    try:
+        log = scan(_gh_lines([f"repos/{repo}/actions/jobs/{job_id}/logs"]))
+    except (PolicyError, OSError, subprocess.SubprocessError):
+        log = None
+    try:
+        notes = scan(
+            _gh_lines([f"repos/{repo}/check-runs/{job_id}/annotations", "--paginate", "--jq", ".[].message"])
+        )
+    except (PolicyError, OSError, subprocess.SubprocessError):
+        notes = None
+    return log, notes
+
+
+def decide_cancel(
+    failed: list[tuple[int, str]],
+    producer: str,
+    sources: Callable[[int], tuple[Evidence | None, Evidence | None]],
+) -> bool:
+    """Cancel iff some failed leg of `producer` is a proven test red.
+
+    `failed` is (id, name) of every failed job in the run; `sources(id)`
+    returns that job's (log, annotations) evidence. More failed legs than
+    MAX_FAILED_JOBS proves nothing.
+    """
+    legs = [j for j, name in failed if is_leg_of(name, producer)]
+    if not legs or len(legs) > MAX_FAILED_JOBS:
+        return False
+    return any(proven_test_red(*sources(j)) for j in legs)
+
+
+def run_cancel_decision(repo: str, run_id: str, attempt: str, producer: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise PolicyError(f"REPO {repo!r} is not owner/name")
+    for what, value in (("RUN_ID", run_id), ("RUN_ATTEMPT", attempt)):
+        if not value.isascii() or not value.isdigit():
+            raise PolicyError(f"{what} {value!r} is not a decimal id")
+    if not producer or producer != producer.strip() or "${{" in producer or not producer.isprintable():
+        raise PolicyError(f"PRODUCER {producer!r} is not a job name")
+    # Every page of the attempt's listing, unfiltered: a job a server-side
+    # filter dropped could never be proven, so nothing is filtered there.
+    listing = _gh_text(
+        [f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs", "--paginate", "--jq", JOB_ROWS_JQ]
+    )
+    return decide_cancel(failed_jobs_named(listing), producer, lambda j: _job_sources(repo, j))
+
+
 def signature_errors(signatures: tuple[tuple[str, str], ...], markers: tuple[str, ...]) -> list[str]:
     """Return why the signature/marker tables could fail open, or []."""
     errors: list[str] = []
@@ -283,6 +392,38 @@ def signature_errors(signatures: tuple[tuple[str, str], ...], markers: tuple[str
     for sid, _ in signatures:
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", sid or ""):
             errors.append(f"signature id {sid!r} is not kebab-case")
+    return errors
+
+
+def proven_marker_errors(
+    proven: tuple[tuple[str, str], ...], markers: tuple[str, ...]
+) -> list[str]:
+    """Return why the proven-test-red table could cancel on a red the rerun
+    policy would retry, or on generic failure text, or []."""
+    errors: list[str] = []
+    if not proven:
+        errors.append("the proven-test-red table is empty")
+    patterns = [p for p, _ in proven]
+    if len(patterns) != len(set(patterns)):
+        errors.append("the proven-test-red table repeats a pattern")
+    probes = ("", " ", "error", "FAIL", "test failed", "error: test run failed",
+              "     TIMEOUT [ 900.001s] x", "     SIGSEGV [   0.4s] x", "  LEAK-FAIL [   1.0s] x")
+    vetoes = [re.compile(m) for m in markers]
+    for pat, sample in proven:
+        try:
+            rx = re.compile(pat)
+        except re.error as exc:
+            errors.append(f"proven-test-red pattern {pat!r} does not compile: {exc}")
+            continue
+        if ".*" in pat:
+            errors.append(f"proven-test-red pattern {pat!r} has a wildcard")
+        if not rx.search(sample):
+            errors.append(f"proven-test-red pattern {pat!r} does not match its sample {sample!r}")
+        if not any(v.search(sample) for v in vetoes):
+            errors.append(f"proven-test-red sample {sample!r} matches no veto marker; the rerun policy would retry it")
+        for probe in probes:
+            if rx.search(probe):
+                errors.append(f"proven-test-red pattern {pat!r} matches crash or generic text {probe!r}")
     return errors
 
 
@@ -385,7 +526,11 @@ def lint(root: str = REPO_ROOT) -> int:
     sys.path.insert(0, HERE)
     import strict_yaml  # noqa: PLC0415  # PyYAML-backed; only `lint` needs it
 
-    errors = signature_errors(SIGNATURES, TEST_FAILURE_MARKERS) + retry_errors(root)
+    errors = (
+        signature_errors(SIGNATURES, TEST_FAILURE_MARKERS)
+        + proven_marker_errors(PROVEN_TEST_RED_MARKERS, TEST_FAILURE_MARKERS)
+        + retry_errors(root)
+    )
     path = os.path.join(root, ".github", "workflows", "rerun-failed-once.yml")
     try:
         with open(path, encoding="utf-8") as fh:
@@ -403,13 +548,13 @@ def lint(root: str = REPO_ROOT) -> int:
 def write_output(path: str, line: str) -> int:
     """Append `line` to the step-output file; no file or a failed write is exit 1."""
     if not path:
-        print("rerun policy: GITHUB_OUTPUT is unset — no rerun", file=sys.stderr)
+        print("rerun policy: GITHUB_OUTPUT is unset — no verdict, so no action", file=sys.stderr)
         return 1
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError as exc:
-        print(f"rerun policy: GITHUB_OUTPUT is unwritable: {exc} — no rerun", file=sys.stderr)
+        print(f"rerun policy: GITHUB_OUTPUT is unwritable: {exc} — no verdict, so no action", file=sys.stderr)
         return 1
     return 0
 
@@ -425,9 +570,22 @@ def main(argv: list[str]) -> int:
         word = "true" if verdict else "false"
         print(f"rerun policy: run {run_id!r} infra-only verdict: {word}")
         return write_output(os.environ.get("GITHUB_OUTPUT", ""), f"rerun={word}")
+    if argv == ["--proven-test-red"]:
+        run_id = os.environ.get("RUN_ID", "")
+        producer = os.environ.get("PRODUCER", "")
+        try:
+            verdict = run_cancel_decision(
+                os.environ.get("REPO", ""), run_id, os.environ.get("RUN_ATTEMPT", ""), producer
+            )
+        except (PolicyError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            print(f"rerun policy: {exc} — no cancel", file=sys.stderr)
+            verdict = False
+        word = "true" if verdict else "false"
+        print(f"rerun policy: run {run_id!r} job {producer!r} proven test red: {word}")
+        return write_output(os.environ.get("GITHUB_OUTPUT", ""), f"cancel={word}")
     if argv == ["--lint"]:
         return lint()
-    print("usage: rerun_policy.py --decide | --lint", file=sys.stderr)
+    print("usage: rerun_policy.py --decide | --proven-test-red | --lint", file=sys.stderr)
     return 2
 
 

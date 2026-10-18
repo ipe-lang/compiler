@@ -254,9 +254,209 @@ class JobIdsTest(unittest.TestCase):
             self.assertEqual(self._decide(os.path.join(tmp, "no", "such")), 1)
 
     def test_unknown_mode_exits_nonzero(self) -> None:
-        for argv in ([], ["decide"], ["lint"], ["--decide", "x"], ["-decide"], ["--decide", "--lint"]):
+        for argv in ([], ["decide"], ["lint"], ["--decide", "x"], ["-decide"], ["--decide", "--lint"], ["--proven-test-red", "x"]):
             with self.subTest(argv):
                 self.assertEqual(rp.main(argv), 2)
+
+
+class ProvenTestRedTest(unittest.TestCase):
+    """The merge-group fail-fast watchers cancel only on a proven test red:
+    a readable log showing a test that ran and failed, readable annotations,
+    and no infra signature in either. Every other red is no cancel, so the
+    run goes on and reports every red it reaches."""
+
+    CLEAN_NOTES = rp.scan([TS + "Process completed with exit code 100."])
+
+    def proven(self, log: list[str] | None, notes: list[str] | None = None) -> bool:
+        return rp.proven_test_red(
+            None if log is None else rp.scan(log),
+            self.CLEAN_NOTES if notes is None else rp.scan(notes),
+        )
+
+    def test_test_failure_is_proven(self) -> None:
+        self.assertTrue(self.proven(TEST_FAIL_LOG))
+        self.assertTrue(self.proven([TS + "test result: FAILED. 3 passed; 1 failed; 0 ignored"]))
+        self.assertTrue(self.proven([TS + "\x1b[31;1m        FAIL\x1b[0m [  12.881s] ipe::emit broken_case"]))
+
+    def test_test_marker_beside_infra_signature_is_not_proven(self) -> None:
+        self.assertFalse(self.proven([*ENOSPC_LOG, *TEST_FAIL_LOG]))
+        self.assertFalse(self.proven(TEST_FAIL_LOG, ["The runner has received a shutdown signal"]))
+
+    def test_infra_only_red_is_not_proven(self) -> None:
+        self.assertFalse(self.proven(ENOSPC_LOG))
+
+    def test_unknown_red_is_not_proven(self) -> None:
+        for log in (
+            [TS + "error: could not compile `ipe` (lib) due to 2 previous errors"],
+            [TS + "error: test run failed"],
+            [TS + "##[error]Process completed with exit code 1."],
+        ):
+            with self.subTest(log):
+                self.assertFalse(self.proven(log))
+
+    def test_crash_is_not_proven(self) -> None:
+        for line in (
+            "     TIMEOUT [ 900.001s] ipe::server_e2e hangs",
+            "     SIGSEGV [   0.4s] ipe::runtime crash",
+            "     SIGKILL [  30.0s] ipe::x oom",
+            "     SIGABRT [   2s] x y",
+            "       ABORT [   2s] x y",
+            "   LEAK-FAIL [   1.0s] ipe::x leaks",
+        ):
+            with self.subTest(line):
+                self.assertFalse(self.proven([TS + line, TS + "error: test run failed"]))
+
+    def test_empty_or_garbled_log_is_not_proven(self) -> None:
+        for log in ([], [""], ["\ufffd\ufffd\x00\x07FA\ufffdIL [ 1s]"], [TS + "FAIL[1s] x", TS + "FAIL [ s] x"]):
+            with self.subTest(log):
+                self.assertFalse(self.proven(log))
+
+    def test_unreadable_source_is_not_proven(self) -> None:
+        self.assertFalse(rp.proven_test_red(None, self.CLEAN_NOTES))
+        self.assertFalse(rp.proven_test_red(rp.scan(TEST_FAIL_LOG), None))
+
+    def test_marker_tables_pass_and_each_proof_is_a_veto(self) -> None:
+        self.assertEqual(rp.proven_marker_errors(rp.PROVEN_TEST_RED_MARKERS, rp.TEST_FAILURE_MARKERS), [])
+
+    def test_fail_open_proven_tables_refused(self) -> None:
+        for table, want in (
+            ((), "is empty"),
+            (((r"error", "error: x"),), "generic text"),
+            (((r"SIGSEGV \[", "  SIGSEGV [ 1s] x"),), "crash or generic"),
+            (((r"FAIL \[.*\]", "FAIL [ 1s] x"),), "wildcard"),
+            (((r"PROVEN-ONLY", "PROVEN-ONLY"),), "matches no veto marker"),
+            (((r"test result: FAILED\.", "nope"),), "does not match its sample"),
+            (((r"(", "x"),), "does not compile"),
+            (((r"test result: FAILED\.", "test result: FAILED."),) * 2, "repeats"),
+        ):
+            with self.subTest(table):
+                errors = rp.proven_marker_errors(table, rp.TEST_FAILURE_MARKERS)
+                self.assertTrue(any(want in e for e in errors), errors)
+
+
+class CancelDecisionTest(unittest.TestCase):
+    PROVEN = (rp.scan(TEST_FAIL_LOG), rp.scan([]))
+    INFRA = (rp.scan(ENOSPC_LOG), rp.scan([]))
+    UNREAD = (None, None)
+
+    def decide(self, failed: list[tuple[int, str]], producer: str, by_id: dict) -> bool:
+        return rp.decide_cancel(failed, producer, lambda j: by_id[j])
+
+    def test_proven_leg_of_the_producer_cancels(self) -> None:
+        self.assertTrue(self.decide([(1, "test-run (2)")], "test-run", {1: self.PROVEN}))
+        self.assertTrue(self.decide([(1, "seal-modset (vendored emit model)")], "seal-modset (vendored emit model)", {1: self.PROVEN}))
+
+    def test_one_proven_leg_beside_unproven_legs_cancels(self) -> None:
+        failed = [(1, "e2e (1)"), (2, "e2e (2)"), (3, "e2e (3)")]
+        self.assertTrue(self.decide(failed, "e2e", {1: self.UNREAD, 2: self.INFRA, 3: self.PROVEN}))
+
+    def test_infra_only_or_unreadable_legs_never_cancel(self) -> None:
+        failed = [(1, "e2e (1)"), (2, "e2e (2)")]
+        self.assertFalse(self.decide(failed, "e2e", {1: self.UNREAD, 2: self.INFRA}))
+
+    def test_another_jobs_test_red_never_cancels(self) -> None:
+        for name in ("e2e-all", "test-run (1)", "e2e (1", "xe2e (1)", "e2e(1)"):
+            with self.subTest(name):
+                self.assertFalse(self.decide([(1, name)], "e2e", {1: self.PROVEN}))
+
+    def test_another_jobs_test_red_beside_an_unproven_leg_never_cancels(self) -> None:
+        failed = [(1, "e2e-all"), (2, "e2e (1)")]
+        self.assertFalse(self.decide(failed, "e2e", {1: self.PROVEN, 2: self.INFRA}))
+
+    def test_leg_rule(self) -> None:
+        self.assertTrue(rp.is_leg_of("e2e", "e2e"))
+        self.assertTrue(rp.is_leg_of("e2e (14)", "e2e"))
+        for name in ("e2e-all", "e2e (1", "e2e(1)", "xe2e (1)", "e2e  (1)x", ""):
+            with self.subTest(name):
+                self.assertFalse(rp.is_leg_of(name, "e2e"))
+
+    def test_no_failed_leg_or_too_many_never_cancel(self) -> None:
+        self.assertFalse(self.decide([], "e2e", {}))
+        many = [(i, f"e2e ({i})") for i in range(1, rp.MAX_FAILED_JOBS + 2)]
+        self.assertFalse(self.decide(many, "e2e", {i: self.PROVEN for i, _ in many}))
+
+    def test_named_listing_parses_and_refuses(self) -> None:
+        listing = "1\tsuccess\tfmt\n2\tfailure\te2e (1)\n3\tskipped\te2e (2)\n4\tcancelled\te2e (3)"
+        self.assertEqual(rp.failed_jobs_named(listing), [(2, "e2e (1)"), (4, "e2e (3)")])
+        self.assertEqual(rp.failed_jobs_named("5\tfailure\ta\tb"), [(5, "a\tb")])
+        for bad in ("12\tfailure", "12\tfailure\t", "x\tfailure\ta", "12\tFailure\ta", "12\tfailure\ta\n12\tsuccess\tb", "\tfailure\ta"):
+            with self.subTest(bad), self.assertRaises(rp.PolicyError):
+                rp.failed_jobs_named(bad)
+
+    def test_job_rows_jq_reads_every_job_unfiltered(self) -> None:
+        self.assertEqual(rp.JOB_ROWS_JQ, '.jobs[] | "\\(.id)\\t\\(.conclusion)\\t\\(.name)"')
+        self.assertNotIn("select", rp.JOB_ROWS_JQ)
+
+    def test_bad_inputs_refused(self) -> None:
+        for args in (
+            ("", "1", "1", "e2e"),
+            ("a/b; rm", "1", "1", "e2e"),
+            ("a/b", "1x", "1", "e2e"),
+            ("a/b", "1", "", "e2e"),
+            ("a/b", "1", "1", ""),
+            ("a/b", "1", "1", " e2e"),
+            ("a/b", "1", "1", "${{ x }}"),
+            ("a/b", "1", "1", "e2e\nx"),
+        ):
+            with self.subTest(args), self.assertRaises(rp.PolicyError):
+                rp.run_cancel_decision(*args)
+
+    def _run(self, output: str | None, env: dict[str, str] | None = None) -> int:
+        keys = ("REPO", "RUN_ID", "RUN_ATTEMPT", "PRODUCER", "GITHUB_OUTPUT")
+        old = {k: os.environ.pop(k, None) for k in keys}
+        os.environ.update(env or {})
+        if output is not None:
+            os.environ["GITHUB_OUTPUT"] = output
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return rp.main(["--proven-test-red"])
+        finally:
+            for k in keys:
+                os.environ.pop(k, None)
+                if old[k] is not None:
+                    os.environ[k] = old[k]
+
+    def test_unprovable_run_writes_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            self.assertEqual(self._run(out), 0)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "cancel=false\n")
+
+    def test_unreadable_listing_writes_false(self) -> None:
+        def refuse(_args: list[str]) -> str:
+            raise rp.PolicyError("`gh api` exited 1")
+
+        old = rp._gh_text
+        rp._gh_text = refuse
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out")
+                env = {"REPO": "a/b", "RUN_ID": "1", "RUN_ATTEMPT": "1", "PRODUCER": "e2e"}
+                self.assertEqual(self._run(out, env), 0)
+                with open(out, encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), "cancel=false\n")
+        finally:
+            rp._gh_text = old
+
+    def test_listing_reads_the_attempt_unfiltered(self) -> None:
+        seen: list[list[str]] = []
+
+        def listing(args: list[str]) -> str:
+            seen.append(args)
+            return "9\tfailure\te2e (3)\n"
+
+        old_text, old_sources = rp._gh_text, rp._job_sources
+        rp._gh_text = listing
+        rp._job_sources = lambda _repo, _j: self.PROVEN
+        try:
+            self.assertTrue(rp.run_cancel_decision("a/b", "5", "2", "e2e"))
+        finally:
+            rp._gh_text, rp._job_sources = old_text, old_sources
+        self.assertEqual(seen, [["repos/a/b/actions/runs/5/attempts/2/jobs", "--paginate", "--jq", rp.JOB_ROWS_JQ]])
+
+    def test_without_output_file_is_red(self) -> None:
+        self.assertEqual(self._run(None), 1)
 
 
 class SignatureTableTest(unittest.TestCase):
