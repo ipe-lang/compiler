@@ -628,8 +628,8 @@ purposeOfOneMibIsBounded =
         loaded <- loadUnitNow (uid "u-a")
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (List.any (ow -> row.unit.uid == uid "u-a" && bounded row.unit.purpose) rows
-                && Maybe.map (iew -> bounded view.unit.purpose) loaded
+            (List.any (\row -> row.unit.uid == uid "u-a" && bounded row.unit.purpose) rows
+                && Maybe.map (\view -> bounded view.unit.purpose) loaded
                 == Just True
             )
 

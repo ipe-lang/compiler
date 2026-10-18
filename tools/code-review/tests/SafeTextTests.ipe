@@ -435,7 +435,13 @@ droppedBytes label =
         Just (LabelCut dropped _) ->
             Just dropped
 
-        _ ->
+        Just (LabelText _) ->
+            Nothing
+
+        Just (LabelEscapes _) ->
+            Nothing
+
+        Nothing ->
             Nothing
 
 
