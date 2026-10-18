@@ -18,7 +18,7 @@ import Lib.Drawn as Drawn exposing (Code(..), DrawnSource, Hue(..), LayoutNote(.
 import Lib.Failure as Failure exposing (LoadFailure)
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), SourceView(..))
-import Lib.Label as Label exposing (Label, LabelPart(..))
+import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
@@ -1002,13 +1002,6 @@ segmentHtml seg =
             Html.span [ Attr.attribute "data-review-escape" "true", Attr.style escapeCss ] [ Html.text (SafeText.escapeSpelling c) ]
 
 
--- One piece of a drawn label: a label parsed from an index column, or text
--- the tool wrote around it.
-type LabelPiece
-    = IndexedLabel Label
-    | ToolText SafeText
-
-
 -- The one sink for index labels: like `safeText`, it draws in byte order and
 -- marks every escape run, and it marks a truncation marker with `cutCss`, so
 -- no label text can pass for a marker the tool wrote.
@@ -1102,7 +1095,7 @@ decisionButtons : RefuseControls -> Queue.QueueState -> Index.UnitView -> Ui.Ele
 decisionButtons controls queueState loaded =
     case Queue.sourceStatusText loaded.view of
         Just why ->
-            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText why)
+            Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (shownLabel why)
 
         Nothing ->
             case queueState of
@@ -1240,7 +1233,7 @@ withheldSource : Index.SourceView -> List (Ui.Element Msg)
 withheldSource view =
     case Queue.sourceStatusText view of
         Just why ->
-            [ Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (safeText why) ]
+            [ Ui.el [ Font.size 12, Font.color (Ui.rgb 220 170 90) ] (shownLabel why) ]
 
         Nothing ->
             []

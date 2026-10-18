@@ -68,6 +68,8 @@ module TestSupport exposing
     , renderedForeign
     , labelOf
     , labelText
+    , quotedLabelOf
+    , piecesShown
     , describeText
     , refusedFor
     , migratedReviewAt
@@ -140,7 +142,7 @@ import Lib.Failure as Failure exposing (DecideRefusal(..), RefuseFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
-import Lib.Label as Label exposing (Label, LabelPart(..))
+import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
@@ -289,7 +291,7 @@ viewTag view =
             "unverifiable"
 
         Unreadable failure ->
-            "unreadable: " ++ SafeText.toString (Index.readFailureText failure)
+            "unreadable: " ++ piecesShown (Index.readFailureText failure)
 
         TooLarge (SpanLines o) ->
             "too large lines " ++ String.fromInt o.lines
@@ -1337,9 +1339,32 @@ labelPartText part =
             Label.markerText dropped hash
 
 
+-- Text the app holds whole, parsed as a stored path a refusal quotes.
+quotedLabelOf : String -> Label
+quotedLabelOf raw =
+    Label.fromQuotedText Label.labelCap raw
+
+
+-- A line's pieces joined as the page draws them: each label as `labelText`
+-- joins it, the tool's text flattened.
+piecesShown : List LabelPiece -> String
+piecesShown pieces =
+    String.concat (List.map pieceShown pieces)
+
+
+pieceShown : LabelPiece -> String
+pieceShown piece =
+    case piece of
+        IndexedLabel label ->
+            labelText label
+
+        ToolText text ->
+            SafeText.toString text
+
+
 describeText : PathError -> String
 describeText err =
-    SafeText.toString (RepoPath.describe err)
+    piecesShown (RepoPath.describe err)
 
 
 -- A parse that failed, and failed for `reason` rather than an unrelated one.

@@ -19,7 +19,7 @@ import Ipe.Tuple as Tuple
 import Lib.Drawn as Drawn exposing (DrawnSource, SourceRow(..))
 import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Highlight as Highlight
-import Lib.Label as Label exposing (Label)
+import Lib.Label as Label exposing (Label, LabelPiece(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (PathError, Root, RootMap, Tag)
@@ -75,7 +75,7 @@ unitByUid roots uid =
         bound =
             boundTags roots
     in
-    ( "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.body_hash, u.updated_sha, f.lang, " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
+    ( "SELECT u.uid, u.line_start, u.line_end, u.body_hash, u.updated_sha, f.lang, " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
     , Uid.toSql uid :: bound.params
     )
 
@@ -128,52 +128,63 @@ loadView conn roots uid =
         case List.head rows of
             Just ( row, shown ) ->
                 do
-                    view <- viewOf conn roots row
-                    links <- linksOf conn row view
-                    Task.succeed (Just { unit = withRow (coreOf row) shown, view = view, links = links })
+                    view <- viewOf conn roots row shown
+                    links <- linksOf conn row shown view
+                    Task.succeed (Just { unit = withRow row shown, view = view, links = links })
 
             Nothing ->
                 Task.succeed Nothing
 
 
-queryUnit : Db.Db -> RootMap -> Uid -> Task.Task Error (List ( RowUnit, RowShown ))
+-- A unit row as its core columns and its display columns. No text column
+-- of the unit is read whole: the path, names and kind come only through
+-- their bounded windows, and a value the app acts on is taken from a window
+-- only when `Label.whole` proves it holds the whole column.
+queryUnit : Db.Db -> RootMap -> Uid -> Task.Task Error (List ( RowCore, RowShown ))
 queryUnit conn roots uid =
     let
         ( sql, params ) =
             unitByUid roots uid
     in
-    Db.queryDecode conn sql params (Db.Decode.map2 (\row shown -> ( row, shown )) rowDecoder shownDecoder)
+    Db.queryDecode conn sql params (Db.Decode.map2 (\row shown -> ( row, shown )) coreDecoder shownDecoder)
 
 
 -- Jump links come only from a shown view; a withheld view links nothing and
 -- reads no names. A shown view costs two indexed queries, each bounded by a
 -- ceiling: the unit's callgraph edges, then the qualified names its
 -- references spell under ipe-index's callee rule. The unit never links to
--- itself.
-linksOf : Db.Db -> RowUnit -> SourceView -> Task.Task Error Links.LinkSet
-linksOf conn row view =
+-- itself. The unit's names reach `Links.candidates` only as their windows,
+-- and its path is bound only when its window holds the whole path: a view is
+-- shown only for such a path, so the other case links nothing.
+linksOf : Db.Db -> RowCore -> RowShown -> SourceView -> Task.Task Error Links.LinkSet
+linksOf conn row columns view =
     case view of
         Shown shown ->
-            let
-                lang =
-                    langOf row.lang
+            case Label.whole columns.path of
+                Just path ->
+                    let
+                        lang =
+                            langOf row.lang
 
-                source =
-                    shownText shown
+                        source =
+                            shownText shown
 
-                wanted =
-                    Links.candidates lang { kind = row.kind, name = row.name, qualified = row.qualified } (Links.references lang source)
-            in
-            do
-                edges <- edgeLinks conn row.uid
-                resolved <- candidateRows conn row wanted.names
-                Task.succeed
-                    (Links.assemble
-                        { edges = edgeReach edges, candidates = wanted.reach }
-                        (List.map (\( uid, qualified ) -> Links.internal qualified uid) edges)
-                        (Links.resolveCandidates wanted.lookups resolved)
-                        (Links.sourceUrls source)
-                    )
+                        wanted =
+                            Links.candidates lang { kind = columns.kind, name = columns.name, qualified = columns.qualified } (Links.references lang source)
+                    in
+                    do
+                        edges <- edgeLinks conn row.uid
+                        resolved <- candidateRows conn path row.uid wanted.names
+                        Task.succeed
+                            (Links.assemble
+                                { edges = edgeReach edges, candidates = wanted.reach }
+                                (List.map (\( uid, qualified ) -> Links.internal qualified uid) edges)
+                                (Links.resolveCandidates wanted.lookups resolved)
+                                (Links.sourceUrls source)
+                            )
+
+                Nothing ->
+                    Task.succeed Links.noLinks
 
         Stale _ ->
             Task.succeed Links.noLinks
@@ -218,14 +229,14 @@ edgeDecoder =
 
 
 -- The `(qualified, uid)` row of each candidate name some unit other than
--- `row` holds; no names read nothing.
-candidateRows : Db.Db -> RowUnit -> List String -> Task.Task Error (List ( String, String ))
-candidateRows conn row names =
+-- the unit `uid` at `path` holds; no names read nothing.
+candidateRows : Db.Db -> String -> Uid -> List String -> Task.Task Error (List ( String, String ))
+candidateRows conn path uid names =
     if List.isEmpty names then
         Task.succeed []
 
     else
-        case candidateQuery row.path row.uid names of
+        case candidateQuery path uid names of
             ( sql, params ) ->
                 Db.queryDecode conn sql params qualifiedDecoder
 
@@ -256,23 +267,6 @@ qualifiedDecoder =
         |> Db.Decode.required "uid" (Db.Decode.string "uid")
 
 
--- The unit page's raw columns: the path its file is read from, the names its
--- links resolve against, its lines, stored hash and language. None of them
--- is shown; what a page shows of the unit is `RowShown`.
-type alias RowUnit =
-    { uid : Uid
-    , path : String
-    , name : String
-    , qualified : String
-    , kind : String
-    , lineStart : Int
-    , lineEnd : Int
-    , bodyHash : String
-    , updatedSha : String
-    , lang : Maybe String
-    }
-
-
 -- The columns every unit row carries into a `Unit` besides its labels.
 type alias RowCore =
     { uid : Uid
@@ -293,17 +287,6 @@ type alias RowShown =
     , kind : Label.Column
     , facing : Label.Column
     , purpose : Maybe Label.Column
-    }
-
-
-coreOf : RowUnit -> RowCore
-coreOf row =
-    { uid = row.uid
-    , lineStart = row.lineStart
-    , lineEnd = row.lineEnd
-    , bodyHash = row.bodyHash
-    , updatedSha = row.updatedSha
-    , lang = row.lang
     }
 
 
@@ -377,88 +360,6 @@ coreDecoder : Db.Decode.Decoder RowCore
 coreDecoder =
     Db.Decode.succeed (\uid lineStart lineEnd bodyHash updatedSha lang -> { uid = uid, lineStart = lineStart, lineEnd = lineEnd, bodyHash = bodyHash, updatedSha = updatedSha, lang = lang })
         |> Db.Decode.required "uid" (Uid.decoder "uid")
-        |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
-        |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
-        |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
-        |> Db.Decode.required "updated_sha" (Db.Decode.string "updated_sha")
-        |> Db.Decode.required "lang" (Db.Decode.nullable (Db.Decode.string "lang"))
-
-
--- The unit row is decoded in two halves of at most ten columns each
--- (`Db.Decode.succeed` lifts at most 10 parameters — IPE-L0121), then merged.
-type alias RowA =
-    { uid : Uid
-    , path : String
-    , name : String
-    , qualified : String
-    }
-
-
-type alias RowB =
-    { kind : String
-    , lineStart : Int
-    , lineEnd : Int
-    , bodyHash : String
-    , updatedSha : String
-    , lang : Maybe String
-    }
-
-
-makeRowA : Uid -> String -> String -> String -> RowA
-makeRowA uid path name qualified =
-    { uid = uid
-    , path = path
-    , name = name
-    , qualified = qualified
-    }
-
-
-makeRowB : String -> Int -> Int -> String -> String -> Maybe String -> RowB
-makeRowB kind lineStart lineEnd bodyHash updatedSha lang =
-    { kind = kind
-    , lineStart = lineStart
-    , lineEnd = lineEnd
-    , bodyHash = bodyHash
-    , updatedSha = updatedSha
-    , lang = lang
-    }
-
-
-mergeRows : RowA -> RowB -> RowUnit
-mergeRows a b =
-    { uid = a.uid
-    , path = a.path
-    , name = a.name
-    , qualified = a.qualified
-    , kind = b.kind
-    , lineStart = b.lineStart
-    , lineEnd = b.lineEnd
-    , bodyHash = b.bodyHash
-    , updatedSha = b.updatedSha
-    , lang = b.lang
-    }
-
-
-rowDecoder : Db.Decode.Decoder RowUnit
-rowDecoder =
-    Db.Decode.andThen
-        (\a -> Db.Decode.map (\b -> mergeRows a b) partBDecoder)
-        partADecoder
-
-
-partADecoder : Db.Decode.Decoder RowA
-partADecoder =
-    Db.Decode.succeed makeRowA
-        |> Db.Decode.required "uid" (Uid.decoder "uid")
-        |> Db.Decode.required "path" (Db.Decode.string "path")
-        |> Db.Decode.required "name" (Db.Decode.string "name")
-        |> Db.Decode.required "qualified" (Db.Decode.string "qualified")
-
-
-partBDecoder : Db.Decode.Decoder RowB
-partBDecoder =
-    Db.Decode.succeed makeRowB
-        |> Db.Decode.required "kind" (Db.Decode.string "kind")
         |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
         |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
@@ -1205,7 +1106,7 @@ refusalDigestText digest =
 type alias RefusalRow =
     { uid : Uid
     , path : Label
-    , lang : String
+    , lang : Label
     , reason : RefusalReason
     , size : Maybe Int
     , digest : Maybe RefusalDigest
@@ -1217,14 +1118,14 @@ type alias RefusalRow =
 type alias RawRefusal =
     { uid : Uid
     , path : Label.Column
-    , lang : String
+    , lang : Label.Column
     , reason : String
     , size : Maybe Int
     , digest : Maybe String
     }
 
 
-makeRawRefusal : Uid -> Label.Column -> String -> String -> Maybe Int -> Maybe String -> RawRefusal
+makeRawRefusal : Uid -> Label.Column -> Label.Column -> String -> Maybe Int -> Maybe String -> RawRefusal
 makeRawRefusal uid path lang reason size digest =
     { uid = uid
     , path = path
@@ -1240,7 +1141,7 @@ rawRefusalDecoder =
     Db.Decode.succeed makeRawRefusal
         |> Db.Decode.required "uid" (Uid.decoder "uid")
         |> Db.Decode.required "path" (columnDecoder "path")
-        |> Db.Decode.required "lang" (Db.Decode.string "lang")
+        |> Db.Decode.required "lang" (columnDecoder "lang")
         |> Db.Decode.required "reason" (Db.Decode.string "reason")
         |> Db.Decode.required "size" (Db.Decode.nullable (Db.Decode.int "size"))
         |> Db.Decode.required "digest" (Db.Decode.nullable (Db.Decode.string "digest"))
@@ -1275,7 +1176,7 @@ refusalRowOf raw =
                         Db.Decode.succeed
                             { uid = raw.uid
                             , path = Label.parse Label.labelCap raw.path
-                            , lang = raw.lang
+                            , lang = Label.parse Label.labelCap raw.lang
                             , reason = reason
                             , size = raw.size
                             , digest = digest
@@ -1335,8 +1236,8 @@ negativeSize size =
             False
 
 
--- A refusal row as a page reads it: its path as a bounded window and its
--- byte length (`shownColumn`), never the whole stored value.
+-- A refusal row as a page reads it: its path and language each as a bounded
+-- window and its byte length (`shownColumn`), never the whole stored value.
 refusalColumns : String
 refusalColumns =
     "SELECT " ++ refusalColumnList ++ " FROM refusals u WHERE"
@@ -1344,14 +1245,7 @@ refusalColumns =
 
 refusalColumnList : String
 refusalColumnList =
-    "u.uid AS uid, " ++ shownColumn "u.path" "path" ++ ", u.lang AS lang, u.reason AS reason, u.size AS size, u.digest AS digest"
-
-
--- A refusal row with its whole stored path besides, for the one read that
--- resolves the path to the file: a decision's re-check of a single row.
-refusalWithPathColumns : String
-refusalWithPathColumns =
-    "SELECT u.path AS path, " ++ refusalColumnList ++ " FROM refusals u WHERE"
+    "u.uid AS uid, " ++ shownColumn "u.path" "path" ++ ", " ++ shownColumn "u.lang" "lang" ++ ", u.reason AS reason, u.size AS size, u.digest AS digest"
 
 
 -- The membership condition on a refusal row `u`: no pair of the `reviewed`
@@ -2065,49 +1959,63 @@ refusalPathFor conn uid =
 
 
 -- The one verification of a unit's source. The stored hash is parsed first,
--- so an unknown scheme refuses before any read; then the stored path is
--- resolved, a span past the line ceiling is withheld before any read, a file
--- unit's child spans are read on `conn`, the file is read and `classifyView`
--- judges the view. Every per-unit cause (refused path, unreadable file,
--- oversized view, bad range, drift) is a `SourceView` state, never a failed
--- task.
-viewOf : Db.Db -> RootMap -> RowUnit -> Task.Task Error SourceView
-viewOf conn roots row =
+-- so an unknown scheme refuses before any read; then a stored path longer
+-- than its window is refused, so no prefix is ever joined; then the stored
+-- path is resolved, a span past the line ceiling is withheld before any
+-- read, a file unit's child spans are read on `conn`, the file is read and
+-- `classifyView` judges the view. Every per-unit cause (refused path,
+-- unreadable file, oversized view, bad range, drift) is a `SourceView`
+-- state, never a failed task.
+viewOf : Db.Db -> RootMap -> RowCore -> RowShown -> Task.Task Error SourceView
+viewOf conn roots row columns =
     case provable (parseAttested row.bodyHash) of
         Nothing ->
             Task.succeed (Stale UnverifiableHash)
 
         Just stored ->
-            case RepoPath.resolve roots row.path of
-                Err refusal ->
-                    Task.succeed (Unreadable (PathRefused refusal))
+            case Label.whole columns.path of
+                Nothing ->
+                    Task.succeed (Unreadable (PathPastWindow (storedPathLabel columns.path)))
 
-                Ok path ->
-                    case spanOversize row.lineStart row.lineEnd of
-                        Just over ->
-                            Task.succeed (TooLarge over)
+                Just storedPath ->
+                    case RepoPath.resolve roots storedPath of
+                        Err refusal ->
+                            Task.succeed (Unreadable (PathRefused refusal))
 
-                        Nothing ->
-                            do
-                                body <- bodyOf conn row
-                                case body of
-                                    Err over ->
-                                        Task.succeed (TooLarge over)
+                        Ok path ->
+                            case spanOversize row.lineStart row.lineEnd of
+                                Just over ->
+                                    Task.succeed (TooLarge over)
 
-                                    Ok covered ->
-                                        File.readFileLimit path sourceCeiling
-                                            |> Task.map (classifyView row.uid (langOf row.lang) stored covered)
-                                            |> Task.onError (\_ -> unreadableAt row.path path)
+                                Nothing ->
+                                    do
+                                        body <- bodyOf conn row columns.kind storedPath
+                                        case body of
+                                            Err over ->
+                                                Task.succeed (TooLarge over)
+
+                                            Ok covered ->
+                                                File.readFileLimit path sourceCeiling
+                                                    |> Task.map (classifyView row.uid (langOf row.lang) stored covered)
+                                                    |> Task.onError (\_ -> unreadableAt (storedPathLabel columns.path) path)
 
 
--- What `row`'s attestation covers, ipe-index's rule: a file unit attests its
--- residual against the spans of every other unit of its file, read one past
+-- A stored path as a read failure names it: a quoted label, so it is drawn
+-- bounded and between quotes it cannot close.
+storedPathLabel : Label.Column -> Label
+storedPathLabel column =
+    Label.parseQuoted Label.labelCap column
+
+
+-- What `row`'s attestation covers, ipe-index's rule: a file unit (its whole
+-- `kind` column is `fileKind`) attests its residual against the spans of
+-- every other unit of its file at `storedPath`, read one past
 -- `childSpanCeiling` so a full read is refused rather than trusted; every
 -- other unit attests its line range.
-bodyOf : Db.Db -> RowUnit -> Task.Task Error (Result Oversize Body)
-bodyOf conn row =
-    if row.kind == fileKind then
-        Db.queryDecode conn childSpansSql [ SqlString row.path, SqlInt (childSpanCeiling + 1) ] spanDecoder
+bodyOf : Db.Db -> RowCore -> Label.Column -> String -> Task.Task Error (Result Oversize Body)
+bodyOf conn row kind storedPath =
+    if Label.whole kind == Just fileKind then
+        Db.queryDecode conn childSpansSql [ SqlString storedPath, SqlInt (childSpanCeiling + 1) ] spanDecoder
             |> Task.map residualBody
 
     else
@@ -2152,14 +2060,14 @@ childSpanCeiling =
 -- Why the read of `stored`'s joined `path` failed, judged by whether
 -- anything is there. The read error's own text is never kept, so no OS
 -- wording or error number reaches the page.
-unreadableAt : String -> Path -> Task.Task Error SourceView
+unreadableAt : Label -> Path -> Task.Task Error SourceView
 unreadableAt stored path =
     File.exists path
         |> Task.map (failureFor stored)
         |> Task.onError (\_ -> Task.succeed (Unreadable (CannotRead stored)))
 
 
-failureFor : String -> Bool -> SourceView
+failureFor : Label -> Bool -> SourceView
 failureFor stored present =
     if present then
         Unreadable (CannotRead stored)
@@ -2168,28 +2076,44 @@ failureFor stored present =
         Unreadable (NoFile stored)
 
 
--- The one rendering of a `ReadFailure`, naming the stored path and the fix.
-readFailureText : ReadFailure -> SafeText
+-- The one rendering of a `ReadFailure`, naming the stored path and the fix:
+-- the stored path is the failure's own quoted label, every other piece the
+-- tool's text, so no index text and no error text reaches the line.
+readFailureText : ReadFailure -> List LabelPiece
 readFailureText failure =
     case failure of
         PathRefused refusal ->
             RepoPath.describe refusal
 
+        PathPastWindow stored ->
+            storedPathText stored
+                (SafeText.concat
+                    [ SafeText.literal "is longer than the "
+                    , SafeText.render (String.fromInt Label.windowChars)
+                    , SafeText.literal " characters the index read returns, so it is never joined; re-run `ipe-index index` from a checkout with shorter paths"
+                    ]
+                )
+
         NoFile stored ->
-            SafeText.concat
-                [ SafeText.literal "index path "
-                , SafeText.quoted stored
-                , SafeText.literal " names no file under the repository root; re-run `ipe-index index` if the file was moved or deleted"
-                ]
+            storedPathText stored (SafeText.literal "names no file under the repository root; re-run `ipe-index index` if the file was moved or deleted")
 
         CannotRead stored ->
-            SafeText.concat
-                [ SafeText.literal "index path "
-                , SafeText.quoted stored
-                , SafeText.literal " exists but did not read as text: it is past the "
-                , SafeText.render (String.fromInt (ByteSize.toBytes sourceCeiling))
-                , SafeText.literal "-byte limit, not UTF-8, not a regular file, or not readable by this process"
-                ]
+            storedPathText stored
+                (SafeText.concat
+                    [ SafeText.literal "exists but did not read as text: it is past the "
+                    , SafeText.render (String.fromInt (ByteSize.toBytes sourceCeiling))
+                    , SafeText.literal "-byte limit, not UTF-8, not a regular file, or not readable by this process"
+                    ]
+                )
+
+
+-- `index path "<stored>" <problem>`, the problem the tool's text.
+storedPathText : Label -> SafeText -> List LabelPiece
+storedPathText stored problem =
+    [ ToolText (SafeText.literal "index path \"")
+    , IndexedLabel stored
+    , ToolText (SafeText.concat [ SafeText.literal "\" ", problem ])
+    ]
 
 
 -- The one judgement of a unit's view, in precedence order: a body past the
@@ -2675,8 +2599,8 @@ reverify settings shown =
                 conn <- readConnection settings
                 rows <- queryUnit conn settings.roots s.uid
                 case List.head rows of
-                    Just ( row, _ ) ->
-                        viewOf conn settings.roots row
+                    Just ( row, columns ) ->
+                        viewOf conn settings.roots row columns
                             |> Task.map (confirmShown s.uid s.hash)
 
                     Nothing ->
@@ -2724,7 +2648,7 @@ reverifyRefusal settings uid digest =
     in
     do
         conn <- readConnection settings
-        rows <- Db.queryDecode conn (refusalWithPathColumns ++ " u.uid = ? AND" ++ bound.sql ++ " LIMIT 1") ([ Uid.toSql uid ] ++ bound.params) refusalWithPathDecoder
+        rows <- Db.queryDecode conn (refusalColumns ++ " u.uid = ? AND" ++ bound.sql ++ " LIMIT 1") ([ Uid.toSql uid ] ++ bound.params) refusalWithPathDecoder
         case List.head rows of
             Just ( row, stored ) ->
                 confirmRefusal settings.roots digest row stored
@@ -2733,13 +2657,15 @@ reverifyRefusal settings uid digest =
                 Task.succeed (Err FileGone)
 
 
--- A refusal row with its stored path, the one form `RepoPath.resolve` reads.
-refusalWithPathDecoder : Db.Decode.Decoder ( RefusalRow, String )
+-- A refusal row with its stored path, the one form `RepoPath.resolve` reads:
+-- the path's window when it holds the whole path, else `Nothing`, so no
+-- prefix of a long path is ever joined.
+refusalWithPathDecoder : Db.Decode.Decoder ( RefusalRow, Maybe String )
 refusalWithPathDecoder =
-    Db.Decode.map2 (\row stored -> ( row, stored )) refusalRowDecoder (Db.Decode.string "path")
+    Db.Decode.map2 (\row column -> ( row, Label.whole column )) refusalRowDecoder (columnDecoder "path")
 
 
-confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> String -> Task.Task Error (Result DecideRefusal Attested)
+confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> Maybe String -> Task.Task Error (Result DecideRefusal Attested)
 confirmRefusal roots digest row stored =
     case row.digest of
         Nothing ->
@@ -2758,7 +2684,7 @@ confirmRefusal roots digest row stored =
 -- content reason's file must still be refused, an entry reason's digest is
 -- of the staged entry and needs no read, and a blocking reason is never
 -- decided.
-stillRefused : RootMap -> RefusalRow -> String -> Task.Task Error (Result DecideRefusal ())
+stillRefused : RootMap -> RefusalRow -> Maybe String -> Task.Task Error (Result DecideRefusal ())
 stillRefused roots row stored =
     case row.reason of
         NotUtf8 ->
@@ -2818,12 +2744,12 @@ atMostSourceCeiling n =
 
 -- The file at `stored` exists and does not read as text within `cap`. The
 -- stored path is the index's escaped form, parsed back to the name it
--- escapes by `unescapeShown`; a path that is not the index's escape of a
--- name names no file this app can join, so it is never re-probed and never
--- decided.
-stillUnreadable : RootMap -> String -> ByteSize -> Task.Task Error (Result DecideRefusal ())
+-- escapes by `unescapeShown`; a path longer than its window (`Nothing`), or
+-- one that is not the index's escape of a name, names no file this app can
+-- join, so it is never re-probed and never decided.
+stillUnreadable : RootMap -> Maybe String -> ByteSize -> Task.Task Error (Result DecideRefusal ())
 stillUnreadable roots stored cap =
-    case Maybe.map (RepoPath.resolve roots) (unescapeShown stored) of
+    case Maybe.map (RepoPath.resolve roots) (Maybe.andThen unescapeShown stored) of
         Just (Ok path) ->
             do
                 present <- File.exists path
@@ -3064,13 +2990,15 @@ type SourceView
 
 
 -- Why a unit's file was not read: its stored path was refused before any
--- read, nothing is at the joined path, or what is there did not read as
--- text within `sourceCeiling`. Each case but a refusal names the stored
--- path; a refusal's `PathError` names it itself.
+-- read, it is longer than the window the index read returns (so no prefix of
+-- it is ever joined), nothing is at the joined path, or what is there did
+-- not read as text within `sourceCeiling`. Each case but a refusal names the
+-- stored path as a quoted label; a refusal's `PathError` names it itself.
 type ReadFailure
     = PathRefused PathError
-    | NoFile String
-    | CannotRead String
+    | PathPastWindow Label
+    | NoFile Label
+    | CannotRead Label
 
 
 -- The scheme prefix of a line range's attestation in `body_hash`.

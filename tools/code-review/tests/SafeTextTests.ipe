@@ -31,7 +31,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
 import Lib.Uid as Uid
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid, labelOf, labelText)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, quotedLabelOf, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid, labelOf, labelText)
 
 
 -- Every member of the runtime's `is_log_hazard` set as it stood before the
@@ -274,7 +274,7 @@ quoteCannotForgeBoundary =
     List.all identity
         [ rendered "a\"b" == "a\\\"b"
         , SafeText.toString (SafeText.quoted "x\" ok \"y") == "\"x\\\" ok \\\"y\""
-        , String.contains "\"ipe:a\\\" has\"" (describeText (MissingTag "ipe:a\" has"))
+        , String.contains "\"ipe:a\\\" has\"" (describeText (MissingTag (quotedLabelOf "ipe:a\" has")))
         , rendered "\\\"" /= rendered "\""
         ]
 
@@ -429,6 +429,84 @@ shortLabelUncut =
     Label.parts (labelOf "ipe:src/lib.rs") == [ LabelText "ipe:src/lib.rs" ]
 
 
+-- A quoted label escapes `"` and `\` as `SafeText.quoted` does, so a stored
+-- path cannot close the quotes the tool draws around it; the same text as a
+-- plain label shows them as text. Red if the quoted parse stops escaping
+-- either character, or the plain parse starts.
+quotedLabelEscapesQuotes : Bool
+quotedLabelEscapesQuotes =
+    Label.parts (quotedLabelOf "a\"b\\c")
+        == [ LabelText "a", LabelEscapes (SafeText.escapeSpelling '"'), LabelText "b", LabelEscapes (SafeText.escapeSpelling '\\'), LabelText "c" ]
+        && Label.parts (labelOf "a\"b\\c")
+        == [ LabelText "a\"b\\c" ]
+        && labelText (quotedLabelOf "x\" ok \"y")
+        == String.dropRight 1 (String.dropLeft 1 (SafeText.toString (SafeText.quoted "x\" ok \"y")))
+
+
+-- A stored path dense with hazards, quoted, still draws at most
+-- `elementCeiling` elements and ends in the marker for the rest. Red if the
+-- quoted parse stops bounding its escape runs.
+quotedLabelBounded : Bool
+quotedLabelBounded =
+    let
+        drawn =
+            Label.parts (quotedLabelOf (String.repeat 200 (codeText 27 ++ "\"a")))
+
+        elements =
+            List.length (List.filter isElement drawn)
+    in
+    elements
+        <= Label.elementCeiling
+        && droppedBytes (quotedLabelOf (String.repeat 200 (codeText 27 ++ "\"a")))
+        /= Nothing
+        && List.length (List.filter isElement (Label.parts (quotedLabelOf "ipe:src/lib.rs")))
+        == 0
+
+
+isElement : LabelPart -> Bool
+isElement part =
+    case part of
+        LabelText _ ->
+            False
+
+        LabelEscapes _ ->
+            True
+
+        LabelCut _ _ ->
+            True
+
+
+-- A column is whole only when the window holds all of it: a column of
+-- exactly `windowChars` characters (one-byte or two-byte) is whole, one
+-- character more is not. A BLOB cell of `2 * windowChars` bytes reads its
+-- window of `windowChars` bytes as hex, a text whose byte count equals the
+-- whole cell's: it is still not whole. Red if `whole` trusts a cut window.
+wholeOnlyWithinWindow : Bool
+wholeOnlyWithinWindow =
+    let
+        at =
+            String.repeat Label.windowChars "a"
+
+        wide =
+            String.repeat Label.windowChars "é"
+
+        hexOfCutBlob =
+            String.repeat Label.windowChars "6c"
+    in
+    Label.whole { shown = hexOfCutBlob, bytes = 2 * Label.windowChars }
+        == Nothing
+        && Label.whole (Label.columnOf at)
+        == Just at
+        && Label.whole (Label.columnOf wide)
+        == Just wide
+        && Label.whole (Label.columnOf (at ++ "a"))
+        == Nothing
+        && Label.whole (Label.columnOf (wide ++ "é"))
+        == Nothing
+        && Label.whole { shown = "a", bytes = 2 }
+        == Nothing
+
+
 droppedBytes : Label -> Maybe Int
 droppedBytes label =
     case List.head (List.reverse (Label.parts label)) of
@@ -462,4 +540,7 @@ checks =
         , Task.succeed ( "adjacent escapes in a label are one run", escapeRunsCoalesce )
         , Task.succeed ( "a label cut inside a character drops the whole character", labelCutsOnCharBoundary )
         , Task.succeed ( "a label within its cap shows all of it with no marker", shortLabelUncut )
+        , Task.succeed ( "a quoted label escapes its quote and backslash", quotedLabelEscapesQuotes )
+        , Task.succeed ( "a hazard-dense quoted label draws at most the element ceiling", quotedLabelBounded )
+        , Task.succeed ( "a column is whole only within the window", wholeOnlyWithinWindow )
         ]
