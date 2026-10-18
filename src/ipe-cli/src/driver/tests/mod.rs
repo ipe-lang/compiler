@@ -1846,20 +1846,17 @@ fn build_manifest_test_entry(fixture: &crate::RootFixture, label: &str) -> Strin
         host: crate::delivery::HostIntent::Served,
     };
     let tests_root = fixture.path().join("tests");
-    let out = ipe_test_temp::temp_root().join(format!("{label}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&out);
+    let scratch = crate::scratch::ScratchDir::new(label).expect("scratch dir");
     let built = build_test_into(
         &source,
         &manifest.src_root,
         &tests_root,
         &tests_root.join("Main.ipe"),
-        OutTarget::Path(&out),
+        OutTarget::Scratch(&scratch),
         &runtime,
-    );
-    assert!(built.is_ok(), "the test entry builds: {:?}", built.err());
-    let cargo_toml = fs::read_to_string(out.join("Cargo.toml")).expect("emitted Cargo.toml");
-    let _ = fs::remove_dir_all(&out);
-    cargo_toml
+    )
+    .expect("the test entry builds");
+    fs::read_to_string(built.path().join("Cargo.toml")).expect("emitted Cargo.toml")
 }
 
 /// A test build links the database driver the manifest declares, as the
@@ -1904,9 +1901,7 @@ fn a_manifest_test_build_whose_src_is_gone_is_refused() {
     let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
     fs::remove_dir_all(&manifest.src_root).expect("remove src/");
     let tests_root = fixture.path().join("tests");
-    let out =
-        ipe_test_temp::temp_root().join(format!("ipec-test-build-src-gone-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&out);
+    let scratch = crate::scratch::ScratchDir::new("ipec-test-build-src-gone").expect("scratch dir");
     let built = build_test_into(
         &SettingsSource::Manifest {
             manifest: &manifest,
@@ -1916,16 +1911,15 @@ fn a_manifest_test_build_whose_src_is_gone_is_refused() {
         &manifest.src_root,
         &tests_root,
         &tests_root.join("Main.ipe"),
-        OutTarget::Path(&out),
+        OutTarget::Scratch(&scratch),
         &runtime,
     );
-    let emitted = out.join("Cargo.toml").exists();
-    let _ = fs::remove_dir_all(&out);
     assert!(
         built.is_err(),
         "a manifest test build without `src/` fell back to a flat build"
     );
-    assert!(!emitted, "the refused test build emitted a crate");
+    let emitted = fs::read_dir(scratch.path()).expect("list scratch").count();
+    assert_eq!(emitted, 0, "the refused test build emitted a crate");
 }
 
 /// The test-stage source collection unions the `src/` and `tests/` trees
