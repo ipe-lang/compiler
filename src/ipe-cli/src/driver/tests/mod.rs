@@ -1892,6 +1892,42 @@ fn a_manifest_project_without_src_is_refused_before_any_test_build() {
     );
 }
 
+/// A manifest project's test build always roots the code under test at the
+/// manifest's `src/` tree: a tree removed after the manifest was read is
+/// refused, never built as a flat project under the manifest's settings.
+#[test]
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn a_manifest_test_build_whose_src_is_gone_is_refused() {
+    let fixture = postgres_test_project();
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let manifest_path = fixture.manifest_path();
+    let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
+    fs::remove_dir_all(&manifest.src_root).expect("remove src/");
+    let tests_root = fixture.path().join("tests");
+    let out =
+        ipe_test_temp::temp_root().join(format!("ipec-test-build-src-gone-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&out);
+    let built = build_test_into(
+        &SettingsSource::Manifest {
+            manifest: &manifest,
+            manifest_path: &manifest_path,
+            host: crate::delivery::HostIntent::Served,
+        },
+        &manifest.src_root,
+        &tests_root,
+        &tests_root.join("Main.ipe"),
+        OutTarget::Path(&out),
+        &runtime,
+    );
+    let emitted = out.join("Cargo.toml").exists();
+    let _ = fs::remove_dir_all(&out);
+    assert!(
+        built.is_err(),
+        "a manifest test build without `src/` fell back to a flat build"
+    );
+    assert!(!emitted, "the refused test build emitted a crate");
+}
+
 /// The test-stage source collection unions the `src/` and `tests/` trees
 /// with the correct per-root relativisation: `src/Lib/Foo.ipe` → `Lib.Foo`,
 /// `tests/Main.ipe` → `Main`, and the entry is the test module. This is the

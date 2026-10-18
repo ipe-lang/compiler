@@ -614,8 +614,9 @@ pub fn build_loose_file_into(
 /// When `project_src_root` is a directory, the code under test is rooted at it
 /// (the `src/` tree) and the test entry's own tree (the `tests/` tree) is
 /// discovered too, so a `tests/Main.ipe` that imports `Lib.Foo` from
-/// `src/Lib/Foo.ipe` resolves; see [`collect_test_sources`]. A project with no
-/// `src/` tree builds the test entry plus the siblings its imports reach, as
+/// `src/Lib/Foo.ipe` resolves; see [`collect_test_sources`]. A manifest project
+/// is always rooted so; a project with no manifest and no `src/` tree builds the
+/// test entry plus the siblings its imports reach, as
 /// [`build_loose_file`] does. Either way the settings are the ones the project
 /// build uses, its database driver included, but for the test crate's name.
 ///
@@ -634,7 +635,14 @@ pub fn build_test_into(
     out: OutTarget<'_>,
     runtime_dir: &Path,
 ) -> Result<EmittedCrate, CliError> {
-    let (project, collected) = if project_src_root.is_dir() {
+    // A manifest project always has its `src/` tree (the manifest reader
+    // refuses one without it), so a tree gone since the read is refused, never
+    // built as a flat project under the manifest's settings.
+    let rooted = match source {
+        SettingsSource::Manifest { .. } => true,
+        SettingsSource::Loose => project_src_root.is_dir(),
+    };
+    let (project, collected) = if rooted {
         (
             ProjectPaths::of_file(test_entry).with_sources(project_src_root),
             collect_test_sources(project_src_root, tests_root, test_entry)?,
@@ -2963,12 +2971,32 @@ pub fn build_project_into(
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
     let manifest = project::parse_manifest(manifest_path)?;
-    let (sources, discovered) = super::read_package_modules(&manifest)?;
+    build_parsed_project_into(&manifest, manifest_path, out, runtime_dir, options, host)
+}
+
+/// [`build_project_into`] for a manifest the caller already parsed from
+/// `manifest_path`.
+///
+/// The manifest is not read again, so every setting the caller judged from
+/// `manifest` (its consent, its driver, its compile target) is the setting the
+/// emit links, even when `package.ipe` changes during the build.
+///
+/// # Errors
+/// As [`build_project_into`].
+pub fn build_parsed_project_into(
+    manifest: &project::ProjectManifest,
+    manifest_path: &Path,
+    out: OutTarget<'_>,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+    host: crate::delivery::HostIntent,
+) -> Result<EmittedCrate, CliError> {
+    let (sources, discovered) = super::read_package_modules(manifest)?;
     refuse_debugger_without_runtime_dep(options)?;
-    refuse_webview_off_web(host, &manifest, &sources)?;
+    refuse_webview_off_web(host, manifest, &sources)?;
     let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path)?;
     build_from_sources_for(
-        &manifest,
+        manifest,
         manifest_path,
         source_set,
         out,
