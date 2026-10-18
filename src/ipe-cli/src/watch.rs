@@ -717,8 +717,9 @@ const REBUILD_INTENT: ipe_backend_rust::BuildIntent = crate::verb::Verb::DEV_WAT
 /// The emit settings a watch rebuild of `resolved` folds, before the FFI
 /// bindings and the runtime dependency are filled in.
 ///
-/// A manifest project goes through the constructor a cold build uses, so the
-/// rebuilt crate carries the same identity name. `ipe dev watch` reloads the
+/// The settings come from the build shape a cold build of the same project
+/// uses, so a manifest project's rebuilt crate carries the same identity name
+/// and links the same database driver. `ipe dev watch` reloads the
 /// served-live web app, so the host is always served: the webview-native
 /// desktop delivery is not a watch target. `debugger` compiles the in-app
 /// debugger overlay into the rebuilt runtime loop.
@@ -734,22 +735,16 @@ fn watch_emit_settings(
         hot_appearance,
         ..crate::BuildOptions::default()
     };
-    resolved.manifest.as_deref().map_or_else(
-        || {
-            crate::driver::loose_emit_settings(
-                ipe_backend_rust::DbDriver::Sqlite,
-                &options,
-                crate::runtime_embed::BundleRole::Out,
-            )
-        },
-        |manifest| {
-            crate::driver::manifest_emit_settings(
-                manifest,
-                &resolved.blame_path,
-                &options,
-                crate::delivery::HostIntent::Served,
-            )
-        },
+    crate::driver::emit_settings(
+        &crate::driver::SettingsSource::discovered(
+            resolved
+                .manifest
+                .as_deref()
+                .map(|manifest| (manifest, resolved.blame_path.as_path())),
+            crate::delivery::HostIntent::Served,
+        ),
+        &options,
+        crate::runtime_embed::BundleRole::Out,
     )
 }
 

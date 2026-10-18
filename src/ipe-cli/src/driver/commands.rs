@@ -1,12 +1,12 @@
 use super::{
     AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget,
-    RuntimeContext, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
-    bluegreen_enabled, build_loose_file_into, build_project_into, bundle_delivery,
-    collect_entry_and_siblings, collect_manifest_rooted_entry, collect_test_sources,
-    compile_prepared, create_source_root, emit_machine_error, emit_permissions,
-    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
-    io_err, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
-    runtime_dep_from_env,
+    RuntimeContext, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
+    attribute_post_link_error, bluegreen_enabled, build_loose_file_into, build_project_into,
+    bundle_delivery, collect_entry_and_siblings, collect_manifest_rooted_entry,
+    collect_test_sources, compile_prepared, create_source_root, emit_machine_error,
+    emit_permissions, emit_settings, find_manifest_for_ipe_file, frame_infer_error,
+    gate_decoder_pipelines, home_to_source_map, io_err, resolve_analysis_target,
+    resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -1607,10 +1607,13 @@ pub fn release_pipeline(
     ) {
         return Err(CliError::NoRunForm { target });
     }
-    // The database driver a release profile's socket allowances follow.
-    let driver = manifest_parsed
-        .as_ref()
-        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
+    // The database driver a release profile's socket allowances follow: the
+    // one the emit links, read from the same build shape.
+    let driver = SettingsSource::discovered(
+        manifest_parsed.as_ref().zip(manifest.as_deref()),
+        HostIntent::Served,
+    )
+    .db_driver();
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
         bundle_delivery(
             host,
@@ -4213,20 +4216,15 @@ pub fn front_check_entry(entry: &Path) -> Result<(), CliError> {
     let graph = build_source_graph(entry)?;
     let config = ipe_db::BuildConfig::new(
         &graph.db,
-        ipe_backend_rust::EmitSettings {
-            db_driver: ipe_backend_rust::DbDriver::Sqlite,
-            ffi: None,
-            target: ipe_ir::Target::Native,
-            wasm_public_env: Vec::new(),
-            mount_base: ipe_backend_rust::MountBase::root(),
-            wasm_hydrate_mode: false,
-            runtime_dep: None,
-            debugger: false,
-            crate_name: ipe_backend_rust::CrateName::SingleFile,
-            hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
-            intent: ipe_backend_rust::BuildIntent::Development,
-        },
+        emit_settings(
+            &SettingsSource::Loose,
+            &BuildOptions {
+                target: ipe_ir::Target::Native,
+                intent: ipe_backend_rust::BuildIntent::Development,
+                ..BuildOptions::from_env()
+            },
+            runtime_embed::BundleRole::Out,
+        ),
     );
     compile_prepared(
         &graph.db,

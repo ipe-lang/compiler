@@ -36,6 +36,12 @@ use crate::text;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// The SQL driver of a build that declares none: a manifest without
+/// `build.database`, and every build without a manifest.
+///
+/// It is the documented default of `AGENTS.md`'s `package.ipe` schema table.
+pub const UNDECLARED_DB_DRIVER: ipe_backend_rust::DbDriver = ipe_backend_rust::DbDriver::Sqlite;
+
 /// The parsed, validated content of a `package.ipe` manifest.
 #[derive(Clone, Debug)]
 pub struct ProjectManifest {
@@ -56,9 +62,8 @@ pub struct ProjectManifest {
     /// `None` when the manifest declares no icon (the packager then omits the
     /// bundle icon rather than inventing one).
     pub icon: Option<PathBuf>,
-    /// The SQL driver the emitted project targets (from `build.database`).
-    /// Defaults to [`ipe_backend_rust::DbDriver::Sqlite`] when absent — the
-    /// documented default in `AGENTS.md`'s `package.ipe` schema table.
+    /// The SQL driver the emitted project targets (from `build.database`), or
+    /// [`UNDECLARED_DB_DRIVER`] when the field is absent.
     pub driver: ipe_backend_rust::DbDriver,
     /// The `[rust]` static-build request layer (`static` / `target` /
     /// `allocator` / `cFree`) — the lowest-precedence layer

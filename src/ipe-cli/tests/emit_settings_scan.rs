@@ -15,6 +15,13 @@
 //! allowlist and mode) are derived into `EmitSettings` at one site,
 //! `manifest_emit_settings`: the driver reads each of those member chains, and
 //! names the hydrate mode, nowhere else but the admitted sites below.
+//!
+//! Every `EmitSettings` comes from `build_pipeline::emit_settings`, which picks
+//! one of its two constructors from the build shape: the constructors are
+//! called nowhere else, a settings value is spelled out only inside them (or
+//! updated from one they built), and the CLI names the no-manifest database
+//! driver only at the manifest's own reader and its one constant, so no build
+//! path re-picks the driver behind the manifest.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -35,7 +42,20 @@ const GUARDED: &[(&str, &str)] = &[
     ("HostIntent", "Served"),
     ("Delivery", "web_desktop"),
     ("WasmMode", "Hydrate"),
+    ("DbDriver", "Sqlite"),
 ];
+
+/// The settings constructors, called only from `emit_settings`; any path
+/// naming one counts.
+const CONSTRUCTORS: &[&str] = &["loose_emit_settings", "manifest_emit_settings"];
+
+/// The label of a settings value spelled out field by field.
+const SETTINGS_LITERAL: &str = "EmitSettings {..}";
+
+/// The label of a path naming the settings constructor `name`.
+fn constructor_label(name: &str) -> String {
+    format!("{name}()")
+}
 
 /// The backend's per-field setters. A setter applied to a configured backend
 /// would override one setting behind the settings value, so none is called
@@ -64,6 +84,13 @@ const CHAIN_TREE_PATHS: &[&str] = &["WasmMode::Hydrate"];
 
 /// The tree the member chains are guarded in.
 const CHAIN_TREE: &str = "src/ipe-cli/src/driver/";
+
+/// The guarded paths judged only in the CLI: the wasm playground has no
+/// manifest, so its one settings literal names the driver itself.
+const CLI_TREE_PATHS: &[&str] = &["DbDriver::Sqlite"];
+
+/// The tree [`CLI_TREE_PATHS`] are judged in.
+const CLI_TREE: &str = "src/ipe-cli/src/";
 
 /// The label of a member chain, as it appears in a site and in [`ADMITTED`].
 fn chain_label(chain: &[&str]) -> String {
@@ -189,7 +216,13 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "HostIntent::Served",
         "src/ipe-cli/src/driver/commands.rs",
         "release_pipeline",
-        2,
+        3,
+    ),
+    (
+        "HostIntent::Served",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "run_project_tests_with",
+        1,
     ),
     (
         "HostIntent::Served",
@@ -201,6 +234,56 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "Delivery::web_desktop",
         "src/ipe-cli/src/driver/commands_pkg.rs",
         "gate_desktop",
+        1,
+    ),
+    // The one settings function picks a constructor by the build shape.
+    (
+        "loose_emit_settings()",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "emit_settings",
+        1,
+    ),
+    (
+        "manifest_emit_settings()",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "emit_settings",
+        1,
+    ),
+    // A settings value is spelled out by its two constructors; the dependency
+    // model and the watch loop update a constructed one; the wasm playground,
+    // which has no manifest, builds its own.
+    (
+        SETTINGS_LITERAL,
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "loose_emit_settings",
+        1,
+    ),
+    (
+        SETTINGS_LITERAL,
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "manifest_emit_settings",
+        1,
+    ),
+    (
+        SETTINGS_LITERAL,
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "compile_source_set_observed",
+        1,
+    ),
+    (SETTINGS_LITERAL, "src/ipe-cli/src/watch.rs", "run_inner", 1),
+    (SETTINGS_LITERAL, "src/wasm/src/lib.rs", "compile_inner", 1),
+    // The no-manifest driver is one constant; the manifest reader turns the
+    // spelled driver into its value.
+    (
+        "DbDriver::Sqlite",
+        "src/ipe-cli/src/project.rs",
+        "<file>",
+        1,
+    ),
+    (
+        "DbDriver::Sqlite",
+        "src/ipe-cli/src/package_manifest.rs",
+        "read_database",
         1,
     ),
 ];
@@ -362,6 +445,11 @@ impl Scan {
         if names.last().is_some_and(|last| last == PROOF) {
             self.hit(PROOF.to_owned());
         }
+        if let Some(last) = names.last()
+            && CONSTRUCTORS.contains(&last.as_str())
+        {
+            self.hit(constructor_label(last));
+        }
     }
 
     /// Count each guarded member chain the field names `names` end in.
@@ -409,6 +497,9 @@ impl Scan {
                     if name == PROOF {
                         self.hit(PROOF.to_owned());
                     }
+                    if CONSTRUCTORS.contains(&name.as_str()) {
+                        self.hit(constructor_label(&name));
+                    }
                     if previous.last().is_some_and(|dot| dot == ".")
                         && SETTERS.contains(&name.as_str())
                     {
@@ -418,6 +509,11 @@ impl Scan {
                     previous.push(name);
                 }
                 TokenTree::Group(group) => {
+                    if group.delimiter() == proc_macro2::Delimiter::Brace
+                        && previous.last().is_some_and(|name| name == "EmitSettings")
+                    {
+                        self.hit(SETTINGS_LITERAL.to_owned());
+                    }
                     self.tokens(group.stream());
                     previous.clear();
                 }
@@ -531,6 +627,14 @@ impl<'ast> Visit<'ast> for Scan {
         {
             self.hit(PROOF.to_owned());
         }
+        if expr
+            .path
+            .segments
+            .last()
+            .is_some_and(|last| last.ident == "EmitSettings")
+        {
+            self.hit(SETTINGS_LITERAL.to_owned());
+        }
         visit::visit_expr_struct(self, expr);
     }
 
@@ -575,7 +679,9 @@ fn refusals(found: &BTreeMap<String, Scan>) -> Vec<String> {
     let mut out = Vec::new();
     for (rel, scan) in found {
         for ((site, what), count) in &scan.sites {
-            if is_chain_label(what) && !rel.starts_with(CHAIN_TREE) {
+            if (is_chain_label(what) && !rel.starts_with(CHAIN_TREE))
+                || (CLI_TREE_PATHS.contains(&what.as_str()) && !rel.starts_with(CLI_TREE))
+            {
                 continue;
             }
             seen.insert((what.clone(), rel.clone(), site.clone()), *count);
@@ -774,6 +880,61 @@ fn a_planted_site_is_refused() -> Result<(), String> {
     refused_by_scan(&breaches)
 }
 
+/// Each planted settings source outside the one settings function, and each
+/// planted no-manifest driver, is refused.
+#[test]
+fn a_planted_settings_source_is_refused() -> Result<(), String> {
+    let pipeline = "src/ipe-cli/src/driver/build_pipeline.rs";
+    let tests_runner = "src/ipe-cli/src/driver/commands_pkg.rs";
+    let breaches = [
+        (
+            pipeline,
+            "fn build_test_into() { loose_emit_settings(&o, BundleRole::Scratch); }\n",
+        ),
+        (
+            pipeline,
+            "fn compile_modules_observed() { let s = manifest_emit_settings(m, p, &o, h, r); }\n",
+        ),
+        (
+            pipeline,
+            "fn other() { let f = super::loose_emit_settings; }\n",
+        ),
+        (
+            pipeline,
+            "fn emit_settings() { loose_emit_settings(o, r); loose_emit_settings(o, r); }\n",
+        ),
+        (
+            pipeline,
+            "fn other() { m!(manifest_emit_settings(m, p, o, h, r)); }\n",
+        ),
+        (
+            tests_runner,
+            "fn build_and_run_test_entry() { let s = EmitSettings { db_driver: d, ..base }; }\n",
+        ),
+        (
+            "src/ipe-cli/src/driver/commands.rs",
+            "fn front_check_entry() { let s = ipe_backend_rust::EmitSettings { debugger: false }; }\n",
+        ),
+        (
+            "src/compiler/db/src/lib.rs",
+            "fn other() { m!(EmitSettings { db_driver: d }); }\n",
+        ),
+        (
+            tests_runner,
+            "fn build_and_run_test_entry() { go(ipe_backend_rust::DbDriver::Sqlite); }\n",
+        ),
+        (
+            "src/ipe-cli/src/watch.rs",
+            "fn watch_emit_settings() { let d = DbDriver::Sqlite; }\n",
+        ),
+        (
+            "src/ipe-cli/src/project.rs",
+            "pub const A: DbDriver = DbDriver::Sqlite;\npub const B: DbDriver = DbDriver::Sqlite;\n",
+        ),
+    ];
+    refused_by_scan(&breaches)
+}
+
 /// Each planted read of a manifest-owned browser setting outside its single
 /// derivation site is refused.
 #[test]
@@ -850,7 +1011,21 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
              fn build_project_with_options() { go(HostIntent::Served); }\n\
              fn build_from_sources() { go(HostIntent::Served); }\n\
              fn manifest_emit_settings() { let e = m.wasm.public_env.to_names(); \
-             let b = m.delivery.browser.base.clone(); let h = w.mode == WasmMode::Hydrate; }\n",
+             let b = m.delivery.browser.base.clone(); let h = w.mode == WasmMode::Hydrate; }\n\
+             fn emit_settings() { match s { Loose => loose_emit_settings(o, r), \
+             Manifest { .. } => manifest_emit_settings(m, p, o, h, r) } }\n\
+             fn loose_emit_settings() { EmitSettings { db_driver: d }; }\n\
+             fn manifest_emit_settings() { EmitSettings { db_driver: d }; }\n\
+             fn compile_source_set_observed() { EmitSettings { ffi, ..settings }; }\n",
+        ),
+        (
+            "src/ipe-cli/src/package_manifest.rs",
+            "fn read_database() { Ok(DbDriver::Sqlite) }\n\
+             fn render() { match d { DbDriver::Sqlite => \"Sqlite\", DbDriver::Postgres => \"Postgres\" } }\n",
+        ),
+        (
+            "src/ipe-cli/src/run_sandbox.rs",
+            "fn axis_for_driver() { match d { DbDriver::Sqlite => 1, DbDriver::Postgres => 2 } }\n",
         ),
         (
             delivery,
@@ -862,7 +1037,8 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
             "fn gate_desktop() { let HostIntent::WebView(p) = Delivery::web_desktop().host_intent() \
              else { return }; }\n\
              fn assemble_mobile() { let base = &manifest.delivery.browser.base; }\n\
-             fn build_under_fixed_base() { let after = parse(p)?\n.delivery\n.browser\n.base; }\n",
+             fn build_under_fixed_base() { let after = parse(p)?\n.delivery\n.browser\n.base; }\n\
+             fn run_project_tests_with() { go(HostIntent::Served); }\n",
         ),
     ];
     for (rel, source) in admitted {
@@ -898,6 +1074,23 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
         planted("src/ipe-cli/src/other.rs", out_of_scope)?,
         Vec::<String>::new(),
         "patterns and test code build nothing"
+    );
+    assert_eq!(
+        planted(
+            "src/wasm/src/lib.rs",
+            "fn compile_inner() { EmitSettings { db_driver: DbDriver::Sqlite }; }\n"
+        )?,
+        Vec::<String>::new(),
+        "the manifest-less playground names its own driver"
+    );
+    assert_eq!(
+        planted(
+            "src/ipe-cli/src/driver/other.rs",
+            "#[cfg(test)]\nmod tests { fn t() { EmitSettings { db_driver: DbDriver::Sqlite }; \
+             loose_emit_settings(o, r); } }\n"
+        )?,
+        Vec::<String>::new(),
+        "test code configures its own emits"
     );
     Ok(())
 }

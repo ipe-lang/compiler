@@ -1785,6 +1785,7 @@ fn test_stage_build_resolves_src_modules_from_tests_dir() {
 
     let out = tmp.join("out");
     let result = build_test_into(
+        &SettingsSource::Loose,
         &src,
         &tests,
         &tests.join("Main.ipe"),
@@ -1797,6 +1798,102 @@ fn test_stage_build_resolves_src_modules_from_tests_dir() {
         result.err()
     );
     let _ = fs::remove_dir_all(&tmp);
+}
+
+/// The test entry of a database-using project: it opens a connection through
+/// `Ipe.Db`, with its statement in a sibling `tests/` module.
+const DB_TEST_MAIN: &str = "\
+module Main exposing (main)
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Db.Unsafe
+import Ipe.Task
+import Support
+
+main =
+    Task.andThen
+        (\\conn ->
+            Unsafe.unsafeExecRaw conn Support.statement
+        )
+        (Db.open Location.memory)
+";
+
+/// The sibling of [`DB_TEST_MAIN`].
+const DB_TEST_SUPPORT: &str =
+    "module Support exposing (statement)\n\nstatement = \"CREATE TABLE t (id INTEGER)\"\n";
+
+/// A project declaring `build = { database = Postgres }`, with a `src/` tree
+/// and the database-using test entry.
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn postgres_test_project() -> crate::RootFixture {
+    let tree = crate::project_root::SourceTree::main("module Main exposing (main)\n\nmain = 1\n")
+        .field("build = { database = Postgres }")
+        .test_module("Main", DB_TEST_MAIN)
+        .test_module("Support", DB_TEST_SUPPORT);
+    crate::RootFixture::from_tree(&tree).expect("fixture")
+}
+
+/// Build `fixture`'s test entry the way the test runner does, with the
+/// manifest's settings, and return the emitted `Cargo.toml`.
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn build_manifest_test_entry(fixture: &crate::RootFixture, label: &str) -> String {
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let manifest_path = fixture.manifest_path();
+    let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
+    let source = SettingsSource::Manifest {
+        manifest: &manifest,
+        manifest_path: &manifest_path,
+        host: crate::delivery::HostIntent::Served,
+    };
+    let tests_root = fixture.path().join("tests");
+    let out = ipe_test_temp::temp_root().join(format!("{label}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&out);
+    let built = build_test_into(
+        &source,
+        &manifest.src_root,
+        &tests_root,
+        &tests_root.join("Main.ipe"),
+        OutTarget::Path(&out),
+        &runtime,
+    );
+    assert!(built.is_ok(), "the test entry builds: {:?}", built.err());
+    let cargo_toml = fs::read_to_string(out.join("Cargo.toml")).expect("emitted Cargo.toml");
+    let _ = fs::remove_dir_all(&out);
+    cargo_toml
+}
+
+/// A test build links the database driver the manifest declares, as the
+/// project build does.
+#[test]
+fn a_test_build_links_the_manifest_database_driver() {
+    let fixture = postgres_test_project();
+    let cargo_toml = build_manifest_test_entry(&fixture, "ipec-test-build-driver");
+    assert!(
+        cargo_toml.contains("\"db-postgres\""),
+        "the test build ignores `database = Postgres`:\n{cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains("\"db-sqlite\""),
+        "the test build links the undeclared driver:\n{cargo_toml}"
+    );
+}
+
+/// A manifest project whose `src/` tree is gone still tests with the
+/// manifest's settings: the entry and its siblings build with its driver.
+#[test]
+fn a_test_build_without_src_still_reads_the_manifest() {
+    let fixture = postgres_test_project();
+    let src = fixture.path().join("src");
+    fs::remove_dir_all(&src).expect("remove src/");
+    let cargo_toml = build_manifest_test_entry(&fixture, "ipec-test-build-no-src");
+    assert!(
+        cargo_toml.contains("\"db-postgres\""),
+        "a test build without `src/` ignores `database = Postgres`:\n{cargo_toml}"
+    );
+    assert!(
+        !cargo_toml.contains("\"db-sqlite\""),
+        "a test build without `src/` links the undeclared driver:\n{cargo_toml}"
+    );
 }
 
 /// The test-stage source collection unions the `src/` and `tests/` trees
@@ -2091,7 +2188,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
         &emit_target(&out_a),
         &runtime,
         Path::new("<cache-e2e>"),
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         Some(&cache_site),
         BuildOptions::default(),
     );
@@ -2125,7 +2222,7 @@ fn on_disk_cache_hit_serves_a_tampered_entry_verbatim() {
         &emit_target(&out_b),
         &runtime,
         Path::new("<cache-e2e>"),
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         Some(&cache_site),
         BuildOptions::default(),
     );
@@ -2191,7 +2288,7 @@ fn cold_build_with_the_cache_inside_a_fresh_output_dir_claims_it() {
             &emit_target(&out),
             &runtime,
             Path::new("<cache-in-out>"),
-            ipe_backend_rust::DbDriver::Sqlite,
+            &SettingsSource::Loose,
             Some(&cache_site),
             BuildOptions::default(),
         )
@@ -2289,7 +2386,7 @@ fn build_through_planted_cache_link(tag: &str, planted: PlantedCacheLink) {
             &emit_target(&out),
             &runtime,
             Path::new("<cache-link>"),
-            ipe_backend_rust::DbDriver::Sqlite,
+            &SettingsSource::Loose,
             Some(&cache_site),
             BuildOptions::default(),
         )
@@ -2358,6 +2455,70 @@ fn find_single_ir_cache_entry(cache_root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// A manifest project declaring `database = Sqlite`, whose `Main` prints one
+/// integer literal.
+struct DriverEditProject {
+    root: crate::RootFixture,
+}
+
+/// A project's module set, as the compile core takes it, and its entry path.
+type ModuleSet = (
+    BTreeMap<Vec<String>, (PathBuf, String)>,
+    Vec<project::DiscoveredModule>,
+    Vec<String>,
+);
+
+impl DriverEditProject {
+    /// The `Main` module both driver-edit tests compile.
+    const MAIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nmain : Task Error ()\nmain =\n    Io.println (String.fromInt 1)\n";
+
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn sqlite() -> Self {
+        let tree = crate::project_root::SourceTree::main(Self::MAIN)
+            .field("build = { database = Sqlite }");
+        Self {
+            root: crate::RootFixture::from_tree(&tree).expect("fixture"),
+        }
+    }
+
+    /// The project's one module, read from where the fixture wrote it.
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn sources(&self) -> ModuleSet {
+        let entry_path = vec!["Main".to_owned()];
+        let main = self.root.path().join("src").join("Main.ipe");
+        let text = fs::read_to_string(&main).expect("read src/Main.ipe");
+        let mut sources = BTreeMap::new();
+        sources.insert(entry_path.clone(), (main.clone(), text));
+        let discovered = vec![project::DiscoveredModule::user(main, entry_path.clone())];
+        (sources, discovered, entry_path)
+    }
+}
+
+/// The served build shape of `manifest`, read from `manifest_path`.
+const fn served<'a>(
+    manifest: &'a project::ProjectManifest,
+    manifest_path: &'a Path,
+) -> SettingsSource<'a> {
+    SettingsSource::Manifest {
+        manifest,
+        manifest_path,
+        host: crate::delivery::HostIntent::Served,
+    }
+}
+
+/// Edit the project's `package.ipe` from `database = Sqlite` to
+/// `database = Postgres` and read it back.
+#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+fn edit_driver_to_postgres(manifest_path: &Path) -> project::ProjectManifest {
+    let text = fs::read_to_string(manifest_path).expect("read package.ipe");
+    let edited = text.replace("database = Sqlite", "database = Postgres");
+    assert_ne!(edited, text, "the fixture declares `database = Sqlite`");
+    fs::write(manifest_path, edited).expect("write package.ipe");
+    let manifest = project::parse_manifest(manifest_path).expect("edited manifest parses");
+    assert_eq!(manifest.driver, ipe_backend_rust::DbDriver::Postgres);
+    manifest
+}
+
 /// **End-to-end proof that a `db_driver`-only edit reuses the
 /// lowered-IR tier instead of a full recompile.** The `EmittedProject`
 /// tier's key folds in `db_driver` (a real dependency of the FINAL emit
@@ -2378,19 +2539,10 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
     let out_b = tmp.join("out-b");
     let _ = fs::remove_dir_all(&tmp);
 
-    let entry_path = vec!["Main".to_owned()];
-    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-    sources.insert(
-        entry_path.clone(),
-        (
-            PathBuf::from("<p>/Main.ipe"),
-            "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nmain : Task Error ()\nmain =\n    Io.println (String.fromInt 1)\n".to_owned(),
-        ),
-    );
-    let discovered = vec![project::DiscoveredModule::user(
-        PathBuf::from("<p>/Main.ipe"),
-        entry_path.clone(),
-    )];
+    let fixture = DriverEditProject::sqlite();
+    let manifest_path = fixture.root.manifest_path();
+    let sqlite = project::parse_manifest(&manifest_path).expect("manifest parses");
+    let (sources, discovered, entry_path) = fixture.sources();
 
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
@@ -2398,8 +2550,8 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
         &entry_path,
         &emit_target(&out_a),
         &runtime,
-        Path::new("<p>"),
-        ipe_backend_rust::DbDriver::Sqlite,
+        &manifest_path,
+        &served(&sqlite, &manifest_path),
         Some(&cache_site),
         BuildOptions::default(),
     );
@@ -2418,17 +2570,18 @@ fn ir_cache_hit_reuses_lowered_program_across_a_db_driver_only_edit() {
         "the cold compile must have populated the IR tier"
     );
 
-    // Same source, DIFFERENT driver, same cache dir: the EmittedProject
-    // tier's key changes (driver is part of it) so it misses, but the
-    // IR tier's key does not depend on driver — it must hit.
+    // Same source, the manifest edited to a DIFFERENT driver, same cache dir:
+    // the EmittedProject tier's key changes (driver is part of it) so it
+    // misses, but the IR tier's key does not depend on driver — it must hit.
+    let postgres = edit_driver_to_postgres(&manifest_path);
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
         &entry_path,
         &emit_target(&out_b),
         &runtime,
-        Path::new("<p>"),
-        ipe_backend_rust::DbDriver::Postgres,
+        &manifest_path,
+        &served(&postgres, &manifest_path),
         Some(&cache_site),
         BuildOptions::default(),
     );
@@ -2469,19 +2622,10 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let out_b = tmp.join("out-b");
     let _ = fs::remove_dir_all(&tmp);
 
-    let entry_path = vec!["Main".to_owned()];
-    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-    sources.insert(
-        entry_path.clone(),
-        (
-            PathBuf::from("<p>/Main.ipe"),
-            "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.String as String\n\nmain : Task Error ()\nmain =\n    Io.println (String.fromInt 1)\n".to_owned(),
-        ),
-    );
-    let discovered = vec![project::DiscoveredModule::user(
-        PathBuf::from("<p>/Main.ipe"),
-        entry_path.clone(),
-    )];
+    let fixture = DriverEditProject::sqlite();
+    let manifest_path = fixture.root.manifest_path();
+    let sqlite = project::parse_manifest(&manifest_path).expect("manifest parses");
+    let (sources, discovered, entry_path) = fixture.sources();
 
     let (result_a, outcome_a) = compile_modules_observed(
         sources.clone(),
@@ -2489,8 +2633,8 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
         &entry_path,
         &emit_target(&out_a),
         &runtime,
-        Path::new("<p>"),
-        ipe_backend_rust::DbDriver::Sqlite,
+        &manifest_path,
+        &served(&sqlite, &manifest_path),
         Some(&cache_site),
         BuildOptions::default(),
     );
@@ -2516,16 +2660,17 @@ fn on_disk_ir_cache_hit_serves_a_tampered_entry_verbatim() {
     let tampered = stored.replace("{\"Int\":1}", "{\"Int\":42}");
     fs::write(&ir_json_path, &tampered).expect("tamper write must succeed");
 
-    // Force the EmittedProject tier to miss (driver flip) so the
+    // Force the EmittedProject tier to miss (a manifest driver edit) so the
     // IR-tier fast path is the one actually exercised.
+    let postgres = edit_driver_to_postgres(&manifest_path);
     let (result_b, outcome_b) = compile_modules_observed(
         sources,
         discovered,
         &entry_path,
         &emit_target(&out_b),
         &runtime,
-        Path::new("<p>"),
-        ipe_backend_rust::DbDriver::Postgres,
+        &manifest_path,
+        &served(&postgres, &manifest_path),
         Some(&cache_site),
         BuildOptions::default(),
     );
@@ -2606,7 +2751,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
         &emit_target(&tmp.join("out-dev")),
         &runtime,
         &blame_path,
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         Some(&cache_site),
         BuildOptions {
             intent: ipe_backend_rust::BuildIntent::Development,
@@ -2620,7 +2765,7 @@ fn production_ir_cache_hit_blames_the_in_memory_entry_source() {
         &emit_target(&tmp.join("out-release")),
         &runtime,
         &blame_path,
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         Some(&cache_site),
         BuildOptions {
             intent: ipe_backend_rust::BuildIntent::Release,
@@ -2685,7 +2830,7 @@ fn cache_dir_none_disables_caching_entirely() {
         &emit_target(&out_dir),
         &runtime,
         Path::new("<cache-e2e>"),
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         None,
         BuildOptions::default(),
     );
@@ -5998,7 +6143,7 @@ fn compile_debug_log_as(verb: Verb, label: &str) -> Result<crate::driver::Emitte
         &emit_target(&tmp.join("out")),
         &runtime,
         &entry_file,
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         None,
         BuildOptions {
             intent: verb.intent(),
@@ -6474,7 +6619,7 @@ fn vendored_debugger_build_is_refused_before_compiling() {
             &emit_target(&out),
             Path::new("<no-runtime>"),
             Path::new("<vendored-debugger>"),
-            ipe_backend_rust::DbDriver::Sqlite,
+            &SettingsSource::Loose,
             None,
             BuildOptions {
                 debugger: true,

@@ -656,3 +656,60 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
     );
     Ok(())
 }
+
+/// A test entry that opens an in-memory sqlite database and prints on success.
+const MEMORY_OPEN_TEST: &str = "module Main exposing (main)
+
+import Ipe.Db
+import Ipe.Db.Location as Location
+import Ipe.Error
+import Ipe.Io as Io
+import Ipe.Task
+
+
+main : Task Error ()
+main =
+    Task.andThen (\\_ -> Io.println \"opened\") (Db.open Location.memory)
+";
+
+/// A Postgres project's test that opens a sqlite location is refused.
+///
+/// The test build links the manifest's database driver, so the engine check
+/// refuses the in-memory location exactly as the shipped binary does; no
+/// server is dialled. Gated on `IPE_E2E=1` — it builds and runs the emitted
+/// test binary. Runs in the `e2e` CI job.
+#[test]
+fn a_postgres_project_test_cannot_open_an_sqlite_location() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the manifest-driver test E2E");
+        return Ok(());
+    }
+    let dir = crate::support::scratch_root()
+        .join(format!("ipe_test_postgres_driver_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::create_dir_all(dir.join("tests"))?;
+    std::fs::write(
+        dir.join("package.ipe"),
+        "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n\
+         package : Package\npackage =\n    { name = \"pgtest\", build = { database = Postgres } }\n",
+    )?;
+    std::fs::copy(fixture("clean.ipe"), dir.join("src").join("Main.ipe"))?;
+    std::fs::write(dir.join("tests").join("Main.ipe"), MEMORY_OPEN_TEST)?;
+
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("package.ipe").to_string_lossy()])?;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !ok,
+        "a sqlite location must be refused under the manifest's postgres driver, got stdout:\n{stdout}"
+    );
+    assert!(
+        format!("{stdout}{stderr}").contains("this build's driver is"),
+        "the refusal must be the runtime's engine check, got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("opened"),
+        "the open must not succeed, got stdout:\n{stdout}"
+    );
+    Ok(())
+}
