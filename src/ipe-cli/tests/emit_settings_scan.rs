@@ -13,8 +13,8 @@
 //!
 //! The settings a manifest owns (the browser mount base, the `[wasm]` public-env
 //! allowlist and mode) are derived into `EmitSettings` at one site,
-//! `manifest_emit_settings`: the driver reads each of those member chains
-//! nowhere else but the admitted sites below.
+//! `manifest_emit_settings`: the driver reads each of those member chains, and
+//! names the hydrate mode, nowhere else but the admitted sites below.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ const GUARDED: &[(&str, &str)] = &[
     ("EmitHost", "WebView"),
     ("HostIntent", "Served"),
     ("Delivery", "web_desktop"),
+    ("WasmMode", "Hydrate"),
 ];
 
 /// The backend's per-field setters. A setter applied to a configured backend
@@ -55,11 +56,11 @@ const SETTERS: &[&str] = &[
 
 /// The manifest member chains the driver reads only at admitted sites, as the
 /// field names from the manifest value down.
-const MEMBER_CHAINS: &[&[&str]] = &[
-    &["delivery", "browser", "base"],
-    &["wasm", "public_env"],
-    &["wasm", "mode"],
-];
+const MEMBER_CHAINS: &[&[&str]] = &[&["delivery", "browser", "base"], &["public_env"]];
+
+/// The guarded paths that, like the member chains, are judged only in
+/// [`CHAIN_TREE`]: the manifest parser and renderer spell the mode elsewhere.
+const CHAIN_TREE_PATHS: &[&str] = &["WasmMode::Hydrate"];
 
 /// The tree the member chains are guarded in.
 const CHAIN_TREE: &str = "src/ipe-cli/src/driver/";
@@ -69,9 +70,10 @@ fn chain_label(chain: &[&str]) -> String {
     format!("field {}", chain.join("."))
 }
 
-/// Whether `what` is the label of a guarded member chain.
+/// Whether `what` is the label of a guarded member chain, or of a guarded path
+/// that is judged only in [`CHAIN_TREE`].
 fn is_chain_label(what: &str) -> bool {
-    MEMBER_CHAINS.iter().any(|chain| chain_label(chain) == what)
+    MEMBER_CHAINS.iter().any(|chain| chain_label(chain) == what) || CHAIN_TREE_PATHS.contains(&what)
 }
 
 /// The webview proof: any construction of it counts.
@@ -126,13 +128,13 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         1,
     ),
     (
-        "field wasm.public_env",
+        "field public_env",
         "src/ipe-cli/src/driver/build_pipeline.rs",
         "manifest_emit_settings",
         1,
     ),
     (
-        "field wasm.mode",
+        "WasmMode::Hydrate",
         "src/ipe-cli/src/driver/build_pipeline.rs",
         "manifest_emit_settings",
         1,
@@ -789,7 +791,7 @@ fn a_planted_browser_delivery_read_is_refused() -> Result<(), String> {
         ),
         (
             commands,
-            "fn release_pipeline() { let h = w.wasm.mode.as_deref() == Some(\"hydrate\"); }\n",
+            "fn release_pipeline() { let h = w.mode == WasmMode::Hydrate; }\n",
         ),
         (
             commands,
@@ -805,7 +807,7 @@ fn a_planted_browser_delivery_read_is_refused() -> Result<(), String> {
         ),
         (
             pipeline,
-            "fn manifest_emit_settings() { let a = m.wasm.mode; let b = m.wasm.mode; }\n",
+            "fn manifest_emit_settings() { let a = WasmMode::Hydrate; let b = WasmMode::Hydrate; }\n",
         ),
     ];
     refused_by_scan(&breaches)
@@ -848,7 +850,7 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
              fn build_project_with_options() { go(HostIntent::Served); }\n\
              fn build_from_sources() { go(HostIntent::Served); }\n\
              fn manifest_emit_settings() { let e = m.wasm.public_env.to_names(); \
-             let b = m.delivery.browser.base.clone(); let h = m.wasm.mode.is_some(); }\n",
+             let b = m.delivery.browser.base.clone(); let h = w.mode == WasmMode::Hydrate; }\n",
         ),
         (
             delivery,
@@ -873,12 +875,13 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
     let out_of_scope = "fn other() { let HostIntent::WebView(p) = h else { return }; \
         if let EmitHost::WebView(w) = e {} }\n\
         #[cfg(test)]\nmod tests { fn t() { RustBackend::new(&i); EmitHost::WebView(w); } }\n";
-    let chains_out_of_scope = "fn other() { let WasmConfig { mode, .. } = w; let b = &m.wasm; }\n\
-        #[cfg(test)]\nmod tests { fn t() { m.delivery.browser.base; m.wasm.mode; m.wasm.public_env; } }\n";
+    let chains_out_of_scope = "fn other() { let WasmConfig::On(WasmBundle { public_env, .. }) = w; \
+        match mode { WasmMode::Hydrate => 1, WasmMode::Solo => 2 }; let b = &m.wasm; }\n\
+        #[cfg(test)]\nmod tests { fn t() { m.delivery.browser.base; b.public_env; WasmMode::Hydrate; } }\n";
     assert_eq!(
         planted("src/ipe-cli/src/driver/commands.rs", chains_out_of_scope)?
             .iter()
-            .filter(|refusal| refusal.contains("field "))
+            .filter(|refusal| refusal.contains("field ") || refusal.contains("WasmMode"))
             .count(),
         0,
         "a pattern, a whole `wasm` read and test code read no guarded chain"
@@ -886,7 +889,7 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
     assert_eq!(
         planted(
             "src/ipe-cli/src/init.rs",
-            "fn other() { let b = parsed.delivery.browser.base; }\n"
+            "fn other() { let b = parsed.delivery.browser.base; let h = w.mode == WasmMode::Hydrate; }\n"
         )?,
         Vec::<String>::new(),
         "the guard covers the driver tree only"

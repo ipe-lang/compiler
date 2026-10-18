@@ -4202,10 +4202,7 @@ mod pack_gate_tests {
     /// mobile SPA shell only hosts `Web` apps.
     #[test]
     fn mobile_gate_refuses_terminal_shape() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let err = validate_mobile_shape(
             Some(project::EntryShape::Terminal),
             Path::new("."),
@@ -4228,10 +4225,7 @@ mod pack_gate_tests {
     /// A declared `Program` shape must be refused for mobile packaging.
     #[test]
     fn mobile_gate_refuses_program_shape() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let err =
             validate_mobile_shape(Some(project::EntryShape::Program), Path::new("."), &wasm_on)
                 .expect_err("Program shape must be refused for mobile");
@@ -4252,7 +4246,7 @@ mod pack_gate_tests {
     /// requires `[wasm] mode` set to `spa` or `hydrate`.
     #[test]
     fn mobile_gate_refuses_web_shape_without_wasm() {
-        let wasm_off = project::WasmConfig::default(); // mode = None -> off
+        let wasm_off = project::WasmConfig::Off;
         let err = validate_mobile_shape(Some(project::EntryShape::Web), Path::new("."), &wasm_off)
             .expect_err("Web shape without wasm must be refused for mobile");
         assert!(
@@ -4271,10 +4265,7 @@ mod pack_gate_tests {
     /// A `Web` shape with wasm mode `spa` passes the mobile gate.
     #[test]
     fn mobile_gate_accepts_web_shape_with_wasm_spa() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         validate_mobile_shape(Some(project::EntryShape::Web), Path::new("."), &wasm_on)
             .expect("Web + wasm=spa must pass the mobile gate");
     }
@@ -4282,10 +4273,7 @@ mod pack_gate_tests {
     /// A `Web` shape with wasm mode `hydrate` also passes the mobile gate.
     #[test]
     fn mobile_gate_accepts_web_shape_with_wasm_hydrate() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("hydrate".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Hydrate));
         validate_mobile_shape(Some(project::EntryShape::Web), Path::new("."), &wasm_on)
             .expect("Web + wasm=hydrate must pass the mobile gate");
     }
@@ -4295,10 +4283,7 @@ mod pack_gate_tests {
     /// `Web` + wasm enabled -> `shape_is_web=true`, `wasm_enabled=true`.
     #[test]
     fn classify_mobile_cap_web_wasm_on() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let cap = classify_mobile_spa_cap(Some(project::EntryShape::Web), Path::new("."), &wasm_on)
             .expect("classification must succeed");
         assert!(cap.shape_is_web, "Web shape must set shape_is_web");
@@ -4308,10 +4293,7 @@ mod pack_gate_tests {
     /// `Terminal` + wasm enabled -> `shape_is_web=false`.
     #[test]
     fn classify_mobile_cap_terminal_wasm_on() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let cap = classify_mobile_spa_cap(
             Some(project::EntryShape::Terminal),
             Path::new("."),
@@ -4327,12 +4309,12 @@ mod pack_gate_tests {
     /// `Web` + wasm off -> `wasm_enabled=false`.
     #[test]
     fn classify_mobile_cap_web_wasm_off() {
-        let wasm_off = project::WasmConfig::default();
+        let wasm_off = project::WasmConfig::Off;
         let cap =
             classify_mobile_spa_cap(Some(project::EntryShape::Web), Path::new("."), &wasm_off)
                 .expect("classification must succeed");
         assert!(cap.shape_is_web, "Web shape must set shape_is_web");
-        assert!(!cap.wasm_enabled, "mode=None must set wasm_enabled=false");
+        assert!(!cap.wasm_enabled, "`Off` must set wasm_enabled=false");
     }
 }
 
