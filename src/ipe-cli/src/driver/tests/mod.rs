@@ -1878,21 +1878,17 @@ fn a_test_build_links_the_manifest_database_driver() {
     );
 }
 
-/// A manifest project whose `src/` tree is gone still tests with the
-/// manifest's settings: the entry and its siblings build with its driver.
+/// A manifest project without its `src/` tree is refused when the manifest is
+/// read, so the test runner never holds a manifest beside a missing source
+/// root: a manifest source always has a `src/` to build from.
 #[test]
-fn a_test_build_without_src_still_reads_the_manifest() {
+fn a_manifest_project_without_src_is_refused_before_any_test_build() {
     let fixture = postgres_test_project();
-    let src = fixture.path().join("src");
-    fs::remove_dir_all(&src).expect("remove src/");
-    let cargo_toml = build_manifest_test_entry(&fixture, "ipec-test-build-no-src");
+    fs::remove_dir_all(fixture.path().join("src")).expect("remove src/");
+    let refused = project::parse_manifest(&fixture.manifest_path());
     assert!(
-        cargo_toml.contains("\"db-postgres\""),
-        "a test build without `src/` ignores `database = Postgres`:\n{cargo_toml}"
-    );
-    assert!(
-        !cargo_toml.contains("\"db-sqlite\""),
-        "a test build without `src/` links the undeclared driver:\n{cargo_toml}"
+        matches!(&refused, Err(CliError::Usage(m)) if m.to_string().contains("source root")),
+        "a manifest without `src/` must be refused at the read: {refused:?}"
     );
 }
 
