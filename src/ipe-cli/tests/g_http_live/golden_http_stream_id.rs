@@ -69,7 +69,7 @@ fn http_stream_open_full_emit_succeeds() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for HttpStream.open's HttpRequest arg (no \

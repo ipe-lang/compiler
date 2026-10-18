@@ -46,7 +46,8 @@ fn emit_golden(golden: &str, out: &Path) -> String {
     let _ = std::fs::remove_dir_all(out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime).expect("routed app must ipe-compile");
+    crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime)
+        .expect("routed app must ipe-compile");
     // A layout builder is compiled-source Ipê, so a home may lower to
     // `src/ipe_mods/*.rs` — scan the WHOLE emitted Ipê-side tree.
     crate::support::read_all_emitted_src(out)

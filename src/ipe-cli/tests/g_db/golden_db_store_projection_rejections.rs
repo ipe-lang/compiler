@@ -47,10 +47,11 @@ fn rejection_diagnostic(golden: &str) -> Diagnostic {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let diag = match ipe::build(&entry, &out, &runtime) {
-        Err(CliError::Pipeline { diag, .. }) => *diag,
-        other => panic!("{golden}: must be rejected with a pipeline diagnostic, got {other:?}"),
-    };
+    let diag =
+        match crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime) {
+            Err(CliError::Pipeline { diag, .. }) => *diag,
+            other => panic!("{golden}: must be rejected with a pipeline diagnostic, got {other:?}"),
+        };
 
     let emitted = out.join("src").join("main.rs");
     assert!(
