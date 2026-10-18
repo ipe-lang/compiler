@@ -1573,6 +1573,156 @@ fn closure_bytes<F: ?Sized>(f: &F) -> Option<Bytes> {
     Bytes::inline::<[usize; 2]>()?.plus_count(std::mem::size_of_val(f))
 }
 
+/// The drawn source view the runtime's view-measure tests share.
+///
+/// One builder for the element bound in this module and the render history
+/// in `dom::dispatch`, so the two modules' tests measure the same shape.
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod drawn_shape {
+    use super::{Attribute, Event, Html, assign_ipe_ids};
+
+    /// A 600-byte message, as wide as a rich app `Msg`.
+    #[derive(Clone)]
+    #[allow(dead_code)] // the bytes are the width; nothing reads them
+    pub struct Wide(pub [u8; 600]);
+
+    crate::retained::inline_measure!(Wide);
+
+    /// An ancestor's key, as long as an app's `Attr.key` value.
+    const ANCESTOR_KEY: &str = "unit-row-key";
+
+    /// The levels from a `code` block down to its deepest drawn element.
+    ///
+    /// The `code` block, a line, a coloured run and the escape inside it.
+    pub const DRAWN_LEVELS: usize = 4;
+
+    /// A source view drawn as a code viewer draws it.
+    ///
+    /// `depth` is the nesting depth of its deepest element, the root counted:
+    /// `depth - DRAWN_LEVELS` keyed `div` ancestors hold one `code` block of
+    /// `lines` line elements with newline text between them. Each line holds
+    /// `runs` coloured runs, each followed by a text sibling; each run holds
+    /// `escapes` escape spans, each after a text sibling and holding its
+    /// spelling, the span both marked and styled. Each line carries a click
+    /// handler with a [`Wide`] message when `handlers` holds. When `spare`
+    /// holds, every children list keeps as many spare slots as it has
+    /// children, the most a list grown by doubling keeps.
+    #[derive(Clone, Copy)]
+    pub struct DrawnShape {
+        pub depth: usize,
+        pub lines: usize,
+        pub runs: usize,
+        pub escapes: usize,
+        pub handlers: bool,
+        pub spare: bool,
+    }
+
+    impl DrawnShape {
+        /// The keyed ancestors above the `code` block.
+        const fn ancestors(self) -> usize {
+            self.depth.saturating_sub(DRAWN_LEVELS)
+        }
+
+        /// The elements the shape draws, or `None` on overflow.
+        pub fn elements(self) -> Option<usize> {
+            let per_run = self.escapes.checked_add(1)?;
+            let per_line = self.runs.checked_mul(per_run)?.checked_add(1)?;
+            self.lines
+                .checked_mul(per_line)?
+                .checked_add(1)?
+                .checked_add(self.ancestors())
+        }
+
+        /// The view, stamped from root `"r"`.
+        pub fn build(self) -> Html<Wide> {
+            let mut view = self.code();
+            for _ in 0..self.ancestors() {
+                view = Html::HElement(
+                    "div".into(),
+                    vec![Attribute::Attr("ipe-key".into(), ANCESTOR_KEY.into())],
+                    vec![view],
+                );
+            }
+            assign_ipe_ids(&mut view, "r");
+            view
+        }
+
+        /// `kids` with the spare capacity the shape asks for.
+        fn children(self, mut kids: Vec<Html<Wide>>) -> Vec<Html<Wide>> {
+            if self.spare {
+                kids.reserve_exact(kids.len());
+            } else {
+                kids.shrink_to_fit();
+            }
+            kids
+        }
+
+        fn code(self) -> Html<Wide> {
+            let mut kids = Vec::new();
+            for row in 0..self.lines {
+                if row > 0 {
+                    kids.push(Html::HText("\n".into()));
+                }
+                kids.push(self.line(row));
+            }
+            Html::HElement(
+                "code".into(),
+                vec![Attribute::Attr(
+                    "style".into(),
+                    "display:block;flex:1;white-space:pre;color:#cdcdd7;unicode-bidi:bidi-override;direction:ltr".into(),
+                )],
+                self.children(kids),
+            )
+        }
+
+        fn line(self, row: usize) -> Html<Wide> {
+            let mut attrs = vec![Attribute::Attr("style".into(), "white-space:pre".into())];
+            if self.handlers {
+                attrs.push(Attribute::EventAttr(Event::OnMsg(
+                    "click".into(),
+                    Box::new(Wide([0; 600])),
+                )));
+            }
+            let mut kids = Vec::new();
+            for col in 0..self.runs {
+                kids.push(self.run(row, col));
+                kids.push(Html::HText(format!(" s{col}")));
+            }
+            Html::HElement("span".into(), attrs, self.children(kids))
+        }
+
+        /// One coloured run: `escapes` escape spans, each after its text.
+        fn run(self, row: usize, col: usize) -> Html<Wide> {
+            let mut kids = Vec::new();
+            for _ in 0..self.escapes {
+                kids.push(Html::HText(format!("t{row}x{col}")));
+                kids.push(escape());
+            }
+            Html::HElement(
+                "span".into(),
+                vec![Attribute::Attr("style".into(), "color:#c792ea".into())],
+                self.children(kids),
+            )
+        }
+    }
+
+    /// One escape span: marked, styled, holding one escape's spelling.
+    fn escape() -> Html<Wide> {
+        Html::HElement(
+            "span".into(),
+            vec![
+                Attribute::Attr("data-review-escape".into(), "true".into()),
+                Attribute::Attr(
+                    "style".into(),
+                    "background-color:#4a3410;border:1px solid #c98a2b;border-radius:2px;color:#ffd27a".into(),
+                ),
+            ],
+            vec![Html::HText("\\u{202E}".into())],
+        )
+    }
+}
+
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
@@ -1641,17 +1791,14 @@ mod tests {
         assert!(attr.retained_bytes().is_some_and(|n| n.get() >= 4096));
     }
 
-    /// A 600-byte message, as wide as a rich app `Msg`.
-    #[derive(Clone)]
-    #[allow(dead_code)] // the bytes are the width; nothing reads them
-    struct Wide([u8; 600]);
+    use super::drawn_shape::{DrawnShape, Wide};
 
     /// A 4 KiB message.
     #[derive(Clone)]
     #[allow(dead_code)] // the bytes are the width; nothing reads them
     struct Huge([u8; 4096]);
 
-    crate::retained::inline_measure!(Wide, Huge);
+    crate::retained::inline_measure!(Huge);
 
     // A wide message does not widen the attribute that carries it.
     #[test]
@@ -1706,48 +1853,97 @@ mod tests {
         assert_eq!(seen, 2);
     }
 
-    /// The bound on one drawn element's resident bytes that an app sizing its
-    /// view by element count relies on.
-    const DRAWN_ELEMENT_BYTES: u64 = 768;
-
-    // A 1000-token source view in the shape a code viewer draws (a `code`
-    // block, one line element with a click handler carrying a 600-byte
-    // message, one styled span per token run) stays within the per-element
-    // bound once stamped.
+    // The shape's element count is the elements it draws, and its deepest
+    // element sits at its depth, so a bound taken per counted element at a
+    // declared depth is a bound per drawn one at that depth.
     #[test]
-    fn a_drawn_source_view_stays_within_the_element_bound() {
-        let (lines, per_line) = (100_usize, 10_usize);
-        let line = |row: usize| {
-            Html::HElement(
-                "span".into(),
-                vec![html_on_msg_("click".into(), Wide([0; 600]))],
-                (0..per_line)
-                    .map(|col| {
-                        Html::HElement(
-                            "span".into(),
-                            vec![Attribute::Attr("style".into(), "color:#cdcdd7".into())],
-                            vec![Html::HText(format!("t{row}x{col}"))],
-                        )
-                    })
-                    .collect(),
-            )
+    fn the_drawn_shape_draws_the_elements_it_counts() {
+        let shape = DrawnShape {
+            depth: 9,
+            lines: 12,
+            runs: 3,
+            escapes: 2,
+            handlers: true,
+            spare: true,
         };
-        let mut view: Html<Wide> = Html::HElement(
-            "code".into(),
-            vec![Attribute::Attr(
-                "style".into(),
-                "unicode-bidi:bidi-override;white-space:pre".into(),
-            )],
-            (0..lines).map(line).collect(),
-        );
-        assign_ipe_ids(&mut view, "0");
-        let elements = u64::try_from(1 + lines + lines * per_line).ok();
-        let measured = view.view_bytes().map(Bytes::get);
-        let bound = elements.and_then(|e| e.checked_mul(DRAWN_ELEMENT_BYTES));
-        assert!(
-            measured.zip(bound).is_some_and(|(m, b)| m <= b),
-            "{measured:?} > {bound:?}"
-        );
+        let view = shape.build();
+        let mut pending = vec![(&view, 1_usize)];
+        let (mut seen, mut deepest) = (0_usize, 0_usize);
+        while let Some((node, depth)) = pending.pop() {
+            if let Html::HElement(_, _, kids) = node {
+                seen += 1;
+                deepest = deepest.max(depth);
+                pending.extend(kids.iter().map(|kid| (kid, depth + 1)));
+            }
+        }
+        assert_eq!(Some(seen), shape.elements());
+        assert_eq!(deepest, shape.depth);
+    }
+
+    /// The element bound at the declared depth, measured on the shared shape.
+    #[cfg(feature = "web")]
+    mod element_bound {
+        use super::super::drawn_shape::DrawnShape;
+        use crate::web::budget::{DRAWN_ELEMENT_BYTES, DRAWN_ELEMENT_DEPTH};
+
+        /// The resident bytes per element of `shape` once stamped, or `None` on overflow.
+        fn bytes_per_element(shape: DrawnShape) -> Option<u64> {
+            let measured = shape.build().view_bytes()?.get();
+            measured.checked_div(u64::try_from(shape.elements()?).ok()?)
+        }
+
+        /// Source views of about the app's element ceiling, their deepest
+        /// element at `depth`, every children list at its most spare: the line
+        /// ceiling's lines of two runs of one escape each; one line of one run
+        /// of six thousand escapes, the dearest element (two attributes, its
+        /// spelling and a text sibling) and the most of it; and a mix.
+        ///
+        /// A child index past the thousandth spells four digits.
+        fn drawn_at(depth: usize) -> [DrawnShape; 3] {
+            let shape = |lines, runs, escapes| DrawnShape {
+                depth,
+                lines,
+                runs,
+                escapes,
+                handlers: false,
+                spare: true,
+            };
+            [shape(5000, 2, 1), shape(1, 1, 6000), shape(1000, 1, 5)]
+        }
+
+        // Every composition of a source view a code viewer draws, its deepest
+        // element at the depth the contract declares under keyed ancestors,
+        // stays within the per-element bound once stamped: the bound is the
+        // dearest composition's, not one view's average.
+        #[test]
+        fn a_drawn_source_view_of_any_composition_stays_within_the_element_bound() {
+            for shape in drawn_at(DRAWN_ELEMENT_DEPTH) {
+                let per = bytes_per_element(shape);
+                assert!(
+                    per.is_some_and(|p| p <= DRAWN_ELEMENT_BYTES.get()),
+                    "{per:?} > {DRAWN_ELEMENT_BYTES:?} at {} lines x {} runs x {} escapes",
+                    shape.lines,
+                    shape.runs,
+                    shape.escapes
+                );
+            }
+        }
+
+        // The same views forty levels deeper than the contract pass the
+        // bound: the measure sees the depth, so a deeper page turns it red.
+        #[test]
+        fn a_drawn_source_view_past_the_declared_depth_breaks_the_element_bound() {
+            for shape in drawn_at(DRAWN_ELEMENT_DEPTH + 40) {
+                let per = bytes_per_element(shape);
+                assert!(
+                    per.is_some_and(|p| p > DRAWN_ELEMENT_BYTES.get()),
+                    "{per:?} <= {DRAWN_ELEMENT_BYTES:?} at {} lines x {} runs x {} escapes",
+                    shape.lines,
+                    shape.runs,
+                    shape.escapes
+                );
+            }
+        }
     }
 
     // An attribute's `{:?}` names the attribute and hides its value.
