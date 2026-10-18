@@ -34,7 +34,7 @@ fn fixture_dir(root: &Path, name: &str) -> PathBuf {
 /// What a test builds: a checked-in golden directory or inline source.
 enum Program {
     Golden(PathBuf),
-    Inline(ipe::RootFixture),
+    Inline(Box<ipe::RootFixture>),
 }
 
 impl Program {
@@ -43,7 +43,7 @@ impl Program {
     }
 
     fn inline(source: &str) -> Self {
-        Self::Inline(crate::root_fixture::main(source))
+        Self::Inline(Box::new(crate::root_fixture::main(source)))
     }
 
     fn build(&self, out: &Path, runtime: &Path) -> Result<(), CliError> {
