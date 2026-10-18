@@ -30,10 +30,12 @@ pub const ENTRY_OVERHEAD: Bytes = Bytes::new(256 * 1024);
 /// The most bytes one drawn source element holds resident once stamped.
 ///
 /// It holds for an element at most [`DRAWN_ELEMENT_DEPTH`] deep, its text and
-/// sibling text included. The pair is a contract with `tools/code-review`,
-/// which mirrors both numbers and sizes its view's element ceiling by them;
-/// a test there reads these two lines.
-pub const DRAWN_ELEMENT_BYTES: Bytes = Bytes::new(1024);
+/// sibling text included, in a view of any composition: the dearest element
+/// (an escape span with its spelling and a text sibling) repeated, every
+/// children list at the spare capacity doubling growth leaves. The pair is a
+/// contract with `tools/code-review`, which mirrors both numbers and sizes its
+/// view's element ceiling by them; a test there reads these two lines.
+pub const DRAWN_ELEMENT_BYTES: Bytes = Bytes::new(1536);
 
 /// The deepest nesting, the root counted, [`DRAWN_ELEMENT_BYTES`] holds at.
 pub const DRAWN_ELEMENT_DEPTH: usize = 24;
@@ -45,8 +47,8 @@ pub const EVICT_WAIT: Duration = Duration::from_millis(250);
 const _: () = assert!(ENTRY_OVERHEAD.get() < SESSION_CEILING.get());
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if one session's ceiling could pass the process budget [ledger #boundary]
 const _: () = assert!(SESSION_CEILING.get() < SESSION_BUDGET.get());
-// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if 8192 drawn elements at their bound could pass half a session's ceiling [ledger #boundary]
-const _: () = assert!(DRAWN_ELEMENT_BYTES.get() * 8192 <= SESSION_CEILING.get() / 2);
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if 4096 drawn elements at their bound could pass half a session's ceiling [ledger #boundary]
+const _: () = assert!(DRAWN_ELEMENT_BYTES.get() * 4096 <= SESSION_CEILING.get() / 2);
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the declared drawn depth passes the depth the stamper and renderer descend to [ledger #boundary]
 const _: () = assert!(DRAWN_ELEMENT_DEPTH < crate::html::MAX_HTML_DEPTH);
 

@@ -1601,15 +1601,20 @@ pub(crate) mod drawn_shape {
     /// `depth` is the nesting depth of its deepest element, the root counted:
     /// `depth - DRAWN_LEVELS` keyed `div` ancestors hold one `code` block of
     /// `lines` line elements with newline text between them. Each line holds
-    /// `runs` coloured runs, each followed by a text sibling and holding its
-    /// text and one escape span, the span both marked and styled. Each line
-    /// carries a click handler with a [`Wide`] message when `handlers` holds.
+    /// `runs` coloured runs, each followed by a text sibling; each run holds
+    /// `escapes` escape spans, each after a text sibling and holding its
+    /// spelling, the span both marked and styled. Each line carries a click
+    /// handler with a [`Wide`] message when `handlers` holds. When `spare`
+    /// holds, every children list keeps as many spare slots as it has
+    /// children, the most a list grown by doubling keeps.
     #[derive(Clone, Copy)]
     pub struct DrawnShape {
         pub depth: usize,
         pub lines: usize,
         pub runs: usize,
+        pub escapes: usize,
         pub handlers: bool,
+        pub spare: bool,
     }
 
     impl DrawnShape {
@@ -1620,7 +1625,8 @@ pub(crate) mod drawn_shape {
 
         /// The elements the shape draws, or `None` on overflow.
         pub fn elements(self) -> Option<usize> {
-            let per_line = self.runs.checked_mul(2)?.checked_add(1)?;
+            let per_run = self.escapes.checked_add(1)?;
+            let per_line = self.runs.checked_mul(per_run)?.checked_add(1)?;
             self.lines
                 .checked_mul(per_line)?
                 .checked_add(1)?
@@ -1641,8 +1647,18 @@ pub(crate) mod drawn_shape {
             view
         }
 
+        /// `kids` with the spare capacity the shape asks for.
+        fn children(self, mut kids: Vec<Html<Wide>>) -> Vec<Html<Wide>> {
+            if self.spare {
+                kids.reserve_exact(kids.len());
+            } else {
+                kids.shrink_to_fit();
+            }
+            kids
+        }
+
         fn code(self) -> Html<Wide> {
-            let mut kids = Vec::with_capacity(self.lines.saturating_mul(2));
+            let mut kids = Vec::new();
             for row in 0..self.lines {
                 if row > 0 {
                     kids.push(Html::HText("\n".into()));
@@ -1655,7 +1671,7 @@ pub(crate) mod drawn_shape {
                     "style".into(),
                     "display:block;flex:1;white-space:pre;color:#cdcdd7;unicode-bidi:bidi-override;direction:ltr".into(),
                 )],
-                kids,
+                self.children(kids),
             )
         }
 
@@ -1667,18 +1683,32 @@ pub(crate) mod drawn_shape {
                     Box::new(Wide([0; 600])),
                 )));
             }
-            let mut kids = Vec::with_capacity(self.runs.saturating_mul(2));
+            let mut kids = Vec::new();
             for col in 0..self.runs {
-                kids.push(run(row, col));
+                kids.push(self.run(row, col));
                 kids.push(Html::HText(format!(" s{col}")));
             }
-            Html::HElement("span".into(), attrs, kids)
+            Html::HElement("span".into(), attrs, self.children(kids))
+        }
+
+        /// One coloured run: `escapes` escape spans, each after its text.
+        fn run(self, row: usize, col: usize) -> Html<Wide> {
+            let mut kids = Vec::new();
+            for _ in 0..self.escapes {
+                kids.push(Html::HText(format!("t{row}x{col}")));
+                kids.push(escape());
+            }
+            Html::HElement(
+                "span".into(),
+                vec![Attribute::Attr("style".into(), "color:#c792ea".into())],
+                self.children(kids),
+            )
         }
     }
 
-    /// One coloured run: its text and one escape span.
-    fn run(row: usize, col: usize) -> Html<Wide> {
-        let escape = Html::HElement(
+    /// One escape span: marked, styled, holding one escape's spelling.
+    fn escape() -> Html<Wide> {
+        Html::HElement(
             "span".into(),
             vec![
                 Attribute::Attr("data-review-escape".into(), "true".into()),
@@ -1688,11 +1718,6 @@ pub(crate) mod drawn_shape {
                 ),
             ],
             vec![Html::HText("\\u{202E}".into())],
-        );
-        Html::HElement(
-            "span".into(),
-            vec![Attribute::Attr("style".into(), "color:#c792ea".into())],
-            vec![Html::HText(format!("t{row}x{col}")), escape],
         )
     }
 }
@@ -1836,7 +1861,9 @@ mod tests {
             depth: 9,
             lines: 12,
             runs: 3,
+            escapes: 2,
             handlers: true,
+            spare: true,
         };
         let view = shape.build();
         let mut pending = vec![(&view, 1_usize)];
@@ -1864,39 +1891,57 @@ mod tests {
             measured.checked_div(u64::try_from(shape.elements()?).ok()?)
         }
 
-        /// A source view at the app's line ceiling, its deepest element at `depth`.
+        /// Source views of about the app's element ceiling, their deepest
+        /// element at `depth`, every children list at its most spare: the line
+        /// ceiling's lines of two runs of one escape each; one line of one run
+        /// of six thousand escapes, the dearest element (two attributes, its
+        /// spelling and a text sibling) and the most of it; and a mix.
         ///
-        /// Every line past the thousandth carries a 4-digit child index.
-        const fn drawn_at(depth: usize) -> DrawnShape {
-            DrawnShape {
+        /// A child index past the thousandth spells four digits.
+        fn drawn_at(depth: usize) -> [DrawnShape; 3] {
+            let shape = |lines, runs, escapes| DrawnShape {
                 depth,
-                lines: 5000,
-                runs: 2,
+                lines,
+                runs,
+                escapes,
                 handlers: false,
+                spare: true,
+            };
+            [shape(5000, 2, 1), shape(1, 1, 6000), shape(1000, 1, 5)]
+        }
+
+        // Every composition of a source view a code viewer draws, its deepest
+        // element at the depth the contract declares under keyed ancestors,
+        // stays within the per-element bound once stamped: the bound is the
+        // dearest composition's, not one view's average.
+        #[test]
+        fn a_drawn_source_view_of_any_composition_stays_within_the_element_bound() {
+            for shape in drawn_at(DRAWN_ELEMENT_DEPTH) {
+                let per = bytes_per_element(shape);
+                assert!(
+                    per.is_some_and(|p| p <= DRAWN_ELEMENT_BYTES.get()),
+                    "{per:?} > {DRAWN_ELEMENT_BYTES:?} at {} lines x {} runs x {} escapes",
+                    shape.lines,
+                    shape.runs,
+                    shape.escapes
+                );
             }
         }
 
-        // A source view in the shape a code viewer draws, its deepest element
-        // at the depth the contract declares under keyed ancestors, stays
-        // within the per-element bound once stamped.
-        #[test]
-        fn a_drawn_source_view_stays_within_the_element_bound() {
-            let per = bytes_per_element(drawn_at(DRAWN_ELEMENT_DEPTH));
-            assert!(
-                per.is_some_and(|p| p <= DRAWN_ELEMENT_BYTES.get()),
-                "{per:?} > {DRAWN_ELEMENT_BYTES:?}"
-            );
-        }
-
-        // The same view forty levels deeper than the contract passes the
+        // The same views forty levels deeper than the contract pass the
         // bound: the measure sees the depth, so a deeper page turns it red.
         #[test]
         fn a_drawn_source_view_past_the_declared_depth_breaks_the_element_bound() {
-            let per = bytes_per_element(drawn_at(DRAWN_ELEMENT_DEPTH + 40));
-            assert!(
-                per.is_some_and(|p| p > DRAWN_ELEMENT_BYTES.get()),
-                "{per:?} <= {DRAWN_ELEMENT_BYTES:?}"
-            );
+            for shape in drawn_at(DRAWN_ELEMENT_DEPTH + 40) {
+                let per = bytes_per_element(shape);
+                assert!(
+                    per.is_some_and(|p| p > DRAWN_ELEMENT_BYTES.get()),
+                    "{per:?} <= {DRAWN_ELEMENT_BYTES:?} at {} lines x {} runs x {} escapes",
+                    shape.lines,
+                    shape.runs,
+                    shape.escapes
+                );
+            }
         }
     }
 

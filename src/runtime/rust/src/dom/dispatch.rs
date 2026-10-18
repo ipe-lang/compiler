@@ -531,7 +531,9 @@ mod tests {
             depth: DRAWN_LEVELS,
             lines,
             runs: 1,
+            escapes: 1,
             handlers,
+            spare: false,
         }
         .build()
     }
