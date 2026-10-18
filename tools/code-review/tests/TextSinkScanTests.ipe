@@ -505,7 +505,6 @@ admittedFlattening =
     [ "Lib/Index.ipe:noTaggedPath"
     , "Lib/Index.ipe:probeRepos"
     , "Lib/Index.ipe:rootMismatch"
-    , "Lib/Links.ipe:linkKey"
     , "Lib/RepoPath.ipe:reposToError"
     , "Lib/RepoPath.ipe:rootRefusal"
     , "Lib/RepoPath.ipe:toError"
@@ -1268,7 +1267,7 @@ scanRefusesEvasions =
                     && caughtBy FlattenedText (inView "shown =\n    Maybe.map SafeText.toString")
                     && caughtBy FlattenedText (inView "shown x =\n    Lib.SafeText.toString x")
                     && caughtBy FlattenedText (inQueue "shown x =\n    SafeText.toString x")
-                    && caughtBy FlattenedText (List.filter (\( rel, _, _ ) -> rel /= "Lib/Links.ipe") sources)
+                    && caughtBy FlattenedText (List.filter (\( rel, _, _ ) -> rel /= "Lib/Settings.ipe") sources)
                     && breaks ComputedUiText (inView "shown e =\n    Ui.text (Error.message e)")
                     && breaks ErrorTextUnrendered (inView "shown e =\n    Ui.text (Error.message e)")
                     && caughtBy ErrorTextUnrendered (inQueue "shown e =\n    SafeText.literal (Error.toString e)")

@@ -347,14 +347,14 @@ sourceTokensRendered =
             String.concat (List.map (\tok -> SafeText.toString (Highlight.tokenText tok)) (Highlight.tokenize lang line))
 
         label =
-            [ Links.internal ("Lib." ++ rlo ++ "x") (Uid.toString (uid "u-x")) ]
-                |> List.map (\l -> SafeText.toString (Links.label l))
+            [ Links.internal (Label.fromText Label.labelCap ("Lib." ++ rlo ++ "x")) (Uid.toString (uid "u-x")) ]
+                |> List.map (\l -> Label.parts (Links.label l))
     in
     List.all
         (\lang -> noHazard (shownIn lang) && String.contains "\\u{202e}" (shownIn lang) && String.contains "\\u{2066}" (shownIn lang))
         [ Highlight.Rust, Highlight.Shell, Highlight.Ipe, Highlight.Unknown ]
         && label
-        == [ "→ Lib.\\u{202e}x" ]
+        == [ [ LabelText "Lib.", LabelEscapes "\\u{202e}", LabelText "x" ] ]
 
 
 -- ── labels ──────────────────────────────────────────────────────────────

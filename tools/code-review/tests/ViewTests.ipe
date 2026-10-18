@@ -431,7 +431,7 @@ hugeUrls =
             "https://x.io/" ++ String.repeat 131072 "a" ++ String.repeat 131072 "." ++ "b"
     in
     Links.sourceUrls ("(" ++ url ++ ")),")
-        == [ External url ]
+        == [ Links.external url ]
         && List.length (Links.sourceUrls (String.repeat 65536 "https://x.io/p, "))
         == 65536
 

@@ -628,7 +628,7 @@ unsafeLinkHasNoHref : Index.UnitView -> String -> Bool
 unsafeLinkHasNoHref loaded url =
     let
         linked =
-            withLinks [ External url ] loaded
+            withLinks [ Lib.Links.external url ] loaded
 
         onPage =
             page (unitPageModel linked)
@@ -656,10 +656,98 @@ safeLinkHasHref : Index.UnitView -> Bool
 safeLinkHasHref loaded =
     let
         linked =
-            withLinks [ External "https://example.com/x" ] loaded
+            withLinks [ Lib.Links.external "https://example.com/x" ] loaded
     in
     has "href=\"https://example.com/x\"" (page (unitPageModel linked))
         && has "href=\"https://example.com/x\"" (page (cardModel linked))
+
+
+-- A URL of exactly the href ceiling is linked whole; one byte over is shown
+-- cut with its marker and never linked, so no href is ever a cut label.
+hrefCeilingIsExact : Index.UnitView -> Bool
+hrefCeilingIsExact loaded =
+    let
+        urlOf n =
+            "https://example.com/" ++ String.repeat (n - 20) "a"
+
+        atCap =
+            urlOf Lib.Links.hrefByteCeiling
+
+        overCap =
+            urlOf (Lib.Links.hrefByteCeiling + 1)
+
+        shown url =
+            page (unitPageModel (withLinks [ Lib.Links.external url ] loaded))
+    in
+    has ("href=\"" ++ atCap ++ "\"") (shown atCap)
+        && not (has "data-review-cut" (shown atCap))
+        && not (has "href=" (shown overCap))
+        && has "data-review-cut" (shown overCap)
+        && String.startsWith "f:" (Lib.Links.linkKey (Lib.Links.external overCap))
+        && String.startsWith "e:" (Lib.Links.linkKey (Lib.Links.external atCap))
+
+
+-- A URL well under the href ceiling whose label is cut by its escape runs
+-- (one past `Label.runCeiling`) is shown cut and never linked, keyed as an
+-- untargeted URL: the href rule is "shown whole", not only "few bytes".
+escapeCutUrlIsUnlinked : Index.UnitView -> Bool
+escapeCutUrlIsUnlinked loaded =
+    let
+        rlo =
+            codeText 8238
+
+        url =
+            "https://example.com/" ++ String.concat (List.map (\c -> c ++ rlo) [ "a", "b", "c", "d" ])
+
+        link =
+            Lib.Links.external url
+
+        shown =
+            page (unitPageModel (withLinks [ link ] loaded))
+    in
+    Label.textBytes url
+        < Lib.Links.hrefByteCeiling
+        && has "data-review-cut" shown
+        && not (has "href=" shown)
+        && String.startsWith "f:" (Lib.Links.linkKey link)
+
+
+-- A unit holding the most links, each named by a hostile qualified name of a
+-- full read window, draws at most `Index.linkElements` for each link past the
+-- first (the first also opens the links row, page chrome), every name cut with
+-- its marker, and holds no more link bytes than the links' share of the queue
+-- label ceiling.
+maxLinksFitBudget : Index.UnitView -> List ( String, Bool )
+maxLinksFitBudget loaded =
+    let
+        links =
+            List.map
+                (\n -> Lib.Links.internal (labelOf (hostileColumn ++ String.fromInt n)) (Uid.toString (uid ("u-link-" ++ String.fromInt n))))
+                (List.range 1 Lib.Links.linkCeiling)
+
+        drawnOn view linkSet =
+            elementsOf (page (view (withLinks linkSet loaded)))
+
+        delta view =
+            drawnOn view links - drawnOn view (List.take 1 links)
+
+        cuts view =
+            List.length (String.split "data-review-cut" (page (view (withLinks links loaded))))
+                - List.length (String.split "data-review-cut" (page (view (withLinks [] loaded))))
+
+        linkBytes =
+            List.sum (List.map (\l -> Label.byteCount (Lib.Links.label l)) links)
+    in
+    [ ( "a card of the most hostile links draws no more than linkElements per link and draws every link cut"
+      , delta cardModel <= (Lib.Links.linkCeiling - 1) * Index.linkElements && cuts cardModel >= Lib.Links.linkCeiling
+      )
+    , ( "a unit page of the most hostile links draws no more than linkElements per link and draws every link cut"
+      , delta unitPageModel <= (Lib.Links.linkCeiling - 1) * Index.linkElements && cuts unitPageModel >= Lib.Links.linkCeiling
+      )
+    , ( "the most hostile links hold no more bytes than their share of the queue label ceiling"
+      , linkBytes > 0 && linkBytes <= Lib.Links.linkCeiling * Lib.Links.linkByteCeiling
+      )
+    ]
 
 
 -- ── checks on the seeded fixture units ──────────────────────────────────
@@ -807,6 +895,8 @@ seededChecks a b =
     , ( "the reported address is escaped as an attribute value", pathAttributeEscaped a )
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
+    , ( "a URL at the href ceiling is linked whole and one byte over is shown cut and never linked", hrefCeilingIsExact a )
+    , ( "a URL under the href ceiling whose label its escape runs cut is shown cut and never linked", escapeCutUrlIsUnlinked a )
     , ( "a read-only server shows no decision control and says why, beside a signing server that shows them", not (button "Approve" readOnlyCard) && not (button "Refuse" readOnlyCard) && has "Read-only: IPE_REVIEW_MAC_KEY is not set, so no decision is recorded." readOnlyCard && button "Approve" shownCard && not (has "Read-only:" shownCard) )
     , ( "a broken chain shows its banner, naming the entry, on the queue and the History, and an intact one shows none", has banner brokenCard && has banner (page (unverifiedHistory (ShownBroken (BreaksAt 2)) ChainBroken)) && not (has "chain breaks" shownCard) && not (has "chain breaks" (page hostileHistory)) )
     , ( "a log with entries past its head and a log signed by another key each show their own banner"
@@ -1417,7 +1507,7 @@ queueBudgetChecks loaded =
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
-        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a ++ queueBudgetChecks a)))
+        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a ++ queueBudgetChecks a ++ maxLinksFitBudget a)))
         , group "hostile source fixture" hostileSourceChecks
         , group "stored decision fixture" storedChecks
         , group "unreviewable file fixture" refusalChecks
