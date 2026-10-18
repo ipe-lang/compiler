@@ -92,11 +92,17 @@ fn wasi_options() -> BuildOptions {
     }
 }
 
-/// Emit `source` for the co-located WASI target into `out`.
+/// `source` as the `Main` module of a fresh project fixture.
+#[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
+fn wasi_fixture(source: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(source).expect("write the project fixture")
+}
+
+/// Emit `fixture` for the co-located WASI target into `out`.
 #[allow(clippy::expect_used)] // test helper: an unresolvable runtime IS the failure
-fn emit_wasi(entry: &Path, out: &Path) -> Result<(), CliError> {
+fn emit_wasi(fixture: &ipe::RootFixture, out: &Path) -> Result<(), CliError> {
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_with_options(entry, out, &runtime, wasi_options())
+    ipe::build_fixture_with_options(fixture, out, &runtime, &wasi_options()).map(drop)
 }
 
 /// A `Direct` script that reaches only the sealed WASI floor: `Ipe.Io` stdio +
@@ -200,11 +206,11 @@ fn wasi_direct_floor_program_cargo_builds_for_wasip1() {
     }
 
     let dir = scratch("wasi_seal_floor");
-    let entry = write_entry(&dir.join("srcdir"), DIRECT_FLOOR_SOURCE);
+    let fixture = wasi_fixture(DIRECT_FLOOR_SOURCE);
     let out = dir.join("out");
 
     // ipe accepts the sealed-floor program for the WASI target and emits it.
-    emit_wasi(&entry, &out).expect("sealed-floor Direct program must ipe-accept for WASI");
+    emit_wasi(&fixture, &out).expect("sealed-floor Direct program must ipe-accept for WASI");
 
     // Forward CI's warm shared target when present so the emitted crate's deps
     // reuse compiled artifacts; else isolate a per-slot target.
@@ -252,10 +258,10 @@ fn wasi_direct_floor_program_cargo_builds_for_wasip1() {
 #[test]
 fn wasi_http_shape_is_refused_fail_closed() {
     let dir = scratch("wasi_seal_http_refusal");
-    let entry = write_entry(&dir.join("srcdir"), HTTP_SHAPE_SOURCE);
+    let fixture = wasi_fixture(HTTP_SHAPE_SOURCE);
     let out = dir.join("out");
 
-    let err = emit_wasi(&entry, &out)
+    let err = emit_wasi(&fixture, &out)
         .expect_err("an Http-reaching program must be REFUSED for the WASI sealed floor");
 
     // The refusal is the sealed-floor gate (IPE-N0029 server-only-kernel-for-wasm),

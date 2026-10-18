@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 
 use ipe::{BuildOptions, CliError};
-use ipe_runtime_rust::encoding::MountBase;
 
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -34,12 +33,9 @@ fn scratch_isolated(name: &str) -> PathBuf {
     dir
 }
 
-#[allow(clippy::expect_used)] // test helper: a failed scratch-dir setup IS the failure
-fn write_entry(dir: &Path, source: &str) -> PathBuf {
-    std::fs::create_dir_all(dir).expect("mkdir scratch");
-    let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).expect("write entry");
-    entry
+#[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
+fn write_fixture(source: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(source).expect("write the project fixture")
 }
 
 fn wasm_options() -> BuildOptions {
@@ -50,9 +46,9 @@ fn wasm_options() -> BuildOptions {
 }
 
 #[allow(clippy::expect_used)] // test helper: an unresolvable runtime IS the failure
-fn build_wasm(entry: &Path, out: &Path) -> Result<(), CliError> {
+fn build_wasm(fixture: &ipe::RootFixture, out: &Path) -> Result<(), CliError> {
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_with_options(entry, out, &runtime, wasm_options())
+    ipe::build_fixture_with_options(fixture, out, &runtime, &wasm_options()).map(drop)
 }
 
 /// A pure `Ipe.Ui` TEA app: the smallest program the wasm target accepts.
@@ -128,22 +124,24 @@ fn wasm_shell_urls_sit_at_the_root() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Build [`PURE_UI_APP`] for the wasm target under the mount base `base`
-/// (`""` is the root) and return the output directory.
+/// Build [`PURE_UI_APP`] for the wasm target under the manifest's
+/// `delivery.browser.basePath` `base` (`""` is the root, no field) and return
+/// the output directory.
 fn build_shell(name: &str, base: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = scratch(name);
-    let src = dir.join("srcdir");
-    std::fs::create_dir_all(&src)?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, PURE_UI_APP)?;
-    let out = dir.join("out");
-    let mount_base = MountBase::parse(base).map_err(|r| r.to_string())?;
-    let runtime = e2e_support::require_runtime().into_path_buf();
-    let options = BuildOptions {
-        mount_base,
-        ..wasm_options()
+    let tree = ipe::project_root::SourceTree::main(PURE_UI_APP);
+    let tree = if base.is_empty() {
+        tree
+    } else {
+        tree.field(&format!(
+            "delivery = {{ browser = {{ basePath = \"{base}\" }} }}"
+        ))
     };
-    ipe::build_with_options(&entry, &out, &runtime, options).map_err(|e| format!("{e:?}"))?;
+    let fixture = ipe::RootFixture::from_tree(&tree)?;
+    let out = dir.join("out");
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build_fixture_with_options(&fixture, &out, &runtime, &wasm_options())
+        .map_err(|e| format!("{e:?}"))?;
     Ok(out)
 }
 
@@ -152,9 +150,9 @@ fn build_shell(name: &str, base: &str) -> Result<PathBuf, Box<dyn std::error::Er
 #[test]
 fn pure_ui_app_emits_wasm_project() {
     let dir = scratch("wasm_gate_green");
-    let entry = write_entry(&dir.join("srcdir"), PURE_UI_APP);
+    let fixture = write_fixture(PURE_UI_APP);
     let out = dir.join("out");
-    build_wasm(&entry, &out).expect("pure Ipe.Ui app must build under --target wasm");
+    build_wasm(&fixture, &out).expect("pure Ipe.Ui app must build under --target wasm");
 
     let manifest = std::fs::read_to_string(out.join("Cargo.toml")).expect("emitted manifest");
     assert!(manifest.contains("crate-type = [\"cdylib\"]"), "{manifest}");
@@ -205,8 +203,7 @@ fn pure_ui_app_emits_wasm_project() {
 #[test]
 fn wasm_web_app_ipe_main_return_type_is_ipe_task() {
     let dir = scratch("wasm_gate_ipe_main_ret");
-    let entry = write_entry(
-        &dir.join("srcdir"),
+    let fixture = write_fixture(
         "module Main exposing (main)\n\
          import Ipe.String as String\n\
          import Ipe.Tea.Web exposing (tea)\n\
@@ -243,7 +240,7 @@ fn wasm_web_app_ipe_main_return_type_is_ipe_task() {
          \x20       }\n",
     );
     let out = dir.join("out");
-    build_wasm(&entry, &out).expect("Web.tea must emit under --target wasm");
+    build_wasm(&fixture, &out).expect("Web.tea must emit under --target wasm");
 
     let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("emitted main.rs");
 
@@ -273,8 +270,7 @@ fn wasm_web_app_ipe_main_return_type_is_ipe_task() {
 #[test]
 fn routed_web_app_emits_wasm_app_routed() {
     let dir = scratch("wasm_gate_routed");
-    let entry = write_entry(
-        &dir.join("srcdir"),
+    let fixture = write_fixture(
         "module Main exposing (main)\n\
          import Ipe.String as String\n\
          import Ipe.Tea.Web exposing (tea, route)\n\
@@ -311,7 +307,7 @@ fn routed_web_app_emits_wasm_app_routed() {
          \x20       }\n",
     );
     let out = dir.join("out");
-    build_wasm(&entry, &out).expect("routed Web.tea must build under --target wasm");
+    build_wasm(&fixture, &out).expect("routed Web.tea must build under --target wasm");
 
     let manifest = std::fs::read_to_string(out.join("Cargo.toml")).expect("emitted manifest");
     assert!(manifest.contains("crate-type = [\"cdylib\"]"), "{manifest}");
@@ -346,8 +342,7 @@ fn routed_web_app_emits_wasm_app_routed() {
 #[test]
 fn routed_web_app_with_on_navigate_emits_update_once() {
     let dir = scratch("wasm_gate_routed_on_navigate");
-    let entry = write_entry(
-        &dir.join("srcdir"),
+    let fixture = write_fixture(
         "module Main exposing (main)\n\
          import Ipe.String as String\n\
          import Ipe.Tea.Web exposing (tea, route)\n\
@@ -385,7 +380,7 @@ fn routed_web_app_with_on_navigate_emits_update_once() {
          \x20       }\n",
     );
     let out = dir.join("out");
-    build_wasm(&entry, &out)
+    build_wasm(&fixture, &out)
         .expect("routed Web.tea with onNavigate must build under --target wasm");
 
     let main_rs = std::fs::read_to_string(out.join("src/main.rs")).expect("emitted main.rs");
@@ -405,8 +400,7 @@ fn routed_web_app_with_on_navigate_emits_update_once() {
 #[allow(clippy::panic)] // test assertion: a non-pipeline error variant IS the failure
 fn server_only_kernel_fails_at_compile_time() {
     let dir = scratch("wasm_gate_red");
-    let entry = write_entry(
-        &dir.join("srcdir"),
+    let fixture = write_fixture(
         "module Main exposing (main)\n\
          import Ipe.File as File\n\
          import Ipe.Path as Path\n\
@@ -418,7 +412,7 @@ fn server_only_kernel_fails_at_compile_time() {
          \x20       Err e -> Task.fail e\n",
     );
     let out = dir.join("out");
-    let err = build_wasm(&entry, &out).expect_err("File.readFile must be denied under wasm");
+    let err = build_wasm(&fixture, &out).expect_err("File.readFile must be denied under wasm");
     let CliError::Pipeline { diag, .. } = err else {
         panic!("expected a pipeline diagnostic, got: {err:?}");
     };
@@ -438,8 +432,7 @@ fn server_only_kernel_fails_at_compile_time() {
 #[allow(clippy::panic)] // test assertion: a non-pipeline error variant IS the failure
 fn process_run_is_denied_under_wasm() {
     let dir = scratch("wasm_gate_process_red");
-    let entry = write_entry(
-        &dir.join("srcdir"),
+    let fixture = write_fixture(
         "module Main exposing (main)\n\
          import Ipe.Process as Process\n\
          import Ipe.Task as Task\n\
@@ -448,7 +441,7 @@ fn process_run_is_denied_under_wasm() {
          \x20   Process.run \"ls\" []\n",
     );
     let out = dir.join("out");
-    let err = build_wasm(&entry, &out).expect_err("Process.run must be denied under wasm");
+    let err = build_wasm(&fixture, &out).expect_err("Process.run must be denied under wasm");
     let CliError::Pipeline { diag, .. } = err else {
         panic!("expected a pipeline diagnostic, got: {err:?}");
     };
@@ -464,8 +457,7 @@ fn process_run_is_denied_under_wasm() {
 #[test]
 fn process_run_still_builds_natively() {
     let dir = scratch("wasm_gate_process_native_ok");
-    let entry = write_entry(
-        &dir.join("srcdir"),
+    let fixture = write_fixture(
         "module Main exposing (main)\n\
          import Ipe.Process as Process\n\
          import Ipe.Task as Task\n\
@@ -475,7 +467,7 @@ fn process_run_still_builds_natively() {
     );
     let out = dir.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
+    ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default())
         .expect("native build of Process.run must stay green");
 }
 
@@ -489,47 +481,45 @@ fn process_run_still_builds_natively() {
 #[allow(clippy::panic)] // test assertion: a non-pipeline error variant IS the failure
 fn transitive_server_import_fails_naming_the_exact_chain() {
     let dir = scratch("wasm_gate_transitive_chain");
-    let srcdir = dir.join("srcdir");
-    std::fs::create_dir_all(&srcdir).expect("mkdir scratch");
-    std::fs::write(
-        srcdir.join("Data.ipe"),
-        "module Data exposing (load)\n\
-         import Ipe.File as File\n\
-         import Ipe.Path as Path\n\
-         import Ipe.Task as Task\n\
-         \n\
-         load : Task Error String\n\
-         load =\n\
-         \x20   case Path.fromString \"/etc/passwd\" of\n\
-         \x20       Ok p -> File.readFile p\n\
-         \x20       Err e -> Task.fail e\n",
-    )
-    .expect("write Data.ipe");
-    std::fs::write(
-        srcdir.join("View.ipe"),
-        "module View exposing (label)\n\
-         import Data exposing (load)\n\
-         import Ipe.Task as Task\n\
-         \n\
-         label : String\n\
-         label = \"view\"\n\
-         \n\
-         forceLink : Task Error String\n\
-         forceLink = load\n",
-    )
-    .expect("write View.ipe");
-    let entry = write_entry(
-        &srcdir,
-        "module Main exposing (main)\n\
-         import Ipe.Io as Io\n\
-         import View exposing (label)\n\
-         \n\
-         main =\n\
-         \x20   Io.println label\n",
-    );
+    let tree = ipe::project_root::SourceTree::new()
+        .module(
+            "Data",
+            "module Data exposing (load)\n\
+             import Ipe.File as File\n\
+             import Ipe.Path as Path\n\
+             import Ipe.Task as Task\n\
+             \n\
+             load : Task Error String\n\
+             load =\n\
+             \x20   case Path.fromString \"/etc/passwd\" of\n\
+             \x20       Ok p -> File.readFile p\n\
+             \x20       Err e -> Task.fail e\n",
+        )
+        .module(
+            "View",
+            "module View exposing (label)\n\
+             import Data exposing (load)\n\
+             import Ipe.Task as Task\n\
+             \n\
+             label : String\n\
+             label = \"view\"\n\
+             \n\
+             forceLink : Task Error String\n\
+             forceLink = load\n",
+        )
+        .module(
+            "Main",
+            "module Main exposing (main)\n\
+             import Ipe.Io as Io\n\
+             import View exposing (label)\n\
+             \n\
+             main =\n\
+             \x20   Io.println label\n",
+        );
+    let fixture = ipe::RootFixture::from_tree(&tree).expect("write the project fixture");
     let out = dir.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let err = ipe::build_loose_file_with_options(&entry, &out, &runtime, wasm_options())
+    let err = ipe::build_fixture_with_options(&fixture, &out, &runtime, &wasm_options())
         .expect_err("View -> Data's File.readFile must be denied transitively");
     let CliError::Pipeline { diag, .. } = err else {
         panic!("expected a pipeline diagnostic, got: {err:?}");
@@ -581,14 +571,14 @@ fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
 
     // Emit the REAL wasm-hydration example (single source of truth) with the
     // hydrate mode its `package.ipe` declares.
-    let entry = e2e_support::manifest_dir!().join("../../examples/wasm/hydration/src/Main.ipe");
+    let manifest = e2e_support::manifest_dir!().join("../../examples/wasm/hydration/package.ipe");
     let out = scratch_isolated("wasm_hydrate_seal").join("out");
     let options = BuildOptions {
         target: ipe_ir::Target::WasmClient,
         wasm_hydrate_mode: true,
         ..BuildOptions::default()
     };
-    ipe::build_loose_file_with_options(&entry, &out, &runtime, options)
+    ipe::build_project_with_options(&manifest, &out, &runtime, &options)
         .expect("wasm-hydration must emit under --target wasm mode=hydrate");
 
     // The emitted glue must name the structurally-emitted struct, not a
@@ -636,8 +626,7 @@ fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
 #[test]
 fn server_only_kernel_still_builds_natively() {
     let dir = scratch("wasm_gate_native_ok");
-    let entry = write_entry(
-        &dir.join("srcdir"),
+    let fixture = write_fixture(
         "module Main exposing (main)\n\
          import Ipe.File as File\n\
          import Ipe.Path as Path\n\
@@ -650,6 +639,6 @@ fn server_only_kernel_still_builds_natively() {
     );
     let out = dir.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
+    ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default())
         .expect("native build of the same program must stay green");
 }
