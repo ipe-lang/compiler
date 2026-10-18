@@ -247,6 +247,76 @@ bodyHashPastWindowFailsRead =
             )
 
 
+-- A stored path that is text but not UTF-8, cut at a NUL byte so that the
+-- hex spelling of its window has exactly the column's byte count, is refused
+-- as not text, never read as that hex spelling. Red if a window is judged
+-- whole from the bytes of its decoded text rather than the bytes SQLite
+-- returned for it.
+pathNotUtf8Refused : Task.Task Error Bool
+pathNotUtf8Refused =
+    do
+        at <- freshScratch "ipe-index-path-not-utf8"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET path = CAST(X'6970653AFFFF004141414141' AS TEXT) WHERE uid = ?" [ Uid.toSql (uid "u-b") ]
+        found <- loadUnitNow (uid "u-b")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (case Maybe.map .view found of
+                Just (Unreadable (PathNotText _)) ->
+                    True
+
+                Just _ ->
+                    False
+
+                Nothing ->
+                    False
+            )
+
+
+-- A column the app acts on that is longer than the read window fails the
+-- read naming the column, never the value, wherever it is read: a queue
+-- row's old hash, a recorded repository tag, a `reviewed` pair and the
+-- copy's stamp. Red if any of them is read whole, unbounded, again.
+actedColumnsPastWindowFailRead : Task.Task Error Bool
+actedColumnsPastWindowFailRead =
+    let
+        long =
+            "replace(hex(zeroblob(3000)), '0', 'a')"
+
+        past col message =
+            maybeContains (col ++ " is longer than the " ++ String.fromInt Label.windowChars ++ " characters") message
+                && not (maybeContains (String.repeat 64 "a") message)
+    in
+    do
+        oldHash <- readMessageAfter "ipe-index-old-hash-past-window" ("UPDATE change_queue SET old_hash = " ++ long ++ " WHERE uid = '" ++ Uid.toString (uid "u-b") ++ "'") (\conn -> pendingRows conn |> Task.map (\_ -> ()))
+        pair <- readMessageAfter "ipe-index-pair-past-window" ("INSERT INTO reviewed VALUES ('x', " ++ long ++ ")") (\conn -> snapshotOn conn |> Task.map (\_ -> ()))
+        stamp <- readMessageAfter "ipe-index-stamp-past-window" ("INSERT OR REPLACE INTO reviewed_stamp (one, head) VALUES (1, " ++ long ++ ")") (\conn -> Index.readStamp conn |> Task.map (\_ -> ()))
+        tag <- reposProbeAfter "ipe-index-repos-tag-past-window" [ "INSERT INTO repos (tag, outer, prefix) VALUES (" ++ long ++ ", NULL, NULL)" ] noRepos
+        Task.succeed
+            (past "old_hash" oldHash
+                && past "body_hash" pair
+                && past "head" stamp
+                && tag
+                /= Nothing
+                && not (maybeContains (String.repeat 64 "a") tag)
+            )
+
+
+-- The failure message, if any, of `read` on a seeded index after `sql` ran.
+readMessageAfter : String -> String -> (Db -> Task.Task Error ()) -> Task.Task Error (Maybe String)
+readMessageAfter name sql read =
+    do
+        at <- freshScratch name
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexScript at.indexDb sql
+        conn <- indexConn
+        message <- probeMessage (read conn)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed message
+
+
 isCut : LabelPart -> Bool
 isCut part =
     case part of
@@ -1846,6 +1916,8 @@ checks =
         , check "a stored path past the read window is refused before the join" pathPastWindowRefused
         , check "a stored path cut at a NUL byte is refused under that cause" pathCutAtNulRefused
         , check "a stored body hash past the read window fails the unit's read" bodyHashPastWindowFailsRead
+        , check "a stored path that is not UTF-8 is refused as not text, never as its hex spelling" pathNotUtf8Refused
+        , check "an old hash, recorded tag, reviewed pair or stamp past the read window fails its read" actedColumnsPastWindowFailRead
         , check "view and attestation match the shared ipe-index vectors" viewHashVectors
         , check "a file unit's residual matches the shared ipe-index vectors" residualVectors
         , check "a file unit shows and attests its residual, never its whole range" fileUnitShowsResidual

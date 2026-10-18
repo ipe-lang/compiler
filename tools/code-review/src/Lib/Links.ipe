@@ -745,8 +745,10 @@ dropOrdinal qualified =
 
 
 -- The links of `lookups` given the `(qualified, uid)` rows the candidate
--- query returned: each lookup links its first alternative that resolved.
-resolveCandidates : List (List String) -> List ( String, String ) -> List Link
+-- query returned: each lookup links its first alternative that resolved. A
+-- row whose uid the read did not return whole (`Nothing`) still resolves
+-- its name, shown unlinked.
+resolveCandidates : List (List String) -> List ( String, Maybe String ) -> List Link
 resolveCandidates lookups rows =
     let
         found =
@@ -755,7 +757,7 @@ resolveCandidates lookups rows =
     List.filterMap (firstResolved found) lookups
 
 
-firstResolved : Dict String String -> List String -> Maybe Link
+firstResolved : Dict String (Maybe String) -> List String -> Maybe Link
 firstResolved found alts =
     case alts of
         [] ->
@@ -763,8 +765,11 @@ firstResolved found alts =
 
         a :: rest ->
             case Dict.get a found of
-                Just uid ->
+                Just (Just uid) ->
                     Just (internal (Label.fromText Label.labelCap a) uid)
+
+                Just Nothing ->
+                    Just (Unlinked (Label.fromText Label.labelCap a))
 
                 Nothing ->
                     firstResolved found rest

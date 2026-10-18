@@ -74,7 +74,7 @@ unitByUid roots uid =
         bound =
             boundTags roots
     in
-    ( "SELECT u.uid, u.line_start, u.line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
+    ( "SELECT " ++ shownColumn "u.uid" "uid" ++ ", u.line_start, u.line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
     , Uid.toSql uid :: bound.params
     )
 
@@ -177,7 +177,7 @@ linksOf conn row columns view =
                         Task.succeed
                             (Links.assemble
                                 { edges = edgeReach edges, candidates = wanted.reach }
-                                (List.map (\( uid, qualified ) -> Links.internal qualified uid) edges)
+                                (List.map edgeLink edges)
                                 (Links.resolveCandidates wanted.lookups resolved)
                                 (Links.sourceUrls source)
                             )
@@ -198,16 +198,26 @@ linksOf conn row columns view =
 -- The callgraph edges ipe-index resolved out of `uid`, one past the link
 -- ceiling, so a full read shows that more edges may exist. Each callee's
 -- qualified name is read as a bounded window and parsed into its label
--- here, and its uid is read one character past a unit id's length, so no
--- edge column reaches the app unbounded.
-edgeLinks : Db.Db -> Uid -> Task.Task Error (List ( String, Label ))
+-- here, and its uid as a bounded window too, so no edge column reaches the
+-- app unbounded. A uid the window does not hold whole links nowhere.
+edgeLinks : Db.Db -> Uid -> Task.Task Error (List ( Maybe String, Label ))
 edgeLinks conn uid =
     Db.queryDecode conn edgeSql [ Uid.toSql uid, Uid.toSql uid, SqlInt (Links.linkCeiling + 1) ] edgeDecoder
 
 
 edgeSql : String
 edgeSql =
-    "SELECT substr(c.callee_uid, 1, " ++ String.fromInt (Uid.uidLength + 1) ++ ") AS callee_uid, " ++ shownColumn "u.qualified" "qualified" ++ " FROM callgraph c JOIN units u ON u.uid = c.callee_uid WHERE c.caller_uid = ? AND c.callee_uid != ? ORDER BY u.qualified, u.uid LIMIT ?"
+    "SELECT " ++ shownColumn "c.callee_uid" "callee_uid" ++ ", " ++ shownColumn "u.qualified" "qualified" ++ " FROM callgraph c JOIN units u ON u.uid = c.callee_uid WHERE c.caller_uid = ? AND c.callee_uid != ? ORDER BY u.qualified, u.uid LIMIT ?"
+
+
+edgeLink : ( Maybe String, Label ) -> Links.Link
+edgeLink edge =
+    case edge of
+        ( Just uid, qualified ) ->
+            Links.internal qualified uid
+
+        ( Nothing, qualified ) ->
+            Links.Unlinked qualified
 
 
 edgeReach : List a -> Links.Reach
@@ -219,17 +229,19 @@ edgeReach edges =
         Links.Complete
 
 
-edgeDecoder : Db.Decode.Decoder ( String, Label )
+edgeDecoder : Db.Decode.Decoder ( Maybe String, Label )
 edgeDecoder =
     Db.Decode.map2
-        (\callee qualified -> ( callee, Label.parse Label.labelCap qualified ))
-        (Db.Decode.string "callee_uid")
+        (\callee qualified -> ( Label.whole callee, Label.parse Label.labelCap qualified ))
+        (columnDecoder "callee_uid")
         (columnDecoder "qualified")
 
 
 -- The `(qualified, uid)` row of each candidate name some unit other than
--- the unit `uid` at `path` holds; no names read nothing.
-candidateRows : Db.Db -> String -> Uid -> List String -> Task.Task Error (List ( String, String ))
+-- the unit `uid` at `path` holds; no names read nothing. A row whose window
+-- does not hold its whole qualified name resolves no name; one whose window
+-- does not hold its whole uid resolves its name to no unit.
+candidateRows : Db.Db -> String -> Uid -> List String -> Task.Task Error (List ( String, Maybe String ))
 candidateRows conn path uid names =
     if List.isEmpty names then
         Task.succeed []
@@ -238,17 +250,17 @@ candidateRows conn path uid names =
         case candidateQuery path uid names of
             ( sql, params ) ->
                 Db.queryDecode conn sql params qualifiedDecoder
+                    |> Task.map (List.filterMap wholeCandidate)
 
 
 -- One statement for every candidate name, on `i_units_qual`: at most one row
 -- per name, the unit in `path` first, then the lowest uid — ipe-index's own
 -- `uid_for_qualified` tie-break. Every name is bound; only placeholders enter
--- the SQL text. A row's qualified name equals a bound name, and its uid is
--- read one character past a unit id's length, so no row is longer than what
--- the page asked for plus a refusable uid.
+-- the SQL text. A row's qualified name and uid are each read as a bounded
+-- window, whatever collation the file declares on them.
 candidateQuery : String -> Uid -> List String -> ( String, List SqlValue )
 candidateQuery path uid names =
-    ( "SELECT qualified, substr(uid, 1, " ++ String.fromInt (Uid.uidLength + 1) ++ ") AS uid FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1"
+    ( "SELECT " ++ shownColumn "qualified" "qualified" ++ ", " ++ shownColumn "uid" "uid" ++ " FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1"
     , List.concat [ [ SqlString path ], List.map SqlString names, [ Uid.toSql uid ] ]
     )
 
@@ -259,11 +271,16 @@ placeholders n =
     String.join ", " (List.repeat n "?")
 
 
-qualifiedDecoder : Db.Decode.Decoder ( String, String )
+qualifiedDecoder : Db.Decode.Decoder ( Label.Column, Label.Column )
 qualifiedDecoder =
-    Db.Decode.succeed (\q u -> ( q, u ))
-        |> Db.Decode.required "qualified" (Db.Decode.string "qualified")
-        |> Db.Decode.required "uid" (Db.Decode.string "uid")
+    Db.Decode.map2 (\q u -> ( q, u )) (columnDecoder "qualified") (columnDecoder "uid")
+
+
+wholeCandidate : ( Label.Column, Label.Column ) -> Maybe ( String, Maybe String )
+wholeCandidate row =
+    case row of
+        ( qualified, uid ) ->
+            Maybe.map (\q -> ( q, Label.whole uid )) (Label.whole qualified)
 
 
 -- The columns every unit row carries into a `Unit` besides its labels:
@@ -291,7 +308,7 @@ type alias RowShown =
 
 
 -- The display columns of a unit row `u`, each under its own name with the
--- `_shown` and `_bytes` suffixes `shownDecoder` reads.
+-- `_shown`, `_bytes` and `_window` suffixes `shownDecoder` reads.
 unitShownNames : List String
 unitShownNames =
     [ "path", "name", "qualified", "kind", "facing", "purpose" ]
@@ -302,47 +319,67 @@ unitShownColumns =
     String.join ", " (List.map (\col -> shownColumn ("u." ++ col) col) unitShownNames)
 
 
--- A display column read for a label: its first `Label.windowChars`
--- characters and the byte length of the whole value, so the database
--- returns a bounded window whatever the column holds.
+-- An index column as the app reads it: its first `Label.windowChars`
+-- characters, the byte length of the whole value, and, when the cell is
+-- stored as text, the byte length of that window, so the database returns
+-- a bounded window whatever the column holds and `Label.extent` can tell a
+-- faithful window from a hex spelling.
 shownColumn : String -> String -> String
 shownColumn source alias =
-    "substr(" ++ source ++ ", 1, " ++ String.fromInt Label.windowChars ++ ") AS " ++ alias ++ "_shown, length(CAST(" ++ source ++ " AS BLOB)) AS " ++ alias ++ "_bytes"
+    let
+        window =
+            "substr(" ++ source ++ ", 1, " ++ String.fromInt Label.windowChars ++ ")"
+    in
+    window ++ " AS " ++ alias ++ "_shown, length(CAST(" ++ source ++ " AS BLOB)) AS " ++ alias ++ "_bytes, CASE WHEN typeof(" ++ source ++ ") = 'text' THEN length(CAST(" ++ window ++ " AS BLOB)) END AS " ++ alias ++ "_window"
 
 
 -- The names `shownColumn` gives the display columns, for a query that
 -- selects them from a subquery.
 unitShownSelect : String
 unitShownSelect =
-    String.join ", " (List.concatMap (\col -> [ col ++ "_shown", col ++ "_bytes" ]) unitShownNames)
+    String.join ", " (List.map shownNames unitShownNames)
+
+
+-- The three names `shownColumn` gives column `alias`.
+shownNames : String -> String
+shownNames alias =
+    alias ++ "_shown, " ++ alias ++ "_bytes, " ++ alias ++ "_window"
 
 
 columnDecoder : String -> Db.Decode.Decoder Label.Column
 columnDecoder col =
-    Db.Decode.succeed (\shown bytes -> { shown = shown, bytes = bytes })
+    Db.Decode.succeed (\shown bytes window -> { shown = shown, bytes = bytes, window = window })
         |> Db.Decode.required (col ++ "_shown") (Db.Decode.string (col ++ "_shown"))
         |> Db.Decode.required (col ++ "_bytes") (Db.Decode.int (col ++ "_bytes"))
+        |> Db.Decode.required (col ++ "_window") (Db.Decode.nullable (Db.Decode.int (col ++ "_window")))
 
 
--- A nullable display column: both halves are NULL together, or the read
--- fails.
+-- A nullable display column: its window and byte length are NULL together,
+-- with no window length, or the read fails.
 nullableColumnDecoder : String -> Db.Decode.Decoder (Maybe Label.Column)
 nullableColumnDecoder col =
     Db.Decode.andThen
         (\pair ->
             case pair of
-                ( Just shown, Just bytes ) ->
-                    Db.Decode.succeed (Just { shown = shown, bytes = bytes })
+                ( ( Just shown, Just bytes ), window ) ->
+                    Db.Decode.succeed (Just { shown = shown, bytes = bytes, window = window })
 
-                ( Nothing, Nothing ) ->
+                ( ( Nothing, Nothing ), Nothing ) ->
                     Db.Decode.succeed Nothing
 
-                _ ->
+                ( ( Nothing, Nothing ), Just _ ) ->
+                    Db.Decode.fail (col ++ " is NULL in its window but not in its window's length")
+
+                ( ( Just _, Nothing ), _ ) ->
+                    Db.Decode.fail (col ++ " is NULL in only one of its window and its length")
+
+                ( ( Nothing, Just _ ), _ ) ->
                     Db.Decode.fail (col ++ " is NULL in only one of its window and its length")
         )
-        (Db.Decode.succeed (\shown bytes -> ( shown, bytes ))
+        (Db.Decode.succeed (\shown bytes window -> ( ( shown, bytes ), window ))
             |> Db.Decode.required (col ++ "_shown") (Db.Decode.nullable (Db.Decode.string (col ++ "_shown")))
             |> Db.Decode.required (col ++ "_bytes") (Db.Decode.nullable (Db.Decode.int (col ++ "_bytes")))
+            |> Db.Decode.required (col ++ "_window") (Db.Decode.nullable (Db.Decode.int (col ++ "_window")))
         )
 
 
@@ -350,22 +387,55 @@ nullableColumnDecoder col =
 -- naming the column and how its window fell short, never the value.
 wholeColumnDecoder : String -> Db.Decode.Decoder String
 wholeColumnDecoder col =
+    Db.Decode.andThen (wholeOf col) (columnDecoder col)
+
+
+-- A nullable windowed column the app acts on: NULL, or its whole text, or
+-- the read fails as `wholeColumnDecoder` does.
+nullableWholeColumnDecoder : String -> Db.Decode.Decoder (Maybe String)
+nullableWholeColumnDecoder col =
     Db.Decode.andThen
         (\column ->
-            case Label.extent column of
-                WholeColumn text ->
-                    Db.Decode.succeed text
+            case column of
+                Nothing ->
+                    Db.Decode.succeed Nothing
 
-                CutAtWindow ->
-                    Db.Decode.fail (col ++ " is longer than the " ++ String.fromInt Label.windowChars ++ " characters the index read returns")
-
-                CutAtNul ->
-                    Db.Decode.fail (col ++ " holds a NUL byte, where the index read stops")
-
-                NotTextCell ->
-                    Db.Decode.fail (col ++ " is not stored as text")
+                Just present ->
+                    Db.Decode.andThen (\text -> Db.Decode.succeed (Just text)) (wholeOf col present)
         )
-        (columnDecoder col)
+        (nullableColumnDecoder col)
+
+
+-- A windowed column read as a unit id: its whole text parsed by `Uid.parse`,
+-- or the read fails naming the column, never the value.
+wholeUidDecoder : String -> Db.Decode.Decoder Uid
+wholeUidDecoder col =
+    Db.Decode.andThen
+        (\text ->
+            case Uid.parse text of
+                Ok uid ->
+                    Db.Decode.succeed uid
+
+                Err _ ->
+                    Db.Decode.fail ("column " ++ col ++ " holds a value that is not a unit id")
+        )
+        (wholeColumnDecoder col)
+
+
+wholeOf : String -> Label.Column -> Db.Decode.Decoder String
+wholeOf col column =
+    case Label.extent column of
+        WholeColumn text ->
+            Db.Decode.succeed text
+
+        CutAtWindow ->
+            Db.Decode.fail (col ++ " is longer than the " ++ String.fromInt Label.windowChars ++ " characters the index read returns")
+
+        CutAtNul ->
+            Db.Decode.fail (col ++ " holds a NUL byte, where the index read stops")
+
+        NotTextCell ->
+            Db.Decode.fail (col ++ " is not stored as text")
 
 
 shownDecoder : Db.Decode.Decoder RowShown
@@ -383,7 +453,7 @@ coreDecoder =
     Db.Decode.map3
         (\( uid, lineStart, lineEnd ) bodyHash lang -> { uid = uid, lineStart = lineStart, lineEnd = lineEnd, bodyHash = bodyHash, lang = lang })
         (Db.Decode.succeed (\uid lineStart lineEnd -> ( uid, lineStart, lineEnd ))
-            |> Db.Decode.required "uid" (Uid.decoder "uid")
+            |> Db.Decode.required "uid" (wholeUidDecoder "uid")
             |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
             |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
         )
@@ -402,8 +472,8 @@ probe settings =
     (do
         conn <- readConnection settings
         Db.queryDecode conn (openColumns (boundTags settings.roots) ++ " LIMIT 0") (boundTags settings.roots).params pendingRowDecoder
-        Db.queryDecode conn "SELECT uid, body_hash FROM reviewed LIMIT 0" [] reviewedPairDecoder
-        Db.queryDecode conn "SELECT head FROM reviewed_stamp LIMIT 0" [] stampDecoder
+        Db.queryDecode conn ("SELECT " ++ reviewedPairColumns ++ " FROM reviewed LIMIT 0") [] reviewedPairDecoder
+        Db.queryDecode conn ("SELECT " ++ shownColumn "head" "head" ++ " FROM reviewed_stamp LIMIT 0") [] stampDecoder
         Db.queryDecode conn (refusalColumns ++ " 0 = 1") [] refusalRowDecoder
         Task.succeed ()
     )
@@ -456,15 +526,15 @@ type alias RepoRow =
 -- an oversized set is seen without reading it whole.
 reposSql : String
 reposSql =
-    "SELECT tag, outer, prefix FROM repos ORDER BY tag LIMIT ?"
+    "SELECT " ++ shownColumn "tag" "tag" ++ ", " ++ shownColumn "outer" "outer" ++ ", " ++ shownColumn "prefix" "prefix" ++ " FROM repos ORDER BY tag LIMIT ?"
 
 
 repoRowDecoder : Db.Decode.Decoder RepoRow
 repoRowDecoder =
     Db.Decode.succeed (\tag outer prefix -> { tag = tag, outer = outer, prefix = prefix })
-        |> Db.Decode.required "tag" (Db.Decode.string "tag")
-        |> Db.Decode.required "outer" (Db.Decode.nullable (Db.Decode.string "outer"))
-        |> Db.Decode.required "prefix" (Db.Decode.nullable (Db.Decode.string "prefix"))
+        |> Db.Decode.required "tag" (wholeColumnDecoder "tag")
+        |> Db.Decode.required "outer" (nullableWholeColumnDecoder "outer")
+        |> Db.Decode.required "prefix" (nullableWholeColumnDecoder "prefix")
 
 
 -- Why the configured roots disagree with the recorded repositories. A bound
@@ -731,11 +801,18 @@ noTaggedPath tags =
         )
 
 
+-- A `reviewed` pair as the app reads it: both columns windowed, and the
+-- read fails unless each window holds its whole column.
+reviewedPairColumns : String
+reviewedPairColumns =
+    shownColumn "uid" "uid" ++ ", " ++ shownColumn "body_hash" "body_hash"
+
+
 reviewedPairDecoder : Db.Decode.Decoder ( String, String )
 reviewedPairDecoder =
     Db.Decode.succeed (\uid hash -> ( uid, hash ))
-        |> Db.Decode.required "uid" (Db.Decode.string "uid")
-        |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
+        |> Db.Decode.required "uid" (wholeColumnDecoder "uid")
+        |> Db.Decode.required "body_hash" (wholeColumnDecoder "body_hash")
 
 
 -- The index database at `settings` opened read-only: the one read
@@ -782,8 +859,8 @@ type Change
 changeDecoder : Db.Decode.Decoder Change
 changeDecoder =
     Db.Decode.succeed (\change old -> ( change, old ))
-        |> Db.Decode.required "change" (Db.Decode.nullable (Db.Decode.string "change"))
-        |> Db.Decode.required "old_hash" (Db.Decode.nullable (Db.Decode.string "old_hash"))
+        |> Db.Decode.required "change" (nullableWholeColumnDecoder "change")
+        |> Db.Decode.required "old_hash" (nullableWholeColumnDecoder "old_hash")
         |> Db.Decode.andThen (\( change, old ) -> changeOf change old)
 
 
@@ -827,7 +904,7 @@ changeOf change old =
 -- one this reviewer does not know.
 openColumns : BoundTags -> String
 openColumns bound =
-    "SELECT uid, line_start, line_end, body_hash_shown, body_hash_bytes, lang_shown, lang_bytes, " ++ unitShownSelect ++ ", change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.line_start AS line_start, u.line_end AS line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ ", q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
+    "SELECT " ++ shownNames "uid" ++ ", line_start, line_end, " ++ shownNames "body_hash" ++ ", " ++ shownNames "lang" ++ ", " ++ unitShownSelect ++ ", " ++ shownNames "change" ++ ", " ++ shownNames "old_hash" ++ ", enqueued_at FROM (SELECT u.uid AS uid, " ++ shownColumn "u.uid" "uid" ++ ", u.line_start AS line_start, u.line_end AS line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ ", " ++ shownColumn "q.change" "change" ++ ", " ++ shownColumn "q.old_hash" "old_hash" ++ ", COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
 
 
 -- The membership condition on a unit row `u`: no pair of the `reviewed`
@@ -1180,12 +1257,12 @@ makeRawRefusal uid path lang reason size digest =
 rawRefusalDecoder : Db.Decode.Decoder RawRefusal
 rawRefusalDecoder =
     Db.Decode.succeed makeRawRefusal
-        |> Db.Decode.required "uid" (Uid.decoder "uid")
+        |> Db.Decode.required "uid" (wholeUidDecoder "uid")
         |> Db.Decode.required "path" (columnDecoder "path")
         |> Db.Decode.required "lang" (columnDecoder "lang")
-        |> Db.Decode.required "reason" (Db.Decode.string "reason")
+        |> Db.Decode.required "reason" (wholeColumnDecoder "reason")
         |> Db.Decode.required "size" (Db.Decode.nullable (Db.Decode.int "size"))
-        |> Db.Decode.required "digest" (Db.Decode.nullable (Db.Decode.string "digest"))
+        |> Db.Decode.required "digest" (nullableWholeColumnDecoder "digest")
 
 
 -- The one decoder of a refusal row. A reason this reviewer does not know, a
@@ -1277,8 +1354,8 @@ negativeSize size =
             False
 
 
--- A refusal row as a page reads it: its path and language each as a bounded
--- window and its byte length (`shownColumn`), never the whole stored value.
+-- A refusal row as a page reads it: every text column as a bounded window
+-- (`shownColumn`), never the whole stored value.
 refusalColumns : String
 refusalColumns =
     "SELECT " ++ refusalColumnList ++ " FROM refusals u WHERE"
@@ -1286,7 +1363,7 @@ refusalColumns =
 
 refusalColumnList : String
 refusalColumnList =
-    "u.uid AS uid, " ++ shownColumn "u.path" "path" ++ ", " ++ shownColumn "u.lang" "lang" ++ ", u.reason AS reason, u.size AS size, u.digest AS digest"
+    shownColumn "u.uid" "uid" ++ ", " ++ shownColumn "u.path" "path" ++ ", " ++ shownColumn "u.lang" "lang" ++ ", " ++ shownColumn "u.reason" "reason" ++ ", u.size AS size, " ++ shownColumn "u.digest" "digest"
 
 
 -- The membership condition on a refusal row `u`: no pair of the `reviewed`
@@ -1616,16 +1693,16 @@ reviewedPage : Db.Db -> Maybe ( String, String ) -> Task.Task Error (List ( Stri
 reviewedPage conn after =
     case after of
         Nothing ->
-            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed ORDER BY uid COLLATE BINARY, body_hash COLLATE BINARY LIMIT ?" [ SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
+            Db.queryDecode conn ("SELECT " ++ reviewedPairColumns ++ " FROM reviewed ORDER BY uid COLLATE BINARY, body_hash COLLATE BINARY LIMIT ?") [ SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
 
         Just ( uid, hash ) ->
-            Db.queryDecode conn "SELECT uid, body_hash FROM reviewed WHERE (uid COLLATE BINARY, body_hash COLLATE BINARY) > (?, ?) ORDER BY uid COLLATE BINARY, body_hash COLLATE BINARY LIMIT ?" [ SqlString uid, SqlString hash, SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
+            Db.queryDecode conn ("SELECT " ++ reviewedPairColumns ++ " FROM reviewed WHERE (uid COLLATE BINARY, body_hash COLLATE BINARY) > (?, ?) ORDER BY uid COLLATE BINARY, body_hash COLLATE BINARY LIMIT ?") [ SqlString uid, SqlString hash, SqlInt (PageSize.toInt PageSize.pairs) ] reviewedPairDecoder
 
 
 stampDecoder : Db.Decode.Decoder String
 stampDecoder =
     Db.Decode.succeed (\head -> head)
-        |> Db.Decode.required "head" (Db.Decode.string "head")
+        |> Db.Decode.required "head" (wholeColumnDecoder "head")
 
 
 -- The head stamped on the `reviewed` copy: Nothing when no stamp row
@@ -1634,7 +1711,7 @@ stampDecoder =
 readStamp : Db.Db -> Task.Task Error (Maybe String)
 readStamp conn =
     do
-        rows <- Db.queryDecode conn "SELECT head FROM reviewed_stamp WHERE one = 1" [] stampDecoder
+        rows <- Db.queryDecode conn ("SELECT " ++ shownColumn "head" "head" ++ " FROM reviewed_stamp WHERE one = 1") [] stampDecoder
         case rows of
             [] ->
                 Task.succeed Nothing

@@ -54,9 +54,11 @@ type Cap
 
 
 -- What the index read returns for one display column: its first
--- `windowChars` characters and the byte length of the whole column.
+-- `windowChars` characters, the byte length of the whole column, and the
+-- byte length SQLite gives that window when the cell is stored as text
+-- (`Nothing` when it is not).
 type alias Column =
-    { shown : String, bytes : Int }
+    { shown : String, bytes : Int, window : Maybe Int }
 
 
 -- A unit's kind, name, qualified name, path and facing, and an unreviewable
@@ -164,17 +166,22 @@ fromQuotedText cap raw =
 -- `windowChars` characters and the byte length of the whole.
 columnOf : String -> Column
 columnOf raw =
-    { shown = String.left windowChars raw, bytes = textBytes raw }
+    let
+        shown =
+            String.left windowChars raw
+    in
+    { shown = shown, bytes = textBytes raw, window = Just (textBytes shown) }
 
 
--- How much of a column its window holds, judged from the window and the
--- column's byte length: all of it, a window cut at `windowChars`, a text
--- window the read cut early, or a cell that did not read as text.
--- SQLite's `substr` ends a text at its first NUL byte, so a window shorter
+-- How much of a column its window holds, judged from the window, the
+-- column's byte length and the window's byte length as SQLite counted it:
+-- all of it, a window cut at `windowChars`, a text window the read cut
+-- early, or a cell that did not read as text. A cell not stored as text, or
+-- whose window did not decode to the bytes SQLite returned (a non-UTF-8
+-- text reads as its hex spelling), is not the column's text. SQLite's
+-- `substr` ends a text at its first NUL byte, so a faithful window shorter
 -- than `windowChars` whose bytes fall short of the column's held a NUL
--- there. A BLOB cell reads as its hex spelling, two characters per byte, so
--- a window with more bytes than the column, or wider than `windowChars`,
--- is not the column's text.
+-- there.
 type ColumnExtent
     = WholeColumn String
     | CutAtWindow
@@ -184,24 +191,26 @@ type ColumnExtent
 
 extent : Column -> ColumnExtent
 extent column =
-    let
-        chars =
-            String.length column.shown
+    case column.window of
+        Nothing ->
+            NotTextCell
 
-        shownBytes =
-            textBytes column.shown
-    in
-    if chars > windowChars || shownBytes > column.bytes then
-        NotTextCell
+        Just windowBytes ->
+            let
+                chars =
+                    String.length column.shown
+            in
+            if chars > windowChars || textBytes column.shown /= windowBytes || windowBytes > column.bytes then
+                NotTextCell
 
-    else if shownBytes == column.bytes then
-        WholeColumn column.shown
+            else if windowBytes == column.bytes then
+                WholeColumn column.shown
 
-    else if chars < windowChars then
-        CutAtNul
+            else if chars < windowChars then
+                CutAtNul
 
-    else
-        CutAtWindow
+            else
+                CutAtWindow
 
 
 -- The column's whole text, when the window holds all of it: a value the app

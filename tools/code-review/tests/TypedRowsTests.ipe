@@ -112,7 +112,7 @@ badLinkUidRendersText =
             Links.internal name "zz"
 
         resolved =
-            Links.resolveCandidates [ [ "x" ] ] [ ( "x", "../evil" ) ]
+            Links.resolveCandidates [ [ "x" ] ] [ ( "x", Just "../evil" ) ]
     in
     isUnlinked edge
         && Links.label edge

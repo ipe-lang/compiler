@@ -493,7 +493,7 @@ wholeOnlyWithinWindow =
         hexOfCutBlob =
             String.repeat Label.windowChars "6c"
     in
-    Label.whole { shown = hexOfCutBlob, bytes = 2 * Label.windowChars }
+    Label.whole { shown = hexOfCutBlob, bytes = 2 * Label.windowChars, window = Nothing }
         == Nothing
         && Label.whole (Label.columnOf at)
         == Just at
@@ -503,7 +503,7 @@ wholeOnlyWithinWindow =
         == Nothing
         && Label.whole (Label.columnOf (wide ++ "é"))
         == Nothing
-        && Label.whole { shown = "a", bytes = 2 }
+        && Label.whole { shown = "a", bytes = 2, window = Just 2 }
         == Nothing
 
 
@@ -511,8 +511,10 @@ wholeOnlyWithinWindow =
 -- `windowChars` characters short of the column's bytes is cut at the
 -- window; a shorter window short of them was cut at a NUL byte; a window
 -- holding more bytes than the column, or wider than the window, is a BLOB's
--- hex spelling. Red if a NUL cut reads as a long column, or a hex spelling
--- as text.
+-- hex spelling; a cell not stored as text, or a window whose bytes are not
+-- the bytes SQLite returned (a non-UTF-8 text cut at a NUL reads as hex
+-- with the column's byte count), is not text. Red if a NUL cut reads as a
+-- long column, or a hex spelling or a non-text cell as text.
 extentNamesItsCause : Bool
 extentNamesItsCause =
     let
@@ -522,12 +524,15 @@ extentNamesItsCause =
     List.map (\column -> extentName (Label.extent column))
         [ Label.columnOf "ipe:src/Main.ipe"
         , Label.columnOf (at ++ "a")
-        , { shown = "ipe:src/Ma", bytes = 17 }
-        , { shown = "6970653a", bytes = 4 }
-        , { shown = String.repeat Label.windowChars "6c", bytes = 2 * Label.windowChars }
-        , { shown = at, bytes = Label.windowChars + 1 }
+        , { shown = "ipe:src/Ma", bytes = 17, window = Just 10 }
+        , { shown = "6970653a", bytes = 4, window = Nothing }
+        , { shown = String.repeat Label.windowChars "6c", bytes = 2 * Label.windowChars, window = Nothing }
+        , { shown = at, bytes = Label.windowChars + 1, window = Just Label.windowChars }
+        , { shown = "ffff", bytes = 4, window = Just 2 }
+        , { shown = "ipe:src/Main.ipe", bytes = 16, window = Nothing }
+        , { shown = "", bytes = 0, window = Nothing }
         ]
-        == [ "whole ipe:src/Main.ipe", "window", "nul", "not text", "not text", "window" ]
+        == [ "whole ipe:src/Main.ipe", "window", "nul", "not text", "not text", "window", "not text", "not text", "not text" ]
 
 
 extentName : ColumnExtent -> String
