@@ -2703,19 +2703,19 @@ fn cache_dir_none_disables_caching_entirely() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// ── [wasm].mode target inference ─────────────────────────────────────────
+// ── wasm mode target inference ───────────────────────────────────────────
 
-fn wasm_config(mode: Option<&str>) -> project::WasmConfig {
-    project::WasmConfig {
-        mode: mode.map(str::to_owned),
-        ..Default::default()
-    }
+/// `Off` for no mode, an `On` bundle in the given mode otherwise.
+fn wasm_config(mode: Option<project::WasmMode>) -> project::WasmConfig {
+    mode.map_or(project::WasmConfig::Off, |mode| {
+        project::WasmConfig::On(project::WasmBundle::new(mode))
+    })
 }
 
-/// `[wasm] mode = "solo"` with no CLI flag → inferred `WasmClient`.
+/// `wasm = On { mode = Solo }` with no CLI flag → inferred `WasmClient`.
 #[test]
 fn wasm_mode_solo_infers_wasm_target() {
-    let cfg = wasm_config(Some("solo"));
+    let cfg = wasm_config(Some(project::WasmMode::Solo));
     assert_eq!(
         resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
         CompileTarget::WasmClient,
@@ -2723,10 +2723,10 @@ fn wasm_mode_solo_infers_wasm_target() {
     );
 }
 
-/// `[wasm] mode = "hydrate"` with no CLI flag → inferred `WasmClient`.
+/// `wasm = On { mode = Hydrate }` with no CLI flag → inferred `WasmClient`.
 #[test]
 fn wasm_mode_hydrate_infers_wasm_target() {
-    let cfg = wasm_config(Some("hydrate"));
+    let cfg = wasm_config(Some(project::WasmMode::Hydrate));
     assert_eq!(
         resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
         CompileTarget::WasmClient,
@@ -2734,10 +2734,10 @@ fn wasm_mode_hydrate_infers_wasm_target() {
     );
 }
 
-/// `[wasm] mode = "off"` → native (explicit opt-out).
+/// `wasm = Off` → native (explicit opt-out).
 #[test]
 fn wasm_mode_off_does_not_infer_wasm_target() {
-    let cfg = wasm_config(Some("off"));
+    let cfg = wasm_config(None);
     assert_eq!(
         resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
         CompileTarget::Native,
@@ -2745,7 +2745,7 @@ fn wasm_mode_off_does_not_infer_wasm_target() {
     );
 }
 
-/// No `[wasm]` section (None config) → native default.
+/// No manifest (None config) → native default.
 #[test]
 fn no_wasm_config_defaults_to_native_target() {
     assert_eq!(
@@ -2755,14 +2755,14 @@ fn no_wasm_config_defaults_to_native_target() {
     );
 }
 
-/// `mode = None` (section present but no mode key) → native.
+/// The default config (no `wasm` field) → native.
 #[test]
-fn wasm_config_absent_mode_key_defaults_to_native_target() {
-    let cfg = wasm_config(None);
+fn wasm_config_default_is_native_target() {
+    let cfg = project::WasmConfig::default();
     assert_eq!(
         resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),
         CompileTarget::Native,
-        "absent mode key must default to native"
+        "an absent wasm field must default to native"
     );
 }
 
@@ -2779,7 +2779,7 @@ fn cli_flag_overrides_absent_manifest_to_wasm() {
 /// CLI `--target wasm` wins even if the manifest says off (highest precedence).
 #[test]
 fn cli_flag_wins_over_mode_off() {
-    let cfg = wasm_config(Some("off"));
+    let cfg = wasm_config(None);
     assert_eq!(
         resolve_compile_target(cli_args::WasmKind::Client, Some(&cfg)),
         CompileTarget::WasmClient,
@@ -2790,7 +2790,7 @@ fn cli_flag_wins_over_mode_off() {
 /// CLI `--target wasi` selects the co-located WASI target, over any manifest.
 #[test]
 fn cli_flag_wasi_selects_colocated_wasi() {
-    let cfg = wasm_config(Some("solo"));
+    let cfg = wasm_config(Some(project::WasmMode::Solo));
     assert_eq!(
         resolve_compile_target(cli_args::WasmKind::Wasi, None),
         CompileTarget::WasmWasi,
@@ -2808,7 +2808,11 @@ fn cli_flag_wasi_selects_colocated_wasi() {
 /// manifest that only knows the browser mode words.
 #[test]
 fn manifest_never_infers_wasi() {
-    for mode in [Some("solo"), Some("hydrate"), Some("off"), None] {
+    for mode in [
+        Some(project::WasmMode::Solo),
+        Some(project::WasmMode::Hydrate),
+        None,
+    ] {
         let cfg = wasm_config(mode);
         assert_ne!(
             resolve_compile_target(cli_args::WasmKind::None, Some(&cfg)),

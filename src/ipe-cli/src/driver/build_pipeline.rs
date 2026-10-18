@@ -242,9 +242,15 @@ pub fn manifest_emit_settings(
         db_driver: manifest.driver,
         ffi: None,
         target: *target,
-        wasm_public_env: manifest.wasm.public_env.to_names(),
+        wasm_public_env: match &manifest.wasm {
+            project::WasmConfig::Off => Vec::new(),
+            project::WasmConfig::On(bundle) => bundle.public_env.to_names(),
+        },
         mount_base: manifest.delivery.browser.base.clone(),
-        wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
+        wasm_hydrate_mode: matches!(
+            &manifest.wasm,
+            project::WasmConfig::On(bundle) if bundle.mode == project::WasmMode::Hydrate
+        ),
         runtime_dep: None,
         debugger: *debugger,
         crate_name: ipe_backend_rust::CrateName::Identity(identity),
