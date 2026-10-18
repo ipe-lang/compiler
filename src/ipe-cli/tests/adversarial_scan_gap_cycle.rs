@@ -25,28 +25,22 @@ fn scan_invisible_cycle_must_not_panic_the_driver() {
 
     let tmp =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_review_scan_gap_cycle");
-    let src = tmp.join("src");
     let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&src).expect("create src dir");
+    fs::create_dir_all(&tmp).expect("create scratch dir");
 
-    // A → B via a TAB after `import`: the lexer's whitespace skip accepts it,
-    // `extract_imports_from_source` (strip_prefix("import ")) does not.
-    fs::write(
-        src.join("A.ipe"),
-        "module A exposing (a)\n\nimport\tB\n\na = 1\n",
-    )
-    .expect("write A");
-    // B → A via a normal import: scan-visible.
-    fs::write(
-        src.join("B.ipe"),
-        "module B exposing (b)\n\nimport A\n\nb = 2\n",
-    )
-    .expect("write B");
+    // A project whose one program starts at `A`.
+    let tree = ipe::project_root::SourceTree::new()
+        .field("programs = [ { name = \"a\", entry = \"A.ipe\" } ]")
+        // A → B via a TAB after `import`: the lexer's whitespace skip accepts it,
+        // `extract_imports_from_source` (strip_prefix("import ")) does not.
+        .module("A", "module A exposing (a)\n\nimport\tB\n\na = 1\n")
+        // B → A via a normal import: scan-visible.
+        .module("B", "module B exposing (b)\n\nimport A\n\nb = 2\n");
+    let fixture = ipe::RootFixture::from_tree(&tree).expect("write and resolve the fixture");
 
     let out = tmp.join("out");
-    let entry = src.join("A.ipe");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ipe::build_loose_file(&entry, &out, &runtime)
+        ipe::build_fixture(&fixture, &out, &runtime)
     }));
 
     match result {

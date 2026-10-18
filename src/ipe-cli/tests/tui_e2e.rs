@@ -116,16 +116,9 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// Compile a Ipê program string, build the emitted Rust project, and return
 /// the path to the compiled binary.
 fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::PathBuf, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("tui_e2e_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).map_err(|e| -> BoxError {
-        format!("{test_name}: cannot create ipe source dir: {e}").into()
+    let fixture = ipe::RootFixture::main(ipe_source).map_err(|e| -> BoxError {
+        format!("{test_name}: cannot write the fixture: {e}").into()
     })?;
-
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, ipe_source)
-        .map_err(|e| -> BoxError { format!("{test_name}: cannot write Main.ipe: {e}").into() })?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("tui_e2e_{test_name}_emitted"));
@@ -133,7 +126,7 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::Pat
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    ipe::build(&entry, &out_dir, &runtime)
+    ipe::build_fixture(&fixture, &out_dir, &runtime)
         .map_err(|e| -> BoxError { format!("{test_name}: ipe dev build failed: {e}").into() })?;
 
     let exe = e2e_support::build_rust_binary(test_name, &out_dir)
@@ -168,20 +161,17 @@ fn compile_and_build(test_name: &str, ipe_source: &str) -> Result<std::path::Pat
 /// only — no cargo build), so it is always live in CI.
 #[test]
 fn tui_onkey_record_typechecks() {
-    // ── helper: write Ipê source to a temp file, run ipe::build, check ok ──
+    // ── helper: write Ipê source to a temp file, run ipe::build_fixture, check ok ──
     fn compile_ok(label: &str, source: &str) -> String {
-        let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("tui_onkey_{label}_ipe"));
-        let _ = std::fs::remove_dir_all(&ipe_dir);
-        let created = std::fs::create_dir_all(&ipe_dir);
+        let fixture = ipe::RootFixture::main(source);
         assert!(
-            created.is_ok(),
-            "{label}: cannot create temp dir: {created:?}"
+            fixture.is_ok(),
+            "{label}: cannot write the fixture: {:?}",
+            fixture.as_ref().err()
         );
-
-        let entry = ipe_dir.join("Main.ipe");
-        let wrote = std::fs::write(&entry, source);
-        assert!(wrote.is_ok(), "{label}: cannot write Main.ipe: {wrote:?}");
+        let Ok(fixture) = fixture else {
+            return String::new();
+        };
 
         let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("tui_onkey_{label}_emitted"));
@@ -189,7 +179,7 @@ fn tui_onkey_record_typechecks() {
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 
-        let built = ipe::build(&entry, &out_dir, &runtime);
+        let built = ipe::build_fixture(&fixture, &out_dir, &runtime);
         assert!(
             built.is_ok(),
             "{label}: ipe dev build failed (T0001 regression?): {:?}",

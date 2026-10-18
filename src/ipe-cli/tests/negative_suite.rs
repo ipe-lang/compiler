@@ -47,6 +47,12 @@ fn write_entry(name: &str, source: &str) -> PathBuf {
     entry
 }
 
+/// `source` as the `Main` module of a fresh project fixture.
+#[allow(clippy::expect_used)] // a failed scratch setup is the test failure
+fn write_fixture(source: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(source).expect("scratch setup must succeed")
+}
+
 /// The outcome of running the pipeline over a fixture.
 #[derive(Debug)]
 enum Outcome {
@@ -60,7 +66,7 @@ enum Outcome {
 }
 
 fn compile(name: &str, source: &str, target: Target) -> Outcome {
-    let entry = write_entry(name, source);
+    let fixture = write_fixture(source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
@@ -71,8 +77,8 @@ fn compile(name: &str, source: &str, target: Target) -> Outcome {
         intent: ipe_backend_rust::BuildIntent::Development,
         ..BuildOptions::default()
     };
-    match ipe::build_with_options(&entry, &out, &runtime, options) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &options) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -81,7 +87,7 @@ fn compile(name: &str, source: &str, target: Target) -> Outcome {
 /// Like [`compile`] but with the production flag set — simulates `ipe release`
 /// so the `Debug.*` gate (IPE-L0140) fires without spawning a real release build.
 fn compile_production(name: &str, source: &str) -> Outcome {
-    let entry = write_entry(name, source);
+    let fixture = write_fixture(source);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-prod-out")
         .join(name);
@@ -91,8 +97,8 @@ fn compile_production(name: &str, source: &str) -> Outcome {
         intent: ipe_backend_rust::BuildIntent::Release,
         ..BuildOptions::default()
     };
-    match ipe::build_with_options(&entry, &out, &runtime, options) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &options) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -117,23 +123,26 @@ fn assert_rejected_production(name: &str, source: &str, expected: &str) {
 /// the entry. Needed for cross-module gates (e.g. duplicate import qualifier)
 /// that the single-file path cannot observe.
 fn compile_project(name: &str, files: &[(&str, &str)]) -> Outcome {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("negsuite-proj")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&src));
-    for (fname, contents) in files {
-        crate::support::expect_scratch_step(name, std::fs::write(src.join(fname), contents));
-    }
+    let tree = files.iter().fold(
+        ipe::project_root::SourceTree::new(),
+        |tree, (fname, contents)| tree.module(fname.trim_end_matches(".ipe"), contents),
+    );
+    let fixture = ipe::RootFixture::from_tree(&tree);
+    assert!(
+        fixture.is_ok(),
+        "{name}: scratch fixture setup failed: {:?}",
+        fixture.as_ref().err()
+    );
+    let Ok(fixture) = fixture else {
+        return Outcome::Accepted("scratch fixture setup failed".to_owned());
+    };
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-proj-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let entry = src.join("Main.ipe");
-    match ipe::build_loose_file(&entry, &out, &runtime) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture(&fixture, &out, &runtime) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -1571,11 +1580,9 @@ fn canon_custom_element_seal_rejects_type_variable() {
 /// [`Outcome`] the shared harness produces — used for the widget-file-exists path,
 /// which needs a real JS file on disk next to the entry.
 fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outcome {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("negsuite-ce")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&dir));
+    let fixture = write_fixture(source);
+    // Widget hooks resolve beside the entry module, under the project's `src/`.
+    let dir = fixture.path().join("src");
     for (rel, contents) in extra {
         let path = dir.join(rel);
         if let Some(parent) = path.parent() {
@@ -1583,15 +1590,13 @@ fn compile_with_files(name: &str, source: &str, extra: &[(&str, &str)]) -> Outco
         }
         crate::support::expect_scratch_step(name, std::fs::write(&path, contents));
     }
-    let entry = dir.join("Main.ipe");
-    crate::support::expect_scratch_step(name, std::fs::write(&entry, source));
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-ce-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
+        Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
         Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
         Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
     }
@@ -1872,7 +1877,6 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
     let name = "custom_element_symlink_escape";
     let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("negsuite-ce-symlink");
     let _ = std::fs::remove_dir_all(&base);
-    let project = base.join("project");
     let outside = base.join("outside");
     // The out-of-project directory and a real file inside it (the escape target).
     crate::support::expect_scratch_step(name, std::fs::create_dir_all(&outside));
@@ -1883,28 +1887,28 @@ fn custom_element_ctor_symlink_escape_rejected_at_build_gate() {
             "export function mount(host, emit) { return {}; }\n",
         ),
     );
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&project));
-    // In-tree `js` is a SYMLINK to the outside directory.
-    crate::support::expect_scratch_step(
-        name,
-        std::os::unix::fs::symlink(&outside, project.join("js")),
-    );
     let src = format!(
         "{HEAD}import Ipe.Ffi.Js.CustomElement as CustomElement\n\
          editor : CustomElement Int String\n\
          editor = CustomElement.fromFile \"js/evil.js\"\n\
          main = 1\n"
     );
-    let entry = project.join("Main.ipe");
-    crate::support::expect_scratch_step(name, std::fs::write(&entry, &src));
+    let fixture = write_fixture(&src);
+    // In-tree `js` (beside the entry module, under `src/`) is a SYMLINK to the
+    // outside directory.
+    crate::support::expect_scratch_step(
+        name,
+        std::os::unix::fs::symlink(&outside, fixture.path().join("src").join("js")),
+    );
     let out = base.join("out");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let outcome = match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
-        Ok(()) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
-        Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
-        Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
-    };
+    let outcome =
+        match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
+            Ok(_) => Outcome::Accepted("compiled successfully (exit 0)".to_owned()),
+            Err(CliError::Pipeline { diag, .. }) => Outcome::Rejected(diag.code().as_str()),
+            Err(other) => Outcome::Accepted(format!("non-pipeline error: {other:?}")),
+        };
     let _ = std::fs::remove_dir_all(&base);
     match outcome {
         Outcome::Rejected(got) => assert_eq!(
@@ -4399,13 +4403,13 @@ main =
 #[test]
 fn row_generic_in_scope_web_embed_refused_undetermined() {
     let name = "row_generic_in_scope_web_embed";
-    let entry = write_entry(name, WEB_EMBED_ROW_IN_SCOPE);
+    let fixture = write_fixture(WEB_EMBED_ROW_IN_SCOPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
             ipe_diagnostics::Diagnostic::Name {
                 msg:
@@ -4430,7 +4434,7 @@ fn row_generic_in_scope_web_embed_refused_undetermined() {
                 other.code().as_str()
             ),
         },
-        Ok(()) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
+        Ok(_) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
         Err(other) => fail_accepted(name, "IPE-N0051", &format!("non-pipeline error: {other:?}")),
     }
 }
@@ -4468,13 +4472,13 @@ main =
 #[test]
 fn unpinned_msg_web_embed_refused() {
     let name = "unpinned_msg_web_embed";
-    let entry = write_entry(name, WEB_EMBED_UNPINNED_MSG);
+    let fixture = write_fixture(WEB_EMBED_UNPINNED_MSG);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("negsuite-out")
         .join(name);
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default()) {
+    match ipe::build_fixture_with_options(&fixture, &out, &runtime, &BuildOptions::default()) {
         Err(CliError::Pipeline { diag, .. }) => match *diag {
             ipe_diagnostics::Diagnostic::Name {
                 msg: ipe_diagnostics::NameError::UnpinnedAppEntry { entry },
@@ -4489,7 +4493,7 @@ fn unpinned_msg_web_embed_refused() {
                 other.code().as_str()
             ),
         },
-        Ok(()) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
+        Ok(_) => fail_accepted(name, "IPE-N0051", "compiled successfully (exit 0)"),
         Err(other) => fail_accepted(name, "IPE-N0051", &format!("non-pipeline error: {other:?}")),
     }
 }

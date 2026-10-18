@@ -102,19 +102,14 @@ fn warm_server_fixture_deps() -> Result<(), BoxError> {
         std::process::id(),
         Instant::now().elapsed().as_nanos()
     ));
-    let ipe_dir = warm_dir.join("ipe");
     let out_dir = warm_dir.join("out");
     let _ = std::fs::remove_dir_all(&warm_dir);
-    std::fs::create_dir_all(&ipe_dir)
-        .map_err(|e| -> BoxError { format!("warm: mkdir {}: {e}", ipe_dir.display()).into() })?;
-
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, server_fixture("warm"))
-        .map_err(|e| -> BoxError { format!("warm: write Main.ipe: {e}").into() })?;
+    let fixture = ipe::RootFixture::main(&server_fixture("warm"))
+        .map_err(|e| -> BoxError { format!("warm: write the fixture: {e}").into() })?;
 
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
-    ipe::build(&entry, &out_dir, &runtime_dir)
+    ipe::build_fixture(&fixture, &out_dir, &runtime_dir)
         .map_err(|e| -> BoxError { format!("warm: ipe dev build failed: {e}").into() })?;
 
     // Non-zero cargo exit is intentionally ignored: warming is best-effort.
