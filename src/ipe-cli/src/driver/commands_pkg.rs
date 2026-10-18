@@ -1700,12 +1700,12 @@ pub fn build_and_run_test_entry(
     // handed, so a `CARGO_TARGET_DIR` or `[build] target-dir` pin is the one
     // the build used.
     let test_bin_name = emitted_bin_filename(crate_dir.path())?;
-    let built = target.dir().path().join("debug").join(&test_bin_name);
+    let compiled = target.dir().path().join("debug").join(&test_bin_name);
     let run_dir = scratch::ScratchDir::new_under(target.dir().path(), "ipe-test-run")
         .or_else(|_| scratch::ScratchDir::new("ipe-test-run"))
         .map_err(|source| CliError::ScratchUnavailable { source })?;
     let bin = run_dir.path().join(&test_bin_name);
-    fs::copy(&built, &bin).map_err(|e| io_err(&built, e))?;
+    fs::copy(&compiled, &bin).map_err(|e| io_err(&compiled, e))?;
     drop(target.release());
 
     // Run the test binary. `Ipe.Test.runMain` exits 0 on all-pass, 1 on any

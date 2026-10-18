@@ -343,7 +343,7 @@ fn rlibs_of(target: &Path, lib: &str) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     for entry in std::fs::read_dir(target.join("debug").join("deps"))? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".rlib") {
+        if name.starts_with(&prefix) && entry.path().extension().is_some_and(|ext| ext == "rlib") {
             found.push(entry.path());
         }
     }
@@ -356,7 +356,7 @@ fn rlibs_of(target: &Path, lib: &str) -> Result<Vec<PathBuf>, Box<dyn Error>> {
 /// Every build record then reads as newer than any source written later,
 /// which is what a coarse-grained file system makes of two builds within one tick.
 fn age_build_records_forward(dir: &Path) -> Result<(), Box<dyn Error>> {
-    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(24 * 60 * 60);
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_hours(24);
     let mut pending = vec![dir.to_path_buf()];
     let mut visited = 0_usize;
     while let Some(next) = pending.pop() {
@@ -435,7 +435,7 @@ fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
         crate::support::scratch_root().join(format!("ipe_test_identity_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let target = base.join("target");
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     for tag in ["a", "b"] {
         let root = base.join(format!("root_{tag}"));
         let dep = root.join("dep");
@@ -623,7 +623,7 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
     source.push_str("\n// edited by hand\n");
     std::fs::write(&lib_rs, source)?;
     std::fs::copy(target.join("ipe-test.Cargo.lock"), out.join("Cargo.lock"))?;
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let hand = Command::new(&cargo)
         .arg("build")
         .current_dir(&out)

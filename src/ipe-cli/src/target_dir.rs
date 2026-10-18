@@ -559,8 +559,7 @@ const SCRATCH_PREFIX: &str = "scratch-";
 pub const TEST_LOCK_FILE: &str = ".ipe-test.lock";
 
 /// How long a shared scratch build directory unused by every run is kept.
-pub const SCRATCH_RETENTION: std::time::Duration =
-    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+pub const SCRATCH_RETENTION: std::time::Duration = std::time::Duration::from_hours(30 * 24);
 
 /// The most entries a prune lists under [`user_cache_root`].
 const SCRATCH_SIBLING_CAP: u32 = 4096;
@@ -1269,7 +1268,7 @@ mod tests {
                 .expect("set mtime");
         }
 
-        const OLD: std::time::Duration = std::time::Duration::from_secs(31 * 24 * 60 * 60);
+        const OLD: std::time::Duration = std::time::Duration::from_hours(31 * 24);
 
         /// A sibling scratch directory under `root` whose lock was last used `last_use` ago.
         fn sibling(root: &Path, name: &str, last_use: std::time::Duration) -> PathBuf {
@@ -1500,17 +1499,10 @@ mod tests {
             )
             .expect("holds the new file");
             assert_eq!(opens, 2, "one retry after the replacement");
-            let named = ipe_fs_open::HeldDir::open_root(&base)
-                .and_then(|dir| {
-                    dir.entry_id(
-                        &ipe_fs_open::EntryName::new(std::ffi::OsStr::new(TEST_LOCK_FILE))
-                            .expect("name"),
-                    )
-                })
-                .expect("named id");
-            assert_eq!(
-                named,
-                Some(ipe_fs_open::FileId::of_file(&held._file).expect("held id"))
+            let named = std::fs::File::open(&lock_path).expect("the named file opens");
+            assert!(
+                matches!(named.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+                "the file the name holds is the locked one"
             );
             drop(held);
             let _ = std::fs::remove_dir_all(&base);

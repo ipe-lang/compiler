@@ -335,20 +335,22 @@ fn prepare_bundled_manifest(manifest: &str, version: &str) -> Result<String, Bun
     Ok(doc.to_string())
 }
 
+/// The embedded runtime crate's files, keyed by path, with their digest.
+type UnstampedBundle = (BTreeMap<PathBuf, String>, RuntimeDigest);
+
 /// The embedded runtime crate's files and their digest, the manifest carrying
 /// [`COMPILER_VERSION`]; the shared base both roles stamp.
-fn unstamped_bundle() -> &'static Result<(BTreeMap<PathBuf, String>, RuntimeDigest), BundleFault> {
-    static BASE: LazyLock<Result<(BTreeMap<PathBuf, String>, RuntimeDigest), BundleFault>> =
-        LazyLock::new(|| {
-            let mut files = BTreeMap::new();
-            collect_dir_text_from_embedded(&RUNTIME_CRATE, Path::new(""), true, &mut files)?;
-            let keys = files
-                .iter()
-                .map(|(path, text)| (digest_path(path), text.as_str()))
-                .collect::<Vec<_>>();
-            let digest = RuntimeDigest::of(keys.iter().map(|(path, text)| (path.as_str(), *text)));
-            Ok((files, digest))
-        });
+fn unstamped_bundle() -> &'static Result<UnstampedBundle, BundleFault> {
+    static BASE: LazyLock<Result<UnstampedBundle, BundleFault>> = LazyLock::new(|| {
+        let mut files = BTreeMap::new();
+        collect_dir_text_from_embedded(&RUNTIME_CRATE, Path::new(""), true, &mut files)?;
+        let keys = files
+            .iter()
+            .map(|(path, text)| (digest_path(path), text.as_str()))
+            .collect::<Vec<_>>();
+        let digest = RuntimeDigest::of(keys.iter().map(|(path, text)| (path.as_str(), *text)));
+        Ok((files, digest))
+    });
     &BASE
 }
 
