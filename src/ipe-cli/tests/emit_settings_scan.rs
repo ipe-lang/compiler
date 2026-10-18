@@ -714,7 +714,6 @@ fn a_planted_site_is_refused() -> Result<(), String> {
     let db = "src/compiler/db/src/lib.rs";
     let pipeline = "src/ipe-cli/src/driver/build_pipeline.rs";
     let delivery = "src/ipe-cli/src/delivery.rs";
-    let commands = "src/ipe-cli/src/driver/commands.rs";
     let breaches = [
         (
             db,
@@ -769,6 +768,17 @@ fn a_planted_site_is_refused() -> Result<(), String> {
             "fn other() { Delivery::web_desktop().host_intent(); }\n",
         ),
         (pipeline, "use crate::delivery::Delivery as D;\n"),
+    ];
+    refused_by_scan(&breaches)
+}
+
+/// Each planted read of a manifest-owned browser setting outside its single
+/// derivation site is refused.
+#[test]
+fn a_planted_browser_delivery_read_is_refused() -> Result<(), String> {
+    let pipeline = "src/ipe-cli/src/driver/build_pipeline.rs";
+    let commands = "src/ipe-cli/src/driver/commands.rs";
+    let breaches = [
         (
             commands,
             "fn release_pipeline() { let b = m.delivery.browser.base.clone(); }\n",
@@ -798,6 +808,11 @@ fn a_planted_site_is_refused() -> Result<(), String> {
             "fn manifest_emit_settings() { let a = m.wasm.mode; let b = m.wasm.mode; }\n",
         ),
     ];
+    refused_by_scan(&breaches)
+}
+
+/// Every planted breach draws a refusal the empty source at its file does not.
+fn refused_by_scan(breaches: &[(&str, &str)]) -> Result<(), String> {
     // An empty source at `rel` already misses each admitted row there; a
     // breach counts only by a refusal that baseline does not carry.
     let mut missed = Vec::new();
