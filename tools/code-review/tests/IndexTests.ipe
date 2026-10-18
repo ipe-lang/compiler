@@ -26,14 +26,14 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Body(..), Oversize(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey
-import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid, insertUnboundUnit)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, indexConn, loadUnitNow, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, langName, repoFile, probeMessage, probeNames, maybeContains, isUnrecorded, modifiedFrom, shownOf, uid, insertUnboundUnit, labelText)
 
 
 -- ── ipe-index bridge ───────────────────────────────────────────────────
@@ -580,6 +580,77 @@ nodeCeilingFitsSessionCeiling =
         <= ByteSize.toBytes Index.viewReserve
 
 
+-- The relation the queue page is sized by: a full page's elements at the
+-- cost of one, plus its label bytes held twice (in the model and in the
+-- drawn tree), fit the quarter of the session ceiling the unit view leaves.
+-- Red if the page size, a label cap or a cost moves without the other.
+queueCeilingFitsQuarter : Bool
+queueCeilingFitsQuarter =
+    0
+        < Index.queueElementCeiling
+        && Index.queueElementCeiling
+        * ByteSize.toBytes Index.elementResidentBytes
+        + 2
+        * Index.queueLabelByteCeiling
+        <= ByteSize.toBytes Index.runtimeSessionCeiling
+        // 4
+
+
+-- A unit whose stored purpose is a mebibyte reaches the queue page and the
+-- unit page as a label of at most the purpose cap plus its marker, whose
+-- marker counts every byte the label dropped. Red if a read pulls the whole
+-- column or the label stops bounding what it was given.
+purposeOfOneMibIsBounded : Task.Task Error Bool
+purposeOfOneMibIsBounded =
+    let
+        stored =
+            1024 * 1024
+
+        bounded purpose =
+            case purpose of
+                Just label ->
+                    Label.byteCount label
+                        <= Label.capBytes Label.purposeCap
+                        + Label.markerByteCeiling
+                        && droppedOf label
+                        == Just (stored - Label.capBytes Label.purposeCap)
+
+                Nothing ->
+                    False
+    in
+    do
+        at <- freshScratch "ipe-index-purpose-bounded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET purpose = ? WHERE uid = ?" [ SqlString (String.repeat stored "p"), Uid.toSql (uid "u-a") ]
+        conn <- indexConn
+        rows <- pendingRows conn
+        loaded <- loadUnitNow (uid "u-a")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (List.any (ow -> row.unit.uid == uid "u-a" && bounded row.unit.purpose) rows
+                && Maybe.map (iew -> bounded view.unit.purpose) loaded
+                == Just True
+            )
+
+
+-- The bytes a label's marker says it dropped, when it ends in one.
+droppedOf : Label -> Maybe Int
+droppedOf label =
+    case List.head (List.reverse (Label.parts label)) of
+        Just (LabelCut dropped _) ->
+            Just dropped
+
+        Just (LabelText _) ->
+            Nothing
+
+        Just (LabelEscapes _) ->
+            Nothing
+
+        Nothing ->
+            Nothing
+
+
 -- The session ceiling the element ceiling is sized under is the runtime's:
 -- the runtime's budget source declares `SESSION_CEILING` as the same whole
 -- number of MiB. Red when either side changes alone.
@@ -706,7 +777,7 @@ unitPageLoadIn base =
                             case mb of
                                 Just loaded ->
                                     Task.succeed
-                                        (SafeText.toString loaded.unit.qualified
+                                        (labelText loaded.unit.qualified
                                             == "Lib.answer"
                                             && shownTextOf loaded.view
                                             == Just viewA
@@ -1393,7 +1464,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1664,6 +1735,8 @@ checks =
         , Task.succeed ( "a long line of one token per byte is never shown highlighted, and one of escapes is withheld", longTokenLinesNeverHighlighted )
         , Task.succeed ( "a view past the element ceiling is too large, never drifted", nodeOversizeRanksBeforeDrift )
         , Task.succeed ( "the element ceiling, at the cost per element, fits three quarters of the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
+        , Task.succeed ( "a full queue page's elements and label bytes fit the quarter of the session ceiling the unit view leaves", queueCeilingFitsQuarter )
+        , check "a mebibyte purpose reaches the queue page and the unit page cut to the purpose cap, its marker counting the dropped bytes" purposeOfOneMibIsBounded
         , check "the mirrored session ceiling is the runtime's" sessionCeilingMirrorsRuntime
         , check "the mirrored cost per drawn element is the runtime's" elementBytesMirrorsRuntime
         , check "the mirrored drawn depth is the runtime's" drawnDepthMirrorsRuntime

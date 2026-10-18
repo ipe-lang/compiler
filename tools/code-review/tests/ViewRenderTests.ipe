@@ -18,14 +18,16 @@ import Lib.App exposing (Model, Page(..), initialModel)
 import Lib.Db as LibDb exposing (BreakAt(..), HistoryCursor(..), LogShown(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
 import Lib.Failure as Failure exposing (DecideRefusal(..), LoadFailure(..), ReasonRefusal(..), RefuseFailure(..), SaveFailure(..))
 import Lib.Format as Format
-import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), RefusalReason(..), SourceView(..), StaleReason(..))
+import Lib.Label as Label exposing (Label)
 import Lib.Links exposing (Hidden(..), Link(..))
+import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (DecisionSlot(..), HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
 import Lib.View as View
-import TestSupport exposing (accepted, decidedRefusalNow, checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
+import TestSupport exposing (accepted, labelOf, labelText, decidedRefusalNow, checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
 
 
 -- Every check here renders the real `View.view` to HTML, the exact string the
@@ -674,16 +676,16 @@ seededChecks a b =
             a.unit
 
         hostileName =
-            { a | unit = { unit | qualified = SafeText.renderForeign hostileText } }
+            { a | unit = { unit | qualified = labelOf hostileText } }
 
         hostilePath =
-            { a | unit = { unit | path = SafeText.renderForeign hostileText } }
+            { a | unit = { unit | path = labelOf hostileText } }
 
         opened =
             page (refusingModel a)
 
         hostileHistory =
-            historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Just (SafeText.renderForeign hostileText) } ]
+            historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Just (labelOf hostileText) } ]
 
         readOnlyCard =
             page (cardModelUnder ShownUnkeyed a)
@@ -704,7 +706,7 @@ seededChecks a b =
             page (cardModelUnder (ShownBroken (BeforeFirst 1)) a)
 
         twin =
-            { unit | uid = uid "u-twin", path = SafeText.renderForeign "ipe:src/twin.rs" }
+            { unit | uid = uid "u-twin", path = labelOf "ipe:src/twin.rs" }
 
         twinCard =
             page { baseModel | queueState = Loaded (queuePage [ queued a, { unit = twin, change = New, changed = Nothing, standing = Queue.Undecided } ] 2 { reviewed = 0, total = 2 }), selectedView = ViewShown a }
@@ -761,9 +763,9 @@ seededChecks a b =
     , ( "untrusted text draws in byte order, and text with no hazard draws no escape marker", has "unicode-bidi:bidi-override" View.displayOrderCss && has "direction:ltr" View.displayOrderCss && has "background-color:" View.escapeCss && has "border:" View.escapeCss && not (has "data-review-escape" shownCard) && has (byteOrderOpen ++ "Lib.answer") shownCard )
     , ( "two units sharing a kind and name each show their place, a unit alone shows its kind and no place"
     , has (placeOf "ipe:src/twin.rs") twinCard
-        && has (placeOf (SafeText.toString unit.path)) twinCard
-        && has (SafeText.toString unit.kind) shownCard
-        && not (has (placeOf (SafeText.toString unit.path)) shownCard)
+        && has (placeOf (labelText unit.path)) twinCard
+        && has (labelText unit.kind) shownCard
+        && not (has (placeOf (labelText unit.path)) shownCard)
     )
     , ( "every page has a title naming it, a language and one h1, and each unit card or history entry opens an h2"
     , documented "Queue" shownCard
@@ -1247,7 +1249,7 @@ untrustedSinkChecks loaded =
             loaded.unit
 
         hostileName =
-            { loaded | unit = { unit | qualified = SafeText.renderForeign hostileText } }
+            { loaded | unit = { unit | qualified = labelOf hostileText } }
 
         titleOf html =
             String.split "</title>" html |> List.head |> Maybe.withDefault html
@@ -1277,10 +1279,147 @@ untrustedSinkChecks loaded =
     ]
 
 
+-- ── a full queue page of hostile labels ────────────────────────────────
+-- A column of `Label.windowChars` characters that opens an escape run every
+-- other character, so each label of it takes the most escape runs and a
+-- marker.
+hostileColumn : String
+hostileColumn =
+    String.left Label.windowChars (String.repeat Label.windowChars (codeText 8238 ++ "a" ++ codeText 0 ++ "\\"))
+
+
+-- A queued unit whose every display column is `column`, so every unit of a
+-- page of them shares a kind, a name and a place and is told apart by uid.
+budgetUnit : Index.Unit -> String -> String -> Queue.QueuedUnit
+budgetUnit unit column id =
+    { unit =
+        { unit
+            | uid = uid id
+            , kind = labelOf column
+            , name = labelOf column
+            , qualified = labelOf column
+            , path = labelOf column
+            , facing = labelOf column
+            , purpose = Just (Label.fromText Label.purposeCap column)
+        }
+    , change = New
+    , changed = Nothing
+    , standing = Queue.Undecided
+    }
+
+
+budgetRefusal : String -> Index.RefusalRow
+budgetRefusal id =
+    { uid = uid id
+    , path = labelOf hostileColumn
+    , lang = "other"
+    , reason = UnreadableEntry
+    , size = Nothing
+    , digest = Nothing
+    }
+
+
+-- The queue page holding `units` and `refusals`, nothing selected.
+budgetModel : List Queue.QueuedUnit -> List Index.RefusalRow -> Model
+budgetModel units refusals =
+    let
+        shown =
+            queuePage units (List.length units) { reviewed = 0, total = List.length units }
+    in
+    { baseModel | queueState = Loaded { shown | refusals = refusals, refusalsOpen = List.length refusals } }
+
+
+-- The elements a page's markup opens: every `<` that does not close one.
+elementsOf : String -> Int
+elementsOf html =
+    List.length (String.split "<" html) - List.length (String.split "</" html)
+
+
+unitLabelBytes : Queue.QueuedUnit -> Int
+unitLabelBytes q =
+    List.sum (List.map Label.byteCount [ q.unit.kind, q.unit.name, q.unit.qualified, q.unit.path, q.unit.facing ])
+        + Maybe.withDefault 0 (Maybe.map Label.byteCount q.unit.purpose)
+
+
+-- The place a unit's card names, as the markup spells it after its path.
+uidPlace : String -> String
+uidPlace id =
+    " · " ++ Uid.toString (uid id) ++ "</span>"
+
+
+queueBudgetChecks : Index.UnitView -> List ( String, Bool )
+queueBudgetChecks loaded =
+    let
+        ids prefix =
+            List.map (
+ -> prefix ++ String.fromInt n) (List.range 1 (PageSize.toInt PageSize.queue))
+
+        units =
+            List.map (budgetUnit loaded.unit hostileColumn) (ids "u-budget-")
+
+        refusals =
+            List.map budgetRefusal (ids "r-budget-")
+
+        full =
+            page (budgetModel units refusals)
+
+        labelBytes =
+            List.sum (List.map unitLabelBytes units) + List.sum (List.map (
+ow -> Label.byteCount row.path) refusals)
+
+        twinColumn tail =
+            String.repeat Label.windowChars "n" ++ tail
+
+        twins =
+            [ budgetUnit loaded.unit (twinColumn "x") "u-twin-x", budgetUnit loaded.unit (twinColumn "y") "u-twin-y" ]
+
+        twinPage =
+            page (budgetModel twins [])
+
+        unit =
+            loaded.unit
+
+        withPath path =
+            page (cardModel { loaded | unit = { unit | path = labelOf path } })
+
+        plainPath =
+            "ipe:src/plain-path.rs"
+
+        nulPath =
+            String.repeat 100 (codeText 0)
+
+        escapesIn html =
+            List.length (String.split "data-review-escape" html)
+
+        pathDraws =
+            List.length (String.split plainPath (withPath plainPath)) - 1
+    in
+    [ ( "a full queue page of hostile labels draws no more elements than the queue element ceiling, and draws every unit cut with its marker"
+      , elementsOf full
+            <= Index.queueElementCeiling
+            && List.all (\id -> has (uidPlace id) full) (ids "u-budget-")
+            && has "data-review-cut" full
+            && has "data-review-escape" full
+      )
+    , ( "a full queue page of hostile labels holds no more label bytes than the queue label ceiling"
+      , labelBytes <= Index.queueLabelByteCeiling && labelBytes > 0
+      )
+    , ( "two units whose columns share their read window and byte length share a label and are told apart by uid"
+      , Label.key (labelOf (twinColumn "x"))
+            == Label.key (labelOf (twinColumn "y"))
+            && has (uidPlace "u-twin-x") twinPage
+            && has (uidPlace "u-twin-y") twinPage
+      )
+    , ( "a hundred adjacent NULs in a unit path draw one escape element wherever the path shows"
+      , pathDraws >= 1 && escapesIn (withPath nulPath) - escapesIn (withPath plainPath) == pathDraws
+      )
+    ]
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
-        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a)))
+        [ group "view fixtures" (withSeededIndex "ipe-view-render-seeded" (\a b -> Task.succeed (seededChecks a b ++ untrustedSinkChecks a ++ queueBudgetChecks a)))
         , group "hostile source fixture" hostileSourceChecks
         , group "stored decision fixture" storedChecks
         , group "unreviewable file fixture" refusalChecks

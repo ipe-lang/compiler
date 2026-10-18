@@ -94,6 +94,26 @@ pub enum UnitBody<'a> {
     Residual(&'a str),
 }
 
+/// The most bytes of a unit's purpose line the index stores. The review app
+/// bounds the purpose it reads on its own; this keeps an oversized doc comment
+/// out of the index for every extractor, so neither boundary rests on the
+/// other.
+pub const PURPOSE_BYTE_CEILING: usize = 512;
+
+/// `purpose` cut to at most [`PURPOSE_BYTE_CEILING`] bytes, on a char boundary.
+fn bounded_purpose(purpose: Option<String>) -> Option<String> {
+    purpose.map(|mut text| {
+        if text.len() > PURPOSE_BYTE_CEILING {
+            let cut = (0..=PURPOSE_BYTE_CEILING)
+                .rev()
+                .find(|&at| text.is_char_boundary(at))
+                .unwrap_or(0);
+            text.truncate(cut);
+        }
+        text
+    })
+}
+
 /// Emit one `units` row whose body is its span.
 ///
 /// Duplicate `(path, kind, qualified)` identities (e.g. several `impl` blocks
@@ -155,7 +175,7 @@ fn emit_attested_unit(
         line_start,
         line_end,
         facing,
-        purpose,
+        purpose: bounded_purpose(purpose),
         body_hash,
         updated_sha: updated_sha.to_string(),
     };
@@ -511,6 +531,51 @@ mod tests {
         assert_eq!(bash_doc_purpose(src, 2), Some("helper".to_string()));
         assert_eq!(bash_doc_purpose(src, 50), None);
         assert_eq!(bash_doc_purpose(src, i64::MIN), None);
+    }
+
+    // A doc line past the purpose ceiling is stored cut to it on a char
+    // boundary, whichever extractor read it: the ceiling falls inside a
+    // two-byte char, so the cut keeps one byte less.
+    #[test]
+    fn purpose_bounded_at_extraction() {
+        let doc = format!("a{}", "\u{e9}".repeat(400));
+        let kept = format!("a{}", "\u{e9}".repeat(255));
+        let fixtures = [
+            (
+                "src/lib.rs",
+                Lang::Rust,
+                format!("/// {doc}\npub fn f() {{}}\n"),
+            ),
+            (
+                "tools/x.sh",
+                Lang::Bash,
+                format!("# {doc}\nhelper() {{\n  :\n}}\n"),
+            ),
+            (
+                "src/A.ipe",
+                Lang::Ipe,
+                format!("module A exposing (x)\n\n-- {doc}\nx = 1\n"),
+            ),
+        ];
+        for (path, lang, src) in fixtures {
+            let store = Store::open(":memory:").unwrap();
+            extract_file(&store, path, lang, &src, "sha").unwrap();
+            let purposes: Vec<String> = store
+                .conn
+                .prepare("SELECT purpose FROM units WHERE purpose IS NOT NULL")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(purposes, vec![kept.clone()], "{path}");
+        }
+        assert_eq!(kept.len(), PURPOSE_BYTE_CEILING - 1);
+        assert_eq!(
+            bounded_purpose(Some("short".to_string())).as_deref(),
+            Some("short")
+        );
+        assert_eq!(bounded_purpose(None), None);
     }
 
     fn defs(store: &Store, path: &str) -> Vec<(String, i64)> {
