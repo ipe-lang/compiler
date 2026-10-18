@@ -12,8 +12,8 @@
 #                                     placeholder so the blessed manifest stays
 #                                     portable across machines
 #
-# A golden dir is built from `Main.ipe` (single-file) or `ipe.toml` (project),
-# whichever it ships. Dirs with only a `Main.ipe` and no `main.rs`
+# A golden dir is built from its `package.ipe` or `ipe.toml` (project), or from
+# a loose `Main.ipe`, whichever it ships. Dirs with only a `Main.ipe` and no `main.rs`
 # (SEAL/run/exit-0 goldens) are left untouched — there is nothing to byte-diff.
 #
 # The default native emit is the dependency model, so the emitted `Cargo.toml`
@@ -84,16 +84,17 @@ for dir in "$GOLDEN_ROOT"/*/; do
     out="$scratch/$name"
     rm -rf "$out"
 
-    # Build from `Main.ipe` (single-file) or `ipe.toml` (project), whichever the
-    # golden ships. Both land the emitted crate at "$out/rust/src/main.rs".
+    # Build from `package.ipe` or `ipe.toml` (project), or from a loose
+    # `Main.ipe`, whichever the golden ships. All land the emitted crate at
+    # "$out/rust/src/main.rs".
     built=0
-    if [[ -f "$dir/Main.ipe" ]]; then
-        if ( cd "$dir" && timeout 120 "$IPE_BIN" dev build "Main.ipe" --out "$out" ) \
+    if [[ -f "$dir/package.ipe" || -f "$dir/ipe.toml" ]]; then
+        if ( cd "$dir" && timeout 120 "$IPE_BIN" dev build --out "$out" ) \
                 > "$scratch/$name.log" 2>&1; then
             built=1
         fi
-    elif [[ -f "$dir/ipe.toml" ]]; then
-        if ( cd "$dir" && timeout 120 "$IPE_BIN" dev build --out "$out" ) \
+    elif [[ -f "$dir/Main.ipe" ]]; then
+        if ( cd "$dir" && timeout 120 "$IPE_BIN" dev build "Main.ipe" --out "$out" ) \
                 > "$scratch/$name.log" 2>&1; then
             built=1
         fi

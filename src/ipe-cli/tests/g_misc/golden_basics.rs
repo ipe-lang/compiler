@@ -13,11 +13,7 @@ fn repo_root() -> PathBuf {
 #[test]
 fn emits_byte_identical_main_rs_as_runtime_dependency() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("Main.ipe");
+    let dir = root.join("tests").join("golden").join("basics");
     let golden = root
         .join("tests")
         .join("golden")
@@ -28,7 +24,7 @@ fn emits_byte_identical_main_rs_as_runtime_dependency() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir: asserts the
@@ -67,11 +63,7 @@ fn end_to_end_builds_and_prints_one() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("Main.ipe");
+    let dir = root.join("tests").join("golden").join("basics");
     // Build OUTSIDE the workspace tree: an emitted project under the workspace's
     // own target/ dir is (correctly) rejected by cargo as a non-member package,
     // and the golden Cargo.toml carries no detaching `[workspace]` stanza.
@@ -79,7 +71,7 @@ fn end_to_end_builds_and_prints_one() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("basics", &out);

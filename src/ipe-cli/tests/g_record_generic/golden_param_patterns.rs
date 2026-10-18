@@ -32,14 +32,14 @@ fn fixture_dir(root: &Path) -> PathBuf {
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let entry = fixture_dir(&root).join("Main.ipe");
+    let dir = fixture_dir(&root);
     let golden = fixture_dir(&root).join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_param_patterns_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir (byte-compares
@@ -58,12 +58,12 @@ fn emits_byte_identical_main_rs() {
 #[test]
 fn emission_preserves_the_load_bearing_shapes() {
     let root = repo_root();
-    let entry = fixture_dir(&root).join("Main.ipe");
+    let dir = fixture_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_param_patterns_shapes");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
     let src = crate::support::read_all_emitted_src(&out);
 
@@ -109,12 +109,12 @@ fn end_to_end_builds_and_prints_one_hundred_twelve() {
         return;
     }
     let root = repo_root();
-    let entry = fixture_dir(&root).join("Main.ipe");
+    let dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_l0105_param_patterns_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("param_patterns", &out);

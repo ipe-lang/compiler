@@ -62,6 +62,39 @@ mod tests {
         assert!(!out.join("src").join("main.rs").exists());
     }
 
+    /// Every checked-in golden that carries an emitted `main.rs` is a project.
+    #[test]
+    fn every_emitted_golden_directory_has_a_manifest() {
+        let goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("golden");
+        let entries = std::fs::read_dir(&goldens).expect("read tests/golden");
+        let mut emitted = 0_usize;
+        let mut offenders = Vec::new();
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.join("main.rs").is_file() {
+                continue;
+            }
+            emitted += 1;
+            if !dir.join(PACKAGE_IPE).is_file() && !dir.join(IPE_TOML).is_file() {
+                offenders.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        assert!(
+            emitted > 100,
+            "found only {emitted} emitted golden directories under {}: the scan is not reading the golden tree",
+            goldens.display()
+        );
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "emitted golden directories with no manifest: {offenders:?}"
+        );
+    }
+
     /// A golden with a `package.ipe` is built from its `src/` root; one without
     /// that root is refused by the build, so no checked-in golden may be one.
     #[test]

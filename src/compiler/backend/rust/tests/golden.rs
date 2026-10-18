@@ -1,7 +1,7 @@
 //! End-to-end byte-equality gate for the Rust backend.
 //!
 //! Builds the canonical golden IR `Program` by hand (the same program the full
-//! pipeline lowers `tests/golden/basics/Main.ipe` into) and asserts that
+//! pipeline lowers `tests/golden/basics/src/Main.ipe` into) and asserts that
 //! [`RustBackend::emit`] reproduces the golden `main.rs` and `Cargo.toml`
 //! byte-for-byte. The golden is the correctness contract.
 

@@ -30,17 +30,16 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn example_entry(root: &Path) -> PathBuf {
+fn example_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("i1346_generic_record_field_name_collision")
-        .join("Main.ipe")
 }
 
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let entry = example_entry(&root);
+    let dir = example_dir(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -52,7 +51,7 @@ fn emits_byte_identical_main_rs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     crate::support::assert_emitted_project_matches_golden_dir(
@@ -71,12 +70,12 @@ fn end_to_end_builds_and_prints_ten() {
     }
 
     let root = repo_root();
-    let entry = example_entry(&root);
+    let dir = example_dir(&root);
     let out = crate::support::scratch_root().join("i1346_generic_record_field_name_collision_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome =

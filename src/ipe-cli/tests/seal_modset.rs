@@ -216,7 +216,7 @@ const AUTHED_ROUTE: &str = include_str!(concat!(
 /// class.
 const AUTHED_STORE_QUERY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/authed_store_query_seal/Main.ipe"
+    "/../../tests/golden/authed_store_query_seal/src/Main.ipe"
 ));
 
 /// Authed-route program that calls `Revocation.revokeSession principal jti cap`

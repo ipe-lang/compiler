@@ -363,7 +363,7 @@ mod tests {
         }
     }
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Parse → canonicalise → infer the golden module, then return the
     /// lowered program alongside the interner. Returns `None` (failing the

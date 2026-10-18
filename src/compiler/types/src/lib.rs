@@ -3847,7 +3847,7 @@ mod tests {
     use super::*;
     use ipe_diagnostics::{Diagnostic, LowerError, TypeError};
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Parse + canonicalise the golden module, returning it plus the interner.
     fn canon_golden() -> Option<(canon::Module, Interner)> {

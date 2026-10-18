@@ -36,24 +36,21 @@ use crate::support::repo_root;
 
 const NAME: &str = "i1349_concrete_record_straddles_two_generic_templates";
 
-fn example_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(NAME)
-        .join("Main.ipe")
+fn example_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(NAME)
 }
 
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let entry = example_entry(&root);
+    let dir = example_dir(&root);
     let golden = root.join("tests").join("golden").join(NAME).join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{NAME}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     crate::support::assert_emitted_project_matches_golden_dir(
@@ -72,12 +69,12 @@ fn end_to_end_builds_and_prints_one_four_five() {
     }
 
     let root = repo_root();
-    let entry = example_entry(&root);
+    let dir = example_dir(&root);
     let out = crate::support::scratch_root().join(format!("{NAME}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(NAME, &out);

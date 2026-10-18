@@ -47,19 +47,18 @@ fn runtime() -> PathBuf {
     e2e_support::require_runtime().into_path_buf()
 }
 
-/// Compile `tests/golden/css_length_color_ssot/Main.ipe` and assert the
+/// Compile `tests/golden/css_length_color_ssot/src/Main.ipe` and assert the
 /// emitted `src/main.rs` plus every `src/ipe_mods/*.rs` file matches the
 /// checked-in golden byte-for-byte. This proves the `Ipe.Css` fold lowers
 /// and emits unchanged.
 #[test]
 fn css_length_color_ssot_emits_byte_identical() {
     let dir = golden_dir();
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_length_color_ssot_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &rt);
+    let built = crate::support::build_golden(&dir, &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_length_color_ssot: {:?}",
@@ -81,12 +80,11 @@ fn css_length_color_ssot_e2e_output_matches_native_table() {
     }
 
     let dir = golden_dir();
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_css_length_color_ssot_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &rt);
+    let built = crate::support::build_golden(&dir, &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_length_color_ssot E2E: {:?}",

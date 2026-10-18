@@ -10,17 +10,14 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn example_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join("char_pattern")
-        .join("Main.ipe")
+fn example_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join("char_pattern")
 }
 
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let entry = example_entry(&root);
+    let dir = example_dir(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -31,7 +28,7 @@ fn emits_byte_identical_main_rs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir (byte-compares
@@ -53,12 +50,12 @@ fn end_to_end_builds_and_prints_two() {
     }
 
     let root = repo_root();
-    let entry = example_entry(&root);
+    let dir = example_dir(&root);
     let out = crate::support::scratch_root().join("ipec_m3b3_char_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("char_pattern", &out);
