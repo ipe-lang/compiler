@@ -21,6 +21,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ipe::RootFixture;
+use ipe::project_root::SourceTree;
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
 /// Seed the project's FFI cache with an inspection for a crate `tm` whose
@@ -88,16 +90,31 @@ const MAIN_IPE: &str = "module Main exposing (main)\n\
     \x20               Err _ -> Io.println \"err double\"\n\
     \x20       Err _ -> Io.println \"err shift\"\n";
 
-fn write_project(dir: &Path, main_ipe: &str) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    if !seed_ffi_cache(dir) {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), main_ipe).is_ok()
+/// The fixture's declared foreign crate: an FFI fixture is filtered by its
+/// declared `rustDependencies`, so it names the crate it binds.
+const TM_DEPENDENCY: &str = "rustDependencies = [ rustDep \"tm\" \"=0.1.0\" ]";
+
+/// A project fixture whose `Main` holds `main_ipe`, declaring `tm`, with its FFI cache seeded.
+fn ffi_fixture(main_ipe: &str) -> RootFixture {
+    ffi_fixture_of(SourceTree::main(main_ipe))
+}
+
+/// The project fixture of `tree` declaring `tm`, with its FFI cache seeded.
+fn ffi_fixture_of(tree: SourceTree) -> RootFixture {
+    let fixture = RootFixture::from_tree(&tree.field(TM_DEPENDENCY))
+        .expect("the fixture project must be written and resolved");
+    assert!(
+        seed_ffi_cache(fixture.path()),
+        "must seed the fixture project's FFI cache"
+    );
+    fixture
+}
+
+/// A fresh scratch directory `name` for files that sit outside the project.
+fn scratch(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&dir);
+    dir
 }
 
 /// Read one emitted file, failing the test with a directory listing when the
@@ -135,17 +152,11 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 fn asserted_call_emits_the_exact_carrier_shim() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_asserted_call");
-    assert!(
-        write_project(&tmp, MAIN_IPE),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_call_out");
     let _ = fs::remove_dir_all(&out);
 
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("asserted-call fixture must build, got: {err}")
     }
 
@@ -188,8 +199,6 @@ fn asserted_call_emits_the_exact_carrier_shim() {
         forwarders.contains("ipe_asserted_tm_shift__"),
         "the Rust.Ffi forwarder must reference the shim:\n{forwarders}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// A carrier the target does not declare EXACTLY is refused at build
@@ -207,20 +216,16 @@ fn a_clamp_requiring_assertion_is_refused() {
         \x20   case clamped 1 of\n\
         \x20       Ok _ -> Io.println \"ok\"\n\
         \x20       Err _ -> Io.println \"err\"\n";
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ipec_ffi_asserted_clamp_refusal");
-    assert!(write_project(&tmp, main), "must write the fixture project");
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_clamp_out");
     let _ = fs::remove_dir_all(&out);
-    let err = ipe::build_loose_file(&entry, &out, &runtime)
+    let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a clamp-requiring assertion must be refused");
     let msg = err.to_string();
     assert!(
         msg.contains("u32") && msg.contains("exact-carrier"),
         "the refusal must name the real carrier and the rule: {msg}"
     );
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// A `Rust.Ffi.call` buried inside a larger expression is refused with the
@@ -235,20 +240,16 @@ fn a_misplaced_asserted_call_is_refused() {
         \x20   case (Rust.Ffi.call \"tm::shift\") 1 of\n\
         \x20       Ok _ -> Io.println \"ok\"\n\
         \x20       Err _ -> Io.println \"err\"\n";
-    let tmp =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_asserted_misplaced");
-    assert!(write_project(&tmp, main), "must write the fixture project");
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_misplaced_out");
     let _ = fs::remove_dir_all(&out);
-    let err = ipe::build_loose_file(&entry, &out, &runtime)
+    let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a misplaced asserted call must be refused");
     let msg = err.to_string();
     assert!(
         msg.contains("IPE-N0038") || msg.contains("ENTIRE body"),
         "the refusal must be the teachable IPE-N0038: {msg}"
     );
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// The asserted escape is a DISCLOSED capability: the whole-program
@@ -256,12 +257,8 @@ fn a_misplaced_asserted_call_is_refused() {
 /// package admission and the runtime consent model see the assertion.
 #[test]
 fn asserted_program_discloses_ffi_raw() {
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_asserted_caps");
-    assert!(
-        write_project(&tmp, MAIN_IPE),
-        "must write the fixture project + FFI cache"
-    );
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
+    let entry = fixture.path().join("src").join("Main.ipe");
 
     // The same front-end seam the build runs: stdlib injection → FFI
     // preparation (scan + interface injection) → lower → capability scan.
@@ -294,8 +291,6 @@ fn asserted_program_discloses_ffi_raw() {
         caps.contains(&ipe_ir::Capability::NativeFfi),
         "every asserted call is also a native crossing: {caps:?}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// The ANALYSIS entrypoints run the same FFI seam the build does: the real
@@ -304,30 +299,22 @@ fn asserted_program_discloses_ffi_raw() {
 /// of refusing on an unresolvable `Rust.Ffi` import.
 #[test]
 fn analysis_entrypoints_accept_an_asserted_program() {
-    let tmp =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_asserted_analysis");
-    assert!(
-        write_project(&tmp, MAIN_IPE),
-        "must write the fixture project + FFI cache"
+    let fixture = ffi_fixture_of(
+        SourceTree::main(MAIN_IPE)
+            .named("asserted-fixture")
+            .field("version = \"0.1.0\""),
     );
-    fs::write(
-        tmp.join("package.ipe"),
-        "module Package exposing (package)\n\n\npackage =\n    { name = \"asserted-fixture\", version = \"0.1.0\" }\n",
-    )
-    .expect("package.ipe");
 
-    let entry = tmp.join("src").join("Main.ipe");
+    let entry = fixture.path().join("src").join("Main.ipe");
     ipe::run_cli(&["type-check".to_owned(), entry.display().to_string()])
         .expect("`ipe type-check` must accept an asserted program");
 
-    let caps = ipe::infer_package_capabilities(&tmp.join("package.ipe"))
+    let caps = ipe::infer_package_capabilities(&fixture.manifest_path())
         .expect("package capability inference must lower an asserted program");
     assert!(
         caps.contains(&ipe_ir::Capability::FfiRaw) && caps.contains(&ipe_ir::Capability::NativeFfi),
         "package inference must disclose the asserted crossing: {caps:?}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// SEAL proof under `IPE_E2E=1`: the emitted crate builds against a REAL
@@ -342,23 +329,17 @@ fn asserted_call_emitted_crate_builds_and_runs() {
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_asserted_call_e2e");
-    assert!(
-        write_project(&tmp, MAIN_IPE),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_asserted_call_e2e_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("asserted-call fixture must build, got: {err}")
     }
 
     // The real foreign crate: `hidden_double` and `boom` exist here but were
     // never inspected — exactly the over-dropped-symbol case the escape hatch
     // is for.
+    let tmp = scratch("ipec_ffi_asserted_call_e2e");
     let tm_dir = tmp.join("tm");
     fs::create_dir_all(tm_dir.join("src")).expect("mkdir tm");
     fs::write(
@@ -441,16 +422,10 @@ const CONST_MAIN_IPE: &str = "module Main exposing (main)\n\
 fn const_read_emits_a_bare_infallible_shim() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_const_read");
-    assert!(
-        write_project(&tmp, CONST_MAIN_IPE),
-        "must write the const fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(CONST_MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_read_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("const fixture must build, got: {err}")
     }
 
@@ -469,8 +444,6 @@ fn const_read_emits_a_bare_infallible_shim() {
         ffi_rs.contains("::tm::consts::LABEL.to_owned()"),
         "a String const must own its &str source; ffi.rs:\n{ffi_rs}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// A `.const` whose asserted type is a `Result` (not a bare scalar) is REFUSED
@@ -479,8 +452,6 @@ fn const_read_emits_a_bare_infallible_shim() {
 fn a_result_typed_const_is_refused() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_const_result_refused");
     let main = "module Main exposing (main)\n\
         import Ipe.Io as Io\n\
         import Ipe.Ffi.Rust as Rust\n\n\
@@ -489,19 +460,15 @@ fn a_result_typed_const_is_refused() {
         \x20   Rust.const \"tm\" \"SHIFT_BASE\"\n\n\
         main =\n\
         \x20   Io.println \"unreached\"\n";
-    assert!(write_project(&tmp, main), "must write the fixture project");
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_result_refused_out");
     let _ = fs::remove_dir_all(&out);
-    let err = ipe::build_loose_file(&entry, &out, &runtime)
+    let err = ipe::build_fixture(&fixture, &out, &runtime)
         .expect_err("a Result-typed .const must be refused");
     assert!(
         err.to_string().contains("bare scalar"),
         "the refusal must name the bare-scalar rule; got: {err}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// SEAL proof under `IPE_E2E=1`: an accepted `.const` program builds against a
@@ -513,19 +480,14 @@ fn const_read_emitted_crate_builds_and_runs() {
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_const_read_e2e");
-    assert!(
-        write_project(&tmp, CONST_MAIN_IPE),
-        "must write the const fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(CONST_MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_const_read_e2e_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("const fixture must build, got: {err}")
     }
 
+    let tmp = scratch("ipec_ffi_const_read_e2e");
     let tm_dir = tmp.join("tm");
     fs::create_dir_all(tm_dir.join("src")).expect("mkdir tm");
     fs::write(
