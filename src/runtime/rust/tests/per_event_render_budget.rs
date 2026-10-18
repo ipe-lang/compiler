@@ -56,7 +56,7 @@ fn row(i: usize, selected: usize, msg: &TestMsg) -> Html<TestMsg> {
         "background:none"
     };
     let msg = match msg {
-        TestMsg::Select(_) => TestMsg::Select(format!("row-{i}")),
+        TestMsg::Select(tag) => TestMsg::Select(format!("row-{i}{tag}")),
         TestMsg::Unmeasured => TestMsg::Unmeasured,
     };
     Html::HElement(
@@ -74,7 +74,8 @@ fn row(i: usize, selected: usize, msg: &TestMsg) -> Html<TestMsg> {
 }
 
 /// The stamped queue view with row `selected` highlighted, every handler
-/// carrying a message shaped like `msg`, and an optional trailing text node.
+/// carrying a message shaped like `msg` (a `Select` tag suffixes each row's
+/// key), and an optional trailing text node.
 fn view_with(selected: usize, msg: &TestMsg, extra: Option<String>) -> Html<TestMsg> {
     let chrome = Html::HElement(
         "header".into(),
@@ -146,17 +147,30 @@ fn a_commit_measures_each_handler_once_for_the_view_and_once_for_its_index() {
 
 // After every commit, the cached charge equals a fresh walk of the same view
 // and the same retained indexes, through the history's fill and its evictions.
+// Each commit's view and index differ in size from every other's, so a measure
+// kept from another render cannot match the walk by coincidence.
 #[allow(clippy::expect_used)] // the fixture commits far below the counter's end
 #[test]
 fn the_cached_charge_equals_a_fresh_walk_after_every_commit() {
     let mut rendered = Rendered::first(keys(), view(0));
     assert_eq!(rendered.resident_bytes(), rendered.measured_fresh());
+    let mut seen = Vec::new();
     for selected in 1..=20 {
-        rendered.commit(view(selected)).expect("commit");
+        let sized = view_with(
+            selected,
+            &TestMsg::Select("k".repeat(selected)),
+            Some("t".repeat(selected.saturating_mul(13))),
+        );
+        rendered.commit(sized).expect("commit");
+        let view_bytes = rendered.last_view().view_bytes();
+        assert!(
+            !seen.contains(&view_bytes),
+            "commit {selected} repeats a size"
+        );
+        seen.push(view_bytes);
         let cached = rendered.resident_bytes();
         assert!(cached.is_some(), "commit {selected} has a charge");
         assert_eq!(cached, rendered.measured_fresh(), "commit {selected}");
-        let view_bytes = rendered.last_view().view_bytes();
         assert!(
             cached.zip(view_bytes).is_some_and(|(all, v)| all > v),
             "the charge covers the view and its indexes: {cached:?} {view_bytes:?}"
