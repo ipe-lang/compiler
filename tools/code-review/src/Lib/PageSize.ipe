@@ -34,11 +34,11 @@ parse rows =
 
 
 -- One queue page of open units, and of unreviewable files: as many as
--- `Index.queueElementCeiling` lets one page draw within its share of the
--- session.
+-- `Index.queueElementCeiling` lets one page draw, with the session's fixed
+-- charge, within its share of the session.
 queue : PageSize
 queue =
-    PageSize 40
+    PageSize 32
 
 
 -- One History page of review rows.

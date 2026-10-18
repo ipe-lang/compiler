@@ -582,7 +582,8 @@ nodeCeilingFitsSessionCeiling =
 
 -- The relation the queue page is sized by: a full page's elements at the
 -- cost of one, plus its label bytes held twice (in the model and in the
--- drawn tree), fit the quarter of the session ceiling the unit view leaves.
+-- drawn tree) and the session's fixed charge, fit the quarter of the session
+-- ceiling the unit view leaves.
 -- Red if the page size, a label cap or a cost moves without the other.
 queueCeilingFitsQuarter : Bool
 queueCeilingFitsQuarter =
@@ -592,6 +593,7 @@ queueCeilingFitsQuarter =
         * ByteSize.toBytes Index.elementResidentBytes
         + 2
         * Index.queueLabelByteCeiling
+        + ByteSize.toBytes Index.runtimeEntryOverhead
         <= ByteSize.toBytes Index.runtimeSessionCeiling
         // 4
 
@@ -649,6 +651,27 @@ droppedOf label =
 
         Nothing ->
             Nothing
+
+
+-- The fixed per-session charge counted against the queue page's quarter is
+-- the one the runtime's budget source declares as `ENTRY_OVERHEAD`, in whole
+-- KiB. Red when either side changes alone.
+entryOverheadMirrorsRuntime : Task.Task Error Bool
+entryOverheadMirrorsRuntime =
+    let
+        kib =
+            1024
+
+        overhead =
+            ByteSize.toBytes Index.runtimeEntryOverhead
+    in
+    Task.map
+        (\source ->
+            modBy kib overhead
+                == 0
+                && String.contains ("\npub const ENTRY_OVERHEAD: Bytes = Bytes::new(" ++ String.fromInt (overhead // kib) ++ " * 1024);\n") source
+        )
+        runtimeBudgetSource
 
 
 -- The session ceiling the element ceiling is sized under is the runtime's:
@@ -1464,7 +1487,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1738,6 +1761,7 @@ checks =
         , Task.succeed ( "a full queue page's elements and label bytes fit the quarter of the session ceiling the unit view leaves", queueCeilingFitsQuarter )
         , check "a mebibyte purpose reaches the queue page and the unit page cut to the purpose cap, its marker counting the dropped bytes" purposeOfOneMibIsBounded
         , check "the mirrored session ceiling is the runtime's" sessionCeilingMirrorsRuntime
+        , check "the mirrored entry overhead is the runtime's" entryOverheadMirrorsRuntime
         , check "the mirrored cost per drawn element is the runtime's" elementBytesMirrorsRuntime
         , check "the mirrored drawn depth is the runtime's" drawnDepthMirrorsRuntime
         , check "roots agreeing with the recorded repositories pass the startup check" reposProbeAccepts

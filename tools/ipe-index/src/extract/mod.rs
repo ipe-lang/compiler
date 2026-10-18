@@ -100,15 +100,23 @@ pub enum UnitBody<'a> {
 /// other.
 pub const PURPOSE_BYTE_CEILING: usize = 512;
 
-/// `purpose` cut to at most [`PURPOSE_BYTE_CEILING`] bytes, on a char boundary.
+/// The mark a cut purpose ends with, inside [`PURPOSE_BYTE_CEILING`], so a
+/// reader of the stored line sees that the doc comment held more.
+const PURPOSE_CUT_MARK: &str = "\u{2026}";
+
+/// `purpose` whole when it fits [`PURPOSE_BYTE_CEILING`] bytes; otherwise cut
+/// on a char boundary and ended with [`PURPOSE_CUT_MARK`], at most the
+/// ceiling in all.
 fn bounded_purpose(purpose: Option<String>) -> Option<String> {
     purpose.map(|mut text| {
         if text.len() > PURPOSE_BYTE_CEILING {
-            let cut = (0..=PURPOSE_BYTE_CEILING)
+            let room = PURPOSE_BYTE_CEILING.saturating_sub(PURPOSE_CUT_MARK.len());
+            let cut = (0..=room)
                 .rev()
                 .find(|&at| text.is_char_boundary(at))
                 .unwrap_or(0);
             text.truncate(cut);
+            text.push_str(PURPOSE_CUT_MARK);
         }
         text
     })
@@ -533,13 +541,14 @@ mod tests {
         assert_eq!(bash_doc_purpose(src, i64::MIN), None);
     }
 
-    // A doc line past the purpose ceiling is stored cut to it on a char
-    // boundary, whichever extractor read it: the ceiling falls inside a
-    // two-byte char, so the cut keeps one byte less.
+    // A doc line past the purpose ceiling is stored cut on a char boundary
+    // and ended with the cut mark, within the ceiling, whichever extractor
+    // read it: the room before the mark ends inside a two-byte char, so the
+    // cut keeps one byte less.
     #[test]
     fn purpose_bounded_at_extraction() {
-        let doc = format!("a{}", "\u{e9}".repeat(400));
-        let kept = format!("a{}", "\u{e9}".repeat(255));
+        let doc = format!("ab{}", "\u{e9}".repeat(400));
+        let kept = format!("ab{}{PURPOSE_CUT_MARK}", "\u{e9}".repeat(253));
         let fixtures = [
             (
                 "src/lib.rs",
@@ -576,6 +585,19 @@ mod tests {
             Some("short")
         );
         assert_eq!(bounded_purpose(None), None);
+    }
+
+    // A purpose of exactly the ceiling is stored whole, with no mark; one
+    // byte past it is cut and marked, never stored as a whole line.
+    #[test]
+    fn purpose_at_the_ceiling_is_whole_and_one_past_is_marked() {
+        let at = "p".repeat(PURPOSE_BYTE_CEILING);
+        assert_eq!(bounded_purpose(Some(at.clone())), Some(at));
+        let past = "p".repeat(PURPOSE_BYTE_CEILING + 1);
+        let cut = bounded_purpose(Some(past)).unwrap_or_default();
+        assert_eq!(cut.len(), PURPOSE_BYTE_CEILING);
+        let kept = "p".repeat(PURPOSE_BYTE_CEILING - PURPOSE_CUT_MARK.len());
+        assert_eq!(cut.strip_suffix(PURPOSE_CUT_MARK), Some(kept.as_str()));
     }
 
     fn defs(store: &Store, path: &str) -> Vec<(String, i64)> {

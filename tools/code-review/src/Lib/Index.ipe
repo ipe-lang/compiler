@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -2314,7 +2314,8 @@ viewByteCeiling =
 -- `viewReserve` for every copy of the view's text, fit three quarters of it:
 -- (12 MiB - 5 MiB) / 1.5 KiB = 4778 elements, rounded down to 4096 so 1 MiB
 -- stays spare; 4096 * 1.5 KiB + 5 MiB = 11 MiB <= 12 MiB. The last quarter
--- holds the model, the render history and the session's fixed charge. The
+-- holds the queue page's chrome and labels with the session's fixed charge
+-- (`queueElementCeiling`), and the 1 MiB spare the model and history. The
 -- relation is checked by a test, over numbers mirrored from the runtime.
 viewNodeCeiling : Int
 viewNodeCeiling =
@@ -2326,9 +2327,9 @@ viewNodeCeiling =
 -- and its path, the page's own chrome with the selected card's links, and
 -- the selected card's labels. A label draws at most `labelElements`. These
 -- elements at `elementResidentBytes` each, plus the labels' bytes in the model
--- and again in the tree, fit the quarter of `runtimeSessionCeiling` the unit
--- view leaves; a test checks the relation and measures a page of hostile
--- labels against the count.
+-- and again in the tree, plus `runtimeEntryOverhead`, fit the quarter of
+-- `runtimeSessionCeiling` the unit view leaves; a test checks the relation
+-- and measures a page of hostile labels against the count.
 queueElementCeiling : Int
 queueElementCeiling =
     let
@@ -2412,6 +2413,15 @@ cardLabels =
 runtimeSessionCeiling : ByteSize
 runtimeSessionCeiling =
     ByteSize.mib 16
+
+
+-- The fixed charge the runtime books against every session before its model
+-- or tree, mirrored from `ENTRY_OVERHEAD` in
+-- `src/runtime/rust/src/web/budget.rs`; a test reads that line and fails when
+-- the two differ.
+runtimeEntryOverhead : ByteSize
+runtimeEntryOverhead =
+    ByteSize.kib 256
 
 
 -- What one drawn element holds resident in the runtime's session tree once
