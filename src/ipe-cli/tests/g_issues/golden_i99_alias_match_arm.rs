@@ -31,11 +31,11 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 #[test]
 fn i99_alias_tuple_match_arm_is_ipec_ok() {
     let root = repo_root();
-    let entry = golden_dir(&root, "alias_tuple_match_arm").join("Main.ipe");
+    let dir = golden_dir(&root, "alias_tuple_match_arm");
     let out = crate::support::scratch_root().join("ipec_i99_alias_tuple_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "#99: alias over a dispatch-free tuple in a match arm must be ipe-0: {:?}",
@@ -52,11 +52,11 @@ fn i99_alias_tuple_match_arm_builds_and_runs() {
         return;
     }
     let root = repo_root();
-    let entry = golden_dir(&root, "alias_tuple_match_arm").join("Main.ipe");
+    let dir = golden_dir(&root, "alias_tuple_match_arm");
     let out = crate::support::scratch_root().join("ipec_i99_alias_tuple_e2e_run");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("alias_tuple_match_arm", &out);
@@ -75,11 +75,11 @@ fn i99_alias_tuple_match_arm_builds_and_runs() {
 #[test]
 fn i99_alias_over_self_edge_is_ipec_ok() {
     let root = repo_root();
-    let entry = golden_dir(&root, "alias_self_edge").join("Main.ipe");
+    let dir = golden_dir(&root, "alias_self_edge");
     let out = crate::support::scratch_root().join("ipec_i99_self_edge_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "#99: alias over a cyclic self-edge field must be ipe-0: {:?}",
@@ -96,11 +96,11 @@ fn i99_alias_over_self_edge_builds_and_runs() {
         return;
     }
     let root = repo_root();
-    let entry = golden_dir(&root, "alias_self_edge").join("Main.ipe");
+    let dir = golden_dir(&root, "alias_self_edge");
     let out = crate::support::scratch_root().join("ipec_i99_self_edge_e2e_run");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("alias_self_edge", &out);
@@ -119,11 +119,11 @@ fn i99_alias_over_self_edge_builds_and_runs() {
 #[test]
 fn i99_alias_over_ctor_inner_is_ipe_l0128() {
     let root = repo_root();
-    let entry = golden_dir(&root, "alias_ctor_rejected").join("Main.ipe");
+    let dir = golden_dir(&root, "alias_ctor_rejected");
     let out = crate::support::scratch_root().join("ipec_i99_alias_ctor_rejected");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     let err = built.expect_err("#99: alias over a dispatch-needing inner must be rejected");
     let rendered = format!("{err:?}");
     assert!(

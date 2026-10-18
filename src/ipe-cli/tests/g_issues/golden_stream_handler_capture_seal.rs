@@ -20,12 +20,8 @@ use ipe_diagnostics::{Diagnostic, Feature, LowerError};
 
 use crate::support::repo_root;
 
-fn fixture_entry(fixture: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe")
+fn fixture_dir(fixture: &str) -> PathBuf {
+    repo_root().join("tests").join("golden").join(fixture)
 }
 
 /// The in-repo runtime module tree, so no case silently skips on a missing runtime.
@@ -46,7 +42,7 @@ fn out_dir(fixture: &str) -> PathBuf {
 /// A fixture passes ipe and, under `IPE_E2E`, its emitted crate cargo-builds.
 fn assert_accepted_and_builds(fixture: &str) {
     let out = out_dir(fixture);
-    let built = ipe::build(&fixture_entry(fixture), &out, &runtime_dir());
+    let built = crate::support::build_golden(&fixture_dir(fixture), &out, &runtime_dir());
     assert!(
         built.is_ok(),
         "{fixture}: the Stream.stream handler capture must pass ipe: {:?}",
@@ -68,7 +64,7 @@ fn assert_accepted_and_builds(fixture: &str) {
 /// A fixture is refused at ipe time with IPE-L0126 raised by the stream-handler gate.
 fn assert_refused_l0126(fixture: &str) {
     let out = out_dir(fixture);
-    let built = ipe::build(&fixture_entry(fixture), &out, &runtime_dir());
+    let built = crate::support::build_golden(&fixture_dir(fixture), &out, &runtime_dir());
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -99,7 +95,7 @@ fn assert_refused_l0126(fixture: &str) {
 /// A fixture is refused at ipe time with IPE-L0152 naming `Stream.stream` as used unsaturated.
 fn assert_refused_l0152(fixture: &str) {
     let out = out_dir(fixture);
-    let built = ipe::build(&fixture_entry(fixture), &out, &runtime_dir());
+    let built = crate::support::build_golden(&fixture_dir(fixture), &out, &runtime_dir());
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

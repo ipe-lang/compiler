@@ -29,12 +29,12 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 /// runtime error — a broken golden cannot pass silently.
 fn compile_build_run(name: &str) -> crate::support::RunOutcome {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
+    let dir = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     crate::support::build_and_run_emitted(name, &out)
@@ -254,11 +254,11 @@ fn all_secret_goldens_compile() {
         // result type-checks end to end.
         "m_secret_io_read",
     ] {
-        let entry = golden_dir(&root, name).join("Main.ipe");
+        let dir = golden_dir(&root, name);
         let out = crate::support::scratch_root().join(format!("ipec_{name}_compileonly"));
         let _ = std::fs::remove_dir_all(&out);
         let runtime = e2e_support::require_runtime().into_path_buf();
-        let built = ipe::build(&entry, &out, &runtime);
+        let built = crate::support::build_golden(&dir, &out, &runtime);
         assert!(built.is_ok(), "{name} must ipec-compile: {:?}", built.err());
     }
 }

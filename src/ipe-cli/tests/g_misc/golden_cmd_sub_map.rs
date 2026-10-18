@@ -25,14 +25,13 @@ fn cmd_sub_map_ipec_cargo_and_run_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("cmd_sub_map");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_cmd_sub_map_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiling a program that calls Cmd.map / Sub.map must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for cmd_sub_map: {:?}",
