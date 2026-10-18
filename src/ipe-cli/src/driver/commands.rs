@@ -1,12 +1,12 @@
 use super::{
     AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget,
-    RuntimeContext, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
-    bluegreen_enabled, build_loose_file_into, build_project_into, bundle_delivery,
-    collect_entry_and_siblings, collect_manifest_rooted_entry, collect_test_sources,
-    compile_prepared, create_source_root, emit_machine_error, emit_permissions,
-    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
-    io_err, resolve_analysis_target, resolve_vendored_runtime_dir, run_version,
-    runtime_dep_from_env,
+    RuntimeContext, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
+    attribute_post_link_error, bluegreen_enabled, build_loose_file_into, build_parsed_project_into,
+    bundle_delivery, collect_entry_and_siblings, collect_manifest_rooted_entry,
+    collect_test_sources, compile_prepared, create_source_root, emit_machine_error,
+    emit_permissions, emit_settings, find_manifest_for_ipe_file, frame_infer_error,
+    gate_decoder_pipelines, home_to_source_map, io_err, resolve_analysis_target,
+    resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -739,9 +739,8 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     //      graph rather than the single entry file.
     let manifest = discover_manifest(&entry_path)?;
 
-    // Parse the manifest early to read [wasm].mode for target inference.
-    // build_project_with_options re-parses it later to fill in publicEnv /
-    // hydrate-mode; the double parse is acceptable (manifests are small).
+    // The manifest is parsed once: its `[wasm].mode` picks the compile target
+    // and the same value is the one the emit and the artifact name read.
     let manifest_parsed = manifest
         .as_deref()
         .map(project::parse_manifest)
@@ -874,7 +873,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // selects the webview executor; every other delivery is served.
     let crate_dir = emit_into(
         &entry_path,
-        manifest.as_deref(),
+        manifest_parsed.as_ref().zip(manifest.as_deref()),
         &EmitTarget::Area(rust_area),
         &runtime_dir,
         options,
@@ -899,7 +898,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
                 runtime_dep,
                 quiet: args.quiet,
             },
-            manifest.as_deref(),
+            manifest_parsed.as_ref(),
         )?),
     };
 
@@ -925,16 +924,17 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
 /// Emit the program at `entry_path` into `target`, returning the claimed crate directory.
 ///
-/// The manifest project is emitted for `host` when one was found, else the
+/// The manifest project is emitted for `host` from the manifest the caller parsed,
+/// never read again, when one was found; else the
 /// entry with its sibling files for the served host. A loose file has no
 /// manifest window, so a webview request for one is refused, never served.
 ///
 /// # Errors
 /// [`CliError::Usage`] for a webview `host` with no manifest; otherwise as
-/// [`build_project_into`] and [`build_loose_file_into`].
+/// [`build_parsed_project_into`] and [`build_loose_file_into`].
 fn emit_into(
     entry_path: &Path,
-    manifest: Option<&Path>,
+    manifest: Option<(&project::ProjectManifest, &Path)>,
     target: &EmitTarget,
     runtime_dir: &Path,
     options: BuildOptions,
@@ -942,7 +942,9 @@ fn emit_into(
 ) -> Result<EmittedCrate, CliError> {
     let out = OutTarget::Proven(target);
     match manifest {
-        Some(m) => build_project_into(m, out, runtime_dir, &options, host),
+        Some((parsed, path)) => {
+            build_parsed_project_into(parsed, path, out, runtime_dir, &options, host)
+        }
         None => match host {
             HostIntent::Served => build_loose_file_into(entry_path, out, runtime_dir, options),
             HostIntent::WebView(_) => Err(CliError::Usage(text::msg::webview_needs_manifest())),
@@ -1145,12 +1147,12 @@ fn build_pure_native_release(
 /// # Errors
 /// - [`CliError::EmittedBuildFailed`] when the emitted crate fails to compile.
 /// - [`CliError::Io`] when the artifact cannot be copied into the project.
-/// - The toolchain and manifest-parse errors of the steps it composes.
+/// - The toolchain errors of the steps it composes.
 pub fn compile_and_finalize_native_build(
     output: &OutputRoot,
     crate_dir: &EmittedCrate,
     build: NativeBuild,
-    manifest: Option<&Path>,
+    manifest: Option<&project::ProjectManifest>,
 ) -> Result<PathBuf, CliError> {
     let NativeBuild {
         cargo: native_cargo,
@@ -1170,10 +1172,6 @@ pub fn compile_and_finalize_native_build(
         runtime_context_for_message()
     } else {
         None
-    };
-    let manifest_parsed = match manifest {
-        Some(m) => Some(project::parse_manifest(m)?),
-        None => None,
     };
     let target_dir =
         crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
@@ -1204,7 +1202,7 @@ pub fn compile_and_finalize_native_build(
         out_dir,
         &output.claim_area(&[OutputArea::Bin])?,
         static_plan.as_ref(),
-        manifest_parsed.as_ref(),
+        manifest,
     )?;
     Ok(artifact)
 }
@@ -1352,7 +1350,7 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
 
     emit_into(
         &entry_path,
-        manifest.as_deref(),
+        manifest_parsed.as_ref().zip(manifest.as_deref()),
         &EmitTarget::Claimed(target.owned().clone()),
         &runtime_dir,
         options,
@@ -1607,10 +1605,13 @@ pub fn release_pipeline(
     ) {
         return Err(CliError::NoRunForm { target });
     }
-    // The database driver a release profile's socket allowances follow.
-    let driver = manifest_parsed
-        .as_ref()
-        .map_or(ipe_backend_rust::DbDriver::Sqlite, |m| m.driver);
+    // The database driver a release profile's socket allowances follow: the
+    // one the emit links, read from the same build shape.
+    let driver = SettingsSource::discovered(
+        manifest_parsed.as_ref().zip(manifest.as_deref()),
+        HostIntent::Served,
+    )
+    .db_driver();
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
         bundle_delivery(
             host,
@@ -1694,7 +1695,7 @@ pub fn release_pipeline(
             };
             let crate_dir = emit_into(
                 &entry_path,
-                manifest.as_deref(),
+                manifest_parsed.as_ref().zip(manifest.as_deref()),
                 &EmitTarget::Area(rust_area),
                 &runtime_dir,
                 options,
@@ -1766,7 +1767,7 @@ pub fn release_pipeline(
         // artifact is the served program.
         let crate_dir = emit_into(
             &entry_path,
-            manifest.as_deref(),
+            manifest_parsed.as_ref().zip(manifest.as_deref()),
             &EmitTarget::Area(rust_area),
             &runtime_dir,
             options,
@@ -1872,7 +1873,7 @@ pub fn release_pipeline(
     // artifact is the served program.
     let app_dir = emit_into(
         &entry_path,
-        manifest.as_deref(),
+        manifest_parsed.as_ref().zip(manifest.as_deref()),
         &EmitTarget::Area(app_area),
         &runtime_dir,
         options,
@@ -3041,7 +3042,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // selects the webview executor; every other delivery is served.
     let crate_dir = emit_into(
         &entry_path,
-        manifest.as_deref(),
+        manifest_parsed.as_ref().zip(manifest.as_deref()),
         &EmitTarget::Area(rust_area),
         &runtime_dir,
         options,
@@ -4213,20 +4214,15 @@ pub fn front_check_entry(entry: &Path) -> Result<(), CliError> {
     let graph = build_source_graph(entry)?;
     let config = ipe_db::BuildConfig::new(
         &graph.db,
-        ipe_backend_rust::EmitSettings {
-            db_driver: ipe_backend_rust::DbDriver::Sqlite,
-            ffi: None,
-            target: ipe_ir::Target::Native,
-            wasm_public_env: Vec::new(),
-            mount_base: ipe_backend_rust::MountBase::root(),
-            wasm_hydrate_mode: false,
-            runtime_dep: None,
-            debugger: false,
-            crate_name: ipe_backend_rust::CrateName::SingleFile,
-            hot_appearance: false,
-            host: ipe_backend_rust::EmitHost::Served,
-            intent: ipe_backend_rust::BuildIntent::Development,
-        },
+        emit_settings(
+            &SettingsSource::Loose,
+            &BuildOptions {
+                target: ipe_ir::Target::Native,
+                intent: ipe_backend_rust::BuildIntent::Development,
+                ..BuildOptions::from_env()
+            },
+            runtime_embed::BundleRole::Out,
+        ),
     );
     compile_prepared(
         &graph.db,
@@ -5435,5 +5431,64 @@ mod loose_host_tests {
             "a loose webview request was not refused"
         );
         assert_eq!(after, claimed, "the refused request wrote into the crate");
+    }
+}
+
+#[cfg(test)]
+mod parsed_manifest_tests {
+    //! A manifest build emits from the manifest its caller parsed, so the
+    //! settings the caller judged (the release profile's driver, the compile
+    //! target) are the ones the emitted crate links.
+
+    use super::emit_into;
+    use crate::delivery::HostIntent;
+    use crate::output_dir::{EmitTarget, OwnedDir};
+    use crate::{BuildOptions, project};
+
+    /// An edit to `package.ipe` after the caller parsed it never reaches the
+    /// emitted crate: the crate links the parsed manifest's driver.
+    #[test]
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn an_edit_after_the_parse_is_not_emitted() {
+        let tree = crate::project_root::SourceTree::main(
+            "module Main exposing (main)\n\nimport Ipe.Db\nimport Ipe.Db.Location as Location\n\
+             import Ipe.Db.Unsafe\nimport Ipe.Task\n\nmain =\n    Task.andThen\n        \
+             (\\conn -> Unsafe.unsafeExecRaw conn \"CREATE TABLE t (id INTEGER)\")\n        \
+             (Db.open Location.memory)\n",
+        )
+        .field("build = { database = Sqlite }");
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let parsed = project::parse_manifest(&manifest_path).expect("manifest parses");
+        let text = std::fs::read_to_string(&manifest_path).expect("read package.ipe");
+        let edited = text.replace("database = Sqlite", "database = Postgres");
+        assert_ne!(edited, text, "the fixture declares `database = Sqlite`");
+        std::fs::write(&manifest_path, edited).expect("edit package.ipe");
+
+        let runtime = super::super::resolve_runtime().expect("the in-repo runtime resolves");
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-parsed-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch base");
+        let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+        let emitted = emit_into(
+            &fixture.path().join("src").join("Main.ipe"),
+            Some((&parsed, &manifest_path)),
+            &EmitTarget::Claimed(crate_dir),
+            &runtime,
+            BuildOptions {
+                runtime_dep: true,
+                ..BuildOptions::default()
+            },
+            HostIntent::Served,
+        )
+        .expect("the project emits");
+        let cargo_toml =
+            std::fs::read_to_string(emitted.path().join("Cargo.toml")).expect("emitted Cargo.toml");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            cargo_toml.contains("\"db-sqlite\"") && !cargo_toml.contains("\"db-postgres\""),
+            "the emit re-read the edited manifest:\n{cargo_toml}"
+        );
     }
 }

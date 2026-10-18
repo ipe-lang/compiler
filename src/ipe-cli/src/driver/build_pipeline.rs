@@ -17,8 +17,8 @@ use ipe_runtime_rust::encoding::MountBase;
 ///
 /// Every field is derived from the verb or the CLI. A value `package.ipe` owns
 /// (the browser mount base, the `[wasm]` public-env allowlist and mode) has no
-/// field here: [`manifest_emit_settings`] reads it from the manifest, and
-/// [`loose_emit_settings`] names the no-manifest constants.
+/// field here: [`emit_settings`] reads it from the manifest, or names the
+/// no-manifest constants for a [`SettingsSource::Loose`] build.
 ///
 /// The static plan is applied post-emit at write time — the compile pipeline
 /// and its on-disk caches stay untouched (their keys deliberately exclude
@@ -148,18 +148,85 @@ fn single_file_crate_name() -> ipe_backend_rust::CrateName {
     )
 }
 
+/// Where a build's emit settings come from, decided once where the manifest is
+/// found.
+///
+/// A loose shape carries no driver: a build without a manifest links
+/// [`project::UNDECLARED_DB_DRIVER`], so a loose build with any other driver has
+/// no representation.
+#[derive(Debug, Clone, Copy)]
+pub enum SettingsSource<'a> {
+    /// A project governed by `package.ipe`, built for the host `host` asks for.
+    Manifest {
+        /// The parsed manifest.
+        manifest: &'a project::ProjectManifest,
+        /// The path the manifest was read from, the seed of the crate identity.
+        manifest_path: &'a Path,
+        /// The host the build serves.
+        host: crate::delivery::HostIntent,
+    },
+    /// A build with no manifest: a single file, a loose file, a front check.
+    Loose,
+}
+
+impl<'a> SettingsSource<'a> {
+    /// The shape of a discovered manifest, or [`Self::Loose`] when none was found.
+    #[must_use]
+    pub const fn discovered(
+        found: Option<(&'a project::ProjectManifest, &'a Path)>,
+        host: crate::delivery::HostIntent,
+    ) -> Self {
+        match found {
+            Some((manifest, manifest_path)) => Self::Manifest {
+                manifest,
+                manifest_path,
+                host,
+            },
+            None => Self::Loose,
+        }
+    }
+
+    /// The database driver this build links, the one reader of the fact.
+    #[must_use]
+    pub const fn db_driver(&self) -> ipe_backend_rust::DbDriver {
+        match self {
+            Self::Manifest { manifest, .. } => manifest.driver,
+            Self::Loose => project::UNDECLARED_DB_DRIVER,
+        }
+    }
+}
+
+/// The emit settings of a build from `source`, for the bundle role `role`.
+///
+/// This is the one entry to both settings constructors, so a build that holds
+/// a manifest always builds with the manifest's settings. `ffi` and
+/// `runtime_dep` stay `None`: the compile core fills both once it has resolved
+/// them.
+#[must_use]
+pub fn emit_settings(
+    source: &SettingsSource<'_>,
+    options: &BuildOptions,
+    role: runtime_embed::BundleRole,
+) -> ipe_backend_rust::EmitSettings {
+    match *source {
+        SettingsSource::Manifest {
+            manifest,
+            manifest_path,
+            host,
+        } => manifest_emit_settings(manifest, manifest_path, options, host, role),
+        SettingsSource::Loose => loose_emit_settings(options, role),
+    }
+}
+
 /// The emit settings of a no-manifest build (a single file, a loose file, a
-/// test entry).
+/// front check).
 ///
 /// There is no manifest window, so the host is always served, and a loose file
 /// declares no browser delivery: the mount base is [`MountBase::root`], the
-/// public-env allowlist is empty and hydrate mode is off. `ffi` and
-/// `runtime_dep` stay `None` here: the compile core fills both once it has
-/// resolved them. A scratch emission is the test runner, named by the fixed
-/// [`ipe_backend_rust::CrateName::Test`], never by the environment.
-#[must_use]
-pub fn loose_emit_settings(
-    db_driver: ipe_backend_rust::DbDriver,
+/// public-env allowlist is empty and hydrate mode is off. A scratch emission is
+/// the test runner, named by the fixed [`ipe_backend_rust::CrateName::Test`],
+/// never by the environment.
+fn loose_emit_settings(
     options: &BuildOptions,
     role: runtime_embed::BundleRole,
 ) -> ipe_backend_rust::EmitSettings {
@@ -178,7 +245,7 @@ pub fn loose_emit_settings(
         runtime_embed::BundleRole::Scratch => ipe_backend_rust::CrateName::Test,
     };
     ipe_backend_rust::EmitSettings {
-        db_driver,
+        db_driver: SettingsSource::Loose.db_driver(),
         ffi: None,
         target: *target,
         wasm_public_env: Vec::new(),
@@ -198,15 +265,16 @@ pub fn loose_emit_settings(
 /// The manifest supplies the driver, `[wasm]` settings, mount base and crate
 /// identity, and, for a webview request, the `delivery.desktop` window. This
 /// is the one constructor of [`ipe_backend_rust::EmitHost::WebView`], and it
-/// is reached only with a [`crate::delivery::WebViewProof`]. `ffi` and
-/// `runtime_dep` stay `None` here: the compile core fills both once it has
-/// resolved them.
-#[must_use]
-pub fn manifest_emit_settings(
+/// is reached only with a [`crate::delivery::WebViewProof`]. A scratch
+/// emission is the test runner, named by the fixed
+/// [`ipe_backend_rust::CrateName::Test`]; every other emission is named by the
+/// project's identity.
+fn manifest_emit_settings(
     manifest: &project::ProjectManifest,
     manifest_path: &Path,
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
+    role: runtime_embed::BundleRole,
 ) -> ipe_backend_rust::EmitSettings {
     let BuildOptions {
         target,
@@ -223,10 +291,15 @@ pub fn manifest_emit_settings(
     // slots in a shared CARGO_TARGET_DIR. The seed is the CANONICAL project
     // directory, so the identity is stable across runs yet distinct per real
     // project location; a symlink/`..` alias resolves to the same slot.
-    let identity = ipe_backend_rust::crate_identity(
-        &ipe_backend_rust::sanitize_cargo_name(&manifest.name),
-        &canonical_project_dir(manifest_path),
-    );
+    let crate_name = match role {
+        runtime_embed::BundleRole::Out => {
+            ipe_backend_rust::CrateName::Identity(ipe_backend_rust::crate_identity(
+                &ipe_backend_rust::sanitize_cargo_name(&manifest.name),
+                &canonical_project_dir(manifest_path),
+            ))
+        }
+        runtime_embed::BundleRole::Scratch => ipe_backend_rust::CrateName::Test,
+    };
     let host = match host {
         crate::delivery::HostIntent::Served => ipe_backend_rust::EmitHost::Served,
         crate::delivery::HostIntent::WebView(_) => {
@@ -253,7 +326,7 @@ pub fn manifest_emit_settings(
         ),
         runtime_dep: None,
         debugger: *debugger,
-        crate_name: ipe_backend_rust::CrateName::Identity(identity),
+        crate_name,
         hot_appearance: *hot_appearance,
         host,
         intent: *intent,
@@ -460,9 +533,6 @@ pub fn build_with_options_into(
         entry_path.clone(),
     )];
 
-    // No manifest on the single-file path — default to sqlite, matching the
-    // documented `package.ipe` default for a project that has no database
-    // setting.
     compile_modules(
         sources,
         discovered,
@@ -470,7 +540,7 @@ pub fn build_with_options_into(
         &target,
         runtime_dir,
         entry,
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         options,
     )
 }
@@ -527,8 +597,6 @@ pub fn build_loose_file_into(
     let target = out.prove(&ProjectPaths::of_file(entry))?;
     let collected = collect_entry_and_siblings(entry)?;
 
-    // No manifest on this path either (the loose-file closure is the "no manifest
-    // found" fallback) — default to sqlite, same rationale as `build`.
     compile_modules(
         collected.sources,
         collected.discovered,
@@ -536,19 +604,21 @@ pub fn build_loose_file_into(
         &target,
         runtime_dir,
         entry,
-        ipe_backend_rust::DbDriver::Sqlite,
+        &SettingsSource::Loose,
         options,
     )
 }
 
-/// Build `ipe verify`'s test entry against the project's `src/` sources.
+/// Build `ipe verify`'s test entry with the settings `source` names.
 ///
-/// Unlike [`build_loose_file`], which follows the entry's
-/// imports within its own directory, this roots the code under test at `project_src_root`
-/// (the `src/` tree) and additionally discovers the test entry's own directory
-/// (the `tests/` tree) — so a `tests/Main.ipe` that imports `Lib.Foo` from
-/// `src/Lib/Foo.ipe` resolves. See [`collect_test_sources`] for the source-set
-/// model.
+/// When `project_src_root` is a directory, the code under test is rooted at it
+/// (the `src/` tree) and the test entry's own tree (the `tests/` tree) is
+/// discovered too, so a `tests/Main.ipe` that imports `Lib.Foo` from
+/// `src/Lib/Foo.ipe` resolves; see [`collect_test_sources`]. A manifest project
+/// is always rooted so; a project with no manifest and no `src/` tree builds the
+/// test entry plus the siblings its imports reach, as
+/// [`build_loose_file`] does. Either way the settings are the ones the project
+/// build uses, its database driver included, but for the test crate's name.
 ///
 /// Returns the claimed crate directory.
 ///
@@ -558,19 +628,32 @@ pub fn build_loose_file_into(
 /// shape cannot be static; [`CliError::OutputRefused`] when `out` overlaps the
 /// test entry's directory or `project_src_root`.
 pub fn build_test_into(
+    source: &SettingsSource<'_>,
     project_src_root: &Path,
     tests_root: &Path,
     test_entry: &Path,
     out: OutTarget<'_>,
     runtime_dir: &Path,
 ) -> Result<EmittedCrate, CliError> {
-    let project = ProjectPaths::of_file(test_entry).with_sources(project_src_root);
+    // A manifest project always has its `src/` tree (the manifest reader
+    // refuses one without it), so a tree gone since the read is refused, never
+    // built as a flat project under the manifest's settings.
+    let rooted = match source {
+        SettingsSource::Manifest { .. } => true,
+        SettingsSource::Loose => project_src_root.is_dir(),
+    };
+    let (project, collected) = if rooted {
+        (
+            ProjectPaths::of_file(test_entry).with_sources(project_src_root),
+            collect_test_sources(project_src_root, tests_root, test_entry)?,
+        )
+    } else {
+        (
+            ProjectPaths::of_file(test_entry),
+            collect_entry_and_siblings(test_entry)?,
+        )
+    };
     let target = out.prove(&project)?;
-    let collected = collect_test_sources(project_src_root, tests_root, test_entry)?;
-
-    // No manifest driver is threaded here (the test stage mirrors the sibling
-    // build's "no manifest" fallback) — default to sqlite, same rationale as
-    // `build_loose_file`.
     compile_modules(
         collected.sources,
         collected.discovered,
@@ -578,7 +661,7 @@ pub fn build_test_into(
         &target,
         runtime_dir,
         test_entry,
-        ipe_backend_rust::DbDriver::Sqlite,
+        source,
         BuildOptions {
             intent: ipe_backend_rust::BuildIntent::Development,
             ..BuildOptions::from_env()
@@ -1015,7 +1098,7 @@ pub fn compile_modules(
     target: &EmitTarget,
     runtime_dir: &Path,
     blame_path: &Path,
-    db_driver: ipe_backend_rust::DbDriver,
+    source: &SettingsSource<'_>,
     options: BuildOptions,
 ) -> Result<EmittedCrate, CliError> {
     let cache_site = cache::env_cache_dir(&target.path()?);
@@ -1026,7 +1109,7 @@ pub fn compile_modules(
         target,
         runtime_dir,
         blame_path,
-        db_driver,
+        source,
         cache_site.as_ref(),
         options,
     )
@@ -1062,7 +1145,7 @@ pub fn compile_modules_observed(
     target: &EmitTarget,
     runtime_dir: &Path,
     blame_path: &Path,
-    db_driver: ipe_backend_rust::DbDriver,
+    source: &SettingsSource<'_>,
     cache_site: Option<&cache::CacheSite>,
     options: BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
@@ -1074,7 +1157,7 @@ pub fn compile_modules_observed(
         Ok(set) => set,
         Err(e) => return (Err(e), CacheOutcome::Miss),
     };
-    let settings = loose_emit_settings(db_driver, &options, target.bundle_role());
+    let settings = emit_settings(source, &options, target.bundle_role());
     compile_source_set_observed(
         source_set,
         entry_path,
@@ -2888,12 +2971,32 @@ pub fn build_project_into(
     host: crate::delivery::HostIntent,
 ) -> Result<EmittedCrate, CliError> {
     let manifest = project::parse_manifest(manifest_path)?;
-    let (sources, discovered) = super::read_package_modules(&manifest)?;
+    build_parsed_project_into(&manifest, manifest_path, out, runtime_dir, options, host)
+}
+
+/// [`build_project_into`] for a manifest the caller already parsed from
+/// `manifest_path`.
+///
+/// The manifest is not read again, so every setting the caller judged from
+/// `manifest` (its consent, its driver, its compile target) is the setting the
+/// emit links, even when `package.ipe` changes during the build.
+///
+/// # Errors
+/// As [`build_project_into`].
+pub fn build_parsed_project_into(
+    manifest: &project::ProjectManifest,
+    manifest_path: &Path,
+    out: OutTarget<'_>,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+    host: crate::delivery::HostIntent,
+) -> Result<EmittedCrate, CliError> {
+    let (sources, discovered) = super::read_package_modules(manifest)?;
     refuse_debugger_without_runtime_dep(options)?;
-    refuse_webview_off_web(host, &manifest, &sources)?;
+    refuse_webview_off_web(host, manifest, &sources)?;
     let source_set = super::PackageSourceSet::assemble(sources, discovered, manifest_path)?;
     build_from_sources_for(
-        &manifest,
+        manifest,
         manifest_path,
         source_set,
         out,
@@ -3004,11 +3107,18 @@ fn build_from_sources_for(
         )));
     }
 
-    let settings = manifest_emit_settings(manifest, manifest_path, options, host);
-
     // The manifest is the blame location for an import cycle (no single file
     // owns it); post-link errors are blamed on the entry file inside the core.
     let target = out.prove(&ProjectPaths::from_manifest(manifest))?;
+    let settings = emit_settings(
+        &SettingsSource::Manifest {
+            manifest,
+            manifest_path,
+            host,
+        },
+        options,
+        target.bundle_role(),
+    );
     let cache_site = cache::env_cache_dir(&target.path()?);
     compile_source_set_observed(
         source_set,
@@ -3590,6 +3700,18 @@ main =
         assert!(!out.exists(), "a refused build emitted output");
     }
 
+    /// The served manifest shape of `manifest`, read from `manifest_path`.
+    const fn served_manifest<'a>(
+        manifest: &'a project::ProjectManifest,
+        manifest_path: &'a Path,
+    ) -> SettingsSource<'a> {
+        SettingsSource::Manifest {
+            manifest,
+            manifest_path,
+            host: crate::delivery::HostIntent::Served,
+        }
+    }
+
     /// Options with every verb-derived field set off its default.
     fn verb_options() -> BuildOptions {
         BuildOptions {
@@ -3613,11 +3735,10 @@ main =
         let manifest_path = fixture.manifest_path();
         let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
         let options = verb_options();
-        let settings = manifest_emit_settings(
-            &manifest,
-            &manifest_path,
+        let settings = emit_settings(
+            &served_manifest(&manifest, &manifest_path),
             &options,
-            crate::delivery::HostIntent::Served,
+            runtime_embed::BundleRole::Out,
         );
         assert_eq!(settings.mount_base.prefix(), "/app");
         assert!(settings.wasm_hydrate_mode, "`mode = Hydrate` is lost");
@@ -3637,11 +3758,10 @@ main =
         let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
         let manifest_path = fixture.manifest_path();
         let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
-        let settings = manifest_emit_settings(
-            &manifest,
-            &manifest_path,
+        let settings = emit_settings(
+            &served_manifest(&manifest, &manifest_path),
             &verb_options(),
-            crate::delivery::HostIntent::Served,
+            runtime_embed::BundleRole::Out,
         );
         assert_eq!(settings.mount_base, MountBase::root());
         assert!(!settings.wasm_hydrate_mode);
@@ -3653,8 +3773,8 @@ main =
     #[test]
     fn a_loose_build_declares_no_browser_delivery() {
         let options = verb_options();
-        let settings = loose_emit_settings(
-            ipe_backend_rust::DbDriver::Sqlite,
+        let settings = emit_settings(
+            &SettingsSource::Loose,
             &options,
             runtime_embed::BundleRole::Out,
         );
@@ -3665,5 +3785,65 @@ main =
         assert_eq!(settings.intent, options.intent);
         assert!(settings.debugger);
         assert!(settings.hot_appearance);
+    }
+
+    /// The options the test runner builds with.
+    fn test_runner_options() -> BuildOptions {
+        BuildOptions {
+            intent: ipe_backend_rust::BuildIntent::Development,
+            ..BuildOptions::from_env()
+        }
+    }
+
+    /// A test build of a manifest project folds the same settings as the
+    /// project build but for its crate name: the test crate, not the identity.
+    #[test]
+    fn a_test_build_matches_the_project_build_but_for_its_crate_name() {
+        let tree =
+            crate::project_root::SourceTree::main("module Main exposing (main)\n\nmain = 1\n")
+                .field("build = { database = Postgres }")
+                .field(r#"delivery = { browser = { basePath = "/app" } }"#)
+                .field(r#"wasm = On { mode = Hydrate, publicEnv = [ "API_BASE_URL" ] }"#);
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
+        let source = served_manifest(&manifest, &manifest_path);
+        let options = test_runner_options();
+        let test = emit_settings(&source, &options, runtime_embed::BundleRole::Scratch);
+        let project = emit_settings(&source, &options, runtime_embed::BundleRole::Out);
+        assert_eq!(test.db_driver, ipe_backend_rust::DbDriver::Postgres);
+        assert_eq!(test.crate_name, ipe_backend_rust::CrateName::Test);
+        let identity = ipe_backend_rust::crate_identity(
+            &ipe_backend_rust::sanitize_cargo_name(&manifest.name),
+            &canonical_project_dir(&manifest_path),
+        );
+        assert_eq!(
+            project.crate_name,
+            ipe_backend_rust::CrateName::Identity(identity)
+        );
+        let renamed = ipe_backend_rust::EmitSettings {
+            crate_name: project.crate_name.clone(),
+            ..test
+        };
+        // The derived equality reads every field, as the cache key fold does.
+        assert_eq!(
+            renamed, project,
+            "a manifest setting is dropped on the test path"
+        );
+    }
+
+    /// A build without a manifest links the undeclared driver, and its test
+    /// crate is the fixed test crate.
+    #[test]
+    fn a_project_without_a_manifest_tests_with_the_undeclared_driver() {
+        let source = SettingsSource::Loose;
+        assert_eq!(source.db_driver(), project::UNDECLARED_DB_DRIVER);
+        let settings = emit_settings(
+            &source,
+            &test_runner_options(),
+            runtime_embed::BundleRole::Scratch,
+        );
+        assert_eq!(settings.db_driver, project::UNDECLARED_DB_DRIVER);
+        assert_eq!(settings.crate_name, ipe_backend_rust::CrateName::Test);
     }
 }

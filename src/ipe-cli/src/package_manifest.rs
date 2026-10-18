@@ -262,7 +262,7 @@ impl ManifestFields {
             root: root.to_path_buf(),
             src_root,
             icon,
-            driver: self.driver.unwrap_or(ipe_backend_rust::DbDriver::Sqlite),
+            driver: self.driver.unwrap_or(crate::project::UNDECLARED_DB_DRIVER),
             static_request: crate::build_plan::StaticRequestLayer {
                 static_build: self.static_build,
                 target: self.target,
@@ -1705,7 +1705,7 @@ fn ship_builder_expr(entry: ShipEntry) -> String {
 /// Render the `build = { … }` field, or `None` when every build setting is at
 /// its default (an absent field reads back as all-defaults).
 fn render_build(manifest: &ProjectManifest) -> Option<String> {
-    let driver_default = manifest.driver == ipe_backend_rust::DbDriver::Sqlite;
+    let driver_default = manifest.driver == crate::project::UNDECLARED_DB_DRIVER;
     let static_layer = &manifest.static_request;
     if driver_default && *static_layer == crate::build_plan::StaticRequestLayer::default() {
         return None;

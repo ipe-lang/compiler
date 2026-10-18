@@ -1,6 +1,6 @@
 use super::{
-    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
-    attribute_canon_errors, attribute_post_link_error, build_loose_file_into, build_project_into,
+    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SettingsSource,
+    SourceGraph, attribute_canon_errors, attribute_post_link_error, build_project_into,
     build_source_graph, build_test_into, capabilities_including_served_widgets,
     classify_entry_shape, create_source_root, default_entry, discover_manifest, emit_machine_error,
     emitted_bin_filename, frame_infer_error, home_to_source_map, lowering_check_query,
@@ -1566,12 +1566,20 @@ pub fn run_project_tests_with(
     // conventional `src/` directory (so `src/Main.ipe`'s sibling `tests/` tree
     // is at `<project-root>/tests`, not `src/tests`); otherwise the entry's
     // directory is itself the project root (a flat single-directory project).
-    let manifest = discover_manifest(&entry_path)?;
-    let (project_root, project_src_root): (PathBuf, PathBuf) = if let Some(m) = manifest.as_ref() {
+    // The manifest is parsed once: its settings are the test build's settings,
+    // its database driver included, so the program under test is the program
+    // the project build ships.
+    let manifest_path = discover_manifest(&entry_path)?;
+    let manifest = match manifest_path.as_deref() {
+        Some(m) => Some(project::parse_manifest(m)?),
+        None => None,
+    };
+    let found = manifest.as_ref().zip(manifest_path.as_deref());
+    let (project_root, project_src_root): (PathBuf, PathBuf) = if let Some((parsed, m)) = found {
         let root = m
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        (root, project::parse_manifest(m)?.src_root)
+        (root, parsed.src_root.clone())
     } else {
         let src_root = entry_path
             .parent()
@@ -1620,9 +1628,12 @@ pub fn run_project_tests_with(
     // temp directory on EVERY exit — a compile failure, a cargo failure, a
     // spawn error, or a normal run — not only the success path.
     let outcome = build_and_run_test_entry(
-        &project_src_root,
-        &tests_root,
-        &test_entry,
+        &SettingsSource::discovered(found, crate::delivery::HostIntent::Served),
+        TestLayout {
+            src_root: &project_src_root,
+            tests_root: &tests_root,
+            entry: &test_entry,
+        },
         &out_scratch,
         &runtime_dir,
         &cargo_bin,
@@ -1633,6 +1644,18 @@ pub fn run_project_tests_with(
     // (compile failure, cargo error, spawn error, or normal completion).
     drop(out_scratch);
     outcome
+}
+
+/// Where a project's tests live: the code under test, the `tests/` tree, and
+/// the tree's entry.
+#[derive(Clone, Copy, Debug)]
+pub struct TestLayout<'a> {
+    /// The project's source root (`src/`, or the project root when flat).
+    pub src_root: &'a Path,
+    /// The `tests/` tree.
+    pub tests_root: &'a Path,
+    /// The test entry, `tests/Main.ipe`.
+    pub entry: &'a Path,
 }
 
 /// Compile the test entry into `out_scratch`, build the emitted Rust project, and
@@ -1657,28 +1680,21 @@ pub fn run_project_tests_with(
 /// [`CliError::TestFailed`] when the binary exits non-zero (a failing case, or
 /// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
-    project_src_root: &Path,
-    tests_root: &Path,
-    test_entry: &Path,
+    source: &SettingsSource<'_>,
+    layout: TestLayout<'_>,
     out_scratch: &scratch::ScratchDir,
     runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
-    let out = OutTarget::Scratch(out_scratch);
-    let crate_dir = if project_src_root.is_dir() {
-        build_test_into(project_src_root, tests_root, test_entry, out, runtime_dir)?
-    } else {
-        build_loose_file_into(
-            test_entry,
-            out,
-            runtime_dir,
-            BuildOptions {
-                intent: ipe_backend_rust::BuildIntent::Development,
-                ..BuildOptions::from_env()
-            },
-        )?
-    };
+    let crate_dir = build_test_into(
+        source,
+        layout.src_root,
+        layout.tests_root,
+        layout.entry,
+        OutTarget::Scratch(out_scratch),
+        runtime_dir,
+    )?;
 
     let target = crate::target_dir::LinkableTargetDir::for_scratch(cargo_bin.path(), out_scratch)?;
     seed_test_lock(target.dir().path(), crate_dir.dir())?;
