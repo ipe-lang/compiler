@@ -52,7 +52,8 @@ area shape =
 ";
 
 /// Lambdas, `let` with a tuple binder, `if`, `case`, a pipeline, a record,
-/// a list and a tuple.
+/// a list, a tuple, a doc above a signature, and a comment run above a
+/// `case` arm.
 const EXPRESSION_SEED: &str = r#"module Seed exposing (config, run)
 
 
@@ -84,6 +85,19 @@ config =
     , items = [ 1, 2, 3 ]
     , pair = ( 1, "a" )
     }
+
+
+-- | Pick a value.
+pick : Int -> Int
+pick n =
+    case n of
+        0 ->
+            1
+
+        -- one
+        -- two
+        _ ->
+            n
 "#;
 
 /// The fewest parser-accepted variants the seeds must yield.
