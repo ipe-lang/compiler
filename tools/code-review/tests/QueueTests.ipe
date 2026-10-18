@@ -35,7 +35,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit, labelOf, labelText)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -425,25 +425,25 @@ selectedTag state =
         ViewLoading loading ->
             case loading.wanted of
                 Just w ->
-                    "loading " ++ labelOf loading.uid ++ " wanting " ++ labelOf w
+                    "loading " ++ fixtureNameOf loading.uid ++ " wanting " ++ fixtureNameOf w
 
                 Nothing ->
-                    "loading " ++ labelOf loading.uid
+                    "loading " ++ fixtureNameOf loading.uid
 
         ViewShown loaded ->
-            "shown " ++ labelOf loaded.unit.uid
+            "shown " ++ fixtureNameOf loaded.unit.uid
 
         ViewMissing unit ->
-            "missing " ++ labelOf unit
+            "missing " ++ fixtureNameOf unit
 
         ViewFailed unit _ ->
-            "failed " ++ labelOf unit
+            "failed " ++ fixtureNameOf unit
 
 
 -- The fixture label `TestSupport.uid` made `unit` from, among the labels the
 -- selection checks use; any other uid shows whole.
-labelOf : Uid -> String
-labelOf unit =
+fixtureNameOf : Uid -> String
+fixtureNameOf unit =
     case List.find (\label -> uid label == unit) [ "a", "b", "c" ] of
         Just label ->
             label
@@ -1045,14 +1045,14 @@ queueStateTextsDistinct =
 sampleQueuedUnit : Queue.QueuedUnit
 sampleQueuedUnit =
     { unit = { uid = uid "u-sample"
-    , path = SafeText.renderForeign "ipe:src/Main.ipe"
-    , kind = SafeText.renderForeign "module"
+    , path = labelOf "ipe:src/Main.ipe"
+    , kind = labelOf "module"
     , lang = Highlight.Ipe
-    , name = SafeText.renderForeign "Main"
-    , qualified = SafeText.renderForeign "Main"
+    , name = labelOf "Main"
+    , qualified = labelOf "Main"
     , lineStart = 1
     , lineEnd = 1
-    , facing = SafeText.renderForeign "internal"
+    , facing = labelOf "internal"
     , purpose = Nothing
     , attested = Index.UnknownScheme "hash-sample"
     , updatedSha = "sha-sample"
@@ -1077,9 +1077,9 @@ labelled id kind qualified path line =
     { sampleQueuedUnit
         | unit = { base
             | uid = uid id
-            , kind = SafeText.renderForeign kind
-            , qualified = SafeText.renderForeign qualified
-            , path = SafeText.renderForeign path
+            , kind = labelOf kind
+            , qualified = labelOf qualified
+            , path = labelOf path
             , lineStart = line
         }
     }
@@ -1142,16 +1142,16 @@ queueLabelsDistinct =
             List.all identity (List.indexedMap (\i a -> List.all identity (List.indexedMap (\j b -> i == j || a /= b) only)) only)
 
         rs =
-            SafeText.renderForeign "ipe:src/r.rs"
+            labelOf "ipe:src/r.rs"
     in
     List.length labels
         == List.length labelFixture
         && distinct
         && List.all (\( q, label ) -> label.kind == q.unit.kind && label.name == q.unit.qualified) labels
         && placeOf "u-file-a" labels
-        == Just (Queue.At (SafeText.renderForeign "ipe:src/a.rs") 1)
+        == Just (Queue.At (labelOf "ipe:src/a.rs") 1)
         && placeOf "u-file-b9" labels
-        == Just (Queue.At (SafeText.renderForeign "ipe:src/b.rs") 9)
+        == Just (Queue.At (labelOf "ipe:src/b.rs") 9)
         && placeOf "u-regex-1" labels
         == Just (Queue.AtUnit rs 3 (uid "u-regex-1"))
         && placeOf "u-regex-2" labels
@@ -1632,7 +1632,7 @@ reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
 reviewWritesGoThroughWriteTransaction =
     let
         others =
-            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Label.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
     in
     do
         cwd <- System.cwd ()
@@ -2811,16 +2811,17 @@ acknowledgeableRefusalListedFirst =
         at <- freshScratch "ipe-index-refusal-order"
         _ <- seedProgressScratch at
         execIndex at.indexDb
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) INSERT INTO refusals (uid, path, lang, reason, size, digest) SELECT printf('%064d', i), printf('ipe:a/%03d', i), 'other', 'unreadable', NULL, NULL FROM n"
+            ("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < " ++ String.fromInt (PageSize.toInt PageSize.queue) ++ ") INSERT INTO refusals (uid, path, lang, reason, size, digest) SELECT printf('%064d', i), printf('ipe:a/%03d', i), 'other', 'unreadable', NULL, NULL FROM n")
             []
         insertRefusal at.indexDb "r-z" "ipe:z/blob.bin" "not-utf8" (SqlInt 4) (refusalDigestOf "a")
         page <- loadPageNow Index.Start
         cleanupProgressScratch at
         Task.succeed
             (page.refusalsOpen
-                == 201
+                == PageSize.toInt PageSize.queue
+                + 1
                 && List.length page.refusals
-                == 200
+                == PageSize.toInt PageSize.queue
                 && List.map (\row -> row.uid) (List.take 1 page.refusals)
                 == [ uid "r-z" ]
             )

@@ -25,12 +25,13 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.SafeText as SafeText exposing (Segment(..))
 import Lib.Settings as Settings
 import Lib.Uid as Uid
-import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
+import TestSupport exposing (tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid, labelOf, labelText)
 
 
 -- Every member of the runtime's `is_log_hazard` set as it stood before the
@@ -320,16 +321,16 @@ indexUnitRendered : Index.Unit -> Bool
 indexUnitRendered u =
     List.all safeShown [ u.name, u.qualified, u.kind, u.facing ]
         && (Maybe.map safeShown u.purpose == Just True)
-        && SafeText.toString u.qualified
+        && labelText u.qualified
         == "Lib.\\u{202e}answer"
 
 
 -- Rendered text holds no hazard and spells at least one as an escape.
-safeShown : SafeText.SafeText -> Bool
+safeShown : Label -> Bool
 safeShown text =
     let
         shown =
-            SafeText.toString text
+            labelText text
     in
     noHazard shown && String.contains "\\u{" shown
 
@@ -356,6 +357,94 @@ sourceTokensRendered =
         == [ "→ Lib.\\u{202e}x" ]
 
 
+-- ── labels ──────────────────────────────────────────────────────────────
+-- Two long paths that agree on their first 300 bytes and differ after them
+-- read as different labels, though both drop the same byte count: their
+-- markers' hashes differ. Red if the hash stops covering the window past
+-- the cap.
+labelTruncationIsInjective : Bool
+labelTruncationIsInjective =
+    let
+        prefix =
+            String.repeat 300 "a"
+
+        one =
+            labelOf (prefix ++ "b" ++ String.repeat 3795 "c")
+
+        other =
+            labelOf (prefix ++ "d" ++ String.repeat 3795 "c")
+    in
+    Label.key one
+        /= Label.key other
+        && labelText one
+        /= labelText other
+        && droppedBytes one
+        == Just (4096 - Label.capBytes Label.labelCap)
+        && droppedBytes other
+        == droppedBytes one
+
+
+-- A hundred adjacent NULs are one escape run, cut at the cap with a marker
+-- for the rest. Red if adjacent escapes stop coalescing, one element each.
+escapeRunsCoalesce : Bool
+escapeRunsCoalesce =
+    let
+        spelling =
+            SafeText.escapeSpelling (Char.fromCode 0)
+
+        kept =
+            Label.capBytes Label.labelCap // String.length spelling
+
+        parts =
+            Label.parts (labelOf (String.repeat 100 (codeText 0)))
+    in
+    case parts of
+        [ LabelEscapes run, LabelCut dropped _ ] ->
+            run == String.repeat kept spelling && dropped == 100 - kept
+
+        _ ->
+            False
+
+
+-- A cap that falls inside a four-byte character drops the whole character:
+-- 254 bytes of text and an emoji keep the text and count the emoji's four
+-- bytes in the marker. Red if a cut splits a character.
+labelCutsOnCharBoundary : Bool
+labelCutsOnCharBoundary =
+    let
+        text =
+            String.repeat 254 "a"
+    in
+    case Label.parts (labelOf (text ++ codeText 128512)) of
+        [ LabelText shown, LabelCut dropped _ ] ->
+            shown == text && dropped == 4
+
+        _ ->
+            False
+
+
+-- A label within its cap shows all of it, with no marker.
+shortLabelUncut : Bool
+shortLabelUncut =
+    Label.parts (labelOf "ipe:src/lib.rs") == [ LabelText "ipe:src/lib.rs" ]
+
+
+droppedBytes : Label -> Maybe Int
+droppedBytes label =
+    case List.head (List.reverse (Label.parts label)) of
+        Just (LabelCut dropped _) ->
+            Just dropped
+
+        Just (LabelText _) ->
+            Nothing
+
+        Just (LabelEscapes _) ->
+            Nothing
+
+        Nothing ->
+            Nothing
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -369,4 +458,8 @@ checks =
         , Task.succeed ( "source tokens and link labels render bidi visibly", sourceTokensRendered )
         , check "the hazard set equals the shared display-hazard vectors" hazardSetMatchesVectors
         , check "every runtime log hazard is a display hazard" logHazardsAreDisplayHazards
+        , Task.succeed ( "two long labels sharing a prefix past the cap read differently", labelTruncationIsInjective )
+        , Task.succeed ( "adjacent escapes in a label are one run", escapeRunsCoalesce )
+        , Task.succeed ( "a label cut inside a character drops the whole character", labelCutsOnCharBoundary )
+        , Task.succeed ( "a label within its cap shows all of it with no marker", shortLabelUncut )
         ]

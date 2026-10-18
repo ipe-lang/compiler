@@ -17,6 +17,7 @@ import Lib.Drawn as Drawn exposing (Code(..), DrawnSource, Hue(..), LayoutNote(.
 import Lib.Failure as Failure exposing (LoadFailure)
 import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), SourceView(..))
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
@@ -261,7 +262,7 @@ refusalCard controls shown row =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ sectionHeading (Ui.el [ Font.size 13, Font.bold, Font.family Font.monospace, Font.color (Ui.rgb 235 235 240) ] (safeText row.path))
+            [ sectionHeading (Ui.el [ Font.size 13, Font.bold, Font.family Font.monospace, Font.color (Ui.rgb 235 235 240) ] (shownLabel [ IndexedLabel row.path ]))
             , Ui.el
                 [ Ui.paddingXY 8 3, Background.color (Ui.rgb 40 40 52), Border.rounded 4, Font.size 11, Font.bold, Font.color (Ui.rgb 220 220 230) ]
                 (safeText (Queue.refusalReasonText row.reason))
@@ -532,7 +533,7 @@ historyHeading row badge bodyHash reviewedAt =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
         [ badge
-        , Ui.el [ Ui.describe (Ui.descHeading 2), Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (nameOf row))
+        , Ui.el [ Ui.describe (Ui.descHeading 2), Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (shownLabel (nameOf row))
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (Index.shortHash bodyHash))
@@ -565,14 +566,14 @@ unverifiedText why =
             "Not counted: the log's chain breaks before this row"
 
 
-nameOf : Queue.HistoryRow -> SafeText
+nameOf : Queue.HistoryRow -> List LabelPiece
 nameOf row =
     case row.name of
         Just n ->
-            n
+            [ IndexedLabel n ]
 
         Nothing ->
-            SafeText.renderForeign (Uid.toString (Queue.entryUid row.entry))
+            [ ToolText (SafeText.renderForeign (Uid.toString (Queue.entryUid row.entry))) ]
 
 
 -- The unit page shows the source of one unit with its resolved links —
@@ -627,12 +628,12 @@ unitPageCard standing loaded =
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
             [ sectionHeading (labelEl 14 (Queue.unitLabel Named unit))
-            , chip unit.facing
+            , labelChip unit.facing
             ]
         , unitStanding (Queue.standingFor unit standing)
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
-            (safeText (unitLocation unit))
+            (shownLabel (unitLocation unit))
         , referencesRow loaded.links
         , sourceBlock loaded
         ]
@@ -813,7 +814,7 @@ unitCard controls queueState selectedView label q =
             , changeBadge q.change
             , standingBadge q.standing
             , changedChip q
-            , chip unit.facing
+            , labelChip unit.facing
             , Ui.el [ Ui.width Ui.fill ] Ui.none
             , case loaded of
                 Just v ->
@@ -824,7 +825,7 @@ unitCard controls queueState selectedView label q =
             ]
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
-            (safeText (SafeText.concat [ unitLocation unit, maybePurpose unit ]))
+            (shownLabel (unitLocation unit ++ maybePurpose unit))
         , changedLine q
         , case loaded of
             Just v ->
@@ -862,8 +863,8 @@ labelEl : Int -> UnitLabel -> Ui.Element Msg
 labelEl size label =
     Ui.row
         [ Ui.spacing 6, Ui.centerY ]
-        ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (safeText label.kind)
-        , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText label.name)
+        ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (shownLabel [ IndexedLabel label.kind ])
+        , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (shownLabel [ IndexedLabel label.name ])
         ]
             ++ placeEls size label.place
         )
@@ -879,39 +880,42 @@ placeEls size place =
             [ placeEl size (placeText path line) ]
 
         AtUnit path line uid ->
-            [ placeEl size (SafeText.concat [ placeText path line, SafeText.literal " · ", SafeText.renderForeign (Uid.toString uid) ]) ]
+            [ placeEl size (placeText path line ++ [ ToolText (SafeText.literal " · "), ToolText (SafeText.renderForeign (Uid.toString uid)) ]) ]
 
 
-placeEl : Int -> SafeText -> Ui.Element Msg
-placeEl size text =
-    Ui.el [ Font.size size, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ] (safeText text)
+placeEl : Int -> List LabelPiece -> Ui.Element Msg
+placeEl size pieces =
+    Ui.el [ Font.size size, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ] (shownLabel pieces)
 
 
-placeText : SafeText -> Int -> SafeText
+placeText : Label -> Int -> List LabelPiece
 placeText path line =
-    SafeText.concat [ path, SafeText.literal (":" ++ String.fromInt line) ]
+    [ IndexedLabel path, ToolText (SafeText.literal (":" ++ String.fromInt line)) ]
 
 
--- `path · lines a-b`, from the unit's rendered path.
-unitLocation : Index.Unit -> SafeText
+-- `path · lines a-b`, from the unit's path label.
+unitLocation : Index.Unit -> List LabelPiece
 unitLocation unit =
-    SafeText.concat
-        [ unit.path
-        , SafeText.literal " · lines "
-        , SafeText.render (String.fromInt unit.lineStart)
-        , SafeText.literal "-"
-        , SafeText.render (String.fromInt unit.lineEnd)
-        ]
+    [ IndexedLabel unit.path
+    , ToolText
+        (SafeText.concat
+            [ SafeText.literal " · lines "
+            , SafeText.render (String.fromInt unit.lineStart)
+            , SafeText.literal "-"
+            , SafeText.render (String.fromInt unit.lineEnd)
+            ]
+        )
+    ]
 
 
-maybePurpose : Index.Unit -> SafeText
+maybePurpose : Index.Unit -> List LabelPiece
 maybePurpose unit =
     case unit.purpose of
         Just p ->
-            SafeText.concat [ SafeText.literal " · purpose ", p ]
+            [ ToolText (SafeText.literal " · purpose "), IndexedLabel p ]
 
         Nothing ->
-            SafeText.literal ""
+            []
 
 
 changeBadge : Index.Change -> Ui.Element Msg
@@ -985,6 +989,49 @@ segmentHtml seg =
             Html.span [ Attr.attribute "data-review-escape" "true", Attr.style escapeCss ] [ Html.text (SafeText.escapeSpelling c) ]
 
 
+-- One piece of a drawn label: a label parsed from an index column, or text
+-- the tool wrote around it.
+type LabelPiece
+    = IndexedLabel Label
+    | ToolText SafeText
+
+
+-- The one sink for index labels: like `safeText`, it draws in byte order and
+-- marks every escape run, and it marks a truncation marker with `cutCss`, so
+-- no label text can pass for a marker the tool wrote.
+shownLabel : List LabelPiece -> Ui.Element msg
+shownLabel pieces =
+    Ui.html (labelHtml pieces)
+
+
+labelHtml : List LabelPiece -> Html.Html msg
+labelHtml pieces =
+    Html.span [ Attr.style displayOrderCss ] (List.concatMap shownHtml pieces)
+
+
+shownHtml : LabelPiece -> List (Html.Html msg)
+shownHtml piece =
+    case piece of
+        IndexedLabel label ->
+            List.map labelPartHtml (Label.parts label)
+
+        ToolText text ->
+            List.map segmentHtml (SafeText.segments text)
+
+
+labelPartHtml : LabelPart -> Html.Html msg
+labelPartHtml part =
+    case part of
+        LabelText s ->
+            Html.text s
+
+        LabelEscapes s ->
+            Html.span [ Attr.attribute "data-review-escape" "true", Attr.style escapeCss ] [ Html.text s ]
+
+        LabelCut dropped hash ->
+            Html.span [ Attr.attribute "data-review-cut" "true", Attr.style cutCss ] [ Html.text (Label.markerText dropped hash) ]
+
+
 -- The CSS every untrusted-text element carries: its characters are drawn in
 -- byte (logical) order, so strong right-to-left letters cannot reorder the
 -- neutral characters around them, and two right-to-left name segments around
@@ -1001,13 +1048,30 @@ escapeCss =
     "background-color:#4a3410;border:1px solid #c98a2b;border-radius:2px;color:#ffd27a"
 
 
+-- The CSS of a truncation marker the tool wrote: a dashed, dimmed box that
+-- neither label text nor an escape draws like.
+cutCss : String
+cutCss =
+    "border:1px dashed #8a8aa0;border-radius:2px;color:#b4b4c8;font-style:italic"
+
+
 chip : SafeText -> Ui.Element Msg
 chip label =
     chipColored label (Ui.rgb 40 40 52)
 
 
+labelChip : Label -> Ui.Element Msg
+labelChip label =
+    chipAround (Ui.rgb 40 40 52) (shownLabel [ IndexedLabel label ])
+
+
 chipColored : SafeText -> Ui.Color -> Ui.Element Msg
 chipColored label bg =
+    chipAround bg (safeText label)
+
+
+chipAround : Ui.Color -> Ui.Element Msg -> Ui.Element Msg
+chipAround bg content =
     Ui.el
         [ Ui.paddingXY 8 3
         , Background.color bg
@@ -1016,7 +1080,7 @@ chipColored label bg =
         , Font.bold
         , Font.color (Ui.rgb 220 220 230)
         ]
-        (safeText label)
+        content
 
 
 -- Approve and Refuse exist only for a verified view on a server that signs
