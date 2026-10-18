@@ -8,14 +8,17 @@
 //! tree (on Windows, any reparse point) refuses the whole read, so no link has
 //! a representation in the snapshot. A module path is the exact listed
 //! spelling of its file, so a name that differs from an import only in case
-//! never satisfies it. The stdlib closure is injected and the FFI catalog
-//! prepared exactly once, over the text read here; every consumer then sees
-//! these bytes and no others.
+//! never satisfies it. The FFI catalog is read once, through the cache
+//! directory the root holds open, never by a path; every consumer then sees
+//! these bytes and that catalog and no others.
 //!
 //! The build sees `src/` and what it injects, never `tests/`: the stdlib
 //! closure and the FFI preparation run over `src/` alone, so no byte under
 //! `tests/` can add, mask or refuse a module of the build. Every `tests/`
 //! module is read, bounded and link-checked with the rest, and held apart.
+//! A test program compiles in its own universe ([`SourceSnapshot::test_view`]):
+//! a separate value built from the same text and the same catalog, never
+//! merged into the build's modules.
 
 #![cfg_attr(
     not(test),
@@ -34,7 +37,7 @@ use ipe_fs_open::{ByteCap, EntryCap, EntryName, FileKind};
 
 use crate::CliError;
 use crate::api_surface::ModulePath;
-use crate::ffi::{FfiPrep, prepare_ffi};
+use crate::ffi::{Catalog, FfiPrep, load_catalog, prepare};
 use crate::io_bounded::{self, SourceRefusal};
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::held::HeldDir;
@@ -171,6 +174,7 @@ pub struct SourceSnapshot {
     modules: BTreeMap<ModulePath, SnapshotModule>,
     tests: BTreeMap<ModulePath, SnapshotModule>,
     ffi: FfiPrep,
+    catalog: Catalog,
 }
 
 impl SourceSnapshot {
@@ -180,8 +184,9 @@ impl SourceSnapshot {
     /// modules are those of `src/` with the stdlib closure and the FFI
     /// interfaces they reach; `tests/` modules are held apart
     /// ([`SourceSnapshot::tests`]), so a `tests/` module never masks, adds
-    /// or refuses one of the build. The FFI catalog is found from the
-    /// project directory.
+    /// or refuses one of the build. The FFI catalog is read once through
+    /// the root's held cache directory ([`ProjectRoot::cache_dir`]) and
+    /// kept, so a test view prepares over the same catalog.
     ///
     /// # Errors
     /// [`CliError::SymlinkInSource`] for a link (on Windows, any reparse
@@ -192,7 +197,7 @@ impl SourceSnapshot {
     /// naming a Windows device; [`CliError::SourceRefused`] for a module file
     /// that is not a regular file or may not be read; [`CliError::Io`] for
     /// text that is not UTF-8 or another failure; every refusal of
-    /// [`prepare_ffi`].
+    /// [`ProjectRoot::cache_dir`], [`load_catalog`] and [`prepare`].
     pub fn read(root: &ProjectRoot, limits: Limits) -> Result<Self, CliError> {
         let mut walk = Walk::new(limits);
         walk.tree(root.src(), SourceDir::Src)?;
@@ -200,33 +205,16 @@ impl SourceSnapshot {
             walk.tree(tests, SourceDir::Tests)?;
         }
         let Walk {
-            src: mut sources,
+            src: sources,
             tests,
             ..
         } = walk;
-        let own: BTreeSet<ModulePath> = sources.keys().cloned().collect();
-        // Injection and preparation each insert only keys absent from
-        // `sources` and record what they inserted; a module's origin is the
-        // record that holds it, the walk's first.
-        let stdlib = inject_compiled_std_closure(&mut sources, &mut Vec::new());
-        let ffi = prepare_ffi(&mut sources, root.path())?;
-        let modules = sources
-            .into_iter()
-            .filter_map(|(module, (path, text))| {
-                let origin = if own.contains(&module) {
-                    SourceOrigin::Own(SourceDir::Src)
-                } else if stdlib.contains(&module) {
-                    SourceOrigin::Stdlib
-                } else if ffi.injected.contains(&module) {
-                    SourceOrigin::FfiInterface
-                } else {
-                    // Text no step recorded inserting earns no origin and is
-                    // never compiled: an import of it resolves to nothing.
-                    return None;
-                };
-                Some((module, SnapshotModule::new(origin, path, text)))
-            })
+        let own = sources
+            .keys()
+            .map(|module| (module.clone(), SourceDir::Src))
             .collect();
+        let catalog = load_catalog(root.cache_dir()?.as_ref())?;
+        let (modules, ffi) = universe(sources, &own, &catalog)?;
         let tests = tests
             .into_iter()
             .map(|(module, (path, text))| {
@@ -237,6 +225,56 @@ impl SourceSnapshot {
         Ok(Self {
             modules,
             tests,
+            ffi,
+            catalog,
+        })
+    }
+
+    /// The `tests/` module `module` as the entry of a test program, when the snapshot holds it.
+    #[must_use]
+    pub fn test_entry(&self, module: &[String]) -> Option<TestEntry<'_>> {
+        self.tests
+            .get_key_value(module)
+            .map(|(module, held)| TestEntry {
+                snapshot: self,
+                module,
+                held,
+            })
+    }
+
+    /// The universe the test program `entry` compiles in, separate from the build's modules.
+    ///
+    /// Its project modules are, first admitted wins: the entry, then every
+    /// `src/` module, then every other `tests/` module. So the entry masks
+    /// a `src/` module of its path, and a `src/` module masks any other
+    /// `tests/` module of its path. The stdlib closure and the FFI
+    /// preparation run again over that universe, with the catalog this
+    /// snapshot read: nothing is read from disk.
+    ///
+    /// # Errors
+    /// Every refusal of [`prepare`] over the test universe, such as an
+    /// asserted call into a crate the catalog does not install.
+    pub fn test_view(entry: TestEntry<'_>) -> Result<TestView, CliError> {
+        let TestEntry {
+            snapshot,
+            module: entry,
+            held: entry_held,
+        } = entry;
+        let mut own = BTreeMap::new();
+        let mut sources = ModuleSources::new();
+        admit(&mut own, &mut sources, entry, entry_held, SourceDir::Tests);
+        for (module, held) in &snapshot.modules {
+            if held.origin == SourceOrigin::Own(SourceDir::Src) {
+                admit(&mut own, &mut sources, module, held, SourceDir::Src);
+            }
+        }
+        for (module, held) in &snapshot.tests {
+            admit(&mut own, &mut sources, module, held, SourceDir::Tests);
+        }
+        let (modules, ffi) = universe(sources, &own, &snapshot.catalog)?;
+        Ok(TestView {
+            entry: entry.clone(),
+            modules,
             ffi,
         })
     }
@@ -264,6 +302,120 @@ impl SourceSnapshot {
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
     }
+}
+
+/// A `tests/` module of one snapshot, named as a test program's entry.
+///
+/// Fields are private: [`SourceSnapshot::test_entry`] is the only mint, so
+/// an entry is always a `tests/` module of the snapshot it is viewed in.
+#[derive(Debug, Clone, Copy)]
+pub struct TestEntry<'s> {
+    snapshot: &'s SourceSnapshot,
+    module: &'s ModulePath,
+    held: &'s SnapshotModule,
+}
+
+impl TestEntry<'_> {
+    /// The entry's module path.
+    #[must_use]
+    pub const fn module(&self) -> &ModulePath {
+        self.module
+    }
+}
+
+/// Every module one test program sees: its own universe, never the build's.
+///
+/// Fields are private: [`SourceSnapshot::test_view`] is the only mint.
+pub struct TestView {
+    entry: ModulePath,
+    modules: BTreeMap<ModulePath, SnapshotModule>,
+    ffi: FfiPrep,
+}
+
+impl TestView {
+    /// The test program's entry module.
+    #[must_use]
+    pub const fn entry(&self) -> &ModulePath {
+        &self.entry
+    }
+
+    /// Every module the test program sees, keyed by module path.
+    #[must_use]
+    pub const fn modules(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
+        &self.modules
+    }
+
+    /// The module `module`, when the test universe holds it.
+    #[must_use]
+    pub fn module(&self, module: &[String]) -> Option<&SnapshotModule> {
+        self.modules.get(module)
+    }
+
+    /// The FFI preparation made over the test universe.
+    #[must_use]
+    pub const fn ffi(&self) -> &FfiPrep {
+        &self.ffi
+    }
+}
+
+impl std::fmt::Debug for TestView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestView")
+            .field("entry", &self.entry)
+            .field("modules", &self.modules)
+            .field("ffi_injected", &self.ffi.injected)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Add `held` to a universe's project modules under `dir`, unless a module of its path is already in.
+fn admit(
+    own: &mut BTreeMap<ModulePath, SourceDir>,
+    sources: &mut ModuleSources,
+    module: &ModulePath,
+    held: &SnapshotModule,
+    dir: SourceDir,
+) {
+    if let std::collections::btree_map::Entry::Vacant(slot) = own.entry(module.clone()) {
+        slot.insert(dir);
+        sources.insert(
+            module.clone(),
+            (held.path().to_path_buf(), held.text().to_owned()),
+        );
+    }
+}
+
+/// Inject the stdlib closure into `sources` and prepare FFI over `catalog`, giving each module its origin.
+///
+/// `own` names the directory of every project module of `sources`.
+/// Injection and preparation each insert only keys absent from `sources`
+/// and record what they inserted; a module's origin is the record that
+/// holds it, the project's first.
+fn universe(
+    mut sources: ModuleSources,
+    own: &BTreeMap<ModulePath, SourceDir>,
+    catalog: &Catalog,
+) -> Result<(BTreeMap<ModulePath, SnapshotModule>, FfiPrep), CliError> {
+    let stdlib = inject_compiled_std_closure(&mut sources, &mut Vec::new());
+    let ffi = prepare(&mut sources, catalog)?;
+    let modules = sources
+        .into_iter()
+        .filter_map(|(module, (path, text))| {
+            let origin = if let Some(dir) = own.get(&module) {
+                SourceOrigin::Own(*dir)
+            } else if stdlib.contains(&module) {
+                SourceOrigin::Stdlib
+            } else if ffi.injected.contains(&module) {
+                SourceOrigin::FfiInterface
+            } else {
+                // Text no step recorded inserting earns no origin and is
+                // never compiled: an import of it resolves to nothing.
+                return None;
+            };
+            Some((module, SnapshotModule::new(origin, path, text)))
+        })
+        .collect();
+    Ok((modules, ffi))
 }
 
 /// A hook run between listing a module file and reading it, so a test can swap the entry.
@@ -651,6 +803,41 @@ mod tests {
 
     fn is_limit_refusal(result: &Result<SourceSnapshot, CliError>) -> bool {
         matches!(result, Err(CliError::DiscoveryLimitReached { .. }))
+    }
+
+    /// A module `name` whose one definition is an asserted call into the crate `tm`.
+    fn asserted_module(name: &str) -> String {
+        format!(
+            "module {name} exposing (shifted)\nimport Rust.Ffi\n\n\
+             shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n"
+        )
+    }
+
+    /// The test view of the `tests/` module `entry`.
+    fn test_view(snapshot: &SourceSnapshot, entry: &str) -> Result<TestView, CliError> {
+        let entry = snapshot.test_entry(&path(entry)).expect("a tests/ module");
+        SourceSnapshot::test_view(entry)
+    }
+
+    /// The text and origin of `module` in `view`.
+    fn seen<'v>(view: &'v TestView, module: &str) -> Option<(&'v str, SourceOrigin)> {
+        view.module(&path(module))
+            .map(|held| (held.text(), held.origin()))
+    }
+
+    /// Install the crate `slug` in the FFI cache of the project at `project`.
+    fn install_crate(project: &Path, slug: &str) {
+        let cache = ipe_ffi::driver::FfiCache::at_project_root(project);
+        let inspection = format!(
+            r#"{{"pkg":"{slug}","name":"{slug}","version":"0.1.0","functions":[{{"name":"shift","params":[{{"name":"n","type":"i64"}}],"results":[{{"name":"","type":"i64"}}],"effect":"pure"}}],"constants":[],"errors":[],"transitiveDeps":[{{"ident":"{slug}","name":"{slug}","version":"0.1.0"}}]}}"#
+        );
+        let installed = ipe_ffi::driver::install_from_inspection(&cache, &inspection);
+        assert!(installed.is_ok(), "install {slug}: {installed:?}");
+    }
+
+    /// The slugs of the crates `prep` was prepared over.
+    fn slugs(prep: &FfiPrep) -> Vec<&str> {
+        prep.catalog.iter().map(|c| c.slug.as_str()).collect()
     }
 
     /// Every own module is read once, with its exact text and directory.
@@ -1049,20 +1236,15 @@ mod tests {
     /// An asserted native call under `tests/` never reaches the build's FFI preparation.
     #[test]
     fn tests_asserted_call_never_reaches_the_build_ffi() {
-        let asserted = |name: &str| {
-            format!(
-                "module {name} exposing (shifted)\nimport Rust.Ffi\n\n\
-                 shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n"
-            )
-        };
-        let in_tests = resolve(&SourceTree::main(MAIN).test_module("Shift", &asserted("Shift")));
+        let in_tests =
+            resolve(&SourceTree::main(MAIN).test_module("Shift", &asserted_module("Shift")));
         let snapshot = read(&in_tests, Limits::DEFAULT).expect("tests/ never reaches FFI");
         assert!(snapshot.ffi().injected.is_empty());
         assert!(snapshot.ffi().emit.is_none());
         assert!(snapshot.tests().contains_key(&path("Shift")));
         // The control: the same module under `src/` is scanned, and its call
         // into a crate no catalog installs is refused.
-        let in_src = resolve(&SourceTree::main(MAIN).module("Shift", &asserted("Shift")));
+        let in_src = resolve(&SourceTree::main(MAIN).module("Shift", &asserted_module("Shift")));
         assert!(matches!(
             read(&in_src, Limits::DEFAULT),
             Err(CliError::FfiPrep(_))
@@ -1158,5 +1340,154 @@ mod tests {
         let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
         let result = ModuleSet::of(scratch.root().entries(), &snapshot);
         assert!(matches!(&result, Err(CliError::EntryMissing { entry }) if entry == "Main.ipe"));
+    }
+
+    /// A `tests/Main.ipe` with a planted error is the test entry, never the `src/Main.ipe` of its path.
+    #[test]
+    fn test_view_entry_is_the_tests_module_with_its_planted_error() {
+        let planted = "module Main exposing (main)\n\nmain =\n    notDefinedAnywhere\n";
+        let scratch = resolve(&SourceTree::main(MAIN).test_module("Main", planted));
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
+        let view = test_view(&snapshot, "Main").expect("the test view");
+        assert_eq!(view.entry(), &path("Main"));
+        let entry = view.module(&path("Main")).expect("the entry");
+        assert_eq!(entry.text(), planted);
+        assert_eq!(entry.origin(), SourceOrigin::Own(SourceDir::Tests));
+        assert_eq!(
+            entry.path(),
+            scratch.root().path().join("tests").join("Main.ipe")
+        );
+        // The build view is a separate value: its `Main` stays the `src/` text.
+        assert_eq!(
+            snapshot.module(&path("Main")).map(SnapshotModule::text),
+            Some(MAIN)
+        );
+        assert!(format!("{view:?}").contains("Main"));
+    }
+
+    /// Only a `tests/` module names a test entry.
+    #[test]
+    fn test_entry_is_only_a_tests_module() {
+        let util = module_source("Util", &[]);
+        let scratch = resolve(
+            &SourceTree::main(MAIN)
+                .module("Util", &util)
+                .test_module("UtilSpec", &module_source("UtilSpec", &["Util"])),
+        );
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
+        assert!(snapshot.test_entry(&path("Util")).is_none());
+        assert!(snapshot.test_entry(&path("Main")).is_none());
+        let entry = snapshot
+            .test_entry(&path("UtilSpec"))
+            .expect("a tests/ module");
+        assert_eq!(entry.module(), &path("UtilSpec"));
+    }
+
+    /// An asserted call into an uninstalled crate under `tests/` refuses its test view, never the build.
+    #[test]
+    fn tests_asserted_call_refuses_the_test_view_not_the_build() {
+        let scratch =
+            resolve(&SourceTree::main(MAIN).test_module("Shift", &asserted_module("Shift")));
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("the build reads");
+        assert!(snapshot.modules().contains_key(&path("Main")));
+        assert!(snapshot.ffi().injected.is_empty());
+        assert!(matches!(
+            test_view(&snapshot, "Shift"),
+            Err(CliError::FfiPrep(_))
+        ));
+        // The control: a test entry with no asserted call prepares cleanly.
+        let clean =
+            resolve(&SourceTree::main(MAIN).test_module("Plain", &module_source("Plain", &[])));
+        let snapshot = read(&clean, Limits::DEFAULT).expect("read");
+        assert!(test_view(&snapshot, "Plain").is_ok());
+    }
+
+    /// The test entry masks a `src/` module of its path; a `src/` module masks any other `tests/` module.
+    #[test]
+    fn test_view_entry_wins_and_src_masks_other_tests_modules() {
+        let util = module_source("Util", &[]);
+        let spec = "module Main exposing (main)\n\nimport Util\nimport Helper\n\nmain =\n    2\n";
+        let helper = module_source("Helper", &[]);
+        let scratch = resolve(
+            &SourceTree::main(MAIN)
+                .module("Util", &util)
+                .test_module("Main", spec)
+                .test_module("Util", "not ipe at all")
+                .test_module("Helper", &helper),
+        );
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
+        let view = test_view(&snapshot, "Main").expect("the test view");
+        assert_eq!(
+            seen(&view, "Main"),
+            Some((spec, SourceOrigin::Own(SourceDir::Tests)))
+        );
+        assert_eq!(
+            seen(&view, "Util"),
+            Some((util.as_str(), SourceOrigin::Own(SourceDir::Src)))
+        );
+        assert_eq!(
+            seen(&view, "Helper"),
+            Some((helper.as_str(), SourceOrigin::Own(SourceDir::Tests)))
+        );
+        // The build view is unchanged by the test view.
+        assert_eq!(
+            snapshot.module(&path("Main")).map(SnapshotModule::text),
+            Some(MAIN)
+        );
+        assert!(snapshot.module(&path("Helper")).is_none());
+    }
+
+    /// The stdlib closure is injected again over the test universe, never into the build.
+    #[test]
+    fn test_view_injects_the_stdlib_its_modules_import() {
+        let spec = module_source("MainSpec", &["Ipe.Palette"]);
+        let scratch = resolve(&SourceTree::main(MAIN).test_module("MainSpec", &spec));
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read");
+        let view = test_view(&snapshot, "MainSpec").expect("the test view");
+        assert_eq!(
+            view.module(&path("Ipe.Palette"))
+                .map(SnapshotModule::origin),
+            Some(SourceOrigin::Stdlib)
+        );
+        assert!(snapshot.module(&path("Ipe.Palette")).is_none());
+    }
+
+    /// A cache planted at the project's old path after resolution is never the snapshot's catalog.
+    ///
+    /// The project directory is renamed away after resolution and a
+    /// project with a foreign crate installed takes its path. The snapshot
+    /// and its test view read the crate of the cache the root holds; the
+    /// control reads the planted crate by path, so the swap is live.
+    #[cfg(unix)]
+    #[test]
+    fn cache_planted_at_the_old_path_is_never_read() {
+        let base = crate::scratch::ScratchDir::new("ipe-snapshot-cache").expect("scratch base");
+        let scratch = SourceTree::main(MAIN)
+            .test_module("Spec", &module_source("Spec", &[]))
+            .resolve_under(base.path())
+            .expect("resolve the tree");
+        let project = scratch.root().path().to_path_buf();
+        install_crate(&project, "tm");
+        let moved = base.path().join("moved");
+        std::fs::rename(&project, &moved).expect("rename the project away");
+        std::fs::create_dir(&project).expect("plant a project at the old path");
+        install_crate(&project, "planted");
+        let snapshot = read(&scratch, Limits::DEFAULT).expect("read through the held root");
+        assert_eq!(slugs(snapshot.ffi()), ["tm"]);
+        assert_eq!(
+            snapshot
+                .catalog
+                .crates()
+                .iter()
+                .map(|c| c.slug.as_str())
+                .collect::<Vec<_>>(),
+            ["tm"]
+        );
+        let view = test_view(&snapshot, "Spec").expect("the test view");
+        assert_eq!(slugs(view.ffi()), ["tm"]);
+        // The control: the by-path search finds the planted crate.
+        let by_path =
+            crate::ffi::prepare_ffi(&mut ModuleSources::new(), &project).expect("by path");
+        assert_eq!(slugs(&by_path), ["planted"]);
     }
 }

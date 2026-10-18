@@ -332,7 +332,7 @@ pub fn find_cache_root(start: &Path) -> Result<Option<TrustedCache>, CliError> {
 /// tampered or half-written cache is refused, never silently skipped), or
 /// refusing a cache entry that fails the owner rule.
 pub fn load_catalog_for(blame_path: &Path) -> Result<Vec<InstalledCrate>, CliError> {
-    load_located_catalog(blame_path).map(|(catalog, _)| catalog)
+    load_located_catalog(blame_path).map(|catalog| catalog.crates)
 }
 
 /// Whether a build can link Rust FFI: an installed crate catalog makes its
@@ -357,17 +357,56 @@ pub fn project_ffi_presence(blame_path: &Path) -> Result<FfiPresence, CliError> 
     })
 }
 
-/// The catalog for `blame_path` with the path of the cache it was read from
-/// (empty when no cache exists), from one discovery walk.
+/// The catalog of the cache one discovery walk up from `blame_path` finds.
+///
+/// Empty when no cache exists.
 ///
 /// # Errors
 /// As [`load_catalog_for`].
-fn load_located_catalog(blame_path: &Path) -> Result<(Vec<InstalledCrate>, PathBuf), CliError> {
-    let Some(cache) = find_cache_root(blame_path)? else {
-        return Ok((Vec::new(), PathBuf::new()));
+fn load_located_catalog(blame_path: &Path) -> Result<Catalog, CliError> {
+    load_catalog(find_cache_root(blame_path)?.as_ref())
+}
+
+/// The installed-crate catalog of one build, read once through a held cache directory.
+///
+/// Fields are private: [`load_catalog`] is the only mint, so a catalog is
+/// always the content of a cache directory held open after its owner check,
+/// and preparing over it never opens the cache again.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    crates: Vec<InstalledCrate>,
+    /// Where the cache was found: the reported directory of injected
+    /// interface modules, never opened.
+    hint: PathBuf,
+}
+
+impl Catalog {
+    /// The installed crates, as read.
+    #[must_use]
+    pub fn crates(&self) -> &[InstalledCrate] {
+        &self.crates
+    }
+}
+
+/// Read the catalog of the held cache `cache`; no cache reads as an empty catalog.
+///
+/// Every catalog read goes through here, from the handle the owner check
+/// opened: the cache is never found again by its path.
+///
+/// # Errors
+/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
+/// tampered or half-written cache is refused, never silently skipped).
+pub fn load_catalog(cache: Option<&TrustedCache>) -> Result<Catalog, CliError> {
+    let Some(cache) = cache else {
+        return Ok(Catalog {
+            crates: Vec::new(),
+            hint: PathBuf::new(),
+        });
     };
-    let catalog = ipe_ffi::driver::load_catalog_from(&cache)?;
-    Ok((catalog, cache.path().to_path_buf()))
+    Ok(Catalog {
+        crates: ipe_ffi::driver::load_catalog_from(cache)?,
+        hint: cache.path().to_path_buf(),
+    })
 }
 
 /// Inject each installed crate's interface module into the build's source
@@ -999,29 +1038,38 @@ pub struct FfiPrep {
     pub emit: Option<ipe_backend_rust::FfiEmit>,
 }
 
-/// Load, inject, and assemble the FFI catalog for a project in one step.
-///
-/// This is the shared seam used by `run_build`, `ipe dev watch`, and `ipe lsp` so
-/// all three compilation paths go through the SAME catalog-load → interface-
-/// inject → emit-assemble sequence. Each caller was previously duplicating
-/// these steps independently, or (in `watch`/`lsp`) skipping them entirely —
-/// both are bugs (CO-INCR-005).
+/// Load the catalog found up from `blame_path`, then [`prepare`] `sources` over it.
 ///
 /// `blame_path` is the project entry file or manifest: the catalog search
 /// walks up from it looking for `.ipe/cache/ffi/rust`.
 ///
-/// `sources` is mutated in-place: one `Rust.<Crate>` interface module is
-/// inserted per installed crate.
-///
 /// # Errors
-/// [`CliError`] when the catalog is tampered/unreadable, two installed
-/// crates pin the same dependency to conflicting version lines, or emitted
-/// code names a dependency the manifest leaves out.
+/// As [`load_catalog_for`] and [`prepare`].
 pub fn prepare_ffi(
     sources: &mut BTreeMap<Vec<String>, (PathBuf, String)>,
     blame_path: &Path,
 ) -> Result<FfiPrep, CliError> {
-    let (mut catalog, cache_hint) = load_located_catalog(blame_path)?;
+    prepare(sources, &load_located_catalog(blame_path)?)
+}
+
+/// Inject and assemble the FFI seam of `sources` over `catalog`.
+///
+/// The one seam every compilation path (build, `ipe dev watch`, `ipe lsp`)
+/// goes through: reserved-name check, nominal unification, asserted-call
+/// scan, interface injection and emit assembly, in that order. `sources`
+/// is mutated in place: one `Rust.<Crate>` interface module is inserted per
+/// installed crate. The cache is never opened here.
+///
+/// # Errors
+/// [`CliError`] when an installed crate claims a reserved name, two
+/// installed crates pin the same dependency to conflicting version lines, or
+/// emitted code names a dependency the manifest leaves out.
+pub fn prepare(
+    sources: &mut BTreeMap<Vec<String>, (PathBuf, String)>,
+    catalog: &Catalog,
+) -> Result<FfiPrep, CliError> {
+    let cache_hint = catalog.hint.as_path();
+    let mut catalog = catalog.crates.clone();
     // The asserted-call classifications lean on two unforgeable names: the
     // `Rust.Ffi` module and the `ipe_asserted_` wrapper prefix. No installed
     // crate may claim either — refused at load, before anything is injected.
@@ -1053,7 +1101,7 @@ pub fn prepare_ffi(
     // Scan for asserted calls BEFORE interface injection, while `sources`
     // holds only project (and stdlib) modules.
     let ScannedFfi { asserted, consts } = scan_asserted(sources, &catalog)?;
-    let mut injected = inject_interfaces(sources, &catalog, &cache_hint)?;
+    let mut injected = inject_interfaces(sources, &catalog, cache_hint)?;
     let mut assembled = assemble_emit(&catalog)?;
     if !asserted.is_empty() || !consts.is_empty() {
         let mod_path: Vec<String> = ipe_canon::asserted::ASSERTED_MODULE
@@ -6330,9 +6378,11 @@ version = \"1\"
     /// Prep functions the reach walk must find from [`FFI_PREP_ENTRY`]: a walk
     /// that loses one (a rename, a parse that stopped early) goes red instead
     /// of passing over less code.
-    const FFI_PREP_REACHED: [&str; 11] = [
+    const FFI_PREP_REACHED: [&str; 13] = [
         "prepare_ffi",
         "load_located_catalog",
+        "load_catalog",
+        "prepare",
         "scan_asserted",
         "asserted_refused",
         "inject_interfaces",
