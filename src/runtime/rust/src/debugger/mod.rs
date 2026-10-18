@@ -1613,13 +1613,14 @@ mod tests {
             let mut live = model(0);
             let mut buf = Buf::measured(live.clone(), cap);
             let mut built = (visits().0 - start.0, visits().1 - start.1);
+            let mut previous = buf.retained_bytes();
             for i in 0..RECORDS {
+                // Step `i` carries `i` bytes of text in its message and its
+                // model, and so does the base advanced over it: a mark that
+                // kept another value's measure differs from the fresh walk.
+                let len = usize::try_from(i).expect("a step index fits a usize");
                 let pre = visits();
-                push(
-                    &mut buf,
-                    &mut live,
-                    TestMsg::Add(i64::try_from(i).expect("a step index fits an i64")),
-                );
+                push(&mut buf, &mut live, TestMsg::Text("x".repeat(len)));
                 let post = visits();
                 built = (built.0 + post.0 - pre.0, built.1 + post.1 - pre.1);
 
@@ -1630,7 +1631,12 @@ mod tests {
                     "record {i}: a charge must read the marks, never walk the values"
                 );
                 assert!(charged.is_some(), "record {i}: every step is measurable");
+                assert_ne!(
+                    charged, previous,
+                    "record {i}: each state measures differently"
+                );
                 assert_eq!(charged, buf.measured_fresh(), "record {i}");
+                previous = charged;
             }
             assert_eq!(
                 built.0, RECORDS,
@@ -1683,9 +1689,16 @@ mod tests {
             );
             assert!(agrees(&buf));
 
-            buf.reset_to_init(model(7));
+            // The new base differs in size from the advanced one it replaces,
+            // so a base left with its old mark disagrees with the fresh walk.
+            let advanced = buf.measured_fresh();
+            buf.reset_to_init(TestModel {
+                text: "y".repeat(100),
+                ..model(7)
+            });
             assert!(buf.is_empty());
             assert!(buf.retained_bytes().is_some());
+            assert_ne!(buf.measured_fresh(), advanced, "reset_to_init");
             assert!(agrees(&buf), "reset_to_init");
         }
 
