@@ -347,9 +347,8 @@ impl<M: RetainedBytes> Rendered<M> {
         view: Option<Bytes>,
         index: impl Fn(&RetainedRender<M>) -> Option<Bytes>,
     ) -> Option<Bytes> {
-        let spare = self.history.capacity().checked_sub(self.history.len())?;
         let base = Bytes::inline::<Self>()?
-            .checked_add(Bytes::slots::<RetainedRender<M>>(spare)?)?
+            .checked_add(crate::retained::deque_frame(&self.history)?)?
             .checked_add(view?)?;
         self.history.iter().try_fold(base, |acc, render| {
             acc.checked_add(Bytes::inline::<NonZeroU64>()?)?

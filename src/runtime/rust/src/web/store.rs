@@ -2008,7 +2008,10 @@ mod tests {
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
+            history: crate::debugger::RecordBuffer::measured(
+                (),
+                crate::debugger::DEFAULT_HISTORY_CAP,
+            ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
@@ -2202,7 +2205,7 @@ mod tests {
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new(
+            history: crate::debugger::RecordBuffer::measured(
                 model,
                 crate::debugger::DEFAULT_HISTORY_CAP,
             ),
@@ -3585,6 +3588,13 @@ mod tests {
         name: String,
     }
 
+    #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
+    impl crate::retained::RetainedBytes for OldModel {
+        fn retained_bytes(&self) -> Option<Bytes> {
+            Bytes::inline::<Self>()?.plus_count(self.name.capacity())
+        }
+    }
+
     // The NEW Model: the old two fields PLUS an appended `scroll` — a purely
     // additive change, so a returning OLD checkpoint must keep count/name and
     // fill scroll from init.
@@ -3634,12 +3644,14 @@ mod tests {
 
     // A SessionEntry for an arbitrary model, for the reconstruction tests.
     #[cfg(any(feature = "db", feature = "redis_store", feature = "web"))]
-    fn handle_model<M: Clone + Send + 'static>(model: M) -> SessionHandle<M, ()> {
+    fn handle_model<M: Clone + Send + crate::retained::RetainedBytes + 'static>(
+        model: M,
+    ) -> SessionHandle<M, ()> {
         let (tx, _rx) = channel::<()>(1);
         let tree: Html<()> = Html::HText(String::new());
         Arc::new(Mutex::new(SessionEntry {
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new(
+            history: crate::debugger::RecordBuffer::measured(
                 model.clone(),
                 crate::debugger::DEFAULT_HISTORY_CAP,
             ),
