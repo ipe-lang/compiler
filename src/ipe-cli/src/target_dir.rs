@@ -1617,13 +1617,19 @@ mod tests {
             }
         }
 
-        /// Set `path`'s mtime `age` before now.
+        /// Set `path`'s mtime `age` before now, for a file or a directory.
         fn age(path: &Path, age: std::time::Duration) {
             let then = std::time::SystemTime::now()
                 .checked_sub(age)
                 .expect("representable");
-            std::fs::OpenOptions::new()
-                .write(true)
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                options.write(true);
+                std::os::windows::fs::OpenOptionsExt::custom_flags(&mut options, 0x0200_0000);
+            }
+            options
                 .open(path)
                 .and_then(|file| file.set_modified(then))
                 .expect("set mtime");
@@ -1926,12 +1932,7 @@ mod tests {
             let root = user_cache_root(&base);
             let dir = root.join("scratch-lockless");
             std::fs::create_dir_all(&dir).expect("dir");
-            let then = std::time::SystemTime::now()
-                .checked_sub(OLD)
-                .expect("representable");
-            std::fs::File::open(&dir)
-                .and_then(|handle| handle.set_modified(then))
-                .expect("age the dir");
+            age(&dir, OLD);
             prune_if_stale_with(
                 &dir,
                 std::time::SystemTime::now(),

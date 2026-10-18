@@ -618,10 +618,10 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
     let out = project.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build(&project.join("Main.ipe"), &out, &runtime).map_err(|e| format!("{e:?}"))?;
-    let lib_rs = out.join("ipe_runtime_dep").join("src").join("lib.rs");
-    let mut source = std::fs::read_to_string(&lib_rs)?;
+    let mod_rs = out.join("ipe_runtime_dep").join("src").join("mod.rs");
+    let mut source = std::fs::read_to_string(&mod_rs)?;
     source.push_str("\n// edited by hand\n");
-    std::fs::write(&lib_rs, source)?;
+    std::fs::write(&mod_rs, source)?;
     std::fs::copy(target.join("ipe-test.Cargo.lock"), out.join("Cargo.lock"))?;
     let cargo = ipe_env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let hand = Command::new(&cargo)
@@ -637,6 +637,7 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
 
     let (ok, _, stderr) = run_captured(ipe_test_command(&project, &cache))?;
     let units = rlibs_of(&target, &lib)?;
+    let reused = std::fs::metadata(&unit)?.modified()?;
     let _ = std::fs::remove_dir_all(&project);
     let _ = std::fs::remove_dir_all(&cache);
     assert!(ok, "the second test run must pass, got stderr:\n{stderr}");
@@ -650,8 +651,7 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
         "the test runtime rlib must survive the out/ build, got {units:?}"
     );
     assert_eq!(
-        std::fs::metadata(&unit)?.modified()?,
-        built,
+        reused, built,
         "the second test run must reuse its own runtime rlib"
     );
     Ok(())
