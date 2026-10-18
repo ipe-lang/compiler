@@ -106,7 +106,10 @@ Checks performed
      `OFF_MAIN_EXPR`, a caching input absent, or an `if:` conjoining
      `github.ref == DEFAULT_BRANCH_REF`), or a subpath of a listed repo no
      row models, so every other ref restores `main`'s caches without
-     evicting them. Every workflow,
+     evicting them; and such a saving step, direct or through a local
+     composite, in a workflow with a trigger outside `CACHE_SAVE_TRIGGERS`
+     (there `github.ref` is the default branch while the run handles a pull
+     request's content). Every workflow,
      manifest, and local action is loaded through `strict_yaml` (see that
      module), so a duplicate mapping key, a `<<` merge key, an anchor/alias,
      or an explicit tag — each legal to a plain YAML loader but resolved
@@ -515,9 +518,10 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       a record no pin uses, a `SCRIPT_ACTIONS` or `CACHE_WRITERS` row naming
       an input its action does not declare, and a pinned action declaring an
       input whose folded name contains `cache` that no `CACHE_WRITERS` row
-      covers (an unmodelled cache writer).  LIMIT: a `run:` step saving
-      through the cache service, or an action that caches with no input
-      naming it, is not modelled.  Records are written only by the maintainer
+      covers, or one in neither `CACHE_WRITERS` nor `CACHE_FREE` (an
+      unmodelled cache writer).  LIMIT: a `CACHE_FREE` row is a reviewed
+      claim, not a proof; a `run:` step reaches the cache service only with
+      the runtime token an action exports to it.  Records are written only by the maintainer
       tool `python3 .github/ci/action_metadata.py --write`, which fetches
       the pinned objects and proves them with the same walk.
       LIMIT: the pinned commit is read from the repository's fork network,
@@ -5469,6 +5473,11 @@ class CacheWriter:
     inputs: tuple[tuple[str, str | None], ...] = ()
     main_if: bool = False
 
+    @property
+    def saves(self) -> bool:
+        """The row lets the step save on `main` (otherwise it saves nowhere)."""
+        return self.main_if or any(want in (MAIN_ONLY_EXPR, OFF_MAIN_EXPR) for _, want in self.inputs)
+
 
 # Every remote action that can save a cache, keyed by (`owner/repo`,
 # subpath) case-folded; subpath `""` is the action at the repo root and `"*"`
@@ -5491,20 +5500,52 @@ CACHE_WRITERS: dict[tuple[str, str], CacheWriter] = {
     ("actions/setup-node", "*"): CacheWriter("actions/setup-node", (("cache", None), ("package-manager-cache", "false"))),
     ("actions/setup-python", "*"): CacheWriter("actions/setup-python", (("cache", None),)),
 }
+# Every other pinned remote action, keyed like `CACHE_WRITERS` (no `"*"`),
+# each reviewed to save no cache (an artifact is not a cache). A pinned action
+# in neither table is refused (check 24), so an action that caches with no
+# input naming the cache fails closed until it is classified.
+CACHE_FREE: frozenset[tuple[str, str]] = frozenset({
+    ("actions/checkout", ""),
+    ("actions/configure-pages", ""),
+    ("actions/deploy-pages", ""),
+    ("actions/download-artifact", ""),
+    ("actions/upload-artifact", ""),
+    ("actions/upload-pages-artifact", ""),
+    ("dtolnay/rust-toolchain", ""),
+    ("googleapis/release-please-action", ""),
+    ("taiki-e/install-action", ""),
+})
+# Under these triggers `github.ref == DEFAULT_BRANCH_REF` holds only for a run
+# of the default branch's own code (a push to it, the schedule, a dispatch by a
+# writer); a pull request, merge group, or release run carries its own ref and
+# so skips a main-only save. Under any other trigger (`pull_request_target`,
+# `workflow_run`, `issue_comment`, ...) `github.ref` is the default branch while
+# the run handles content no push to it made: a main-only save there writes the
+# cache scope every `main` and release run restores from. Check 6 refuses it.
+CACHE_SAVE_TRIGGERS: frozenset[str] = frozenset(
+    {"push", "pull_request", "merge_group", "schedule", "workflow_dispatch", "release"}
+)
 # `owner/repo` and the subpath (empty at the root) of a remote `uses:`.
 USES_SUBPATH_RE = re.compile(r"([^/@]+/[^/@]+)(?:/([^@]*))?(?:@|$)")
+
+
+def _remote_key(uses: object) -> tuple[str, str] | None:
+    """The case-folded (`owner/repo`, subpath) of a remote `uses:`, or None
+    (a local or `docker://` step, or no `owner/repo` shape)."""
+    if not isinstance(uses, str) or uses.startswith(("./", "docker://")):
+        return None
+    m = USES_SUBPATH_RE.match(uses.casefold())
+    return None if m is None else (m[1], m[2] or "")
 
 
 def cache_writer(uses: object) -> CacheWriter | str | None:
     """The `CACHE_WRITERS` row a `uses:` runs under, a refusal when its repo
     is listed but its subpath is not, or None for an action no row lists
     (and for a local or `docker://` step)."""
-    if not isinstance(uses, str) or uses.startswith(("./", "docker://")):
+    key = _remote_key(uses)
+    if key is None:
         return None
-    m = USES_SUBPATH_RE.match(uses.casefold())
-    if m is None:
-        return None
-    repo, sub = m[1], m[2] or ""
+    repo, sub = key
     row = CACHE_WRITERS.get((repo, sub)) or CACHE_WRITERS.get((repo, "*"))
     if row is not None:
         return row
@@ -5547,6 +5588,19 @@ def _refuse_cache_save(st: Step, loc: str, errors: list[str]) -> None:
     why = _main_conjunct(st.raw.get("if")) if row.main_if else None
     if why is not None:
         errors.append(f"{loc} uses {row.name}, which saves a cache, but its {why}, so only main writes the cache; refused")
+
+
+def _reaches_cache_save(st: Step, actions: LocalActions, depth: int = 0) -> bool:
+    """`st` runs a `CACHE_WRITERS` action that saves on `main`, itself or
+    through the local composites it reaches (a chain past
+    `LOCAL_ACTION_DEPTH_LIMIT` is refused on its own)."""
+    row = cache_writer(st.uses)
+    if isinstance(row, CacheWriter) and row.saves:
+        return True
+    local = actions.lookup(st.uses)
+    if local is None or depth >= LOCAL_ACTION_DEPTH_LIMIT:
+        return False
+    return any(_reaches_cache_save(s, actions, depth + 1) for s in local.steps)
 
 
 def _audit_step(st: Step, loc: str, policy: StepPolicy, errors: list[str]) -> None:
@@ -6705,8 +6759,7 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
 
     LIMIT — static YAML cannot see, and this check does NOT prove absent:
       - a third-party action that itself exports a wrapper into the job, or
-        a cache action other than `Swatinem/rust-cache` that saves from a
-        pull request ref;
+        one that `CACHE_FREE` classifies as saving no cache yet saves one;
       - a repo script or interpreter snippet invoked from `run:` (`run:
         tools/ci/wire.sh`, `python -c ...`) that writes a wrapper or the env
         file under a name it assembles at run time, or a package manager
@@ -6787,6 +6840,8 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
     base_policy = policy
     for wf in wfs.workflows:
         policy = replace(base_policy, workspace=wf.workspace)
+        triggers = _triggers(wf.doc)
+        foreign = "an unrecognised `on:`" if triggers is None else ", ".join(sorted(triggers - CACHE_SAVE_TRIGGERS))
         wloc = f"{wf.fname}: workflow-level"
         _refuse_env_keys(_scoped_env(wf.doc, f"{wloc} env", errors), wloc, errors)
         _audit_defaults(wf.doc, wf.fname, policy.repo_top, errors)
@@ -6811,6 +6866,12 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
                 action = actions.resolve(st.uses, stloc)
                 if action is not None:
                     actions.close(action, stloc)
+                if foreign and _reaches_cache_save(st, actions):
+                    errors.append(
+                        f"{stloc} saves a cache on `main`, but the workflow also runs on {foreign}, where "
+                        "`github.ref` is the default branch while the run handles content no push to it made, "
+                        "so the save writes the cache `main` and release runs restore; refused"
+                    )
             _check_tool_job(wf, job, steps, jloc, root, errors)
 
     # One defect reached from several sites is reported once.
@@ -7016,8 +7077,8 @@ def check_action_inputs(
 def _check_cache_writer(fname: str, loc: str, uses: str, inputs: action_metadata.ActionInputs, refuse) -> None:
     """A pinned remote action against `CACHE_WRITERS`: one declaring an
     input whose folded name contains `cache` must have a row (check 6 holds
-    the step to it), and a row must name only inputs the action declares,
-    or the rule it states pins nothing."""
+    the step to it), any other one a `CACHE_FREE` row, and a row must name
+    only inputs the action declares, or the rule it states pins nothing."""
     row = cache_writer(uses)
     if isinstance(row, str):
         return  # refused by check 6
@@ -7028,6 +7089,12 @@ def _check_cache_writer(fname: str, loc: str, uses: str, inputs: action_metadata
                 ErrorKind.CACHE_WRITER_UNMODELLED, fname, loc,
                 f"runs {uses!r}, which declares the cache inputs {cachey} but has no `CACHE_WRITERS` row holding "
                 "it to saving only on main; refused",
+            )
+        elif _remote_key(uses) not in CACHE_FREE:
+            refuse(
+                ErrorKind.CACHE_WRITER_UNMODELLED, fname, loc,
+                f"runs {uses!r}, which neither a `CACHE_WRITERS` row holds to saving only on main nor "
+                "`CACHE_FREE` classifies as saving no cache; refused",
             )
         return
     missing = sorted(k for k, _ in row.inputs if k not in inputs.declared)

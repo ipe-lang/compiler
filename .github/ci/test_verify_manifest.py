@@ -1122,6 +1122,38 @@ class TestCacheWritersSaveMainOnly(unittest.TestCase):
         (e,) = self.refusals()
         self.assertIn("./.github/actions/c/action.yml", e)
 
+    def test_save_under_a_default_ref_trigger_refused(self) -> None:
+        saving = (
+            f"steps:\n  - uses: actions/cache/save@{_SHA40}\n    if: {_MAIN}\n",
+            f"steps:\n  - uses: Swatinem/rust-cache@{_SHA40}\n    with:\n      save-if: ${{{{ {_MAIN} }}}}\n",
+            f"steps:\n  - uses: vmactions/freebsd-vm@{_SHA40}\n    with:\n"
+            "      disable-cache: ${{ github.ref != 'refs/heads/main' }}\n",
+            "steps:\n  - uses: ./.github/actions/c\n",
+        )
+        self.fx.composite("c", "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/d\n")
+        self.fx.composite("d", f"runs:\n  using: composite\n  steps:\n    - uses: actions/cache/save@{_SHA40}\n      if: {_MAIN}\n")
+        for on in ("pull_request_target", "workflow_run", "[push, issue_comment]", "7"):
+            for body in saving:
+                with self.subTest(on=on, body=body):
+                    self.fx.workflow("ci.yml", _ci(body).replace("on: push\n", f"on: {on}\n"))
+                    hits = [e for e in self.fx.errors() if "the workflow also runs on" in e]
+                    self.assertEqual(len(hits), 1, self.fx.errors())
+        for on in ("push", "[pull_request, merge_group, schedule, workflow_dispatch, release]"):
+            for body in saving:
+                with self.subTest(on=on, body=body):
+                    self.fx.workflow("ci.yml", _ci(body).replace("on: push\n", f"on: {on}\n"))
+                    self.assertEqual(self.fx.errors(), [])
+
+    def test_non_saving_step_under_a_default_ref_trigger_passes(self) -> None:
+        for body in (
+            f"steps:\n  - uses: actions/cache/restore@{_SHA40}\n    with:\n      path: x\n      key: k\n",
+            f"steps:\n  - uses: actions/setup-python@{_SHA40}\n",
+            f"steps:\n  - uses: actions/setup-node@{_SHA40}\n    with:\n      package-manager-cache: \"false\"\n",
+        ):
+            with self.subTest(body=body):
+                self.fx.workflow("ci.yml", _ci(body).replace("on: push\n", "on: pull_request_target\n"))
+                self.assertEqual(self.fx.errors(), [])
+
     def test_live_workflows_all_save_main_only(self) -> None:
         errors: list[str] = []
         check_workflow_steps(_load(os.path.dirname(HERE), errors), errors)
@@ -7469,6 +7501,12 @@ class TestActionInputs(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.fx = WorkflowFixture(os.path.join(self._tmp.name, "repo"))
         self.records = os.path.join(self._tmp.name, "ci", "action-metadata")
+        # The fixture actions (`vendor/vm`, at the root and the two subpaths
+        # the walk tests use) are classified as saving no cache.
+        free = {("vendor/vm", ""), ("vendor/vm", "sub/dir"), ("vendor/vm", "sub/gone")}
+        patch = mock.patch.object(verify_manifest, "CACHE_FREE", verify_manifest.CACHE_FREE | free)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def record(self, pin: _PinObjects, owner: str = "vendor", repo: str = "vm", text: str | None = None) -> str:
         path = os.path.join(self.records, owner, repo, f"{pin.sha}.json")
@@ -7561,6 +7599,19 @@ class TestActionInputs(unittest.TestCase):
         with mock.patch.dict(verify_manifest.CACHE_WRITERS, {("vendor/vm", "*"): row}):
             self.proven_step("run: echo\n", _PinObjects(yml))
             self.assertEqual(self.errors(), [])
+
+    def test_unclassified_action_refused(self) -> None:
+        with mock.patch.object(verify_manifest, "CACHE_FREE", frozenset()):
+            self.proven_step("run: echo\n")
+            self.assertRefused("CACHE_WRITER_UNMODELLED", "'vendor/vm@", "`CACHE_FREE`")
+        # A row classifies one subpath, not its siblings.
+        self.proven_step("run: echo\n", _PinObjects(subpath=("sub", "other")), "/sub/other")
+        self.assertRefused("CACHE_WRITER_UNMODELLED", "'vendor/vm/sub/other@", "`CACHE_FREE`")
+
+    def test_cache_free_action_declaring_a_cache_input_refused(self) -> None:
+        yml = _VM_DECL.replace("inputs:\n", "inputs:\n  cache-dir:\n    description: c\n")
+        self.proven_step("run: echo\n", _PinObjects(yml))
+        self.assertRefused("CACHE_WRITER_UNMODELLED", "'vendor/vm@", "['cache-dir']")
 
     def test_cache_writer_row_naming_an_undeclared_input_refused(self) -> None:
         row = verify_manifest.CacheWriter("vendor/vm", (("save-if", None),))
