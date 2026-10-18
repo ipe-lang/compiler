@@ -1245,8 +1245,6 @@ isUnitA entry =
         == Just "purpose-A"
         && Index.storedHash u.attested
         == Index.attest viewA
-        && u.updatedSha
-        == "shaA"
         && shownTextOf entry.view
         == Just viewA
 

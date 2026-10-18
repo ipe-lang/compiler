@@ -134,6 +134,7 @@ type alias LinksFixture =
     , plan : List String
     , hugeEdge : List Label
     , longUid : List String
+    , nulUid : List String
     }
 
 
@@ -220,10 +221,13 @@ linksFixture =
         execIndexUnchecked at.indexDb "UPDATE units SET uid = uid || 'a' WHERE uid IN (?, ?)" [ Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-exact") ]
         execIndexUnchecked at.indexDb "UPDATE callgraph SET callee_uid = callee_uid || 'a' WHERE callee_uid = ?" [ Uid.toSql (uid "u-edge") ]
         longUid <- loadUnitNow (uid "u-src")
+        execIndexUnchecked at.indexDb "UPDATE units SET uid = substr(uid, 1, 64) || char(0) || 'a' WHERE uid IN (?, ?)" [ SqlString (Uid.toString (uid "u-edge") ++ "a"), SqlString (Uid.toString (uid "u-exact") ++ "a") ]
+        execIndexUnchecked at.indexDb "UPDATE callgraph SET callee_uid = substr(callee_uid, 1, 64) || char(0) || 'a' WHERE callee_uid = ?" [ SqlString (Uid.toString (uid "u-edge") ++ "a") ]
+        nulUid <- loadUnitNow (uid "u-src")
         cleanupIndex at.indexDb at.repo
         removeFileIfAny (at.repo ++ "/src/links.rs")
         removeFileIfAny (at.repo ++ "/src/Feature.ipe")
-        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan, hugeEdge = labelsTo "u-edge" huge, longUid = keysOf longUid }
+        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan, hugeEdge = labelsTo "u-edge" huge, longUid = keysOf longUid, nulUid = keysOf nulUid }
 
 
 fixtureChecks : LinksFixture -> List ( String, Bool )
@@ -266,6 +270,13 @@ fixtureChecks got =
             && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap (String.repeat hugeQualifiedBytes "z"))) got.longUid
             && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap "app::util::exact")) got.longUid
             && List.member (internalKey "u-helper") got.longUid
+      )
+    , ( "a callee or a resolved reference whose stored uid is a unit id, a NUL byte and more is shown unlinked, never linked to the id the read's NUL cut spells"
+      , not (List.member (internalKey "u-edge") got.nulUid)
+            && not (List.member (internalKey "u-exact") got.nulUid)
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap (String.repeat hugeQualifiedBytes "z"))) got.nulUid
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap "app::util::exact")) got.nulUid
+            && List.member (internalKey "u-helper") got.nulUid
       )
     ]
 
@@ -362,7 +373,7 @@ firstOccurrence =
             Links.candidates Highlight.Ipe (unitNamed "file" "FILE" "F.FILE") (Links.references Highlight.Ipe "b a b c a")
 
         resolved =
-            Links.resolveCandidates wanted.lookups [ ( "c", Uid.toString (uid "u-c") ), ( "a", Uid.toString (uid "u-a") ), ( "b", Uid.toString (uid "u-b") ) ]
+            Links.resolveCandidates wanted.lookups [ ( "c", Just (Uid.toString (uid "u-c")) ), ( "a", Just (Uid.toString (uid "u-a")) ), ( "b", Just (Uid.toString (uid "u-b")) ) ]
 
         assembled =
             Links.assemble { edges = Complete, candidates = Complete } [ Links.internal (Label.fromText Label.labelCap "a") (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")

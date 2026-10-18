@@ -1,4 +1,4 @@
-module Lib.Label exposing (Cap, Column, Label, LabelPart(..), LabelPiece(..), byteCount, capBytes, columnOf, elementCeiling, fromQuotedText, fromText, key, labelCap, markerByteCeiling, markerText, parse, parseQuoted, parts, piecesText, purposeCap, runCeiling, textBytes, whole, windowChars)
+module Lib.Label exposing (Cap, Column, ColumnExtent(..), Label, LabelPart(..), LabelPiece(..), byteCount, capBytes, columnOf, elementCeiling, extent, fromQuotedText, fromText, key, labelCap, markerByteCeiling, markerText, parse, parseQuoted, parts, piecesText, purposeCap, runCeiling, textBytes, whole, windowChars)
 
 -- A display column of the index, parsed once into a bounded label: at most
 -- `capBytes cap` bytes of shown text (escape spellings counted at their
@@ -54,9 +54,11 @@ type Cap
 
 
 -- What the index read returns for one display column: its first
--- `windowChars` characters and the byte length of the whole column.
+-- `windowChars` characters, the byte length of the whole column, and the
+-- byte length SQLite gives that window when the cell is stored as text
+-- (`Nothing` when it is not).
 type alias Column =
-    { shown : String, bytes : Int }
+    { shown : String, bytes : Int, window : Maybe Int }
 
 
 -- A unit's kind, name, qualified name, path and facing, and an unreviewable
@@ -164,22 +166,70 @@ fromQuotedText cap raw =
 -- `windowChars` characters and the byte length of the whole.
 columnOf : String -> Column
 columnOf raw =
-    { shown = String.left windowChars raw, bytes = textBytes raw }
+    let
+        shown =
+            String.left windowChars raw
+    in
+    { shown = shown, bytes = textBytes raw, window = Just (textBytes shown) }
+
+
+-- How much of a column its window holds, judged from the window, the
+-- column's byte length and the window's byte length as SQLite counted it:
+-- all of it, a window cut at `windowChars`, a text window the read cut
+-- early, or a cell that did not read as text. A cell not stored as text, or
+-- whose window did not decode to the bytes SQLite returned (a non-UTF-8
+-- text reads as its hex spelling), is not the column's text. SQLite's
+-- `substr` ends a text at its first NUL byte, so a faithful window shorter
+-- than `windowChars` whose bytes fall short of the column's held a NUL
+-- there.
+type ColumnExtent
+    = WholeColumn String
+    | CutAtWindow
+    | CutAtNul
+    | NotTextCell
+
+
+extent : Column -> ColumnExtent
+extent column =
+    case column.window of
+        Nothing ->
+            NotTextCell
+
+        Just windowBytes ->
+            let
+                chars =
+                    String.length column.shown
+            in
+            if chars > windowChars || textBytes column.shown /= windowBytes || windowBytes > column.bytes then
+                NotTextCell
+
+            else if windowBytes == column.bytes then
+                WholeColumn column.shown
+
+            else if chars < windowChars then
+                CutAtNul
+
+            else
+                CutAtWindow
 
 
 -- The column's whole text, when the window holds all of it: a value the app
--- may act on (join, bind, compare). `Nothing` when the column is longer than
--- the window, so no decision is ever taken on a prefix. A window wider than
--- `windowChars` is not the text the read returns (a BLOB or non-UTF-8 cell
--- reads as its hex spelling, twice its bytes), so its byte count proves
--- nothing and it is never whole.
+-- may act on (join, bind, compare). `Nothing` for every other `extent`, so
+-- no decision is ever taken on a prefix or on a hex spelling.
 whole : Column -> Maybe String
 whole column =
-    if String.length column.shown <= windowChars && textBytes column.shown == column.bytes then
-        Just column.shown
+    case extent column of
+        WholeColumn text ->
+            Just text
 
-    else
-        Nothing
+        CutAtWindow ->
+            Nothing
+
+        CutAtNul ->
+            Nothing
+
+        NotTextCell ->
+            Nothing
 
 
 -- The pieces flattened for a terminal or an error: a label's text and escape
@@ -213,8 +263,11 @@ partText part =
 
 
 -- The one constructor of a label from a column. Total: every column parses.
--- One left-to-right pass over the window; once the cap or the run ceiling
--- stops it, the rest of the window is skipped.
+-- One left-to-right pass over the window counts what is kept and where each
+-- part starts and ends; the parts are then cut from the kept text once each.
+-- The pass carries only counts and at most `2 * runCeiling + 1` closed
+-- spans, so its cost is linear in the window whatever the text holds; once
+-- the cap or the run ceiling stops it, the rest of the window is skipped.
 parse : Cap -> Column -> Label
 parse cap column =
     parseWith SafeText.isHazard cap column
@@ -236,8 +289,11 @@ parseWith escaped cap column =
         scanned =
             String.foldl (scanChar escaped (capBytes cap)) startScan window
 
+        keptText =
+            String.left scanned.taken window
+
         kept =
-            flushOpen scanned.open scanned.done
+            List.map (spanPart keptText) (closeOpen scanned.taken scanned.open scanned.closed)
 
         dropped =
             max 0 (column.bytes - scanned.raw)
@@ -248,12 +304,12 @@ parseWith escaped cap column =
                 columnHash column.bytes window
         in
         Label
-            { parts = List.reverse (LabelCut dropped hash :: kept)
+            { parts = kept ++ [ LabelCut dropped hash ]
             , bytes = scanned.spent + textBytes (markerText dropped hash)
             }
 
     else
-        Label { parts = List.reverse kept, bytes = scanned.spent }
+        Label { parts = kept, bytes = scanned.spent }
 
 
 -- The first eight hex digits of the SHA-256 of the column's byte length and
@@ -263,23 +319,32 @@ columnHash bytes window =
     String.left 8 (Crypto.sha256 (String.fromInt bytes ++ ":" ++ window))
 
 
--- The part a scan is still filling: none, shown text or an escape run.
-type Open
-    = NoOpen
-    | OpenText String
-    | OpenEscapes String
+-- What a span of the kept text draws as: shown text or an escape run.
+type SpanKind
+    = TextSpan
+    | EscapeSpan
+
+
+-- The span a scan is still filling, from its first character.
+type alias OpenSpan =
+    { kind : SpanKind, start : Int }
+
+
+-- A finished span: the characters `start` up to `end` of the kept text.
+type alias Span =
+    { kind : SpanKind, start : Int, end : Int }
 
 
 -- A scan's state: the shown bytes spent against the cap, the raw column
--- bytes kept, the escape runs opened, the open part, the finished parts
--- (newest first) and whether the scan has stopped.
+-- bytes and the characters kept, the escape runs opened, the open span, the
+-- finished spans (in order) and whether the scan has stopped.
 type alias Scan =
-    { spent : Int, raw : Int, runs : Int, open : Open, done : List LabelPart, stopped : Bool }
+    { spent : Int, raw : Int, taken : Int, runs : Int, open : Maybe OpenSpan, closed : List Span, stopped : Bool }
 
 
 startScan : Scan
 startScan =
-    { spent = 0, raw = 0, runs = 0, open = NoOpen, done = [], stopped = False }
+    { spent = 0, raw = 0, taken = 0, runs = 0, open = Nothing, closed = [], stopped = False }
 
 
 scanChar : (Char -> Bool) -> Int -> Char -> Scan -> Scan
@@ -287,129 +352,102 @@ scanChar escaped cap c scan =
     if scan.stopped then
         scan
 
-    else if escaped c then
+    else
         let
-            spelling =
-                SafeText.escapeSpelling c
+            kind =
+                if escaped c then
+                    EscapeSpan
 
-            opensRun =
-                case scan.open of
-                    OpenEscapes _ ->
-                        False
+                else
+                    TextSpan
 
-                    NoOpen ->
-                        True
-
-                    OpenText _ ->
-                        True
+            opens =
+                not (continues kind scan.open)
 
             runs =
-                if opensRun then
+                if opens && isEscape kind then
                     scan.runs + 1
 
                 else
                     scan.runs
 
             spent =
-                scan.spent + textBytes spelling
+                scan.spent + shownWidth kind c
         in
         if runs > runCeiling || spent > cap then
             { scan | stopped = True }
 
-        else
+        else if opens then
             { scan
                 | spent = spent
                 , raw = scan.raw + charBytes c
+                , taken = scan.taken + 1
                 , runs = runs
-                , open = appendEscape spelling scan.open
-                , done = closeText scan.open scan.done
+                , open = Just { kind = kind, start = scan.taken }
+                , closed = closeOpen scan.taken scan.open scan.closed
             }
-
-    else
-        let
-            width =
-                charBytes c
-
-            spent =
-                scan.spent + width
-        in
-        if spent > cap then
-            { scan | stopped = True }
 
         else
-            { scan
-                | spent = spent
-                , raw = scan.raw + width
-                , open = appendText c scan.open
-                , done = closeEscapes scan.open scan.done
-            }
+            { scan | spent = spent, raw = scan.raw + charBytes c, taken = scan.taken + 1 }
 
 
-appendEscape : String -> Open -> Open
-appendEscape spelling open =
+-- The bytes one kept character shows: its escape spelling's, or its own.
+shownWidth : SpanKind -> Char -> Int
+shownWidth kind c =
+    case kind of
+        EscapeSpan ->
+            textBytes (SafeText.escapeSpelling c)
+
+        TextSpan ->
+            charBytes c
+
+
+isEscape : SpanKind -> Bool
+isEscape kind =
+    case kind of
+        EscapeSpan ->
+            True
+
+        TextSpan ->
+            False
+
+
+-- Whether a character of `kind` extends the open span.
+continues : SpanKind -> Maybe OpenSpan -> Bool
+continues kind open =
     case open of
-        OpenEscapes run ->
-            OpenEscapes (String.append run spelling)
+        Just span ->
+            isEscape span.kind == isEscape kind
 
-        NoOpen ->
-            OpenEscapes spelling
-
-        OpenText _ ->
-            OpenEscapes spelling
+        Nothing ->
+            False
 
 
-appendText : Char -> Open -> Open
-appendText c open =
+-- `closed` with the open span, if any, finished at character `at`.
+closeOpen : Int -> Maybe OpenSpan -> List Span -> List Span
+closeOpen at open closed =
     case open of
-        OpenText text ->
-            OpenText (String.append text (String.fromChar c))
+        Just span ->
+            closed ++ [ { kind = span.kind, start = span.start, end = at } ]
 
-        NoOpen ->
-            OpenText (String.fromChar c)
-
-        OpenEscapes _ ->
-            OpenText (String.fromChar c)
+        Nothing ->
+            closed
 
 
--- `done` with the open text finished onto it when an escape follows it.
-closeText : Open -> List LabelPart -> List LabelPart
-closeText open done =
-    case open of
-        OpenText text ->
-            LabelText text :: done
+-- A finished span cut from the kept text: its text as shown, or its
+-- characters' escape spellings joined.
+spanPart : String -> Span -> LabelPart
+spanPart keptText span =
+    let
+        piece =
+            String.slice span.start span.end keptText
+    in
+    case span.kind of
+        TextSpan ->
+            LabelText piece
 
-        NoOpen ->
-            done
-
-        OpenEscapes _ ->
-            done
-
-
--- `done` with the open escape run finished onto it when text follows it.
-closeEscapes : Open -> List LabelPart -> List LabelPart
-closeEscapes open done =
-    case open of
-        OpenEscapes run ->
-            LabelEscapes run :: done
-
-        NoOpen ->
-            done
-
-        OpenText _ ->
-            done
-
-
-flushOpen : Open -> List LabelPart -> List LabelPart
-flushOpen open done =
-    case open of
-        OpenText text ->
-            LabelText text :: done
-
-        OpenEscapes run ->
-            LabelEscapes run :: done
-
-        NoOpen ->
-            done
+        EscapeSpan ->
+            LabelEscapes (String.concat (List.map SafeText.escapeSpelling (String.toList piece)))
 
 
 -- The UTF-8 bytes of a text.

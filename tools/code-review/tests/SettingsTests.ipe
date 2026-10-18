@@ -225,6 +225,29 @@ rootProbeJoinsIndexedPath =
             )
 
 
+-- A sampled index path longer than the read window is never joined and
+-- reaches the root refusal only as its bounded label: the message carries
+-- the truncation marker and stays far below the path's length. Red if the
+-- root check reads the raw path column again.
+rootProbeBoundsLongPath : Task.Task Error Bool
+rootProbeBoundsLongPath =
+    do
+        at <- freshScratch "ipe-index-root-long"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb "UPDATE units SET path = 'ipe:' || replace(hex(zeroblob(3000)), '0', 'a')" []
+        long <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (Maybe.map (String.startsWith "IPE_INDEX_ROOT ") long
+                == Just True
+                && maybeContains " is not found under " long
+                && maybeContains " bytes, #" long
+                && Maybe.map (\message -> String.length message < 2048) long
+                == Just True
+            )
+
+
 -- An index whose units all carry a tag no configured root binds is refused
 -- at startup naming the configured tag, even though the root exists: none
 -- of its units could be read. An index with no units passes. Red if the
@@ -1498,6 +1521,7 @@ checks =
         , check "a file that is not a SQLite database is refused as one" notSqliteRefused
         , check "a root holding none of the index's files is refused at startup" rootProbeJoinsIndexedPath
         , check "an index with no unit under a configured tag is refused at startup" rootProbeRefusesUntaggedIndex
+        , check "a sampled index path past the read window reaches the root refusal bounded" rootProbeBoundsLongPath
         , check "the environment is read and parsed only at its startup sites" startupReadsAdmittedOnly
         , check "the startup scan refuses an aliased, wrapped or relocated reader" startupScanRefusesEvasions
         , check "no session state type carries the startup settings" settingsNeverInSessionState

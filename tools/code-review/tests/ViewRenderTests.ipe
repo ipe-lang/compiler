@@ -300,6 +300,8 @@ withheldCases =
     , { view = Unreadable (CannotRead (quotedLabelOf "ipe:dir.rs")), reason = "Source unreadable: " }
     , { view = Unreadable (PathRefused (UnknownTag (quotedLabelOf "other:a.rs"))), reason = "Source unreadable: " }
     , { view = Unreadable (PathPastWindow (quotedLabelOf (String.repeat (Label.windowChars + 1) "a"))), reason = "Source unreadable: " }
+    , { view = Unreadable (PathHoldsNul (quotedLabelOf "ipe:src/Ma")), reason = "Source unreadable: " }
+    , { view = Unreadable (PathNotText (quotedLabelOf "69")), reason = "Source unreadable: " }
     , oversizeCase (SpanLines { lines = Index.viewLineCeiling + 1 })
     , oversizeCase (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
     , oversizeCase (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
@@ -330,6 +332,12 @@ withheldName view =
 
         Unreadable (PathPastWindow _) ->
             Just "PathPastWindow"
+
+        Unreadable (PathHoldsNul _) ->
+            Just "PathHoldsNul"
+
+        Unreadable (PathNotText _) ->
+            Just "PathNotText"
 
         Unreadable (NoFile _) ->
             Just "NoFile"
