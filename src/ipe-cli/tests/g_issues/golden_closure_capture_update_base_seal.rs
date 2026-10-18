@@ -51,12 +51,12 @@ fn fn_section<'a>(emitted: &'a str, name: &str) -> &'a str {
 #[test]
 fn update_base_capture_pre_clones_only_a_reused_local() {
     let root = crate::support::repo_root();
-    let entry = golden_dir(&root).join("Main.ipe");
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe must accept the program, got: {built:?}"
@@ -87,12 +87,12 @@ fn update_base_capture_seal_runs() {
         return;
     }
     let root = crate::support::repo_root();
-    let entry = golden_dir(&root).join("Main.ipe");
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe must accept the program, got: {built:?}"
@@ -141,31 +141,16 @@ main =
     bump { job = Task.succeed 7, tag = 3 }
 ";
 
-fn write_scratch(name: &str, source: &str) -> Option<PathBuf> {
-    let dir = crate::support::scratch_root()
-        .join("closure-capture-update-base")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).ok()?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
-}
-
 /// Refusal: a non-`Clone` update-base capture reused after the closure fails closed.
 #[test]
 fn nonclone_update_base_capture_reuse_fails_closed() {
     let name = "nonclone_update_base_capture_reuse";
-    let entry = crate::support::expect_scratch_entry(
-        name,
-        write_scratch(name, NONCLONE_UPDATE_BASE_CAPTURE_REUSE),
-    );
+    let fixture = crate::root_fixture::main(NONCLONE_UPDATE_BASE_CAPTURE_REUSE);
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
+    match crate::root_fixture::build(&fixture, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => assert_eq!(
             diag.code(),
             ipe_diagnostics::IPE_L0135,

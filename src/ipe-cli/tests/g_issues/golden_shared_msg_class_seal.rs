@@ -20,21 +20,17 @@ use ipe::CliError;
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
-        .join("src")
-        .join("Main.ipe")
+fn fixture_dir(root: &Path, golden: &str) -> PathBuf {
+    root.join("tests").join("golden").join(golden)
 }
 
 /// Emit `golden` and return the emitted `Lib` module's Rust.
 fn emitted_lib(golden: &str) -> Result<String, String> {
-    let entry = fixture_entry(&repo_root(), golden);
+    let golden_dir = fixture_dir(&repo_root(), golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}_emit"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_loose_file(&entry, &out, &runtime)
+    crate::support::build_golden(&golden_dir, &out, &runtime)
         .map_err(|e| format!("{golden} must be accepted, got: {e:?}"))?;
     let lib_rs = out.join("src").join("ipe_mods").join("ipe_mod_lib.rs");
     std::fs::read_to_string(&lib_rs).map_err(|e| format!("read {}: {e}", lib_rs.display()))
@@ -53,11 +49,11 @@ fn assert_generic(golden: &str, emitted: &str, helpers: &[&str]) {
 /// THE SEAL: `golden` is accepted and, under `IPE_E2E=1`, the emitted crate
 /// `cargo build`s.
 fn assert_seal(golden: &str) {
-    let entry = fixture_entry(&repo_root(), golden);
+    let golden_dir = fixture_dir(&repo_root(), golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{golden} must be accepted, got: {built:?}");
     crate::support::assert_seal_builds(golden, &out);
 }
@@ -95,11 +91,11 @@ fn shared_msg_class_middle_seal_builds() {
 #[test]
 fn wrapped_threaded_msg_is_refused() {
     let golden = "wrapped_threaded_msg_seal";
-    let entry = fixture_entry(&repo_root(), golden);
+    let golden_dir = fixture_dir(&repo_root(), golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}_emit"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

@@ -20,31 +20,21 @@
 
 use std::path::{Path, PathBuf};
 
-use ipe::CliError;
+use ipe::{CliError, RootFixture};
 
-use crate::golden_ffi_nonclone_handle_reuse_seal::{provision_handle_demo, write_project};
+use crate::golden_ffi_nonclone_handle_reuse_seal::{ffi_fixture, provision_handle_demo};
 
 /// A runtime `false` the optimiser cannot fold — a deliberate failure marker.
 const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-/// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed by
-/// `name`, returning the entry path. Panics on scratch-setup failure — a
-/// swallowed setup error here would let a refusal test pass vacuously without
-/// ever exercising the fail-closed path.
-#[allow(clippy::expect_used)] // a swallowed scratch-setup error would let a refusal test pass vacuously
-fn write_single(name: &str, source: &str) -> PathBuf {
-    let dir = crate::support::scratch_root()
-        .join("ipec_enum_payload_nonclone")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src)
-        .expect("create scratch src dir for enum-payload-nonclone fixture");
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).expect("write Main.ipe fixture source");
-    entry
+/// A project fixture whose only module `Main` holds `source`. Panics on
+/// setup failure — a swallowed setup error here would let a refusal test pass
+/// vacuously without ever exercising the fail-closed path.
+#[allow(clippy::expect_used)] // a swallowed setup error would let a refusal test pass vacuously
+fn write_single(source: &str) -> RootFixture {
+    RootFixture::main(source).expect("the enum-payload-nonclone fixture project resolves")
 }
 
 /// The scratch output dir for `name`, cleared.
@@ -56,23 +46,23 @@ fn out_dir(name: &str) -> PathBuf {
     out
 }
 
-/// Assert `ipe` rejects the build of `entry` with the typed `expected` code.
+/// Assert `ipe` rejects the build of `fixture` with the typed `expected` code.
 #[track_caller]
 #[allow(clippy::expect_used)] // a missing runtime must fail the refusal test, never skip it
 #[allow(clippy::panic)] // a refused precondition is the test failure
-fn assert_rejected(name: &str, entry: &Path, expected: ipe_diagnostics::Code) {
+fn assert_rejected(name: &str, fixture: &RootFixture, expected: ipe_diagnostics::Code) {
     // Unlike an accepted-build test, a refusal test proves nothing if it skips
     // silently here — a missing runtime would let the fail-closed assertion
     // pass vacuously without ever driving the pipeline.
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = out_dir(name);
-    match ipe::build_loose_file(entry, &out, &runtime) {
+    match ipe::build_fixture(fixture, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => assert_eq!(
             diag.code(),
             expected,
             "{name}: expected a fail-closed {expected:?}, got a different diagnostic"
         ),
-        Ok(()) => panic!(
+        Ok(_) => panic!(
             "{name}: ipe ACCEPTED a non-Clone enum-payload reuse (exit 0) — the \
              emitted crate would fail cargo, a SEAL break"
         ),
@@ -83,14 +73,14 @@ fn assert_rejected(name: &str, entry: &Path, expected: ipe_diagnostics::Code) {
     }
 }
 
-/// Build `entry` and return its out dir; an `ipe` refusal fails the test.
+/// Build `fixture` and return its out dir; an `ipe` refusal fails the test.
 #[track_caller]
 #[allow(clippy::panic)] // a refused well-formed program is the test failure
-fn accepted_out(name: &str, entry: &Path) -> PathBuf {
+fn accepted_out(name: &str, fixture: &RootFixture) -> PathBuf {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = out_dir(name);
-    match ipe::build_loose_file(entry, &out, &runtime) {
-        Ok(()) => out,
+    match ipe::build_fixture(fixture, &out, &runtime) {
+        Ok(_) => out,
         Err(err) => {
             panic!("{name}: ipe REJECTED a well-formed program — a false rejection: {err}")
         }
@@ -267,49 +257,39 @@ const FFI_HANDLE_ENUM_LINEAR: &str = "module Main exposing (main)\n\
 #[test]
 fn task_payload_enum_reuse_fails_closed() {
     let name = "task_payload_enum_reuse";
-    let entry = write_single(name, TASK_PAYLOAD_ENUM_REUSE);
-    assert_rejected(name, &entry, ipe_diagnostics::IPE_L0135);
+    let fixture = write_single(TASK_PAYLOAD_ENUM_REUSE);
+    assert_rejected(name, &fixture, ipe_diagnostics::IPE_L0135);
 }
 
 #[test]
 fn task_payload_enum_linear_builds() {
     let name = "task_payload_enum_linear";
-    let entry = write_single(name, TASK_PAYLOAD_ENUM_LINEAR);
-    let out = accepted_out(name, &entry);
+    let fixture = write_single(TASK_PAYLOAD_ENUM_LINEAR);
+    let out = accepted_out(name, &fixture);
     assert_runs(name, &out, "ran");
 }
 
 #[test]
 fn clone_payload_enum_reuse_builds() {
     let name = "clone_payload_enum_reuse";
-    let entry = write_single(name, CLONE_PAYLOAD_ENUM_REUSE);
-    let out = accepted_out(name, &entry);
+    let fixture = write_single(CLONE_PAYLOAD_ENUM_REUSE);
+    let out = accepted_out(name, &fixture);
     assert_runs(name, &out, "8");
 }
 
 #[test]
 fn ffi_handle_enum_reuse_fails_closed() {
     let name = "ffi_handle_enum_reuse";
-    let project = crate::support::scratch_root().join("ipec_ffi_handle_enum_reuse");
-    assert!(
-        write_project(&project, FFI_HANDLE_ENUM_REUSE),
-        "must write the fixture project + FFI cache to a temp dir"
-    );
-    let entry = project.join("src").join("Main.ipe");
-    assert_rejected(name, &entry, ipe_diagnostics::IPE_L0130);
+    let fixture = ffi_fixture(FFI_HANDLE_ENUM_REUSE);
+    assert_rejected(name, &fixture, ipe_diagnostics::IPE_L0130);
 }
 
 #[test]
 #[allow(clippy::panic)] // a missing emitted enum is the test failure
 fn ffi_handle_enum_linear_builds() {
     let name = "ffi_handle_enum_linear";
-    let project = crate::support::scratch_root().join("ipec_ffi_handle_enum_linear");
-    assert!(
-        write_project(&project, FFI_HANDLE_ENUM_LINEAR),
-        "must write the fixture project + FFI cache to a temp dir"
-    );
-    let entry = project.join("src").join("Main.ipe");
-    let out = accepted_out(name, &entry);
+    let fixture = ffi_fixture(FFI_HANDLE_ENUM_LINEAR);
+    let out = accepted_out(name, &fixture);
 
     let emitted = emitted_app_rs(&out);
     // The backend module-prefixes every user type name (`naming::enum_name`,
@@ -326,6 +306,6 @@ fn ffi_handle_enum_linear_builds() {
          foreign type cannot satisfy; got attributes: {attrs:?}"
     );
 
-    provision_handle_demo(&project, &out);
+    provision_handle_demo(fixture.path(), &out);
     assert_runs(name, &out, "3");
 }

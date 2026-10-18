@@ -47,15 +47,15 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 
 fn try_build(name: &str) -> Result<(), String> {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("src").join("Main.ipe");
-    if !entry.exists() {
-        return Err(format!("fixture not found: {}", entry.display()));
+    let dir = golden_dir(&root, name);
+    if !dir.exists() {
+        return Err(format!("fixture not found: {}", dir.display()));
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_loose_file(&entry, &out, &runtime).map_err(|e| e.to_string())
+    crate::support::build_golden(&dir, &out, &runtime).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

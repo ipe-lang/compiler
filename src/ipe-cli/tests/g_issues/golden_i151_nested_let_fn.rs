@@ -52,16 +52,15 @@ fn repo_root() -> PathBuf {
 #[test]
 fn c01_nested_let_fn_callee_green() {
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join("nested_let_fn_callee")
-        .join("Main.ipe");
+        .join("nested_let_fn_callee");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nested_let_fn_callee");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for nested_let_fn_callee (was IPE-L0126 pre-fix): {:?}",
@@ -106,16 +105,12 @@ fn c01_nested_let_fn_callee_green() {
 #[test]
 fn c02_poly_fn_on_error_green() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("poly_task_on_error")
-        .join("Main.ipe");
+    let golden_dir = root.join("tests").join("golden").join("poly_task_on_error");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("poly_task_on_error");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for poly_task_on_error (was IPE-L0126 pre-fix): {:?}",

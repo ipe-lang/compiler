@@ -40,14 +40,13 @@ fn lazy_emit_seal_ipec_cargo_and_run_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("lazy_emit_seal");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_i146_lazy_emit_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: prior diagnostic was IPE-I0001 LazyLazy no emit arm.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for lazy_emit_seal (IPE-I0001 must be gone): {:?}",

@@ -34,14 +34,13 @@ fn console_app_ipec_cargo_and_run_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("console_app_seal");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_i111_console_app_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiler must succeed (this shape can fail with IPE-L0107).
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for console_app_seal: {:?}",

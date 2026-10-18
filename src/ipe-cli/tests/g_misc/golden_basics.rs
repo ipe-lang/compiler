@@ -28,7 +28,7 @@ fn emits_byte_identical_main_rs_as_runtime_dependency() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir: asserts the
@@ -79,7 +79,7 @@ fn end_to_end_builds_and_prints_one() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("basics", &out);
@@ -92,23 +92,21 @@ fn end_to_end_builds_and_prints_one() {
 }
 
 /// A `CliError::Pipeline` must render as a coded, prose-first report — not a
-/// `{:?}` debug dump. We feed `build` a deliberately ill-formed `.ipe` source and
+/// `{:?}` debug dump. We build a project whose `Main` is deliberately ill-formed and
 /// assert the displayed error carries a `-- … ERROR` title rule, its `IPE-…`
 /// code, and the `ipe explain` footer pointer.
 #[test]
 fn pipeline_error_renders_with_code_and_explain_pointer() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("pipeline_err");
-    let _ = std::fs::create_dir_all(&dir);
-    let entry = dir.join("Bad.ipe");
     // Malformed: a top-level declaration with no right-hand side. This is
     // rejected at the parse stage boundary, the first pipeline stage.
-    let wrote = std::fs::write(&entry, "module Main exposing (main)\n\nmain =\n");
-    assert!(wrote.is_ok(), "must write ill-formed source");
+    let fixture = ipe::RootFixture::main("module Main exposing (main)\n\nmain =\n")
+        .expect("an ill-formed module still resolves as a project");
 
     // The runtime dir is never reached: the parse error fires first. Pass a
     // path that need not exist.
     let runtime = dir.join("no-runtime");
-    let built = ipe::build(&entry, &dir.join("out"), &runtime);
+    let built = ipe::build_fixture(&fixture, &dir.join("out"), &runtime);
 
     assert!(
         matches!(&built, Err(ipe::CliError::Pipeline { .. })),

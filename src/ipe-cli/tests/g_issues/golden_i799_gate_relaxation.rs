@@ -24,11 +24,8 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn entry_of(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
 /// Emit gate + byte-identity golden for a newly-admitted case: the frontend must
@@ -37,13 +34,13 @@ fn entry_of(root: &Path, name: &str) -> PathBuf {
 /// the E2E test for THE SEAL proof.
 fn assert_byte_identical(name: &str) {
     let root = repo_root();
-    let entry = entry_of(&root, name);
+    let golden_dir = fixture_dir(&root, name);
     let golden = root.join("tests").join("golden").join(name).join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a sound composite-builder capture must be accepted + emitted, got: {built:?}"
@@ -59,12 +56,12 @@ fn assert_byte_identical(name: &str) {
 /// and run the emitted crate, asserting the round-trip output.
 fn assert_builds_and_runs(name: &str) {
     let root = repo_root();
-    let entry = entry_of(&root, name);
+    let golden_dir = fixture_dir(&root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{name} must be accepted, got: {built:?}");
 
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -85,12 +82,12 @@ fn assert_builds_and_runs(name: &str) {
 /// A still-non-`Clone` capture must fail closed with `expected` at `ipe` time.
 fn assert_fail_closed(name: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
-    let entry = entry_of(&root, name);
+    let golden_dir = fixture_dir(&root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_gate"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {
         Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

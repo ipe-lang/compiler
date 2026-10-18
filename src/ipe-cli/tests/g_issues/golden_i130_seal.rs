@@ -37,22 +37,18 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Assert that `ipe::build(fixture)` surfaces `expected` as a
+/// Assert that building the golden `fixture` surfaces `expected` as a
 /// `CliError::Pipeline` diagnostic.  Runs WITHOUT `IPE_E2E` so the gate
 /// checks remain fast in the default CI pass.
 #[allow(dead_code)] // retained gate helper for env-gated fixtures
 fn assert_ipec_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_dir = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -80,17 +76,13 @@ fn c01_enum_capture_fix1() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("enum_capture")
-        .join("Main.ipe");
+    let golden_dir = root.join("tests").join("golden").join("enum_capture");
     let out = crate::support::scratch_root().join("ipec_i130_enum_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for enum_capture: {:?}",
@@ -125,17 +117,13 @@ fn c02_record_capture_fix1() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("record_capture")
-        .join("Main.ipe");
+    let golden_dir = root.join("tests").join("golden").join("record_capture");
     let out = crate::support::scratch_root().join("ipec_i130_record_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for record_capture: {:?}",
@@ -171,17 +159,13 @@ fn c13_complex_arg_hoist_t4() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("complex_arg_hoist")
-        .join("Main.ipe");
+    let golden_dir = root.join("tests").join("golden").join("complex_arg_hoist");
     let out = crate::support::scratch_root().join("ipec_i130_complex_arg_hoist_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for complex_arg_hoist: {:?}",
@@ -219,16 +203,15 @@ fn c13_complex_arg_hoist_t4() {
 #[test]
 fn c14_nested_lambda_noncopy_promoted_accepts() {
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join("nested_lambda_noncopy")
-        .join("Main.ipe");
+        .join("nested_lambda_noncopy");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i130_nested_lambda_noncopy_accept");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "nested-lambda fn callee must Arc-promote and build: {:?}",
@@ -259,16 +242,15 @@ fn c14_nested_lambda_noncopy_promoted_accepts() {
 #[test]
 fn c05_streamwriter_capture_forward() {
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join("streamwriter_capture")
-        .join("Main.ipe");
+        .join("streamwriter_capture");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("streamwriter_capture");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "StreamWriter capture-forward must pass ipec (was IPE-L0126): {:?}",
@@ -299,16 +281,15 @@ fn c05_streamwriter_capture_forward() {
 #[test]
 fn c06_stream_string_capture_seal() {
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join("stream_string_capture")
-        .join("Main.ipe");
+        .join("stream_string_capture");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("stream_string_capture");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "Stream.stream String-capture must pass ipec: {:?}",

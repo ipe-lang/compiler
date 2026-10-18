@@ -47,7 +47,7 @@ fn i193_update_base_ipec_accepts_and_clones_consuming_use() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for update_base_after_move: {:?}",
@@ -92,9 +92,9 @@ fn i193_update_base_idempotent() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let b1 = ipe::build_loose_file(&entry, &out1, &runtime);
+    let b1 = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out1, &runtime);
     assert!(b1.is_ok(), "pass 1 must succeed: {:?}", b1.err());
-    let b2 = ipe::build_loose_file(&entry, &out2, &runtime);
+    let b2 = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out2, &runtime);
     assert!(b2.is_ok(), "pass 2 must succeed: {:?}", b2.err());
 
     let main1 = std::fs::read_to_string(out1.join("src").join("main.rs"))
@@ -123,7 +123,7 @@ fn i193_update_base_cargo_builds_and_runs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed: {:?}",

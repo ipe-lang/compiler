@@ -41,7 +41,8 @@ fn emits_byte_identical_main_rs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry(&root), &out, &runtime);
+    let built =
+        crate::support::build_golden(crate::support::golden_dir_of(&entry(&root)), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     crate::support::assert_emitted_project_matches_golden_dir(
@@ -64,7 +65,8 @@ fn end_to_end_prints_just_nothing_nothing() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry(&root), &out, &runtime);
+    let built =
+        crate::support::build_golden(crate::support::golden_dir_of(&entry(&root)), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(golden_name(), &out);

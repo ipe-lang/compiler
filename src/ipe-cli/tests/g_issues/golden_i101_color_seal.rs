@@ -71,14 +71,13 @@ fn user_color_via_hof_resolves_to_own_enum() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("user_color_hof");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_i101_user_color_hof_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe must succeed (it always did — the hole was cargo-side).
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for user_color_hof: {:?}",
@@ -138,13 +137,12 @@ fn user_color_in_record_field_agrees_across_paths() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("user_color_record");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_i101_user_color_record_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for user_color_record: {:?}",

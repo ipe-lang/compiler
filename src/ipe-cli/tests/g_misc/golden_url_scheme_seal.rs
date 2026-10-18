@@ -32,7 +32,7 @@ fn built_url_scheme(root: &Path, out: &Path) -> Result<(), ipe::CliError> {
         .join("Main.ipe");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime)
+    crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime)
 }
 
 /// Emit assertion: the frontend must accept the whole refusal matrix — every

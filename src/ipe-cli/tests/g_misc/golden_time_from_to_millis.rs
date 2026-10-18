@@ -34,7 +34,7 @@ fn time_from_to_millis_emits() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "time_from_to_millis: Time.fromMillis/toMillis must emit cleanly; got: {built:?}"
@@ -55,7 +55,7 @@ fn time_from_to_millis_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "time_from_to_millis: build must succeed: {:?}",

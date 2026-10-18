@@ -18,11 +18,8 @@ const GOLDEN: &str = "generic_msg_input_sync_seal";
 /// The helpers generic over `msg`, one per `Sync`-bounding Input kernel.
 const HELPERS: [&str; 3] = ["checkboxOf", "radioOf", "radioRowOf"];
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// The emitted signature line of the `Main` function spelled `ipe_name`.
@@ -48,12 +45,12 @@ fn signature_of<'a>(emitted: &'a str, ipe_name: &str) -> Option<&'a str> {
 #[test]
 fn generic_msg_input_sync_bounds_emitted() {
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
@@ -77,12 +74,12 @@ fn generic_msg_input_sync_bounds_emitted() {
 #[test]
 fn generic_msg_input_sync_seal_builds() {
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"

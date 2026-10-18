@@ -4,6 +4,9 @@
 
 mod support;
 
+#[path = "g_misc/src_golden.rs"]
+mod src_golden;
+
 #[path = "g_misc/golden_alias.rs"]
 mod golden_alias;
 #[path = "g_misc/golden_alias_move_seal.rs"]
