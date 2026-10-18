@@ -380,7 +380,8 @@ shownDecoder =
 
 coreDecoder : Db.Decode.Decoder RowCore
 coreDecoder =
-    Db.Decode.map3 (\( uid, lineStart, lineEnd ) bodyHash lang -> { uid = uid, lineStart = lineStart, lineEnd = lineEnd, bodyHash = bodyHash, lang = lang })
+    Db.Decode.map3
+        (\( uid, lineStart, lineEnd ) bodyHash lang -> { uid = uid, lineStart = lineStart, lineEnd = lineEnd, bodyHash = bodyHash, lang = lang })
         (Db.Decode.succeed (\uid lineStart lineEnd -> ( uid, lineStart, lineEnd ))
             |> Db.Decode.required "uid" (Uid.decoder "uid")
             |> Db.Decode.required "line_start" (Db.Decode.int "line_start")

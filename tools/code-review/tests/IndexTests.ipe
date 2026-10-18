@@ -220,7 +220,10 @@ pathCutAtNulRefused =
                         && List.any isCut (Label.parts stored)
                         && String.contains "holds a NUL byte" (piecesShown (Index.readFailureText (PathHoldsNul stored)))
 
-                _ ->
+                Just _ ->
+                    False
+
+                Nothing ->
                     False
             )
 
