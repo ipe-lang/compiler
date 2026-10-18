@@ -12,16 +12,21 @@ use ipe_backend_rust::rust_str_lit;
 use ipe_runtime_rust::encoding::MountBase;
 
 /// Options modifying a build beyond plain source compilation — some (the
-/// static plan) apply post-emit at write time; others (`target`,
-/// `wasm_public_env`) feed the compile/emit pipeline itself.
+/// static plan) apply post-emit at write time; others (`target`, `intent`)
+/// feed the compile/emit pipeline itself.
+///
+/// Every field is derived from the verb or the CLI. A value `package.ipe` owns
+/// (the browser mount base, the `[wasm]` public-env allowlist and mode) has no
+/// field here: [`manifest_emit_settings`] reads it from the manifest, and
+/// [`loose_emit_settings`] names the no-manifest constants.
 ///
 /// The static plan is applied post-emit at write time — the compile pipeline
 /// and its on-disk caches stay untouched (their keys deliberately exclude
 /// the plan; the transform is a deterministic function of the plan applied
 /// on cache-hit and cache-miss paths alike).
-// The three `bool` fields (`wasm_hydrate_mode`, `runtime_dep`,
-// `tree_shake_vendored`) are genuinely independent, orthogonal build toggles —
-// any combination is valid (a dep-model hydrate build, a vendored tree-shaken
+// The `bool` fields (`runtime_dep`, `tree_shake_vendored`, `debugger`,
+// `hot_appearance`) are genuinely independent, orthogonal build toggles —
+// any combination is valid (a dep-model debugger build, a vendored tree-shaken
 // build, …). They are not the states of one machine, so collapsing them into
 // a two-variant enum or a state enum would obscure their independence rather than
 // clarify it; the clippy heuristic's usual remedy does not apply here.
@@ -36,30 +41,6 @@ pub struct BuildOptions {
     /// `ipe dev build --target wasm`) — threaded into kernel resolution (the
     /// Layer-1 wasm gate), the emitted manifest, and both cache keys.
     pub target: ipe_ir::Target,
-    /// The `[wasm] publicEnv` allowlist from `package.ipe`, already validated
-    /// against the secret-name denylist at parse time. Empty when the
-    /// project has no `[wasm]` section (or no manifest — the
-    /// sibling-discovery single-file path). Threaded into
-    /// [`ipe_backend_rust::RustBackend::with_wasm_public_env`] /
-    /// [`ipe_db::BuildConfig::wasm_public_env`].
-    pub wasm_public_env: Vec<String>,
-    /// Where the emitted browser shell is served, parsed once from the
-    /// manifest's `browser.basePath`.
-    ///
-    /// A manifest build overwrites it in `build_project_with_options`; a
-    /// single-file build (no manifest) names [`MountBase::root`]. Threaded into
-    /// [`ipe_backend_rust::RustBackend::with_mount_base`] /
-    /// [`ipe_db::BuildConfig::mount_base`] and the build cache key.
-    pub mount_base: MountBase,
-    /// `true` when `[wasm] mode = "hydrate"` in the project's `package.ipe`.
-    /// Causes the backend to emit a `#[wasm_bindgen] pub fn hydrate(model_json: &str)`
-    /// export in addition to the `#[wasm_bindgen(start)] pub fn ipe_start()` entry.
-    /// The emitted `hydrate` function parses the island JSON as the user's declared
-    /// `HydrationState` type, converts to `Model` via `fromHydrationState`, and
-    /// calls `ipe_runtime::wasm::wasm_adopt_app`. On parse failure it falls back
-    /// to clean `ipe_main()` with a console warning (fault-tolerant hydrate — see
-    /// spec Q6 §"Fault-tolerant hydrate — parse, don't unwrap").
-    pub wasm_hydrate_mode: bool,
     /// The verb family this build serves, threaded into
     /// [`ipe_db::BuildConfig::intent`].
     ///
@@ -170,7 +151,9 @@ fn single_file_crate_name() -> ipe_backend_rust::CrateName {
 /// The emit settings of a no-manifest build (a single file, a loose file, a
 /// test entry).
 ///
-/// There is no manifest window, so the host is always served. `ffi` and
+/// There is no manifest window, so the host is always served, and a loose file
+/// declares no browser delivery: the mount base is [`MountBase::root`], the
+/// public-env allowlist is empty and hydrate mode is off. `ffi` and
 /// `runtime_dep` stay `None` here: the compile core fills both once it has
 /// resolved them. A scratch emission is the test runner, named by the fixed
 /// [`ipe_backend_rust::CrateName::Test`], never by the environment.
@@ -180,6 +163,16 @@ pub fn loose_emit_settings(
     options: &BuildOptions,
     role: runtime_embed::BundleRole,
 ) -> ipe_backend_rust::EmitSettings {
+    let BuildOptions {
+        target,
+        intent,
+        debugger,
+        hot_appearance,
+        // Consumed by the compile core and the write step, not by emit settings.
+        static_plan: _,
+        runtime_dep: _,
+        tree_shake_vendored: _,
+    } = options;
     let crate_name = match role {
         runtime_embed::BundleRole::Out => single_file_crate_name(),
         runtime_embed::BundleRole::Scratch => ipe_backend_rust::CrateName::Test,
@@ -187,16 +180,16 @@ pub fn loose_emit_settings(
     ipe_backend_rust::EmitSettings {
         db_driver,
         ffi: None,
-        target: options.target,
-        wasm_public_env: options.wasm_public_env.clone(),
-        mount_base: options.mount_base.clone(),
-        wasm_hydrate_mode: options.wasm_hydrate_mode,
+        target: *target,
+        wasm_public_env: Vec::new(),
+        mount_base: MountBase::root(),
+        wasm_hydrate_mode: false,
         runtime_dep: None,
-        debugger: options.debugger,
+        debugger: *debugger,
         crate_name,
-        hot_appearance: options.hot_appearance,
+        hot_appearance: *hot_appearance,
         host: ipe_backend_rust::EmitHost::Served,
-        intent: options.intent,
+        intent: *intent,
     }
 }
 
@@ -215,6 +208,16 @@ pub fn manifest_emit_settings(
     options: &BuildOptions,
     host: crate::delivery::HostIntent,
 ) -> ipe_backend_rust::EmitSettings {
+    let BuildOptions {
+        target,
+        intent,
+        debugger,
+        hot_appearance,
+        // Consumed by the compile core and the write step, not by emit settings.
+        static_plan: _,
+        runtime_dep: _,
+        tree_shake_vendored: _,
+    } = options;
     // The emitted crate identity is uniquified per project so two projects
     // that share a friendly name but live at different paths own SEPARATE
     // slots in a shared CARGO_TARGET_DIR. The seed is the CANONICAL project
@@ -238,16 +241,16 @@ pub fn manifest_emit_settings(
     ipe_backend_rust::EmitSettings {
         db_driver: manifest.driver,
         ffi: None,
-        target: options.target,
+        target: *target,
         wasm_public_env: manifest.wasm.public_env.to_names(),
         mount_base: manifest.delivery.browser.base.clone(),
         wasm_hydrate_mode: manifest.wasm.mode.as_deref() == Some("hydrate"),
         runtime_dep: None,
-        debugger: options.debugger,
+        debugger: *debugger,
         crate_name: ipe_backend_rust::CrateName::Identity(identity),
-        hot_appearance: options.hot_appearance,
+        hot_appearance: *hot_appearance,
         host,
-        intent: options.intent,
+        intent: *intent,
     }
 }
 
@@ -353,16 +356,10 @@ pub fn bluegreen_from_env_values(no_bluegreen: Option<&str>, bluegreen: Option<&
 
 impl Default for BuildOptions {
     /// The vendored, native, release-intent options of a single-file build.
-    ///
-    /// The mount base is named [`MountBase::root`]: a single file carries no
-    /// manifest, and a manifest build overwrites it from `browser.basePath`.
     fn default() -> Self {
         Self {
             static_plan: None,
             target: ipe_ir::Target::default(),
-            wasm_public_env: Vec::new(),
-            mount_base: MountBase::root(),
-            wasm_hydrate_mode: false,
             intent: ipe_backend_rust::BuildIntent::default(),
             runtime_dep: false,
             tree_shake_vendored: false,
@@ -3585,5 +3582,82 @@ main =
         };
         assert_eq!(err.to_string(), expected.to_string());
         assert!(!out.exists(), "a refused build emitted output");
+    }
+
+    /// Options with every verb-derived field set off its default.
+    fn verb_options() -> BuildOptions {
+        BuildOptions {
+            target: ipe_ir::Target::WasmClient,
+            intent: ipe_backend_rust::BuildIntent::Development,
+            debugger: true,
+            hot_appearance: true,
+            ..BuildOptions::default()
+        }
+    }
+
+    /// A manifest build reads the mount base, the public-env allowlist and the
+    /// hydrate mode from `package.ipe`, and the verb-derived fields from the options.
+    #[test]
+    fn a_manifest_build_takes_its_browser_settings_from_the_manifest() {
+        let tree =
+            crate::project_root::SourceTree::main("module Main exposing (main)\n\nmain = 1\n")
+                .field(r#"delivery = { browser = { basePath = "/app" } }"#)
+                .field(r#"wasm = On { mode = Hydrate, publicEnv = [ "API_BASE_URL" ] }"#);
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
+        let options = verb_options();
+        let settings = manifest_emit_settings(
+            &manifest,
+            &manifest_path,
+            &options,
+            crate::delivery::HostIntent::Served,
+        );
+        assert_eq!(settings.mount_base.prefix(), "/app");
+        assert!(settings.wasm_hydrate_mode, "`mode = Hydrate` is lost");
+        assert_eq!(settings.wasm_public_env, vec!["API_BASE_URL".to_owned()]);
+        assert_eq!(settings.target, options.target);
+        assert_eq!(settings.intent, options.intent);
+        assert_eq!(settings.debugger, options.debugger);
+        assert_eq!(settings.hot_appearance, options.hot_appearance);
+    }
+
+    /// A manifest that declares no browser settings builds at the root with no
+    /// public env and no hydrate mode, whatever the options carry.
+    #[test]
+    fn a_manifest_without_browser_settings_builds_at_the_root() {
+        let tree =
+            crate::project_root::SourceTree::main("module Main exposing (main)\n\nmain = 1\n");
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
+        let settings = manifest_emit_settings(
+            &manifest,
+            &manifest_path,
+            &verb_options(),
+            crate::delivery::HostIntent::Served,
+        );
+        assert_eq!(settings.mount_base, MountBase::root());
+        assert!(!settings.wasm_hydrate_mode);
+        assert!(settings.wasm_public_env.is_empty());
+    }
+
+    /// A loose build declares no browser delivery: the root mount base, no
+    /// public env and no hydrate mode, with the verb-derived fields carried over.
+    #[test]
+    fn a_loose_build_declares_no_browser_delivery() {
+        let options = verb_options();
+        let settings = loose_emit_settings(
+            ipe_backend_rust::DbDriver::Sqlite,
+            &options,
+            runtime_embed::BundleRole::Out,
+        );
+        assert_eq!(settings.mount_base, MountBase::root());
+        assert!(!settings.wasm_hydrate_mode);
+        assert!(settings.wasm_public_env.is_empty());
+        assert_eq!(settings.target, options.target);
+        assert_eq!(settings.intent, options.intent);
+        assert!(settings.debugger);
+        assert!(settings.hot_appearance);
     }
 }

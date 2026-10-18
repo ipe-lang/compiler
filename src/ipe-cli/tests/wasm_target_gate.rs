@@ -110,6 +110,23 @@ fn wasm_shell_urls_derive_from_base() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// A loose file declares no browser delivery, so its wasm shell sits at the root.
+#[test]
+fn a_loose_wasm_build_serves_its_shell_at_the_root() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = scratch("wasm_shell_loose_root");
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src)?;
+    let entry = src.join("Main.ipe");
+    std::fs::write(&entry, PURE_UI_APP)?;
+    let out = dir.join("out");
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build_loose_file_with_options(&entry, &out, &runtime, wasm_options())
+        .map_err(|e| format!("{e:?}"))?;
+    let index = std::fs::read_to_string(out.join("www/index.html"))?;
+    assert!(index.contains("src=\"/boot.js\""), "{index}");
+    Ok(())
+}
+
 /// The root mount base keeps the shell URLs at `/`.
 #[test]
 fn wasm_shell_urls_sit_at_the_root() -> Result<(), Box<dyn std::error::Error>> {
@@ -569,13 +586,12 @@ fn hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm() {
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    // Emit the REAL wasm-hydration example (single source of truth) with the
-    // hydrate mode its `package.ipe` declares.
+    // Emit the REAL wasm-hydration example (single source of truth): the hydrate
+    // mode comes from its own `package.ipe`, never from the build options.
     let manifest = e2e_support::manifest_dir!().join("../../examples/wasm/hydration/package.ipe");
     let out = scratch_isolated("wasm_hydrate_seal").join("out");
     let options = BuildOptions {
         target: ipe_ir::Target::WasmClient,
-        wasm_hydrate_mode: true,
         ..BuildOptions::default()
     };
     ipe::build_project_with_options(&manifest, &out, &runtime, &options)

@@ -853,12 +853,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     let options = BuildOptions {
         static_plan,
         target: compile_target.ir_target(),
-        wasm_public_env: Vec::new(),
-        // A single file carries no manifest: its shell is served at the root.
-        // A manifest project overwrites this from `browser.basePath` in
-        // build_project_with_options.
-        mount_base: ipe_backend_rust::MountBase::root(),
-        wasm_hydrate_mode: false,
         // A `dev build` is a development artifact — Debug.* is permitted.
         intent: Verb::DEV_BUILD.intent(),
         runtime_dep,
@@ -1690,20 +1684,6 @@ pub fn release_pipeline(
             let options = BuildOptions {
                 static_plan: None,
                 target: ipe_ir::Target::WasmClient,
-                wasm_public_env: manifest_parsed
-                    .as_ref()
-                    .map(|m| m.wasm.public_env.to_names())
-                    .unwrap_or_default(),
-                // The manifest's `browser.basePath`; a single file (no
-                // manifest) is served at the root.
-                mount_base: manifest_parsed
-                    .as_ref()
-                    .map_or_else(ipe_backend_rust::MountBase::root, |m| {
-                        m.delivery.browser.base.clone()
-                    }),
-                wasm_hydrate_mode: manifest_wasm
-                    .as_ref()
-                    .is_some_and(|w| w.mode.as_deref() == Some("hydrate")),
                 intent: verb.intent(),
                 runtime_dep,
                 tree_shake_vendored: false,
@@ -3043,12 +3023,6 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     let options = BuildOptions {
         static_plan,
         target: compile_target.ir_target(),
-        wasm_public_env: Vec::new(),
-        // A single file carries no manifest: its shell is served at the root.
-        // A manifest project overwrites this from `browser.basePath` in
-        // build_project_with_options.
-        mount_base: ipe_backend_rust::MountBase::root(),
-        wasm_hydrate_mode: false,
         intent: Verb::DEV_RUN.intent(),
         runtime_dep,
         // `ipe dev run` builds and executes; it never tree-shakes the vendored tree
