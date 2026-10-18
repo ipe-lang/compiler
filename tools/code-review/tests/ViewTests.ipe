@@ -453,6 +453,23 @@ hugeSegments =
         == [ Verbatim (String.repeat 65536 "ab") ]
 
 
+-- A 128Ki-escape text is 256Ki segments, rendered and joined in one pass
+-- each. Red (the run never ends) if the scan or the join builds its segments
+-- by consing onto the head, which copies the list per escape.
+hugeEscapeRuns : Bool
+hugeEscapeRuns =
+    let
+        drawn =
+            SafeText.renderForeign (String.repeat 131072 (codeText 8238 ++ "a"))
+    in
+    List.length (SafeText.segments drawn)
+        == 262144
+        && List.take 2 (SafeText.segments drawn)
+        == [ Escaped (Char.fromCode 8238), Verbatim "a" ]
+        && List.length (SafeText.segments (SafeText.concat (List.repeat 131072 (SafeText.render "\"x"))))
+        == 262144
+
+
 -- A residual over a million-line file, every second line covered, keeps
 -- each odd line with one covered row between neighbours.
 hugeResidual : Bool
@@ -942,6 +959,7 @@ checks =
         , Task.succeed ( "references over a 64Ki-token unit finish", hugeLinks )
         , Task.succeed ( "a 256 KiB URL word and 64Ki URL words are trimmed", hugeUrls )
         , Task.succeed ( "a 256 KiB token with one U+202E is three segments", hugeSegments )
+        , Task.succeed ( "a 128Ki-escape text renders and joins in one linear pass", hugeEscapeRuns )
         , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
         , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
         , Task.succeed ( "a run of source lines copies as the source spells it, line numbers apart", sourceCopiesAsWritten )

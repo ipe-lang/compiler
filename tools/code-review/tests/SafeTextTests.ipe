@@ -478,7 +478,9 @@ isElement part =
 
 -- A column is whole only when the window holds all of it: a column of
 -- exactly `windowChars` characters (one-byte or two-byte) is whole, one
--- character more is not. Red if `whole` trusts a cut window.
+-- character more is not. A BLOB cell of `2 * windowChars` bytes reads its
+-- window of `windowChars` bytes as hex, a text whose byte count equals the
+-- whole cell's: it is still not whole. Red if `whole` trusts a cut window.
 wholeOnlyWithinWindow : Bool
 wholeOnlyWithinWindow =
     let
@@ -487,8 +489,13 @@ wholeOnlyWithinWindow =
 
         wide =
             String.repeat Label.windowChars "é"
+
+        hexOfCutBlob =
+            String.repeat Label.windowChars "6c"
     in
-    Label.whole (Label.columnOf at)
+    Label.whole { shown = hexOfCutBlob, bytes = 2 * Label.windowChars }
+        == Nothing
+        && Label.whole (Label.columnOf at)
         == Just at
         && Label.whole (Label.columnOf wide)
         == Just wide
