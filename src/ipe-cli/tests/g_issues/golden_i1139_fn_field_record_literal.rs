@@ -27,17 +27,17 @@ use ipe::CliError;
 use crate::support::repo_root;
 
 fn fixture(root: &Path, dir: &str) -> PathBuf {
-    root.join("tests").join("golden").join(dir).join("Main.ipe")
+    root.join("tests").join("golden").join(dir)
 }
 
 /// Assert that building `<golden dir>/Main.ipe` fails closed with IPE-L0107.
 fn assert_rejects_l0107(dir: &str) {
     let root = repo_root();
-    let entry = fixture(&root, dir);
+    let golden_dir = fixture(&root, dir);
     let out = crate::support::scratch_root().join(format!("ipec_{dir}"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

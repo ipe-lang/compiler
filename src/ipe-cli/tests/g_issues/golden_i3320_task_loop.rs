@@ -27,11 +27,31 @@ use ipe_diagnostics::{Code, Diagnostic, Family, Feature, LowerError};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
+}
+
+/// What a test builds: a checked-in golden directory or inline source.
+enum Program {
+    Golden(PathBuf),
+    Inline(ipe::RootFixture),
+}
+
+impl Program {
+    fn golden(name: &str) -> Self {
+        Self::Golden(fixture_dir(&repo_root(), name))
+    }
+
+    fn inline(source: &str) -> Self {
+        Self::Inline(crate::root_fixture::main(source))
+    }
+
+    fn build(&self, out: &Path, runtime: &Path) -> Result<(), CliError> {
+        match self {
+            Self::Golden(dir) => crate::support::build_golden(dir, out, runtime),
+            Self::Inline(fixture) => crate::root_fixture::build(fixture, out, runtime),
+        }
+    }
 }
 
 fn out_dir(name: &str) -> PathBuf {
@@ -44,10 +64,10 @@ fn out_dir(name: &str) -> PathBuf {
 /// failing the test when `ipe` rejects it.
 #[track_caller]
 fn accept_fixture(name: &str) -> PathBuf {
-    let entry = fixture_entry(&repo_root(), name);
+    let golden = fixture_dir(&repo_root(), name);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{name}: ipe must accept the fixture; got {built:?}"
@@ -77,14 +97,14 @@ fn accept_and_run(name: &str, expected_stdout: &str) {
     );
 }
 
-/// The pipeline diagnostic `ipe` refuses `entry` with, failing the test when it
+/// The pipeline diagnostic `ipe` refuses `program` with, failing the test when it
 /// is accepted or fails outside the pipeline.
 #[track_caller]
 #[allow(clippy::expect_used)] // the code is asserted present just above the `expect`
-fn refusal_code(name: &str, entry: &Path) -> Code {
+fn refusal_code(name: &str, program: &Program) -> Code {
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(entry, &out, &runtime);
+    let built = program.build(&out, &runtime);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         Ok(()) | Err(_) => None,
@@ -96,26 +116,17 @@ fn refusal_code(name: &str, entry: &Path) -> Code {
     code.expect("asserted present above")
 }
 
-/// Write `source` as a single-file `Main.ipe` under a fresh scratch dir.
-fn write_single(name: &str, source: &str) -> Option<PathBuf> {
-    let dir = crate::support::scratch_root().join("i3320-src").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
-    let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
-}
 
-/// Assert `ipe` refuses `entry` through the function-loop-state gate itself.
+/// Assert `ipe` refuses `program` through the function-loop-state gate itself.
 ///
 /// IPE-L0114 is shared with other unsupported-lowering refusals (a function
 /// constructor payload among them), so the code alone does not pin the gate;
 /// the `Feature` does.
 #[track_caller]
-fn assert_refused_as_function_state(name: &str, entry: &Path) {
+fn assert_refused_as_function_state(name: &str, program: &Program) {
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(entry, &out, &runtime);
+    let built = program.build(&out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -179,8 +190,7 @@ fn self_recursive_and_then_at_the_same_size_trips_the_recursion_guard() {
 #[test]
 fn a_step_whose_result_type_is_never_fixed_is_refused_at_ipe_time() {
     let name = "task_loop_no_step_value";
-    let entry = fixture_entry(&repo_root(), name);
-    let code = refusal_code(name, &entry);
+    let code = refusal_code(name, &Program::golden(name));
     assert_eq!(
         code,
         ipe_diagnostics::IPE_L0102,
@@ -192,8 +202,7 @@ fn a_step_whose_result_type_is_never_fixed_is_refused_at_ipe_time() {
 #[test]
 fn a_step_capturing_a_task_is_refused_at_ipe_time() {
     let name = "task_loop_nonclone_capture";
-    let entry = fixture_entry(&repo_root(), name);
-    let code = refusal_code(name, &entry);
+    let code = refusal_code(name, &Program::golden(name));
     assert_eq!(
         code,
         ipe_diagnostics::IPE_L0126,
@@ -215,8 +224,7 @@ fn a_stored_step_from_a_record_field_or_adt_payload_builds_and_runs() {
 #[test]
 fn a_function_typed_loop_state_is_refused_at_ipe_time() {
     let name = "task_loop_fn_state";
-    let entry = fixture_entry(&repo_root(), name);
-    assert_refused_as_function_state(name, &entry);
+    assert_refused_as_function_state(name, &Program::golden(name));
 }
 
 #[test]
@@ -232,8 +240,7 @@ fn qualified_parser_and_task_steps_share_one_program() {
 /// Refuse `source` and assert the diagnostic's family.
 #[track_caller]
 fn assert_refused_in_family(name: &str, source: &str, family: Family) {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
-    let code = refusal_code(name, &entry);
+    let code = refusal_code(name, &Program::inline(source));
     assert_eq!(
         code.family(),
         family,
@@ -302,8 +309,7 @@ main =
 #[test]
 fn a_point_free_loop_at_a_function_state_is_refused_at_ipe_time() {
     let name = "task_loop_point_free_fn_state";
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, POINT_FREE_FN_STATE));
-    assert_refused_as_function_state(name, &entry);
+    assert_refused_as_function_state(name, &Program::inline(POINT_FREE_FN_STATE));
 }
 
 #[test]
@@ -322,9 +328,7 @@ fn a_step_that_returns_no_step_is_a_type_error() {
 #[test]
 fn two_unqualified_step_imports_are_refused_as_a_duplicate_type() {
     let name = "task_loop_two_unqualified_steps";
-    let entry =
-        crate::support::expect_scratch_entry(name, write_single(name, TWO_UNQUALIFIED_STEPS));
-    let code = refusal_code(name, &entry);
+    let code = refusal_code(name, &Program::inline(TWO_UNQUALIFIED_STEPS));
     assert_eq!(
         code,
         ipe_diagnostics::IPE_N0012,

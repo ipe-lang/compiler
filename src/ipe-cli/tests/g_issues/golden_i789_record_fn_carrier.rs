@@ -21,11 +21,10 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("fcf_record_fn")
-        .join("Main.ipe")
 }
 
 /// Emit gate + byte-identity golden: the frontend must accept the bare-fn
@@ -36,7 +35,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn record_fn_literal_emits_byte_identical() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -46,7 +45,7 @@ fn record_fn_literal_emits_byte_identical() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a bare function stored in a record literal via `wrap (\\n -> n)` must be \
@@ -67,12 +66,12 @@ fn record_fn_literal_emits_byte_identical() {
 #[test]
 fn record_fn_literal_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i789_fcf_record_fn_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "fcf_record_fn must be accepted, got: {built:?}"

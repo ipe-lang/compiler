@@ -47,12 +47,12 @@ fn signature_of<'a>(emitted: &'a str, ipe_name: &str) -> Option<&'a str> {
 #[test]
 fn generic_succeed_capture_sync_bounds_emitted() {
     let root = crate::support::repo_root();
-    let entry = fixture_dir(&root).join("Main.ipe");
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
@@ -81,12 +81,11 @@ fn generic_succeed_tail_sync_seal_runs() {
 
     let root = crate::support::repo_root();
     let dir = fixture_dir(&root);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"

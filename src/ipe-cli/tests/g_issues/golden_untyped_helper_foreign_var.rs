@@ -20,13 +20,32 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Assert `ipe` refuses `entry` with the foreign-variable refusal at `chip`'s name in `file`.
-fn assert_chip_refused(name: &str, entry: &Path, file: &str) {
+/// Where a golden keeps its modules.
+#[derive(Clone, Copy)]
+enum Layout {
+    /// One `Main.ipe` at the golden's root.
+    Root,
+    /// `Main` and `Widgets` under `src/`, with no manifest.
+    Src,
+}
+
+/// Build the golden `golden`, laid out as `layout`, into `out`.
+fn build(golden: &Path, layout: Layout, out: &Path, runtime: &Path) -> Result<(), ipe::CliError> {
+    match layout {
+        Layout::Root => crate::support::build_golden(golden, out, runtime),
+        Layout::Src => {
+            crate::root_fixture::build_src_golden(golden, &["Main", "Widgets"], out, runtime)
+        }
+    }
+}
+
+/// Assert `ipe` refuses `golden` with the foreign-variable refusal at `chip`'s name in `file`.
+fn assert_chip_refused(name: &str, golden: &Path, layout: Layout, file: &str) {
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(entry, &out, &runtime);
+    let built = build(golden, layout, &out, &runtime);
     let Err(ipe::CliError::Pipeline {
         file: diag_file,
         src,
@@ -78,8 +97,7 @@ fn assert_chip_refused(name: &str, entry: &Path, file: &str) {
 fn untyped_helper_foreign_msg_refused() {
     let name = "untyped_helper_foreign_msg_refused";
     let root = crate::support::repo_root();
-    let entry = golden_dir(&root, name).join("src").join("Main.ipe");
-    assert_chip_refused(name, &entry, "Widgets.ipe");
+    assert_chip_refused(name, &golden_dir(&root, name), Layout::Src, "Widgets.ipe");
 }
 
 /// Refused within one module: `framed` keeps `row` generic over the `msg` `chip` borrows.
@@ -87,25 +105,24 @@ fn untyped_helper_foreign_msg_refused() {
 fn untyped_helper_foreign_msg_single_refused() {
     let name = "untyped_helper_foreign_msg_single_refused";
     let root = crate::support::repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
-    assert_chip_refused(name, &entry, "Main.ipe");
+    assert_chip_refused(name, &golden_dir(&root, name), Layout::Root, "Main.ipe");
 }
 
-/// Build `entry` and assert `ipe` accepts it.
-fn assert_accepted(name: &str, entry: &Path, out: &Path) {
+/// Build `golden` and assert `ipe` accepts it.
+fn assert_accepted(name: &str, golden: &Path, layout: Layout, out: &Path) {
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(entry, out, &runtime);
+    let built = build(golden, layout, out, &runtime);
     assert!(
         built.is_ok(),
         "{name}: ipe dev build must accept the program, got: {built:?}"
     );
 }
 
-/// THE SEAL: build the accepted `entry`, run it, and compare its output to `expected.txt`.
-fn assert_seal_runs(name: &str, golden: &Path, entry: &Path) {
+/// THE SEAL: build the accepted `golden`, run it, and compare its output to `expected.txt`.
+fn assert_seal_runs(name: &str, golden: &Path, layout: Layout) {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
-    assert_accepted(name, entry, &out);
+    assert_accepted(name, golden, layout, &out);
     let run = crate::support::build_and_run_emitted(name, &out);
     assert_eq!(
         run.exit_code,
@@ -122,18 +139,16 @@ const DEFAULTED: &str = "untyped_helper_defaulted_owner_seal";
 #[test]
 fn untyped_helper_annotated_msg_emitted() {
     let root = crate::support::repo_root();
-    let entry = golden_dir(&root, ANNOTATED).join("src").join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{ANNOTATED}_emit"));
-    assert_accepted(ANNOTATED, &entry, &out);
+    assert_accepted(ANNOTATED, &golden_dir(&root, ANNOTATED), Layout::Src, &out);
 }
 
 /// Control: an owner whose `msg` is defaulted owns no variable, so the untyped helper is accepted.
 #[test]
 fn untyped_helper_defaulted_owner_emitted() {
     let root = crate::support::repo_root();
-    let entry = golden_dir(&root, DEFAULTED).join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{DEFAULTED}_emit"));
-    assert_accepted(DEFAULTED, &entry, &out);
+    assert_accepted(DEFAULTED, &golden_dir(&root, DEFAULTED), Layout::Root, &out);
 }
 
 /// THE SEAL for the annotated control: the emitted crate builds and prints its rendering.
@@ -144,8 +159,7 @@ fn untyped_helper_annotated_msg_seal_runs() {
     }
     let root = crate::support::repo_root();
     let golden = golden_dir(&root, ANNOTATED);
-    let entry = golden.join("src").join("Main.ipe");
-    assert_seal_runs(ANNOTATED, &golden, &entry);
+    assert_seal_runs(ANNOTATED, &golden, Layout::Src);
 }
 
 /// THE SEAL for the defaulted-owner control: the emitted crate builds and prints its rendering.
@@ -156,6 +170,5 @@ fn untyped_helper_defaulted_owner_seal_runs() {
     }
     let root = crate::support::repo_root();
     let golden = golden_dir(&root, DEFAULTED);
-    let entry = golden.join("Main.ipe");
-    assert_seal_runs(DEFAULTED, &golden, &entry);
+    assert_seal_runs(DEFAULTED, &golden, Layout::Root);
 }

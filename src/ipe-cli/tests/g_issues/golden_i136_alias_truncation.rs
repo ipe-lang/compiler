@@ -18,16 +18,15 @@ fn repo_root() -> PathBuf {
 
 fn assert_builds(fixture: &str) {
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+        .join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{fixture}: alias catch-all + trailing arm must warn (IPE-T0011) and \

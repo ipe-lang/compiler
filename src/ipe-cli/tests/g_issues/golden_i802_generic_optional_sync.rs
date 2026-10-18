@@ -28,11 +28,10 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "generic_optional_decoder";
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(GOLDEN)
-        .join("Main.ipe")
 }
 
 /// Emit gate + byte-identity golden: the frontend must accept the generic
@@ -44,7 +43,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn generic_optional_sync_emits_byte_identical() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -54,7 +53,7 @@ fn generic_optional_sync_emits_byte_identical() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a generic combinator threading a type var through `JsonDecP.optional` / \
@@ -74,12 +73,12 @@ fn generic_optional_sync_emits_byte_identical() {
 #[test]
 fn generic_optional_sync_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i802_generic_optional_sync_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {

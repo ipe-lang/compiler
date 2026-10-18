@@ -17,11 +17,10 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "polymorphic_msg_helper_seal";
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(GOLDEN)
-        .join("Main.ipe")
 }
 
 /// Emit gate: the genuinely-polymorphic helpers must be accepted and emitted
@@ -29,12 +28,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn polymorphic_msg_helper_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_polymorphic_msg_helper_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a message-polymorphic helper used at two concrete msg types must keep \
@@ -49,12 +48,12 @@ fn polymorphic_msg_helper_emits() {
 #[test]
 fn polymorphic_msg_helper_seal_builds() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_polymorphic_msg_helper_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     crate::support::assert_seal_builds(GOLDEN, &out);

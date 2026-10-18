@@ -36,13 +36,12 @@ fn console_app_glues_consecutive_renders_matching_go_oracle() {
         .join("tests")
         .join("golden")
         .join("console_app_view_separator");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_i122_console_app_view_separator_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed: {:?}",

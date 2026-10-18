@@ -35,19 +35,6 @@ const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-/// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed by
-/// `name`, returning the entry path (or `None` if scratch setup fails).
-fn write_single(name: &str, source: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("untyped-app-entry-row")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).ok()?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
-}
 
 /// The scratch output dir for `name`, cleared.
 fn out_dir(name: &str) -> PathBuf {
@@ -181,12 +168,9 @@ fn untyped_embed_row_model_pinned_msg_builds() {
 }
 
 /// Build `source` as `name`, returning the build result and its output dir.
-#[allow(clippy::panic)] // a refused well-formed program is the test failure
 fn build_fixture(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
-    let Some(entry) = write_single(name, source) else {
-        panic!("{name}: could not write the fixture into the scratch dir");
-    };
+    let fixture = crate::root_fixture::main(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    (ipe::build(&entry, &out, &runtime), out)
+    (crate::root_fixture::build(&fixture, &out, &runtime), out)
 }

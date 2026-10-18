@@ -15,12 +15,10 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "cross_module_chained_msg_slot_seal";
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(GOLDEN)
-        .join("src")
-        .join("Main.ipe")
 }
 
 /// Emit gate: every `Lib` helper stays generic, threading its enclosing `Mid`
@@ -28,12 +26,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn cross_module_chained_msg_slot_emits_generic_helpers() -> Result<(), String> {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_cross_module_chained_msg_slot_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build_loose_file(&entry, &out, &runtime)
+    crate::support::build_golden(&golden_dir, &out, &runtime)
         .map_err(|e| format!("{GOLDEN} must be accepted, got: {e:?}"))?;
     let lib_rs = out.join("src").join("ipe_mods").join("ipe_mod_lib.rs");
     let emitted =
@@ -54,12 +52,12 @@ fn cross_module_chained_msg_slot_emits_generic_helpers() -> Result<(), String> {
 #[test]
 fn cross_module_chained_msg_slot_seal_builds() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_cross_module_chained_msg_slot_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     crate::support::assert_seal_builds(GOLDEN, &out);

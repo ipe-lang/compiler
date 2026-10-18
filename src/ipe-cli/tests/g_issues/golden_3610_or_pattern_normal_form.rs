@@ -35,7 +35,7 @@
 //! IPE_E2E=1 cargo test -p ipe --test g_issues golden_3610
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use ipe::CliError;
@@ -90,24 +90,18 @@ fn out_dir(name: &str) -> PathBuf {
     out
 }
 
-/// Write `HEADER` + `body` as a single-file `Main.ipe` under a fresh scratch dir.
-#[allow(clippy::expect_used)] // a scratch-dir write failure is a test-environment fault
-fn write_single(name: &str, body: &str) -> PathBuf {
-    let dir = crate::support::scratch_root().join("3610-src").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create the scratch source dir");
-    let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, format!("{HEADER}{body}")).expect("write the scratch Main.ipe");
-    entry
+/// A project fixture whose `Main` holds `HEADER` + `body`.
+fn fixture(body: &str) -> ipe::RootFixture {
+    crate::root_fixture::main(&format!("{HEADER}{body}"))
 }
 
-/// Build `entry` with `ipe`, returning its emitted directory, or failing the
+/// Build `program` with `ipe`, returning its emitted directory, or failing the
 /// test when `ipe` rejects it.
 #[track_caller]
-fn accept(name: &str, entry: &Path) -> PathBuf {
+fn accept(name: &str, program: &ipe::RootFixture) -> PathBuf {
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(entry, &out, &runtime);
+    let built = crate::root_fixture::build(program, &out, &runtime);
     assert!(
         built.is_ok(),
         "{name}: ipe must accept the program; got {built:?}"
@@ -119,8 +113,8 @@ fn accept(name: &str, entry: &Path) -> PathBuf {
 /// asserting exit 0 and `expected_stdout`. Returns the emitted directory.
 #[track_caller]
 fn accept_and_run(name: &str, body: &str, expected_stdout: &str) -> PathBuf {
-    let entry = write_single(name, body);
-    let out = accept(name, &entry);
+    let program = fixture(body);
+    let out = accept(name, &program);
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return out;
     }
@@ -143,10 +137,10 @@ fn accept_and_run(name: &str, body: &str, expected_stdout: &str) -> PathBuf {
 /// returning the refusal's span.
 #[track_caller]
 fn refused_l0116(name: &str, body: &str) -> Option<Span> {
-    let entry = write_single(name, body);
+    let program = fixture(body);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::root_fixture::build(&program, &out, &runtime);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         Ok(()) | Err(_) => None,
@@ -428,12 +422,12 @@ main =
     Io.println (String.fromInt (redundant Red ( Leaf, Node Leaf 5 Leaf )))
 "
     );
-    let entry = write_single("split_body_warning_once", &body);
+    let program = fixture(&body);
     let out = out_dir("split_body_warning_once");
     let runtime = e2e_support::require_runtime().into_path_buf();
     let ran = Command::new(crate::support::ipe_bin())
         .args(["release", "eject"])
-        .arg(&entry)
+        .arg(program.path())
         .arg("--out")
         .arg(&out)
         .arg("--runtime")
@@ -547,8 +541,8 @@ main =
 /// Splits adding exactly `OR_SPLIT_NODE_CEILING` nodes are accepted.
 #[test]
 fn node_ceiling_at_limit_builds() {
-    let entry = write_single("node_ceiling_at_limit", &node_ceiling_source(false));
-    accept("node_ceiling_at_limit", &entry);
+    let program = fixture(&node_ceiling_source(false));
+    accept("node_ceiling_at_limit", &program);
 }
 
 /// One node past `OR_SPLIT_NODE_CEILING` is refused.
@@ -719,10 +713,10 @@ pick c =
 main =
     Io.println (String.fromInt (pick Green) ++ \",\" ++ String.fromInt (pick Blue))
 ";
-    let entry = write_single("alias_over_or", body);
+    let program = fixture(body);
     let out = out_dir("alias_over_or");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::root_fixture::build(&program, &out, &runtime);
     let refusal = match &built {
         Err(CliError::Pipeline { diag, .. }) => match diag.as_ref() {
             Diagnostic::Lower {

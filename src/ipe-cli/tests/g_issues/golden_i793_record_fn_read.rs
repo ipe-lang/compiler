@@ -23,11 +23,10 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("fcf_record_fn_read")
-        .join("Main.ipe")
 }
 
 /// Emit gate + byte-identity golden: the frontend must accept the record-field
@@ -38,7 +37,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn record_fn_read_emits_byte_identical() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -48,7 +47,7 @@ fn record_fn_read_emits_byte_identical() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a record-field fn read passed into a higher-order parameter must be \
@@ -68,12 +67,12 @@ fn record_fn_read_emits_byte_identical() {
 #[test]
 fn record_fn_read_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i793_fcf_record_fn_read_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "fcf_record_fn_read must be accepted, got: {built:?}"

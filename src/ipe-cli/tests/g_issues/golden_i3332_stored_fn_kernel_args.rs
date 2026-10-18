@@ -40,23 +40,23 @@ const FAMILIES: [(&str, &str); 6] = [
     ("String", "stored_fn_kernel_string"),
 ];
 
+fn fixture_dir(name: &str) -> PathBuf {
+    repo_root().join("tests").join("golden").join(name)
+}
+
 fn fixture_entry(name: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+    fixture_dir(name).join("Main.ipe")
 }
 
 /// Build the fixture `name`, then (under `IPE_E2E=1`) `cargo build` and run it,
 /// asserting exit 0 and `expected_stdout`.
 #[track_caller]
 fn accept_and_run(name: &str, expected_stdout: &str) {
-    let entry = fixture_entry(name);
+    let dir = fixture_dir(name);
     let out = crate::support::scratch_root().join(format!("ipec_i3332_{name}"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{name}: ipe must accept the fixture; got {built:?}"

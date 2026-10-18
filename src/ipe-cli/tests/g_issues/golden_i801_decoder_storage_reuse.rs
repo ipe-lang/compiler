@@ -29,11 +29,10 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "decoder_storage_reuse";
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(GOLDEN)
-        .join("Main.ipe")
 }
 
 /// Emit gate + byte-identity golden: the frontend must accept the stored-decoder
@@ -44,7 +43,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn decoder_storage_reuse_emits_byte_identical() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -54,7 +53,7 @@ fn decoder_storage_reuse_emits_byte_identical() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a generic combinator storing a bare `Decoder a` and forwarding it into \
@@ -74,12 +73,12 @@ fn decoder_storage_reuse_emits_byte_identical() {
 #[test]
 fn decoder_storage_reuse_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i801_decoder_storage_reuse_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {

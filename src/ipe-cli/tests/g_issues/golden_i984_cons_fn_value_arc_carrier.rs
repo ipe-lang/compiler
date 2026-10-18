@@ -24,23 +24,22 @@ const NAME: &str = "i984_cons_fn_value_arc_carrier";
 /// `Arc` shim).
 const NAME_MAYBE: &str = "i984_maybe_payload_box_carrier";
 
-fn entry_of(root: &Path, name: &str) -> PathBuf {
+fn fixture_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(name)
-        .join("Main.ipe")
 }
 
 fn assert_byte_identical(name: &str) {
     let root = repo_root();
-    let entry = entry_of(&root, name);
+    let golden_dir = fixture_dir(&root, name);
     let golden = root.join("tests").join("golden").join(name).join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     crate::support::assert_emitted_project_matches_golden_dir(
@@ -90,12 +89,12 @@ fn assert_e2e_prints(name: &str, want_stdout: &str) {
         return;
     }
     let root = repo_root();
-    let entry = entry_of(&root, name);
+    let golden_dir = fixture_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);

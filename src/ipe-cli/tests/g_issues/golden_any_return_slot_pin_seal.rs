@@ -69,27 +69,15 @@ const UNPINNED: &str = "crate::main_page(n)";
 /// The program's stdout: each rendering, comma-separated.
 const EXPECTED: &str = "x,<div>x</div>,0\n";
 
-/// Write [`SOURCE`] as `src/Main.ipe` under a fresh scratch dir keyed by `suffix`, returning the entry.
-fn write_entry(suffix: &str) -> Option<PathBuf> {
-    let dir = crate::support::scratch_root().join(format!("ipec_{NAME}_{suffix}_src"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).ok()?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, SOURCE).ok()?;
-    Some(entry)
-}
-
-/// Build the program into a fresh `out` dir, returning the emitted dir.
+/// Build [`SOURCE`] as a project fixture into a fresh `out` dir, returning the emitted dir.
 fn build(suffix: &str) -> PathBuf {
-    let entry = write_entry(suffix);
-    assert!(entry.is_some(), "{NAME}: scratch source setup failed");
+    let fixture = crate::root_fixture::main(SOURCE);
     let out = crate::support::scratch_root().join(format!("ipec_{NAME}_{suffix}"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = entry.map(|entry| ipe::build_loose_file(&entry, &out, &runtime));
+    let built = crate::root_fixture::build(&fixture, &out, &runtime);
     assert!(
-        matches!(built, Some(Ok(()))),
+        matches!(built, Ok(())),
         "{NAME}: ipe dev build must accept the program, got: {built:?}"
     );
     out

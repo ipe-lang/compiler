@@ -43,17 +43,16 @@ fn f1_multiuse_let_clone() {
     }
 
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join("multiuse_let_clone")
-        .join("Main.ipe");
+        .join("multiuse_let_clone");
     let out = crate::support::scratch_root().join("ipec_i104_multiuse_let_clone_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for multiuse_let_clone: {:?}",
@@ -85,17 +84,16 @@ fn f2_closure_capture_reuse() {
     }
 
     let root = repo_root();
-    let entry = root
+    let golden_dir = root
         .join("tests")
         .join("golden")
-        .join("closure_capture_reuse")
-        .join("Main.ipe");
+        .join("closure_capture_reuse");
     let out = crate::support::scratch_root().join("ipec_i112_closure_capture_reuse_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for closure_capture_reuse: {:?}",

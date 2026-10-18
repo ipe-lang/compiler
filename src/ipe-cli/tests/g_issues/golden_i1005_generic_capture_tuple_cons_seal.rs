@@ -20,11 +20,10 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "generic_capture_tuple_cons_seal";
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(GOLDEN)
-        .join("Main.ipe")
 }
 
 /// Emit gate + byte-identity golden: the frontend must accept the tuple-cons
@@ -34,7 +33,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn generic_capture_tuple_cons_emits_byte_identical() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -44,7 +43,7 @@ fn generic_capture_tuple_cons_emits_byte_identical() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a tuple-cons-head continuation lambda over a generic element must be \
@@ -66,12 +65,12 @@ fn generic_capture_tuple_cons_emits_byte_identical() {
 #[test]
 fn generic_capture_tuple_cons_seal_builds() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i1005_generic_capture_tuple_cons_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     crate::support::assert_seal_builds(GOLDEN, &out);

@@ -27,11 +27,10 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "codec_combinators";
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(GOLDEN)
-        .join("Main.ipe")
 }
 
 /// Accept + emit gate (always): the composite combinator program must be
@@ -40,12 +39,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn codec_combinators_accepts_and_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i663_codec_combinators_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "the `Ipe.Codec` composite combinator surface must be accepted + emitted \
@@ -60,12 +59,12 @@ fn codec_combinators_accepts_and_emits() {
 #[test]
 fn codec_combinators_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i663_codec_combinators_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
