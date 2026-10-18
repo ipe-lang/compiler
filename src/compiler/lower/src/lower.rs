@@ -22,7 +22,7 @@ use ipe_diagnostics::{
     DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
     MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
-use ipe_intern::{Interner, Symbol};
+use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_ir::free_vars::{
     mentions_free, pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee,
 };
@@ -13535,7 +13535,7 @@ impl WildcardMarker {
     /// An interner diagnostic when the fresh symbol cannot be interned.
     pub fn mint(interner: &mut Interner) -> DResult<Self> {
         interner
-            .fresh_symbols("anyw_", 1)?
+            .fresh_symbols(SynthStem::AnyWild, 1)?
             .first()
             .copied()
             .map(Self)
