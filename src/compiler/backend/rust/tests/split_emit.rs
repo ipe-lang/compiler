@@ -301,7 +301,7 @@ fn emit_spine_of_a_program_naming_only_a_db_type_has_no_projection() -> DResult<
     let dsn_param = interner.intern("dsn")?;
     let takes_dsn = interner.intern("takesDsn")?;
     let mut func = int_func(2, takes_dsn, lib_home);
-    func.params = vec![(dsn_param, IrType::Dsn)];
+    func.params = vec![ipe_ir::Param::owned(dsn_param, IrType::Dsn)];
     program
         .modules
         .first_mut()

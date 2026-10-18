@@ -578,11 +578,11 @@ fn write_func(out: &mut String, func: &Func, interner: &Interner) {
     let params = func
         .params
         .iter()
-        .map(|(sym, ty)| {
+        .map(|p| {
             format!(
                 "{} : {}",
-                sym_name(interner, *sym),
-                ir_type_name(interner, ty)
+                sym_name(interner, p.sym),
+                ir_type_name(interner, &p.ty)
             )
         })
         .collect::<Vec<_>>()
@@ -1095,7 +1095,7 @@ mod tests {
             type_params: vec![],
             row_params: vec![],
             params: vec![
-                (
+                crate::Param::owned(
                     m,
                     IrType::Enum {
                         home: ModPath(vec![]),
@@ -1103,7 +1103,7 @@ mod tests {
                         args: vec![],
                     },
                 ),
-                (count, IrType::Int),
+                crate::Param::owned(count, IrType::Int),
             ],
             ret: IrType::Int,
             body: Expr::Match(Match::new(Expr::Var(m), tick_arms, &[inc, dec])?),
@@ -1259,7 +1259,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(n, IrType::Int)],
+                    params: vec![crate::Param::owned(n, IrType::Int)],
                     ret: IrType::Int,
                     body,
                 }],
@@ -1353,7 +1353,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(n, IrType::Int)],
+                    params: vec![crate::Param::owned(n, IrType::Int)],
                     ret: IrType::Tuple(vec![IrType::Int, IrType::Bool]),
                     body,
                 }],
@@ -1450,7 +1450,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(param, rec_ty.clone())],
+                    params: vec![crate::Param::owned(param, rec_ty.clone())],
                     ret: rec_ty,
                     body,
                 }],
@@ -1626,7 +1626,10 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(g, IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)))],
+                    params: vec![crate::Param::owned(
+                        g,
+                        IrType::Fun(vec![IrType::Int], Box::new(IrType::Int)),
+                    )],
                     ret: IrType::Int,
                     body,
                 }],
@@ -1709,7 +1712,10 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(i.intern("k")?, IrType::Fun(vec![], Box::new(IrType::Bool)))],
+                    params: vec![crate::Param::owned(
+                        i.intern("k")?,
+                        IrType::Fun(vec![], Box::new(IrType::Bool)),
+                    )],
                     ret: IrType::Bool,
                     body: Expr::Int(0),
                 }],
@@ -1828,7 +1834,7 @@ program
                     home: ModPath(vec![]),
                     type_params: vec![],
                     row_params: vec![],
-                    params: vec![(
+                    params: vec![crate::Param::owned(
                         m,
                         IrType::Enum {
                             home: ModPath(vec![]),
@@ -1944,7 +1950,7 @@ program
                         home: ModPath(vec![]),
                         type_params: vec![],
                         row_params: vec![],
-                        params: vec![(
+                        params: vec![crate::Param::owned(
                             w,
                             IrType::Enum {
                                 home: ModPath(vec![]),

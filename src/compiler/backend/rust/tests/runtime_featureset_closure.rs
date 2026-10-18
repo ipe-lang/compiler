@@ -1104,7 +1104,7 @@ fn email_parse_address_only_cargo_builds() -> DResult<()> {
         home: ModPath(vec![main_mod]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(s_sym, IrType::Str)],
+        params: vec![ipe_ir::Param::owned(s_sym, IrType::Str)],
         ret: IrType::Maybe(Box::new(IrType::EmailAddress)),
         body: Expr::Call {
             callee: Callee::Kernel(KernelFn::EmailAddressParse),

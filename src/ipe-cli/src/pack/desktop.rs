@@ -172,7 +172,7 @@ pub enum AppShape {
 
 impl AppShape {
     /// The lowercase name of this shape, used in a refusal diagnostic.
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::WebView => "webView",
             Self::Web => "web",

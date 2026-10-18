@@ -26,6 +26,8 @@ mod crate_specs;
 mod doc;
 mod emit_console;
 mod emit_doc;
+mod emit_settings;
+pub use emit_settings::{CrateName, EmitHost, EmitSettings, SINGLE_FILE_CRATE_NAME};
 mod emit_expr;
 mod emit_model_gate;
 mod emit_model_schema;
@@ -231,50 +233,11 @@ pub enum FfiGluePayload {
 ///
 /// Holds a reference to the [`Interner`] used to build the program, so it can
 /// resolve the [`Symbol`]s carried by the IR without widening the
-/// [`Backend::emit`] signature.
-// Each boolean is an independent emit-shape switch (production gate, debugger,
-// hot-appearance, webview-host) set by its own `with_*` builder; a bit-flags
-// enum would obscure that each is toggled in isolation.
-#[allow(clippy::struct_excessive_bools)]
+/// [`Backend::emit`] signature, plus the [`EmitSettings`] every emit reads.
+/// Production chains build it through [`Self::configured`].
 pub struct RustBackend<'a> {
     interner: &'a Interner,
-    db_driver: DbDriver,
-    ffi: Option<FfiEmit>,
-    target: ipe_ir::Target,
-    wasm_public_env: Vec<String>,
-    mount_base: MountBase,
-    wasm_hydrate_mode: bool,
-    runtime_dep: Option<RuntimeDep>,
-    /// `true` when `ipe dev build --debugger` / `ipe dev run --debugger` was passed. Adds
-    /// the runtime `debugger` feature to the emitted project's dependency feature
-    /// list so the TEA driver instantiates the recorder. Never set for
-    /// `ipe release` (the release command does not expose the flag), so no
-    /// production artifact carries recorder code. Set via [`Self::with_debugger`].
-    debugger: bool,
-    /// The verb family this emit serves; selects the `dev-posture` runtime
-    /// feature. Set via [`Self::with_build_intent`]; default `Release`.
-    build_intent: BuildIntent,
-    /// The project name from `package.ipe`, sanitized into a valid Cargo package
-    /// name via [`sanitize_cargo_name`]. Becomes the emitted crate's
-    /// `[package] name`. Empty string signals "use the safe fallback
-    /// `ipe-app`" — set via [`Self::with_project_name`].
-    cargo_name: String,
-    /// `true` when the dev-only `IPE_WATCH_HOT_APPEARANCE` flag is set. Routes
-    /// style-value literals through a per-view `LiteralTable` for appearance
-    /// hot-swap. Set via [`Self::with_hot_appearance`]; default off.
-    hot_appearance: bool,
-    /// `true` when the resolved delivery is `web desktop` — webview-native. The
-    /// webview delivery is a HOST decision (from the CLI's resolved
-    /// shape × runtime × host), not a distinct `main` entry, so it is threaded in
-    /// here rather than read from a source leaf. It forces `uses_webview` on,
-    /// which selects the webview executor and the `default = ["webview"]` feature.
-    /// Set via [`Self::with_webview_host`]; default off (served `web`).
-    webview_host: bool,
-    /// The desktop window configuration for a webview-native (`web desktop`)
-    /// delivery, resolved from the manifest `delivery.desktop` block. `None`
-    /// (the default, and always for a served `web`) selects the built-in
-    /// fallback window. Set via [`Self::with_webview_window`].
-    webview_window: Option<WebViewWindow>,
+    settings: EmitSettings,
 }
 
 /// The desktop window configuration for a webview-native (`web desktop`)
@@ -479,7 +442,7 @@ pub fn identity_hex(canonical_dir: &std::path::Path) -> String {
 /// messages keep the plain project name; only the internal crate identity carries
 /// the suffix.
 #[must_use]
-pub fn crate_identity(base: &str, canonical_dir: &std::path::Path) -> String {
+pub fn crate_identity(base: &str, canonical_dir: &std::path::Path) -> CrateIdentity {
     let digest = identity_hex(canonical_dir);
     let hex = digest.get(..CRATE_IDENTITY_HEX_LEN).unwrap_or(&digest);
 
@@ -491,7 +454,22 @@ pub fn crate_identity(base: &str, canonical_dir: &std::path::Path) -> String {
         base_trunc = base_trunc.get(..max_base).unwrap_or(base_trunc);
     }
     let base_trunc = base_trunc.trim_end_matches('-');
-    format!("{base_trunc}_{hex}")
+    CrateIdentity(format!("{base_trunc}_{hex}"))
+}
+
+/// A manifest project's crate identity: its sanitized name joined with the
+/// canonical-path digest.
+///
+/// Built only by [`crate_identity`], so no other string can stand in for it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CrateIdentity(String);
+
+impl CrateIdentity {
+    /// Borrow the identity as the emitted `[package] name`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The dependency-model emit selector.
@@ -516,38 +494,60 @@ pub struct RuntimeDep {
 }
 
 impl<'a> RustBackend<'a> {
-    /// Construct a backend that resolves IR symbols through `interner`.
-    /// Defaults to [`DbDriver::Sqlite`] — call [`Self::with_db_driver`] to
-    /// target Postgres.
+    /// Construct a backend with the settings of a bare single-file release
+    /// emit, for the backend's own tests and sweeps.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // String::new() is not const-stable
-    pub fn new(interner: &'a Interner) -> Self {
+    pub const fn new(interner: &'a Interner) -> Self {
         Self {
             interner,
-            db_driver: DbDriver::Sqlite,
-            ffi: None,
-            target: ipe_ir::Target::Native,
-            wasm_public_env: Vec::new(),
-            mount_base: MountBase::root(),
-            wasm_hydrate_mode: false,
-            runtime_dep: None,
-            debugger: false,
-            build_intent: BuildIntent::Release,
-            cargo_name: String::new(),
-            hot_appearance: false,
-            webview_host: false,
-            webview_window: None,
+            settings: EmitSettings::unconfigured(),
         }
     }
 
-    /// Set the emitted crate's package name from the `package.ipe` name field.
-    /// The value is sanitized via [`sanitize_cargo_name`] before use, so any
-    /// valid (or invalid) name produces a valid Cargo package name.
-    /// When not called (or called with an empty string), the emitted crate is
-    /// named `ipe-app` — the safe default.
+    /// Construct a backend that emits with exactly `settings`.
+    ///
+    /// The one constructor every production chain uses: each field of the
+    /// settings value is applied, so no chain can leave one at a default.
+    #[must_use]
+    pub fn configured(interner: &'a Interner, settings: &EmitSettings) -> Self {
+        let EmitSettings {
+            db_driver,
+            ffi,
+            target,
+            wasm_public_env,
+            mount_base,
+            wasm_hydrate_mode,
+            runtime_dep,
+            debugger,
+            crate_name,
+            hot_appearance,
+            host,
+            intent,
+        } = settings;
+        Self {
+            interner,
+            settings: EmitSettings {
+                db_driver: *db_driver,
+                ffi: ffi.clone(),
+                target: *target,
+                wasm_public_env: wasm_public_env.clone(),
+                mount_base: mount_base.clone(),
+                wasm_hydrate_mode: *wasm_hydrate_mode,
+                runtime_dep: runtime_dep.clone(),
+                debugger: *debugger,
+                crate_name: crate_name.clone(),
+                hot_appearance: *hot_appearance,
+                host: host.clone(),
+                intent: *intent,
+            },
+        }
+    }
+
+    /// Pin the emitted crate's package name, sanitized via
+    /// [`CargoPackageName::sanitize`].
     #[must_use]
     pub fn with_project_name(mut self, name: &str) -> Self {
-        self.cargo_name = sanitize_cargo_name(name);
+        self.settings.crate_name = CrateName::Pinned(CargoPackageName::sanitize(name));
         self
     }
 
@@ -562,7 +562,7 @@ impl<'a> RustBackend<'a> {
     /// subtree on either target.
     #[must_use]
     pub fn with_runtime_dep(mut self, runtime_dep: Option<RuntimeDep>) -> Self {
-        self.runtime_dep = runtime_dep;
+        self.settings.runtime_dep = runtime_dep;
         self
     }
 
@@ -573,7 +573,7 @@ impl<'a> RustBackend<'a> {
     /// carries recorder code.
     #[must_use]
     pub const fn with_debugger(mut self, debugger: bool) -> Self {
-        self.debugger = debugger;
+        self.settings.debugger = debugger;
         self
     }
 
@@ -584,28 +584,7 @@ impl<'a> RustBackend<'a> {
     /// emits neither, so the shipped binary has no development console default.
     #[must_use]
     pub const fn with_build_intent(mut self, intent: BuildIntent) -> Self {
-        self.build_intent = intent;
-        self
-    }
-
-    /// Mark the emit as a webview-native (`web desktop`) delivery. This is the
-    /// single source of the `uses_webview` signal: it is a resolved host
-    /// decision from the CLI, not a source-level entry. When set, the emitted
-    /// project selects the webview executor and promotes `webview` to the default
-    /// feature list; a served `web` (the default host) leaves it unset.
-    #[must_use]
-    pub const fn with_webview_host(mut self, webview_host: bool) -> Self {
-        self.webview_host = webview_host;
-        self
-    }
-
-    /// Set the desktop window configuration for a webview-native (`web desktop`)
-    /// delivery. Sourced from the manifest `delivery.desktop` block by the CLI.
-    /// Only consulted when [`Self::with_webview_host`] is set; a served `web`
-    /// leaves it `None`.
-    #[must_use]
-    pub fn with_webview_window(mut self, window: Option<WebViewWindow>) -> Self {
-        self.webview_window = window;
+        self.settings.intent = intent;
         self
     }
 
@@ -616,7 +595,7 @@ impl<'a> RustBackend<'a> {
     /// in which case the emit is byte-identical to the direct-literal form.
     #[must_use]
     pub const fn with_hot_appearance(mut self, hot_appearance: bool) -> Self {
-        self.hot_appearance = hot_appearance;
+        self.settings.hot_appearance = hot_appearance;
         self
     }
 
@@ -624,7 +603,7 @@ impl<'a> RustBackend<'a> {
     /// (`Native` by default; `WasmClient` under `ipe dev build --target wasm`).
     #[must_use]
     pub const fn with_target(mut self, target: ipe_ir::Target) -> Self {
-        self.target = target;
+        self.settings.target = target;
         self
     }
 
@@ -632,7 +611,7 @@ impl<'a> RustBackend<'a> {
     /// database setting). No-op on programs that don't use any Db kernel.
     #[must_use]
     pub const fn with_db_driver(mut self, driver: DbDriver) -> Self {
-        self.db_driver = driver;
+        self.settings.db_driver = driver;
         self
     }
 
@@ -641,7 +620,7 @@ impl<'a> RustBackend<'a> {
     /// foreign-wrapper call.
     #[must_use]
     pub fn with_ffi(mut self, ffi: Option<FfiEmit>) -> Self {
-        self.ffi = ffi;
+        self.settings.ffi = ffi;
         self
     }
 
@@ -653,7 +632,7 @@ impl<'a> RustBackend<'a> {
     /// `WasmClient` gets the SAME allowlist on each.
     #[must_use]
     pub fn with_wasm_public_env(mut self, names: Vec<String>) -> Self {
-        self.wasm_public_env = names;
+        self.settings.wasm_public_env = names;
         self
     }
 
@@ -664,7 +643,7 @@ impl<'a> RustBackend<'a> {
     /// default is [`MountBase::root`].
     #[must_use]
     pub fn with_mount_base(mut self, base: MountBase) -> Self {
-        self.mount_base = base;
+        self.settings.mount_base = base;
         self
     }
 
@@ -677,7 +656,7 @@ impl<'a> RustBackend<'a> {
     /// hydrate — spec Q6 §"Fault-tolerant hydrate — parse, don't unwrap").
     #[must_use]
     pub const fn with_wasm_hydrate_mode(mut self, enabled: bool) -> Self {
-        self.wasm_hydrate_mode = enabled;
+        self.settings.wasm_hydrate_mode = enabled;
         self
     }
 
@@ -692,23 +671,7 @@ impl<'a> RustBackend<'a> {
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`] or
     /// [`project::emit_spine`].
     pub fn emit_spine(&self, program: &Program) -> DResult<String> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::emit_spine(&ctx, program)
     }
 
@@ -722,23 +685,7 @@ impl<'a> RustBackend<'a> {
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`].
     #[cfg(test)]
     pub(crate) fn emit_ctx_for_tests(&self, program: &Program) -> DResult<EmitCtx<'a>> {
-        EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )
+        EmitCtx::build(self.interner, program, self.settings.clone())
     }
 
     /// The runtime-crate cargo features `program` selects — the SSOT
@@ -752,23 +699,7 @@ impl<'a> RustBackend<'a> {
     ///
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`].
     pub fn runtime_feature_names(&self, program: &Program) -> DResult<Vec<&'static str>> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         Ok(runtime_features::runtime_features(&ctx).as_feature_names())
     }
 
@@ -782,23 +713,7 @@ impl<'a> RustBackend<'a> {
     /// Propagates any [`Diagnostic`] from [`EmitCtx::build`] or
     /// [`project::emit_module_file`].
     pub fn emit_module_file(&self, program: &Program, home: &ModPath) -> DResult<String> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::emit_module_file(
             &ctx,
             program,
@@ -827,23 +742,7 @@ impl<'a> RustBackend<'a> {
         spine_text: &str,
         module_texts: &BTreeMap<ModPath, String>,
     ) -> DResult<EmittedProject> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::assemble_split_manifest(&ctx, program, spine_text, module_texts)
     }
 }
@@ -879,23 +778,7 @@ impl Backend for RustBackend<'_> {
     }
 
     fn emit(&self, program: &Program) -> DResult<EmittedProject> {
-        let ctx = EmitCtx::build(
-            self.interner,
-            program,
-            self.db_driver,
-            self.ffi.clone(),
-            self.target,
-            self.wasm_public_env.clone(),
-            self.mount_base.clone(),
-            self.wasm_hydrate_mode,
-            self.runtime_dep.clone(),
-            self.debugger,
-            self.build_intent,
-            self.cargo_name.clone(),
-            self.hot_appearance,
-            self.webview_host,
-            self.webview_window.clone(),
-        )?;
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
         project::emit_program(&ctx, program)
     }
 }
@@ -1577,6 +1460,10 @@ pub(crate) struct EmitCtx<'a> {
     /// the inlined `impl Fn` fast path rather than a wasted heap allocation. A
     /// function with no such params carries no entry (the common case).
     impl_fn_params: BTreeMap<FuncId, Vec<usize>>,
+    /// The pass of every parameter of every function in the program, read to
+    /// re-prove each function's borrow facts at emit entry
+    /// ([`ipe_ir::borrow::verify`]).
+    passes: ipe_ir::borrow::PassTable,
     /// Function id → the order of its explicit Rust generics, for a function
     /// that declares any ([`GenericLayout`]). Read to render a use-site
     /// [`ipe_ir::CallPin::MsgUnit`] turbofish against the callee's own clause.
@@ -1590,13 +1477,9 @@ pub(crate) struct EmitCtx<'a> {
     /// field names; the resolver then disambiguates by the record's full shape.
     /// Every `IrType::Record` and every record literal resolves through this map.
     record_by_fieldset: BTreeMap<Vec<String>, Vec<usize>>,
-    /// The sanitized Cargo package name for the emitted crate. Derived from
-    /// the `package.ipe` name field via [`sanitize_cargo_name`] and threaded in
-    /// through [`RustBackend::with_project_name`]. Used by
-    /// [`crate::project::assemble_project_files`] to write `[package] name =
-    /// "<cargo_name>"` into the emitted `Cargo.toml`. Defaults to `"ipe-app"`
-    /// when no project name is supplied.
-    pub(crate) cargo_name: String,
+    /// The emitted crate's `[package] name`, written into the emitted
+    /// `Cargo.toml`.
+    pub(crate) crate_name: CrateName,
     /// `true` when `IPE_WATCH_HOT_APPEARANCE` is set — the dev-only flag that
     /// routes style-value literals through a per-view [`ipe_runtime::literal_table::LiteralTable`]
     /// so a `view` appearance edit can hot-swap without recompiling. Default off:
@@ -1847,25 +1730,25 @@ fn clone_under(
 impl<'a> EmitCtx<'a> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::similar_names)] // `uses_ui` / `uses_tui` are intentionally similar
-    #[allow(clippy::too_many_arguments)] // the backend-config thread-through (driver, ffi, target, wasm, runtime-dep, debugger, cargo_name)
-    #[allow(clippy::fn_params_excessive_bools)] // each bool is an independent emit-shape switch threaded from BuildConfig
-    fn build(
-        interner: &'a Interner,
-        program: &Program,
-        db_driver: DbDriver,
-        ffi: Option<FfiEmit>,
-        target: ipe_ir::Target,
-        wasm_public_env: Vec<String>,
-        mount_base: MountBase,
-        wasm_hydrate_mode: bool,
-        runtime_dep: Option<RuntimeDep>,
-        debugger: bool,
-        build_intent: BuildIntent,
-        cargo_name: String,
-        hot_appearance: bool,
-        webview_host: bool,
-        webview_window: Option<WebViewWindow>,
-    ) -> DResult<Self> {
+    fn build(interner: &'a Interner, program: &Program, settings: EmitSettings) -> DResult<Self> {
+        let EmitSettings {
+            db_driver,
+            ffi,
+            target,
+            wasm_public_env,
+            mount_base,
+            wasm_hydrate_mode,
+            runtime_dep,
+            debugger,
+            crate_name,
+            hot_appearance,
+            host,
+            intent: build_intent,
+        } = settings;
+        let (webview_host, webview_window) = match host {
+            EmitHost::Served => (false, None),
+            EmitHost::WebView(window) => (true, Some(window)),
+        };
         // Every emission entry builds its context here, so a malformed literal
         // route path is refused whether or not emission reaches the route.
         route_grammar::refuse_malformed_literals(program)?;
@@ -2052,7 +1935,7 @@ impl<'a> EmitCtx<'a> {
         let mut shapes: BTreeMap<Vec<String>, ShapeOccurrences> = BTreeMap::new();
         for module in &program.modules {
             for func in &module.funcs {
-                for (_, ty) in &func.params {
+                for ipe_ir::Param { ty, .. } in &func.params {
                     collect_record_shapes(interner, ty, &mut shapes)?;
                 }
                 collect_record_shapes(interner, &func.ret, &mut shapes)?;
@@ -2319,7 +2202,7 @@ impl<'a> EmitCtx<'a> {
 
         // detect Ipe.Ui / Ipe.Html / Ipe.Web / Ipe.Tui / Ipe.Console / Ipe.WebView usage.
         // `uses_webview` is the webview-native delivery signal: the resolved
-        // `web desktop` host (threaded in as `webview_host`) OR a source module
+        // `web desktop` host (`EmitHost::WebView`) OR a source module
         // that still carries the leaf. A webview-native delivery renders the
         // server-free `web-core` core over a local IPC bridge; it does NOT run the
         // axum `web` surface, so `uses_webview` does NOT force `uses_web`. The
@@ -2449,7 +2332,7 @@ impl<'a> EmitCtx<'a> {
                 .flat_map(|m| m.funcs.iter())
                 .filter(|f| is_ipe_ui_structural_wrapper(f, interner))
                 .map(|f| {
-                    let params: Vec<Symbol> = f.params.iter().map(|(s, _)| *s).collect();
+                    let params: Vec<Symbol> = f.params.iter().map(|p| p.sym).collect();
                     (f.id, (params, f.body.clone()))
                 })
                 .collect();
@@ -2525,10 +2408,11 @@ impl<'a> EmitCtx<'a> {
             enum_traits,
             func_names,
             impl_fn_params,
+            passes: ipe_ir::borrow::PassTable::of_program(program),
             generic_layouts,
             record_structs,
             record_by_fieldset,
-            cargo_name,
+            crate_name,
             // Appearance hot-swap routes literals through the crate-root
             // `LiteralTable` (`ipe_runtime::literal_table`), a pure module a
             // dev-loop build compiles under either `web-core` (the served render
@@ -2581,7 +2465,7 @@ impl<'a> EmitCtx<'a> {
                 if self.interner.resolve(func.name) != Some(ipe_ir::HYDRATION_PROJECTION_NAME) {
                     continue;
                 }
-                let Some((_, param_ty)) = func.params.first() else {
+                let Some(ipe_ir::Param { ty: param_ty, .. }) = func.params.first() else {
                     // A `fromHydrationState` with no parameter cannot name an
                     // island type — treat as absent (fall through to clean init).
                     return Ok(None);
@@ -3886,6 +3770,17 @@ impl<'a> EmitCtx<'a> {
             })
     }
 
+    /// Re-prove `func`'s parameter pass facts before any of its Rust is rendered.
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] when a `Borrowed` parameter is not provably
+    /// read-only, so a fact that did not come from the borrow analysis (a
+    /// deserialized cache entry, a hand-built program) is refused here.
+    pub(crate) fn verify_borrows(&self, func: &ipe_ir::Func) -> DResult<()> {
+        ipe_ir::borrow::verify(func, &self.passes, &self.enum_variants)
+            .map_err(|v| v.into_diagnostic("ipe_backend_rust::emit_func"))
+    }
+
     /// Was the 0-based parameter `idx` of function `id` monomorphized to an
     /// `impl Fn` generic (so a call site passes its closure argument UNBOXED)?
     /// `false` for a call to any function that took no such param — the common
@@ -4098,7 +3993,7 @@ fn program_type_feature_requirements(program: &Program) -> BTreeSet<ipe_ir::Runt
     let mut out = BTreeSet::new();
     for module in &program.modules {
         for func in &module.funcs {
-            for (_, ty) in &func.params {
+            for ipe_ir::Param { ty, .. } in &func.params {
                 collect_type_feature_requirements(ty, &mut out);
             }
             collect_type_feature_requirements(&func.ret, &mut out);
@@ -5530,23 +5425,7 @@ mod record_struct_namespace_tests {
         // `EmitCtx::build` itself must still succeed today — the
         // record-vs-enum collision is a PRE-EXISTING gap `build` does not
         // check; this task adds the check as a SEPARATE, explicit gate.
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
         assert_eq!(ctx.record_structs().len(), 1);
         assert_eq!(
             ctx.record_structs().first().map(|r| r.name.as_str()),
@@ -5638,23 +5517,7 @@ mod record_struct_namespace_tests {
             }],
         };
 
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
         ctx.assert_record_structs_disjoint_from_type_namespace(&BTreeSet::new())
     }
 
@@ -5730,23 +5593,7 @@ mod record_struct_namespace_tests {
             }],
         };
 
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
 
         let colliding: BTreeSet<Symbol> = [snake, camel].into_iter().collect();
         let result = ctx.assert_row_witness_names_disjoint(&colliding, &BTreeSet::new());
@@ -6082,7 +5929,8 @@ mod crate_identity_tests {
 
     #[test]
     fn identity_keeps_the_friendly_base_as_prefix() {
-        let id = crate_identity("my-app", Path::new("/tmp/one"));
+        let identity = crate_identity("my-app", Path::new("/tmp/one"));
+        let id = identity.as_str();
         assert!(
             id.starts_with("my-app_"),
             "identity must keep the friendly base as its prefix, got {id:?}"
@@ -6103,7 +5951,8 @@ mod crate_identity_tests {
     #[test]
     fn over_long_base_is_truncated_under_the_cargo_ceiling() {
         let long_base = "a".repeat(100);
-        let id = crate_identity(&long_base, Path::new("/tmp/x"));
+        let identity = crate_identity(&long_base, Path::new("/tmp/x"));
+        let id = identity.as_str();
         assert!(id.len() <= 64, "identity {} chars exceeds 64", id.len());
         assert!(id.ends_with(&format!("_{}", id.rsplit('_').next().unwrap_or_default())));
     }

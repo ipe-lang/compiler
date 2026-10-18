@@ -9,8 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use super::{ProjectRoot, ScratchRoot, SourceTree};
+use crate::delivery::HostIntent;
 use crate::package_manifest::PACKAGE_IPE;
-use crate::{BuildOptions, CliError, build_project_with_options};
+use crate::{BuildOptions, CliError};
 
 /// A project tree written to a private directory and resolved, removed on drop.
 #[derive(Debug)]
@@ -100,7 +101,7 @@ pub fn build_fixture(
     build_fixture_with_options(fixture, out_dir, runtime_dir, &BuildOptions::from_env())
 }
 
-/// [`build_fixture`] with explicit [`BuildOptions`].
+/// [`build_fixture`] with explicit [`BuildOptions`], for the served host.
 ///
 /// # Errors
 /// As [`crate::build_project_with_options`].
@@ -110,7 +111,31 @@ pub fn build_fixture_with_options(
     runtime_dir: &Path,
     options: &BuildOptions,
 ) -> Result<BuiltFixture, CliError> {
-    build_project_with_options(&fixture.manifest_path(), out_dir, runtime_dir, options)?;
+    build_fixture_for(fixture, out_dir, runtime_dir, options, HostIntent::Served)
+}
+
+/// [`build_fixture_with_options`] for the host `host` asks for.
+///
+/// A webview host is reached only through a resolved delivery's
+/// [`crate::delivery::Delivery::host_intent`], the way production reaches it.
+///
+/// # Errors
+/// As [`crate::build_project_with_options`], plus [`CliError::Usage`] when
+/// `host` asks for the webview host but the entry is not a web program.
+pub fn build_fixture_for(
+    fixture: &RootFixture,
+    out_dir: &Path,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+    host: HostIntent,
+) -> Result<BuiltFixture, CliError> {
+    crate::driver::build_project_into(
+        &fixture.manifest_path(),
+        crate::driver::OutTarget::Path(out_dir),
+        runtime_dir,
+        options,
+        host,
+    )?;
     Ok(BuiltFixture {
         out: out_dir.to_path_buf(),
     })
