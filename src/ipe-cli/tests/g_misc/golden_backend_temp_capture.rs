@@ -30,7 +30,7 @@ fn emit(name: &str, out: &Path) -> String {
         out,
         &runtime,
     );
-    assert!(built.is_ok(), "{name}: ipe build failed: {:?}", built.err());
+    assert!(built.is_ok(), "{name}: build failed: {:?}", built.err());
     crate::support::read_all_emitted_src(out)
 }
 
