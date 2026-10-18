@@ -28,14 +28,13 @@ fn region_all_members_ipec_and_cargo_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("region_seal");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_i117_region_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiler must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for region_seal: {:?}",

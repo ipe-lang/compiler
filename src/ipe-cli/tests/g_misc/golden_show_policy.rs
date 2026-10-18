@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::golden_ffi_nonclone_handle_reuse_seal::write_project;
+use crate::golden_ffi_nonclone_handle_reuse_seal::ffi_fixture;
 
 fn repo_root() -> PathBuf {
     let joined = e2e_support::manifest_dir!().join("..").join("..");
@@ -34,7 +34,7 @@ fn build_every_leaf() -> PathBuf {
     let out = crate::support::scratch_root().join("ipec_show_policy_every_leaf");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "showing every constructible leaf must compile: {:?}",
@@ -90,15 +90,10 @@ fn showing_a_rust_handle_is_refused_before_cargo() {
     let source = golden_entry(&repo_root(), "show_refused_foreign");
     let main = std::fs::read_to_string(&source)
         .unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
-    let tmp = crate::support::scratch_root().join("ipec_show_refused_foreign");
-    assert!(
-        write_project(&tmp, &main),
-        "must write the fixture project + FFI cache to a temp dir"
-    );
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(&main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("show_refused_foreign_out");
     let _ = std::fs::remove_dir_all(&out);
-    let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) else {
+    let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) else {
         panic!("showing a `Rust.*` handle must be refused, but ipe accepted it")
     };
     let ipe::CliError::Pipeline { diag, .. } = &err else {

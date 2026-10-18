@@ -30,7 +30,7 @@ fn timestamp_arithmetic_emits() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "timestamp_arithmetic: typed Timestamp+Duration arithmetic must emit cleanly; got: {built:?}"
@@ -51,7 +51,7 @@ fn timestamp_arithmetic_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "timestamp_arithmetic: build must succeed: {:?}",

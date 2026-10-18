@@ -84,15 +84,11 @@ fn html_app_out_dir(tag: &str) -> PathBuf {
 
 /// Compile a fixture into its own out dir.
 #[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
-fn compile(fixture: &str, tag: &str, out: &PathBuf) -> Result<(), ipe::CliError> {
-    let ipe_dir = crate::support::scratch_root().join(format!("bare_ui_{tag}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(&ipe_dir).expect("the fixture scratch dir must be writable");
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, fixture).expect("the fixture scratch dir must be writable");
+fn compile(fixture: &str, out: &PathBuf) -> Result<(), ipe::CliError> {
+    let project = ipe::RootFixture::main(fixture).expect("the fixture project resolves");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime)
+    ipe::build_fixture(&project, out, &runtime).map(drop)
 }
 
 /// Concatenate the emitted `.rs` files that carry GENERATED program code —
@@ -137,7 +133,7 @@ fn emitted_program_sources(out: &Path) -> String {
 /// mid-build. Returns the out dir.
 fn emit_and_assert_bare_html_view(tag: &str) -> PathBuf {
     let out = html_app_out_dir(tag);
-    let result = compile(BARE_HTML_VIEW_APP, tag, &out);
+    let result = compile(BARE_HTML_VIEW_APP, &out);
     assert!(
         result.is_ok(),
         "a bare `view : Model -> Html` must arity-fill and be ipe-0, got: {:?}",
@@ -168,7 +164,7 @@ fn bare_html_view_emits_concrete_msg() {
 #[test]
 fn bare_attribute_and_element_arity_fill() {
     let out = crate::support::scratch_root().join("bare_ui_attr_out");
-    let result = compile(BARE_ATTRIBUTE_HELPER, "attr", &out);
+    let result = compile(BARE_ATTRIBUTE_HELPER, &out);
     assert!(
         result.is_ok(),
         "bare `Attribute` / `Element` annotations must arity-fill and be ipe-0, \

@@ -53,11 +53,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("console_app_seal")
-        .join("Main.ipe");
+    let dir = root.join("tests").join("golden").join("console_app_seal");
     let out = crate::support::scratch_root().join("ipec_session_replay_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -67,7 +63,7 @@ fn record_then_replay_is_deterministic_and_refuses_bad_logs() {
         debugger: true,
         ..ipe::BuildOptions::from_env()
     };
-    let built = ipe::build_with_options(&entry, &out, &runtime, options);
+    let built = ipe::build_golden_dir(&dir, &out, &runtime, &options);
     assert!(
         built.is_ok(),
         "ipe dev build --debugger must succeed: {:?}",

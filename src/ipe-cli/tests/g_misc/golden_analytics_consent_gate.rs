@@ -46,7 +46,8 @@ fn analytics_module_resolves_and_builds() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry(&root), &out, &runtime);
+    let built =
+        crate::support::build_golden(crate::support::golden_dir_of(&entry(&root)), &out, &runtime);
     assert!(
         built.is_ok(),
         "analytics_consent_gate: `ipe dev build` must exit 0 (Ipe.Analytics resolves \
@@ -69,7 +70,8 @@ fn analytics_consent_gate_end_to_end() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry(&root), &out, &runtime);
+    let built =
+        crate::support::build_golden(crate::support::golden_dir_of(&entry(&root)), &out, &runtime);
     assert!(
         built.is_ok(),
         "analytics_consent_gate: `ipe dev build` must exit 0: {:?}",
