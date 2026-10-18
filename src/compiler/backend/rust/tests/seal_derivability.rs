@@ -163,7 +163,7 @@ fn decoder_field_record_has_no_derive() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, rec)],
+        params: vec![ipe_ir::Param::owned(par, rec)],
         ret: IrType::Int,
         body: Expr::Access {
             record: Box::new(Expr::Var(par)),
@@ -217,7 +217,7 @@ fn normal_record_keeps_full_derive() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, rec)],
+        params: vec![ipe_ir::Param::owned(par, rec)],
         ret: IrType::Int,
         body: Expr::Access {
             record: Box::new(Expr::Var(par)),
@@ -309,7 +309,7 @@ fn record_fields_render_through_their_show_rows() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, rec)],
+        params: vec![ipe_ir::Param::owned(par, rec)],
         ret: IrType::Bytes,
         body: Expr::Access {
             record: Box::new(Expr::Var(par)),
@@ -386,7 +386,7 @@ fn web_html_helper_record_gets_cdpeq_without_serde() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(p, helper_rec)],
+        params: vec![ipe_ir::Param::owned(p, helper_rec)],
         ret: IrType::Str,
         body: Expr::Access {
             record: Box::new(Expr::Var(p)),
@@ -400,7 +400,7 @@ fn web_html_helper_record_gets_cdpeq_without_serde() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(p, model_rec)],
+        params: vec![ipe_ir::Param::owned(p, model_rec)],
         ret: IrType::Int,
         body: Expr::Access {
             record: Box::new(Expr::Var(p)),
@@ -499,7 +499,7 @@ fn build_capture_clone_on_key_down(interner: &mut Interner) -> DResult<Program> 
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(pfx, IrType::Str)],
+        params: vec![ipe_ir::Param::owned(pfx, IrType::Str)],
         ret: IrType::Str,
         body,
     };
@@ -615,7 +615,7 @@ fn on_key_up_capture_clone_peeled_outside_arc() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(pfx, IrType::Str)],
+        params: vec![ipe_ir::Param::owned(pfx, IrType::Str)],
         ret: IrType::Str,
         body,
     };
@@ -708,7 +708,7 @@ fn on_file_capture_clone_peeled_outside_arc() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(pfx, IrType::Str)],
+        params: vec![ipe_ir::Param::owned(pfx, IrType::Str)],
         ret: IrType::Str,
         body,
     };
@@ -801,7 +801,7 @@ fn on_bool_capture_clone_peeled_outside_arc() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(pfx, IrType::Str)],
+        params: vec![ipe_ir::Param::owned(pfx, IrType::Str)],
         ret: IrType::Bool,
         body,
     };
@@ -894,7 +894,7 @@ fn ui_view_program(interner: &mut Interner, ret: IrType, call_body: Expr) -> DRe
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(pfx, IrType::Str)],
+        params: vec![ipe_ir::Param::owned(pfx, IrType::Str)],
         ret,
         body: call_body,
     };

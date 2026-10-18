@@ -498,7 +498,7 @@ pub(super) fn expr_type_mentions(expr: &Expr, pred: &impl Fn(&IrType) -> bool) -
 /// so this is the sole position that reaches them.
 pub(super) fn func_type_mentions(f: &Func, pred: &impl Fn(&IrType) -> bool) -> bool {
     pred(&f.ret)
-        || f.params.iter().any(|(_, t)| pred(t))
+        || f.params.iter().any(|ipe_ir::Param { ty: t, .. }| pred(t))
         || expr_type_mentions(&f.body, pred)
         || f.row_params
             .iter()

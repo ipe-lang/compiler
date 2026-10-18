@@ -897,7 +897,7 @@ pub struct Func {
     /// witness bounds, and every use-site agree. `R`-prefixed names cannot
     /// collide with the `T`-prefixed ordinary type generics.
     pub row_params: Vec<RowParam>,
-    pub params: Vec<(Symbol, IrType)>,
+    pub params: Vec<crate::Param>,
     pub ret: IrType,
     pub body: Expr,
 }
@@ -5212,7 +5212,7 @@ mod tests {
             home: ModPath(vec![]),
             type_params: vec![(a, BoundSet::UNBOUNDED)],
             row_params: vec![],
-            params: vec![(x, IrType::Generic(a))],
+            params: vec![crate::Param::owned(x, IrType::Generic(a))],
             ret: IrType::Generic(a),
             body: Expr::Var(x),
         };
@@ -5228,7 +5228,7 @@ mod tests {
             home: ModPath(vec![]),
             type_params: vec![(a, BoundSet::UNBOUNDED), (b, BoundSet::UNBOUNDED)],
             row_params: vec![],
-            params: vec![(x, IrType::Generic(a))],
+            params: vec![crate::Param::owned(x, IrType::Generic(a))],
             ret: IrType::Generic(b),
             body: Expr::Var(x),
         };
@@ -5249,7 +5249,7 @@ mod tests {
             home: ModPath(vec![]),
             type_params: vec![(a, bounds)],
             row_params: vec![],
-            params: vec![(x, IrType::Generic(a))],
+            params: vec![crate::Param::owned(x, IrType::Generic(a))],
             ret: IrType::Generic(a),
             body: Expr::Var(x),
         };
@@ -5814,7 +5814,7 @@ mod serde_persistence_tests {
             home: ModPath(vec![]),
             type_params: vec![],
             row_params: vec![],
-            params: vec![(msg_param, IrType::Generic(msg_param))],
+            params: vec![crate::Param::owned(msg_param, IrType::Generic(msg_param))],
             ret: IrType::Unit,
             body,
         };

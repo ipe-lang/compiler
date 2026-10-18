@@ -116,7 +116,7 @@ fn tag_program(interner: &mut Interner, payload: Pat) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -384,7 +384,7 @@ fn bare_int_min_program(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(w, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(w, IrType::Int)],
         ret: IrType::Int,
         body: Expr::Match(ipe_ir::Match::new_flat(Expr::Var(w), arms)?),
     };
@@ -464,7 +464,7 @@ fn maybe_int_min_program(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -561,7 +561,7 @@ fn alias_program(interner: &mut Interner) -> DResult<(Program, Symbol, Symbol)> 
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w,
             IrType::Enum {
                 home: ModPath(vec![]),

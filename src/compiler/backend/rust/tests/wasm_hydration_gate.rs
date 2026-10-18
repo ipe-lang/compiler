@@ -71,7 +71,7 @@ fn hydrate_program_named(
         home: ModPath(vec![main]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(hs_param, hs_ty)],
+        params: vec![ipe_ir::Param::owned(hs_param, hs_ty)],
         ret: IrType::Int,
         body: Expr::Var(hs_param),
     };
@@ -284,7 +284,7 @@ fn hydrate_program_with_record_projection(interner: &mut Interner) -> DResult<Pr
         home: ModPath(vec![main]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(hs, rec())],
+        params: vec![ipe_ir::Param::owned(hs, rec())],
         ret: rec(),
         // Body is irrelevant to the glue↔type-name contract this test proves;
         // the signature's parameter type is what the glue must agree with.
@@ -501,7 +501,7 @@ fn hydrate_program_with_nested_adt(
         home: ModPath(vec![main]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(hs_param, hs_ty)],
+        params: vec![ipe_ir::Param::owned(hs_param, hs_ty)],
         ret: IrType::Int,
         body: Expr::Int(0),
     };

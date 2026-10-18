@@ -4977,7 +4977,12 @@ fn propagate_call_site_bounds(
     // `IrType` trees once, not per round.
     let sig_param_tys: Vec<Vec<IrType>> = funcs
         .iter()
-        .map(|f| f.params.iter().map(|(_, t)| t.clone()).collect())
+        .map(|f| {
+            f.params
+                .iter()
+                .map(|ipe_ir::Param { ty: t, .. }| t.clone())
+                .collect()
+        })
         .collect();
     let sig_rets: Vec<IrType> = funcs.iter().map(|f| f.ret.clone()).collect();
 
@@ -4996,7 +5001,11 @@ fn propagate_call_site_bounds(
             // caller tvars its bound value data-flow-derives from — so a tvar
             // reaching a bound-obliging callee slot through a local value, not
             // just a forwarded param, still inherits the callee's bound.
-            let caller_params: Vec<(Symbol, IrType)> = caller.params.clone();
+            let caller_params: Vec<(Symbol, IrType)> = caller
+                .params
+                .iter()
+                .map(|p| (p.sym, p.ty.clone()))
+                .collect();
             let caller_tvars: Vec<Symbol> = caller.type_params.iter().map(|(tv, _)| *tv).collect();
 
             let mut binder_tvars: std::collections::HashMap<Symbol, Vec<Symbol>> =
@@ -9773,7 +9782,7 @@ fn prune_dead_type_decls(
     let mut reachable_records: std::collections::HashSet<IrType> = std::collections::HashSet::new();
     for f in funcs {
         collect_ir_type_refs(&f.ret, &mut reachable_enums, &mut reachable_records);
-        for (_, t) in &f.params {
+        for ipe_ir::Param { ty: t, .. } in &f.params {
             collect_ir_type_refs(t, &mut reachable_enums, &mut reachable_records);
         }
         for r in &f.row_params {
@@ -16893,7 +16902,7 @@ impl<'a> Lowerer<'a> {
             uses_ffi,
             uses_async_runtime,
         };
-        Ok(Program {
+        let mut program = Program {
             modules: vec![module],
             // Import-derived, computed in canon (the source imports are gone by
             // now) and carried on the canonical module; the capability scan reads
@@ -16904,7 +16913,15 @@ impl<'a> Lowerer<'a> {
             // union-folded across every linked module. The scan reads it to
             // disclose each `js-port:<axis>`.
             imported_web_capabilities: self.m.imported_web_capabilities.clone(),
+        };
+        // The pass fact of every parameter is decided once over the whole
+        // program and re-proven at lowering exit; `borrow::run` verifies.
+        let env = self.clone_env();
+        ipe_ir::borrow::run(&mut program, |ty| {
+            clone_class::param_is_multiuse_clonable(env, ty)
         })
+        .map_err(|d| (d, Vec::new()))?;
+        Ok(program)
     }
 
     /// Synthesise the built-in `SqlValue` ADT as an [`EnumDef`].
@@ -17567,7 +17584,10 @@ impl<'a> Lowerer<'a> {
             home: ModPath(def.home().to_vec()),
             type_params,
             row_params,
-            params,
+            params: params
+                .into_iter()
+                .map(|(sym, ty)| ipe_ir::Param::owned(sym, ty))
+                .collect(),
             ret,
             body,
         })

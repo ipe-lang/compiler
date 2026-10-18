@@ -119,7 +119,7 @@ fn maybe_program(i: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             m,
             IrType::Enum {
                 home: ModPath(vec![]),
@@ -307,7 +307,7 @@ fn tree_sum_fn(interner: &mut Interner, syms: &TreeSyms) -> DResult<Func> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(scrut, syms.self_ty.clone())],
+        params: vec![ipe_ir::Param::owned(scrut, syms.self_ty.clone())],
         ret: IrType::Int,
         body: Expr::Match(Match::new(Expr::Var(scrut), arms, &[syms.leaf, syms.node])?),
     })
@@ -525,7 +525,7 @@ fn concrete_multi_field_enum_emits() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             s,
             IrType::Enum {
                 home: ModPath(vec![]),
