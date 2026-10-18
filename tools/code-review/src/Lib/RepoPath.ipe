@@ -12,6 +12,7 @@ import Ipe.String as String
 import Ipe.System as System
 import Ipe.Task as Task
 import Ipe.Tuple as Tuple
+import Lib.Label as Label exposing (Label, LabelPiece(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 
 
@@ -74,23 +75,24 @@ type RootMap
 
 
 -- Why a stored `tag:relative` index path, or a root map, was refused. Each
--- stored-path variant carries the stored path as it came off the index and
--- nothing else: `Ipe.Path` decides the path refusals, but its error text
--- names the root's absolute directory, so it is dropped where the refusal is
--- built and never reaches a page. `UnknownTag` is a well-formed tag the map
+-- stored-path variant carries the stored path as a quoted `Label` and nothing
+-- else, so a refusal draws a bounded label whatever the index held:
+-- `Ipe.Path` decides the path refusals, but its error text names the root's
+-- absolute directory, so it is dropped where the refusal is built and never
+-- reaches a page. `UnknownTag` is a well-formed tag the map
 -- does not bind; `ClaimedByDeeperRoot` is a path that lies at or under a
 -- declared root deeper than its own tag's, which owns it. `NoRoots`,
 -- `DuplicateTag`, `DuplicateRoot` (two tags on one directory, named in
 -- binding order) and `TooManyRoots` refuse a map's construction.
 type PathError
-    = MissingTag String
-    | UnknownTag String
-    | InvalidRelative String
-    | NotUnderRoot String
+    = MissingTag Label
+    | UnknownTag Label
+    | InvalidRelative Label
+    | NotUnderRoot Label
     | NoRoots
     | DuplicateTag String
     | DuplicateRoot String String
-    | ClaimedByDeeperRoot String
+    | ClaimedByDeeperRoot Label
     | TooManyRoots
 
 
@@ -100,10 +102,16 @@ type PathError
 parseTag : String -> Result PathError Tag
 parseTag raw =
     if raw == "" || String.contains "/" raw || String.contains ":" raw then
-        Err (MissingTag raw)
+        Err (MissingTag (storedLabel raw))
 
     else
         Ok (Tag raw)
+
+
+-- A stored path as a refusal shows it: a quoted label of `Label.labelCap`.
+storedLabel : String -> Label
+storedLabel stored =
+    Label.fromQuotedText Label.labelCap stored
 
 
 tagName : Tag -> String
@@ -667,30 +675,30 @@ resolve roots stored =
         prefix :: first :: more ->
             case parseTag prefix of
                 Err _ ->
-                    Err (MissingTag stored)
+                    Err (MissingTag (storedLabel stored))
 
                 Ok tag ->
                     case bindingFor roots tag of
                         Nothing ->
-                            Err (UnknownTag stored)
+                            Err (UnknownTag (storedLabel stored))
 
                         Just binding ->
                             joinUnder binding.root stored (String.join ":" (first :: more))
                                 |> Result.andThen (refuseIfClaimed binding stored)
 
         _ ->
-            Err (MissingTag stored)
+            Err (MissingTag (storedLabel stored))
 
 
 joinUnder : Root -> String -> String -> Result PathError Path
 joinUnder root stored rel =
     case Path.fromString rel of
         Err _ ->
-            Err (InvalidRelative stored)
+            Err (InvalidRelative (storedLabel stored))
 
         Ok relPath ->
             Path.under (rootPath root) relPath
-                |> Result.mapError (\_ -> NotUnderRoot stored)
+                |> Result.mapError (\_ -> NotUnderRoot (storedLabel stored))
 
 
 -- `path`, unless a root deeper than `binding`'s owns it.
@@ -701,68 +709,73 @@ refuseIfClaimed binding stored path =
             segmentsOf (Path.toString path)
     in
     if List.any (\deeper -> startsWith deeper segments) binding.deeper then
-        Err (ClaimedByDeeperRoot stored)
+        Err (ClaimedByDeeperRoot (storedLabel stored))
 
     else
         Ok path
 
 
--- A refusal as diagnostic text: fixed text per constructor around its payload.
--- The stored path and every tag are foreign text, so they enter only through
--- `SafeText.quoted`/`render`.
-describe : PathError -> SafeText
+-- A refusal as the pieces of a diagnostic line: fixed text per constructor
+-- around its payload. The stored path is a quoted label read from the index,
+-- so it is drawn bounded and between quotes it cannot close; a tag is
+-- operator configuration of at most `repoNameByteCeiling` bytes and enters
+-- through `SafeText.quoted`.
+describe : PathError -> List LabelPiece
 describe err =
     case err of
         MissingTag stored ->
-            SafeText.concat [ SafeText.literal "index path ", SafeText.quoted stored, SafeText.literal " has no `tag:` prefix" ]
+            storedPath stored "has no `tag:` prefix"
 
         InvalidRelative stored ->
-            SafeText.concat
-                [ SafeText.literal "index path "
-                , SafeText.quoted stored
-                , SafeText.literal " is not a valid relative path: it holds a NUL byte, or a `..` (however spelled) that climbs out of it"
-                ]
+            storedPath stored "is not a valid relative path: it holds a NUL byte, or a `..` (however spelled) that climbs out of it"
 
         UnknownTag stored ->
-            SafeText.concat [ SafeText.literal "index path ", SafeText.quoted stored, SafeText.literal " names a repo tag no configured root binds" ]
+            storedPath stored "names a repo tag no configured root binds"
 
         NotUnderRoot stored ->
-            SafeText.concat
-                [ SafeText.literal "index path "
-                , SafeText.quoted stored
-                , SafeText.literal " does not join to a path strictly below its repo root: it is empty, `.`, or absolute, or holds an element that may not be joined"
-                ]
+            storedPath stored "does not join to a path strictly below its repo root: it is empty, `.`, or absolute, or holds an element that may not be joined"
 
         NoRoots ->
-            SafeText.literal "no repository root is configured"
+            [ ToolText (SafeText.literal "no repository root is configured") ]
 
         DuplicateTag tag ->
-            SafeText.concat [ SafeText.literal "repo tag ", SafeText.quoted tag, SafeText.literal " is bound to more than one root" ]
+            [ ToolText (SafeText.concat [ SafeText.literal "repo tag ", SafeText.quoted tag, SafeText.literal " is bound to more than one root" ]) ]
 
         DuplicateRoot first second ->
-            SafeText.concat
-                [ SafeText.literal "repo tags "
-                , SafeText.quoted first
-                , SafeText.literal " and "
-                , SafeText.quoted second
-                , SafeText.literal " are bound to one directory; bind each directory to one tag"
-                ]
+            [ ToolText
+                (SafeText.concat
+                    [ SafeText.literal "repo tags "
+                    , SafeText.quoted first
+                    , SafeText.literal " and "
+                    , SafeText.quoted second
+                    , SafeText.literal " are bound to one directory; bind each directory to one tag"
+                    ]
+                )
+            ]
 
         ClaimedByDeeperRoot stored ->
-            SafeText.concat
-                [ SafeText.literal "index path "
-                , SafeText.quoted stored
-                , SafeText.literal " lies under a deeper configured repo root, which owns it"
-                ]
+            storedPath stored "lies under a deeper configured repo root, which owns it"
 
         TooManyRoots ->
-            SafeText.concat
-                [ SafeText.literal "more than "
-                , SafeText.render (String.fromInt maxRoots)
-                , SafeText.literal " repository roots are configured"
-                ]
+            [ ToolText
+                (SafeText.concat
+                    [ SafeText.literal "more than "
+                    , SafeText.render (String.fromInt maxRoots)
+                    , SafeText.literal " repository roots are configured"
+                    ]
+                )
+            ]
+
+
+-- `index path "<stored>" <problem>`, the problem a fixed text of this module.
+storedPath : Label -> String -> List LabelPiece
+storedPath stored problem =
+    [ ToolText (SafeText.literal "index path \"")
+    , IndexedLabel stored
+    , ToolText (SafeText.concat [ SafeText.literal "\" ", SafeText.literal problem ])
+    ]
 
 
 toError : PathError -> Error
 toError err =
-    Error.invalidInput (SafeText.toString (describe err))
+    Error.invalidInput (SafeText.toString (Label.piecesText (describe err)))

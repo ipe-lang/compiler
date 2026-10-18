@@ -1,4 +1,4 @@
-module Lib.Label exposing (Cap, Column, Label, LabelPart(..), byteCount, capBytes, elementCeiling, fromText, key, labelCap, markerByteCeiling, markerText, parse, parts, purposeCap, runCeiling, textBytes, windowChars)
+module Lib.Label exposing (Cap, Column, Label, LabelPart(..), LabelPiece(..), byteCount, capBytes, columnOf, elementCeiling, fromQuotedText, fromText, key, labelCap, markerByteCeiling, markerText, parse, parseQuoted, parts, piecesText, purposeCap, runCeiling, textBytes, whole, windowChars)
 
 -- A display column of the index, parsed once into a bounded label: at most
 -- `capBytes cap` bytes of shown text (escape spellings counted at their
@@ -17,13 +17,15 @@ module Lib.Label exposing (Cap, Column, Label, LabelPart(..), byteCount, capByte
 --
 -- Hazard characters are escaped as `SafeText.renderForeign` escapes them;
 -- adjacent escapes coalesce into one `LabelEscapes` run, so a run of hostile
--- characters draws one element, not one per character.
+-- characters draws one element, not one per character. A quoted label (one
+-- shown between the tool's `"` quotes) also escapes `\` and `"` as
+-- `SafeText.render` does, so the column cannot close the quotes it sits in.
 
 import Ipe.Char as Char
 import Ipe.Crypto as Crypto
 import Ipe.List as List
 import Ipe.String as String
-import Lib.SafeText as SafeText
+import Lib.SafeText as SafeText exposing (SafeText)
 
 
 type Label
@@ -37,6 +39,13 @@ type LabelPart
     = LabelText String
     | LabelEscapes String
     | LabelCut Int String
+
+
+-- One piece of a line the tool draws: a label read from the index, or text
+-- the tool wrote around it.
+type LabelPiece
+    = IndexedLabel Label
+    | ToolText SafeText
 
 
 -- The most bytes of shown text a label of this kind keeps.
@@ -142,7 +151,62 @@ partKey part =
 -- parsed exactly as the index read of the same column would be.
 fromText : Cap -> String -> Label
 fromText cap raw =
-    parse cap { shown = String.left windowChars raw, bytes = textBytes raw }
+    parse cap (columnOf raw)
+
+
+-- `fromText` for a label shown between the tool's quotes.
+fromQuotedText : Cap -> String -> Label
+fromQuotedText cap raw =
+    parseQuoted cap (columnOf raw)
+
+
+-- Text the app holds whole, as the index read returns a column: the first
+-- `windowChars` characters and the byte length of the whole.
+columnOf : String -> Column
+columnOf raw =
+    { shown = String.left windowChars raw, bytes = textBytes raw }
+
+
+-- The column's whole text, when the window holds all of it: a value the app
+-- may act on (join, bind, compare). `Nothing` when the column is longer than
+-- the window, so no decision is ever taken on a prefix.
+whole : Column -> Maybe String
+whole column =
+    if textBytes column.shown == column.bytes then
+        Just column.shown
+
+    else
+        Nothing
+
+
+-- The pieces flattened for a terminal or an error: a label's text and escape
+-- runs as shown, its marker spelled out, the tool's text as written.
+piecesText : List LabelPiece -> SafeText
+piecesText pieces =
+    SafeText.concat (List.concatMap pieceText pieces)
+
+
+pieceText : LabelPiece -> List SafeText
+pieceText piece =
+    case piece of
+        IndexedLabel label ->
+            List.map partText (parts label)
+
+        ToolText text ->
+            [ text ]
+
+
+partText : LabelPart -> SafeText
+partText part =
+    case part of
+        LabelText s ->
+            SafeText.renderForeign s
+
+        LabelEscapes s ->
+            SafeText.renderForeign s
+
+        LabelCut dropped hash ->
+            SafeText.renderForeign (markerText dropped hash)
 
 
 -- The one constructor of a label from a column. Total: every column parses.
@@ -150,12 +214,24 @@ fromText cap raw =
 -- stops it, the rest of the window is skipped.
 parse : Cap -> Column -> Label
 parse cap column =
+    parseWith SafeText.isHazard cap column
+
+
+-- `parse` for a label shown between the tool's quotes: `\` and `"` are
+-- escaped too.
+parseQuoted : Cap -> Column -> Label
+parseQuoted cap column =
+    parseWith (\c -> SafeText.isHazard c || c == '\\' || c == '"') cap column
+
+
+parseWith : (Char -> Bool) -> Cap -> Column -> Label
+parseWith escaped cap column =
     let
         window =
             String.left windowChars column.shown
 
         scanned =
-            String.foldl (scanChar (capBytes cap)) startScan window
+            String.foldl (scanChar escaped (capBytes cap)) startScan window
 
         kept =
             flushOpen scanned.open scanned.done
@@ -203,12 +279,12 @@ startScan =
     { spent = 0, raw = 0, runs = 0, open = NoOpen, done = [], stopped = False }
 
 
-scanChar : Int -> Char -> Scan -> Scan
-scanChar cap c scan =
+scanChar : (Char -> Bool) -> Int -> Char -> Scan -> Scan
+scanChar escaped cap c scan =
     if scan.stopped then
         scan
 
-    else if SafeText.isHazard c then
+    else if escaped c then
         let
             spelling =
                 SafeText.escapeSpelling c

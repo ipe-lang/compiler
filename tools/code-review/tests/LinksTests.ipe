@@ -275,7 +275,7 @@ fixtureChecks got =
 manyNames : Int -> Links.Candidates
 manyNames n =
     Links.candidates Highlight.Rust
-        { kind = "fn", name = "f", qualified = "f" }
+        (unitNamed "fn" "f" "f")
         (Links.references Highlight.Rust (String.join " " (List.map (\i -> "n" ++ String.fromInt i) (List.range 1 n))))
 
 
@@ -347,11 +347,19 @@ linkCeilingCut =
         == Just "+1 or more"
 
 
+
+-- A unit's stored identity as the index read returns it: each column through
+-- the same window `Label.columnOf` applies.
+unitNamed : String -> String -> String -> Links.UnitName
+unitNamed kind name qualified =
+    { kind = Label.columnOf kind, name = Label.columnOf name, qualified = Label.columnOf qualified }
+
+
 firstOccurrence : Bool
 firstOccurrence =
     let
         wanted =
-            Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (Links.references Highlight.Ipe "b a b c a")
+            Links.candidates Highlight.Ipe (unitNamed "file" "FILE" "F.FILE") (Links.references Highlight.Ipe "b a b c a")
 
         resolved =
             Links.resolveCandidates wanted.lookups [ ( "c", Uid.toString (uid "u-c") ), ( "a", Uid.toString (uid "u-a") ), ( "b", Uid.toString (uid "u-b") ) ]
@@ -373,22 +381,57 @@ candidateRule =
         namesFor lang unit refs =
             (Links.candidates lang unit refs).names
     in
-    namesFor Highlight.Rust { kind = "fn", name = "caller", qualified = "app::links::caller#2" } [ Bare "helper" ]
+    namesFor Highlight.Rust (unitNamed "fn" "caller" "app::links::caller#2") [ Bare "helper" ]
         == [ "helper", "app::links::helper" ]
-        && namesFor Highlight.Ipe { kind = "fn", name = "run", qualified = "Feature.run" } [ Bare "go", Path "Foo.bar" ]
+        && namesFor Highlight.Ipe (unitNamed "fn" "run" "Feature.run") [ Bare "go", Path "Foo.bar" ]
         == [ "go", "Feature.go", "Foo.bar" ]
-        && namesFor Highlight.Rust { kind = "file", name = "FILE", qualified = "app::links::FILE" } [ Bare "helper" ]
+        && namesFor Highlight.Rust (unitNamed "file" "FILE" "app::links::FILE") [ Bare "helper" ]
         == [ "helper" ]
-        && namesFor Highlight.Rust { kind = "fn", name = "other", qualified = "app::links::caller" } [ Bare "helper" ]
+        && namesFor Highlight.Rust (unitNamed "fn" "other" "app::links::caller") [ Bare "helper" ]
         == [ "helper" ]
-        && namesFor Highlight.Rust { kind = "fn", name = "f", qualified = "mycrate::m::f" } [ Path "crate::util::g" ]
+        && namesFor Highlight.Rust (unitNamed "fn" "f" "mycrate::m::f") [ Path "crate::util::g" ]
         == [ "mycrate::util::g" ]
-        && namesFor Highlight.Ipe { kind = "fn", name = "f", qualified = "M.f" } [ Path "crate.util.g" ]
+        && namesFor Highlight.Ipe (unitNamed "fn" "f" "M.f") [ Path "crate.util.g" ]
         == [ "crate.util.g" ]
-        && namesFor Highlight.Shell { kind = "fn", name = "f", qualified = "m::f" } [ Bare "g", Path "crate::x" ]
+        && namesFor Highlight.Shell (unitNamed "fn" "f" "m::f") [ Bare "g", Path "crate::x" ]
         == [ "g", "crate::x" ]
-        && namesFor Highlight.Unknown { kind = "fn", name = "f", qualified = "m::f" } [ Bare "g" ]
+        && namesFor Highlight.Unknown (unitNamed "fn" "f" "m::f") [ Bare "g" ]
         == [ "g" ]
+
+
+-- A unit whose kind, name or qualified name is longer than the index read's
+-- window builds no candidate and reads as capped, so no lookup is ever
+-- spelled from a prefix of a name. The same unit with every column exactly at
+-- the window builds its candidates. Red if a cut column reaches the rule.
+cutNameBuildsNoCandidate : Bool
+cutNameBuildsNoCandidate =
+    let
+        nameAt chars =
+            String.repeat chars "c"
+
+        atWindow =
+            unitNamed "fn" (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 5))
+
+        refs =
+            [ Bare "helper" ]
+
+        refused unit =
+            let
+                got =
+                    Links.candidates Highlight.Rust unit refs
+            in
+            List.isEmpty got.names && List.isEmpty got.lookups && got.reach == Capped
+
+        shown =
+            Links.candidates Highlight.Rust atWindow refs
+    in
+    shown.names
+        == [ "helper", "app::helper" ]
+        && shown.reach
+        == Complete
+        && refused (unitNamed "fn" (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 4)))
+        && refused (unitNamed "fn" (nameAt (Label.windowChars + 1)) ("app::" ++ nameAt (Label.windowChars - 5)))
+        && refused (unitNamed (String.repeat (Label.windowChars + 1) "f") (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 5)))
 
 
 -- A Rust `.` is a field or method access, never a path: `a.b.c` names `a`
@@ -451,7 +494,7 @@ calleeVectorDecoder =
     Decode.map3
         (\unit callee wanted -> { unit = unit, callee = callee, candidates = wanted })
         (Decode.map3
-            (\kind name qualified -> { kind = kind, name = name, qualified = qualified })
+            unitNamed
             (Decode.field "kind" Decode.string)
             (Decode.field "name" Decode.string)
             (Decode.field "qualified" Decode.string)
@@ -470,6 +513,7 @@ checks =
                 , ( "links past the link ceiling set hidden to Exactly the cut count", linkCeilingCut )
                 , ( "first occurrence wins across candidates, resolved links and urls", firstOccurrence )
                 , ( "candidates follow ipe-index's callee rule", candidateRule )
+                , ( "a unit name past the index window builds no candidate", cutNameBuildsNoCandidate )
                 , ( "references follow the shown tokens", referencesFollowTokens )
                 , ( "candidate names are bound, never spliced into the SQL text", candidateSqlBound )
                 ]

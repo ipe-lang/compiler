@@ -29,13 +29,14 @@ import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
+import Lib.Label as Label
 import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit, labelOf, labelText)
+import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit, labelOf, labelText)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -788,9 +789,10 @@ unitPageStatesDistinct =
             [ Stale Drifted
             , Stale (RangeOutOfFile { lineCount = 3 })
             , Stale UnverifiableHash
-            , Unreadable (NoFile "ipe:gone.rs")
-            , Unreadable (CannotRead "ipe:dir.rs")
-            , Unreadable (PathRefused (UnknownTag "other:a.rs"))
+            , Unreadable (NoFile (quotedLabelOf "ipe:gone.rs"))
+            , Unreadable (CannotRead (quotedLabelOf "ipe:dir.rs"))
+            , Unreadable (PathRefused (UnknownTag (quotedLabelOf "other:a.rs")))
+            , Unreadable (PathPastWindow (quotedLabelOf (String.repeat (Label.windowChars + 1) "a")))
             , TooLarge (SpanLines { lines = Index.viewLineCeiling + 1 })
             , TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
             , TooLarge (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
@@ -798,7 +800,7 @@ unitPageStatesDistinct =
             ]
 
         sourceTexts =
-            List.filterMap (Queue.sourceStatusText >> Maybe.map SafeText.toString) withheldViews
+            List.filterMap (Queue.sourceStatusText >> Maybe.map piecesShown) withheldViews
     in
     do
         at <- freshScratch "ipe-index-unit-page-states"
@@ -827,7 +829,7 @@ byteCeilingTextRoundsUp : Bool
 byteCeilingTextRoundsUp =
     maybeContains
         "257 KiB"
-        (Maybe.map SafeText.toString (Queue.sourceStatusText (TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) }))))
+        (Maybe.map piecesShown (Queue.sourceStatusText (TooLarge (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) }))))
 
 
 isNotFound : Queue.UnitPageState -> Bool

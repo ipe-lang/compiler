@@ -24,7 +24,7 @@ import Lib.Db as LibDb exposing (Decision(..), HistoryCursor(..))
 import Lib.Drawn as Drawn exposing (Mode(..), SourceRow(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
-import Lib.Index as Index exposing (Body(..), Oversize(..), SourceView(..), StaleReason(..))
+import Lib.Index as Index exposing (Body(..), Oversize(..), ReadFailure(..), SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
@@ -165,6 +165,59 @@ unreadableReasonsTyped =
         gone <- viewTagsAfter "ipe-index-unreadable-gone" (\at -> removeFileIfAny (at.repo ++ "/src/Main.ipe"))
         dir <- viewTagsAfter "ipe-index-unreadable-dir" mainIpeAsDirectory
         Task.succeed (typedUnreadable "names no file" gone && typedUnreadable "did not read as text" dir)
+
+
+-- A stored path one character longer than the index read's window is
+-- refused before any join or read, named by a bounded label; a path exactly
+-- at the window is not refused for its length (it names no file). Red if a
+-- cut path reaches `resolve` or the read, or if the window refuses a whole
+-- path.
+pathPastWindowRefused : Task.Task Error Bool
+pathPastWindowRefused =
+    do
+        at <- freshScratch "ipe-index-path-past-window"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndexUnchecked at.indexDb "UPDATE units SET path = ? WHERE uid = ?" [ SqlString (storedPathOf (Label.windowChars + 1)), Uid.toSql (uid "u-b") ]
+        past <- loadUnitNow (uid "u-b")
+        execIndexUnchecked at.indexDb "UPDATE units SET path = ? WHERE uid = ?" [ SqlString (storedPathOf Label.windowChars), Uid.toSql (uid "u-b") ]
+        within <- loadUnitNow (uid "u-b")
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (case ( Maybe.map .view past, Maybe.map .view within ) of
+                ( Just (Unreadable (PathPastWindow stored)), Just (Unreadable failure) ) ->
+                    Label.byteCount stored
+                        <= Label.capBytes Label.labelCap
+                        + Label.markerByteCeiling
+                        && List.length (Label.parts stored)
+                        <= Label.elementCeiling
+                        && not (pastWindow failure)
+
+                _ ->
+                    False
+            )
+
+
+pastWindow : ReadFailure -> Bool
+pastWindow failure =
+    case failure of
+        PathPastWindow _ ->
+            True
+
+        PathRefused _ ->
+            False
+
+        NoFile _ ->
+            False
+
+        CannotRead _ ->
+            False
+
+
+-- A stored path under the `ipe` tag of `chars` characters in all.
+storedPathOf : Int -> String
+storedPathOf chars =
+    "ipe:" ++ String.repeat (chars - 4) "a"
 
 
 -- `src/Main.ipe` replaced by a directory of that name.
@@ -1721,6 +1774,7 @@ checks =
         , check "one missing file fails only its unit" oneMissingFileIsolated
         , check "source file past the read ceiling refused" oversizedSourceRefused
         , check "an unreadable file renders a typed reason, never the OS error" unreadableReasonsTyped
+        , check "a stored path past the read window is refused before the join" pathPastWindowRefused
         , check "view and attestation match the shared ipe-index vectors" viewHashVectors
         , check "a file unit's residual matches the shared ipe-index vectors" residualVectors
         , check "a file unit shows and attests its residual, never its whole range" fileUnitShowsResidual
