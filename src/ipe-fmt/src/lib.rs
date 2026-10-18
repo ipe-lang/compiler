@@ -4422,6 +4422,105 @@ mod tests {
         assert_eq!(meaning, "formatted output parsed to a different AST");
     }
 
+    /// The run fault of formatting `src` with its own print, `from` replaced
+    /// by `to`; the edit keeps every comment, so only the run guard can fire.
+    fn run_fault(src: &str, from: &str, to: &str) -> Option<(Owner, RunFault)> {
+        let printed = format_source(src).expect("formats");
+        assert!(printed.contains(from), "{from:?} not in:\n{printed}");
+        match format_guarded(src, OutputCap::for_input(src.len()), |p, m| {
+            p.module(m).replacen(from, to, 1)
+        }) {
+            Err(FmtError::RoundTrip(RoundTripFault::CommentRun { owner, fault })) => {
+                Some((owner, fault))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn comment_guard_refuses_glued_section_comment() {
+        let src = "module M exposing (x)\n\n\n-- section\n\n\nx =\n    1\n";
+        assert_eq!(
+            run_fault(src, "-- section\n\n\n", "-- section\n"),
+            Some((Owner::Decl(0), RunFault::HeadRun))
+        );
+    }
+
+    #[test]
+    fn comment_guard_refuses_split_run() {
+        let src = "module M exposing (x)\n\n\n-- a\n-- b\nx =\n    1\n";
+        assert_eq!(
+            run_fault(src, "-- b\nx =\n    1", "x =\n    -- b\n    1"),
+            Some((Owner::Decl(0), RunFault::Adjacency))
+        );
+    }
+
+    #[test]
+    fn comment_guard_refuses_lost_gap_inside_run() {
+        let src = "module M exposing (x)\n\n\n-- a\n\n-- b\nx =\n    1\n";
+        assert_eq!(
+            run_fault(src, "-- a\n\n-- b", "-- a\n-- b"),
+            Some((Owner::Decl(0), RunFault::Adjacency))
+        );
+    }
+
+    #[test]
+    fn comment_guard_refuses_detached_module_doc() {
+        let src = "-- | doc\nmodule M exposing (x)\n\n\nx =\n    1\n";
+        assert_eq!(
+            run_fault(src, "-- | doc\n", "-- | doc\n\n"),
+            Some((Owner::Header, RunFault::HeadRun))
+        );
+    }
+
+    #[test]
+    fn comment_guard_refuses_run_moved_to_another_declaration() {
+        let src = "module M exposing (x, y)\n\n\nx =\n    1\n\n\n-- about y\ny =\n    2\n";
+        assert_eq!(
+            run_fault(
+                src,
+                "x =\n    1\n\n\n-- about y\n",
+                "-- about y\nx =\n    1\n\n\n"
+            ),
+            Some((Owner::Decl(0), RunFault::OwnerMultiset))
+        );
+    }
+
+    #[test]
+    fn comment_guard_refuses_hoist_joining_a_doc() {
+        let src = "module M exposing (x)\n\n\n-- | doc\nx =\n    -- inner\n    1\n";
+        assert_eq!(
+            run_fault(
+                src,
+                "-- | doc\nx =\n    -- inner\n",
+                "-- inner\n-- | doc\nx =\n"
+            ),
+            Some((Owner::Decl(0), RunFault::HeadRun))
+        );
+    }
+
+    #[test]
+    fn comment_guard_refuses_comment_inserted_inside_run() {
+        let src = "module M exposing (x)\n\n\n-- a\n-- b\nx =\n    -- c\n    1\n";
+        assert_eq!(
+            run_fault(
+                src,
+                "-- a\n-- b\nx =\n    -- c\n",
+                "-- a\n-- c\n-- b\nx =\n"
+            ),
+            Some((Owner::Decl(0), RunFault::Adjacency))
+        );
+    }
+
+    #[test]
+    fn comment_guard_refuses_blank_inserted_in_case_arm_run() {
+        let src = "module M exposing (f)\n\n\nf x =\n    case x of\n        0 ->\n            1\n\n        -- one\n        -- two\n        _ ->\n            2\n";
+        assert_eq!(
+            run_fault(src, "-- one\n        -- two", "-- one\n\n        -- two"),
+            Some((Owner::Decl(0), RunFault::Adjacency))
+        );
+    }
+
     /// A triple-quoted string strips the margin of its anchor column from
     /// every later line, so moving it to another column changes its value:
     /// the formatter refuses rather than printing the moved string.

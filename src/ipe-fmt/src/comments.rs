@@ -55,11 +55,6 @@ impl Comment {
         self.anchor
     }
 
-    /// The offset of the comment's first byte.
-    pub const fn start(&self) -> usize {
-        self.start
-    }
-
     /// The gap after the previous comment.
     pub const fn gap_before(&self) -> Gap {
         self.gap_before

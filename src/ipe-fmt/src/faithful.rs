@@ -142,14 +142,6 @@ fn owners_kept(
     after: &Layout,
     output: &[Comment],
 ) -> Result<(), Refusal> {
-    let owned = |layout: &Layout, list: &[Comment]| {
-        let mut v: Vec<(Owner, CommentKey<'_>)> = list
-            .iter()
-            .map(|c| (layout.owner(c.anchor()), c.key()))
-            .collect();
-        v.sort_unstable();
-        v
-    };
     let a = owned(before, input);
     let b = owned(after, output);
     if a == b {
@@ -168,6 +160,16 @@ fn owners_kept(
     })
 }
 
+/// Each comment of `list` keyed by its owner, sorted.
+fn owned<'a>(layout: &Layout, list: &'a [Comment]) -> Vec<(Owner, CommentKey<'a>)> {
+    let mut v: Vec<(Owner, CommentKey<'a>)> = list
+        .iter()
+        .map(|c| (layout.owner(c.anchor()), c.key()))
+        .collect();
+    v.sort_unstable();
+    v
+}
+
 /// An adjacent pair: two consecutive comments at the same anchor.
 type Pair<'a> = (Owner, CommentKey<'a>, Gap, CommentKey<'a>);
 
@@ -179,19 +181,6 @@ fn pairs_kept(
     after: &Layout,
     output: &[Comment],
 ) -> Result<(), Refusal> {
-    let pairs = |layout: &Layout, list: &[Comment]| {
-        let mut v: Vec<Pair<'_>> = list
-            .windows(2)
-            .filter_map(|w| match w {
-                [a, b] if a.anchor() == b.anchor() => {
-                    Some((layout.owner(a.anchor()), a.key(), b.gap_before(), b.key()))
-                }
-                _ => None,
-            })
-            .collect();
-        v.sort_unstable();
-        v
-    };
     let need = pairs(before, input);
     let have = pairs(after, output);
     let mut have = have.iter().peekable();
@@ -205,6 +194,21 @@ fn pairs_kept(
         }
     }
     Ok(())
+}
+
+/// The adjacent pairs of `list`, sorted.
+fn pairs<'a>(layout: &Layout, list: &'a [Comment]) -> Vec<Pair<'a>> {
+    let mut v: Vec<Pair<'a>> = list
+        .windows(2)
+        .filter_map(|w| match w {
+            [a, b] if a.anchor() == b.anchor() => {
+                Some((layout.owner(a.anchor()), a.key(), b.gap_before(), b.key()))
+            }
+            _ => None,
+        })
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 /// C3: the run directly above each head stays a suffix of the output's run
