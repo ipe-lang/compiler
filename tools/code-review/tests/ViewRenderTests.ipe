@@ -27,7 +27,7 @@ import Lib.RepoPath exposing (PathError(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid
 import Lib.View as View
-import TestSupport exposing (accepted, labelOf, labelText, decidedRefusalNow, checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
+import TestSupport exposing (accepted, labelOf, quotedLabelOf, labelText, decidedRefusalNow, checkReporting, cleanupIndex, codeText, execIndex, freshScratch, loadHistoryPageNow, loadPageNow, loadUnitNow, migratedReviewAt, removeFileIfAny, renderedForeign, seedIndex, uid, writeFileText, appendSigned, rawRow, countingVerifier, testKeyHex)
 
 
 -- Every check here renders the real `View.view` to HTML, the exact string the
@@ -296,9 +296,10 @@ withheldCases =
     [ staleCase Drifted
     , staleCase (RangeOutOfFile { lineCount = 2 })
     , staleCase UnverifiableHash
-    , { view = Unreadable (NoFile "ipe:gone.rs"), reason = "Source unreadable: " }
-    , { view = Unreadable (CannotRead "ipe:dir.rs"), reason = "Source unreadable: " }
-    , { view = Unreadable (PathRefused (UnknownTag "other:a.rs")), reason = "Source unreadable: " }
+    , { view = Unreadable (NoFile (quotedLabelOf "ipe:gone.rs")), reason = "Source unreadable: " }
+    , { view = Unreadable (CannotRead (quotedLabelOf "ipe:dir.rs")), reason = "Source unreadable: " }
+    , { view = Unreadable (PathRefused (UnknownTag (quotedLabelOf "other:a.rs"))), reason = "Source unreadable: " }
+    , { view = Unreadable (PathPastWindow (quotedLabelOf (String.repeat (Label.windowChars + 1) "a"))), reason = "Source unreadable: " }
     , oversizeCase (SpanLines { lines = Index.viewLineCeiling + 1 })
     , oversizeCase (ViewBytes { size = ByteSize.bytes (ByteSize.toBytes Index.viewByteCeiling + 1) })
     , oversizeCase (ChildSpans { atLeast = Index.childSpanCeiling + 1 })
@@ -326,6 +327,9 @@ withheldName view =
 
         Unreadable (PathRefused _) ->
             Just "PathRefused"
+
+        Unreadable (PathPastWindow _) ->
+            Just "PathPastWindow"
 
         Unreadable (NoFile _) ->
             Just "NoFile"
@@ -1318,7 +1322,7 @@ untrustedSinkChecks loaded =
                 && List.all (\failure -> fixedInByteOrder (prefixOf slot) failure (render slot failure)) everyCase
 
         unreadable stored =
-            { loaded | view = Unreadable (NoFile stored) }
+            { loaded | view = Unreadable (NoFile (quotedLabelOf stored)) }
 
         unreadablePrefix =
             byteOrderOpen ++ Html.escapeHtml "Source unreadable: index path "
@@ -1402,7 +1406,7 @@ budgetRefusal : String -> Index.RefusalRow
 budgetRefusal id =
     { uid = uid id
     , path = labelOf hostileColumn
-    , lang = "other"
+    , lang = labelOf "other"
     , reason = UnreadableEntry
     , size = Nothing
     , digest = Nothing

@@ -32,7 +32,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), ReposError(..), Root, R
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid
-import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, piecesShown, quotedLabelOf, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
 
 
 -- ── guard the path resolver ─────────────────────────────────────────────
@@ -157,7 +157,7 @@ refusalNames fragment result =
             False
 
         Err err ->
-            String.contains fragment (SafeText.toString (RepoPath.describe err))
+            String.contains fragment (describeText err)
 
 
 refused : Result PathError Path.Path -> Bool
@@ -306,7 +306,7 @@ pathRefusalPageTextFixed =
                 Path.toString (RepoPath.rootPath root)
 
             pageText err =
-                SafeText.toString (Index.readFailureText (PathRefused err))
+                piecesShown (Index.readFailureText (PathRefused err))
 
             fixed expected stored =
                 case RepoPath.resolve roots stored of
@@ -328,13 +328,13 @@ pathRefusalPageTextFixed =
                 && String.length base > 1
                 && resolvesTo (rootText ++ "/src/x.ipe") (RepoPath.resolve roots "ipe:src/x.ipe")
                 && List.all identity
-                    [ fixed (InvalidRelative "ipe:../x") "ipe:../x"
-                    , fixed (InvalidRelative "ipe:a/../../escape") "ipe:a/../../escape"
-                    , fixed (InvalidRelative "ipe:a\0b") "ipe:a\0b"
-                    , fixed (NotUnderRoot "ipe:/etc/passwd") "ipe:/etc/passwd"
-                    , fixed (NotUnderRoot "ipe:") "ipe:"
-                    , fixed (NotUnderRoot "ipe:.") "ipe:."
-                    , fixed (NotUnderRoot "ipe:a/..") "ipe:a/.."
+                    [ fixed (InvalidRelative (quotedLabelOf "ipe:../x")) "ipe:../x"
+                    , fixed (InvalidRelative (quotedLabelOf "ipe:a/../../escape")) "ipe:a/../../escape"
+                    , fixed (InvalidRelative (quotedLabelOf "ipe:a\0b")) "ipe:a\0b"
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:/etc/passwd")) "ipe:/etc/passwd"
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:")) "ipe:"
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:.")) "ipe:."
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:a/..")) "ipe:a/.."
                     ]
             )
 
@@ -487,16 +487,16 @@ describeEscapesStoredPath : Bool
 describeEscapesStoredPath =
     let
         osc =
-            describeText (MissingTag (codeText 27 ++ "]0;x" ++ codeText 7))
+            describeText (MissingTag (quotedLabelOf (codeText 27 ++ "]0;x" ++ codeText 7)))
 
         cr =
-            describeText (MissingTag "a\rb")
+            describeText (MissingTag (quotedLabelOf "a\rb"))
 
         lf =
-            describeText (MissingTag "a\nb")
+            describeText (MissingTag (quotedLabelOf "a\nb"))
 
         rlo =
-            describeText (MissingTag (codeText 8238 ++ "gpj.exe"))
+            describeText (MissingTag (quotedLabelOf (codeText 8238 ++ "gpj.exe")))
     in
     List.all identity
         [ String.contains "\\u{1b}]0;x\\u{7}" osc
@@ -543,16 +543,16 @@ withForeign : String -> PathError -> PathError
 withForeign stored err =
     case err of
         MissingTag _ ->
-            MissingTag stored
+            MissingTag (quotedLabelOf stored)
 
         UnknownTag _ ->
-            UnknownTag stored
+            UnknownTag (quotedLabelOf stored)
 
         InvalidRelative _ ->
-            InvalidRelative stored
+            InvalidRelative (quotedLabelOf stored)
 
         NotUnderRoot _ ->
-            NotUnderRoot stored
+            NotUnderRoot (quotedLabelOf stored)
 
         NoRoots ->
             NoRoots
@@ -564,7 +564,7 @@ withForeign stored err =
             DuplicateRoot stored stored
 
         ClaimedByDeeperRoot _ ->
-            ClaimedByDeeperRoot stored
+            ClaimedByDeeperRoot (quotedLabelOf stored)
 
         TooManyRoots ->
             TooManyRoots
@@ -572,14 +572,14 @@ withForeign stored err =
 
 allPathErrors : List PathError
 allPathErrors =
-    [ MissingTag ""
-    , UnknownTag ""
-    , InvalidRelative ""
-    , NotUnderRoot ""
+    [ MissingTag (quotedLabelOf "")
+    , UnknownTag (quotedLabelOf "")
+    , InvalidRelative (quotedLabelOf "")
+    , NotUnderRoot (quotedLabelOf "")
     , NoRoots
     , DuplicateTag ""
     , DuplicateRoot "" ""
-    , ClaimedByDeeperRoot ""
+    , ClaimedByDeeperRoot (quotedLabelOf "")
     , TooManyRoots
     ]
 

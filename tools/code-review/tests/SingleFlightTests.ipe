@@ -1027,7 +1027,7 @@ blockingRow : Index.RefusalRow
 blockingRow =
     { uid = uid "r-blocking"
     , path = labelOf "ipe:src/unreadable.txt"
-    , lang = "other"
+    , lang = labelOf "other"
     , reason = UnreadableEntry
     , size = Nothing
     , digest = Nothing

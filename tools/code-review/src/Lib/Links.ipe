@@ -178,12 +178,35 @@ type Reference
     | Bare String
 
 
--- A unit's stored identity, from which its own module is read.
+-- A unit's stored identity as the index read returns it, each column a
+-- bounded window and its byte length, from which its own module is read.
 type alias UnitName =
+    { kind : Label.Column
+    , name : Label.Column
+    , qualified : Label.Column
+    }
+
+
+-- A unit's stored identity, every column whole: what the candidate rule
+-- reads, built only by `wholeName`.
+type alias WholeName =
     { kind : String
     , name : String
     , qualified : String
     }
+
+
+-- The identity whole, when each window holds its whole column; `Nothing`
+-- when any column is longer than its window, so no candidate is ever built
+-- from a prefix of a name.
+wholeName : UnitName -> Maybe WholeName
+wholeName unit =
+    case ( Label.whole unit.kind, Label.whole unit.name, Label.whole unit.qualified ) of
+        ( Just kind, Just name, Just qualified ) ->
+            Just { kind = kind, name = name, qualified = qualified }
+
+        _ ->
+            Nothing
 
 
 -- The references of a shown source, in source order, folded over the tokens
@@ -485,7 +508,9 @@ closeWalk walk refs =
 -- `names` holds every distinct alternative, in first-occurrence order. The
 -- first reference whose alternatives would carry `names` past
 -- `linkCandidateCeiling` is not looked up, nor is any after it, and `reach`
--- says so.
+-- says so. A unit whose kind, name or qualified name is longer than its
+-- window looks nothing up, and `reach` is `Capped`: the page says links may
+-- be missing rather than linking from a prefix.
 type alias Candidates =
     { lookups : List (List String)
     , names : List String
@@ -501,7 +526,17 @@ type alias CandidateAcc =
 
 
 candidates : Lang -> UnitName -> List Reference -> Candidates
-candidates lang unit refs =
+candidates lang columns refs =
+    case wholeName columns of
+        Just unit ->
+            candidatesOf lang unit refs
+
+        Nothing ->
+            { lookups = [], names = [], reach = Capped }
+
+
+candidatesOf : Lang -> WholeName -> List Reference -> Candidates
+candidatesOf lang unit refs =
     let
         rule =
             Highlight.pathRule lang
@@ -598,7 +633,7 @@ referenceKey ref =
             "b:" ++ t
 
 
-alternatives : Maybe PathRule -> UnitName -> Maybe String -> Reference -> List String
+alternatives : Maybe PathRule -> WholeName -> Maybe String -> Reference -> List String
 alternatives rule unit base ref =
     case ref of
         Path p ->
@@ -620,7 +655,7 @@ alternatives rule unit base ref =
 -- `crate::`) names the unit's own crate: the first segment of its qualified
 -- name, the crate root ipe-index roots every module path at. A language
 -- with no such word looks every path up as written.
-ownRootRewrite : Maybe PathRule -> UnitName -> String -> String
+ownRootRewrite : Maybe PathRule -> WholeName -> String -> String
 ownRootRewrite rule unit path =
     case rule of
         Just r ->
@@ -635,7 +670,7 @@ ownRootRewrite rule unit path =
             path
 
 
-rootedAt : String -> String -> UnitName -> String -> String
+rootedAt : String -> String -> WholeName -> String -> String
 rootedAt sep prefix unit path =
     if String.startsWith prefix path then
         case List.head (String.split sep unit.qualified) of
@@ -665,7 +700,7 @@ separatorText sep =
 -- duplicate ordinal, then without `separator ++ name` at its end. A file
 -- unit, a qualified name without that suffix, and a language that spells no
 -- path have none.
-moduleBase : Maybe PathRule -> UnitName -> Maybe String
+moduleBase : Maybe PathRule -> WholeName -> Maybe String
 moduleBase rule unit =
     case rule of
         Just r ->
@@ -675,7 +710,7 @@ moduleBase rule unit =
             Nothing
 
 
-moduleUnder : String -> UnitName -> Maybe String
+moduleUnder : String -> WholeName -> Maybe String
 moduleUnder sep unit =
     let
         qualified =
