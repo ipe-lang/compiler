@@ -9,7 +9,7 @@
 //! The `RadioOption` opaque type was also absent from the IR (`UiCtor` enum)
 //! and from the type-routing in `ir_type_from_canon` / `ir_type_from_ty`.
 //!
-//! This test asserts that `ipe::build` succeeds on the fixture — no pipeline
+//! This test asserts that `support::build_golden` succeeds on the fixture — no pipeline
 //! diagnostic, no panic.  It does NOT run cargo or the emitted binary (no
 //! `IPE_E2E` required).
 
@@ -34,7 +34,8 @@ fn input_radio_row_typechecks_and_lowers() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let result = ipe::build(&entry, &out, &runtime);
+    let result =
+        crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         result.is_ok(),
         "Input.radio / Input.radioRow / Input.option must compile without diagnostic; got: {:?}",

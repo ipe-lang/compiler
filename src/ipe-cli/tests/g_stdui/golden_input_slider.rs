@@ -8,7 +8,7 @@
 //! at resolution time (the name was unregistered in `STDLIB_MODULE_QUALIFIERS`
 //! in older builds) or a `CompilerBug` panic at lowering.
 //!
-//! This test asserts that `ipe::build` succeeds on the fixture — no pipeline
+//! This test asserts that `support::build_golden` succeeds on the fixture — no pipeline
 //! diagnostic, no panic.  It does NOT run cargo or the emitted binary (no
 //! `IPE_E2E` required).
 
@@ -33,7 +33,8 @@ fn input_slider_typechecks_and_lowers() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let result = ipe::build(&entry, &out, &runtime);
+    let result =
+        crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         result.is_ok(),
         "Input.slider must compile without diagnostic; got: {:?}",

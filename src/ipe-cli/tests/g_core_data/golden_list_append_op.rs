@@ -33,7 +33,7 @@ fn compile_golden(name: &str) -> PathBuf {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
     out
 }
@@ -71,7 +71,7 @@ fn append_on_int_is_rejected_at_typecheck() {
     let out = crate::support::scratch_root().join("ipec_m_neg_append_on_int_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_err(),
         "`++` on `Int` MUST fail at ipec type-check (Appendable obligation), \

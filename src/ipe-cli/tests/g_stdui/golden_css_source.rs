@@ -39,7 +39,11 @@ fn css_source_builds_and_injects_leaf_kernels() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_source_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build_project(&css_manifest(), &out, &runtime());
+    let res = crate::support::build_golden(
+        crate::support::golden_dir_of(&css_manifest()),
+        &out,
+        &runtime(),
+    );
     assert!(
         res.is_ok(),
         "Ipe.Css project must build (inject → canon-as-stdlib → lower → emit): {:?}",
@@ -82,7 +86,11 @@ fn css_e2e_neutralises_injection() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_source_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build_project(&css_manifest(), &out, &runtime());
+    let res = crate::support::build_golden(
+        crate::support::golden_dir_of(&css_manifest()),
+        &out,
+        &runtime(),
+    );
     assert!(res.is_ok(), "Ipe.Css build must succeed: {:?}", res.err());
 
     let outcome = crate::support::build_and_run_emitted("spike-css-source", &out);
