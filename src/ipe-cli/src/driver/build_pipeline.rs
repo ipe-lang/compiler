@@ -116,14 +116,19 @@ pub enum OutTarget<'a> {
     Proven(&'a EmitTarget),
     /// A bare path, proven against the project being built.
     Path(&'a Path),
+    /// A private scratch directory: its runtime bundle is stamped with the
+    /// scratch role and written under the pinned mtime, and its crate is the
+    /// fixed test crate.
+    Scratch(&'a crate::scratch::ScratchDir),
 }
 
 impl OutTarget<'_> {
-    /// The proven target, proving a bare path against `project`.
+    /// The proven target, proving a bare path or a scratch root against `project`.
     fn prove(self, project: &ProjectPaths) -> Result<EmitTarget, CliError> {
         match self {
             Self::Proven(target) => Ok(target.clone()),
             Self::Path(out_dir) => EmitTarget::at(out_dir, project),
+            Self::Scratch(scratch) => EmitTarget::in_scratch(scratch, project),
         }
     }
 }
@@ -167,12 +172,18 @@ fn single_file_crate_name() -> ipe_backend_rust::CrateName {
 ///
 /// There is no manifest window, so the host is always served. `ffi` and
 /// `runtime_dep` stay `None` here: the compile core fills both once it has
-/// resolved them.
+/// resolved them. A scratch emission is the test runner, named by the fixed
+/// [`ipe_backend_rust::CrateName::Test`], never by the environment.
 #[must_use]
 pub fn loose_emit_settings(
     db_driver: ipe_backend_rust::DbDriver,
     options: &BuildOptions,
+    role: runtime_embed::BundleRole,
 ) -> ipe_backend_rust::EmitSettings {
+    let crate_name = match role {
+        runtime_embed::BundleRole::Out => single_file_crate_name(),
+        runtime_embed::BundleRole::Scratch => ipe_backend_rust::CrateName::Test,
+    };
     ipe_backend_rust::EmitSettings {
         db_driver,
         ffi: None,
@@ -182,7 +193,7 @@ pub fn loose_emit_settings(
         wasm_hydrate_mode: options.wasm_hydrate_mode,
         runtime_dep: None,
         debugger: options.debugger,
-        crate_name: single_file_crate_name(),
+        crate_name,
         hot_appearance: options.hot_appearance,
         host: ipe_backend_rust::EmitHost::Served,
         intent: options.intent,
@@ -1060,7 +1071,7 @@ pub fn compile_modules_observed(
         Ok(set) => set,
         Err(e) => return (Err(e), CacheOutcome::Miss),
     };
-    let settings = loose_emit_settings(db_driver, &options);
+    let settings = loose_emit_settings(db_driver, &options, target.bundle_role());
     compile_source_set_observed(
         source_set,
         entry_path,
@@ -2272,7 +2283,8 @@ pub fn write_emitted_project(
 ) -> Result<EmittedCrate, CliError> {
     use ipe_backend_rust::static_build;
 
-    let mut manifest = build_emit_manifest(emitted, runtime_dir, tree_shake_vendored)?;
+    let role = target.bundle_role();
+    let mut manifest = build_emit_manifest(emitted, runtime_dir, tree_shake_vendored, role)?;
     match floor {
         crate::run_sandbox::EmitFloor::DevelopmentMarker => {
             let main_rs = manifest
@@ -2304,7 +2316,7 @@ pub fn write_emitted_project(
     // The reconcile below prunes and overwrites, so it runs only in a directory
     // proven ipe-owned and disjoint from the project.
     let crate_dir = target.claim()?;
-    reconcile_emitted_project(&manifest, &crate_dir)?;
+    reconcile_emitted_project(&manifest, &crate_dir, role)?;
     if static_plan.is_none() {
         remove_stale_static_config(&crate_dir)?;
     }
@@ -2477,6 +2489,7 @@ pub fn build_emit_manifest(
     emitted: &ipe_backend::EmittedProject,
     runtime_dir: &Path,
     tree_shake_vendored: bool,
+    role: runtime_embed::BundleRole,
 ) -> Result<BTreeMap<PathBuf, String>, CliError> {
     let mut manifest = BTreeMap::new();
     // The emit shape is self-describing: a vendored emit always writes
@@ -2510,10 +2523,12 @@ pub fn build_emit_manifest(
         // runtime source under that directory so the dep resolves in any
         // environment — cross-compiler container, offline, CI — without a
         // host-absolute path. The embedded source is the binary's own version,
-        // identical to the in-repo tree by construction.
-        let embedded = runtime_embed::collect_embedded_crate_text()?;
-        for (rel, text) in embedded {
-            manifest.insert(PathBuf::from("ipe_runtime_dep").join(rel), text.clone());
+        // identical to the in-repo tree by construction; its manifest version
+        // carries `role` and the bundle's content digest, so cargo never shares
+        // a compiled unit between two bundles that differ.
+        let embedded = runtime_embed::bundled_runtime(role)?;
+        for (rel, text) in embedded.files() {
+            manifest.insert(Path::new(RUNTIME_DEP_DIR).join(rel), text.clone());
         }
     }
     manifest.insert(PathBuf::from("Cargo.toml"), emitted.cargo_toml.clone());
@@ -2665,12 +2680,25 @@ pub fn collect_dir_text(
 pub fn reconcile_emitted_project(
     manifest: &BTreeMap<PathBuf, String>,
     crate_dir: &OwnedDir,
+    role: runtime_embed::BundleRole,
 ) -> Result<(), CliError> {
     for (rel, contents) in manifest {
-        write_if_changed(&crate_dir.path_to(rel)?, contents)?;
+        let target = crate_dir.path_to(rel)?;
+        let pinned = match role {
+            runtime_embed::BundleRole::Out => false,
+            runtime_embed::BundleRole::Scratch => rel.starts_with(RUNTIME_DEP_DIR),
+        };
+        if pinned {
+            target.write_pinned(contents.as_bytes(), crate::output_dir::BUNDLE_MTIME)?;
+        } else {
+            write_if_changed(&target, contents)?;
+        }
     }
     prune_orphaned_files(crate_dir, manifest)
 }
+
+/// The directory of an emitted crate the bundled runtime is written under.
+const RUNTIME_DEP_DIR: &str = "ipe_runtime_dep";
 
 /// Write `contents` to `target` only when the existing content differs.
 ///
@@ -3106,7 +3134,12 @@ mod tests {
             ("src/ipe_runtime/x.rs", "// a\rb\n"),
             ("src/ipe_mods/upper.RS", "// a\u{2066}b\n"),
         ] {
-            let refused = build_emit_manifest(&vendored_project(&[(path, body)]), missing, true);
+            let refused = build_emit_manifest(
+                &vendored_project(&[(path, body)]),
+                missing,
+                true,
+                runtime_embed::BundleRole::Out,
+            );
             assert!(
                 matches!(&refused, Err(CliError::Pipeline { .. })),
                 "a raw hazard in {path} passed the manifest"
@@ -3138,7 +3171,13 @@ mod tests {
             ("www/index.html", "<p>\u{202E}\r</p>"),
         ] {
             assert!(
-                build_emit_manifest(&vendored_project(&[(path, body)]), missing, true).is_ok(),
+                build_emit_manifest(
+                    &vendored_project(&[(path, body)]),
+                    missing,
+                    true,
+                    runtime_embed::BundleRole::Out,
+                )
+                .is_ok(),
                 "lexable or non-Rust text in {path} was refused"
             );
         }

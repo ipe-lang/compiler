@@ -1076,6 +1076,31 @@ impl FlooredBuild<'_> {
         }
         .run()
     }
+
+    /// Remove every compiled unit of `package` from the build directory, ahead of [`Self::run`].
+    ///
+    /// The clean builds no binary, so it writes no floor; it runs in the
+    /// profile the finish picks, against the same crate and directory.
+    ///
+    /// # Errors
+    /// The errors of [`CargoBuild::clean_package`].
+    pub(crate) fn clean_package(&self, package: &str) -> Result<(), CliError> {
+        let profile = match self.finish {
+            NativeFinish::Dev => CargoProfile::Dev,
+            NativeFinish::Release { .. } => CargoProfile::Release,
+        };
+        CargoBuild {
+            cargo: self.cargo,
+            krate: CargoCrate::Emitted(self.crate_dir.dir()),
+            profile,
+            target: self.target,
+            target_dir: self.target_dir,
+            output: self.output,
+            what: self.what,
+            runtime: None,
+        }
+        .clean_package(package)
+    }
 }
 
 /// Build the pure-native release binary of `crate_dir` for `triple`: an

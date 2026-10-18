@@ -1607,7 +1607,6 @@ pub fn run_project_tests_with(
         path: PathBuf::from("ipe-verify-test"),
         source: e,
     })?;
-    let out_dir = out_scratch.path().to_path_buf();
 
     // Build the test entry. When the project has a `src/` tree, the test entry
     // is built against BOTH it (the code under test) and the `tests/` tree (its
@@ -1624,7 +1623,7 @@ pub fn run_project_tests_with(
         &project_src_root,
         &tests_root,
         &test_entry,
-        &out_dir,
+        &out_scratch,
         &runtime_dir,
         &cargo_bin,
         stdio,
@@ -1636,26 +1635,37 @@ pub fn run_project_tests_with(
     outcome
 }
 
-/// Compile the test entry into `out_dir`, build the emitted Rust project, and
-/// run the resulting `ipe-app` binary, classifying its exit code.
+/// Compile the test entry into `out_scratch`, build the emitted Rust project, and
+/// run the resulting test binary, classifying its exit code.
 ///
 /// Split from [`run_project_tests`] so the caller's temp-directory cleanup runs
 /// on every exit of this fallible sequence, not only the success path.
 ///
+/// The build directory is held locked from before the build until the built
+/// binary is copied out ([`crate::target_dir::LinkableTargetDir::for_scratch`]),
+/// pinned or shared alike. Under that lock the crate's `Cargo.lock` is seeded
+/// from the directory's lock slot, every unit of the previous test runner is
+/// cleaned (so the verdict never comes from a stale test unit), the crate is
+/// built, its lock is stored back to the slot, and the binary is copied into a
+/// private directory. The copy runs after the lock is released, so no later
+/// build can replace the binary this run judges.
+///
 /// # Errors
-/// The compile/build error on a compile or cargo failure; [`CliError::Io`] when
-/// the test binary cannot be spawned; [`CliError::TestFailed`] when it exits
-/// non-zero (a failing case, or a crash/signal with no exit code).
+/// The compile/build error on a compile or cargo failure; the refusals of
+/// [`crate::target_dir::LinkableTargetDir::for_scratch`];
+/// [`CliError::Io`] when the lock slot, the binary copy, or the spawn fails;
+/// [`CliError::TestFailed`] when the binary exits non-zero (a failing case, or
+/// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
     project_src_root: &Path,
     tests_root: &Path,
     test_entry: &Path,
-    out_dir: &Path,
+    out_scratch: &scratch::ScratchDir,
     runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
-    let out = OutTarget::Path(out_dir);
+    let out = OutTarget::Scratch(out_scratch);
     let crate_dir = if project_src_root.is_dir() {
         build_test_into(project_src_root, tests_root, test_entry, out, runtime_dir)?
     } else {
@@ -1670,33 +1680,39 @@ pub fn build_and_run_test_entry(
         )?
     };
 
-    // Compile the emitted Rust project.
-    let target_dir =
-        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), crate_dir.path(), None)?;
-    FlooredBuild {
+    let target = crate::target_dir::LinkableTargetDir::for_scratch(cargo_bin.path(), out_scratch)?;
+    seed_test_lock(target.dir().path(), crate_dir.dir())?;
+    let build = FlooredBuild {
         cargo: cargo_bin,
         crate_dir: &crate_dir,
         finish: NativeFinish::Dev,
         target: CargoTarget::Host,
-        target_dir: &target_dir,
+        target_dir: target.dir(),
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
         runtime: runtime_context_for_message(),
-    }
-    .run()?;
+    };
+    build.clean_package(ipe_backend_rust::TEST_CRATE_NAME)?;
+    build.run()?;
+    store_test_lock(target.dir().path(), crate_dir.dir())?;
 
     // Read the compiled binary back from the build directory the build was
     // handed, so a `CARGO_TARGET_DIR` or `[build] target-dir` pin is the one
-    // the build used. The binary name matches the emitted crate's package name
-    // (read from `Cargo.toml`).
-    let test_bin_name = emitted_bin_filename(out_dir)?;
-    let mut bin = target_dir.path().to_path_buf();
-    bin.push("debug");
-    bin.push(&test_bin_name);
+    // the build used.
+    let test_bin_name = emitted_bin_filename(crate_dir.path())?;
+    let built = target.dir().path().join("debug").join(&test_bin_name);
+    let run_dir = scratch::ScratchDir::new_under(target.dir().path(), "ipe-test-run")
+        .or_else(|_| scratch::ScratchDir::new("ipe-test-run"))
+        .map_err(|source| CliError::ScratchUnavailable { source })?;
+    let bin = run_dir.path().join(&test_bin_name);
+    fs::copy(&built, &bin).map_err(|e| io_err(&built, e))?;
+    drop(target.release());
 
     // Run the test binary. `Ipe.Test.runMain` exits 0 on all-pass, 1 on any
     // failure — propagate that as a stage error.
-    let run_status = run_test_binary(bin, stdio, std::io::stderr)?;
+    let run_status = run_test_binary(bin, stdio, std::io::stderr);
+    drop(run_dir);
+    let run_status = run_status?;
 
     if run_status.success() {
         Ok(TestOutcome::AllPassed)
@@ -1706,6 +1722,85 @@ pub fn build_and_run_test_entry(
         // failure; classify the absent code as a failure, never a pass.
         let code = run_status.code().unwrap_or(1);
         Err(CliError::TestFailed { code })
+    }
+}
+
+/// The lock slot of a build directory: the test runner's last built `Cargo.lock`.
+pub const TEST_LOCK_SLOT: &str = "ipe-test.Cargo.lock";
+
+/// The most bytes a `Cargo.lock` carried through [`TEST_LOCK_SLOT`] may hold.
+const TEST_LOCK_CAP: u64 = 16 * 1024 * 1024;
+
+/// Seed `crate_dir`'s `Cargo.lock` from `target`'s [`TEST_LOCK_SLOT`], when that is a regular file.
+///
+/// The seeded lock is only a candidate: the build's offline `--locked` probe
+/// still judges it, and a drifted one is resolved afresh.
+///
+/// # Errors
+/// [`CliError::Io`] when the slot cannot be read or is larger than
+/// [`TEST_LOCK_CAP`]; the refusals of writing the crate's lock.
+fn seed_test_lock(target: &Path, crate_dir: &OwnedDir) -> Result<(), CliError> {
+    match read_regular_entry(target, TEST_LOCK_SLOT)? {
+        Some(lock) => crate_dir.path_to("Cargo.lock")?.write(&lock),
+        None => Ok(()),
+    }
+}
+
+/// Store `crate_dir`'s `Cargo.lock` as `target`'s [`TEST_LOCK_SLOT`].
+///
+/// The slot is replaced through an exclusively created temp file and a
+/// rename, so it is never written through a link and never seen half written.
+///
+/// # Errors
+/// [`CliError::Io`] when the crate's lock cannot be read or the slot cannot be written.
+fn store_test_lock(target: &Path, crate_dir: &OwnedDir) -> Result<(), CliError> {
+    let Some(lock) = read_regular_entry(crate_dir.path(), "Cargo.lock")? else {
+        return Ok(());
+    };
+    let slot = target.join(TEST_LOCK_SLOT);
+    let temp = target.join(format!(".{TEST_LOCK_SLOT}.{}.tmp", std::process::id()));
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err(&temp, e)),
+    }
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(&lock))
+        .and_then(|()| fs::rename(&temp, &slot));
+    written.map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        io_err(&slot, e)
+    })
+}
+
+/// The bytes of the regular file `name` in `dir`, read without following a link.
+///
+/// `None` when the entry is absent, a link, or not a regular file.
+///
+/// # Errors
+/// [`CliError::Io`] when `dir` cannot be opened or the file cannot be read or
+/// is larger than [`TEST_LOCK_CAP`].
+fn read_regular_entry(dir: &Path, name: &str) -> Result<Option<Vec<u8>>, CliError> {
+    let path = dir.join(name);
+    let entry = ipe_fs_open::EntryName::new(std::ffi::OsStr::new(name))
+        .ok_or_else(|| io_err(&path, std::io::ErrorKind::InvalidInput.into()))?;
+    let cap = ipe_fs_open::ByteCap::new(TEST_LOCK_CAP)
+        .ok_or_else(|| io_err(&path, std::io::ErrorKind::InvalidInput.into()))?;
+    let opened = ipe_fs_open::HeldDir::open_root(dir).and_then(|held| held.open_regular(&entry));
+    match opened {
+        Ok(file) => file
+            .read_bytes(cap)
+            .map(Some)
+            .map_err(|refusal| io_err(&path, refusal.into_io())),
+        Err(
+            ipe_fs_open::OpenRefusal::Absent
+            | ipe_fs_open::OpenRefusal::Link
+            | ipe_fs_open::OpenRefusal::NotRegular(_),
+        ) => Ok(None),
+        Err(refusal) => Err(io_err(&path, refusal.into_io())),
     }
 }
 

@@ -9,7 +9,7 @@
 //! offline; the offline cases (usage, no-test-entry) always run.
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod support;
@@ -247,6 +247,412 @@ fn a_test_entry_importing_the_database_stdlib_passes() -> TestResult {
     assert!(
         stdout.contains("all tests passed"),
         "the settled outcome must appear, got stdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// A fresh per-user cache base for one test, under this binary's scratch root.
+fn fresh_cache(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let cache = crate::support::scratch_root().join(format!("{name}_cache_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cache)?;
+    Ok(cache)
+}
+
+/// Lay out a project whose `tests/Main.ipe` is the fixture `tests_fixture`, returning its root.
+fn fixture_project(name: &str, tests_fixture: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = crate::support::scratch_root().join(format!("{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tests"))?;
+    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
+    std::fs::copy(fixture(tests_fixture), dir.join("tests").join("Main.ipe"))?;
+    Ok(dir)
+}
+
+/// An `ipe test` of `project` with no build-directory pin and `cache` as the per-user cache base.
+fn ipe_test_command(project: &Path, cache: &Path) -> Command {
+    let mut cmd = Command::new(support::ipe_bin());
+    cmd.arg("test")
+        .arg(project.join("Main.ipe"))
+        .env_remove("CARGO_TARGET_DIR")
+        .env("XDG_CACHE_HOME", cache);
+    cmd
+}
+
+/// Run `cmd` to its exit and capture `(success, stdout, stderr)`.
+fn run_captured(mut cmd: Command) -> Result<(bool, String, String), Box<dyn Error>> {
+    let out = cmd.output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// Every shared scratch build directory under `cache`.
+fn scratch_targets(cache: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let root = cache.join("ipe").join("t");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(&root)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("scratch-") {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
+}
+
+/// The one shared scratch build directory under `cache`.
+fn the_scratch_target(cache: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let mut targets = scratch_targets(cache)?;
+    assert_eq!(
+        targets.len(),
+        1,
+        "exactly one shared scratch build directory must exist, got {targets:?}"
+    );
+    targets
+        .pop()
+        .ok_or_else(|| "no shared scratch build directory".into())
+}
+
+/// The `[lib] name` of the bundled runtime manifest.
+fn runtime_lib_name() -> Result<String, Box<dyn Error>> {
+    let manifest =
+        std::fs::read_to_string(e2e_support::require_runtime_crate().join("Cargo.toml"))?;
+    let mut in_lib = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_lib = line == "[lib]";
+        } else if in_lib && let Some(value) = line.strip_prefix("name") {
+            let name = value
+                .trim_start()
+                .trim_start_matches('=')
+                .trim()
+                .trim_matches('"');
+            return Ok(name.to_owned());
+        }
+    }
+    Err("the bundled runtime manifest names no `[lib]`".into())
+}
+
+/// Every compiled rlib of the library `lib` in `target`'s dev profile.
+fn rlibs_of(target: &Path, lib: &str) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let prefix = format!("lib{lib}-");
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(target.join("debug").join("deps"))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".rlib") {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// Move the modification time of every file under `dir` a day ahead.
+///
+/// Every build record then reads as newer than any source written later,
+/// which is what a coarse-grained file system makes of two builds within one tick.
+fn age_build_records_forward(dir: &Path) -> Result<(), Box<dyn Error>> {
+    let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(24 * 60 * 60);
+    let mut pending = vec![dir.to_path_buf()];
+    let mut visited = 0_usize;
+    while let Some(next) = pending.pop() {
+        visited += 1;
+        assert!(visited < 1_000_000, "the build directory is unbounded");
+        for entry in std::fs::read_dir(&next)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                std::fs::File::options()
+                    .write(true)
+                    .open(entry.path())?
+                    .set_modified(ahead)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Two runs of one project share one runtime unit, built once.
+///
+/// Run 2 builds in the same shared scratch directory as run 1, and the
+/// runtime rlib run 1 built is the only one there, untouched by run 2.
+#[test]
+fn a_second_test_run_reuses_the_runtime_unit_of_the_first() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the runtime reuse E2E");
+        return Ok(());
+    }
+    let cache = fresh_cache("ipe_test_reuse")?;
+    let project = fixture_project("ipe_test_reuse", "tests_pass.ipe")?;
+    let lib = runtime_lib_name()?;
+
+    let (ok, _, stderr) = run_captured(ipe_test_command(&project, &cache))?;
+    assert!(ok, "run 1 must pass, got stderr:\n{stderr}");
+    let target = the_scratch_target(&cache)?;
+    let first = rlibs_of(&target, &lib)?;
+    assert_eq!(
+        first.len(),
+        1,
+        "run 1 must build one runtime rlib, got {first:?}"
+    );
+    let Some(unit) = first.first() else {
+        return Err("run 1 built no runtime rlib".into());
+    };
+    let built = std::fs::metadata(unit)?.modified()?;
+
+    let (ok, _, stderr) = run_captured(ipe_test_command(&project, &cache))?;
+    assert!(ok, "run 2 must pass, got stderr:\n{stderr}");
+    let second = rlibs_of(&the_scratch_target(&cache)?, &lib)?;
+    assert_eq!(second, first, "run 2 must reuse run 1's runtime rlib");
+    assert_eq!(
+        std::fs::metadata(unit)?.modified()?,
+        built,
+        "run 2 must not rebuild the runtime rlib"
+    );
+    let _ = std::fs::remove_dir_all(&project);
+    let _ = std::fs::remove_dir_all(&cache);
+    Ok(())
+}
+
+/// Cargo keeps two path dependencies apart when only their build metadata differs.
+///
+/// Two root crates share one build directory, each depending on a crate `dep`
+/// of the same source whose versions differ only in `+a` / `+b`. Each gets
+/// its own `dep` rlib, so a version stamp keys a runtime unit by content.
+#[test]
+fn build_metadata_alone_keeps_two_path_dependency_units_apart() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the build-metadata identity E2E");
+        return Ok(());
+    }
+    let base =
+        crate::support::scratch_root().join(format!("ipe_test_identity_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let target = base.join("target");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    for tag in ["a", "b"] {
+        let root = base.join(format!("root_{tag}"));
+        let dep = root.join("dep");
+        std::fs::create_dir_all(dep.join("src"))?;
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(
+            dep.join("Cargo.toml"),
+            format!("[package]\nname = \"dep\"\nversion = \"0.1.0+{tag}\"\nedition = \"2024\"\n"),
+        )?;
+        std::fs::write(dep.join("src").join("lib.rs"), "pub fn one() -> u8 { 1 }\n")?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"root_{tag}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
+                 [workspace]\n\n[dependencies]\ndep = {{ path = \"dep\" }}\n"
+            ),
+        )?;
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "fn main() { std::process::exit(i32::from(dep::one()) - 1); }\n",
+        )?;
+        let out = Command::new(&cargo)
+            .arg("build")
+            .arg("--offline")
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", &target)
+            .output()?;
+        assert!(
+            out.status.success(),
+            "root_{tag} must build, got stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let rlibs = rlibs_of(&target, "dep")?;
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        rlibs.len(),
+        2,
+        "versions differing only in build metadata must build two units, got {rlibs:?}"
+    );
+    Ok(())
+}
+
+/// A failing project run after a passing one on the same directory fails.
+///
+/// The passing run's build records are moved a day ahead first, so every
+/// source the failing run writes reads as older than them; the previous test
+/// runner's units are cleaned under the lock, so its verdict is never reused.
+#[test]
+fn a_failing_run_after_a_passing_one_is_judged_by_its_own_build() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the stale-verdict E2E");
+        return Ok(());
+    }
+    let cache = fresh_cache("ipe_test_stale")?;
+    let pass = fixture_project("ipe_test_stale_pass", "tests_pass.ipe")?;
+    let fail = fixture_project("ipe_test_stale_fail", "tests_fail.ipe")?;
+
+    let (ok, _, stderr) = run_captured(ipe_test_command(&pass, &cache))?;
+    assert!(ok, "the passing project must pass, got stderr:\n{stderr}");
+    age_build_records_forward(&the_scratch_target(&cache)?)?;
+
+    let (ok, stdout, _) = run_captured(ipe_test_command(&fail, &cache))?;
+    let _ = std::fs::remove_dir_all(&pass);
+    let _ = std::fs::remove_dir_all(&fail);
+    let _ = std::fs::remove_dir_all(&cache);
+    assert!(
+        !ok,
+        "the failing project must exit non-zero, got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("failed"),
+        "the failing case must be counted, got stdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// Two projects tested at once on one directory each get their own verdict.
+#[test]
+fn two_concurrent_test_runs_each_judge_their_own_project() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the concurrent-run E2E");
+        return Ok(());
+    }
+    let cache = fresh_cache("ipe_test_concurrent")?;
+    let pass = fixture_project("ipe_test_concurrent_pass", "tests_pass.ipe")?;
+    let fail = fixture_project("ipe_test_concurrent_fail", "tests_fail.ipe")?;
+
+    let mut passing = ipe_test_command(&pass, &cache);
+    let mut failing = ipe_test_command(&fail, &cache);
+    let passing = passing
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let failing = failing
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let passed = passing.wait_with_output()?;
+    let failed = failing.wait_with_output()?;
+    let _ = std::fs::remove_dir_all(&pass);
+    let _ = std::fs::remove_dir_all(&fail);
+    let _ = std::fs::remove_dir_all(&cache);
+    assert!(
+        passed.status.success(),
+        "the passing project must pass, got stderr:\n{}",
+        String::from_utf8_lossy(&passed.stderr)
+    );
+    assert!(
+        !failed.status.success(),
+        "the failing project must fail, got stdout:\n{}",
+        String::from_utf8_lossy(&failed.stdout)
+    );
+    Ok(())
+}
+
+/// Run 2 replays run 1's lock offline, resolving nothing.
+///
+/// Run 1 stores its `Cargo.lock` in the directory's lock slot; run 2 runs
+/// with the network off, passes, and stores a lock byte-equal to the slot it
+/// was seeded from.
+#[test]
+fn a_second_test_run_replays_the_stored_lock_offline() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the lock-carry E2E");
+        return Ok(());
+    }
+    let cache = fresh_cache("ipe_test_lock")?;
+    let project = fixture_project("ipe_test_lock", "tests_pass.ipe")?;
+
+    let (ok, _, stderr) = run_captured(ipe_test_command(&project, &cache))?;
+    assert!(ok, "run 1 must pass, got stderr:\n{stderr}");
+    let slot = the_scratch_target(&cache)?.join("ipe-test.Cargo.lock");
+    let seeded = std::fs::read(&slot)?;
+
+    let mut offline = ipe_test_command(&project, &cache);
+    offline.env("CARGO_NET_OFFLINE", "true");
+    let (ok, _, stderr) = run_captured(offline)?;
+    let stored = std::fs::read(&slot)?;
+    let _ = std::fs::remove_dir_all(&project);
+    let _ = std::fs::remove_dir_all(&cache);
+    assert!(ok, "run 2 must pass offline, got stderr:\n{stderr}");
+    assert!(
+        stored == seeded,
+        "run 2 must build with the lock it was seeded from"
+    );
+    Ok(())
+}
+
+/// A hand-edited `out/` built in the shared directory never stands in for the test runtime.
+///
+/// After a test run, an `out/` project whose bundled runtime source is edited
+/// is built by hand with the shared directory as `CARGO_TARGET_DIR`. Its
+/// runtime unit carries the out role, so a second test run keeps its own
+/// runtime unit, untouched, beside it and passes.
+#[test]
+fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping: set IPE_E2E=1 to run the hand-edited out/ E2E");
+        return Ok(());
+    }
+    let cache = fresh_cache("ipe_test_out")?;
+    let project = fixture_project("ipe_test_out", "tests_pass.ipe")?;
+    let lib = runtime_lib_name()?;
+
+    let (ok, _, stderr) = run_captured(ipe_test_command(&project, &cache))?;
+    assert!(ok, "the first test run must pass, got stderr:\n{stderr}");
+    let target = the_scratch_target(&cache)?;
+    let scratch_units = rlibs_of(&target, &lib)?;
+    assert_eq!(
+        scratch_units.len(),
+        1,
+        "one test runtime rlib, got {scratch_units:?}"
+    );
+    let Some(unit) = scratch_units.first().cloned() else {
+        return Err("the first test run built no runtime rlib".into());
+    };
+    let built = std::fs::metadata(&unit)?.modified()?;
+
+    let out = project.join("out");
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    ipe::build(&project.join("Main.ipe"), &out, &runtime).map_err(|e| format!("{e:?}"))?;
+    let lib_rs = out.join("ipe_runtime_dep").join("src").join("lib.rs");
+    let mut source = std::fs::read_to_string(&lib_rs)?;
+    source.push_str("\n// edited by hand\n");
+    std::fs::write(&lib_rs, source)?;
+    std::fs::copy(target.join("ipe-test.Cargo.lock"), out.join("Cargo.lock"))?;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let hand = Command::new(&cargo)
+        .arg("build")
+        .current_dir(&out)
+        .env("CARGO_TARGET_DIR", &target)
+        .output()?;
+    assert!(
+        hand.status.success(),
+        "the hand-edited out/ must build, got stderr:\n{}",
+        String::from_utf8_lossy(&hand.stderr)
+    );
+
+    let (ok, _, stderr) = run_captured(ipe_test_command(&project, &cache))?;
+    let units = rlibs_of(&target, &lib)?;
+    let _ = std::fs::remove_dir_all(&project);
+    let _ = std::fs::remove_dir_all(&cache);
+    assert!(ok, "the second test run must pass, got stderr:\n{stderr}");
+    assert_eq!(
+        units.len(),
+        2,
+        "the out/ runtime unit must stand beside the test one, got {units:?}"
+    );
+    assert!(
+        units.contains(&unit),
+        "the test runtime rlib must survive the out/ build, got {units:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&unit)?.modified()?,
+        built,
+        "the second test run must reuse its own runtime rlib"
     );
     Ok(())
 }

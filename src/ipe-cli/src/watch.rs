@@ -735,7 +735,13 @@ fn watch_emit_settings(
         ..crate::BuildOptions::default()
     };
     resolved.manifest.as_deref().map_or_else(
-        || crate::driver::loose_emit_settings(ipe_backend_rust::DbDriver::Sqlite, &options),
+        || {
+            crate::driver::loose_emit_settings(
+                ipe_backend_rust::DbDriver::Sqlite,
+                &options,
+                crate::runtime_embed::BundleRole::Out,
+            )
+        },
         |manifest| {
             crate::driver::manifest_emit_settings(
                 manifest,

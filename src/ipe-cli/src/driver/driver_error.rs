@@ -173,6 +173,21 @@ pub enum CliError {
         /// The host linker family that cannot open it.
         linker: crate::target_dir::HostLinker,
     },
+    /// The embedded runtime manifest could not be stamped for bundling.
+    ///
+    /// The manifest is a build input, so this is an internal invariant breach;
+    /// the build stops rather than link a runtime whose identity is unknown.
+    BundledManifest {
+        /// Why the manifest could not be prepared.
+        detail: String,
+    },
+    /// Another `ipe test` held the shared test build directory past the wall.
+    TestTargetBusy {
+        /// The held lock file, as display text.
+        path: TerminalSafe,
+        /// The wall the wait ran past.
+        wall: remote_ingest::LocalWall,
+    },
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     /// Carries the (trimmed) input and a deterministic did-you-mean list over
     /// the known codes, in the shared ranker's order.
@@ -749,6 +764,8 @@ impl CliError {
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
             Self::CargoBuildTimedOut { .. } => "cargo-build-timed-out",
             Self::TargetDirUnlinkable { .. } => "target-dir-unlinkable",
+            Self::BundledManifest { .. } => "bundled-manifest",
+            Self::TestTargetBusy { .. } => "test-target-busy",
             Self::UnknownCode { .. } => "unknown-code",
             Self::DocNotFound { .. } => "doc-not-found",
             Self::StaticRefusal(_) => "static-refusal",
@@ -833,7 +850,7 @@ impl CliError {
                     }
                 }
             }
-            Self::RuntimeVersionMismatch { .. } => Internal,
+            Self::RuntimeVersionMismatch { .. } | Self::BundledManifest { .. } => Internal,
             Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
             Self::Usage(_)
             | Self::UnknownCommand { .. }
@@ -879,6 +896,7 @@ impl CliError {
             | Self::LocalLimitExceeded(_)
             | Self::CargoBuildTimedOut { .. }
             | Self::TargetDirUnlinkable { .. }
+            | Self::TestTargetBusy { .. }
             | Self::ChildPipeHeld(_)
             | Self::ThreadRefused { .. }
             | Self::ChildPipeUnread(..)
@@ -1182,6 +1200,11 @@ impl std::fmt::Display for CliError {
                 let d = Diagnostic::TargetDirUnlinkable { detail };
                 f.write_str(&render(&d, "", ""))
             }
+            Self::BundledManifest { detail } => f.write_str(&text::cli_bundled_manifest(detail)),
+            Self::TestTargetBusy { path, wall } => f.write_str(&text::cli_test_target_busy(
+                path,
+                &remote_ingest::IngestLimit::Time(wall.limit()),
+            )),
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
             Self::ThreadRefused { role, source } => {
                 f.write_str(&text::cli_thread_refused(role, &source.kind()))

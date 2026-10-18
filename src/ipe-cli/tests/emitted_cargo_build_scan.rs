@@ -10,8 +10,8 @@
 //!   is held by `cargo_step_scan`);
 //! - constructing each value those two commands build from: a
 //!   `CargoCrate::Emitted` (only in `FlooredBuild::run`, which embeds the floor
-//!   its posture decides, and the wasm bundlers, whose crates no native reader
-//!   runs), a `WatchBuild` (only in the watch loop's `spawn_cargo_build`, from a
+//!   its posture decides, `FlooredBuild::clean_package`, which builds no
+//!   binary, and the wasm bundlers, whose crates no native reader runs), a `WatchBuild` (only in the watch loop's `spawn_cargo_build`, from a
 //!   `DevMarkedCrate`), an `EmittedCrate` (only in `write_emitted_project`, which
 //!   wrote the floor it records) and a `DevMarkedCrate` (only in
 //!   `EmittedCrate::dev_marked`, which checks that floor).
@@ -81,6 +81,12 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         1,
     ),
     ("driver/commands.rs", "FlooredBuild::run", "Emitted", 1),
+    (
+        "driver/commands.rs",
+        "FlooredBuild::clean_package",
+        "Emitted",
+        1,
+    ),
     ("driver/commands.rs", "bundle_wasm", "Emitted", 1),
     ("driver/commands.rs", "bundle_wasi", "Emitted", 1),
     ("watch.rs", "spawn_cargo_build", "WatchBuild", 1),
@@ -541,6 +547,7 @@ fn admitted_with(rel: &str, extra: &str) -> String {
     let admitted = match rel {
         "driver/commands.rs" => {
             "impl<'a> FlooredBuild<'a> { fn run(self) { let _ = CargoCrate::Emitted(self.crate_dir); } }\n\
+             impl FlooredBuild<'_> { fn clean_package(&self) { let _ = CargoCrate::Emitted(self.crate_dir); } }\n\
              pub fn bundle_wasm(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n\
              pub fn bundle_wasi(d: &OwnedDir) { let _ = CargoCrate::Emitted(d); }\n"
         }
