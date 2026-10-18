@@ -32,8 +32,8 @@ fn measures() -> u64 {
 /// A row's click message; each measure of it is counted.
 #[derive(Clone)]
 enum TestMsg {
-    /// Select the row at this position.
-    Select(usize),
+    /// Select the row with this key.
+    Select(String),
     /// A message with no measure, as a `Msg` holding an unmeasured field has.
     Unmeasured,
 }
@@ -42,7 +42,7 @@ impl RetainedBytes for TestMsg {
     fn retained_bytes(&self) -> Option<Bytes> {
         MEASURES.with(|n| n.set(n.get().saturating_add(1)));
         match self {
-            Self::Select(_) => Bytes::inline::<Self>(),
+            Self::Select(key) => Bytes::inline::<Self>()?.plus(key),
             Self::Unmeasured => None,
         }
     }
@@ -56,7 +56,7 @@ fn row(i: usize, selected: usize, msg: &TestMsg) -> Html<TestMsg> {
         "background:none"
     };
     let msg = match msg {
-        TestMsg::Select(_) => TestMsg::Select(i),
+        TestMsg::Select(_) => TestMsg::Select(format!("row-{i}")),
         TestMsg::Unmeasured => TestMsg::Unmeasured,
     };
     Html::HElement(
@@ -97,7 +97,7 @@ fn view_with(selected: usize, msg: &TestMsg, extra: Option<String>) -> Html<Test
 
 /// The stamped queue view with row `selected` highlighted.
 fn view(selected: usize) -> Html<TestMsg> {
-    view_with(selected, &TestMsg::Select(0), None)
+    view_with(selected, &TestMsg::Select(String::new()), None)
 }
 
 /// Fresh session keys from the host's entropy.
@@ -177,7 +177,7 @@ fn a_grown_view_moves_the_cache_and_the_fresh_walk_alike() {
     let plain = rendered.last_view().view_bytes().map(Bytes::get);
     let text = "x".repeat(4096);
     rendered
-        .commit(view_with(2, &TestMsg::Select(0), Some(text)))
+        .commit(view_with(2, &TestMsg::Select(String::new()), Some(text)))
         .expect("commit");
     let grown = rendered.last_view().view_bytes().map(Bytes::get);
     let delta = |after: Option<u64>, before: Option<u64>| {
