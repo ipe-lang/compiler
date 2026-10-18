@@ -36,22 +36,18 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Build `fixture` and assert `ipe::build` succeeds (a fast, always-on
+/// Build the golden `fixture` and assert the build succeeds (a fast, always-on
 /// compile check that alone covers the "invalid Rust" seal-breach witnesses
 /// — the string-literal and record-field-collision cases — which otherwise
 /// fail at `cargo build`).
 fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for fixture {fixture}: {:?}",
@@ -68,16 +64,12 @@ fn assert_e2e_output(fixture: &str, expect_contains: &str) {
         return;
     }
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden = root.join("tests").join("golden").join(fixture);
     let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {fixture}: {:?}",

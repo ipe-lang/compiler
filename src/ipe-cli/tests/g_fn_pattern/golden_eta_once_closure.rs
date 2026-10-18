@@ -24,12 +24,8 @@ use ipe_diagnostics::{Diagnostic, Feature, LowerError, Span};
 
 use crate::support::repo_root;
 
-fn fixture_entry(fixture: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe")
+fn golden_dir(fixture: &str) -> PathBuf {
+    repo_root().join("tests").join("golden").join(fixture)
 }
 
 fn out_dir(fixture: &str) -> PathBuf {
@@ -41,7 +37,8 @@ fn out_dir(fixture: &str) -> PathBuf {
 /// The span of the last `needle` in the fixture source: its leading `h`.
 fn capture_span(fixture: &str, needle: &str) -> Span {
     #[allow(clippy::expect_used)] // a missing fixture is a broken test, not a refusal
-    let src = std::fs::read_to_string(fixture_entry(fixture)).expect("fixture source reads");
+    let src = std::fs::read_to_string(golden_dir(fixture).join("Main.ipe"))
+        .expect("fixture source reads");
     #[allow(clippy::expect_used)] // the needle is written into the fixture
     let lo = src.rfind(needle).expect("needle is in the fixture");
     #[allow(clippy::expect_used)] // fixtures are far below 4 GiB
@@ -54,8 +51,8 @@ fn capture_span(fixture: &str, needle: &str) -> Span {
 
 /// A fixture is refused at ipe time by the once check, at the moved capture.
 fn assert_refused_at_capture(fixture: &str, needle: &str) {
-    let built = ipe::build(
-        &fixture_entry(fixture),
+    let built = crate::support::build_golden(
+        &golden_dir(fixture),
         &out_dir(fixture),
         &e2e_support::require_runtime().into_path_buf(),
     );
@@ -125,8 +122,8 @@ fn task_capture_partial_is_refused_at_the_capture() {
 #[test]
 fn admitted_once_positions_pass_ipe() {
     let fixture = "eta_once_admitted";
-    let built = ipe::build(
-        &fixture_entry(fixture),
+    let built = crate::support::build_golden(
+        &golden_dir(fixture),
         &out_dir(fixture),
         &e2e_support::require_runtime().into_path_buf(),
     );
@@ -146,8 +143,8 @@ fn admitted_once_positions_build_and_run() {
     let fixture = "eta_once_admitted";
     let out = crate::support::scratch_root().join("ipec_eta_once_admitted_e2e");
     let _ = std::fs::remove_dir_all(&out);
-    let built = ipe::build(
-        &fixture_entry(fixture),
+    let built = crate::support::build_golden(
+        &golden_dir(fixture),
         &out,
         &e2e_support::require_runtime().into_path_buf(),
     );
@@ -284,21 +281,15 @@ main =
 /// The lines [`SOURCE_ADMITTED`] prints, in order.
 const SOURCE_ADMITTED_STDOUT: &str = "partial=42\na\nx\nb\ny\nz\nz\nr\n";
 
-/// Write `source` as a one-file program and return its entry and output dir.
-#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
-fn write_program(name: &str, source: &str) -> (PathBuf, PathBuf) {
-    let dir = crate::support::scratch_root().join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the fixture scratch dir must be writable");
-    let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).expect("the fixture scratch dir must be writable");
-    (entry, dir.join("out"))
-}
-
+/// Build `source` as a one-module project fixture into a fresh out dir.
+///
+/// Returns the driver result and the out dir.
 fn build_source(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
-    let (entry, out) = write_program(name, source);
+    let fixture = crate::root_fixture::main(source);
+    let out = crate::support::scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    (ipe::build(&entry, &out, &runtime), out)
+    (crate::root_fixture::build(&fixture, &out, &runtime), out)
 }
 
 /// The one-byte span of the last `needle` in `source`: its leading capture.

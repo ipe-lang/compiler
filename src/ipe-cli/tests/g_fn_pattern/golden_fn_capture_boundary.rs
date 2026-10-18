@@ -447,21 +447,15 @@ main =
         |> Task.map (\_ -> ())
 "#;
 
-/// Write `source` as a one-file program and return its entry and output dir.
-#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
-fn write_program(name: &str, source: &str) -> (PathBuf, PathBuf) {
-    let dir = crate::support::scratch_root().join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the fixture scratch dir must be writable");
-    let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).expect("the fixture scratch dir must be writable");
-    (entry, dir.join("out"))
-}
-
+/// Build `source` as a one-module project fixture into a fresh out dir.
+///
+/// Returns the driver result and the out dir.
 fn build(name: &str, source: &str) -> (Result<(), CliError>, PathBuf) {
-    let (entry, out) = write_program(name, source);
+    let fixture = crate::root_fixture::main(source);
+    let out = crate::support::scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    (ipe::build(&entry, &out, &runtime), out)
+    (crate::root_fixture::build(&fixture, &out, &runtime), out)
 }
 
 /// The span of the last `needle` in `source`.
