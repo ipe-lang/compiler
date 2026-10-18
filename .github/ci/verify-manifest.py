@@ -5744,6 +5744,7 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "test_local_gate.py": _SELF_TEST,
     "test_cargo_invocation.py": _SELF_TEST,
     "test_claims_table.py": _SELF_TEST,
+    "test_check_required_set.py": _SELF_TEST,
     "rerun_policy.py": {("--lint",): _V, ("--decide",): _O},
     "nightly_green.py": {("--lint",): _V, ("--verdict",): _V},
     "check_required_set.py": {(): _V, ("--fetch",): _V, ("--fetch-admin",): _V},

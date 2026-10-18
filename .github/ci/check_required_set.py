@@ -25,7 +25,8 @@ Modes:
   --render-put FILE
               print the ruleset PUT body that applies `required-set.json`:
               the admin-read ruleset JSON in FILE, parsed like `--live` save
-              for its required pairs, with those pairs replaced by the set and
+              for its required pairs and its queue settings, with those pairs
+              replaced by the set, the queue settings by `MERGE_QUEUE`, and
               only the writable keys (`PUT_KEYS`) kept. The body is printed
               only once it, re-parsed, passes `--live`.
 
@@ -35,9 +36,10 @@ other key, rule type, or parameter is refused, so a protection GitHub adds
 or an owner toggles is never waved through unread.  It must be active on the
 default branch with no exclusions and no bypass actors, carry exactly one
 `required_status_checks` rule (strict policy off, enforced on create) whose
-pairs equal the derived set in both directions, and exactly one all-green
-`merge_queue` rule. GitHub returns `bypass_actors` only to a ruleset admin, so
-`--fetch` (a workflow token) cannot see them: it refuses a non-empty list when
+pairs equal the derived set in both directions, and exactly one
+`merge_queue` rule whose every setting equals `MERGE_QUEUE`. GitHub returns
+`bypass_actors` only to a ruleset admin, so `--fetch` (a workflow token)
+cannot see them: it refuses a non-empty list when
 one is returned and otherwise leaves the bypass proof to an admin read.
 `--fetch-admin` and `--live` are admin reads: a body without the list is
 refused, so a token that cannot see bypass actors fails rather than passes.
@@ -199,14 +201,28 @@ _PULL_REQUEST_PARAMS: dict[str, type] = {
     "require_extra_approval_for_unattributed_changes": bool,
     "allowed_merge_methods": list,
 }
-_MERGE_QUEUE_PARAMS: dict[str, type] = {
-    "merge_method": str,
-    "max_entries_to_build": int,
-    "min_entries_to_merge": int,
-    "max_entries_to_merge": int,
-    "min_entries_to_merge_wait_minutes": int,
-    "grouping_strategy": str,
-    "check_response_timeout_minutes": int,
+# The merge queue's settings: every parameter the `merge_queue` rule carries,
+# each pinned to its value here (its JSON type included), so the parse refuses
+# a missing, unknown, retyped, or changed one. This table is the parse table:
+# a parameter cannot be parsed without being pinned.
+MERGE_QUEUE: dict[str, object] = {
+    # Each entry lands as one commit on `main`.
+    "merge_method": "SQUASH",
+    # Every queued entry gets its own full run, so the runs in flight at once
+    # are this many; past what the runner pool carries, every run slows.
+    "max_entries_to_build": 2,
+    "min_entries_to_merge": 1,
+    # Under `ALLGREEN` a group merges only once each entry's own run is green,
+    # so a larger group than the build width buys nothing.
+    "max_entries_to_merge": 2,
+    "min_entries_to_merge_wait_minutes": 5,
+    # Each entry's own checks must pass: the strict policy stays off because
+    # the queue builds every entry on the combined tree, and `HEADGREEN` would
+    # land the group's inner commits with no green run of their own.
+    "grouping_strategy": "ALLGREEN",
+    # The longest full run fits inside it; a context that never reports fails
+    # the entry rather than holding the queue.
+    "check_response_timeout_minutes": 120,
 }
 _STATUS_PARAMS = frozenset(
     {"strict_required_status_checks_policy", "do_not_enforce_on_create", "required_status_checks"}
@@ -245,10 +261,9 @@ def _rule(rule: object) -> tuple[str, tuple[Pair, ...]]:
         _typed_params(params, f"{what}'s parameters", _PULL_REQUEST_PARAMS)
         return head, ()
     if head == "merge_queue":
-        params = _typed_params(params, f"{what}'s parameters", _MERGE_QUEUE_PARAMS)
-        # The strict policy stays off because the queue builds every entry on
-        # the combined tree; only `ALLGREEN` requires each entry's own checks.
-        _pin(params["grouping_strategy"], "ALLGREEN", f"{what}'s grouping_strategy")
+        params = _closed(params, f"{what}'s parameters", frozenset(MERGE_QUEUE))
+        for key, want in MERGE_QUEUE.items():
+            _pin(params[key], want, f"{what}'s {key}")
         return head, ()
     params = _closed(params, f"{what}'s parameters", _STATUS_PARAMS)
     _pin(params["strict_required_status_checks_policy"], False, f"{what}'s strict_required_status_checks_policy")
@@ -304,13 +319,20 @@ PUT_KEYS = ("name", "target", "enforcement", "conditions", "bypass_actors", "rul
 
 
 def render_put(rs: object, required: list[Pair]) -> str:
-    """The PUT body applying `required` to the ruleset GET body `rs`, or
-    `Refused`. `rs` must pass the admin-read parse (its own required pairs
+    """The PUT body applying `required` and `MERGE_QUEUE` to the ruleset GET
+    body `rs`, or `Refused`. `rs`, with its queue settings set to
+    `MERGE_QUEUE`, must pass the admin-read parse (its own required pairs
     aside, which the body replaces); the body, re-read as the GET would
     return it, must pass the same parse with exactly `required`."""
+    if not isinstance(rs, dict) or not isinstance(rs.get("rules"), list):
+        raise Refused("the ruleset is not an object with a `rules` list")
+    queued = [
+        {**r, "parameters": {**r["parameters"], **MERGE_QUEUE}}
+        if isinstance(r, dict) and r.get("type") == "merge_queue" and isinstance(r.get("parameters"), dict) else r
+        for r in rs["rules"]
+    ]
+    rs = {**rs, "rules": queued}
     parse_ruleset(rs, admin_read=True)
-    if not isinstance(rs, dict):  # the parse refuses a non-object; this narrows the type
-        raise Refused("the ruleset is not an object")
     want = json.loads(render(required))
     rules = [
         {**r, "parameters": {**r["parameters"], "required_status_checks": want}}

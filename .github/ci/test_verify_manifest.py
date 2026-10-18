@@ -2674,15 +2674,10 @@ def _pr_rule(**over: object) -> dict:
 
 
 def _queue_rule(**over: object) -> dict:
-    params = {
-        "merge_method": "SQUASH",
-        "max_entries_to_build": 5,
-        "min_entries_to_merge": 1,
-        "max_entries_to_merge": 5,
-        "min_entries_to_merge_wait_minutes": 5,
-        "grouping_strategy": "ALLGREEN",
-        "check_response_timeout_minutes": 90,
-    }
+    """The pinned `merge_queue` rule (`check_required_set.MERGE_QUEUE`), with `over` applied."""
+    import check_required_set  # noqa: PLC0415  # sibling module; SSOT of the queue pins
+
+    params = dict(check_required_set.MERGE_QUEUE)
     params.update(over)
     return {"type": "merge_queue", "parameters": params}
 
@@ -2903,6 +2898,8 @@ class TestSsotOutputTools(unittest.TestCase):
             ("head-green queue", _with_rules(("merge_queue", _queue_rule(grouping_strategy="HEADGREEN")))),
             ("queue param unread", _with_rules(("merge_queue", _queue_rule(frob=1)))),
             ("queue param mistyped", _with_rules(("merge_queue", _queue_rule(max_entries_to_build="5")))),
+            ("queue built wider", _with_rules(("merge_queue", _queue_rule(max_entries_to_build=3)))),
+            ("queue timeout changed", _with_rules(("merge_queue", _queue_rule(check_response_timeout_minutes=90)))),
             ("review param unread", _with_rules(("pull_request", _pr_rule(frob=True)))),
             ("review param mistyped", _with_rules(("pull_request", _pr_rule(required_approving_review_count=True)))),
             ("deletion with parameters", _with_rules(("deletion", {"type": "deletion", "parameters": {}}))),
