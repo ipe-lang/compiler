@@ -11,6 +11,8 @@
 //! otherwise. A backend that receives a [`Program`] never has to re-check
 //! exhaustiveness.
 
+pub mod borrow;
+mod carrier;
 mod enum_facts;
 pub mod free_vars;
 mod held;
@@ -23,6 +25,8 @@ pub mod record_shapes;
 pub mod seq_clone;
 mod show_policy;
 
+pub use borrow::{Param, ParamPass};
+pub use carrier::wants_arc_ctor;
 pub use enum_facts::{
     EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS, home_is_ffi_interface,
     is_store_row_phantom_union, payload_leaf_is_clone,

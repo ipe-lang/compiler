@@ -20,8 +20,9 @@ use std::ops::Range;
 use ipe_diagnostics::{Diagnostic, Located, TokenKind, render};
 use ipe_intern::Interner;
 use ipe_parse::TokenClass;
+use ipe_syntax::fixity::chain_groups;
 use ipe_syntax::{
-    Ctor, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module, Pattern,
+    BinOp, Ctor, Exposed, Exposing, Expr, Expr_, ForeignDecl, Import, LetBinding, Module, Pattern,
     Pattern_, Privacy, TypeAlias, TypeAnnotation, Union, Value, escape_char_body, escape_str_body,
     strip_anchor_margin,
 };
@@ -854,18 +855,9 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Four spaces per indent level, charged to this print's budget.
-    const fn pad(&self, indent: usize) -> Pad<'_> {
-        self.pads.pad(indent)
-    }
-
-    /// The indentation of the leading-comma continuation lines inside a
-    /// multiline record / list / tuple.
-    ///
-    /// elm-format aligns the `,` with the opening bracket, which sits at the
-    /// construct's own indent.
-    const fn pad_in(&self, indent: usize) -> Pad<'_> {
-        self.pads.pad(indent)
+    /// The spaces reaching `col`, charged to this print's budget.
+    const fn pad(&self, col: Col) -> Pad<'_> {
+        self.pads.pad(col)
     }
 
     fn sym(&self, s: ipe_intern::Symbol) -> String {
@@ -1057,18 +1049,18 @@ impl<'a> Printer<'a> {
         (comments, rendered)
     }
 
-    /// `body` preceded by `comments`, one per line, continuing at `indent`.
+    /// `body` preceded by `comments`, one per line, continuing at `col`.
     fn with_comments<'c>(
         &self,
         comments: impl IntoIterator<Item = &'c Comment>,
         body: &str,
-        indent: usize,
+        col: Col,
     ) -> String {
         let mut comments = comments.into_iter().peekable();
         if comments.peek().is_none() {
             return body.to_owned();
         }
-        let pad = self.pad(indent);
+        let pad = self.pad(col);
         let mut out = String::new();
         for c in comments {
             let _ = write!(out, "{}\n{pad}", c.text);
@@ -1484,7 +1476,7 @@ impl<'a> Printer<'a> {
             out.push_str(&c.text);
             out.push('\n');
         }
-        let _ = write!(out, "foreign {head} =\n    {}", self.expr(body, 1));
+        let _ = write!(out, "foreign {head} =\n    {}", self.expr(body, Col::BODY));
         out
     }
 
@@ -1565,9 +1557,9 @@ impl<'a> Printer<'a> {
         // if the source wrote the record across multiple lines, keep it broken.
         let body = match &a.body.value {
             TypeAnnotation::TRecord(fields) => {
-                self.type_record(fields, 1, self.was_multiline(a.body.span))
+                self.type_record(fields, Col::BODY, self.was_multiline(a.body.span))
             }
-            other => self.type_annotation(other, 1),
+            other => self.type_annotation(other, Col::BODY),
         };
         // A comment written between the `=` sign and the body type attaches to
         // the body's first token; one inside the body (outside a record
@@ -1623,7 +1615,7 @@ impl<'a> Printer<'a> {
         s.push_str(" =");
         // The body always goes on the next line, four-space indented — the
         // elm-format canonical form for a top-level definition.
-        let body = self.expr(&v.body, 1);
+        let body = self.expr(&v.body, Col::BODY);
         let _ = write!(s, "\n    {body}");
         s
     }
@@ -1647,8 +1639,8 @@ impl<'a> Printer<'a> {
             // chain is joined with ` -> `; anything else prints as one atom.
             let mark = self.pads.mark();
             let one = match ann {
-                TypeAnnotation::TLambda(_, _) => self.arrow_chain(ann, 0).join(" -> "),
-                _ => self.type_app(ann, 0),
+                TypeAnnotation::TLambda(_, _) => self.arrow_chain(ann, Col::ZERO).join(" -> "),
+                _ => self.type_app(ann, Col::ZERO),
             };
             // A record type inside the signature may still force its own break;
             // fall through to the multi-line form only if that happened.
@@ -1657,21 +1649,21 @@ impl<'a> Printer<'a> {
             }
             self.pads.rewind(mark, one);
         }
-        // Multi-line: `name :` then the type indented one level.
-        let body = self.type_multiline(ann, 1);
+        // Multi-line: `name :` then the type at the body column.
+        let body = self.type_multiline(ann, Col::BODY);
         format!("{name} :\n{body}")
     }
 
-    /// Render `t` broken across lines at indentation `indent`. An arrow chain
-    /// lays out one segment per line; a type application whose single-line form
+    /// Render `t` broken across lines at column `col`. An arrow chain lays out
+    /// one segment per line; a type application whose single-line form
     /// overflows the width budget breaks its arguments one per line (elm-format
-    /// indents each argument one level under the applied head); anything else is
-    /// a single indented line.
-    fn type_multiline(&self, t: &TypeAnnotation, indent: usize) -> String {
-        let cur_pad = self.pad(indent);
+    /// indents each argument one tab stop past the applied head); anything else
+    /// is a single indented line.
+    fn type_multiline(&self, t: &TypeAnnotation, col: Col) -> String {
+        let cur_pad = self.pad(col);
         match t {
             TypeAnnotation::TLambda(_, _) => {
-                let parts = self.arrow_chain(t, indent);
+                let parts = self.arrow_chain(t, col);
                 let mut it = parts.into_iter();
                 let first = it.next().unwrap_or_default();
                 let mut out = format!("{cur_pad}{first}");
@@ -1682,37 +1674,38 @@ impl<'a> Printer<'a> {
             }
             TypeAnnotation::TType(q, segs, args) if !args.is_empty() => {
                 let mark = self.pads.mark();
-                let one = self.type_app(t, indent);
-                if fits(&one, indent * 4) {
+                let one = self.type_app(t, col);
+                if fits(&one, col) {
                     return format!("{cur_pad}{one}");
                 }
                 self.pads.rewind(mark, one);
-                // Break the application: head on its own line, each argument one
-                // level deeper on its own line.
-                let arg_pad = self.pad(indent + 1);
+                // Break the application: head on its own line, each argument
+                // one tab stop in on its own line.
+                let arg_col = col.tab();
+                let arg_pad = self.pad(arg_col);
                 let mut out = format!("{cur_pad}{}", self.type_head(*q, segs));
                 for a in args {
-                    let _ = write!(out, "\n{arg_pad}{}", self.type_atom_indent(a, indent + 1));
+                    let _ = write!(out, "\n{arg_pad}{}", self.type_atom_indent(a, arg_col));
                 }
                 out
             }
-            _ => format!("{cur_pad}{}", self.type_app(t, indent)),
+            _ => format!("{cur_pad}{}", self.type_app(t, col)),
         }
     }
 
-    fn type_annotation(&self, t: &TypeAnnotation, indent: usize) -> String {
+    fn type_annotation(&self, t: &TypeAnnotation, col: Col) -> String {
         match t {
             TypeAnnotation::TLambda(_, _) => {
                 // Collect the full arrow chain and join with ` -> ` (single
                 // line when it fits).
-                let parts = self.arrow_chain(t, indent);
+                let parts = self.arrow_chain(t, col);
                 let one = parts.join(" -> ");
-                if fits(&one, indent * 4) {
+                if fits(&one, col) {
                     one
                 } else {
-                    // Multiline arrow: each arrow on its own line, four-space
-                    // indented past the current level, `->` leading.
-                    let pad = self.pad(indent + 1);
+                    // Multiline arrow: each arrow on its own line, one tab stop
+                    // past the type's column, `->` leading.
+                    let pad = self.pad(col.tab());
                     let mut it = parts.into_iter();
                     let first = it.next().unwrap_or_default();
                     let mut out = first;
@@ -1722,32 +1715,30 @@ impl<'a> Printer<'a> {
                     out
                 }
             }
-            _ => self.type_app(t, indent),
+            _ => self.type_app(t, col),
         }
     }
 
-    fn arrow_chain(&self, t: &TypeAnnotation, indent: usize) -> Vec<String> {
+    fn arrow_chain(&self, t: &TypeAnnotation, col: Col) -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = t;
         while let TypeAnnotation::TLambda(a, b) = cur {
-            out.push(self.type_app(a, indent));
+            out.push(self.type_app(a, col));
             cur = b;
         }
-        out.push(self.type_app(cur, indent));
+        out.push(self.type_app(cur, col));
         out
     }
 
-    fn type_app(&self, t: &TypeAnnotation, indent: usize) -> String {
+    fn type_app(&self, t: &TypeAnnotation, col: Col) -> String {
         match t {
             TypeAnnotation::TType(q, segs, args) if !args.is_empty() => {
                 let head = self.type_head(*q, segs);
-                let arg_strs: Vec<String> = args
-                    .iter()
-                    .map(|a| self.type_atom_indent(a, indent))
-                    .collect();
+                let arg_strs: Vec<String> =
+                    args.iter().map(|a| self.type_atom_indent(a, col)).collect();
                 format!("{head} {}", arg_strs.join(" "))
             }
-            _ => self.type_atom_indent(t, indent),
+            _ => self.type_atom_indent(t, col),
         }
     }
 
@@ -1762,32 +1753,32 @@ impl<'a> Printer<'a> {
     }
 
     fn type_atom(&self, t: &TypeAnnotation) -> String {
-        self.type_atom_indent(t, 0)
+        self.type_atom_indent(t, Col::ZERO)
     }
 
     /// A type in atom position — parenthesised when it is a compound (arrow,
     /// applied constructor, or tuple) that would otherwise re-associate.
-    fn type_atom_indent(&self, t: &TypeAnnotation, indent: usize) -> String {
+    fn type_atom_indent(&self, t: &TypeAnnotation, col: Col) -> String {
         match t {
             TypeAnnotation::TVar(s) => self.sym(*s),
             TypeAnnotation::TUnit => "()".to_owned(),
             TypeAnnotation::TType(q, segs, args) if args.is_empty() => self.type_head(*q, segs),
             TypeAnnotation::TType(..) => {
-                format!("({})", self.type_app(t, indent))
+                format!("({})", self.type_app(t, col.past(1)))
             }
             TypeAnnotation::TLambda(..) => {
-                format!("({})", self.type_annotation(t, indent))
+                format!("({})", self.type_annotation(t, col.past(1)))
             }
             TypeAnnotation::TTuple(elems) => {
                 let parts: Vec<String> = elems
                     .iter()
-                    .map(|e| self.type_annotation(e, indent))
+                    .map(|e| self.type_annotation(e, col.past(2)))
                     .collect();
                 format!("( {} )", parts.join(", "))
             }
-            TypeAnnotation::TRecord(fields) => self.type_record(fields, indent, false),
+            TypeAnnotation::TRecord(fields) => self.type_record(fields, col, false),
             TypeAnnotation::TRecordOpen(row_var, fields) => {
-                self.type_record_open(*row_var, fields, indent)
+                self.type_record_open(*row_var, fields, col)
             }
         }
     }
@@ -1800,7 +1791,7 @@ impl<'a> Printer<'a> {
         &self,
         row_var: ipe_intern::Symbol,
         fields: &[(Located<ipe_intern::Symbol>, TypeAnnotation)],
-        indent: usize,
+        col: Col,
     ) -> String {
         let parts: Vec<String> = fields
             .iter()
@@ -1808,7 +1799,7 @@ impl<'a> Printer<'a> {
                 format!(
                     "{} : {}",
                     self.sym(n.value),
-                    self.type_annotation(ty, indent)
+                    self.type_annotation(ty, col.tab())
                 )
             })
             .collect();
@@ -1822,20 +1813,26 @@ impl<'a> Printer<'a> {
     fn type_record(
         &self,
         fields: &[(Located<ipe_intern::Symbol>, TypeAnnotation)],
-        indent: usize,
+        col: Col,
         force_multi: bool,
     ) -> String {
         if fields.is_empty() {
             return "{}".to_owned();
         }
+        // A field's type starts on the field's line when it renders on one
+        // line, and otherwise on the next line one tab stop past the field.
+        let field_col = col.past(2);
         let parts: Vec<String> = fields
             .iter()
             .map(|(n, ty)| {
-                format!(
-                    "{} : {}",
-                    self.sym(n.value),
-                    self.type_annotation(ty, indent)
-                )
+                let value_col = field_col.tab();
+                let ty_s = self.type_annotation(ty, value_col);
+                let name = self.sym(n.value);
+                if has_layout_newline(&ty_s) {
+                    format!("{name} :\n{}{ty_s}", self.pad(value_col))
+                } else {
+                    format!("{name} : {ty_s}")
+                }
             })
             .collect();
         // A comment written above a record-type field attaches to the field's
@@ -1856,8 +1853,8 @@ impl<'a> Printer<'a> {
         if !force_multi && !has_field_comments && !one.contains('\n') {
             return one;
         }
-        let pad = self.pad(indent);
-        let inner = self.pad_in(indent);
+        let pad = self.pad(col);
+        let inner = pad;
         let mut out = String::from("{");
         for (i, (part, lead)) in parts.iter().zip(&leading).enumerate() {
             // The comment block precedes the field it annotates, mirroring the
@@ -1951,7 +1948,7 @@ impl<'a> Printer<'a> {
 
     // -- Expressions --------------------------------------------------------
 
-    /// Format an expression at the given indentation (in 4-space units).
+    /// Format an expression whose first line starts at column `col`.
     ///
     /// A `do` block reaches the printer already desugared into its
     /// `Task.andThen` / `let` chain; it is re-sugared here so the output keeps
@@ -1960,24 +1957,22 @@ impl<'a> Printer<'a> {
     /// outside a `do` (`BareWildcardBinding`).
     ///
     /// The comments anchored at the expression's first token print above it,
-    /// each on its own line at `indent`.
-    fn expr(&self, e: &Expr, indent: usize) -> String {
+    /// each on its own line at `col`.
+    fn expr(&self, e: &Expr, col: Col) -> String {
         #[cfg(test)]
         count_render_call();
         if self.pads.exceeded() {
             // The print is refused whole: rendering more is wasted work.
             return String::new();
         }
-        let (comments, body) = self.claim_expr(e, || self.expr_shape(e, indent));
-        self.with_comments(comments, &body, indent)
+        let (comments, body) = self.claim_expr(e, || self.expr_shape(e, col));
+        self.with_comments(comments, &body, col)
     }
 
     /// Format an expression without its leading comments.
-    fn expr_shape(&self, e: &Expr, indent: usize) -> String {
-        self.do_view(e).map_or_else(
-            || self.expr_node(e, indent),
-            |view| self.do_block(&view, indent),
-        )
+    fn expr_shape(&self, e: &Expr, col: Col) -> String {
+        self.do_view(e)
+            .map_or_else(|| self.expr_node(e, col), |view| self.do_block(&view, col))
     }
 
     /// The source offset just past the `do` keyword of a block's span.
@@ -2087,62 +2082,62 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// Print a recovered `do` block, one statement per line one level in.
+    /// Print a recovered `do` block, one statement per line one tab stop in.
     ///
     /// The result expression comes last; comments written between statements
-    /// keep their place.
-    fn do_block(&self, view: &DoView<'_>, indent: usize) -> String {
-        let stmt_pad = self.pad(indent + 1);
+    /// keep their place. A statement's expression starts past its `p <- ` or
+    /// `p = ` head, at the column that head ends on.
+    fn do_block(&self, view: &DoView<'_>, col: Col) -> String {
+        let stmt = col.tab();
+        let stmt_pad = self.pad(stmt);
         // A parenthesised block's node starts at its `(`: a comment between
         // the `(` and the keyword attaches to the keyword.
         let keyword_lo = view.keyword_end.saturating_sub("do".len());
         let mut out = if self.is_claimed(keyword_lo) {
             String::from("do")
         } else {
-            self.with_comments(self.anchored(keyword_lo), "do", indent)
+            self.with_comments(self.anchored(keyword_lo), "do", col)
         };
         for step in &view.steps {
             // A bound or pure statement starts at its binder; a bare run is an
             // expression and carries its own comments.
             let line = match step {
-                DoStep::Bind(pat, task) => self.with_comments(
-                    self.anchored(pat.span.lo as usize),
-                    &format!(
-                        "{} <- {}",
-                        self.pattern(&pat.value),
-                        self.expr(task, indent + 1)
-                    ),
-                    indent + 1,
-                ),
-                DoStep::Let(pat, value) => self.with_comments(
-                    self.anchored(pat.span.lo as usize),
-                    &format!(
-                        "{} = {}",
-                        self.pattern(&pat.value),
-                        self.expr(value, indent + 1)
-                    ),
-                    indent + 1,
-                ),
-                DoStep::Run(task) => self.expr(task, indent + 1),
+                DoStep::Bind(pat, task) => self.do_binding(pat, "<-", task, stmt),
+                DoStep::Let(pat, value) => self.do_binding(pat, "=", value, stmt),
+                DoStep::Run(task) => self.expr(task, stmt),
             };
             let _ = write!(out, "\n{stmt_pad}{line}");
         }
         // With no statement peeled, the result IS the `do`-stamped node: print
         // its own shape, or `expr` would recognise the block again.
         let result = if view.steps.is_empty() {
-            self.expr_node(view.result, indent + 1)
+            self.expr_node(view.result, stmt)
         } else {
-            self.expr(view.result, indent + 1)
+            self.expr(view.result, stmt)
         };
         let _ = write!(out, "\n{stmt_pad}{result}");
         out
+    }
+
+    /// A `p <- task` or `p = value` statement of a `do` block at column
+    /// `stmt`, with the comments above its binder.
+    ///
+    /// The right-hand side starts where the `p <- ` head ends.
+    fn do_binding(&self, pat: &Pattern, arrow: &str, rhs: &Expr, stmt: Col) -> String {
+        let head = format!("{} {arrow} ", self.pattern(&pat.value));
+        let rhs_s = self.expr(rhs, stmt.past(head.chars().count()));
+        self.with_comments(
+            self.anchored(pat.span.lo as usize),
+            &format!("{head}{rhs_s}"),
+            stmt,
+        )
     }
 
     /// Format an expression node by its own shape, without `do` re-sugaring.
     ///
     /// A node the parser desugared from a sugar prints as that sugar: a getter
     /// lambda as its field accessor `.a.b`, a `Basics.negate` call as `-e`.
-    fn expr_node(&self, e: &Expr, indent: usize) -> String {
+    fn expr_node(&self, e: &Expr, col: Col) -> String {
         if let Some(path) = ipe_parse::field_accessor(e) {
             return path.iter().fold(String::new(), |mut s, field| {
                 s.push('.');
@@ -2151,7 +2146,7 @@ impl<'a> Printer<'a> {
             });
         }
         if let Some(operand) = ipe_parse::negation(e, self.interner) {
-            return format!("-{}", self.expr_atom(operand, indent));
+            return format!("-{}", self.expr_atom(operand, col.past(1)));
         }
         match &e.value {
             Expr_::VarLocal(s) => self.sym(*s),
@@ -2173,23 +2168,23 @@ impl<'a> Printer<'a> {
             },
             Expr_::Char(c) => format!("'{}'", escape_char_body(c)),
             Expr_::Unit => "()".to_owned(),
-            Expr_::Call(head, args) => self.call(head, args, indent, e.span),
-            Expr_::Binops(chain, last) => self.binops(chain, last, indent, e.span),
-            Expr_::Case(scrut, arms) => self.case(scrut, arms, indent),
-            Expr_::Lambda(params, body) => self.lambda(params, body, indent, e.span),
-            Expr_::Let(bindings, body) => self.let_(bindings, body, indent),
-            Expr_::If(branches, else_) => self.if_(branches, else_, indent),
-            Expr_::Tuple(elems) => self.tuple(elems, indent, e.span),
-            Expr_::List(elems) => self.list(elems, indent, e.span),
-            Expr_::Record(fields) => self.record(fields, indent, e.span),
-            Expr_::Update(base, fields) => self.update(base, fields, indent, e.span),
+            Expr_::Call(head, args) => self.call(head, args, col, e.span),
+            Expr_::Binops(chain, last) => self.binops(chain, last, col, e.span),
+            Expr_::Case(scrut, arms) => self.case(scrut, arms, col),
+            Expr_::Lambda(params, body) => self.lambda(params, body, col, e.span),
+            Expr_::Let(bindings, body) => self.let_(bindings, body, col),
+            Expr_::If(branches, else_) => self.if_(branches, else_, col),
+            Expr_::Tuple(elems) => self.tuple(elems, col, e.span),
+            Expr_::List(elems) => self.list(elems, col, e.span),
+            Expr_::Record(fields) => self.record(fields, col, e.span),
+            Expr_::Update(base, fields) => self.update(base, fields, col, e.span),
             Expr_::Access(base, field) => {
                 // An accessor base keeps its parentheses: `(.a).b` written bare
                 // reads back as the one accessor `.a.b`.
                 let base_s = if ipe_parse::field_accessor(base).is_some() {
-                    format!("({})", self.expr(base, indent))
+                    format!("({})", self.expr(base, col.past(1)))
                 } else {
-                    self.expr_atom(base, indent)
+                    self.expr_atom(base, col)
                 };
                 format!("{base_s}.{}", self.sym(field.value))
             }
@@ -2201,53 +2196,47 @@ impl<'a> Printer<'a> {
     /// bind incorrectly against its surroundings.
     ///
     /// Leading comments print above the parentheses, not inside them.
-    fn expr_atom(&self, e: &Expr, indent: usize) -> String {
+    fn expr_atom(&self, e: &Expr, col: Col) -> String {
         #[cfg(test)]
         count_render_call();
         if self.pads.exceeded() {
             // The print is refused whole: rendering more is wasted work.
             return String::new();
         }
-        let (comments, body) = self.claim_expr(e, || self.atom_shape(e, indent));
-        self.with_comments(comments, &body, indent)
+        let (comments, body) = self.claim_expr(e, || self.atom_shape(e, col));
+        self.with_comments(comments, &body, col)
     }
 
     /// An expression in atom position, without its leading comments.
-    fn atom_shape(&self, e: &Expr, indent: usize) -> String {
+    fn atom_shape(&self, e: &Expr, col: Col) -> String {
         if ipe_parse::field_accessor(e).is_some() {
-            return self.expr(e, indent);
+            return self.expr(e, col);
         }
         // A negative numeric literal (`-5`, `-1.0`) prints with a leading `-`,
         // which the parser reads as a binary subtraction operator once the
         // literal sits after another atom — so `f (-5)` bare-printed as `f -5`
         // re-parses as `f - 5`. In atom position the sign must stay wrapped.
         if is_negative_literal(&e.value) {
-            return format!("({})", self.expr(e, indent));
+            return format!("({})", self.expr(e, col.past(1)));
         }
         if needs_parens_as_atom(&e.value) {
-            let inner = self.expr(e, indent);
+            let inner = self.expr(e, col.past(1));
             if inner.contains('\n') {
-                // A multiline compound in parens: the head follows `(`
-                // directly, continuation lines keep their indentation, and the
-                // closing `)` sits on its own line at this atom's indent —
-                // elm-format's parenthesised-block layout.
-                format!("({}\n{})", inner, self.pad(indent))
+                // A multiline compound in parens: the content starts right
+                // after `(`, one column in, and the closing `)` sits on its
+                // own line at the `(` column — elm-format's
+                // parenthesised-block layout.
+                format!("({}\n{})", inner, self.pad(col))
             } else {
                 format!("({inner})")
             }
         } else {
-            self.expr(e, indent)
+            self.expr(e, col)
         }
     }
 
-    fn call(
-        &self,
-        head: &Expr,
-        args: &[Expr],
-        indent: usize,
-        span: ipe_diagnostics::Span,
-    ) -> String {
-        let head_s = self.expr_atom(head, indent);
+    fn call(&self, head: &Expr, args: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
+        let head_s = self.expr_atom(head, col);
         // Single-line application when the whole thing fits, nothing broke, and
         // the source kept it on one line (elm-format's modal rule). Each
         // argument is rendered here exactly ONCE: the multiline branch below
@@ -2256,8 +2245,8 @@ impl<'a> Printer<'a> {
         // one level per statement) costs one render per node, not one render
         // per node per enclosing level — the latter is exponential in nesting
         // depth, since each enclosing level's trial re-walks every level below.
-        let arg_one_strs: Vec<String> =
-            args.iter().map(|a| self.expr_atom(a, indent + 1)).collect();
+        let arg_col = col.tab();
+        let arg_one_strs: Vec<String> = args.iter().map(|a| self.expr_atom(a, arg_col)).collect();
         let one = format!("{head_s} {}", arg_one_strs.join(" "));
         if !has_layout_newline(&one) && !self.was_multiline(span) {
             return one;
@@ -2273,7 +2262,7 @@ impl<'a> Printer<'a> {
         //     only broke on width, elm-format instead stacks all of them.
         //   * otherwise (Case 3): the function stands alone and EVERY argument
         //     goes on its own indented line.
-        let inner = self.pad(indent + 1);
+        let inner = self.pad(arg_col);
         // `split_first` avoids indexing/slicing panics and cleanly expresses the
         // "first argument joins the head line" branch.
         // The first argument hugs the function line — elm-format's `FAJoinFirst`
@@ -2297,7 +2286,7 @@ impl<'a> Printer<'a> {
             match (args.split_first(), arg_one_strs.split_first()) {
                 (Some((first, _)), Some((first_str, tail_strs)))
                     if Self::joins_on_head_line(first, first_str)
-                        && head_line_fits(&head_s, first, indent)
+                        && head_line_fits(&head_s, first, col)
                         && (is_simple_ref(first)
                             || first_is_block(first)
                             || later_block(tail_strs)) =>
@@ -2354,95 +2343,155 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// An operator chain, laid out by its precedence groups.
+    ///
+    /// A group is the run of operands its loosest operators split (see
+    /// [`chain_groups`]); a tighter run between two splits is a child group.
+    /// A broken group keeps its first operand on the current line and starts
+    /// each split operator's line one tab stop past the group's column, the
+    /// operand following on that line; a group of `<|` instead leaves each
+    /// operator at the end of its line and starts the operand on the next. A
+    /// child group breaks only when it must (an operand broke, or a comment
+    /// sits above one); the whole chain also breaks when the source wrote it
+    /// across lines, elm-format's modal rule.
     fn binops(
         &self,
         chain: &[(Expr, Located<ipe_intern::Symbol>)],
         last: &Expr,
-        indent: usize,
+        col: Col,
         span: ipe_diagnostics::Span,
     ) -> String {
-        // The backward pipe `<|` breaks differently from every other operator:
-        // it is right-associative and elm-format leaves it at the END of the
-        // left operand's line, dropping the right-hand side onto the next line
-        // indented one level (`f x <|\n    g y`). A whole chain of `<|` nests
-        // this way. Every other operator (`|>`, `::`, `++`, `==`, …) begins the
-        // continuation line instead.
         let ops: Vec<String> = chain.iter().map(|(_, op)| self.sym(op.value)).collect();
-        let all_backward = ops.iter().all(|op| op == "<|");
-        let first_operand = chain.first().map_or(last, |(operand, _)| operand);
+        let operands: Vec<&Expr> = chain
+            .iter()
+            .map(|(operand, _)| operand)
+            .chain(std::iter::once(last))
+            .collect();
+        let groups = OpGroups::of(&ops);
 
-        // Every operand is rendered exactly ONCE, at the indent it takes in
-        // the broken layout, and the flat-versus-broken choice reads those
-        // renderings. A rendering with no layout newline reads identically at
-        // any indent (padding is only ever inserted after a newline), so the
-        // same string serves the flat layout too. Rendering a flat candidate
-        // first and every operand again for the broken layout costs two
-        // renders per node per ENCLOSING chain, which is exponential in
-        // nesting depth.
-        //
+        // Every operand is rendered exactly ONCE, at the column it takes in
+        // the broken layout, and each group's flat-versus-broken choice reads
+        // those renderings. A rendering with no layout newline reads
+        // identically at any column (padding is only ever inserted after a
+        // newline), so the same string serves a flat group too. Rendering a
+        // flat candidate first and every operand again for the broken layout
+        // costs two renders per node per ENCLOSING chain, which is exponential
+        // in nesting depth.
+        let mut at: Vec<Col> = vec![col; operands.len()];
+        for g in &groups.0 {
+            let base = at.get(g.lo).copied().unwrap_or(col);
+            let line = base.tab();
+            for &split in &g.splits {
+                let op = ops.get(split).map_or("", String::as_str);
+                let start = if g.backward {
+                    line
+                } else {
+                    line.past(op.chars().count() + 1)
+                };
+                if let Some(slot) = at.get_mut(split + 1) {
+                    *slot = start;
+                }
+            }
+        }
         // Each operator carries the operand to its right. A comment above an
         // operator line attaches to that right operand, so it is claimed here
         // and printed above the operator.
-        let first_s = self.binop_operand(first_operand, indent);
-        let rights: Vec<(&str, Comments<'a>, String)> = ops
+        let last_index = operands.len().saturating_sub(1);
+        let mut rendered: Vec<Item<'a>> = operands
             .iter()
+            .zip(&at)
             .enumerate()
-            .map(|(i, op)| {
-                let (operand, is_last) = chain.get(i + 1).map_or((last, true), |(o, _)| (o, false));
-                let at = if all_backward && !is_last {
-                    indent
-                } else {
-                    indent + 1
-                };
-                let (comments, s) = self.claim_expr(operand, || {
-                    if is_last {
-                        self.binop_last_operand(operand, at)
+            .map(|(i, (operand, &c))| {
+                let render = || {
+                    if i == last_index {
+                        self.binop_last_operand(operand, c)
                     } else {
-                        self.binop_operand(operand, at)
+                        self.binop_operand(operand, c)
                     }
-                });
-                (op.as_str(), comments, s)
+                };
+                if i == 0 {
+                    (Vec::new(), render())
+                } else {
+                    self.claim_expr(operand, render)
+                }
             })
             .collect();
 
-        // Modal, like every other construct: a chain written on one line stays
-        // single-line however wide (elm-format keeps 900-column `::` chains
-        // intact), and only a source-multiline chain — or one whose operand
-        // itself broke, or that carries a comment — lays out one operator per
-        // continuation line.
-        let commented = rights.iter().any(|(_, comments, _)| !comments.is_empty());
-        if !commented && !self.was_multiline(span) {
-            let mut one = first_s.clone();
-            for (op, _, s) in &rights {
-                let _ = write!(one, " {op} {s}");
+        // Children sit after their parent, so the reverse order assembles
+        // every child before the group that holds it.
+        let mut texts: Vec<String> = vec![String::new(); groups.0.len()];
+        for (index, g) in groups.0.iter().enumerate().rev() {
+            let mut children = g.children.iter();
+            let mut segments: Vec<(Comments<'a>, String)> = Vec::new();
+            let ends = g.splits.iter().copied().chain(std::iter::once(g.hi));
+            let mut start = g.lo;
+            for end in ends {
+                let comments = if start == g.lo {
+                    Vec::new()
+                } else {
+                    rendered
+                        .get_mut(start)
+                        .map(|(cs, _)| std::mem::take(cs))
+                        .unwrap_or_default()
+                };
+                let text = if end > start {
+                    children
+                        .next()
+                        .and_then(|&child| texts.get_mut(child))
+                        .map(std::mem::take)
+                        .unwrap_or_default()
+                } else {
+                    rendered
+                        .get_mut(start)
+                        .map(|(_, text)| std::mem::take(text))
+                        .unwrap_or_default()
+                };
+                segments.push((comments, text));
+                start = end + 1;
             }
-            if !has_layout_newline(&one) {
-                return one;
+            let forced = segments
+                .iter()
+                .any(|(cs, text)| !cs.is_empty() || has_layout_newline(text));
+            let broken = forced || (index == 0 && self.was_multiline(span));
+            let line = at.get(g.lo).copied().unwrap_or(col).tab();
+            let text = self.op_group(&ops, g, segments, broken, line);
+            if let Some(slot) = texts.get_mut(index) {
+                *slot = text;
             }
         }
-        let inner = self.pad(indent + 1);
-        if all_backward {
-            // Each right operand opens the next line one level in; its
-            // comments head that line.
-            let mut out = first_s;
-            for (op, comments, s) in &rights {
-                let line = self.with_comments(comments.iter().copied(), s, indent + 1);
-                let _ = write!(out, " {op}\n{inner}{line}");
+        texts.into_iter().next().unwrap_or_default()
+    }
+
+    /// Join one operator group's `segments`, the first operand or child
+    /// group and then the one right of each split, each with its comments.
+    ///
+    /// A `broken` group starts each split's line at `line`.
+    fn op_group(
+        &self,
+        ops: &[String],
+        g: &OpGroup,
+        segments: Vec<(Comments<'a>, String)>,
+        broken: bool,
+        line: Col,
+    ) -> String {
+        let mut segments = segments.into_iter();
+        let mut out = segments.next().map(|(_, text)| text).unwrap_or_default();
+        let pad = self.pad(line);
+        for (&split, (comments, text)) in g.splits.iter().zip(segments) {
+            let op = ops.get(split).map_or("", String::as_str);
+            if !broken {
+                let _ = write!(out, " {op} {text}");
+            } else if g.backward {
+                // Each right operand opens the next line; its comments head
+                // that line.
+                let text = self.with_comments(comments.iter().copied(), &text, line);
+                let _ = write!(out, " {op}\n{pad}{text}");
+            } else {
+                for c in comments {
+                    let _ = write!(out, "\n{pad}{}", c.text);
+                }
+                let _ = write!(out, "\n{pad}{op} {text}");
             }
-            return out;
-        }
-        // Multiline: the FIRST operand stays on the current line at the base
-        // indent; every operator then begins a continuation line indented one
-        // level, with its right-hand operand following on that same line. So
-        //   { … }
-        //       |> Vector
-        // keeps the record at the base indent and only the `|>` step indents.
-        let mut out = first_s;
-        for (op, comments, s) in &rights {
-            for c in comments {
-                let _ = write!(out, "\n{inner}{}", c.text);
-            }
-            let _ = write!(out, "\n{inner}{op} {s}");
         }
         out
     }
@@ -2452,13 +2501,13 @@ impl<'a> Printer<'a> {
     /// every binary operator, so `List.foldr f start <| toList v` is
     /// unambiguous and elm-format leaves both calls bare. Only a nested operator
     /// chain, `case` / `if` / `let`, or lambda still needs wrapping.
-    fn binop_operand(&self, e: &Expr, indent: usize) -> String {
+    fn binop_operand(&self, e: &Expr, col: Col) -> String {
         // A `do` block desugars to a call, but its statement layout would
         // swallow a following operator line: it keeps its parentheses.
         if matches!(e.value, Expr_::Call(..)) && self.do_keyword_end(e.span).is_none() {
-            self.expr(e, indent)
+            self.expr(e, col)
         } else {
-            self.expr_atom(e, indent)
+            self.expr_atom(e, col)
         }
     }
 
@@ -2466,11 +2515,11 @@ impl<'a> Printer<'a> {
     /// wrapping parens — the operator to its left already delimits it and its
     /// body extends to the end of the expression, so elm-format emits it bare
     /// (`f <| \x -> body`). Every other operand keeps [`Self::binop_operand`].
-    fn binop_last_operand(&self, e: &Expr, indent: usize) -> String {
+    fn binop_last_operand(&self, e: &Expr, col: Col) -> String {
         if matches!(e.value, Expr_::Lambda(..)) {
-            self.expr(e, indent)
+            self.expr(e, col)
         } else {
-            self.binop_operand(e, indent)
+            self.binop_operand(e, col)
         }
     }
 
@@ -2478,7 +2527,7 @@ impl<'a> Printer<'a> {
         &self,
         params: &[Pattern],
         body: &Expr,
-        indent: usize,
+        col: Col,
         span: ipe_diagnostics::Span,
     ) -> String {
         let ps: Vec<String> = params.iter().map(|p| self.pattern_atom(&p.value)).collect();
@@ -2486,7 +2535,7 @@ impl<'a> Printer<'a> {
         // its `claim_expr`.
         let head = format!("\\{} ->", ps.join(" "));
         // A block-form body (`let` / `case` / `if`) always drops to the next
-        // line, indented one level: an inline `-> let …` would place the `let`
+        // line, one tab stop in: an inline `-> let …` would place the `let`
         // keyword mid-line, breaking its layout-sensitive block on re-parse.
         // A modal body — one written across multiple source lines — also drops
         // to its own indented line, matching elm-format's `\x ->\n    body`.
@@ -2495,35 +2544,38 @@ impl<'a> Printer<'a> {
         // multi-line, so the block form is the one a second pass would pick.
         // Any other body stays inline after the arrow.
         //
-        // Rendered exactly ONCE, at the block indent, and reused for both the
+        // Rendered exactly ONCE, at the block column, and reused for both the
         // inline and the block candidate: a result with no embedded newline
-        // reads identically at any indent (padding is only ever inserted
+        // reads identically at any column (padding is only ever inserted
         // after a newline), so that one string serves either placement.
-        // Trying an inline render at this indent, rejecting it, and
-        // re-rendering at the block indent — as elm-format's own two-pass
+        // Trying an inline render at this column, rejecting it, and
+        // re-rendering at the block column — as elm-format's own two-pass
         // check would — costs one render per node per ENCLOSING level; for a
         // right-nested lambda chain (a `do` block's desugared binds, one
         // level per statement) that is exponential in the number of
-        // statements. Budgeting the fits-inline check at the block indent
-        // (one narrower than the inline placement actually occupies) is
+        // statements. Budgeting the fits-inline check at the block column
+        // (narrower than the inline placement actually occupies) is
         // conservative-only: a narrower width budget can only ever wrap a
         // body the wider one would have kept on one line, never the reverse,
         // so this can pick block form a body would have fit on the arrow's
         // line, but never the other way around.
         let block_body = matches!(body.value, Expr_::Let(..) | Expr_::Case(..) | Expr_::If(..))
             || !self.anchored(body.span.lo as usize).is_empty();
-        let body_s = self.expr(body, indent + 1);
+        let body_col = col.tab();
+        let body_s = self.expr(body, body_col);
         if !block_body && !self.was_multiline(span) && !has_layout_newline(&body_s) {
             format!("{head} {body_s}")
         } else {
-            format!("{head}\n{}{body_s}", self.pad(indent + 1))
+            format!("{head}\n{}{body_s}", self.pad(body_col))
         }
     }
 
-    fn case(&self, scrut: &Expr, arms: &[(Pattern, Expr)], indent: usize) -> String {
-        let scrut_s = self.expr(scrut, indent);
-        let arm_pad = self.pad(indent + 1);
-        let body_pad = self.pad(indent + 2);
+    fn case(&self, scrut: &Expr, arms: &[(Pattern, Expr)], col: Col) -> String {
+        let scrut_s = self.expr(scrut, col.past("case ".len()));
+        let arm_col = col.tab();
+        let body_col = arm_col.tab();
+        let arm_pad = self.pad(arm_col);
+        let body_pad = self.pad(body_col);
         let mut out = format!("case {scrut_s} of");
         for (i, (pat, body)) in arms.iter().enumerate() {
             // A comment above an arm attaches to its pattern and sits on its
@@ -2545,7 +2597,7 @@ impl<'a> Printer<'a> {
                     out.push('\n');
                 }
             }
-            let body_s = self.expr(body, indent + 2);
+            let body_s = self.expr(body, body_col);
             let _ = write!(
                 out,
                 "\n{arm_pad}{} ->\n{body_pad}{body_s}",
@@ -2555,9 +2607,11 @@ impl<'a> Printer<'a> {
         out
     }
 
-    fn let_(&self, bindings: &[LetBinding], body: &Expr, indent: usize) -> String {
-        let bind_pad = self.pad(indent + 1);
-        let body_val_pad = self.pad(indent + 2);
+    fn let_(&self, bindings: &[LetBinding], body: &Expr, col: Col) -> String {
+        let bind_col = col.tab();
+        let value_col = bind_col.tab();
+        let bind_pad = self.pad(bind_col);
+        let body_val_pad = self.pad(value_col);
         let mut out = String::from("let");
         for (i, b) in bindings.iter().enumerate() {
             // elm-format separates successive `let` bindings with a blank
@@ -2588,11 +2642,11 @@ impl<'a> Printer<'a> {
             push_indented_comments(&mut out, above.iter().chain(inside), bind_pad);
             // elm-format ALWAYS drops a `let` binding's value onto its own
             // four-space-indented line, however short — `x =\n    1`.
-            let val = self.expr(value, indent + 2);
+            let val = self.expr(value, value_col);
             let _ = write!(out, "\n{bind_pad}{binder} =\n{body_val_pad}{val}");
         }
-        let in_pad = self.pad(indent);
-        let _ = write!(out, "\n{in_pad}in\n{in_pad}{}", self.expr(body, indent));
+        let in_pad = self.pad(col);
+        let _ = write!(out, "\n{in_pad}in\n{in_pad}{}", self.expr(body, col));
         out
     }
 
@@ -2606,8 +2660,9 @@ impl<'a> Printer<'a> {
         }
     }
 
-    fn if_(&self, branches: &[(Expr, Expr)], else_: &Expr, indent: usize) -> String {
-        let inner = self.pad(indent + 1);
+    fn if_(&self, branches: &[(Expr, Expr)], else_: &Expr, col: Col) -> String {
+        let body_col = col.tab();
+        let inner = self.pad(body_col);
         let mut out = String::new();
         for (i, (cond, body)) in branches.iter().enumerate() {
             let lead = if i == 0 { "if" } else { "else if" };
@@ -2618,77 +2673,82 @@ impl<'a> Printer<'a> {
                     .token_before(cond.span.lo as usize)
                     .filter(|t| matches!(t.kind, TokenKind::If));
                 for c in keyword.map_or(&[][..], |t| self.anchored(t.lo)) {
-                    let _ = write!(out, "{}\n{}", c.text, self.pad(indent));
+                    let _ = write!(out, "{}\n{}", c.text, self.pad(col));
                 }
             }
             let _ = write!(
                 out,
                 "{lead} {} then\n{inner}{}\n\n{}",
-                self.expr(cond, indent),
-                self.expr(body, indent + 1),
-                self.pad(indent)
+                self.expr(cond, col.past(lead.len() + 1)),
+                self.expr(body, body_col),
+                self.pad(col)
             );
         }
-        let _ = write!(out, "else\n{inner}{}", self.expr(else_, indent + 1));
+        let _ = write!(out, "else\n{inner}{}", self.expr(else_, body_col));
         out
     }
 
-    // Collection elements are rendered at the collection's OWN indent (the
-    // bracket level), not one level deeper: elm-format treats the leading
-    // `[ ` / `, ` separator as cosmetic and indents an element's internal
-    // breaks (e.g. a nested application's arguments) by 4 from the bracket
-    // column, i.e. to `(indent + 1) * 4`. Rendering elements at `indent + 1`
-    // would double-count that step.
+    // A collection element starts two columns past its bracket, after the
+    // `[ ` / `, ` it follows, and is rendered at that column; the `,` lines
+    // and the closing bracket sit at the bracket's column.
     //
     // A comment above an element attaches to its first token (a record
     // field's name) and prints on its own line above the element; one above
     // the closing bracket prints above the bracket. A commented collection is
     // always multi-line.
-    fn tuple(&self, elems: &[Expr], indent: usize, span: ipe_diagnostics::Span) -> String {
-        let items = self.elements(elems, indent);
-        self.collection("(", ")", &items, span, indent)
+    fn tuple(&self, elems: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
+        let items = self.elements(elems, col.past(2));
+        self.collection("(", ")", &items, span, col)
     }
 
-    fn list(&self, elems: &[Expr], indent: usize, span: ipe_diagnostics::Span) -> String {
+    fn list(&self, elems: &[Expr], col: Col, span: ipe_diagnostics::Span) -> String {
         if elems.is_empty() {
-            return self.with_comments(self.closing_comments(span), "[]", indent);
+            return self.with_comments(self.closing_comments(span), "[]", col);
         }
-        let items = self.elements(elems, indent);
-        self.collection("[", "]", &items, span, indent)
+        let items = self.elements(elems, col.past(2));
+        self.collection("[", "]", &items, span, col)
     }
 
     fn record(
         &self,
         fields: &[(Located<ipe_intern::Symbol>, Expr)],
-        indent: usize,
+        col: Col,
         span: ipe_diagnostics::Span,
     ) -> String {
         if fields.is_empty() {
-            return self.with_comments(self.closing_comments(span), "{}", indent);
+            return self.with_comments(self.closing_comments(span), "{}", col);
         }
-        let items = self.fields(fields, indent);
-        self.collection("{", "}", &items, span, indent)
+        let items = self.fields(fields, col.past(2));
+        self.collection("{", "}", &items, span, col)
     }
 
-    /// Each element of a list or tuple with the comments above it.
-    fn elements(&self, elems: &[Expr], indent: usize) -> Vec<Item<'a>> {
+    /// Each element of a list or tuple, rendered at `col`, with the comments
+    /// above it.
+    fn elements(&self, elems: &[Expr], col: Col) -> Vec<Item<'a>> {
         elems
             .iter()
-            .map(|e| self.claim_expr(e, || self.expr(e, indent)))
+            .map(|e| self.claim_expr(e, || self.expr(e, col)))
             .collect()
     }
 
-    /// Each `name = value` field of a record with the comments above it.
-    fn fields(
-        &self,
-        fields: &[(Located<ipe_intern::Symbol>, Expr)],
-        indent: usize,
-    ) -> Vec<Item<'a>> {
+    /// Each `name = value` field of a record, starting at `col`, with the
+    /// comments above it.
+    ///
+    /// A value that renders on one line follows its `=`; any other starts on
+    /// the next line, one tab stop past the field.
+    fn fields(&self, fields: &[(Located<ipe_intern::Symbol>, Expr)], col: Col) -> Vec<Item<'a>> {
+        let value_col = col.tab();
         fields
             .iter()
             .map(|(n, v)| {
                 self.claim(n.span.lo as usize, None, || {
-                    format!("{} = {}", self.sym(n.value), self.expr(v, indent))
+                    let name = self.sym(n.value);
+                    let value = self.expr(v, value_col);
+                    if has_layout_newline(&value) {
+                        format!("{name} =\n{}{value}", self.pad(value_col))
+                    } else {
+                        format!("{name} = {value}")
+                    }
                 })
             })
             .collect()
@@ -2703,7 +2763,7 @@ impl<'a> Printer<'a> {
         close: &str,
         items: &[Item<'a>],
         span: ipe_diagnostics::Span,
-        indent: usize,
+        col: Col,
     ) -> String {
         let closing = self.closing_comments(span);
         let commented = !closing.is_empty() || items.iter().any(|(cs, _)| !cs.is_empty());
@@ -2712,20 +2772,21 @@ impl<'a> Printer<'a> {
         if !commented && !has_layout_newline(&one) && !self.was_multiline(span) {
             return one;
         }
-        comma_multiline(&self.pads, open, close, items, closing, indent)
+        comma_multiline(&self.pads, open, close, items, closing, col)
     }
 
     fn update(
         &self,
         base: &Located<ipe_intern::Symbol>,
         fields: &[(Located<ipe_intern::Symbol>, Expr)],
-        indent: usize,
+        col: Col,
         span: ipe_diagnostics::Span,
     ) -> String {
         let base_s = self.sym(base.value);
-        // Field values render at one level deeper than the brace so a value's
-        // own line breaks align under the multi-line update body.
-        let items = self.fields(fields, indent + 1);
+        // The `| ` / `, ` lines start one tab stop past the brace, and each
+        // field two columns past that.
+        let bar_col = col.tab();
+        let items = self.fields(fields, bar_col.past(2));
         let closing = self.closing_comments(span);
         let commented = !closing.is_empty() || items.iter().any(|(cs, _)| !cs.is_empty());
         let parts: Vec<&str> = items.iter().map(|(_, s)| s.as_str()).collect();
@@ -2734,11 +2795,11 @@ impl<'a> Printer<'a> {
             return one;
         }
         // Multiline update: `{ base` on the first line, then the `| field` /
-        // `, field` lines indented ONE LEVEL DEEPER than the brace (elm-format
-        // aligns the update pipe under the record body, not under the `{`), and
-        // the closing `}` back at the brace column.
-        let close_pad = self.pad(indent);
-        let inner = self.pad(indent + 1);
+        // `, field` lines one tab stop past the brace (elm-format aligns the
+        // update pipe under the record body, not under the `{`), and the
+        // closing `}` back at the brace column.
+        let close_pad = self.pad(col);
+        let inner = self.pad(bar_col);
         let mut out = format!("{{ {base_s}");
         for (i, (comments, p)) in items.iter().enumerate() {
             let lead = if i == 0 { "|" } else { "," };
@@ -2804,28 +2865,63 @@ const fn needs_parens_as_atom(e: &Expr_) -> bool {
     )
 }
 
-/// Whether `s` contains a newline that is part of the source *layout* rather
-/// than the *content* of a triple-quoted (`"""…"""`) string. elm-format's modal
-/// rule keys the multi-line layout of a construct on whether the construct was
-/// written across multiple source lines — but a multi-line string literal is a
-/// single logical token, so the `\n`s inside its `"""…"""` delimiters are
-/// content, not layout. Counting them would make e.g. `interpolate """…\n…"""`
-/// look "source-multiline" and wrongly break the surrounding call.
+/// Whether `s` contains a newline that is part of the source *layout*.
+///
+/// The scan follows the lexer's token boundaries: a `\n` inside a
+/// triple-quoted string is content, and a `"""` inside a normal string, a
+/// char literal, or a comment opens nothing. A newline inside a block comment
+/// is layout, as is a token left unterminated (the conservative reading).
 fn has_layout_newline(s: &str) -> bool {
-    let mut in_triple = false;
-    let mut rest = s.as_bytes();
-    while let Some((&head, tail)) = rest.split_first() {
-        if rest.starts_with(b"\"\"\"") {
-            in_triple = !in_triple;
-            rest = rest.get(3..).unwrap_or(&[]);
-            continue;
-        }
-        if head == b'\n' && !in_triple {
-            return true;
-        }
-        rest = tail;
+    let mut rest = s;
+    loop {
+        rest = if let Some(after) = rest.strip_prefix("\"\"\"") {
+            match after.split_once("\"\"\"") {
+                Some((_, tail)) => tail,
+                None => return true,
+            }
+        } else if let Some(after) = rest.strip_prefix("--") {
+            after
+                .find('\n')
+                .map_or("", |end| after.get(end..).unwrap_or(""))
+        } else if let Some(after) = rest.strip_prefix("{-") {
+            let tail = skip_block_comment_body(after);
+            let body = after
+                .get(..after.len().saturating_sub(tail.len()))
+                .unwrap_or(after);
+            if body.contains('\n') || !body.ends_with("-}") {
+                return true;
+            }
+            tail
+        } else {
+            let mut chars = rest.chars();
+            match chars.next() {
+                None => return false,
+                Some('\n') => return true,
+                Some(quote @ ('"' | '\'')) => match skip_quoted(chars.as_str(), quote) {
+                    Some(tail) => tail,
+                    None => return true,
+                },
+                Some(_) => chars.as_str(),
+            }
+        };
     }
-    false
+}
+
+/// What follows a single-line quoted token whose opening `quote` is already
+/// consumed, honouring `\\` escapes; `None` when a raw newline or the end
+/// comes before the closing quote.
+fn skip_quoted(rest: &str, quote: char) -> Option<&str> {
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '\n' => return None,
+            '\\' => {
+                chars.next()?;
+            }
+            c if c == quote => return Some(chars.as_str()),
+            _ => {}
+        }
+    }
 }
 
 /// Whether the head plus its first argument fits on one line before the
@@ -2834,14 +2930,14 @@ fn has_layout_newline(s: &str) -> bool {
 /// when that opening line stays within the width budget, otherwise the string
 /// drops to its own indented line. Other joinable first arguments (names, empty
 /// collections) are short and always fit.
-fn head_line_fits(head_s: &str, first: &Expr, indent: usize) -> bool {
+fn head_line_fits(head_s: &str, first: &Expr, col: Col) -> bool {
     let Expr_::MultilineStr { raw: s, .. } = &first.value else {
         return true;
     };
     let first_content = s.split_once('\n').map_or(s.as_str(), |(f, _)| f);
     // column of the head + head + ` ` + `"""` + first content line
-    let col = indent * 4 + head_s.chars().count() + 1 + 3 + first_content.chars().count();
-    col <= MAX_WIDTH
+    let end = col.past(head_s.chars().count() + 1 + 3 + first_content.chars().count());
+    end.0 <= MAX_WIDTH
 }
 
 /// Push the name offset of every closed-record field inside `t`: the anchors
@@ -2877,6 +2973,62 @@ type Item<'c> = (Comments<'c>, String);
 
 /// The comments a node prints above itself.
 type Comments<'c> = Vec<&'c Comment>;
+
+/// One precedence group of an operator chain, as the printer lays it out.
+struct OpGroup {
+    /// The index of the group's first operand.
+    lo: usize,
+    /// The index of the group's last operand.
+    hi: usize,
+    /// The operator indices the group splits at, left to right.
+    splits: Vec<usize>,
+    /// The child groups' indices, left to right.
+    children: Vec<usize>,
+    /// Whether every split is `<|`, which ends its line instead of starting
+    /// the next one.
+    backward: bool,
+}
+
+/// The precedence groups of one operator chain; a child sits after its
+/// parent, and group `0` is the root.
+struct OpGroups(Vec<OpGroup>);
+
+impl OpGroups {
+    /// The groups of the chain whose operators are spelled `ops`.
+    ///
+    /// The parser builds a chain only from the closed [`BinOp`] set. A
+    /// spelling outside it has no precedence, so its chain is one group that
+    /// splits at every operator; the re-parse guard then judges the output.
+    fn of(ops: &[String]) -> Self {
+        let known: Option<Vec<BinOp>> = ops.iter().map(|op| BinOp::from_text(op)).collect();
+        let Some(known) = known else {
+            return Self(vec![OpGroup {
+                lo: 0,
+                hi: ops.len(),
+                splits: (0..ops.len()).collect(),
+                children: Vec::new(),
+                backward: false,
+            }]);
+        };
+        let groups = chain_groups(&known);
+        Self(
+            groups
+                .groups()
+                .iter()
+                .map(|g| OpGroup {
+                    lo: g.lo(),
+                    hi: g.hi(),
+                    splits: g.splits().to_vec(),
+                    children: g.children().to_vec(),
+                    backward: g
+                        .splits()
+                        .iter()
+                        .all(|&i| known.get(i) == Some(&BinOp::PipeLeft)),
+                })
+                .collect(),
+        )
+    }
+}
 
 /// Push each comment on its own line, ending each with a newline.
 fn push_comment_lines<'c>(out: &mut String, comments: impl IntoIterator<Item = &'c Comment>) {
@@ -2958,71 +3110,26 @@ fn comma_multiline(
     close: &str,
     items: &[Item<'_>],
     closing: &[Comment],
-    indent: usize,
+    col: Col,
 ) -> String {
-    let pad = pads.pad(indent);
-    let inner = pads.pad(indent);
+    let pad = pads.pad(col);
     let mut out = String::from(open);
     for (i, (comments, part)) in items.iter().enumerate() {
-        push_indented_comments(&mut out, comments.iter().copied(), inner);
-        let part = hang_element(pads, part);
+        push_indented_comments(&mut out, comments.iter().copied(), pad);
         match (i, comments.is_empty()) {
             (0, true) => {
                 let _ = write!(out, " {part}");
             }
             (0, false) => {
-                let _ = write!(out, "\n{inner}  {part}");
+                let _ = write!(out, "\n{pad}  {part}");
             }
             _ => {
-                let _ = write!(out, "\n{inner}, {part}");
+                let _ = write!(out, "\n{pad}, {part}");
             }
         }
     }
-    push_indented_comments(&mut out, closing, inner);
+    push_indented_comments(&mut out, closing, pad);
     let _ = write!(out, "\n{pad}{close}");
-    out
-}
-
-/// Align a multi-line collection ELEMENT under the two-column content offset
-/// created by its `( ` / `, ` / `[ ` prefix. elm-format's box model places an
-/// element two spaces past the bracket, so a nested comma-delimited collection
-/// (`{ … }`, `[ … ]`, `( … )`) — whose own continuation commas and closing
-/// bracket would otherwise sit at the bracket column — must hang two spaces to
-/// line up under its opener. Only such a "leading-bracket" element is shifted;
-/// an application or pipe element already indents correctly by four, so shifting
-/// it would over-indent its continuation lines.
-///
-/// Each shift is charged to `pads`: nested collections shift one line once
-/// per enclosing level, so the shift multiplies like indentation does.
-fn hang_element(pads: &PadBudget, part: &str) -> String {
-    let starts_collection = part.starts_with("{ ") || part.starts_with("[ ");
-    if !starts_collection || !part.contains('\n') {
-        return part.to_owned();
-    }
-    // The element opens a comma-delimited collection at the two-space content
-    // offset. Its *own* structural lines — the leading-comma continuations and
-    // the closing bracket at the collection's base column — must hang two
-    // spaces to sit under the opener. Lines that are more deeply indented (a
-    // nested application's arguments, or a `|>` pipe step following the
-    // collection) are left untouched: shifting them would misalign them.
-    let base_indent = part
-        .lines()
-        .nth(1)
-        .map_or(0, |l| l.len() - l.trim_start().len());
-    let mut out = String::with_capacity(part.len() + 8);
-    for (i, line) in part.split('\n').enumerate() {
-        if i > 0 {
-            out.push('\n');
-            let this_indent = line.len() - line.trim_start().len();
-            let trimmed = line.trim_start();
-            let is_own_structure = this_indent == base_indent
-                && (trimmed.starts_with(", ") || trimmed == "}" || trimmed == "]");
-            if is_own_structure && pads.charge(HANG_UNIT.len()) {
-                out.push_str(HANG_UNIT);
-            }
-        }
-        out.push_str(line);
-    }
     out
 }
 
@@ -3059,18 +3166,44 @@ impl Decl<'_> {
 // Small formatting helpers
 // ---------------------------------------------------------------------------
 
-/// One indent level.
-const INDENT_UNIT: &str = "    ";
+/// One indent step: the width [`Col::tab`] rounds up to.
+const INDENT_UNIT: usize = 4;
 
-/// The two columns a nested collection element hangs past its bracket.
-const HANG_UNIT: &str = "  ";
+/// A column of the printed text, counted in chars from the line start.
+///
+/// Every child is placed at the column its parent computed from the text it
+/// put before the child, so no rendered text is ever re-indented and no
+/// indentation is counted in levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Col(usize);
+
+impl Col {
+    /// The left margin.
+    const ZERO: Self = Self(0);
+
+    /// The body column of a top-level declaration.
+    const BODY: Self = Self(INDENT_UNIT);
+
+    /// The next tab stop strictly right of this column.
+    const fn tab(self) -> Self {
+        Self(
+            (self.0 / INDENT_UNIT)
+                .saturating_add(1)
+                .saturating_mul(INDENT_UNIT),
+        )
+    }
+
+    /// The column `width` chars right of this one.
+    const fn past(self, width: usize) -> Self {
+        Self(self.0.saturating_add(width))
+    }
+}
 
 /// The indentation bytes one print may still emit.
 ///
 /// A layout repeats one indentation on every line it breaks, so indentation
-/// is the output an input multiplies: every rendering of a [`Pad`], and every
-/// [`HANG_UNIT`] a nested collection adds to a line, is charged its bytes
-/// here, against the print's [`OutputCap`]. A candidate layout that is thrown
+/// is the output an input multiplies: every rendering of a [`Pad`] is charged
+/// its bytes here, against the print's [`OutputCap`]. A candidate layout that is thrown
 /// away gives its bytes back ([`PadBudget::rewind`]), so only the kept text is
 /// charged. Past the budget a pad renders nothing, the print is marked
 /// exceeded for good, and every later render returns at once: the caller
@@ -3088,12 +3221,9 @@ impl PadBudget {
         }
     }
 
-    /// The indentation of `level` levels, charged each time it renders.
-    const fn pad(&self, level: usize) -> Pad<'_> {
-        Pad {
-            level,
-            budget: self,
-        }
+    /// The indentation reaching `col`, charged each time it renders.
+    const fn pad(&self, col: Col) -> Pad<'_> {
+        Pad { col, budget: self }
     }
 
     /// Take `bytes` from the budget.
@@ -3140,31 +3270,35 @@ impl PadBudget {
 #[derive(Clone, Copy)]
 struct PadMark(usize);
 
-/// Indentation of a number of levels, rendered through its [`PadBudget`].
+/// The spaces reaching one column, rendered through its [`PadBudget`].
 #[derive(Clone, Copy)]
 struct Pad<'b> {
-    level: usize,
+    col: Col,
     budget: &'b PadBudget,
 }
 
 impl fmt::Display for Pad<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self
-            .budget
-            .charge(self.level.saturating_mul(INDENT_UNIT.len()))
-        {
-            for _ in 0..self.level {
-                f.write_str(INDENT_UNIT)?;
+        if self.budget.charge(self.col.0) {
+            let mut left = self.col.0;
+            while left > 0 {
+                let chunk = left.min(SPACES.len());
+                f.write_str(SPACES.get(..chunk).unwrap_or(""))?;
+                left -= chunk;
             }
         }
         Ok(())
     }
 }
 
+/// One write of spaces. A `{:width$}` argument is a `u16` at run time and
+/// panics past 65535, so a column an input decides is written in chunks.
+const SPACES: &str = "                                                                ";
+
 /// Whether `s`, placed at column `col`, fits within [`MAX_WIDTH`]. A multi-line
 /// `s` never "fits" as a single line.
-fn fits(s: &str, col: usize) -> bool {
-    !s.contains('\n') && col + s.chars().count() <= MAX_WIDTH
+fn fits(s: &str, col: Col) -> bool {
+    !s.contains('\n') && col.past(s.chars().count()).0 <= MAX_WIDTH
 }
 
 /// Render a float the way the source spelled it back canonically: an integral
@@ -4052,8 +4186,8 @@ mod tests {
         let src = nested_deep_list(24, 40);
         let out = format_source(&src).expect("a small deep list formats");
         assert!(
-            out.contains(&format!("\n{}, aaaaaaaaaaaaaaa", INDENT_UNIT.repeat(49))),
-            "precondition: the items sit 49 levels deep: {out}"
+            out.contains(&format!("\n{}, aaaaaaaaaaaaaaa", " ".repeat(196))),
+            "precondition: the items sit 196 columns deep: {out}"
         );
         let exact = OutputCap(out.len());
         assert_eq!(
@@ -4073,13 +4207,25 @@ mod tests {
     #[test]
     fn pad_budget_charges_every_rendering() {
         let budget = PadBudget::new(OutputCap(8));
-        let pad = budget.pad(1);
+        let pad = budget.pad(Col(4));
         assert_eq!(format!("{pad}{pad}"), "        ");
         assert!(!budget.exceeded());
         assert_eq!(format!("{pad}"), "");
         assert!(budget.exceeded());
-        assert_eq!(format!("{}", budget.pad(0)), "");
+        assert_eq!(format!("{}", budget.pad(Col::ZERO)), "");
         assert!(budget.exceeded());
+    }
+
+    /// A column past `u16::MAX` renders in full: the pad never hands a
+    /// runtime width to the formatter, which panics there.
+    #[test]
+    fn pad_past_u16_max_renders_every_space() {
+        let budget = PadBudget::new(OutputCap(1 << 20));
+        let rendered = format!("{}", budget.pad(Col(70_000)));
+        assert_eq!(rendered.len(), 70_000);
+        assert!(rendered.bytes().all(|b| b == b' '));
+        assert!(!budget.exceeded());
+        assert_eq!(SPACES.len(), 64);
     }
 
     /// A rewind gives back what was charged since its mark, and an exceeded
@@ -4088,22 +4234,22 @@ mod tests {
     fn pad_budget_rewind_refunds_only_an_unexceeded_budget() {
         let budget = PadBudget::new(OutputCap(8));
         let mark = budget.mark();
-        let discarded = format!("{}", budget.pad(2));
+        let discarded = format!("{}", budget.pad(Col(8)));
         assert_eq!(discarded, "        ");
         budget.rewind(mark, discarded);
-        assert_eq!(format!("{}", budget.pad(2)), "        ");
+        assert_eq!(format!("{}", budget.pad(Col(8))), "        ");
         let mark = budget.mark();
-        assert_eq!(format!("{}", budget.pad(1)), "");
+        assert_eq!(format!("{}", budget.pad(Col(1))), "");
         assert!(budget.exceeded());
         budget.rewind(mark, String::new());
         assert!(budget.exceeded());
-        assert_eq!(format!("{}", budget.pad(0)), "");
+        assert_eq!(format!("{}", budget.pad(Col::ZERO)), "");
     }
 
     /// A module whose value is `depth` source-multiline pipes, each into a
     /// lambda whose body is the next pipe.
     fn nested_pipe_lambdas(depth: usize) -> String {
-        let pad = |n: usize| INDENT_UNIT.repeat(n);
+        let pad = |n: usize| " ".repeat(INDENT_UNIT * n);
         let mut body = format!("{}b", pad(1 + 3 * depth));
         for k in (0..depth).rev() {
             let i = 1 + 3 * k;
@@ -4196,7 +4342,7 @@ mod tests {
 
     /// A module whose value is `depth` lists nested in their first element,
     /// the innermost holding `items` ones: every line of the innermost list
-    /// hangs two columns once per enclosing list.
+    /// starts two columns further in per enclosing list.
     fn nested_first_lists(depth: usize, items: usize) -> String {
         let ones = vec!["1"; items].join(",");
         let open = "[ ".repeat(depth);
@@ -4204,12 +4350,12 @@ mod tests {
         format!("module M exposing (x)\n\n\nx =\n    {open}{ones}\n    {close}\n")
     }
 
-    /// The hang a nested collection adds to each line is charged like
-    /// indentation: past the cap the printer stops rendering, so its text
+    /// The columns a nested collection adds to each line are charged like
+    /// any indentation: past the cap the printer stops rendering, so its text
     /// stays within the cap plus four times the source, where rendering every
-    /// hang would hold the source's items times twice its depth.
+    /// line's columns would hold the source's items times twice its depth.
     #[test]
-    fn hang_past_the_cap_is_charged() {
+    fn nested_collection_columns_past_the_cap_are_charged() {
         let depth = 20;
         let small = format_source(&nested_first_lists(depth, 50)).expect("a small nest formats");
         let deepest = small
@@ -4220,7 +4366,7 @@ mod tests {
             .unwrap_or(0);
         assert!(
             deepest >= 2 * (depth - 1),
-            "precondition: the innermost items hang once per enclosing list: {small}"
+            "precondition: the innermost items move in once per enclosing list: {small}"
         );
         let larger = format_source(&nested_first_lists(depth, 100)).expect("a small nest formats");
         let growth = larger.len().saturating_sub(small.len()) / 50;
@@ -4231,7 +4377,7 @@ mod tests {
         let bound = cap.bytes() + 4 * src.len();
         assert!(
             growth * items > bound,
-            "precondition: rendering every hang passes the bound: {growth} * {items} <= {bound}"
+            "precondition: rendering every column passes the bound: {growth} * {items} <= {bound}"
         );
         let rendered = Cell::new(0usize);
         let refused = format_guarded(&src, cap, |p, m| {
@@ -4516,5 +4662,97 @@ mod tests {
             "a `?` operator is refused: {unknown}"
         );
         assert!(verify_rewrite(src, &src.replace(" + ", " ? ")).is_err());
+    }
+
+    /// The layout scan reads token boundaries: a `"""` inside a comment, a
+    /// normal string, or a char literal opens no string, so the newline after
+    /// it is still layout.
+    #[test]
+    fn layout_newline_ignores_triple_quote_outside_a_string() {
+        assert!(!has_layout_newline("f \"\"\"a\nb\"\"\" x"));
+        assert!(has_layout_newline("-- see \"\"\"\nx"));
+        assert!(has_layout_newline("\"a\\\"\"\"\" \nx"));
+        assert!(has_layout_newline("{- \"\"\" -}\nx"));
+        assert!(has_layout_newline("{- a\nb -} x"));
+        assert!(has_layout_newline("'\"' \"\"\"\nx"));
+        assert!(!has_layout_newline("'\\'' x"));
+        assert!(has_layout_newline("\"\"\"never closed"));
+        assert!(!has_layout_newline("{- {- -} -} x -- tail"));
+    }
+
+    /// Format `src`, asserting the print is a fixed point of itself.
+    #[allow(clippy::panic)] // a refused print fails the test with its reason
+    fn fixed_point(src: &str) -> String {
+        let once = format_source(src).unwrap_or_else(|e| panic!("refused: {e:?}\n{src}"));
+        let twice = format_source(&once).unwrap_or_else(|e| panic!("refused twice: {e:?}\n{once}"));
+        assert_eq!(once, twice, "not idempotent");
+        once
+    }
+
+    const LAYOUT_A: &str = "module X exposing (x)\n\n\na : Int -> { x : Int, p : { r : Int, t : Int }, y : Int }\na n =\n    { x = 1\n    , p =\n        { r = n - 1 + (n - 2)\n        , t = n + 3\n        }\n    , y = 2\n    }\n";
+    const LAYOUT_B: &str = "module X exposing (x)\n\n\nb : Bool -> String -> Bool\nb rootText base =\n    String.startsWith \"/\" rootText\n        && String.length base > 1\n        && String.length base > 2\n";
+    const LAYOUT_C: &str = "module X exposing (x)\n\n\nc : List ( String, Bool )\nc =\n    [ ( \"one\"\n      , True\n            && False\n            && True\n      )\n    , ( \"two\"\n      , True\n            && False\n            && True\n      )\n    ]\n";
+    const LAYOUT_D: &str = "module X exposing (x)\n\n\nd : Bool -> List String\nd x =\n    (if x then\n        [ \"a\" ]\n\n     else\n        []\n    )\n        ++ (if x then\n                [ \"b\" ]\n\n            else\n                []\n           )\n";
+
+    /// A nested record under `field =` and a newline keeps its own lines at
+    /// the field's next tab stop.
+    #[test]
+    fn nested_record_value_is_a_fixed_point() {
+        assert_eq!(fixed_point(LAYOUT_A), LAYOUT_A);
+    }
+
+    /// An `&&` chain whose operands hold a tighter `>` breaks only at `&&`.
+    #[test]
+    fn mixed_precedence_chain_is_a_fixed_point() {
+        assert_eq!(fixed_point(LAYOUT_B), LAYOUT_B);
+        let split_at_gt = LAYOUT_B.replace(
+            "        && String.length base > 1\n",
+            "        && String.length base\n        > 1\n",
+        );
+        assert_eq!(fixed_point(&split_at_gt), LAYOUT_B);
+        let regrouped = LAYOUT_B.replace(
+            "String.startsWith \"/\" rootText\n        && String.length base > 1",
+            "(String.startsWith \"/\" rootText\n        && String.length base)\n        > 1",
+        );
+        assert_ne!(regrouped, LAYOUT_B, "precondition: the rewrite applies");
+        assert!(
+            verify_rewrite(LAYOUT_B, &regrouped).is_err(),
+            "a print that regroups the chain is refused"
+        );
+    }
+
+    /// A multi-line tuple element of a list keeps its continuation lines at
+    /// the columns its own `(` and operands start on.
+    #[test]
+    fn multiline_tuple_in_list_is_a_fixed_point() {
+        assert_eq!(fixed_point(LAYOUT_C), LAYOUT_C);
+    }
+
+    /// A parenthesised `if` after `++` lays out from the column its `(`
+    /// starts on.
+    #[test]
+    fn parenthesised_if_under_append_is_a_fixed_point() {
+        assert_eq!(fixed_point(LAYOUT_D), LAYOUT_D);
+    }
+
+    /// A record field whose value carries a comment holding `"""` still
+    /// breaks: the comment opens no string.
+    #[test]
+    fn triple_quote_in_comment_keeps_the_layout() {
+        let src = "module X exposing (x)\n\n\na : { p : Int, q : Int }\na =\n    { p =\n        -- see \"\"\"\n        1\n    , q = 2\n    }\n";
+        assert_eq!(fixed_point(src), src);
+    }
+
+    const BAD_A: &str = "module X exposing (x)\n\n\na : Int -> { x : Int, p : { r : Int, t : Int }, y : Int }\na n =\n    { x = 1\n    , p = { r = n - 1 + (n - 2)\n    , t = n + 3\n    }\n    , y = 2\n    }\n";
+    const BAD_C: &str = "module X exposing (x)\n\n\nc : List ( String, Bool )\nc =\n    [ ( \"one\"\n    , True\n        && False\n        && True\n    )\n    , ( \"two\"\n    , True\n        && False\n        && True\n    )\n    ]\n";
+    const BAD_D: &str = "module X exposing (x)\n\n\nd : Bool -> List String\nd x =\n    (if x then\n        [ \"a\" ]\n\n    else\n        []\n    )\n        ++ (if x then\n            [ \"b\" ]\n\n        else\n            []\n        )\n";
+
+    /// The prints the level-counted printer produced for A, C and D format
+    /// back to the layouts they were printed from.
+    #[test]
+    fn earlier_misprints_format_to_their_layout() {
+        assert_eq!(fixed_point(BAD_A), LAYOUT_A);
+        assert_eq!(fixed_point(BAD_C), LAYOUT_C);
+        assert_eq!(fixed_point(BAD_D), LAYOUT_D);
     }
 }

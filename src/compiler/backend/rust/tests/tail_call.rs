@@ -84,7 +84,10 @@ fn emit_count_main_rs(tco: bool) -> DResult<String> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params,
+        params: params
+            .into_iter()
+            .map(|(sym, ty)| ipe_ir::Param::owned(sym, ty))
+            .collect(),
         ret: IrType::Int,
         body: count_body,
     };

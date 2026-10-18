@@ -73,7 +73,7 @@ fn build_identity_program(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![(a, BoundSet::UNBOUNDED)],
         row_params: vec![],
-        params: vec![(x, IrType::Generic(a))],
+        params: vec![ipe_ir::Param::owned(x, IrType::Generic(a))],
         ret: IrType::Generic(a),
         body: Expr::Var(x),
     };
@@ -264,7 +264,7 @@ fn build_bounded_program(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![(a, num_bounds)],
         row_params: vec![],
-        params: vec![(x, IrType::Generic(a))],
+        params: vec![ipe_ir::Param::owned(x, IrType::Generic(a))],
         ret: IrType::Generic(a),
         body: Expr::BinOp {
             op: BinOp::IntAdd,
@@ -281,7 +281,10 @@ fn build_bounded_program(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![(a, ord_bounds)],
         row_params: vec![],
-        params: vec![(p, IrType::Generic(a)), (q, IrType::Generic(a))],
+        params: vec![
+            ipe_ir::Param::owned(p, IrType::Generic(a)),
+            ipe_ir::Param::owned(q, IrType::Generic(a)),
+        ],
         ret: IrType::Generic(a),
         body: Expr::If {
             cond: Box::new(Expr::BinOp {

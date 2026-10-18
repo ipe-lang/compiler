@@ -135,7 +135,7 @@ fn record_trio(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(arg, IrType::Int)],
+        params: vec![ipe_ir::Param::owned(arg, IrType::Int)],
         ret: rec.clone(),
         body: Expr::Record {
             fields: vec![(x, Expr::Var(arg)), (y, Expr::Int(2))],
@@ -149,7 +149,7 @@ fn record_trio(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, rec.clone())],
+        params: vec![ipe_ir::Param::owned(par, rec.clone())],
         ret: rec.clone(),
         body: Expr::Update {
             record: Box::new(Expr::Var(par)),
@@ -163,7 +163,7 @@ fn record_trio(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, rec)],
+        params: vec![ipe_ir::Param::owned(par, rec)],
         ret: IrType::Int,
         body: Expr::Access {
             record: Box::new(Expr::Var(par)),
@@ -307,7 +307,7 @@ fn synthesises_nested_record_structs() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, outer)],
+        params: vec![ipe_ir::Param::owned(par, outer)],
         ret: xy.clone(),
         body: Expr::Access {
             record: Box::new(Expr::Var(par)),
@@ -399,7 +399,7 @@ fn distinct_shapes_sharing_a_field_set_emit_two_structs() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, int_ty.clone())],
+        params: vec![ipe_ir::Param::owned(par, int_ty.clone())],
         ret: int_ty.clone(),
         body: Expr::Record {
             fields: vec![(x, Expr::Int(1))],
@@ -413,7 +413,7 @@ fn distinct_shapes_sharing_a_field_set_emit_two_structs() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(qar, str_ty.clone())],
+        params: vec![ipe_ir::Param::owned(qar, str_ty.clone())],
         ret: str_ty.clone(),
         body: Expr::Record {
             fields: vec![(x, Expr::Str("hi".to_owned()))],
@@ -482,7 +482,7 @@ fn end_to_end_distinct_shapes_cargo_check() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(par, int_ty.clone())],
+        params: vec![ipe_ir::Param::owned(par, int_ty.clone())],
         ret: int_ty.clone(),
         body: Expr::Record {
             fields: vec![(x, Expr::Int(1))],
@@ -495,7 +495,7 @@ fn end_to_end_distinct_shapes_cargo_check() -> DResult<()> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(qar, str_ty.clone())],
+        params: vec![ipe_ir::Param::owned(qar, str_ty.clone())],
         ret: str_ty.clone(),
         body: Expr::Record {
             fields: vec![(x, Expr::Str("hi".to_owned()))],

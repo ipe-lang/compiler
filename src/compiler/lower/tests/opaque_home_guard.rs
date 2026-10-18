@@ -185,7 +185,7 @@ fn lower_leaf_param_ty(leaf: &str, leaf_home: &[Symbol], declare_union: bool) ->
         .flat_map(|module| &module.funcs)
         .find(|f| f.name == tag)
         .and_then(|f| f.params.first())
-        .map(|(_, ty)| ty.clone());
+        .map(|ipe_ir::Param { ty, .. }| ty.clone());
     param.unwrap_or_else(|| {
         assert!(
             false_marker(),

@@ -241,9 +241,7 @@ pub fn impl_fn_param_indices(func: &Func) -> Vec<usize> {
     func.params
         .iter()
         .enumerate()
-        .filter(|(_, (sym, ty))| {
-            is_plain_boxed_fun(ty) && !fn_binder_used_as_value(*sym, &func.body)
-        })
+        .filter(|(_, p)| is_plain_boxed_fun(&p.ty) && !fn_binder_used_as_value(p.sym, &func.body))
         .map(|(i, _)| i)
         .collect()
 }
