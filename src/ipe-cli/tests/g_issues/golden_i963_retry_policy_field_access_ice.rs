@@ -34,9 +34,7 @@ fn fixture(root: &Path) -> PathBuf {
 }
 
 fn fixture_named(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
+    root.join("tests").join("golden").join(name)
 }
 
 fn built(root: &Path, out: &Path) -> Result<(), CliError> {

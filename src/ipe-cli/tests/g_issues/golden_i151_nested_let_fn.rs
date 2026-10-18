@@ -105,10 +105,7 @@ fn c01_nested_let_fn_callee_green() {
 #[test]
 fn c02_poly_fn_on_error_green() {
     let root = repo_root();
-    let golden_dir = root
-        .join("tests")
-        .join("golden")
-        .join("poly_task_on_error");
+    let golden_dir = root.join("tests").join("golden").join("poly_task_on_error");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("poly_task_on_error");
     let _ = std::fs::remove_dir_all(&out);
 

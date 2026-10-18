@@ -22,9 +22,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "generic_decoder_send";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Accept + emit gate (always): the generic decoder combinator must be accepted

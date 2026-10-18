@@ -43,10 +43,7 @@ fn f1_multiuse_let_clone() {
     }
 
     let root = repo_root();
-    let golden_dir = root
-        .join("tests")
-        .join("golden")
-        .join("multiuse_let_clone");
+    let golden_dir = root.join("tests").join("golden").join("multiuse_let_clone");
     let out = crate::support::scratch_root().join("ipec_i104_multiuse_let_clone_e2e");
     let _ = std::fs::remove_dir_all(&out);
 

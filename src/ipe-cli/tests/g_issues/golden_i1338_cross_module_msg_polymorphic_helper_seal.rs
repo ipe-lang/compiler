@@ -32,9 +32,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "i1338_cross_module_msg_polymorphic_helper_seal";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: the frontend must accept the cross-module helper and emit it

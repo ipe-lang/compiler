@@ -16,9 +16,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "cross_module_chained_msg_slot_seal";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: every `Lib` helper stays generic, threading its enclosing `Mid`

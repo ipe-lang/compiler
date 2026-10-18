@@ -25,9 +25,7 @@ const NAME: &str = "i984_cons_fn_value_arc_carrier";
 const NAME_MAYBE: &str = "i984_maybe_payload_box_carrier";
 
 fn fixture_dir(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
+    root.join("tests").join("golden").join(name)
 }
 
 fn assert_byte_identical(name: &str) {

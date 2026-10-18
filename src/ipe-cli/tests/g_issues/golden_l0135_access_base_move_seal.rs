@@ -47,7 +47,6 @@ const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-
 /// The scratch output dir for `name`, cleared.
 fn out_dir(name: &str) -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))

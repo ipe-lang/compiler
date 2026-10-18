@@ -21,9 +21,7 @@ use ipe::CliError;
 use crate::support::repo_root;
 
 fn fixture_dir(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
+    root.join("tests").join("golden").join(golden)
 }
 
 /// Emit `golden` and return the emitted `Lib` module's Rust.

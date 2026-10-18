@@ -42,7 +42,6 @@ const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-
 fn out_dir(name: &str) -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("i858-update-base-out")

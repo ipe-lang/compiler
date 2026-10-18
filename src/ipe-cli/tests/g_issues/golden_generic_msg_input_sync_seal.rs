@@ -19,9 +19,7 @@ const GOLDEN: &str = "generic_msg_input_sync_seal";
 const HELPERS: [&str; 3] = ["checkboxOf", "radioOf", "radioRowOf"];
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// The emitted signature line of the `Main` function spelled `ipe_name`.

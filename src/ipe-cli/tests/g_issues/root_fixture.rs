@@ -39,7 +39,8 @@ pub fn build_src_golden(
     let mut tree = SourceTree::new();
     for module in modules {
         let path = src.join(format!("{module}.ipe"));
-        let source = std::fs::read_to_string(&path).map_err(|source| CliError::Io { path, source })?;
+        let source =
+            std::fs::read_to_string(&path).map_err(|source| CliError::Io { path, source })?;
         tree = tree.module(module, &source);
     }
     let fixture = RootFixture::from_tree(&tree)?;

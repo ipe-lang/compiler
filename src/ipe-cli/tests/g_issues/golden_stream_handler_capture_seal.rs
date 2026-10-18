@@ -21,10 +21,7 @@ use ipe_diagnostics::{Diagnostic, Feature, LowerError};
 use crate::support::repo_root;
 
 fn fixture_dir(fixture: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(fixture)
+    repo_root().join("tests").join("golden").join(fixture)
 }
 
 /// The in-repo runtime module tree, so no case silently skips on a missing runtime.

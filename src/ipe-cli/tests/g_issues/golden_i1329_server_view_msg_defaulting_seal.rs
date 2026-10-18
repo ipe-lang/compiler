@@ -28,9 +28,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "i1329_server_view_msg_defaulting_seal";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: the frontend must accept the server whose `Ipe.Ui` and `Ipe.Html`

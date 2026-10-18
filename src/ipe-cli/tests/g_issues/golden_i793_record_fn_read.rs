@@ -24,9 +24,7 @@ use std::path::{Path, PathBuf};
 use crate::support::repo_root;
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join("fcf_record_fn_read")
+    root.join("tests").join("golden").join("fcf_record_fn_read")
 }
 
 /// Emit gate + byte-identity golden: the frontend must accept the record-field

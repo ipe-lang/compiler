@@ -18,10 +18,7 @@ fn repo_root() -> PathBuf {
 
 fn assert_builds(fixture: &str) {
     let root = repo_root();
-    let golden_dir = root
-        .join("tests")
-        .join("golden")
-        .join(fixture);
+    let golden_dir = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture);
     let _ = std::fs::remove_dir_all(&out);
 

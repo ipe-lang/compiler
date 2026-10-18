@@ -46,9 +46,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn fixture_dir(root: &Path, fixture: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(fixture)
+    root.join("tests").join("golden").join(fixture)
 }
 
 /// ipe-0 ∧ carrier-unification: the compiler must accept the program AND emit

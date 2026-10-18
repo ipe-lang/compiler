@@ -18,9 +18,7 @@ const GOLDEN: &str = "generic_carrier_send_seal";
 const HELPERS: [&str; 4] = ["subMapped", "cmdMapped", "subDiscarded", "cmdDiscarded"];
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// The bounds of the first generic `T1` of the `Main` function spelled `ipe_name`.

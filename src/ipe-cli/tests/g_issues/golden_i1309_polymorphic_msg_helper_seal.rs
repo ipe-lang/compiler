@@ -18,9 +18,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "polymorphic_msg_helper_seal";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: the genuinely-polymorphic helpers must be accepted and emitted

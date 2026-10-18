@@ -27,9 +27,7 @@ const FORWARDERS: [&str; 6] = [
 ];
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// The emitted signature line of the `Main` function spelled `ipe_name`.

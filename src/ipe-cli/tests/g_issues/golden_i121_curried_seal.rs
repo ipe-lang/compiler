@@ -466,10 +466,7 @@ fn f10_generic_curried_capture_builds_and_runs() {
         return;
     }
     let root = repo_root();
-    let golden_dir = root
-        .join("tests")
-        .join("golden")
-        .join("generic_curried");
+    let golden_dir = root.join("tests").join("golden").join("generic_curried");
     let out = crate::support::scratch_root().join("ipec_i121_generic_curried_e2e");
     let _ = std::fs::remove_dir_all(&out);
 

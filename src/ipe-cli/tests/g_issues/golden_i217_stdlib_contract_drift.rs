@@ -35,9 +35,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn fixture_dir(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
+    root.join("tests").join("golden").join(name)
 }
 
 /// Compile a fixture and assert `ipe` accepts it (the contract now matches the

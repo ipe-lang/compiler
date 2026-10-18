@@ -27,10 +27,7 @@ fn repo_root() -> PathBuf {
 
 fn compile_golden(name: &str) -> PathBuf {
     let root = repo_root();
-    let golden_dir = root
-        .join("tests")
-        .join("golden")
-        .join(name);
+    let golden_dir = root.join("tests").join("golden").join(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 

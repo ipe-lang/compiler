@@ -30,9 +30,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "codec_enum_taggedunion";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Accept + emit gate (always): the sum-type combinator program must be accepted

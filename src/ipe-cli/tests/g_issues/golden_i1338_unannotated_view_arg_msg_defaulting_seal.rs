@@ -22,9 +22,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "i1338_unannotated_view_arg_msg_defaulting_seal";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: the frontend must accept the unannotated free-`msg` helpers and

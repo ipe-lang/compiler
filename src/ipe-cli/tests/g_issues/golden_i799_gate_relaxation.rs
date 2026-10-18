@@ -25,9 +25,7 @@ use std::path::{Path, PathBuf};
 use crate::support::repo_root;
 
 fn fixture_dir(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
+    root.join("tests").join("golden").join(name)
 }
 
 /// Emit gate + byte-identity golden for a newly-admitted case: the frontend must

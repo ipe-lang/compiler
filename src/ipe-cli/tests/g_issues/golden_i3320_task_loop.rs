@@ -116,7 +116,6 @@ fn refusal_code(name: &str, program: &Program) -> Code {
     code.expect("asserted present above")
 }
 
-
 /// Assert `ipe` refuses `program` through the function-loop-state gate itself.
 ///
 /// IPE-L0114 is shared with other unsupported-lowering refusals (a function

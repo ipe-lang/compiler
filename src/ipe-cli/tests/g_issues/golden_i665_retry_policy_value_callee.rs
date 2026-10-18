@@ -32,9 +32,7 @@ fn fixture_dir(root: &Path) -> PathBuf {
 }
 
 fn fixture_dir_named(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
+    root.join("tests").join("golden").join(name)
 }
 
 /// Build the fixture; return whether the frontend accepted + emitted it.

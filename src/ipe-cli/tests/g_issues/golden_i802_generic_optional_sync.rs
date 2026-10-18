@@ -29,9 +29,7 @@ use crate::support::repo_root;
 const GOLDEN: &str = "generic_optional_decoder";
 
 fn fixture_dir(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate + byte-identity golden: the frontend must accept the generic
