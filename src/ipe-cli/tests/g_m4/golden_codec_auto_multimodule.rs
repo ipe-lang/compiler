@@ -38,19 +38,44 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// `ipe dev build` (multi-module, sibling discovery) must succeed — the derive in
+/// The modules of a multi-module golden, each as `(module, path under the golden dir)`.
+///
+/// The golden keeps its modules beside `Main.ipe` with no manifest, so the
+/// fixture names each one; a module the golden lacks fails the read loudly.
+const MODULES: &[(&str, &str)] = &[("Main", "Main.ipe"), ("Lib.Rows", "Lib/Rows.ipe")];
+
+/// The golden `dir` as a project fixture holding each of its [`MODULES`] under `src/`.
+#[allow(clippy::expect_used)] // an unreadable checked-in golden is a broken fixture: fail loudly
+fn fixture_of(dir: &Path) -> ipe::RootFixture {
+    let tree = MODULES.iter().fold(
+        ipe::project_root::SourceTree::new(),
+        |tree, (module, file)| {
+            let source =
+                std::fs::read_to_string(dir.join(file)).expect("a golden module is readable");
+            tree.module(module, &source)
+        },
+    );
+    ipe::RootFixture::from_tree(&tree).expect("the golden's modules resolve as a project")
+}
+
+/// Build the golden `dir` as a project into `out`.
+fn build(dir: &Path, out: &Path, runtime: &Path) -> Result<ipe::BuiltFixture, ipe::CliError> {
+    ipe::build_fixture(&fixture_of(dir), out, runtime)
+}
+
+/// The multi-module project build must succeed — the derive in
 /// the dependency module resolves its constructors without an `exposing (..)`
 /// clause. Checked unconditionally (no `cargo`), since IPE-N0041 fired here
 /// before the fix.
 fn assert_ipe_derive_succeeds(name: &str) {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
+    let dir = golden_dir(&root, name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_ipe_out"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = build(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {name} (Codec.auto in a dependency module, \
@@ -68,13 +93,12 @@ fn assert_runs_and_matches_oracle(name: &str) {
 
     let root = repo_root();
     let dir = golden_dir(&root, name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = build(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);

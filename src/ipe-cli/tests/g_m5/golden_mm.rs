@@ -54,7 +54,7 @@ fn mm_local_pkg_emits_byte_identical_main_rs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_local_pkg");
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 
     // Emitted `src/main.rs` must equal the checked-in golden `main.rs`, routed
@@ -73,7 +73,7 @@ fn mm_diamond_emits_byte_identical_main_rs() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_diamond");
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 
     // Byte-diff half: emitted `src/main.rs` must equal the golden `main.rs`,
@@ -107,7 +107,7 @@ fn mm_qualtype_local_shadow_compiles() {
     let fixture = golden_dir("mm_qualtype_local_shadow");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_qualtype_local_shadow");
     let _ = std::fs::remove_dir_all(&out);
-    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 }
 
@@ -121,7 +121,7 @@ fn expect_error_code(fixture_name: &str, expected: ipe_diagnostics::Code) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture_name);
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(
         res.is_err(),
         "fixture `{fixture_name}` must fail but succeeded"
@@ -278,7 +278,7 @@ fn expect_error_at_line(
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(fixture_name);
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(
         res.is_err(),
         "fixture `{fixture_name}` must fail but succeeded"
@@ -321,7 +321,7 @@ fn mm_open_user_unused_compiles() {
     let fixture = golden_dir("mm_open_user_unused");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_open_user_unused");
     let _ = std::fs::remove_dir_all(&out);
-    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 }
 
@@ -346,6 +346,6 @@ fn mm_open_user_explicit_wins_compiles() {
     let fixture = golden_dir("mm_open_user_explicit_wins");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mm_open_user_explicit_wins");
     let _ = std::fs::remove_dir_all(&out);
-    let res = ipe::build_project(&fixture.join("package.ipe"), &out, &runtime());
+    let res = crate::support::build_golden(&fixture, &out, &runtime());
     assert!(res.is_ok(), "build_project failed: {:?}", res.err());
 }

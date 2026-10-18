@@ -43,7 +43,10 @@ fn built_code(root: &Path, name: &str) -> (Result<(), CliError>, PathBuf) {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    (ipe::build(&entry, &out, &runtime), out)
+    (
+        crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime),
+        out,
+    )
 }
 
 /// Build a green fixture, assert acceptance, and (under `IPE_E2E=1`) build the

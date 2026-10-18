@@ -32,7 +32,7 @@ fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code)
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -67,7 +67,7 @@ fn redundant_branch_after_catch_all_is_ipe_t0011_warning_build_succeeds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "redundant branch after catch-all must WARN (IPE-T0011) and build, got: {:?}",

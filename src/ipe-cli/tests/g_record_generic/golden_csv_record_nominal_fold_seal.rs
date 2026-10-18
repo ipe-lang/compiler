@@ -65,7 +65,7 @@ fn built_main_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<
     let entry = fixture_entry(root);
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime);
     let emitted = if built.is_ok() {
         // Scan the emitted APP modules only (`src/ipe_mods/` + `src/main.rs`),
         // not the vendored `src/ipe_runtime/` — the runtime's own `csv.rs`
@@ -121,7 +121,7 @@ fn csv_record_nominal_fold_seal_builds_and_runs() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let entry = fixture_entry(&root);
     let _ = std::fs::remove_dir_all(&out);
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "csv_record_nominal_fold_seal: must be accepted, got: {built:?}"

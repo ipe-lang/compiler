@@ -14,31 +14,23 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[allow(clippy::expect_used)]
 fn runtime() -> PathBuf {
     e2e_support::require_runtime().into_path_buf()
 }
 
-#[allow(clippy::expect_used)]
-fn write_entry(test_name: &str, main_ipe: &str) -> PathBuf {
-    let dir = crate::support::scratch_root().join(format!("ipe_param_any_seal_{test_name}"));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create source dir");
-    let entry = dir.join("Main.ipe");
-    fs::write(&entry, main_ipe).expect("write Main.ipe");
-    entry
+#[allow(clippy::expect_used)] // test setup: an unwritable fixture IS the failure
+fn fixture_of(main_ipe: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(main_ipe).expect("write the project fixture")
 }
 
-#[allow(clippy::expect_used)]
-fn emit(entry: &Path, test_name: &str) -> (Result<(), ipe::CliError>, PathBuf) {
+fn emit(fixture: &ipe::RootFixture, test_name: &str) -> (Result<(), ipe::CliError>, PathBuf) {
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("param_any_seal_{test_name}"));
     let _ = fs::remove_dir_all(&out);
-    // The single-entry path emits a crate named `ipe-app`, the anchor
-    // `support::assert_seal_builds` retargets under `IPE_E2E=1`.
-    let result = ipe::build(entry, &out, &runtime());
+    let result = ipe::build_fixture(fixture, &out, &runtime()).map(drop);
     (result, out)
 }
 
@@ -48,8 +40,7 @@ fn emit(entry: &Path, test_name: &str) -> (Result<(), ipe::CliError>, PathBuf) {
 /// `T{n}` returned where `String` is expected.
 #[test]
 fn threaded_param_any_concretizes_and_builds() {
-    let entry = write_entry(
-        "threaded",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -61,7 +52,7 @@ main : Task Error ()
 main = Io.println (thread \"hi\")
 ",
     );
-    let (built, out) = emit(&entry, "threaded");
+    let (built, out) = emit(&fixture, "threaded");
     assert!(
         built.is_ok(),
         "`thread : any -> any; thread x = x` called at a concrete type must be \
@@ -76,9 +67,6 @@ main = Io.println (thread \"hi\")
          concrete return:\n{emitted}"
     );
     support::assert_seal_builds("param_any_seal_threaded", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A parameter `any` the body does NOT thread into the `any` return
@@ -88,8 +76,7 @@ main = Io.println (thread \"hi\")
 /// than blanket-rejecting or blanket-concretizing every param-any + return-any.
 #[test]
 fn unthreaded_param_any_stays_generic_and_builds() {
-    let entry = write_entry(
-        "unthreaded",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -101,7 +88,7 @@ main : Task Error ()
 main = Io.println (constFn \"yo\")
 ",
     );
-    let (built, out) = emit(&entry, "unthreaded");
+    let (built, out) = emit(&fixture, "unthreaded");
     assert!(
         built.is_ok(),
         "`constFn : any -> any; constFn x = \"hi\"` must be accepted (the param is \
@@ -115,9 +102,6 @@ main = Io.println (constFn \"yo\")
          -> String`):\n{emitted}"
     );
     support::assert_seal_builds("param_any_seal_unthreaded", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A genuine NAMED type variable threaded through the body (`id2 : a -> a`) is
@@ -126,8 +110,7 @@ main = Io.println (constFn \"yo\")
 /// the minted `any` symbols, not a named variable).
 #[test]
 fn named_type_var_stays_generic_and_builds() {
-    let entry = write_entry(
-        "namedvar",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -139,7 +122,7 @@ main : Task Error ()
 main = Io.println (id2 \"hey\")
 ",
     );
-    let (built, out) = emit(&entry, "namedvar");
+    let (built, out) = emit(&fixture, "namedvar");
     assert!(
         built.is_ok(),
         "`id2 : a -> a; id2 x = x` is genuine rank-1 polymorphism and must be \
@@ -152,9 +135,6 @@ main = Io.println (id2 \"hey\")
         "a named type variable stays generic (`fn main_id2<T1>(x: T1) -> T1`):\n{emitted}"
     );
     support::assert_seal_builds("param_any_seal_namedvar", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// Calling a threaded `any -> any` at two DIFFERENT concrete types is a type
@@ -163,8 +143,7 @@ main = Io.println (id2 \"hey\")
 /// unify. One concrete lowering per wildcard position, exactly as `any` requires.
 #[test]
 fn threaded_param_any_at_two_types_is_rejected() {
-    let entry = write_entry(
-        "two_types",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -177,15 +156,12 @@ main : Task Error ()
 main = Io.println (String.concat (thread \"hi\") (thread (String.fromInt 3)))
 ",
     );
-    let (built, _out) = emit(&entry, "two_types");
+    let (built, _out) = emit(&fixture, "two_types");
     assert!(
         built.is_err(),
         "a threaded `any -> any` used at two different concrete types must be an \
          `ipe`-time type error (one concrete lowering), never an accept-then-cargo-fail"
     );
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A wildcard-`any` parameter that the body BOTH reads via a `Db.get*` ROW
@@ -197,8 +173,7 @@ main = Io.println (String.concat (thread \"hi\") (thread (String.fromInt 3)))
 /// accept-then-`cargo`-fail (THE SEAL).
 #[test]
 fn row_accessor_param_threaded_to_return_builds() {
-    let entry = write_entry(
-        "row_thread",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Dict as Dict
@@ -221,7 +196,7 @@ main =
   Io.println (Unsafe.unsafeGetString \"name\" r)
 ",
     );
-    let (built, out) = emit(&entry, "row_thread");
+    let (built, out) = emit(&fixture, "row_thread");
     assert!(
         built.is_ok(),
         "a row-accessor param threaded into an `any` return must be accepted \
@@ -236,9 +211,6 @@ main =
          independently-concretized row carrier:\n{emitted}"
     );
     support::assert_seal_builds("param_any_seal_row_thread", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A record threaded through a wildcard-`any` `any -> any` (`useIt p = p`,
@@ -250,8 +222,7 @@ main =
 /// monomorphises to the caller's own record, and the return must follow it.
 #[test]
 fn record_threaded_through_any_builds() {
-    let entry = write_entry(
-        "record_thread",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -273,7 +244,7 @@ main =
   Io.println r.name
 ",
     );
-    let (built, out) = emit(&entry, "record_thread");
+    let (built, out) = emit(&fixture, "record_thread");
     assert!(
         built.is_ok(),
         "a record threaded through `any -> any` must be accepted (the param \
@@ -288,9 +259,6 @@ main =
          narrowed structural record that a full-record caller mismatches:\n{emitted}"
     );
     support::assert_seal_builds("param_any_seal_record_thread", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A record param the body BOTH threads to an `any` return AND directly
@@ -300,8 +268,7 @@ main =
 /// return follows it. It must build.
 #[test]
 fn record_threaded_and_field_read_builds() {
-    let entry = write_entry(
-        "record_thread_read",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -320,7 +287,7 @@ main =
   Io.println v.name
 ",
     );
-    let (built, out) = emit(&entry, "record_thread_read");
+    let (built, out) = emit(&fixture, "record_thread_read");
     assert!(
         built.is_ok(),
         "a record param the body threads AND field-reads must be accepted and \
@@ -328,9 +295,6 @@ main =
         built.err()
     );
     support::assert_seal_builds("param_any_seal_record_thread_read", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A wildcard-`any` parameter used ONLY via direct field access, called with a
@@ -343,8 +307,7 @@ main =
 /// record satisfies the witness and builds.
 #[test]
 fn field_read_param_accepts_wider_caller_record() {
-    let entry = write_entry(
-        "field_read_wider",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -361,7 +324,7 @@ main =
     Io.println (getName u)
 ",
     );
-    let (built, out) = emit(&entry, "field_read_wider");
+    let (built, out) = emit(&fixture, "field_read_wider");
     assert!(
         built.is_ok(),
         "a field-read `any` param must accept a caller record wider than the \
@@ -377,9 +340,6 @@ main =
          record a wider caller mismatches:\n{emitted}"
     );
     support::assert_seal_builds("param_any_seal_field_read_wider", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// The same field-read `any` param called with a record carrying EXACTLY the
@@ -387,8 +347,7 @@ main =
 /// of the exact-match case, so no shape is regressed.
 #[test]
 fn field_read_param_accepts_exact_caller_record() {
-    let entry = write_entry(
-        "field_read_exact",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -405,7 +364,7 @@ main =
     Io.println (getName u)
 ",
     );
-    let (built, out) = emit(&entry, "field_read_exact");
+    let (built, out) = emit(&fixture, "field_read_exact");
     assert!(
         built.is_ok(),
         "a field-read `any` param must still accept a caller record of exactly \
@@ -413,9 +372,6 @@ main =
         built.err()
     );
     support::assert_seal_builds("param_any_seal_field_read_exact", &out);
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A wildcard-`any` parameter RELAYED straight into a callee that reads it as a
@@ -428,8 +384,7 @@ main =
 /// essential: the unsatisfiable bound only surfaces once rustc monomorphises.
 #[test]
 fn any_param_relayed_into_row_callee_is_rejected() {
-    let entry = write_entry(
-        "relay_row_callee",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -447,16 +402,13 @@ main =
     Io.println (relay { name = \"Ada\" })
 ",
     );
-    let (built, _out) = emit(&entry, "relay_row_callee");
+    let (built, _out) = emit(&fixture, "relay_row_callee");
     assert!(
         built.is_err(),
         "an `any` param relayed into a field-reading callee cannot satisfy the \
          callee's row-witness bound and must be rejected at `ipe` time, never \
          emitted as Rust that fails cargo E0277"
     );
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }
 
 /// A wildcard-`any` parameter passed as a CALL ARGUMENT to a field-reading
@@ -468,8 +420,7 @@ main =
 /// surface.
 #[test]
 fn any_param_in_call_arg_position_is_rejected_when_called() {
-    let entry = write_entry(
-        "callarg_row_callee",
+    let fixture = fixture_of(
         "\
 module Main exposing (main)
 import Ipe.Io as Io
@@ -487,14 +438,11 @@ main =
     Io.println (firstName { name = \"Ada\" })
 ",
     );
-    let (built, _out) = emit(&entry, "callarg_row_callee");
+    let (built, _out) = emit(&fixture, "callarg_row_callee");
     assert!(
         built.is_err(),
         "an `any` param in call-arg position of a field-reading callee cannot \
          satisfy the callee's row-witness bound and must be rejected at `ipe` \
          time, never emitted as Rust that fails cargo E0277"
     );
-    if let Some(parent) = entry.parent() {
-        let _ = fs::remove_dir_all(parent);
-    }
 }

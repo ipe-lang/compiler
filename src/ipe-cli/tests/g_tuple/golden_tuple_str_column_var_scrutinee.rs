@@ -46,7 +46,11 @@ fn str_column_var_scrutinee_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&fixture_entry(), &out, &runtime);
+    let built = crate::support::build_golden(
+        crate::support::golden_dir_of(&fixture_entry()),
+        &out,
+        &runtime,
+    );
     assert!(
         built.is_ok(),
         "variable-scrutinee string-column tuple `case` must build (#182); got {:?}",
@@ -68,7 +72,11 @@ fn str_column_var_scrutinee_cargo_builds_and_runs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&fixture_entry(), &out, &runtime);
+    let built = crate::support::build_golden(
+        crate::support::golden_dir_of(&fixture_entry()),
+        &out,
+        &runtime,
+    );
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for tuple_str_column_var_scrutinee: {:?}",

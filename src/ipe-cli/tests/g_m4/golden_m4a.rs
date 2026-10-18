@@ -42,7 +42,7 @@ fn assert_byte_identical(name: &str) {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir (byte-compares
@@ -70,7 +70,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);

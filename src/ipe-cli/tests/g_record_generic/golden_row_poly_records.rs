@@ -79,7 +79,7 @@ fn subset_access_ipec_accepts_and_resolves_superset_struct() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must accept row_poly_subset_access (P2, subset field \
@@ -117,7 +117,7 @@ fn subset_access_cargo_builds_and_prints_ada() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for row_poly_subset_access: {:?}",
@@ -157,7 +157,7 @@ fn subset_pattern_ipec_accepts_and_completes_superset_pattern() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must accept row_poly_subset_pattern (P5 case pattern + \
@@ -196,7 +196,7 @@ fn subset_pattern_cargo_builds_and_prints_iri_ada_bo() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for row_poly_subset_pattern: {:?}",
@@ -235,7 +235,7 @@ fn closed_superset_is_ipe_t0001() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let res = ipe::build(&entry, &out, &runtime);
+    let res = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(res.is_err(), "{name} must fail to compile");
     let err = res.expect_err("`res` must be rejected");
     assert_eq!(
@@ -281,7 +281,7 @@ fn two_different_supersets_is_ipe_t0001() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let res = ipe::build(&entry, &out, &runtime);
+    let res = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(res.is_err(), "{name} must fail to compile");
     let err = res.expect_err("`res` must be rejected");
     assert_eq!(
@@ -318,7 +318,7 @@ fn row_var_annotation_lowers_to_witness_generic() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "{name} must now BUILD: a single-field argument-position row annotation \
@@ -368,7 +368,7 @@ fn accessor_ipec_accepts_and_resolves_concrete_getter() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must accept row_poly_accessor (P8, first-class accessor \
@@ -405,7 +405,7 @@ fn accessor_cargo_builds_and_prints_names() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for row_poly_accessor: {:?}",
@@ -447,7 +447,7 @@ fn row_poly_greet_lowers_and_monomorphises_two_shapes() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must accept row_poly_greet (one row-poly fn at two shapes): \
@@ -497,7 +497,7 @@ fn row_poly_greet_cargo_builds_and_prints_both() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for row_poly_greet: {:?}",
@@ -533,7 +533,7 @@ fn row_poly_task_seq_row_read_routes_effect_through_getter() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must accept row_poly_task_seq_row_read: {:?}",
@@ -587,7 +587,7 @@ fn row_poly_task_seq_row_read_cargo_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for row_poly_task_seq_row_read: {:?}",
@@ -628,7 +628,7 @@ fn let_rebind_of_row_is_ipe_l0131() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let res = ipe::build(&entry, &out, &runtime);
+    let res = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         res.is_err(),
         "{name} must fail to compile (row value escapes)"
@@ -658,7 +658,7 @@ fn subset_pattern_param_of_row_is_ipe_l0131() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let res = ipe::build(&entry, &out, &runtime);
+    let res = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         res.is_err(),
         "{name} must fail to compile (subset pattern over a row)"
@@ -690,7 +690,7 @@ fn non_first_arg_row_is_ipe_l0131_not_ice() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let res = ipe::build(&entry, &out, &runtime);
+    let res = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(res.is_err(), "{name} must fail to compile");
     let err = res.expect_err("`res` must be rejected");
     assert_eq!(
@@ -719,7 +719,7 @@ fn captured_clone_field_read_is_ipe_l0131() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let res = ipe::build(&entry, &out, &runtime);
+    let res = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         res.is_err(),
         "{name} must fail to compile (captured row field read escapes)"
@@ -761,7 +761,7 @@ fn accessor_two_shapes_cargo_builds_and_prints_both() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for row_poly_accessor_two_shapes: {:?}",
@@ -801,7 +801,7 @@ fn row_poly_multi_lowers_with_one_witness_bound_per_field() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must accept row_poly_multi (a two-field row at two shapes): \
@@ -852,7 +852,7 @@ fn row_poly_multi_cargo_builds_and_prints_both() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for row_poly_multi: {:?}",
@@ -893,7 +893,7 @@ fn row_poly_passthrough_lowers_to_r1_to_r1() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "{name} must accept (G1: return-position row reusing the arg row var): {:?}",
@@ -927,7 +927,7 @@ fn row_poly_passthrough_cargo_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {name}: {:?}",
@@ -967,7 +967,7 @@ fn row_poly_update_lowers_to_setter_witness() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "{name} must accept (G1 + G2: return-position row + update-through-row): {:?}",
@@ -1015,7 +1015,7 @@ fn row_poly_update_cargo_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {name}: {:?}",
@@ -1058,7 +1058,7 @@ fn row_poly_map_update_funcvalue_lowers_and_builds() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "{name} must accept (G1 + G2 + G6: row-poly fn used as HOF value): {:?}",
@@ -1080,7 +1080,7 @@ fn row_poly_map_update_cargo_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {name}: {:?}",
@@ -1110,30 +1110,27 @@ fn row_poly_map_update_cargo_builds_and_runs() {
 #[test]
 fn unannotated_relay_of_row_poly_fn_is_ipe_l0131() {
     let name = "row_poly_unannotated_relay_neg";
-    let src = crate::support::scratch_root().join(format!("{name}_src"));
     let out = crate::support::scratch_root().join(format!("{name}_out"));
-    let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&out);
-    std::fs::create_dir_all(&src).expect("create fixture dir");
-    std::fs::write(
-        src.join("Lib.ipe"),
-        "module Lib exposing (relay)\n\n\n\
-         greet : { r | name : String } -> String\n\
-         greet rec =\n    rec.name\n\n\n\
-         relay r =\n    greet r\n",
-    )
-    .expect("write Lib.ipe");
-    std::fs::write(
-        src.join("Main.ipe"),
-        "module Main exposing (main)\n\n\
-         import Lib\n\
-         import Ipe.Io as Io\n\n\n\
-         main =\n    Io.println (Lib.relay { name = \"Ada\", age = 1 })\n",
-    )
-    .expect("write Main.ipe");
+    let tree = ipe::project_root::SourceTree::new()
+        .module(
+            "Lib",
+            "module Lib exposing (relay)\n\n\n\
+             greet : { r | name : String } -> String\n\
+             greet rec =\n    rec.name\n\n\n\
+             relay r =\n    greet r\n",
+        )
+        .module(
+            "Main",
+            "module Main exposing (main)\n\n\
+             import Lib\n\
+             import Ipe.Io as Io\n\n\n\
+             main =\n    Io.println (Lib.relay { name = \"Ada\", age = 1 })\n",
+        );
+    let fixture = ipe::RootFixture::from_tree(&tree).expect("Lib and Main resolve as a project");
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let res = ipe::build_loose_file(&src.join("Main.ipe"), &out, &runtime);
+    let res = ipe::build_fixture(&fixture, &out, &runtime);
     let err = res.expect_err("an unannotated relay of a row-poly fn must be rejected");
     assert_eq!(
         diag_code(&err),
@@ -1158,7 +1155,7 @@ fn free_unused_row_is_accepted() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "{name}: a free open row must not reach a scope-less lowering: {:?}",
@@ -1182,7 +1179,7 @@ fn helper_borrowing_a_signature_row_is_ipe_l0102() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     let diag = match &built {
         Err(ipe::CliError::Pipeline { diag, .. }) => diag,
         other => panic!(
