@@ -480,6 +480,12 @@ class WiringTest(unittest.TestCase):
         self.assertTrue(_refused(lambda j: j["seal-slice-cover"]["steps"].append({"run": f"{es.COVER_INVOCATION} --again"}),
                                  "exactly one step"))
 
+    def test_second_spelling_of_the_cover_in_its_job_refused(self) -> None:
+        # A second run of the cover script under another spelling is not the
+        # exact invocation, yet still runs the proof twice.
+        self.assertTrue(_refused(lambda j: j["seal-slice-cover"]["steps"].append({"run": f"python3 ./{es.COVER_SCRIPT}"}),
+                                 "cover in exactly one step"))
+
     def test_verdict_without_the_cover_need_refused(self) -> None:
         self.assertTrue(_refused(lambda j: j["seal-slice"]["needs"].remove("seal-slice-cover"), "must need `seal-slice-cover`"))
         self.assertTrue(_refused(lambda j: j["seal-slice"].pop("needs"), "must need `seal-slice-cover`"))
