@@ -687,6 +687,31 @@ hrefCeilingIsExact loaded =
         && String.startsWith "e:" (Lib.Links.linkKey (Lib.Links.external atCap))
 
 
+-- A URL well under the href ceiling whose label is cut by its escape runs
+-- (one past `Label.runCeiling`) is shown cut and never linked, keyed as an
+-- untargeted URL: the href rule is "shown whole", not only "few bytes".
+escapeCutUrlIsUnlinked : Index.UnitView -> Bool
+escapeCutUrlIsUnlinked loaded =
+    let
+        rlo =
+            codeText 8238
+
+        url =
+            "https://example.com/" ++ String.concat (List.map (\c -> c ++ rlo) [ "a", "b", "c", "d" ])
+
+        link =
+            Lib.Links.external url
+
+        shown =
+            page (unitPageModel (withLinks [ link ] loaded))
+    in
+    Label.textBytes url
+        < Lib.Links.hrefByteCeiling
+        && has "data-review-cut" shown
+        && not (has "href=" shown)
+        && String.startsWith "f:" (Lib.Links.linkKey link)
+
+
 -- A unit holding the most links, each named by a hostile qualified name of a
 -- full read window, draws at most `Index.linkElements` for each link past the
 -- first (the first also opens the links row, page chrome), every name cut with
@@ -871,6 +896,7 @@ seededChecks a b =
     , ( "an unsafe link target renders as plain text with no href", List.all (unsafeLinkHasNoHref a) unsafeTargets )
     , ( "an https link target renders as an href", safeLinkHasHref a )
     , ( "a URL at the href ceiling is linked whole and one byte over is shown cut and never linked", hrefCeilingIsExact a )
+    , ( "a URL under the href ceiling whose label its escape runs cut is shown cut and never linked", escapeCutUrlIsUnlinked a )
     , ( "a read-only server shows no decision control and says why, beside a signing server that shows them", not (button "Approve" readOnlyCard) && not (button "Refuse" readOnlyCard) && has "Read-only: IPE_REVIEW_MAC_KEY is not set, so no decision is recorded." readOnlyCard && button "Approve" shownCard && not (has "Read-only:" shownCard) )
     , ( "a broken chain shows its banner, naming the entry, on the queue and the History, and an intact one shows none", has banner brokenCard && has banner (page (unverifiedHistory (ShownBroken (BreaksAt 2)) ChainBroken)) && not (has "chain breaks" shownCard) && not (has "chain breaks" (page hostileHistory)) )
     , ( "a log with entries past its head and a log signed by another key each show their own banner"

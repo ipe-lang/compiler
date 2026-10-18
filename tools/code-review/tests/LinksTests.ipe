@@ -133,6 +133,7 @@ type alias LinksFixture =
     , ipe : List String
     , plan : List String
     , hugeEdge : List Label
+    , longUid : List String
     }
 
 
@@ -216,10 +217,13 @@ linksFixture =
         plan <- candidatePlan
         execIndexUnchecked at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat hugeQualifiedBytes "z"), Uid.toSql (uid "u-edge") ]
         huge <- loadUnitNow (uid "u-src")
+        execIndexUnchecked at.indexDb "UPDATE units SET uid = uid || 'a' WHERE uid IN (?, ?)" [ Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-exact") ]
+        execIndexUnchecked at.indexDb "UPDATE callgraph SET callee_uid = callee_uid || 'a' WHERE callee_uid = ?" [ Uid.toSql (uid "u-edge") ]
+        longUid <- loadUnitNow (uid "u-src")
         cleanupIndex at.indexDb at.repo
         removeFileIfAny (at.repo ++ "/src/links.rs")
         removeFileIfAny (at.repo ++ "/src/Feature.ipe")
-        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan, hugeEdge = labelsTo "u-edge" huge }
+        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan, hugeEdge = labelsTo "u-edge" huge, longUid = keysOf longUid }
 
 
 fixtureChecks : LinksFixture -> List ( String, Bool )
@@ -255,6 +259,13 @@ fixtureChecks got =
                         == Just (hugeQualifiedBytes - Label.capBytes Label.labelCap)
                 )
                 got.hugeEdge
+      )
+    , ( "a callee or a resolved reference whose stored uid is a unit id and one more hex digit is shown unlinked, never linked to the id its first 64 digits spell"
+      , not (List.member (internalKey "u-edge") got.longUid)
+            && not (List.member (internalKey "u-exact") got.longUid)
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap (String.repeat hugeQualifiedBytes "z"))) got.longUid
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap "app::util::exact")) got.longUid
+            && List.member (internalKey "u-helper") got.longUid
       )
     ]
 
