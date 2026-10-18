@@ -25,7 +25,7 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
-import Lib.Label as Label
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Links as Links exposing (Hidden(..), Link(..), Reach(..), Reference(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
@@ -132,7 +132,44 @@ type alias LinksFixture =
     , rustHidden : Maybe Hidden
     , ipe : List String
     , plan : List String
+    , hugeEdge : List Label
     }
+
+
+-- The bytes of the stored qualified name of the callee the over-cap check
+-- writes: far past the read window, so only a bound applied at the read keeps
+-- the link's label small.
+hugeQualifiedBytes : Int
+hugeQualifiedBytes =
+    1024 * 1024
+
+
+-- The bytes a label's marker counts as dropped, if it was cut.
+droppedOf : Label -> Maybe Int
+droppedOf label =
+    case List.head (List.reverse (Label.parts label)) of
+        Just (LabelCut dropped _) ->
+            Just dropped
+
+        Just (LabelText _) ->
+            Nothing
+
+        Just (LabelEscapes _) ->
+            Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- The labels of every link from `found` to fixture unit `label`.
+labelsTo : String -> Maybe Index.UnitView -> List Label
+labelsTo label found =
+    case found of
+        Just loaded ->
+            List.map Links.label (List.filter (\l -> Links.linkKey l == internalKey label) loaded.links.links)
+
+        Nothing ->
+            []
 
 
 -- The `linkKey` of an internal link to fixture unit `label`.
@@ -177,10 +214,12 @@ linksFixture =
         rust <- loadUnitNow (uid "u-src")
         ipe <- loadUnitNow (uid "u-ipe")
         plan <- candidatePlan
+        execIndexUnchecked at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat hugeQualifiedBytes "z"), Uid.toSql (uid "u-edge") ]
+        huge <- loadUnitNow (uid "u-src")
         cleanupIndex at.indexDb at.repo
         removeFileIfAny (at.repo ++ "/src/links.rs")
         removeFileIfAny (at.repo ++ "/src/Feature.ipe")
-        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan }
+        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan, hugeEdge = labelsTo "u-edge" huge }
 
 
 fixtureChecks : LinksFixture -> List ( String, Bool )
@@ -204,6 +243,19 @@ fixtureChecks got =
     )
     , ( "a call written as `Foo.bar(x)` links `Foo.bar`", got.ipe == [ internalKey "u-foo" ] )
     , ( "the candidate query uses i_units_qual", List.any (String.contains "i_units_qual") got.plan )
+    , ( "a callee whose stored qualified name is a mebibyte links under a label cut at the read, its marker counting the dropped bytes"
+      , List.length got.hugeEdge
+            == 1
+            && List.all
+                (\l ->
+                    Label.byteCount l
+                        <= Label.capBytes Label.labelCap
+                        + Label.markerByteCeiling
+                        && droppedOf l
+                        == Just (hugeQualifiedBytes - Label.capBytes Label.labelCap)
+                )
+                got.hugeEdge
+      )
     ]
 
 
