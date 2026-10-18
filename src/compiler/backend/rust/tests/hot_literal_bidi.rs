@@ -198,7 +198,7 @@ fn update_hot_program(interner: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(model_sym, rec.clone())],
+        params: vec![ipe_ir::Param::owned(model_sym, rec.clone())],
         ret: IrType::Tuple(vec![rec, IrType::Cmd(Box::new(IrType::Int))]),
         body: Expr::Match(case),
     };

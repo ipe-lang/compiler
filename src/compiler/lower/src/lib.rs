@@ -474,10 +474,16 @@ mod tests {
 
         // params: msg : Enum(Msg), count : Int.
         assert_eq!(update.params.len(), 2);
-        let Some((p0, t0)) = update.params.first() else {
+        let Some(ipe_ir::Param {
+            sym: p0, ty: t0, ..
+        }) = update.params.first()
+        else {
             return;
         };
-        let Some((p1, t1)) = update.params.get(1) else {
+        let Some(ipe_ir::Param {
+            sym: p1, ty: t1, ..
+        }) = update.params.get(1)
+        else {
             return;
         };
         assert_eq!(i.resolve(*p0), Some("msg"));
@@ -599,9 +605,9 @@ mod tests {
         let Some((func, i)) = opt else { return };
         assert_eq!(func.params.len(), 1, "one (synthetic) parameter");
         assert!(
-            matches!(func.params.first(), Some((_, IrType::Tuple(es))) if es.len() == 2),
+            matches!(func.params.first(), Some(ipe_ir::Param { ty: IrType::Tuple(es), .. }) if es.len() == 2),
             "the parameter's type is a 2-element tuple, got {:?}",
-            func.params.first().map(|(_, t)| t)
+            func.params.first().map(|ipe_ir::Param { ty: t, .. }| t)
         );
         let Expr::Destructure {
             binder,
@@ -721,7 +727,7 @@ mod tests {
         assert!(bounds.is_unbounded(), "wrap's `a` is an unbounded generic");
         // The single parameter is `IrType::Generic(a)`.
         assert!(
-            matches!(func.params.first(), Some((_, IrType::Generic(s))) if *s == param_sym),
+            matches!(func.params.first(), Some(ipe_ir::Param { ty: IrType::Generic(s), .. }) if *s == param_sym),
             "parameter lowers to Generic(a), got {:?}",
             func.params
         );
@@ -1162,7 +1168,7 @@ mod tests {
 
         // The parameter's IrType is Generic(any_sym).
         assert_eq!(func.params.len(), 1, "one parameter");
-        let Some((_, param_ty)) = func.params.first() else {
+        let Some(ipe_ir::Param { ty: param_ty, .. }) = func.params.first() else {
             return;
         };
         assert!(
@@ -1206,7 +1212,9 @@ mod tests {
         let Some((func, i)) = opt else { return };
 
         assert_eq!(func.params.len(), 2, "two parameters");
-        let (Some((_, a_ty)), Some((_, b_ty))) = (func.params.first(), func.params.get(1)) else {
+        let (Some(ipe_ir::Param { ty: a_ty, .. }), Some(ipe_ir::Param { ty: b_ty, .. })) =
+            (func.params.first(), func.params.get(1))
+        else {
             return;
         };
 

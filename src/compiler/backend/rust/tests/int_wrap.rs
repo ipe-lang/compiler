@@ -357,7 +357,7 @@ fn generic_double_program(interner: &mut Interner, arg: i64) -> DResult<Program>
             BoundSet::UNBOUNDED.with_add().with_copy().with_clone(),
         )],
         row_params: vec![],
-        params: vec![(sym_x, IrType::Generic(sym_a))],
+        params: vec![ipe_ir::Param::owned(sym_x, IrType::Generic(sym_a))],
         ret: IrType::Generic(sym_a),
         body: Expr::BinOp {
             op: BinOp::Add,

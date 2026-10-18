@@ -332,7 +332,7 @@ fn unannotated_fn_with_concrete_solved_type_lowers_cleanly() -> DResult<()> {
     let func = single_func(&res)
         .expect("unannotated monomorphic fn must lower cleanly without a type annotation");
     assert_eq!(func.params.len(), 1, "one typed param expected: {res:?}");
-    let param_ty = func.params.first().map(|(_, t)| t);
+    let param_ty = func.params.first().map(|ipe_ir::Param { ty: t, .. }| t);
     assert_eq!(
         param_ty,
         Some(&IrType::Int),
@@ -371,7 +371,7 @@ fn wildcard_parameter_lowers_to_a_fresh_binder() -> DResult<()> {
         1,
         "one synthetic param expected: {res:?}"
     );
-    let param_ty = func.params.first().map(|(_, t)| t);
+    let param_ty = func.params.first().map(|ipe_ir::Param { ty: t, .. }| t);
     assert_eq!(param_ty, Some(&IrType::Int), "param type is the annotation");
     assert_eq!(func.ret, IrType::Int, "return type is the annotation tail");
     Ok(())
@@ -398,7 +398,9 @@ fn function_type_in_annotation_argument_lowers_to_fun() -> DResult<()> {
     };
     let res = run(Vec::new(), vec![def], BTreeMap::new(), &mut i);
     let func = single_func(&res);
-    let param_ty = func.and_then(|fc| fc.params.first()).map(|(_, t)| t);
+    let param_ty = func
+        .and_then(|fc| fc.params.first())
+        .map(|ipe_ir::Param { ty: t, .. }| t);
     assert_eq!(
         param_ty,
         Some(&IrType::Fun(vec![IrType::Int], Box::new(IrType::Int))),
@@ -436,7 +438,8 @@ fn parametric_annotation_lowers_to_generic_func() -> DResult<()> {
         "identity quantifies exactly [a], unbounded: {res:?}"
     );
     assert_eq!(
-        func.and_then(|f| f.params.first()).map(|(_, t)| t),
+        func.and_then(|f| f.params.first())
+            .map(|ipe_ir::Param { ty: t, .. }| t),
         Some(&IrType::Generic(a)),
         "the parameter type lowers to Generic(a): {res:?}"
     );
@@ -615,7 +618,7 @@ fn threaded_param_wildcard_any_concretizes_from_region() -> DResult<()> {
     let func = single_func(&res).expect("`thread : any -> any` must lower cleanly");
     assert_eq!(
         func.params,
-        vec![(x, IrType::Str)],
+        vec![ipe_ir::Param::owned(x, IrType::Str)],
         "the threaded parameter concretizes to the return's type (`String`): {res:?}"
     );
     assert_eq!(
@@ -673,7 +676,7 @@ fn unthreaded_param_wildcard_any_stays_generic() -> DResult<()> {
     let func = single_func(&res).expect("`constFn : any -> any` must lower cleanly");
     // The parameter stays a generic (its own minted `any` symbol); the return is
     // the concrete body type.
-    let (_, param_ty) = func.params.first().expect("one parameter");
+    let ipe_ir::Param { ty: param_ty, .. } = func.params.first().expect("one parameter");
     assert!(
         matches!(param_ty, IrType::Generic(_)),
         "an unthreaded parameter `any` stays generic: {res:?}"

@@ -1460,6 +1460,10 @@ pub(crate) struct EmitCtx<'a> {
     /// the inlined `impl Fn` fast path rather than a wasted heap allocation. A
     /// function with no such params carries no entry (the common case).
     impl_fn_params: BTreeMap<FuncId, Vec<usize>>,
+    /// The pass of every parameter of every function in the program, read to
+    /// re-prove each function's borrow facts at emit entry
+    /// ([`ipe_ir::borrow::verify`]).
+    passes: ipe_ir::borrow::PassTable,
     /// Function id → the order of its explicit Rust generics, for a function
     /// that declares any ([`GenericLayout`]). Read to render a use-site
     /// [`ipe_ir::CallPin::MsgUnit`] turbofish against the callee's own clause.
@@ -1931,7 +1935,7 @@ impl<'a> EmitCtx<'a> {
         let mut shapes: BTreeMap<Vec<String>, ShapeOccurrences> = BTreeMap::new();
         for module in &program.modules {
             for func in &module.funcs {
-                for (_, ty) in &func.params {
+                for ipe_ir::Param { ty, .. } in &func.params {
                     collect_record_shapes(interner, ty, &mut shapes)?;
                 }
                 collect_record_shapes(interner, &func.ret, &mut shapes)?;
@@ -2328,7 +2332,7 @@ impl<'a> EmitCtx<'a> {
                 .flat_map(|m| m.funcs.iter())
                 .filter(|f| is_ipe_ui_structural_wrapper(f, interner))
                 .map(|f| {
-                    let params: Vec<Symbol> = f.params.iter().map(|(s, _)| *s).collect();
+                    let params: Vec<Symbol> = f.params.iter().map(|p| p.sym).collect();
                     (f.id, (params, f.body.clone()))
                 })
                 .collect();
@@ -2404,6 +2408,7 @@ impl<'a> EmitCtx<'a> {
             enum_traits,
             func_names,
             impl_fn_params,
+            passes: ipe_ir::borrow::PassTable::of_program(program),
             generic_layouts,
             record_structs,
             record_by_fieldset,
@@ -2460,7 +2465,7 @@ impl<'a> EmitCtx<'a> {
                 if self.interner.resolve(func.name) != Some(ipe_ir::HYDRATION_PROJECTION_NAME) {
                     continue;
                 }
-                let Some((_, param_ty)) = func.params.first() else {
+                let Some(ipe_ir::Param { ty: param_ty, .. }) = func.params.first() else {
                     // A `fromHydrationState` with no parameter cannot name an
                     // island type — treat as absent (fall through to clean init).
                     return Ok(None);
@@ -3765,6 +3770,17 @@ impl<'a> EmitCtx<'a> {
             })
     }
 
+    /// Re-prove `func`'s parameter pass facts before any of its Rust is rendered.
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] when a `Borrowed` parameter is not provably
+    /// read-only, so a fact that did not come from the borrow analysis (a
+    /// deserialized cache entry, a hand-built program) is refused here.
+    pub(crate) fn verify_borrows(&self, func: &ipe_ir::Func) -> DResult<()> {
+        ipe_ir::borrow::verify(func, &self.passes, &self.enum_variants)
+            .map_err(|v| v.into_diagnostic("ipe_backend_rust::emit_func"))
+    }
+
     /// Was the 0-based parameter `idx` of function `id` monomorphized to an
     /// `impl Fn` generic (so a call site passes its closure argument UNBOXED)?
     /// `false` for a call to any function that took no such param — the common
@@ -3977,7 +3993,7 @@ fn program_type_feature_requirements(program: &Program) -> BTreeSet<ipe_ir::Runt
     let mut out = BTreeSet::new();
     for module in &program.modules {
         for func in &module.funcs {
-            for (_, ty) in &func.params {
+            for ipe_ir::Param { ty, .. } in &func.params {
                 collect_type_feature_requirements(ty, &mut out);
             }
             collect_type_feature_requirements(&func.ret, &mut out);

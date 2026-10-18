@@ -43,20 +43,17 @@ const fn call(callee: Callee, args: Vec<Expr>) -> Expr {
 }
 
 /// A function with no type or row parameters.
-const fn func(
-    id: u32,
-    name: Symbol,
-    params: Vec<(Symbol, IrType)>,
-    ret: IrType,
-    body: Expr,
-) -> Func {
+fn func(id: u32, name: Symbol, params: Vec<(Symbol, IrType)>, ret: IrType, body: Expr) -> Func {
     Func {
         id: FuncId::from_raw(id),
         name,
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params,
+        params: params
+            .into_iter()
+            .map(|(sym, ty)| ipe_ir::Param::owned(sym, ty))
+            .collect(),
         ret,
         body,
     }
