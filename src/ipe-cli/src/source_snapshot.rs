@@ -1429,6 +1429,13 @@ mod tests {
             seen(&view, "Helper"),
             Some((helper.as_str(), SourceOrigin::Own(SourceDir::Tests)))
         );
+        let own: Vec<&ModulePath> = view
+            .modules()
+            .iter()
+            .filter(|(_, held)| matches!(held.origin(), SourceOrigin::Own(_)))
+            .map(|(module, _)| module)
+            .collect();
+        assert_eq!(own, [&path("Helper"), &path("Main"), &path("Util")]);
         // The build view is unchanged by the test view.
         assert_eq!(
             snapshot.module(&path("Main")).map(SnapshotModule::text),
