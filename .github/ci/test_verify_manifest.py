@@ -2658,17 +2658,11 @@ def _status_rule(checks: list | None = None, **over: object) -> dict:
 
 
 def _pr_rule(**over: object) -> dict:
-    params = {
-        "required_approving_review_count": 0,
-        "dismiss_stale_reviews_on_push": True,
-        "required_reviewers": [],
-        "require_code_owner_review": False,
-        "dismissal_restriction": {"enabled": False, "allowed_actors": []},
-        "require_last_push_approval": False,
-        "required_review_thread_resolution": True,
-        "require_extra_approval_for_unattributed_changes": True,
-        "allowed_merge_methods": ["merge", "squash", "rebase"],
-    }
+    """The pinned `pull_request` rule (`check_required_set.PULL_REQUEST`), with `over` applied."""
+    import copy  # noqa: PLC0415
+    import check_required_set  # noqa: PLC0415  # sibling module; SSOT of the review pins
+
+    params = copy.deepcopy(check_required_set.PULL_REQUEST)
     params.update(over)
     return {"type": "pull_request", "parameters": params}
 
@@ -2902,6 +2896,7 @@ class TestSsotOutputTools(unittest.TestCase):
             ("queue timeout changed", _with_rules(("merge_queue", _queue_rule(check_response_timeout_minutes=90)))),
             ("review param unread", _with_rules(("pull_request", _pr_rule(frob=True)))),
             ("review param mistyped", _with_rules(("pull_request", _pr_rule(required_approving_review_count=True)))),
+            ("review thread resolution off", _with_rules(("pull_request", _pr_rule(required_review_thread_resolution=False)))),
             ("deletion with parameters", _with_rules(("deletion", {"type": "deletion", "parameters": {}}))),
             ("unexamined rule type", _ruleset(rules=_ruleset()["rules"] + [{"type": "update"}])),
             ("untyped rule", _ruleset(rules=_ruleset()["rules"] + [{}])),
