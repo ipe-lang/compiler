@@ -87,8 +87,8 @@ pub fn emit_expr_at(
         Expr::Bool(b) => Ok(if *b { "true" } else { "false" }.to_owned()),
         // The unit value renders as the Rust unit expression `()`.
         Expr::Unit => Ok("()".to_owned()),
-        Expr::Var(sym) => ctx.emit_ident(*sym),
-        Expr::CloneVar(sym) => Ok(format!("{}.clone()", ctx.emit_ident(*sym)?)),
+        Expr::Var(sym) => ctx.emit_local_ident(*sym),
+        Expr::CloneVar(sym) => Ok(format!("{}.clone()", ctx.emit_local_ident(*sym)?)),
         Expr::Ctor {
             home,
             ty,
@@ -177,7 +177,7 @@ pub fn emit_expr_at(
                 let inlined_s = emit_expr_at(ctx, &inlined_body, indent, child, generics)?;
                 Ok(format!("({{ {inlined_s} }})"))
             } else {
-                let name_s = ctx.emit_ident(*name)?;
+                let name_s = ctx.emit_local_ident(*name)?;
                 let value_s = emit_expr_at(ctx, value, indent, child, generics)?;
                 let body_s = emit_expr_at(ctx, body, indent, child, generics)?;
                 Ok(format!("({{ let {name_s} = {value_s}; {body_s} }})"))
@@ -717,7 +717,7 @@ pub fn emit_expr_at(
                 }
                 return Ok(format!("({base}).{getter}().clone()"));
             }
-            let field = ctx.emit_ident(*field)?;
+            let field = ctx.emit_member_ident(*field)?;
             if moves || ir_type_is_definitely_copy(field_ty) {
                 Ok(format!("({base}).{field}"))
             } else {
@@ -919,7 +919,7 @@ pub fn emit_ctor(
     // (`IpeMaybe::Just(..)`, `IpeResult::Err(..)`); its payload is never a
     // self-recursive user field, so no field-boxing lookup applies.
     if let Some(runtime) = ctx.builtin_runtime_enum(home, ty) {
-        let path = format!("{runtime}::{}", ctx.emit_ident(variant)?);
+        let path = format!("{runtime}::{}", ctx.emit_member_ident(variant)?);
         if args.is_empty() {
             return Ok(path);
         }
@@ -929,7 +929,11 @@ pub fn emit_ctor(
         }
         return Ok(format!("{path}({})", parts.join(", ")));
     }
-    let path = format!("{}::{}", ctx.enum_name(home, ty)?, ctx.emit_ident(variant)?);
+    let path = format!(
+        "{}::{}",
+        ctx.enum_name(home, ty)?,
+        ctx.emit_member_ident(variant)?
+    );
     if args.is_empty() {
         return Ok(path);
     }
@@ -1065,14 +1069,14 @@ pub fn emit_transition_arm(ctx: &EmitCtx, body: &Expr) -> DResult<Option<String>
     // Resolve a field symbol to its serde key — the emitted Rust field ident,
     // which (no serde rename) is exactly the key the runtime Model JSON object is
     // keyed by. `None` for an unresolved symbol refuses (never a guessed key).
-    let resolve = |sym: Symbol| ctx.emit_ident(sym).ok();
+    let resolve = |sym: Symbol| ctx.emit_member_ident(sym).ok();
     let Some(ct) = crate::transition_classify::transition_of_arm(body, model_param, &resolve)
     else {
         return Ok(None);
     };
     // The model parameter's emitted ident, consumed by value by the arm (only one
     // match branch runs, so the move is sound).
-    let model_ident = ctx.emit_ident(model_param)?;
+    let model_ident = ctx.emit_local_ident(model_param)?;
     // The baked datum, as a Rust string literal. `to_json` emits only the JSON
     // grammar's own escapes; wrap it as a Rust string with the escapes a Rust
     // string literal needs (`"` and `\`), which the JSON writer already produced,
@@ -1111,7 +1115,7 @@ pub fn emit_sub_arm(ctx: &EmitCtx, kernel: KernelFn, args: &[Expr]) -> Option<St
     // which (no serde rename) is exactly the tag serde uses for the enum's
     // externally-tagged form. `None` for an unresolved symbol refuses (never a
     // guessed tag).
-    let resolve_variant = |sym: Symbol| ctx.emit_ident(sym).ok();
+    let resolve_variant = |sym: Symbol| ctx.emit_member_ident(sym).ok();
     let cs = crate::sub_classify::sub_of_call(kernel, args, &resolve_variant)?;
     // The baked datum, as a Rust string literal. `to_json` emits only the JSON
     // grammar's own escapes; wrap it as a Rust string with the escapes a Rust
@@ -1156,7 +1160,7 @@ pub fn emit_init_datum(
     depth: u16,
     generics: GenericScope,
 ) -> DResult<Option<String>> {
-    let resolve = |sym: Symbol| ctx.emit_ident(sym).ok();
+    let resolve = |sym: Symbol| ctx.emit_member_ident(sym).ok();
     let Some(cd) = crate::transition_classify::init_datum_of_body(body, &resolve) else {
         return Ok(None);
     };

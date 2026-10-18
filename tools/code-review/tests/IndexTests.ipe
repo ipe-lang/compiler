@@ -500,14 +500,14 @@ viewPastNodeCeilingWithheld =
         < ByteSize.toBytes Index.viewByteCeiling
 
 
--- A line of 3000 keywords takes more elements coloured than the ceiling and
+-- A line of 7000 keywords takes more elements coloured than the ceiling and
 -- four plain, so it is shown plain; a short line is shown coloured. Red if
 -- the plain drawing is not tried, or tried first.
 plainFallbackWhenColorsTooMany : Bool
 plainFallbackWhenColorsTooMany =
     let
         keywords =
-            String.repeat 3000 "fn "
+            String.repeat 7000 "fn "
     in
     Drawn.elements (Drawn.highlighted Rust [ Numbered 1 keywords ])
         > Index.viewNodeCeiling
@@ -517,7 +517,7 @@ plainFallbackWhenColorsTooMany =
         == Just Highlighted
 
 
--- A 6.8 KB line of one token per byte, and a 129 KiB one, are shown plain
+-- A 14 KB line of one token per byte, and a 129 KiB one, are shown plain
 -- or withheld, never coloured past the ceiling; a 129 KiB line of escapes
 -- is withheld by its element count. Red if the element check is removed.
 longTokenLinesNeverHighlighted : Bool
@@ -537,7 +537,7 @@ longTokenLinesNeverHighlighted =
         escapes =
             escapeLine 33024
     in
-    withinCeiling (classifyLine (String.repeat 3400 "1 "))
+    withinCeiling (classifyLine (String.repeat 7000 "1 "))
         && withinCeiling (classifyLine (String.repeat 66048 "1 "))
         && nodesOver (classifyLine escapes)
         == Just 33028
@@ -592,15 +592,42 @@ sessionCeilingMirrorsRuntime =
         ceiling =
             ByteSize.toBytes Index.runtimeSessionCeiling
     in
+    Task.map
+        (\source ->
+            modBy mib ceiling
+                == 0
+                && String.contains ("\npub const SESSION_CEILING: Bytes = Bytes::mib(" ++ String.fromInt (ceiling // mib) ++ ");\n") source
+        )
+        runtimeBudgetSource
+
+
+-- The cost per element the element ceiling is sized by is the runtime's:
+-- the runtime's budget source declares `DRAWN_ELEMENT_BYTES` as the same
+-- number of bytes. Red when either side changes alone.
+elementBytesMirrorsRuntime : Task.Task Error Bool
+elementBytesMirrorsRuntime =
+    Task.map
+        (String.contains ("\npub const DRAWN_ELEMENT_BYTES: Bytes = Bytes::new(" ++ String.fromInt (ByteSize.toBytes Index.elementResidentBytes) ++ ");\n"))
+        runtimeBudgetSource
+
+
+-- The depth the cost per element holds at is the runtime's: the runtime's
+-- budget source declares `DRAWN_ELEMENT_DEPTH` as the same depth. Red when
+-- either side changes alone.
+drawnDepthMirrorsRuntime : Task.Task Error Bool
+drawnDepthMirrorsRuntime =
+    Task.map
+        (String.contains ("\npub const DRAWN_ELEMENT_DEPTH: usize = " ++ String.fromInt Index.drawnDepthCeiling ++ ";\n"))
+        runtimeBudgetSource
+
+
+-- The runtime's budget source, which declares the numbers this app mirrors.
+runtimeBudgetSource : Task.Task Error String
+runtimeBudgetSource =
     do
         cwd <- System.cwd ()
         path <- Task.fromResult (Path.fromString (repoFile cwd "src/runtime/rust/src/web/budget.rs"))
-        source <- File.readFileLimit path (ByteSize.kib 256)
-        Task.succeed
-            (modBy mib ceiling
-                == 0
-                && String.contains ("\npub const SESSION_CEILING: Bytes = Bytes::mib(" ++ String.fromInt (ceiling // mib) ++ ");\n") source
-            )
+        File.readFileLimit path (ByteSize.kib 256)
 
 
 -- Both ceilings are positive, and the byte ceiling is within the read
@@ -1366,7 +1393,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "elementResidentBytes", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1638,6 +1665,8 @@ checks =
         , Task.succeed ( "a view past the element ceiling is too large, never drifted", nodeOversizeRanksBeforeDrift )
         , Task.succeed ( "the element ceiling, at the cost per element, fits three quarters of the runtime's session ceiling", nodeCeilingFitsSessionCeiling )
         , check "the mirrored session ceiling is the runtime's" sessionCeilingMirrorsRuntime
+        , check "the mirrored cost per drawn element is the runtime's" elementBytesMirrorsRuntime
+        , check "the mirrored drawn depth is the runtime's" drawnDepthMirrorsRuntime
         , check "roots agreeing with the recorded repositories pass the startup check" reposProbeAccepts
         , check "a missing or oversized recorded repository set refuses startup" reposProbeRefusesSetShape
         , check "a bound, recorded or nested tag the index disagrees on refuses startup" reposProbeRefusesDisagreement

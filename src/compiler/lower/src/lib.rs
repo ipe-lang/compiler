@@ -50,7 +50,7 @@ pub use lower::tco_analysis;
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::Diagnostic;
-use ipe_intern::Interner;
+use ipe_intern::{Interner, SynthStem};
 use ipe_types::SolvedTypes;
 
 /// Lower a canonical module + its solved types into the typed IR.
@@ -121,7 +121,7 @@ pub fn lower(
     // the per-site charges above do not see; reserve it on top.
     let eta_params = interner
         .fresh_symbols(
-            "eta_",
+            SynthStem::Eta,
             pool_counts
                 .max_live_eta_params
                 .saturating_add(lower::max_mapper_wrap_eta_demand(m, types))
@@ -135,7 +135,7 @@ pub fn lower(
     // and its sizing stays the per-module widest arity.
     let cap_params = interner
         .fresh_symbols(
-            "cap_",
+            SynthStem::Cap,
             lower::max_def_arity_per_module(m)
                 .max(max_ctor_arity)
                 .max(MAX_CALLEE_ARITY),
@@ -150,13 +150,13 @@ pub fn lower(
     // inside its body can never collide on `arg_i` (no reliance on shadowing).
     // Minted through the same owned `&mut Interner`.
     let param_binders = interner
-        .fresh_symbols("arg_", pool_counts.destructure_param_sites)
+        .fresh_symbols(SynthStem::Arg, pool_counts.destructure_param_sites)
         .map_err(homeless)?;
     // One fresh symbol per wildcard `any` occurrence in a typed signature, so
     // `split_typed_sig` never shares one symbol across two occurrences the
     // checker independently pinned to different concrete types.
     let any_param_binders = interner
-        .fresh_symbols("anyp_", lower::count_any_param_sites(m))
+        .fresh_symbols(SynthStem::AnyParam, lower::count_any_param_sites(m))
         .map_err(homeless)?;
     // The symbol every wildcard `any` lowers to before it is freshened or
     // pinned; no source identifier can spell it.
@@ -165,7 +165,7 @@ pub fn lower(
     // `Store.selectToMaybe` call site, for the concrete per-column decode the
     // intercept emits there.
     let projection_decode_binders = interner
-        .fresh_symbols("projdec_", pool_counts.projection_decode_sites)
+        .fresh_symbols(SynthStem::ProjDecode, pool_counts.projection_decode_sites)
         .map_err(homeless)?;
     // one fresh thunk-binder symbol per syntactic destructure-binder
     // `let` / single-arm product `case` site, consumed only when the bound
@@ -173,18 +173,21 @@ pub fn lower(
     // inside the lowerer; this count is purely syntactic, so it over-counts
     // harmlessly).
     let destructure_thunk_binders = interner
-        .fresh_symbols("destr_thunk_", pool_counts.destructure_thunk_sites)
+        .fresh_symbols(SynthStem::DestrThunk, pool_counts.destructure_thunk_sites)
         .map_err(homeless)?;
     // C2: one fresh `Vec` payload binder per `case`-arm site that nests a
     // list / cons sub-pattern inside a constructor payload.
     let nested_cons_binders = interner
-        .fresh_symbols("ncons_", pool_counts.nested_cons_payload_sites)
+        .fresh_symbols(SynthStem::NestedCons, pool_counts.nested_cons_payload_sites)
         .map_err(homeless)?;
     // Sibling desugaring: one fresh `String` payload binder per `case`-arm site
     // that nests a string-literal sub-pattern directly inside a constructor
     // payload (`Just "live"`).
     let nested_strlit_binders = interner
-        .fresh_symbols("nstrlit_", pool_counts.nested_strlit_payload_sites)
+        .fresh_symbols(
+            SynthStem::NestedStrLit,
+            pool_counts.nested_strlit_payload_sites,
+        )
         .map_err(homeless)?;
     // One fresh binder per tuple-element position for the tuple-elem-rebind
     // synthesis: a multi-arm `case` on a non-literal tuple scrutinee with
@@ -192,7 +195,7 @@ pub fn lower(
     // to fresh temps and construct a synthetic literal-tuple scrutinee, enabling
     // the coerced-column backend path. Sized as an upper bound.
     let tuple_elem_binders = interner
-        .fresh_symbols("telem_", pool_counts.tuple_elem_rebind_sites)
+        .fresh_symbols(SynthStem::TupleElem, pool_counts.tuple_elem_rebind_sites)
         .map_err(homeless)?;
     // The built-in `Maybe` / `Result` types + constructors are Prelude
     // built-ins (no `type` declaration), so the lowerer needs their symbols to
@@ -623,7 +626,7 @@ mod tests {
             "binder is `(a, b)`"
         );
         assert!(
-            matches!(value.as_ref(), Expr::Var(s) if i.resolve(*s).is_some_and(|n| n.starts_with("arg_"))),
+            matches!(value.as_ref(), Expr::Var(s) if i.resolve(*s).is_some_and(|n| n.starts_with(SynthStem::Arg.text()))),
             "destructured value is the synthetic parameter"
         );
         assert!(
@@ -1173,7 +1176,8 @@ mod tests {
             "param type must be Generic(any_sym), got {param_ty:?}"
         );
         assert!(
-            i.resolve(*any_sym).is_some_and(|n| n.starts_with("anyp_")),
+            i.resolve(*any_sym)
+                .is_some_and(|n| n.starts_with(SynthStem::AnyParam.text())),
             "the wildcard's generic must be a freshened `anyp_N` symbol, got {:?}",
             i.resolve(*any_sym)
         );

@@ -347,8 +347,9 @@ impl<M: RetainedBytes> Rendered<M> {
         view: Option<Bytes>,
         index: impl Fn(&RetainedRender<M>) -> Option<Bytes>,
     ) -> Option<Bytes> {
+        let spare = self.history.capacity().checked_sub(self.history.len())?;
         let base = Bytes::inline::<Self>()?
-            .checked_add(crate::retained::deque_frame(&self.history)?)?
+            .checked_add(Bytes::slots::<RetainedRender<M>>(spare)?)?
             .checked_add(view?)?;
         self.history.iter().try_fold(base, |acc, render| {
             acc.checked_add(Bytes::inline::<NonZeroU64>()?)?
@@ -516,6 +517,7 @@ impl<M: Clone> Rendered<M> {
 mod tests {
     use super::*;
     use crate::assign_ipe_ids;
+    use crate::html::drawn_shape::{DRAWN_LEVELS, DrawnShape, Wide};
 
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
@@ -563,37 +565,26 @@ mod tests {
         );
     }
 
-    /// A 600-byte message, as wide as a rich app `Msg`.
-    #[derive(Clone)]
-    #[allow(dead_code)] // the bytes are the width; nothing reads them
-    struct Wide([u8; 600]);
-
-    crate::retained::inline_measure!(Wide);
-
-    /// A stamped `code` block of `n` token spans; each span carries a click
-    /// handler when `handlers` holds.
-    fn drawn(n: usize, handlers: bool) -> Html<Wide> {
-        let span = |i: usize| {
-            let mut attrs = vec![Attribute::Attr("style".into(), "color:#cdcdd7".into())];
-            if handlers {
-                attrs.push(Attribute::EventAttr(Event::OnMsg(
-                    "click".into(),
-                    Box::new(Wide([0; 600])),
-                )));
-            }
-            Html::HElement("span".into(), attrs, vec![Html::HText(format!("t{i}"))])
-        };
-        let mut view = Html::HElement("code".into(), Vec::new(), (0..n).map(span).collect());
-        assign_ipe_ids(&mut view, "0");
-        view
+    /// The shared drawn source view of `lines` lines, one coloured run each;
+    /// each line carries a click handler when `handlers` holds.
+    fn drawn(lines: usize, handlers: bool) -> Html<Wide> {
+        DrawnShape {
+            depth: DRAWN_LEVELS,
+            lines,
+            runs: 1,
+            escapes: 1,
+            handlers,
+            spare: false,
+        }
+        .build()
     }
 
-    /// The bytes a full render history of `drawn(n, handlers)` keeps resident
-    /// beyond its current view.
-    fn history_bytes(n: usize, handlers: bool) -> Option<u64> {
-        let mut rendered = Rendered::first(keys(), drawn(n, handlers));
+    /// The bytes a full render history of `drawn(lines, handlers)` keeps
+    /// resident beyond its current view.
+    fn history_bytes(lines: usize, handlers: bool) -> Option<u64> {
+        let mut rendered = Rendered::first(keys(), drawn(lines, handlers));
         for _ in 0..RENDER_HISTORY_DEPTH.get() {
-            rendered.commit(drawn(n, handlers)).ok()?;
+            rendered.commit(drawn(lines, handlers)).ok()?;
         }
         let all = rendered.resident_bytes()?.get();
         all.checked_sub(rendered.last_view().view_bytes()?.get())

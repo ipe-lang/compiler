@@ -3308,6 +3308,7 @@ dependencies = [
  "ipe-runtime-rust",
  "ipe_annotate",
  "ipe_diagnostics",
+ "ipe_fmt",
  "ipe_intern",
  "ipe_kernels",
  "ipe_parse",

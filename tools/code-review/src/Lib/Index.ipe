@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -2209,14 +2209,14 @@ viewByteCeiling =
 -- The most elements a shown view's drawing may take. The session's model and
 -- its one charged tree are refused past `runtimeSessionCeiling`;
 -- `viewNodeCeiling` elements at `elementResidentBytes` each, plus
--- `viewReserve` for every copy of the view's text, fit three quarters of it.
--- The last quarter holds the page outside the view and the error of the
--- per-element cost, which is estimated, not measured:
--- 2048 * 3 KiB + 5 MiB = 11 MiB <= 12 MiB. The relation is checked by a test,
--- and the ceiling can rise as the runtime's cost per element falls.
+-- `viewReserve` for every copy of the view's text, fit three quarters of it:
+-- (12 MiB - 5 MiB) / 1.5 KiB = 4778 elements, rounded down to 4096 so 1 MiB
+-- stays spare; 4096 * 1.5 KiB + 5 MiB = 11 MiB <= 12 MiB. The last quarter
+-- holds the model, the render history and the session's fixed charge. The
+-- relation is checked by a test, over numbers mirrored from the runtime.
 viewNodeCeiling : Int
 viewNodeCeiling =
-    2048
+    4096
 
 
 -- The runtime's per-session memory ceiling, mirrored from `SESSION_CEILING`
@@ -2227,13 +2227,24 @@ runtimeSessionCeiling =
     ByteSize.mib 16
 
 
--- What one drawn element holds resident in the runtime's session tree: the
--- element, its attributes (each slot as large as the app's message, held
--- inline, the `Vec` grown to four slots by the element id the runtime adds),
--- and one text child.
+-- What one drawn element holds resident in the runtime's session tree once
+-- stamped, its text and sibling text included, at most `drawnDepthCeiling`
+-- deep, in a view of any composition: mirrored from `DRAWN_ELEMENT_BYTES` in
+-- `src/runtime/rust/src/web/budget.rs`, whose test measures it on views of
+-- this app's shapes at that depth. A test here reads that line and fails when
+-- the two differ.
 elementResidentBytes : ByteSize
 elementResidentBytes =
-    ByteSize.kib 3
+    ByteSize.bytes 1536
+
+
+-- The deepest nesting, the root counted, `elementResidentBytes` holds at:
+-- mirrored from `DRAWN_ELEMENT_DEPTH` in `src/runtime/rust/src/web/budget.rs`.
+-- An element's id spells every ancestor, so a deeper page costs each element
+-- more; a test measures how deep the unit page draws its source.
+drawnDepthCeiling : Int
+drawnDepthCeiling =
+    24
 
 
 -- What a shown view holds besides its counted elements, at most

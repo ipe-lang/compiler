@@ -1,0 +1,21 @@
+module Main exposing (main)
+
+import Ipe.Io as Io
+import Ipe.String as String
+
+-- A `String` parameter spelled like the backend's tuple-binding temporary,
+-- which holds an `Int`. The parameter must stay a `String`, so the program
+-- builds and prints `hi0`.
+
+
+greet : String -> String
+greet __ipe_bind_0 =
+    let
+        ( x as p, c ) =
+            ( 5, 3 )
+    in
+    __ipe_bind_0 ++ String.fromInt (p + c - x - c)
+
+
+main =
+    Io.println (greet "hi")

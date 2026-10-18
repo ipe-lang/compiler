@@ -739,8 +739,8 @@ pub fn emit_task_loop_call(
         });
     }
     let path = ctx.enum_name(home, *name)?;
-    let continue_ident = ctx.emit_ident(*continue_sym)?;
-    let done_ident = ctx.emit_ident(*done_sym)?;
+    let continue_ident = ctx.emit_member_ident(*continue_sym)?;
+    let done_ident = ctx.emit_member_ident(*done_sym)?;
     let ceiling_s = emit_expr_at(ctx, ceiling, indent, child, generics)?;
     let init_s = emit_expr_at(ctx, init, indent, child, generics)?;
     let step_s = emit_expr_at(ctx, step, indent, child, generics)?;
@@ -2054,7 +2054,7 @@ pub fn stream_handler_capture_prologue(ctx: &EmitCtx, handler: &Expr) -> DResult
     collect_free_vars(handler, &mut captured);
     let mut prologue = String::new();
     for sym in captured {
-        let id = ctx.emit_ident(sym)?;
+        let id = ctx.emit_local_ident(sym)?;
         write!(prologue, "let {id} = {id}.clone(); ").map_err(|_| Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::stream_handler_capture_prologue",
             detail: "writing capture-clone prologue failed".to_owned(),
@@ -2492,7 +2492,7 @@ pub fn render_hoisted_clone_prefix(
 ) -> DResult<String> {
     let mut prefix = String::new();
     for &(name, value) in hoisted {
-        let name_s = ctx.emit_ident(name)?;
+        let name_s = ctx.emit_local_ident(name)?;
         let value_s = emit_expr_at(ctx, value, indent, child, generics)?;
         write!(prefix, "let {name_s} = {value_s}; ").map_err(|e| Diagnostic::CompilerBug {
             where_: "ipe_backend_rust::render_hoisted_clone_prefix",
@@ -2709,7 +2709,10 @@ pub fn compile_list_fills(
     let mut v = Vec::with_capacity(list_holes.len());
     for lh in list_holes {
         let xs_code = emit_expr_at(ctx, &lh.xs, indent, child, generics)?;
-        let item_name = format!("__ipe_li_{}", lh.item_sym.as_raw());
+        // The fills read the item through its own symbol, so the binder is the
+        // same local ident a `Var` of that symbol emits; the item is owned,
+        // exactly as the `List.map` lambda param it replaces.
+        let item_name = ctx.emit_local_ident(lh.item_sym)?;
         let mut fills = Vec::with_capacity(lh.item_fills.len());
         for fill_expr in &lh.item_fills {
             fills.push(emit_expr_at(ctx, fill_expr, indent, child, generics)?);
@@ -2720,7 +2723,7 @@ pub fn compile_list_fills(
             format!("vec![{}]", fills.join(", "))
         };
         v.push(format!(
-            "({xs_code}).iter().map(|{item_name}| {fills_vec}).collect::<Vec<_>>()"
+            "({xs_code}).into_iter().map(|{item_name}| {fills_vec}).collect::<Vec<_>>()"
         ));
     }
     Ok(v)

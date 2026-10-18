@@ -868,6 +868,93 @@ codeBlocks html =
     List.filterMap (\piece -> List.head (String.split "</code>" piece)) (List.drop 1 (String.split "<code " html))
 
 
+-- The nesting depth, the root counted, of the deepest element inside a
+-- `code` block of `html`, or 0 when it has none. Every `<` of the markup
+-- opens or closes a tag, since the sink escapes it in text and attributes;
+-- a tag ending in `/>` is void and opens no level.
+deepestDrawnDepth : String -> Int
+deepestDrawnDepth html =
+    (List.foldl drawnDepthStep { depth = 0, code = Nothing, deepest = 0 } (List.drop 1 (String.split "<" html))).deepest
+
+
+drawnDepthStep : String -> { depth : Int, code : Maybe Int, deepest : Int } -> { depth : Int, code : Maybe Int, deepest : Int }
+drawnDepthStep piece state =
+    if String.startsWith "/" piece then
+        let
+            depth =
+                state.depth - 1
+        in
+        case state.code of
+            Just codeDepth ->
+                if depth < codeDepth then
+                    { state | depth = depth, code = Nothing }
+
+                else
+                    { state | depth = depth }
+
+            Nothing ->
+                { state | depth = depth }
+
+    else if String.startsWith "!" piece then
+        state
+
+    else
+        let
+            depth =
+                state.depth + 1
+
+            void =
+                String.endsWith "/" (Maybe.withDefault piece (List.head (String.split ">" piece)))
+
+            code =
+                case state.code of
+                    Just codeDepth ->
+                        Just codeDepth
+
+                    Nothing ->
+                        if String.startsWith "code " piece || String.startsWith "code>" piece then
+                            Just depth
+
+                        else
+                            Nothing
+
+            deepest =
+                case code of
+                    Just _ ->
+                        max state.deepest depth
+
+                    Nothing ->
+                        state.deepest
+
+            open =
+                if void then
+                    state.depth
+
+                else
+                    depth
+        in
+        { depth = open, code = code, deepest = deepest }
+
+
+-- A page draws its source within the depth the runtime's cost per element
+-- holds at: an element's id spells each of its ancestors, so a layout that
+-- wraps the source deeper costs every drawn element more than the element
+-- ceiling is sized by. The page must draw an escape inside a coloured run,
+-- the deepest drawn element, so the depth is measured, not assumed. Red if
+-- a wrapper moves the source past `Index.drawnDepthCeiling`.
+drawnDepthWithinBound : String -> Bool
+drawnDepthWithinBound html =
+    let
+        deepest =
+            deepestDrawnDepth html
+    in
+    List.any (has "data-review-escape") (codeBlocks html)
+        && 0
+        < deepest
+        && deepest
+        <= Index.drawnDepthCeiling
+
+
 -- The fixture unit's four lines with a comment holding `hostileText`, then the
 -- six ASCII characters of an escape spelling and the real U+200B it names.
 hostileView : String
@@ -899,6 +986,7 @@ hostileSourceChecks =
             , ( "a hostile source token draws in its code block's byte order, which no element inside resets", hostileSourceInByteOrder (page (cardModel loaded)) && hostileSourceInByteOrder (page (unitPageModel loaded)) )
             , ( "source text spelling an escape draws as plain text, the real character it names as a marked escape", has (hostileEscaped ++ asciiSpelling ++ escapeMarkup "\\u{200b}") (page (cardModel loaded)) && not (has (codeText 8203) (page (cardModel loaded))) )
             , ( "a hostile source still offers its decision buttons", button "Approve" (page (cardModel loaded)) && button "Refuse" (page (cardModel loaded)) )
+            , ( "the unit page and the queue card draw their source within the drawn depth ceiling", drawnDepthWithinBound (page (unitPageModel loaded)) && drawnDepthWithinBound (page (cardModel loaded)) )
             ]
 
 
