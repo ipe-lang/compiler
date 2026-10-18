@@ -189,26 +189,29 @@ pub fn mangle_reserved(name: String) -> String {
     }
 }
 
-/// The prefix that moves a `__`-leading user local out of the backend temporary namespace.
+/// The prefix that moves an `_`-leading user local out of the backend temporary namespace.
 pub const USER_LOCAL_ESCAPE: &str = "__u";
 
 /// The Rust spelling of a user local binder: a parameter, a `let` or pattern binder, a closure parameter.
 ///
-/// The backend mints its own locals (`__ipe_bind_0`, `__ipe_box_0`, `__tco_0`,
-/// ...) with a leading `__`, and the lexer admits a user identifier spelled the
-/// same, so a verbatim user local could be shadowed by a temporary. A user
-/// identifier that starts with `__` is therefore emitted as
-/// [`USER_LOCAL_ESCAPE`] followed by the identifier, so its image starts with
-/// `__u__`, which no backend temporary does; every other identifier passes
-/// through. [`mangle_reserved`] then applies to the result.
+/// The backend mints its own locals with a leading `_` (`__ipe_bind_0`,
+/// `__ipe_box_0`, `__tco_0`, `_ipe_recursion_guard`, ...), and the lexer admits
+/// a user identifier spelled the same, so a verbatim user local could be
+/// shadowed by a temporary. A user identifier that starts with `_`, other than
+/// the bare wildcard `_`, is therefore emitted as [`USER_LOCAL_ESCAPE`]
+/// followed by the identifier, so its image starts with `__u_`, which no
+/// backend temporary does; every other identifier passes through.
+/// [`mangle_reserved`] then applies to the result. The image still starts with
+/// `_`, so an unused `_x` stays exempt from Rust's unused-variable lint.
 ///
 /// The fold is injective: the escaped class gains one fixed prefix, the
-/// pass-through class never starts with `__`, and the escaped image always
-/// does, so the two images are disjoint. A keyword stem never starts with
-/// `__`, so the escape and the keyword mangle touch disjoint inputs.
+/// pass-through class never starts with `_` except the bare `_`, and the
+/// escaped image always starts with `__u_`, so the two images are disjoint. A
+/// keyword stem never starts with `_`, so the escape and the keyword mangle
+/// touch disjoint inputs.
 #[must_use]
 pub fn local_ident(name: &str) -> String {
-    if name.starts_with("__") {
+    if name.starts_with('_') && name != "_" {
         mangle_reserved(format!("{USER_LOCAL_ESCAPE}{name}"))
     } else {
         mangle_reserved(name.to_owned())
@@ -652,6 +655,8 @@ mod tests {
             "__ipe_box_0",
             "__ipe_arm_alias_0",
             "__ipe_li_7",
+            "_ipe_recursion_guard",
+            "_req",
             "__ipe_rec",
             "__ipe_upd_0",
             "__tco_0",
@@ -698,24 +703,30 @@ mod tests {
 
     /// No user local folds into the backend temporary namespace.
     ///
-    /// Every image either does not start with `__` or starts with the escaped
-    /// `__u__`, so it is never `__ipe_…` nor any other backend temporary.
+    /// Every image is the bare wildcard, does not start with `_`, or starts with
+    /// the escaped `__u_`, so it is never `__ipe_…`, `_ipe_recursion_guard`, nor
+    /// any other backend temporary.
     #[test]
     fn local_ident_is_disjoint_from_backend_temporaries() {
         for input in local_ident_inputs() {
             let out = super::local_ident(&input);
             assert!(
-                !out.starts_with("__") || out.starts_with("__u__"),
+                out == "_" || !out.starts_with('_') || out.starts_with("__u_"),
                 "{input:?} folds to {out:?}, inside the backend temporary namespace"
             );
             assert!(
-                !out.starts_with("__ipe_"),
+                !out.starts_with("__ipe_") && out != "_ipe_recursion_guard",
                 "{input:?} folds to the temporary {out:?}"
             );
         }
         assert_eq!(super::local_ident("__ipe_bind_0"), "__u__ipe_bind_0");
         assert_eq!(super::local_ident("count"), "count");
         assert_eq!(super::local_ident("match"), "match_");
-        assert_eq!(super::local_ident("_x"), "_x");
+        assert_eq!(super::local_ident("_x"), "__u_x");
+        assert_eq!(super::local_ident("_"), "_");
+        assert_eq!(
+            super::local_ident("_ipe_recursion_guard"),
+            "__u_ipe_recursion_guard"
+        );
     }
 }

@@ -2709,7 +2709,10 @@ pub fn compile_list_fills(
     let mut v = Vec::with_capacity(list_holes.len());
     for lh in list_holes {
         let xs_code = emit_expr_at(ctx, &lh.xs, indent, child, generics)?;
-        let item_name = format!("__ipe_li_{}", lh.item_sym.as_raw());
+        // The fills read the item through its own symbol, so the binder is the
+        // same local ident a `Var` of that symbol emits; the item is owned,
+        // exactly as the `List.map` lambda param it replaces.
+        let item_name = ctx.emit_local_ident(lh.item_sym)?;
         let mut fills = Vec::with_capacity(lh.item_fills.len());
         for fill_expr in &lh.item_fills {
             fills.push(emit_expr_at(ctx, fill_expr, indent, child, generics)?);
@@ -2720,7 +2723,7 @@ pub fn compile_list_fills(
             format!("vec![{}]", fills.join(", "))
         };
         v.push(format!(
-            "({xs_code}).iter().map(|{item_name}| {fills_vec}).collect::<Vec<_>>()"
+            "({xs_code}).into_iter().map(|{item_name}| {fills_vec}).collect::<Vec<_>>()"
         ));
     }
     Ok(v)

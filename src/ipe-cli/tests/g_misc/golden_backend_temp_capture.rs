@@ -1,11 +1,12 @@
 //! A user local spelled like a backend temporary keeps its own value.
 //!
-//! The backend mints locals such as `__ipe_bind_0` and `__ipe_box_0`, and the
-//! lexer admits a user identifier spelled the same. Every `__`-leading user
-//! local is emitted escaped as `__u__…`, outside the temporary namespace, so
-//! the temporary can no longer shadow it: without the escape `bind-shadow`
-//! prints `5` (a silent miscompile), and `bind-type` and `box-shadow` pass
-//! `ipe` but fail `cargo` (a SEAL break).
+//! The backend mints locals such as `__ipe_bind_0`, `__ipe_box_0` and
+//! `_ipe_recursion_guard`, and the lexer admits a user identifier spelled the
+//! same. Every `_`-leading user local other than the bare `_` is emitted
+//! escaped as `__u_…`, outside the temporary namespace, so the temporary can no
+//! longer shadow it: without the escape `bind-shadow` prints `5` (a silent
+//! miscompile), and `bind-type`, `box-shadow` and `guard-shadow` pass `ipe` but
+//! fail `cargo` (a SEAL break).
 //!
 //! The emit tier pins the escaped spelling in the emitted Rust; behind
 //! `IPE_E2E=1` each project must build and print its line.
@@ -75,4 +76,10 @@ fn a_param_spelled_like_the_tuple_temp_keeps_its_type() {
 fn a_binder_spelled_like_the_box_temp_stays_distinct() {
     assert_emits_escaped("box-shadow", "__u__ipe_box_0");
     assert_runs("box-shadow", "42\n");
+}
+
+#[test]
+fn a_param_spelled_like_the_recursion_guard_keeps_its_value() {
+    assert_emits_escaped("guard-shadow", "__u_ipe_recursion_guard");
+    assert_runs("guard-shadow", "42\n");
 }
