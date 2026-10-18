@@ -1351,8 +1351,7 @@ queueBudgetChecks : Index.UnitView -> List ( String, Bool )
 queueBudgetChecks loaded =
     let
         ids prefix =
-            List.map (
- -> prefix ++ String.fromInt n) (List.range 1 (PageSize.toInt PageSize.queue))
+            List.map (\n -> prefix ++ String.fromInt n) (List.range 1 (PageSize.toInt PageSize.queue))
 
         units =
             List.map (budgetUnit loaded.unit hostileColumn) (ids "u-budget-")
@@ -1364,8 +1363,7 @@ queueBudgetChecks loaded =
             page (budgetModel units refusals)
 
         labelBytes =
-            List.sum (List.map unitLabelBytes units) + List.sum (List.map (
-ow -> Label.byteCount row.path) refusals)
+            List.sum (List.map unitLabelBytes units) + List.sum (List.map (\row -> Label.byteCount row.path) refusals)
 
         twinColumn tail =
             String.repeat Label.windowChars "n" ++ tail
