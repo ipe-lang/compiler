@@ -328,6 +328,48 @@ impl CargoBuild<'_> {
         Ok(stdout)
     }
 
+    /// Remove every compiled unit of `package` from the build directory, ahead of the build.
+    ///
+    /// The crate's lock is established first, exactly as [`Self::run`]
+    /// establishes it, so the clean replays that lock offline and never
+    /// resolves on its own. `cargo clean --package <package> --locked
+    /// --offline` then runs with the build's program, directory and
+    /// environment (its `CARGO_TARGET_DIR` included), held to
+    /// [`LOCK_RESOLVE_LIMITS`].
+    ///
+    /// # Errors
+    /// The lock errors of [`Self::run`]; [`CliError::EmittedBuildFailed`] if
+    /// the clean exits non-zero; [`CliError::LocalLimitExceeded`],
+    /// [`CliError::Io`] or [`CliError::ChildPipeHeld`] from its runner.
+    pub fn clean_package(&self, package: &str) -> Result<(), CliError> {
+        if let CargoCrate::Emitted(dir) = self.krate {
+            dir.verify()?;
+        }
+        let build = self.command();
+        match self.krate.lock_policy() {
+            LockPolicy::ReplayOrResolve(owned) => {
+                let _locked: Locked = establish_lock(&build, owned, self.output.verbosity())?;
+            }
+            LockPolicy::Committed => {}
+        }
+        let dir = self.dir();
+        let mut clean = Command::new(build.get_program());
+        clean
+            .args(["clean", "--package", package, "--locked", "--offline"])
+            .current_dir(dir);
+        forward_build_env(&build, &mut clean);
+        match run_local(clean, LOCK_RESOLVE_LIMITS, LocalSource::CargoClean) {
+            Ok(captured) if captured.status.success() => Ok(()),
+            Ok(captured) => Err(CliError::EmittedBuildFailed {
+                what: "the clean of the previous test runner's build output",
+                code: captured.status.code().unwrap_or(1),
+                stderr: captured.stderr.to_terminal(),
+                runtime: None,
+            }),
+            Err(e) => Err(local_run_error(dir, e)),
+        }
+    }
+
     /// The build's captured stdout, or why the drained build failed.
     ///
     /// A build stopped at its wall outranks every other failure, since its
