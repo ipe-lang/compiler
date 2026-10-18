@@ -480,8 +480,8 @@ errorTextNames =
     [ "Error.toString", "Error.message", "Ipe.Error.toString", "Ipe.Error.message" ]
 
 
--- The renderers that draw a `SafeText`'s parts and a source's tokens, each
--- once per `Html.text` it holds.
+-- The renderers that draw a `SafeText`'s parts, a label's parts and a
+-- source's tokens, each once per `Html.text` it holds.
 sanctionedHtmlText : List String
 sanctionedHtmlText =
     [ "Lib/View.ipe:segmentHtml"
@@ -491,6 +491,9 @@ sanctionedHtmlText =
     , "Lib/View.ipe:codeChildren"
     , "Lib/View.ipe:pieceHtml"
     , "Lib/View.ipe:pieceHtml"
+    , "Lib/View.ipe:labelPartHtml"
+    , "Lib/View.ipe:labelPartHtml"
+    , "Lib/View.ipe:labelPartHtml"
     ]
 
 
@@ -503,9 +506,6 @@ admittedFlattening =
     , "Lib/Index.ipe:probeRepos"
     , "Lib/Index.ipe:rootMismatch"
     , "Lib/Links.ipe:linkKey"
-    , "Lib/Queue.ipe:nameKey"
-    , "Lib/Queue.ipe:nameKey"
-    , "Lib/Queue.ipe:placeKey"
     , "Lib/RepoPath.ipe:reposToError"
     , "Lib/RepoPath.ipe:rootRefusal"
     , "Lib/RepoPath.ipe:toError"
@@ -650,6 +650,9 @@ literalConstants =
 admittedMarkup : List String
 admittedMarkup =
     [ "Lib/View.ipe:codeHtml"
+    , "Lib/View.ipe:labelHtml"
+    , "Lib/View.ipe:labelPartHtml"
+    , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:pieceHtml"

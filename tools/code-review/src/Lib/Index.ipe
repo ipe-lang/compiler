@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -7,7 +7,6 @@ import Ipe.Crypto as Crypto
 import Ipe.Db
 import Ipe.Db.Decode
 import Ipe.Db.Sql as Sql
-import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Error as Error
 import Ipe.File as File
 import Ipe.List as List
@@ -20,6 +19,7 @@ import Ipe.Tuple as Tuple
 import Lib.Drawn as Drawn exposing (DrawnSource, SourceRow(..))
 import Lib.Failure exposing (DecideRefusal(..))
 import Lib.Highlight as Highlight
+import Lib.Label as Label exposing (Label)
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.RepoPath as RepoPath exposing (PathError, Root, RootMap, Tag)
@@ -33,21 +33,22 @@ import Lib.Uid as Uid exposing (Uid)
 -- One ipe-index unit's metadata, never its source: a queue page lists these
 -- without reading a file. Every text column a page shows (`path`, the
 -- `tag:relative` form ipe-index stores; `name`; `qualified`; `kind`;
--- `facing`; `purpose`) is `SafeText`, rendered once here, so no index text
--- can reach a page raw; `lang` is the language ipe-index stores for the
--- unit's file, parsed for highlighting. `attested` is the stored body hash,
+-- `facing`; `purpose`) is a `Label`, read through a bounded window and
+-- parsed once in `withRow`, so no index text reaches a page raw or
+-- unbounded; `lang` is the language ipe-index stores for the unit's file,
+-- parsed for highlighting. `attested` is the stored body hash,
 -- parsed once.
 type alias Unit =
     { uid : Uid
-    , path : SafeText
-    , name : SafeText
-    , qualified : SafeText
-    , kind : SafeText
+    , path : Label
+    , name : Label
+    , qualified : Label
+    , kind : Label
     , lang : Highlight.Lang
     , lineStart : Int
     , lineEnd : Int
-    , facing : SafeText
-    , purpose : Maybe SafeText
+    , facing : Label
+    , purpose : Maybe Label
     , attested : AttestedHash
     , updatedSha : String
     }
@@ -74,7 +75,7 @@ unitByUid roots uid =
         bound =
             boundTags roots
     in
-    ( "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.facing, u.purpose, u.body_hash, u.updated_sha, f.lang FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
+    ( "SELECT u.uid, u.path, u.name, u.qualified, u.kind, u.line_start, u.line_end, u.body_hash, u.updated_sha, f.lang, " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
     , Uid.toSql uid :: bound.params
     )
 
@@ -125,23 +126,23 @@ loadView conn roots uid =
     do
         rows <- queryUnit conn roots uid
         case List.head rows of
-            Just row ->
+            Just ( row, shown ) ->
                 do
                     view <- viewOf conn roots row
                     links <- linksOf conn row view
-                    Task.succeed (Just { unit = withRow row, view = view, links = links })
+                    Task.succeed (Just { unit = withRow (coreOf row) shown, view = view, links = links })
 
             Nothing ->
                 Task.succeed Nothing
 
 
-queryUnit : Db.Db -> RootMap -> Uid -> Task.Task Error (List RowUnit)
+queryUnit : Db.Db -> RootMap -> Uid -> Task.Task Error (List ( RowUnit, RowShown ))
 queryUnit conn roots uid =
     let
         ( sql, params ) =
             unitByUid roots uid
     in
-    Db.queryDecode conn sql params rowDecoder
+    Db.queryDecode conn sql params (Db.Decode.map2 (\row shown -> ( row, shown )) rowDecoder shownDecoder)
 
 
 -- Jump links come only from a shown view; a withheld view links nothing and
@@ -249,6 +250,9 @@ qualifiedDecoder =
         |> Db.Decode.required "uid" (Db.Decode.string "uid")
 
 
+-- The unit page's raw columns: the path its file is read from, the names its
+-- links resolve against, its lines, stored hash and language. None of them
+-- is shown; what a page shows of the unit is `RowShown`.
 type alias RowUnit =
     { uid : Uid
     , path : String
@@ -257,15 +261,124 @@ type alias RowUnit =
     , kind : String
     , lineStart : Int
     , lineEnd : Int
-    , facing : String
-    , purpose : Maybe String
     , bodyHash : String
     , updatedSha : String
     , lang : Maybe String
     }
 
 
--- The queue row is decoded in two halves of at most ten columns each
+-- The columns every unit row carries into a `Unit` besides its labels.
+type alias RowCore =
+    { uid : Uid
+    , lineStart : Int
+    , lineEnd : Int
+    , bodyHash : String
+    , updatedSha : String
+    , lang : Maybe String
+    }
+
+
+-- The display columns of a unit row, each read as a bounded window and its
+-- byte length (`shownColumn`), so no read returns an unbounded value.
+type alias RowShown =
+    { path : Label.Column
+    , name : Label.Column
+    , qualified : Label.Column
+    , kind : Label.Column
+    , facing : Label.Column
+    , purpose : Maybe Label.Column
+    }
+
+
+coreOf : RowUnit -> RowCore
+coreOf row =
+    { uid = row.uid
+    , lineStart = row.lineStart
+    , lineEnd = row.lineEnd
+    , bodyHash = row.bodyHash
+    , updatedSha = row.updatedSha
+    , lang = row.lang
+    }
+
+
+-- The display columns of a unit row `u`, each under its own name with the
+-- `_shown` and `_bytes` suffixes `shownDecoder` reads.
+unitShownNames : List String
+unitShownNames =
+    [ "path", "name", "qualified", "kind", "facing", "purpose" ]
+
+
+unitShownColumns : String
+unitShownColumns =
+    String.join ", " (List.map (\col -> shownColumn ("u." ++ col) col) unitShownNames)
+
+
+-- A display column read for a label: its first `Label.windowChars`
+-- characters and the byte length of the whole value, so the database
+-- returns a bounded window whatever the column holds.
+shownColumn : String -> String -> String
+shownColumn source alias =
+    "substr(" ++ source ++ ", 1, " ++ String.fromInt Label.windowChars ++ ") AS " ++ alias ++ "_shown, length(CAST(" ++ source ++ " AS BLOB)) AS " ++ alias ++ "_bytes"
+
+
+-- The names `shownColumn` gives the display columns, for a query that
+-- selects them from a subquery.
+unitShownSelect : String
+unitShownSelect =
+    String.join ", " (List.concatMap (\col -> [ col ++ "_shown", col ++ "_bytes" ]) unitShownNames)
+
+
+columnDecoder : String -> Db.Decode.Decoder Label.Column
+columnDecoder col =
+    Db.Decode.succeed (\shown bytes -> { shown = shown, bytes = bytes })
+        |> Db.Decode.required (col ++ "_shown") (Db.Decode.string (col ++ "_shown"))
+        |> Db.Decode.required (col ++ "_bytes") (Db.Decode.int (col ++ "_bytes"))
+
+
+-- A nullable display column: both halves are NULL together, or the read
+-- fails.
+nullableColumnDecoder : String -> Db.Decode.Decoder (Maybe Label.Column)
+nullableColumnDecoder col =
+    Db.Decode.andThen
+        (\pair ->
+            case pair of
+                ( Just shown, Just bytes ) ->
+                    Db.Decode.succeed (Just { shown = shown, bytes = bytes })
+
+                ( Nothing, Nothing ) ->
+                    Db.Decode.succeed Nothing
+
+                _ ->
+                    Db.Decode.fail (col ++ " is NULL in only one of its window and its length")
+        )
+        (Db.Decode.succeed (\shown bytes -> ( shown, bytes ))
+            |> Db.Decode.required (col ++ "_shown") (Db.Decode.nullable (Db.Decode.string (col ++ "_shown")))
+            |> Db.Decode.required (col ++ "_bytes") (Db.Decode.nullable (Db.Decode.int (col ++ "_bytes")))
+        )
+
+
+shownDecoder : Db.Decode.Decoder RowShown
+shownDecoder =
+    Db.Decode.map2
+        (\( path, name, qualified ) ( kind, facing, purpose ) ->
+            { path = path, name = name, qualified = qualified, kind = kind, facing = facing, purpose = purpose }
+        )
+        (Db.Decode.map3 (\p n q -> ( p, n, q )) (columnDecoder "path") (columnDecoder "name") (columnDecoder "qualified"))
+        (Db.Decode.map3 (\k f p -> ( k, f, p )) (columnDecoder "kind") (columnDecoder "facing") (nullableColumnDecoder "purpose"))
+
+
+coreDecoder : Db.Decode.Decoder RowCore
+coreDecoder =
+    Db.Decode.succeed (\uid lineStart lineEnd bodyHash updatedSha lang -> { uid = uid, lineStart = lineStart, lineEnd = lineEnd, bodyHash = bodyHash, updatedSha = updatedSha, lang = lang })
+        |> Db.Decode.required "uid" (Uid.decoder "uid")
+        |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
+        |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
+        |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
+        |> Db.Decode.required "updated_sha" (Db.Decode.string "updated_sha")
+        |> Db.Decode.required "lang" (Db.Decode.nullable (Db.Decode.string "lang"))
+
+
+-- The unit row is decoded in two halves of at most ten columns each
 -- (`Db.Decode.succeed` lifts at most 10 parameters — IPE-L0121), then merged.
 type alias RowA =
     { uid : Uid
@@ -279,8 +392,6 @@ type alias RowB =
     { kind : String
     , lineStart : Int
     , lineEnd : Int
-    , facing : String
-    , purpose : Maybe String
     , bodyHash : String
     , updatedSha : String
     , lang : Maybe String
@@ -296,13 +407,11 @@ makeRowA uid path name qualified =
     }
 
 
-makeRowB : String -> Int -> Int -> String -> Maybe String -> String -> String -> Maybe String -> RowB
-makeRowB kind lineStart lineEnd facing purpose bodyHash updatedSha lang =
+makeRowB : String -> Int -> Int -> String -> String -> Maybe String -> RowB
+makeRowB kind lineStart lineEnd bodyHash updatedSha lang =
     { kind = kind
     , lineStart = lineStart
     , lineEnd = lineEnd
-    , facing = facing
-    , purpose = purpose
     , bodyHash = bodyHash
     , updatedSha = updatedSha
     , lang = lang
@@ -318,8 +427,6 @@ mergeRows a b =
     , kind = b.kind
     , lineStart = b.lineStart
     , lineEnd = b.lineEnd
-    , facing = b.facing
-    , purpose = b.purpose
     , bodyHash = b.bodyHash
     , updatedSha = b.updatedSha
     , lang = b.lang
@@ -348,8 +455,6 @@ partBDecoder =
         |> Db.Decode.required "kind" (Db.Decode.string "kind")
         |> Db.Decode.required "line_start" (Db.Decode.int "line_start")
         |> Db.Decode.required "line_end" (Db.Decode.int "line_end")
-        |> Db.Decode.required "facing" (Db.Decode.string "facing")
-        |> Db.Decode.required "purpose" (Db.Decode.nullable (Db.Decode.string "purpose"))
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
         |> Db.Decode.required "updated_sha" (Db.Decode.string "updated_sha")
         |> Db.Decode.required "lang" (Db.Decode.nullable (Db.Decode.string "lang"))
@@ -774,7 +879,7 @@ changeOf change old =
 -- one this reviewer does not know.
 openColumns : BoundTags -> String
 openColumns bound =
-    "SELECT uid, path, name, qualified, kind, line_start, line_end, facing, purpose, body_hash, updated_sha, lang, change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.path AS path, u.name AS name, u.qualified AS qualified, u.kind AS kind, u.line_start AS line_start, u.line_end AS line_end, u.facing AS facing, u.purpose AS purpose, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
+    "SELECT uid, line_start, line_end, body_hash, updated_sha, lang, " ++ unitShownSelect ++ ", change, old_hash, enqueued_at FROM (SELECT u.uid AS uid, u.line_start AS line_start, u.line_end AS line_end, u.body_hash AS body_hash, u.updated_sha AS updated_sha, f.lang AS lang, " ++ unitShownColumns ++ ", q.change AS change, q.old_hash AS old_hash, COALESCE(q.enqueued_at, 0) AS enqueued_at FROM units u LEFT JOIN files f ON f.path = u.path LEFT JOIN change_queue q ON q.uid = u.uid AND q.new_hash = u.body_hash AND q.change IS NOT 'deleted' WHERE" ++ openMembership ++ " AND" ++ bound.sql ++ ")"
 
 
 -- The membership condition on a unit row `u`: no pair of the `reviewed`
@@ -803,11 +908,13 @@ pendingPageQuery bound size cursor =
             )
 
 
-pendingRowDecoder : Db.Decode.Decoder ( RowUnit, Change, Int )
+pendingRowDecoder : Db.Decode.Decoder PendingRow
 pendingRowDecoder =
-    Db.Decode.andThen
-        (\row -> Db.Decode.map (\( change, at ) -> ( row, change, at )) openColumnsDecoder)
-        rowDecoder
+    Db.Decode.map3
+        (\core shown ( change, at ) -> { unit = withRow core shown, change = change, enqueuedAt = at })
+        coreDecoder
+        shownDecoder
+        openColumnsDecoder
 
 
 openColumnsDecoder : Db.Decode.Decoder ( Change, Int )
@@ -831,7 +938,6 @@ loadPendingPage conn bound size cursor =
             pendingPageQuery bound size cursor
     in
     Db.queryDecode conn sql params pendingRowDecoder
-        |> Task.map (List.map (\( row, change, at ) -> { unit = withRow row, change = change, enqueuedAt = at }))
 
 
 countDecoder : Db.Decode.Decoder Int
@@ -1086,12 +1192,13 @@ refusalDigestText digest =
 
 
 -- One file the index could not review, as a queue page lists it. `path` is
--- the index's escaped `tag:relative` form, rendered once; `digest` is
+-- the index's escaped `tag:relative` form, read through a bounded window and
+-- parsed once into a `Label`; `digest` is
 -- Nothing exactly for a blocking reason, so a row no decision can bind has
 -- no hash to bind it to. No file byte is ever part of it.
 type alias RefusalRow =
     { uid : Uid
-    , path : SafeText
+    , path : Label
     , lang : String
     , reason : RefusalReason
     , size : Maybe Int
@@ -1103,7 +1210,7 @@ type alias RefusalRow =
 -- parsed.
 type alias RawRefusal =
     { uid : Uid
-    , path : String
+    , path : Label.Column
     , lang : String
     , reason : String
     , size : Maybe Int
@@ -1111,7 +1218,7 @@ type alias RawRefusal =
     }
 
 
-makeRawRefusal : Uid -> String -> String -> String -> Maybe Int -> Maybe String -> RawRefusal
+makeRawRefusal : Uid -> Label.Column -> String -> String -> Maybe Int -> Maybe String -> RawRefusal
 makeRawRefusal uid path lang reason size digest =
     { uid = uid
     , path = path
@@ -1126,7 +1233,7 @@ rawRefusalDecoder : Db.Decode.Decoder RawRefusal
 rawRefusalDecoder =
     Db.Decode.succeed makeRawRefusal
         |> Db.Decode.required "uid" (Uid.decoder "uid")
-        |> Db.Decode.required "path" (Db.Decode.string "path")
+        |> Db.Decode.required "path" (columnDecoder "path")
         |> Db.Decode.required "lang" (Db.Decode.string "lang")
         |> Db.Decode.required "reason" (Db.Decode.string "reason")
         |> Db.Decode.required "size" (Db.Decode.nullable (Db.Decode.int "size"))
@@ -1161,7 +1268,7 @@ refusalRowOf raw =
                     else
                         Db.Decode.succeed
                             { uid = raw.uid
-                            , path = SafeText.renderForeign raw.path
+                            , path = Label.parse Label.labelCap raw.path
                             , lang = raw.lang
                             , reason = reason
                             , size = raw.size
@@ -1222,9 +1329,23 @@ negativeSize size =
             False
 
 
+-- A refusal row as a page reads it: its path as a bounded window and its
+-- byte length (`shownColumn`), never the whole stored value.
 refusalColumns : String
 refusalColumns =
-    "SELECT u.uid AS uid, u.path AS path, u.lang AS lang, u.reason AS reason, u.size AS size, u.digest AS digest FROM refusals u WHERE"
+    "SELECT " ++ refusalColumnList ++ " FROM refusals u WHERE"
+
+
+refusalColumnList : String
+refusalColumnList =
+    "u.uid AS uid, " ++ shownColumn "u.path" "path" ++ ", u.lang AS lang, u.reason AS reason, u.size AS size, u.digest AS digest"
+
+
+-- A refusal row with its whole stored path besides, for the one read that
+-- resolves the path to the file: a decision's re-check of a single row.
+refusalWithPathColumns : String
+refusalWithPathColumns =
+    "SELECT u.path AS path, " ++ refusalColumnList ++ " FROM refusals u WHERE"
 
 
 -- The membership condition on a refusal row `u`: no pair of the `reviewed`
@@ -1912,48 +2033,29 @@ rebuildReviewed settings refill =
             )
 
 
--- The ipe-index `units` table modelled as a typed store over its explicit
--- columns, so a lookup runs through `Store.findBy` with a bound value rather
--- than a hand-written `WHERE` fragment. The store is read-only here — only
--- queried, never migrated — so its column set need only cover the columns a
--- query reads.
-unitsStore : Result Error (Store Store.Row)
-unitsStore =
-    Store.fromColumns "units"
-        [ Store.textColumn "uid"
-        , Store.textColumn "qualified"
-        ]
-        |> Result.map Store.public
-
-
--- The unit's qualified name from the units table, rendered for display, if
--- the unit still exists, or else the escaped path of the unreviewable file
--- the uid names (a decided unit whose source was deleted leaves a review
--- row but no name). The `uid` value is always a bound parameter, never
--- interpolated into SQL text.
-nameFor : Db.Db -> Uid -> Task.Task Error (Maybe SafeText)
+-- The unit's qualified name from the units table, read through a bounded
+-- window and parsed into a `Label`, if the unit still exists, or else the
+-- label of the path of the unreviewable file the uid names (a decided unit
+-- whose source was deleted leaves a review row but no name). The `uid` value
+-- is always a bound parameter, never interpolated into SQL text.
+nameFor : Db.Db -> Uid -> Task.Task Error (Maybe Label)
 nameFor conn uid =
-    case unitsStore of
-        Err e ->
-            Task.fail e
+    do
+        rows <- Db.queryDecode conn ("SELECT " ++ shownColumn "qualified" "qualified" ++ " FROM units WHERE uid = ? COLLATE BINARY LIMIT 1") [ Uid.toSql uid ] (nullableColumnDecoder "qualified")
+        case List.head rows of
+            Just qualified ->
+                Task.succeed (Maybe.map (Label.parse Label.labelCap) qualified)
 
-        Ok store ->
-            do
-                rows <- Store.findBy conn store "uid" (Uid.toSql uid)
-                case List.head rows of
-                    Just row ->
-                        Task.succeed (Maybe.map SafeText.renderForeign (Result.toMaybe (Store.readText "qualified" row)))
-
-                    Nothing ->
-                        refusalPathFor conn uid
+            Nothing ->
+                refusalPathFor conn uid
 
 
--- An unreviewable file's escaped path, the label of a decision on its
+-- The label of an unreviewable file's path, the name of a decision on its
 -- refusal row while the index holds the row.
-refusalPathFor : Db.Db -> Uid -> Task.Task Error (Maybe SafeText)
+refusalPathFor : Db.Db -> Uid -> Task.Task Error (Maybe Label)
 refusalPathFor conn uid =
-    Db.queryDecode conn "SELECT path FROM refusals WHERE uid = ? COLLATE BINARY LIMIT 1" [ Uid.toSql uid ] storedPathDecoder
-        |> Task.map (\rows -> Maybe.map SafeText.renderForeign (List.head rows))
+    Db.queryDecode conn ("SELECT " ++ shownColumn "path" "path" ++ " FROM refusals WHERE uid = ? COLLATE BINARY LIMIT 1") [ Uid.toSql uid ] (columnDecoder "path")
+        |> Task.map (\rows -> Maybe.map (Label.parse Label.labelCap) (List.head rows))
 
 
 -- The one verification of a unit's source. The stored hash is parsed first,
@@ -2219,6 +2321,91 @@ viewNodeCeiling =
     4096
 
 
+-- The most elements a queue page draws besides the selected unit's source:
+-- each rail row's chrome and its three labels, each unreviewable file's card
+-- and its path, the page's own chrome with the selected card's links, and
+-- the selected card's labels. A label draws at most `labelElements`. These
+-- elements at `elementResidentBytes` each, plus the labels' bytes in the model
+-- and again in the tree, fit the quarter of `runtimeSessionCeiling` the unit
+-- view leaves; a test checks the relation and measures a page of hostile
+-- labels against the count.
+queueElementCeiling : Int
+queueElementCeiling =
+    let
+        rows =
+            PageSize.toInt PageSize.queue
+    in
+    rows
+        * (railRowChrome + railLabels * labelElements)
+        + rows
+        * (refusalRowChrome + labelElements)
+        + queuePageChrome
+        + cardLabels
+        * labelElements
+
+
+-- The most bytes the labels of one queue page hold: each unit's five labels
+-- and its purpose, and each unreviewable file's path, at their caps with a
+-- marker.
+queueLabelByteCeiling : Int
+queueLabelByteCeiling =
+    let
+        rows =
+            PageSize.toInt PageSize.queue
+
+        label =
+            Label.capBytes Label.labelCap + Label.markerByteCeiling
+
+        purpose =
+            Label.capBytes Label.purposeCap + Label.markerByteCeiling
+    in
+    rows * (5 * label + purpose) + rows * label
+
+
+-- One drawn label: its wrapping span and at most `Label.elementCeiling`
+-- elements inside it.
+labelElements : Int
+labelElements =
+    1 + Label.elementCeiling
+
+
+-- A rail row's elements besides its labels: the button, its row, the label
+-- row, the three label boxes and the two badges, with room to spare.
+railRowChrome : Int
+railRowChrome =
+    12
+
+
+-- The labels a rail row draws: kind, name and place.
+railLabels : Int
+railLabels =
+    3
+
+
+-- An unreviewable file's card besides its path: the card, its two rows, the
+-- heading, the reason chip, the spacer, the decision controls, the size and
+-- the digest, with room to spare.
+refusalRowChrome : Int
+refusalRowChrome =
+    20
+
+
+-- A queue page's elements outside its rows and the selected card's labels:
+-- the header and navigation, the progress, banner and hint lines, the
+-- selected card's chrome and open refusal panel, and two per link the card
+-- can show.
+queuePageChrome : Int
+queuePageChrome =
+    200 + 2 * Links.linkCeiling
+
+
+-- The labels the selected card draws: kind, name and place in its heading,
+-- its facing, its path and its purpose.
+cardLabels : Int
+cardLabels =
+    6
+
+
 -- The runtime's per-session memory ceiling, mirrored from `SESSION_CEILING`
 -- in `src/runtime/rust/src/web/budget.rs`; a test reads that line and fails
 -- when the two differ.
@@ -2265,20 +2452,20 @@ sourceCeiling =
     ByteSize.mib 16
 
 
--- The single decode point from a raw row: the stored hash and language are
--- parsed here, and every displayed text column is rendered into `SafeText`.
-withRow : RowUnit -> Unit
-withRow row =
+-- The single decode point from a unit row: the stored hash and language are
+-- parsed here, and every displayed column is parsed into a bounded `Label`.
+withRow : RowCore -> RowShown -> Unit
+withRow row shown =
     { uid = row.uid
-    , path = SafeText.renderForeign row.path
-    , name = SafeText.renderForeign row.name
-    , qualified = SafeText.renderForeign row.qualified
-    , kind = SafeText.renderForeign row.kind
+    , path = Label.parse Label.labelCap shown.path
+    , name = Label.parse Label.labelCap shown.name
+    , qualified = Label.parse Label.labelCap shown.qualified
+    , kind = Label.parse Label.labelCap shown.kind
     , lang = langOf row.lang
     , lineStart = row.lineStart
     , lineEnd = row.lineEnd
-    , facing = SafeText.renderForeign row.facing
-    , purpose = Maybe.map SafeText.renderForeign row.purpose
+    , facing = Label.parse Label.labelCap shown.facing
+    , purpose = Maybe.map (Label.parse Label.purposeCap) shown.purpose
     , attested = parseAttested row.bodyHash
     , updatedSha = row.updatedSha
     }
@@ -2460,7 +2647,7 @@ reverify settings shown =
                 conn <- readConnection settings
                 rows <- queryUnit conn settings.roots s.uid
                 case List.head rows of
-                    Just row ->
+                    Just ( row, _ ) ->
                         viewOf conn settings.roots row
                             |> Task.map (confirmShown s.uid s.hash)
 
@@ -2509,7 +2696,7 @@ reverifyRefusal settings uid digest =
     in
     do
         conn <- readConnection settings
-        rows <- Db.queryDecode conn (refusalColumns ++ " u.uid = ? AND" ++ bound.sql ++ " LIMIT 1") ([ Uid.toSql uid ] ++ bound.params) refusalWithPathDecoder
+        rows <- Db.queryDecode conn (refusalWithPathColumns ++ " u.uid = ? AND" ++ bound.sql ++ " LIMIT 1") ([ Uid.toSql uid ] ++ bound.params) refusalWithPathDecoder
         case List.head rows of
             Just ( row, stored ) ->
                 confirmRefusal settings.roots digest row stored
@@ -2521,9 +2708,7 @@ reverifyRefusal settings uid digest =
 -- A refusal row with its stored path, the one form `RepoPath.resolve` reads.
 refusalWithPathDecoder : Db.Decode.Decoder ( RefusalRow, String )
 refusalWithPathDecoder =
-    Db.Decode.andThen
-        (\raw -> Db.Decode.map (\row -> ( row, raw.path )) (refusalRowOf raw))
-        rawRefusalDecoder
+    Db.Decode.map2 (\row stored -> ( row, stored )) refusalRowDecoder (Db.Decode.string "path")
 
 
 confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> String -> Task.Task Error (Result DecideRefusal Attested)

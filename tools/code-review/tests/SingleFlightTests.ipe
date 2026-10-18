@@ -20,7 +20,7 @@ import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid exposing (Uid)
 import Lib.View as View
-import TestSupport exposing (check, checkReporting, cleanupIndex, decideNow, envAppSettings, freshScratch, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid)
+import TestSupport exposing (check, checkReporting, cleanupIndex, decideNow, envAppSettings, freshScratch, loadUnitNow, migratedReviewAt, refusalOf, removeFileIfAny, seedIndex, testMacKey, uid, labelOf, labelText)
 
 
 -- Every check drives the app's own `App.update`, the dispatch `src/Main.ipe`
@@ -524,7 +524,7 @@ busyRendered settings a b =
             page shown
 
         aName =
-            SafeText.toString a.unit.qualified
+            labelText a.unit.qualified
 
         waiting =
             page { shown | page = unitAt b.unit.uid }
@@ -1026,7 +1026,7 @@ decisionRefusedBeforeReading =
 blockingRow : Index.RefusalRow
 blockingRow =
     { uid = uid "r-blocking"
-    , path = SafeText.literal "ipe:src/unreadable.txt"
+    , path = labelOf "ipe:src/unreadable.txt"
     , lang = "other"
     , reason = UnreadableEntry
     , size = Nothing

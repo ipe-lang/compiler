@@ -66,6 +66,8 @@ module TestSupport exposing
     , noHazard
     , rendered
     , renderedForeign
+    , labelOf
+    , labelText
     , describeText
     , refusedFor
     , migratedReviewAt
@@ -138,6 +140,7 @@ import Lib.Failure as Failure exposing (DecideRefusal(..), RefuseFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
@@ -1222,21 +1225,21 @@ isUnitA entry =
     u.uid
         == uid "u-a"
         && isNew entry.change
-        && SafeText.toString u.path
+        && labelText u.path
         == "ipe:src/Lib.rs"
-        && SafeText.toString u.name
+        && labelText u.name
         == "answer"
-        && SafeText.toString u.qualified
+        && labelText u.qualified
         == "Lib.answer"
-        && SafeText.toString u.kind
+        && labelText u.kind
         == "fn"
         && u.lineStart
         == 3
         && u.lineEnd
         == 6
-        && SafeText.toString u.facing
+        && labelText u.facing
         == "internal"
-        && Maybe.map SafeText.toString u.purpose
+        && Maybe.map labelText u.purpose
         == Just "purpose-A"
         && Index.storedHash u.attested
         == Index.attest viewA
@@ -1256,13 +1259,13 @@ isUnitB entry =
         == uid "u-b"
         && modifiedFrom entry.change
         == Just "oldB"
-        && SafeText.toString u.path
+        && labelText u.path
         == "ipe:src/Main.ipe"
-        && SafeText.toString u.kind
+        && labelText u.kind
         == "module"
-        && SafeText.toString u.facing
+        && labelText u.facing
         == "user"
-        && Maybe.map SafeText.toString u.purpose
+        && Maybe.map labelText u.purpose
         == Nothing
         && shownTextOf entry.view
         == Just viewB
@@ -1307,6 +1310,31 @@ rendered raw =
 renderedForeign : String -> String
 renderedForeign raw =
     SafeText.toString (SafeText.renderForeign raw)
+
+
+-- Text the app holds whole, parsed as an index column of a unit's label.
+labelOf : String -> Label
+labelOf raw =
+    Label.fromText Label.labelCap raw
+
+
+-- A label's parts joined as the page draws them, its marker included.
+labelText : Label -> String
+labelText shown =
+    String.concat (List.map labelPartText (Label.parts shown))
+
+
+labelPartText : LabelPart -> String
+labelPartText part =
+    case part of
+        LabelText s ->
+            s
+
+        LabelEscapes s ->
+            s
+
+        LabelCut dropped hash ->
+            Label.markerText dropped hash
 
 
 describeText : PathError -> String

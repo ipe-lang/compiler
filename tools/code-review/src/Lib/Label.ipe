@@ -1,0 +1,359 @@
+module Lib.Label exposing (Cap, Column, Label, LabelPart(..), byteCount, capBytes, elementCeiling, fromText, key, labelCap, markerByteCeiling, markerText, parse, parts, purposeCap, runCeiling, windowChars)
+
+-- A display column of the index, parsed once into a bounded label: at most
+-- `capBytes cap` bytes of shown text (escape spellings counted at their
+-- spelled length), at most `runCeiling` escape runs, and a tool-written
+-- marker `… (+N bytes, #hash)` when the column held more. A label therefore
+-- draws at most `elementCeiling` elements and holds at most
+-- `capBytes cap + markerByteCeiling` bytes, whatever the column held.
+--
+-- The index read returns a bounded window of the column (`windowChars`
+-- characters) and the column's full byte length, so no read pulls an
+-- unbounded value into the app. The marker's hash is over that window and
+-- that length, so two long columns that differ anywhere in the window or in
+-- length read differently. Not guaranteed: two columns with the same first
+-- `windowChars` characters and the same byte length share a marker; the queue
+-- tells such units apart by their uid.
+--
+-- Hazard characters are escaped as `SafeText.renderForeign` escapes them;
+-- adjacent escapes coalesce into one `LabelEscapes` run, so a run of hostile
+-- characters draws one element, not one per character.
+
+import Ipe.Char as Char
+import Ipe.Crypto as Crypto
+import Ipe.List as List
+import Ipe.String as String
+import Lib.SafeText as SafeText
+
+
+type Label
+    = Label { parts : List LabelPart, bytes : Int }
+
+
+-- One drawn piece of a label: text shown as it arrived, a run of escape
+-- spellings the tool wrote, or the truncation marker with the bytes it
+-- dropped and the column's short hash.
+type LabelPart
+    = LabelText String
+    | LabelEscapes String
+    | LabelCut Int String
+
+
+-- The most bytes of shown text a label of this kind keeps.
+type Cap
+    = Cap Int
+
+
+-- What the index read returns for one display column: its first
+-- `windowChars` characters and the byte length of the whole column.
+type alias Column =
+    { shown : String, bytes : Int }
+
+
+-- A unit's kind, name, qualified name, path and facing, and an unreviewable
+-- file's path.
+labelCap : Cap
+labelCap =
+    Cap 256
+
+
+-- A unit's purpose line.
+purposeCap : Cap
+purposeCap =
+    Cap 512
+
+
+capBytes : Cap -> Int
+capBytes cap =
+    case cap of
+        Cap n ->
+            n
+
+
+-- The characters of a column the index read returns. Every character is at
+-- least one byte, so the window is never shorter than any cap.
+windowChars : Int
+windowChars =
+    4096
+
+
+-- The most escape runs one label shows; the run past it ends the label.
+runCeiling : Int
+runCeiling =
+    3
+
+
+-- The most elements one label draws: one per escape run and one for the
+-- marker. Shown text is a text node, not an element.
+elementCeiling : Int
+elementCeiling =
+    runCeiling + 1
+
+
+-- The most bytes a marker takes: `… (+`, at most 19 digits, ` bytes, #`,
+-- eight hex digits and `)`.
+markerByteCeiling : Int
+markerByteCeiling =
+    48
+
+
+-- The marker a truncated label ends with.
+markerText : Int -> String -> String
+markerText dropped hash =
+    "… (+" ++ String.fromInt dropped ++ " bytes, #" ++ hash ++ ")"
+
+
+parts : Label -> List LabelPart
+parts label =
+    case label of
+        Label l ->
+            l.parts
+
+
+-- The bytes the label shows: its text, its escape spellings and its marker.
+byteCount : Label -> Int
+byteCount label =
+    case label of
+        Label l ->
+            l.bytes
+
+
+-- An injective flat form of the label for dedup and grouping keys: each part
+-- tagged and length-prefixed, so no two part lists share a key.
+key : Label -> String
+key label =
+    String.concat (List.map partKey (parts label))
+
+
+partKey : LabelPart -> String
+partKey part =
+    case part of
+        LabelText s ->
+            "t" ++ String.fromInt (String.length s) ++ ":" ++ s
+
+        LabelEscapes s ->
+            "e" ++ String.fromInt (String.length s) ++ ":" ++ s
+
+        LabelCut dropped hash ->
+            "c" ++ String.fromInt dropped ++ ":" ++ String.fromInt (String.length hash) ++ ":" ++ hash
+
+
+-- Text the app holds whole (a test's fixture, a value already in memory)
+-- parsed exactly as the index read of the same column would be.
+fromText : Cap -> String -> Label
+fromText cap raw =
+    parse cap { shown = String.left windowChars raw, bytes = textBytes raw }
+
+
+-- The one constructor of a label from a column. Total: every column parses.
+-- One left-to-right pass over the window; once the cap or the run ceiling
+-- stops it, the rest of the window is skipped.
+parse : Cap -> Column -> Label
+parse cap column =
+    let
+        window =
+            String.left windowChars column.shown
+
+        scanned =
+            String.foldl (scanChar (capBytes cap)) startScan window
+
+        kept =
+            flushOpen scanned.open scanned.done
+
+        dropped =
+            max 0 (column.bytes - scanned.raw)
+    in
+    if scanned.stopped || dropped > 0 then
+        let
+            hash =
+                columnHash column.bytes window
+        in
+        Label
+            { parts = List.reverse (LabelCut dropped hash :: kept)
+            , bytes = scanned.spent + textBytes (markerText dropped hash)
+            }
+
+    else
+        Label { parts = List.reverse kept, bytes = scanned.spent }
+
+
+-- The first eight hex digits of the SHA-256 of the column's byte length and
+-- window.
+columnHash : Int -> String -> String
+columnHash bytes window =
+    String.left 8 (Crypto.sha256 (String.fromInt bytes ++ ":" ++ window))
+
+
+-- The part a scan is still filling: none, shown text or an escape run.
+type Open
+    = NoOpen
+    | OpenText String
+    | OpenEscapes String
+
+
+-- A scan's state: the shown bytes spent against the cap, the raw column
+-- bytes kept, the escape runs opened, the open part, the finished parts
+-- (newest first) and whether the scan has stopped.
+type alias Scan =
+    { spent : Int, raw : Int, runs : Int, open : Open, done : List LabelPart, stopped : Bool }
+
+
+startScan : Scan
+startScan =
+    { spent = 0, raw = 0, runs = 0, open = NoOpen, done = [], stopped = False }
+
+
+scanChar : Int -> Char -> Scan -> Scan
+scanChar cap c scan =
+    if scan.stopped then
+        scan
+
+    else if SafeText.isHazard c then
+        let
+            spelling =
+                SafeText.escapeSpelling c
+
+            opensRun =
+                case scan.open of
+                    OpenEscapes _ ->
+                        False
+
+                    NoOpen ->
+                        True
+
+                    OpenText _ ->
+                        True
+
+            runs =
+                if opensRun then
+                    scan.runs + 1
+
+                else
+                    scan.runs
+
+            spent =
+                scan.spent + textBytes spelling
+        in
+        if runs > runCeiling || spent > cap then
+            { scan | stopped = True }
+
+        else
+            { scan
+                | spent = spent
+                , raw = scan.raw + charBytes c
+                , runs = runs
+                , open = appendEscape spelling scan.open
+                , done = closeText scan.open scan.done
+            }
+
+    else
+        let
+            width =
+                charBytes c
+
+            spent =
+                scan.spent + width
+        in
+        if spent > cap then
+            { scan | stopped = True }
+
+        else
+            { scan
+                | spent = spent
+                , raw = scan.raw + width
+                , open = appendText c scan.open
+                , done = closeEscapes scan.open scan.done
+            }
+
+
+appendEscape : String -> Open -> Open
+appendEscape spelling open =
+    case open of
+        OpenEscapes run ->
+            OpenEscapes (String.append run spelling)
+
+        NoOpen ->
+            OpenEscapes spelling
+
+        OpenText _ ->
+            OpenEscapes spelling
+
+
+appendText : Char -> Open -> Open
+appendText c open =
+    case open of
+        OpenText text ->
+            OpenText (String.append text (String.fromChar c))
+
+        NoOpen ->
+            OpenText (String.fromChar c)
+
+        OpenEscapes _ ->
+            OpenText (String.fromChar c)
+
+
+-- `done` with the open text finished onto it when an escape follows it.
+closeText : Open -> List LabelPart -> List LabelPart
+closeText open done =
+    case open of
+        OpenText text ->
+            LabelText text :: done
+
+        NoOpen ->
+            done
+
+        OpenEscapes _ ->
+            done
+
+
+-- `done` with the open escape run finished onto it when text follows it.
+closeEscapes : Open -> List LabelPart -> List LabelPart
+closeEscapes open done =
+    case open of
+        OpenEscapes run ->
+            LabelEscapes run :: done
+
+        NoOpen ->
+            done
+
+        OpenText _ ->
+            done
+
+
+flushOpen : Open -> List LabelPart -> List LabelPart
+flushOpen open done =
+    case open of
+        OpenText text ->
+            LabelText text :: done
+
+        OpenEscapes run ->
+            LabelEscapes run :: done
+
+        NoOpen ->
+            done
+
+
+-- The UTF-8 bytes of a text.
+textBytes : String -> Int
+textBytes text =
+    String.foldl (\c n -> n + charBytes c) 0 text
+
+
+-- The UTF-8 width of one character.
+charBytes : Char -> Int
+charBytes c =
+    let
+        code =
+            Char.toCode c
+    in
+    if code < 128 then
+        1
+
+    else if code < 2048 then
+        2
+
+    else if code < 65536 then
+        3
+
+    else
+        4

@@ -18,6 +18,7 @@ import Lib.Format as Format
 -- module.
 import Lib.Highlight as Highlight
 import Lib.Index as Index exposing (Oversize(..), RefusalReason(..), SourceView(..), StaleReason(..))
+import Lib.Label as Label exposing (Label)
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
@@ -119,8 +120,8 @@ standingFor unit read =
 -- as much of its location as tells it apart from every other unit on the
 -- same page. Kept as separate typed fields so no two parts can run together.
 type alias UnitLabel =
-    { kind : SafeText
-    , name : SafeText
+    { kind : Label
+    , name : Label
     , place : Place
     }
 
@@ -130,8 +131,8 @@ type alias UnitLabel =
 -- path and line are shared, so the uid, unique on a page, settles it.
 type Place
     = Named
-    | At SafeText Int
-    | AtUnit SafeText Int Uid
+    | At Label Int
+    | AtUnit Label Int Uid
 
 
 -- The one label builder: every label on screen comes from a unit's typed
@@ -182,16 +183,18 @@ shared counts key =
     Maybe.withDefault 0 (Dict.get key counts) > 1
 
 
--- Collision keys over length-prefixed parts, so no two different part lists
--- spell the same key.
+-- Collision keys over length-prefixed parts of the labels as shown, so no
+-- two different part lists spell the same key, and two units whose labels
+-- read alike (two long names cut to the same marker among them) count as
+-- shared and are told apart further.
 nameKey : Index.Unit -> String
 nameKey unit =
-    keyPart (SafeText.toString unit.kind) ++ keyPart (SafeText.toString unit.qualified)
+    keyPart (Label.key unit.kind) ++ keyPart (Label.key unit.qualified)
 
 
 placeKey : Index.Unit -> String
 placeKey unit =
-    nameKey unit ++ keyPart (SafeText.toString unit.path) ++ keyPart (String.fromInt unit.lineStart)
+    nameKey unit ++ keyPart (Label.key unit.path) ++ keyPart (String.fromInt unit.lineStart)
 
 
 keyPart : String -> String
@@ -466,7 +469,7 @@ ticketNumber ticket =
 -- (Nothing when the unit no longer exists there).
 type alias HistoryRow =
     { entry : LibDb.ReviewEntry
-    , name : Maybe SafeText
+    , name : Maybe Label
     }
 
 
