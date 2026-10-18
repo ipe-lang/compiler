@@ -32,7 +32,7 @@ fn draft_query_without_classification_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     // Pin the REASON, not just the failure: a `Draft` read is a type mismatch
     // (Store expected, Draft found) — IPE-T0001. Asserting only `is_err()` would
     // pass on any unrelated build failure, leaving the deny-by-default guarantee

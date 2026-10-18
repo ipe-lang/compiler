@@ -42,7 +42,7 @@ fn app_settings_web_seal_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "a `Web.appWith` carrying a shape-checked settings list must be accepted, got: {built:?}"
@@ -62,7 +62,7 @@ fn hard_coded_db_url_secret_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("Secret")),
         Ok(()),
@@ -87,7 +87,7 @@ fn non_setting_in_settings_list_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("Setting")),
         Ok(()),
@@ -113,7 +113,7 @@ fn bare_int_host_bind_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("HostMode")),
         Ok(()),
@@ -139,7 +139,7 @@ fn bare_int_web_csrf_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("CsrfMode")),
         Ok(()),
@@ -165,7 +165,7 @@ fn auth_max_lifetime_seal_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "`Web.authMaxLifetime` must be accepted (no N0005) and emit a buildable crate, \
@@ -187,7 +187,7 @@ fn auth_slide_window_seal_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "`Web.authSlideWindow` must be accepted (no N0005) and emit a buildable crate, \
@@ -210,7 +210,7 @@ fn auth_revocation_seal_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "`Web.withRevocation Web.revocationStore` must be accepted (no N0005) and emit \
@@ -247,7 +247,7 @@ fn authed_route_revocation_vendored_declares_module() {
         runtime_dep: false,
         ..ipe::BuildOptions::default()
     };
-    let built = ipe::build_with_options(&entry, &out, &runtime, opts);
+    let built = ipe::build_golden_dir(crate::support::golden_dir_of(&entry), &out, &runtime, &opts);
     assert!(
         built.is_ok(),
         "an `authed_route` program must be accepted under the vendored emit model, \
@@ -275,7 +275,7 @@ fn bare_int_log_level_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("LogLevel")),
         Ok(()),
@@ -302,7 +302,7 @@ fn config_binding_threads_into_web_app_and_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "a named `config` binding threaded into a `Web.tea` entry must be accepted \
@@ -324,7 +324,7 @@ fn discarded_config_binding_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_N0043, None),
         Ok(()),
@@ -351,7 +351,7 @@ fn from_env_required_seal_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "`App.fromEnvRequired` must be accepted and emit a buildable crate, got: {built:?}"
@@ -372,7 +372,7 @@ fn console_token_settings_seal_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "`Console.adminToken`/`ingestToken`/`metricsToken` must be accepted and emit \
@@ -394,7 +394,7 @@ fn hard_coded_console_token_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("Secret")),
         Ok(()),
@@ -421,7 +421,7 @@ fn config_binding_beside_inline_appwith_is_rejected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_N0043, None),
         Ok(()),

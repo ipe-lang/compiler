@@ -57,7 +57,7 @@ fn assert_ipec_accepts_without_ipe_row(fixture: &str) {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {fixture}: {:?}",
@@ -89,7 +89,7 @@ fn assert_cargo_builds_and_runs(fixture: &str, expected_stdout: &str) {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {fixture}: {:?}",
