@@ -5,6 +5,7 @@
 //! Comments are compared by text, so a permutation among comments of equal
 //! text is invisible to it.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use ipe_syntax::Module;
@@ -144,19 +145,22 @@ fn owners_kept(
 ) -> Result<(), Refusal> {
     let a = owned(before, input);
     let b = owned(after, output);
-    if a == b {
-        return Ok(());
-    }
-    let owner = a
-        .iter()
-        .zip(&b)
-        .find(|(x, y)| x != y)
-        .map(|(x, y)| x.0.min(y.0))
-        .or_else(|| a.get(b.len()).or_else(|| b.get(a.len())).map(|x| x.0))
-        .unwrap_or(Owner::Header);
-    Err(Refusal::Run {
-        owner,
-        fault: RunFault::OwnerMultiset,
+    first_difference(&a, &b).map_or(Ok(()), |owner| {
+        Err(Refusal::Run {
+            owner,
+            fault: RunFault::OwnerMultiset,
+        })
+    })
+}
+
+/// The owner at the first position where the sorted lists `a` and `b`
+/// differ, or `None` when they are equal.
+fn first_difference(a: &[(Owner, CommentKey<'_>)], b: &[(Owner, CommentKey<'_>)]) -> Option<Owner> {
+    (0..a.len().max(b.len())).find_map(|i| match (a.get(i), b.get(i)) {
+        (Some(x), Some(y)) if x == y => None,
+        (Some(x), Some(y)) => Some(x.0.min(y.0)),
+        (Some(x), None) | (None, Some(x)) => Some(x.0),
+        (None, None) => None,
     })
 }
 
@@ -214,20 +218,18 @@ fn pairs<'a>(layout: &Layout, list: &'a [Comment]) -> Vec<Pair<'a>> {
 /// C3: the run directly above each head stays a suffix of the output's run
 /// there, with the same inner gaps and gap to the head, and a blank line
 /// before it when comments were hoisted above it.
-fn head_runs_kept<'a>(
+fn head_runs_kept(
     before: &Layout,
-    input: &'a [Comment],
+    input: &[Comment],
     after: &Layout,
-    output: &'a [Comment],
+    output: &[Comment],
 ) -> Result<usize, Refusal> {
-    let at = |list: &'a [Comment], head: usize| -> Vec<&'a Comment> {
-        list.iter().filter(|c| c.anchor() == Some(head)).collect()
-    };
+    let (anchored_in, anchored_out) = (by_anchor(input), by_anchor(output));
     let mut count = 0usize;
     for ((owner, head_in), (_, head_out)) in before.heads().zip(after.heads()) {
-        let run_in = at(input, head_in);
-        let run_out = at(output, head_out);
-        if !head_run_kept(&run_in, &run_out) {
+        let run_in = run_at(&anchored_in, head_in);
+        let run_out = run_at(&anchored_out, head_out);
+        if !head_run_kept(run_in, run_out) {
             return Err(Refusal::Run {
                 owner,
                 fault: RunFault::HeadRun,
@@ -238,6 +240,25 @@ fn head_runs_kept<'a>(
         }
     }
     Ok(count)
+}
+
+/// The comments of `list` grouped by anchor, each group in source order.
+///
+/// Built in one pass, so the head-run check costs `O(n log n)` in the comment
+/// count however many heads the module has.
+fn by_anchor(list: &[Comment]) -> BTreeMap<usize, Vec<&Comment>> {
+    let mut runs: BTreeMap<usize, Vec<&Comment>> = BTreeMap::new();
+    for c in list {
+        if let Some(anchor) = c.anchor() {
+            runs.entry(anchor).or_default().push(c);
+        }
+    }
+    runs
+}
+
+/// The run anchored at `head`, empty when no comment is.
+fn run_at<'m, 'a>(runs: &'m BTreeMap<usize, Vec<&'a Comment>>, head: usize) -> &'m [&'a Comment] {
+    runs.get(&head).map_or(&[], Vec::as_slice)
 }
 
 /// Whether `run_out` keeps `run_in` as the run above its head.
