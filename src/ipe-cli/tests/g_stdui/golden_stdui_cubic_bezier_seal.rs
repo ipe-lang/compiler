@@ -53,12 +53,10 @@ fn build_project(slot: &str, source: &str) -> (PathBuf, Result<(), ipe::CliError
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("stdui_cubic_bezier_seal_{slot}"));
     let _ = std::fs::remove_dir_all(&out);
-    let src = out.join("src");
-    std::fs::create_dir_all(&src).expect("mk cubic-bezier seal project dirs");
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).expect("write Main.ipe");
+    std::fs::create_dir_all(&out).expect("create the scratch output dir");
+    let fixture = ipe::RootFixture::main(source).expect("the inline Main project resolves");
     let emit = out.join("emit");
-    let res = ipe::build(&entry, &emit, &runtime());
+    let res = ipe::build_fixture(&fixture, &emit, &runtime()).map(drop);
     (emit, res)
 }
 

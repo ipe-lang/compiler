@@ -43,7 +43,7 @@ fn css_opacity_refinement_emits() {
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = ipe::build(&entry, &out, &rt);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_opacity_refinement: {:?}",
@@ -65,7 +65,7 @@ fn css_opacity_refinement_e2e_output_matches_expected() {
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = ipe::build(&entry, &out, &rt);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_opacity_refinement E2E: {:?}",
