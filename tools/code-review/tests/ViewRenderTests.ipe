@@ -628,7 +628,7 @@ unsafeLinkHasNoHref : Index.UnitView -> String -> Bool
 unsafeLinkHasNoHref loaded url =
     let
         linked =
-            withLinks [ External url ] loaded
+            withLinks [ Lib.Links.external url ] loaded
 
         onPage =
             page (unitPageModel linked)
@@ -656,7 +656,7 @@ safeLinkHasHref : Index.UnitView -> Bool
 safeLinkHasHref loaded =
     let
         linked =
-            withLinks [ External "https://example.com/x" ] loaded
+            withLinks [ Lib.Links.external "https://example.com/x" ] loaded
     in
     has "href=\"https://example.com/x\"" (page (unitPageModel linked))
         && has "href=\"https://example.com/x\"" (page (cardModel linked))

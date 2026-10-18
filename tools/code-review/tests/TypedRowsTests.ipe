@@ -9,6 +9,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Label as Label exposing (LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (UnitPageState(..))
@@ -98,27 +99,33 @@ entryAccepted unit =
 
 
 -- A stored link target that is not a unit id builds no internal link: its
--- name shows as plain text, keyed apart from every internal link, whether it
+-- name shows as its label, keyed apart from every internal link, whether it
 -- came from a callgraph edge or a resolved reference. Red if `Internal` is
 -- built from an unparsed uid.
 badLinkUidRendersText : Bool
 badLinkUidRendersText =
     let
+        name =
+            Label.fromText Label.labelCap "app::x"
+
         edge =
-            Links.internal "app::x" "zz"
+            Links.internal name "zz"
 
         resolved =
             Links.resolveCandidates [ [ "x" ] ] [ ( "x", "../evil" ) ]
     in
     isUnlinked edge
-        && SafeText.toString (Links.label edge)
-        == "app::x"
+        && Links.label edge
+        == name
+        && Label.parts name
+        == [ LabelText "app::x" ]
         && Links.linkKey edge
-        == "t:app::x"
+        == "t:"
+        ++ Label.key name
         && List.all isUnlinked resolved
         && List.length resolved
         == 1
-        && not (isUnlinked (Links.internal "app::y" (Uid.toString (uid "u-y"))))
+        && not (isUnlinked (Links.internal (Label.fromText Label.labelCap "app::y") (Uid.toString (uid "u-y"))))
 
 
 isUnlinked : Link -> Bool

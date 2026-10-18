@@ -25,6 +25,7 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label
 import Lib.Links as Links exposing (Hidden(..), Link(..), Reach(..), Reference(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
@@ -246,7 +247,7 @@ candidateCeiling =
 
 internalLinks : Int -> List Link
 internalLinks n =
-    List.map (\i -> Links.internal ("q" ++ String.fromInt i) (Uid.toString (uid ("u" ++ String.fromInt i)))) (List.range 1 n)
+    List.map (\i -> Links.internal (Label.fromText Label.labelCap ("q" ++ String.fromInt i)) (Uid.toString (uid ("u" ++ String.fromInt i)))) (List.range 1 n)
 
 
 linkCeilingCut : Bool
@@ -293,7 +294,7 @@ firstOccurrence =
             Links.resolveCandidates wanted.lookups [ ( "c", Uid.toString (uid "u-c") ), ( "a", Uid.toString (uid "u-a") ), ( "b", Uid.toString (uid "u-b") ) ]
 
         assembled =
-            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal "a" (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
+            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal (Label.fromText Label.labelCap "a") (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
     in
     wanted.names
         == [ "b", "a", "c" ]

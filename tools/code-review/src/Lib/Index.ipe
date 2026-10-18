@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -186,15 +186,18 @@ linksOf conn row view =
 
 
 -- The callgraph edges ipe-index resolved out of `uid`, one past the link
--- ceiling, so a full read shows that more edges may exist.
-edgeLinks : Db.Db -> Uid -> Task.Task Error (List ( String, String ))
+-- ceiling, so a full read shows that more edges may exist. Each callee's
+-- qualified name is read as a bounded window and parsed into its label
+-- here, and its uid is read one character past a unit id's length, so no
+-- edge column reaches the app unbounded.
+edgeLinks : Db.Db -> Uid -> Task.Task Error (List ( String, Label ))
 edgeLinks conn uid =
     Db.queryDecode conn edgeSql [ Uid.toSql uid, Uid.toSql uid, SqlInt (Links.linkCeiling + 1) ] edgeDecoder
 
 
 edgeSql : String
 edgeSql =
-    "SELECT c.callee_uid, u.qualified FROM callgraph c JOIN units u ON u.uid = c.callee_uid WHERE c.caller_uid = ? AND c.callee_uid != ? ORDER BY u.qualified, u.uid LIMIT ?"
+    "SELECT substr(c.callee_uid, 1, " ++ String.fromInt (Uid.uidLength + 1) ++ ") AS callee_uid, " ++ shownColumn "u.qualified" "qualified" ++ " FROM callgraph c JOIN units u ON u.uid = c.callee_uid WHERE c.caller_uid = ? AND c.callee_uid != ? ORDER BY u.qualified, u.uid LIMIT ?"
 
 
 edgeReach : List a -> Links.Reach
@@ -206,11 +209,12 @@ edgeReach edges =
         Links.Complete
 
 
-edgeDecoder : Db.Decode.Decoder ( String, String )
+edgeDecoder : Db.Decode.Decoder ( String, Label )
 edgeDecoder =
-    Db.Decode.succeed (\callee qualified -> ( callee, qualified ))
-        |> Db.Decode.required "callee_uid" (Db.Decode.string "callee_uid")
-        |> Db.Decode.required "qualified" (Db.Decode.string "qualified")
+    Db.Decode.map2
+        (\callee qualified -> ( callee, Label.parse Label.labelCap qualified ))
+        (Db.Decode.string "callee_uid")
+        (columnDecoder "qualified")
 
 
 -- The `(qualified, uid)` row of each candidate name some unit other than
@@ -229,10 +233,12 @@ candidateRows conn row names =
 -- One statement for every candidate name, on `i_units_qual`: at most one row
 -- per name, the unit in `path` first, then the lowest uid — ipe-index's own
 -- `uid_for_qualified` tie-break. Every name is bound; only placeholders enter
--- the SQL text.
+-- the SQL text. A row's qualified name equals a bound name, and its uid is
+-- read one character past a unit id's length, so no row is longer than what
+-- the page asked for plus a refusable uid.
 candidateQuery : String -> Uid -> List String -> ( String, List SqlValue )
 candidateQuery path uid names =
-    ( "SELECT qualified, uid FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1"
+    ( "SELECT qualified, substr(uid, 1, " ++ String.fromInt (Uid.uidLength + 1) ++ ") AS uid FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1"
     , List.concat [ [ SqlString path ], List.map SqlString names, [ Uid.toSql uid ] ]
     )
 
@@ -2347,7 +2353,7 @@ queueElementCeiling =
 
 -- The most bytes the labels of one queue page hold: each unit's five labels
 -- and its purpose, and each unreviewable file's path, at their caps with a
--- marker.
+-- marker, and every link the selected card shows at `Links.linkByteCeiling`.
 queueLabelByteCeiling : Int
 queueLabelByteCeiling =
     let
@@ -2360,7 +2366,7 @@ queueLabelByteCeiling =
         purpose =
             Label.capBytes Label.purposeCap + Label.markerByteCeiling
     in
-    rows * (5 * label + purpose) + rows * label
+    rows * (5 * label + purpose) + rows * label + Links.linkCeiling * Links.linkByteCeiling
 
 
 -- One drawn label: its wrapping span and at most `Label.elementCeiling`
@@ -2393,11 +2399,23 @@ refusalRowChrome =
 
 -- A queue page's elements outside its rows and the selected card's labels:
 -- the header and navigation, the progress, banner and hint lines, the
--- selected card's chrome and open refusal panel, and two per link the card
--- can show.
+-- selected card's chrome and open refusal panel, and `linkElements` for each
+-- link the card can show.
 queuePageChrome : Int
 queuePageChrome =
-    200 + 2 * Links.linkCeiling
+    200 + Links.linkCeiling * linkElements
+
+
+-- One drawn link: its anchor and the label it wraps, the mark included.
+linkElements : Int
+linkElements =
+    linkAnchor + labelElements
+
+
+-- The elements a link draws around its label.
+linkAnchor : Int
+linkAnchor =
+    1
 
 
 -- The labels the selected card draws: kind, name and place in its heading,

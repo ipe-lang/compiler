@@ -1,4 +1,4 @@
-module Lib.Links exposing (Candidates, Hidden(..), Link(..), LinkSet, Reach(..), Reference(..), UnitName, assemble, candidates, hiddenNote, internal, label, linkCandidateCeiling, linkCeiling, linkKey, noLinks, references, resolveCandidates, sourceUrls)
+module Lib.Links exposing (Candidates, ExternalUrl, Hidden(..), Link(..), LinkSet, Reach(..), Reference(..), UnitName, assemble, candidates, external, hiddenNote, href, hrefByteCeiling, internal, label, linkByteCeiling, linkCandidateCeiling, linkCeiling, linkKey, mark, noLinks, references, resolveCandidates, sourceUrls)
 
 import Ipe.Char as Char
 import Ipe.Dict as Dict
@@ -7,31 +7,77 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.Set as Set
 import Ipe.String as String
 import Lib.Highlight as Highlight exposing (Lang, PathRule, Separator(..), Token(..))
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.Uid as Uid exposing (Uid)
 
 
 -- A link a unit page shows. An internal link jumps to the /unit/<uid> page of
--- its target, labelled with the target's qualified name rendered once into
--- `SafeText`; an external link keeps its raw URL for the `href` check, and
--- `label` renders it. `Unlinked` is a target whose stored uid is not a unit
--- id: its name shows as plain text and no address is built from it.
+-- its target, labelled with the target's qualified name as a bounded
+-- `Label`; an external link is an `ExternalUrl`. `Unlinked` is a target
+-- whose stored uid is not a unit id: its name shows as a label and no
+-- address is built from it. Every name a link shows is a `Label`, so a link
+-- draws at most `Label.elementCeiling` elements of untrusted text and holds
+-- at most `linkByteCeiling` bytes, whatever the index or the source held.
 type Link
-    = Internal SafeText Uid
-    | External String
-    | Unlinked SafeText
+    = Internal Label Uid
+    | External ExternalUrl
+    | Unlinked Label
 
 
--- A link to unit `uid`, labelled with its stored qualified name. The stored
--- uid is parsed here, the one point index link rows enter.
-internal : String -> String -> Link
+-- A URL the shown source spells: its label, and the raw URL for the `href`
+-- check only when it fits `hrefByteCeiling`. Opaque: built only by
+-- `external`, so no href past the ceiling has a representation.
+type ExternalUrl
+    = ExternalUrl { shown : Label, href : Maybe String }
+
+
+-- The most bytes of a URL a link targets. It is the label cap, so a linked
+-- URL always shows whole and a URL the label cuts is shown, never linked.
+hrefByteCeiling : Int
+hrefByteCeiling =
+    Label.capBytes Label.labelCap
+
+
+-- The most bytes one link holds: its mark, its label at the cap with a
+-- marker, and its href.
+linkByteCeiling : Int
+linkByteCeiling =
+    markByteCeiling + Label.capBytes Label.labelCap + Label.markerByteCeiling + hrefByteCeiling
+
+
+-- The bytes of the longest mark a link shows before its label.
+markByteCeiling : Int
+markByteCeiling =
+    4
+
+
+-- A link to unit `uid`, labelled with its qualified name as the index read
+-- parsed it. The stored uid is parsed here, the one point index link rows
+-- enter.
+internal : Label -> String -> Link
 internal qualified uid =
     case Uid.parse uid of
         Ok target ->
-            Internal (SafeText.renderForeign qualified) target
+            Internal qualified target
 
         Err _ ->
-            Unlinked (SafeText.renderForeign qualified)
+            Unlinked qualified
+
+
+-- An external link to `url`, labelled with it; targeted only when it fits
+-- `hrefByteCeiling` and its label shows it whole.
+external : String -> Link
+external url =
+    let
+        shown =
+            Label.fromText Label.labelCap url
+    in
+    if Label.textBytes url <= hrefByteCeiling && not (List.any isCut (Label.parts shown)) then
+        External (ExternalUrl { shown = shown, href = Just url })
+
+    else
+        External (ExternalUrl { shown = shown, href = Nothing })
 
 
 -- How many links a page holds back. `Exactly n` counts links the page read
@@ -680,7 +726,7 @@ firstResolved found alts =
         a :: rest ->
             case Dict.get a found of
                 Just uid ->
-                    Just (internal a uid)
+                    Just (internal (Label.fromText Label.labelCap a) uid)
 
                 Nothing ->
                     firstResolved found rest
@@ -694,7 +740,7 @@ sourceUrls source =
         |> String.words
         |> List.map trimPunct
         |> List.filter isUrl
-        |> List.map External
+        |> List.map external
 
 
 isUrl : String -> Bool
@@ -758,29 +804,73 @@ dedup links =
     firstByKey linkKey links
 
 
--- The text a link shows, never raw: an internal link's rendered name, an
--- external link's URL with every control and bidi character escaped.
-label : Link -> SafeText
+-- The name a link shows, a bounded label: an internal or unlinked target's
+-- qualified name, an external link's URL.
+label : Link -> Label
 label link =
     case link of
         Internal name _ ->
-            SafeText.concat [ SafeText.literal "→ ", name ]
+            name
 
-        External url ->
-            SafeText.concat [ SafeText.literal "↗ ", SafeText.renderForeign url ]
+        External (ExternalUrl url) ->
+            url.shown
 
         Unlinked name ->
             name
 
 
+-- The tool's mark before a link's label: `→` for a unit, `↗` for a URL, none
+-- for a name that links nowhere.
+mark : Link -> Maybe SafeText
+mark link =
+    case link of
+        Internal _ _ ->
+            Just (SafeText.literal "→ ")
+
+        External _ ->
+            Just (SafeText.literal "↗ ")
+
+        Unlinked _ ->
+            Nothing
+
+
+-- The raw URL an external link targets, when it fits `hrefByteCeiling`.
+href : ExternalUrl -> Maybe String
+href url =
+    case url of
+        ExternalUrl u ->
+            u.href
+
+
+-- A link's dedup key: a unit's uid, a targeted URL whole, or the label of
+-- an untargeted URL or an unlinked name, which tells two names apart as far
+-- as their labels do.
 linkKey : Link -> String
 linkKey link =
     case link of
         Internal _ uid ->
             "i:" ++ Uid.toString uid
 
-        External url ->
-            "e:" ++ url
+        External (ExternalUrl url) ->
+            case url.href of
+                Just raw ->
+                    "e:" ++ raw
+
+                Nothing ->
+                    "f:" ++ Label.key url.shown
 
         Unlinked name ->
-            "t:" ++ SafeText.toString name
+            "t:" ++ Label.key name
+
+
+isCut : LabelPart -> Bool
+isCut part =
+    case part of
+        LabelCut _ _ ->
+            True
+
+        LabelText _ ->
+            False
+
+        LabelEscapes _ ->
+            False

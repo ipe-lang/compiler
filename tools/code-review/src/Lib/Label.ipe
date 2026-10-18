@@ -1,4 +1,4 @@
-module Lib.Label exposing (Cap, Column, Label, LabelPart(..), byteCount, capBytes, elementCeiling, fromText, key, labelCap, markerByteCeiling, markerText, parse, parts, purposeCap, runCeiling, windowChars)
+module Lib.Label exposing (Cap, Column, Label, LabelPart(..), byteCount, capBytes, elementCeiling, fromText, key, labelCap, markerByteCeiling, markerText, parse, parts, purposeCap, runCeiling, textBytes, windowChars)
 
 -- A display column of the index, parsed once into a bounded label: at most
 -- `capBytes cap` bytes of shown text (escape spellings counted at their

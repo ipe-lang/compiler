@@ -3,6 +3,7 @@ module Lib.View exposing (codeCss, codeHtml, displayOrderCss, drawnHtml, escapeC
 import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
 import Ipe.List as List
+import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result)
 import Ipe.String as String
 import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
@@ -660,11 +661,12 @@ hiddenNoteEl hidden =
             []
 
 
--- | Render a link from a fail-closed `LinkTarget` and a label. With no target
--- (an unsafe / unparseable one) the anchor degrades to the plain label text —
--- the reader still sees it, but no `href` is emitted.
-linkOrText : Maybe Ui.LinkTarget -> SafeText -> Ui.Element Msg
-linkOrText target labelText =
+-- | Render a link from a fail-closed `LinkTarget` and its label pieces. With
+-- no target (an unsafe / unparseable one, or a URL past the href ceiling)
+-- the anchor degrades to the plain label — the reader still sees it, but no
+-- `href` is emitted.
+linkOrText : Maybe Ui.LinkTarget -> List LabelPiece -> Ui.Element Msg
+linkOrText target pieces =
     case target of
         Just t ->
             Ui.link
@@ -673,23 +675,34 @@ linkOrText target labelText =
                 , Font.color (Ui.rgb 130 170 240)
                 , Ui.padding 4
                 ]
-                { url = t, label = safeText labelText }
+                { url = t, label = shownLabel pieces }
 
         Nothing ->
-            safeText labelText
+            shownLabel pieces
 
 
 linkEl : Links.Link -> Ui.Element Msg
 linkEl link =
     case link of
         Internal _ uid ->
-            linkOrText (Result.toMaybe (Ui.linkTarget ("/unit/" ++ Uid.toString uid))) (Links.label link)
+            linkOrText (Result.toMaybe (Ui.linkTarget ("/unit/" ++ Uid.toString uid))) (linkPieces link)
 
         External url ->
-            linkOrText (Result.toMaybe (Ui.linkTarget url)) (Links.label link)
+            linkOrText (Maybe.andThen (\raw -> Result.toMaybe (Ui.linkTarget raw)) (Links.href url)) (linkPieces link)
 
         Unlinked _ ->
-            safeText (Links.label link)
+            shownLabel (linkPieces link)
+
+
+-- A link's mark, then its label.
+linkPieces : Links.Link -> List LabelPiece
+linkPieces link =
+    case Links.mark link of
+        Just m ->
+            [ ToolText m, IndexedLabel (Links.label link) ]
+
+        Nothing ->
+            [ IndexedLabel (Links.label link) ]
 
 
 -- Where a unit's current body stands in the review log: not reviewed,
