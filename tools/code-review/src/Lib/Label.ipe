@@ -169,10 +169,13 @@ columnOf raw =
 
 -- The column's whole text, when the window holds all of it: a value the app
 -- may act on (join, bind, compare). `Nothing` when the column is longer than
--- the window, so no decision is ever taken on a prefix.
+-- the window, so no decision is ever taken on a prefix. A window wider than
+-- `windowChars` is not the text the read returns (a BLOB or non-UTF-8 cell
+-- reads as its hex spelling, twice its bytes), so its byte count proves
+-- nothing and it is never whole.
 whole : Column -> Maybe String
 whole column =
-    if textBytes column.shown == column.bytes then
+    if String.length column.shown <= windowChars && textBytes column.shown == column.bytes then
         Just column.shown
 
     else

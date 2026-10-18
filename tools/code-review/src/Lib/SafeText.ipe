@@ -146,18 +146,18 @@ literal text =
 concat : List SafeText -> SafeText
 concat pieces =
     case List.foldl joinSegment ( "", [] ) (List.concatMap segments pieces) of
-        ( pending, reversed ) ->
-            SafeText (List.reverse (flushedOnto pending reversed))
+        ( pending, done ) ->
+            SafeText (flushed pending done)
 
 
 joinSegment : Segment -> ( String, List Segment ) -> ( String, List Segment )
-joinSegment seg ( pending, reversed ) =
+joinSegment seg ( pending, done ) =
     case seg of
         Verbatim s ->
-            ( String.append pending s, reversed )
+            ( String.append pending s, done )
 
         Escaped c ->
-            ( "", Escaped c :: flushedOnto pending reversed )
+            ( "", flushed pending done ++ [ Escaped c ] )
 
 
 segments : SafeText -> List Segment
@@ -230,35 +230,34 @@ escapeWith : Bool -> String -> List Segment
 escapeWith escapeBackslash raw =
     if String.any (needsEscape escapeBackslash) raw then
         case String.foldl (scanChar escapeBackslash) ( "", [] ) raw of
-            ( pending, reversed ) ->
-                List.reverse (flushedOnto pending reversed)
+            ( pending, done ) ->
+                flushed pending done
 
     else
         verbatim raw
 
 
 -- One step of a left-to-right scan: `pending` holds the verbatim text read
--- since the last escape; `reversed` the segments before it, newest first.
--- Each step conses one segment at the head, so the scan is linear in the
--- text and the one reverse at its end restores reading order.
+-- since the last escape; `done` the segments before it, in order. Both grow
+-- at their end in place, so the scan is linear in the text; a segment consed
+-- onto the head would copy the whole list each step.
 scanChar : Bool -> Char -> ( String, List Segment ) -> ( String, List Segment )
-scanChar escapeBackslash c ( pending, reversed ) =
+scanChar escapeBackslash c ( pending, done ) =
     if needsEscape escapeBackslash c then
-        ( "", Escaped c :: flushedOnto pending reversed )
+        ( "", flushed pending done ++ [ Escaped c ] )
 
     else
-        ( String.append pending (String.fromChar c), reversed )
+        ( String.append pending (String.fromChar c), done )
 
 
--- `reversed` (newest first) with the verbatim text `pending` consed onto it,
--- when there is any.
-flushedOnto : String -> List Segment -> List Segment
-flushedOnto pending reversed =
+-- `done` with the verbatim text `pending` after it, when there is any.
+flushed : String -> List Segment -> List Segment
+flushed pending done =
     if String.isEmpty pending then
-        reversed
+        done
 
     else
-        Verbatim pending :: reversed
+        done ++ [ Verbatim pending ]
 
 
 -- `n` (non-negative) in lowercase hex, no leading zeros. Each step drops one
