@@ -10,6 +10,11 @@
 //! the CLI and the wasm driver and refuses each of those spellings outside the
 //! (file, function) sites admitted below, macro bodies included. Patterns are
 //! never counted: matching on a host builds nothing.
+//!
+//! The settings a manifest owns (the browser mount base, the `[wasm]` public-env
+//! allowlist and mode) are derived into `EmitSettings` at one site,
+//! `manifest_emit_settings`: the driver reads each of those member chains
+//! nowhere else but the admitted sites below.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -47,6 +52,27 @@ const SETTERS: &[&str] = &[
     "with_mount_base",
     "with_wasm_hydrate_mode",
 ];
+
+/// The manifest member chains the driver reads only at admitted sites, as the
+/// field names from the manifest value down.
+const MEMBER_CHAINS: &[&[&str]] = &[
+    &["delivery", "browser", "base"],
+    &["wasm", "public_env"],
+    &["wasm", "mode"],
+];
+
+/// The tree the member chains are guarded in.
+const CHAIN_TREE: &str = "src/ipe-cli/src/driver/";
+
+/// The label of a member chain, as it appears in a site and in [`ADMITTED`].
+fn chain_label(chain: &[&str]) -> String {
+    format!("field {}", chain.join("."))
+}
+
+/// Whether `what` is the label of a guarded member chain.
+fn is_chain_label(what: &str) -> bool {
+    MEMBER_CHAINS.iter().any(|chain| chain_label(chain) == what)
+}
 
 /// The webview proof: any construction of it counts.
 const PROOF: &str = "WebViewProof";
@@ -91,6 +117,39 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "EmitHost::WebView",
         "src/ipe-cli/src/driver/build_pipeline.rs",
         "manifest_emit_settings",
+        1,
+    ),
+    (
+        "field delivery.browser.base",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "manifest_emit_settings",
+        1,
+    ),
+    (
+        "field wasm.public_env",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "manifest_emit_settings",
+        1,
+    ),
+    (
+        "field wasm.mode",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "manifest_emit_settings",
+        1,
+    ),
+    // The mobile shell is laid out for the manifest's mount base, and a base
+    // that changes during the build is refused: reads of the base, not
+    // derivations of emit settings.
+    (
+        "field delivery.browser.base",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "assemble_mobile",
+        1,
+    ),
+    (
+        "field delivery.browser.base",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "build_under_fixed_base",
         1,
     ),
     (PROOF, "src/ipe-cli/src/delivery.rs", "host_intent", 1),
@@ -209,6 +268,35 @@ fn type_name(ty: &syn::Type) -> Option<String> {
     }
 }
 
+/// The field name of a member access.
+fn member_name(member: &syn::Member) -> String {
+    match member {
+        syn::Member::Named(ident) => ident.to_string(),
+        syn::Member::Unnamed(index) => index.index.to_string(),
+    }
+}
+
+/// The field names of the access chain ending at `expr`, outermost last, seen
+/// through parentheses, borrows and groups.
+fn field_chain(expr: &syn::ExprField) -> Vec<String> {
+    let mut names = vec![member_name(&expr.member)];
+    let mut base = &*expr.base;
+    loop {
+        match base {
+            syn::Expr::Field(field) => {
+                names.push(member_name(&field.member));
+                base = &field.base;
+            }
+            syn::Expr::Paren(inner) => base = &inner.expr,
+            syn::Expr::Reference(inner) => base = &inner.expr,
+            syn::Expr::Group(inner) => base = &inner.expr,
+            _ => break,
+        }
+    }
+    names.reverse();
+    names
+}
+
 /// What the scan found in one source.
 #[derive(Default)]
 struct Scan {
@@ -274,6 +362,35 @@ impl Scan {
         }
     }
 
+    /// Count each guarded member chain the field names `names` end in.
+    fn member_chains(&mut self, names: &[String]) {
+        for chain in MEMBER_CHAINS {
+            let wanted: Vec<String> = chain.iter().map(|field| (*field).to_owned()).collect();
+            if names.ends_with(&wanted) {
+                self.hit(chain_label(chain));
+            }
+        }
+    }
+
+    /// Count each guarded member chain a macro body spells, `name` being its
+    /// last field and `previous` the tokens before it.
+    fn macro_member_chains(&mut self, previous: &[String], name: &str) {
+        for chain in MEMBER_CHAINS {
+            let Some((last, leading)) = chain.split_last() else {
+                continue;
+            };
+            let mut spelled: Vec<String> = Vec::new();
+            for field in leading {
+                spelled.push(".".to_owned());
+                spelled.push((*field).to_owned());
+            }
+            spelled.push(".".to_owned());
+            if name == *last && previous.ends_with(&spelled) {
+                self.hit(chain_label(chain));
+            }
+        }
+    }
+
     /// Count every guarded spelling of a macro body.
     fn tokens(&mut self, tokens: TokenStream) {
         let mut previous: Vec<String> = Vec::new();
@@ -295,6 +412,7 @@ impl Scan {
                     {
                         self.hit(format!(".{name}"));
                     }
+                    self.macro_member_chains(&previous, &name);
                     previous.push(name);
                 }
                 TokenTree::Group(group) => {
@@ -395,6 +513,13 @@ impl<'ast> Visit<'ast> for Scan {
         visit::visit_expr_method_call(self, expr);
     }
 
+    fn visit_expr_field(&mut self, expr: &'ast syn::ExprField) {
+        if self.in_pattern == 0 {
+            self.member_chains(&field_chain(expr));
+        }
+        visit::visit_expr_field(self, expr);
+    }
+
     fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
         if expr
             .path
@@ -448,6 +573,9 @@ fn refusals(found: &BTreeMap<String, Scan>) -> Vec<String> {
     let mut out = Vec::new();
     for (rel, scan) in found {
         for ((site, what), count) in &scan.sites {
+            if is_chain_label(what) && !rel.starts_with(CHAIN_TREE) {
+                continue;
+            }
             seen.insert((what.clone(), rel.clone(), site.clone()), *count);
         }
         for (site, what) in &scan.aliases {
@@ -641,6 +769,50 @@ fn a_planted_site_is_refused() -> Result<(), String> {
         ),
         (pipeline, "use crate::delivery::Delivery as D;\n"),
     ];
+    refused_by_scan(&breaches)
+}
+
+/// Each planted read of a manifest-owned browser setting outside its single
+/// derivation site is refused.
+#[test]
+fn a_planted_browser_delivery_read_is_refused() -> Result<(), String> {
+    let pipeline = "src/ipe-cli/src/driver/build_pipeline.rs";
+    let commands = "src/ipe-cli/src/driver/commands.rs";
+    let breaches = [
+        (
+            commands,
+            "fn release_pipeline() { let b = m.delivery.browser.base.clone(); }\n",
+        ),
+        (
+            commands,
+            "fn release_pipeline() { let e = manifest.wasm.public_env.to_names(); }\n",
+        ),
+        (
+            commands,
+            "fn release_pipeline() { let h = w.wasm.mode.as_deref() == Some(\"hydrate\"); }\n",
+        ),
+        (
+            commands,
+            "fn release_pipeline() { let b = (&m).delivery.browser.base; }\n",
+        ),
+        (
+            commands,
+            "fn release_pipeline() { m!(manifest.delivery.browser.base); }\n",
+        ),
+        (
+            pipeline,
+            "fn loose_emit_settings() { let e = m.wasm.public_env; }\n",
+        ),
+        (
+            pipeline,
+            "fn manifest_emit_settings() { let a = m.wasm.mode; let b = m.wasm.mode; }\n",
+        ),
+    ];
+    refused_by_scan(&breaches)
+}
+
+/// Every planted breach draws a refusal the empty source at its file does not.
+fn refused_by_scan(breaches: &[(&str, &str)]) -> Result<(), String> {
     // An empty source at `rel` already misses each admitted row there; a
     // breach counts only by a refusal that baseline does not carry.
     let mut missed = Vec::new();
@@ -674,7 +846,9 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
              HostIntent::WebView(_) => EmitHost::WebView(w) }; }\n\
              fn compile_source_set_observed() { RustBackend::configured(&g, &s); }\n\
              fn build_project_with_options() { go(HostIntent::Served); }\n\
-             fn build_from_sources() { go(HostIntent::Served); }\n",
+             fn build_from_sources() { go(HostIntent::Served); }\n\
+             fn manifest_emit_settings() { let e = m.wasm.public_env.to_names(); \
+             let b = m.delivery.browser.base.clone(); let h = m.wasm.mode.is_some(); }\n",
         ),
         (
             delivery,
@@ -684,7 +858,9 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
         (
             "src/ipe-cli/src/driver/commands_pkg.rs",
             "fn gate_desktop() { let HostIntent::WebView(p) = Delivery::web_desktop().host_intent() \
-             else { return }; }\n",
+             else { return }; }\n\
+             fn assemble_mobile() { let base = &manifest.delivery.browser.base; }\n\
+             fn build_under_fixed_base() { let after = parse(p)?\n.delivery\n.browser\n.base; }\n",
         ),
     ];
     for (rel, source) in admitted {
@@ -697,6 +873,24 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
     let out_of_scope = "fn other() { let HostIntent::WebView(p) = h else { return }; \
         if let EmitHost::WebView(w) = e {} }\n\
         #[cfg(test)]\nmod tests { fn t() { RustBackend::new(&i); EmitHost::WebView(w); } }\n";
+    let chains_out_of_scope = "fn other() { let WasmConfig { mode, .. } = w; let b = &m.wasm; }\n\
+        #[cfg(test)]\nmod tests { fn t() { m.delivery.browser.base; m.wasm.mode; m.wasm.public_env; } }\n";
+    assert_eq!(
+        planted("src/ipe-cli/src/driver/commands.rs", chains_out_of_scope)?
+            .iter()
+            .filter(|refusal| refusal.contains("field "))
+            .count(),
+        0,
+        "a pattern, a whole `wasm` read and test code read no guarded chain"
+    );
+    assert_eq!(
+        planted(
+            "src/ipe-cli/src/init.rs",
+            "fn other() { let b = parsed.delivery.browser.base; }\n"
+        )?,
+        Vec::<String>::new(),
+        "the guard covers the driver tree only"
+    );
     assert_eq!(
         planted("src/ipe-cli/src/other.rs", out_of_scope)?,
         Vec::<String>::new(),
