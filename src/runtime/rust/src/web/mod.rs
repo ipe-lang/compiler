@@ -6269,7 +6269,7 @@ mod handlers {
     /// render, minting its epoch, and return that epoch with the stamped
     /// render; `None` when no epoch is left to mint.
     #[cfg(feature = "debugger")]
-    fn commit_debug_render<Model, Msg: Clone>(
+    fn commit_debug_render<Model, Msg: Clone + RetainedBytes>(
         handle: &store::SessionHandle<Model, Msg>,
         tree: Html<Msg>,
     ) -> Option<(RenderEpoch, StampedHtml)> {
