@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ipe::{BuildOptions, CliError, build_plan};
+use ipe::{BuildOptions, CliError, RootFixture, build_fixture_with_options, build_plan};
 use ipe_backend_rust::static_build::{
     CARGO_CONFIG_MARKER, CProfile, StaticAllocator, StaticPlan, StaticTriple,
 };
@@ -18,17 +18,15 @@ mod support;
 
 use support::repo_root;
 
-fn write_hello(dir: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let entry = dir.join("Main.ipe");
-    std::fs::write(
-        &entry,
+/// The hello program as a project in a private scratch tree.
+fn hello_project() -> RootFixture {
+    RootFixture::main(
         "module Main exposing (main)\n\
          import Ipe.Io as Io\n\
          \n\
          main =\n    Io.println \"static hello\"\n",
-    )?;
-    Ok(entry)
+    )
+    .expect("the hello project resolves")
 }
 
 const fn dlmalloc_plan() -> StaticPlan {
@@ -56,7 +54,7 @@ fn default_line(manifest: &str) -> String {
 fn static_emit_activates_dlmalloc_and_dynamic_rebuild_restores_baseline() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_emit_shape");
     let _ = std::fs::remove_dir_all(&scratch);
-    let entry = write_hello(&scratch.join("srcdir")).expect("write hello source");
+    let project = hello_project();
     let out = scratch.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -64,7 +62,7 @@ fn static_emit_activates_dlmalloc_and_dynamic_rebuild_restores_baseline() {
         static_plan: Some(dlmalloc_plan()),
         ..BuildOptions::default()
     };
-    ipe::build_with_options(&entry, &out, &runtime, statik).expect("static build");
+    build_fixture_with_options(&project, &out, &runtime, &statik).expect("static build");
 
     let manifest = std::fs::read_to_string(out.join("Cargo.toml")).expect("emitted manifest");
     let def = default_line(&manifest);
@@ -83,7 +81,7 @@ fn static_emit_activates_dlmalloc_and_dynamic_rebuild_restores_baseline() {
     assert!(!config.contains("target-dir"));
 
     // Dynamic rebuild of the same out-dir: baseline restored, config gone.
-    ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
+    build_fixture_with_options(&project, &out, &runtime, &BuildOptions::default())
         .expect("dynamic rebuild");
     let manifest = std::fs::read_to_string(out.join("Cargo.toml")).expect("emitted manifest");
     assert!(
@@ -103,19 +101,19 @@ fn static_emit_activates_dlmalloc_and_dynamic_rebuild_restores_baseline() {
 fn dynamic_build_leaves_user_cargo_config_alone() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_emit_user_config");
     let _ = std::fs::remove_dir_all(&scratch);
-    let entry = write_hello(&scratch.join("srcdir")).expect("write hello source");
+    let project = hello_project();
     let out = scratch.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // The first build claims `out`; the user's config lands in the owned dir.
-    ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
+    build_fixture_with_options(&project, &out, &runtime, &BuildOptions::default())
         .expect("first dynamic build");
     let config_path = out.join(".cargo").join("config.toml");
     std::fs::create_dir_all(out.join(".cargo")).expect("mk .cargo");
     let user_config = "# hand-written by a user\n[net]\noffline = false\n";
     std::fs::write(&config_path, user_config).expect("write user config");
 
-    ipe::build_with_options(&entry, &out, &runtime, BuildOptions::default())
+    build_fixture_with_options(&project, &out, &runtime, &BuildOptions::default())
         .expect("dynamic rebuild");
     let after = std::fs::read_to_string(&config_path).expect("user config must survive");
     assert_eq!(after, user_config);
@@ -126,7 +124,7 @@ fn dynamic_build_leaves_user_cargo_config_alone() {
 fn static_emit_mimalloc_optin_activates_mimalloc() {
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_emit_mimalloc");
     let _ = std::fs::remove_dir_all(&scratch);
-    let entry = write_hello(&scratch.join("srcdir")).expect("write hello source");
+    let project = hello_project();
     let out = scratch.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
 
@@ -139,7 +137,7 @@ fn static_emit_mimalloc_optin_activates_mimalloc() {
         }),
         ..BuildOptions::default()
     };
-    ipe::build_with_options(&entry, &out, &runtime, statik).expect("static build");
+    build_fixture_with_options(&project, &out, &runtime, &statik).expect("static build");
     let manifest = std::fs::read_to_string(out.join("Cargo.toml")).expect("emitted manifest");
     let def = default_line(&manifest);
     assert!(def.contains(r#""alloc_mimalloc""#), "{def}");
@@ -537,24 +535,23 @@ fn end_to_end_static_binary_is_static_and_runs() {
         return;
     }
     let root = repo_root();
-    let entry = root
+    let manifest = root
         .join("examples")
         .join("shapes")
         .join("non-tea")
         .join("hello-world")
-        .join("src")
-        .join("Main.ipe");
+        .join("package.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("static_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     let plan = dlmalloc_plan();
     build_plan::preflight(&plan).expect("toolchain preflight (musl target + C compiler)");
-    ipe::build_with_options(
-        &entry,
+    ipe::build_project_with_options(
+        &manifest,
         &out,
         &runtime,
-        BuildOptions {
+        &BuildOptions {
             static_plan: Some(plan),
             ..BuildOptions::default()
         },

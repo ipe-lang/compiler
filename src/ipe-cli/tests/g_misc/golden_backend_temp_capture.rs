@@ -21,16 +21,23 @@ fn fixture_dir(root: &Path, name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Emit `name`'s `Main.ipe` into `out` and return the emitted `main.rs` text.
+/// Emit `name`'s `Main.ipe` as a project into `out` and return the emitted `main.rs` text.
 fn emit(name: &str, out: &Path) -> String {
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(
-        &fixture_dir(&repo_root(), name).join("Main.ipe"),
-        out,
-        &runtime,
+    let source = std::fs::read_to_string(fixture_dir(&repo_root(), name).join("Main.ipe"));
+    assert!(source.is_ok(), "{name}: the fixture source must read");
+    let fixture = ipe::RootFixture::main(source.as_deref().unwrap_or_default());
+    assert!(fixture.is_ok(), "{name}: the fixture project must resolve");
+    let Ok(fixture) = fixture else {
+        return String::new();
+    };
+    let built = ipe::build_fixture(&fixture, out, &runtime);
+    assert!(
+        built.is_ok(),
+        "{name}: build failed: {:?}",
+        built.as_ref().err()
     );
-    assert!(built.is_ok(), "{name}: build failed: {:?}", built.err());
     crate::support::read_all_emitted_src(out)
 }
 
