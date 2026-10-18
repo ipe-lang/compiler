@@ -1629,9 +1629,11 @@ pub fn run_project_tests_with(
     // spawn error, or a normal run — not only the success path.
     let outcome = build_and_run_test_entry(
         &SettingsSource::discovered(found, crate::delivery::HostIntent::Served),
-        &project_src_root,
-        &tests_root,
-        &test_entry,
+        TestLayout {
+            src_root: &project_src_root,
+            tests_root: &tests_root,
+            entry: &test_entry,
+        },
         &out_scratch,
         &runtime_dir,
         &cargo_bin,
@@ -1642,6 +1644,18 @@ pub fn run_project_tests_with(
     // (compile failure, cargo error, spawn error, or normal completion).
     drop(out_scratch);
     outcome
+}
+
+/// Where a project's tests live: the code under test, the `tests/` tree, and
+/// the tree's entry.
+#[derive(Clone, Copy, Debug)]
+pub struct TestLayout<'a> {
+    /// The project's source root (`src/`, or the project root when flat).
+    pub src_root: &'a Path,
+    /// The `tests/` tree.
+    pub tests_root: &'a Path,
+    /// The test entry, `tests/Main.ipe`.
+    pub entry: &'a Path,
 }
 
 /// Compile the test entry into `out_scratch`, build the emitted Rust project, and
@@ -1667,9 +1681,7 @@ pub fn run_project_tests_with(
 /// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
     source: &SettingsSource<'_>,
-    project_src_root: &Path,
-    tests_root: &Path,
-    test_entry: &Path,
+    layout: TestLayout<'_>,
     out_scratch: &scratch::ScratchDir,
     runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
@@ -1677,9 +1689,9 @@ pub fn build_and_run_test_entry(
 ) -> Result<TestOutcome, CliError> {
     let crate_dir = build_test_into(
         source,
-        project_src_root,
-        tests_root,
-        test_entry,
+        layout.src_root,
+        layout.tests_root,
+        layout.entry,
         OutTarget::Scratch(out_scratch),
         runtime_dir,
     )?;
