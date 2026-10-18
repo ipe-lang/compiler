@@ -18,24 +18,23 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("eta_inline_arg_capture")
-        .join("Main.ipe")
 }
 
 /// ipe-0: the residual closure clones the captured `s` at its inlined read.
 #[test]
 fn eta_inline_arg_capture_ipec_clones_capture() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("eta_inline_arg_capture_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for eta_inline_arg_capture: {:?}",
@@ -58,13 +57,13 @@ fn eta_inline_arg_capture_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_eta_inline_arg_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed: {:?}",

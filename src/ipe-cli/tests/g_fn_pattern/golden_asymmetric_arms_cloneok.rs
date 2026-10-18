@@ -35,11 +35,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("asymmetric_arms_cloneok")
-        .join("Main.ipe")
 }
 
 /// ipe-0 + clone-count snapshot: the compiler must accept the program and
@@ -63,14 +62,14 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i193_ipec_accepts_asymmetric_arms() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i193_asymmetric_arms_cloneok_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for asymmetric_arms_cloneok: {:?}",
@@ -114,7 +113,7 @@ fn i193_ipec_accepts_asymmetric_arms() {
 #[test]
 fn i193_idempotent() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out1 =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i193_asymmetric_arms_idempotent_pass1");
     let out2 =
@@ -124,9 +123,9 @@ fn i193_idempotent() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let b1 = ipe::build_loose_file(&entry, &out1, &runtime);
+    let b1 = crate::support::build_golden(&golden, &out1, &runtime);
     assert!(b1.is_ok(), "pass 1 must succeed: {:?}", b1.err());
-    let b2 = ipe::build_loose_file(&entry, &out2, &runtime);
+    let b2 = crate::support::build_golden(&golden, &out2, &runtime);
     assert!(b2.is_ok(), "pass 2 must succeed: {:?}", b2.err());
 
     let main1 = crate::support::read_all_emitted_src(&out1);
@@ -148,13 +147,13 @@ fn i193_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i193_asymmetric_arms_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed: {:?}",

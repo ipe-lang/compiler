@@ -45,7 +45,6 @@ fn wildcard_lambda_pany_ipec_cargo_and_run_zero() {
         .join("tests")
         .join("golden")
         .join("wildcard_lambda_pany");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_l0102_wildcard_lambda_pany_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -54,7 +53,7 @@ fn wildcard_lambda_pany_ipec_cargo_and_run_zero() {
     // ipe-0: compiler must succeed.  Without the wildcard mapping this fails
     // with IPE-L0102 ("unsupported feature: Polymorphism") on the `\_ ->`
     // lambda parameter.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for wildcard_lambda_pany (was: IPE-L0102 Polymorphism): {:?}",

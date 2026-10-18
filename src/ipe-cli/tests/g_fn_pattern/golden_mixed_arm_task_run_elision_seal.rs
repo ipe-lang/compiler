@@ -21,20 +21,19 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("mixed_arm_task_run_elision")
-        .join("Main.ipe")
 }
 
 /// Build the fixture and return the emitted `src/main.rs` text. `None` when the
 /// build fails (the caller's `assert!` reports the diag).
 fn built_main_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<String>) {
-    let entry = fixture_entry(root);
+    let golden = golden_dir(root);
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, out, &runtime);
+    let built = crate::support::build_golden(&golden, out, &runtime);
     let main_rs = if built.is_ok() {
         std::fs::read_to_string(out.join("src").join("main.rs")).ok()
     } else {
@@ -113,9 +112,9 @@ fn mixed_arm_task_run_elision_builds_and_runs() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_mixed_arm_task_run_elision_e2e");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let entry = fixture_entry(&root);
+    let golden = golden_dir(&root);
     let _ = std::fs::remove_dir_all(&out);
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "mixed_arm_task_run_elision: must be accepted, got: {built:?}"

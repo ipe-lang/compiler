@@ -16,17 +16,15 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn example_entry(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("fn_record_nested_transitive")
-        .join("Main.ipe")
 }
 
 #[test]
 fn nested_transitive_emits_byte_identical_main_rs() {
     let root = repo_root();
-    let entry = example_entry(&root);
     let golden = root
         .join("tests")
         .join("golden")
@@ -36,7 +34,7 @@ fn nested_transitive_emits_byte_identical_main_rs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     crate::support::assert_emitted_project_matches_golden_dir(
@@ -51,12 +49,12 @@ fn nested_transitive_end_to_end_prints_twenty_seven() {
         return;
     }
     let root = repo_root();
-    let entry = example_entry(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_fn_record_nested_transitive_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("fn_record_nested_transitive", &out);
