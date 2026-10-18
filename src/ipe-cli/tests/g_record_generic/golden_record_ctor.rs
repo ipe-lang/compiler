@@ -45,7 +45,7 @@ fn record_ctor_end_to_end_field_order() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("record_ctor", &out);
@@ -74,7 +74,7 @@ fn record_ctor_and_literal_share_one_struct() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let emitted = std::fs::read_to_string(out.join("src").join("main.rs"));
@@ -131,7 +131,7 @@ fn seal_fn_field_alias_emits_no_struct() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     // ipe MUST succeed — a function-embedding alias that is merely NAMED
     // (declared, never constructed) is a valid program.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipec must accept a merely-named function-embedding record alias: {:?}",
@@ -173,7 +173,7 @@ fn seal_fn_field_alias_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "ipe dev build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("record_ctor_fn_field", &out);
@@ -207,7 +207,7 @@ fn seal_opaque_field_alias_emits_no_struct() {
     let runtime = e2e_support::require_runtime().into_path_buf();
     // ipe MUST succeed — an opaque-wrapper-field alias that is merely NAMED
     // (declared, never constructed) is a valid program.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipec must accept a merely-named opaque-wrapper-field record alias: {:?}",
@@ -250,7 +250,7 @@ fn seal_opaque_field_alias_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(built.is_ok(), "ipe dev build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("record_ctor_opaque_field", &out);
@@ -279,7 +279,7 @@ fn seal_opaque_field_used_as_ctor_fails_closed() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
     assert!(
         built.is_err(),
         "using an opaque-wrapper-field alias as a ctor must fail CLOSED at ipec, \
@@ -307,7 +307,8 @@ fn record_ctor_cross_module_end_to_end() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_project(&manifest, &out, &runtime);
+    let built =
+        crate::support::build_golden(crate::support::golden_dir_of(&manifest), &out, &runtime);
     assert!(
         built.is_ok(),
         "cross-module build failed: {:?}",
