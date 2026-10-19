@@ -1533,7 +1533,10 @@ const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing 
 /// the patches only onto the DOM of `from`, then adopts `to`.
 ///
 /// A commit a tab's event caused names that tab and the event's seq
-/// (`tab`, `tabSeq`); any other commit's frame carries neither.
+/// (`tab`, `tabSeq`), and the element its render newly autofocuses (`focus`,
+/// see [`crate::dom::focus_target`]) when there is one; any other commit's
+/// frame carries none of the three, so no render it did not cause moves a
+/// tab's focus.
 #[derive(serde::Serialize)]
 #[cfg(feature = "web")]
 struct PatchEnvelope<'a> {
@@ -1546,23 +1549,28 @@ struct PatchEnvelope<'a> {
     cause: Option<FrameCause>,
 }
 
-/// The tab event a frame's commit answers.
+/// The tab event a frame's commit answers, and the element it focuses there.
 #[derive(serde::Serialize)]
 #[cfg(feature = "web")]
 struct FrameCause {
     tab: String,
     #[serde(rename = "tabSeq")]
     seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus: Option<crate::dom::StampedId>,
 }
 
 #[cfg(feature = "web")]
 impl FrameCause {
-    /// The cause a frame names for a commit of `origin`; `None` when no tab's event caused it.
-    fn of(origin: Origin) -> Option<Self> {
+    /// The cause a frame names for a commit of `origin`, with the element
+    /// `target` names; `None`, and `target` never run, when no tab's event
+    /// caused it.
+    fn of(origin: Origin, target: impl FnOnce() -> Option<crate::dom::StampedId>) -> Option<Self> {
         match origin {
             Origin::Tab { tab, seq } => Some(Self {
                 tab: tab.to_token(),
                 seq,
+                focus: target(),
             }),
             Origin::None => None,
         }
@@ -1577,7 +1585,7 @@ async fn send_patches_frame(
     global_seq: u64,
     step: EpochStep,
     patches: &[crate::web::diff::Patch],
-    origin: Origin,
+    cause: Option<FrameCause>,
 ) {
     let Some(sse) = sse else {
         return;
@@ -1587,7 +1595,7 @@ async fn send_patches_frame(
         from: step.from.to_token(),
         to: step.to.to_token(),
         patches,
-        cause: FrameCause::of(origin),
+        cause,
     };
     if let Ok(json) = serde_json::to_string(&env) {
         let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
@@ -3064,6 +3072,11 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         let committed = {
             let mut e = strong.lock().unwrap_or_else(|e| e.into_inner());
             let patches = e.rendered.diff_to(&tree);
+            // The element this render newly autofocuses, read against the
+            // render the patches apply onto, only for a tab's own event.
+            let cause = FrameCause::of(origin, || {
+                crate::dom::focus_target(e.rendered.last_view(), &tree)
+            });
             // noop. Here
             // `e.model` STILL holds the OLD model (top-of-loop cloned it OUT; the
             // store isn't updated until the assignment below), so `e.model ==
@@ -3083,12 +3096,12 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
                         e.history
                             .record(msg_for_history, next.clone(), &|m, mdl| (*update)(m, mdl));
                     });
-                    Some((patches, step, e.seq, e.sse_tx.clone(), noop))
+                    Some((patches, cause, step, e.seq, e.sse_tx.clone(), noop))
                 }
                 Err(EpochExhausted) => None,
             }
         };
-        let Some((patches, step, seq, sse, noop)) = committed else {
+        let Some((patches, cause, step, seq, sse, noop)) = committed else {
             // The render history cannot mint another epoch: close the session so
             // the next request takes the session-lost path.
             close_session(&store, &sid, Some(&strong), CloseReason::Ended).await;
@@ -3114,7 +3127,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             1,
         );
 
-        send_patches_frame(sse, seq, step, &patches, origin).await;
+        send_patches_frame(sse, seq, step, &patches, cause).await;
 
         // Write-through: checkpoint the committed model to the store (a touch
         // for memory; a re-serialize for persistent backends) on every commit.
@@ -3839,7 +3852,7 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
             close_session(store, scope.sid(), Some(&handle), CloseReason::OverCeiling).await;
             continue;
         }
-        send_patches_frame(sse, seq, step, &patches, Origin::None).await;
+        send_patches_frame(sse, seq, step, &patches, None).await;
     }
 }
 
@@ -13446,7 +13459,7 @@ mod emitted_router_behavior_tests {
                 from: String::new(),
                 to: String::new(),
                 patches: &[],
-                cause: FrameCause::of(origin),
+                cause: FrameCause::of(origin, || None),
             })
             .expect("an envelope serializes")
         };
@@ -13459,6 +13472,7 @@ mod emitted_router_behavior_tests {
             caused.get("tabSeq").and_then(serde_json::Value::as_u64),
             Some(3)
         );
+        assert!(caused.get("focus").is_none(), "no target names no focus");
         let uncaused = frame(Origin::None);
         assert!(
             uncaused.get("tab").is_none() && uncaused.get("tabSeq").is_none(),
@@ -13466,6 +13480,58 @@ mod emitted_router_behavior_tests {
         );
         assert_eq!(Origin::of_event(Some(tab), None), Origin::None);
         assert_eq!(Origin::of_event(None, Some(3)), Origin::None);
+    }
+
+    /// A tab's own commit names the element its render newly autofocuses; a
+    /// commit no tab caused never looks for one, so it names none.
+    #[test]
+    #[allow(clippy::expect_used)] // the tab token and the envelope are fixtures
+    fn only_a_tab_commit_names_the_element_it_focuses() {
+        use crate::html::Attribute;
+        let tab = TabId::parse(TAB).expect("TAB is a tab token");
+        let panel = |open: bool| {
+            let field = Html::HElement(
+                "input".to_string(),
+                vec![Attribute::Attr("autofocus".to_string(), String::new())],
+                Vec::new(),
+            );
+            stamped(Html::HElement(
+                "main".to_string(),
+                Vec::new(),
+                if open { vec![field] } else { Vec::new() },
+            ))
+        };
+        let (closed, open) = (panel(false), panel(true));
+        let want = crate::dom::focus_target(&closed, &open);
+        assert!(want.is_some(), "the opened field is a focus target");
+        let frame = |origin| {
+            let looked = std::cell::Cell::new(false);
+            let cause = FrameCause::of(origin, || {
+                looked.set(true);
+                crate::dom::focus_target(&closed, &open)
+            });
+            let json = serde_json::to_value(PatchEnvelope {
+                global_seq: 1,
+                from: String::new(),
+                to: String::new(),
+                patches: &[],
+                cause,
+            })
+            .expect("an envelope serializes");
+            (json, looked.get())
+        };
+        let (caused, looked) = frame(Origin::Tab { tab, seq: 1 });
+        assert!(looked, "a tab's own commit looks for its focus target");
+        assert_eq!(
+            caused.get("focus").and_then(serde_json::Value::as_str),
+            want.as_ref().map(crate::dom::StampedId::as_str)
+        );
+        let (uncaused, looked) = frame(Origin::None);
+        assert!(
+            !looked,
+            "a commit no tab caused never looks for a focus target"
+        );
+        assert!(uncaused.get("focus").is_none(), "{uncaused}");
     }
 
     /// A queued event holds its Msg's bytes against its own session's budget.

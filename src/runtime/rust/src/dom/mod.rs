@@ -10,6 +10,8 @@ pub mod diff;
 pub use diff::*;
 pub mod dispatch;
 pub use dispatch::*;
+pub mod focus;
+pub use focus::*;
 // `form.rs` decodes typed form records through `serde_urlencoded`. Its consumers
 // are the render hosts — the Live web wire (`web::mod`), the browser-WASM sink
 // (`wasm::mod`), and the native webview bridge — all of which select the

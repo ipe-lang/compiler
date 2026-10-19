@@ -302,6 +302,9 @@ struct App<Model, Msg> {
     tree: RefCell<Html<Msg>>,
     index: RefCell<HandlerIndex<Msg>>,
     queue: RefCell<VecDeque<Msg>>,
+    /// What caused the Msgs `queue` holds, and so whether their render may
+    /// move focus.
+    cause: RefCell<BatchCause>,
     frame_scheduled: Cell<bool>,
     update: Box<dyn Fn(Msg, Model) -> (Model, IpeCmd<Msg>)>,
     view: Box<dyn Fn(Model) -> Html<Msg>>,
@@ -355,6 +358,60 @@ where
     app.submgr.borrow_mut().update(sub, &emit);
 }
 
+/// What caused the Msgs one [`flush`] folds into one render.
+///
+/// Only a render every Msg of which a user's own DOM event caused may move
+/// focus, and only while focus is where it was when the first of those events
+/// fired; a Msg from a subscription, a command result or a widget makes the
+/// whole batch [`BatchCause::Program`], whose render never moves focus.
+enum BatchCause {
+    /// No Msg queued.
+    Empty,
+    /// Only user DOM events, the first fired while `focused` held focus.
+    User { focused: Option<web_sys::Element> },
+    /// At least one Msg no user DOM event caused.
+    Program,
+}
+
+/// Where a queued Msg came from.
+#[derive(Clone, Copy)]
+enum Source {
+    /// A DOM event the user fired on the app's own elements.
+    User,
+    /// A subscription, a command result or a widget.
+    Program,
+}
+
+impl BatchCause {
+    /// The cause of this batch once a Msg from `source` joins it.
+    fn with(self, source: Source) -> Self {
+        match (self, source) {
+            (Self::Empty, Source::User) => Self::User {
+                focused: active_element(),
+            },
+            (user @ Self::User { .. }, Source::User) => user,
+            (Self::Empty | Self::User { .. } | Self::Program, Source::Program)
+            | (Self::Program, Source::User) => Self::Program,
+        }
+    }
+}
+
+/// The element holding focus, if any.
+fn active_element() -> Option<web_sys::Element> {
+    document().ok().and_then(|d| d.active_element())
+}
+
+/// Focus the element stamped `id`, when the render on screen holds it.
+fn focus_stamped(id: &crate::dom::StampedId) {
+    let selector = format!("[ipe-id=\"{}\"]", id.as_str());
+    let found = document()
+        .ok()
+        .and_then(|d| d.query_selector(&selector).ok().flatten());
+    if let Some(el) = found.and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok()) {
+        let _ = el.focus();
+    }
+}
+
 fn mount_app<Model, Msg, FInit, FUpdate, FView, FSubs>(
     init: FInit,
     update: FUpdate,
@@ -393,6 +450,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(BatchCause::Empty),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -490,6 +548,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(BatchCause::Empty),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -616,6 +675,7 @@ where
         tree: RefCell::new(tree),
         index: RefCell::new(index),
         queue: RefCell::new(VecDeque::new()),
+        cause: RefCell::new(BatchCause::Empty),
         frame_scheduled: Cell::new(false),
         update: Box::new(update),
         view: Box::new(view),
@@ -899,7 +959,7 @@ where
                 app.index.borrow().resolve(&ipe_id, name, &args)
             };
             if let Some(msg) = resolved {
-                enqueue(app, msg);
+                enqueue_from(app, msg, Source::User);
                 return;
             }
         }
@@ -973,7 +1033,18 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
+    enqueue_from(app, msg, Source::Program);
+}
+
+/// [`enqueue`] a Msg that came from `source`.
+fn enqueue_from<Model, Msg>(app: &Rc<App<Model, Msg>>, msg: Msg, source: Source)
+where
+    Model: Clone + 'static,
+    Msg: Clone + 'static,
+{
     app.queue.borrow_mut().push_back(msg);
+    let cause = app.cause.replace(BatchCause::Empty).with(source);
+    *app.cause.borrow_mut() = cause;
     if app.frame_scheduled.get() {
         return;
     }
@@ -1004,6 +1075,7 @@ where
     Msg: Clone + 'static,
 {
     let msgs: Vec<Msg> = app.queue.borrow_mut().drain(..).collect();
+    let cause = app.cause.replace(BatchCause::Empty);
     if msgs.is_empty() {
         return;
     }
@@ -1060,7 +1132,19 @@ where
         let mut new_tree = (app.view)(model);
         assign_ipe_ids(&mut new_tree, ROOT_IPE_ID);
         let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
+        // The element this render newly autofocuses, read before the patches
+        // apply (applying them can move focus itself), only for a batch of the
+        // user's own events while focus is still where the first one left it.
+        let focus = match cause {
+            BatchCause::User { focused } if active_element() == focused => {
+                crate::dom::focus_target(&app.tree.borrow(), &new_tree)
+            }
+            BatchCause::User { .. } | BatchCause::Empty | BatchCause::Program => None,
+        };
         apply_patches(&patches);
+        if let Some(id) = focus {
+            focus_stamped(&id);
+        }
         *app.index.borrow_mut() = build_index(&new_tree);
         *app.tree.borrow_mut() = new_tree;
         // A widget that first appears via an `html`-subtree replace bypasses the

@@ -835,9 +835,11 @@ function __ipeRestoreFocus(container, path, ids) {
 // focused at load (the first `[autofocus]` below `root`) only while the load's
 // own autofocus is still due: nothing has held focus since the client started,
 // the user has not pressed a key or a pointer, and the URL names no fragment
-// target (the browser skips autofocus for one too). Any later frame only puts
-// lost focus back (`__ipeRestoreFocus`): an element is never autofocused after
-// the user has acted or focus has been somewhere.
+// target (the browser skips autofocus for one too). A later frame moves focus
+// only to the element its render newly autofocuses (the frame's `focus`), and
+// only when that render answers an event this tab sent and focus has not moved
+// since the event was sent (`__ipeFocusDue`); every other frame only puts lost
+// focus back (`__ipeRestoreFocus`).
 var __ipeMounted = false;
 var __ipeAutofocusSpent = (function() {
   var now = __ipeDoc.active();
@@ -863,6 +865,42 @@ function __ipeFocusAutofocus(root) {
   var now = __ipeDoc.active();
   if (__ipeAutofocusSpent || (now && now !== __ipeDoc.body())) return;
   var el = __ipeNode.firstAutofocus(root);
+  if (el) __ipeNode.focus(el);
+}
+// The focus epoch counts every focus change in the document; each event this
+// tab sends records it under the event's seq, newest last and at most
+// `__IPE_FOCUS_SENT_MAX` of them. A frame's focus is due only when the record
+// of the event it answers is still held and its epoch is the current one.
+var __ipeFocusEpoch = 0;
+var __IPE_FOCUS_SENT_MAX = 64;
+var __ipeFocusSent = [];
+["focusin", "focusout"].forEach(function(type) {
+  __ipeDoc.on(type, function() { __ipeFocusEpoch++; }, true);
+});
+function __ipeNoteSent(seq) {
+  __ipeFocusSent.push({seq: seq, epoch: __ipeFocusEpoch});
+  if (__ipeFocusSent.length > __IPE_FOCUS_SENT_MAX) __ipeFocusSent.shift();
+}
+// The stamped id a patches frame moves focus to, or null. A frame of this tab
+// retires the record of the event it answers and of every earlier one, so no
+// later frame answers them again.
+function __ipeFocusDue(frame) {
+  if (!__ipeTabId || frame.tab !== __ipeTabId || typeof frame.tabSeq !== "number") return null;
+  var sent = null;
+  var kept = [];
+  for (var i = 0; i < __ipeFocusSent.length; i++) {
+    var rec = __ipeFocusSent[i];
+    if (rec.seq === frame.tabSeq) sent = rec;
+    else if (rec.seq > frame.tabSeq) kept.push(rec);
+  }
+  __ipeFocusSent = kept;
+  if (!sent || sent.epoch !== __ipeFocusEpoch) return null;
+  if (typeof frame.focus !== "string" || !/^[A-Za-z0-9_.:-]+$/.test(frame.focus)) return null;
+  return frame.focus;
+}
+// Focus the element stamped `id`, when the render on screen holds it.
+function __ipeFocusStamped(id) {
+  var el = __ipeDoc.query("[ipe-id=" + __ipeCssString(id) + "]");
   if (el) __ipeNode.focus(el);
 }
 
@@ -1263,6 +1301,7 @@ function __ipeSend(msgName, args, handlerId, opts) {
   if (epoch) body.epoch = epoch;
   if (__ipeTabId) body.tab = __ipeTabId;
   if (snapshot) body.inputState = snapshot;
+  __ipeNoteSent(mySeq);
   __ipePostEvent(body);
 }
 
@@ -2574,7 +2613,11 @@ var __ipeLiveFrames = {
       return;
     }
     __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
-      __ipeAdoptPatches(frame.from, frame.to, frame.patches);
+      // Read before the patches apply: applying them can move focus itself.
+      var focus = __ipeFocusDue(frame);
+      if (__ipeAdoptPatches(frame.from, frame.to, frame.patches) && focus !== null) {
+        __ipeFocusStamped(focus);
+      }
     }, frame.globalSeq);
   },
   // Dev-watch blue-green cutover cue. The watch server sends this right after
