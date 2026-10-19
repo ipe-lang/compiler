@@ -79,8 +79,9 @@ fn run_subcommand_builds_and_executes_hello_program() {
 
         // The program is a real project in a private scratch tree.
         let fixture = RootFixture::main(SRC);
-        assert!(fixture.is_ok(), "write project: {fixture:?}");
-        let Ok(fixture) = fixture else { return };
+        let Ok(fixture) = fixture else {
+            panic!("write project: {fixture:?}")
+        };
         let dir =
             std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_run_subcommand_e2e");
         let _ = fs::remove_dir_all(&dir);
@@ -95,8 +96,9 @@ fn run_subcommand_builds_and_executes_hello_program() {
         // child process to check stdout.  This exercises the same code paths as
         // run_run without sacrificing the test runner.
         let built = build_fixture(&fixture, &out_dir, &runtime_dir);
-        assert!(built.is_ok(), "ipe dev build step must succeed: {built:?}");
-        let Ok(built) = built else { return };
+        let Ok(built) = built else {
+            panic!("ipe dev build step must succeed: {built:?}")
+        };
 
         // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
         // ambient CARGO_TARGET_DIR a local lane set); fall back to an isolated
@@ -115,8 +117,9 @@ fn run_subcommand_builds_and_executes_hello_program() {
 
         // --- Step 3: run the binary, capture stdout ---
         let bin = built.binary_in(&target_dir.join("debug"));
-        assert!(bin.is_ok(), "the emitted binary name must read: {bin:?}");
-        let Ok(bin) = bin else { return };
+        let Ok(bin) = bin else {
+            panic!("the emitted binary name must read: {bin:?}")
+        };
         let run = std::process::Command::new(&bin).output();
         let Ok(run) = run else {
             panic!("failed to run emitted binary: {run:?}")
