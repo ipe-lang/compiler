@@ -211,6 +211,13 @@ selected : Bool -> Attribute msg
 autofocus : Bool -> Attribute msg
 ```
 
+`autofocus on` — a control with `autofocus` takes keyboard focus when the
+page loads, and when it appears in a render that answers the user's own
+action in that tab (opening a panel moves focus into its first field). A
+render the user's action did not cause (a subscription, a command result,
+another tab), a control that already carried `autofocus`, and a render that
+lands after focus has moved elsewhere never move focus.
+
 ## `tabindex`
 
 ```ipe
