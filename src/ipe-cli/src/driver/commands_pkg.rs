@@ -1923,7 +1923,7 @@ pub fn verify_test_quiet(path: Option<&str>) -> Result<(), CliError> {
 
 pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
     let (format, positional) = cli_args::split_format(rest, "capabilities")?;
-    let caps = capabilities_in(&working_dir()?, positional.first().map(String::as_str))?;
+    let caps = capabilities_in(&working_dir()?, positional.first().copied())?;
     let names: Vec<&'static str> = caps.iter().map(|c| c.as_str()).collect();
     crate::screen::emit_report(
         format,

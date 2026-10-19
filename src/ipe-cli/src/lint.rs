@@ -6,7 +6,7 @@
 //! one [`SourceSnapshot`] of that root — never the injected stdlib — reads an
 //! optional `lint.ipe` from the root, runs every enabled rule over the parsed
 //! source, and renders each finding compiler-style. A file argument names one
-//! module of the project ([`ProjectRoot::target`]): every module is still read
+//! module of the project ([`ProjectRoot::target`](crate::project_root::ProjectRoot::target)): every module is still read
 //! for context, but only that module's findings are reported, and `--fix`
 //! rewrites only its file. With `--fix` every machine-applicable
 //! (semantics-preserving) rewrite is applied and reported; otherwise a
@@ -26,7 +26,7 @@ use ipe_lint::{LINT_CONFIG_FILE as LINT_IPE, LintConfig, SourceModule};
 
 use crate::api_surface::ModulePath;
 use crate::driver::{analysis_root, analysis_target, module_missing, working_dir};
-use crate::project_root::{AnalysisTarget, ProjectRoot, SourceDir};
+use crate::project_root::{AnalysisTarget, SourceDir};
 use crate::screen::{self, Screen, Stream, Tone};
 use crate::source_snapshot::{Limits, SnapshotModule, SourceOrigin, SourceSnapshot};
 use crate::{CliError, cli_args, text};
@@ -92,7 +92,7 @@ pub(crate) fn run_lint(rest: &[String]) -> Result<(), CliError> {
 ///
 /// # Errors
 /// [`CliError::Usage`] on misuse or a malformed `lint.ipe`; every refusal of
-/// [`analysis_root`] and [`ProjectRoot::target`] ([`CliError::NoManifest`],
+/// [`analysis_root`] and [`ProjectRoot::target`](crate::project_root::ProjectRoot::target) ([`CliError::NoManifest`],
 /// [`CliError::FileOutsideRoot`], …) and of [`SourceSnapshot::read`];
 /// [`CliError::LintGateFailed`] when a surviving finding is at or above the
 /// gate severity (report path only).
