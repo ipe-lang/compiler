@@ -13,14 +13,13 @@ module Main exposing (main)
 -- An absent or denied Wake Lock API resolves the Task with a typed `Err` — never
 -- a thrown error or a silently dropped frame.
 
-
+import Ipe.Browser.WakeLock as WakeLock
+import Ipe.Error as Error exposing (Error)
+import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.Task as Task
 import Ipe.Ui as Ui
-import Ipe.Browser.WakeLock as WakeLock
-import Ipe.Error as Error exposing (Error)
 
 
 type alias Model =

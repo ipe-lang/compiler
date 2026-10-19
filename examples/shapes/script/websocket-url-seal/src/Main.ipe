@@ -1,15 +1,15 @@
 module Main exposing (main)
 
-import Ipe.WebSocket as WebSocket
-import Ipe.Url as Url
 import Ipe.Duration as Duration
 import Ipe.Error exposing (Error)
-import Ipe.Result as Result exposing (Result(..))
-import Ipe.Maybe as Maybe
-import Ipe.String as String
-import Ipe.List as List
-import Ipe.Task as Task
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task
+import Ipe.Url as Url
+import Ipe.WebSocket as WebSocket
 
 
 -- Seal WebSocket targets and build a connect configuration without opening a
@@ -25,7 +25,6 @@ import Ipe.Io as Io
 --   • Two parse boundaries compose: `Url.fromString` rejects a malformed URL,
 --     then `WebSocket.url` narrows the scheme — each failure is a typed `Err`.
 
-
 -- Seal a raw string into a `WsUrl`: first `Url.fromString`, then the ws/wss
 -- scheme narrowing. Either boundary can reject with a typed error.
 seal : String -> Result Error WebSocket.WsUrl
@@ -38,7 +37,6 @@ seal raw =
 describe : String -> String
 describe raw =
     case seal raw of
-
         Ok wsUrl ->
             raw
                 ++ "  ->  sealed host="
@@ -74,7 +72,6 @@ main =
         List.map (\c -> Io.println ("  " ++ describe c)) candidates
             |> printAll
         case seal "wss://feed.example.com/stream" of
-
             Ok wsUrl ->
                 let
                     cfg =

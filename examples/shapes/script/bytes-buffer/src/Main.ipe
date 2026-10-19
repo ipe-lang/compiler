@@ -1,9 +1,9 @@
 module Main exposing (main)
 
 import Ipe.Bytes as Bytes
+import Ipe.Io as Io
 import Ipe.Maybe as Maybe exposing (Maybe(..))
 import Ipe.String as String
-import Ipe.Io as Io
 
 
 -- Work with a raw byte buffer. The load-bearing idea: `Bytes` is a DISTINCT type
@@ -28,7 +28,6 @@ main =
     let
         buffer =
             Bytes.fromString message
-
         -- A window into the buffer: the first four bytes. `slice` clamps
         -- out-of-range indices, so it can never index out of bounds.
         head4 =
@@ -51,7 +50,6 @@ main =
 decodeText : Bytes -> String
 decodeText buffer =
     case Bytes.toString buffer of
-
         Just text ->
             "\"" ++ text ++ "\""
 

@@ -1,10 +1,10 @@
 module Main exposing (main)
 
-import Ipe.Trace as Trace
 import Ipe.Debug as Debug
+import Ipe.Io as Io
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
+import Ipe.Trace as Trace
 
 
 -- `Ipe.Trace` groups a unit of work into a named span; `Ipe.Debug.log` is the
@@ -17,7 +17,6 @@ import Ipe.Io as Io
 --     annotates it with a `key = value`. Both are `Task Error ()` you sequence.
 --   • `Debug.log label value` prints `"label: value"` to stderr and returns the
 --     value UNCHANGED, so you can drop it into an expression without rewiring it.
-
 
 -- The steps of a checkout, each a small Task returning a running subtotal.
 reserveStock : Int -> Task Error Int

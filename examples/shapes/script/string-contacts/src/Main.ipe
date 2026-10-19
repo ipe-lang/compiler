@@ -1,11 +1,11 @@
 module Main exposing (main)
 
-import Ipe.String as String
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
-import Ipe.Tuple as Tuple
+import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
+import Ipe.Tuple as Tuple
 
 
 -- Normalise a block of raw "Name <email>" contact lines into a clean roster,

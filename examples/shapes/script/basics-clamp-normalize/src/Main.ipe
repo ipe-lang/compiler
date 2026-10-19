@@ -1,9 +1,9 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- Exercise the implicit prelude (`Ipe.Basics`): the handful of names that are in

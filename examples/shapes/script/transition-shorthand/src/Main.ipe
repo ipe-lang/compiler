@@ -1,7 +1,7 @@
 module Main exposing (main)
 
-import Ipe.Ui.Transition as Transition exposing (Step)
 import Ipe.Io as Io
+import Ipe.Ui.Transition as Transition exposing (Step)
 
 
 -- `Ipe.Ui.Transition` describes a CSS transition as a list of typed `Step`
@@ -14,7 +14,6 @@ import Ipe.Io as Io
 --   • `buildShorthand` renders the parts to the single CSS value, filling in
 --     defaults for any facet you leave out, and scans the result — a rejected
 --     value renders as the empty string, fail-closed, never an unchecked one.
-
 
 -- Fade in with a short delay and an ease-in-out curve.
 fade : List Step

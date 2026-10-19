@@ -1,12 +1,12 @@
 module Main exposing (main)
 
 import Ipe.Dict as Dict exposing (Dict)
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe exposing (Maybe(..))
 import Ipe.String as String
-import Ipe.Tuple as Tuple
 import Ipe.Task as Task
-import Ipe.Io as Io
+import Ipe.Tuple as Tuple
 
 
 -- A checkout tally built on a `Dict`. A scanner emits a flat stream of SKUs
@@ -16,7 +16,6 @@ import Ipe.Io as Io
 --     upserting a running count without a "does the key exist yet?" branch.
 --   • `Dict.get` returns `Maybe`, so a scanned SKU absent from the price book is
 --     a value the type forces us to handle — never a crash, never a silent zero.
-
 
 -- The price book: SKU -> price in cents. `Dict.fromList` builds it; a later
 -- pair with the same key would overwrite an earlier one.
@@ -51,7 +50,6 @@ bump sku tally =
 increment : Maybe Int -> Maybe Int
 increment current =
     case current of
-
         Nothing ->
             Just 1
 
@@ -78,7 +76,6 @@ lineItem pair =
             String.padRight 8 ' ' (Tuple.first pair) ++ "x" ++ String.fromInt qty ++ "  "
     in
     case priced pair of
-
         Just cents ->
             label ++ money (cents * qty)
 

@@ -9,7 +9,6 @@ package =
     , version = "0.1.0"
     , capabilities =
         { declares = []
-
         -- The `Ipe.Browser.ScreenOrientation` import discloses
         -- `js-port:screen-orientation`; the `:raw` floor is also disclosed.
         -- Both must be accepted here or the build fails closed (IPE-S0002).

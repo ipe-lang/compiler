@@ -21,20 +21,20 @@ module Main exposing (main)
 -- Chromium via `wasm-bindgen-test`), and this gap is closed structurally by
 -- M5's reachability closure, not by a per-module workaround here.
 
+import Ipe.Http as Http
+import Ipe.Log as Log
+import Ipe.PubSub as PubSub
+import Ipe.Random as Random
 import Ipe.String as String
+import Ipe.Task as Task
 import Ipe.Tea.Web exposing (tea)
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.Log as Log
-import Ipe.Random as Random
-import Ipe.Http as Http
-import Ipe.Url as Url
-import Ipe.PubSub as PubSub
-import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Ipe.Ui.Background as Background
 import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
+import Ipe.Url as Url
 
 
 type Page
@@ -179,19 +179,23 @@ view model =
         [ Ui.spacing 14, Ui.padding 32 ]
         [ Ui.el [ Font.size 20, Font.bold ] (Ui.text "M4 Cmd/Sub browser-effects bridge")
         , labelled "ticks (Sub.every):" (Ui.el [] (Ui.text (String.fromInt model.ticks)))
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ actionButton LogClicked "Log.info"
             , Ui.el [] (Ui.text model.lastLog)
             ]
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ actionButton RollDice "Random.int 1 6"
             , Ui.el [] (Ui.text ("dice: " ++ String.fromInt model.dice))
             ]
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ actionButton PingClicked "PubSub.publish"
             , Ui.el [] (Ui.text ("pings received: " ++ String.fromInt model.pings ++ " / " ++ model.lastPing))
             ]
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ actionButton FetchClicked "Http.get"
             , Ui.el [] (Ui.text model.fetchStatus)
             ]
