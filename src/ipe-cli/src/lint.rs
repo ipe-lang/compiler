@@ -1,13 +1,17 @@
 //! `ipe lint [<path>]` (+ `--fix`) — extensible static analysis over `.ipe`
 //! source.
 //!
-//! The command loads the project's own (user) modules through the SAME
-//! resolution path `ipe dev build` uses — never the injected stdlib — reads an
-//! optional `lint.ipe`, runs every enabled rule over the parsed source, and
-//! renders each finding compiler-style. With `--fix` it applies every
-//! machine-applicable (semantics-preserving) rewrite and reports what changed;
-//! otherwise a surviving finding at or above the configured gate severity exits
-//! non-zero for CI.
+//! The command runs over the project rooted at the current directory (or the
+//! directory its argument names): it reads the project's own modules from the
+//! one [`SourceSnapshot`] of that root — never the injected stdlib — reads an
+//! optional `lint.ipe` from the root, runs every enabled rule over the parsed
+//! source, and renders each finding compiler-style. A file argument names one
+//! module of the project ([`ProjectRoot::target`]): every module is still read
+//! for context, but only that module's findings are reported, and `--fix`
+//! rewrites only its file. With `--fix` every machine-applicable
+//! (semantics-preserving) rewrite is applied and reported; otherwise a
+//! surviving finding at or above the configured gate severity exits non-zero
+//! for CI.
 //!
 //! `--json` emits findings as `{"schema":"ipe.cli.lint/1","findings":[…]}`.
 //! `--plain` prints one line per finding: `<severity>:<file>:<line>:<col>: <message>`.
@@ -20,13 +24,17 @@ use std::path::{Path, PathBuf};
 
 use ipe_lint::{LINT_CONFIG_FILE as LINT_IPE, LintConfig, SourceModule};
 
+use crate::api_surface::ModulePath;
+use crate::driver::{analysis_root, analysis_target, module_missing, working_dir};
+use crate::project_root::{AnalysisTarget, ProjectRoot, SourceDir};
 use crate::screen::{self, Screen, Stream, Tone};
-use crate::{CliError, cli_args, text, watch};
+use crate::source_snapshot::{Limits, SnapshotModule, SourceOrigin, SourceSnapshot};
+use crate::{CliError, cli_args, text};
 
 /// Parsed `ipe lint` arguments.
 pub(crate) struct LintArgs {
-    /// The path to lint: a `.ipe` file or a project directory. Defaults to the
-    /// current project.
+    /// The path to lint: a module file of the project or a project directory.
+    /// Defaults to the current directory's project.
     pub(crate) entry: Option<String>,
     /// Apply every machine-applicable fix instead of only reporting.
     pub(crate) fix: bool,
@@ -75,63 +83,116 @@ pub(crate) fn parse_lint_args(rest: &[String]) -> Result<LintArgs, CliError> {
 /// `ipe lint [<path>]` — run the linter, printing findings (or applying fixes).
 ///
 /// # Errors
-/// [`CliError::Usage`] on misuse; [`CliError::Io`] on a filesystem failure;
-/// [`CliError::Pipeline`] if an entry file fails to parse; [`CliError::Usage`]
-/// for a malformed `lint.ipe`; [`CliError::LintGateFailed`] when a surviving
-/// finding is at or above the gate severity (report path only).
+/// Every refusal of [`run_lint_in`] over the current directory.
 pub(crate) fn run_lint(rest: &[String]) -> Result<(), CliError> {
-    let args = parse_lint_args(rest)?;
-    let entry = match args.entry {
-        Some(e) => PathBuf::from(e),
-        None => PathBuf::from(crate::default_entry()?),
-    };
-
-    let resolved = watch::resolve_project_sources(&entry, None)?;
-
-    // The config lives next to the resolved manifest, or in the entry's
-    // directory for a single-file lint. Absent → defaults.
-    let config = load_config(&resolved.blame_path)?;
-
-    // Map every user module to its source and file path (for rendering).
-    let mut paths: BTreeMap<Vec<String>, PathBuf> = BTreeMap::new();
-    let mut modules: Vec<SourceModule> = Vec::new();
-    for (module, (path, source)) in &resolved.sources {
-        paths.insert(module.clone(), path.clone());
-        modules.push(SourceModule {
-            module: module.clone(),
-            source: source.clone(),
-        });
-    }
-
-    if args.fix {
-        // Fixes reach modules found by walking the project, so each rewrite must
-        // stay inside it (the manifest's directory, or a single file's own).
-        let root = resolved
-            .blame_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        return apply_and_report(&modules, &config, &paths, &root);
-    }
-    report_findings(&modules, &config, &paths, args.format)
+    run_lint_in(&working_dir()?, rest)
 }
 
-/// Read `lint.ipe` from the directory holding `blame_path` (the resolved
-/// manifest or entry file), returning defaults when none exists.
+/// [`run_lint`] with `cwd` as the current directory.
+///
+/// # Errors
+/// [`CliError::Usage`] on misuse or a malformed `lint.ipe`; every refusal of
+/// [`analysis_root`] and [`ProjectRoot::target`] ([`CliError::NoManifest`],
+/// [`CliError::FileOutsideRoot`], …) and of [`SourceSnapshot::read`];
+/// [`CliError::LintGateFailed`] when a surviving finding is at or above the
+/// gate severity (report path only).
+pub(crate) fn run_lint_in(cwd: &Path, rest: &[String]) -> Result<(), CliError> {
+    let args = parse_lint_args(rest)?;
+    let (root, file) = analysis_root(cwd, args.entry.as_deref().map(Path::new))?;
+    let config = load_config(root.path())?;
+    let scope = LintScope::of(&analysis_target(&root, file.as_ref())?)?;
+    if args.fix {
+        return apply_and_report(&scope, &config, root.path());
+    }
+    report_findings(&scope, &config, args.format)
+}
+
+/// The project modules one lint reads, and the one whose findings it reports.
+struct LintScope {
+    /// Every project module the rules see, in module-path order.
+    modules: Vec<SourceModule>,
+    /// The file each module was read from, for rendering and rewriting.
+    paths: BTreeMap<ModulePath, PathBuf>,
+    /// The module a file argument named; `None` reports every module.
+    focus: Option<ModulePath>,
+}
+
+impl LintScope {
+    /// The modules `target` reads, all from one snapshot of its root.
+    ///
+    /// The whole project, or one of its `src/` modules, reads the build's own
+    /// modules; a `tests/` module reads its test program's universe. Injected
+    /// stdlib and FFI interface text is never linted.
+    ///
+    /// # Errors
+    /// Every refusal of [`SourceSnapshot::read`] and
+    /// [`SourceSnapshot::test_view`]; [`CliError::Io`] (`NotFound`) for a
+    /// `tests/` module the snapshot does not hold.
+    fn of(target: &AnalysisTarget<'_>) -> Result<Self, CliError> {
+        let (AnalysisTarget::Project(root) | AnalysisTarget::Module { root, .. }) = target;
+        let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
+        match target {
+            AnalysisTarget::Project(_) => Ok(Self::over(snapshot.modules(), None)),
+            AnalysisTarget::Module {
+                dir: SourceDir::Src,
+                module,
+                ..
+            } => Ok(Self::over(snapshot.modules(), Some(module.clone()))),
+            AnalysisTarget::Module {
+                dir: SourceDir::Tests,
+                module,
+                ..
+            } => {
+                let Some(entry) = snapshot.test_entry(module) else {
+                    return Err(module_missing(root, SourceDir::Tests, module));
+                };
+                let view = SourceSnapshot::test_view(entry)?;
+                Ok(Self::over(view.modules(), Some(view.entry().clone())))
+            }
+        }
+    }
+
+    /// The project's own modules of `held`, reporting `focus` alone when given.
+    fn over(held: &BTreeMap<ModulePath, SnapshotModule>, focus: Option<ModulePath>) -> Self {
+        let mut modules = Vec::new();
+        let mut paths = BTreeMap::new();
+        for (module, held) in held {
+            if !matches!(held.origin(), SourceOrigin::Own(_)) {
+                continue;
+            }
+            paths.insert(module.clone(), held.path().to_path_buf());
+            modules.push(SourceModule {
+                module: module.clone(),
+                source: held.text().to_owned(),
+            });
+        }
+        Self {
+            modules,
+            paths,
+            focus,
+        }
+    }
+
+    /// Whether `module` is one whose findings and rewrites this lint reports.
+    fn reports(&self, module: &[String]) -> bool {
+        self.focus.as_deref().is_none_or(|focus| focus == module)
+    }
+}
+
+/// Read `lint.ipe` from the project root `dir`, returning defaults when none exists.
 ///
 /// The read goes through [`ipe_lint::load_lint_config`], the one bounded,
 /// open-once reader the language server shares. `lint.ipe` is found by
 /// convention, not named by the user, so a symlink, FIFO, device, or
 /// directory at that name is [`CliError::SourceRefused`] and an oversized
 /// one [`CliError::FileTooLarge`] — never followed, waited on, or ignored.
-fn load_config(blame_path: &Path) -> Result<LintConfig, CliError> {
+fn load_config(dir: &Path) -> Result<LintConfig, CliError> {
     use ipe_lint::{LintConfigLoadError, WorkspaceReadError};
 
     use crate::io_bounded::{SourceRefusal, access_error, source_refused};
 
-    let dir = ipe_lint::lint_config_dir(blame_path);
     let path = dir.join(LINT_IPE);
-    ipe_lint::load_lint_config(&dir).map_err(|e| match e {
+    ipe_lint::load_lint_config(dir).map_err(|e| match e {
         LintConfigLoadError::Read(WorkspaceReadError::Unreadable(source)) => {
             access_error(&path, source)
         }
@@ -150,23 +211,24 @@ fn load_config(blame_path: &Path) -> Result<LintConfig, CliError> {
     })
 }
 
-/// Run the linter and print each finding; fail the gate if any survives at or
-/// above the gate severity.
+/// Run the linter over `scope` and print each finding it reports; fail the gate
+/// if any reported finding survives at or above the gate severity.
 // The three output formats (JSON, plain, human) each need their own rendering
 // path. Splitting into separate functions would obscure that they all read the
 // same report and share the same gate-trip logic, so the body is intentionally
 // kept together.
 #[allow(clippy::too_many_lines)]
 fn report_findings(
-    modules: &[SourceModule],
+    scope: &LintScope,
     config: &LintConfig,
-    paths: &BTreeMap<Vec<String>, PathBuf>,
     format: cli_args::OutputFormat,
 ) -> Result<(), CliError> {
     use crate::cli_args::json;
     use cli_args::OutputFormat::{Human, Json, Plain};
 
-    let Ok(report) = ipe_lint::run(modules, config, &ipe_lint::NeverCancel);
+    let LintScope { modules, paths, .. } = scope;
+    let Ok(mut report) = ipe_lint::run(modules, config, &ipe_lint::NeverCancel);
+    report.findings.retain(|f| scope.reports(&f.module));
     let source_of: BTreeMap<&[String], &str> = modules
         .iter()
         .map(|m| (m.module.as_slice(), m.source.as_str()))
@@ -342,13 +404,18 @@ fn byte_to_line_col(source: &str, offset: u32) -> (usize, usize) {
 ///
 /// Call sites the change-signature engine cannot rewrite mechanically are
 /// printed as manual-review notices — fail-closed.
-fn apply_and_report(
-    modules: &[SourceModule],
-    config: &LintConfig,
-    paths: &BTreeMap<Vec<String>, PathBuf>,
-    root: &Path,
-) -> Result<(), CliError> {
-    let local_outcome = ipe_lint::apply_fixes(modules, config);
+///
+/// A lint focused on one module rewrites that module's file alone: a
+/// signature fix whose call-site rewrites reach another module is withheld
+/// whole, and reported, so no partial change leaves a caller out of step.
+fn apply_and_report(scope: &LintScope, config: &LintConfig, root: &Path) -> Result<(), CliError> {
+    let LintScope { modules, paths, .. } = scope;
+    let mut local_outcome = ipe_lint::apply_fixes(modules, config);
+    if scope.focus.is_some() {
+        local_outcome
+            .rewritten
+            .retain(|module, _| scope.reports(module));
+    }
 
     // Build the post-local-fix module list: substitute locally-rewritten
     // sources so sig-fix sees the already-improved text.
@@ -365,10 +432,26 @@ fn apply_and_report(
         })
         .collect();
 
-    let sig_outcome = ipe_lint::apply_sig_fixes(&modules_after_local, config);
-
-    let total = local_outcome.applied + sig_outcome.applied;
+    let mut sig_outcome = ipe_lint::apply_sig_fixes(&modules_after_local, config);
     let mut out = Screen::new(Stream::Stdout);
+    if sig_outcome
+        .rewritten
+        .keys()
+        .any(|module| !scope.reports(module))
+    {
+        sig_outcome.rewritten.clear();
+        sig_outcome.applied = 0;
+        out.line(
+            Tone::UserError,
+            "lint --fix: signature fixes withheld: they rewrite modules other than the one named; run lint --fix without a file to apply them",
+        );
+    }
+
+    let total = if scope.focus.is_some() {
+        local_outcome.rewritten.len() + sig_outcome.rewritten.len()
+    } else {
+        local_outcome.applied + sig_outcome.applied
+    };
     if total == 0 && sig_outcome.manual_reviews.is_empty() {
         out.line(Tone::Text, "lint --fix: no machine-applicable fixes");
         out.emit();
@@ -408,7 +491,7 @@ fn apply_and_report(
         }
     }
 
-    if total > 0 {
+    if total > 0 && scope.focus.is_none() {
         out.line(
             Tone::Success,
             &format!(

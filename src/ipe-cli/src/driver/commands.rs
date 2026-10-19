@@ -1,24 +1,27 @@
 use super::{
-    AnalysisTarget, BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget,
-    RuntimeContext, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
-    attribute_post_link_error, bluegreen_enabled, build_loose_file_into, build_parsed_project_into,
-    bundle_delivery, collect_entry_and_siblings, collect_manifest_rooted_entry,
-    collect_test_sources, compile_prepared, create_source_root, emit_machine_error,
+    BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget, RuntimeContext,
+    SettingsSource, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
+    bluegreen_enabled, build_loose_file_into, build_parsed_project_into, bundle_delivery,
+    collect_entry_and_siblings, compile_prepared, create_source_root, emit_machine_error,
     emit_permissions, emit_settings, find_manifest_for_ipe_file, frame_infer_error,
-    gate_decoder_pipelines, home_to_source_map, io_err, resolve_analysis_target,
-    resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
+    gate_decoder_pipelines, home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version,
+    runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
 use ipe_diagnostics::suggest;
 
+use crate::api_surface::ModulePath;
 use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
 };
-use crate::contained_path::ResolvedPath;
 use crate::delivery::HostIntent;
 use crate::loose_file::LooseFileError;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
+use crate::project_root::{
+    AnalysisTarget, EntrySet, FileArg, ProjectRoot, ResolvedEntry, RootArg, SourceDir,
+};
+use crate::source_snapshot::{Limits, SnapshotModule, SourceOrigin, SourceSnapshot};
 use crate::style::TerminalSafe;
 use crate::verb::{CommandName, DevVerb, ReleaseVerb, Umbrella, Verb};
 use crate::{
@@ -441,20 +444,31 @@ pub fn resolve_output_root(
 /// code, never from config or the CLI. `entry_arg` is the raw positional (a
 /// `.ipe` file, a project directory, or a bare `.`): a file no manifest governs
 /// is read as the user named it, following a link; a governed project's entry
-/// is the convention file below its source root, never followed. A source that
-/// does not parse yields [`delivery::Shape::Script`] — the cross-check then
-/// does not fire and the build pipeline reports the real parse error with a
-/// blamed span.
+/// is the build's entry module below its source root, never followed. A library
+/// (no program, no `src/Main.ipe`, some `exposedModules`) has no `main` to pin
+/// a shape and classifies as [`delivery::Shape::Script`], as does a source that
+/// does not parse — the cross-check then does not fire and the build pipeline
+/// reports the real refusal with a blamed span.
 ///
 /// # Errors
 /// [`CliError::Io`] when the entry source cannot be read, or the manifest /
-/// entry-resolution errors of [`super::analysis_root_of`].
+/// entry-resolution errors of [`project::ProjectManifest::resolved_entry`].
 pub fn classify_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliError> {
     let source = match discover_manifest(entry_arg)? {
         None => io_bounded::read_user_named(entry_arg, io_bounded::SOURCE_CAP)?,
         Some(manifest) => {
             let parsed = project::parse_manifest(&manifest)?;
-            let entry = super::analysis_root_of(&parsed)?;
+            let main = parsed.src_root.join("Main.ipe");
+            if parsed.default_program().is_none()
+                && !parsed.exposed_modules.is_empty()
+                && !main.is_file()
+            {
+                return Ok(delivery::Shape::from_main(
+                    ipe_canon::shape_source::MainShape::Script,
+                ));
+            }
+            let module = parsed.resolved_entry()?;
+            let entry = parsed.src_root.join(format!("{}.ipe", module.join("/")));
             io_bounded::read_beneath(&parsed.src_root, &entry, io_bounded::SOURCE_CAP)?
         }
     };
@@ -694,11 +708,6 @@ pub fn run_build(rest: &[String]) -> Result<(), CliError> {
 #[allow(clippy::too_many_lines)]
 pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     let args = cli_args::parse_build(rest)?;
-    let entry = match args.entry {
-        Some(e) => e,
-        None => default_entry()?,
-    };
-    let entry_path = PathBuf::from(&entry);
 
     let wants_static = matches!(
         &args.mode,
@@ -710,17 +719,14 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // IR-dump path carries no options to drop.
     let (out, wasm_target, cli_layer) = match args.mode {
         cli_args::BuildMode::EmitIr => {
-            // `--emit-ir` reads a single entry file, so route a directory / bare
-            // `.` project root to its entry `.ipe` — the same convention the
-            // analysis surfaces use — rather than handing the directory straight
-            // to the source reader (which would fail with a raw "Is a directory").
-            // A file argument is never substituted for the project's default
-            // entry; only widened to `tests ∪ src` when it names a test file.
-            let ir_target = resolve_analysis_target(&entry_path)?;
-            let tree = emit_ir_text_for_target(&ir_target)?;
+            // The project is the current directory (or the directory named); a
+            // file argument names one of its modules, never the default entry.
+            let (root, file) =
+                analysis_root(&working_dir()?, args.entry.as_deref().map(Path::new))?;
+            let tree = emit_ir_text(&root, file.as_ref())?;
             screen::emit_machine(screen::Stream::Stdout, &tree);
             return Ok(BuildSuccess {
-                entry,
+                entry: args.entry.unwrap_or_else(|| ".".to_owned()),
                 out_dir: PathBuf::new(),
             });
         }
@@ -730,6 +736,11 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
             static_layer,
         } => (out, wasm, static_layer),
     };
+    let entry = match args.entry {
+        Some(e) => e,
+        None => default_entry()?,
+    };
+    let entry_path = PathBuf::from(&entry);
 
     // Route the build:
     //   1. Directory → expect package.ipe inside it.
@@ -797,7 +808,8 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // `--fix` carries durable authorization: apply machine-applicable fixes
     // non-interactively before the build sees the source.
     if bundle_host.is_none() && args.fix {
-        apply_fixes_cmd(&entry_path, true, &mut std::io::stdout())?;
+        let (root, file) = analysis_root(&working_dir()?, Some(&entry_path))?;
+        apply_fixes_cmd(&root, file.as_ref(), true, &mut std::io::stdout())?;
     }
 
     if let Some(host) = bundle_host {
@@ -3466,11 +3478,8 @@ pub const fn run_explain(_rest: &[String]) -> Result<(), CliError> {
 /// `--yes` is durable authorization to apply every machine-applicable edit.
 pub fn run_fix(rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_fix(rest)?;
-    apply_fixes_cmd(
-        &PathBuf::from(&args.entry),
-        args.auto,
-        &mut std::io::stdout(),
-    )?;
+    let (root, file) = analysis_root(&working_dir()?, Some(Path::new(&args.entry)))?;
+    apply_fixes_cmd(&root, file.as_ref(), args.auto, &mut std::io::stdout())?;
     Ok(())
 }
 
@@ -3578,21 +3587,6 @@ pub fn did_you_mean_codes(input: &str) -> Vec<&'static str> {
 }
 
 // ===========================================================================
-// `--emit-ir` — pretty-print the lowered IR
-// ===========================================================================
-
-/// Run parse → canon → types → lower and return the pretty-printed IR tree,
-/// stopping before codegen.
-///
-/// # Errors
-/// Returns [`CliError::Pipeline`] when the compiler rejects the program, or
-/// [`CliError::Io`] when the entry file cannot be read.
-pub fn emit_ir_text(entry: &Path) -> Result<String, CliError> {
-    let file = ResolvedPath::of(entry).map_err(|e| io_err(entry, e))?;
-    emit_ir_text_for_target(&AnalysisTarget::Loose(file))
-}
-
-// ===========================================================================
 // `capabilities` — report / verify a program's inferred capability set
 // ===========================================================================
 
@@ -3690,6 +3684,14 @@ pub struct SourceGraph {
 }
 
 impl SourceGraph {
+    /// The path the entry module's text was read from, which its diagnostics blame.
+    #[must_use]
+    pub fn entry_path(&self) -> &Path {
+        self.sources
+            .get(&self.entry_module_path)
+            .map_or_else(|| Path::new(""), |(path, _)| path.as_path())
+    }
+
     /// Run the per-module canonicalisation blame loop, then map a rejecting
     /// query's [`ipe_db::PipelineError`] to the source file that OWNS it — the SAME
     /// attribution the build path uses (`attribute_canon_errors` +
@@ -3782,41 +3784,7 @@ pub fn build_source_graph(entry: &Path) -> Result<SourceGraph, CliError> {
     build_source_graph_from(collect_entry_and_siblings(entry)?, entry)
 }
 
-/// Build the whole-program source graph for a manifest-governed file analysed
-/// by itself, over the src-rooted module set [`collect_manifest_rooted_entry`]
-/// discovers (the same set `ipe dev build` compiles) — so a nested file importing
-/// by its full module path (`Api.Handlers` importing `Api.Types`) resolves.
-///
-/// # Errors
-/// Same as [`build_source_graph`].
-pub fn build_source_graph_for_manifest_file(
-    src_root: &Path,
-    entry: &Path,
-) -> Result<SourceGraph, CliError> {
-    build_source_graph_from(collect_manifest_rooted_entry(src_root, entry)?, entry)
-}
-
-/// Build the whole-program source graph for a `tests/`-rooted entry, unioning
-/// the project's `src/` tree with its `tests/` tree — [`collect_test_sources`],
-/// `ipe verify`'s own `tests ∪ src` convention — so `ipe type-check tests/X.ipe`
-/// and its sibling analysis surfaces see every module a test file may import
-/// from either tree.
-///
-/// # Errors
-/// Same as [`build_source_graph`].
-pub fn build_source_graph_for_test(
-    project_src_root: &Path,
-    tests_root: &Path,
-    test_entry: &Path,
-) -> Result<SourceGraph, CliError> {
-    build_source_graph_from(
-        collect_test_sources(project_src_root, tests_root, test_entry)?,
-        test_entry,
-    )
-}
-
-/// The [`build_source_graph`] / [`build_source_graph_for_test`] shared core:
-/// inject the compiled-source stdlib closure and the FFI seam into an already
+/// The [`build_source_graph`] core: inject the compiled-source stdlib closure and the FFI seam into an already
 /// collected module set, then create the salsa source root.
 ///
 /// # Errors
@@ -4117,48 +4085,7 @@ pub fn named_sources_for_web_scan(
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic;
 /// [`CliError::Io`] when a source file cannot be read.
 pub fn typecheck_entry_via_graph(entry: &Path) -> Result<(), CliError> {
-    typecheck_graph(&build_source_graph(entry)?, entry)
-}
-
-/// The `tests/`-rooted sibling of [`typecheck_entry_via_graph`]: type-check a
-/// test entry over the `tests ∪ src` module set [`build_source_graph_for_test`]
-/// builds, so a test-only type error is caught by `ipe type-check` the same way
-/// a src-tree error is.
-///
-/// # Errors
-/// Same as [`typecheck_entry_via_graph`].
-pub fn typecheck_test_entry_via_graph(
-    project_src_root: &Path,
-    tests_root: &Path,
-    test_entry: &Path,
-) -> Result<(), CliError> {
-    typecheck_graph(
-        &build_source_graph_for_test(project_src_root, tests_root, test_entry)?,
-        test_entry,
-    )
-}
-
-/// The manifest-rooted sibling of [`typecheck_entry_via_graph`]: type-check a
-/// nested, non-entry file over the src-rooted module set
-/// [`build_source_graph_for_manifest_file`] builds, so its imports resolve
-/// against the project's real `src_root` rather than the file's own directory.
-///
-/// # Errors
-/// Same as [`typecheck_entry_via_graph`].
-pub fn typecheck_manifest_file_via_graph(src_root: &Path, entry: &Path) -> Result<(), CliError> {
-    typecheck_graph(
-        &build_source_graph_for_manifest_file(src_root, entry)?,
-        entry,
-    )
-}
-
-/// The [`typecheck_entry_via_graph`] / [`typecheck_test_entry_via_graph`]
-/// shared core: run [`typecheck_query`] over the given graph.
-///
-/// # Errors
-/// [`CliError::Pipeline`] carrying the first compiler diagnostic.
-fn typecheck_graph(graph: &SourceGraph, blame_path: &Path) -> Result<(), CliError> {
-    graph.run_attributed(blame_path, typecheck_query)
+    build_source_graph(entry)?.run_attributed(entry, typecheck_query)
 }
 
 /// The type-check every analysis surface demands of a source graph: link, HM
@@ -4235,70 +4162,190 @@ pub fn front_check_entry(entry: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Type-check the entry an [`AnalysisTarget`] names, dispatching to the `src`-
-/// rooted or `tests ∪ src`-rooted graph builder depending on the variant —
-/// the one place every `resolve_analysis_target` caller routes through so a
-/// FILE argument is always analysed as itself.
+/// The process's current directory: the root every analysis command resolves.
 ///
 /// # Errors
-/// Same as [`typecheck_entry_via_graph`].
-pub fn typecheck_target(target: &AnalysisTarget) -> Result<(), CliError> {
+/// [`CliError::Io`] when the current directory cannot be read.
+pub fn working_dir() -> Result<PathBuf, CliError> {
+    std::env::current_dir().map_err(|e| io_err(Path::new("."), e))
+}
+
+/// Resolve the project an analysis command runs over, and split off its file argument.
+///
+/// The root is `cwd`, or the directory `arg` names ([`RootArg::of`]); any
+/// other `arg` is a file argument over `cwd`, judged by
+/// [`ProjectRoot::target`]. No directory above is consulted.
+///
+/// # Errors
+/// Every refusal of [`ProjectRoot::resolve`], [`CliError::NoManifest`] first.
+pub fn analysis_root(
+    cwd: &Path,
+    arg: Option<&Path>,
+) -> Result<(ProjectRoot, Option<FileArg>), CliError> {
+    let (root_arg, file) = RootArg::of(cwd, arg);
+    Ok((ProjectRoot::resolve(root_arg)?, file))
+}
+
+/// What `file` names in `root`: the whole project when there is none.
+///
+/// # Errors
+/// Every refusal of [`ProjectRoot::target`].
+pub fn analysis_target<'r>(
+    root: &'r ProjectRoot,
+    file: Option<&FileArg>,
+) -> Result<AnalysisTarget<'r>, CliError> {
+    file.map_or(Ok(AnalysisTarget::Project(root)), |file| root.target(file))
+}
+
+/// The source graphs one analysis checks: one per entry it names, all over one snapshot.
+///
+/// The whole project is every member of its [`EntrySet`]: each program's
+/// entry, or each exposed module of a library. A `src/` module is checked
+/// over the build's modules; a `tests/` module over its own
+/// [`SourceSnapshot::test_view`], never merged into the build's.
+///
+/// # Errors
+/// Every refusal of [`SourceSnapshot::read`] and [`SourceSnapshot::test_view`];
+/// [`CliError::Io`] (`NotFound`) when the snapshot holds no module the target
+/// names.
+pub fn analysis_graphs(target: &AnalysisTarget<'_>) -> Result<Vec<SourceGraph>, CliError> {
     match target {
-        AnalysisTarget::Loose(file) => typecheck_entry_via_graph(file.as_path()),
-        AnalysisTarget::Source { file, src_root } => {
-            typecheck_manifest_file_via_graph(src_root.as_path(), file.as_path())
+        AnalysisTarget::Project(root) => {
+            let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
+            entry_modules(root.entries())
+                .into_iter()
+                .map(|module| graph_over(root, snapshot.modules(), SourceDir::Src, module))
+                .collect()
         }
-        AnalysisTarget::Test {
-            file,
-            src_root,
-            tests_root,
+        AnalysisTarget::Module {
+            root,
+            dir: SourceDir::Src,
+            module,
         } => {
-            typecheck_test_entry_via_graph(src_root.as_path(), tests_root.as_path(), file.as_path())
+            let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
+            Ok(vec![graph_over(
+                root,
+                snapshot.modules(),
+                SourceDir::Src,
+                module,
+            )?])
+        }
+        AnalysisTarget::Module {
+            root,
+            dir: SourceDir::Tests,
+            module,
+        } => {
+            let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
+            let Some(entry) = snapshot.test_entry(module) else {
+                return Err(module_missing(root, SourceDir::Tests, module));
+            };
+            let view = SourceSnapshot::test_view(entry)?;
+            Ok(vec![graph_over(
+                root,
+                view.modules(),
+                SourceDir::Tests,
+                view.entry(),
+            )?])
         }
     }
 }
 
-/// Build the source graph an [`AnalysisTarget`] names, returning it alongside
-/// the path an attributed query should blame diagnostics against.
-///
-/// # Errors
-/// Same as [`build_source_graph`].
-pub fn source_graph_for_target(
-    target: &AnalysisTarget,
-) -> Result<(SourceGraph, PathBuf), CliError> {
-    match target {
-        AnalysisTarget::Loose(file) => Ok((
-            build_source_graph(file.as_path())?,
-            file.as_path().to_path_buf(),
-        )),
-        AnalysisTarget::Source { file, src_root } => Ok((
-            build_source_graph_for_manifest_file(src_root.as_path(), file.as_path())?,
-            file.as_path().to_path_buf(),
-        )),
-        AnalysisTarget::Test {
-            file,
-            src_root,
-            tests_root,
-        } => Ok((
-            build_source_graph_for_test(src_root.as_path(), tests_root.as_path(), file.as_path())?,
-            file.as_path().to_path_buf(),
-        )),
+/// Every entry module of `entries`, in declared order.
+pub fn entry_modules(entries: &EntrySet) -> Vec<&[String]> {
+    match entries {
+        EntrySet::Programs(programs) => programs.iter().map(ResolvedEntry::module).collect(),
+        EntrySet::Library(exposed) => exposed.iter().map(Vec::as_slice).collect(),
     }
 }
 
-/// [`emit_ir_text`] over an [`AnalysisTarget`] rather than a bare entry path,
-/// so `ipe dev build --emit-ir <file>` never substitutes the project's default
-/// entry for a named file.
+/// The refusal for a module the snapshot does not hold, naming the file it would lie at.
+pub fn module_missing(root: &ProjectRoot, dir: SourceDir, module: &[String]) -> CliError {
+    let dir_name = match dir {
+        SourceDir::Src => "src",
+        SourceDir::Tests => "tests",
+    };
+    CliError::Io {
+        path: root
+            .path()
+            .join(dir_name)
+            .join(format!("{}.ipe", module.join("/"))),
+        source: std::io::ErrorKind::NotFound.into(),
+    }
+}
+
+/// The source graph of `entry` over `modules`, each keeping the origin the snapshot gave it.
 ///
 /// # Errors
-/// Same as [`emit_ir_text`].
-pub fn emit_ir_text_for_target(target: &AnalysisTarget) -> Result<String, CliError> {
-    let (graph, blame_path) = source_graph_for_target(target)?;
-    let program = graph.run_attributed(&blame_path, |db, root, file| {
-        ipe_db::lower_program(db, root, file).clone()
-    })?;
-    let interner = ipe_db::Db::interner(&graph.db).lock();
-    Ok(ipe_ir::pretty(&program, &interner))
+/// [`CliError::Io`] (`NotFound`) when `modules` holds no `entry`.
+fn graph_over(
+    root: &ProjectRoot,
+    modules: &BTreeMap<ModulePath, SnapshotModule>,
+    dir: SourceDir,
+    entry: &[String],
+) -> Result<SourceGraph, CliError> {
+    let mut sources = BTreeMap::new();
+    let mut stdlib = std::collections::BTreeSet::new();
+    let mut ffi_injected = std::collections::BTreeSet::new();
+    for (module, held) in modules {
+        match held.origin() {
+            SourceOrigin::Own(_) => {}
+            SourceOrigin::Stdlib => {
+                stdlib.insert(module.clone());
+            }
+            SourceOrigin::FfiInterface => {
+                ffi_injected.insert(module.clone());
+            }
+        }
+        sources.insert(
+            module.clone(),
+            (held.path().to_path_buf(), held.text().to_owned()),
+        );
+    }
+    let db = ipe_db::IpeDatabase::new();
+    let source_root = create_source_root(&db, &sources, &stdlib, &ffi_injected);
+    let Some(entry_file) = source_root.files(&db).get(entry).copied() else {
+        return Err(module_missing(root, dir, entry));
+    };
+    Ok(SourceGraph {
+        db,
+        source_root,
+        entry_file,
+        sources,
+        entry_module_path: entry.to_vec(),
+    })
+}
+
+/// Type-check every entry `target` names, stopping at the first refusal.
+///
+/// # Errors
+/// [`CliError::Pipeline`] carrying the first compiler diagnostic; every
+/// refusal of [`analysis_graphs`].
+pub fn typecheck_target(target: &AnalysisTarget<'_>) -> Result<(), CliError> {
+    for graph in analysis_graphs(target)? {
+        graph.run_attributed(graph.entry_path(), typecheck_query)?;
+    }
+    Ok(())
+}
+
+/// Lower a program to IR and pretty-print it, stopping before codegen.
+///
+/// `file` names one module of `root` ([`ProjectRoot::target`]); with none,
+/// every entry of the project is printed, one after another.
+///
+/// # Errors
+/// [`CliError::Pipeline`] when the compiler rejects the program; every
+/// refusal of [`ProjectRoot::target`] and [`analysis_graphs`].
+pub fn emit_ir_text(root: &ProjectRoot, file: Option<&FileArg>) -> Result<String, CliError> {
+    let target = analysis_target(root, file)?;
+    let mut trees = Vec::new();
+    for graph in analysis_graphs(&target)? {
+        let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
+            ipe_db::lower_program(db, root, file).clone()
+        })?;
+        let interner = ipe_db::Db::interner(&graph.db).lock();
+        trees.push(ipe_ir::pretty(&program, &interner));
+    }
+    Ok(trees.join("\n"))
 }
 
 #[cfg(test)]

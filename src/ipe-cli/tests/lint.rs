@@ -1,12 +1,13 @@
 //! `ipe lint` (+ `--fix`) — a golden per rule (fixture → findings) plus the
 //! `--fix` rewrite and idempotence for the one fixable rule.
 //!
-//! Each fixture exercises exactly one rule. The findings assertion pins the rule
-//! name and the offending source location; the `--fix` assertion pins the exact
+//! Each fixture exercises exactly one rule, linted as the `src/Main.ipe` of a
+//! fresh project run from its root. The findings assertion pins the rule name
+//! and the offending source location; the `--fix` assertion pins the exact
 //! rewritten source and that a second `--fix` pass changes nothing.
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -44,9 +45,44 @@ fn run_ipe(args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
     ))
 }
 
-/// Lint one fixture file and return its stdout.
+/// Run `ipe` in `dir` with `NO_COLOR=1` and capture `(success, stdout, stderr)`.
+fn run_ipe_in(dir: &Path, args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
+    let out = Command::new(support::ipe_bin())
+        .args(args)
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// A fresh project holding each `(path under src/, source)` of `modules`, by its canonical path.
+fn project(tag: &str, modules: &[(&str, &str)]) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = std::fs::canonicalize(scratch(tag)?)?;
+    std::fs::write(dir.join("package.ipe"), support::package_ipe(tag))?;
+    for (rel, source) in modules {
+        let path = dir.join("src").join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, source)?;
+    }
+    Ok(dir)
+}
+
+/// A fresh project whose `src/Main.ipe` is the lint fixture `name`.
+fn fixture_project(tag: &str, name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let source = std::fs::read_to_string(fixture(name))?;
+    project(tag, &[("Main.ipe", &source)])
+}
+
+/// Lint one fixture as its own project's `src/Main.ipe` and return the stdout.
 fn lint(fixture_name: &str) -> Result<String, Box<dyn Error>> {
-    let (_ok, stdout, _stderr) = run_ipe(&["lint", &fixture(fixture_name).to_string_lossy()])?;
+    let dir = fixture_project("rule", fixture_name)?;
+    let (_ok, stdout, _stderr) = run_ipe_in(&dir, &["lint"])?;
     Ok(stdout)
 }
 
@@ -129,10 +165,9 @@ fn prefer_pipeline_reports_and_fixes() -> TestResult {
     );
 
     // Fix: the nested call is rewritten to the pipeline, verbatim.
-    let dir = scratch("fix")?;
-    let path = dir.join("Main.ipe");
-    std::fs::copy(fixture("prefer_pipeline.ipe"), &path)?;
-    let (ok, stdout, _e) = run_ipe(&["lint", "--fix", &path.to_string_lossy()])?;
+    let dir = fixture_project("fix", "prefer_pipeline.ipe")?;
+    let path = dir.join("src/Main.ipe");
+    let (ok, stdout, _e) = run_ipe_in(&dir, &["lint", "--fix", "src/Main.ipe"])?;
     assert!(ok, "a warn-only --fix exits 0:\n{stdout}");
     let fixed = std::fs::read_to_string(&path)?;
     assert!(
@@ -145,7 +180,7 @@ fn prefer_pipeline_reports_and_fixes() -> TestResult {
     );
 
     // Idempotence: a second --fix pass changes nothing.
-    let (_ok2, stdout2, _e2) = run_ipe(&["lint", "--fix", &path.to_string_lossy()])?;
+    let (_ok2, stdout2, _e2) = run_ipe_in(&dir, &["lint", "--fix", "src/Main.ipe"])?;
     assert!(
         stdout2.contains("no machine-applicable fixes"),
         "re-running --fix finds nothing:\n{stdout2}"
@@ -155,13 +190,14 @@ fn prefer_pipeline_reports_and_fixes() -> TestResult {
 
 #[test]
 fn inline_suppression_silences_a_site() -> TestResult {
-    let dir = scratch("suppress")?;
-    let path = dir.join("Main.ipe");
-    std::fs::write(
-        &path,
-        "module Main exposing (render)\n\n-- ipe-lint: allow adjacent-bools\nrender : Bool -> Bool -> String\nrender a b =\n    \"x\"\n",
+    let dir = project(
+        "suppress",
+        &[(
+            "Main.ipe",
+            "module Main exposing (render)\n\n-- ipe-lint: allow adjacent-bools\nrender : Bool -> Bool -> String\nrender a b =\n    \"x\"\n",
+        )],
     )?;
-    let (_ok, stdout, _e) = run_ipe(&["lint", &path.to_string_lossy()])?;
+    let (_ok, stdout, _e) = run_ipe_in(&dir, &["lint", "src/Main.ipe"])?;
     assert!(
         stdout.contains("no findings"),
         "inline suppression silences the only finding:\n{stdout}"
@@ -282,11 +318,8 @@ fn a_symlinked_lint_config_is_refused_not_followed() -> TestResult {
 /// The product header, then every line in the two-space gutter; `NO_COLOR` output carries no colour.
 #[test]
 fn human_output_is_framed_and_guttered() -> TestResult {
-    let out = Command::new(support::ipe_bin())
-        .args(["lint", &fixture("prim_param.ipe").to_string_lossy()])
-        .env("NO_COLOR", "1")
-        .output()?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dir = fixture_project("framed", "prim_param.ipe")?;
+    let (_ok, stdout, _e) = run_ipe_in(&dir, &["lint"])?;
     let header = format!(
         "\n  Ipê language - v{} - {}\n",
         env!("CARGO_PKG_VERSION"),
@@ -309,11 +342,11 @@ fn human_output_is_framed_and_guttered() -> TestResult {
 /// `--json` and `--plain` are machine output: never framed, never coloured.
 #[test]
 fn machine_output_is_never_framed() -> TestResult {
-    let file = fixture("prim_param.ipe").to_string_lossy().into_owned();
-    let (_ok, json, _e) = run_ipe(&["lint", "--json", &file])?;
+    let dir = fixture_project("machine", "prim_param.ipe")?;
+    let (_ok, json, _e) = run_ipe_in(&dir, &["lint", "--json"])?;
     assert!(json.starts_with('{'), "JSON is flush and unframed:\n{json}");
     assert!(!json.contains("Ipê language"), "no header in JSON:\n{json}");
-    let (_ok, plain, _e) = run_ipe(&["lint", "--plain", &file])?;
+    let (_ok, plain, _e) = run_ipe_in(&dir, &["lint", "--plain"])?;
     assert!(
         !plain.contains("Ipê language"),
         "no header in plain:\n{plain}"
@@ -321,6 +354,128 @@ fn machine_output_is_never_framed() -> TestResult {
     assert!(
         plain.lines().all(|l| !l.starts_with(' ')),
         "plain lines are flush-left:\n{plain}"
+    );
+    Ok(())
+}
+
+/// A module holding the one fixable `prefer-pipeline` finding.
+fn nested_call_module(module: &str) -> String {
+    format!(
+        "module {module} exposing (report)\n\n\nreport records =\n    String.concat (List.map fmt (List.filter live records))\n"
+    )
+}
+
+/// A root with `src/Main.ipe` and `src/Helper.ipe`, each holding one fixable finding.
+fn two_module_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
+    project(
+        tag,
+        &[
+            ("Main.ipe", &nested_call_module("Main")),
+            ("Helper.ipe", &nested_call_module("Helper")),
+        ],
+    )
+}
+
+/// The exact `NoManifest` refusal text for `dir`.
+fn no_manifest_text(dir: &Path) -> String {
+    format!(
+        "error[IPE-E0004]: no package.ipe at {}; run `ipe init` there",
+        dir.display()
+    )
+}
+
+/// A file argument names one module of the current directory's project: every
+/// module is read for context, but only the named one's findings are reported,
+/// and `--fix` rewrites only its file. A file outside the root is refused with
+/// the exact `FileOutsideRoot` text, never linted loose.
+#[test]
+fn lint_of_a_named_module_reports_and_fixes_only_that_module() -> TestResult {
+    let dir = two_module_project("focus")?;
+    let main = dir.join("src/Main.ipe");
+    let main_before = std::fs::read(&main)?;
+
+    let (_ok, stdout, stderr) = run_ipe_in(&dir, &["lint", "src/Helper.ipe"])?;
+    assert!(
+        stdout.contains("lint/prefer-pipeline") && stdout.contains("Helper.ipe"),
+        "the named module's finding is reported:\n{stdout}{stderr}"
+    );
+    assert!(
+        !stdout.contains("Main.ipe"),
+        "no other module's finding is reported:\n{stdout}"
+    );
+
+    let (ok, stdout, stderr) = run_ipe_in(&dir, &["lint", "--fix", "src/Helper.ipe"])?;
+    assert!(ok, "a warn-only --fix exits 0:\n{stdout}{stderr}");
+    let helper = std::fs::read_to_string(dir.join("src/Helper.ipe"))?;
+    assert!(
+        helper.contains("records |> List.filter live |> List.map fmt"),
+        "the named module is fixed:\n{helper}"
+    );
+    assert_eq!(
+        std::fs::read(&main)?,
+        main_before,
+        "--fix on one module leaves every other module byte-identical"
+    );
+
+    let elsewhere = dir
+        .parent()
+        .ok_or("the scratch project has a parent")?
+        .join("elsewhere");
+    std::fs::create_dir_all(&elsewhere)?;
+    std::fs::write(elsewhere.join("X.ipe"), nested_call_module("X"))?;
+    let (ok, stdout, stderr) = run_ipe_in(&dir, &["lint", "../elsewhere/X.ipe"])?;
+    let want = format!(
+        "error[IPE-E0011]: {} names no module of this project: a file argument must lie under \
+         `src/` or `tests/` of the current directory, or be its package.ipe; cd into {} and run \
+         ipe there",
+        dir.join("../elsewhere/X.ipe").display(),
+        dir.join("../elsewhere").display()
+    );
+    assert!(
+        !ok && stderr.contains(&want),
+        "a file outside the root is refused with the exact text:\nwant: {want}\n{stdout}{stderr}"
+    );
+    Ok(())
+}
+
+/// With no argument, lint reports every module of the root.
+#[test]
+fn lint_with_no_argument_reports_every_module() -> TestResult {
+    let dir = two_module_project("whole")?;
+    let (_ok, stdout, stderr) = run_ipe_in(&dir, &["lint"])?;
+    assert!(
+        stdout.contains("Main.ipe") && stdout.contains("Helper.ipe"),
+        "every module's finding is reported:\n{stdout}{stderr}"
+    );
+    Ok(())
+}
+
+/// `ipe lint` in a subdirectory of a project is refused with the exact
+/// `NoManifest` text: the manifest above it is never consulted.
+#[test]
+fn lint_in_a_subdirectory_of_a_project_is_refused() -> TestResult {
+    let dir = two_module_project("subdir")?;
+    let src = dir.join("src");
+    let (ok, stdout, stderr) = run_ipe_in(&src, &["lint"])?;
+    let want = no_manifest_text(&src);
+    assert!(
+        !ok && stderr.contains(&want),
+        "a subdirectory is no root:\nwant: {want}\n{stdout}{stderr}"
+    );
+    Ok(())
+}
+
+/// `ipe lint` in a directory with no `package.ipe` is refused with the exact
+/// `NoManifest` text, never linting the loose files there.
+#[test]
+fn lint_without_a_manifest_is_refused_naming_the_directory() -> TestResult {
+    let dir = std::fs::canonicalize(scratch("nomanifest")?)?;
+    std::fs::write(dir.join("Main.ipe"), nested_call_module("Main"))?;
+    let (ok, stdout, stderr) = run_ipe_in(&dir, &["lint"])?;
+    let want = no_manifest_text(&dir);
+    assert!(
+        !ok && stderr.contains(&want),
+        "no package.ipe is no root:\nwant: {want}\n{stdout}{stderr}"
     );
     Ok(())
 }

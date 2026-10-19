@@ -21,7 +21,13 @@
 //! now exercises the full `ipe::build` path this fixture originally had to
 //! route around.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The IR text of every entry of the project at `dir`.
+fn emit_ir(dir: &Path) -> Result<String, ipe::CliError> {
+    let root = ipe::project_root::ProjectRoot::resolve(ipe::project_root::RootArg::at(dir))?;
+    ipe::emit_ir_text(&root, None)
+}
 
 fn repo_root() -> PathBuf {
     let joined = e2e_support::manifest_dir!().join("..").join("..");
@@ -35,9 +41,7 @@ fn repo_root() -> PathBuf {
 fn http_stream_open_returns_stream_id_not_int() {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join("http_stream_id");
-    let entry = crate::support::golden_source(&golden_project, "Main");
-
-    let result = ipe::emit_ir_text(&entry);
+    let result = emit_ir(&golden_project);
     assert!(
         result.is_ok(),
         "HttpStream.open typed as `Task Error StreamId` must pass type-check + lower \

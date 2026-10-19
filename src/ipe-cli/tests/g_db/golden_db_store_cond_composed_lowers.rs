@@ -13,12 +13,14 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
-        .join("src")
-        .join("Main.ipe")
+fn fixture_project(root: &Path, golden: &str) -> PathBuf {
+    root.join("tests").join("golden").join(golden)
+}
+
+/// The IR text of every entry of the project at `dir`.
+fn emit_ir(dir: &Path) -> Result<String, ipe::CliError> {
+    let root = ipe::project_root::ProjectRoot::resolve(ipe::project_root::RootArg::at(dir))?;
+    ipe::emit_ir_text(&root, None)
 }
 
 /// A composed `Store.Cond` lowers to its emitted enum — no empty-home ICE.
@@ -26,9 +28,7 @@ fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
 fn cond_in_composed_position_lowers_to_its_enum() {
     const GOLDEN: &str = "db_store_cond_composed_lowers";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
-
-    let lowered = ipe::emit_ir_text(&entry);
+    let lowered = emit_ir(&fixture_project(&root, GOLDEN));
     let ir = lowered.as_deref().unwrap_or("");
     // The emitted enum and its leaf construction are present — proof the `Cond`
     // lowered through the home-keyed enum path, not the empty-home ICE arm. An

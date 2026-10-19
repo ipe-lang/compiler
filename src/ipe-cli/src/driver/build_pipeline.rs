@@ -680,8 +680,8 @@ pub struct CollectedSources {
 ///
 /// This is the file-path shorthand's source-collection step, shared by the
 /// build path ([`build_loose_file_with_options`]) and the
-/// single-entry analysis paths ([`lower_entry_via_graph`], [`emit_ir_text`]) so all
-/// three see the SAME module set. It delegates to
+/// single-entry analysis path ([`lower_entry_via_graph`]) so both see the SAME
+/// module set. It delegates to
 /// [`crate::loose_file::resolve_loose_file`] — the one loose-file resolver
 /// `ipe dev watch` and `ipe lsp` also use — so every surface compiles the same
 /// bounded closure: one probed path per import, regular files contained in
@@ -706,47 +706,6 @@ pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, Loos
         sources: loaded.sources,
         discovered: loaded.discovered,
         entry_module_path: loaded.entry_module,
-    })
-}
-
-/// Collect the sources for a manifest-governed file analysed by itself (e.g.
-/// `ipe type-check src/Api/Handlers.ipe`): the WHOLE `src_root` tree — the
-/// same [`project::discover_modules`] set `ipe dev build` compiles — rather than
-/// the loose closure rooted at the file's own directory.
-///
-/// The loose closure ([`collect_entry_and_siblings`]) resolves an import
-/// relative to the ENTRY's directory, which is only correct when the entry's
-/// directory IS the project's source root (as for the default `<src_root>/Main.ipe`
-/// entry). A nested file's own directory
-/// is a subdirectory of `src_root`, not `src_root` itself, so the same closure
-/// would look for `Api.Types` at `<entry-dir>/Api/Types.ipe` instead of
-/// `src_root/Api/Types.ipe`. Discovering the whole `src_root` tree side-steps
-/// this: every module's path is relativised against `src_root`, matching what
-/// the emitted build sees.
-///
-/// # Errors
-/// [`CliError::Pipeline`] when the entry does not parse; [`CliError::Io`] on
-/// any filesystem failure reading a discovered module;
-/// [`CliError::DiscoveryLimitReached`] when the `src_root` tree is too large.
-pub fn collect_manifest_rooted_entry(
-    src_root: &Path,
-    entry: &Path,
-) -> Result<CollectedSources, CliError> {
-    // A named file reaches here canonicalised, its links already resolved, so
-    // it is read beneath `src_root` like the convention entry: never followed.
-    let entry_source =
-        crate::io_bounded::read_beneath(src_root, entry, crate::io_bounded::SOURCE_CAP)?;
-    let entry_module_path = parse_entry_module_path(entry, &entry_source)?;
-
-    let mut discovered = project::discover_modules(src_root)?;
-    ensure_entry_present(&mut discovered, entry, &entry_module_path);
-
-    let sources = read_discovered_sources(&discovered, entry, &entry_module_path, &entry_source)?;
-
-    Ok(CollectedSources {
-        sources,
-        discovered,
-        entry_module_path,
     })
 }
 

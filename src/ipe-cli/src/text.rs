@@ -729,6 +729,8 @@ messages! {
     internal_module_not_in_source_map = "internal-module-not-in-source-map";
     /// A library package (only `exposedModules`) has no runnable entry.
     library_package_no_entry = "library-package-no-entry";
+    /// `ipe capabilities` named a file that is not one of the project's entries.
+    capabilities_not_an_entry(arg, entries) = "capabilities-not-an-entry";
     /// A `--debugger` build under the vendored emit model.
     debugger_needs_runtime_dep = "debugger-needs-runtime-dep";
     /// A packager could not find a `package.ipe` from the given root.

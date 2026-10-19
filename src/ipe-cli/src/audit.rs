@@ -1359,9 +1359,6 @@ fn derive_disclosure(
 
 /// The module path of a package's entry: the declared program's entry, else `Main`, else the first exposed module.
 ///
-/// The same choice [`crate::driver::analysis_root_of`] makes over files,
-/// made over the module `sources` a caller holds.
-///
 /// # Errors
 /// [`CliError::Manifest`]-family errors when a declared program's entry is refused.
 fn entry_module_of(

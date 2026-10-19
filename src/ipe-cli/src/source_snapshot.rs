@@ -22,14 +22,6 @@
 //! a separate value built from the same text and the same catalog, never
 //! merged into the build's modules.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the build reads its sources through this snapshot once it is wired in"
-    )
-)]
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -288,18 +280,39 @@ impl SourceSnapshot {
     }
 
     /// Every `tests/` module, keyed by module path, including one whose path a `src/` module has.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the test runner reads its programs through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub const fn tests(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
         &self.tests
     }
 
     /// The module `module`, when the snapshot holds it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the build reads its module set through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub fn module(&self, module: &[String]) -> Option<&SnapshotModule> {
         self.modules.get(module)
     }
 
     /// The FFI preparation made over this snapshot's text.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the build prepares FFI through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
@@ -319,6 +332,13 @@ pub struct TestEntry<'s> {
 
 impl TestEntry<'_> {
     /// The entry's module path.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the test runner names its programs through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub const fn module(&self) -> &ModulePath {
         self.module
@@ -348,12 +368,26 @@ impl TestView {
     }
 
     /// The module `module`, when the test universe holds it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the test runner reads its programs through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub fn module(&self, module: &[String]) -> Option<&SnapshotModule> {
         self.modules.get(module)
     }
 
     /// The FFI preparation made over the test universe.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the test runner prepares FFI through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
@@ -670,12 +704,26 @@ impl std::fmt::Debug for SourceSnapshot {
 }
 
 /// The modules one build compiles: a closed set over a snapshot.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the build reads its module set through this snapshot once it is wired in"
+    )
+)]
 #[derive(Debug, Clone)]
 pub struct ModuleSet<'s> {
     snapshot: &'s SourceSnapshot,
     members: BTreeSet<&'s ModulePath>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the build reads its module set through this snapshot once it is wired in"
+    )
+)]
 impl<'s> ModuleSet<'s> {
     /// The modules `entries` builds from `snapshot`, closed under import.
     ///

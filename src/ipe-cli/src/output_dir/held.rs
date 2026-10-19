@@ -380,10 +380,6 @@ impl HeldDir {
     /// [`CliError::DiscoveryLimitReached`] when the directory holds more than
     /// `cap` entries; otherwise the source-read refusal of the listing
     /// ([`refusal_error`]).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the source snapshot reader is its consumer")
-    )]
     pub fn list_names(&self, cap: EntryCap) -> Result<Vec<(EntryName, FileKind)>, CliError> {
         self.dir.entries(cap).map_err(|refusal| match refusal {
             OpenRefusal::TooManyEntries(cap) => CliError::DiscoveryLimitReached {
@@ -410,10 +406,6 @@ impl HeldDir {
     /// [`CliError::SourceRefused`] for a link, a non-regular entry, or a denied
     /// open; [`CliError::FileTooLarge`] past `cap`; [`CliError::Io`] for an
     /// absent entry, content that is not UTF-8, or another failure.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the source snapshot reader is its consumer")
-    )]
     pub fn read_file_capped(&self, name: &EntryName, cap: ByteCap) -> Result<String, CliError> {
         let path = self.path.join(name.as_os_str());
         let file = self

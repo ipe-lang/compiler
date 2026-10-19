@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod support;
 
@@ -51,12 +52,27 @@ fn run_ipe(args: &[&str]) -> Run {
     }
 }
 
+/// A fresh project directory whose `src/Main.ipe` is the `type_check` fixture file `name`.
+///
+/// `ipe type-check <dir>` names that project: a file argument must lie in the
+/// project of the current directory.
 fn fixture(name: &str) -> String {
-    support::manifest_dir()
-        .join("tests/fixtures/type_check")
-        .join(name)
-        .to_string_lossy()
-        .into_owned()
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = support::scratch_root().join(format!(
+        "diag_json_project_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(dir.join("src")).expect("create the fixture project's src/");
+    std::fs::write(dir.join("package.ipe"), support::package_ipe("diag")).expect("package.ipe");
+    std::fs::copy(
+        support::manifest_dir()
+            .join("tests/fixtures/type_check")
+            .join(name),
+        dir.join("src").join("Main.ipe"),
+    )
+    .expect("copy the fixture into src/Main.ipe");
+    dir.to_string_lossy().into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -160,8 +176,9 @@ fn type_check_json_on_success_exits_zero_with_ok_object() {
 
 #[test]
 fn type_check_json_diagnostic_is_deterministic() {
-    let r1 = run_ipe(&["type-check", "--json", &fixture("type_error.ipe")]);
-    let r2 = run_ipe(&["type-check", "--json", &fixture("type_error.ipe")]);
+    let project = fixture("type_error.ipe");
+    let r1 = run_ipe(&["type-check", "--json", &project]);
+    let r2 = run_ipe(&["type-check", "--json", &project]);
     assert_eq!(
         r1.stderr, r2.stderr,
         "--json diagnostic output must be byte-identical across runs"
