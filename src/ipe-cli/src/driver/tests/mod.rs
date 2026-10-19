@@ -3249,7 +3249,7 @@ fn a_non_entry_src_file_is_analysed_as_itself_and_refused_by_capabilities() {
     assert_eq!(
         caps.err().map(|e| e.to_string()),
         Some(
-            CliError::Usage(text::msg::capabilities_not_an_entry(
+            CliError::Usage(crate::text::msg::capabilities_not_an_entry(
                 &dir.join("src/Other.ipe").display(),
                 &"src/Main.ipe",
             ))
