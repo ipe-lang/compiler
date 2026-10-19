@@ -410,7 +410,6 @@ fn shared_dep_target() -> Option<String> {
 /// either ceiling.
 #[must_use]
 pub fn build_and_run(source: &str, base: &Path) -> StageOutcome {
-    use std::process::Command;
     let scratch = match probe_root(source, base) {
         Ok(scratch) => scratch,
         Err(outcome) => return outcome,
@@ -425,11 +424,7 @@ pub fn build_and_run(source: &str, base: &Path) -> StageOutcome {
         }
     };
 
-    let project = scratch.root().path();
-    let mut cmd = Command::new(&ipe_bin);
-    cmd.args(crate::verb::Verb::DEV_RUN.argv())
-        .arg(project)
-        .current_dir(project);
+    let mut cmd = dev_run_project(&ipe_bin, scratch.root());
     // Link the heavy dependency tree from the warm shared target when the CI
     // job offers one; otherwise inherit the ambient env (isolate — the default
     // for a local run).
@@ -438,6 +433,24 @@ pub fn build_and_run(source: &str, base: &Path) -> StageOutcome {
     }
 
     self_run_outcome(cmd, SELF_RUN_LIMITS)
+}
+
+/// `ipe dev run` of the project `root`, launched by `ipe_bin` from the project's own directory.
+///
+/// The project is named by its directory, never by a file in it, and no
+/// environment override names its emitted crate: the crate identity is the
+/// manifest name joined to the canonical directory, so two projects sharing
+/// one cargo target never share an app crate.
+#[must_use]
+pub(crate) fn dev_run_project(
+    ipe_bin: &Path,
+    root: &crate::project_root::ProjectRoot,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(ipe_bin);
+    cmd.args(crate::verb::Verb::DEV_RUN.argv())
+        .arg(root.path())
+        .current_dir(root.path());
+    cmd
 }
 
 /// Run the self-run `cmd` under `ceiling` and judge it.
@@ -597,6 +610,33 @@ mod root_tests {
             crate::runtime_embed::BundleRole::Out,
         )
         .crate_name
+    }
+
+    /// A probe run names its project by directory, from that directory, with no
+    /// environment override of the emitted crate's name.
+    #[test]
+    fn a_probe_run_names_its_project_by_directory_with_no_crate_override() {
+        let base = ScratchDir::new("ipe-probe-command").expect("scratch base");
+        let scratch = probe_root(
+            "module Main exposing (main)\n\nmain =\n    1\n",
+            base.path(),
+        )
+        .expect("probe project");
+        let project = scratch.root().path();
+        let cmd = super::dev_run_project(std::path::Path::new("ipe"), scratch.root());
+        let mut want: Vec<&std::ffi::OsStr> = crate::verb::Verb::DEV_RUN
+            .argv()
+            .into_iter()
+            .map(std::ffi::OsStr::new)
+            .collect();
+        want.push(project.as_os_str());
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), want);
+        assert_eq!(cmd.get_current_dir(), Some(project));
+        assert!(
+            cmd.get_envs().next().is_none(),
+            "a probe run sets no environment of its own: {:?}",
+            cmd.get_envs().collect::<Vec<_>>()
+        );
     }
 
     /// Two probe projects under one base, as two concurrent probe builds sharing

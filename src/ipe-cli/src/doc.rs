@@ -3293,16 +3293,11 @@ fn run_example_and_check(
     label: &str,
     expected: &[String],
 ) -> Result<(), String> {
-    use std::process::Command;
-
     // Locate this binary (we re-invoke ourselves as `ipe dev run`).
     let ipe_bin = std::env::current_exe()
         .map_err(|e| format!("{label}: could not locate ipe binary: {e}"))?;
 
-    let mut cmd = Command::new(&ipe_bin);
-    cmd.args(crate::verb::Verb::DEV_RUN.argv())
-        .arg(root.path())
-        .current_dir(root.path());
+    let mut cmd = crate::coverage::probe::dev_run_project(&ipe_bin, root);
     // Forward the warm shared target into the `ipe dev run` child's CARGO_TARGET_DIR.
     // CI's e2e/seal jobs export ONLY IPE_ORACLE_SHARED_TARGET, which production
     // `ipe dev run` never reads; without this translation the child cold-builds the

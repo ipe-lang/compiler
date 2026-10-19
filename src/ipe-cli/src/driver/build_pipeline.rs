@@ -132,13 +132,11 @@ pub fn runtime_dep_from_env() -> bool {
 ///
 /// A single-file build carries no `package.ipe`, so its emitted crate is
 /// otherwise always named `ipe-app`. When many single-file builds share ONE
-/// cargo target dir (the coverage harness driving a per-symbol emit into a warm
-/// shared dep target) that constant name makes their app-crate cargo
-/// fingerprints collide: cargo could reuse a prior probe's compiled `ipe-app`
-/// and mask a genuinely broken emit, defeating the seal the coverage sweep
-/// exists to hold. Setting a UNIQUE name per build gives each app crate its own
-/// fingerprint, so a broken emit still fails to build even against a warm
-/// target. This is the one read of the variable.
+/// cargo target dir that constant name makes their app-crate cargo
+/// fingerprints collide: cargo could reuse a prior build's compiled `ipe-app`
+/// and mask a genuinely broken emit. Setting a UNIQUE name per build gives
+/// each app crate its own fingerprint, so a broken emit still fails to build
+/// even against a warm target. This is the one read of the variable.
 fn single_file_crate_name() -> ipe_backend_rust::CrateName {
     ipe_env::var("IPE_EMIT_PACKAGE_NAME").ok().map_or(
         ipe_backend_rust::CrateName::SingleFile,
@@ -218,8 +216,7 @@ pub fn emit_settings(
     }
 }
 
-/// The emit settings of a no-manifest build (a single file, a loose file, a
-/// front check).
+/// The emit settings of a no-manifest build (a single file, a loose file).
 ///
 /// There is no manifest window, so the host is always served, and a loose file
 /// declares no browser delivery: the mount base is [`MountBase::root`], the

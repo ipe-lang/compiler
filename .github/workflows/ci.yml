@@ -350,8 +350,8 @@ jobs:
 
   # Doctest-style gate (ADR 0059): every fenced ```ipe block on every registry
   # explain page and every docs/constructs and docs/topics page is judged
-  # in-process through the build front end (`ipe::front_check_entry`), short of
-  # cargo. The checker is `src/ipe-cli/tests/explain_examples.rs`.
+  # in-process, as the one module of a scratch project, through the build
+  # front end (`ipe::front_check`), short of cargo. The checker is `src/ipe-cli/tests/explain_examples.rs`.
   # Fence info strings:
   #   ```ipe                      MUST be accepted
   #   ```ipe ipe:error            explain page: refused with the page's own code

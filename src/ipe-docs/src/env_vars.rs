@@ -265,8 +265,8 @@ static HAND_TABLE: &[EnvVar] = &[
         name: "IPE_EMIT_PACKAGE_NAME",
         default: Cow::Borrowed("unset (`ipe-app`)"),
         purpose: "Overrides the emitted crate's package name for a single-file build \
-                  (validated through the package-name sanitizer). Set by the coverage \
-                  probe to give each emitted build a unique crate identity; not intended \
+                  (validated through the package-name sanitizer), so single-file builds \
+                  sharing one cargo target keep distinct crate identities; not intended \
                   for operator use.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,
