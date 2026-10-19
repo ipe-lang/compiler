@@ -43,7 +43,6 @@ fn decoder_storage_reuse_emits_byte_identical() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let golden_project = root.join("tests").join("golden").join(GOLDEN);
-    let golden = golden_project.join("main.rs");
     let out = crate::support::scratch_root().join("ipec_i801_decoder_storage_reuse_emit");
     let _ = std::fs::remove_dir_all(&out);
 

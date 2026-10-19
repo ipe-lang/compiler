@@ -33,7 +33,6 @@ fn generic_capture_tuple_cons_emits_byte_identical() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let golden_project = root.join("tests").join("golden").join(GOLDEN);
-    let golden = golden_project.join("main.rs");
     let out = crate::support::scratch_root().join("ipec_i1005_generic_capture_tuple_cons_emit");
     let _ = std::fs::remove_dir_all(&out);
 

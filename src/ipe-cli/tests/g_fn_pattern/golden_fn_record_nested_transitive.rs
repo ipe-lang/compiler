@@ -29,7 +29,6 @@ fn nested_transitive_emits_byte_identical_main_rs() {
         .join("tests")
         .join("golden")
         .join("fn_record_nested_transitive");
-    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_record_nested_transitive_emit");
     let _ = std::fs::remove_dir_all(&out);
 

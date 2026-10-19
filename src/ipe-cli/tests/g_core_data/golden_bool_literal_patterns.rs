@@ -25,7 +25,6 @@ fn emits_byte_identical_main_rs() {
         .join("tests")
         .join("golden")
         .join("bool_literal_patterns");
-    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m3b3_bool_emit");
     let _ = std::fs::remove_dir_all(&out);
 

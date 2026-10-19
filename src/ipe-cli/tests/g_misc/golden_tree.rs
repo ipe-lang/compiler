@@ -30,7 +30,6 @@ fn emits_byte_identical_main_rs() {
     let root = repo_root();
     let dir = example_dir(&root);
     let golden_project = root.join("tests").join("golden").join("tree");
-    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m3a_tree_emit");
     let _ = std::fs::remove_dir_all(&out);
 

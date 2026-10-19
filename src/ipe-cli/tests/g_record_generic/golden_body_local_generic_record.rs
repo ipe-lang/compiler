@@ -39,7 +39,6 @@ fn emits_byte_identical_main_rs() {
         .join("tests")
         .join("golden")
         .join("body_local_generic_record");
-    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("body_local_generic_record_emit");
     let _ = std::fs::remove_dir_all(&out);
 

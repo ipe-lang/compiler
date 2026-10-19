@@ -34,7 +34,6 @@ fn emits_byte_identical_main_rs() {
     let root = repo_root();
     let dir = fixture_dir(&root);
     let golden_project = fixture_dir(&root);
-    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_param_patterns_emit");
     let _ = std::fs::remove_dir_all(&out);
 

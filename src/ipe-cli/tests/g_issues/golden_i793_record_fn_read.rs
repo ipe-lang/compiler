@@ -37,7 +37,6 @@ fn record_fn_read_emits_byte_identical() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
     let golden_project = root.join("tests").join("golden").join("fcf_record_fn_read");
-    let golden = golden_project.join("main.rs");
     let out = crate::support::scratch_root().join("ipec_i793_fcf_record_fn_read_emit");
     let _ = std::fs::remove_dir_all(&out);
 

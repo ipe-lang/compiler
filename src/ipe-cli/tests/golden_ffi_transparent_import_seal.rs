@@ -320,11 +320,12 @@ fn showing_a_transparent_union_is_accepted() {
 /// Writes and builds the `show_transparent_foreign` project; returns the fixture and build output.
 fn build_show_transparent() -> (RootFixture, PathBuf) {
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let golden_project = repo_root()
+    let source = repo_root()
         .join("tests")
         .join("golden")
-        .join("show_transparent_foreign");
-    let source = crate::support::golden_source(&golden_project, "Main");
+        .join("show_transparent_foreign")
+        .join("src")
+        .join("Main.ipe");
     let main =
         fs::read_to_string(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
     let fixture = ffi_fixture(&main);

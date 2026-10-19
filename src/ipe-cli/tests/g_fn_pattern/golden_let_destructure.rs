@@ -23,7 +23,6 @@ fn golden_dir(root: &Path) -> PathBuf {
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
     let golden_project = root.join("tests").join("golden").join("let_destructure");
-    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m3b2_let_destructure_emit");
     let _ = std::fs::remove_dir_all(&out);
 
