@@ -45,7 +45,8 @@ mod tests {
     const TEST_SUPPORT: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
 
-    const MODULE: &str = "module Main exposing (main)\n\nmain =\n    1\n";
+    const MODULE: &str =
+        "module Main exposing (main)\nimport Ipe.Io as Io\n\nmain =\n    Io.println \"ok\"\n";
 
     /// A directory holding only `Main.ipe` is no golden: it is refused with the
     /// no-manifest text and nothing is emitted. The same sources as a project
