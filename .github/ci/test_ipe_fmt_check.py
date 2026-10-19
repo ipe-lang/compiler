@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for `ipe_fmt_check`: drift, an empty discovery and a missing binary all fail."""
+"""Tests for `tools/scripts/ipe-fmt-check.py`: drift, an empty discovery and a missing binary all fail."""
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import stat
 import subprocess
@@ -13,10 +14,17 @@ from collections.abc import Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import ipe_fmt_check  # noqa: E402
 import strict_yaml  # noqa: E402
 
-STEP_RUN = "python3 .github/ci/ipe_fmt_check.py"
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_SPEC = importlib.util.spec_from_file_location(
+    "ipe_fmt_check", os.path.join(_REPO, "tools", "scripts", "ipe-fmt-check.py")
+)
+assert _SPEC is not None and _SPEC.loader is not None
+ipe_fmt_check = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(ipe_fmt_check)
+
+STEP_RUN = "python3 tools/scripts/ipe-fmt-check.py"
 FLOOR_JOB = "first-party-check-floor"
 FLOOR_CONTEXT = "first-party check floor (ipe type-check only)"
 

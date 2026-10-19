@@ -1108,7 +1108,7 @@ jobs:
       - name: Every in-repo Ipê project is ipe-fmt clean
         env:
           IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
-        run: python3 .github/ci/ipe_fmt_check.py
+        run: python3 tools/scripts/ipe-fmt-check.py
 
   # `ipe-runtime-rust`'s `default = []` leaves `compression`/`csv`/`config`/
   # `tokio` (and every other optional feature) OFF, so the `test` job above

@@ -196,7 +196,7 @@ checks:
           env:
             IPE_BIN: "{ipe_bin}"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
-        - cmd: python3 .github/ci/ipe_fmt_check.py
+        - cmd: python3 tools/scripts/ipe-fmt-check.py
           env:
             IPE_BIN: "{ipe_bin}"
             IPE_RUNTIME_DIR: "{repo_root}/src/runtime/rust/src"
