@@ -8,9 +8,11 @@
 //! tree (on Windows, any reparse point) refuses the whole read, so no link has
 //! a representation in the snapshot. A module path is the exact listed
 //! spelling of its file, so a name that differs from an import only in case
-//! never satisfies it. The FFI catalog is read once, through the cache
-//! directory the root holds open, never by a path; every consumer then sees
-//! these bytes and that catalog and no others.
+//! never satisfies it. The FFI catalog is read once, its artifacts through
+//! the cache directory the root holds open, never by a path; every consumer
+//! then sees these bytes and that catalog and no others. A wrapper crate's
+//! directory is the exception: it is jailed and bound by path, as `cargo`
+//! later builds it.
 //!
 //! The build sees `src/` and what it injects, never `tests/`: the stdlib
 //! closure and the FFI preparation run over `src/` alone, so no byte under
@@ -1498,5 +1500,39 @@ mod tests {
         let by_path =
             crate::ffi::prepare_ffi(&mut ModuleSources::new(), &project).expect("by path");
         assert_eq!(slugs(&by_path), ["planted"]);
+    }
+
+    /// A refused cache refuses the snapshot: a linked cache directory, and a tampered artifact.
+    #[cfg(unix)]
+    #[test]
+    fn refused_cache_refuses_the_snapshot() {
+        let linked = resolve(&SourceTree::main(MAIN));
+        let ffi = linked.root().path().join(".ipe").join("cache").join("ffi");
+        std::fs::create_dir_all(&ffi).expect("cache parent");
+        let elsewhere = linked.root().path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("link target");
+        std::os::unix::fs::symlink(elsewhere, ffi.join("rust")).expect("link the cache");
+        let refused = read(&linked, Limits::DEFAULT);
+        assert!(
+            matches!(
+                refused,
+                Err(CliError::TrustRefused(
+                    crate::owner_trust::TrustRefusal::FfiCacheEscapes(_)
+                ))
+            ),
+            "{refused:?}"
+        );
+        let tampered = resolve(&SourceTree::main(MAIN));
+        install_crate(tampered.root().path(), "tm");
+        let cache = ipe_ffi::driver::FfiCache::at_project_root(tampered.root().path());
+        for artifact in std::fs::read_dir(cache.root()).expect("list the cache") {
+            let artifact = artifact.expect("a cache entry").path();
+            std::fs::write(artifact, "{").expect("tamper with the artifact");
+        }
+        let refused = read(&tampered, Limits::DEFAULT);
+        assert!(
+            matches!(refused, Err(CliError::TrustRefused(_))),
+            "{refused:?}"
+        );
     }
 }
