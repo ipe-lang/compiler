@@ -77,25 +77,28 @@ fn run_subcommand_builds_and_executes_hello_program() {
         // and the walk-up also fails, which happens in CI without the repo tree).
         let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
-        // Write the source file into a temp directory.
+        // The program is a real project in a private scratch tree.
+        let fixture = RootFixture::main(SRC);
+        let Ok(fixture) = fixture else {
+            panic!("write project: {fixture:?}")
+        };
         let dir =
             std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_run_subcommand_e2e");
         let _ = fs::remove_dir_all(&dir);
-        let entry = dir.join("Main.ipe");
-        let created = fs::create_dir_all(&dir).and_then(|()| fs::write(&entry, SRC));
-        assert!(created.is_ok(), "write source: {created:?}");
 
         // Use a dedicated out dir so CARGO_TARGET_DIR contention is isolated.
         let out_dir = dir.join("out");
 
         // --- Step 1+2: compile + cargo build via run_cli ---
         // We cannot call run_cli("run", …) directly here because on Unix it would
-        // exec (replace) this test process.  Instead, call the public `build`
-        // function + cargo build directly to verify SEAL, then run the binary as a
+        // exec (replace) this test process.  Instead, call the public project build
+        // + cargo build directly to verify SEAL, then run the binary as a
         // child process to check stdout.  This exercises the same code paths as
         // run_run without sacrificing the test runner.
-        let built = ipe::build(&entry, &out_dir, &runtime_dir);
-        assert!(built.is_ok(), "ipe dev build step must succeed: {built:?}");
+        let built = build_fixture(&fixture, &out_dir, &runtime_dir);
+        let Ok(built) = built else {
+            panic!("ipe dev build step must succeed: {built:?}")
+        };
 
         // Forward the warm shared target (IPE_ORACLE_SHARED_TARGET in CI, else an
         // ambient CARGO_TARGET_DIR a local lane set); fall back to an isolated
@@ -113,7 +116,10 @@ fn run_subcommand_builds_and_executes_hello_program() {
         );
 
         // --- Step 3: run the binary, capture stdout ---
-        let bin: PathBuf = target_dir.join("debug").join("ipe-app");
+        let bin = built.binary_in(&target_dir.join("debug"));
+        let Ok(bin) = bin else {
+            panic!("the emitted binary name must read: {bin:?}")
+        };
         let run = std::process::Command::new(&bin).output();
         let Ok(run) = run else {
             panic!("failed to run emitted binary: {run:?}")
