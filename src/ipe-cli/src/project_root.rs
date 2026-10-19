@@ -124,6 +124,17 @@ pub enum SourceDir {
     Tests,
 }
 
+impl SourceDir {
+    /// The directory's name below the project root.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Src => SRC_DIR,
+            Self::Tests => TESTS_DIR,
+        }
+    }
+}
+
 /// What one analysis command looks at.
 #[derive(Debug)]
 pub enum AnalysisTarget<'r> {
@@ -173,17 +184,18 @@ impl RootArg {
         };
         let joined = cwd.join(arg);
         if joined.is_dir() {
-            (Self { dir: joined }, None)
+            (Self::at(&joined), None)
         } else {
             (Self::at(cwd), Some(FileArg { path: joined }))
         }
     }
 
-    /// The directory `dir` as the root.
+    /// The directory `dir` as the root, its `.` components dropped so every
+    /// way of spelling one directory yields one root path.
     #[must_use]
     pub fn at(dir: &Path) -> Self {
         Self {
-            dir: dir.to_path_buf(),
+            dir: dir.components().collect(),
         }
     }
 
@@ -311,23 +323,21 @@ impl ProjectRoot {
     }
 
     /// The held `src/` directory.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the source snapshot reader is its consumer")
-    )]
     #[must_use]
     pub(crate) const fn src(&self) -> &HeldDir {
         &self.src
     }
 
     /// The held `tests/` directory, when the project has one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the source snapshot reader is its consumer")
-    )]
     #[must_use]
     pub(crate) const fn tests(&self) -> Option<&HeldDir> {
         self.tests.as_ref()
+    }
+
+    /// The path of the project's test source directory, whether or not it exists.
+    #[must_use]
+    pub fn test_sources_path(&self) -> PathBuf {
+        self.path().join(TESTS_DIR)
     }
 
     /// Judge a file argument against this project.

@@ -22,14 +22,6 @@
 //! a separate value built from the same text and the same catalog, never
 //! merged into the build's modules.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the build reads its sources through this snapshot once it is wired in"
-    )
-)]
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -281,6 +273,35 @@ impl SourceSnapshot {
         })
     }
 
+    /// The modules the `dir` module `module` is analysed over, when the snapshot holds a `tests/` one.
+    ///
+    /// A `src/` module is analysed over the build's modules
+    /// ([`SourceSnapshot::modules`]); a `tests/` module over its own
+    /// [`SourceSnapshot::test_view`], never merged into the build's. `None`
+    /// when `dir` is `tests/` and the snapshot holds no `tests/` module
+    /// `module`; whether a `src/` module is held is the caller's to check
+    /// against each module's [`SourceOrigin`].
+    ///
+    /// # Errors
+    /// Every refusal of [`SourceSnapshot::test_view`].
+    pub fn view<'s>(
+        &'s self,
+        dir: SourceDir,
+        module: &'s [String],
+    ) -> Result<Option<ModuleView<'s>>, CliError> {
+        match dir {
+            SourceDir::Src => Ok(Some(ModuleView::Build {
+                modules: &self.modules,
+                entry: module,
+            })),
+            SourceDir::Tests => self
+                .test_entry(module)
+                .map(Self::test_view)
+                .transpose()
+                .map(|view| view.map(|view| ModuleView::Test(Box::new(view)))),
+        }
+    }
+
     /// Every module the build sees, keyed by module path.
     #[must_use]
     pub const fn modules(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
@@ -288,18 +309,39 @@ impl SourceSnapshot {
     }
 
     /// Every `tests/` module, keyed by module path, including one whose path a `src/` module has.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the test runner reads its programs through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub const fn tests(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
         &self.tests
     }
 
     /// The module `module`, when the snapshot holds it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the build reads its module set through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub fn module(&self, module: &[String]) -> Option<&SnapshotModule> {
         self.modules.get(module)
     }
 
     /// The FFI preparation made over this snapshot's text.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the build prepares FFI through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
@@ -319,6 +361,13 @@ pub struct TestEntry<'s> {
 
 impl TestEntry<'_> {
     /// The entry's module path.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the test runner names its programs through this snapshot once it is wired in"
+        )
+    )]
     #[must_use]
     pub const fn module(&self) -> &ModulePath {
         self.module
@@ -357,6 +406,41 @@ impl TestView {
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
+    }
+}
+
+/// The modules one project module is analysed over, and the entry it names in them.
+///
+/// Minted by [`SourceSnapshot::view`].
+pub enum ModuleView<'s> {
+    /// A `src/` module over the build's modules.
+    Build {
+        /// Every module the build sees.
+        modules: &'s BTreeMap<ModulePath, SnapshotModule>,
+        /// The module analysed.
+        entry: &'s [String],
+    },
+    /// A `tests/` module over its own test universe.
+    Test(Box<TestView>),
+}
+
+impl ModuleView<'_> {
+    /// Every module the analysed module sees, keyed by module path.
+    #[must_use]
+    pub fn modules(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
+        match self {
+            Self::Build { modules, .. } => modules,
+            Self::Test(view) => view.modules(),
+        }
+    }
+
+    /// The analysed module.
+    #[must_use]
+    pub fn entry(&self) -> &[String] {
+        match self {
+            Self::Build { entry, .. } => entry,
+            Self::Test(view) => view.entry(),
+        }
     }
 }
 
@@ -670,12 +754,26 @@ impl std::fmt::Debug for SourceSnapshot {
 }
 
 /// The modules one build compiles: a closed set over a snapshot.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the build reads its module set through this snapshot once it is wired in"
+    )
+)]
 #[derive(Debug, Clone)]
 pub struct ModuleSet<'s> {
     snapshot: &'s SourceSnapshot,
     members: BTreeSet<&'s ModulePath>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the build reads its module set through this snapshot once it is wired in"
+    )
+)]
 impl<'s> ModuleSet<'s> {
     /// The modules `entries` builds from `snapshot`, closed under import.
     ///

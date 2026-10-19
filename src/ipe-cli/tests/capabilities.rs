@@ -3,9 +3,10 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ipe::project_root::{ProjectRoot, RootArg, ScratchRoot, SourceTree};
 use ipe::verify_capabilities;
 use ipe_ir::{Capability, WebCapability};
 
@@ -95,6 +96,38 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// A project whose `src/Main.ipe` is the fixture `name`, removed on drop.
+fn fixture_project(name: &str) -> Result<ScratchRoot, Box<dyn Error>> {
+    let source = std::fs::read_to_string(fixture(name))?;
+    Ok(SourceTree::main(&source).resolve()?)
+}
+
+/// Verify `declared` against the capabilities inferred over the project at `dir`.
+fn verify(dir: &Path, declared: &BTreeSet<Capability>) -> Result<(), ipe::CliError> {
+    verify_capabilities(&ProjectRoot::resolve(RootArg::at(dir))?, declared)
+}
+
+/// Create `dir` as an empty project: its `package.ipe` and an empty `src/`.
+fn create_project_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(
+        dir.join("package.ipe"),
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"cappkg\", version = \"0.1.0\" }\n",
+    )
+}
+
+/// Run the built `ipe` binary in `dir` and return its captured `(status_success, stdout)`.
+fn run_ipe_in(dir: &Path, args: &[&str]) -> Result<(bool, String), Box<dyn Error>> {
+    let out = Command::new(support::ipe_bin())
+        .args(args)
+        .current_dir(dir)
+        .output()?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
 /// Run the built `ipe` binary and return its captured `(status_success, stdout)`.
 fn run_ipe(args: &[&str]) -> Result<(bool, String), Box<dyn Error>> {
     let out = Command::new(support::ipe_bin()).args(args).output()?;
@@ -106,11 +139,8 @@ fn run_ipe(args: &[&str]) -> Result<(bool, String), Box<dyn Error>> {
 
 #[test]
 fn reports_network_for_an_http_program() -> TestResult {
-    let (ok, stdout) = run_ipe(&[
-        "capabilities",
-        "--plain",
-        &fixture("uses_http.ipe").to_string_lossy(),
-    ])?;
+    let project = fixture_project("http_project/src/Main.ipe")?;
+    let (ok, stdout) = run_ipe_in(project.root().path(), &["capabilities", "--plain"])?;
     assert!(ok, "capabilities must exit 0");
     assert_eq!(stdout.trim(), "network");
     Ok(())
@@ -118,11 +148,8 @@ fn reports_network_for_an_http_program() -> TestResult {
 
 #[test]
 fn reports_none_for_a_pure_program() -> TestResult {
-    let (ok, stdout) = run_ipe(&[
-        "capabilities",
-        "--plain",
-        &fixture("pure_string.ipe").to_string_lossy(),
-    ])?;
+    let project = fixture_project("pure_string.ipe")?;
+    let (ok, stdout) = run_ipe_in(project.root().path(), &["capabilities", "--plain"])?;
     assert!(ok, "capabilities must exit 0");
     // Under `--plain`, a pure program emits zero records (empty) — the "no
     // capabilities" wording lives only in the human default and `--json`'s `[]`.
@@ -138,11 +165,8 @@ fn reports_unsafe_for_an_html_unsafe_script_program() -> TestResult {
     // Importing `Ipe.Html.Unsafe` (the inline-`<script>` / raw-HTML escape-hatch
     // home) discloses the `unsafe` capability — the import itself is the signal,
     // so a raw HTML/script sink cannot hide from `ipe capabilities`.
-    let (ok, stdout) = run_ipe(&[
-        "capabilities",
-        "--plain",
-        &fixture("uses_html_unsafe_script.ipe").to_string_lossy(),
-    ])?;
+    let project = fixture_project("uses_html_unsafe_script.ipe")?;
+    let (ok, stdout) = run_ipe_in(project.root().path(), &["capabilities", "--plain"])?;
     assert!(ok, "capabilities must exit 0");
     assert_eq!(stdout.trim(), "unsafe");
     Ok(())
@@ -160,26 +184,32 @@ fn capabilities_help_page_lists_the_command() -> TestResult {
 }
 
 #[test]
-fn verify_accepts_the_exact_declared_set() {
+fn verify_accepts_the_exact_declared_set() -> TestResult {
     let declared = BTreeSet::from([Capability::Network]);
-    let r = verify_capabilities(&fixture("uses_http.ipe"), &declared);
+    let project = fixture_project("http_project/src/Main.ipe")?;
+    let r = verify_capabilities(project.root(), &declared);
     assert!(r.is_ok(), "an exact declaration verifies: {r:?}");
+    Ok(())
 }
 
 #[test]
-fn verify_rejects_underdeclared() {
+fn verify_rejects_underdeclared() -> TestResult {
     // The program uses `network` but declares nothing.
     let declared = BTreeSet::new();
-    let r = verify_capabilities(&fixture("uses_http.ipe"), &declared);
+    let project = fixture_project("http_project/src/Main.ipe")?;
+    let r = verify_capabilities(project.root(), &declared);
     assert!(r.is_err(), "an empty declaration must be rejected");
+    Ok(())
 }
 
 #[test]
-fn verify_rejects_overdeclared() {
+fn verify_rejects_overdeclared() -> TestResult {
     // The pure program uses nothing but declares `filesystem`.
     let declared = BTreeSet::from([Capability::Filesystem]);
-    let r = verify_capabilities(&fixture("pure_string.ipe"), &declared);
+    let project = fixture_project("pure_string.ipe")?;
+    let r = verify_capabilities(project.root(), &declared);
     assert!(r.is_err(), "an over-declaration must be rejected");
+    Ok(())
 }
 
 /// A program importing the compiled-source `Ipe.File` veneer discloses
@@ -191,9 +221,8 @@ fn verify_rejects_overdeclared() {
 #[test]
 fn importing_ipe_file_discloses_filesystem() -> TestResult {
     let dir = write_single("file-cap", FILE_WRITE_APP)?;
-    let entry = dir.join("Main.ipe");
-    let exact = verify_capabilities(&entry, &BTreeSet::from([Capability::Filesystem]));
-    let under = verify_capabilities(&entry, &BTreeSet::new());
+    let exact = verify(&dir, &BTreeSet::from([Capability::Filesystem]));
+    let under = verify(&dir, &BTreeSet::new());
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         exact.is_ok(),
@@ -223,8 +252,8 @@ main =
 /// tag, caught against a real program rather than a minimal fixture.
 #[test]
 fn acceptance_http_and_clock_example_infers_network_and_clock() -> TestResult {
-    let example = fixture("uses_http_and_clock.ipe");
-    let (ok, stdout) = run_ipe(&["capabilities", "--plain", &example.to_string_lossy()])?;
+    let example = fixture_project("uses_http_and_clock.ipe")?;
+    let (ok, stdout) = run_ipe_in(example.root().path(), &["capabilities", "--plain"])?;
     assert!(ok, "capabilities must exit 0 on the example");
     let reported: BTreeSet<&str> = stdout.split_whitespace().collect();
     assert_eq!(
@@ -235,7 +264,7 @@ fn acceptance_http_and_clock_example_infers_network_and_clock() -> TestResult {
 
     // The library verifier agrees with the reported set exactly.
     let declared = BTreeSet::from([Capability::Network, Capability::Clock]);
-    let r = verify_capabilities(&example, &declared);
+    let r = verify_capabilities(example.root(), &declared);
     assert!(r.is_ok(), "the exact inferred set must verify: {r:?}");
     Ok(())
 }
@@ -320,8 +349,7 @@ fn server_mount_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
 #[test]
 fn a_web_app_mounts_into_a_server() -> TestResult {
     let dir = server_mount_project("typecheck")?;
-    let entry = dir.join("src/Main.ipe");
-    let (ok, stdout) = run_ipe(&["type-check", &entry.to_string_lossy()])?;
+    let (ok, stdout) = run_ipe_in(&dir, &["type-check", "src/Main.ipe"])?;
     assert!(
         ok,
         "a Web app mounted via Server.mountApp (Web.embed …) inside Server.listen \
@@ -340,11 +368,10 @@ fn a_web_app_mounts_into_a_server() -> TestResult {
 #[test]
 fn a_widget_program_discloses_custom_element() -> TestResult {
     let dir = widget_project("infer")?;
-    let entry = dir.join("src/Main.ipe");
     // Declaring exactly `{custom-element}` must verify: it is the whole inferred
     // set of a widget app that reaches no other effect.
     let declared = BTreeSet::from([Capability::CustomElement]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "a widget program's inferred set is exactly {{custom-element}}: {r:?}"
@@ -359,10 +386,9 @@ fn a_widget_program_discloses_custom_element() -> TestResult {
 #[test]
 fn a_widget_program_that_hides_custom_element_is_rejected() -> TestResult {
     let dir = widget_project("hide")?;
-    let entry = dir.join("src/Main.ipe");
     // Declare the empty set even though the program ships a widget.
     let declared = BTreeSet::new();
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -456,9 +482,8 @@ fn unmounted_widget_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
 #[test]
 fn an_unmounted_handle_still_discloses_custom_element() -> TestResult {
     let dir = unmounted_widget_project("infer")?;
-    let entry = dir.join("src/Main.ipe");
     let declared = BTreeSet::from([Capability::CustomElement]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "an unmounted-handle app's inferred set is exactly {{custom-element}}: {r:?}"
@@ -473,9 +498,8 @@ fn an_unmounted_handle_still_discloses_custom_element() -> TestResult {
 #[test]
 fn an_unmounted_handle_that_hides_custom_element_is_rejected() -> TestResult {
     let dir = unmounted_widget_project("hide")?;
-    let entry = dir.join("src/Main.ipe");
     let declared = BTreeSet::new();
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -517,9 +541,8 @@ fn a_handle_constructed_in_an_imported_module_discloses_custom_element() -> Test
     )?;
     std::fs::write(dir.join("src/js/counter.js"), COUNTER_JS)?;
 
-    let entry = dir.join("src/Main.ipe");
     let declared = BTreeSet::from([Capability::CustomElement]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "a handle constructed in an imported module must disclose `custom-element` transitively: {r:?}"
@@ -615,8 +638,8 @@ fn js_port_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("Main.ipe"), JS_PORT_APP)?;
+    create_project_dir(&dir)?;
+    std::fs::write(dir.join("src/Main.ipe"), JS_PORT_APP)?;
     Ok(dir)
 }
 
@@ -627,9 +650,8 @@ fn js_port_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
 #[test]
 fn a_port_program_discloses_js_port() -> TestResult {
     let dir = js_port_project("infer")?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "a hand-rolled port program's inferred set is exactly {{js-port:raw}}: {r:?}"
@@ -692,16 +714,15 @@ fn importing_browser_clipboard_discloses_js_port_clipboard() -> TestResult {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("Main.ipe"), CLIPBOARD_APP)?;
-    let entry = dir.join("Main.ipe");
+    create_project_dir(&dir)?;
+    std::fs::write(dir.join("src/Main.ipe"), CLIPBOARD_APP)?;
     // The `:clipboard` characterised axis AND the `:raw` kernel floor (the
     // `Clipboard.write` body reaches `Js.send`) are both disclosed.
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Clipboard),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Clipboard must disclose js-port:clipboard (+ the :raw floor): {r:?}"
@@ -722,18 +743,18 @@ fn a_transitive_browser_import_reaches_the_linked_set() -> TestResult {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
+    create_project_dir(&dir)?;
     // `Widget` is the intermediate dep: it imports the browser module and re-exposes
     // a plain helper. `Main` imports only `Widget`, never the browser module.
     std::fs::write(
-        dir.join("Widget.ipe"),
+        dir.join("src/Widget.ipe"),
         "module Widget exposing (copy)\n\
          import Ipe.Browser.Clipboard as Clipboard\n\
          copy : String -> Cmd msg\n\
          copy s =\n    Clipboard.write s\n",
     )?;
     std::fs::write(
-        dir.join("Main.ipe"),
+        dir.join("src/Main.ipe"),
         "module Main exposing (main)\n\
          import Ipe.Tea.Web as Web\n\
          import Ipe.Tea.Web.Cmd as Cmd\n\
@@ -752,12 +773,11 @@ fn a_transitive_browser_import_reaches_the_linked_set() -> TestResult {
          subscriptions _model =\n    Sub.none\n\
          main =\n    Web.tea\n        { init = init, update = update, view = view, subscriptions = subscriptions\n        , routes = [], notFound = Copy\n        }\n",
     )?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Clipboard),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "a dep-of-dep Ipe.Browser.Clipboard import must reach the linked entry's set (MUST-FIX #1): {r:?}"
@@ -794,9 +814,8 @@ fn web_consent_refuses_ungranted_clipboard_then_admits_it() {
 #[test]
 fn a_port_program_that_hides_js_port_is_rejected() -> TestResult {
     let dir = js_port_project("hide")?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::new();
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -863,8 +882,8 @@ fn write_single(tag: &str, src: &str) -> Result<PathBuf, Box<dyn Error>> {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("Main.ipe"), src)?;
+    create_project_dir(&dir)?;
+    std::fs::write(dir.join("src/Main.ipe"), src)?;
     Ok(dir)
 }
 
@@ -874,12 +893,11 @@ fn write_single(tag: &str, src: &str) -> Result<PathBuf, Box<dyn Error>> {
 #[test]
 fn importing_browser_geolocation_discloses_js_port_geolocation() -> TestResult {
     let dir = write_single("geo", GEOLOCATION_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Geolocation),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Geolocation must disclose js-port:geolocation (+ the :raw floor): {r:?}"
@@ -930,12 +948,11 @@ main =
 #[test]
 fn importing_geolocation_internals_discloses_the_same_axis() -> TestResult {
     let dir = write_single("geointernals", GEOLOCATION_INTERNALS_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Geolocation),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing the Internals submodule must disclose js-port:geolocation (prefix key): {r:?}"
@@ -949,10 +966,9 @@ fn importing_geolocation_internals_discloses_the_same_axis() -> TestResult {
 #[test]
 fn a_geolocation_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("geonogrant", GEOLOCATION_APP)?;
-    let entry = dir.join("Main.ipe");
     // Grant only the raw floor, not the geolocation axis.
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1040,12 +1056,11 @@ main =
 #[test]
 fn importing_browser_notification_discloses_js_port_notification() -> TestResult {
     let dir = write_single("note", NOTIFICATION_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Notification),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Notification must disclose js-port:notification (+ the :raw floor): {r:?}"
@@ -1059,9 +1074,8 @@ fn importing_browser_notification_discloses_js_port_notification() -> TestResult
 #[test]
 fn a_notification_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("notenogrant", NOTIFICATION_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1130,12 +1144,11 @@ main =
 #[test]
 fn importing_browser_storage_discloses_js_port_storage() -> TestResult {
     let dir = write_single("storage", STORAGE_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Storage),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Storage must disclose js-port:storage (+ the :raw floor): {r:?}"
@@ -1148,9 +1161,8 @@ fn importing_browser_storage_discloses_js_port_storage() -> TestResult {
 #[test]
 fn a_storage_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("storagenogrant", STORAGE_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1212,12 +1224,11 @@ main =
 #[test]
 fn importing_browser_vibration_discloses_js_port_vibration() -> TestResult {
     let dir = write_single("vib", VIBRATION_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Vibration),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Vibration must disclose js-port:vibration (+ the :raw floor): {r:?}"
@@ -1230,9 +1241,8 @@ fn importing_browser_vibration_discloses_js_port_vibration() -> TestResult {
 #[test]
 fn a_vibration_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("vibnogrant", VIBRATION_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1310,12 +1320,11 @@ main =
 #[test]
 fn importing_browser_share_discloses_js_port_share() -> TestResult {
     let dir = write_single("share", SHARE_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Share),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Share must disclose js-port:share (+ the :raw floor): {r:?}"
@@ -1328,9 +1337,8 @@ fn importing_browser_share_discloses_js_port_share() -> TestResult {
 #[test]
 fn a_share_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("sharenogrant", SHARE_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1396,12 +1404,11 @@ main =
 #[test]
 fn importing_browser_battery_discloses_js_port_battery() -> TestResult {
     let dir = write_single("battery", BATTERY_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Battery),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Battery must disclose js-port:battery (+ the :raw floor): {r:?}"
@@ -1414,9 +1421,8 @@ fn importing_browser_battery_discloses_js_port_battery() -> TestResult {
 #[test]
 fn a_battery_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("batterynogrant", BATTERY_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1483,12 +1489,11 @@ main =
 #[test]
 fn importing_browser_network_info_discloses_js_port_network_info() -> TestResult {
     let dir = write_single("netinfo", NETWORK_INFO_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::NetworkInfo),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.NetworkInfo must disclose js-port:network-info (+ the :raw floor): {r:?}"
@@ -1501,9 +1506,8 @@ fn importing_browser_network_info_discloses_js_port_network_info() -> TestResult
 #[test]
 fn a_network_info_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("netinfonogrant", NETWORK_INFO_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1566,12 +1570,11 @@ main =
 #[test]
 fn importing_browser_file_picker_discloses_js_port_file() -> TestResult {
     let dir = write_single("filepicker", FILE_PICKER_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::File),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.FilePicker must disclose js-port:file (+ the :raw floor): {r:?}"
@@ -1584,9 +1587,8 @@ fn importing_browser_file_picker_discloses_js_port_file() -> TestResult {
 #[test]
 fn a_file_picker_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("filepickernogrant", FILE_PICKER_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1649,12 +1651,11 @@ main =
 #[test]
 fn importing_browser_camera_discloses_js_port_camera() -> TestResult {
     let dir = write_single("camera", CAMERA_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Camera),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Camera must disclose js-port:camera (+ the :raw floor): {r:?}"
@@ -1667,9 +1668,8 @@ fn importing_browser_camera_discloses_js_port_camera() -> TestResult {
 #[test]
 fn a_camera_app_without_the_grant_is_rejected() -> TestResult {
     let dir = write_single("cameranogrant", CAMERA_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1738,12 +1738,11 @@ main =
 #[test]
 fn importing_browser_microphone_discloses_js_port_microphone() -> TestResult {
     let dir = write_single("microphone", MICROPHONE_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Microphone),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Microphone must disclose js-port:microphone (+ the :raw floor): {r:?}"
@@ -1757,11 +1756,10 @@ fn importing_browser_microphone_discloses_js_port_microphone() -> TestResult {
 #[test]
 fn a_microphone_app_without_the_grant_is_rejected_ipe_s0002() -> TestResult {
     let dir = write_single("micnogrant", MICROPHONE_APP)?;
-    let entry = dir.join("Main.ipe");
     // Granting only `:raw` (the kernel floor) is not enough — the specific
     // `js-port:microphone` axis must be accepted explicitly.
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,
@@ -1824,12 +1822,11 @@ main =
 #[test]
 fn importing_browser_gamepad_discloses_js_port_gamepad() -> TestResult {
     let dir = write_single("gamepad", GAMEPAD_APP)?;
-    let entry = dir.join("Main.ipe");
     let declared = BTreeSet::from([
         Capability::JsPort(WebCapability::Gamepad),
         Capability::JsPort(WebCapability::Raw),
     ]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         r.is_ok(),
         "importing Ipe.Browser.Gamepad must disclose js-port:gamepad (+ the :raw floor): {r:?}"
@@ -1843,11 +1840,10 @@ fn importing_browser_gamepad_discloses_js_port_gamepad() -> TestResult {
 #[test]
 fn a_gamepad_app_without_the_grant_is_rejected_ipe_s0002() -> TestResult {
     let dir = write_single("gamepadnogrant", GAMEPAD_APP)?;
-    let entry = dir.join("Main.ipe");
     // Granting only `:raw` (the kernel floor) is not enough — the specific
     // `js-port:gamepad` axis must be accepted explicitly.
     let declared = BTreeSet::from([Capability::JsPort(WebCapability::Raw)]);
-    let r = verify_capabilities(&entry, &declared);
+    let r = verify(&dir, &declared);
     assert!(
         matches!(
             &r,

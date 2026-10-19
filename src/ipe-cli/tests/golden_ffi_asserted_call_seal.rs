@@ -305,9 +305,11 @@ fn analysis_entrypoints_accept_an_asserted_program() {
             .field("version = \"0.1.0\""),
     );
 
-    let entry = fixture.path().join("src").join("Main.ipe");
-    ipe::run_cli(&["type-check".to_owned(), entry.display().to_string()])
-        .expect("`ipe type-check` must accept an asserted program");
+    ipe::run_cli(&[
+        "type-check".to_owned(),
+        fixture.path().display().to_string(),
+    ])
+    .expect("`ipe type-check` must accept an asserted program");
 
     let caps = ipe::infer_package_capabilities(&fixture.manifest_path())
         .expect("package capability inference must lower an asserted program");

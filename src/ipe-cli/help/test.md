@@ -6,7 +6,7 @@ ipe test [<path>]
 
 ## Arguments
 
-A source file, a project directory, or a package.ipe. Defaults to the current project. The tests build with the project's package.ipe settings, its database driver included.
+A project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project, which selects that project. Defaults to the current directory's project. The tests always run from the project's tests/Main.ipe and build with its package.ipe settings, its database driver included.
 
 ## Options
 

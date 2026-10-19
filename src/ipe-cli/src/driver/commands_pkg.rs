@@ -1,22 +1,24 @@
 use super::{
-    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SettingsSource,
-    SourceGraph, attribute_canon_errors, attribute_post_link_error, build_project_into,
-    build_source_graph, build_test_into, capabilities_including_served_widgets,
-    classify_entry_shape, create_source_root, default_entry, discover_manifest, emit_machine_error,
-    emitted_bin_filename, frame_infer_error, home_to_source_map, lowering_check_query,
-    program_constructs_a_widget, resolve_runtime, resolve_vendored_runtime_dir, run_build,
-    runtime_context_for_message, source_graph_for_target, typecheck_target,
+    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
+    analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
+    attribute_post_link_error, build_project_into, build_test_into,
+    capabilities_including_served_widgets, classify_entry_shape, create_source_root,
+    discover_manifest, emit_machine_error, emitted_bin_filename, entry_modules, frame_infer_error,
+    home_to_source_map, lowering_check_query, program_constructs_a_widget, resolve_runtime,
+    resolve_vendored_runtime_dir, run_build, runtime_context_for_message, typecheck_target,
+    working_dir,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, Verbosity};
-use crate::contained_path::ResolvedPath;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
+use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
+use crate::source_snapshot::{Limits, SourceOrigin, SourceSnapshot, TestView};
 use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
-    audit, cli_args, contained_path, delivery, ffi, fmt, fs, index, pack, progress, project,
-    publish, resolve, scratch, style, text, toolchain, version_check,
+    audit, cli_args, delivery, ffi, fmt, fs, index, pack, progress, project, publish, resolve,
+    scratch, style, text, toolchain, version_check,
 };
 use zeroize::Zeroizing;
 
@@ -1227,159 +1229,6 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// The source file `ipe type-check` uses as its analysis root for a manifest
-/// project.
-///
-/// The entry is the build's ([`project::ProjectManifest::resolved_entry`]): a
-/// declared program's entry module (when a `programs` stage names one) wins, its
-/// file resolved through the [`contained_path::ContainedRelPath`] gate so it
-/// cannot escape the source root; otherwise
-/// `<src_root>/Main.ipe`. A library (a manifest declaring `exposedModules` with
-/// no `src/Main.ipe` and no runnable program) has no `main` to check, so its
-/// analysis root is its first exposed module's file — checking the public
-/// surface is a library's meaningful verification.
-///
-/// # Errors
-/// [`CliError::Usage`] when a declared program's entry names no module (the
-/// build's own refusal); [`CliError::PathEscape`] when its file resolves outside
-/// the source root.
-pub fn analysis_root_of(parsed: &project::ProjectManifest) -> Result<PathBuf, CliError> {
-    if let Some(program) = parsed.default_program() {
-        // The build's own module path for the entry, never the raw `entry`
-        // string: an entry the build refuses is refused here.
-        let module = parsed.resolved_entry()?;
-        let rel = format!("{}.ipe", module.join("/"));
-        let contained =
-            contained_path::ContainedRelPath::parse(&parsed.src_root, &rel).map_err(|reason| {
-                CliError::PathEscape {
-                    raw: program.entry.clone(),
-                    reason,
-                }
-            })?;
-        return Ok(contained.resolved().to_path_buf());
-    }
-    // No declared program: `Main.ipe`, else the first exposed module's file.
-    // Fall back to `Main.ipe` (the caller surfaces a clean missing-entry
-    // diagnostic) when the manifest names neither.
-    let main = parsed.src_root.join("Main.ipe");
-    if main.is_file() {
-        return Ok(main);
-    }
-    if let Some(module) = parsed.exposed_modules.first() {
-        let rel: PathBuf = module.split('.').collect();
-        return Ok(parsed.src_root.join(rel).with_extension("ipe"));
-    }
-    Ok(main)
-}
-
-/// The directory name a governing manifest's test tree lives under, relative
-/// to the project root — the one spelling [`resolve_analysis_target`] and
-/// [`run_project_tests_with`] both key off, so the two can never drift apart.
-const TESTS_DIR_NAME: &str = "tests";
-
-/// The analysis an `ipe type-check`-family `<path>` argument resolved to.
-///
-/// A FILE argument is always analysed as itself. It is project-rooted
-/// ([`Self::Source`] or [`Self::Test`]) exactly when its canonical path
-/// lies under the governing manifest's canonical `src/` or `tests/` root, and
-/// loose ([`Self::Loose`]) otherwise. A DIRECTORY argument (or none) names
-/// the project's own entry file, which is then classified exactly like a file
-/// argument — so every form shares one root resolution, the build's `src` root.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnalysisTarget {
-    /// A file no manifest roots, canonicalised like every other file
-    /// variant so each diagnostic names it the same way.
-    Loose(ResolvedPath),
-    /// A file under a governing manifest's `src/` root.
-    Source {
-        /// The named file.
-        file: ResolvedPath,
-        /// The governing manifest's `src/` root.
-        src_root: ResolvedPath,
-    },
-    /// A file under a governing manifest's `tests/` root.
-    Test {
-        /// The named test file.
-        file: ResolvedPath,
-        /// The governing manifest's `src/` root.
-        src_root: ResolvedPath,
-        /// The governing manifest's `tests/` root, so a nested test file
-        /// widens against the whole `tests/` tree, not its own directory.
-        tests_root: ResolvedPath,
-    },
-}
-
-/// Resolve a `check`/analysis `<path>` argument to its [`AnalysisTarget`].
-///
-/// A directory (or no) argument names its own manifest's entry
-/// ([`analysis_root_of`]), classified against that same manifest's roots (never
-/// one nested nearer the entry), so the directory form analyses the same
-/// `src`-rooted module set the build compiles rather than a closure rooted at
-/// the entry's own directory. A FILE argument is canonicalised once; the
-/// manifest governing that canonical path is found, and the file is
-/// project-rooted only when its canonical path lies strictly under that
-/// manifest's canonical `tests/` or `src/` root.
-///
-/// # Errors
-/// A manifest's own parse errors for a directory argument;
-/// [`CliError::Io`] when the file (a named one, or a directory's entry) cannot
-/// be canonicalised (`NotFound` when it is missing), or a project, `src/`, or
-/// existing `tests/` root cannot be; a manifest's own parse errors for a file
-/// under a governing manifest.
-pub fn resolve_analysis_target(path: &Path) -> Result<AnalysisTarget, CliError> {
-    if path.is_dir() {
-        let Some(manifest_path) = discover_manifest(path)? else {
-            return resolve_file_target(path);
-        };
-        // The directory's own manifest roots its entry, as it roots the build;
-        // the entry is never re-governed by a manifest nested beneath it.
-        let parsed = project::parse_manifest(&manifest_path)?;
-        let entry = analysis_root_of(&parsed)?;
-        let file = ResolvedPath::of(&entry).map_err(|e| io_err(&entry, e))?;
-        return classify_under_manifest(file, &parsed);
-    }
-    resolve_file_target(path)
-}
-
-/// Classify a FILE against the manifest governing its canonical path.
-fn resolve_file_target(path: &Path) -> Result<AnalysisTarget, CliError> {
-    let file = ResolvedPath::of(path).map_err(|e| io_err(path, e))?;
-    let Some(manifest_path) = discover_manifest(file.as_path())? else {
-        return Ok(AnalysisTarget::Loose(file));
-    };
-    let parsed = project::parse_manifest(&manifest_path)?;
-    classify_under_manifest(file, &parsed)
-}
-
-/// Classify a canonical `file` against `parsed`'s canonical `tests/` and `src/`
-/// roots: the one root resolution every [`resolve_analysis_target`] form
-/// routes through.
-fn classify_under_manifest(
-    file: ResolvedPath,
-    parsed: &project::ProjectManifest,
-) -> Result<AnalysisTarget, CliError> {
-    let project_root = ResolvedPath::of(&parsed.root).map_err(|e| io_err(&parsed.root, e))?;
-    let src_root = ResolvedPath::of(&parsed.src_root).map_err(|e| io_err(&parsed.src_root, e))?;
-    let tests_dir = parsed.root.join(TESTS_DIR_NAME);
-    let tests_root = match ResolvedPath::of(&tests_dir) {
-        Ok(root) => Some(root),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_err(&tests_dir, e)),
-    }
-    .filter(|root| root.is_strictly_under(&project_root));
-    if let Some(tests_root) = tests_root.filter(|root| file.is_strictly_under(root)) {
-        return Ok(AnalysisTarget::Test {
-            file,
-            src_root,
-            tests_root,
-        });
-    }
-    if file.is_strictly_under(&src_root) {
-        return Ok(AnalysisTarget::Source { file, src_root });
-    }
-    Ok(AnalysisTarget::Loose(file))
-}
-
 /// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
 /// injection-aware source graph `ipe dev build` uses, but demands only the
 /// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
@@ -1406,15 +1255,19 @@ pub fn run_type_check(rest: &[String]) -> Result<(), CliError> {
 /// Inner implementation of [`run_type_check`], unaware of how a failure is
 /// rendered; the caller routes any error through the resolved output format.
 pub fn run_type_check_body(rest: &[String]) -> Result<(), CliError> {
+    run_type_check_in(&working_dir()?, rest)
+}
+
+/// [`run_type_check_body`] with `cwd` as the current directory.
+///
+/// # Errors
+/// Every refusal of [`analysis_root`], [`analysis_target`] and
+/// [`typecheck_target`].
+pub fn run_type_check_in(cwd: &Path, rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_type_check(rest)?;
-    let arg = match args.entry {
-        Some(e) => PathBuf::from(e),
-        None => PathBuf::from(default_entry()?),
-    };
-    let target = resolve_analysis_target(&arg)?;
     // Propagate any diagnostic raw; `run_type_check` routes it through the
     // resolved output format (the single machine-error boundary).
-    typecheck_target(&target)?;
+    typecheck_in(cwd, args.entry.as_deref())?;
     match args.format {
         cli_args::OutputFormat::Json => {
             // The shared machine envelope; a clean type-check carries an empty
@@ -1522,84 +1375,57 @@ pub enum TestStdio {
 /// Build and run a project's `tests/Main.ipe`, the single test runner shared by
 /// `ipe test` and `ipe verify`'s final stage.
 ///
-/// The test entry is the file at `<project-root>/tests/Main.ipe`. The project
-/// root is the directory holding `package.ipe`; with no manifest it is the parent
-/// of the entry's `src/` directory (the conventional layout), or the entry's
-/// own directory for a flat single-directory project. The test entry is built
-/// against the project's `src/` tree AND its `tests/` siblings, so a test that
-/// imports the code under test resolves. When the test entry is absent the
-/// runner returns [`TestOutcome::NoTestEntry`] — a project with no test entry is
-/// not an error. When it exists, the test runner is compiled to a temporary
-/// output directory, the emitted Rust project is built with `cargo build`, and
-/// the resulting `ipe-app` binary is executed. The binary itself prints the
-/// per-test failures and the `N passed, M failed` summary (from
-/// `Ipe.Test.runMain`) to stdout; this function only classifies its exit code.
+/// The test entry is the module `tests/Main.ipe` of the project `path` names:
+/// a project directory, its `package.ipe`, or a module under its `src/` or
+/// `tests/`; with no `path`, the current directory. The project is resolved
+/// exactly as `ipe dev build` resolves it ([`ProjectRoot::resolve`]): the
+/// directory must hold `package.ipe` itself, and no parent directory is ever
+/// searched. The test program is the snapshot's own test universe
+/// ([`SourceSnapshot::test_view`]) — the entry, the project's `src/` tree, its
+/// other `tests/` modules, and the stdlib closure and FFI preparation over the
+/// one catalog the snapshot read — built with the manifest's settings, so the
+/// program under test is the program the project build ships. When the test
+/// entry is absent the runner returns [`TestOutcome::NoTestEntry`] — a project
+/// with no test entry is not an error. When it exists, the test runner is
+/// compiled to a temporary output directory, the emitted Rust project is built
+/// with `cargo build`, and the resulting `ipe-app` binary is executed. The
+/// binary itself prints the per-test failures and the `N passed, M failed`
+/// summary (from `Ipe.Test.runMain`) to stdout; this function only classifies
+/// its exit code.
 ///
 /// # Errors
 /// [`CliError::TestFailed`] when the test binary exits non-zero (one or more
-/// cases failed) — the binary's own output is the report. Otherwise any build
-/// or toolchain error encountered while compiling the runner.
+/// cases failed) — the binary's own output is the report. Otherwise every
+/// refusal of [`ProjectRoot::resolve`], [`ProjectRoot::target`],
+/// [`SourceSnapshot::read`] and [`SourceSnapshot::test_view`], or any build or
+/// toolchain error encountered while compiling the runner.
 pub fn run_project_tests(path: Option<&str>) -> Result<TestOutcome, CliError> {
-    run_project_tests_with(path, TestStdio::Inherit)
+    run_project_tests_with(&working_dir()?, path, TestStdio::Inherit)
 }
 
-/// The shared test runner, parameterised by where the test binary's own summary
-/// goes ([`TestStdio`]). See [`run_project_tests`] for the resolution rules.
+/// The shared test runner over the project `path` names from `cwd`,
+/// parameterised by where the test binary's own summary goes ([`TestStdio`]).
+///
+/// See [`run_project_tests`] for the resolution rules.
 ///
 /// # Errors
 /// As [`run_project_tests`].
 pub fn run_project_tests_with(
+    cwd: &Path,
     path: Option<&str>,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
-    // Resolve the project root from the supplied path (or cwd defaults).
-    let entry_path = match path {
-        Some(p) => PathBuf::from(p),
-        None => PathBuf::from(default_entry()?),
-    };
-
-    // Resolve the project root and the source root (the `src/` tree the code
-    // under test lives in). With a manifest, both come from it — the manifest's
-    // directory and its declared `src_root` (honouring a `srcDir` override).
-    // Without a manifest, the entry's own directory is the source root, and the
-    // project root is the source root's parent when the entry lives under a
-    // conventional `src/` directory (so `src/Main.ipe`'s sibling `tests/` tree
-    // is at `<project-root>/tests`, not `src/tests`); otherwise the entry's
-    // directory is itself the project root (a flat single-directory project).
-    // The manifest is parsed once: its settings are the test build's settings,
-    // its database driver included, so the program under test is the program
-    // the project build ships.
-    let manifest_path = discover_manifest(&entry_path)?;
-    let manifest = match manifest_path.as_deref() {
-        Some(m) => Some(project::parse_manifest(m)?),
-        None => None,
-    };
-    let found = manifest.as_ref().zip(manifest_path.as_deref());
-    let (project_root, project_src_root): (PathBuf, PathBuf) = if let Some((parsed, m)) = found {
-        let root = m
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        (root, parsed.src_root.clone())
-    } else {
-        let src_root = entry_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let root = if src_root.file_name().and_then(|n| n.to_str()) == Some("src") {
-            src_root
-                .parent()
-                .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-        } else {
-            src_root.clone()
-        };
-        (root, src_root)
-    };
-
-    let tests_root = project_root.join(TESTS_DIR_NAME);
-    let test_entry = tests_root.join("Main.ipe");
-    if !test_entry.is_file() {
-        // No test entry — there is nothing to run.
+    let (root, file) = analysis_root(cwd, path.map(Path::new))?;
+    // A named file selects its project and nothing more; it must still lie
+    // under the project's `src/` or `tests/`.
+    analysis_target(&root, file.as_ref())?;
+    let snapshot = SourceSnapshot::read(&root, Limits::DEFAULT)?;
+    let Some(entry) = snapshot.test_entry(&[TEST_ENTRY_MODULE.to_owned()]) else {
         return Ok(TestOutcome::NoTestEntry);
-    }
+    };
+    // The test universe is judged, its FFI calls included, before any
+    // toolchain is asked for.
+    let view = SourceSnapshot::test_view(entry)?;
 
     // Fail closed before emitting: the test stage shells out to cargo to build
     // the test runner, so a missing toolchain is reported with its root cause
@@ -1616,23 +1442,11 @@ pub fn run_project_tests_with(
         source: e,
     })?;
 
-    // Build the test entry. When the project has a `src/` tree, the test entry
-    // is built against BOTH it (the code under test) and the `tests/` tree (its
-    // test-only siblings), so a `tests/Main.ipe` importing `Lib.Foo` from
-    // `src/Lib/Foo.ipe` resolves. A `tests/`-only project with no `src/` (a
-    // standalone test) falls back to sibling discovery rooted at `tests/`. On
-    // any compile failure the stage propagates that error directly — the error
-    // is already a well-formed `CliError`.
-    // Build, then run, the test entry. Everything after the temp output is
-    // created runs inside this closure so a single cleanup below removes the
-    // temp directory on EVERY exit — a compile failure, a cargo failure, a
-    // spawn error, or a normal run — not only the success path.
     let outcome = build_and_run_test_entry(
-        &SettingsSource::discovered(found, crate::delivery::HostIntent::Served),
-        TestLayout {
-            src_root: &project_src_root,
-            tests_root: &tests_root,
-            entry: &test_entry,
+        &TestProgram {
+            root: &root,
+            view: &view,
+            host: crate::delivery::HostIntent::Served,
         },
         &out_scratch,
         &runtime_dir,
@@ -1646,16 +1460,18 @@ pub fn run_project_tests_with(
     outcome
 }
 
-/// Where a project's tests live: the code under test, the `tests/` tree, and
-/// the tree's entry.
-#[derive(Clone, Copy, Debug)]
-pub struct TestLayout<'a> {
-    /// The project's source root (`src/`, or the project root when flat).
-    pub src_root: &'a Path,
-    /// The `tests/` tree.
-    pub tests_root: &'a Path,
-    /// The test entry, `tests/Main.ipe`.
-    pub entry: &'a Path,
+/// The module every project's test program is entered at: `tests/Main.ipe`.
+const TEST_ENTRY_MODULE: &str = "Main";
+
+/// One test program: the project it belongs to, its universe, and the host it is built for.
+#[derive(Clone, Copy)]
+pub struct TestProgram<'a> {
+    /// The resolved project, the source of the build's settings.
+    pub root: &'a ProjectRoot,
+    /// The program's modules and FFI preparation.
+    pub view: &'a TestView,
+    /// The host the program is built for.
+    pub host: crate::delivery::HostIntent,
 }
 
 /// Compile the test entry into `out_scratch`, build the emitted Rust project, and
@@ -1680,18 +1496,16 @@ pub struct TestLayout<'a> {
 /// [`CliError::TestFailed`] when the binary exits non-zero (a failing case, or
 /// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
-    source: &SettingsSource<'_>,
-    layout: TestLayout<'_>,
+    program: &TestProgram<'_>,
     out_scratch: &scratch::ScratchDir,
     runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
     let crate_dir = build_test_into(
-        source,
-        layout.src_root,
-        layout.tests_root,
-        layout.entry,
+        program.root,
+        program.view,
+        program.host,
         OutTarget::Scratch(out_scratch),
         runtime_dir,
     )?;
@@ -1932,7 +1746,7 @@ pub fn run_test_json(path: Option<&str>) -> Result<(), CliError> {
     use cli_args::json;
 
     let verdict = |result: &str| json::object(&[("result", json::string(result))]);
-    match run_project_tests_with(path, TestStdio::Quiet) {
+    match run_project_tests_with(&working_dir()?, path, TestStdio::Quiet) {
         Ok(TestOutcome::AllPassed) => {
             json_line(&verdict("passed"));
             Ok(())
@@ -2046,48 +1860,90 @@ fn json_line(object: &str) {
 /// as [`verify_check`], but through the non-printing core so stdout stays clean
 /// for the JSON verdict (a diagnostic still renders through the error channel).
 pub fn verify_check_quiet(path: Option<&str>) -> Result<(), CliError> {
-    let arg = match path {
-        Some(e) => PathBuf::from(e),
-        None => PathBuf::from(default_entry()?),
-    };
-    let target = resolve_analysis_target(&arg)?;
-    typecheck_target(&target)
+    typecheck_in(&working_dir()?, path)
+}
+
+/// Type-check what `arg` names in the project at `cwd`: every entry when there is none.
+///
+/// # Errors
+/// Every refusal of [`analysis_root`], [`analysis_target`] and
+/// [`typecheck_target`].
+pub fn typecheck_in(cwd: &Path, arg: Option<&str>) -> Result<(), CliError> {
+    let (root, file) = analysis_root(cwd, arg.map(Path::new))?;
+    typecheck_target(&analysis_target(&root, file.as_ref())?)
 }
 
 /// The test stage in machine-quiet form: the shared runner with the test
 /// binary's own summary routed to stderr, so stdout stays the JSON verdict alone.
 pub fn verify_test_quiet(path: Option<&str>) -> Result<(), CliError> {
-    run_project_tests_with(path, TestStdio::Quiet).map(|_| ())
+    run_project_tests_with(&working_dir()?, path, TestStdio::Quiet).map(|_| ())
 }
 
 pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
     let (format, positional) = cli_args::split_format(rest, "capabilities")?;
-    let arg = match positional.first() {
-        Some(e) => PathBuf::from(e),
-        None => PathBuf::from(default_entry()?),
-    };
-    // Route a directory / project-root `.` to its entry `.ipe` file, the same
-    // argument convention `ipe type-check` uses. Without this a bare
-    // `ipe capabilities` in a project dir passes `.` straight to the reader and
-    // fails with a raw "Is a directory" io error. A file argument is never
-    // substituted — only widened to `tests ∪ src` when it names a test file.
-    let target = resolve_analysis_target(&arg)?;
-    let (graph, entry) = source_graph_for_target(&target)?;
-    let program = graph.run_attributed(&entry, |db, root, file| {
-        ipe_db::lower_program(db, root, file).clone()
-    })?;
-    let caps = capabilities_including_served_widgets(
-        &graph.db,
-        graph.source_root,
-        graph.entry_file,
-        &program,
-    );
+    let caps = capabilities_in(&working_dir()?, positional.first().copied())?;
     let names: Vec<&'static str> = caps.iter().map(|c| c.as_str()).collect();
     crate::screen::emit_report(
         format,
         &render_capabilities(&names, format, &std::io::stdout()),
     );
     Ok(())
+}
+
+/// The capabilities what `arg` names in the project at `cwd` exercises.
+///
+/// No argument (or a directory, or `package.ipe`) is every entry of the
+/// project, their sets unioned. A file argument must name one of the
+/// project's entries: a capability set is a program's, and any other module
+/// is not one.
+///
+/// # Errors
+/// Every refusal of [`analysis_root`] and [`analysis_target`];
+/// [`CliError::Usage`] for a file naming no entry; [`CliError::Pipeline`] when
+/// an entry does not lower.
+pub fn capabilities_in(
+    cwd: &Path,
+    arg: Option<&str>,
+) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
+    let (root, file) = analysis_root(cwd, arg.map(Path::new))?;
+    let target = analysis_target(&root, file.as_ref())?;
+    if let (Some(file), AnalysisTarget::Module { dir, module, .. }) = (file.as_ref(), &target) {
+        let entries = entry_modules(root.entries());
+        if *dir != SourceDir::Src || !entries.contains(&module.as_slice()) {
+            let named: Vec<String> = entries
+                .iter()
+                .map(|entry| format!("src/{}.ipe", entry.join("/")))
+                .collect();
+            return Err(CliError::Usage(text::msg::capabilities_not_an_entry(
+                &file.path().display(),
+                &named.join(", "),
+            )));
+        }
+    }
+    target_capabilities(&target)
+}
+
+/// The union of the capabilities every entry `target` names exercises.
+///
+/// # Errors
+/// [`CliError::Pipeline`] when an entry does not lower; every refusal of
+/// [`analysis_graphs`].
+fn target_capabilities(
+    target: &AnalysisTarget<'_>,
+) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
+    let mut caps = std::collections::BTreeSet::new();
+    for graph in analysis_graphs(target)? {
+        let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
+            ipe_db::lower_program(db, root, file).clone()
+        })?;
+        caps.extend(capabilities_including_served_widgets(
+            &graph.db,
+            graph.source_root,
+            graph.entry_file,
+            &program,
+        ));
+    }
+    Ok(caps)
 }
 
 /// Render a program's inferred capability set in the requested [`OutputFormat`].
@@ -2726,7 +2582,7 @@ pub fn render_version(format: cli_args::OutputFormat, stream: &impl std::io::IsT
     }
 }
 
-/// Verify a declared capability set equals the set inferred from `entry`.
+/// Verify a declared capability set equals the set inferred from every entry of `root`.
 ///
 /// Returns `Ok(())` iff `declared` is exactly the inferred set. Otherwise a
 /// [`CliError::CapabilityMismatch`] naming the capabilities used but not
@@ -2735,22 +2591,13 @@ pub fn render_version(format: cli_args::OutputFormat, stream: &impl std::io::IsT
 /// under-declared manifest.
 ///
 /// # Errors
-/// [`CliError::Pipeline`] / [`CliError::Io`] when `entry` cannot be lowered, or
+/// [`CliError::Pipeline`] / [`CliError::Io`] when an entry cannot be lowered, or
 /// [`CliError::CapabilityMismatch`] on a set mismatch.
 pub fn verify_capabilities(
-    entry: &Path,
+    root: &ProjectRoot,
     declared: &std::collections::BTreeSet<ipe_ir::Capability>,
 ) -> Result<(), CliError> {
-    let graph = build_source_graph(entry)?;
-    let program = graph.run_attributed(entry, |db, root, file| {
-        ipe_db::lower_program(db, root, file).clone()
-    })?;
-    let inferred = capabilities_including_served_widgets(
-        &graph.db,
-        graph.source_root,
-        graph.entry_file,
-        &program,
-    );
+    let inferred = target_capabilities(&AnalysisTarget::Project(root))?;
     if *declared == inferred {
         return Ok(());
     }
@@ -2861,6 +2708,40 @@ impl PackageSourceSet {
             snapshot.modules().to_vec(),
             &snapshot_manifest_path(snapshot),
         )
+    }
+
+    /// The source set of the test program `view`: its universe as the snapshot holds it, never re-read.
+    ///
+    /// Nothing is injected or prepared again: the stdlib closure and the FFI
+    /// preparation are the ones the view was minted with, so the test build
+    /// binds the one catalog the snapshot read.
+    #[must_use]
+    pub fn from_test_view(view: &TestView) -> Self {
+        let mut sources = BTreeMap::new();
+        let mut injected = std::collections::BTreeSet::new();
+        let mut entries = Vec::new();
+        for (module, held) in view.modules() {
+            if held.origin() == SourceOrigin::Stdlib {
+                injected.insert(module.clone());
+            }
+            if module == view.entry() {
+                entries.push(project::DiscoveredModule::user(
+                    held.path().to_path_buf(),
+                    module.clone(),
+                ));
+            }
+            sources.insert(
+                module.clone(),
+                (held.path().to_path_buf(), held.text().to_owned()),
+            );
+        }
+        Self {
+            sources,
+            entries,
+            injected,
+            ffi_injected: view.ffi().injected.clone(),
+            ffi_emit: view.ffi().emit.clone(),
+        }
     }
 
     /// Inject the compiled-source stdlib closure and the FFI interface modules into `sources`.
@@ -3452,15 +3333,16 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// The fix command/flow: diagnose `entry` with the build's own resolution and
-/// apply the machine-applicable suggestions of its first diagnostic.
+/// The fix command/flow: diagnose what `file` names in `root` with the build's
+/// own resolution and apply the machine-applicable suggestions of its first
+/// diagnostic.
 ///
-/// The named file is analysed as `ipe type-check` analyses it: under the
-/// governing manifest's `src`/`tests` roots, or as the loose closure a build of
-/// the file alone compiles — never by a reduced single-module resolution, so a
-/// name the build binds through an import is never "corrected". A directory
-/// names its manifest's entry, the file a build of that directory compiles
-/// from. A diagnostic another module owns is reported, never patched.
+/// The named module is analysed as `ipe type-check` analyses it, over the one
+/// [`SourceSnapshot`](crate::source_snapshot::SourceSnapshot) of `root` —
+/// never by a reduced single-module resolution, so a name the build binds
+/// through an import is never "corrected". No file names every entry of the
+/// project, each fixed in turn. A diagnostic another module owns is reported,
+/// never patched.
 ///
 /// `auto` (set by `--yes` / `--fix`) is durable authorization to apply every
 /// edit without prompting; otherwise each edit is confirmed interactively on
@@ -3475,15 +3357,23 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// The refusal of a project context that cannot be built (an unreadable or
 /// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
 /// filesystem failure.
-pub fn apply_fixes_cmd<W: Write>(entry: &Path, auto: bool, w: &mut W) -> Result<(), CliError> {
-    let target = resolve_analysis_target(entry)?;
-    let (mut graph, blame_path) = source_graph_for_target(&target)?;
-    // A directory names its manifest's entry: every report names that file.
-    let entry = if entry.is_dir() {
-        blame_path.as_path()
-    } else {
-        entry
-    };
+pub fn apply_fixes_cmd<W: Write>(
+    root: &ProjectRoot,
+    file: Option<&FileArg>,
+    auto: bool,
+    w: &mut W,
+) -> Result<(), CliError> {
+    let target = analysis_target(root, file)?;
+    for graph in analysis_graphs(&target)? {
+        fix_entry(graph, auto, w)?;
+    }
+    Ok(())
+}
+
+/// Fix the entry of one source graph; every report names the entry's file.
+fn fix_entry<W: Write>(mut graph: SourceGraph, auto: bool, w: &mut W) -> Result<(), CliError> {
+    let blame_path = graph.entry_path().to_path_buf();
+    let entry = blame_path.as_path();
     let entry_real = fs::canonicalize(&blame_path).map_err(|e| io_err(&blame_path, e))?;
     let source = graph.entry_file.text(&graph.db).clone();
     let first = run_fix_check(&graph, &blame_path, &entry_real)?;

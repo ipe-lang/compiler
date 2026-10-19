@@ -278,7 +278,7 @@ fn assert_library_type_checks(tag: &str, init_args: &[String], entry_rel: &std::
     );
     let checked = ipe::run_cli(&[
         "type-check".to_owned(),
-        entry.to_string_lossy().into_owned(),
+        target.to_string_lossy().into_owned(),
     ]);
     assert!(
         checked.is_ok(),

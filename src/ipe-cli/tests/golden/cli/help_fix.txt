@@ -8,7 +8,7 @@ exit: 0
   ipe fix <path>
 
   Arguments:
-    The source file to fix.
+    The module file to fix, under `src/` or `tests/` of the current directory's project.
 
   Options:
     [--yes|-y]  apply every fix without per-edit confirmation

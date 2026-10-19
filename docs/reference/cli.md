@@ -63,7 +63,7 @@ Type-check a program without building or running it.
 ipe type-check [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A module file under `src/` or `tests/` of the current directory's project, a project directory, or a package.ipe. Defaults to the current directory's project, every entry.
 
 **Flags:**
 
@@ -77,7 +77,7 @@ Run extensible static analysis over Ipê source (idiom, consistency, safety-by-c
 ipe lint [<path>]
 ```
 
-**Arguments:** A source file or a project directory to lint. Defaults to the current project.
+**Arguments:** A module file under `src/` or `tests/` of the current directory's project, whose findings alone are reported and fixed, or a project directory. Defaults to the current directory's project, every module.
 
 **Flags:**
 
@@ -93,7 +93,7 @@ Build and run the project's tests/Main.ipe, reporting pass/fail.
 ipe test [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project. The tests build with the project's package.ipe settings, its database driver included.
+**Arguments:** A project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project, which selects that project. Defaults to the current directory's project. The tests always run from the project's tests/Main.ipe and build with its package.ipe settings, its database driver included.
 
 **Flags:**
 
@@ -107,7 +107,7 @@ Run the whole project gate: format, type-check, build, then test.
 ipe verify [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project. Defaults to the current directory's project.
 
 **Flags:**
 
@@ -246,7 +246,7 @@ Report the security capabilities a program exercises, inferred from its code.
 ipe capabilities [<path>]
 ```
 
-**Arguments:** A source file, a project directory, or a package.ipe. Defaults to the current project.
+**Arguments:** A project directory, its package.ipe, or one of its entry files under `src/`; a file must lie in the current directory's project. Defaults to the current directory's project, every entry.
 
 **Flags:**
 
@@ -276,7 +276,7 @@ Apply the compiler's machine-applicable fixes to a source file.
 ipe fix <path>
 ```
 
-**Arguments:** The source file to fix.
+**Arguments:** The module file to fix, under `src/` or `tests/` of the current directory's project.
 
 **Flags:**
 

@@ -16,20 +16,22 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_project(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("email_send_composed_lowers")
-        .join("src")
-        .join("Main.ipe")
+}
+
+/// The IR text of every entry of the project at `dir`.
+fn emit_ir(dir: &Path) -> Result<String, ipe::CliError> {
+    let root = ipe::project_root::ProjectRoot::resolve(ipe::project_root::RootArg::at(dir))?;
+    ipe::emit_ir_text(&root, None)
 }
 
 /// A point-free `Email.send` lowers — no empty-home ICE.
 #[test]
 fn point_free_email_send_lowers_to_its_enum() {
-    let entry = fixture_entry(&repo_root());
-
-    let lowered = ipe::emit_ir_text(&entry);
+    let lowered = emit_ir(&fixture_project(&repo_root()));
     let ir = lowered.as_deref().unwrap_or("");
     // The aliased kernel value and its `EmailProvider` parameter type are
     // present in the lowered IR — proof the type lowered through the home-keyed

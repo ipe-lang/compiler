@@ -24,6 +24,18 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The manifest of every project these tests lay out.
+const PACKAGE_IPE: &str = "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n\
+                           package : Package\npackage =\n    { name = \"testproj\" }\n";
+
+/// Lay out the project `dir`: its `package.ipe` and the clean `src/Main.ipe`.
+fn write_project(dir: &Path) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("package.ipe"), PACKAGE_IPE)?;
+    std::fs::copy(fixture("clean.ipe"), dir.join("src").join("Main.ipe"))?;
+    Ok(())
+}
+
 /// Run the built `ipe` binary and capture `(success, stdout, stderr)`.
 fn run_ipe(args: &[&str]) -> Result<(bool, String, String), Box<dyn Error>> {
     let out = Command::new(support::ipe_bin()).args(args).output()?;
@@ -54,10 +66,9 @@ fn unexpected_flag_is_misuse_and_shows_help() -> TestResult {
 fn a_project_with_no_test_entry_reports_nothing_to_run_and_exits_zero() -> TestResult {
     let dir = crate::support::scratch_root().join(format!("ipe_test_none_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
+    write_project(&dir)?;
 
-    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("Main.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         ok,
@@ -66,6 +77,33 @@ fn a_project_with_no_test_entry_reports_nothing_to_run_and_exits_zero() -> TestR
     assert!(
         stdout.contains("no tests to run"),
         "the command must report there is nothing to run, got stdout:\n{stdout}"
+    );
+    Ok(())
+}
+
+/// A directory with no `package.ipe` is no project to test: `ipe test` refuses
+/// it naming the directory, even with a `tests/Main.ipe` beside a loose entry,
+/// and never searches a parent directory. This is offline — the refusal comes
+/// before any build.
+#[test]
+fn a_directory_without_a_manifest_is_refused() -> TestResult {
+    let dir =
+        crate::support::scratch_root().join(format!("ipe_test_no_manifest_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
+    std::fs::create_dir_all(dir.join("loose").join("tests"))?;
+    std::fs::copy(fixture("clean.ipe"), dir.join("loose").join("Main.ipe"))?;
+    std::fs::copy(
+        fixture("tests_pass.ipe"),
+        dir.join("loose").join("tests").join("Main.ipe"),
+    )?;
+
+    let (ok, _stdout, stderr) = run_ipe(&["test", &dir.join("loose").to_string_lossy()])?;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!ok, "a directory without a manifest must be refused");
+    assert!(
+        stderr.contains("IPE-E0004") && stderr.contains("loose"),
+        "the refusal must be NoManifest naming the directory, got stderr:\n{stderr}"
     );
     Ok(())
 }
@@ -81,14 +119,14 @@ fn a_project_with_passing_tests_exits_zero_with_a_summary() -> TestResult {
     }
     let dir = crate::support::scratch_root().join(format!("ipe_test_pass_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
-    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::copy(
         fixture("tests_pass.ipe"),
         dir.join("tests").join("Main.ipe"),
     )?;
 
-    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("Main.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         ok,
@@ -112,14 +150,14 @@ fn a_project_with_a_failing_test_names_it_and_exits_non_zero() -> TestResult {
     }
     let dir = crate::support::scratch_root().join(format!("ipe_test_fail_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
-    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::copy(
         fixture("tests_fail.ipe"),
         dir.join("tests").join("Main.ipe"),
     )?;
 
-    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("Main.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !ok,
@@ -181,8 +219,8 @@ main =
 fn write_db_test_project(name: &str, test_entry: &str) -> Result<PathBuf, Box<dyn Error>> {
     let dir = crate::support::scratch_root().join(format!("{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
-    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::write(dir.join("tests").join("Main.ipe"), test_entry)?;
     Ok(dir)
 }
@@ -204,7 +242,7 @@ fn a_catch_all_in_the_test_entry_is_refused_at_its_own_arm() -> TestResult {
     };
     let dir = write_db_test_project("ipe_test_catch_all", &entry)?;
 
-    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("Main.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !ok,
@@ -238,7 +276,7 @@ fn a_test_entry_importing_the_database_stdlib_passes() -> TestResult {
     }
     let dir = write_db_test_project("ipe_test_db_clean", &db_test_entry("Ok _"))?;
 
-    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("Main.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         ok,
@@ -263,8 +301,8 @@ fn fresh_cache(name: &str) -> Result<PathBuf, Box<dyn Error>> {
 fn fixture_project(name: &str, tests_fixture: &str) -> Result<PathBuf, Box<dyn Error>> {
     let dir = crate::support::scratch_root().join(format!("{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
-    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::copy(fixture(tests_fixture), dir.join("tests").join("Main.ipe"))?;
     Ok(dir)
 }
@@ -273,7 +311,7 @@ fn fixture_project(name: &str, tests_fixture: &str) -> Result<PathBuf, Box<dyn E
 fn ipe_test_command(project: &Path, cache: &Path) -> Command {
     let mut cmd = Command::new(support::ipe_bin());
     cmd.arg("test")
-        .arg(project.join("Main.ipe"))
+        .arg(project)
         .env_remove("CARGO_TARGET_DIR")
         .env("XDG_CACHE_HOME", cache);
     cmd
@@ -699,7 +737,7 @@ fn a_postgres_project_test_cannot_open_an_sqlite_location() -> TestResult {
     std::fs::copy(fixture("clean.ipe"), dir.join("src").join("Main.ipe"))?;
     std::fs::write(dir.join("tests").join("Main.ipe"), MEMORY_OPEN_TEST)?;
 
-    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("package.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !ok,

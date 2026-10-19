@@ -66,11 +66,11 @@ pub const INVOCATIONS: &[Invocation] = &[
     },
     Invocation {
         golden: "capabilities_http",
-        // Inference over a committed fixture; `--plain` is flush-left and carries
-        // no version banner. Skipped on a sparse checkout lacking the fixture.
+        // Inference over a committed fixture project; `--plain` is flush-left and
+        // carries no version banner. Skipped on a sparse checkout lacking the fixture.
         args: |root| {
-            let fixture = root.join("src/ipe-cli/tests/fixtures/capabilities/uses_http.ipe");
-            fixture.is_file().then(|| {
+            let fixture = root.join("src/ipe-cli/tests/fixtures/capabilities/http_project");
+            fixture.join("package.ipe").is_file().then(|| {
                 vec![
                     "capabilities".to_owned(),
                     fixture.to_string_lossy().into_owned(),
