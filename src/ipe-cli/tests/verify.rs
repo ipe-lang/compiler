@@ -10,7 +10,7 @@
 //! `cargo nextest` stays fast and offline).
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod support;
@@ -22,6 +22,18 @@ fn fixture(name: &str) -> PathBuf {
     support::manifest_dir()
         .join("tests/fixtures/verify")
         .join(name)
+}
+
+/// The manifest of every project these tests lay out.
+const PACKAGE_IPE: &str = "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\n\
+                           package : Package\npackage =\n    { name = \"verifyproj\" }\n";
+
+/// Lay out the project `dir`: its `package.ipe` and the clean `src/Main.ipe`.
+fn write_project(dir: &Path) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("package.ipe"), PACKAGE_IPE)?;
+    std::fs::copy(fixture("clean.ipe"), dir.join("src").join("Main.ipe"))?;
+    Ok(())
 }
 
 /// Run the built `ipe` binary and capture `(success, stdout, stderr)`.
@@ -117,13 +129,11 @@ fn clean_project_passes_every_stage() -> TestResult {
         eprintln!("skipping: set IPE_E2E=1 to run the building verify E2E");
         return Ok(());
     }
-    // Copy the clean entry into a fresh directory named `Main.ipe` so the build
-    // stage's default entry conventions apply cleanly.
     let dir =
         crate::support::scratch_root().join(format!("ipe_verify_clean_{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    let src = dir.join("Main.ipe");
-    std::fs::copy(fixture("clean.ipe"), &src)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
+    let src = dir.join("src").join("Main.ipe");
 
     let (ok, stdout, stderr) = run_ipe(&["verify", &src.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
@@ -150,17 +160,21 @@ fn project_with_passing_tests_clears_the_test_stage() -> TestResult {
         eprintln!("skipping: set IPE_E2E=1 to run the test-stage E2E");
         return Ok(());
     }
-    // Set up a project dir with Main.ipe + tests/Main.ipe (all tests pass).
+    // A project with src/Main.ipe + tests/Main.ipe (all tests pass).
     let dir = crate::support::scratch_root()
         .join(format!("ipe_verify_tests_pass_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
-    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::copy(
         fixture("tests_pass.ipe"),
         dir.join("tests").join("Main.ipe"),
     )?;
 
-    let (ok, stdout, stderr) = run_ipe(&["verify", &dir.join("Main.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&[
+        "verify",
+        &dir.join("src").join("Main.ipe").to_string_lossy(),
+    ])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         ok,
@@ -189,6 +203,7 @@ fn test_stage_resolves_src_modules_from_a_sibling_tests_dir() -> TestResult {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src").join("Lib"))?;
     std::fs::create_dir_all(dir.join("tests"))?;
+    std::fs::write(dir.join("package.ipe"), PACKAGE_IPE)?;
 
     // Code under test: src/Lib/Foo.ipe.
     std::fs::write(
@@ -237,14 +252,18 @@ fn project_with_failing_tests_fails_the_test_stage() -> TestResult {
     }
     let dir = crate::support::scratch_root()
         .join(format!("ipe_verify_tests_fail_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    write_project(&dir)?;
     std::fs::create_dir_all(dir.join("tests"))?;
-    std::fs::copy(fixture("clean.ipe"), dir.join("Main.ipe"))?;
     std::fs::copy(
         fixture("tests_fail.ipe"),
         dir.join("tests").join("Main.ipe"),
     )?;
 
-    let (ok, stdout, stderr) = run_ipe(&["verify", &dir.join("Main.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&[
+        "verify",
+        &dir.join("src").join("Main.ipe").to_string_lossy(),
+    ])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !ok,

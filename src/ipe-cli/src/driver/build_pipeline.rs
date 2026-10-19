@@ -4,6 +4,8 @@ use crate::loose_file::LooseFileError;
 #[cfg(not(unix))]
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
+use crate::project_root::{ProjectRoot, SourceDir};
+use crate::source_snapshot::TestView;
 use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path, fs,
     project, render, runtime_embed, text,
@@ -609,16 +611,13 @@ pub fn build_loose_file_into(
     )
 }
 
-/// Build `ipe verify`'s test entry with the settings `source` names.
+/// Build the test program `view` of the project `root`, for the host `host` asks for.
 ///
-/// When `project_src_root` is a directory, the code under test is rooted at it
-/// (the `src/` tree) and the test entry's own tree (the `tests/` tree) is
-/// discovered too, so a `tests/Main.ipe` that imports `Lib.Foo` from
-/// `src/Lib/Foo.ipe` resolves; see [`collect_test_sources`]. A manifest project
-/// is always rooted so; a project with no manifest and no `src/` tree builds the
-/// test entry plus the siblings its imports reach, as
-/// [`build_loose_file`] does. Either way the settings are the ones the project
-/// build uses, its database driver included, but for the test crate's name.
+/// The program is compiled exactly as `view` holds it: its modules, the stdlib
+/// closure and the FFI preparation were all read once, from the handles `root`
+/// holds, so nothing is discovered or read again here. The settings are the
+/// manifest's, the ones the project build uses, its database driver included,
+/// but for the test crate's name.
 ///
 /// Returns the claimed crate directory.
 ///
@@ -626,47 +625,48 @@ pub fn build_loose_file_into(
 /// [`CliError::Pipeline`] when the compiler rejects the program; [`CliError::Io`]
 /// on any filesystem failure; [`CliError::StaticRefusal`] when the emitted app
 /// shape cannot be static; [`CliError::OutputRefused`] when `out` overlaps the
-/// test entry's directory or `project_src_root`.
+/// project's `src/` or `tests/` tree.
 pub fn build_test_into(
-    source: &SettingsSource<'_>,
-    project_src_root: &Path,
-    tests_root: &Path,
-    test_entry: &Path,
+    root: &ProjectRoot,
+    view: &TestView,
+    host: crate::delivery::HostIntent,
     out: OutTarget<'_>,
     runtime_dir: &Path,
 ) -> Result<EmittedCrate, CliError> {
-    // A manifest project always has its `src/` tree (the manifest reader
-    // refuses one without it), so a tree gone since the read is refused, never
-    // built as a flat project under the manifest's settings.
-    let rooted = match source {
-        SettingsSource::Manifest { .. } => true,
-        SettingsSource::Loose => project_src_root.is_dir(),
+    let manifest_path = root.path().join(crate::package_manifest::PACKAGE_IPE);
+    let tests_dir = root.path().join(SourceDir::Tests.name());
+    let target =
+        out.prove(&ProjectPaths::from_manifest(root.manifest()).with_sources(&tests_dir))?;
+    let options = BuildOptions {
+        intent: ipe_backend_rust::BuildIntent::Development,
+        ..BuildOptions::from_env()
     };
-    let (project, collected) = if rooted {
-        (
-            ProjectPaths::of_file(test_entry).with_sources(project_src_root),
-            collect_test_sources(project_src_root, tests_root, test_entry)?,
-        )
-    } else {
-        (
-            ProjectPaths::of_file(test_entry),
-            collect_entry_and_siblings(test_entry)?,
-        )
-    };
-    let target = out.prove(&project)?;
-    compile_modules(
-        collected.sources,
-        collected.discovered,
-        &collected.entry_module_path,
+    let settings = emit_settings(
+        &SettingsSource::Manifest {
+            manifest: root.manifest(),
+            manifest_path: &manifest_path,
+            host,
+        },
+        &options,
+        target.bundle_role(),
+    );
+    // A diagnostic with no single owner (an import cycle) is blamed on the
+    // test entry, the file the run names.
+    let blame_path = view
+        .module(view.entry())
+        .map_or_else(|| manifest_path.clone(), |held| held.path().to_path_buf());
+    let cache_site = cache::env_cache_dir(&target.path()?);
+    compile_source_set_observed(
+        super::PackageSourceSet::from_test_view(view),
+        view.entry(),
         &target,
         runtime_dir,
-        test_entry,
-        source,
-        BuildOptions {
-            intent: ipe_backend_rust::BuildIntent::Development,
-            ..BuildOptions::from_env()
-        },
+        &blame_path,
+        settings,
+        cache_site.as_ref(),
+        &options,
     )
+    .0
 }
 
 /// A loose entry plus the sibling modules its imports reach, ready to feed the shared compile core.
@@ -707,137 +707,6 @@ pub fn collect_entry_and_siblings(entry: &Path) -> Result<CollectedSources, Loos
         discovered: loaded.discovered,
         entry_module_path: loaded.entry_module,
     })
-}
-
-/// Collect the sources for `ipe verify`'s test stage: the project's `src/`
-/// tree (the code under test) unioned with the `tests/` tree (the test entry
-/// and any test-only siblings).
-///
-/// A test entry lives in a sibling directory from the code it exercises
-/// (`tests/Main.ipe` importing `Lib.Db` under `src/Lib/`), so a single-root
-/// discovery cannot see both: `src/` and `tests/` must be relativised against
-/// their OWN roots for module paths to resolve (`src/Lib/Foo.ipe` → `Lib.Foo`,
-/// `tests/Main.ipe` → `Main`). This resolves both rooted discoveries into one
-/// well-typed [`CollectedSources`] whose entry is the test module, so a test
-/// module can import the code under test AND its test-only siblings.
-///
-/// When a module path is defined in both trees, the `src/` definition wins for
-/// non-entry modules — the code under test is authoritative — while the entry
-/// module is always the test entry itself.
-///
-/// # Errors
-/// [`CliError::Pipeline`] when the test entry does not parse; [`CliError::Io`]
-/// on any filesystem failure reading a discovered module.
-pub fn collect_test_sources(
-    project_src_root: &Path,
-    tests_root: &Path,
-    test_entry: &Path,
-) -> Result<CollectedSources, CliError> {
-    // A named test file reaches here canonicalised, its links already resolved;
-    // `ipe verify`'s `tests/Main.ipe` is a convention file. Neither is followed.
-    let entry_source =
-        crate::io_bounded::read_beneath(tests_root, test_entry, crate::io_bounded::SOURCE_CAP)?;
-    let entry_module_path = parse_entry_module_path(test_entry, &entry_source)?;
-
-    // The `tests/` tree is rooted at `tests_root` (the caller's, e.g. the
-    // manifest-governed project's `<project_root>/tests`) rather than
-    // re-derived from the test entry's own parent — a nested test file
-    // (`tests/Support/Helpers.ipe`) must still widen against the WHOLE
-    // `tests/` tree, not just its own directory, so
-    // `tests/Support/Helpers.ipe` → `Support.Helpers`.
-
-    // The code under test: the `src/` tree, rooted at itself so
-    // `src/Lib/Foo.ipe` → `Lib.Foo` — the SAME relativisation the build stage
-    // uses. Union the two rooted discoveries; a `src/` module masks a `tests/`
-    // module of the same path (code under test wins), and the test entry is
-    // always added last so it is never masked.
-    let mut discovered = project::discover_modules(project_src_root)?;
-    let src_paths: std::collections::BTreeSet<Vec<String>> = discovered
-        .iter()
-        .map(|m| m.module_path().to_vec())
-        .collect();
-    for m in project::discover_modules(tests_root)? {
-        if !src_paths.contains(m.module_path()) {
-            discovered.push(m);
-        }
-    }
-    ensure_entry_present(&mut discovered, test_entry, &entry_module_path);
-
-    let sources =
-        read_discovered_sources(&discovered, test_entry, &entry_module_path, &entry_source)?;
-
-    Ok(CollectedSources {
-        sources,
-        discovered,
-        entry_module_path,
-    })
-}
-
-/// Parse a `.ipe` entry file's already-read source to learn its declared
-/// module path (e.g. `["Lib", "Db"]`).
-///
-/// # Errors
-/// [`CliError::Pipeline`] when the source does not parse.
-pub fn parse_entry_module_path(entry: &Path, source: &str) -> Result<Vec<String>, CliError> {
-    let pipeline_err = |diag: Diagnostic| CliError::Pipeline {
-        file: entry.to_path_buf(),
-        src: source.to_owned(),
-        diag: Box::new(diag),
-    };
-    let mut name_interner = Interner::new();
-    let parsed = ipe_parse::parse_module(source, &mut name_interner).map_err(&pipeline_err)?;
-    Ok(parsed
-        .name
-        .value
-        .iter()
-        .map(|s| name_interner.resolve(*s).unwrap_or_default().to_owned())
-        .collect())
-}
-
-/// Ensure the entry itself is in the discovered set, even when its file name
-/// does not match the module-segment validation (e.g. a temp path). This
-/// prevents the entry from being silently dropped.
-pub fn ensure_entry_present(
-    discovered: &mut Vec<project::DiscoveredModule>,
-    entry: &Path,
-    entry_module_path: &[String],
-) {
-    if !discovered
-        .iter()
-        .any(|m| m.module_path() == entry_module_path)
-    {
-        discovered.push(project::DiscoveredModule::user(
-            entry.to_path_buf(),
-            entry_module_path.to_vec(),
-        ));
-    }
-}
-
-/// Read every discovered module into the module-path-keyed source map. The
-/// entry's source is already in memory (`entry_source`), so it is inserted
-/// without a second read.
-///
-/// # Errors
-/// [`CliError::Io`] on any filesystem failure reading a discovered module.
-pub fn read_discovered_sources(
-    discovered: &[project::DiscoveredModule],
-    entry: &Path,
-    entry_module_path: &[String],
-    entry_source: &str,
-) -> Result<BTreeMap<Vec<String>, (PathBuf, String)>, CliError> {
-    let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
-    for m in discovered {
-        if m.module_path() == entry_module_path {
-            sources.insert(
-                entry_module_path.to_vec(),
-                (entry.to_path_buf(), entry_source.to_owned()),
-            );
-        } else {
-            let src = crate::io_bounded::read_walked_source(m.path())?;
-            sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
-        }
-    }
-    Ok(sources)
 }
 
 /// The most directories [`find_manifest_for_ipe_file`] examines on its way up.

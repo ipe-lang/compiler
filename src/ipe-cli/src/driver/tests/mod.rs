@@ -1738,59 +1738,58 @@ fn sibling_discovery_compiles_two_module_program() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-/// `ipe verify`'s test-stage build: a `tests/Main.ipe` that imports a module
-/// living under `src/Lib/` must resolve the `src/` code under test, not fail
-/// with IPE-N0020. This is the standard `src/` + `tests/` layout the naive
-/// entry-parent source root cannot see across.
+/// A program that builds and prints one line.
+const RUNNABLE_MAIN: &str =
+    "module Main exposing (main)\nimport Ipe.Io as Io\n\nmain = Io.println \"ok\"\n";
+
+/// Build `root`'s `tests/Main.ipe` program the way the test runner does and
+/// return the emitted `Cargo.toml`.
+fn build_root_test_entry(
+    root: &crate::project_root::ProjectRoot,
+    label: &str,
+) -> Result<String, CliError> {
+    use crate::source_snapshot::{Limits, SourceSnapshot};
+    let runtime = resolve_runtime()?;
+    let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
+    let main = ["Main".to_owned()];
+    let Some(entry) = snapshot.test_entry(&main) else {
+        return Err(module_missing(
+            root,
+            crate::project_root::SourceDir::Tests,
+            &main,
+        ));
+    };
+    let view = SourceSnapshot::test_view(entry)?;
+    let scratch = crate::scratch::ScratchDir::new(label)
+        .map_err(|source| CliError::ScratchUnavailable { source })?;
+    let built = build_test_into(
+        root,
+        &view,
+        crate::delivery::HostIntent::Served,
+        OutTarget::Scratch(&scratch),
+        &runtime,
+    )?;
+    let cargo_toml = built.path().join("Cargo.toml");
+    fs::read_to_string(&cargo_toml).map_err(|e| io_err(&cargo_toml, e))
+}
+
+/// The test build: a `tests/Main.ipe` that imports a module living under
+/// `src/Lib/` resolves the `src/` code under test, never failing with
+/// IPE-N0020.
 #[test]
 fn test_stage_build_resolves_src_modules_from_tests_dir() {
-    let runtime = resolve_runtime();
-    let runtime = runtime.expect("`runtime` must succeed");
-
-    let tmp = ipe_test_temp::temp_root().join("ipec_verify_test_stage_src_disc");
-    let _ = fs::remove_dir_all(&tmp);
-    let src = tmp.join("src");
-    let tests = tmp.join("tests");
-    fs::create_dir_all(src.join("Lib")).expect("create src/Lib/");
-    fs::create_dir_all(&tests).expect("create tests/");
-
-    // Code under test: src/Lib/Foo.ipe (a multi-segment module referenced
-    // via an alias, the way real projects import a nested module).
-    fs::write(
-        src.join("Lib").join("Foo.ipe"),
-        "module Lib.Foo exposing (answer)\nanswer = 42\n",
-    )
-    .expect("write src/Lib/Foo.ipe");
-
-    // A src entry that also uses the library (mirrors a real project).
-    fs::write(
-        src.join("Main.ipe"),
-        "module Main exposing (main)\nimport Lib.Foo as Foo\nimport Ipe.Io as Io\nimport Ipe.String as String\nmain = Io.println (String.fromInt Foo.answer)\n",
-    )
-    .expect("write src/Main.ipe");
-
-    // Test entry in the sibling tests/ directory imports the src/ module.
-    fs::write(
-        tests.join("Main.ipe"),
-        "module Main exposing (main)\nimport Lib.Foo as Foo\nimport Ipe.Io as Io\nimport Ipe.String as String\nmain = Io.println (String.fromInt Foo.answer)\n",
-    )
-    .expect("write tests/Main.ipe");
-
-    let out = tmp.join("out");
-    let result = build_test_into(
-        &SettingsSource::Loose,
-        &src,
-        &tests,
-        &tests.join("Main.ipe"),
-        OutTarget::Path(&out),
-        &runtime,
+    let uses_foo = "module Main exposing (main)\nimport Lib.Foo as Foo\nimport Ipe.Io as Io\n\
+                    import Ipe.String as String\nmain = Io.println (String.fromInt Foo.answer)\n";
+    let project = analysis_project(
+        &SourceTree::main(uses_foo)
+            .module("Lib.Foo", "module Lib.Foo exposing (answer)\nanswer = 42\n")
+            .test_module("Main", uses_foo),
     );
+    let built = build_root_test_entry(project.root(), "ipec-test-build-src-modules");
     assert!(
-        result.is_ok(),
-        "the test stage must resolve src/ modules from tests/ (no IPE-N0020): {:?}",
-        result.err()
+        built.is_ok(),
+        "the test build must resolve src/ modules from tests/ (no IPE-N0020): {built:?}"
     );
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// The test entry of a database-using project: it opens a connection through
@@ -1826,38 +1825,13 @@ fn postgres_test_project() -> crate::RootFixture {
     crate::RootFixture::from_tree(&tree).expect("fixture")
 }
 
-/// Build `fixture`'s test entry the way the test runner does, with the
-/// manifest's settings, and return the emitted `Cargo.toml`.
-#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
-fn build_manifest_test_entry(fixture: &crate::RootFixture, label: &str) -> String {
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
-    let manifest_path = fixture.manifest_path();
-    let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
-    let source = SettingsSource::Manifest {
-        manifest: &manifest,
-        manifest_path: &manifest_path,
-        host: crate::delivery::HostIntent::Served,
-    };
-    let tests_root = fixture.path().join("tests");
-    let scratch = crate::scratch::ScratchDir::new(label).expect("scratch dir");
-    let built = build_test_into(
-        &source,
-        &manifest.src_root,
-        &tests_root,
-        &tests_root.join("Main.ipe"),
-        OutTarget::Scratch(&scratch),
-        &runtime,
-    )
-    .expect("the test entry builds");
-    fs::read_to_string(built.path().join("Cargo.toml")).expect("emitted Cargo.toml")
-}
-
 /// A test build links the database driver the manifest declares, as the
 /// project build does.
 #[test]
 fn a_test_build_links_the_manifest_database_driver() {
     let fixture = postgres_test_project();
-    let cargo_toml = build_manifest_test_entry(&fixture, "ipec-test-build-driver");
+    let cargo_toml = build_root_test_entry(fixture.root(), "ipec-test-build-driver")
+        .expect("the test entry builds");
     assert!(
         cargo_toml.contains("\"db-postgres\""),
         "the test build ignores `database = Postgres`:\n{cargo_toml}"
@@ -1882,82 +1856,126 @@ fn a_manifest_project_without_src_is_refused_before_any_test_build() {
     );
 }
 
-/// A manifest project's test build always roots the code under test at the
-/// manifest's `src/` tree: a tree removed after the manifest was read is
-/// refused, never built as a flat project under the manifest's settings.
-#[test]
-#[allow(clippy::expect_used)] // a failed fixture setup is the test failure
-fn a_manifest_test_build_whose_src_is_gone_is_refused() {
-    let fixture = postgres_test_project();
-    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
-    let manifest_path = fixture.manifest_path();
-    let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
-    fs::remove_dir_all(&manifest.src_root).expect("remove src/");
-    let tests_root = fixture.path().join("tests");
-    let scratch = crate::scratch::ScratchDir::new("ipec-test-build-src-gone").expect("scratch dir");
-    let built = build_test_into(
-        &SettingsSource::Manifest {
-            manifest: &manifest,
-            manifest_path: &manifest_path,
-            host: crate::delivery::HostIntent::Served,
-        },
-        &manifest.src_root,
-        &tests_root,
-        &tests_root.join("Main.ipe"),
-        OutTarget::Scratch(&scratch),
-        &runtime,
-    );
-    assert!(
-        built.is_err(),
-        "a manifest test build without `src/` fell back to a flat build"
-    );
-    let emitted = fs::read_dir(scratch.path()).expect("list scratch").count();
-    assert_eq!(emitted, 0, "the refused test build emitted a crate");
+/// The test runner over the project `arg` names from `cwd`, its binary's summary kept quiet.
+fn test_run_in(cwd: &Path, arg: Option<&str>) -> Result<TestOutcome, CliError> {
+    run_project_tests_with(cwd, arg, TestStdio::Quiet)
 }
 
-/// The test-stage source collection unions the `src/` and `tests/` trees
-/// with the correct per-root relativisation: `src/Lib/Foo.ipe` → `Lib.Foo`,
-/// `tests/Main.ipe` → `Main`, and the entry is the test module. This is the
-/// resolution the build depends on, asserted without a runtime.
+/// A directory with no `package.ipe` is no project to test: the run is refused
+/// with the exact `NoManifest` text, whatever file it names, before any build.
 #[test]
-fn collect_test_sources_unions_src_and_tests_trees() {
-    let tmp = ipe_test_temp::temp_root().join("ipec_collect_test_sources_union");
-    let _ = fs::remove_dir_all(&tmp);
-    let src = tmp.join("src");
-    let tests = tmp.join("tests");
-    fs::create_dir_all(src.join("Lib")).expect("create src/Lib/");
-    fs::create_dir_all(&tests).expect("create tests/");
-    fs::write(
-        src.join("Lib").join("Foo.ipe"),
-        "module Lib.Foo exposing (answer)\nanswer = 42\n",
-    )
-    .expect("write src/Lib/Foo.ipe");
-    fs::write(
-        tests.join("Main.ipe"),
-        "module Main exposing (main)\nimport Lib.Foo as Foo\nmain = Foo.answer\n",
-    )
-    .expect("write tests/Main.ipe");
+fn a_test_run_without_a_manifest_is_refused_naming_the_directory() {
+    let dir = session_scratch("test_run_no_manifest");
+    fs::create_dir_all(dir.join("tests")).expect("tests/");
+    fs::write(dir.join("Main.ipe"), CLEAN_MAIN).expect("loose Main.ipe");
+    fs::write(dir.join("tests").join("Main.ipe"), CLEAN_MAIN).expect("tests/Main.ipe");
+    let bare = test_run_in(&dir, None);
+    let named = test_run_in(&dir, Some("Main.ipe"));
+    let _ = fs::remove_dir_all(&dir);
+    let want = no_manifest_text(&dir);
+    assert_eq!(bare.err().map(|e| e.to_string()), Some(want.clone()));
+    assert_eq!(named.err().map(|e| e.to_string()), Some(want));
+}
 
-    let collected = collect_test_sources(&src, &tests, &tests.join("Main.ipe"))
-        .expect("collect_test_sources must succeed");
-
+/// A subdirectory of a project is no project to test: the manifest above it is
+/// never consulted. The control: the project directory itself runs.
+#[test]
+fn a_test_run_in_a_subdirectory_of_a_project_is_refused() {
+    let project = analysis_project(&SourceTree::main(CLEAN_MAIN));
+    let dir = project.root().path();
+    let src = dir.join("src");
     assert_eq!(
-        collected.entry_module_path,
-        vec!["Main".to_owned()],
-        "the entry is the test module"
+        test_run_in(&src, None).err().map(|e| e.to_string()),
+        Some(no_manifest_text(&src))
     );
+    assert!(matches!(
+        test_run_in(dir, None),
+        Ok(TestOutcome::NoTestEntry)
+    ));
+}
+
+/// A file argument outside `src/` and `tests/` is refused with the exact
+/// `FileOutsideRoot` text, never run loose. The control: a module of the
+/// project selects it.
+#[test]
+fn a_test_run_naming_a_file_outside_src_and_tests_is_refused() {
+    let project = analysis_project(&SourceTree::main(CLEAN_MAIN));
+    let dir = project.root().path();
+    fs::create_dir_all(dir.join("scripts")).expect("scripts/");
+    fs::write(dir.join("scripts").join("Y.ipe"), CLEAN_MAIN).expect("scripts/Y.ipe");
+    assert_eq!(
+        test_run_in(dir, Some("scripts/Y.ipe"))
+            .err()
+            .map(|e| e.to_string()),
+        Some(outside_root_text(
+            dir,
+            "scripts/Y.ipe",
+            &dir.join("scripts")
+        ))
+    );
+    assert!(matches!(
+        test_run_in(dir, Some("src/Main.ipe")),
+        Ok(TestOutcome::NoTestEntry)
+    ));
+}
+
+/// A project directory without its `src/` tree is refused when the root is
+/// resolved, so a test run never builds `tests/` alone under the manifest's
+/// settings.
+#[test]
+fn a_test_run_of_a_project_without_src_is_refused() {
+    let project = analysis_project(&SourceTree::main(CLEAN_MAIN).test_module("Main", CLEAN_MAIN));
+    let dir = project.root().path().to_path_buf();
+    fs::remove_dir_all(dir.join("src")).expect("remove src/");
+    let run = test_run_in(&dir, None);
     assert!(
-        collected
-            .sources
-            .contains_key(&vec!["Lib".to_owned(), "Foo".to_owned()]),
-        "src/Lib/Foo.ipe must be present as Lib.Foo, got keys: {:?}",
-        collected.sources.keys().collect::<Vec<_>>()
+        matches!(&run, Err(CliError::NoSrcDir { root }) if *root == dir),
+        "{run:?}"
     );
+}
+
+/// An asserted call into an uninstalled crate in `tests/Main.ipe` refuses the
+/// test run before any toolchain is asked for, while the project build of the
+/// same project, which never sees `tests/`, succeeds.
+#[test]
+fn a_test_calling_an_uninstalled_crate_refuses_the_run_not_the_build() {
+    let asserted = "module Main exposing (shifted)\nimport Rust.Ffi\n\n\n\
+                    shifted : Int -> Result Error Int\nshifted =\n    Rust.Ffi.call \"tm::shift\"\n";
+    let tree = SourceTree::main(RUNNABLE_MAIN).test_module("Main", asserted);
+    let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+    let run = test_run_in(fixture.path(), None);
+    assert!(matches!(run, Err(CliError::FfiPrep(_))), "{run:?}");
+
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let out = session_scratch("test_run_ffi_build_out").join("out");
+    let built = crate::build_fixture(&fixture, &out, &runtime);
+    let _ = fs::remove_dir_all(out.parent().unwrap_or(&out));
     assert!(
-        collected.sources.contains_key(&vec!["Main".to_owned()]),
-        "the test entry must be present as Main"
+        built.is_ok(),
+        "the project build never sees tests/: {built:?}"
     );
-    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// A planted type error in `tests/Main.ipe` fails the test run blamed on that
+/// file, while the project build of the same project succeeds.
+#[test]
+fn a_planted_error_in_the_test_entry_fails_the_run_naming_it() {
+    let tree = SourceTree::main(RUNNABLE_MAIN).test_module(
+        "Main",
+        "module Main exposing (main)\n\n\nmain : Int\nmain =\n    \"not an int\"\n",
+    );
+    let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+    let run = test_run_in(fixture.path(), None);
+    assert!(blamed_on(&run, "tests/Main.ipe"), "{run:?}");
+
+    let runtime = resolve_runtime().expect("the in-repo runtime resolves");
+    let out = session_scratch("test_run_planted_build_out").join("out");
+    let built = crate::build_fixture(&fixture, &out, &runtime);
+    let _ = fs::remove_dir_all(out.parent().unwrap_or(&out));
+    assert!(
+        built.is_ok(),
+        "the project build never sees tests/: {built:?}"
+    );
 }
 
 // -----------------------------------------------------------------------

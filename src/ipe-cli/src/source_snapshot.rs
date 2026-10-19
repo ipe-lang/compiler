@@ -397,26 +397,12 @@ impl TestView {
     }
 
     /// The module `module`, when the test universe holds it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the test runner reads its programs through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub fn module(&self, module: &[String]) -> Option<&SnapshotModule> {
         self.modules.get(module)
     }
 
     /// The FFI preparation made over the test universe.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the test runner prepares FFI through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
