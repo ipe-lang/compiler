@@ -54,7 +54,7 @@ fn unannotated_value_sync_bounds_emitted() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::root_fixture::build_src_golden(&golden, &["Main", "Lib"], &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
@@ -80,7 +80,7 @@ fn unannotated_value_sync_seal_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::root_fixture::build_src_golden(&golden, &["Main", "Lib"], &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"

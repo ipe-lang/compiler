@@ -49,29 +49,24 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe` and assert the emitted `src/main.rs`
+/// Compile `tests/golden/<name>/src/Main.ipe` and assert the emitted `src/main.rs`
 /// equals the checked-in `tests/golden/<name>/main.rs` byte-for-byte.
 fn assert_byte_identical(name: &str) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
-    let entry = dir.join("Main.ipe");
-    let golden = dir.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir (byte-compares
     // the emitted `src/main.rs` against the golden `main.rs`). Replaces the
     // former hand-rolled `read_to_string` + `assert_eq!` pair with the shared
     // harness helper.
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &dir);
 }
 
 /// Full spine: compile, build the emitted Cargo project, run it, and assert its
@@ -84,12 +79,11 @@ fn assert_runs_and_matches_oracle(name: &str) {
 
     let root = repo_root();
     let dir = golden_dir(&root, name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);

@@ -200,7 +200,7 @@ mod tests {
     use ipe_diagnostics::{Diagnostic, NameError, Span, StdlibReach};
     use ipe_intern::Symbol;
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Parse + canonicalise the golden module. Returns `None` (failing the
     /// caller's assertions) rather than panicking, per the no-panic gate.

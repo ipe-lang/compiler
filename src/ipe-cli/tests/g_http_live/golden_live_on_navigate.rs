@@ -38,15 +38,11 @@ fn repo_root() -> PathBuf {
 // failure signal we want to surface loudly.
 #[allow(clippy::expect_used)]
 fn emit_golden(golden: &str, out: &Path) -> String {
-    let entry = repo_root()
-        .join("tests")
-        .join("golden")
-        .join(golden)
-        .join("Main.ipe");
+    let golden_project = repo_root().join("tests").join("golden").join(golden);
     let _ = std::fs::remove_dir_all(out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime)
+    crate::support::build_golden(&golden_project, out, &runtime)
         .expect("routed app must ipe-compile");
     // A layout builder is compiled-source Ipê, so a home may lower to
     // `src/ipe_mods/*.rs` — scan the WHOLE emitted Ipê-side tree.

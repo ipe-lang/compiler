@@ -18,11 +18,8 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn golden_entry(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn golden_project_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
 /// The DSN password sentinel `show_policy_every_leaf` parses.
@@ -30,11 +27,11 @@ const DSN_PASSWORD: &str = "hunter2SENTINEL";
 
 /// Builds the every-leaf fixture, refusing the test when `ipe` rejects it.
 fn build_every_leaf() -> PathBuf {
-    let entry = golden_entry(&repo_root(), "show_policy_every_leaf");
+    let entry = golden_project_dir(&repo_root(), "show_policy_every_leaf");
     let out = crate::support::scratch_root().join("ipec_show_policy_every_leaf");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "showing every constructible leaf must compile: {:?}",
@@ -87,7 +84,10 @@ fn every_shown_leaf_renders_through_its_row() {
 #[allow(clippy::panic)] // a refused precondition is the test failure
 fn showing_a_rust_handle_is_refused_before_cargo() {
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let source = golden_entry(&repo_root(), "show_refused_foreign");
+    let source = crate::support::golden_source(
+        &golden_project_dir(&repo_root(), "show_refused_foreign"),
+        "Main",
+    );
     let main = std::fs::read_to_string(&source)
         .unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
     let fixture = ffi_fixture(&main);

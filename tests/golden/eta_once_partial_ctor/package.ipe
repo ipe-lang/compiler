@@ -1,0 +1,9 @@
+module Package exposing (package)
+
+import Ipe.Package exposing (..)
+
+
+package : Package
+package =
+    { name = "eta-once-partial-ctor"
+    }

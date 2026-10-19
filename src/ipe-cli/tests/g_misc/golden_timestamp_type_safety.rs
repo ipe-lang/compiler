@@ -20,16 +20,15 @@ fn repo_root() -> PathBuf {
 #[test]
 fn adding_two_timestamps_is_ipe_t0001() {
     let root = repo_root();
-    let entry = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("timestamp_add_two_ts_rejected")
-        .join("Main.ipe");
+        .join("timestamp_add_two_ts_rejected");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("timestamp_add_two_ts_rejected_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let got_code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

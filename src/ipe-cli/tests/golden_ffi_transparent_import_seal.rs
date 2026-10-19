@@ -324,6 +324,7 @@ fn build_show_transparent() -> (RootFixture, PathBuf) {
         .join("tests")
         .join("golden")
         .join("show_transparent_foreign")
+        .join("src")
         .join("Main.ipe");
     let main =
         fs::read_to_string(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display()));

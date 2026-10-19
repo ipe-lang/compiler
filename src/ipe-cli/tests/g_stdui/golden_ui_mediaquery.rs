@@ -12,7 +12,7 @@
 //!
 //! ## What is tested
 //!
-//! * `ipe dev build` compiles `tests/golden/ui_mediaquery/Main.ipe`
+//! * `ipe dev build` compiles `tests/golden/ui_mediaquery/src/Main.ipe`
 //!   (canon → types → lower → Rust backend) — i.e. `Ui.mediaQuery` is a
 //!   backed kernel end to end, not a reachable-but-unbacked reserved member.
 //! * The emitted Rust project `cargo build`s and the binary runs and exits 0.
@@ -52,12 +52,11 @@ fn ui_mediaquery_compiles_builds_and_renders_markers() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("ui_mediaquery");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_ui_mediaquery_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for ui_mediaquery: {:?}",

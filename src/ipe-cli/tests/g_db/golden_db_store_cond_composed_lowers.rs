@@ -17,6 +17,7 @@ fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join(golden)
+        .join("src")
         .join("Main.ipe")
 }
 

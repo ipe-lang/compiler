@@ -21,11 +21,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn golden(name: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+    repo_root().join("tests").join("golden").join(name)
 }
 
 fn out(name: &str) -> PathBuf {
@@ -39,11 +35,7 @@ fn append_and_number_on_same_var_is_ipe_t0014() {
     let rt = e2e_support::require_runtime().into_path_buf();
     let o = out("append_number");
     let _ = std::fs::remove_dir_all(&o);
-    let built = crate::support::build_golden(
-        crate::support::golden_dir_of(&golden("append_number")),
-        &o,
-        &rt,
-    );
+    let built = crate::support::build_golden(&golden("append_number"), &o, &rt);
     let code = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -62,11 +54,7 @@ fn number_only_var_still_defaults_to_int() {
     let rt = e2e_support::require_runtime().into_path_buf();
     let o = out("number_only");
     let _ = std::fs::remove_dir_all(&o);
-    let built = crate::support::build_golden(
-        crate::support::golden_dir_of(&golden("number_only")),
-        &o,
-        &rt,
-    );
+    let built = crate::support::build_golden(&golden("number_only"), &o, &rt);
     assert!(
         built.is_ok(),
         "Number-only super var must still default to Int and compile: {built:?}"

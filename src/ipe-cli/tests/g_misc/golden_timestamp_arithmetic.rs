@@ -13,11 +13,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_project(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("timestamp_arithmetic")
-        .join("Main.ipe")
 }
 
 /// Emit-only gate: the frontend must accept the typed Timestamp arithmetic
@@ -25,12 +24,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn timestamp_arithmetic_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("timestamp_arithmetic_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "timestamp_arithmetic: typed Timestamp+Duration arithmetic must emit cleanly; got: {built:?}"
@@ -46,12 +45,12 @@ fn timestamp_arithmetic_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_timestamp_arithmetic_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "timestamp_arithmetic: build must succeed: {:?}",

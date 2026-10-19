@@ -22,12 +22,11 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn css_manifest() -> PathBuf {
+fn css_project() -> PathBuf {
     repo_root()
         .join("tests")
         .join("fixtures")
         .join("spike-css-source")
-        .join("package.ipe")
 }
 
 /// The compiled-source `Ipe.Css` resolves + lowers like a user module: the
@@ -39,11 +38,7 @@ fn css_source_builds_and_injects_leaf_kernels() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_source_emit");
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = crate::support::build_golden(
-        crate::support::golden_dir_of(&css_manifest()),
-        &out,
-        &runtime(),
-    );
+    let res = crate::support::build_golden(&css_project(), &out, &runtime());
     assert!(
         res.is_ok(),
         "Ipe.Css project must build (inject → canon-as-stdlib → lower → emit): {:?}",
@@ -86,11 +81,7 @@ fn css_e2e_neutralises_injection() {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_source_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
-    let res = crate::support::build_golden(
-        crate::support::golden_dir_of(&css_manifest()),
-        &out,
-        &runtime(),
-    );
+    let res = crate::support::build_golden(&css_project(), &out, &runtime());
     assert!(res.is_ok(), "Ipe.Css build must succeed: {:?}", res.err());
 
     let outcome = crate::support::build_and_run_emitted("spike-css-source", &out);

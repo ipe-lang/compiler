@@ -35,7 +35,7 @@ fn fixture_dir(root: &Path, name: &str) -> PathBuf {
 fn assert_byte_identical(name: &str) {
     let root = repo_root();
     let golden_dir = fixture_dir(&root, name);
-    let golden = root.join("tests").join("golden").join(name).join("main.rs");
+    let golden_project = root.join("tests").join("golden").join(name);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
@@ -46,10 +46,7 @@ fn assert_byte_identical(name: &str) {
         "a sound composite-builder capture must be accepted + emitted, got: {built:?}"
     );
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// THE SEAL for a newly-admitted case: under `IPE_E2E=1`, actually `cargo build`

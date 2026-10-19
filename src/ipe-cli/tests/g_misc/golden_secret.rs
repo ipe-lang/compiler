@@ -24,7 +24,7 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe`, build the emitted Cargo project,
+/// Compile `tests/golden/<name>/src/Main.ipe`, build the emitted Cargo project,
 /// run it, and return the captured stdout. Fails the test on any build or
 /// runtime error — a broken golden cannot pass silently.
 fn compile_build_run(name: &str) -> crate::support::RunOutcome {

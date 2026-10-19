@@ -30,23 +30,18 @@ fn golden_dir(root: &Path) -> PathBuf {
 #[test]
 fn pattern_binder_forward_emits_byte_identical_main_rs() {
     let root = repo_root();
-    let golden = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("fn_pattern_binder_forward")
-        .join("main.rs");
+        .join("fn_pattern_binder_forward");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_pattern_binder_forward_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built =
-        crate::support::build_golden(crate::support::golden_dir_of(&golden), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 #[test]

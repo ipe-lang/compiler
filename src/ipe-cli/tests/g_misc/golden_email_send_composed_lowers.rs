@@ -20,6 +20,7 @@ fn fixture_entry(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("email_send_composed_lowers")
+        .join("src")
         .join("Main.ipe")
 }
 

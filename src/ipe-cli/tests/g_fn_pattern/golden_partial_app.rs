@@ -20,7 +20,7 @@
 //! `Main.ipe` to stdout `6\n33\n103\n`, exit 0:
 //!
 //! ```text
-//! $ ipe dev run tests/golden/partial_app/Main.ipe
+//! $ ipe dev run tests/golden/partial_app/src/Main.ipe
 //! 6
 //! 33
 //! 103
@@ -41,24 +41,16 @@ fn golden_dir(root: &Path) -> PathBuf {
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join("partial_app")
-        .join("main.rs");
+    let golden_project = root.join("tests").join("golden").join("partial_app");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i216_partial_app_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built =
-        crate::support::build_golden(crate::support::golden_dir_of(&golden), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// Full spine: compile, build the emitted Cargo project, run it, and assert the

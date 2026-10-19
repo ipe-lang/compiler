@@ -37,7 +37,7 @@ fn out_dir(fixture: &str) -> PathBuf {
 /// The span of the last `needle` in the fixture source: its leading `h`.
 fn capture_span(fixture: &str, needle: &str) -> Span {
     #[allow(clippy::expect_used)] // a missing fixture is a broken test, not a refusal
-    let src = std::fs::read_to_string(golden_dir(fixture).join("Main.ipe"))
+    let src = std::fs::read_to_string(golden_dir(fixture).join("src").join("Main.ipe"))
         .expect("fixture source reads");
     #[allow(clippy::expect_used)] // the needle is written into the fixture
     let lo = src.rfind(needle).expect("needle is in the fixture");

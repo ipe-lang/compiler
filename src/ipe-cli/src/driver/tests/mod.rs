@@ -313,6 +313,7 @@ fn golden_entry() -> PathBuf {
         .join("tests")
         .join("golden")
         .join("basics")
+        .join("src")
         .join("Main.ipe")
 }
 
@@ -445,6 +446,7 @@ fn emit_ir_resolves_compiled_source_stdlib_with_own_types() {
         .join("tests")
         .join("golden")
         .join("test_summary_line_219")
+        .join("src")
         .join("Main.ipe");
     let tree = emit_ir_text(&entry);
     assert!(
@@ -490,6 +492,7 @@ fn compiled_source_stdlib_own_imports_resolve_no_n0034() {
         .join("tests")
         .join("golden")
         .join("money_parse_currency_maybe")
+        .join("src")
         .join("Main.ipe");
     let tree = emit_ir_text(&entry);
     assert!(

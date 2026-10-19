@@ -13,22 +13,14 @@ fn repo_root() -> PathBuf {
 #[test]
 fn emits_byte_identical_main_rs_as_runtime_dependency() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("Main.ipe");
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("main.rs");
+    let dir = root.join("tests").join("golden").join("basics");
+    let golden_project = root.join("tests").join("golden").join("basics");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m0_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir: asserts the
@@ -36,10 +28,7 @@ fn emits_byte_identical_main_rs_as_runtime_dependency() {
     // match byte-for-byte. Replaces the former hand-rolled `read_to_string` +
     // `assert_eq!` pair — proven equal in discriminating power side by side
     // before that block was removed.
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 
     // The default native emit is the dependency model: no runtime source is
     // vendored into the user crate, and the manifest declares the runtime as a
@@ -67,11 +56,7 @@ fn end_to_end_builds_and_prints_one() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("basics")
-        .join("Main.ipe");
+    let dir = root.join("tests").join("golden").join("basics");
     // Build OUTSIDE the workspace tree: an emitted project under the workspace's
     // own target/ dir is (correctly) rejected by cargo as a non-member package,
     // and the golden Cargo.toml carries no detaching `[workspace]` stanza.
@@ -79,7 +64,7 @@ fn end_to_end_builds_and_prints_one() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("basics", &out);

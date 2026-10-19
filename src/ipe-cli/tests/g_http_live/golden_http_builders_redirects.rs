@@ -23,18 +23,17 @@ fn repo_root() -> PathBuf {
 #[test]
 fn redirect_builders_compile_and_run() {
     let root = repo_root();
-    let entry = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("http_builders_redirects")
-        .join("Main.ipe");
+        .join("http_builders_redirects");
     let out = crate::support::scratch_root().join("ipec_m5b_http_builders_redirects_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: the builders must resolve through the kernel path.
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for http_builders_redirects: {:?}",

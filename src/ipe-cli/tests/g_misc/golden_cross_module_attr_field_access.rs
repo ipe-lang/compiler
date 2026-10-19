@@ -45,10 +45,7 @@ fn try_build(name: &str) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let fixture = crate::src_golden::fixture_of(&dir);
-    ipe::build_fixture(&fixture, &out, &runtime)
-        .map(drop)
-        .map_err(|e| e.to_string())
+    crate::support::build_golden(&dir, &out, &runtime).map_err(|e| e.to_string())
 }
 
 /// The IPE-T0012 must blame `Dep.ipe` (which owns `rec.missing`), never the

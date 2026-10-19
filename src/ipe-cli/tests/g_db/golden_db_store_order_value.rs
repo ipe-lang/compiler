@@ -16,23 +16,20 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "db_store_order_value";
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("Main.ipe")
+fn fixture_project(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: the frontend accepts and emits the `Store.Order` value program.
 #[test]
 fn db_store_order_value_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_order_value_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "a `Store.Order` annotation must be accepted and emitted, got: {built:?}"
@@ -46,12 +43,12 @@ fn db_store_order_value_seal_runs() {
         return;
     }
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_order_value_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     let outcome = crate::support::build_and_run_emitted(GOLDEN, &out);

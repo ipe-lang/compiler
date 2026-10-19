@@ -23,25 +23,17 @@ fn repo_root() -> PathBuf {
 }
 
 fn built_statuscode(root: &Path, out: &Path) -> Result<(), ipe::CliError> {
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("statuscode_seal")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("statuscode_seal");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime)
+    crate::support::build_golden(&golden_project, out, &runtime)
 }
 
 fn built_imagesrc(root: &Path, out: &Path) -> Result<(), ipe::CliError> {
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("imagesrc_seal")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("imagesrc_seal");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime)
+    crate::support::build_golden(&golden_project, out, &runtime)
 }
 
 // ── Ipe.Http.StatusCode ──────────────────────────────────────────────────────

@@ -1,7 +1,7 @@
 //! `Task.attempt` is CALLABLE from user code and completes the SEAL.
 //!
 //! `Task.attempt : (Result Error a -> msg) -> Task Error a -> Cmd msg` bridges a
-//! Task into a Cmd from `init` (`tests/golden/task_attempt/Main.ipe`). This pins
+//! Task into a Cmd from `init` (`tests/golden/task_attempt/src/Main.ipe`). This pins
 //! ipe-0 ∧ cargo-0 ∧ run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and
 //! runs), that the combinator lowers to the runtime `cmd_perform`, and that the
 //! attempted task actually runs (the initial view shows `value: 0`, then the

@@ -35,11 +35,8 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path, fixture: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe")
+fn project_path(root: &Path, fixture: &str) -> PathBuf {
+    root.join("tests").join("golden").join(fixture)
 }
 
 /// ipe-0 ∧ NO spurious `IpeRow` bound — checked unconditionally (cheap, no
@@ -51,13 +48,13 @@ fn entry_path(root: &Path, fixture: &str) -> PathBuf {
 #[allow(clippy::expect_used)]
 fn assert_ipec_accepts_without_ipe_row(fixture: &str) {
     let root = repo_root();
-    let entry = entry_path(&root, fixture);
+    let entry = project_path(&root, fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{fixture}_ipec_out"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {fixture}: {:?}",
@@ -83,13 +80,13 @@ fn assert_cargo_builds_and_runs(fixture: &str, expected_stdout: &str) {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root, fixture);
+    let entry = project_path(&root, fixture);
     let out = crate::support::scratch_root().join(format!("ipec_{fixture}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for {fixture}: {:?}",

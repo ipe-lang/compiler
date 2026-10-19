@@ -28,17 +28,14 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Parse + type-check + lower `tests/golden/http_stream_id/Main.ipe`.
+/// Parse + type-check + lower `tests/golden/http_stream_id/src/Main.ipe`.
 /// Asserts the pipeline succeeds (no IPE-T0001 from mismatched `Int` vs
 /// `StreamId`, and no `callee_arity` panic from a missing lower arm).
 #[test]
 fn http_stream_open_returns_stream_id_not_int() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("http_stream_id")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("http_stream_id");
+    let entry = crate::support::golden_source(&golden_project, "Main");
 
     let result = ipe::emit_ir_text(&entry);
     assert!(
@@ -59,17 +56,13 @@ fn http_stream_open_returns_stream_id_not_int() {
 #[test]
 fn http_stream_open_full_emit_succeeds() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("http_stream_id")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("http_stream_id");
     let out = crate::support::scratch_root().join("ipec_i148_http_stream_id_full_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for HttpStream.open's HttpRequest arg (no \

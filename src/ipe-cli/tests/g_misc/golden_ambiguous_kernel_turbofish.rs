@@ -29,12 +29,8 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn golden_entry(name: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn golden_project_dir(name: &str) -> PathBuf {
+    repo_root().join("tests").join("golden").join(name)
 }
 
 const FIXTURE: &str = "ambiguous_kernel_turbofish";
@@ -43,11 +39,11 @@ const FIXTURE: &str = "ambiguous_kernel_turbofish";
 /// Pure ipe compile: no cargo, always runs.
 #[test]
 fn ambiguous_kernel_turbofish_compiles() {
-    let entry = golden_entry(FIXTURE);
+    let entry = golden_project_dir(FIXTURE);
     let out = crate::support::scratch_root().join("ipec_i181_ambiguous_kernel");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipec must compile the ambiguous-kernel shapes, got: {:?}",
@@ -64,12 +60,11 @@ fn ambiguous_kernel_turbofish_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let entry = golden_entry(FIXTURE);
+    let entry = golden_project_dir(FIXTURE);
     let out = crate::support::scratch_root().join("ipec_i181_ambiguous_kernel_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime)
-        .expect("build must succeed");
+    crate::support::build_golden(&entry, &out, &runtime).expect("build must succeed");
     let outcome = crate::support::build_and_run_emitted("i181_ambiguous_kernel", &out);
     assert_eq!(
         outcome.exit_code,

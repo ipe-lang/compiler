@@ -6,7 +6,7 @@
 //!
 //! ## Positives (build → run → byte-diff against the cached oracle)
 //!
-//! Each single-file positive compiles `tests/golden/<name>/Main.ipe` through
+//! Each single-file positive compiles `tests/golden/<name>/src/Main.ipe` through
 //! `ipe`, builds the emitted Rust project in the shared cargo target, runs it,
 //! and checks stdout against the cached golden oracle (`oracle.meta` +
 //! `expected_go.txt`). All three carry `oracle_divergence = false` ...//! reference compiler produces byte-identical stdout, captured via

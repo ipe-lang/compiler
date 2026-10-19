@@ -39,18 +39,14 @@ fn poly_fn_attr_list_ipec_and_cargo_zero() {
     }
 
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("poly_fn_attr_list")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("poly_fn_attr_list");
     let out = crate::support::scratch_root().join("ipec_i139_poly_fn_attr_list_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiler must succeed.
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for poly_fn_attr_list: {:?}",

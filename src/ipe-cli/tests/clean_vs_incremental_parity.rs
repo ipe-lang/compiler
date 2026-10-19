@@ -258,10 +258,11 @@ fn assert_parity(label: &str, warm: &CompileOutcome, cold: &CompileOutcome) {
 }
 
 /// Load a golden fixture directory into an in-memory source map (every
-/// `*.ipe` under it, module paths derived from the relative file paths).
-/// `None` when the directory holds no `Main` module.
+/// `*.ipe` under its source root, module paths derived from the relative file
+/// paths). The source root is the project's `src/`. `None` when the
+/// directory holds no `Main` module.
 fn fixture_user_sources(dir: &Path) -> Option<UserSources> {
-    let discovered = project::discover_modules(dir).ok()?;
+    let discovered = project::discover_modules(dir.join("src").as_path()).ok()?;
     if !discovered.iter().any(|m| m.module_path() == entry_path()) {
         return None;
     }

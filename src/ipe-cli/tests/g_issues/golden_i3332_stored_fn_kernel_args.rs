@@ -45,7 +45,7 @@ fn fixture_dir(name: &str) -> PathBuf {
 }
 
 fn fixture_entry(name: &str) -> PathBuf {
-    fixture_dir(name).join("Main.ipe")
+    fixture_dir(name).join("src").join("Main.ipe")
 }
 
 /// Build the fixture `name`, then (under `IPE_E2E=1`) `cargo build` and run it,

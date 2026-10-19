@@ -42,11 +42,7 @@ fn fixture_dir(root: &Path) -> PathBuf {
 fn decoder_storage_reuse_emits_byte_identical() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("main.rs");
+    let golden_project = root.join("tests").join("golden").join(GOLDEN);
     let out = crate::support::scratch_root().join("ipec_i801_decoder_storage_reuse_emit");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -59,10 +55,7 @@ fn decoder_storage_reuse_emits_byte_identical() {
          clonable `Arc` carrier and is passed by value), got: {built:?}"
     );
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// THE SEAL: under `IPE_E2E=1`, actually `cargo build` and run the emitted crate,

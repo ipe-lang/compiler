@@ -1,5 +1,5 @@
 //! The layout-cost bound over the golden corpus: every function body of every
-//! lowerable `tests/golden/*/Main.ipe` (or `tests/golden/*/src/Main.ipe`) lays out within an eighth of the
+//! lowerable `tests/golden/*/src/Main.ipe` lays out within an eighth of the
 //! renderer's fuel, never falling back to its plain layout.
 //!
 //! Each entry is lowered through the build's front-end seam (compiled-source
@@ -21,8 +21,7 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Every golden fixture directory's `Main.ipe` entry, beside the directory's
-/// manifest or under its `src/` root, sorted.
+/// Every golden project's `src/Main.ipe` entry, sorted.
 fn golden_entries() -> Vec<PathBuf> {
     let golden = repo_root().join("tests").join("golden");
     let mut entries = Vec::new();
@@ -30,26 +29,21 @@ fn golden_entries() -> Vec<PathBuf> {
         return entries;
     };
     for dir in read.flatten() {
-        let beside = dir.path().join("Main.ipe");
-        let under_src = dir.path().join("src").join("Main.ipe");
-        if beside.is_file() {
-            entries.push(beside);
-        } else if under_src.is_file() {
-            entries.push(under_src);
+        let entry = dir.path().join("src").join("Main.ipe");
+        if entry.is_file() {
+            entries.push(entry);
         }
     }
     entries.sort();
     entries
 }
 
-/// The fixture directory name of `entry`, looking past a `src/` root.
+/// The golden project's directory name for `entry`, looking past its `src/` root.
 fn fixture_name(entry: &Path) -> String {
-    let dir = entry.parent();
-    let dir = match dir {
-        Some(d) if d.file_name().is_some_and(|n| n == "src") => d.parent(),
-        other => other,
-    };
-    dir.and_then(Path::file_name)
+    entry
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
 }

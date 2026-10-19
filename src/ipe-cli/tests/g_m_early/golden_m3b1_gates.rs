@@ -32,16 +32,12 @@ fn repo_root() -> PathBuf {
 /// Returns the emitted output directory for the optional E2E build+run.
 fn build_ok(fixture: &str, out_suffix: &str) -> PathBuf {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "fixture {fixture}: tuple-pattern shape must now build cleanly, got {built:?}"

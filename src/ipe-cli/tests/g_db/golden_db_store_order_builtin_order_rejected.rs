@@ -11,11 +11,8 @@ use ipe::CliError;
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
-        .join("Main.ipe")
+fn fixture_project(root: &Path, golden: &str) -> PathBuf {
+    root.join("tests").join("golden").join(golden)
 }
 
 /// Comparing `Store.Asc` with `LT` MUST be rejected at ipe time with IPE-T0001.
@@ -23,12 +20,12 @@ fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
 fn store_order_compared_with_builtin_order_is_rejected() {
     const GOLDEN: &str = "db_store_order_builtin_order_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_db_store_order_builtin_order_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     // Pin the reason, not just the failure: an unrelated build error must not
     // stand in for the head-identity refusal.
     let got = match &built {

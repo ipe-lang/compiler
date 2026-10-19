@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use ipe_syntax::{Exposed, Exposing, Expr, Expr_, Pattern_, TypeAnnotation, Value};
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Every published keyword lexes as its keyword token, never an identifier.
     #[test]

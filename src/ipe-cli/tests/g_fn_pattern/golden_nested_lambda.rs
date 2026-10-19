@@ -24,7 +24,7 @@
 //! `Main.ipe` to stdout `6\n`, exit 0:
 //!
 //! ```text
-//! $ ipe dev run tests/golden/nested_lambda/Main.ipe
+//! $ ipe dev run tests/golden/nested_lambda/src/Main.ipe
 //! 6
 //! ```
 //!
@@ -43,28 +43,20 @@ fn golden_dir(root: &Path) -> PathBuf {
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join("nested_lambda")
-        .join("main.rs");
+    let golden_project = root.join("tests").join("golden").join("nested_lambda");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m1_nested_lambda_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built =
-        crate::support::build_golden(crate::support::golden_dir_of(&golden), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     // Directory-diff the emitted project against the golden dir (byte-compares
     // the emitted `src/main.rs` against the golden `main.rs`). Replaces the
     // former hand-rolled `read_to_string` + `assert_eq!` pair with the shared
     // harness helper.
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// Full spine: compile, build the emitted Cargo project, run it, and assert the

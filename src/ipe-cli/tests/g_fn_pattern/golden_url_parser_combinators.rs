@@ -4,7 +4,7 @@
 //! A typed `Url` is matched through a `case` chain over `parse` of `s` / `int` /
 //! `string` / `slash` / `top` / `withQuery` / `query` patterns, reading captures
 //! with `firstInt` / `firstString` / `firstQuery`
-//! (`tests/golden/url_parser_combinators/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧
+//! (`tests/golden/url_parser_combinators/src/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧
 //! run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs) and the matched
 //! routes are rendered (`blog:42 user:alice home search:rust nomatch`), proving
 //! the pure-data patterns lower over the shipped `Ipe.Url` accessors. Path

@@ -47,14 +47,13 @@ fn solo_out() -> PathBuf {
 /// Compile the on-disk solo golden (`tests/golden/live_param_routes`) into
 /// `out`. Returns
 fn compile_solo_into(out: &Path) -> Result<(), CliError> {
-    let entry = repo_root()
+    let golden_project = repo_root()
         .join("tests")
         .join("golden")
-        .join("live_param_routes")
-        .join("Main.ipe");
+        .join("live_param_routes");
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    crate::support::build_golden(crate::support::golden_dir_of(&entry), out, &runtime)
+    crate::support::build_golden(&golden_project, out, &runtime)
 }
 
 /// Compile an inline source through the ipe pipeline (no cargo).
