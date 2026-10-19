@@ -826,6 +826,7 @@ mod tests {
     }
 
     /// Install the crate `slug` in the FFI cache of the project at `project`.
+    #[cfg(unix)]
     fn install_crate(project: &Path, slug: &str) {
         let cache = ipe_ffi::driver::FfiCache::at_project_root(project);
         let inspection = format!(
@@ -836,6 +837,7 @@ mod tests {
     }
 
     /// The slugs of the crates `prep` was prepared over.
+    #[cfg(unix)]
     fn slugs(prep: &FfiPrep) -> Vec<&str> {
         prep.catalog.iter().map(|c| c.slug.as_str()).collect()
     }
