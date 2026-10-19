@@ -1043,9 +1043,8 @@ jobs:
           fail=0
           for toml in examples/shapes/*/*/package.ipe; do
             dir="$(dirname "$toml")"
-            entry="$dir/src/Main.ipe"
             echo "::group::$dir"
-            if ! "$IPE" type-check "$entry"; then
+            if ! "$IPE" type-check "$dir"; then
               echo "::error::ipe type-check regressed: $dir"; fail=1; echo "::endgroup::"; continue
             fi
             if ! "$IPE" dev build "$toml" --out "$dir/out"; then
