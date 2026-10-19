@@ -35,6 +35,7 @@ pub use crate::encoding::{
 };
 #[cfg(feature = "web")]
 use crate::encoding::{EncodedBase, QueryText};
+use crate::system::RefusedText;
 
 /// A declared route: a parsed URL pattern + a builder that applies the
 /// captured `:param` strings (in pattern order) to the page constructor.
@@ -194,6 +195,25 @@ pub fn console_line(class: Option<&str>, detail: &str) -> String {
     }
 }
 
+/// The browser-console line for a mount refusal: `[ipe-wasm:<class>] <refusal>`.
+///
+/// A [`MountRefusal`]'s `Display` is already safe for a log line (every text
+/// it quotes is scrubbed exactly once, where the refusal is built or by its
+/// own `Display`), so routing it through [`console_line`] would scrub it twice
+/// and double every `\` it shows. This sink checks the rendered refusal
+/// instead: hazard-free text is written as is, and only text holding a log
+/// hazard (which no refusal renders) is scrubbed again, failing closed.
+pub fn console_refusal_line(class: &str, refusal: &MountRefusal) -> String {
+    use crate::system::{is_log_hazard, scrub_log_controls as scrub};
+    let shown = refusal.to_string();
+    let shown = if shown.chars().any(is_log_hazard) {
+        scrub(&shown).into_owned()
+    } else {
+        shown
+    };
+    format!("[ipe-wasm:{}] {shown}", scrub(class))
+}
+
 /// Why the browser client refused to mount an app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MountRefusal {
@@ -212,14 +232,14 @@ pub enum MountRefusal {
         /// The DOM event name.
         event: &'static str,
         /// The platform's report.
-        detail: String,
+        detail: RefusedText,
     },
     /// A DOM construction step failed.
     Dom {
         /// The step that failed.
         step: &'static str,
         /// The platform's report, when it gave one.
-        detail: Option<String>,
+        detail: Option<RefusedText>,
     },
 }
 
@@ -232,17 +252,14 @@ impl std::fmt::Display for MountRefusal {
             Self::NoWindow => f.write_str("no window (not a browser context)"),
             Self::NoDocument => f.write_str("the window has no document"),
             Self::NoBody => f.write_str("the document has no <body>"),
-            Self::Listener { event, detail } => write!(
-                f,
-                "addEventListener({}) failed: {}",
-                scrub(event),
-                scrub(detail)
-            ),
+            Self::Listener { event, detail } => {
+                write!(f, "addEventListener({}) failed: {detail}", scrub(event))
+            }
             Self::Dom { step, detail: None } => write!(f, "{} failed", scrub(step)),
             Self::Dom {
                 step,
                 detail: Some(detail),
-            } => write!(f, "{} failed: {}", scrub(step), scrub(detail)),
+            } => write!(f, "{} failed: {detail}", scrub(step)),
         }
     }
 }
@@ -1173,6 +1190,70 @@ mod tests {
         assert_scrubbed(&refusal.to_string());
     }
 
+    /// A platform report is scrubbed once, where the refusal is built: a `\`
+    /// renders as `\\`, never re-escaped to `\\\\` by the `Display`.
+    #[test]
+    fn mount_refusal_scrubs_platform_detail_once() {
+        let listener = MountRefusal::Listener {
+            event: "click",
+            detail: RefusedText::new("a\\b\n"),
+        };
+        let dom = MountRefusal::Dom {
+            step: "createElement(div)",
+            detail: Some(RefusedText::new("a\\b\n")),
+        };
+        assert_eq!(
+            listener.to_string(),
+            "addEventListener(click) failed: a\\\\b\\n"
+        );
+        assert_eq!(dom.to_string(), "createElement(div) failed: a\\\\b\\n");
+    }
+
+    /// A mount refusal reaches the browser console scrubbed exactly once: a
+    /// `\` it quotes shows as `\\` there too, and the line stays one line with
+    /// no raw control or bidi character.
+    #[test]
+    fn console_refusal_line_scrubs_once() {
+        let cases = [
+            (
+                MountRefusal::Listener {
+                    event: "click",
+                    detail: RefusedText::new("a\\b\n"),
+                },
+                "[ipe-wasm:MountFailed] addEventListener(click) failed: a\\\\b\\n",
+            ),
+            (
+                MountRefusal::Dom {
+                    step: "createElement(div)",
+                    detail: Some(RefusedText::new("a\\b")),
+                },
+                "[ipe-wasm:MountFailed] createElement(div) failed: a\\\\b",
+            ),
+            (
+                MountRefusal::RouteTable(RoutePatternRefusal {
+                    pattern: "/a\\b".to_owned(),
+                    refusal: RouteSegmentRefusal::Decode(bad_escape()),
+                }),
+                "[ipe-wasm:MountFailed] route pattern `/a\\\\b` is malformed: ",
+            ),
+        ];
+        for (refusal, expected) in cases {
+            let line = console_refusal_line("MountFailed", &refusal);
+            assert!(line.starts_with(expected), "{line:?} vs {expected:?}");
+            assert!(!line.contains("\\\\\\\\"), "scrubbed twice: {line:?}");
+        }
+        let hostile = MountRefusal::Listener {
+            event: "click",
+            detail: RefusedText::new(HOSTILE),
+        };
+        let line = console_refusal_line(HOSTILE, &hostile);
+        assert!(
+            !line.chars().any(crate::system::is_log_hazard),
+            "a raw control survived: {line:?}"
+        );
+        assert_eq!(line.lines().count(), 1, "{line:?}");
+    }
+
     #[test]
     fn mount_refusal_scrubs_bidi_and_controls() {
         let every = [
@@ -1186,11 +1267,11 @@ mod tests {
             MountRefusal::NoBody,
             MountRefusal::Listener {
                 event: "click",
-                detail: HOSTILE.to_owned(),
+                detail: RefusedText::new(HOSTILE),
             },
             MountRefusal::Dom {
                 step: "createElement(div)",
-                detail: Some(HOSTILE.to_owned()),
+                detail: Some(RefusedText::new(HOSTILE)),
             },
             MountRefusal::Dom {
                 step: "root cast to HtmlElement",
