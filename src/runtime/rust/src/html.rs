@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::css_safety;
@@ -398,71 +399,21 @@ fn render_into_ctx<M>(
             };
             s.push('<');
             s.push_str(tag);
-            // Collect regular + bool attrs into (key, value) pairs, then sort
-            // by key — alphabetical order matches the byte-exact output expected
-            // by golden tests. A BoolAttr renders as `k="true"` (the string
-            // "true"), NOT a bare `k`.
-            let mut pairs: Vec<(&str, String)> = vec![];
-            let mut events: Vec<&str> = vec![];
-            let mut ipe_id: Option<&str> = None;
-            // Multi-valued attribute merge: `class` is HTML's space-separated
-            // and `style` HTML's semicolon-separated multi-valued attribute: an
-            // element carrying BOTH a Ipe.Ui-computed inline `style` (from
-            // padding/background/border attrs) AND a user
-            // `Ui.htmlAttribute "style" "z-index: 5"` must emit ONE merged
-            // `style="…computed…; z-index: 5"`, not two `style="…"`
-            // attributes (the browser keeps only the first → the user's
-            // declarations are silently dropped). The Rust attribute list
-            // never went through  map accumulation, so we fold the merge
-            // here at collection time. First-seen value keeps its position
-            // (Ipe.Ui composes the computed style first); later values append
-            // so a user style declared last can override. Every other key is
-            // last-wins (two `href`/`value` ⇒ override, matching  map set).
-            for a in attrs {
-                match a {
-                    Attribute::Attr(k, v) => {
-                        let k = k.as_str();
-                        if k == STAMPED_ID_ATTR {
-                            ipe_id = Some(v);
-                        }
-                        match pairs.iter_mut().find(|(pk, _)| *pk == k) {
-                            Some((_, existing)) if !existing.is_empty() && k == "class" => {
-                                existing.push(' ');
-                                existing.push_str(v);
-                            }
-                            Some((_, existing)) if !existing.is_empty() && k == "style" => {
-                                // `; ` separator unless `existing` already ends
-                                // with `;` (then a single space) — avoids `;;`.
-                                if existing.ends_with(';') {
-                                    existing.push(' ');
-                                } else {
-                                    existing.push_str("; ");
-                                }
-                                existing.push_str(v);
-                            }
-                            Some((_, existing)) => {
-                                // Last-wins for every other key (and for an
-                                // empty existing style/class — nothing to join).
-                                existing.clear();
-                                existing.push_str(v);
-                            }
-                            None => pairs.push((k, v.clone())),
-                        }
-                    }
-                    Attribute::BoolAttr(k, true) => {
-                        let k = k.as_str();
-                        match pairs.iter_mut().find(|(pk, _)| *pk == k) {
-                            Some((_, existing)) => {
-                                existing.clear();
-                                existing.push_str("true");
-                            }
-                            None => pairs.push((k, "true".to_string())),
-                        }
-                    }
-                    Attribute::BoolAttr(_, false) | Attribute::NoAttr => {}
-                    Attribute::EventAttr(e) => events.push(e.name()),
-                }
-            }
+            // Regular + bool attrs as (key, value) pairs, sorted by key below:
+            // alphabetical order matches the byte-exact output expected by
+            // golden tests.
+            let mut pairs = attribute_pairs(attrs);
+            let ipe_id = attrs.iter().rev().find_map(|a| match a {
+                Attribute::Attr(k, v) if k == STAMPED_ID_ATTR => Some(v.as_str()),
+                _ => None,
+            });
+            let mut events: Vec<&str> = attrs
+                .iter()
+                .filter_map(|a| match a {
+                    Attribute::EventAttr(e) => Some(e.name()),
+                    _ => None,
+                })
+                .collect();
             // <textarea> and <select> have NO `value` attribute in the HTML spec
             // — a textarea's displayed value is its TEXT CONTENT; a select's is the
             // `selected` <option>. Emitting `<textarea value="…">` renders EMPTY in
@@ -475,7 +426,7 @@ fn render_into_ctx<M>(
                 && let Some(pos) = pairs.iter().position(|(k, _)| *k == "value")
             {
                 let (_, v) = pairs.remove(pos);
-                textarea_value = Some(v);
+                textarea_value = Some(v.into_owned());
             }
             // <option selected> flip: when rendered as a direct child of a
             // <select> with a value, set `selected` on the value-matching option
@@ -488,7 +439,7 @@ fn render_into_ctx<M>(
             {
                 pairs.retain(|(k, _)| *k != "selected");
                 if pairs.iter().any(|(k, v)| *k == "value" && v == sv) {
-                    pairs.push(("selected", "selected".to_string()));
+                    pairs.push(("selected", Cow::Borrowed("selected")));
                 }
             }
             pairs.sort_by(|a, b| a.0.cmp(b.0));
@@ -870,7 +821,92 @@ fn is_dangerous_attr_name(name: &str) -> bool {
 const RESERVED_ATTR_PREFIX: &[u8] = b"ipe-";
 
 /// The attribute carrying the identity the ipe-id stamper assigns.
-const STAMPED_ID_ATTR: &str = "ipe-id";
+pub(crate) const STAMPED_ID_ATTR: &str = "ipe-id";
+
+/// Whether `id` is spelled in the stamper's alphabet: non-empty, and every
+/// character an ASCII letter or digit, `-`, the escape lead [`ID_ESCAPE`], the
+/// step separator [`ID_STEP_SEP`] or the key separator [`ID_KEY_SEP`].
+///
+/// Every id the stamper writes holds; an id that fails names no element the
+/// stamper reached. The browser client mirrors this set in `__IPE_STAMPED_ID`.
+pub(crate) fn is_stamped_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == '-'
+                || c == ID_ESCAPE
+                || c == ID_STEP_SEP
+                || c == ID_KEY_SEP
+        })
+}
+
+/// The CSS attribute selector for the element stamped `id`, when `id` is in
+/// the stamped alphabet, which needs no escaping between the quotes.
+#[cfg(any(
+    feature = "web-core",
+    all(target_arch = "wasm32", feature = "wasm-client")
+))]
+pub(crate) fn stamped_selector(id: &str) -> Option<String> {
+    is_stamped_id(id).then(|| format!("[{STAMPED_ID_ATTR}=\"{id}\"]"))
+}
+
+/// The attribute pairs an element with attributes `attrs` carries, in
+/// first-appearance order: what the renderer writes at first paint and what
+/// the patch diff compares, so the two never disagree on a value.
+///
+/// A `BoolAttr` that holds is the value `"true"`; a false one, an event and
+/// `NoAttr` carry no pair. `class` (space-separated) and `style`
+/// (semicolon-separated) are HTML's multi-valued attributes: a later regular
+/// value of either joins the one already held, so a computed `style` and a
+/// user `Ui.htmlAttribute "style" "z-index: 5"` become one `style`, not two
+/// attributes of which the browser keeps only the first. Every other repeated
+/// key, an empty held value, or a `BoolAttr` takes the later value.
+pub(crate) fn attribute_pairs<M>(attrs: &[Attribute<M>]) -> Vec<(&str, Cow<'_, str>)> {
+    /// Pair count past which a key lookup goes through a hash index rather
+    /// than a scan, so a long attribute list costs linear time.
+    const SCANNED_PAIRS: usize = 16;
+    let mut pairs: Vec<(&str, Cow<'_, str>)> = Vec::with_capacity(attrs.len());
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for a in attrs {
+        let (k, v, joins) = match a {
+            Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
+            Attribute::BoolAttr(k, true) => (k.as_str(), "true", false),
+            Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => {
+                continue;
+            }
+        };
+        let held = if pairs.len() <= SCANNED_PAIRS {
+            pairs.iter().position(|(pk, _)| *pk == k)
+        } else {
+            if index.is_empty() {
+                index.extend(pairs.iter().enumerate().map(|(i, (pk, _))| (*pk, i)));
+            }
+            index.get(k).copied()
+        };
+        let Some((_, existing)) = held.and_then(|i| pairs.get_mut(i)) else {
+            if !index.is_empty() {
+                index.insert(k, pairs.len());
+            }
+            pairs.push((k, Cow::Borrowed(v)));
+            continue;
+        };
+        let sep = match k {
+            "class" => Some(" "),
+            "style" if existing.ends_with(';') => Some(" "),
+            "style" => Some("; "),
+            _ => None,
+        };
+        match sep.filter(|_| joins && !existing.is_empty()) {
+            Some(sep) => {
+                let joined = existing.to_mut();
+                joined.push_str(sep);
+                joined.push_str(v);
+            }
+            None => *existing = Cow::Borrowed(v),
+        }
+    }
+    pairs
+}
 
 /// The attribute `Html.keyed` sets; the stamper reads it as the key segment.
 const KEY_ATTR: &str = "ipe-key";
@@ -1730,6 +1766,148 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
         Inc,
+    }
+
+    /// Every stamped id of `node`, in document order.
+    fn stamped_ids(node: &Html<()>, out: &mut Vec<String>) {
+        if let Html::HElement(_, attrs, kids) = node {
+            for a in attrs {
+                if let Attribute::Attr(k, v) = a
+                    && k == STAMPED_ID_ATTR
+                {
+                    out.push(v.clone());
+                }
+            }
+            for kid in kids {
+                stamped_ids(kid, out);
+            }
+        }
+    }
+
+    /// Whatever the root path, tags and keys spell, every id the stamper
+    /// writes is in the alphabet [`is_stamped_id`] admits.
+    #[test]
+    fn every_stamped_id_holds_the_stamped_alphabet() {
+        let every_char: String = (0u8..=0x7f)
+            .map(char::from)
+            .chain(['é', '日', '\u{1F600}'])
+            .collect();
+        let kids = every_char
+            .chars()
+            .map(|c| {
+                Html::HElement(
+                    format!("x{c}"),
+                    vec![
+                        Attribute::Attr(KEY_ATTR.into(), format!("k{c}")),
+                        Attribute::Attr(STAMPED_ID_ATTR.into(), format!("forged{c}")),
+                    ],
+                    vec![],
+                )
+            })
+            .chain([Html::HElement(DOCTYPE_WRAPPER_TAG.into(), vec![], vec![])])
+            .collect();
+        let mut root: Html<()> = Html::HElement("ul".into(), vec![], kids);
+        assign_ipe_ids(&mut root, &every_char);
+        let mut ids = vec![];
+        stamped_ids(&root, &mut ids);
+        assert_eq!(ids.len(), every_char.chars().count() + 2);
+        for id in &ids {
+            assert!(is_stamped_id(id), "{id:?}");
+        }
+    }
+
+    /// The stamped alphabet is exactly ASCII letters and digits with `-`, `.`,
+    /// `_` and `:`, and the browser client checks a focus id against that same
+    /// set.
+    #[test]
+    fn the_stamped_alphabet_is_one_set_in_rust_and_in_the_client() {
+        let in_client_class = |c: char| c.is_ascii_alphanumeric() || "_.:-".contains(c);
+        for c in (0u8..=0x7f).map(char::from).chain(['é', '日', '\u{1F600}']) {
+            assert_eq!(is_stamped_id(&c.to_string()), in_client_class(c), "{c:?}");
+            assert_eq!(is_stamped_id(&format!("r{c}")), in_client_class(c), "{c:?}");
+        }
+        assert!(!is_stamped_id(""));
+        let client = include_str!("web/client.js");
+        assert_eq!(
+            client
+                .matches("var __IPE_STAMPED_ID = /^[A-Za-z0-9_.:-]+$/;")
+                .count(),
+            1,
+            "the client's stamped-id check drifted from `is_stamped_id`"
+        );
+    }
+
+    /// The raw `[ipe-id="…"]` selector is built only for an id in the stamped
+    /// alphabet: a forged id that would break out of the quoted value gets no
+    /// selector at all, whichever caller asks.
+    #[test]
+    fn a_stamped_selector_is_refused_outside_the_stamped_alphabet() {
+        for forged in [
+            "",
+            "a\"]{}*{color:red}[a=\"",
+            "a]",
+            "a\\22",
+            "a b",
+            "a/b",
+            "é",
+        ] {
+            assert_eq!(stamped_selector(forged), None, "{forged:?}");
+        }
+        assert_eq!(
+            stamped_selector("r.0_div:k-1").as_deref(),
+            Some("[ipe-id=\"r.0_div:k-1\"]")
+        );
+    }
+
+    /// A long attribute list merges and overrides exactly as a short one: the
+    /// hash index past the scan threshold agrees with a plain scan.
+    #[test]
+    fn attribute_pairs_agree_past_the_scan_threshold() {
+        fn scanned(attrs: &[Attribute<()>]) -> Vec<(&str, String)> {
+            let mut pairs: Vec<(&str, String)> = vec![];
+            for a in attrs {
+                let (k, v, joins) = match a {
+                    Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
+                    Attribute::BoolAttr(k, true) => (k.as_str(), "true", false),
+                    _ => continue,
+                };
+                match pairs.iter_mut().find(|(pk, _)| *pk == k) {
+                    Some((_, e)) if joins && !e.is_empty() && k == "class" => {
+                        e.push(' ');
+                        e.push_str(v);
+                    }
+                    Some((_, e)) if joins && !e.is_empty() && k == "style" => {
+                        e.push_str(if e.ends_with(';') { " " } else { "; " });
+                        e.push_str(v);
+                    }
+                    Some((_, e)) => *e = v.to_owned(),
+                    None => pairs.push((k, v.to_owned())),
+                }
+            }
+            pairs
+        }
+        let mut attrs: Vec<Attribute<()>> = vec![
+            Attribute::Attr("class".into(), "a".into()),
+            Attribute::Attr("style".into(), "p: 1;".into()),
+        ];
+        attrs.extend((0..40).map(|i| Attribute::Attr(format!("data-{i}"), i.to_string())));
+        attrs.extend([
+            Attribute::Attr("class".into(), "b".into()),
+            Attribute::Attr("style".into(), "q: 2".into()),
+            Attribute::Attr("data-3".into(), "over".into()),
+            Attribute::BoolAttr("class".into(), true),
+            Attribute::Attr("class".into(), "c".into()),
+            Attribute::Attr("data-late".into(), String::new()),
+            Attribute::Attr("data-late".into(), "set".into()),
+        ]);
+        for len in 0..=attrs.len() {
+            let slice = attrs.get(..len).unwrap_or_default();
+            let got: Vec<(&str, String)> = attribute_pairs(slice)
+                .into_iter()
+                .map(|(k, v)| (k, v.into_owned()))
+                .collect();
+            assert_eq!(got, scanned(slice), "{len}");
+        }
     }
 
     // A tree far deeper than any recursion could walk is measured on the heap,

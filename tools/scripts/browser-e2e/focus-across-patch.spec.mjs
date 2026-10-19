@@ -608,3 +608,23 @@ test("focus-across-patch: a focus target no longer on screen is ignored", async 
   expect(await focusedId(page)).toBe("root");
   expect(errors).toEqual([]);
 });
+
+test("focus-across-patch: a focus id outside the stamper alphabet is refused though an element carries it", async ({
+  page,
+}) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await open(page);
+  await focusRoot(page);
+  // A focusable element whose `ipe-id` the stamper could never have written:
+  // the lookup would find it, so only the alphabet check keeps focus put.
+  await page.evaluate(() =>
+    document
+      .getElementById("ipe-root")
+      .insertAdjacentHTML("beforeend", '<input id="spoof" ipe-id="a b" aria-label="spoof">'),
+  );
+  await feedFrame(page, { step: "next", focus: "a b" });
+  await page.waitForTimeout(100);
+  expect(await focusedId(page)).toBe("root");
+  expect(errors).toEqual([]);
+});

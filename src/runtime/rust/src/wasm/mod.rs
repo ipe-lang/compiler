@@ -359,42 +359,7 @@ where
 }
 
 /// What caused the Msgs one [`flush`] folds into one render.
-///
-/// Only a render every Msg of which a user's own DOM event caused may move
-/// focus, and only while focus is where it was when the first of those events
-/// fired; a Msg from a subscription, a command result or a widget makes the
-/// whole batch [`BatchCause::Program`], whose render never moves focus.
-enum BatchCause {
-    /// No Msg queued.
-    Empty,
-    /// Only user DOM events, the first fired while `focused` held focus.
-    User { focused: Option<web_sys::Element> },
-    /// At least one Msg no user DOM event caused.
-    Program,
-}
-
-/// Where a queued Msg came from.
-#[derive(Clone, Copy)]
-enum Source {
-    /// A DOM event the user fired on the app's own elements.
-    User,
-    /// A subscription, a command result or a widget.
-    Program,
-}
-
-impl BatchCause {
-    /// The cause of this batch once a Msg from `source` joins it.
-    fn with(self, source: Source) -> Self {
-        match (self, source) {
-            (Self::Empty, Source::User) => Self::User {
-                focused: active_element(),
-            },
-            (user @ Self::User { .. }, Source::User) => user,
-            (Self::Empty | Self::User { .. } | Self::Program, Source::Program)
-            | (Self::Program, Source::User) => Self::Program,
-        }
-    }
-}
+type BatchCause = crate::dom::BatchCause<web_sys::Element>;
 
 /// The element holding focus, if any.
 fn active_element() -> Option<web_sys::Element> {
@@ -403,7 +368,9 @@ fn active_element() -> Option<web_sys::Element> {
 
 /// Focus the element stamped `id`, when the render on screen holds it.
 fn focus_stamped(id: &crate::dom::StampedId) {
-    let selector = format!("[ipe-id=\"{}\"]", id.as_str());
+    let Some(selector) = crate::html::stamped_selector(id.as_str()) else {
+        return;
+    };
     let found = document()
         .ok()
         .and_then(|d| d.query_selector(&selector).ok().flatten());
@@ -920,7 +887,7 @@ where
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok());
     while let Some(el) = cur {
-        if let Some(ipe_id) = el.get_attribute("ipe-id") {
+        if let Some(ipe_id) = el.get_attribute(crate::html::STAMPED_ID_ATTR) {
             // The generated `OnWidget` closure runs the total, fail-closed seal
             // up-decoder over `detail`; a mismatch yields `None` (clean drop).
             if let Some(msg) = app
@@ -950,7 +917,7 @@ where
 
     let mut cur = target;
     while let Some(el) = cur {
-        if let Some(ipe_id) = el.get_attribute("ipe-id") {
+        if let Some(ipe_id) = el.get_attribute(crate::html::STAMPED_ID_ATTR) {
             let resolved = if name == "submit" {
                 ev.prevent_default();
                 let fd = collect_form_data(&el);
@@ -959,7 +926,7 @@ where
                 app.index.borrow().resolve(&ipe_id, name, &args)
             };
             if let Some(msg) = resolved {
-                enqueue_from(app, msg, Source::User);
+                enqueue_from(app, msg, crate::dom::MsgSource::User);
                 return;
             }
         }
@@ -1033,17 +1000,20 @@ where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
-    enqueue_from(app, msg, Source::Program);
+    enqueue_from(app, msg, crate::dom::MsgSource::Program);
 }
 
 /// [`enqueue`] a Msg that came from `source`.
-fn enqueue_from<Model, Msg>(app: &Rc<App<Model, Msg>>, msg: Msg, source: Source)
+fn enqueue_from<Model, Msg>(app: &Rc<App<Model, Msg>>, msg: Msg, source: crate::dom::MsgSource)
 where
     Model: Clone + 'static,
     Msg: Clone + 'static,
 {
     app.queue.borrow_mut().push_back(msg);
-    let cause = app.cause.replace(BatchCause::Empty).with(source);
+    let cause = app
+        .cause
+        .replace(BatchCause::Empty)
+        .with(source, active_element);
     *app.cause.borrow_mut() = cause;
     if app.frame_scheduled.get() {
         return;
@@ -1135,11 +1105,10 @@ where
         // The element this render newly autofocuses, read before the patches
         // apply (applying them can move focus itself), only for a batch of the
         // user's own events while focus is still where the first one left it.
-        let focus = match cause {
-            BatchCause::User { focused } if active_element() == focused => {
-                crate::dom::focus_target(&app.tree.borrow(), &new_tree)
-            }
-            BatchCause::User { .. } | BatchCause::Empty | BatchCause::Program => None,
+        let focus = if cause.may_focus(active_element) {
+            crate::dom::focus_target(&app.tree.borrow(), &new_tree)
+        } else {
+            None
         };
         apply_patches(&patches);
         if let Some(id) = focus {
@@ -1299,7 +1268,10 @@ fn apply_patches(patches: &[Patch]) {
         return;
     };
     for p in patches {
-        let selector = format!("[ipe-id=\"{}\"]", p.id.replace('"', "\\\""));
+        // An id outside the stamper alphabet names no stamped element.
+        let Some(selector) = crate::html::stamped_selector(&p.id) else {
+            continue;
+        };
         let Ok(Some(el)) = document.query_selector(&selector) else {
             // A stale id can appear when a parent html-replace in this same
             // batch already rewrote the subtree — benign, matching client.js.
@@ -1324,43 +1296,52 @@ fn apply_patches(patches: &[Patch]) {
             // glue's `set state(v)` setter forwards the decoded object to the
             // author hook — data handed to a setter, never spliced into markup.
             if k == "state" && widget::is_widget_tag(&el.tag_name().to_lowercase()) {
-                widget::set_widget_down_property(&el, v);
+                widget::set_widget_down_property(&el, v.as_deref().unwrap_or_default());
                 continue;
             }
-            if v.is_empty() {
-                let _ = el.remove_attribute(k);
-            } else {
-                let _ = el.set_attribute(k, v);
-                sync_dom_property(&el, k, v);
+            match v {
+                None => {
+                    let _ = el.remove_attribute(k);
+                    clear_dom_property(&el, k);
+                }
+                Some(v) => {
+                    let _ = el.set_attribute(k, v);
+                    sync_dom_property(&el, k, v);
+                }
             }
         }
     }
 }
 
-/// Attributes whose DOM *property* does not reflect from the attribute —
-/// mirror `client.js`'s value/checked/selected/disabled sync.
-fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
-    let truthy = !val.is_empty() && val != "false";
-    match key {
-        "value" => {
-            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                input.set_value(val);
-            } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
-                ta.set_value(val);
-            } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
-                sel.set_value(val);
-            }
-        }
-        "checked" => {
-            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                input.set_checked(truthy);
-            }
-        }
-        "disabled" => {
-            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                input.set_disabled(truthy);
-            }
-        }
-        _ => {}
+/// Attributes a patch mirrors onto a live property, by attribute name — the
+/// `__IPE_LIVE_PROPS` table of `client.js`. Once the user or a script sets one
+/// of these properties it stops following its attribute, so every set and every
+/// removal writes the property beside the attribute.
+const LIVE_PROPS: [&str; 3] = ["checked", "selected", "disabled"];
+
+fn set_live_prop(el: &web_sys::Element, key: &str, on: bool) {
+    if LIVE_PROPS.contains(&key) {
+        // A frozen or exotic element refuses the write; the attribute stands.
+        let _ = js_sys::Reflect::set(el, &JsValue::from_str(key), &JsValue::from_bool(on));
     }
+}
+
+/// A set attribute's property sync, as `client.js`: `value` writes the live
+/// value, a live property follows the value unless it spells `false`.
+fn sync_dom_property(el: &web_sys::Element, key: &str, val: &str) {
+    if key == "value" {
+        if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+            input.set_value(val);
+        } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+            ta.set_value(val);
+        } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+            sel.set_value(val);
+        }
+    }
+    set_live_prop(el, key, val != "false");
+}
+
+/// A removed attribute clears its live property, as `client.js`.
+fn clear_dom_property(el: &web_sys::Element, key: &str) {
+    set_live_prop(el, key, false);
 }

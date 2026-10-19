@@ -423,13 +423,11 @@ var __ipeSwapToast = __ipeBootCfg["swapToast"];
 var __ipeHelloEverOk = false;
 
 // ── Input authority protocol state ───────────────────────────
-// See docs/internals/web/input-authority-protocol.md §Client state.
-// Step 2 populates these counters + per-input table on every send
-// and response; Step 3 activates the patch filter that reads them;
-// Step 4 activates the stale-drop test against __ipeLastAppliedSeq.
+// Every send and every response updates these counters and the per-input
+// table; the patch filter reads them, and a response at or below
+// __ipeLastAppliedSeq is dropped as stale.
 //
-// Cycle 3 P47 (pub/sub global+local seq split — see
-// docs/internals/web/pubsub-design.md §3.2): __ipeLastGlobalSeq is the
+// Broadcast and local sequences are split: __ipeLastGlobalSeq is the
 // app-wide broadcast counter. The server stamps it onto every
 // broadcast-derived SSE frame (event:patches OR event:patch); the
 // client dedupes against the largest value already applied so a
@@ -440,7 +438,7 @@ var __ipeHelloEverOk = false;
 // ordering constraint" and never blocks.
 var __ipeClientSeq = 0;       // monotonic, client-owned; bumped on every __ipeSend
 var __ipeLastAppliedSeq = 0;  // server-owned; largest local seq already applied
-var __ipeLastGlobalSeq = 0;   // server-owned; largest broadcast globalSeq already applied (P47)
+var __ipeLastGlobalSeq = 0;   // server-owned; largest broadcast globalSeq already applied
 var __ipeInputs = {};         // ipe-id → InputEntry (populated by __ipeBindOne)
 
 function __ipeInputEntry(sid) {
@@ -502,7 +500,7 @@ function __ipeIngestSeq(seq, ackInputs, globalSeq) {
   if (typeof seq === "number" && seq > __ipeLastAppliedSeq) {
     __ipeLastAppliedSeq = seq;
   }
-  // Cycle 3 P47: monotonic-applied semantics on the broadcast counter,
+  // Monotonic-applied semantics on the broadcast counter,
   // mirroring the local-seq path. Missing / zero / non-numeric globalSeq
   // is treated as "no broadcast ordering constraint" and ignored.
   if (typeof globalSeq === "number" && globalSeq > __ipeLastGlobalSeq) {
@@ -526,8 +524,7 @@ function __ipeIngestSeq(seq, ackInputs, globalSeq) {
 // would regress the DOM. Legacy frames that omit seq (or report 0)
 // always apply — pre-upgrade servers keep working.
 //
-// Cycle 3 P47 (pub/sub global+local seq split — see
-// docs/internals/web/pubsub-design.md §3.2): broadcast-derived frames also
+// Broadcast-derived frames also
 // carry an OPTIONAL globalSeq. If supplied AND already applied (i.e.
 // globalSeq > 0 && globalSeq <= __ipeLastGlobalSeq) the frame is
 // dropped — a replayed broadcast (e.g. an SSE reconnect re-delivering
@@ -580,9 +577,7 @@ function __ipeHandleResponse(seq, ackInputs, applyFn, globalSeq) {
 // element has no authority attribute set (no value/checked/selected,
 // no textarea content, no option[selected]). For these the user-
 // owned client state is canonical; we splice the live node across
-// the swap so the user's typing isn't blanked. See
-// docs/internals/web/input-authority-protocol.md §I6 (full-body
-// preservation).
+// the swap so the user's typing isn't blanked.
 function __ipePlaceholderUncontrolled(placeholder) {
   if (!placeholder) return false;
   if (placeholder.hasAttribute("value")) return false;
@@ -638,8 +633,7 @@ function __ipeFindPlaceholder(tmp, live) {
 //   2. EVERY uncontrolled input/textarea/select in the subtree
 //      (anything the server didn't render an authority attribute for).
 //      Without this, an unfocused password field gets recreated by the
-//      innerHTML swap and the user's typed secret is blanked — see
-//      Bug 2 in docs/internals/web/architecture.md §Input preservation.
+//      innerHTML swap and the user's typed secret is blanked.
 // __ipeApplyPatches (p.html and large p.text patches) parses and swaps in one
 // call; __ipePatch (full body) takes the two steps apart to pick the page
 // shell's root out of its one parse.
@@ -884,6 +878,9 @@ function __ipeNoteSent(seq) {
 // The stamped id a patches frame moves focus to, or null. A frame of this tab
 // retires the record of the event it answers and of every earlier one, so no
 // later frame answers them again.
+// The stamper's alphabet (`html::is_stamped_id`); a focus id outside it names no
+// stamped element and is refused before it reaches a selector.
+var __IPE_STAMPED_ID = /^[A-Za-z0-9_.:-]+$/;
 function __ipeFocusDue(frame) {
   if (!__ipeTabId || frame.tab !== __ipeTabId || typeof frame.tabSeq !== "number") return null;
   var sent = null;
@@ -895,7 +892,7 @@ function __ipeFocusDue(frame) {
   }
   __ipeFocusSent = kept;
   if (!sent || sent.epoch !== __ipeFocusEpoch) return null;
-  if (typeof frame.focus !== "string" || !/^[A-Za-z0-9_.:-]+$/.test(frame.focus)) return null;
+  if (typeof frame.focus !== "string" || !__IPE_STAMPED_ID.test(frame.focus)) return null;
   return frame.focus;
 }
 // Focus the element stamped `id`, when the render on screen holds it.
@@ -992,7 +989,7 @@ function __ipeShellRoot(tmp, t) {
 // each with a freshly-created one carrying a STRICT ALLOWLIST of
 // attributes. Freshly-created script nodes execute on insertion.
 //
-// Security (Cycle 3 audit gap C9 / cycle 2 plan P31):
+// Security:
 //   - Attribute copy is filtered through __ipeScriptAttrAllowlist.
 //     Event-handler attrs (onerror, onload, onclick, …) are NEVER
 //     re-emitted — the original unfiltered loop allowed an attacker
@@ -1147,7 +1144,6 @@ __ipeDoc.on("focusout", function(ev) {
 // navigates or closes the tab would normally be discarded — the
 // setTimeout is torn down with the page. These handlers flush
 // synchronously so the final keystroke always reaches the server.
-// See docs/internals/web/input-authority-protocol.md §I3.
 
 // __ipeCollectPendingBatch — snapshot every pending-debounce entry
 // into a batch array, bumping __ipeClientSeq per entry so each gets
@@ -1263,7 +1259,7 @@ window.addEventListener("beforeunload", __ipeFlushPendingBeacon);
 window.addEventListener("pagehide", __ipeFlushPendingBeacon);
 
 // ── Core send ────────────────────────────────────────────────
-// Wire format (see docs/internals/web/input-authority-protocol.md §Request):
+// Wire format:
 //   {sessionId, seq, msg, args, handlerId, epoch?, tab?, inputState?}
 //   * seq is client-monotonic — server uses it to match responses to
 //     the inputState snapshot that produced them; with tab it marks a
@@ -1531,7 +1527,7 @@ function __ipeApplyPatches(patches) {
   // this patch cycle. The next user interaction (option click, blur)
   // triggers a fresh response and reconciliation. Sibling subtrees
   // and unrelated parts of the DOM apply normally — the dropdown is
-  // unaffected. See Bug 3 in docs/internals/web/architecture.md.
+  // unaffected.
   var openSel = __ipeSelectOpen() ? __ipeDoc.active() : null;
   for (var i = 0; i < patches.length; i++) {
     var p = patches[i];
@@ -1590,9 +1586,13 @@ function __ipeApplyPatches(patches) {
         }
         var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
             ? __IPE_LIVE_PROPS[k] : null;
-        if (v === "") {
+        // A removal crosses as null; a set as a string, the empty string
+        // included (`autofocus ""` is a set). Any other shape is refused.
+        if (v === null) {
           __ipeNode.removeAttr(el, k);
           if (prop !== null) el[prop] = false;
+        } else if (typeof v !== "string") {
+          continue;
         } else {
           __ipeNode.setAttr(el, k, v);
           // Sync DOM properties that don't reflect from attrs.
@@ -2352,8 +2352,7 @@ function __ipeShowSwapToast() {
 // 'error', leaving the client silently wedged. The server now sends
 // an immediate 'hello' event and a periodic 'heartbeat'; the client
 // watchdog (below) treats absence of either as a wedge and force-
-// reconnects with backoff. See docs/internals/web/architecture.md
-// §SSE wedge detection.
+// reconnects with backoff.
 var __ipeSSE = null;
 var __ipeOpenAt = 0;          // ms timestamp of last EventSource.open
 var __ipeOpenStartedAt = 0;   // ms timestamp of the last __ipeOpenSSE
@@ -2537,14 +2536,14 @@ var __ipeLiveFrames = {
       }, frame.globalSeq);
     }
   },
-  // Cycle 3 P50b / Gap C11 — structural-patches SSE event.
+  // Structural-patches SSE event.
   //
-  // The producer (Cycle 3 P50a) now ships event:patches for any
+  // The producer ships event:patches for any
   // render whose diff against the previous tree fits in a small
   // patch list (the typical 1-3 attribute/text node change at
   // ~200-1000 B, vs the ~14 KB full body). The legacy event:patch
   // handler above stays for first-renders, reconnect-resync,
-  // full-replace fallbacks, and any pre-P50a server.
+  // and full-replace fallbacks.
   //
   // Shape parity with the HTTP /_ipe/event reply: frame is
   // {seq, ackInputs, patches} — identical to writeEventJSON's
@@ -2590,7 +2589,7 @@ var __ipeLiveFrames = {
     try { frame = JSON.parse(text); }
     catch (_) {
       // Producer guarantees JSON for event:patches; a non-JSON
-      // payload is impossible from a P50a+ server. Drop silently
+      // payload is impossible from this runtime's server. Drop silently
       // rather than running __ipePatch on garbage.
       return;
     }

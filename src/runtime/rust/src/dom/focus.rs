@@ -6,20 +6,17 @@
 //! element it names, under the applier's own rule for which renders may move
 //! focus at all.
 
-use crate::html::{Attribute, Html, MAX_HTML_DEPTH};
+use crate::html::{Attribute, Html, MAX_HTML_DEPTH, STAMPED_ID_ATTR, is_stamped_id};
 use std::collections::HashSet;
 
 /// The attribute whose element takes focus when it appears.
 const AUTOFOCUS_ATTR: &str = "autofocus";
 
-/// The attribute the stamper writes an element's identity to.
-const STAMPED_ID_ATTR: &str = "ipe-id";
-
 /// The `ipe-id` the stamper gave one element of a render.
 ///
 /// Built only from the stamped `ipe-id` of an element the stamper reached, and
-/// only when it holds the stamper's alphabet (`[A-Za-z0-9_.:-]`, non-empty), so
-/// it quotes inside a CSS attribute selector without escaping.
+/// only when it holds the stamper's alphabet ([`is_stamped_id`]), so it quotes
+/// inside a CSS attribute selector without escaping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
@@ -36,19 +33,11 @@ impl StampedId {
 /// The stamped id of an element with attributes `attrs`, when it has a well-formed one.
 fn stamped_id<M>(attrs: &[Attribute<M>]) -> Option<&str> {
     attrs.iter().find_map(|attr| match attr {
-        Attribute::Attr(name, id) if name == STAMPED_ID_ATTR && is_stamped_spelling(id) => {
+        Attribute::Attr(name, id) if name == STAMPED_ID_ATTR && is_stamped_id(id) => {
             Some(id.as_str())
         }
         _ => None,
     })
-}
-
-/// Whether `id` is spelled in the stamper's alphabet.
-fn is_stamped_spelling(id: &str) -> bool {
-    !id.is_empty()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
 }
 
 /// Whether an element with attributes `attrs` carries `autofocus`.
@@ -108,6 +97,63 @@ pub fn focus_target<M>(old: &Html<M>, new: &Html<M>) -> Option<StampedId> {
         false
     });
     first_autofocused(new, |id| !before.contains(id)).map(|id| StampedId(id.to_owned()))
+}
+
+/// Where a Msg an applier queues came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsgSource {
+    /// A DOM event the user fired on the app's own elements.
+    User,
+    /// A subscription, a command result or a widget.
+    Program,
+}
+
+/// What caused the Msgs an applier folds into one render, `E` being the
+/// applier's handle on the element that holds focus.
+///
+/// Only a render every Msg of which a user's own DOM event caused may move
+/// focus, and only while focus is where it was when the first of those events
+/// fired; one Msg from anywhere else makes the whole batch
+/// [`BatchCause::Program`], whose render never moves focus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchCause<E> {
+    /// No Msg queued.
+    Empty,
+    /// Only user DOM events, the first fired while `focused` held focus.
+    User {
+        /// The element holding focus when the first event fired.
+        focused: Option<E>,
+    },
+    /// At least one Msg no user DOM event caused.
+    Program,
+}
+
+impl<E> BatchCause<E> {
+    /// The cause of this batch once a Msg from `source` joins it; `active`
+    /// reads the element holding focus, and only the batch's first user event
+    /// reads it.
+    #[must_use]
+    pub fn with(self, source: MsgSource, active: impl FnOnce() -> Option<E>) -> Self {
+        match (self, source) {
+            (Self::Empty, MsgSource::User) => Self::User { focused: active() },
+            (user @ Self::User { .. }, MsgSource::User) => user,
+            (Self::Empty | Self::User { .. } | Self::Program, MsgSource::Program)
+            | (Self::Program, MsgSource::User) => Self::Program,
+        }
+    }
+
+    /// Whether this batch's render may move focus, `active` reading the
+    /// element that holds focus now.
+    #[must_use]
+    pub fn may_focus(&self, active: impl FnOnce() -> Option<E>) -> bool
+    where
+        E: PartialEq,
+    {
+        match self {
+            Self::User { focused } => active() == *focused,
+            Self::Empty | Self::Program => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -248,8 +294,10 @@ mod tests {
         let replaced = diff(&replaced_from, &new, &RenderCtx::Unstamped);
         assert!(
             in_place.iter().all(|p| p.html.is_none())
-                && in_place.iter().any(|p| !p.attrs.is_empty()),
-            "the first change is an attribute patch: {in_place:?}"
+                && in_place
+                    .iter()
+                    .any(|p| p.attrs.get(AUTOFOCUS_ATTR) == Some(&Some(String::new()))),
+            "the first change sets `autofocus` in place, as first paint writes it: {in_place:?}"
         );
         assert!(
             replaced.iter().any(|p| p.html.is_some()),
@@ -299,6 +347,41 @@ mod tests {
         }
         let reached = stamped(reached);
         assert!(target(&page(vec![]), &reached).is_some());
+    }
+
+    /// A batch of `sources`, the user's first event fired while element 1
+    /// held focus.
+    fn batch(sources: &[MsgSource]) -> BatchCause<u8> {
+        sources
+            .iter()
+            .fold(BatchCause::Empty, |cause, s| cause.with(*s, || Some(1)))
+    }
+
+    #[test]
+    fn only_a_batch_of_the_users_own_events_may_move_focus() {
+        assert!(batch(&[MsgSource::User]).may_focus(|| Some(1)));
+        assert!(batch(&[MsgSource::User, MsgSource::User]).may_focus(|| Some(1)));
+        for refused in [
+            &[][..],
+            &[MsgSource::Program],
+            &[MsgSource::User, MsgSource::Program],
+            &[MsgSource::Program, MsgSource::User],
+            &[MsgSource::User, MsgSource::Program, MsgSource::User],
+        ] {
+            assert!(!batch(refused).may_focus(|| Some(1)), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn focus_that_moved_since_the_first_event_is_never_taken() {
+        assert!(!batch(&[MsgSource::User]).may_focus(|| Some(2)));
+        assert!(!batch(&[MsgSource::User]).may_focus(|| None));
+        // A later event of the batch does not re-read where focus is.
+        let cause = BatchCause::Empty
+            .with(MsgSource::User, || Some(1))
+            .with(MsgSource::User, || Some(2));
+        assert_eq!(cause, BatchCause::User { focused: Some(1) });
+        assert!(!cause.may_focus(|| Some(2)));
     }
 
     #[test]

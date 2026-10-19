@@ -1,7 +1,9 @@
 use crate::csp::{STYLE_NONCE_BYTES, StyleNonce};
 use crate::dom::diff::{Patch, diff};
 use crate::entropy::{EntropyError, fill_entropy};
-use crate::html::{Attribute, Event, FormData, Html, RenderCtx, StampedHtml, render_stamped};
+use crate::html::{
+    Attribute, Event, FormData, Html, RenderCtx, STAMPED_ID_ATTR, StampedHtml, render_stamped,
+};
 use crate::retained::{Bytes, RetainedBytes, hash_table};
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -106,7 +108,7 @@ fn walk<M: Clone>(root: &Html<M>, map: &mut HashMap<String, HashMap<String, Even
             let id = attrs
                 .iter()
                 .find_map(|a| match a {
-                    Attribute::Attr(k, v) if k == "ipe-id" => Some(v.as_str()),
+                    Attribute::Attr(k, v) if k == STAMPED_ID_ATTR => Some(v.as_str()),
                     _ => None,
                 })
                 .unwrap_or_default();

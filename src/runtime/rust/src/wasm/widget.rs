@@ -126,15 +126,15 @@ pub fn sync_widget_properties<M>(document: &web_sys::Document, tree: &crate::htm
                 for a in attrs {
                     if let Attribute::Attr(k, v) = a {
                         match k.as_str() {
-                            "ipe-id" => ipe_id = Some(v),
+                            crate::html::STAMPED_ID_ATTR => ipe_id = Some(v),
                             "state" => state = Some(v),
                             _ => {}
                         }
                     }
                 }
                 if let (Some(id), Some(encoded)) = (ipe_id, state) {
-                    let selector = format!("[ipe-id=\"{}\"]", id.replace('"', "\\\""));
-                    if let Ok(Some(el)) = document.query_selector(&selector) {
+                    let selector = crate::html::stamped_selector(id);
+                    if let Some(Ok(Some(el))) = selector.map(|s| document.query_selector(&s)) {
                         set_widget_down_property(&el, encoded);
                     }
                 }

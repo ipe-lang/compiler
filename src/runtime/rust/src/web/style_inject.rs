@@ -31,7 +31,7 @@
 //! (matches  idempotency contract), a belt-and-braces against a missed
 //! call site.
 
-use crate::html::{Attribute, Html, is_void};
+use crate::html::{Attribute, Html, STAMPED_ID_ATTR, is_stamped_id, is_void, stamped_selector};
 
 /// True for elements a scoped `<style>` must NOT be prepended into as a child.
 /// Covers void tags (they render no children) AND value-bearing tags whose
@@ -198,12 +198,12 @@ fn inject_pass<M>(node: &mut Html<M>, kind: StyleBlock, depth: usize) {
 
 /// Build the `<style>` node for an element's markers and strip those markers
 /// from its attrs. Returns `None` (markers still stripped) when there's no
-/// ipe-id, an ipe-id outside [`is_selector_safe_ipe_id`], no non-empty marker,
+/// ipe-id, an ipe-id outside the stamped alphabet ([`is_stamped_id`]), no non-empty marker,
 /// or the built CSS is empty.
 fn build_style_node<M>(attrs: &mut Vec<Attribute<M>>, kind: StyleBlock) -> Option<Html<M>> {
     let markers = kind.markers();
-    let ipe_id = match attr_get(attrs, "ipe-id") {
-        Some(s) if is_selector_safe_ipe_id(&s) => s,
+    let ipe_id = match attr_get(attrs, STAMPED_ID_ATTR) {
+        Some(s) if is_stamped_id(&s) => s,
         _ => {
             strip_markers(attrs, markers);
             return None;
@@ -224,23 +224,11 @@ fn build_style_node<M>(attrs: &mut Vec<Attribute<M>>, kind: StyleBlock) -> Optio
     Some(Html::HElement(
         "style".to_string(),
         vec![
-            Attribute::Attr("ipe-id".to_string(), kind.block_id(&ipe_id)),
+            Attribute::Attr(STAMPED_ID_ATTR.to_string(), kind.block_id(&ipe_id)),
             Attribute::Attr(kind.owner_attr().to_string(), ipe_id),
         ],
         vec![Html::HRaw(css)],
     ))
-}
-
-/// The ipe-id is spliced raw into `[ipe-id="…"]` inside an `HRaw` `<style>`
-/// body. `assign_ipe_ids` builds it from `[A-Za-z0-9_:.-]` alone (every tag
-/// and key byte outside `[A-Za-z0-9-]` is hex-escaped behind `.`); an id with
-/// any other byte (a `"`, `]`, `{`, `<`, `\`) did not come from that stamper
-/// and gets no style block.
-fn is_selector_safe_ipe_id(id: &str) -> bool {
-    !id.is_empty()
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'.' | b'!'))
 }
 
 /// Read an attribute's value by key (owned clone — values are short and this
@@ -292,7 +280,9 @@ fn build_mq<M>(ipe_id: &str, attrs: &[Attribute<M>]) -> String {
     // important declaration still wins over a stylesheet important one, so an
     // author who deliberately pins a property inline keeps precedence.
     let important_rules = mark_declarations_important(&safe_rules);
-    let selector = format!("[ipe-id=\"{ipe_id}\"]");
+    let Some(selector) = stamped_selector(ipe_id) else {
+        return String::new();
+    };
     format!("@media {safe_query} {{ {selector} {{ {important_rules} }} }}")
 }
 
@@ -323,7 +313,9 @@ fn build_pc<M>(ipe_id: &str, attrs: &[Attribute<M>]) -> String {
     if encoded.is_empty() {
         return String::new();
     }
-    let selector = format!("[ipe-id=\"{ipe_id}\"]");
+    let Some(selector) = stamped_selector(ipe_id) else {
+        return String::new();
+    };
     let mut out = String::new();
     for entry in encoded.split("||") {
         let (tag, css) = match entry.split_once('|') {
@@ -384,7 +376,9 @@ fn build_tr<M>(ipe_id: &str, attrs: &[Attribute<M>]) -> String {
         Some(v) => strip_style_close(v.as_str()),
         None => return String::new(),
     };
-    let selector = format!("[ipe-id=\"{ipe_id}\"]");
+    let Some(selector) = stamped_selector(ipe_id) else {
+        return String::new();
+    };
     if respect {
         format!(
             "@media (prefers-reduced-motion: no-preference) {{ {selector} {{ transition: {safe_rules}; }} }}"
@@ -400,7 +394,9 @@ fn build_anim<M>(ipe_id: &str, attrs: &[Attribute<M>]) -> String {
         return String::new();
     }
     let ident = ipe_id_to_css_ident(ipe_id);
-    let selector = format!("[ipe-id=\"{ipe_id}\"]");
+    let Some(selector) = stamped_selector(ipe_id) else {
+        return String::new();
+    };
     let mut keyframes = String::new();
     let mut gated: Vec<String> = vec![];
     let mut ungated: Vec<String> = vec![];
@@ -611,7 +607,7 @@ mod tests {
             "data-ipe-anim-rules",
             "9bad name!||300ms ease||0% { opacity: 0 } </style>||1",
         )];
-        let css = build_anim("r.0#div", &attrs);
+        let css = build_anim("r.0_div", &attrs);
         assert!(!css.contains("</style"), "{css}");
         // Sink hardening: the body carries trailing content
         // after the last keyframe block (`</style>`), so
@@ -631,7 +627,7 @@ mod tests {
             "data-ipe-anim-rules",
             "9bad name!||300ms ease||0% { opacity: 0 } 100% { opacity: 1 }||1",
         )];
-        let css = build_anim("r.0#div", &attrs);
+        let css = build_anim("r.0_div", &attrs);
         assert!(css.contains("@keyframes _9bad_name___r_0_div"), "{css}");
         assert!(
             css.contains("@media (prefers-reduced-motion: no-preference)"),
@@ -744,7 +740,17 @@ mod tests {
     /// `[ipe-id="…"]` selector: no style block, markers still stripped.
     #[test]
     fn forged_ipe_id_outside_the_stamper_charset_gets_no_style_block() {
-        for forged in ["x\"]{}*{color:red}[a=\"", "a]", "a{", "a\\22", "a<b", ""] {
+        for forged in [
+            "x\"]{}*{color:red}[a=\"",
+            "a]",
+            "a{",
+            "a\\22",
+            "a<b",
+            "a!b",
+            "a b",
+            "a/b",
+            "",
+        ] {
             let mut tree: Html<()> = Html::HElement(
                 "button".to_string(),
                 vec![
@@ -769,7 +775,7 @@ mod tests {
         let mut tree: Html<()> = Html::HElement(
             "button".to_string(),
             vec![
-                attr("ipe-id", "r_0_!doctype-wrapper_0_li.x:k-1"),
+                attr("ipe-id", "r_0_.21doctype-wrapper_0_li.2ex:k-1"),
                 attr("data-ipe-pc-rules", "h|color: red"),
             ],
             vec![],
@@ -1349,14 +1355,14 @@ mod tests {
         ];
         for body in bodies {
             let baked_marker = format!("anim||300ms ease||{body}||1");
-            let baked = build_anim("r.0#div", &[attr("data-ipe-anim-rules", &baked_marker)]);
+            let baked = build_anim("r.0_div", &[attr("data-ipe-anim-rules", &baked_marker)]);
 
             // Dev-patched path: the body is read back from a patched table slot,
             // the exact emitted read shape, then encoded into the same marker.
             let mut table = LiteralTable::from_defaults(&["0% { opacity: 0 } 100% { opacity: 1 }"]);
             table.apply_patch(&[(0, body.to_owned())]);
             let patched_marker = format!("anim||300ms ease||{}||1", table.get(0));
-            let patched = build_anim("r.0#div", &[attr("data-ipe-anim-rules", &patched_marker)]);
+            let patched = build_anim("r.0_div", &[attr("data-ipe-anim-rules", &patched_marker)]);
 
             assert_eq!(
                 baked, patched,
