@@ -17,7 +17,6 @@ const SITES: &[(&str, &str)] = &[
     ("driver/build_pipeline.rs", "out_dir"),
     ("driver/build_pipeline.rs", "out_dir"),
     ("driver/commands_pkg.rs", "&out"),
-    ("driver/tests/mod.rs", "&out"),
     ("project_root/fixture.rs", "out_dir"),
 ];
 
