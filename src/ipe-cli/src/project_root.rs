@@ -184,17 +184,18 @@ impl RootArg {
         };
         let joined = cwd.join(arg);
         if joined.is_dir() {
-            (Self { dir: joined }, None)
+            (Self::at(&joined), None)
         } else {
             (Self::at(cwd), Some(FileArg { path: joined }))
         }
     }
 
-    /// The directory `dir` as the root.
+    /// The directory `dir` as the root, its `.` components dropped so every
+    /// way of spelling one directory yields one root path.
     #[must_use]
     pub fn at(dir: &Path) -> Self {
         Self {
-            dir: dir.to_path_buf(),
+            dir: dir.components().collect(),
         }
     }
 
