@@ -21,7 +21,6 @@
 //! headless-browser round trip is out of scope for this native suite.
 
 use ipe::BuildOptions;
-use ipe_runtime_rust::encoding::MountBase;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -74,18 +73,29 @@ const EDITOR_JS: &str = "export function mount(host, emit) {\n  return { onState
 
 /// Emit the widget app for the `WasmClient` target to a temp dir (no `cargo`).
 fn emit_wasm(test_name: &str) -> Result<std::path::PathBuf, BoxError> {
-    emit_wasm_under(test_name, MountBase::root())
+    emit_wasm_under(test_name, None)
 }
 
-/// Emit the widget app for the `WasmClient` target, served under `base`.
-fn emit_wasm_under(test_name: &str, base: MountBase) -> Result<std::path::PathBuf, BoxError> {
-    let ipe_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("wasm_widget_{test_name}_ipe"));
-    let _ = std::fs::remove_dir_all(&ipe_dir);
-    std::fs::create_dir_all(ipe_dir.join("js"))?;
-    std::fs::write(ipe_dir.join("js/editor.js"), EDITOR_JS)?;
-    let entry = ipe_dir.join("Main.ipe");
-    std::fs::write(&entry, WIDGET_APP)?;
+/// Emit the widget app for the `WasmClient` target, served under the manifest's
+/// `delivery.browser.basePath` when `base_path` is given (else at the root).
+fn emit_wasm_under(
+    test_name: &str,
+    base_path: Option<&str>,
+) -> Result<std::path::PathBuf, BoxError> {
+    let tree = ipe::project_root::SourceTree::main(WIDGET_APP);
+    let tree = match base_path {
+        Some(base) => tree.field(&format!(
+            "delivery = {{ browser = {{ basePath = \"{base}\" }} }}"
+        )),
+        None => tree,
+    };
+    let fixture = ipe::RootFixture::from_tree(&tree).map_err(|e| -> BoxError {
+        format!("{test_name}: cannot write the fixture: {e}").into()
+    })?;
+    // Widget hooks resolve beside the entry module, under the project's `src/`.
+    let js_dir = fixture.path().join("src").join("js");
+    std::fs::create_dir_all(&js_dir)?;
+    std::fs::write(js_dir.join("editor.js"), EDITOR_JS)?;
 
     let out_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("wasm_widget_{test_name}_out"));
@@ -94,8 +104,7 @@ fn emit_wasm_under(test_name: &str, base: MountBase) -> Result<std::path::PathBu
     let runtime = e2e_support::require_runtime().into_path_buf();
     let mut opts = BuildOptions::from_env();
     opts.target = ipe_ir::Target::WasmClient;
-    opts.mount_base = base;
-    ipe::build_with_options(&entry, &out_dir, &runtime, opts)
+    ipe::build_fixture_with_options(&fixture, &out_dir, &runtime, &opts)
         .map_err(|e| -> BoxError { format!("{test_name}: wasm emit failed: {e:?}").into() })?;
     Ok(out_dir)
 }
@@ -210,8 +219,7 @@ fn wasm_widget_bundle_is_property_and_custom_event_glue() -> Result<(), BoxError
 /// path the URL is built from.
 #[test]
 fn widget_splice_under_base() -> Result<(), BoxError> {
-    let base = MountBase::parse("/app").map_err(|r| -> BoxError { r.to_string().into() })?;
-    let out = emit_wasm_under("under_base", base)?;
+    let out = emit_wasm_under("under_base", Some("/app"))?;
     let asset = find_one(&out, "widget.")?;
     let glue_file = find_one(&out, "widget-glue.")?;
     let asset_name = asset.file_name().and_then(|n| n.to_str()).unwrap_or("");

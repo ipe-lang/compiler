@@ -341,10 +341,8 @@ hugeLineRows lang =
 -- Ipê comments are `--` and nested `{- -}`; `//` is not one.
 ipeComments : Bool
 ipeComments =
-    Highlight.tokenize Ipe "x -- c"
-        == [ Ident "x", Plain " ", Comment "-- c" ]
-        && Highlight.tokenize Ipe "{- a {- b -} c -} y"
-        == [ Comment "{- a {- b -} c -}", Plain " ", Ident "y" ]
+    Highlight.tokenize Ipe "x -- c" == [ Ident "x", Plain " ", Comment "-- c" ]
+        && Highlight.tokenize Ipe "{- a {- b -} c -} y" == [ Comment "{- a {- b -} c -}", Plain " ", Ident "y" ]
         && not (hasComment (Highlight.tokenize Ipe "a // b"))
         && not (hasComment (Highlight.tokenize Ipe "a /* b */"))
         && reassembles Ipe "a // b"
@@ -377,8 +375,7 @@ blockCarry : Bool
 blockCarry =
     case Drawn.rowLines Ipe [ Numbered 1 "{- a", Numbered 2 "b -} x" ] of
         [ TokenLine 1 first, TokenLine 2 second ] ->
-            first
-                == [ Comment "{- a" ]
+            first == [ Comment "{- a" ]
                 && List.any (isComment "b -}") second
                 && List.any (isIdent "x") second
                 && coveredResets
@@ -409,18 +406,15 @@ tabDrawsAsTab =
         && not (String.contains "\\t" html)
         && String.contains "\\u{202e}" html
         && not (String.contains (codeText 8238) html)
-        && List.map SafeText.segments (Highlight.tokenRuns (Plain "a\tb"))
-        == [ [ Verbatim "a" ], [ Verbatim "b" ] ]
+        && List.map SafeText.segments (Highlight.tokenRuns (Plain "a\tb")) == [ [ Verbatim "a" ], [ Verbatim "b" ] ]
 
 
 -- The references of a 64Ki-token unit are read in one pass: one per bare
 -- word, one per dotted path.
 hugeLinks : Bool
 hugeLinks =
-    List.length (Links.references Rust (String.repeat 65536 "a "))
-        == 65536
-        && List.length (Links.references Ipe (String.repeat 32768 "a.b "))
-        == 32768
+    List.length (Links.references Rust (String.repeat 65536 "a ")) == 65536
+        && List.length (Links.references Ipe (String.repeat 32768 "a.b ")) == 32768
 
 
 -- A 256 KiB URL word, and 64Ki URL words, are trimmed in one pass each.
@@ -430,10 +424,8 @@ hugeUrls =
         url =
             "https://x.io/" ++ String.repeat 131072 "a" ++ String.repeat 131072 "." ++ "b"
     in
-    Links.sourceUrls ("(" ++ url ++ ")),")
-        == [ External url ]
-        && List.length (Links.sourceUrls (String.repeat 65536 "https://x.io/p, "))
-        == 65536
+    Links.sourceUrls ("(" ++ url ++ ")),") == [ Links.external url ]
+        && List.length (Links.sourceUrls (String.repeat 65536 "https://x.io/p, ")) == 65536
 
 
 -- A 256 KiB token holding one U+202E is three segments: the text before,
@@ -447,10 +439,22 @@ hugeSegments =
         after =
             String.repeat 131071 "b"
     in
-    SafeText.segments (SafeText.renderForeign (before ++ codeText 8238 ++ after))
-        == [ Verbatim before, Escaped (Char.fromCode 8238), Verbatim after ]
-        && SafeText.segments (SafeText.concat (List.repeat 65536 (SafeText.renderForeign "ab")))
-        == [ Verbatim (String.repeat 65536 "ab") ]
+    SafeText.segments (SafeText.renderForeign (before ++ codeText 8238 ++ after)) == [ Verbatim before, Escaped (Char.fromCode 8238), Verbatim after ]
+        && SafeText.segments (SafeText.concat (List.repeat 65536 (SafeText.renderForeign "ab"))) == [ Verbatim (String.repeat 65536 "ab") ]
+
+
+-- A 128Ki-escape text is 256Ki segments, rendered and joined in one pass
+-- each. Red (the run never ends) if the scan or the join builds its segments
+-- by consing onto the head, which copies the list per escape.
+hugeEscapeRuns : Bool
+hugeEscapeRuns =
+    let
+        drawn =
+            SafeText.renderForeign (String.repeat 131072 (codeText 8238 ++ "a"))
+    in
+    List.length (SafeText.segments drawn) == 262144
+        && List.take 2 (SafeText.segments drawn) == [ Escaped (Char.fromCode 8238), Verbatim "a" ]
+        && List.length (SafeText.segments (SafeText.concat (List.repeat 131072 (SafeText.render "\"x")))) == 262144
 
 
 -- A residual over a million-line file, every second line covered, keeps
@@ -458,8 +462,7 @@ hugeSegments =
 hugeResidual : Bool
 hugeResidual =
     Index.residualText (List.map (\k -> ( 2 * k, 2 * k )) (List.range 1 500000)) (String.repeat 1000000 "x\n")
-        == "\nx"
-        ++ String.repeat 499999 "\n\nx"
+        == "\nx" ++ String.repeat 499999 "\n\nx"
 
 
 -- A `\r` before a line's `\n` is the CRLF line break in Rust and Ipê, and
@@ -468,8 +471,7 @@ crlfByLanguage : Bool
 crlfByLanguage =
     case ( Drawn.rowLines Rust [ Numbered 1 "fn x\r" ], Drawn.rowLines Shell [ Numbered 1 "cd /x\r" ] ) of
         ( [ TokenLine 1 rust ], [ TokenLine 1 shell ] ) ->
-            rust
-                == [ Keyword "fn", Plain " ", Ident "x" ]
+            rust == [ Keyword "fn", Plain " ", Ident "x" ]
                 && List.member (Plain "\r") shell
                 && String.contains "data-review-escape" (codeOf (Drawn.highlighted Shell [ Numbered 1 "cd /x\r" ]))
 
@@ -529,13 +531,10 @@ sourceCopiesAsWritten =
         gutter =
             Html.render (View.gutterHtml [ 1, 2, 3 ])
     in
-    markupText code
-        == "fn a() {\n\tlet  x = 1;\n}"
-        && List.length (String.split "<span style=\"white-space:pre\">" code)
-        == 4
+    markupText code == "fn a() {\n\tlet  x = 1;\n}"
+        && List.length (String.split "<span style=\"white-space:pre\">" code) == 4
         && String.contains "white-space:pre" code
-        && markupText gutter
-        == "1\n2\n3"
+        && markupText gutter == "1\n2\n3"
         && String.contains "user-select:none" gutter
         && String.contains "aria-hidden" gutter
         && not (String.contains "user-select:none" code)
@@ -583,12 +582,10 @@ drawnCountIsRenderedCount =
         both lang rows =
             agrees (Drawn.highlighted lang rows)
                 && agrees (Drawn.plain lang rows)
-                && Drawn.elements (Drawn.plain lang rows)
-                <= Drawn.elements (Drawn.highlighted lang rows)
+                && Drawn.elements (Drawn.plain lang rows) <= Drawn.elements (Drawn.highlighted lang rows)
     in
     List.all (\lang -> List.all (both lang) drawnFixtures) [ Rust, Ipe, Shell, Unknown ]
-        && Drawn.elements (Drawn.highlighted Rust [ Numbered 1 "fn x" ])
-        == 6
+        && Drawn.elements (Drawn.highlighted Rust [ Numbered 1 "fn x" ]) == 6
 
 
 -- Fifty adjacent escapes draw as one marked element holding all fifty
@@ -614,14 +611,10 @@ sameColourTokensShareOneElement =
         rows =
             [ Numbered 1 "a b" ]
     in
-    Drawn.parts (Drawn.highlighted Rust rows)
-        == [ LineRun [ 1 ] (ColoredLines [ [ Run TextHue [ Chars "a b" ] ] ]) ]
-        && occurrences "<span" (codeOf (Drawn.highlighted Rust rows))
-        == 1
-        && occurrences "<span" (codeOf (Drawn.highlighted Rust [ Numbered 1 "fn fn" ]))
-        == 3
-        && Drawn.parts (Drawn.plain Rust rows)
-        == [ LineRun [ 1 ] (PlainText [ Chars "a b" ]) ]
+    Drawn.parts (Drawn.highlighted Rust rows) == [ LineRun [ 1 ] (ColoredLines [ [ Run TextHue [ Chars "a b" ] ] ]) ]
+        && occurrences "<span" (codeOf (Drawn.highlighted Rust rows)) == 1
+        && occurrences "<span" (codeOf (Drawn.highlighted Rust [ Numbered 1 "fn fn" ])) == 3
+        && Drawn.parts (Drawn.plain Rust rows) == [ LineRun [ 1 ] (PlainText [ Chars "a b" ]) ]
 
 
 -- A line holding U+202E and U+2066 draws in byte order by its code block:
@@ -637,10 +630,8 @@ codeBlockHoldsDisplayOrder =
         inOrder html =
             String.startsWith ("<code style=\"" ++ View.codeCss ++ "\">") html
                 && String.contains View.displayOrderCss View.codeCss
-                && occurrences "unicode-bidi" html
-                == 1
-                && occurrences "data-review-escape" html
-                == 2
+                && occurrences "unicode-bidi" html == 1
+                && occurrences "data-review-escape" html == 2
     in
     inOrder (codeOf (Drawn.highlighted Rust rows)) && inOrder (codeOf (Drawn.plain Rust rows))
 
@@ -673,14 +664,10 @@ layoutOnlyWhereLanguageReadsIt =
     not (String.contains "data-review-escape" layout)
         && not (String.contains mark layout)
         && not (String.contains "\r" layout)
-        && markupText (drawn Rust layoutRows)
-        == "fn x\n\tfn y"
-        && markupText (plainDrawn Rust layoutRows)
-        == "fn x\n\tfn y"
-        && Drawn.layoutNotes Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "fn y" ]
-        == [ ByteOrderMark, CrlfLineEnds ]
-        && Drawn.layoutNotes Rust [ Numbered 1 "fn x", Numbered 2 "fn y" ]
-        == []
+        && markupText (drawn Rust layoutRows) == "fn x\n\tfn y"
+        && markupText (plainDrawn Rust layoutRows) == "fn x\n\tfn y"
+        && Drawn.layoutNotes Rust [ Numbered 1 (mark ++ "fn x\r"), Numbered 2 "fn y" ] == [ ByteOrderMark, CrlfLineEnds ]
+        && Drawn.layoutNotes Rust [ Numbered 1 "fn x", Numbered 2 "fn y" ] == []
         && List.all (\code -> escapes (codeText code) (drawn Rust [ Numbered 1 ("a" ++ codeText code ++ "b") ])) [ 7, 27, 127, 133, 155, 8203, 8238, 8294, 65279 ]
         && List.all (\code -> escapes (codeText code) (plainDrawn Rust [ Numbered 1 ("a" ++ codeText code ++ "b") ])) [ 7, 27, 127, 133, 155, 8203, 8238, 8294, 65279 ]
         && escapes "\r" (plainDrawn Shell [ Numbered 1 "cd /x\r" ])
@@ -690,10 +677,8 @@ layoutOnlyWhereLanguageReadsIt =
         && escapes mark (drawn Unknown [ Numbered 1 (mark ++ "x") ])
         && escapes "\r" (drawn Shell [ Numbered 1 "cd /x\r" ])
         && escapes "\r" (drawn Rust [ Numbered 1 "a\rb" ])
-        && Drawn.layoutNotes Shell [ Numbered 1 (mark ++ "cd /x\r") ]
-        == []
-        && Drawn.layoutNotes Rust [ Numbered 2 (mark ++ "fn x") ]
-        == []
+        && Drawn.layoutNotes Shell [ Numbered 1 (mark ++ "cd /x\r") ] == []
+        && Drawn.layoutNotes Rust [ Numbered 2 (mark ++ "fn x") ] == []
 
 
 -- A layout's two facts alone decide what a line loses: where its grammar
@@ -711,32 +696,21 @@ layoutDecidesWhatIsHidden =
         hiding =
             { lineEnds = CrlfIsOneBreak, leadingMark = MarkSkipped }
     in
-    Drawn.layoutLine hiding 1 line
-        == "x"
-        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkIsText } 1 line
-        == line
-        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkSkipped } 1 line
-        == "x\r"
-        && Drawn.layoutLine { lineEnds = CrlfIsOneBreak, leadingMark = MarkIsText } 1 line
-        == mark
-        ++ "x"
-        && Drawn.layoutLine hiding 2 line
-        == mark
-        ++ "x"
-        && Drawn.layoutLine hiding 1 "a\rb"
-        == "a\rb"
+    Drawn.layoutLine hiding 1 line == "x"
+        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkIsText } 1 line == line
+        && Drawn.layoutLine { lineEnds = CrIsText, leadingMark = MarkSkipped } 1 line == "x\r"
+        && Drawn.layoutLine { lineEnds = CrlfIsOneBreak, leadingMark = MarkIsText } 1 line == mark ++ "x"
+        && Drawn.layoutLine hiding 2 line == mark ++ "x"
+        && Drawn.layoutLine hiding 1 "a\rb" == "a\rb"
 
 
 -- A Rust `br"…"` or `cr"…"` is a raw string: its `\` escapes nothing, so
 -- the string closes at its quote and the next row is code.
 rawPrefixedStrings : Bool
 rawPrefixedStrings =
-    Highlight.tokenize Rust "br\"\\\" x"
-        == [ Str "br\"\\\"", Plain " ", Ident "x" ]
-        && Highlight.tokenize Rust "cr#\"a\"#"
-        == [ Str "cr#\"a\"#" ]
-        && Highlight.tokenize Rust "break crate"
-        == [ Keyword "break", Plain " ", Keyword "crate" ]
+    Highlight.tokenize Rust "br\"\\\" x" == [ Str "br\"\\\"", Plain " ", Ident "x" ]
+        && Highlight.tokenize Rust "cr#\"a\"#" == [ Str "cr#\"a\"#" ]
+        && Highlight.tokenize Rust "break crate" == [ Keyword "break", Plain " ", Keyword "crate" ]
         && rawRowCloses
 
 
@@ -757,8 +731,7 @@ heredocBodies : Bool
 heredocBodies =
     case Drawn.rowLines Shell [ Numbered 1 "cat <<EOF", Numbered 2 "don't", Numbered 3 "EOF", Numbered 4 "rm -rf x" ] of
         [ _, _, _, TokenLine 4 fourth ] ->
-            fourth
-                == [ Ident "rm", Plain " ", Plain "-", Ident "rf", Plain " ", Ident "x" ]
+            fourth == [ Ident "rm", Plain " ", Plain "-", Ident "rf", Plain " ", Ident "x" ]
                 && heredocTabs
                 && hereStringCarries
                 && List.member (Ident "rm") (Highlight.tokenize Shell "cat <<EOF\ndon't\nEOF\nrm -rf x")
@@ -843,22 +816,14 @@ decisionReachedOnlyThroughDecidableSource =
         app <- File.readFileLimit appPath (ByteSize.kib 64)
         mainSrc <- File.readFileLimit mainPath (ByteSize.kib 64)
         Task.succeed
-            (count "Queue.decide " app
-                == 1
-                && count "decideOn " app
-                == 3
-                && count oneCall (squashed app)
-                == 1
-                && count "Queue.decideRefusal " app
-                == 1
-                && count oneRefusalCall (squashed app)
-                == 1
-                && count "Queue.decide " mainSrc
-                == 0
-                && count "decideOn" mainSrc
-                == 0
-                && count "decideRefusal" mainSrc
-                == 0
+            (count "Queue.decide " app == 1
+                && count "decideOn " app == 3
+                && count oneCall (squashed app) == 1
+                && count "Queue.decideRefusal " app == 1
+                && count oneRefusalCall (squashed app) == 1
+                && count "Queue.decide " mainSrc == 0
+                && count "decideOn" mainSrc == 0
+                && count "decideRefusal" mainSrc == 0
             )
 
 
@@ -867,10 +832,8 @@ checks =
     Task.sequence
         [ Task.succeed
             ( "formatReviewedAt renders UTC"
-            , Format.formatReviewedAt (Timestamp.fromUnixMillis 0)
-                == "1970-01-01 00:00:00"
-                && Format.formatReviewedAt (Timestamp.fromUnixMillis 1700000000000)
-                == "2023-11-14 22:13:20"
+            , Format.formatReviewedAt (Timestamp.fromUnixMillis 0) == "1970-01-01 00:00:00"
+                && Format.formatReviewedAt (Timestamp.fromUnixMillis 1700000000000) == "2023-11-14 22:13:20"
             )
         , Task.succeed
             ( "highlight: rust keywords vs identifiers"
@@ -895,16 +858,11 @@ checks =
             )
         , Task.succeed
             ( "percent: decided over queued"
-            , Format.percent 3 4
-                == "75%"
-                && Format.percent 0 4
-                == "0%"
-                && Format.percent 4 4
-                == "100%"
-                && Format.percent 5 4
-                == "125%"
-                && Format.percent 0 0
-                == "0%"
+            , Format.percent 3 4 == "75%"
+                && Format.percent 0 4 == "0%"
+                && Format.percent 4 4 == "100%"
+                && Format.percent 5 4 == "125%"
+                && Format.percent 0 0 == "0%"
             )
         , Task.succeed ( "keyboard shortcuts map to the button msgs", testKeys )
         , check "a decision reaches Queue.decide only through the decidable source" decisionReachedOnlyThroughDecidableSource
@@ -921,16 +879,11 @@ checks =
         , Task.succeed ( "a one-mebibyte block comment is one token", largeTokenTokenizes )
         , Task.succeed
             ( "an escaped quote stays inside its string literal"
-            , Highlight.tokenize Highlight.Rust "\"a\\\"b\" c"
-                == [ Str "\"a\\\"b\"", Plain " ", Ident "c" ]
-                && Highlight.tokenize Highlight.Rust "\"ab\\"
-                == [ Plain "\"ab\\" ]
-                && Highlight.tokenize Highlight.Rust "x // c\ny"
-                == [ Ident "x", Plain " ", Comment "// c", Plain "\n", Ident "y" ]
-                && Highlight.tokenize Highlight.Rust "a/b**/"
-                == [ Ident "a", Plain "/", Ident "b", Plain "*", Plain "*", Plain "/" ]
-                && Highlight.tokenize Highlight.Rust "/**/1.5_"
-                == [ Comment "/**/", Num "1.5_" ]
+            , Highlight.tokenize Highlight.Rust "\"a\\\"b\" c" == [ Str "\"a\\\"b\"", Plain " ", Ident "c" ]
+                && Highlight.tokenize Highlight.Rust "\"ab\\" == [ Plain "\"ab\\" ]
+                && Highlight.tokenize Highlight.Rust "x // c\ny" == [ Ident "x", Plain " ", Comment "// c", Plain "\n", Ident "y" ]
+                && Highlight.tokenize Highlight.Rust "a/b**/" == [ Ident "a", Plain "/", Ident "b", Plain "*", Plain "*", Plain "/" ]
+                && Highlight.tokenize Highlight.Rust "/**/1.5_" == [ Comment "/**/", Num "1.5_" ]
             )
         , Task.succeed ( "a 256 KiB one-line Rust unit draws as one row", hugeLineRows Rust )
         , Task.succeed ( "a 256 KiB one-line Ipe unit draws as one row", hugeLineRows Ipe )
@@ -942,6 +895,7 @@ checks =
         , Task.succeed ( "references over a 64Ki-token unit finish", hugeLinks )
         , Task.succeed ( "a 256 KiB URL word and 64Ki URL words are trimmed", hugeUrls )
         , Task.succeed ( "a 256 KiB token with one U+202E is three segments", hugeSegments )
+        , Task.succeed ( "a 128Ki-escape text renders and joins in one linear pass", hugeEscapeRuns )
         , Task.succeed ( "a million-line residual keeps every uncovered line", hugeResidual )
         , Task.succeed ( "a CRLF \\r is a line break in Rust and text in shell", crlfByLanguage )
         , Task.succeed ( "a run of source lines copies as the source spells it, line numbers apart", sourceCopiesAsWritten )

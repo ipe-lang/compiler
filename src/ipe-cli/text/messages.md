@@ -204,6 +204,10 @@ ipe package publish: expected a single <path> argument
 
 directory supplied but no package.ipe found inside it
 
+## webview-needs-manifest
+
+a `web desktop` build needs a project: its desktop window comes from `delivery.desktop` in `package.ipe`, and this entry file has none
+
 ## legacy-toml-hint
 
 no package.ipe in this directory (found a legacy ipe.toml — package.ipe is the project manifest the toolchain reads)
@@ -714,6 +718,19 @@ the project's build directory
 ## cli-target-dir-user-cache
 
 the per-user build cache the compiler would build in instead
+
+## cli-target-dir-scratch-cache
+
+the shared test build directory in the per-user cache
+
+## cli-test-target-busy
+
+another `ipe test` held the test build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe test` is running, or set `CARGO_TARGET_DIR` to build elsewhere
+
+## cli-bundled-manifest
+
+could not prepare the bundled runtime manifest: {detail}
+  the build was stopped rather than link a runtime of unknown identity
 
 ## cli-target-dir-sysroot
 

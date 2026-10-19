@@ -189,7 +189,7 @@ fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
             .expect("canonical project dir");
         assert_eq!(
             name_pkg,
-            ipe_backend_rust::crate_identity("crc32-checksum", &canonical),
+            ipe_backend_rust::crate_identity("crc32-checksum", &canonical).as_str(),
             "the emitted crate is the project name plus its canonical directory"
         );
 

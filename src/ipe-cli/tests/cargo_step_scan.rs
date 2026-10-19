@@ -380,11 +380,14 @@ fn a_program_not_naming_cargo_is_left_to_the_spawn_inventory() {
 ///
 /// A build is handed the resolved build directory, and the metadata query
 /// reads the Cargo config's pin with the variable removed, so it never reads
-/// back what ipe sets. Resolving or replaying a lockfile writes no build output, so
-/// neither is held to anything.
+/// back what ipe sets. A clean removes build output, so it takes the build's
+/// whole environment (the resolved build directory included) and can never
+/// clean another directory. Resolving or replaying a lockfile writes no build
+/// output, so neither is held to anything.
 const TARGET_DIR_RULES: &[(&str, Option<&str>)] = &[
     ("build", Some(".env(\"CARGO_TARGET_DIR\",target_dir)")),
     ("metadata", Some(".env_remove(\"CARGO_TARGET_DIR\")")),
+    ("clean", Some("forward_build_env(&build,&mutclean)")),
     ("generate-lockfile", None),
     ("update", None),
 ];

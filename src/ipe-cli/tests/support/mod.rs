@@ -111,14 +111,18 @@ pub fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// The directory holding a golden's `main.rs` — i.e. `golden.parent()` — with a
-/// non-panicking fallback (a golden path built as `<dir>/main.rs` always has a
-/// parent; the fallback keeps this `expect`-free under the workspace-wide
-/// `clippy::expect_used` deny). Centralises the derivation for the 40+ golden
-/// tests that need it rather than copy-pasting `golden.parent().expect(...)`.
-#[allow(dead_code)] // shared helper: used by the 45 byte-diff goldens, not every binary
-pub fn golden_dir_of(golden: &Path) -> &Path {
-    golden.parent().unwrap_or(golden)
+/// The source file of module `module` (dotted, `Lib.Rows`) in the golden
+/// project `dir`: `dir/src/Lib/Rows.ipe`.
+///
+/// Every golden is a project whose modules live under `src/`; this is the one
+/// place a test spells that layout.
+#[must_use]
+#[allow(dead_code)] // shared helper: not every golden test binary reads a golden source
+pub fn golden_source(dir: &Path, module: &str) -> PathBuf {
+    let mut path = dir.join("src");
+    path.extend(module.split('.'));
+    path.set_extension("ipe");
+    path
 }
 
 /// Render a minimal `package.ipe` manifest body naming `name` — the project

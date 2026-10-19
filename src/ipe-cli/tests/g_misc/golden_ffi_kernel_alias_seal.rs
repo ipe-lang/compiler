@@ -24,31 +24,17 @@
 use std::fs;
 use std::path::PathBuf;
 
-fn write_project(dir: &std::path::Path, main: &str) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), main).is_ok()
-}
-
 /// Build the user project and assert `ipe` rejects it with the origin-gate
 /// diagnostic `NameError::KernelAliasInUserSource` (IPE-N0042).
-fn assert_rejected_as_user_kernel_alias(sub_dir: &str, out_dir: &str, main: &str) {
+#[allow(clippy::expect_used)] // a fixture-setup failure must fail the test loudly
+fn assert_rejected_as_user_kernel_alias(out_dir: &str, main: &str) {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = crate::support::scratch_root().join(sub_dir);
-    assert!(
-        write_project(&tmp, main),
-        "must write the fixture project to a temp dir"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ipe::RootFixture::main(main).expect("the fixture project resolves");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_dir);
     let _ = fs::remove_dir_all(&out);
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
     let is_user_kernel_alias = matches!(
         &built,
         Err(ipe::CliError::Pipeline { diag, .. })
@@ -72,7 +58,6 @@ fn assert_rejected_as_user_kernel_alias(sub_dir: &str, out_dir: &str, main: &str
 #[test]
 fn user_alias_to_unregistered_kernel_is_rejected() {
     assert_rejected_as_user_kernel_alias(
-        "ipec_196_ffi_kernel_alias_unknown",
         "m196_unknown_kernel_alias_out",
         "module Main exposing (main)\n\
          import Ipe.Io as Io\n\n\
@@ -88,7 +73,6 @@ fn user_alias_to_unregistered_kernel_is_rejected() {
 #[test]
 fn user_alias_with_malformed_string_is_rejected() {
     assert_rejected_as_user_kernel_alias(
-        "ipec_196_ffi_kernel_alias_malformed",
         "m196_malformed_kernel_alias_out",
         "module Main exposing (main)\n\
          import Ipe.Io as Io\n\n\
@@ -107,7 +91,6 @@ fn user_alias_with_malformed_string_is_rejected() {
 #[test]
 fn user_alias_to_registered_kernel_is_still_rejected() {
     assert_rejected_as_user_kernel_alias(
-        "ipec_196_ffi_kernel_alias_registered",
         "m196_registered_kernel_alias_out",
         "module Main exposing (main)\n\
          import Ipe.Io as Io\n\n\

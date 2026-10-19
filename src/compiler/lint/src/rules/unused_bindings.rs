@@ -80,6 +80,7 @@ fn walk_expr(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
         Expr_::Access(rec, _) => walk_expr(ctx, rec, out),
         Expr_::VarLocal(_)
         | Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)
@@ -187,6 +188,7 @@ fn collect_used(expr: &Expr, used: &mut HashSet<Symbol>) {
         }
         Expr_::Access(rec, _) => collect_used(rec, used),
         Expr_::VarQual(_, _)
+        | Expr_::TaskAndThen
         | Expr_::Int(_)
         | Expr_::Float(_)
         | Expr_::Str(_)

@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """SSOT for the e2e SEAL shard partition: its selection, its plan, its wiring.
 
-A shard's test selection is defined here once. `--plan` publishes every
-shard's selection as the `changes` job output `e2e_plan`; each `e2e` matrix
-shard runs `cargo nextest run` on its own entry of that plan, and `seal-slice`
-proves (`tools/scripts/e2e-shard-cover.py`, from the run's own nextest archive)
-that the same plan partitions the archive exactly: every test is selected by
-exactly one shard and no shard selects a test outside the archive. `--lint`
-proves ci.yml wires exactly that: the `e2e` matrix enumerates shards
-1..SHARDS, its one nextest run reads its selection only from the plan, and
-`seal-slice` proves the cover of that same plan; artifact-guard runs it.
+A shard's test selection is defined here once, as an ordered table of shard
+groups whose last group takes the complement. `--plan` publishes every shard's
+selection as the `changes` job output `e2e_plan`; each `e2e` matrix shard runs
+`cargo nextest run` on its own entry of that plan, and `seal-slice-cover`
+proves (`tools/scripts/e2e-shard-cover.py`, from the run's own nextest archive,
+in parallel with the shards) that the same plan partitions the archive exactly:
+every test is selected by exactly one shard and no shard selects a test outside
+the archive. `seal-slice` is the phase verdict over the shards and that proof.
+`--lint` proves the group table is well formed and ci.yml wires exactly that:
+the `e2e` matrix enumerates shards 1..SHARDS, its one nextest run reads its
+selection only from the plan, the cover of that same plan runs once, only in
+`seal-slice-cover`, unconditionally, and `seal-slice` needs it; artifact-guard
+runs it.
 
 Modes:
   --plan    write `plan=<JSON {"K": {"filter", "partition"}}>` to $GITHUB_OUTPUT.
-  --lint    fail unless ci.yml wires the plan, the shards and the cover exactly.
+  --lint    fail unless the groups are well formed and ci.yml wires the plan,
+            the shards and the cover exactly.
 
 Every failure exits non-zero; an unwritable output or an unexpected shape is a
 failure, never a pass.
@@ -31,11 +36,14 @@ CI_WORKFLOW = os.path.join(REPO, ".github", "workflows", "ci.yml")
 E2E_JOB = "e2e"
 CHANGES_JOB = "changes"
 SEAL_SLICE_JOB = "seal-slice"
+SEAL_COVER_JOB = "seal-slice-cover"
+TEST_PREP_JOB = "test-prep"
 PLAN_INVOCATION = "python3 .github/ci/e2e_shard.py --plan"
 PLAN_STEP_ID = "e2e-plan"
 PLAN_OUTPUT = "e2e_plan"
 PLAN_OUTPUT_VALUE = "${{ steps.e2e-plan.outputs.plan }}"
-COVER_INVOCATION = "python3 tools/scripts/e2e-shard-cover.py"
+COVER_SCRIPT = "tools/scripts/e2e-shard-cover.py"
+COVER_INVOCATION = f"python3 {COVER_SCRIPT}"
 COVER_ENV = {"E2E_PLAN": "${{ needs.changes.outputs.e2e_plan }}"}
 _SHARD_ENTRY = "fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard]"
 SHARD_ENV = {
@@ -46,17 +54,89 @@ SHARD_ENV = {
 # The goldens whose emitted project drives a real multi-minute cold `cargo
 # build` (webview/wry, server/axum, the live-HTTP set, the watch daemons). The
 # `ci` nextest profile serializes this set into `heavy-server-e2e`
-# (max-threads=1), so the HEAVY shards spread it across parallel runners and
-# the LIGHT shards run the heavy-free complement at full width.
+# (max-threads=1), so its tests are spread across parallel runners rather than
+# queued behind each other on one.
 HEAVY = (
     "binary(watch_sigterm) | binary(watch_integration) | binary(watch_hot_appearance)"
     " | binary(watch_bluegreen) | binary(watch_cancellation) | binary(server_e2e)"
     " | binary(live_e2e) | binary(http_e2e) | binary(g_http_live) | binary(webview_e2e)"
     " | binary(secured_store_e2e) | binary(server_shutdown_e2e) | binary(test_command) | binary(verify) | binary(stdlib_coverage_dynamic)"
 )
-HEAVY_SHARDS = 5
-LIGHT_SHARDS = 9
-SHARDS = HEAVY_SHARDS + LIGHT_SHARDS
+COMPLEMENT = "all()"
+
+# The shard groups, in order: `(name, filter, shards)`. Group i selects
+# `filter_i` minus every earlier group's filter (`effective_filters`), and the
+# last group's filter is `COMPLEMENT`, so every test is in exactly one group
+# whatever the filters match; each group's tests are split by
+# `--partition count:k/shards`. The sizes balance measured test time and are
+# advisory only: a test no named group matches still runs in the complement,
+# and `e2e-shard-cover.py` proves the partition on every run's archive.
+# - each multi-minute `stdlib_coverage_dynamic` column test gets a shard alone,
+#   since the heavy group runs serially and either one would set a shard's
+#   length;
+# - the rest of the serialized heavy set;
+# - the two longest light binaries, kept apart from the rest so their tests
+#   spread evenly instead of landing in one complement shard;
+# - the complement, at full width.
+GROUPS: tuple[tuple[str, str, int], ...] = (
+    ("coverage-build-run", "binary(stdlib_coverage_dynamic) & test(=build_run_column_over_a_representative_slice)", 1),
+    ("coverage-dynamic-columns", "binary(stdlib_coverage_dynamic) & test(=dynamic_columns_pass_over_the_whole_surface)", 1),
+    ("heavy", HEAVY, 3),
+    ("db-issues", "binary(g_db) | binary(g_issues)", 3),
+    ("light", COMPLEMENT, 6),
+)
+
+
+class ShardError(Exception):
+    """A shard index, group table, listing, or workflow shape that proves nothing."""
+
+
+def group_errors(groups: object) -> list[str]:
+    """Return why `groups` is not an ordered group table whose last filter takes the complement, or []."""
+    if not isinstance(groups, tuple) or not groups:
+        return ["the shard groups must be a non-empty tuple"]
+    errors: list[str] = []
+    names: set[str] = set()
+    for i, group in enumerate(groups, start=1):
+        if not isinstance(group, tuple) or len(group) != 3:
+            errors.append(f"group {i} must be a (name, filter, shards) tuple")
+            continue
+        name, filt, shards = group
+        if not isinstance(name, str) or not name.strip() or not name.isascii():
+            errors.append(f"group {i} has an empty or non-ASCII name")
+        elif name in names:
+            errors.append(f"group {i} repeats the name {name!r}")
+        else:
+            names.add(name)
+        if not isinstance(filt, str) or not filt.strip() or not filt.isascii():
+            errors.append(f"group {i} ({name!r}) has an empty or non-ASCII filter")
+        if isinstance(shards, bool) or not isinstance(shards, int) or shards < 1:
+            errors.append(f"group {i} ({name!r}) must run on at least one shard, got {shards!r}")
+    last = groups[-1]
+    if not isinstance(last, tuple) or len(last) != 3 or last[1] != COMPLEMENT:
+        errors.append(f"the last group's filter must be `{COMPLEMENT}`, so a test no named group matches still runs")
+    return errors
+
+
+def shard_total(groups: tuple[tuple[str, str, int], ...]) -> int:
+    """Return how many shards `groups` spreads over, refusing a malformed table."""
+    errors = group_errors(groups)
+    if errors:
+        raise ShardError("; ".join(errors))
+    return sum(shards for _, _, shards in groups)
+
+
+def effective_filters(groups: tuple[tuple[str, str, int], ...]) -> list[str]:
+    """Return each group's selection: its own filter minus every earlier group's."""
+    shard_total(groups)
+    out: list[str] = []
+    for i, (_, filt, _) in enumerate(groups):
+        earlier = " | ".join(f"({f})" for _, f, _ in groups[:i])
+        out.append(f"({filt}) & not ({earlier})" if earlier else f"({filt})")
+    return out
+
+
+SHARDS = shard_total(GROUPS)
 
 ARCHIVE_ARGS = ("--archive-file", "nextest.tar.zst", "--workspace-remap", ".", "--profile", "ci")
 # `--test-threads=2`: each E2E test drives a memory-heavy emitted-project
@@ -69,17 +149,17 @@ RUN_COMMAND = " ".join(
 )
 
 
-class ShardError(Exception):
-    """A shard index, listing, or workflow shape that proves nothing."""
-
-
-def selection(shard: int) -> list[str]:
+def selection(shard: int, groups: tuple[tuple[str, str, int], ...] = GROUPS) -> list[str]:
     """Return the nextest filter + partition arguments of one shard."""
-    if isinstance(shard, bool) or not isinstance(shard, int) or not 1 <= shard <= SHARDS:
-        raise ShardError(f"shard must be an integer in 1..{SHARDS}, got {shard!r}")
-    if shard <= HEAVY_SHARDS:
-        return ["-E", HEAVY, "--partition", f"count:{shard}/{HEAVY_SHARDS}"]
-    return ["-E", f"not ({HEAVY})", "--partition", f"count:{shard - HEAVY_SHARDS}/{LIGHT_SHARDS}"]
+    total = shard_total(groups)
+    if isinstance(shard, bool) or not isinstance(shard, int) or not 1 <= shard <= total:
+        raise ShardError(f"shard must be an integer in 1..{total}, got {shard!r}")
+    first = 1
+    for (_, _, shards), filt in zip(groups, effective_filters(groups), strict=True):
+        if shard < first + shards:
+            return ["-E", filt, "--partition", f"count:{shard - first + 1}/{shards}"]
+        first += shards
+    raise ShardError(f"shard {shard} falls in no group")
 
 
 def plan() -> dict[str, dict[str, str]]:
@@ -103,7 +183,8 @@ def write_plan(path: str) -> int:
     except OSError as exc:
         print(f"e2e_shard: GITHUB_OUTPUT is unwritable: {exc}", file=sys.stderr)
         return 1
-    print(f"e2e_shard: planned {SHARDS} shards ({HEAVY_SHARDS} heavy, {LIGHT_SHARDS} light).")
+    sizes = ", ".join(f"{name} {shards}" for name, _, shards in GROUPS)
+    print(f"e2e_shard: planned {SHARDS} shards ({sizes}).")
     return 0
 
 
@@ -136,12 +217,15 @@ def _exact_step(steps: list[dict], text: str, what: str) -> tuple[dict | None, l
     return step, errors
 
 
-def wiring_errors(workflow: dict) -> list[str]:
+def wiring_errors(workflow: dict, groups: tuple[tuple[str, str, int], ...] = GROUPS) -> list[str]:
     """Return why ci.yml could run a shard, or prove a cover, off the SSOT plan, or []."""
+    errors = group_errors(groups)
+    if errors:
+        return errors
+    total = shard_total(groups)
     jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
     if not isinstance(jobs, dict):
         return ["ci.yml has no jobs"]
-    errors: list[str] = []
     changes = jobs.get(CHANGES_JOB)
     if not isinstance(changes, dict):
         errors.append(f"ci.yml has no `{CHANGES_JOB}` job")
@@ -163,8 +247,8 @@ def wiring_errors(workflow: dict) -> list[str]:
     matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
     if not isinstance(matrix, dict) or set(matrix) != {"shard"}:
         errors.append(f"`{E2E_JOB}` matrix must have exactly one key, `shard`")
-    elif matrix["shard"] != list(range(1, SHARDS + 1)):
-        errors.append(f"`{E2E_JOB}` matrix shard is {matrix['shard']!r}, expected 1..{SHARDS}")
+    elif matrix["shard"] != list(range(1, total + 1)):
+        errors.append(f"`{E2E_JOB}` matrix shard is {matrix['shard']!r}, expected 1..{total}")
     if CHANGES_JOB not in _needs(job):
         errors.append(f"`{E2E_JOB}` must need `{CHANGES_JOB}`, the job that publishes the plan")
     steps = _steps(job)
@@ -182,13 +266,28 @@ def wiring_errors(workflow: dict) -> list[str]:
     seal = jobs.get(SEAL_SLICE_JOB)
     if not isinstance(seal, dict):
         errors.append(f"ci.yml has no `{SEAL_SLICE_JOB}` job")
-    else:
-        if CHANGES_JOB not in _needs(seal):
-            errors.append(f"`{SEAL_SLICE_JOB}` must need `{CHANGES_JOB}`, the job that publishes the plan")
-        step, errs = _exact_step(_steps(seal), COVER_INVOCATION, f"`{SEAL_SLICE_JOB}`")
-        errors += errs
-        if step is not None and step.get("env") != COVER_ENV:
-            errors.append(f"`{SEAL_SLICE_JOB}`: the cover step's env must be exactly {COVER_ENV}")
+    elif SEAL_COVER_JOB not in _needs(seal):
+        errors.append(f"`{SEAL_SLICE_JOB}` must need `{SEAL_COVER_JOB}`, so its verdict cannot omit the cover")
+    for job_id, other in jobs.items():
+        if job_id != SEAL_COVER_JOB and any(_runs(s, COVER_SCRIPT) for s in _steps(other)):
+            errors.append(f"job {job_id!r} runs the cover outside `{SEAL_COVER_JOB}`")
+    cover_job = jobs.get(SEAL_COVER_JOB)
+    if not isinstance(cover_job, dict):
+        errors.append(f"ci.yml has no `{SEAL_COVER_JOB}` job")
+        return errors
+    for need in (CHANGES_JOB, TEST_PREP_JOB):
+        if need not in _needs(cover_job):
+            errors.append(f"`{SEAL_COVER_JOB}` must need `{need}`, the job that publishes the plan and the archive")
+    cover_steps = _steps(cover_job)
+    if sum(_runs(s, COVER_SCRIPT) for s in cover_steps) != 1:
+        errors.append(f"`{SEAL_COVER_JOB}` must run the cover in exactly one step")
+    step, errs = _exact_step(cover_steps, COVER_INVOCATION, f"`{SEAL_COVER_JOB}`")
+    errors += errs
+    if step is not None:
+        if "if" in step:
+            errors.append(f"`{SEAL_COVER_JOB}`: the cover step must carry no `if:`; a skipped step leaves the job green")
+        if step.get("env") != COVER_ENV:
+            errors.append(f"`{SEAL_COVER_JOB}`: the cover step's env must be exactly {COVER_ENV}")
     return errors
 
 
@@ -203,12 +302,12 @@ def lint(path: str = CI_WORKFLOW) -> int:
     except Exception as exc:  # noqa: BLE001  # any read or parse failure is a refusal
         print(f"e2e shard lint: ci.yml is unreadable: {exc}", file=sys.stderr)
         return 1
-    errors = wiring_errors(workflow)
+    errors = [*group_errors(GROUPS), *wiring_errors(workflow)]
     for err in errors:
         print(f"e2e shard lint: {err}", file=sys.stderr)
     if errors:
         return 1
-    print(f"e2e shard lint: ci.yml runs shards 1..{SHARDS} from the plan and proves its cover.")
+    print(f"e2e shard lint: ci.yml runs shards 1..{SHARDS} from the plan and proves its cover in `{SEAL_COVER_JOB}`.")
     return 0
 
 

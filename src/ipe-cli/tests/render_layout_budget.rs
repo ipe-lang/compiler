@@ -1,5 +1,5 @@
 //! The layout-cost bound over the golden corpus: every function body of every
-//! lowerable `tests/golden/*/Main.ipe` lays out within an eighth of the
+//! lowerable `tests/golden/*/src/Main.ipe` lays out within an eighth of the
 //! renderer's fuel, never falling back to its plain layout.
 //!
 //! Each entry is lowered through the build's front-end seam (compiled-source
@@ -21,7 +21,7 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Every golden fixture directory that carries a `Main.ipe` entry, sorted.
+/// Every golden project's `src/Main.ipe` entry, sorted.
 fn golden_entries() -> Vec<PathBuf> {
     let golden = repo_root().join("tests").join("golden");
     let mut entries = Vec::new();
@@ -29,7 +29,7 @@ fn golden_entries() -> Vec<PathBuf> {
         return entries;
     };
     for dir in read.flatten() {
-        let entry = dir.path().join("Main.ipe");
+        let entry = dir.path().join("src").join("Main.ipe");
         if entry.is_file() {
             entries.push(entry);
         }
@@ -38,10 +38,11 @@ fn golden_entries() -> Vec<PathBuf> {
     entries
 }
 
-/// The fixture directory name of `entry`.
+/// The golden project's directory name for `entry`, looking past its `src/` root.
 fn fixture_name(entry: &Path) -> String {
     entry
         .parent()
+        .and_then(Path::parent)
         .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()

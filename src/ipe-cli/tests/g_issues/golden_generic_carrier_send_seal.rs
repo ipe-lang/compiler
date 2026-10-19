@@ -17,11 +17,8 @@ const GOLDEN: &str = "generic_carrier_send_seal";
 /// The helpers carrying their generic `a` under a `Cmd` / `Sub` in the body only.
 const HELPERS: [&str; 4] = ["subMapped", "cmdMapped", "subDiscarded", "cmdDiscarded"];
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// The bounds of the first generic `T1` of the `Main` function spelled `ipe_name`.
@@ -52,12 +49,12 @@ fn first_generic_of<'a>(main_rs: &'a str, ipe_name: &str) -> Option<&'a str> {
 #[test]
 fn generic_carrier_send_bounds_emitted() {
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
@@ -78,12 +75,12 @@ fn generic_carrier_send_bounds_emitted() {
 #[test]
 fn generic_carrier_send_seal_builds() {
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"

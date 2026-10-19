@@ -4,7 +4,7 @@
 //! A typed `Url` is matched through a `case` chain over `parse` of `s` / `int` /
 //! `string` / `slash` / `top` / `withQuery` / `query` patterns, reading captures
 //! with `firstInt` / `firstString` / `firstQuery`
-//! (`tests/golden/url_parser_combinators/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧
+//! (`tests/golden/url_parser_combinators/src/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧
 //! run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs) and the matched
 //! routes are rendered (`blog:42 user:alice home search:rust nomatch`), proving
 //! the pure-data patterns lower over the shipped `Ipe.Url` accessors. Path
@@ -32,14 +32,13 @@ fn url_parser_combinators_ipec_cargo_and_run_zero() {
         .join("tests")
         .join("golden")
         .join("url_parser_combinators");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_url_parser_combinators_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiling a program that calls the routing combinators must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for url_parser_combinators: {:?}",

@@ -31,20 +31,16 @@ fn fixture(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("retry_policy_field_access_ice")
-        .join("Main.ipe")
 }
 
 fn fixture_named(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+    root.join("tests").join("golden").join(name)
 }
 
 fn built(root: &Path, out: &Path) -> Result<(), CliError> {
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&fixture(root), out, &runtime)
+    crate::support::build_golden(&fixture(root), out, &runtime)
 }
 
 /// The fix must not regress: a user record with a lone `shouldRetry` field is
@@ -52,11 +48,11 @@ fn built(root: &Path, out: &Path) -> Result<(), CliError> {
 #[test]
 fn retry_policy_nearmiss_still_rejects() {
     let root = repo_root();
-    let entry = fixture_named(&root, "retry_policy_shape_nearmiss");
+    let golden_dir = fixture_named(&root, "retry_policy_shape_nearmiss");
     let out = crate::support::scratch_root().join("ipec_i963_nearmiss_guard");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,

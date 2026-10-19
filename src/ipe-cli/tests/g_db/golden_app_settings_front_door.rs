@@ -24,11 +24,8 @@ use ipe_diagnostics::{
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
-        .join("Main.ipe")
+fn fixture_project(root: &Path, golden: &str) -> PathBuf {
+    root.join("tests").join("golden").join(golden)
 }
 
 /// THE SEAL: the settings-carrying web app is accepted and (under `IPE_E2E=1`)
@@ -37,12 +34,12 @@ fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
 fn app_settings_web_seal_builds() {
     const GOLDEN: &str = "app_settings_web_seal";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_web_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "a `Web.appWith` carrying a shape-checked settings list must be accepted, got: {built:?}"
@@ -57,12 +54,12 @@ fn app_settings_web_seal_builds() {
 fn hard_coded_db_url_secret_is_rejected() {
     const GOLDEN: &str = "app_settings_hardcoded_secret_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_hardcoded_secret_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("Secret")),
         Ok(()),
@@ -82,12 +79,12 @@ fn hard_coded_db_url_secret_is_rejected() {
 fn non_setting_in_settings_list_is_rejected() {
     const GOLDEN: &str = "app_settings_non_setting_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_non_setting_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("Setting")),
         Ok(()),
@@ -108,12 +105,12 @@ fn non_setting_in_settings_list_is_rejected() {
 fn bare_int_host_bind_is_rejected() {
     const GOLDEN: &str = "app_settings_bare_int_host_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_bare_int_host_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("HostMode")),
         Ok(()),
@@ -134,12 +131,12 @@ fn bare_int_host_bind_is_rejected() {
 fn bare_int_web_csrf_is_rejected() {
     const GOLDEN: &str = "app_settings_bare_int_csrf_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_bare_int_csrf_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("CsrfMode")),
         Ok(()),
@@ -160,12 +157,12 @@ fn bare_int_web_csrf_is_rejected() {
 fn auth_max_lifetime_seal_builds() {
     const GOLDEN: &str = "app_settings_auth_max_lifetime_seal";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_auth_max_lifetime_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "`Web.authMaxLifetime` must be accepted (no N0005) and emit a buildable crate, \
@@ -182,12 +179,12 @@ fn auth_max_lifetime_seal_builds() {
 fn auth_slide_window_seal_builds() {
     const GOLDEN: &str = "app_settings_auth_slide_window_seal";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_auth_slide_window_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "`Web.authSlideWindow` must be accepted (no N0005) and emit a buildable crate, \
@@ -205,12 +202,12 @@ fn auth_slide_window_seal_builds() {
 fn auth_revocation_seal_builds() {
     const GOLDEN: &str = "app_settings_auth_revocation_seal";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_auth_revocation_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "`Web.withRevocation Web.revocationStore` must be accepted (no N0005) and emit \
@@ -236,7 +233,7 @@ fn auth_revocation_seal_builds() {
 fn authed_route_revocation_vendored_declares_module() {
     const GOLDEN: &str = "authed_route_revocation_vendored_seal";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_authed_route_revocation_vendored_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -247,7 +244,7 @@ fn authed_route_revocation_vendored_declares_module() {
         runtime_dep: false,
         ..ipe::BuildOptions::default()
     };
-    let built = ipe::build_with_options(&entry, &out, &runtime, opts);
+    let built = ipe::build_golden_dir(&entry, &out, &runtime, &opts);
     assert!(
         built.is_ok(),
         "an `authed_route` program must be accepted under the vendored emit model, \
@@ -270,12 +267,12 @@ fn authed_route_revocation_vendored_declares_module() {
 fn bare_int_log_level_is_rejected() {
     const GOLDEN: &str = "app_settings_bare_int_loglevel_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_bare_int_loglevel_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("LogLevel")),
         Ok(()),
@@ -297,12 +294,12 @@ fn bare_int_log_level_is_rejected() {
 fn config_binding_threads_into_web_app_and_builds() {
     const GOLDEN: &str = "app_settings_config_binding";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_config_binding_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "a named `config` binding threaded into a `Web.tea` entry must be accepted \
@@ -319,12 +316,12 @@ fn config_binding_threads_into_web_app_and_builds() {
 fn discarded_config_binding_is_rejected() {
     const GOLDEN: &str = "app_settings_discarded_config_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_discarded_config_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_N0043, None),
         Ok(()),
@@ -346,12 +343,12 @@ fn discarded_config_binding_is_rejected() {
 fn from_env_required_seal_builds() {
     const GOLDEN: &str = "app_settings_fromenv_required_seal";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_fromenv_required_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "`App.fromEnvRequired` must be accepted and emit a buildable crate, got: {built:?}"
@@ -367,12 +364,12 @@ fn from_env_required_seal_builds() {
 fn console_token_settings_seal_builds() {
     const GOLDEN: &str = "app_settings_console_token_seal";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_console_token_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "`Console.adminToken`/`ingestToken`/`metricsToken` must be accepted and emit \
@@ -389,12 +386,12 @@ fn console_token_settings_seal_builds() {
 fn hard_coded_console_token_is_rejected() {
     const GOLDEN: &str = "app_settings_hardcoded_token_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_hardcoded_token_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_T0001, Some("Secret")),
         Ok(()),
@@ -416,12 +413,12 @@ fn hard_coded_console_token_is_rejected() {
 fn config_binding_beside_inline_appwith_is_rejected() {
     const GOLDEN: &str = "app_settings_config_beside_inline_appwith";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_app_settings_config_beside_inline_appwith");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert_eq!(
         judge_rejection(&built, IPE_N0043, None),
         Ok(()),
@@ -589,7 +586,7 @@ fn every_app_settings_fixture_is_exercised() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(FIXTURE_PREFIX) {
             assert!(
-                entry.path().join("Main.ipe").is_file(),
+                entry.path().join("src").join("Main.ipe").is_file(),
                 "{name}: fixture directory has no Main.ipe"
             );
             on_disk.push(name);

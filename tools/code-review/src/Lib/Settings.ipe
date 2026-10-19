@@ -12,6 +12,7 @@ import Ipe.String as String
 import Ipe.Task as Task
 import Lib.EnvLookup as EnvLookup
 import Lib.Epoch exposing (Epoch)
+import Lib.Label as Label
 import Lib.RepoPath as RepoPath exposing (PathError, RootMap, Tag)
 import Lib.ReviewKey exposing (ReviewKey)
 import Lib.SafeText as SafeText exposing (SafeText)
@@ -118,9 +119,9 @@ parseIndexSettings rawDb rawRoot rawRepos =
         root <- RepoPath.parseRoot rawRoot
         extra <- parseRepoRoots rawRepos
         roots <- ipeTag
-            |> Result.andThen (\tag -> RepoPath.rootMap (( tag, root ) :: extra))
-            |> Result.mapError rootsRefusal
-            |> Task.fromResult
+                    |> Result.andThen (\tag -> RepoPath.rootMap (( tag, root ) :: extra))
+                    |> Result.mapError rootsRefusal
+                    |> Task.fromResult
         Task.succeed { db = db, roots = roots }
 
 
@@ -156,7 +157,7 @@ rootsRefusal err =
         (SafeText.toString
             (SafeText.concat
                 [ SafeText.literal "IPE_INDEX_ROOT and IPE_INDEX_REPOS: "
-                , RepoPath.describe err
+                , Label.piecesText (RepoPath.describe err)
                 , SafeText.literal "; bind each repository once, `ipe` through IPE_INDEX_ROOT and every other through one IPE_INDEX_REPOS entry"
                 ]
             )

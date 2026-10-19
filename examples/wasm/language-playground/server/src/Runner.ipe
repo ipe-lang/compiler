@@ -139,12 +139,9 @@ splitLine line state =
 
 isBanner : String -> Bool
 isBanner line =
-    String.left 8 line
-        == "// ==== "
-        && String.right 5 line
-        == " ===="
-        && String.length line
-        > 13
+    String.left 8 line == "// ==== "
+        && String.right 5 line == " ===="
+        && String.length line > 13
 
 
 writeAll : String -> List ( String, String ) -> Task Error ()

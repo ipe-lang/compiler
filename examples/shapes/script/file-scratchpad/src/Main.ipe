@@ -1,12 +1,12 @@
 module Main exposing (main)
 
-import Ipe.File as File
-import Ipe.Path as Path exposing (Path)
-import Ipe.Task as Task
 import Ipe.Error exposing (Error)
-import Ipe.List as List
-import Ipe.String as String
+import Ipe.File as File
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Path as Path exposing (Path)
+import Ipe.String as String
+import Ipe.Task as Task
 
 
 -- A tiny scratchpad: create a fresh temp directory, write two notes into it,
@@ -22,25 +22,20 @@ main =
         -- `File.tempDir` returns the new directory's absolute path as a String.
         dir <- File.tempDir "scratchpad"
         Io.println ("scratch dir: " ++ dir)
-
         -- Build validated paths under it. `toPath` lifts the `Result` from
         -- `Path.fromString` into the task chain with `Task.fromResult`, so a
         -- bad path fails the whole task rather than slipping through.
         notePath <- toPath (dir ++ "/note.txt")
         todoPath <- toPath (dir ++ "/todo.txt")
-
         -- Write two files. `writeFile` overwrites; both return `Task Error ()`.
         File.writeFile notePath "remember to water the plants\n"
         File.writeFile todoPath "- ship the docs\n- rest\n"
-
         -- Read one back and print it.
         contents <- File.readFile notePath
         Io.println ("note.txt says: " ++ String.trim contents)
-
         -- Confirm existence through the typed path, and list the directory.
         present <- File.exists todoPath
         Io.println ("todo.txt exists: " ++ boolText present)
-
         dirPath <- toPath dir
         entries <- File.readDir dirPath
         Io.println ("entries: " ++ String.join ", " (List.sort entries))

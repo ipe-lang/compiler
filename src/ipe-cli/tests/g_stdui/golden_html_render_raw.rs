@@ -1,5 +1,5 @@
 //! End-to-end SEAL for the `Ipe.Html` render / raw / inline-script surface.
-//! Compiles `tests/golden/html_render_raw/Main.ipe` through `ipe`, builds the
+//! Compiles `tests/golden/html_render_raw/src/Main.ipe` through `ipe`, builds the
 //! emitted Rust project, runs it, and asserts on the rendered HTML. Gated on
 //! `IPE_E2E=1`.
 //!
@@ -36,12 +36,11 @@ fn html_render_escapes_text_and_emits_raw_and_script() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("html_render_raw");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_html_render_raw_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for html_render_raw: {:?}",

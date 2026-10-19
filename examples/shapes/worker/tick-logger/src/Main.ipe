@@ -14,8 +14,8 @@ third tick `subscriptions` becomes `Sub.none`, so the loop settles and the worke
 completes — no new socket or network capability, existing effects only.
 -}
 
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.String as String
 import Ipe.Task as Task
 import Ipe.Tea.Worker
 import Ipe.Tea.Worker.Cmd as Cmd

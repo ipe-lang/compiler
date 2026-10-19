@@ -18,6 +18,7 @@ import Lib.Format as Format
 -- module.
 import Lib.Highlight as Highlight
 import Lib.Index as Index exposing (Oversize(..), RefusalReason(..), SourceView(..), StaleReason(..))
+import Lib.Label as Label exposing (Label, LabelPiece(..))
 import Lib.Links as Links
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.ReviewKey as ReviewKey exposing (MacKey, ReviewKey(..))
@@ -119,8 +120,8 @@ standingFor unit read =
 -- as much of its location as tells it apart from every other unit on the
 -- same page. Kept as separate typed fields so no two parts can run together.
 type alias UnitLabel =
-    { kind : SafeText
-    , name : SafeText
+    { kind : Label
+    , name : Label
     , place : Place
     }
 
@@ -130,8 +131,8 @@ type alias UnitLabel =
 -- path and line are shared, so the uid, unique on a page, settles it.
 type Place
     = Named
-    | At SafeText Int
-    | AtUnit SafeText Int Uid
+    | At Label Int
+    | AtUnit Label Int Uid
 
 
 -- The one label builder: every label on screen comes from a unit's typed
@@ -182,16 +183,18 @@ shared counts key =
     Maybe.withDefault 0 (Dict.get key counts) > 1
 
 
--- Collision keys over length-prefixed parts, so no two different part lists
--- spell the same key.
+-- Collision keys over length-prefixed parts of the labels as shown, so no
+-- two different part lists spell the same key, and two units whose labels
+-- read alike (two long names cut to the same marker among them) count as
+-- shared and are told apart further.
 nameKey : Index.Unit -> String
 nameKey unit =
-    keyPart (SafeText.toString unit.kind) ++ keyPart (SafeText.toString unit.qualified)
+    keyPart (Label.key unit.kind) ++ keyPart (Label.key unit.qualified)
 
 
 placeKey : Index.Unit -> String
 placeKey unit =
-    nameKey unit ++ keyPart (SafeText.toString unit.path) ++ keyPart (String.fromInt unit.lineStart)
+    nameKey unit ++ keyPart (Label.key unit.path) ++ keyPart (String.fromInt unit.lineStart)
 
 
 keyPart : String -> String
@@ -466,7 +469,7 @@ ticketNumber ticket =
 -- (Nothing when the unit no longer exists there).
 type alias HistoryRow =
     { entry : LibDb.ReviewEntry
-    , name : Maybe SafeText
+    , name : Maybe Label
     }
 
 
@@ -1208,36 +1211,38 @@ unitPageStatusText state =
 
 
 -- Why a unit's source is withheld, in place of the source and the decision
--- buttons; Nothing only for a verified view.
-sourceStatusText : Index.SourceView -> Maybe SafeText
+-- buttons; Nothing only for a verified view. A line is the tool's text
+-- around at most the stored path, which arrives as the failure's own label,
+-- so no index column reaches the line but as a `Label`.
+sourceStatusText : Index.SourceView -> Maybe (List LabelPiece)
 sourceStatusText view =
     case view of
         Shown _ ->
             Nothing
 
         Stale Drifted ->
-            Just (SafeText.literal "Source changed since it was indexed; re-run `ipe-index index` to review it.")
+            Just [ ToolText (SafeText.literal "Source changed since it was indexed; re-run `ipe-index index` to review it.") ]
 
         Stale (RangeOutOfFile r) ->
-            Just (SafeText.literal ("The file now has " ++ String.fromInt r.lineCount ++ " lines, fewer than this unit's range; re-run `ipe-index index` to review it."))
+            Just [ ToolText (SafeText.literal ("The file now has " ++ String.fromInt r.lineCount ++ " lines, fewer than this unit's range; re-run `ipe-index index` to review it.")) ]
 
         Stale UnverifiableHash ->
-            Just (SafeText.literal "This unit's hash predates source attestation; re-run `ipe-index index` to verify it.")
+            Just [ ToolText (SafeText.literal "This unit's hash predates source attestation; re-run `ipe-index index` to verify it.") ]
 
         Unreadable failure ->
-            Just (SafeText.concat [ SafeText.literal "Source unreadable: ", Index.readFailureText failure ])
+            Just (ToolText (SafeText.literal "Source unreadable: ") :: Index.readFailureText failure)
 
         TooLarge (SpanLines o) ->
-            Just (SafeText.literal ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy))
+            Just [ ToolText (SafeText.literal ("This unit spans " ++ String.fromInt o.lines ++ " lines, past the " ++ String.fromInt Index.viewLineCeiling ++ "-line review ceiling." ++ notShownRemedy)) ]
 
         TooLarge (ViewBytes o) ->
-            Just (SafeText.literal ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy))
+            Just [ ToolText (SafeText.literal ("This unit's source is " ++ kibText (ByteSize.toBytes o.size) ++ ", past the " ++ kibText (ByteSize.toBytes Index.viewByteCeiling) ++ " review ceiling." ++ notShownRemedy)) ]
 
         TooLarge (ChildSpans o) ->
-            Just (SafeText.literal ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it."))
+            Just [ ToolText (SafeText.literal ("This file holds at least " ++ String.fromInt o.atLeast ++ " other units, past the " ++ String.fromInt Index.childSpanCeiling ++ "-unit review ceiling. It is not shown and cannot be decided here; split the file to review it.")) ]
 
         TooLarge (ViewNodes o) ->
-            Just (SafeText.literal ("This unit's source draws as " ++ String.fromInt o.nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling." ++ notShownRemedy))
+            Just [ ToolText (SafeText.literal ("This unit's source draws as " ++ String.fromInt o.nodes ++ " elements even without highlighting, past the " ++ String.fromInt Index.viewNodeCeiling ++ "-element review ceiling." ++ notShownRemedy)) ]
 
 
 -- What a reviewer can do about a view past a ceiling.

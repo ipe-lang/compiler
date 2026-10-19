@@ -9,6 +9,7 @@ import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
 import Lib.Db as LibDb exposing (HistoryCursor(..), ReviewEntry(..), StoredDecision(..), Unverified(..))
+import Lib.Label as Label exposing (LabelPart(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize exposing (PageSize)
 import Lib.Queue as Queue exposing (UnitPageState(..))
@@ -43,10 +44,8 @@ uidParseRefuses =
         , String.repeat 63 "a" ++ codeText 65345
         , String.repeat 63 "a" ++ codeText 1635
         ]
-        && Result.map Uid.toString (Uid.parse hex)
-        == Ok hex
-        && Result.map Uid.toString (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        && Result.map Uid.toString (Uid.parse hex) == Ok hex
+        && Result.map Uid.toString (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 
 -- True when `raw` is refused as invalid input.
@@ -70,8 +69,7 @@ routeUidRefusedNotQueried =
         && entryRefused ("../" ++ String.repeat 61 "a")
         && entryRefused (String.repeat 64 "F")
         && entryAccepted (uid "u-a")
-        && Maybe.map SafeText.toString (Queue.unitPageStatusText UnitIdRefused)
-        == Just "This address does not name a unit."
+        && Maybe.map SafeText.toString (Queue.unitPageStatusText UnitIdRefused) == Just "This address does not name a unit."
 
 
 entryRefused : String -> Bool
@@ -98,27 +96,28 @@ entryAccepted unit =
 
 
 -- A stored link target that is not a unit id builds no internal link: its
--- name shows as plain text, keyed apart from every internal link, whether it
+-- name shows as its label, keyed apart from every internal link, whether it
 -- came from a callgraph edge or a resolved reference. Red if `Internal` is
 -- built from an unparsed uid.
 badLinkUidRendersText : Bool
 badLinkUidRendersText =
     let
+        name =
+            Label.fromText Label.labelCap "app::x"
+
         edge =
-            Links.internal "app::x" "zz"
+            Links.internal name "zz"
 
         resolved =
-            Links.resolveCandidates [ [ "x" ] ] [ ( "x", "../evil" ) ]
+            Links.resolveCandidates [ [ "x" ] ] [ ( "x", Just "../evil" ) ]
     in
     isUnlinked edge
-        && SafeText.toString (Links.label edge)
-        == "app::x"
-        && Links.linkKey edge
-        == "t:app::x"
+        && Links.label edge == name
+        && Label.parts name == [ LabelText "app::x" ]
+        && Links.linkKey edge == "t:" ++ Label.key name
         && List.all isUnlinked resolved
-        && List.length resolved
-        == 1
-        && not (isUnlinked (Links.internal "app::y" (Uid.toString (uid "u-y"))))
+        && List.length resolved == 1
+        && not (isUnlinked (Links.internal (Label.fromText Label.labelCap "app::y") (Uid.toString (uid "u-y"))))
 
 
 isUnlinked : Link -> Bool

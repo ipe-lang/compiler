@@ -31,17 +31,16 @@ fn repo_root() -> PathBuf {
 #[test]
 fn i193_nonclone_fn_once_per_arm_rejected() {
     let root = repo_root();
-    let entry = root
+    let golden = root
         .join("tests")
         .join("golden")
-        .join("nonclone_fn_once_per_arm")
-        .join("Main.ipe");
+        .join("nonclone_fn_once_per_arm");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i193_nonclone_fn_once_per_arm_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "per-arm fn-value uses must SUM to 2 and Arc-promote the param \

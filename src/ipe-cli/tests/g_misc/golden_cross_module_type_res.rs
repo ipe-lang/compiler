@@ -13,7 +13,7 @@
 //! so they compile cleanly without the heuristic.  See `golden_i138_total_resolution`
 //! for the error-path regression gate.
 //!
-//! These tests only check that `ipe::build` succeeds (exit 0); they do NOT
+//! These tests only check that the example project builds (exit 0); they do NOT
 //! build or run the emitted Rust project and do NOT require `IPE_E2E`.
 //!
 //! Run:
@@ -21,14 +21,14 @@
 //! cargo test -p ipe --test golden_cross_module_type_res
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
     let joined = e2e_support::manifest_dir!().join("..").join("..");
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Compile an example's entry point with `ipe::build` and assert exit 0.
+/// Build the example project holding `entry_rel` (its `src/Main.ipe`) and assert exit 0.
 /// Skips silently when the runtime directory is not present (e.g. a minimal
 /// checkout without the embedded stdlib), so the test never fails in CI
 /// environments that only have the crates but not the full repo layout.
@@ -43,9 +43,10 @@ fn assert_ipec_exit0(label: &str, entry_rel: &str) {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    // Multi-module examples require sibling-discovery so imports like
-    // `import State exposing (..)` resolve to adjacent `.ipe` files.
-    let result = ipe::build_loose_file(&entry, &out, &runtime);
+    // The project is the directory above `src/`: its manifest roots every
+    // module an import like `import State exposing (..)` reaches.
+    let project = entry.parent().and_then(Path::parent).unwrap_or(&root);
+    let result = crate::support::build_golden(project, &out, &runtime);
     assert!(
         result.is_ok(),
         "ipec must compile {label} cleanly (exit 0): {:?}",

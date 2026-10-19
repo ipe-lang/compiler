@@ -38,12 +38,11 @@ fn runtime() -> PathBuf {
 #[test]
 fn css_opacity_refinement_emits() {
     let dir = fixture_dir();
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("css_opacity_refinement_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = ipe::build(&entry, &out, &rt);
+    let built = crate::support::build_golden(&dir, &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_opacity_refinement: {:?}",
@@ -60,12 +59,11 @@ fn css_opacity_refinement_e2e_output_matches_expected() {
     }
 
     let dir = fixture_dir();
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_css_opacity_refinement_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let rt = runtime();
-    let built = ipe::build(&entry, &out, &rt);
+    let built = crate::support::build_golden(&dir, &out, &rt);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for css_opacity_refinement E2E: {:?}",

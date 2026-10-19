@@ -898,7 +898,7 @@ fn emit_route_render(
                 ctor: ctx.resolve_ident(*variant)?.into(),
             }));
         };
-        let path = format!("{enum_s}::{}", ctx.emit_ident(*variant)?);
+        let path = format!("{enum_s}::{}", ctx.emit_member_ident(*variant)?);
         let mut binds = Vec::with_capacity(fields.len());
         let mut render_args = Vec::with_capacity(fields.len());
         for (i, field_ty) in fields.iter().enumerate() {
@@ -1318,8 +1318,8 @@ mod schema_tag_tests {
     use ipe_intern::Interner;
     use ipe_ir::{Callee, Expr, Func, FuncId, IrType, KernelFn, ModPath, Module, Program, UiCtor};
 
+    use crate::EmitCtx;
     use crate::emit_types::GenericScope;
-    use crate::{DbDriver, EmitCtx};
 
     fn fn_item(interner: &mut Interner, id: u32, name: &str) -> DResult<Func> {
         Ok(Func {
@@ -1455,23 +1455,7 @@ mod schema_tag_tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )?;
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())?;
 
         // Model = { count : Int } (no `page` field → the single-page branch).
         let model = IrType::Record(BTreeMap::from([(count, IrType::Int)]));

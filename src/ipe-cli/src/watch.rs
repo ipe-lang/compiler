@@ -455,17 +455,10 @@ pub(crate) struct ResolvedProject {
     pub(crate) discovered: Vec<project::DiscoveredModule>,
     pub(crate) entry_path: Vec<String>,
     pub(crate) blame_path: PathBuf,
-    pub(crate) db_driver: ipe_backend_rust::DbDriver,
-    /// The `[wasm] publicEnv` allowlist (empty for the no-manifest loose-file
-    /// path — there is no manifest to declare one).
-    pub(crate) wasm_public_env: Vec<String>,
-    /// The manifest's `browser.basePath` (the root for the no-manifest
-    /// loose-file path).
-    pub(crate) mount_base: ipe_backend_rust::MountBase,
-    /// The sanitized Cargo package name for the emitted crate (from `package.ipe`
-    /// name via [`ipe_backend_rust::sanitize_cargo_name`]). Empty string
-    /// when no manifest is present (sibling-discovery path uses `"ipe-app"`).
-    pub(crate) cargo_name: String,
+    /// The parsed `package.ipe`, `None` for the no-manifest loose-file path.
+    /// Its emit settings are derived by the one constructor a build uses, so a
+    /// watch rebuild and a cold build emit the same crate.
+    pub(crate) manifest: Option<Box<project::ProjectManifest>>,
     /// What the confined watcher observes for this snapshot.
     pub(crate) scope: ScopeSpec,
 }
@@ -551,7 +544,6 @@ pub(crate) fn resolve_project_sources(
             let src = crate::io_bounded::read_walked_source(m.path())?;
             sources.insert(m.module_path().to_vec(), (m.path().to_path_buf(), src));
         }
-        let cargo_name = ipe_backend_rust::sanitize_cargo_name(&manifest.name);
         // The entry defaults to `["Main"]`; a `programs` manifest routes its
         // (default) program's declared entry file through instead. Named
         // multi-program selection is a reported residual — see
@@ -566,10 +558,7 @@ pub(crate) fn resolve_project_sources(
             discovered,
             entry_path,
             blame_path: manifest_path,
-            db_driver: manifest.driver,
-            wasm_public_env: manifest.wasm.public_env.to_names(),
-            mount_base: manifest.delivery.browser.base,
-            cargo_name,
+            manifest: Some(Box::new(manifest)),
             scope: ScopeSpec::Package {
                 root: package_root,
                 source_files,
@@ -588,10 +577,7 @@ pub(crate) fn resolve_project_sources(
         discovered: loaded.discovered,
         entry_path: loaded.entry_module,
         blame_path: entry.to_path_buf(),
-        db_driver: ipe_backend_rust::DbDriver::Sqlite,
-        wasm_public_env: Vec::new(),
-        mount_base: ipe_backend_rust::MountBase::root(),
-        cargo_name: String::new(),
+        manifest: None,
         scope: ScopeSpec::LooseFile {
             entry: entry.to_path_buf(),
             module_files: loaded.probed_files,
@@ -727,6 +713,40 @@ const REBUILD_TARGET: ipe_ir::Target = ipe_ir::Target::Native;
 /// The intent every watch rebuild emits with: a development loop, so `Debug.*`
 /// is allowed.
 const REBUILD_INTENT: ipe_backend_rust::BuildIntent = crate::verb::Verb::DEV_WATCH.intent();
+
+/// The emit settings a watch rebuild of `resolved` folds, before the FFI
+/// bindings and the runtime dependency are filled in.
+///
+/// The settings come from the build shape a cold build of the same project
+/// uses, so a manifest project's rebuilt crate carries the same identity name
+/// and links the same database driver. `ipe dev watch` reloads the
+/// served-live web app, so the host is always served: the webview-native
+/// desktop delivery is not a watch target. `debugger` compiles the in-app
+/// debugger overlay into the rebuilt runtime loop.
+fn watch_emit_settings(
+    resolved: &ResolvedProject,
+    debugger: bool,
+    hot_appearance: bool,
+) -> ipe_backend_rust::EmitSettings {
+    let options = crate::BuildOptions {
+        target: REBUILD_TARGET,
+        intent: REBUILD_INTENT,
+        debugger,
+        hot_appearance,
+        ..crate::BuildOptions::default()
+    };
+    crate::driver::emit_settings(
+        &crate::driver::SettingsSource::discovered(
+            resolved
+                .manifest
+                .as_deref()
+                .map(|manifest| (manifest, resolved.blame_path.as_path())),
+            crate::delivery::HostIntent::Served,
+        ),
+        &options,
+        crate::runtime_embed::BundleRole::Out,
+    )
+}
 
 /// The floor every watch rebuild's crate carries: the development marker.
 const REBUILD_FLOOR: crate::run_sandbox::EmitFloor =
@@ -1296,6 +1316,7 @@ fn run_inner(
                     schedule_resolve_retry(&evt_tx);
                 }
 
+                let settings = watch_emit_settings(&resolved, opts.debugger, opts.hot_appearance);
                 let mut sources = resolved.sources;
                 let mut discovered = resolved.discovered;
                 let injected = project::inject_compiled_std_closure(&mut sources, &mut discovered);
@@ -1345,32 +1366,22 @@ fn run_inner(
                 // Every field is reconciled on every pass, so a warm config
                 // holds exactly what a cold rebuild would build.
                 let cfg = db_main.sync_config(ipe_db::BuildConfigFields {
-                    db_driver: resolved.db_driver,
-                    // The backend writes FFI bindings (src/ffi.rs) into the
-                    // emitted project — the same slot `run_build` fills.
-                    ffi: ffi_prep.emit,
-                    target: REBUILD_TARGET,
-                    wasm_public_env: resolved.wasm_public_env.clone(),
-                    mount_base: resolved.mount_base.clone(),
-                    wasm_hydrate_mode: false,
-                    intent: REBUILD_INTENT,
-                    // Dependency-model emit: the project links the runtime as a
-                    // path dependency (what `ipe dev build` uses by default), so
-                    // no runtime source is vendored into `src/ipe_runtime/`.
-                    // `runtime_dep_root` is the verified crate root (holds
-                    // `Cargo.toml`), resolved once before the loop via
-                    // `runtime_embed::resolve()`, matching `ipe dev build`'s path.
-                    runtime_dep: Some(ipe_backend_rust::RuntimeDep {
-                        root: runtime_dep_root.clone(),
-                    }),
-                    // `ipe dev watch --debugger` compiles the in-app debugger
-                    // overlay into the rebuilt runtime loop.
-                    debugger: opts.debugger,
-                    cargo_name: resolved.cargo_name.clone(),
-                    hot_appearance: opts.hot_appearance,
-                    // `ipe dev watch` reloads the served-live web app; the
-                    // webview-native desktop delivery is not a watch target.
-                    webview_host: false,
+                    settings: ipe_backend_rust::EmitSettings {
+                        // The backend writes FFI bindings (src/ffi.rs) into the
+                        // emitted project — the same slot `run_build` fills.
+                        ffi: ffi_prep.emit,
+                        // Dependency-model emit: the project links the runtime
+                        // as a path dependency (what `ipe dev build` uses by
+                        // default), so no runtime source is vendored into
+                        // `src/ipe_runtime/`. `runtime_dep_root` is the verified
+                        // crate root (holds `Cargo.toml`), resolved once before
+                        // the loop via `runtime_embed::resolve()`, matching
+                        // `ipe dev build`'s path.
+                        runtime_dep: Some(ipe_backend_rust::RuntimeDep {
+                            root: runtime_dep_root.clone(),
+                        }),
+                        ..settings
+                    },
                 });
 
                 // The prior worker (if any) has already unwound by the time
@@ -3400,10 +3411,32 @@ mod tests {
         dir_has_dep_rlib, emitted_binds_http, emitted_is_tui, emitted_is_web, env_flag_on,
         first_error_line, mint_hot_token, mpsc, prove_green_crate, push_control_appearance,
         resolve_project_sources, schedule_resolve_retry, send_control_frame, spawn_command,
-        strip_ansi, watch_line, watch_status_body,
+        strip_ansi, watch_emit_settings, watch_line, watch_status_body,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+
+    /// A watch rebuild names its crate by the project's identity, exactly as a
+    /// cold build of the same project does.
+    #[test]
+    fn watch_name_matches_build() {
+        let fixture = crate::RootFixture::main("module Main exposing (main)\n\nmain =\n    1\n")
+            .expect("fixture");
+        let resolved = resolve_project_sources(fixture.path(), None).expect("resolved");
+        let settings = watch_emit_settings(&resolved, false, false);
+        let canonical = std::fs::canonicalize(fixture.path()).expect("canonical");
+        let expected = ipe_backend_rust::crate_identity(
+            &ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
+            &canonical,
+        );
+        assert_eq!(settings.crate_name.as_str(), expected.as_str());
+        assert_ne!(
+            settings.crate_name.as_str(),
+            ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
+            "the friendly name alone would share a cargo slot across projects"
+        );
+        assert_eq!(settings.host, ipe_backend_rust::EmitHost::Served);
+    }
 
     /// Build an `EmittedProject` whose `src/main.rs` carries `main_rs`, so the
     /// HTTP-detection predicates can be tested on their real scan surface without

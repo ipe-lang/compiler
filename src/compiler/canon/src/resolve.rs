@@ -5293,6 +5293,7 @@ fn canonicalise_expr(e: &src::Expr, env: &Env, interner: &mut Interner) -> DResu
         src::Expr_::Unit => canon::Expr_::Unit,
         src::Expr_::VarLocal(name) => resolve_var(*name, span, env, interner)?,
         src::Expr_::VarQual(qual, name) => resolve_qual_var(*qual, *name, span, env, interner)?,
+        src::Expr_::TaskAndThen => resolve_task_and_then(span, env, interner)?,
         src::Expr_::Call(f, args) => {
             if let Some(node) = canonicalise_foreign_call(f, args, span, env, interner)? {
                 node
@@ -5737,6 +5738,51 @@ fn import_required(
             imported_as,
         },
     }
+}
+
+/// The import path of the module every `do` bind sequences through.
+pub const DO_BIND_MODULE: &[&str] = &["Ipe", "Task"];
+
+/// The `do` statement operator whose bind sequences through [`DO_BIND_MODULE`].
+const DO_BIND_OPERATOR: &str = "<-";
+
+/// Resolve a `do` bind's [`src::Expr_::TaskAndThen`] to the `Task.andThen`
+/// kernel, by identity.
+///
+/// The gate is an import of [`DO_BIND_MODULE`] under any spelling: an alias
+/// renames the module, never what `do` means, and a different module aliased
+/// `Task` never stands in for it. With no such import the bind is IPE-N0034
+/// naming the `<-` the source wrote and `import Ipe.Task`, never a `Task`
+/// qualifier the source does not spell.
+///
+/// # Errors
+/// IPE-N0034 when no import of [`DO_BIND_MODULE`] exists;
+/// [`Diagnostic::CompilerBug`] if the interner is exhausted.
+fn resolve_task_and_then(span: Span, env: &Env, interner: &mut Interner) -> DResult<canon::Expr_> {
+    let kernel = StdlibKernel::TaskAndThen;
+    let def = kernel.def();
+    let path = DO_BIND_MODULE
+        .iter()
+        .map(|segment| interner.intern(segment))
+        .collect::<DResult<Vec<Symbol>>>()?;
+    if !env
+        .import_scope
+        .imported_modules
+        .contains(&ModuleIdentity::Source(path))
+    {
+        return Err(Diagnostic::Name {
+            span,
+            msg: NameError::OperatorImportRequired {
+                operator: DO_BIND_OPERATOR.into(),
+                module: DO_BIND_MODULE.join(".").into_boxed_str(),
+            },
+        });
+    }
+    Ok(canon::Expr_::VarKernel {
+        id: Some(kernel),
+        module: interner.intern(def.qualifier)?,
+        name: interner.intern(def.name)?,
+    })
 }
 
 /// The verdict for a qualified use of `qualifier`, which holds no members here.
@@ -9284,6 +9330,117 @@ mod unary_minus_hygiene_tests {
             panic!("v body must be a Let");
         };
         assert_negate_kernel_callee(in_body, &i);
+    }
+}
+
+#[cfg(test)]
+mod do_bind_identity_tests {
+    //! A `do` bind resolves to the `Task.andThen` kernel by identity: the gate
+    //! is an import of [`DO_BIND_MODULE`] under any spelling, so an alias can
+    //! neither retarget `do` (`import Ipe.Json.Decode as Task`) nor hide the
+    //! module it binds through (`import Ipe.Task as T`).
+    #![allow(clippy::panic, clippy::expect_used)] // test setup: a failed parse/canon IS the failure
+
+    use super::*;
+
+    fn sym(i: &mut Interner, s: &str) -> Symbol {
+        i.intern(s).expect("intern must succeed")
+    }
+
+    /// A `do`-only body: the bind names no qualifier at all.
+    const DO_BODY: &str = "main t =\n    do\n        a <- t\n        t\n";
+
+    /// Canonicalise `Main` (its `imports` then [`DO_BODY`]) against a stand-in
+    /// `Ipe.Task` producer.
+    fn canon_main(imports: &str) -> (DResult<canon::Module>, Interner) {
+        let mut i = Interner::new();
+        let task_path: Vec<Symbol> = DO_BIND_MODULE.iter().map(|s| sym(&mut i, s)).collect();
+        let main_path = vec![sym(&mut i, "Main")];
+        let mut deps: BTreeMap<Vec<Symbol>, crate::ModuleExports> = BTreeMap::new();
+        let producer =
+            "module Ipe.Task exposing (succeed)\n\nsucceed : a -> a\nsucceed a =\n    a\n";
+        let parsed_task = ipe_parse::parse_module(producer, &mut i).expect("producer parses");
+        let (_, exports) = canonicalise_module_with_origin(
+            &parsed_task,
+            &task_path,
+            &deps,
+            ModuleOrigin::EmbeddedStdlib,
+            &mut i,
+        )
+        .expect("producer canonicalises");
+        deps.insert(task_path, exports);
+
+        let src = format!("module Main exposing (main)\n\n{imports}\n\n{DO_BODY}");
+        let parsed = ipe_parse::parse_module(&src, &mut i).expect("importer parses");
+        let result =
+            canonicalise_module(&parsed, &main_path, &deps, &mut i).map(|(module, _)| module);
+        (result, i)
+    }
+
+    /// Whether `main`'s body is a call of the `Task.andThen` kernel.
+    fn binds_through_task_kernel(module: &canon::Module, i: &Interner) -> bool {
+        module
+            .defs
+            .iter()
+            .find(|d| i.resolve(d.name().value) == Some("main"))
+            .is_some_and(|d| match d {
+                canon::Def::Untyped { body, .. } | canon::Def::Typed { body, .. } => {
+                    matches!(&body.value, canon::Expr_::Call(callee, _) if is_task_and_then(callee))
+                }
+            })
+    }
+
+    /// Whether `result` is IPE-N0034 naming the `<-` the source wrote and
+    /// `import Ipe.Task`, never a `Task` qualifier the source does not spell
+    /// (a module aliased `Task` is imported, so "`Task` is the module
+    /// `Ipe.Task`" would misdescribe it).
+    fn requires_task_import(result: &DResult<canon::Module>) -> bool {
+        matches!(
+            result,
+            Err(Diagnostic::Name {
+                msg: NameError::OperatorImportRequired { operator, module },
+                ..
+            }) if &**operator == "<-" && &**module == "Ipe.Task"
+        )
+    }
+
+    /// A different module aliased `Task` never stands in for `Ipe.Task`: the
+    /// bind is refused, not sequenced through `Json.Decode.andThen`.
+    #[test]
+    fn module_aliased_task_does_not_retarget_do() {
+        let (result, _) = canon_main("import Ipe.Json.Decode as Task");
+        assert!(requires_task_import(&result), "{result:?}");
+    }
+
+    /// The remedy the refusal names clears it even while the `Task` alias
+    /// stays on `Json.Decode`.
+    #[test]
+    fn task_import_beside_a_task_alias_binds_through_ipe_task() {
+        let (result, i) = canon_main("import Ipe.Json.Decode as Task\nimport Ipe.Task");
+        let module = result.expect("the `Ipe.Task` import admits `do`");
+        assert!(binds_through_task_kernel(&module, &i));
+    }
+
+    /// With no `Ipe.Task` import, `do` is IPE-N0034.
+    #[test]
+    fn do_without_task_import_is_refused() {
+        let (result, _) = canon_main("import Ipe.Json.Decode as Decode");
+        assert!(requires_task_import(&result), "{result:?}");
+    }
+
+    /// `Ipe.Task` under any alias, or none, admits `do` and binds through the
+    /// `Task.andThen` kernel.
+    #[test]
+    fn task_import_under_any_alias_binds_through_task_kernel() {
+        for imports in [
+            "import Ipe.Task",
+            "import Ipe.Task as T",
+            "import Ipe.Task as Task",
+        ] {
+            let (result, i) = canon_main(imports);
+            let module = result.expect("an `Ipe.Task` import admits `do`");
+            assert!(binds_through_task_kernel(&module, &i), "{imports}");
+        }
     }
 }
 

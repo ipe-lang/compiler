@@ -45,7 +45,10 @@ Checks performed
       and every step `if:` a closed `StepGuard` (none; `always()`;
       release-only run/no-op; a classifier output's `!= 'false'` run form
       paired with its `== 'false'` no-op, read from an earlier
-      `change_class.py` step of that scope; a needed job's success). A
+      `change_class.py` step of that scope; a needed job's success; on a
+      step that saves a cache, `github.ref == 'refs/heads/main'` conjoined
+      with at most a classifier run form and an earlier `actions/cache`
+      step's `cache-hit != 'true'` — a skipped save decides nothing). A
       reporting job holds a decider under a guard whose absent input means
       run: a VERDICT `TOOL_INVOCATIONS` row, the phase verdict, a command a
       `local:` block mirrors, or the one script step its `INLINE_DECIDERS`
@@ -84,7 +87,18 @@ Checks performed
      consumed by ci.yml's `cancel-on-cheap-red` watcher — is well-formed (exact keys, non-empty strings with
      no surrounding whitespace, no duplicate job), its job set equals the
      watcher's `needs:`, and each pair's step is a `name:` of that job's steps
-     in ci.yml.
+     in ci.yml.  Its `test_watchers` list (ci.yml tests-phase job ids, unique)
+     generates the merge-group fail-fast watchers: ci.yml holds exactly one
+     job `cancel-on-test-red-<id>` per listed producer and no other job of
+     that prefix anywhere, each exactly `expected_test_watcher_steps`' shape —
+     `needs: [changes, <id>]`, `if:` exactly `TEST_WATCHER_IF` (`failure()`
+     and the `changes` merge-group marker), `actions: write` and
+     `contents: read` only, a pinned sparse checkout of `rerun_policy.py`, the
+     `--proven-test-red` proof step naming the producer's context, and a
+     cancel step gated on the proof's exact `true`.  The classifier's leg
+     rule over each producer's context picks exactly that producer's
+     contexts, and `changes` publishes the marker as
+     `MERGE_GROUP_OUTPUT_VALUE`.  Their write grants derive from the list.
   6. rustc wiring and cache hygiene: no job wraps or replaces rustc, so
      every build compiles with the pinned toolchain's own rustc and no cache
      stands between the source and the artifact a gate vouches for. Every
@@ -98,9 +112,15 @@ Checks performed
      `rustc-wrapper` config spelling), or assembling its target through a
      GitHub Actions expression function (`format(`, `join(`, `toJSON(`, or
      `fromJSON(` over a literal; any letter case) instead of naming it
-     literally; and a `Swatinem/rust-cache` step whose `with.save-if` is not
-     exactly `RUST_CACHE_SAVE_IF`, so only `main` writes the dependency cache
-     and a pull request run restores it without evicting it. Every workflow,
+     literally; and a step running a `CACHE_WRITERS` action that is not held
+     to saving only on `main` (an input pinned to `MAIN_ONLY_EXPR` /
+     `OFF_MAIN_EXPR`, a caching input absent, or an `if:` conjoining
+     `github.ref == DEFAULT_BRANCH_REF`), or a subpath of a listed repo no
+     row models, so every other ref restores `main`'s caches without
+     evicting them; and such a saving step, direct or through a local
+     composite, in a workflow with a trigger outside `CACHE_SAVE_TRIGGERS`
+     (there `github.ref` is the default branch while the run handles a pull
+     request's content). Every workflow,
      manifest, and local action is loaded through `strict_yaml` (see that
      module), so a duplicate mapping key, a `<<` merge key, an anchor/alias,
      or an explicit tag — each legal to a plain YAML loader but resolved
@@ -173,7 +193,8 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
      `permissions:` value with no `write` scope.  A job-level `write` scope is
      admitted only on a job whose `if:` has no `||` and has, among its
      `&&`-conjuncts at parenthesis depth 0, exactly
-     `github.event_name == 'pull_request'`.  A bare
+     `github.event_name == 'pull_request'`, or on a generated test watcher
+     (check 5) whose `if:` is exactly `TEST_WATCHER_IF`.  A bare
      `github.event_name != 'pull_request'` full-tier test (either operand
      order) must be followed by `&& github.event_name != 'merge_group'`, so a
      merge-group run takes the PR tier rather than silently running the full
@@ -232,7 +253,9 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       (`needs.changes.outputs.<phase> == 'true'`, or `github.event_name ==
       'pull_request'` for a PR-only job), plus on a cheap job at most the
       `|| needs.changes.outputs.release_only == 'true'` disjunct; no other
-      conjunct names the event.  A job needs only jobs that run on every event
+      conjunct names the event or reads the merge-group marker, which only a
+      generated test watcher (check 5) reads, through its exact
+      `TEST_WATCHER_IF`, and which places it in a merge-group-only phase.  A job needs only jobs that run on every event
       it runs on, and never a verdict.  A skipped required check reads as
       passing, so a tests or post_merge work job never reports a `gate`
       context: it reports through a phase verdict, a job whose `if:` is
@@ -506,8 +529,13 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       warns, and the setting does nothing), a case variant of a declared
       input or two keys fold-equal, a non-string key, a required input with
       no default left out, a deprecated input passed, a pin with no record,
-      a record no pin uses, and a `SCRIPT_ACTIONS` row naming an input its
-      action does not declare.  Records are written only by the maintainer
+      a record no pin uses, a `SCRIPT_ACTIONS` or `CACHE_WRITERS` row naming
+      an input its action does not declare, and a pinned action declaring an
+      input whose folded name contains `cache` that no `CACHE_WRITERS` row
+      covers, or one in neither `CACHE_WRITERS` nor `CACHE_FREE` (an
+      unmodelled cache writer).  LIMIT: a `CACHE_FREE` row is a reviewed
+      claim, not a proof; a `run:` step reaches the cache service only with
+      the runtime token an action exports to it.  Records are written only by the maintainer
       tool `python3 .github/ci/action_metadata.py --write`, which fetches
       the pinned objects and proves them with the same walk.
       LIMIT: the pinned commit is read from the repository's fork network,
@@ -569,6 +597,7 @@ import cargo_invocation  # noqa: E402  # the one cargo-invocation reader, checks
 import check_required_set  # noqa: E402  # owns the admin-read environment's name
 import claims_table  # noqa: E402  # the one reader of test-claims.yml, check 20
 import action_metadata  # noqa: E402  # proven declared inputs of every pinned action, check 24
+import rerun_policy  # noqa: E402  # the job-name leg rule the merge-group test watchers apply
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Both extensions: a workflow (or, for check 6, a local composite action) is a
@@ -590,11 +619,38 @@ HEAVY_SHARD_ANCHORS = ("test-run", "e2e")
 HEAVY_SHARD_ARTIFACT = "nextest-archive"
 _STATUS_FN = re.compile(r"\b(always|failure|cancelled)\s*\(", re.IGNORECASE)
 CANCEL_WATCHER_JOB_ID = "cancel-on-cheap-red"
+# Merge-group fail-fast: `deterministic-checks.json`'s `test_watchers` lists
+# the heavy tests-phase producers (ci.yml job ids). Each gets exactly one
+# generated watcher job, `TEST_WATCHER_PREFIX + <id>`, whose whole shape
+# `expected_test_watcher` pins: it starts only on a red need of a merge-group
+# run and cancels only when `rerun_policy.py --proven-test-red` proves a
+# failed leg of its producer is a test red.
+TEST_WATCHERS_KEY = "test_watchers"
+TEST_WATCHER_WORKFLOW = "ci.yml"
+TEST_WATCHER_PREFIX = "cancel-on-test-red-"
+MERGE_GROUP_OUTPUT = "merge_group"
+MERGE_GROUP_OUTPUT_VALUE = "${{ github.event_name == 'merge_group' }}"
+TEST_WATCHER_IF = f"failure() && needs.changes.outputs.{MERGE_GROUP_OUTPUT} == 'true'"
+TEST_WATCHER_PERMISSIONS = {"actions": "write", "contents": "read"}
+TEST_WATCHER_CHECKOUT_WITH = {
+    "persist-credentials": False,
+    "sparse-checkout": ".github/ci/rerun_policy.py\n",
+    "sparse-checkout-cone-mode": False,
+}
+TEST_WATCHER_PROOF_ID = "proof"
+TEST_WATCHER_CANCEL_IF = f"steps.{TEST_WATCHER_PROOF_ID}.outputs.cancel == 'true'"
+TEST_WATCHER_PRODUCER_MARKER = "needs.changes.outputs.tests == 'true'"
 
-# The dependency cache is written from `main` only: a pull request run
-# restores it and never evicts it with a branch-local save.
+# Caches are saved from `main` only. A cache saved under any other ref (a
+# pull request, a merge group, a tag) is readable by no later run of another
+# ref, and it evicts the ones `main` saved from the shared budget; every
+# other ref restores `main`'s caches and saves none. SSOT: the ref and the
+# two expressions every cache-writing step is pinned to.
+DEFAULT_BRANCH_REF = "refs/heads/main"
+MAIN_ONLY_EXPR = "${{ github.ref == '" + DEFAULT_BRANCH_REF + "' }}"
+OFF_MAIN_EXPR = "${{ github.ref != '" + DEFAULT_BRANCH_REF + "' }}"
 RUST_CACHE_REPO = "Swatinem/rust-cache"
-RUST_CACHE_SAVE_IF = "${{ github.ref == 'refs/heads/main' }}"
+RUST_CACHE_SAVE_IF = MAIN_ONLY_EXPR
 # mold is installed only by the local composite, which pins the release digest.
 RAW_MOLD_ACTION_REPO = "rui314/setup-mold"
 MOLD_COMPOSITE_USES = "./.github/actions/mold"
@@ -933,8 +989,11 @@ def load_deterministic_checks(
     except (OSError, ValueError) as e:
         errors.append(f"cannot read {where}: {e}")
         return None
-    if not isinstance(doc, dict) or set(doc) != {"about", "checks"}:
-        errors.append(f"{where}: top level must be an object with exactly the keys 'about' and 'checks'")
+    if not isinstance(doc, dict) or not {"about", "checks"} <= set(doc) <= {"about", "checks", TEST_WATCHERS_KEY}:
+        errors.append(
+            f"{where}: top level must be an object with the keys 'about' and 'checks' "
+            f"and at most {TEST_WATCHERS_KEY!r}"
+        )
         return None
     checks = doc["checks"]
     if not isinstance(checks, list) or not checks:
@@ -1060,6 +1119,199 @@ def check_deterministic_set(wfs: WorkflowSet, errors: list[str]) -> None:
             f"{CANCEL_WATCHER_JOB_ID!r} needs {sorted(extra)} but they are "
             f"missing from {DETERMINISTIC_CHECKS_FILE}"
         )
+
+
+def load_test_watchers(errors: list[str], root: str = REPO_ROOT) -> list[str] | None:
+    """`deterministic-checks.json`'s `test_watchers`: the ci.yml job ids each
+    owning one merge-group test watcher, or None (with the reason recorded)
+    when the file or the list is malformed. An absent key is no watchers: no
+    run is ever cancelled, the conservative outcome."""
+    if load_deterministic_checks(errors, root) is None:
+        return None
+    where = os.path.join(root, "ci", "deterministic-checks.json")
+    with open(where) as f:
+        doc = json.load(f)
+    if TEST_WATCHERS_KEY not in doc:
+        return []
+    ids = doc[TEST_WATCHERS_KEY]
+    if not isinstance(ids, list) or not ids:
+        errors.append(f"{where}: {TEST_WATCHERS_KEY!r} must be a non-empty list of ci.yml job ids")
+        return None
+    out: list[str] = []
+    for i, jid in enumerate(ids):
+        if not isinstance(jid, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", jid):
+            errors.append(f"{where}: {TEST_WATCHERS_KEY}[{i}] = {jid!r} is not a job id")
+            return None
+        if jid in out:
+            errors.append(f"{where}: {TEST_WATCHERS_KEY} lists {jid!r} more than once")
+            return None
+        out.append(jid)
+    return out
+
+
+def test_watcher_grants(producers: list[str]) -> dict[tuple[str, str | None, str], str]:
+    """The `WRITE_GRANTS` rows the generated test watchers hold."""
+    return {
+        (TEST_WATCHER_WORKFLOW, TEST_WATCHER_PREFIX + p, "actions"): (
+            f"cancels a merge-group run once a {p!r} test red is proven"
+        )
+        for p in producers
+    }
+
+
+def is_test_watcher(fname: str, wj: WorkflowJob) -> bool:
+    """Whether a job carries the test-watcher id and the exact merge-group-only
+    `if:`. Checks 8 and 11 admit exactly this shape; `check_test_watchers`
+    holds every such job to the generated set and its whole pinned shape."""
+    return (
+        fname == TEST_WATCHER_WORKFLOW
+        and wj.job_id.startswith(TEST_WATCHER_PREFIX)
+        and wj.raw.get("if") == TEST_WATCHER_IF
+    )
+
+
+def expected_test_watcher_steps(producer_context: str) -> list[dict]:
+    """The proof and cancel steps of a test watcher, as YAML loads them; the
+    leading pinned checkout is compared apart (its pin moves)."""
+    return [
+        {
+            "name": "Prove a test red",
+            "id": TEST_WATCHER_PROOF_ID,
+            "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "REPO": "${{ github.repository }}",
+                "RUN_ID": "${{ github.run_id }}",
+                "RUN_ATTEMPT": "${{ github.run_attempt }}",
+                "PRODUCER": producer_context,
+            },
+            "run": "python3 .github/ci/rerun_policy.py --proven-test-red",
+        },
+        {
+            "name": "Cancel the run on a proven test red",
+            "if": TEST_WATCHER_CANCEL_IF,
+            "env": {
+                "GH_TOKEN": "${{ github.token }}",
+                "REPO": "${{ github.repository }}",
+                "RUN_ID": "${{ github.run_id }}",
+            },
+            "run": (
+                'gh run cancel "$RUN_ID" --repo "$REPO" || '
+                'echo "::warning::gh run cancel failed for run $RUN_ID."'
+            ),
+        },
+    ]
+
+
+def check_test_watchers(wfs: WorkflowSet, errors: list[str]) -> None:
+    """The merge-group test watchers are exactly the jobs generated from
+    `test_watchers`: one per listed producer, none other, each in its pinned
+    shape — `needs: [changes, <producer>]`, `if:` exactly `TEST_WATCHER_IF`,
+    `actions: write` + `contents: read` only, a sparse checkout of the
+    classifier, the proof step, and a cancel step gated on the proof's exact
+    `true`. Each producer is a tests-phase ci.yml job whose failed legs the
+    classifier's leg rule picks out exactly, and `changes` publishes the
+    merge-group marker the watchers read."""
+    where = f"{DETERMINISTIC_CHECKS_FILE} {TEST_WATCHERS_KEY}"
+    producers = load_test_watchers(errors, wfs.root)
+    if producers is None:
+        return
+    wf = wfs.get(TEST_WATCHER_WORKFLOW)
+    for other in wfs.workflows:
+        if other.fname == TEST_WATCHER_WORKFLOW:
+            continue
+        for wj in other.jobs:
+            if wj.job_id.startswith(TEST_WATCHER_PREFIX):
+                errors.append(
+                    f"{other.fname}: job {wj.job_id!r} is named as a test watcher; "
+                    f"test watchers live only in {TEST_WATCHER_WORKFLOW}"
+                )
+    if wf is None:
+        if producers:
+            errors.append(f"{where}: {TEST_WATCHER_WORKFLOW} is absent")
+        return
+    by_id = {j.job_id: j for j in wf.jobs}
+    expected = {TEST_WATCHER_PREFIX + p: p for p in producers}
+    for jid in sorted(set(by_id) - set(expected)):
+        if jid.startswith(TEST_WATCHER_PREFIX):
+            errors.append(
+                f"{TEST_WATCHER_WORKFLOW}: job {jid!r} is not a generated test watcher — "
+                f"its producer is not listed in {where}; refused"
+            )
+    if producers:
+        changes = by_id.get("changes")
+        outputs = changes.raw.get("outputs") if changes is not None else None
+        got = outputs.get(MERGE_GROUP_OUTPUT) if isinstance(outputs, dict) else None
+        if got != MERGE_GROUP_OUTPUT_VALUE:
+            errors.append(
+                f"{TEST_WATCHER_WORKFLOW}: `changes` output {MERGE_GROUP_OUTPUT!r} must be exactly "
+                f"{MERGE_GROUP_OUTPUT_VALUE!r} (the test watchers' marker), got {got!r}"
+            )
+    contexts = [c for j in wf.jobs for c in j.contexts]
+    for watcher_id, producer_id in expected.items():
+        loc = f"{TEST_WATCHER_WORKFLOW}: test watcher {watcher_id!r}"
+        producer = by_id.get(producer_id)
+        if producer is None or producer_id.startswith(TEST_WATCHER_PREFIX):
+            errors.append(f"{where}: {producer_id!r} is not a ci.yml producer job")
+            continue
+        conjuncts = _top_level_conjuncts(str(producer.raw.get("if", "")))
+        if conjuncts is None or TEST_WATCHER_PRODUCER_MARKER not in conjuncts:
+            errors.append(
+                f"{where}: {producer_id!r} is not a tests-phase job (its `if:` lacks "
+                f"{TEST_WATCHER_PRODUCER_MARKER!r} at the top level)"
+            )
+        base = str(producer.raw.get("name", producer_id))
+        if "${{" in base or base != base.strip() or not base.isprintable():
+            errors.append(f"{where}: {producer_id!r} has a templated or unprintable context base {base!r}")
+            continue
+        legs = {c for c in contexts if rerun_policy.is_leg_of(c, base)}
+        if legs != set(producer.contexts):
+            errors.append(
+                f"{where}: the leg rule over {base!r} picks {sorted(legs)}, not exactly "
+                f"{producer_id!r}'s own contexts {sorted(producer.contexts)} — another job's red "
+                "could cancel the run"
+            )
+        wj = by_id.get(watcher_id)
+        if wj is None:
+            errors.append(f"{loc} is missing; {where} lists {producer_id!r}")
+            continue
+        job = wj.raw
+        keys = set(job)
+        if keys != {"runs-on", "needs", "if", "permissions", "steps"}:
+            errors.append(f"{loc} carries keys {sorted(keys)}; exactly runs-on, needs, if, permissions, steps")
+        if job.get("runs-on") != "ubuntu-latest":
+            errors.append(f"{loc} `runs-on:` must be `ubuntu-latest`")
+        if job.get("needs") != ["changes", producer_id]:
+            errors.append(f"{loc} `needs:` must be exactly [changes, {producer_id}], got {job.get('needs')!r}")
+        if job.get("if") != TEST_WATCHER_IF:
+            errors.append(
+                f"{loc} `if:` must be exactly {TEST_WATCHER_IF!r} — `failure()` and the "
+                f"merge-group marker, nothing else; got {job.get('if')!r}"
+            )
+        if job.get("permissions") != TEST_WATCHER_PERMISSIONS:
+            errors.append(
+                f"{loc} `permissions:` must be exactly {TEST_WATCHER_PERMISSIONS!r}, "
+                f"got {job.get('permissions')!r}"
+            )
+        steps = job.get("steps")
+        if not isinstance(steps, list) or len(steps) != 3 or not all(isinstance(s, dict) for s in steps):
+            errors.append(f"{loc} must have exactly three steps: the checkout, the proof, the cancel")
+            continue
+        checkout = steps[0]
+        if (
+            set(checkout) != {"uses", "with"}
+            or not isinstance(checkout.get("uses"), str)
+            or not _CHECKOUT_PIN.fullmatch(checkout["uses"])
+            or checkout.get("with") != TEST_WATCHER_CHECKOUT_WITH
+        ):
+            errors.append(f"{loc} step 1 must be the pinned sparse checkout of `.github/ci/rerun_policy.py`")
+        proof, cancel = expected_test_watcher_steps(base)
+        if steps[1] != proof:
+            errors.append(f"{loc} step 2 must be exactly the proof step {proof!r}, got {steps[1]!r}")
+        if steps[2] != cancel:
+            errors.append(
+                f"{loc} step 3 must be exactly the cancel step gated on {TEST_WATCHER_CANCEL_IF!r} "
+                f"(no cancel on an unproven red), got {steps[2]!r}"
+            )
 
 
 def _refuse_shape(loc: str, what: str, expected: str, got: object, errors: list[str]) -> None:
@@ -1188,6 +1440,8 @@ class ErrorKind(enum.Enum):
     ACTION_INPUT_CASE_VARIANT = "action-input-case-variant"
     ACTION_INPUT_REQUIRED_MISSING = "action-input-required-missing"
     ACTION_INPUT_DEPRECATED = "action-input-deprecated"
+    CACHE_WRITER_UNMODELLED = "cache-writer-unmodelled"
+    CACHE_WRITER_ROW_INVALID = "cache-writer-row-invalid"
 
 
 @dataclass(frozen=True)
@@ -1470,7 +1724,10 @@ def check_permissions(
     may write); no `permissions:` value, workflow or job level, is
     `write-all` or grants a `FORGING_SCOPES` write; and every other write
     grant is a `WRITE_GRANTS` row, every row one some workflow grants."""
-    grants = WRITE_GRANTS if grants is None else grants
+    if grants is None:
+        # The watcher rows derive from the SSOT; a malformed one yields none,
+        # and `check_test_watchers` records why.
+        grants = {**WRITE_GRANTS, **test_watcher_grants(load_test_watchers([], wfs.root) or [])}
     seen: set[tuple[str, str | None, str]] = set()
     for wf in wfs.workflows:
         if "permissions" not in wf.doc:
@@ -1828,6 +2085,7 @@ class StepGuardKind(enum.Enum):
     CLASSIFIER_RUN = "classifier-run"
     CLASSIFIER_NOOP = "classifier-noop"
     PREP_SUCCEEDED = "prep-succeeded"
+    MAIN_SAVE = "main-save"
 
 
 # The guards a decider step may run under: each runs the step whenever its
@@ -1845,13 +2103,19 @@ class StepGuard:
     `needs.changes.outputs.release_only != 'true'` / `== 'true'`.
     `CLASSIFIER_RUN`/`CLASSIFIER_NOOP`: `steps.<ref>.outputs.<scope> !=
     'false'` / `== 'false'`, so an absent classifier output means run.
-    `PREP_SUCCEEDED`: `needs.<ref>.result == 'success'`. Where `ref` must
-    point, and the pairing rules, are checked by `check_required_guards`.
+    `PREP_SUCCEEDED`: `needs.<ref>.result == 'success'`. `MAIN_SAVE`:
+    `github.ref == 'refs/heads/main'` conjoined with at most one
+    `CLASSIFIER_RUN` term (`ref`, `scope`) and at most one
+    `steps.<hit>.outputs.cache-hit != 'true'`, admitted only on a step that
+    saves a cache (a `CACHE_WRITERS` row with `main_if`), which decides
+    nothing. Where `ref` and `hit` must point, and the pairing rules, are
+    checked by `check_required_guards`.
     """
 
     kind: StepGuardKind
     ref: str | None = None
     scope: str | None = None
+    hit: str | None = None
 
     @staticmethod
     def parse(raw: object) -> StepGuard | str:
@@ -1874,6 +2138,27 @@ class StepGuard:
         path = _ref_compare(e, "==", "success")
         if path is not None and len(path) == 3 and path[0] == "needs" and path[2] == "result":
             return StepGuard(StepGuardKind.PREP_SUCCEEDED, path[1])
+        terms = _flatten(e, "&&")
+        main = [t for t in terms if _ref_compare(t, "==", DEFAULT_BRANCH_REF) == ("github", "ref")]
+        if len(main) == 1:
+            run: tuple[str, ...] | None = None
+            hit: tuple[str, ...] | None = None
+            for t in terms:
+                if t is main[0]:
+                    continue
+                p = _ref_compare(t, "!=", "false")
+                if run is None and p is not None and len(p) == 4 and p[0] == "steps" and p[2] == "outputs":
+                    run = p
+                    continue
+                p = _ref_compare(t, "!=", "true")
+                if hit is None and p is not None and len(p) == 4 and p[0] == "steps" and p[2:] == ("outputs", "cache-hit"):
+                    hit = p
+                    continue
+                return f"`if:` {raw!r} is not an admitted step guard"
+            return StepGuard(
+                StepGuardKind.MAIN_SAVE, None if run is None else run[1], None if run is None else run[3],
+                None if hit is None else hit[1],
+            )
         return f"`if:` {raw!r} is not an admitted step guard"
 
 
@@ -1898,6 +2183,7 @@ INLINE_DECIDERS: dict[tuple[str, str], str] = {
     ("ci.yml", "release-targets-freebsd"): "Check in FreeBSD VM",
     ("ci.yml", "release-targets-run"): "Check ipe + ipe-ffi-inspector",
     ("ci.yml", "seal-modset-vendored"): "Run seal_modset under the vendored emit model",
+    ("ci.yml", "seal-slice-cover"): "Prove the e2e shards partition the archived test set",
     ("ci.yml", "seal-smoke-run"): "Emit + build + run (examples/shapes/non-tea/hello-world)",
     ("ci.yml", "shapes-examples"): "Check + emit + build every first-party shape",
     ("ci.yml", "test-run"): (
@@ -1927,7 +2213,7 @@ class ScriptAction:
 # inline decider runs is refused.
 SCRIPT_ACTIONS: dict[str, ScriptAction] = {
     "vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc": ScriptAction(
-        inputs=frozenset({"sync-time", "prepare", "run"}),
+        inputs=frozenset({"sync-time", "disable-cache", "prepare", "run"}),
         why=(
             "the pinned `index.js` runs `with.run` through `execSSH(runCmd, sshConfig)` with `ignoreReturn` "
             "false: a non-zero ssh exit throws, and `main` ends in `core.setFailed` plus `process.exit(1)`; "
@@ -2251,13 +2537,16 @@ def check_required_guards(
                 refuse(ErrorKind.STEP_GUARD_UNADMITTED, fname, spath, f"{g} — a skipped step reports as passing; refused")
                 guards.append(None)
                 continue
-            why = _step_guard_context(g, wj, steps[:i])
+            why = _step_guard_context(g, wj, st, steps[:i])
             if why is not None:
                 refuse(ErrorKind.STEP_GUARD_UNADMITTED, fname, spath, f"{why}; refused")
                 guards.append(None)
                 continue
             guards.append(g)
-        run_scopes = {(g.ref, g.scope) for g in guards if g is not None and g.kind is StepGuardKind.CLASSIFIER_RUN}
+        run_scopes = {
+            (g.ref, g.scope) for g in guards
+            if g is not None and (g.kind is StepGuardKind.CLASSIFIER_RUN or (g.kind is StepGuardKind.MAIN_SAVE and g.scope))
+        }
         noop_scopes = {(g.ref, g.scope) for g in guards if g is not None and g.kind is StepGuardKind.CLASSIFIER_NOOP}
         for ref, scope in sorted(run_scopes ^ noop_scopes):
             refuse(
@@ -2366,13 +2655,23 @@ def _is_phase_verdict(wj: WorkflowJob) -> bool:
     return False
 
 
-def _step_guard_context(g: StepGuard, wj: WorkflowJob, earlier: list[Step]) -> str | None:
+def _step_guard_context(g: StepGuard, wj: WorkflowJob, st: Step, earlier: list[Step]) -> str | None:
     """Why a parsed step guard does not fit where it stands, or None."""
+    if g.kind is StepGuardKind.MAIN_SAVE:
+        row = cache_writer(st.uses)
+        if not isinstance(row, CacheWriter) or not row.main_if:
+            return "skips the step off `main`, which is admitted only on a step that saves a cache"
+        if g.hit is not None and not any(
+            e.raw.get("id") == g.hit and uses_action(e.uses, "actions/cache") for e in earlier
+        ):
+            return f"reads `steps.{g.hit}.outputs.cache-hit`, but no earlier step {g.hit!r} runs `actions/cache`"
+        if g.ref is None:
+            return None
     if g.kind in (StepGuardKind.RELEASE_ONLY_RUN, StepGuardKind.RELEASE_ONLY_NOOP) and CLASSIFIER_JOB not in wj.needs:
         return f"reads `{CLASSIFIER_JOB}` outputs but the job does not need it"
     if g.kind is StepGuardKind.PREP_SUCCEEDED and g.ref not in wj.needs:
         return f"reads `needs.{g.ref}.result` but the job does not need {g.ref!r}"
-    if g.kind in (StepGuardKind.CLASSIFIER_RUN, StepGuardKind.CLASSIFIER_NOOP):
+    if g.kind in (StepGuardKind.CLASSIFIER_RUN, StepGuardKind.CLASSIFIER_NOOP, StepGuardKind.MAIN_SAVE):
         flag = "--" + str(g.scope).replace("_", "-")
         for st in earlier:
             if st.raw.get("id") != g.ref:
@@ -2688,12 +2987,15 @@ def check_merge_queue(wfs: WorkflowSet, gate_producers: set[str], errors: list[s
             jid, job = wj.job_id, wj.raw
             if "permissions" not in job or not _grants_write(job["permissions"]):
                 continue
+            if is_test_watcher(fname, wj):
+                continue
             conjuncts = _top_level_conjuncts(str(job.get("if", "")))
             if conjuncts is None or _PR_ONLY not in conjuncts:
                 errors.append(
                     f"{fname}: job {str(jid)!r} holds a write scope in a merge_group "
                     "workflow; its `if:` must be a conjunction requiring "
-                    "`github.event_name == 'pull_request'` at the top level"
+                    "`github.event_name == 'pull_request'` at the top level (or be a "
+                    f"generated test watcher whose `if:` is exactly {TEST_WATCHER_IF!r})"
                 )
         # The canonical phase outputs are pinned by check 11; they exclude the
         # merge queue from no phase by accident.
@@ -2930,6 +3232,8 @@ _AGGREGATOR_KEYS = frozenset({"name", "runs-on", "needs", "if", "steps", "timeou
 _EVENTS = frozenset({"pull_request", "merge_group", "push", "schedule", "workflow_dispatch"})
 # A PR-only job (`_PR_ONLY` conjunct): the cheap phase's narrowest member.
 _PR_PHASE = "pull_request_only"
+# A generated test watcher (`is_test_watcher`): runs on merge-group runs only.
+_MERGE_GROUP_PHASE = "merge_group_only"
 
 
 def _phase_events(phase: str | None) -> frozenset[str]:
@@ -2938,6 +3242,8 @@ def _phase_events(phase: str | None) -> frozenset[str]:
         return _EVENTS
     if phase == _PR_PHASE:
         return frozenset({"pull_request"})
+    if phase == _MERGE_GROUP_PHASE:
+        return frozenset({"merge_group"})
     return _EVENTS - frozenset(PHASE_EXCLUDES[phase])
 
 
@@ -2989,7 +3295,7 @@ def _job_phase(where: str, wj: WorkflowJob, errors: list[str]) -> tuple[bool, st
             phases.append(m.group(1))
         elif c == _PR_ONLY:
             phases.append(_PR_PHASE)
-        elif _EVENT_NAME.search(c) or re.search(r"outputs\.(cheap|tests|post_merge)\b", c):
+        elif _EVENT_NAME.search(c) or re.search(r"outputs\.(cheap|tests|post_merge|merge_group)\b", c):
             errors.append(f"check 11: {where} `if:` conjunct {c!r} routes by event outside the phase markers")
             return False, None
     if len(phases) != 1:
@@ -3097,6 +3403,9 @@ def check_phase_routing(wfs: WorkflowSet, gate_contexts: set[str], errors: list[
             if any(isinstance(s, dict) and s.get("uses") == PHASE_VERDICT_ACTION for s in job.get("steps") or []):
                 aggregators.append(jid)
                 _check_aggregator(where, wf, wj, errors)
+                continue
+            if is_test_watcher(fname, wj):
+                phases[jid] = _MERGE_GROUP_PHASE
                 continue
             ok, phase = _job_phase(where, wj, errors)
             if not ok:
@@ -5398,24 +5707,151 @@ def _uses_repo(st: Step, owner_repo: str) -> bool:
     return uses_action(st.uses, owner_repo)
 
 
-def _refuse_rust_cache_save(st: Step, loc: str, errors: list[str]) -> None:
-    """Rule (a): a `Swatinem/rust-cache` step saves only on `main` — its
-    `with.save-if` is exactly `RUST_CACHE_SAVE_IF`. Absent, the action saves
-    from every ref, so pull request runs evict the `main` cache they restore."""
+@dataclass(frozen=True)
+class CacheWriter:
+    """How one remote action is held to saving only on `main`: each of
+    `inputs` is `with:` text the step passes exactly (`None`: the step must
+    not pass it), and `main_if` requires the step's `if:` to conjoin
+    `github.ref == DEFAULT_BRANCH_REF` at its top level."""
+
+    name: str
+    inputs: tuple[tuple[str, str | None], ...] = ()
+    main_if: bool = False
+
+    @property
+    def saves(self) -> bool:
+        """The row lets the step save on `main` (otherwise it saves nowhere)."""
+        return self.main_if or any(want in (MAIN_ONLY_EXPR, OFF_MAIN_EXPR) for _, want in self.inputs)
+
+
+# Every remote action that can save a cache, keyed by (`owner/repo`,
+# subpath) case-folded; subpath `""` is the action at the repo root and `"*"`
+# any subpath. A `uses:` of a listed repo at a subpath no row names is
+# refused (check 6), and a pinned action declaring an input whose name
+# contains `cache` that no row covers is refused (check 24): an unmodelled
+# cache writer fails closed.
+CACHE_WRITERS: dict[tuple[str, str], CacheWriter] = {
+    # Saves from every ref unless `save-if` says otherwise.
+    ("swatinem/rust-cache", "*"): CacheWriter(RUST_CACHE_REPO, (("save-if", RUST_CACHE_SAVE_IF),)),
+    # `disable-cache` turns off both the restore and the save of the VM
+    # image and apt cache; the action has no save-only switch.
+    ("vmactions/freebsd-vm", "*"): CacheWriter("vmactions/freebsd-vm", (("disable-cache", OFF_MAIN_EXPR),)),
+    # Restores, then saves in a post step on a miss.
+    ("actions/cache", ""): CacheWriter("actions/cache", main_if=True),
+    ("actions/cache", "save"): CacheWriter("actions/cache/save", main_if=True),
+    ("actions/cache", "restore"): CacheWriter("actions/cache/restore"),
+    # `package-manager-cache` defaults to on: it caches whenever the root
+    # `package.json` names a `packageManager`.
+    ("actions/setup-node", "*"): CacheWriter("actions/setup-node", (("cache", None), ("package-manager-cache", "false"))),
+    ("actions/setup-python", "*"): CacheWriter("actions/setup-python", (("cache", None),)),
+}
+# Every other pinned remote action, keyed like `CACHE_WRITERS` (no `"*"`),
+# each reviewed to save no cache (an artifact is not a cache). A pinned action
+# in neither table is refused (check 24), so an action that caches with no
+# input naming the cache fails closed until it is classified.
+CACHE_FREE: frozenset[tuple[str, str]] = frozenset({
+    ("actions/checkout", ""),
+    ("actions/configure-pages", ""),
+    ("actions/deploy-pages", ""),
+    ("actions/download-artifact", ""),
+    ("actions/upload-artifact", ""),
+    ("actions/upload-pages-artifact", ""),
+    ("dtolnay/rust-toolchain", ""),
+    ("googleapis/release-please-action", ""),
+    ("taiki-e/install-action", ""),
+})
+# Under these triggers `github.ref == DEFAULT_BRANCH_REF` holds only for a run
+# of the default branch's own code (a push to it, the schedule, a dispatch by a
+# writer); a pull request, merge group, or release run carries its own ref and
+# so skips a main-only save. Under any other trigger (`pull_request_target`,
+# `workflow_run`, `issue_comment`, ...) `github.ref` is the default branch while
+# the run handles content no push to it made: a main-only save there writes the
+# cache scope every `main` and release run restores from. Check 6 refuses it.
+CACHE_SAVE_TRIGGERS: frozenset[str] = frozenset(
+    {"push", "pull_request", "merge_group", "schedule", "workflow_dispatch", "release"}
+)
+# `owner/repo` and the subpath (empty at the root) of a remote `uses:`.
+USES_SUBPATH_RE = re.compile(r"([^/@]+/[^/@]+)(?:/([^@]*))?(?:@|$)")
+
+
+def _remote_key(uses: object) -> tuple[str, str] | None:
+    """The case-folded (`owner/repo`, subpath) of a remote `uses:`, or None
+    (a local or `docker://` step, or no `owner/repo` shape)."""
+    if not isinstance(uses, str) or uses.startswith(("./", "docker://")):
+        return None
+    m = USES_SUBPATH_RE.match(uses.casefold())
+    return None if m is None else (m[1], m[2] or "")
+
+
+def cache_writer(uses: object) -> CacheWriter | str | None:
+    """The `CACHE_WRITERS` row a `uses:` runs under, a refusal when its repo
+    is listed but its subpath is not, or None for an action no row lists
+    (and for a local or `docker://` step)."""
+    key = _remote_key(uses)
+    if key is None:
+        return None
+    repo, sub = key
+    row = CACHE_WRITERS.get((repo, sub)) or CACHE_WRITERS.get((repo, "*"))
+    if row is not None:
+        return row
+    if any(r == repo for r, _ in CACHE_WRITERS):
+        return f"runs {uses!r}, a subpath of {repo!r} no `CACHE_WRITERS` row models"
+    return None
+
+
+def _main_conjunct(raw: object) -> str | None:
+    """Why the `if:` `raw` does not skip its step off `main` — it must
+    conjoin `github.ref == DEFAULT_BRANCH_REF` at its top level — or None."""
+    if raw is None:
+        return "has no `if:`"
+    e = _one_condition(raw)
+    if isinstance(e, str):
+        return f"`if:` {e}"
+    if any(_ref_compare(c, "==", DEFAULT_BRANCH_REF) == ("github", "ref") for c in _flatten(e, "&&")):
+        return None
+    return f"`if:` {raw!r} does not conjoin `github.ref == '{DEFAULT_BRANCH_REF}'` at its top level"
+
+
+def _refuse_cache_save(st: Step, loc: str, errors: list[str]) -> None:
+    """Rule (a): a step running a `CACHE_WRITERS` action saves only on
+    `main`. Left to its defaults, such an action saves from every ref, and a
+    cache saved off `main` no later run reads while it evicts `main`'s."""
+    row = cache_writer(st.uses)
+    if row is None:
+        return
+    if isinstance(row, str):
+        errors.append(f"{loc} {row}; refused")
+        return
     w = st.raw.get("with")
-    got = w.get("save-if") if isinstance(w, dict) else None
-    if got != RUST_CACHE_SAVE_IF:
-        errors.append(
-            f"{loc} uses {RUST_CACHE_REPO} with save-if {got!r} — it must be exactly "
-            f"{RUST_CACHE_SAVE_IF!r}, so only main writes the cache; refused"
-        )
+    for key, want in row.inputs:
+        got = w.get(key) if isinstance(w, dict) else None
+        if got != want:
+            must = "absent" if want is None else f"exactly {want!r}"
+            errors.append(
+                f"{loc} uses {row.name} with {key} {got!r} — it must be {must}, so only main writes the cache; refused"
+            )
+    why = _main_conjunct(st.raw.get("if")) if row.main_if else None
+    if why is not None:
+        errors.append(f"{loc} uses {row.name}, which saves a cache, but its {why}, so only main writes the cache; refused")
+
+
+def _reaches_cache_save(st: Step, actions: LocalActions, depth: int = 0) -> bool:
+    """`st` runs a `CACHE_WRITERS` action that saves on `main`, itself or
+    through the local composites it reaches (a chain past
+    `LOCAL_ACTION_DEPTH_LIMIT` is refused on its own)."""
+    row = cache_writer(st.uses)
+    if isinstance(row, CacheWriter) and row.saves:
+        return True
+    local = actions.lookup(st.uses)
+    if local is None or depth >= LOCAL_ACTION_DEPTH_LIMIT:
+        return False
+    return any(_reaches_cache_save(s, actions, depth + 1) for s in local.steps)
 
 
 def _audit_step(st: Step, loc: str, policy: StepPolicy, errors: list[str]) -> None:
     """Rules (a)/(b)/(c)/(e)/(f)/(g)/(j) for one step."""
     _refuse_unpinned_uses(st, loc, errors)
-    if _uses_repo(st, RUST_CACHE_REPO):
-        _refuse_rust_cache_save(st, loc, errors)
+    _refuse_cache_save(st, loc, errors)
     if _uses_repo(st, RAW_MOLD_ACTION_REPO):
         errors.append(
             f"{loc} runs the raw {RAW_MOLD_ACTION_REPO} action directly — use "
@@ -5553,7 +5989,9 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "test_local_gate.py": _SELF_TEST,
     "test_cargo_invocation.py": _SELF_TEST,
     "test_claims_table.py": _SELF_TEST,
-    "rerun_policy.py": {("--lint",): _V, ("--decide",): _O},
+    "test_check_required_set.py": _SELF_TEST,
+    "test_ipe_fmt_check.py": _SELF_TEST,
+    "rerun_policy.py": {("--lint",): _V, ("--decide",): _O, ("--proven-test-red",): _O},
     "nightly_green.py": {("--lint",): _V, ("--verdict",): _V},
     "check_required_set.py": {(): _V, ("--fetch",): _V, ("--fetch-admin",): _V},
     "manifest-lock-consistency.sh": {(): _V},
@@ -5787,6 +6225,10 @@ TOOL_ENV_ALLOWLIST: dict[str, frozenset[EnvScope]] = {
     # the id of the run a `workflow_run` event names.
     "MERGE_GROUP_BASE_SHA": frozenset({EnvScope.STEP}),
     "RUN_ID": frozenset({EnvScope.STEP}),
+    # The run attempt whose job listing a merge-group test watcher reads, and
+    # the producer context whose failed legs it classifies.
+    "RUN_ATTEMPT": frozenset({EnvScope.STEP}),
+    "PRODUCER": frozenset({EnvScope.STEP}),
     "CARGO_TERM_COLOR": frozenset({EnvScope.WORKFLOW}),
     "CARGO_INCREMENTAL": frozenset({EnvScope.WORKFLOW}),
 }
@@ -6468,11 +6910,12 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
     """Checks 6 and 7 over every step of every workflow and reachable local action.
     Returns the resolved local actions, the traversal check 24 reads.
 
-    No job wraps or replaces rustc, and only `main` saves the dependency
+    No job wraps or replaces rustc, and only `main` saves a
     cache. Refused:
-      (a) a `Swatinem/rust-cache` step (case-folded, any ref or subpath) in a
-          workflow or reachable local action whose `with.save-if` is not
-          exactly `RUST_CACHE_SAVE_IF`;
+      (a) a step (in a workflow or reachable local action) running a
+          `CACHE_WRITERS` action (case-folded, any ref) that its row does not
+          hold to saving only on `main`, or a subpath of a listed repo that
+          no row models;
       (b) an `env:` key naming a wrapper var or a rustc-replacing var
           (`RUSTC`, `CARGO_BUILD_RUSTC`) (case-folded) at workflow, job,
           container, service, or step scope, in a workflow or any reachable
@@ -6567,8 +7010,7 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
 
     LIMIT — static YAML cannot see, and this check does NOT prove absent:
       - a third-party action that itself exports a wrapper into the job, or
-        a cache action other than `Swatinem/rust-cache` that saves from a
-        pull request ref;
+        one that `CACHE_FREE` classifies as saving no cache yet saves one;
       - a repo script or interpreter snippet invoked from `run:` (`run:
         tools/ci/wire.sh`, `python -c ...`) that writes a wrapper or the env
         file under a name it assembles at run time, or a package manager
@@ -6649,6 +7091,8 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
     base_policy = policy
     for wf in wfs.workflows:
         policy = replace(base_policy, workspace=wf.workspace)
+        triggers = _triggers(wf.doc)
+        foreign = "an unrecognised `on:`" if triggers is None else ", ".join(sorted(triggers - CACHE_SAVE_TRIGGERS))
         wloc = f"{wf.fname}: workflow-level"
         _refuse_env_keys(_scoped_env(wf.doc, f"{wloc} env", errors), wloc, errors)
         _audit_defaults(wf.doc, wf.fname, policy.repo_top, errors)
@@ -6673,6 +7117,12 @@ def check_workflow_steps(wfs: WorkflowSet, errors: list[str]) -> LocalActions:
                 action = actions.resolve(st.uses, stloc)
                 if action is not None:
                     actions.close(action, stloc)
+                if foreign and _reaches_cache_save(st, actions):
+                    errors.append(
+                        f"{stloc} saves a cache on `main`, but the workflow also runs on {foreign}, where "
+                        "`github.ref` is the default branch while the run handles content no push to it made, "
+                        "so the save writes the cache `main` and release runs restore; refused"
+                    )
             _check_tool_job(wf, job, steps, jloc, root, errors)
 
     # One defect reached from several sites is reported once.
@@ -6871,7 +7321,40 @@ def check_action_inputs(
             inputs = None if pin is None else proven.get(pin.key, {}).get(pin.path)
             if inputs is None:
                 continue  # unpinned (check 7) or its record refused above
+            _check_cache_writer(fname, loc, uses, inputs, refuse)
         _check_with_keys(fname, loc, uses, with_, inputs, refuse)
+
+
+def _check_cache_writer(fname: str, loc: str, uses: str, inputs: action_metadata.ActionInputs, refuse) -> None:
+    """A pinned remote action against `CACHE_WRITERS`: one declaring an
+    input whose folded name contains `cache` must have a row (check 6 holds
+    the step to it), any other one a `CACHE_FREE` row, and a row must name
+    only inputs the action declares, or the rule it states pins nothing."""
+    row = cache_writer(uses)
+    if isinstance(row, str):
+        return  # refused by check 6
+    if row is None:
+        cachey = sorted(d for d in inputs.declared if "cache" in action_metadata.fold_input_name(d))
+        if cachey:
+            refuse(
+                ErrorKind.CACHE_WRITER_UNMODELLED, fname, loc,
+                f"runs {uses!r}, which declares the cache inputs {cachey} but has no `CACHE_WRITERS` row holding "
+                "it to saving only on main; refused",
+            )
+        elif _remote_key(uses) not in CACHE_FREE:
+            refuse(
+                ErrorKind.CACHE_WRITER_UNMODELLED, fname, loc,
+                f"runs {uses!r}, which neither a `CACHE_WRITERS` row holds to saving only on main nor "
+                "`CACHE_FREE` classifies as saving no cache; refused",
+            )
+        return
+    missing = sorted(k for k, _ in row.inputs if k not in inputs.declared)
+    if missing:
+        refuse(
+            ErrorKind.CACHE_WRITER_ROW_INVALID, "verify-manifest.py", "CACHE_WRITERS",
+            f"the {row.name!r} row pins {missing}, which {uses!r} does not declare (it declares "
+            f"{sorted(inputs.declared)}); refused",
+        )
 
 
 def check_ci_suites_required(wfs: WorkflowSet, entries: list[dict], errors: list[str]) -> None:
@@ -7217,7 +7700,7 @@ _VM_ACTION_RE = re.compile(r"vmactions/freebsd-vm@[0-9a-f]{40}")
 _RUST_CACHE_PIN_RE = re.compile(r"Swatinem/rust-cache@[0-9a-f]{40}")
 _DTOLNAY_PIN_RE = re.compile(r"dtolnay/rust-toolchain@[0-9a-f]{40}")
 # The FreeBSD VM step's inputs but `run`.
-_VM_PRELUDE = {"prepare": "pkg install -y rust"}
+_VM_PRELUDE = {"disable-cache": OFF_MAIN_EXPR, "prepare": "pkg install -y rust"}
 # A matrix `os` or `target`: a runner label or a target triple, nothing a
 # shell or an expression can read as syntax.
 _MATRIX_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -7991,6 +8474,7 @@ def main() -> int:
 
     # ---- 5. ci/deterministic-checks.json vs the watcher + ci.yml steps ----
     check_deterministic_set(workflows, errors)
+    check_test_watchers(workflows, errors)
 
     # ---- 6+7. rustc wiring + cache saves; pinned CI inputs + env-file writes ----
     local_actions = check_workflow_steps(workflows, errors)

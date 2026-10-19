@@ -1,9 +1,9 @@
 module Main exposing (main)
 
 import Ipe.Crypto as Crypto exposing (Key)
-import Ipe.String as String
 import Ipe.Io as Io
 import Ipe.Maybe exposing (Maybe(..))
+import Ipe.String as String
 
 
 -- `Ipe.Crypto` makes key/message role confusion a compile error. Three ideas:
@@ -16,7 +16,6 @@ import Ipe.Maybe exposing (Maybe(..))
 --   • Comparing a computed MAC against an expected one uses `constantTimeEqual`,
 --     never `==`: a byte-by-byte early-exit compare would leak, through timing,
 --     how much of the value matched.
-
 
 -- Build the signing key ONCE. `keyFromString` returns `Maybe Key` — an empty key
 -- is `Nothing` — so the fallible parse happens here, at the boundary, and every
@@ -44,9 +43,7 @@ verify key message presented =
 main =
     do
         Io.println ("sha256(hello): " ++ Crypto.sha256 "hello")
-
         case signingKey of
-
             Just key ->
                 let
                     message =

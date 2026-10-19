@@ -23,16 +23,12 @@ fn repo_root() -> PathBuf {
 
 fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -58,16 +54,12 @@ fn non_exhaustive_int_case_is_ipe_t0010() {
 #[test]
 fn redundant_branch_after_catch_all_is_ipe_t0011_warning_build_succeeds() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("gate_redundant")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("gate_redundant");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m3b3_gate_redundant_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "redundant branch after catch-all must WARN (IPE-T0011) and build, got: {:?}",

@@ -406,7 +406,7 @@ mod tests {
     use super::*;
     use ipe_syntax::{Exposed, Exposing, Expr, Expr_, Pattern_, TypeAnnotation, Value};
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Every published keyword lexes as its keyword token, never an identifier.
     #[test]
@@ -632,14 +632,10 @@ mod tests {
     /// A well-formed module header so a per-construct test isolates the body.
     const HDR: &str = "module Main exposing (main)\n";
 
-    /// Whether `e` is a call of `Task.<name>`.
-    fn is_task_call(e: &Expr_, i: &Interner, name: &str) -> bool {
-        matches!(
-            e,
-            Expr_::Call(callee, _)
-                if matches!(&callee.value, Expr_::VarQual(q, n)
-                    if i.resolve(*q) == Some("Task") && i.resolve(*n) == Some(name))
-        )
+    /// Whether `e` is a `do` bind: a call of the [`Expr_::TaskAndThen`]
+    /// identity node, never a `Task.andThen` spelling.
+    fn is_do_bind(e: &Expr_) -> bool {
+        matches!(e, Expr_::Call(callee, _) if matches!(callee.value, Expr_::TaskAndThen))
     }
 
     #[test]
@@ -650,7 +646,7 @@ mod tests {
         let m = parse_module(&src, &mut i).expect("do block parses");
         let main = find_value(&m, &i, "main").expect("main present");
         assert!(
-            is_task_call(&main.body.value, &i, "andThen"),
+            is_do_bind(&main.body.value),
             "expected a `Task.andThen` call, got {:?}",
             main.body.value
         );
@@ -660,6 +656,22 @@ mod tests {
                 "andThen's first argument must be the continuation lambda"
             );
         }
+    }
+
+    /// A written `Task.andThen` call stays a spelled `VarQual`: only a `do`
+    /// statement builds the identity node.
+    #[test]
+    fn written_task_and_then_is_no_do_bind() {
+        let mut i = Interner::new();
+        let src = format!("{HDR}main =\n    Task.andThen (\\x -> other x) task\n");
+        let m = parse_module(&src, &mut i).expect("written call parses");
+        let main = find_value(&m, &i, "main").expect("main present");
+        assert!(!is_do_bind(&main.body.value), "{:?}", main.body.value);
+        assert!(
+            matches!(&main.body.value, Expr_::Call(callee, _) if matches!(callee.value, Expr_::VarQual(..))),
+            "{:?}",
+            main.body.value
+        );
     }
 
     #[test]
@@ -717,7 +729,7 @@ mod tests {
         let m = parse_module(&src, &mut i).expect("Task.parallel inside do parses");
         let main = find_value(&m, &i, "main").expect("main present");
         assert!(
-            is_task_call(&main.body.value, &i, "andThen"),
+            is_do_bind(&main.body.value),
             "outer `do` desugars to `Task.andThen`, got {:?}",
             main.body.value
         );

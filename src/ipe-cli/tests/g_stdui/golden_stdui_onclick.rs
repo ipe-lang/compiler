@@ -39,17 +39,16 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Compile / build / run `tests/golden/stdui_onclick/Main.ipe` and return
+/// Compile / build / run `tests/golden/stdui_onclick/src/Main.ipe` and return
 /// the golden directory together with the run outcome.  Gated on `IPE_E2E=1`.
 fn build_run_onclick() -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("stdui_onclick");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_m7_stdui_onclick_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for stdui_onclick: {:?}",

@@ -2,7 +2,7 @@
 //!
 //! A child sub-component's `Cmd ChildMsg` / `Sub ChildMsg` are folded into a
 //! parent `Cli.tea` via `Cmd.map` / `Sub.map`, retagging them into the
-//! parent's `Msg` (`tests/golden/cmd_sub_map/Main.ipe`). This pins ipe-0 ∧
+//! parent's `Msg` (`tests/golden/cmd_sub_map/src/Main.ipe`). This pins ipe-0 ∧
 //! cargo-0 ∧ run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs) and
 //! that the emitted main routes through the Cli runtime entry. The runtime
 //! unit tests (`ipe_runtime::tea::map_tests`) cover the retagging semantics.
@@ -25,14 +25,13 @@ fn cmd_sub_map_ipec_cargo_and_run_zero() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("cmd_sub_map");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_cmd_sub_map_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // ipe-0: compiling a program that calls Cmd.map / Sub.map must succeed.
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for cmd_sub_map: {:?}",

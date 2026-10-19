@@ -182,90 +182,253 @@ fn concretize_manifest(manifest: &str) -> String {
         + if manifest.ends_with('\n') { "\n" } else { "" }
 }
 
-/// Prepare the runtime manifest for bundling alongside an emitted dep-model
-/// crate: concretize the version AND strip every `[dev-dependencies]` /
-/// `[target.*.dev-dependencies]` section.
+/// Which emission a bundled runtime copy serves, stamped into its version.
 ///
-/// Dev-dependency sections are irrelevant when the runtime crate is used as a
-/// cargo dependency (cargo never installs dev deps for non-root crates). They
-/// may however contain workspace-relative `path` entries (e.g. sibling compiler
-/// crates) that do not resolve when the manifest lives outside the workspace.
-/// Stripping them keeps the bundled crate's manifest self-contained.
-///
-/// The strip is line-granular: a `[…dev-dependencies]` header line begins a
-/// section that continues until the next TOML table header (`[` at column 0)
-/// or end of file. Comment lines inside a skipped section are dropped with the
-/// section, keeping the output clean.
-fn prepare_bundled_manifest(manifest: &str) -> String {
-    let concretized = concretize_manifest(manifest);
-    let mut out = String::with_capacity(concretized.len());
-    let mut in_dev_deps = false;
-    let trailing_newline = concretized.ends_with('\n');
-    for line in concretized.lines() {
-        let trimmed = line.trim();
-        // A TOML table header at column 0 starts a new section.
-        if trimmed.starts_with('[') {
-            in_dev_deps = trimmed.contains("dev-dependencies");
-        }
-        if !in_dev_deps {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    // Preserve (or not) the trailing newline the original carried.
-    if !trailing_newline && out.ends_with('\n') {
-        out.pop();
-    }
-    out
+/// A scratch bundle (`ipe test`) and an `out/` bundle of the same bytes are two
+/// cargo units, so a hand-edited `out/` copy built into a shared target can
+/// never stand in for the scratch one. There is no default: every emission
+/// names its role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleRole {
+    /// A project's own output directory.
+    Out,
+    /// A private scratch directory created for one run.
+    Scratch,
 }
 
-/// Collect the embedded runtime crate as a path→text map for dep bundling.
+impl BundleRole {
+    /// The role's token in the stamped version.
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Out => "out",
+            Self::Scratch => "scratch",
+        }
+    }
+}
+
+/// Bytes of a [`RuntimeDigest`].
+const RUNTIME_DIGEST_LEN: usize = 16;
+
+/// The digest of every bundled runtime byte, the runtime unit's content identity.
 ///
-/// Rewrites the root `Cargo.toml` via [`prepare_bundled_manifest`] (concrete
-/// version, no dev-dependencies) and skips `tests/`. Relative paths are rooted
-/// at the crate root (e.g. `Cargo.toml`, `src/mod.rs`).
+/// SHA-256 over a length-framed encoding, truncated to 128 bits: a domain tag,
+/// then for each file in path order the path and the text, each preceded by its
+/// length as a little-endian `u64`, so no two file sets share an encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeDigest([u8; RUNTIME_DIGEST_LEN]);
+
+/// The domain tag opening a [`RuntimeDigest`] input.
+const RUNTIME_DIGEST_TAG: &[u8] = b"ipe-runtime-bundle\0";
+
+impl RuntimeDigest {
+    /// The digest of `files`, given in path order as (`/`-joined path, text).
+    fn of<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(RUNTIME_DIGEST_TAG);
+        for (path, text) in files {
+            for part in [path.as_bytes(), text.as_bytes()] {
+                hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+                hasher.update(part);
+            }
+        }
+        let full = hasher.finalize();
+        let mut out = [0u8; RUNTIME_DIGEST_LEN];
+        for (slot, byte) in out.iter_mut().zip(full.iter()) {
+            *slot = *byte;
+        }
+        Self(out)
+    }
+
+    /// The digest as 32 lowercase hex digits.
+    #[must_use]
+    pub fn hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// The embedded runtime crate prepared for one [`BundleRole`].
+#[derive(Debug)]
+pub struct BundledRuntime {
+    /// Every bundled file, relative to the crate root, with its text.
+    files: BTreeMap<PathBuf, String>,
+    /// The digest of the files before the manifest was stamped.
+    digest: RuntimeDigest,
+}
+
+impl BundledRuntime {
+    /// Every bundled file, relative to the crate root, with its text.
+    #[must_use]
+    pub const fn files(&self) -> &BTreeMap<PathBuf, String> {
+        &self.files
+    }
+
+    /// The content digest the manifest's version carries.
+    #[must_use]
+    pub const fn digest(&self) -> RuntimeDigest {
+        self.digest
+    }
+}
+
+/// Why the embedded runtime cannot be bundled, cached so every use fails alike.
+#[derive(Debug, Clone)]
+enum BundleFault {
+    /// The embedded file at this bundle-relative path is not UTF-8.
+    NotUtf8(PathBuf),
+    /// The embedded manifest cannot be stamped.
+    Manifest(ManifestFault),
+}
+
+/// Why the embedded runtime manifest cannot be stamped for bundling.
+#[derive(Debug, Clone)]
+pub enum ManifestFault {
+    /// The manifest is not TOML.
+    Unparsable(toml_edit::TomlError),
+    /// The manifest has no `[package]` table.
+    NoPackageTable,
+    /// The bundle has no UTF-8 root manifest.
+    NoUtf8Manifest,
+}
+
+impl std::fmt::Display for ManifestFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unparsable(e) => write!(f, "the manifest is not TOML: {e}"),
+            Self::NoPackageTable => f.write_str("the manifest has no `[package]` table"),
+            Self::NoUtf8Manifest => f.write_str("the bundle has no UTF-8 root manifest"),
+        }
+    }
+}
+
+impl BundleFault {
+    /// The error this fault surfaces as.
+    fn to_error(&self) -> CliError {
+        match self {
+            Self::NotUtf8(rel) => CliError::RuntimeMaterializeFailed {
+                detail: format!("embedded runtime file {} is not valid UTF-8", rel.display()),
+            },
+            Self::Manifest(fault) => CliError::BundledManifest {
+                fault: fault.clone(),
+            },
+        }
+    }
+}
+
+/// The version a bundled manifest carries: `<COMPILER_VERSION>+ipe.<role>.<digest hex>`.
 ///
-/// Used to materialise `ipe_runtime_dep/` alongside a dep-model emitted crate
-/// so the relative path dep in its `Cargo.toml` resolves in any environment.
+/// Semver build metadata, which cargo hashes into the unit's identity, so two
+/// bundles differing in one byte or in role never share a compiled unit.
+#[must_use]
+pub fn stamped_version(role: BundleRole, digest: RuntimeDigest) -> String {
+    format!("{COMPILER_VERSION}+ipe.{}.{}", role.token(), digest.hex())
+}
+
+/// Prepare the runtime manifest for bundling: set `package.version` to `version`
+/// and remove every `dev-dependencies` table, `target.*` ones included.
+///
+/// Dev dependencies are never built for a non-root crate, and they may name
+/// workspace-relative paths that do not resolve outside the workspace. The
+/// manifest is parsed once as TOML, so a key that merely mentions
+/// `dev-dependencies` is kept.
 ///
 /// # Errors
-///
-/// [`CliError::RuntimeMaterializeFailed`] when an embedded file is not valid
-/// UTF-8 (unexpected for in-repo source; surfaced loudly rather than silently
-/// skipped).
-pub fn collect_embedded_crate_text()
--> Result<&'static std::collections::BTreeMap<std::path::PathBuf, String>, CliError> {
-    // The embedded runtime crate is compiled-in (`include_dir!`) and thus
-    // invariant for the process lifetime, as is the pure manifest transform
-    // applied to it. Compute the path→text map once and reuse it across every
-    // emit cycle rather than re-walking + re-validating the tree each time. On
-    // the UTF-8 refusal path the detail is cached so the fail-closed error
-    // still surfaces (once, at first use, deterministically).
-    static EMBEDDED: LazyLock<Result<BTreeMap<PathBuf, String>, String>> = LazyLock::new(|| {
-        let mut out = BTreeMap::new();
-        collect_dir_text_from_embedded(&RUNTIME_CRATE, Path::new(""), true, &mut out).map_err(
-            |e| match e {
-                CliError::RuntimeMaterializeFailed { detail } => detail,
-                other => other.to_string(),
-            },
-        )?;
-        Ok(out)
-    });
-    EMBEDDED
-        .as_ref()
-        .map_err(|detail| CliError::RuntimeMaterializeFailed {
-            detail: detail.clone(),
-        })
+/// [`BundleFault::Manifest`] when the manifest does not parse.
+fn prepare_bundled_manifest(manifest: &str, version: &str) -> Result<String, BundleFault> {
+    let mut doc = manifest
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| BundleFault::Manifest(ManifestFault::Unparsable(e)))?;
+    let package = doc
+        .get_mut("package")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or(BundleFault::Manifest(ManifestFault::NoPackageTable))?;
+    package.insert("version", toml_edit::value(version));
+    doc.remove("dev-dependencies");
+    if let Some(targets) = doc
+        .get_mut("target")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        for (_, target) in targets.iter_mut() {
+            if let Some(target) = target.as_table_like_mut() {
+                target.remove("dev-dependencies");
+            }
+        }
+    }
+    Ok(doc.to_string())
 }
 
-/// Recursive helper for [`collect_embedded_crate_text`]: traverses `dir`,
-/// prepending `prefix` to each entry's relative path.
+/// The embedded runtime crate's files, keyed by path, with their digest.
+type UnstampedBundle = (BTreeMap<PathBuf, String>, RuntimeDigest);
+
+/// The embedded runtime crate's files and their digest, the manifest carrying
+/// [`COMPILER_VERSION`]; the shared base both roles stamp.
+fn unstamped_bundle() -> &'static Result<UnstampedBundle, BundleFault> {
+    static BASE: LazyLock<Result<UnstampedBundle, BundleFault>> = LazyLock::new(|| {
+        let mut files = BTreeMap::new();
+        collect_dir_text_from_embedded(&RUNTIME_CRATE, Path::new(""), true, &mut files)?;
+        let keys = files
+            .iter()
+            .map(|(path, text)| (digest_path(path), text.as_str()))
+            .collect::<Vec<_>>();
+        let digest = RuntimeDigest::of(keys.iter().map(|(path, text)| (path.as_str(), *text)));
+        Ok((files, digest))
+    });
+    &BASE
+}
+
+/// `path`'s components joined with `/`, the form a [`RuntimeDigest`] reads on every host.
+fn digest_path(path: &Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The embedded runtime crate bundled for `role`: its manifest's version
+/// stamped with the role and the content digest, dev dependencies removed,
+/// `tests/` skipped.
+///
+/// Computed once per role and reused across every emit.
+///
+/// # Errors
+/// [`CliError::RuntimeMaterializeFailed`] when an embedded file is not UTF-8;
+/// [`CliError::BundledManifest`] when the embedded manifest does not parse.
+pub fn bundled_runtime(role: BundleRole) -> Result<&'static BundledRuntime, CliError> {
+    /// The bundle of `role`, stamped from the shared base.
+    fn stamp(role: BundleRole) -> Result<BundledRuntime, BundleFault> {
+        let (base, digest) = unstamped_bundle().as_ref().map_err(Clone::clone)?;
+        let mut files = base.clone();
+        let manifest = RUNTIME_CRATE
+            .get_file(MANIFEST)
+            .and_then(|file| std::str::from_utf8(file.contents()).ok())
+            .ok_or(BundleFault::Manifest(ManifestFault::NoUtf8Manifest))?;
+        let stamped = prepare_bundled_manifest(manifest, &stamped_version(role, *digest))?;
+        files.insert(PathBuf::from(MANIFEST), stamped);
+        Ok(BundledRuntime {
+            files,
+            digest: *digest,
+        })
+    }
+    static OUT: LazyLock<Result<BundledRuntime, BundleFault>> =
+        LazyLock::new(|| stamp(BundleRole::Out));
+    static SCRATCH: LazyLock<Result<BundledRuntime, BundleFault>> =
+        LazyLock::new(|| stamp(BundleRole::Scratch));
+    match role {
+        BundleRole::Out => &OUT,
+        BundleRole::Scratch => &SCRATCH,
+    }
+    .as_ref()
+    .map_err(BundleFault::to_error)
+}
+
+/// Recursive helper for [`unstamped_bundle`]: traverses `dir`, prepending
+/// `prefix` to each entry's relative path; the root manifest carries
+/// [`COMPILER_VERSION`].
 fn collect_dir_text_from_embedded(
     dir: &include_dir::Dir<'_>,
     prefix: &std::path::Path,
     at_root: bool,
-    out: &mut std::collections::BTreeMap<std::path::PathBuf, String>,
-) -> Result<(), CliError> {
+    out: &mut BTreeMap<PathBuf, String>,
+) -> Result<(), BundleFault> {
     for entry in dir.entries() {
         match entry {
             include_dir::DirEntry::Dir(sub) => {
@@ -278,16 +441,10 @@ fn collect_dir_text_from_embedded(
             include_dir::DirEntry::File(file) => {
                 let name = file.path().file_name().unwrap_or_default();
                 let rel = prefix.join(name);
-                let text = std::str::from_utf8(file.contents()).map_err(|_| {
-                    CliError::RuntimeMaterializeFailed {
-                        detail: format!(
-                            "embedded runtime file {} is not valid UTF-8",
-                            rel.display()
-                        ),
-                    }
-                })?;
+                let text = std::str::from_utf8(file.contents())
+                    .map_err(|_| BundleFault::NotUtf8(rel.clone()))?;
                 let text = if at_root && name == std::ffi::OsStr::new(MANIFEST) {
-                    prepare_bundled_manifest(text)
+                    prepare_bundled_manifest(text, COMPILER_VERSION)?
                 } else {
                     text.to_owned()
                 };
@@ -680,5 +837,141 @@ mod tests {
     fn ipe_home_refuses_without_any_absolute_home() {
         let got = ipe_home_from(None, Some("rel".into()), None);
         assert!(matches!(got, Err(CliError::RuntimeHomeUnknown)));
+    }
+
+    /// The digest of one (path, text) pair.
+    fn digest_of(path: &str, text: &str) -> RuntimeDigest {
+        RuntimeDigest::of([(path, text)])
+    }
+
+    #[test]
+    fn one_changed_byte_changes_the_digest_and_the_stamp() {
+        let base = digest_of("src/lib.rs", "pub fn a() {}");
+        let changed = digest_of("src/lib.rs", "pub fn b() {}");
+        let renamed = digest_of("src/lic.rs", "pub fn a() {}");
+        assert_ne!(base, changed);
+        assert_ne!(base, renamed);
+        assert_ne!(
+            stamped_version(BundleRole::Scratch, base),
+            stamped_version(BundleRole::Scratch, changed)
+        );
+    }
+
+    #[test]
+    fn a_byte_moved_across_the_path_text_boundary_changes_the_digest() {
+        assert_ne!(digest_of("ab", "c"), digest_of("a", "bc"));
+        assert_ne!(
+            RuntimeDigest::of([("a", ""), ("b", "")]),
+            RuntimeDigest::of([("ab", "")])
+        );
+    }
+
+    #[test]
+    fn out_and_scratch_stamps_differ_for_the_same_files() {
+        let digest = digest_of("src/lib.rs", "");
+        assert_ne!(
+            stamped_version(BundleRole::Out, digest),
+            stamped_version(BundleRole::Scratch, digest)
+        );
+        let out = bundled_runtime(BundleRole::Out).expect("out bundle");
+        let scratch = bundled_runtime(BundleRole::Scratch).expect("scratch bundle");
+        assert_eq!(out.digest(), scratch.digest());
+        assert_ne!(
+            out.files().get(Path::new(MANIFEST)),
+            scratch.files().get(Path::new(MANIFEST))
+        );
+    }
+
+    /// Whether `version` is `MAJOR.MINOR.PATCH+ipe.<role>.<32 lowercase hex>`.
+    fn is_stamp_for(version: &str, role: &str) -> bool {
+        let Some((core, meta)) = version.split_once('+') else {
+            return false;
+        };
+        let numeric = core.split('.').collect::<Vec<_>>();
+        let core_ok = numeric.len() == 3
+            && numeric
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+        let Some(hex) = meta
+            .strip_prefix("ipe.")
+            .and_then(|rest| rest.strip_prefix(role))
+            .and_then(|rest| rest.strip_prefix('.'))
+        else {
+            return false;
+        };
+        core_ok
+            && hex.len() == 32
+            && hex
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    }
+
+    /// Whether `table` holds a `dev-dependencies` table at any depth.
+    fn holds_dev_dependencies(table: &toml::Table) -> bool {
+        table.iter().any(|(key, value)| {
+            key == "dev-dependencies" || value.as_table().is_some_and(holds_dev_dependencies)
+        })
+    }
+
+    #[test]
+    fn the_stamped_manifest_carries_the_stamp_and_no_dev_dependencies() {
+        for (role, token) in [(BundleRole::Out, "out"), (BundleRole::Scratch, "scratch")] {
+            let bundle = bundled_runtime(role).expect("bundle");
+            let manifest = bundle
+                .files()
+                .get(Path::new(MANIFEST))
+                .expect("bundled manifest");
+            let parsed = manifest
+                .parse::<toml::Table>()
+                .expect("stamped manifest parses");
+            let version = parsed
+                .get("package")
+                .and_then(toml::Value::as_table)
+                .and_then(|package| package.get("version"))
+                .and_then(toml::Value::as_str)
+                .expect("package.version");
+            assert!(is_stamp_for(version, token), "{version}");
+            assert!(semver::Version::parse(version).is_ok(), "{version}");
+            assert_eq!(version, stamped_version(role, bundle.digest()));
+            assert!(!holds_dev_dependencies(&parsed));
+        }
+        assert!(!is_stamp_for("0.1.0+ipe.out.ABCDEF", "out"));
+        assert!(!is_stamp_for(
+            "0.1+ipe.out.00000000000000000000000000000000",
+            "out"
+        ));
+    }
+
+    #[test]
+    fn a_key_mentioning_dev_dependencies_is_kept_while_the_table_goes() {
+        let fixture = "[package]\nname = \"r\"\nversion.workspace = true\n\n\
+            [features]\nextra = [\"default-dev-dependencies\"]\n\n\
+            [dependencies]\nserde = \"1\"\n\n\
+            [target.'cfg(unix)'.dev-dependencies]\nlibc = \"0.2\"\n\n\
+            [dev-dependencies]\ntempfile = \"3\"\n";
+        let out = prepare_bundled_manifest(fixture, "1.2.3+ipe.out.x").expect("prepares");
+        let parsed = out.parse::<toml::Table>().expect("parses");
+        assert!(!holds_dev_dependencies(&parsed));
+        assert!(out.contains("default-dev-dependencies"));
+        assert!(out.contains("serde"));
+        assert!(matches!(
+            parsed
+                .get("package")
+                .and_then(|p| p.get("version"))
+                .and_then(toml::Value::as_str),
+            Some("1.2.3+ipe.out.x")
+        ));
+    }
+
+    #[test]
+    fn an_unparsable_manifest_is_a_typed_fault() {
+        assert!(matches!(
+            prepare_bundled_manifest("[package\n", "1.0.0"),
+            Err(BundleFault::Manifest(ManifestFault::Unparsable(_)))
+        ));
+        assert!(matches!(
+            prepare_bundled_manifest("[dependencies]\n", "1.0.0"),
+            Err(BundleFault::Manifest(ManifestFault::NoPackageTable))
+        ));
     }
 }

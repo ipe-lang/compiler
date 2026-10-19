@@ -1683,6 +1683,72 @@ fn value_hole_static_sibling_hot_swaps_without_rebuild() -> Result<(), BoxError>
     stop_and_join(&handle, join)
 }
 
+/// A `Web.tea` whose view maps a lambda over `model.items` — under the flag the
+/// `List.map` becomes a template list hole whose per-item fills read the
+/// lambda's parameter `entry`.
+fn web_fixture_list_hole(label: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\n\
+         import Ipe.Tea.Web as Web\n\
+         import Ipe.Ui as Ui\n\
+         import Ipe.List as List\n\
+         import Ipe.Tea.Web.Cmd\n\
+         import Ipe.Tea.Web.Sub\n\n\
+         type alias Model = {{ items : List String }}\n\n\
+         type Msg = Noop\n\n\
+         init : WebReq -> ( Model, Cmd Msg )\n\
+         init _req =\n    \
+             ( {{ items = [ \"apple\", \"pear\" ] }}, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update _msg model =\n    \
+             ( model, Cmd.none )\n\n\
+         view : Model -> Element Msg\n\
+         view model =\n    \
+             Ui.column []\n        \
+                 [ Ui.text \"{label}\"\n        \
+                 , Ui.column [] (List.map (\\entry -> Ui.row [] [ Ui.text entry ]) model.items)\n        \
+                 ]\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    \
+             Sub.none\n\n\
+         main =\n    \
+             Web.tea\n        \
+                 {{ init = init, update = update, view = view, subscriptions = subscriptions\n        \
+                 , routes = [], notFound = Noop\n        \
+                 }}\n",
+    )
+}
+
+/// A list hole's per-item closure binds the item under the same ident its fills
+/// read: the flag-on cold build cargo-compiles and serves every item.
+#[test]
+#[cfg(target_os = "linux")]
+fn list_hole_item_binder_matches_its_reads() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+
+    let (ipe_dir, out_dir) = fresh_dirs("listhole")?;
+    write_main(&ipe_dir, &web_fixture_list_hole("marker"))?;
+
+    let sink = EventSink::default();
+    let port = 19188;
+    let (join, handle) = start_watch(&ipe_dir.join("Main.ipe"), &out_dir, port, &sink);
+
+    assert!(
+        wait_for_serving(port, Duration::from_mins(4)),
+        "the flag-on cold build of a list-hole view must cargo-compile and serve"
+    );
+    let body = http_get_body(port).ok_or("server must serve a body after cold build")?;
+    assert!(
+        body.contains("apple") && body.contains("pear"),
+        "every list item must render through its list-hole fill: {body}"
+    );
+
+    stop_and_join(&handle, join)
+}
+
 /// A `Web.tea` counter whose `update` is a data-describable transition arm
 /// (`Increment -> ( { m | count = m.count + step }, Cmd.none )`). Under the flag
 /// the arm compiles to `apply_transition_hot("<baked datum>", model)`, so editing

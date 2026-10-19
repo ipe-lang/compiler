@@ -239,7 +239,8 @@ escapeWith escapeBackslash raw =
 
 -- One step of a left-to-right scan: `pending` holds the verbatim text read
 -- since the last escape; `done` the segments before it, in order. Both grow
--- at their end, so the scan is linear in the text.
+-- at their end in place, so the scan is linear in the text; a segment consed
+-- onto the head would copy the whole list each step.
 scanChar : Bool -> Char -> ( String, List Segment ) -> ( String, List Segment )
 scanChar escapeBackslash c ( pending, done ) =
     if needsEscape escapeBackslash c then

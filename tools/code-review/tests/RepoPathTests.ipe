@@ -32,7 +32,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), ReposError(..), Root, R
 import Lib.SafeText as SafeText
 import Lib.Settings as Settings
 import Lib.Uid as Uid
-import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
+import TestSupport exposing (openFileAt, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, envSettings, loadFirstPage, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, piecesShown, quotedLabelOf, refusedFor, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, uid)
 
 
 -- ── guard the path resolver ─────────────────────────────────────────────
@@ -157,7 +157,7 @@ refusalNames fragment result =
             False
 
         Err err ->
-            String.contains fragment (SafeText.toString (RepoPath.describe err))
+            String.contains fragment (describeText err)
 
 
 refused : Result PathError Path.Path -> Bool
@@ -263,14 +263,11 @@ relativeRootAccepted =
         System.setenv "IPE_INDEX_ROOT" rel
         settings <- envSettings
         Task.succeed
-            (Path.toString (RepoPath.rootPath root)
-                == Path.toString cwdPath
-                && Path.toString (RepoPath.rootPath dotRoot)
-                == Path.toString cwdPath
+            (Path.toString (RepoPath.rootPath root) == Path.toString cwdPath
+                && Path.toString (RepoPath.rootPath dotRoot) == Path.toString cwdPath
                 && resolvesTo (Path.toString cwdPath ++ "/package.ipe") (RepoPath.resolve settings.roots "ipe:package.ipe")
                 && refusedAs "unknown-tag" (RepoPath.resolve settings.roots "other:package.ipe")
-                && Result.map RepoPath.tagName Settings.ipeTag
-                == Ok "ipe"
+                && Result.map RepoPath.tagName Settings.ipeTag == Ok "ipe"
             )
 
 
@@ -306,7 +303,7 @@ pathRefusalPageTextFixed =
                 Path.toString (RepoPath.rootPath root)
 
             pageText err =
-                SafeText.toString (Index.readFailureText (PathRefused err))
+                piecesShown (Index.readFailureText (PathRefused err))
 
             fixed expected stored =
                 case RepoPath.resolve roots stored of
@@ -314,10 +311,8 @@ pathRefusalPageTextFixed =
                         False
 
                     Err err ->
-                        refusalName err
-                            == refusalName expected
-                            && pageText err
-                            == describeText expected
+                        refusalName err == refusalName expected
+                            && pageText err == describeText expected
                             && String.contains (SafeText.toString (SafeText.quoted stored)) (pageText err)
                             && not (String.contains rootText (pageText err))
                             && not (String.contains base (pageText err))
@@ -328,13 +323,13 @@ pathRefusalPageTextFixed =
                 && String.length base > 1
                 && resolvesTo (rootText ++ "/src/x.ipe") (RepoPath.resolve roots "ipe:src/x.ipe")
                 && List.all identity
-                    [ fixed (InvalidRelative "ipe:../x") "ipe:../x"
-                    , fixed (InvalidRelative "ipe:a/../../escape") "ipe:a/../../escape"
-                    , fixed (InvalidRelative "ipe:a\0b") "ipe:a\0b"
-                    , fixed (NotUnderRoot "ipe:/etc/passwd") "ipe:/etc/passwd"
-                    , fixed (NotUnderRoot "ipe:") "ipe:"
-                    , fixed (NotUnderRoot "ipe:.") "ipe:."
-                    , fixed (NotUnderRoot "ipe:a/..") "ipe:a/.."
+                    [ fixed (InvalidRelative (quotedLabelOf "ipe:../x")) "ipe:../x"
+                    , fixed (InvalidRelative (quotedLabelOf "ipe:a/../../escape")) "ipe:a/../../escape"
+                    , fixed (InvalidRelative (quotedLabelOf "ipe:a\0b")) "ipe:a\0b"
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:/etc/passwd")) "ipe:/etc/passwd"
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:")) "ipe:"
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:.")) "ipe:."
+                    , fixed (NotUnderRoot (quotedLabelOf "ipe:a/..")) "ipe:a/.."
                     ]
             )
 
@@ -487,16 +482,16 @@ describeEscapesStoredPath : Bool
 describeEscapesStoredPath =
     let
         osc =
-            describeText (MissingTag (codeText 27 ++ "]0;x" ++ codeText 7))
+            describeText (MissingTag (quotedLabelOf (codeText 27 ++ "]0;x" ++ codeText 7)))
 
         cr =
-            describeText (MissingTag "a\rb")
+            describeText (MissingTag (quotedLabelOf "a\rb"))
 
         lf =
-            describeText (MissingTag "a\nb")
+            describeText (MissingTag (quotedLabelOf "a\nb"))
 
         rlo =
-            describeText (MissingTag (codeText 8238 ++ "gpj.exe"))
+            describeText (MissingTag (quotedLabelOf (codeText 8238 ++ "gpj.exe")))
     in
     List.all identity
         [ String.contains "\\u{1b}]0;x\\u{7}" osc
@@ -543,16 +538,16 @@ withForeign : String -> PathError -> PathError
 withForeign stored err =
     case err of
         MissingTag _ ->
-            MissingTag stored
+            MissingTag (quotedLabelOf stored)
 
         UnknownTag _ ->
-            UnknownTag stored
+            UnknownTag (quotedLabelOf stored)
 
         InvalidRelative _ ->
-            InvalidRelative stored
+            InvalidRelative (quotedLabelOf stored)
 
         NotUnderRoot _ ->
-            NotUnderRoot stored
+            NotUnderRoot (quotedLabelOf stored)
 
         NoRoots ->
             NoRoots
@@ -564,7 +559,7 @@ withForeign stored err =
             DuplicateRoot stored stored
 
         ClaimedByDeeperRoot _ ->
-            ClaimedByDeeperRoot stored
+            ClaimedByDeeperRoot (quotedLabelOf stored)
 
         TooManyRoots ->
             TooManyRoots
@@ -572,14 +567,14 @@ withForeign stored err =
 
 allPathErrors : List PathError
 allPathErrors =
-    [ MissingTag ""
-    , UnknownTag ""
-    , InvalidRelative ""
-    , NotUnderRoot ""
+    [ MissingTag (quotedLabelOf "")
+    , UnknownTag (quotedLabelOf "")
+    , InvalidRelative (quotedLabelOf "")
+    , NotUnderRoot (quotedLabelOf "")
     , NoRoots
     , DuplicateTag ""
     , DuplicateRoot "" ""
-    , ClaimedByDeeperRoot ""
+    , ClaimedByDeeperRoot (quotedLabelOf "")
     , TooManyRoots
     ]
 
@@ -611,8 +606,7 @@ diagnosticsNeverRaw =
         tree <- freshNested
         nestedRoots <- mapOf [ ( "out", tree.outer ), ( "in", tree.inner ) ]
         Task.succeed
-            (List.length allPathErrors
-                == 9
+            (List.length allPathErrors == 9
                 && List.all (\err -> clean (withForeign hazards err)) allPathErrors
                 && List.all
                     (resolvedClean roots)
@@ -892,10 +886,8 @@ tooManyRootsRefused =
         limit <- maxReposVector
         roots <- distinctRoots (limit + 1)
         Task.succeed
-            (limit
-                >= 1
-                && RepoPath.maxRoots
-                == limit
+            (limit >= 1
+                && RepoPath.maxRoots == limit
                 && mapRefusedAs "too-many-roots" (mapResult roots)
                 && not (mapRefused (mapResult (List.take limit roots)))
             )
@@ -1012,14 +1004,12 @@ reposRefusedAs raw expected position =
                             text =
                                 SafeText.toString (RepoPath.describeRepos raw err)
                         in
-                        reposErrorName err
-                            == expected
+                        reposErrorName err == expected
                             && String.startsWith "IPE_INDEX_REPOS " text
                             && noHazard text
-                            && (position
-                                == 0
-                                || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
-                            )
+                            && (position == 0
+                                    || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
+                               )
             )
 
 
@@ -1046,8 +1036,7 @@ reposUnsetBindsIpeOnly =
         base <- freshDir "ipe-repos-unset"
         settings <- Settings.parseIndexSettings (base ++ "/index.db") base Settings.EnvUnset
         Task.succeed
-            (List.map (\( tag, _ ) -> RepoPath.tagName tag) (RepoPath.boundRoots settings.roots)
-                == [ "ipe" ]
+            (List.map (\( tag, _ ) -> RepoPath.tagName tag) (RepoPath.boundRoots settings.roots) == [ "ipe" ]
                 && not (refused (RepoPath.resolve settings.roots "ipe:src/x"))
                 && refusedAs "unknown-tag" (RepoPath.resolve settings.roots "ext:src/x")
             )
@@ -1132,8 +1121,7 @@ reposRootsNameTheirEntry =
             (List.member ( "ipe", "IPE_INDEX_ROOT" ) origins
                 && List.any (\( name, origin ) -> name == "ext" && String.startsWith "IPE_INDEX_REPOS entry 1 (" origin) origins
                 && List.any (\( name, origin ) -> name == "docs" && String.startsWith "IPE_INDEX_REPOS entry 2 (" origin) origins
-                && List.length origins
-                == 3
+                && List.length origins == 3
             )
 
 
@@ -1187,10 +1175,8 @@ reposCeilingCountsIpe =
         atCeiling <- reposSettingsRefusal base (numberedEntries base (limit - 1))
         overCeiling <- reposSettingsRefusal base (numberedEntries base limit)
         Task.succeed
-            (RepoPath.maxRoots
-                == limit
-                && atCeiling
-                == Nothing
+            (RepoPath.maxRoots == limit
+                && atCeiling == Nothing
                 && maybeContains "repository roots are configured" overCeiling
             )
 

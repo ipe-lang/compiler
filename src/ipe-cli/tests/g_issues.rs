@@ -4,6 +4,9 @@
 
 mod support;
 
+#[path = "g_issues/root_fixture.rs"]
+mod root_fixture;
+
 #[path = "g_issues/golden_3121_boxed_field_nested_pat_seal.rs"]
 mod golden_3121_boxed_field_nested_pat_seal;
 #[path = "g_issues/golden_3610_or_pattern_normal_form.rs"]

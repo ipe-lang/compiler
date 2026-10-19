@@ -28,11 +28,8 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join("input_arc_capture")
-        .join("Main.ipe")
+fn project_path(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join("input_arc_capture")
 }
 
 /// ipe-0: the compiler must accept the program AND emit the capture-clone `let`
@@ -43,13 +40,13 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i191_ipec_accepts_and_hoists_capture_clone() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i191_input_arc_capture_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for input_arc_capture: {:?}",
@@ -102,13 +99,13 @@ fn i191_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i191_input_arc_capture_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for input_arc_capture: {:?}",

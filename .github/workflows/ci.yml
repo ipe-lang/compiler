@@ -13,7 +13,7 @@ name: Build & test
 #     A pull request runs only this phase.
 #   • TESTS (`tests`: merge queue, dispatch) — test (nextest, with the `ipe`
 #     feature job wasi-run and the Windows job windows-test), the 14-shard e2e
-#     SEAL and seal-slice's coverage proof, seal-smoke, seal-modset (vendored),
+#     SEAL and its coverage proof (seal-slice-cover), seal-smoke, seal-modset (vendored),
 #     the runtime feature-combo / full-feature builds, registry-admission, the
 #     release-target checks, the Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
 #     the queue is about to land.
@@ -95,6 +95,9 @@ jobs:
       cheap: ${{ github.event_name != 'push' }}
       tests: ${{ github.event_name != 'pull_request' && github.event_name != 'push' }}
       post_merge: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+      # The merge-group fail-fast watchers' event marker (they alone read it;
+      # verify-manifest pins its expression).
+      merge_group: ${{ github.event_name == 'merge_group' }}
       # An unset output (classifier crash) reads as `true`: absent proof, run.
       wasm: ${{ steps.classify.outputs.wasm != 'false' }}
       code: ${{ steps.classify.outputs.code != 'false' }}
@@ -111,8 +114,8 @@ jobs:
       # ever splices the raw writer value into a `run:` script.
       release_only: ${{ steps.release.outputs.release_only == 'true' }}
       # `e2e_plan` — every e2e shard's nextest selection, from the SSOT
-      # `.github/ci/e2e_shard.py`; the shards run it and `seal-slice` proves it
-      # partitions the archive.
+      # `.github/ci/e2e_shard.py`; the shards run it and `seal-slice-cover`
+      # proves it partitions the archive.
       e2e_plan: ${{ steps.e2e-plan.outputs.plan }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -197,6 +200,10 @@ jobs:
         run: python3 .github/ci/test_cargo_invocation.py -v
       - name: Prove the test-claims table refusals (unit tests)
         run: python3 .github/ci/test_claims_table.py -v
+      - name: Prove the live-ruleset merge-queue pin refusals (unit tests)
+        run: python3 .github/ci/test_check_required_set.py -v
+      - name: Prove the in-repo ipe-fmt check refusals (unit tests)
+        run: python3 .github/ci/test_ipe_fmt_check.py -v
       - name: The derived required-set is in sync with the manifest
         run: python3 .github/ci/check_required_set.py
 
@@ -509,6 +516,9 @@ jobs:
       - name: Check in FreeBSD VM
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
         with:
+          # The VM image and apt cache are saved only on `main`; off it the action
+          # neither saves nor restores (verify-manifest check 6).
+          disable-cache: ${{ github.ref != 'refs/heads/main' }}
           prepare: pkg install -y rust
           run: cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
 
@@ -1092,6 +1102,13 @@ jobs:
         env:
           IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
         run: bash tools/scripts/first-party-check-floor.sh
+      # Every tracked Ipê project (a directory holding a tracked `package.ipe`,
+      # test inputs under a `tests` directory aside) must be `ipe fmt --check`
+      # clean; the set is discovered from git, so a new project is held at once.
+      - name: Every in-repo Ipê project is ipe-fmt clean
+        env:
+          IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
+        run: python3 tools/scripts/ipe-fmt-check.py
 
   # `ipe-runtime-rust`'s `default = []` leaves `compression`/`csv`/`config`/
   # `tokio` (and every other optional feature) OFF, so the `test` job above
@@ -1391,9 +1408,10 @@ jobs:
           # only links its own `main.rs`.
           IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
           # This shard's entry of the `changes` job's `e2e_plan`, whose SSOT is
-          # `.github/ci/e2e_shard.py`: shards 1-5 spread the heavy cold-build
-          # goldens, shards 6-14 the heavy-free complement, all from the
-          # prebuilt archive (no recompile). `seal-slice` proves the plan
+          # `.github/ci/e2e_shard.py`: its ordered shard groups spread the
+          # heavy cold-build goldens and the longest light binaries across
+          # runners, and its last group takes the complement, all from the
+          # prebuilt archive (no recompile). `seal-slice-cover` proves the plan
           # partitions the archive's test set exactly, and artifact-guard
           # (`e2e_shard.py --lint`) pins this matrix and this wiring.
           SHARD_FILTER: ${{ fromJSON(needs.changes.outputs.e2e_plan)[matrix.shard].filter }}
@@ -1443,19 +1461,38 @@ jobs:
           scope: ${{ needs.changes.outputs.code }}
 
   # ── SEAL slice ────────────────────────────────────────────────────────────
-  # The main-required `seal-slice` context. Its executor is `e2e`: the e2e shards
-  # run every archived test under IPE_E2E=1, so this job composes their result
-  # instead of re-running a subset of the same binaries. What it adds is the
-  # coverage proof: `tools/scripts/e2e-shard-cover.py` lists the run's own
-  # archive and fails unless the `e2e_plan` the shards ran partitions its test
-  # set exactly (every test in exactly one shard), so "e2e runs every test" is
-  # checked on every run, not assumed. Its first step is the phase verdict, as
-  # `e2e-all`.
+  # The e2e shard coverage proof: `tools/scripts/e2e-shard-cover.py` lists the
+  # run's own archive and fails unless the `e2e_plan` the shards run partitions
+  # its test set exactly (every test in exactly one shard), so "e2e runs every
+  # test" is checked on every run, not assumed. It reads only the archive
+  # (`test-prep`) and the plan (`changes`), never a shard result, so it runs
+  # beside the shards, not after them. `e2e_shard.py --lint` pins that the cover
+  # runs here once, unconditionally, and that `seal-slice` needs this job.
+  seal-slice-cover:
+    runs-on: ubuntu-latest
+    needs: [changes, test-prep]
+    timeout-minutes: 20
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      - name: Prove the e2e shards partition the archived test set
+        env:
+          E2E_PLAN: ${{ needs.changes.outputs.e2e_plan }}
+        run: python3 tools/scripts/e2e-shard-cover.py
+
+  # The main-required `seal-slice` context: the phase verdict over the e2e
+  # shards, which run every archived test under IPE_E2E=1, and over
+  # `seal-slice-cover`, the proof that they do. A red, cancelled or wrongly
+  # skipped shard or cover fails it.
   seal-slice:
     name: seal-slice
     runs-on: ubuntu-latest
-    needs: [changes, e2e, test-prep]
-    timeout-minutes: 20
+    needs: [changes, test-prep, e2e, seal-slice-cover]
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1467,28 +1504,12 @@ jobs:
         with:
           results: >-
             changes=${{ needs.changes.result }}
-            e2e=${{ needs.e2e.result }}
             test-prep=${{ needs.test-prep.result }}
+            e2e=${{ needs.e2e.result }}
+            seal-slice-cover=${{ needs.seal-slice-cover.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
-      # The coverage proof needs the archive, so it runs whenever the archive
-      # was built — on every run whose e2e shards could have run.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: needs.test-prep.result == 'success'
-      - uses: ./.github/actions/rust-toolchain-pinned
-        if: needs.test-prep.result == 'success'
-      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
-        if: needs.test-prep.result == 'success'
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        if: needs.test-prep.result == 'success'
-        with:
-          name: nextest-archive
-      - name: Prove the e2e shards partition the archived test set
-        if: needs.test-prep.result == 'success'
-        env:
-          E2E_PLAN: ${{ needs.changes.outputs.e2e_plan }}
-        run: python3 tools/scripts/e2e-shard-cover.py
 
   # Vendored-emit SEAL gate: runs the `seal_modset` suite under the vendored
   # runtime-source emit model (`IPE_RUNTIME_VENDORED=1`). The normal e2e shards
@@ -2024,6 +2045,301 @@ jobs:
           echo "a deterministic check step failed on PR run $RUN_ID — cancelling the rest of the run so the heavy tier stops consuming runners."
           gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
 
+  # Merge-group fail-fast: one watcher per heavy tests-phase producer listed
+  # in `.github/ci/deterministic-checks.json` (`test_watchers`). A watcher
+  # starts only when a need failed on a merge-group run, and cancels the run
+  # only when `rerun_policy.py --proven-test-red` proves a failed leg of its
+  # producer is a test that ran and failed with no infrastructure signature
+  # (log and annotations both read, every page of the attempt's job listing).
+  # An unknown, crash, infra-only or unreadable red never cancels: the run
+  # completes and reports every red it reaches. A cancelled run concludes
+  # every phase verdict `failure` (the verdict fails on a cancelled need), so
+  # the queue sees a red, never a missing context. Under fail-fast a second,
+  # unrelated red in the same entry may go unreported until the next entry.
+  #
+  # `ci/verify-manifest.py` generates each watcher's exact job from the SSOT
+  # and refuses a missing, unlisted or reshaped one (an extra permission, an
+  # `if:` without `failure()` or the merge-group marker, a cancel not gated
+  # on the proof's exact `true`).
+  cancel-on-test-red-windows-test:
+    runs-on: ubuntu-latest
+    needs: [changes, windows-test]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'windows-test'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-wasi-run:
+    runs-on: ubuntu-latest
+    needs: [changes, wasi-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'wasi-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-test-run:
+    runs-on: ubuntu-latest
+    needs: [changes, test-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'test-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-e2e:
+    runs-on: ubuntu-latest
+    needs: [changes, e2e]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'e2e'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-runtime-full-features-run:
+    runs-on: ubuntu-latest
+    needs: [changes, runtime-full-features-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'runtime-full-features-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-runtime-feature-combos-run:
+    runs-on: ubuntu-latest
+    needs: [changes, runtime-feature-combos-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'runtime-feature-combos-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-seal-modset-vendored:
+    runs-on: ubuntu-latest
+    needs: [changes, seal-modset-vendored]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'seal-modset (vendored emit model)'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-linux-x64-tier2:
+    runs-on: ubuntu-latest
+    needs: [changes, linux-x64-tier2]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'linux-x64-tier2 (bwrap+seccomp — the real Linux jail proof)'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
+  cancel-on-test-red-release-targets-run:
+    runs-on: ubuntu-latest
+    needs: [changes, release-targets-run]
+    if: failure() && needs.changes.outputs.merge_group == 'true'
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/rerun_policy.py
+          sparse-checkout-cone-mode: false
+      - name: Prove a test red
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PRODUCER: 'release-targets-run'
+        run: python3 .github/ci/rerun_policy.py --proven-test-red
+      - name: Cancel the run on a proven test red
+        if: steps.proof.outputs.cancel == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: gh run cancel "$RUN_ID" --repo "$REPO" || echo "::warning::gh run cancel failed for run $RUN_ID."
+
   # Headless-browser behaviour gate for Ipe.Browser.Geolocation +
   # Ipe.Browser.Clipboard — the three flows a raw TcpStream HTTP test cannot
   # exercise (browser permission grant/deny + JS API round-trips):
@@ -2067,6 +2383,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
+          # No package-manager cache: this step never writes one (verify-manifest check 6).
+          package-manager-cache: "false"
       - name: Install Playwright + Chromium
         working-directory: tools/scripts/browser-e2e
         run: |

@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.Ui.Responsive as Responsive
-import Ipe.String as String
-import Ipe.List as List
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Ui.Responsive as Responsive
 
 
 -- `Ipe.Ui.Responsive` classifies a viewport size into a `DeviceClass`, so a view

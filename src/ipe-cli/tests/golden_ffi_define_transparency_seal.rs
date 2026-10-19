@@ -20,6 +20,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ipe::RootFixture;
+use ipe::project_root::SourceTree;
 use ipe_ffi::driver::{FfiCache, install_from_inspection};
 
 /// Seed the project's FFI cache with an inspection document for a crate
@@ -74,16 +76,19 @@ const MAIN_IPE: &str = "module Main exposing (main)\n\
     \x20           ++ \" \" ++ describe (Demo.message_new_increment ())\n\
     \x20           ++ \" \" ++ describe Increment)\n";
 
-fn write_project(dir: &Path) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    if !seed_define_ffi_cache(dir) {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), MAIN_IPE).is_ok()
+/// The fixture's declared foreign crate: an FFI fixture is filtered by its
+/// declared `rustDependencies`, so it names the crate it binds.
+const DEMO_DEPENDENCY: &str = "rustDependencies = [ rustDep \"demo\" \"=0.1.0\" ]";
+
+/// A project fixture whose `Main` holds `main_ipe`, declaring `demo`, with its FFI cache seeded.
+fn ffi_fixture(main_ipe: &str) -> RootFixture {
+    let fixture = RootFixture::from_tree(&SourceTree::main(main_ipe).field(DEMO_DEPENDENCY))
+        .expect("the fixture project must be written and resolved");
+    assert!(
+        seed_define_ffi_cache(fixture.path()),
+        "must seed the fixture project's FFI cache"
+    );
+    fixture
 }
 
 /// Read one emitted file, failing the test with a directory listing when the
@@ -122,18 +127,11 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 fn define_transparency_emits_the_conversion_seam() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_define_transparency");
-    assert!(
-        write_project(&tmp),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_define_transparency_out");
     let _ = fs::remove_dir_all(&out);
 
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("define-transparency fixture must build, got: {err}")
     }
 
@@ -164,8 +162,6 @@ fn define_transparency_emits_the_conversion_seam() {
         ffi_rs.contains("pub fn demo_counter_new(arg0: i64) -> Counter {"),
         "the constructor must stay typed at the defined type; ffi.rs:\n{ffi_rs}"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }
 
 /// SEAL proof under `IPE_E2E=1`: the emitted crate builds and runs with no
@@ -179,17 +175,10 @@ fn define_transparency_emitted_crate_builds_and_runs() {
     }
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ipec_ffi_define_transparency_e2e");
-    assert!(
-        write_project(&tmp),
-        "must write the fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MAIN_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_define_transparency_e2e_out");
     let _ = fs::remove_dir_all(&out);
-    if let Err(err) = ipe::build_loose_file(&entry, &out, &runtime) {
+    if let Err(err) = ipe::build_fixture(&fixture, &out, &runtime) {
         panic!("define-transparency fixture must build, got: {err}")
     }
 
@@ -198,6 +187,8 @@ fn define_transparency_emitted_crate_builds_and_runs() {
     // The fixture crate cannot live on crates.io — repoint the pin at an
     // empty local stand-in; the defined types themselves are self-contained
     // in `_bindings.rs` and reference nothing from it.
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_define_transparency_e2e");
+    let _ = fs::remove_dir_all(&tmp);
     let demo_dir = tmp.join("demo");
     fs::create_dir_all(demo_dir.join("src")).expect("mkdir demo");
     fs::write(
@@ -251,18 +242,6 @@ const MISMATCHED_RECORD_IPE: &str = "module Main exposing (main)\n\
     main =\n\
     \x20   Io.println (String.fromInt (count (Demo.counter_new 41)))\n";
 
-fn write_mismatched_project(dir: &Path) -> bool {
-    let src = dir.join("src");
-    let _ = fs::remove_dir_all(dir);
-    if fs::create_dir_all(&src).is_err() {
-        return false;
-    }
-    if !seed_define_ffi_cache(dir) {
-        return false;
-    }
-    fs::write(src.join("Main.ipe"), MISMATCHED_RECORD_IPE).is_ok()
-}
-
 /// PIECE-2 REFUSAL SEAL (value-struct auto-marshal): a `.fn` returns a value
 /// struct that surfaces by shape as an Ipê record (`Counter` ⇒ `{ value :
 /// Int }`, no `.type`). An Ipê program whose record shape MISMATCHES the real
@@ -274,23 +253,14 @@ fn write_mismatched_project(dir: &Path) -> bool {
 fn value_struct_marshal_refuses_a_mismatched_record_shape() {
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ipec_ffi_value_struct_mismatch");
-    assert!(
-        write_mismatched_project(&tmp),
-        "must write the mismatched-record fixture project + FFI cache"
-    );
-
-    let entry = tmp.join("src").join("Main.ipe");
+    let fixture = ffi_fixture(MISMATCHED_RECORD_IPE);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_value_struct_mismatch_out");
     let _ = fs::remove_dir_all(&out);
 
-    let result = ipe::build_loose_file(&entry, &out, &runtime);
+    let result = ipe::build_fixture(&fixture, &out, &runtime);
     assert!(
         result.is_err(),
         "a record shape that mismatches the marshalled value struct's real \
          fields must be REFUSED, never silently accepted"
     );
-
-    let _ = fs::remove_dir_all(&tmp);
 }

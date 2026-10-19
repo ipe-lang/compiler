@@ -26,11 +26,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_project(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("runtime_shape_fold_seal")
-        .join("Main.ipe")
 }
 
 /// Recursively concatenate every emitted `.rs` file under `dir`.
@@ -57,10 +56,10 @@ fn concat_emitted_rs(dir: &Path, out: &mut String) {
 /// the app-side codegen chose. `None` when the build failed (the caller's
 /// `assert!` reports the diag).
 fn built_app_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<String>) {
-    let entry = fixture_entry(root);
+    let entry = fixture_project(root);
     let _ = std::fs::remove_dir_all(out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, out, &runtime);
+    let built = crate::support::build_golden(&entry, out, &runtime);
     let emitted = if built.is_ok() {
         let mut acc = std::fs::read_to_string(out.join("src").join("main.rs")).unwrap_or_default();
         acc.push('\n');
@@ -113,9 +112,9 @@ fn runtime_shape_fold_seal_builds_and_runs() {
     let root = repo_root();
     let out = crate::support::scratch_root().join("ipec_runtime_shape_fold_seal_e2e");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let _ = std::fs::remove_dir_all(&out);
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "runtime_shape_fold_seal: must be accepted, got: {built:?}"

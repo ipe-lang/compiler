@@ -73,8 +73,8 @@ use crate::CliError;
 /// failure; [`CliError::Pipeline`] when a file cannot be parsed or the
 /// formatter's round-trip guard trips; [`CliError::FmtOutputTooLarge`] when a
 /// file's formatted output would pass its cap. Under `--check`, an unformatted
-/// file is reported as a non-zero exit via [`CliError::Usage`] carrying the
-/// list.
+/// file is reported as a non-zero exit via [`CliError::CheckFailed`] carrying
+/// the list.
 pub fn run_fmt(rest: &[String]) -> Result<(), CliError> {
     // `--help` / `-h` is a request for output, not an error — honour it before
     // the typed parse (which treats every dashed token as a flag to validate).
@@ -204,9 +204,9 @@ fn report_check(
             let list = crate::text::TerminalBlock::lines(
                 unformatted.iter().map(|p| format!("  {}", p.display())),
             );
-            Err(CliError::Usage(crate::text::msg::fmt_unformatted_files(
-                &list,
-            )))
+            Err(CliError::CheckFailed(
+                crate::text::msg::fmt_unformatted_files(&list),
+            ))
         }
     }
 }
@@ -241,16 +241,23 @@ pub fn format_stdin_from(reader: impl Read) -> Result<StdinFormatted, CliError> 
 
 /// Format stdin to stdout. When `check` is true, print a diff instead.
 fn run_fmt_stdin(check: bool) -> Result<(), CliError> {
+    run_fmt_stdin_from(std::io::stdin().lock(), check)
+}
+
+/// [`run_fmt_stdin`] over any reader.
+fn run_fmt_stdin_from(reader: impl Read, check: bool) -> Result<(), CliError> {
     let StdinFormatted {
         source: src,
         formatted,
-    } = format_stdin_from(std::io::stdin().lock())?;
+    } = format_stdin_from(reader)?;
 
     if check {
         if formatted != src {
             // Print a unified diff for CI consumption.
             diff_eprint("<stdin>", &src, &formatted);
-            return Err(CliError::Usage(crate::text::msg::fmt_stdin_unformatted()));
+            return Err(CliError::CheckFailed(
+                crate::text::msg::fmt_stdin_unformatted(),
+            ));
         }
     } else {
         std::io::Write::write_all(&mut std::io::stdout(), formatted.as_bytes()).map_err(|e| {
@@ -299,12 +306,12 @@ fn fmt_err_to_cli(file: &Path, e: FmtError) -> CliError {
             src,
             diag: Box::new(diag),
         },
-        FmtError::RoundTrip { detail } => CliError::Pipeline {
+        FmtError::RoundTrip(fault) => CliError::Pipeline {
             file: file.to_path_buf(),
             src: String::new(),
             diag: Box::new(Diagnostic::CompilerBug {
                 where_: "ipe fmt",
-                detail,
+                detail: fault.to_string(),
             }),
         },
         FmtError::Limit(FmtLimit::OutputBytes { cap }) => CliError::FmtOutputTooLarge {
@@ -365,4 +372,84 @@ fn collect_ipe_files(root: &Path) -> Result<FmtTargets, CliError> {
     }
     out.sort();
     Ok(FmtTargets::Walked(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::screen::{Header, error_screen};
+
+    const UNFORMATTED: &str = "module M exposing (x)\n\nx =\n  1\n";
+
+    /// The first line of the `ipe fmt` help page.
+    const USAGE_FIRST_LINE: &str = "Format Ipê source files.";
+
+    /// The synopsis line of the `ipe fmt` help page.
+    const USAGE_SYNOPSIS: &str = "ipe fmt [<path>]";
+
+    /// The human error screen of `err`, header omitted.
+    fn screen_of(err: &CliError) -> String {
+        error_screen(err, false)
+            .map(|screen| screen.render(Header::Omitted))
+            .unwrap_or_default()
+    }
+
+    fn assert_verdict_without_usage(err: &CliError) {
+        assert!(matches!(err, CliError::CheckFailed(_)), "{err:?}");
+        assert_eq!(err.machine_kind(), "check-failed");
+        let screen = screen_of(err);
+        assert!(!screen.contains(USAGE_FIRST_LINE), "{screen}");
+        assert!(!screen.contains(USAGE_SYNOPSIS), "{screen}");
+        assert!(!screen.contains("Options"), "{screen}");
+    }
+
+    /// A dirty stdin check is a verdict: its screen carries no usage page.
+    #[test]
+    fn a_dirty_stdin_check_is_a_verdict_not_usage() {
+        let err = run_fmt_stdin_from(UNFORMATTED.as_bytes(), true).err();
+        assert!(err.is_some(), "a dirty stdin check must fail");
+        let Some(err) = err else {
+            return;
+        };
+        assert_verdict_without_usage(&err);
+        assert!(screen_of(&err).contains("stdin is not formatted"));
+    }
+
+    /// A formatted stdin passes the check.
+    #[test]
+    fn a_formatted_stdin_check_passes() {
+        let canonical = format_source(UNFORMATTED).unwrap_or_default();
+        assert!(!canonical.is_empty(), "the fixture must format");
+        assert!(run_fmt_stdin_from(canonical.as_bytes(), true).is_ok());
+    }
+
+    /// A dirty directory check names the files and carries no usage page.
+    #[test]
+    fn a_dirty_directory_check_is_a_verdict_not_usage() {
+        let err = report_check(
+            &[PathBuf::from("src/A.ipe"), PathBuf::from("src/B.ipe")],
+            crate::cli_args::OutputFormat::Human,
+        )
+        .err();
+        assert!(err.is_some(), "a dirty check must fail");
+        let Some(err) = err else {
+            return;
+        };
+        assert_verdict_without_usage(&err);
+        let screen = screen_of(&err);
+        assert!(screen.contains("src/A.ipe"), "{screen}");
+        assert!(screen.contains("src/B.ipe"), "{screen}");
+    }
+
+    /// A malformed command line still renders the usage page.
+    #[test]
+    fn a_malformed_fmt_command_line_still_renders_usage() {
+        let err = crate::run_cli(&["fmt".to_owned(), "--no-such-flag".to_owned()]).err();
+        assert!(
+            matches!(err, Some(CliError::CommandUsage { .. })),
+            "{err:?}"
+        );
+        let screen = err.as_ref().map(screen_of).unwrap_or_default();
+        assert!(screen.contains(USAGE_FIRST_LINE), "{screen}");
+    }
 }

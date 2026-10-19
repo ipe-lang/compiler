@@ -1,11 +1,11 @@
 module Main exposing (main)
 
-import Ipe.Uuid as Uuid
-import Ipe.Task as Task
-import Ipe.List as List
-import Ipe.String as String
-import Ipe.Maybe as Maybe
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+import Ipe.Task as Task
+import Ipe.Uuid as Uuid
 
 
 -- Mint identifiers for new records, exercising the three ideas most `Ipe.Uuid`
@@ -19,7 +19,6 @@ import Ipe.Io as Io
 --   • `parse` is PURE validation: it checks a string is a well-formed UUID and
 --     returns `Nothing` for garbage — the typed boundary for IDs arriving from
 --     outside.
-
 
 -- Mint three time-ordered IDs in sequence. Because v7 embeds a timestamp, IDs
 -- created later compare greater — `List.sort` recovers creation order.

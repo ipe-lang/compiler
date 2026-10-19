@@ -119,6 +119,8 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::EmittedBuildFailed { .. }
         | CliError::CargoBuildTimedOut { .. }
         | CliError::TargetDirUnlinkable { .. }
+        | CliError::BundledManifest { .. }
+        | CliError::TestTargetBusy { .. }
         | CliError::UnknownCode { .. }
         | CliError::DocNotFound { .. }
         | CliError::StaticRefusal(_)
@@ -131,6 +133,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::PackageAudit(_)
         | CliError::Publish(_)
         | CliError::VersionRefused { .. }
+        | CliError::CheckFailed(_)
         | CliError::DocCoverage(_)
         | CliError::DocExamplesFailed(_)
         | CliError::CommandUsage { .. }

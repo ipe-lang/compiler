@@ -11,11 +11,10 @@ use std::path::{Path, PathBuf};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path) -> PathBuf {
+fn fixture_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("backoff_strategy_adt")
-        .join("Main.ipe")
 }
 
 /// The frontend must accept all four `BackoffStrategy` variants used via the
@@ -24,11 +23,11 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn backoff_strategy_adt_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i1421_backoff_strategy_emit");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "BackoffStrategy builders and retryWith must be accepted and emitted; \
@@ -44,11 +43,11 @@ fn backoff_strategy_adt_emits() {
 #[test]
 fn backoff_strategy_adt_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i1421_backoff_strategy_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "backoff_strategy_adt: must be accepted; got: {built:?}"

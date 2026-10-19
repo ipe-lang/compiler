@@ -1,6 +1,6 @@
 use super::{
-    BuildOptions, CliError, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
-    attribute_canon_errors, attribute_post_link_error, build_loose_file_into, build_project_into,
+    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SettingsSource,
+    SourceGraph, attribute_canon_errors, attribute_post_link_error, build_project_into,
     build_source_graph, build_test_into, capabilities_including_served_widgets,
     classify_entry_shape, create_source_root, default_entry, discover_manifest, emit_machine_error,
     emitted_bin_filename, frame_infer_error, home_to_source_map, lowering_check_query,
@@ -176,17 +176,20 @@ pub fn classify_desktop_shape(
         Some(project::EntryShape::WebView) => Ok(pack::desktop::AppShape::WebView),
         Some(project::EntryShape::Terminal) => Ok(pack::desktop::AppShape::Terminal),
         Some(project::EntryShape::Program) => Ok(pack::desktop::AppShape::Program),
-        None => match classify_entry_shape(root)? {
-            delivery::Shape::Web => Ok(pack::desktop::AppShape::WebView),
-            delivery::Shape::Tui | delivery::Shape::Cli => Ok(pack::desktop::AppShape::Terminal),
-            // A `script` renders nothing and a `worker` runs a view-less loop
-            // (a server is a `script` running `Server.listen`, rendering http
-            // rather than a desktop window); all classify as a plain program so
-            // the webview gate refuses them by name.
-            delivery::Shape::Script | delivery::Shape::Worker => {
-                Ok(pack::desktop::AppShape::Program)
-            }
-        },
+        None => Ok(desktop_app_shape(classify_entry_shape(root)?)),
+    }
+}
+
+/// The desktop app shape a classified `main` shape packages as.
+pub const fn desktop_app_shape(shape: delivery::Shape) -> pack::desktop::AppShape {
+    match shape {
+        delivery::Shape::Web => pack::desktop::AppShape::WebView,
+        delivery::Shape::Tui | delivery::Shape::Cli => pack::desktop::AppShape::Terminal,
+        // A `script` renders nothing and a `worker` runs a view-less loop (a
+        // server is a `script` running `Server.listen`, rendering http rather
+        // than a desktop window); all classify as a plain program so the
+        // webview gate refuses them by name.
+        delivery::Shape::Script | delivery::Shape::Worker => pack::desktop::AppShape::Program,
     }
 }
 
@@ -272,9 +275,12 @@ struct BundleAssembler<'a> {
 /// for the wrapped assembler. The ONLY way to obtain one is
 /// [`BundleAssembler::gate_desktop`], which runs the gate first; its
 /// [`assemble`](GatedDesktop::assemble) is the sole entry to desktop assembly.
+/// It carries the webview proof the gate minted, so the packaged app is always
+/// emitted for the webview host.
 pub struct GatedDesktop<'a> {
     assembler: BundleAssembler<'a>,
     finish: NativeFinish<'a>,
+    webview: delivery::WebViewProof,
 }
 
 /// A mobile-shape gate witness: proof that [`validate_mobile_shape`] passed for
@@ -291,7 +297,17 @@ impl GatedDesktop<'_> {
     /// Build/emit errors from the underlying compile; [`CliError::Io`] on any
     /// filesystem failure while materialising the bundle.
     pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
-        self.assembler.assemble_desktop(os, self.finish)
+        self.assembler
+            .assemble_desktop(os, self.finish, self.webview)
+    }
+
+    /// Emit the packaged app's crate into `out` without running cargo.
+    ///
+    /// # Errors
+    /// Build/emit errors from the underlying compile.
+    #[cfg(test)]
+    pub fn emit(&self, out: OutTarget<'_>) -> Result<EmittedCrate, CliError> {
+        self.assembler.emit_desktop(out, self.webview)
     }
 }
 
@@ -338,9 +354,23 @@ impl<'a> BundleAssembler<'a> {
         root: &Path,
     ) -> Result<GatedDesktop<'a>, CliError> {
         validate_desktop_shape(manifest.default_program().and_then(|p| p.shape), root)?;
+        // The desktop packager ships the `web desktop` delivery, so the gate
+        // that admitted the shape mints its webview proof.
+        let delivery::HostIntent::WebView(webview) =
+            delivery::Delivery::web_desktop().host_intent()
+        else {
+            // `web desktop` always resolves to the webview host; were it not
+            // to, the packager refuses rather than bundle a served program.
+            return Err(CliError::Usage(crate::text::Message::relay(
+                &pack::desktop::DesktopRefusal::NotWebView {
+                    shape: pack::desktop::AppShape::Program.as_str(),
+                },
+            )));
+        };
         Ok(GatedDesktop {
             assembler: Self::new(manifest, manifest_path, BundleProfile::of(&finish)),
             finish,
+            webview,
         })
     }
 
@@ -367,6 +397,29 @@ impl<'a> BundleAssembler<'a> {
         Ok(GatedMobile(Self::new(manifest, manifest_path, profile)))
     }
 
+    /// Emit the desktop app's crate into `out` for the webview host `webview`
+    /// proves.
+    ///
+    /// # Errors
+    /// Build/emit errors from the underlying compile.
+    fn emit_desktop(
+        &self,
+        out: OutTarget<'_>,
+        webview: delivery::WebViewProof,
+    ) -> Result<EmittedCrate, CliError> {
+        let runtime_dir = resolve_vendored_runtime_dir(None, false)?;
+        build_project_into(
+            self.manifest_path,
+            out,
+            &runtime_dir,
+            &BuildOptions {
+                intent: self.profile.build_intent(),
+                ..BuildOptions::from_env()
+            },
+            delivery::HostIntent::WebView(webview),
+        )
+    }
+
     /// Emit + compile the app to a binary, generate the desktop bundle layout,
     /// and materialise (Linux) or describe (macOS/Windows) the bundle on disk.
     /// Private: reached only through a [`GatedDesktop`] witness, so the shape
@@ -379,6 +432,7 @@ impl<'a> BundleAssembler<'a> {
         &self,
         os: pack::desktop::DesktopOs,
         finish: NativeFinish<'_>,
+        webview: delivery::WebViewProof,
     ) -> Result<(), CliError> {
         use std::fmt::Write as _;
 
@@ -402,16 +456,7 @@ impl<'a> BundleAssembler<'a> {
         // (non-static) native build.
         let output = OutputRoot::resolve(None, &ProjectPaths::from_manifest(manifest))?;
         let rust_target = EmitTarget::Area(output.area(&[OutputArea::Rust]));
-        let runtime_dir = resolve_vendored_runtime_dir(None, false)?;
-        let crate_dir = build_project_into(
-            self.manifest_path,
-            OutTarget::Proven(&rust_target),
-            &runtime_dir,
-            &BuildOptions {
-                intent: self.profile.build_intent(),
-                ..BuildOptions::from_env()
-            },
-        )?;
+        let crate_dir = self.emit_desktop(OutTarget::Proven(&rust_target), webview)?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
         // A `release web desktop` bundle carries an optimised binary and its
@@ -1521,12 +1566,20 @@ pub fn run_project_tests_with(
     // conventional `src/` directory (so `src/Main.ipe`'s sibling `tests/` tree
     // is at `<project-root>/tests`, not `src/tests`); otherwise the entry's
     // directory is itself the project root (a flat single-directory project).
-    let manifest = discover_manifest(&entry_path)?;
-    let (project_root, project_src_root): (PathBuf, PathBuf) = if let Some(m) = manifest.as_ref() {
+    // The manifest is parsed once: its settings are the test build's settings,
+    // its database driver included, so the program under test is the program
+    // the project build ships.
+    let manifest_path = discover_manifest(&entry_path)?;
+    let manifest = match manifest_path.as_deref() {
+        Some(m) => Some(project::parse_manifest(m)?),
+        None => None,
+    };
+    let found = manifest.as_ref().zip(manifest_path.as_deref());
+    let (project_root, project_src_root): (PathBuf, PathBuf) = if let Some((parsed, m)) = found {
         let root = m
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        (root, project::parse_manifest(m)?.src_root)
+        (root, parsed.src_root.clone())
     } else {
         let src_root = entry_path
             .parent()
@@ -1562,7 +1615,6 @@ pub fn run_project_tests_with(
         path: PathBuf::from("ipe-verify-test"),
         source: e,
     })?;
-    let out_dir = out_scratch.path().to_path_buf();
 
     // Build the test entry. When the project has a `src/` tree, the test entry
     // is built against BOTH it (the code under test) and the `tests/` tree (its
@@ -1576,10 +1628,13 @@ pub fn run_project_tests_with(
     // temp directory on EVERY exit — a compile failure, a cargo failure, a
     // spawn error, or a normal run — not only the success path.
     let outcome = build_and_run_test_entry(
-        &project_src_root,
-        &tests_root,
-        &test_entry,
-        &out_dir,
+        &SettingsSource::discovered(found, crate::delivery::HostIntent::Served),
+        TestLayout {
+            src_root: &project_src_root,
+            tests_root: &tests_root,
+            entry: &test_entry,
+        },
+        &out_scratch,
         &runtime_dir,
         &cargo_bin,
         stdio,
@@ -1591,67 +1646,89 @@ pub fn run_project_tests_with(
     outcome
 }
 
-/// Compile the test entry into `out_dir`, build the emitted Rust project, and
-/// run the resulting `ipe-app` binary, classifying its exit code.
+/// Where a project's tests live: the code under test, the `tests/` tree, and
+/// the tree's entry.
+#[derive(Clone, Copy, Debug)]
+pub struct TestLayout<'a> {
+    /// The project's source root (`src/`, or the project root when flat).
+    pub src_root: &'a Path,
+    /// The `tests/` tree.
+    pub tests_root: &'a Path,
+    /// The test entry, `tests/Main.ipe`.
+    pub entry: &'a Path,
+}
+
+/// Compile the test entry into `out_scratch`, build the emitted Rust project, and
+/// run the resulting test binary, classifying its exit code.
 ///
 /// Split from [`run_project_tests`] so the caller's temp-directory cleanup runs
 /// on every exit of this fallible sequence, not only the success path.
 ///
+/// The build directory is held locked from before the build until the built
+/// binary is copied out ([`crate::target_dir::LinkableTargetDir::for_scratch`]),
+/// pinned or shared alike. Under that lock the crate's `Cargo.lock` is seeded
+/// from the directory's lock slot, every unit of the previous test runner is
+/// cleaned (so the verdict never comes from a stale test unit), the crate is
+/// built, its lock is stored back to the slot, and the binary is copied into a
+/// private directory. The copy runs after the lock is released, so no later
+/// build can replace the binary this run judges.
+///
 /// # Errors
-/// The compile/build error on a compile or cargo failure; [`CliError::Io`] when
-/// the test binary cannot be spawned; [`CliError::TestFailed`] when it exits
-/// non-zero (a failing case, or a crash/signal with no exit code).
+/// The compile/build error on a compile or cargo failure; the refusals of
+/// [`crate::target_dir::LinkableTargetDir::for_scratch`];
+/// [`CliError::Io`] when the lock slot, the binary copy, or the spawn fails;
+/// [`CliError::TestFailed`] when the binary exits non-zero (a failing case, or
+/// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
-    project_src_root: &Path,
-    tests_root: &Path,
-    test_entry: &Path,
-    out_dir: &Path,
+    source: &SettingsSource<'_>,
+    layout: TestLayout<'_>,
+    out_scratch: &scratch::ScratchDir,
     runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
-    let out = OutTarget::Path(out_dir);
-    let crate_dir = if project_src_root.is_dir() {
-        build_test_into(project_src_root, tests_root, test_entry, out, runtime_dir)?
-    } else {
-        build_loose_file_into(
-            test_entry,
-            out,
-            runtime_dir,
-            BuildOptions {
-                intent: ipe_backend_rust::BuildIntent::Development,
-                ..BuildOptions::from_env()
-            },
-        )?
-    };
+    let crate_dir = build_test_into(
+        source,
+        layout.src_root,
+        layout.tests_root,
+        layout.entry,
+        OutTarget::Scratch(out_scratch),
+        runtime_dir,
+    )?;
 
-    // Compile the emitted Rust project.
-    let target_dir =
-        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), crate_dir.path(), None)?;
-    FlooredBuild {
+    let target = crate::target_dir::LinkableTargetDir::for_scratch(cargo_bin.path(), out_scratch)?;
+    seed_test_lock(target.dir().path(), crate_dir.dir())?;
+    let build = FlooredBuild {
         cargo: cargo_bin,
         crate_dir: &crate_dir,
         finish: NativeFinish::Dev,
         target: CargoTarget::Host,
-        target_dir: &target_dir,
+        target_dir: target.dir(),
         output: CargoOutput::Human(Verbosity::Progress),
         what: "the emitted test runner",
         runtime: runtime_context_for_message(),
-    }
-    .run()?;
+    };
+    build.clean_package(ipe_backend_rust::TEST_CRATE_NAME)?;
+    build.run()?;
+    store_test_lock(target.dir().path(), crate_dir.dir())?;
 
     // Read the compiled binary back from the build directory the build was
     // handed, so a `CARGO_TARGET_DIR` or `[build] target-dir` pin is the one
-    // the build used. The binary name matches the emitted crate's package name
-    // (read from `Cargo.toml`).
-    let test_bin_name = emitted_bin_filename(out_dir)?;
-    let mut bin = target_dir.path().to_path_buf();
-    bin.push("debug");
-    bin.push(&test_bin_name);
+    // the build used.
+    let test_bin_name = emitted_bin_filename(crate_dir.path())?;
+    let compiled = target.dir().path().join("debug").join(&test_bin_name);
+    let run_dir = scratch::ScratchDir::new_under(target.dir().path(), "ipe-test-run")
+        .or_else(|_| scratch::ScratchDir::new("ipe-test-run"))
+        .map_err(|source| CliError::ScratchUnavailable { source })?;
+    let bin = run_dir.path().join(&test_bin_name);
+    fs::copy(&compiled, &bin).map_err(|e| io_err(&compiled, e))?;
+    drop(target.release());
 
     // Run the test binary. `Ipe.Test.runMain` exits 0 on all-pass, 1 on any
     // failure — propagate that as a stage error.
-    let run_status = run_test_binary(bin, stdio, std::io::stderr)?;
+    let run_status = run_test_binary(bin, stdio, std::io::stderr);
+    drop(run_dir);
+    let run_status = run_status?;
 
     if run_status.success() {
         Ok(TestOutcome::AllPassed)
@@ -1661,6 +1738,85 @@ pub fn build_and_run_test_entry(
         // failure; classify the absent code as a failure, never a pass.
         let code = run_status.code().unwrap_or(1);
         Err(CliError::TestFailed { code })
+    }
+}
+
+/// The lock slot of a build directory: the test runner's last built `Cargo.lock`.
+pub const TEST_LOCK_SLOT: &str = "ipe-test.Cargo.lock";
+
+/// The most bytes a `Cargo.lock` carried through [`TEST_LOCK_SLOT`] may hold.
+const TEST_LOCK_CAP: u64 = 16 * 1024 * 1024;
+
+/// Seed `crate_dir`'s `Cargo.lock` from `target`'s [`TEST_LOCK_SLOT`], when that is a regular file.
+///
+/// The seeded lock is only a candidate: the build's offline `--locked` probe
+/// still judges it, and a drifted one is resolved afresh.
+///
+/// # Errors
+/// [`CliError::Io`] when the slot cannot be read or is larger than
+/// [`TEST_LOCK_CAP`]; the refusals of writing the crate's lock.
+fn seed_test_lock(target: &Path, crate_dir: &OwnedDir) -> Result<(), CliError> {
+    match read_regular_entry(target, TEST_LOCK_SLOT)? {
+        Some(lock) => crate_dir.path_to("Cargo.lock")?.write(&lock),
+        None => Ok(()),
+    }
+}
+
+/// Store `crate_dir`'s `Cargo.lock` as `target`'s [`TEST_LOCK_SLOT`].
+///
+/// The slot is replaced through an exclusively created temp file and a
+/// rename, so it is never written through a link and never seen half written.
+///
+/// # Errors
+/// [`CliError::Io`] when the crate's lock cannot be read or the slot cannot be written.
+fn store_test_lock(target: &Path, crate_dir: &OwnedDir) -> Result<(), CliError> {
+    let Some(lock) = read_regular_entry(crate_dir.path(), "Cargo.lock")? else {
+        return Ok(());
+    };
+    let slot = target.join(TEST_LOCK_SLOT);
+    let temp = target.join(format!(".{TEST_LOCK_SLOT}.{}.tmp", std::process::id()));
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err(&temp, e)),
+    }
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(&lock))
+        .and_then(|()| fs::rename(&temp, &slot));
+    written.map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        io_err(&slot, e)
+    })
+}
+
+/// The bytes of the regular file `name` in `dir`, read without following a link.
+///
+/// `None` when the entry is absent, a link, or not a regular file.
+///
+/// # Errors
+/// [`CliError::Io`] when `dir` cannot be opened or the file cannot be read or
+/// is larger than [`TEST_LOCK_CAP`].
+fn read_regular_entry(dir: &Path, name: &str) -> Result<Option<Vec<u8>>, CliError> {
+    let path = dir.join(name);
+    let entry = ipe_fs_open::EntryName::new(std::ffi::OsStr::new(name))
+        .ok_or_else(|| io_err(&path, std::io::ErrorKind::InvalidInput.into()))?;
+    let cap = ipe_fs_open::ByteCap::new(TEST_LOCK_CAP)
+        .ok_or_else(|| io_err(&path, std::io::ErrorKind::InvalidInput.into()))?;
+    let opened = ipe_fs_open::HeldDir::open_root(dir).and_then(|held| held.open_regular(&entry));
+    match opened {
+        Ok(file) => file
+            .read_bytes(cap)
+            .map(Some)
+            .map_err(|refusal| io_err(&path, refusal.into_io())),
+        Err(
+            ipe_fs_open::OpenRefusal::Absent
+            | ipe_fs_open::OpenRefusal::Link
+            | ipe_fs_open::OpenRefusal::NotRegular(_),
+        ) => Ok(None),
+        Err(refusal) => Err(io_err(&path, refusal.into_io())),
     }
 }
 
@@ -4062,10 +4218,7 @@ mod pack_gate_tests {
     /// mobile SPA shell only hosts `Web` apps.
     #[test]
     fn mobile_gate_refuses_terminal_shape() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let err = validate_mobile_shape(
             Some(project::EntryShape::Terminal),
             Path::new("."),
@@ -4088,10 +4241,7 @@ mod pack_gate_tests {
     /// A declared `Program` shape must be refused for mobile packaging.
     #[test]
     fn mobile_gate_refuses_program_shape() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let err =
             validate_mobile_shape(Some(project::EntryShape::Program), Path::new("."), &wasm_on)
                 .expect_err("Program shape must be refused for mobile");
@@ -4112,7 +4262,7 @@ mod pack_gate_tests {
     /// requires `[wasm] mode` set to `spa` or `hydrate`.
     #[test]
     fn mobile_gate_refuses_web_shape_without_wasm() {
-        let wasm_off = project::WasmConfig::default(); // mode = None -> off
+        let wasm_off = project::WasmConfig::Off;
         let err = validate_mobile_shape(Some(project::EntryShape::Web), Path::new("."), &wasm_off)
             .expect_err("Web shape without wasm must be refused for mobile");
         assert!(
@@ -4131,10 +4281,7 @@ mod pack_gate_tests {
     /// A `Web` shape with wasm mode `spa` passes the mobile gate.
     #[test]
     fn mobile_gate_accepts_web_shape_with_wasm_spa() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         validate_mobile_shape(Some(project::EntryShape::Web), Path::new("."), &wasm_on)
             .expect("Web + wasm=spa must pass the mobile gate");
     }
@@ -4142,10 +4289,7 @@ mod pack_gate_tests {
     /// A `Web` shape with wasm mode `hydrate` also passes the mobile gate.
     #[test]
     fn mobile_gate_accepts_web_shape_with_wasm_hydrate() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("hydrate".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Hydrate));
         validate_mobile_shape(Some(project::EntryShape::Web), Path::new("."), &wasm_on)
             .expect("Web + wasm=hydrate must pass the mobile gate");
     }
@@ -4155,10 +4299,7 @@ mod pack_gate_tests {
     /// `Web` + wasm enabled -> `shape_is_web=true`, `wasm_enabled=true`.
     #[test]
     fn classify_mobile_cap_web_wasm_on() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let cap = classify_mobile_spa_cap(Some(project::EntryShape::Web), Path::new("."), &wasm_on)
             .expect("classification must succeed");
         assert!(cap.shape_is_web, "Web shape must set shape_is_web");
@@ -4168,10 +4309,7 @@ mod pack_gate_tests {
     /// `Terminal` + wasm enabled -> `shape_is_web=false`.
     #[test]
     fn classify_mobile_cap_terminal_wasm_on() {
-        let wasm_on = project::WasmConfig {
-            mode: Some("solo".to_owned()),
-            ..Default::default()
-        };
+        let wasm_on = project::WasmConfig::On(project::WasmBundle::new(project::WasmMode::Solo));
         let cap = classify_mobile_spa_cap(
             Some(project::EntryShape::Terminal),
             Path::new("."),
@@ -4187,12 +4325,12 @@ mod pack_gate_tests {
     /// `Web` + wasm off -> `wasm_enabled=false`.
     #[test]
     fn classify_mobile_cap_web_wasm_off() {
-        let wasm_off = project::WasmConfig::default();
+        let wasm_off = project::WasmConfig::Off;
         let cap =
             classify_mobile_spa_cap(Some(project::EntryShape::Web), Path::new("."), &wasm_off)
                 .expect("classification must succeed");
         assert!(cap.shape_is_web, "Web shape must set shape_is_web");
-        assert!(!cap.wasm_enabled, "mode=None must set wasm_enabled=false");
+        assert!(!cap.wasm_enabled, "`Off` must set wasm_enabled=false");
     }
 }
 
@@ -4482,6 +4620,90 @@ mod admission_tests {
                 Err(CliError::PackageAudit(_))
             ),
             "an entry hiding an audited capability is refused"
+        );
+    }
+
+    /// The desktop packager emits the webview app, titled by the manifest's
+    /// `delivery.desktop` window, and never the served web app.
+    #[test]
+    fn desktop_packager_emits_webview() {
+        const WEB_APP: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+
+type Msg
+    = Increment
+
+type alias Model =
+    { count : Int }
+
+init : WebReq -> ( Model, Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd Msg )
+update _msg model =
+    ( { model | count = model.count + 1 }, Cmd.none )
+
+view : Model -> Element Msg
+view _model =
+    Ui.el [ Ui.onClick Increment ] (Ui.text "+")
+
+subscriptions : Model -> Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = Increment
+        }
+"#;
+        let tree = crate::project_root::SourceTree::main(WEB_APP)
+            .field("delivery = { desktop = { title = \"Packaged\", width = 640, height = 480 } }");
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let manifest = project::parse_manifest(&manifest_path).expect("manifest");
+        let gated = BundleAssembler::gate_desktop(
+            &manifest,
+            &manifest_path,
+            NativeFinish::Dev,
+            fixture.path(),
+        )
+        .expect("a web app passes the desktop gate");
+        let out = ipe_test_temp::temp_root()
+            .join(format!("ipe-desktop-packager-emit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        gated
+            .emit(OutTarget::Path(&out))
+            .expect("the packaged app emits");
+        // `ipe_main` sits in the entry's module file when the program has
+        // more than one home, so the whole emitted program is read.
+        let mut program = std::fs::read_to_string(out.join("src/main.rs")).expect("main.rs");
+        if let Ok(mods) = std::fs::read_dir(out.join("src/ipe_mods")) {
+            for entry in mods.flatten() {
+                program.push_str(&std::fs::read_to_string(entry.path()).expect("module file"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&out);
+        assert!(
+            program.contains("fn ipe_main() -> ipe_runtime::tea::WebViewApp"),
+            "not the webview executor"
+        );
+        assert!(
+            program.contains("title: \"Packaged\".to_string(), size: (640, 480)"),
+            "not the manifest window"
+        );
+        assert!(
+            !program.contains("ipe_runtime::tea::WebApp("),
+            "the served web app was emitted"
         );
     }
 }

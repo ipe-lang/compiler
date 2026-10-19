@@ -235,7 +235,7 @@ fn assert_scaffold_builds(
         entry.display()
     );
     let out_dir = target.join("out");
-    let built = ipe::build(&entry, &out_dir, runtime_dir);
+    let built = ipe::build_project(&target.join("package.ipe"), &out_dir, runtime_dir);
     assert!(
         built.is_ok(),
         "[{tag}] ipe dev build on the scaffold must succeed: {built:?}"
@@ -290,7 +290,7 @@ fn assert_library_type_checks(tag: &str, init_args: &[String], entry_rel: &std::
 }
 
 /// E2E (gated on `IPE_E2E=1`): EVERY application scaffold shape compiles end to
-/// end — `ipe::build` emits a Rust project and `cargo build` on it must succeed
+/// end — `ipe::build_project` emits a Rust project and `cargo build` on it must succeed
 /// (THE SEAL) — and the `--lib` library type-checks (a library has no runnable
 /// entry to build). Driven from [`ipe::init::InitShape::ALL`] so a
 /// newly added shape cannot silently escape the accept-then-build proof: the

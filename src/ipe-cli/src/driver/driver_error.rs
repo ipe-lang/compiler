@@ -48,6 +48,11 @@ pub enum CliError {
     /// Command-line or manifest misuse; carries the catalog message saying what
     /// was wrong and how to fix it.
     Usage(text::Message),
+    /// A check ran correctly and its verdict on the user's input is "failed"
+    /// (e.g. `ipe fmt --check` found unformatted files). Carries the catalog
+    /// message with the findings. A verdict is not command misuse, so it exits
+    /// non-zero with the message alone and never the command's `--help` page.
+    CheckFailed(text::Message),
     /// No command, or an unrecognised one: the top-level help is shown and the
     /// process exits non-zero. Distinct from [`Self::Usage`] because it renders
     /// the full sectioned screen (coloured for a terminal) rather than a hint.
@@ -172,6 +177,21 @@ pub enum CliError {
         path: TerminalSafe,
         /// The host linker family that cannot open it.
         linker: crate::target_dir::HostLinker,
+    },
+    /// The embedded runtime manifest could not be stamped for bundling.
+    ///
+    /// The manifest is a build input, so this is an internal invariant breach;
+    /// the build stops rather than link a runtime whose identity is unknown.
+    BundledManifest {
+        /// Why the manifest could not be prepared.
+        fault: crate::runtime_embed::ManifestFault,
+    },
+    /// Another `ipe test` held the shared test build directory past the wall.
+    TestTargetBusy {
+        /// The held lock file, as display text.
+        path: TerminalSafe,
+        /// The wall the wait ran past.
+        wall: remote_ingest::LocalWall,
     },
     /// `ipe explain <CODE>` was given a string that is not a taxonomy code.
     /// Carries the (trimmed) input and a deterministic did-you-mean list over
@@ -735,6 +755,7 @@ impl CliError {
     pub const fn machine_kind(&self) -> &'static str {
         match self {
             Self::Usage(_) | Self::FfiPrep(_) => "usage",
+            Self::CheckFailed(_) => "check-failed",
             Self::UnknownCommand { .. } => "unknown-command",
             Self::Io { .. } => "io",
             Self::ScratchUnavailable { .. } => "scratch-unavailable",
@@ -749,6 +770,8 @@ impl CliError {
             Self::EmittedBuildFailed { .. } => "emitted-build-failed",
             Self::CargoBuildTimedOut { .. } => "cargo-build-timed-out",
             Self::TargetDirUnlinkable { .. } => "target-dir-unlinkable",
+            Self::BundledManifest { .. } => "bundled-manifest",
+            Self::TestTargetBusy { .. } => "test-target-busy",
             Self::UnknownCode { .. } => "unknown-code",
             Self::DocNotFound { .. } => "doc-not-found",
             Self::StaticRefusal(_) => "static-refusal",
@@ -833,9 +856,10 @@ impl CliError {
                     }
                 }
             }
-            Self::RuntimeVersionMismatch { .. } => Internal,
+            Self::RuntimeVersionMismatch { .. } | Self::BundledManifest { .. } => Internal,
             Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
             Self::Usage(_)
+            | Self::CheckFailed(_)
             | Self::UnknownCommand { .. }
             | Self::Io { .. }
             | Self::ScratchUnavailable { .. }
@@ -879,6 +903,7 @@ impl CliError {
             | Self::LocalLimitExceeded(_)
             | Self::CargoBuildTimedOut { .. }
             | Self::TargetDirUnlinkable { .. }
+            | Self::TestTargetBusy { .. }
             | Self::ChildPipeHeld(_)
             | Self::ThreadRefused { .. }
             | Self::ChildPipeUnread(..)
@@ -964,7 +989,7 @@ impl std::fmt::Display for CliError {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(hint) => f.write_str(hint),
+            Self::Usage(hint) | Self::CheckFailed(hint) => f.write_str(hint),
             Self::UnknownCommand { attempted } => fmt_unknown_command(attempted, f),
             Self::Io { path, source } => fmt_io_error(path, source, f),
             Self::ScratchUnavailable { source } => {
@@ -1182,6 +1207,11 @@ impl std::fmt::Display for CliError {
                 let d = Diagnostic::TargetDirUnlinkable { detail };
                 f.write_str(&render(&d, "", ""))
             }
+            Self::BundledManifest { fault } => f.write_str(&text::cli_bundled_manifest(fault)),
+            Self::TestTargetBusy { path, wall } => f.write_str(&text::cli_test_target_busy(
+                path,
+                &remote_ingest::IngestLimit::Time(wall.limit()),
+            )),
             Self::ChildPipeHeld(stream) => f.write_str(&text::cli_child_pipe_held(stream)),
             Self::ThreadRefused { role, source } => {
                 f.write_str(&text::cli_thread_refused(role, &source.kind()))

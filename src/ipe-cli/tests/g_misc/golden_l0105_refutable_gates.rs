@@ -33,16 +33,12 @@ fn repo_root() -> PathBuf {
 /// only when the runtime cannot be resolved.
 fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -125,15 +121,14 @@ fn single_ctor_union_def_param_is_ipe_t0015() {
 #[test]
 fn single_ctor_case_accessor_compiles() {
     let root = repo_root();
-    let entry = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("money_ctor_accessor_case")
-        .join("Main.ipe");
+        .join("money_ctor_accessor_case");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("money_ctor_accessor_case_emit");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "single-ctor case accessor must compile: {:?}",

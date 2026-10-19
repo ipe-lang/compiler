@@ -1,11 +1,11 @@
 module Main exposing (main)
 
-import Ipe.System as System
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.String as String
+import Ipe.System as System
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- A tiny CLI that reads its inputs from the two process-global sources and writes
@@ -21,7 +21,6 @@ import Ipe.Io as Io
 -- `System.args ()` yields the USER arguments (the program name is already
 -- dropped); the whole-argv `System.getArg n` is the escape hatch when index 0
 -- (the executable path) is genuinely wanted.
-
 
 -- The first user argument is the name to greet, or "world" when none was passed.
 -- `List.head` returns `Maybe String` — absence is a value, not an index panic.

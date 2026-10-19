@@ -25,6 +25,7 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (SourceView(..), StaleReason(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (Label, LabelPart(..))
 import Lib.Links as Links exposing (Hidden(..), Link(..), Reach(..), Reference(..))
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
@@ -120,8 +121,8 @@ fixtureRows indexDb =
     Task.sequence
         (List.map (insertFixtureUnit indexDb) fixtureUnits
             ++ [ execIndex indexDb "INSERT INTO files (path, lang) VALUES (?, ?), (?, ?)" [ SqlString "ipe:src/links.rs", SqlString "rs", SqlString "ipe:src/Feature.ipe", SqlString "ipe" ]
-            , execIndex indexDb "INSERT INTO callgraph (caller_uid, callee_uid) VALUES (?, ?), (?, ?)" [ Uid.toSql (uid "u-src"), Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-src"), Uid.toSql (uid "u-src") ]
-            ]
+               , execIndex indexDb "INSERT INTO callgraph (caller_uid, callee_uid) VALUES (?, ?), (?, ?)" [ Uid.toSql (uid "u-src"), Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-src"), Uid.toSql (uid "u-src") ]
+               ]
         )
         |> Task.map (\_ -> ())
 
@@ -131,7 +132,46 @@ type alias LinksFixture =
     , rustHidden : Maybe Hidden
     , ipe : List String
     , plan : List String
+    , hugeEdge : List Label
+    , longUid : List String
+    , nulUid : List String
     }
+
+
+-- The bytes of the stored qualified name of the callee the over-cap check
+-- writes: far past the read window, so only a bound applied at the read keeps
+-- the link's label small.
+hugeQualifiedBytes : Int
+hugeQualifiedBytes =
+    1024 * 1024
+
+
+-- The bytes a label's marker counts as dropped, if it was cut.
+droppedOf : Label -> Maybe Int
+droppedOf label =
+    case List.head (List.reverse (Label.parts label)) of
+        Just (LabelCut dropped _) ->
+            Just dropped
+
+        Just (LabelText _) ->
+            Nothing
+
+        Just (LabelEscapes _) ->
+            Nothing
+
+        Nothing ->
+            Nothing
+
+
+-- The labels of every link from `found` to fixture unit `label`.
+labelsTo : String -> Maybe Index.UnitView -> List Label
+labelsTo label found =
+    case found of
+        Just loaded ->
+            List.map Links.label (List.filter (\l -> Links.linkKey l == internalKey label) loaded.links.links)
+
+        Nothing ->
+            []
 
 
 -- The `linkKey` of an internal link to fixture unit `label`.
@@ -176,10 +216,18 @@ linksFixture =
         rust <- loadUnitNow (uid "u-src")
         ipe <- loadUnitNow (uid "u-ipe")
         plan <- candidatePlan
+        execIndexUnchecked at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat hugeQualifiedBytes "z"), Uid.toSql (uid "u-edge") ]
+        huge <- loadUnitNow (uid "u-src")
+        execIndexUnchecked at.indexDb "UPDATE units SET uid = uid || 'a' WHERE uid IN (?, ?)" [ Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-exact") ]
+        execIndexUnchecked at.indexDb "UPDATE callgraph SET callee_uid = callee_uid || 'a' WHERE callee_uid = ?" [ Uid.toSql (uid "u-edge") ]
+        longUid <- loadUnitNow (uid "u-src")
+        execIndexUnchecked at.indexDb "UPDATE units SET uid = substr(uid, 1, 64) || char(0) || 'a' WHERE uid IN (?, ?)" [ SqlString (Uid.toString (uid "u-edge") ++ "a"), SqlString (Uid.toString (uid "u-exact") ++ "a") ]
+        execIndexUnchecked at.indexDb "UPDATE callgraph SET callee_uid = substr(callee_uid, 1, 64) || char(0) || 'a' WHERE callee_uid = ?" [ SqlString (Uid.toString (uid "u-edge") ++ "a") ]
+        nulUid <- loadUnitNow (uid "u-src")
         cleanupIndex at.indexDb at.repo
         removeFileIfAny (at.repo ++ "/src/links.rs")
         removeFileIfAny (at.repo ++ "/src/Feature.ipe")
-        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan }
+        Task.succeed { rust = keysOf rust, rustHidden = Maybe.map (\v -> v.links.hidden) rust, ipe = keysOf ipe, plan = plan, hugeEdge = labelsTo "u-edge" huge, longUid = keysOf longUid, nulUid = keysOf nulUid }
 
 
 fixtureChecks : LinksFixture -> List ( String, Bool )
@@ -189,20 +237,41 @@ fixtureChecks got =
     , ( "a bare reference links to its own module's unit", List.member (internalKey "u-helper") got.rust )
     , ( "a bare reference never links to another module's unit of the same name", not (List.member (internalKey "u-shared") got.rust) )
     , ( "a duplicate qualified name links the same-path unit, then the lowest uid"
-    , List.member (internalKey "u-twin-z") got.rust
-        && not (List.member (internalKey "u-twin-a") got.rust)
-        && List.member (internalKey "u-pair-a") got.rust
-        && not (List.member (internalKey "u-pair-b") got.rust)
-    )
+      , List.member (internalKey "u-twin-z") got.rust
+            && not (List.member (internalKey "u-twin-a") got.rust)
+            && List.member (internalKey "u-pair-a") got.rust
+            && not (List.member (internalKey "u-pair-b") got.rust)
+      )
     , ( "a unit never links to itself", not (List.member (internalKey "u-src") got.rust) )
     , ( "links are edges first, then references in first-occurrence order, nothing hidden"
-    , got.rust
-        == [ internalKey "u-edge", internalKey "u-helper", internalKey "u-exact", internalKey "u-twin-z", internalKey "u-pair-a" ]
-        && got.rustHidden
-        == Just NoneHidden
-    )
+      , got.rust == [ internalKey "u-edge", internalKey "u-helper", internalKey "u-exact", internalKey "u-twin-z", internalKey "u-pair-a" ]
+            && got.rustHidden == Just NoneHidden
+      )
     , ( "a call written as `Foo.bar(x)` links `Foo.bar`", got.ipe == [ internalKey "u-foo" ] )
     , ( "the candidate query uses i_units_qual", List.any (String.contains "i_units_qual") got.plan )
+    , ( "a callee whose stored qualified name is a mebibyte links under a label cut at the read, its marker counting the dropped bytes"
+      , List.length got.hugeEdge == 1
+            && List.all
+                (\l ->
+                    Label.byteCount l <= Label.capBytes Label.labelCap + Label.markerByteCeiling
+                        && droppedOf l == Just (hugeQualifiedBytes - Label.capBytes Label.labelCap)
+                )
+                got.hugeEdge
+      )
+    , ( "a callee or a resolved reference whose stored uid is a unit id and one more hex digit is shown unlinked, never linked to the id its first 64 digits spell"
+      , not (List.member (internalKey "u-edge") got.longUid)
+            && not (List.member (internalKey "u-exact") got.longUid)
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap (String.repeat hugeQualifiedBytes "z"))) got.longUid
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap "app::util::exact")) got.longUid
+            && List.member (internalKey "u-helper") got.longUid
+      )
+    , ( "a callee or a resolved reference whose stored uid is a unit id, a NUL byte and more is shown unlinked, never linked to the id the read's NUL cut spells"
+      , not (List.member (internalKey "u-edge") got.nulUid)
+            && not (List.member (internalKey "u-exact") got.nulUid)
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap (String.repeat hugeQualifiedBytes "z"))) got.nulUid
+            && List.member ("t:" ++ Label.key (Label.fromText Label.labelCap "app::util::exact")) got.nulUid
+            && List.member (internalKey "u-helper") got.nulUid
+      )
     ]
 
 
@@ -211,7 +280,7 @@ fixtureChecks got =
 manyNames : Int -> Links.Candidates
 manyNames n =
     Links.candidates Highlight.Rust
-        { kind = "fn", name = "f", qualified = "f" }
+        (unitNamed "fn" "f" "f")
         (Links.references Highlight.Rust (String.join " " (List.map (\i -> "n" ++ String.fromInt i) (List.range 1 n))))
 
 
@@ -229,24 +298,17 @@ candidateCeiling =
                 ( _, params ) ->
                     List.length params
     in
-    List.length over.names
-        == Links.linkCandidateCeiling
-        && over.reach
-        == Capped
-        && bound
-        == Links.linkCandidateCeiling
-        + 2
-        && (Links.assemble { edges = Complete, candidates = over.reach } [] [] []).hidden
-        == AtLeast 0
-        && List.length atCeiling.names
-        == Links.linkCandidateCeiling
-        && atCeiling.reach
-        == Complete
+    List.length over.names == Links.linkCandidateCeiling
+        && over.reach == Capped
+        && bound == Links.linkCandidateCeiling + 2
+        && (Links.assemble { edges = Complete, candidates = over.reach } [] [] []).hidden == AtLeast 0
+        && List.length atCeiling.names == Links.linkCandidateCeiling
+        && atCeiling.reach == Complete
 
 
 internalLinks : Int -> List Link
 internalLinks n =
-    List.map (\i -> Links.internal ("q" ++ String.fromInt i) (Uid.toString (uid ("u" ++ String.fromInt i)))) (List.range 1 n)
+    List.map (\i -> Links.internal (Label.fromText Label.labelCap ("q" ++ String.fromInt i)) (Uid.toString (uid ("u" ++ String.fromInt i)))) (List.range 1 n)
 
 
 linkCeilingCut : Bool
@@ -267,40 +329,37 @@ linkCeilingCut =
         note hidden =
             Maybe.map SafeText.toString (Links.hiddenNote hidden)
     in
-    List.length over.links
-        == Links.linkCeiling
-        && over.hidden
-        == Exactly 3
-        && note over.hidden
-        == Just "+3 more"
-        && full.hidden
-        == NoneHidden
-        && note full.hidden
-        == Nothing
-        && edgesCut.hidden
-        == AtLeast 1
-        && note edgesCut.hidden
-        == Just "+1 or more"
+    List.length over.links == Links.linkCeiling
+        && over.hidden == Exactly 3
+        && note over.hidden == Just "+3 more"
+        && full.hidden == NoneHidden
+        && note full.hidden == Nothing
+        && edgesCut.hidden == AtLeast 1
+        && note edgesCut.hidden == Just "+1 or more"
+
+
+-- A unit's stored identity as the index read returns it: each column through
+-- the same window `Label.columnOf` applies.
+unitNamed : String -> String -> String -> Links.UnitName
+unitNamed kind name qualified =
+    { kind = Label.columnOf kind, name = Label.columnOf name, qualified = Label.columnOf qualified }
 
 
 firstOccurrence : Bool
 firstOccurrence =
     let
         wanted =
-            Links.candidates Highlight.Ipe { kind = "file", name = "FILE", qualified = "F.FILE" } (Links.references Highlight.Ipe "b a b c a")
+            Links.candidates Highlight.Ipe (unitNamed "file" "FILE" "F.FILE") (Links.references Highlight.Ipe "b a b c a")
 
         resolved =
-            Links.resolveCandidates wanted.lookups [ ( "c", Uid.toString (uid "u-c") ), ( "a", Uid.toString (uid "u-a") ), ( "b", Uid.toString (uid "u-b") ) ]
+            Links.resolveCandidates wanted.lookups [ ( "c", Just (Uid.toString (uid "u-c")) ), ( "a", Just (Uid.toString (uid "u-a")) ), ( "b", Just (Uid.toString (uid "u-b")) ) ]
 
         assembled =
-            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal "a" (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
+            Links.assemble { edges = Complete, candidates = Complete } [ Links.internal (Label.fromText Label.labelCap "a") (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
     in
-    wanted.names
-        == [ "b", "a", "c" ]
-        && List.map Links.linkKey resolved
-        == [ internalKey "u-b", internalKey "u-a", internalKey "u-c" ]
-        && List.map Links.linkKey assembled.links
-        == [ internalKey "u-a", internalKey "u-b", internalKey "u-c", "e:https://x.io" ]
+    wanted.names == [ "b", "a", "c" ]
+        && List.map Links.linkKey resolved == [ internalKey "u-b", internalKey "u-a", internalKey "u-c" ]
+        && List.map Links.linkKey assembled.links == [ internalKey "u-a", internalKey "u-b", internalKey "u-c", "e:https://x.io" ]
 
 
 candidateRule : Bool
@@ -309,22 +368,47 @@ candidateRule =
         namesFor lang unit refs =
             (Links.candidates lang unit refs).names
     in
-    namesFor Highlight.Rust { kind = "fn", name = "caller", qualified = "app::links::caller#2" } [ Bare "helper" ]
-        == [ "helper", "app::links::helper" ]
-        && namesFor Highlight.Ipe { kind = "fn", name = "run", qualified = "Feature.run" } [ Bare "go", Path "Foo.bar" ]
-        == [ "go", "Feature.go", "Foo.bar" ]
-        && namesFor Highlight.Rust { kind = "file", name = "FILE", qualified = "app::links::FILE" } [ Bare "helper" ]
-        == [ "helper" ]
-        && namesFor Highlight.Rust { kind = "fn", name = "other", qualified = "app::links::caller" } [ Bare "helper" ]
-        == [ "helper" ]
-        && namesFor Highlight.Rust { kind = "fn", name = "f", qualified = "mycrate::m::f" } [ Path "crate::util::g" ]
-        == [ "mycrate::util::g" ]
-        && namesFor Highlight.Ipe { kind = "fn", name = "f", qualified = "M.f" } [ Path "crate.util.g" ]
-        == [ "crate.util.g" ]
-        && namesFor Highlight.Shell { kind = "fn", name = "f", qualified = "m::f" } [ Bare "g", Path "crate::x" ]
-        == [ "g", "crate::x" ]
-        && namesFor Highlight.Unknown { kind = "fn", name = "f", qualified = "m::f" } [ Bare "g" ]
-        == [ "g" ]
+    namesFor Highlight.Rust (unitNamed "fn" "caller" "app::links::caller#2") [ Bare "helper" ] == [ "helper", "app::links::helper" ]
+        && namesFor Highlight.Ipe (unitNamed "fn" "run" "Feature.run") [ Bare "go", Path "Foo.bar" ] == [ "go", "Feature.go", "Foo.bar" ]
+        && namesFor Highlight.Rust (unitNamed "file" "FILE" "app::links::FILE") [ Bare "helper" ] == [ "helper" ]
+        && namesFor Highlight.Rust (unitNamed "fn" "other" "app::links::caller") [ Bare "helper" ] == [ "helper" ]
+        && namesFor Highlight.Rust (unitNamed "fn" "f" "mycrate::m::f") [ Path "crate::util::g" ] == [ "mycrate::util::g" ]
+        && namesFor Highlight.Ipe (unitNamed "fn" "f" "M.f") [ Path "crate.util.g" ] == [ "crate.util.g" ]
+        && namesFor Highlight.Shell (unitNamed "fn" "f" "m::f") [ Bare "g", Path "crate::x" ] == [ "g", "crate::x" ]
+        && namesFor Highlight.Unknown (unitNamed "fn" "f" "m::f") [ Bare "g" ] == [ "g" ]
+
+
+-- A unit whose kind, name or qualified name is longer than the index read's
+-- window builds no candidate and reads as capped, so no lookup is ever
+-- spelled from a prefix of a name. The same unit with every column exactly at
+-- the window builds its candidates. Red if a cut column reaches the rule.
+cutNameBuildsNoCandidate : Bool
+cutNameBuildsNoCandidate =
+    let
+        nameAt chars =
+            String.repeat chars "c"
+
+        atWindow =
+            unitNamed "fn" (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 5))
+
+        refs =
+            [ Bare "helper" ]
+
+        refused unit =
+            let
+                got =
+                    Links.candidates Highlight.Rust unit refs
+            in
+            List.isEmpty got.names && List.isEmpty got.lookups && got.reach == Capped
+
+        shown =
+            Links.candidates Highlight.Rust atWindow refs
+    in
+    shown.names == [ "helper", "app::helper" ]
+        && shown.reach == Complete
+        && refused (unitNamed "fn" (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 4)))
+        && refused (unitNamed "fn" (nameAt (Label.windowChars + 1)) ("app::" ++ nameAt (Label.windowChars - 5)))
+        && refused (unitNamed (String.repeat (Label.windowChars + 1) "f") (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 5)))
 
 
 -- A Rust `.` is a field or method access, never a path: `a.b.c` names `a`
@@ -332,10 +416,8 @@ candidateRule =
 -- unit can hold. A `..` range starts no member, so its end still names.
 referencesFollowTokens : Bool
 referencesFollowTokens =
-    Links.references Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b"
-        == [ Bare "a", Bare "x", Bare "T", Path "crate::m::f", Path "Foo::bar", Bare "a", Bare "b" ]
-        && Links.references Highlight.Ipe "Foo.bar(x) model.count"
-        == [ Path "Foo.bar", Bare "x", Path "model.count" ]
+    Links.references Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b" == [ Bare "a", Bare "x", Bare "T", Path "crate::m::f", Path "Foo::bar", Bare "a", Bare "b" ]
+        && Links.references Highlight.Ipe "Foo.bar(x) model.count" == [ Path "Foo.bar", Bare "x", Path "model.count" ]
         && List.isEmpty (Links.references Highlight.Shell "Foo.bar x")
         && List.isEmpty (Links.references Highlight.Unknown "Foo.bar x")
 
@@ -346,12 +428,9 @@ candidateSqlBound =
         ( sql, params ) ->
             not (String.contains "evil" sql)
                 && String.contains "IN (?, ?)" sql
-                && params
-                == [ SqlString "ipe:p", SqlString "evil'); DROP TABLE units; --", SqlString "b", Uid.toSql (uid "u-self") ]
-                && Index.placeholders 3
-                == "?, ?, ?"
-                && Index.placeholders 0
-                == ""
+                && params == [ SqlString "ipe:p", SqlString "evil'); DROP TABLE units; --", SqlString "b", Uid.toSql (uid "u-self") ]
+                && Index.placeholders 3 == "?, ?, ?"
+                && Index.placeholders 0 == ""
 
 
 -- One row of ipe-index's `tests/callee_vectors.json`: a caller unit's stored
@@ -386,8 +465,7 @@ calleeVectorDecoder : Decode.Decoder CalleeVector
 calleeVectorDecoder =
     Decode.map3
         (\unit callee wanted -> { unit = unit, callee = callee, candidates = wanted })
-        (Decode.map3
-            (\kind name qualified -> { kind = kind, name = name, qualified = qualified })
+        (Decode.map3 unitNamed
             (Decode.field "kind" Decode.string)
             (Decode.field "name" Decode.string)
             (Decode.field "qualified" Decode.string)
@@ -406,6 +484,7 @@ checks =
                 , ( "links past the link ceiling set hidden to Exactly the cut count", linkCeilingCut )
                 , ( "first occurrence wins across candidates, resolved links and urls", firstOccurrence )
                 , ( "candidates follow ipe-index's callee rule", candidateRule )
+                , ( "a unit name past the index window builds no candidate", cutNameBuildsNoCandidate )
                 , ( "references follow the shown tokens", referencesFollowTokens )
                 , ( "candidate names are bound, never spliced into the SQL text", candidateSqlBound )
                 ]

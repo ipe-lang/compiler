@@ -468,23 +468,7 @@ pub fn native_vs_legacy_sweep(
     interner: &Interner,
     program: &ipe_ir::Program,
 ) -> DResult<(Vec<SweepDivergence>, usize, usize)> {
-    let ctx = EmitCtx::build(
-        interner,
-        program,
-        crate::DbDriver::Sqlite,
-        None,
-        ipe_ir::Target::Native,
-        Vec::new(),
-        crate::MountBase::root(),
-        false,
-        None,
-        false,
-        crate::BuildIntent::Release,
-        String::new(),
-        false,
-        false,
-        None,
-    )?;
+    let ctx = EmitCtx::build(interner, program, crate::EmitSettings::unconfigured())?;
     let mut divergences = Vec::new();
     let mut compared = 0usize;
     let mut skipped = 0usize;
@@ -1231,7 +1215,7 @@ fn build_ctor(
     // the runtime enum; its payload is never a self-recursive user field, so no
     // field-boxing lookup applies (matching the string emitter).
     if let Some(runtime) = ctx.builtin_runtime_enum(home, ty) {
-        let path = format!("{runtime}::{}", ctx.emit_ident(variant)?);
+        let path = format!("{runtime}::{}", ctx.emit_member_ident(variant)?);
         let docs = build_args(ctx, args, indent, child, generics)?;
         return Ok(delimited(
             Doc::owned(format!("{path}("))?,
@@ -1240,7 +1224,11 @@ fn build_ctor(
         ));
     }
 
-    let path = format!("{}::{}", ctx.enum_name(home, ty)?, ctx.emit_ident(variant)?);
+    let path = format!(
+        "{}::{}",
+        ctx.enum_name(home, ty)?,
+        ctx.emit_member_ident(variant)?
+    );
     let fields = ctx.variant_fields(home, ty, variant)?;
     if fields.len() != args.len() {
         return Err(Diagnostic::CompilerBug {
@@ -1318,7 +1306,7 @@ fn build_let(
             Doc::text(leaf!("})")),
         ])));
     }
-    let name_s = ctx.emit_ident(name)?;
+    let name_s = ctx.emit_local_ident(name)?;
     let value_doc = build_doc(ctx, value, indent, child, generics)?;
     let body_doc = build_doc(ctx, body, indent, child, generics)?;
     // One-statement block: `let name = value;` then `body`, each on its own line.
@@ -1405,7 +1393,7 @@ fn build_record(
     let (struct_name, is_server_response) = record_struct_name(ctx, fields, ty)?;
     let mut field_docs = Vec::with_capacity(fields.len() + usize::from(is_server_response));
     for (sym, value) in fields {
-        let field_ident = ctx.emit_ident(*sym)?;
+        let field_ident = ctx.emit_member_ident(*sym)?;
         let value_doc = build_doc(ctx, value, indent, child, generics)?;
         field_docs.push(Doc::concat(vec![
             Doc::owned(format!("{field_ident}: "))?,
@@ -1509,7 +1497,7 @@ fn build_update(
     inner.push(base_doc);
     inner.push(Doc::text(leaf!(";")));
     for (i, (sym, _value)) in fields.iter().enumerate() {
-        let field_ident = ctx.emit_ident(*sym)?;
+        let field_ident = ctx.emit_member_ident(*sym)?;
         inner.push(Doc::HardLine);
         inner.push(Doc::owned(format!(
             "__ipe_rec.{field_ident} = __ipe_upd_{i};"
@@ -1738,7 +1726,7 @@ fn build_closure(
     for (param, ty) in params {
         parts.push(format!(
             "{}: {}",
-            ctx.emit_ident(*param)?,
+            ctx.emit_local_ident(*param)?,
             render_type(ctx, ty, generics)?
         ));
     }
@@ -1880,7 +1868,7 @@ fn build_applied_lambda(
     let (own_args, surplus_args) = args.split_at(own);
     let mut inner = Vec::with_capacity(own * 4 + 2);
     for ((param, ty), arg) in params.iter().zip(own_args.iter()) {
-        let p = ctx.emit_ident(*param)?;
+        let p = ctx.emit_local_ident(*param)?;
         let t = render_type(ctx, ty, generics)?;
         let arg_doc = build_doc(ctx, arg, indent, child, generics)?;
         inner.push(Doc::HardLine);
@@ -2136,11 +2124,11 @@ mod tests {
     use ipe_ir::once_closure::MovedCapture;
 
     use super::build_doc;
+    use crate::EmitCtx;
     use crate::doc::{ChainOperand, Doc, whitespace_normalize};
     use crate::emit_expr::{InfixOp, emit_expr_at};
     use crate::emit_types::GenericScope;
     use crate::render::{RenderConfig, render};
-    use crate::{DbDriver, EmitCtx};
 
     /// A minimal one-module `Program` whose interner carries a handful of value
     /// identifiers (`a`, `b`, `c`, `x`) so `Expr::Var` fixtures resolve. The
@@ -2308,19 +2296,7 @@ mod tests {
         let ctx = EmitCtx::build(
             &fx.interner,
             &fx.program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
+            crate::EmitSettings::unconfigured(),
         )
         .expect("EmitCtx::build");
         f(&ctx)
@@ -3051,24 +3027,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let scope = GenericScope::new(&[]);
         let expr = Expr::If {
             cond: Box::new(Expr::Var(cond)),
@@ -3680,24 +3640,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let expr = Expr::Lambda {
             params: vec![(x, IrType::Int)],
             ret: IrType::Int,
@@ -4081,24 +4025,8 @@ mod tests {
                 uses_async_runtime: false,
             }],
         };
-        let ctx = EmitCtx::build(
-            &interner,
-            &program,
-            DbDriver::Sqlite,
-            None,
-            ipe_ir::Target::Native,
-            Vec::new(),
-            crate::MountBase::root(),
-            false,
-            None,
-            false,
-            crate::BuildIntent::Release,
-            String::new(),
-            false,
-            false,
-            None,
-        )
-        .expect("EmitCtx::build");
+        let ctx = EmitCtx::build(&interner, &program, crate::EmitSettings::unconfigured())
+            .expect("EmitCtx::build");
         let scope = GenericScope::new(&[]);
         let expr = Expr::TaskSeq {
             effect: Box::new(Expr::Var(short_eff)),

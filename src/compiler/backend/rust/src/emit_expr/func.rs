@@ -11,6 +11,10 @@ use core::fmt::Write as _;
 use ipe_intern::rust_str_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
+/// The function-value carrier decider lives in the IR so lowering and emit
+/// share one definition.
+pub use ipe_ir::wants_arc_ctor;
+
 /// Emit an `Expr` in TAIL/STATEMENT context — the interior of a `TailLoop`'s
 /// `loop { … }`. Every path ends in either a `return <expr>;` (a leaf
 /// tail position) or a `continue;` (a `TailRecur` jump), so the `loop` types as
@@ -79,7 +83,7 @@ pub fn emit_expr_tail(
             ))
         }
         Expr::Let { name, value, body } => {
-            let n = ctx.emit_ident(*name)?;
+            let n = ctx.emit_local_ident(*name)?;
             let v = emit_expr_at(ctx, value, indent, child, generics)?;
             let b = emit_expr_tail(ctx, body, indent, child, generics, loop_params)?;
             Ok(format!("{pad}let {n} = {v};\n{b}"))
@@ -127,7 +131,7 @@ pub fn emit_expr_tail(
             }
             let mut writes = String::new();
             for (idx, (name, _ty)) in loop_params.iter().enumerate() {
-                let n = ctx.emit_ident(*name)?;
+                let n = ctx.emit_local_ident(*name)?;
                 writeln!(writes, "{pad}{n} = __tco_{idx};").map_err(|e| {
                     Diagnostic::CompilerBug {
                         where_: "ipe_backend_rust::emit_expr_tail",
@@ -217,7 +221,7 @@ pub fn emit_apply(
         let child = depth + 1;
         let mut bindings = String::new();
         for ((param, ty), arg) in params.iter().zip(args.iter()) {
-            let p = ctx.emit_ident(*param)?;
+            let p = ctx.emit_local_ident(*param)?;
             let t = render_type(ctx, ty, generics)?;
             let a = emit_expr_at(ctx, arg, indent, child, generics)?;
             // write! to String is infallible (String::write_fmt delegates to push_str).
@@ -272,48 +276,6 @@ pub fn emit_apply(
 /// `ty` is the value's `Fun` IR type; [`render_type`] renders it as the typed
 /// smart-pointer.  Kept `#[inline(never)]` for the same frame-size reason as
 /// the neighbouring helpers.
-/// Does a function value / lambda of IR type `ty` fill one of the runtime's
-/// `Arc<dyn Fn + Send + Sync>` callback slots (so it must be boxed with
-/// `Arc::new`, not `Box::new`)? The shapes:
-///   • `ServerHandler<E>`: `Fn(ServerRequest) -> IpeTask<E, ServerResponse>`
-///   • `WsServerCfg` callbacks, `-> IpeTask<E, ()>`:
-///       - `Fn(WsHandle)`           (onConnect / onClose)
-///       - `Fn(WsHandle, String)`   (onMessage)
-///       - `Fn(WsHandle, Error)`    (onError — 2nd param is the error type,
-///         NOT String; its setter `ws_server_with_on_error` takes `Arc<…>`)
-///
-/// This MUST dispatch on the `IrType` STRUCTURE, never on the rendered type
-/// string. `render_type` renders `ServerHandler<E>` as the type-ALIAS name
-/// `"ServerHandler<IpeError>"` — NOT the expanded `"Arc<dyn Fn…>"` — so a
-/// `starts_with("Arc<")` string test silently misclassifies every handler shape
-/// as `Box` and reintroduces the E0308 seal break for inline
-/// `Server.post path (\req -> …)` handler lambdas (the regression this shared
-/// helper closes). The param patterns are kept in LOCK-STEP with `render_type`'s
-/// WS/ServerHandler Arc arms (`emit_types.rs`) — a shape rendered as `Arc<…>`
-/// there but boxed with `Box::new` here (or vice-versa) is an E0308. Both
-/// `emit_func_value` and `emit_lambda` route through here so the two emit paths
-/// can never drift.
-pub fn wants_arc_ctor(ty: &IrType) -> bool {
-    // A promoted `SharedFun` slot renders `Arc<dyn Fn>` (`render_type`), so its
-    // value must be built with `Arc::new`, not `Box::new` — the two carriers are
-    // distinct Rust types and mixing them is an E0308.
-    if matches!(ty, IrType::SharedFun(_, _)) {
-        return true;
-    }
-    matches!(ty,
-        IrType::Fun(params, ret)
-            if (matches!(params.as_slice(), [IrType::ServerRequest])
-                && matches!(ret.as_ref(), IrType::Task(inner)
-                    if matches!(inner.as_ref(), IrType::ServerResponse)))
-               || (matches!(
-                    params.as_slice(),
-                    [IrType::WebSocketServer]
-                        | [IrType::WebSocketServer, IrType::Str | IrType::Error]
-                ) && matches!(ret.as_ref(), IrType::Task(inner)
-                    if matches!(inner.as_ref(), IrType::Unit)))
-    )
-}
-
 #[inline(never)]
 pub fn emit_func_value(
     ctx: &EmitCtx,
@@ -361,7 +323,7 @@ pub fn emit_lambda_unboxed(
     for (param, ty) in params {
         parts.push(format!(
             "{}: {}",
-            ctx.emit_ident(*param)?,
+            ctx.emit_local_ident(*param)?,
             render_type(ctx, ty, generics)?
         ));
     }
@@ -789,7 +751,7 @@ pub fn tea_update_model_param(func: &ipe_ir::Func) -> Option<Symbol> {
     if !matches!(second, IrType::Cmd(_)) {
         return None;
     }
-    func.params.last().map(|(sym, _)| *sym)
+    func.params.last().map(|p| p.sym)
 }
 
 /// Whether `func` is a TEA `subscriptions` function — `Model -> Sub Msg`. The
@@ -857,6 +819,7 @@ pub fn emit_init_hot_for_func(
               through helpers without clarifying the single straight-line flow"
 )]
 pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<String> {
+    ctx.verify_borrows(func)?;
     let name = ctx.func_name(func.id)?.to_owned();
 
     // ── Entry-point Task.run elision ──────────────────────────────────────────
@@ -924,8 +887,8 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
     let row_binder_syms: Vec<Symbol> = func
         .params
         .iter()
-        .filter(|(_, ty)| matches!(ty, IrType::RowGeneric(_)))
-        .map(|(sym, _)| *sym)
+        .filter(|ipe_ir::Param { ty, .. }| matches!(ty, IrType::RowGeneric(_)))
+        .map(|p| p.sym)
         .collect();
     let generics = GenericScope::with_rows(&scope_syms, &row_syms, &row_binder_syms);
 
@@ -941,13 +904,13 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
     let impl_fn_params = impl_fn_param_indices(func);
 
     let mut params = Vec::with_capacity(func.params.len());
-    for (i, (param, ty)) in func.params.iter().enumerate() {
+    for (i, ipe_ir::Param { sym: param, ty, .. }) in func.params.iter().enumerate() {
         let rendered = if impl_fn_params.contains(&i) {
             impl_fn_generic_name(i)
         } else {
             render_type(ctx, ty, generics)?
         };
-        params.push(format!("{}: {rendered}", ctx.emit_ident(*param)?));
+        params.push(format!("{}: {rendered}", ctx.emit_local_ident(*param)?));
     }
     let ret = render_type(ctx, ret_ty, generics)?;
 
@@ -1035,7 +998,7 @@ pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<St
             } => {
                 let mut shadows = String::new();
                 for (param, _ty) in loop_params {
-                    let p = ctx.emit_ident(*param)?;
+                    let p = ctx.emit_local_ident(*param)?;
                     write!(shadows, "let mut {p} = {p};\n    ").map_err(|e| {
                         Diagnostic::CompilerBug {
                             where_: "ipe_backend_rust::emit_func",
@@ -1468,7 +1431,11 @@ pub fn render_fn_generics(
     // admits too, and forwarding the param into a runtime `Arc<dyn Fn + Send +
     // Sync>` slot still type-checks.
     for &idx in impl_fn_params {
-        let Some((_, IrType::Fun(params, ret))) = func.params.get(idx) else {
+        let Some(ipe_ir::Param {
+            ty: IrType::Fun(params, ret),
+            ..
+        }) = func.params.get(idx)
+        else {
             return Err(Diagnostic::CompilerBug {
                 where_: "ipe_backend_rust::render_fn_generics",
                 detail: "impl-Fn param index did not point at an IrType::Fun".to_owned(),
@@ -1553,7 +1520,7 @@ pub fn impl_fn_generic_name(idx: usize) -> String {
 pub fn type_var_in_fn_param(func: &Func, sym: Symbol) -> bool {
     func.params
         .iter()
-        .any(|(_, ty)| ty_mentions_var_under_fn(ty, sym, false))
+        .any(|ipe_ir::Param { ty, .. }| ty_mentions_var_under_fn(ty, sym, false))
 }
 
 /// `true` if the type variable `sym` is the message parameter of a `Ipe.Ui` /

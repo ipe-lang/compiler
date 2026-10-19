@@ -28,19 +28,18 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Run the ipe pipeline on `tests/golden/live_let_bound_routes/Main.ipe`,
+/// Run the ipe pipeline on `tests/golden/live_let_bound_routes/src/Main.ipe`,
 /// emitting into `out`.
 fn run_ipec(out: &Path) -> Result<(), ipe::CliError> {
     let root = repo_root();
-    let entry = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("live_let_bound_routes")
-        .join("Main.ipe");
+        .join("live_let_bound_routes");
     let _ = std::fs::remove_dir_all(out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, out, &runtime)
+    crate::support::build_golden(&golden_project, out, &runtime)
 }
 
 /// The emit dir shared by the compile-only assertions.

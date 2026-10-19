@@ -33,16 +33,15 @@ fn repo_root() -> PathBuf {
 #[test]
 fn error_nominal_payload_compiles() {
     let root = repo_root();
-    let entry = root
+    let golden = root
         .join("tests")
         .join("golden")
-        .join("error_nominal_payload")
-        .join("Main.ipe");
+        .join("error_nominal_payload");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("error_nominal_payload_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for error_nominal_payload: {:?}",
@@ -56,16 +55,15 @@ fn error_nominal_payload_runs_and_prints_expected_output() {
         return;
     }
     let root = repo_root();
-    let entry = root
+    let golden = root
         .join("tests")
         .join("golden")
-        .join("error_nominal_payload")
-        .join("Main.ipe");
+        .join("error_nominal_payload");
     let out = crate::support::scratch_root().join("ipec_error_nominal_payload_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for error_nominal_payload: {:?}",

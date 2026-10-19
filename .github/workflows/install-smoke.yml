@@ -75,6 +75,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
+          # The VM image and apt cache are saved only on `main`; off it the action
+          # neither saves nor restores (verify-manifest check 6).
+          disable-cache: ${{ github.ref != 'refs/heads/main' }}
           # Copy the host token into the VM so install.sh's release lookup is
           # authenticated (avoids anonymous API rate-limit 403).
           envs: 'GITHUB_TOKEN'

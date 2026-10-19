@@ -17,14 +17,13 @@ module Main exposing (main)
 -- base64url string), never any key bytes. A real relying party would forward the
 -- attestation / assertion envelope to its server for verification.
 
-
+import Ipe.Browser.WebAuthn as WebAuthn
+import Ipe.Error as Error exposing (Error)
+import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Error as Error exposing (Error)
-import Ipe.Browser.WebAuthn as WebAuthn
-import Ipe.Task as Task
 
 
 type alias Model =

@@ -1,8 +1,8 @@
 module Main exposing (main)
 
-import Ipe.Test as Test exposing (Test)
 import Ipe.List as List
 import Ipe.Result exposing (Result(..))
+import Ipe.Test as Test exposing (Test)
 
 
 -- `Ipe.Test` is a lightweight in-process test framework. Three ideas:
@@ -15,7 +15,6 @@ import Ipe.Result exposing (Result(..))
 --   • `Test.runMain` runs the tree, prints a summary, and sets the process exit
 --     code — 0 when every test passes, non-zero otherwise — so a suite is a
 --     runnable program CI can gate on.
-
 
 -- The function under test: a tiny pure helper.
 doubled : Int -> Int

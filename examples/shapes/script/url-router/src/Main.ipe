@@ -1,12 +1,12 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+import Ipe.Task as Task
 import Ipe.Url as Url
 import Ipe.Url.Parser as Parser
-import Ipe.Task as Task
-import Ipe.Maybe as Maybe
-import Ipe.List as List
-import Ipe.String as String
-import Ipe.Io as Io
 
 
 -- Match request URLs into a typed `Page`, exercising the three ideas most
@@ -36,7 +36,6 @@ type Page
 page : Url.Url -> Page
 page url =
     case Parser.parse (Parser.slash (Parser.s "blog") Parser.int) url of
-
         Just caps ->
             BlogPost (Maybe.withDefault 0 (Parser.firstInt caps))
 
@@ -47,7 +46,6 @@ page url =
 pageUser : Url.Url -> Page
 pageUser url =
     case Parser.parse (Parser.slash (Parser.s "user") Parser.string) url of
-
         Just caps ->
             UserProfile (Maybe.withDefault "?" (Parser.firstString caps))
 
@@ -58,7 +56,6 @@ pageUser url =
 pageSearch : Url.Url -> Page
 pageSearch url =
     case Parser.parse (Parser.withQuery (Parser.s "search") (Parser.query "q")) url of
-
         Just caps ->
             Search (Parser.firstQuery caps)
 
@@ -69,7 +66,6 @@ pageSearch url =
 pageHome : Url.Url -> Page
 pageHome url =
     case Parser.parse Parser.top url of
-
         Just _ ->
             Home
 
@@ -80,7 +76,6 @@ pageHome url =
 render : Page -> String
 render r =
     case r of
-
         Home ->
             "Home"
 
@@ -101,7 +96,6 @@ render r =
 dispatch : String -> String
 dispatch rawPath =
     case Url.fromString ("https://app.example.com" ++ rawPath) of
-
         Ok url ->
             rawPath ++ "  ->  " ++ render (page url)
 

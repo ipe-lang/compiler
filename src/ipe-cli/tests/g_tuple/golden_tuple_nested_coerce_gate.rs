@@ -28,12 +28,8 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry(fixture: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe")
+fn fixture_project(fixture: &str) -> PathBuf {
+    repo_root().join("tests").join("golden").join(fixture)
 }
 
 /// Build the named golden fixture and assert it surfaces exactly IPE-L0115 as a
@@ -42,12 +38,12 @@ fn fixture_entry(fixture: &str) -> PathBuf {
 /// descriptive message — never a panic. A skip occurs only when the runtime
 /// cannot be resolved.
 fn assert_l0115_gate(fixture: &str, out_suffix: &str) {
-    let entry = fixture_entry(fixture);
+    let entry = fixture_project(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -69,7 +65,11 @@ fn nested_tuple_str_column_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&fixture_entry("i_tuple_nested_coerce_str"), &out, &runtime);
+    let built = crate::support::build_golden(
+        &fixture_project("i_tuple_nested_coerce_str"),
+        &out,
+        &runtime,
+    );
     assert!(
         built.is_ok(),
         "a string-literal column nested in a nested-tuple column on a variable \
@@ -89,7 +89,11 @@ fn nested_tuple_str_column_cargo_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&fixture_entry("i_tuple_nested_coerce_str"), &out, &runtime);
+    let built = crate::support::build_golden(
+        &fixture_project("i_tuple_nested_coerce_str"),
+        &out,
+        &runtime,
+    );
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for i_tuple_nested_coerce_str: {:?}",

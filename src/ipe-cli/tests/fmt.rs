@@ -253,6 +253,40 @@ fn check_flag_exit_contract() {
     assert!(res.is_ok(), "--check failed a formatted file: {res:?}");
 }
 
+/// A dirty `fmt --check` through the command dispatcher is a verdict: it lists
+/// the unformatted file and never renders the command's usage page.
+#[test]
+fn dirty_check_through_the_dispatcher_lists_files_without_usage() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fmt_check_verdict");
+    fs::create_dir_all(&dir).unwrap();
+    let unf = dir.join("Dirty.ipe");
+    fs::write(&unf, "module M exposing (x)\n\nx =\n  1\n").unwrap();
+
+    let res = ipe::run_cli(&[
+        "fmt".to_owned(),
+        "--check".to_owned(),
+        dir.to_string_lossy().into_owned(),
+    ]);
+    assert!(
+        matches!(res, Err(CliError::CheckFailed(_))),
+        "a dirty check is a verdict, not command misuse: {res:?}"
+    );
+    let err = res.err().unwrap();
+    let screen = ipe::screen::error_screen(&err, false)
+        .map(|s| s.render(ipe::screen::Header::Omitted))
+        .unwrap_or_default();
+    assert!(screen.contains("Dirty.ipe"), "{screen}");
+    assert!(!screen.contains("Format Ipê source files."), "{screen}");
+    assert!(!screen.contains("Options"), "{screen}");
+
+    // The same input with a mistyped flag is misuse and still shows usage.
+    let res = ipe::run_cli(&["fmt".to_owned(), "--chek".to_owned()]);
+    assert!(
+        matches!(res, Err(CliError::CommandUsage { .. })),
+        "a malformed command line renders usage: {res:?}"
+    );
+}
+
 /// A directory argument formats every `.ipe` under it.
 #[test]
 fn directory_formats_all_ipe_files() {

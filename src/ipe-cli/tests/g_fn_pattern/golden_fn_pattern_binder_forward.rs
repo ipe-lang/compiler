@@ -21,33 +21,27 @@ use ipe::CliError;
 
 use crate::support::repo_root;
 
-fn example_entry(root: &Path) -> PathBuf {
+fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("fn_pattern_binder_forward")
-        .join("Main.ipe")
 }
 
 #[test]
 fn pattern_binder_forward_emits_byte_identical_main_rs() {
     let root = repo_root();
-    let entry = example_entry(&root);
-    let golden = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("fn_pattern_binder_forward")
-        .join("main.rs");
+        .join("fn_pattern_binder_forward");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fn_pattern_binder_forward_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 #[test]
@@ -56,12 +50,12 @@ fn pattern_binder_forward_end_to_end_prints_nine() {
         return;
     }
     let root = repo_root();
-    let entry = example_entry(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_fn_pattern_binder_forward_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted("fn_pattern_binder_forward", &out);
@@ -72,17 +66,13 @@ fn pattern_binder_forward_end_to_end_prints_nine() {
     assert_eq!(outcome.exit_code, Some(0), "exit 0 (THE SEAL)");
 }
 
-/// Build a one-file program to a fresh temp dir and return the driver result.
-#[allow(clippy::expect_used)] // an unwritable scratch dir is the test failure
+/// Build `source` as a one-module project fixture into a fresh out dir and return the driver result.
 fn build_source(name: &str, source: &str) -> Result<(), CliError> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the fixture scratch dir must be writable");
-    let entry = dir.join("Main.ipe");
-    std::fs::write(&entry, source).expect("the fixture scratch dir must be writable");
-    let out = dir.join("out");
+    let fixture = crate::root_fixture::main(source);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out, &runtime)
+    crate::root_fixture::build(&fixture, &out, &runtime)
 }
 
 #[test]

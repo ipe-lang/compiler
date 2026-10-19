@@ -1,9 +1,9 @@
 module Main exposing (main)
 
 import Ipe.Config as Config exposing (Decoder)
+import Ipe.Io as Io
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
-import Ipe.Io as Io
 
 
 -- Decode an untyped TOML document into a typed `AppConfig` record with a
@@ -64,7 +64,6 @@ brokenToml =
 report : String -> String -> String
 report label toml =
     case Config.decodeToml toml configDecoder of
-
         Ok cfg ->
             label
                 ++ ": OK "

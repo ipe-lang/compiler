@@ -13,16 +13,15 @@ module Main exposing (main)
 -- ordinary `Err` the update folds, never a thrown error or a silently dropped
 -- frame.
 
-
+import Ipe.Browser.Clipboard as Clipboard
+import Ipe.Browser.Geolocation as Geo
+import Ipe.Error as Error exposing (Error)
+import Ipe.String as String
+import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Error as Error exposing (Error)
-import Ipe.String as String
-import Ipe.Browser.Geolocation as Geo
-import Ipe.Browser.Clipboard as Clipboard
-import Ipe.Task as Task
 
 
 type alias Model =

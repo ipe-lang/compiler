@@ -36,12 +36,11 @@ fn upsert_matches_oracle() {
     }
     let root = repo_root();
     let dir = root.join("tests").join("golden").join(GOLDEN);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "build failed for {GOLDEN}: {:?}",
@@ -114,17 +113,13 @@ main =
 
 /// Build the template with `target` in place of `TARGET`, under scratch `name`.
 fn build_with_target(name: &str, target: &str) -> Result<(), CliError> {
-    let dir = crate::support::scratch_root().join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&src));
-    let entry = src.join("Main.ipe");
     let source = UPSERT_TEMPLATE.replace("TARGET", target);
-    crate::support::expect_scratch_step(name, std::fs::write(&entry, source));
+    #[allow(clippy::expect_used)] // a fixture-setup failure must fail the test loudly
+    let fixture = ipe::RootFixture::main(&source).expect("the fixture project resolves");
     let out = crate::support::scratch_root().join(format!("{name}_out"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&entry, &out, &runtime)
+    ipe::build_fixture(&fixture, &out, &runtime).map(drop)
 }
 
 /// Assert the `store` control builds and `target` is rejected with `IPE-T0001`.

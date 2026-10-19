@@ -129,6 +129,13 @@ const SITES: &[SiteRow] = &[
     ("cargo_step.rs", "build_command", "cargo", Runner::Cargo, 1),
     (
         "cargo_step.rs",
+        "CargoBuild::clean_package",
+        "build.get_program()",
+        Runner::Local("LOCK_RESOLVE_LIMITS"),
+        1,
+    ),
+    (
+        "cargo_step.rs",
         "probe_lock_within",
         "build.get_program()",
         Runner::Local("LOCK_RESOLVE_LIMITS"),

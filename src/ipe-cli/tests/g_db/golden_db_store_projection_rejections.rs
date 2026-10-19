@@ -20,11 +20,8 @@ use ipe_diagnostics::{Diagnostic, LowerError, StoreSelectProjectionDefect};
 
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
-        .join("Main.ipe")
+fn fixture_project(root: &Path, golden: &str) -> PathBuf {
+    root.join("tests").join("golden").join(golden)
 }
 
 /// Build `golden` and return the diagnostic code it was rejected with.
@@ -42,12 +39,12 @@ fn rejection_code(golden: &str) -> ipe_diagnostics::Code {
 /// crate.
 fn rejection_diagnostic(golden: &str) -> Diagnostic {
     let root = repo_root();
-    let entry = fixture_entry(&root, golden);
+    let entry = fixture_project(&root, golden);
     let out = crate::support::scratch_root().join(format!("ipec_{golden}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let diag = match ipe::build(&entry, &out, &runtime) {
+    let diag = match crate::support::build_golden(&entry, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => *diag,
         other => panic!("{golden}: must be rejected with a pipeline diagnostic, got {other:?}"),
     };

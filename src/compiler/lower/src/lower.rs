@@ -22,7 +22,7 @@ use ipe_diagnostics::{
     DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located, LowerError,
     MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
 };
-use ipe_intern::{Interner, Symbol};
+use ipe_intern::{Interner, Symbol, SynthStem};
 use ipe_ir::free_vars::{
     mentions_free, pat_bound_symbols, pat_moves_nested_part, pat_moves_scrutinee,
 };
@@ -78,8 +78,8 @@ use record_shapes::{
     is_websocket_cfg_shape, ty_is_int,
 };
 use ty_templates::{
-    canon_type_contains_record_key_set, generic_binding_breaks_clone, match_signature_template,
-    ty_contains_fun, ty_contains_record_key_set, ty_fields_mention_var,
+    GroundTy, canon_type_contains_record_key_set, generic_binding_breaks_clone,
+    match_signature_template, ty_contains_fun, ty_contains_record_key_set, ty_fields_mention_var,
     ty_has_fun_in_derive_carrier,
 };
 
@@ -4977,7 +4977,12 @@ fn propagate_call_site_bounds(
     // `IrType` trees once, not per round.
     let sig_param_tys: Vec<Vec<IrType>> = funcs
         .iter()
-        .map(|f| f.params.iter().map(|(_, t)| t.clone()).collect())
+        .map(|f| {
+            f.params
+                .iter()
+                .map(|ipe_ir::Param { ty: t, .. }| t.clone())
+                .collect()
+        })
         .collect();
     let sig_rets: Vec<IrType> = funcs.iter().map(|f| f.ret.clone()).collect();
 
@@ -4996,7 +5001,11 @@ fn propagate_call_site_bounds(
             // caller tvars its bound value data-flow-derives from — so a tvar
             // reaching a bound-obliging callee slot through a local value, not
             // just a forwarded param, still inherits the callee's bound.
-            let caller_params: Vec<(Symbol, IrType)> = caller.params.clone();
+            let caller_params: Vec<(Symbol, IrType)> = caller
+                .params
+                .iter()
+                .map(|p| (p.sym, p.ty.clone()))
+                .collect();
             let caller_tvars: Vec<Symbol> = caller.type_params.iter().map(|(tv, _)| *tv).collect();
 
             let mut binder_tvars: std::collections::HashMap<Symbol, Vec<Symbol>> =
@@ -9773,7 +9782,7 @@ fn prune_dead_type_decls(
     let mut reachable_records: std::collections::HashSet<IrType> = std::collections::HashSet::new();
     for f in funcs {
         collect_ir_type_refs(&f.ret, &mut reachable_enums, &mut reachable_records);
-        for (_, t) in &f.params {
+        for ipe_ir::Param { ty: t, .. } in &f.params {
             collect_ir_type_refs(t, &mut reachable_enums, &mut reachable_records);
         }
         for r in &f.row_params {
@@ -13526,7 +13535,7 @@ impl WildcardMarker {
     /// An interner diagnostic when the fresh symbol cannot be interned.
     pub fn mint(interner: &mut Interner) -> DResult<Self> {
         interner
-            .fresh_symbols("anyw_", 1)?
+            .fresh_symbols(SynthStem::AnyWild, 1)?
             .first()
             .copied()
             .map(Self)
@@ -16893,7 +16902,7 @@ impl<'a> Lowerer<'a> {
             uses_ffi,
             uses_async_runtime,
         };
-        Ok(Program {
+        let mut program = Program {
             modules: vec![module],
             // Import-derived, computed in canon (the source imports are gone by
             // now) and carried on the canonical module; the capability scan reads
@@ -16904,7 +16913,15 @@ impl<'a> Lowerer<'a> {
             // union-folded across every linked module. The scan reads it to
             // disclose each `js-port:<axis>`.
             imported_web_capabilities: self.m.imported_web_capabilities.clone(),
+        };
+        // The pass fact of every parameter is decided once over the whole
+        // program and re-proven at lowering exit; `borrow::run` verifies.
+        let env = self.clone_env();
+        ipe_ir::borrow::run(&mut program, |ty| {
+            clone_class::param_is_multiuse_clonable(env, ty)
         })
+        .map_err(|d| (d, Vec::new()))?;
+        Ok(program)
     }
 
     /// Synthesise the built-in `SqlValue` ADT as an [`EnumDef`].
@@ -17421,12 +17438,14 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Collect every distinct CLOSED record shape the module's expressions
+    /// Collect every distinct GROUND record shape the module's expressions
     /// construct or read, as [`IrType::Record`]s for the backend to synthesise a
     /// struct from. A record literal lives inside a function body, where its
     /// type appears in no signature — so the type-directed lowerer surfaces it
     /// here from the solver's per-region (and per-binding) types, which is the
-    /// only place the solved record shape is known.
+    /// only place the solved record shape is known. The pass runs outside any
+    /// def scope, so it lowers only a [`GroundTy`] (see
+    /// [`Self::collect_records_in_ty`]).
     ///
     /// Determinism: both maps walked are `BTreeMap`s, and duplicates are dropped
     /// by full structural equality, so the output order is fixed.
@@ -17460,7 +17479,7 @@ impl<'a> Lowerer<'a> {
                 // `RetryPolicy e` is the one stdlib record whose type parameter
                 // `e` may remain a free `Ty::Var` (the solver leaves it
                 // unresolved when the error channel is not further constrained).
-                // The `!ty_fields_mention_var` guard below would skip it, but the
+                // The groundness guard below would skip it, but the
                 // backend MUST have a registered struct to call
                 // `record_struct_by_key` — otherwise field access and retry
                 // builders ICE (IPE-I0001). Detect this exact shape first and
@@ -17479,20 +17498,19 @@ impl<'a> Lowerer<'a> {
                     }
                     return Ok(());
                 }
-                // Only a FULLY-CONCRETE record shape is surfaced here. A record
-                // carrying a type variable is a generic shape that necessarily
-                // appears in a (polymorphic) signature — the backend synthesises
-                // and reconciles the generic struct from `func.params` / `func.ret`
-                // there. Surfacing it again from the solved region/env type would
-                // be redundant and, worse, has no source-level [`Symbol`] to name
-                // the generic (the solver's variable id is not a source symbol),
-                // so [`Self::ir_type_from_ty`] would reject the bare `Ty::Var`
-                // field as an under-determined polymorphic value. Skipping it is
-                // sound: an unannotated binding can never be generic (the lowerer rejects an
-                // untyped binding with parameters), so every genuinely-generic
-                // record reaches the backend through a signature.
-                if !ty_fields_mention_var(ty) {
-                    let ir = self.ir_type_from_ty(ty, Span::DUMMY)?;
+                // Only a GROUND record shape (no type variable, wildcard, or
+                // open row tail at any depth) is surfaced here. This pass runs
+                // outside every def scope, and only a ground type lowers the
+                // same in every scope: a variable or a row tail reads the def's
+                // generics, row parameters, and read site, so outside a def it
+                // has no lowering at all (a signature row variable would turn
+                // into a fields-only struct no emitted function names). A
+                // non-ground record reaches the backend through the shapes that
+                // name it: a signature (the backend's `func.params` /
+                // `func.ret` prepass) or a body slot
+                // (`collect_body_record_shapes`).
+                if let Some(ground) = GroundTy::new(ty) {
+                    let ir = self.ir_type_from_ground(ground)?;
                     // G-b gate: skip records whose IR carries a function type.
                     // The `Web.tea` cfg record has function-typed fields
                     // (init/update/view/subscriptions); emitting a Rust struct
@@ -17566,7 +17584,10 @@ impl<'a> Lowerer<'a> {
             home: ModPath(def.home().to_vec()),
             type_params,
             row_params,
-            params,
+            params: params
+                .into_iter()
+                .map(|(sym, ty)| ipe_ir::Param::owned(sym, ty))
+                .collect(),
             ret,
             body,
         })
@@ -20720,6 +20741,16 @@ impl<'a> Lowerer<'a> {
             })
     }
 
+    /// Lower a ground type, the one lowering that reads no def scope.
+    ///
+    /// A [`GroundTy`] holds no variable and no open row tail, so no arm of
+    /// [`Self::ir_type_from_ty`] it reaches consults the generic map, the row
+    /// parameters, or the read site: the result is the same inside and
+    /// outside every def. A pass with no def scope lowers only through here.
+    fn ir_type_from_ground(&self, ground: GroundTy<'_>) -> DResult<IrType> {
+        self.ir_type_from_ty(ground.ty(), Span::DUMMY)
+    }
+
     /// Lower `ty` as part of the current def's emitted signature ([`ReadSite::Signature`]).
     fn signature_ir_type(&self, ty: &Ty, span: Span) -> DResult<IrType> {
         let saved = self.read_site.replace(ReadSite::Signature);
@@ -21525,16 +21556,20 @@ impl<'a> Lowerer<'a> {
                     .collect::<DResult<Vec<_>>>()?;
                 Ok(IrType::Tuple(lowered))
             }
-            // A record type: the row tail decides first, before any nominal
-            // shape fold can name the fields.
-            //  - open over the def's own signature row variable → that row
-            //    parameter's generic (`R{n}`): the value is whatever record the
-            //    caller passed, never a struct synthesised from the fields the
-            //    body happens to read;
-            //  - open over any other quantified variable → no row parameter
-            //    carries it, so it has no lowering (IPE-L0131);
-            //  - open over an unquantified variable, or closed → the flat field
-            //    map below, keyed by field name.
+            // A record type: the row tail decides first, by its owner and the
+            // read site (the one `var_owner` query, as for a `Ty::Var`), before
+            // any nominal shape fold can name the fields.
+            //  - the def's own signature row variable → that row parameter's
+            //    generic (`R{n}`), never a struct of the fields the body reads;
+            //  - the def's own generic that no row parameter carries → no
+            //    lowering (IPE-L0131);
+            //  - another binding's generic read in this def's signature → the
+            //    owner emits it as its own generic (IPE-L0102);
+            //  - another binding's generic read in this def's body → a caller of
+            //    the owner: the zero-extension flat field map below;
+            //  - a row no binding owns → the zero-extension flat field map (the
+            //    empty row solves a free row, and every reader sees one variable);
+            //  - closed → the flat field map below, keyed by field name.
             //
             // Special case: detect the canonical 6-field `HttpRequest` record —
             // `body`, `headers`, `method`, `redirects`, `timeout`, `url` —
@@ -21544,14 +21579,19 @@ impl<'a> Lowerer<'a> {
             // backend-synthesised struct with an auto-generated name.
             Ty::Record(fields, tail) => {
                 match tail {
-                    RowTail::Open(raw) => match self.poly_tvar_symbol(*raw) {
-                        Some(sym) if self.current_row_params.borrow().contains(&sym) => {
-                            return Ok(IrType::RowGeneric(sym));
+                    RowTail::Open(raw) => match (self.var_owner(*raw), self.read_site.get()) {
+                        (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => {
+                            return if self.current_row_params.borrow().contains(&sym) {
+                                Ok(IrType::RowGeneric(sym))
+                            } else {
+                                Err(unsupported(span, Feature::RowPolyRecordAnnotation))
+                            };
                         }
-                        Some(_) => {
-                            return Err(unsupported(span, Feature::RowPolyRecordAnnotation));
+                        (VarOwner::Elsewhere { owner, sym }, ReadSite::Signature) => {
+                            return Err(self.foreign_type_variable(&owner, sym, span));
                         }
-                        None => {}
+                        (VarOwner::Elsewhere { .. }, ReadSite::Body)
+                        | (VarOwner::Unowned, ReadSite::Signature | ReadSite::Body) => {}
                     },
                     RowTail::Closed => {}
                 }
@@ -34154,7 +34194,7 @@ mod tests {
                     lowerer.ir_type_from_ty(&ty, span),
                     Ok(super::IrType::Record(_))
                 ),
-                "an unquantified open tail keeps the flat field map"
+                "an unowned open tail keeps the zero-extension field map"
             );
             lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::from([*r]), || {
                 assert_eq!(
@@ -34405,6 +34445,161 @@ mod tests {
                 super::VarOwner::Unowned
             );
             assert!(lowerer.ty_is_unbound_free(&Ty::Var(ipe_types::tag_solver_var(5))));
+        });
+    }
+
+    /// The record shapes the scope-less pre-pass registers for `ty`.
+    fn pre_pass_records(lowerer: &Lowerer<'_>, ty: &Ty) -> Vec<super::IrType> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(
+            lowerer.collect_records_in_ty(ty, &mut out, &mut seen),
+            Ok(()),
+            "the pre-pass walk never fails on a well-formed type"
+        );
+        out
+    }
+
+    /// The scope-less pre-pass registers no open row, so a signature row variable gets no struct.
+    #[test]
+    fn pre_pass_registers_no_open_row() {
+        with_named_lowerer(&["x", "Int"], |lowerer, syms| {
+            let [x, int] = syms else { return };
+            let open = row_open_record(vec![(*x, builtin_leaf(*int))]);
+            let arrow = Ty::Fun(Box::new(open), Box::new(builtin_leaf(*int)));
+            let registered = pre_pass_records(lowerer, &arrow);
+            assert!(
+                registered.is_empty(),
+                "an open row has no scope-free lowering, got {registered:?}"
+            );
+        });
+    }
+
+    /// A closed record holding an open row deeper down is not ground, so the pre-pass skips it too.
+    #[test]
+    fn pre_pass_registers_no_nested_open_row() {
+        with_named_lowerer(&["w", "x", "Int"], |lowerer, syms| {
+            let [w, x, int] = syms else { return };
+            let inner = row_open_record(vec![(*x, builtin_leaf(*int))]);
+            let outer = Ty::Record(
+                std::iter::once((*w, inner)).collect(),
+                ipe_types::RowTail::Closed,
+            );
+            let registered = pre_pass_records(lowerer, &outer);
+            assert!(
+                registered.is_empty(),
+                "a closed record over a nested open row is not ground, got {registered:?}"
+            );
+        });
+    }
+
+    /// Control: a ground record is registered once, alone or nested inside an open row.
+    #[test]
+    fn pre_pass_registers_ground_records() {
+        with_named_lowerer(&["w", "x", "Int"], |lowerer, syms| {
+            let [w, x, int] = syms else { return };
+            let closed = Ty::Record(
+                std::iter::once((*x, builtin_leaf(*int))).collect(),
+                ipe_types::RowTail::Closed,
+            );
+            let closed_ir = lowerer.ir_type_from_ty(&closed, Span::DUMMY);
+            assert!(
+                matches!(closed_ir, Ok(super::IrType::Record(_))),
+                "the closed record lowers to a flat record, got {closed_ir:?}"
+            );
+            let Ok(closed_ir) = closed_ir else { return };
+            assert_eq!(
+                pre_pass_records(lowerer, &closed),
+                vec![closed_ir.clone()],
+                "a ground record is registered once"
+            );
+            let open = row_open_record(vec![(*w, closed)]);
+            assert_eq!(
+                pre_pass_records(lowerer, &open),
+                vec![closed_ir],
+                "a ground record nested in an open row is registered once, the open row never"
+            );
+        });
+    }
+
+    /// Another binding's row variable read in the def's signature is refused, never a flat struct.
+    ///
+    /// The same tail read in the body is a caller of its owner and keeps the
+    /// zero-extension field map, as does a row no binding owns at either site.
+    #[test]
+    fn foreign_row_tail_in_a_signature_is_refused() {
+        with_foreign_var_lowerer(&[], |lowerer| {
+            let field = lowerer.current_name.get();
+            let open_over = |raw: u32| {
+                Ty::Record(
+                    std::iter::once((field, Ty::Unit)).collect(),
+                    ipe_types::RowTail::Open(ipe_types::tag_solver_var(raw)),
+                )
+            };
+            let foreign = open_over(5);
+            let unowned = open_over(6);
+            let span = Span::new(3, 4);
+            let body = lowerer.ir_type_from_ty(&foreign, span);
+            assert!(
+                matches!(body, Ok(super::IrType::Record(_))),
+                "a body read of a foreign row keeps the flat field map, got {body:?}"
+            );
+            assert!(
+                matches!(
+                    lowerer.ir_type_from_ty(&unowned, span),
+                    Ok(super::IrType::Record(_))
+                ),
+                "an unowned row read in a body keeps the flat field map"
+            );
+            lowerer.read_site.set(super::ReadSite::Signature);
+            let res = lowerer.ir_type_from_ty(&foreign, span);
+            assert!(
+                matches!(
+                    &res,
+                    Err(super::Diagnostic::Lower {
+                        span: s,
+                        msg: super::LowerError::ForeignTypeVariable { helper, owner, var },
+                    }) if *s == span && &**helper == "chip" && &**owner == "row" && &**var == "msg"
+                ),
+                "expected ForeignTypeVariable(chip, row, msg), got {res:?}"
+            );
+            let unowned_sig = lowerer.ir_type_from_ty(&unowned, span);
+            lowerer.read_site.set(super::ReadSite::Body);
+            assert!(
+                matches!(unowned_sig, Ok(super::IrType::Record(_))),
+                "an unowned row read in a signature keeps the flat field map, got {unowned_sig:?}"
+            );
+        });
+    }
+
+    /// Control: a ground type lowers the same outside every scope and inside a row-generic one.
+    #[test]
+    fn ground_type_lowers_alike_in_and_out_of_scope() {
+        with_named_lowerer(&["r", "x", "Int"], |lowerer, syms| {
+            let [r, x, int] = syms else { return };
+            let closed = Ty::Record(
+                std::iter::once((*x, builtin_leaf(*int))).collect(),
+                ipe_types::RowTail::Closed,
+            );
+            assert!(
+                super::GroundTy::new(&row_open_record(vec![(*x, builtin_leaf(*int))])).is_none(),
+                "an open row has no ground view"
+            );
+            let ground = super::GroundTy::new(&closed);
+            assert!(ground.is_some(), "a closed record of a builtin is ground");
+            let Some(ground) = ground else { return };
+            let outside = lowerer.ir_type_from_ground(ground);
+            let inside = lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::from([*r]), || {
+                lowerer.ir_type_from_ty(&closed, Span::DUMMY)
+            });
+            assert!(
+                matches!(outside, Ok(super::IrType::Record(_))),
+                "the ground record lowers outside every scope, got {outside:?}"
+            );
+            assert_eq!(
+                outside, inside,
+                "a ground type has one lowering in every scope"
+            );
         });
     }
 

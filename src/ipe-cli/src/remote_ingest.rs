@@ -1354,6 +1354,8 @@ pub enum LocalSource {
     LockProbe,
     /// A `cargo metadata --no-deps` reading a crate's target directory.
     CargoMetadata,
+    /// An offline `cargo clean --package` removing a test runner's previous build output.
+    CargoClean,
     /// A toolchain query: a tool's version or its installed targets.
     ToolQuery,
     /// A `cargo-deny check` over an emitted crate's dependency graph.
@@ -1381,6 +1383,7 @@ impl std::fmt::Display for LocalSource {
             Self::LockFetch => "cargo lock resolve",
             Self::LockProbe => "cargo lock probe",
             Self::CargoMetadata => "cargo metadata query",
+            Self::CargoClean => "cargo clean of the test runner",
             Self::ToolQuery => "toolchain query",
             Self::SupplyChainScan => "cargo-deny supply-chain scan",
             Self::RustcQuery => "rustc version query",

@@ -297,30 +297,64 @@ pub struct EpochStep {
     pub to: RenderEpoch,
 }
 
+/// One retained render: its counter, its handler index, and the index's
+/// measure taken when the render was committed.
+type RetainedRender<M> = (NonZeroU64, HandlerIndex<M>, Option<Bytes>);
+
 /// The last committed view and the handler indexes of the retained renders.
 ///
 /// The only way to install a new view is [`Self::commit`], which builds its
 /// index and mints its epoch together, so no index can change without a new
-/// epoch.
+/// epoch. A view and an index are immutable once committed, so each is
+/// measured once, where it is installed, and the measure is kept beside it:
+/// [`Self::resident_bytes`] reads those measures and walks no tree.
 pub struct Rendered<M> {
     incarnation: Incarnation,
     style_nonce: StyleNonce,
     current: NonZeroU64,
     last_view: Html<M>,
-    history: VecDeque<(NonZeroU64, HandlerIndex<M>)>,
+    /// The measure of `last_view`, written only where `last_view` is.
+    view_bytes: Option<Bytes>,
+    history: VecDeque<RetainedRender<M>>,
 }
 
 impl<M: RetainedBytes> Rendered<M> {
     /// The bytes the current view and every retained handler index keep resident.
+    ///
+    /// Reads the measures taken at commit, so its cost is the history depth,
+    /// never the size of a view; a part with no measure makes it `None`.
     #[must_use]
     pub fn resident_bytes(&self) -> Option<Bytes> {
+        self.resident_from(self.view_bytes, |(_, _, bytes)| *bytes)
+    }
+
+    /// The bytes [`Self::resident_bytes`] charges, measured afresh.
+    ///
+    /// Walks the current view and every retained index: the reference the
+    /// commit-time measures are checked against.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn measured_fresh(&self) -> Option<Bytes> {
+        self.resident_from(self.last_view.view_bytes(), |(_, index, _)| {
+            index.resident_bytes()
+        })
+    }
+
+    /// The resident total, given the current view's measure and how to
+    /// measure each retained render's index.
+    fn resident_from(
+        &self,
+        view: Option<Bytes>,
+        index: impl Fn(&RetainedRender<M>) -> Option<Bytes>,
+    ) -> Option<Bytes> {
         let spare = self.history.capacity().checked_sub(self.history.len())?;
         let base = Bytes::inline::<Self>()?
-            .checked_add(Bytes::slots::<(NonZeroU64, HandlerIndex<M>)>(spare)?)?
-            .checked_add(self.last_view.view_bytes()?)?;
-        self.history.iter().try_fold(base, |acc, (_, index)| {
+            .checked_add(Bytes::slots::<RetainedRender<M>>(spare)?)?
+            .checked_add(view?)?;
+        self.history.iter().try_fold(base, |acc, render| {
             acc.checked_add(Bytes::inline::<NonZeroU64>()?)?
-                .checked_add(index.resident_bytes()?)
+                .checked_add(Bytes::inline::<Option<Bytes>>()?)?
+                .checked_add(index(render)?)
         })
     }
 }
@@ -333,7 +367,7 @@ impl<M> Rendered<M> {
     }
 }
 
-impl<M: Clone> Rendered<M> {
+impl<M: Clone + RetainedBytes> Rendered<M> {
     /// The first render of a new history, at counter 1.
     ///
     /// `keys` are the history's for its whole life: no method replaces them.
@@ -347,12 +381,15 @@ impl<M: Clone> Rendered<M> {
             incarnation,
             style_nonce,
         } = keys;
+        let index = build_index(&tree);
+        let index_bytes = index.resident_bytes();
         let mut history = VecDeque::with_capacity(RENDER_HISTORY_DEPTH.get());
-        history.push_back((n, build_index(&tree)));
+        history.push_back((n, index, index_bytes));
         Self {
             incarnation,
             style_nonce,
             current: n,
+            view_bytes: tree.view_bytes(),
             last_view: tree,
             history,
         }
@@ -372,18 +409,22 @@ impl<M: Clone> Rendered<M> {
         let from = self.epoch();
         let next = self.current.checked_add(1).ok_or(EpochExhausted)?;
         let index = build_index(&tree);
+        let index_bytes = index.resident_bytes();
         while self.history.len() >= RENDER_HISTORY_DEPTH.get() {
             self.history.pop_front();
         }
-        self.history.push_back((next, index));
+        self.history.push_back((next, index, index_bytes));
         self.current = next;
+        self.view_bytes = tree.view_bytes();
         self.last_view = tree;
         Ok(EpochStep {
             from,
             to: self.epoch(),
         })
     }
+}
 
+impl<M: Clone> Rendered<M> {
     /// The epoch of the current view.
     #[must_use]
     pub const fn epoch(&self) -> RenderEpoch {
@@ -431,8 +472,8 @@ impl<M: Clone> Rendered<M> {
         }
         self.history
             .iter()
-            .find(|(n, _)| *n == at.n)
-            .map(|(_, index)| index)
+            .find(|(n, _, _)| *n == at.n)
+            .map(|(_, index, _)| index)
             .ok_or(StaleEpoch::Evicted)
     }
 
@@ -476,6 +517,7 @@ impl<M: Clone> Rendered<M> {
 mod tests {
     use super::*;
     use crate::assign_ipe_ids;
+    use crate::html::drawn_shape::{DRAWN_LEVELS, DrawnShape, Wide};
 
     #[derive(Clone, Debug, PartialEq)]
     enum Msg {
@@ -523,37 +565,26 @@ mod tests {
         );
     }
 
-    /// A 600-byte message, as wide as a rich app `Msg`.
-    #[derive(Clone)]
-    #[allow(dead_code)] // the bytes are the width; nothing reads them
-    struct Wide([u8; 600]);
-
-    crate::retained::inline_measure!(Wide);
-
-    /// A stamped `code` block of `n` token spans; each span carries a click
-    /// handler when `handlers` holds.
-    fn drawn(n: usize, handlers: bool) -> Html<Wide> {
-        let span = |i: usize| {
-            let mut attrs = vec![Attribute::Attr("style".into(), "color:#cdcdd7".into())];
-            if handlers {
-                attrs.push(Attribute::EventAttr(Event::OnMsg(
-                    "click".into(),
-                    Box::new(Wide([0; 600])),
-                )));
-            }
-            Html::HElement("span".into(), attrs, vec![Html::HText(format!("t{i}"))])
-        };
-        let mut view = Html::HElement("code".into(), Vec::new(), (0..n).map(span).collect());
-        assign_ipe_ids(&mut view, "0");
-        view
+    /// The shared drawn source view of `lines` lines, one coloured run each;
+    /// each line carries a click handler when `handlers` holds.
+    fn drawn(lines: usize, handlers: bool) -> Html<Wide> {
+        DrawnShape {
+            depth: DRAWN_LEVELS,
+            lines,
+            runs: 1,
+            escapes: 1,
+            handlers,
+            spare: false,
+        }
+        .build()
     }
 
-    /// The bytes a full render history of `drawn(n, handlers)` keeps resident
-    /// beyond its current view.
-    fn history_bytes(n: usize, handlers: bool) -> Option<u64> {
-        let mut rendered = Rendered::first(keys(), drawn(n, handlers));
+    /// The bytes a full render history of `drawn(lines, handlers)` keeps
+    /// resident beyond its current view.
+    fn history_bytes(lines: usize, handlers: bool) -> Option<u64> {
+        let mut rendered = Rendered::first(keys(), drawn(lines, handlers));
         for _ in 0..RENDER_HISTORY_DEPTH.get() {
-            rendered.commit(drawn(n, handlers)).ok()?;
+            rendered.commit(drawn(lines, handlers)).ok()?;
         }
         let all = rendered.resident_bytes()?.get();
         all.checked_sub(rendered.last_view().view_bytes()?.get())

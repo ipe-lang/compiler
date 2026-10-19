@@ -43,20 +43,16 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Assert that `ipe::build(fixture)` SUCCEEDS (exit-0 from the lowerer).
+/// Assert that building the golden `fixture` SUCCEEDS (exit-0 from the lowerer).
 /// Runs without `IPE_E2E` so this check is always fast.
 fn assert_ipec_ok(fixture: &str, out_suffix: &str) {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_dir = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for fixture {fixture}: {:?}",
@@ -84,17 +80,13 @@ fn a1_ctor_map_bare() {
 
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let root = repo_root();
-        let entry = root
-            .join("tests")
-            .join("golden")
-            .join("ctor_map_bare")
-            .join("Main.ipe");
+        let golden_dir = root.join("tests").join("golden").join("ctor_map_bare");
         let out = crate::support::scratch_root().join("ipec_i147_ctor_map_bare_e2e");
         let _ = std::fs::remove_dir_all(&out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 
-        let built = ipe::build(&entry, &out, &runtime);
+        let built = crate::support::build_golden(&golden_dir, &out, &runtime);
         assert!(
             built.is_ok(),
             "ipe dev build must succeed for ctor_map_bare: {:?}",
@@ -127,17 +119,13 @@ fn a2_ctor_partial_multiarg_with_clone() {
 
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let root = repo_root();
-        let entry = root
-            .join("tests")
-            .join("golden")
-            .join("ctor_partial")
-            .join("Main.ipe");
+        let golden_dir = root.join("tests").join("golden").join("ctor_partial");
         let out = crate::support::scratch_root().join("ipec_i147_ctor_partial_e2e");
         let _ = std::fs::remove_dir_all(&out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 
-        let built = ipe::build(&entry, &out, &runtime);
+        let built = crate::support::build_golden(&golden_dir, &out, &runtime);
         assert!(
             built.is_ok(),
             "ipe dev build must succeed for ctor_partial: {:?}",
@@ -170,17 +158,13 @@ fn a3_ctor_stored_in_record_field() {
 
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let root = repo_root();
-        let entry = root
-            .join("tests")
-            .join("golden")
-            .join("ctor_field")
-            .join("Main.ipe");
+        let golden_dir = root.join("tests").join("golden").join("ctor_field");
         let out = crate::support::scratch_root().join("ipec_i147_ctor_field_e2e");
         let _ = std::fs::remove_dir_all(&out);
 
         let runtime = e2e_support::require_runtime().into_path_buf();
 
-        let built = ipe::build(&entry, &out, &runtime);
+        let built = crate::support::build_golden(&golden_dir, &out, &runtime);
         assert!(
             built.is_ok(),
             "ipe dev build must succeed for ctor_field: {:?}",

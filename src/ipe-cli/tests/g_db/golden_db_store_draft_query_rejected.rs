@@ -14,11 +14,8 @@ use std::path::{Path, PathBuf};
 use crate::golden_app_settings_front_door::{emitted_rust, judge_rejection};
 use crate::support::repo_root;
 
-fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden)
-        .join("Main.ipe")
+fn fixture_project(root: &Path, golden: &str) -> PathBuf {
+    root.join("tests").join("golden").join(golden)
 }
 
 /// A read (`Store.all`) applied to an unclassified `Draft` MUST be rejected at
@@ -27,12 +24,12 @@ fn fixture_entry(root: &Path, golden: &str) -> PathBuf {
 fn draft_query_without_classification_is_rejected() {
     const GOLDEN: &str = "db_store_draft_query_rejected";
     let root = repo_root();
-    let entry = fixture_entry(&root, GOLDEN);
+    let entry = fixture_project(&root, GOLDEN);
     let out = crate::support::scratch_root().join("ipec_db_store_draft_query_rejected");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     // Pin the REASON, not just the failure: a `Draft` read is a type mismatch
     // (Store expected, Draft found) — IPE-T0001. Asserting only `is_err()` would
     // pass on any unrelated build failure, leaving the deny-by-default guarantee

@@ -43,8 +43,8 @@ fn golden_dir(root: &Path) -> PathBuf {
         .join("captured_record_field_access_clone")
 }
 
-fn entry_path(root: &Path) -> PathBuf {
-    golden_dir(root).join("Main.ipe")
+fn project_path(root: &Path) -> PathBuf {
+    golden_dir(root)
 }
 
 /// ipe-0 + emitted-source assertion (unconditional, cheap — no `cargo`): the
@@ -54,14 +54,14 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn captured_record_field_access_is_cloned_not_moved() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("captured_record_field_access_clone_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for captured_record_field_access_clone: {:?}",
@@ -92,14 +92,14 @@ fn captured_record_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let gdir = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_captured_record_field_access_clone_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for captured_record_field_access_clone: {:?}",

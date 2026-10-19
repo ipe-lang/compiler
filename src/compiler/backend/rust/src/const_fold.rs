@@ -474,7 +474,9 @@ fn specialize_whitelisted_call(
             return None;
         }
         let mut subst = BTreeMap::new();
-        for (((param, _), arg), fold) in func.params.iter().zip(args).zip(&arg_folds) {
+        for ((ipe_ir::Param { sym: param, .. }, arg), fold) in
+            func.params.iter().zip(args).zip(&arg_folds)
+        {
             // A scalar-folding argument substitutes as its direct literal (the value
             // the inlined body's fold would reduce it to anyway); every other argument
             // substitutes verbatim so its own expression re-folds in place.
@@ -1190,7 +1192,7 @@ fn eval_func_body(
         return None;
     }
     let mut child_locals = BTreeMap::new();
-    for ((param, _), value) in func.params.iter().zip(arg_vals) {
+    for (ipe_ir::Param { sym: param, .. }, value) in func.params.iter().zip(arg_vals) {
         child_locals.insert(*param, value.clone());
     }
     let child = FoldEnv {
@@ -1438,7 +1440,7 @@ mod tests {
             home,
             type_params: vec![],
             row_params: vec![],
-            params: vec![(param, IrType::Str)],
+            params: vec![ipe_ir::Param::owned(param, IrType::Str)],
             ret: IrType::Str,
             body: Expr::Var(param),
         }

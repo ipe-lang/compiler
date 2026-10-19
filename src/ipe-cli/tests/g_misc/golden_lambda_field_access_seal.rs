@@ -214,21 +214,15 @@ fn assert_accepted_and_builds(name: &str, source: &str) {
 /// (`None`, after a failed assertion, when scratch or runtime setup fails).
 fn build_fixture(name: &str, source: &str) -> Option<(Result<(), CliError>, PathBuf)> {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("lambda-field-access");
-    let src = root.join(name).join("src");
-    let _ = std::fs::remove_dir_all(root.join(name));
-    let entry = src.join("Main.ipe");
-    if std::fs::create_dir_all(&src)
-        .and_then(|()| std::fs::write(&entry, source))
-        .is_err()
-    {
+    let Ok(fixture) = ipe::RootFixture::main(source) else {
         assert!(
             false_marker(),
-            "{name}: could not write the fixture into the scratch dir"
+            "{name}: could not write the fixture project"
         );
         return None;
-    }
+    };
     let out = root.join(format!("{name}-out"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    Some((ipe::build(&entry, &out, &runtime), out))
+    Some((ipe::build_fixture(&fixture, &out, &runtime).map(drop), out))
 }

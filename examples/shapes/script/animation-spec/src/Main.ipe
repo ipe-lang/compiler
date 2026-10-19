@@ -1,7 +1,7 @@
 module Main exposing (main)
 
-import Ipe.Ui.Animation as Animation
 import Ipe.Io as Io
+import Ipe.Ui.Animation as Animation
 
 
 -- `Ipe.Ui.Animation` describes a CSS animation as a `Spec` value, built up with

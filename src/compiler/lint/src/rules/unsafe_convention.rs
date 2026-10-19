@@ -8,6 +8,7 @@
 //! judgement is policy on valid code: a lint, not a type rule. It is advisory
 //! (no `--fix`): removing an escape hatch is a design decision, never mechanical.
 
+use ipe_diagnostics::Span;
 use ipe_syntax::{Expr, Expr_};
 
 use crate::finding::Finding;
@@ -47,17 +48,7 @@ fn is_unsafe_ref(ctx: &Ctx, expr: &Expr) -> Option<String> {
 /// used bare — exactly once at its own span.
 fn walk(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
     if let Some(shown) = is_unsafe_ref(ctx, expr) {
-        out.push(ctx.advisory(
-            "unsafe-convention",
-            expr.span,
-            format!("`{shown}` is an escape hatch — its use bypasses a normal safety guarantee"),
-            vec![
-                "reach for an `unsafe*` / `.Unsafe` binding only when the invariant is checked \
-                 elsewhere; make the choice deliberate and reviewed"
-                    .to_owned(),
-                "suppress: `-- ipe-lint: allow unsafe-convention`".to_owned(),
-            ],
-        ));
+        report(ctx, expr.span, &shown, out);
     }
     // A matched reference is a `VarQual`/`VarLocal` leaf with no sub-expressions,
     // so this descent reports it exactly once; a `Call` to an `unsafe*` callee
@@ -65,7 +56,25 @@ fn walk(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
     walk_children(ctx, expr, out);
 }
 
+/// Report one `unsafe*` reference, spelled `shown`, at `span`.
+fn report(ctx: &Ctx, span: Span, shown: &str, out: &mut Vec<Finding>) {
+    out.push(ctx.advisory(
+        "unsafe-convention",
+        span,
+        format!("`{shown}` is an escape hatch — its use bypasses a normal safety guarantee"),
+        vec![
+            "reach for an `unsafe*` / `.Unsafe` binding only when the invariant is checked \
+             elsewhere; make the choice deliberate and reviewed"
+                .to_owned(),
+            "suppress: `-- ipe-lint: allow unsafe-convention`".to_owned(),
+        ],
+    ));
+}
+
 /// Recurse into every sub-expression of `expr`.
+///
+/// Every variant has its own arm, so a new child-bearing variant is a compile
+/// error here rather than a subtree the rule silently never visits.
 fn walk_children(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
     match &expr.value {
         Expr_::Call(callee, args) => {
@@ -111,12 +120,27 @@ fn walk_children(ctx: &Ctx, expr: &Expr, out: &mut Vec<Finding>) {
             }
         }
         Expr_::Access(base, _field) => walk(ctx, base, out),
-        Expr_::Update(_base, fields) => {
+        Expr_::Update(base, fields) => {
+            // The updated record is a bare name, not an `Expr`: `walk` never
+            // sees it, so it is checked here.
+            let name = ctx.text(base.value);
+            if name.starts_with("unsafe") {
+                report(ctx, base.span, name, out);
+            }
             for (_name, value) in fields {
                 walk(ctx, value, out);
             }
         }
-        // Leaves: literals, unit, bare references (handled at `walk`'s top).
-        _ => {}
+        // Leaves: bare references (reported at `walk`'s top), the `do` bind's
+        // identity head, literals, and unit.
+        Expr_::VarLocal(_)
+        | Expr_::VarQual(..)
+        | Expr_::TaskAndThen
+        | Expr_::Int(_)
+        | Expr_::Float(_)
+        | Expr_::Str(_)
+        | Expr_::MultilineStr { .. }
+        | Expr_::Char(_)
+        | Expr_::Unit => {}
     }
 }

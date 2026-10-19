@@ -28,19 +28,16 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// The entry `tests/golden/<fixture>/Main.ipe`.
-fn fixture_entry(fixture: &str) -> PathBuf {
-    repo_root()
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe")
+/// The entry `tests/golden/<fixture>/src/Main.ipe`.
+fn fixture_project(fixture: &str) -> PathBuf {
+    repo_root().join("tests").join("golden").join(fixture)
 }
 
 /// The rendered diagnostic with terminal colour sequences removed.
 fn plain_render(diag: &ipe_diagnostics::Diagnostic, entry: &std::path::Path) -> String {
-    let source = std::fs::read_to_string(entry).unwrap_or_default();
-    let rendered = ipe_diagnostics::render(diag, &entry.display().to_string(), &source);
+    let source_path = crate::support::golden_source(entry, "Main");
+    let source = std::fs::read_to_string(&source_path).unwrap_or_default();
+    let rendered = ipe_diagnostics::render(diag, &source_path.display().to_string(), &source);
     let mut out = String::with_capacity(rendered.len());
     let mut chars = rendered.chars();
     while let Some(c) = chars.next() {
@@ -62,12 +59,12 @@ fn plain_render(diag: &ipe_diagnostics::Diagnostic, entry: &std::path::Path) -> 
 /// kind or at the wrong site does not pass on the code alone, and assert NO
 /// Rust was emitted (the pipeline stopped before codegen).
 fn assert_gate(fixture: &str, out_suffix: &str, expected: ipe_diagnostics::Code, needle: &str) {
-    let entry = fixture_entry(fixture);
+    let entry = fixture_project(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     let got = match &built {
         Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
         _ => None,
@@ -207,7 +204,7 @@ fn sort_by_scalar_keys_build_and_order() {
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&fixture_entry(name), &out, &runtime);
+    let built = crate::support::build_golden(&fixture_project(name), &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let run = crate::support::build_and_run_emitted(name, &out);

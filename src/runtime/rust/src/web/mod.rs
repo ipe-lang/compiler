@@ -727,7 +727,7 @@ pub struct SessionEntry<Model, Msg> {
     /// Bounded rolling message log for time-travel scrubbing. Present only
     /// when the `debugger` feature is active; absent builds pay no cost.
     #[cfg(feature = "debugger")]
-    pub history: crate::debugger::RecordBuffer<Msg, Model>,
+    pub history: crate::debugger::RecordBuffer<Msg, Model, crate::debugger::Measured>,
     /// Current scrub cursor for `back`/`forward` stepping.
     ///
     /// `None` = live mode (no active time-travel); `Some(n)` = the last step
@@ -5126,8 +5126,10 @@ mod handlers {
         let (event_tx, event_rx) = mpsc::channel::<QueuedEvent<Msg>>(EVENT_QUEUE_CAP);
         let (enter_tx, enter_rx) = mpsc::channel::<EnterRequest>(ENTER_QUEUE_CAP.get());
         #[cfg(feature = "debugger")]
-        let history_init =
-            crate::debugger::RecordBuffer::new(model.clone(), crate::debugger::DEFAULT_HISTORY_CAP);
+        let history_init = crate::debugger::RecordBuffer::measured(
+            model.clone(),
+            crate::debugger::DEFAULT_HISTORY_CAP,
+        );
         let Admission { slot, charge } = admitted;
         let mut resident = SessionEntry {
             model,
@@ -6261,7 +6263,7 @@ mod handlers {
     /// render, minting its epoch, and return that epoch with the stamped
     /// render; `None` when no epoch is left to mint.
     #[cfg(feature = "debugger")]
-    fn commit_debug_render<Model, Msg: Clone>(
+    fn commit_debug_render<Model, Msg: Clone + RetainedBytes>(
         handle: &store::SessionHandle<Model, Msg>,
         tree: Html<Msg>,
     ) -> Option<(RenderEpoch, StampedHtml)> {
@@ -6587,7 +6589,7 @@ mod handlers {
         // malformed, oversized, or type-mismatched blob yields None.
         let update = st.update.clone();
         let replay_scope = scope.clone();
-        let imported = crate::debugger::import_msgs::<Msg, Model, _>(
+        let imported = crate::debugger::import_msgs::<Msg, Model, _, crate::debugger::Measured>(
             &body,
             init_model,
             move |msg, model| pubsub::with_session(&replay_scope, || (*update)(msg, model)),
@@ -7626,7 +7628,10 @@ mod reload_push_tests {
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
+            history: crate::debugger::RecordBuffer::measured(
+                (),
+                crate::debugger::DEFAULT_HISTORY_CAP,
+            ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
@@ -7744,7 +7749,7 @@ mod hot_appearance_push_tests {
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new(
+            history: crate::debugger::RecordBuffer::measured(
                 count,
                 crate::debugger::DEFAULT_HISTORY_CAP,
             ),
@@ -9593,7 +9598,10 @@ mod sse_reconnect_reconcile_tests {
             entered_path: entered_path.map(dp),
             enter_tx,
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new(page, crate::debugger::DEFAULT_HISTORY_CAP),
+            history: crate::debugger::RecordBuffer::measured(
+                page,
+                crate::debugger::DEFAULT_HISTORY_CAP,
+            ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
@@ -10395,7 +10403,10 @@ mod watch_status_handler_tests {
             entered_path: None,
             enter_tx: tokio::sync::mpsc::channel(1).0,
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new((), crate::debugger::DEFAULT_HISTORY_CAP),
+            history: crate::debugger::RecordBuffer::measured(
+                (),
+                crate::debugger::DEFAULT_HISTORY_CAP,
+            ),
             #[cfg(feature = "debugger")]
             debug_cursor: None,
             liveness: crate::web::SessionLiveness::default(),
@@ -16638,7 +16649,7 @@ mod route_entry_cmd_tests {
             entered_path: Some(root_path()),
             enter_tx,
             #[cfg(feature = "debugger")]
-            history: crate::debugger::RecordBuffer::new(
+            history: crate::debugger::RecordBuffer::measured(
                 model,
                 crate::debugger::DEFAULT_HISTORY_CAP,
             ),
@@ -19252,5 +19263,68 @@ mod page_csrf_mint_tests {
         });
         assert_eq!(reused.ok(), Some(token));
         assert_eq!(mints.get(), 0, "a reused token draws nothing");
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "web",
+    feature = "debugger",
+    not(target_arch = "wasm32")
+))]
+mod session_history_charge_tests {
+    use super::*;
+    use tokio::sync::mpsc::channel;
+
+    #[derive(Clone, Debug)]
+    enum ChargeMsg {
+        Measurable,
+        Unmeasurable,
+    }
+
+    impl RetainedBytes for ChargeMsg {
+        fn retained_bytes(&self) -> Option<Bytes> {
+            match self {
+                Self::Measurable => Bytes::inline::<Self>(),
+                Self::Unmeasurable => None,
+            }
+        }
+    }
+
+    fn entry_after(msg: ChargeMsg) -> SessionEntry<i64, ChargeMsg> {
+        let (tx, _rx) = channel::<ChargeMsg>(1);
+        let tree: Html<ChargeMsg> = Html::HText(String::new());
+        let mut history =
+            crate::debugger::RecordBuffer::measured(0_i64, crate::debugger::DEFAULT_HISTORY_CAP);
+        history.record(msg, 1, &|_msg, model| (model, IpeCmd::None));
+        SessionEntry {
+            model: 1,
+            rendered: Rendered::first(SessionKeys::distinct(), tree),
+            tabs: TabSeqs::default(),
+            seq: 0,
+            sse_tx: None,
+            msg_tx: tx,
+            event_tx: tokio::sync::mpsc::channel(1).0,
+            entered_path: None,
+            enter_tx: tokio::sync::mpsc::channel(1).0,
+            history,
+            debug_cursor: None,
+            liveness: SessionLiveness::default(),
+            charge: budget::Charge::detached(),
+            cmds: Arc::new(budget::SessionCmds::new()),
+        }
+    }
+
+    // Refusal: a resident history step with no measure fails the session's
+    // recharge closed, at its own ceiling.
+    #[test]
+    fn an_unmeasured_history_step_refuses_the_recharge() {
+        let mut entry = entry_after(ChargeMsg::Unmeasurable);
+        assert_eq!(entry.resident_bytes(), None);
+        assert_eq!(entry.recharge_resident(), Err(budget::OverBudget::Session));
+
+        let mut entry = entry_after(ChargeMsg::Measurable);
+        assert!(entry.resident_bytes().is_some());
+        assert_eq!(entry.recharge_resident(), Ok(()));
     }
 }

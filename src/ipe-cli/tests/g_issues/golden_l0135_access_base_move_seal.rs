@@ -47,20 +47,6 @@ const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-/// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed by
-/// `name`, returning the entry path (or `None` if scratch setup fails).
-fn write_single(name: &str, source: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("l0135-access-base")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).ok()?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
-}
-
 /// The scratch output dir for `name`, cleared.
 fn out_dir(name: &str) -> PathBuf {
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -75,10 +61,10 @@ fn out_dir(name: &str) -> PathBuf {
 /// point is that emission never happens.
 #[track_caller]
 fn assert_rejected(name: &str, source: &str, expected: ipe_diagnostics::Code) {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
+    let fixture = crate::root_fixture::main(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
+    match crate::root_fixture::build(&fixture, &out, &runtime) {
         Err(CliError::Pipeline { diag, .. }) => assert_eq!(
             diag.code(),
             expected,
@@ -101,10 +87,10 @@ fn assert_rejected(name: &str, source: &str, expected: ipe_diagnostics::Code) {
 /// that the emitted crate `cargo build`s and runs to `expected_stdout`.
 #[track_caller]
 fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
+    let fixture = crate::root_fixture::main(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
+    match crate::root_fixture::build(&fixture, &out, &runtime) {
         Ok(()) => {}
         Err(CliError::Pipeline { diag, .. }) => {
             assert!(

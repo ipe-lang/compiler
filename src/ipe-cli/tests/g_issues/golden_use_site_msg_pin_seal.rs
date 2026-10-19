@@ -32,20 +32,16 @@ fn golden_dir(root: &Path) -> PathBuf {
     root.join("tests").join("golden").join(GOLDEN)
 }
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    golden_dir(root).join("src").join("Main.ipe")
-}
-
 /// Emit gate: every open message slot is pinned to `()`; a generic caller's use is not.
 #[test]
 fn use_site_msg_pin_emitted() {
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_emit"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
@@ -71,16 +67,12 @@ fn use_site_msg_pin_emitted() {
 fn use_site_open_non_msg_var_refused() {
     let name = "use_site_open_non_msg_refused";
     let root = crate::support::repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe");
+    let golden = root.join("tests").join("golden").join(name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     let code = match &built {
         Err(ipe::CliError::Pipeline { diag, .. }) => Some(diag.code()),
         Ok(()) | Err(_) => None,
@@ -99,12 +91,12 @@ fn use_site_msg_pin_seal_runs() {
         return;
     }
     let root = crate::support::repo_root();
-    let entry = fixture_entry(&root);
+    let golden = golden_dir(&root);
     let out = crate::support::scratch_root().join(format!("ipec_{GOLDEN}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build_loose_file(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden, &out, &runtime);
     assert!(
         built.is_ok(),
         "{GOLDEN}: ipe dev build must accept the program, got: {built:?}"
@@ -116,5 +108,5 @@ fn use_site_msg_pin_seal_runs() {
         Some(0),
         "{GOLDEN}: the emitted program must exit 0"
     );
-    crate::support::assert_self_regression(GOLDEN, &golden_dir(&root), &run.stdout);
+    crate::support::assert_self_regression(GOLDEN, &golden, &run.stdout);
 }

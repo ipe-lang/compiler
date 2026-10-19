@@ -43,7 +43,6 @@ import TestSupport exposing (check)
 -- read from the tokens, so whitespace, comments and line breaks inside one
 -- change nothing.
 
-
 -- The modules of `src`, each by its path relative to `src` with its text.
 -- A file past `fileCeiling`, a module past `moduleByteCeiling`, or one that
 -- cannot be read fails the read.
@@ -88,7 +87,6 @@ readSource prefix path =
 
     else
         Task.fail (Error.unexpected (file ++ " is not under src"))
-
 
 
 -- ── the lexer ───────────────────────────────────────────────────────────
@@ -435,9 +433,7 @@ finish ( mode, meta, toks ) =
             broke meta toks
 
 
-
 -- ── the rules ───────────────────────────────────────────────────────────
-
 
 -- The property each violation breaks: a `Ui.text` of computed text, an
 -- `Html.text` outside the sanctioned renderers, a `SafeText.toString` at a
@@ -480,8 +476,8 @@ errorTextNames =
     [ "Error.toString", "Error.message", "Ipe.Error.toString", "Ipe.Error.message" ]
 
 
--- The renderers that draw a `SafeText`'s parts and a source's tokens, each
--- once per `Html.text` it holds.
+-- The renderers that draw a `SafeText`'s parts, a label's parts and a
+-- source's tokens, each once per `Html.text` it holds.
 sanctionedHtmlText : List String
 sanctionedHtmlText =
     [ "Lib/View.ipe:segmentHtml"
@@ -491,6 +487,9 @@ sanctionedHtmlText =
     , "Lib/View.ipe:codeChildren"
     , "Lib/View.ipe:pieceHtml"
     , "Lib/View.ipe:pieceHtml"
+    , "Lib/View.ipe:labelPartHtml"
+    , "Lib/View.ipe:labelPartHtml"
+    , "Lib/View.ipe:labelPartHtml"
     ]
 
 
@@ -502,10 +501,6 @@ admittedFlattening =
     [ "Lib/Index.ipe:noTaggedPath"
     , "Lib/Index.ipe:probeRepos"
     , "Lib/Index.ipe:rootMismatch"
-    , "Lib/Links.ipe:linkKey"
-    , "Lib/Queue.ipe:nameKey"
-    , "Lib/Queue.ipe:nameKey"
-    , "Lib/Queue.ipe:placeKey"
     , "Lib/RepoPath.ipe:reposToError"
     , "Lib/RepoPath.ipe:rootRefusal"
     , "Lib/RepoPath.ipe:toError"
@@ -650,6 +645,9 @@ literalConstants =
 admittedMarkup : List String
 admittedMarkup =
     [ "Lib/View.ipe:codeHtml"
+    , "Lib/View.ipe:labelHtml"
+    , "Lib/View.ipe:labelPartHtml"
+    , "Lib/View.ipe:labelPartHtml"
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:linkEl"
     , "Lib/View.ipe:pieceHtml"
@@ -1197,7 +1195,6 @@ scanViolations lexedSources =
         ++ List.concatMap (\( rel, _, lexed ) -> importViolations rel lexed.imports) lexedSources
 
 
-
 -- ── the real tree ───────────────────────────────────────────────────────
 
 
@@ -1265,7 +1262,7 @@ scanRefusesEvasions =
                     && caughtBy FlattenedText (inView "shown =\n    Maybe.map SafeText.toString")
                     && caughtBy FlattenedText (inView "shown x =\n    Lib.SafeText.toString x")
                     && caughtBy FlattenedText (inQueue "shown x =\n    SafeText.toString x")
-                    && caughtBy FlattenedText (List.filter (\( rel, _, _ ) -> rel /= "Lib/Links.ipe") sources)
+                    && caughtBy FlattenedText (List.filter (\( rel, _, _ ) -> rel /= "Lib/Settings.ipe") sources)
                     && breaks ComputedUiText (inView "shown e =\n    Ui.text (Error.message e)")
                     && breaks ErrorTextUnrendered (inView "shown e =\n    Ui.text (Error.message e)")
                     && caughtBy ErrorTextUnrendered (inQueue "shown e =\n    SafeText.literal (Error.toString e)")
@@ -1356,9 +1353,7 @@ prependTo rel extra sources =
         sources
 
 
-
 -- ── scanner self-tests ──────────────────────────────────────────────────
-
 
 -- A site is keyed by the last column-0 lowercase word above it, a literal
 -- is one token whatever it holds, and a comment is none. Red if the lexer
@@ -1369,36 +1364,23 @@ lexerReadsLiterals =
         kinds text =
             List.map (\t -> t.kind) (lex text).tokens
     in
-    sitesOf flattenNames "M.ipe" (lex "first x =\n    SafeText.toString x\n\n\nsecond x =\n    SafeText.toString x\n")
-        == [ "M.ipe:first", "M.ipe:second" ]
-        && kinds "\"a -- b {- c\" x"
-        == [ StringToken, WordToken ]
-        && kinds "\"\"\"a\n\"b\"\n\"\"\" x"
-        == [ StringToken, WordToken ]
-        && kinds "\"\"\"a\\\"\"\" x"
-        == [ StringToken, WordToken ]
-        && kinds "\"\"\"a\"\"\"\" x\""
-        == [ StringToken, StringToken ]
+    sitesOf flattenNames "M.ipe" (lex "first x =\n    SafeText.toString x\n\n\nsecond x =\n    SafeText.toString x\n") == [ "M.ipe:first", "M.ipe:second" ]
+        && kinds "\"a -- b {- c\" x" == [ StringToken, WordToken ]
+        && kinds "\"\"\"a\n\"b\"\n\"\"\" x" == [ StringToken, WordToken ]
+        && kinds "\"\"\"a\\\"\"\" x" == [ StringToken, WordToken ]
+        && kinds "\"\"\"a\"\"\"\" x\"" == [ StringToken, StringToken ]
         && (lex "\"\"\"{{x}}\"\"\"").interpolated
         && not (lex "\"\"\"{ {x} }\"\"\" {{").interpolated
-        && List.map (\i -> ( i.moduleName, i.qualifier, i.exposed, i.malformed )) (lex "import A.B\nimport C as D exposing (E, F(..), g)\nimport\n    H\n        exposing (..)\nx = 1\n").imports
-        == [ ( "A.B", "A.B", [], False ), ( "C", "D", [ "E", "F", "g" ], False ), ( "H", "H", [ ".." ], False ) ]
-        && List.map (\t -> t.text) (lex "import A exposing (b)\nx = A.c").code
-        == [ "x", "=", "A.c" ]
-        && List.map (\i -> i.malformed) (lex "import A exposing (b c)\nimport\nimport D as\n").imports
-        == [ True, True, True ]
-        && kinds "'\"' x '\\'' y"
-        == [ Punctuation, WordToken, Punctuation, WordToken ]
-        && kinds "a {- b {- c -} d -} e -- f\ng"
-        == [ WordToken, WordToken, WordToken ]
-        && kinds "a - b"
-        == [ WordToken, Punctuation, WordToken ]
+        && List.map (\i -> ( i.moduleName, i.qualifier, i.exposed, i.malformed )) (lex "import A.B\nimport C as D exposing (E, F(..), g)\nimport\n    H\n        exposing (..)\nx = 1\n").imports == [ ( "A.B", "A.B", [], False ), ( "C", "D", [ "E", "F", "g" ], False ), ( "H", "H", [ ".." ], False ) ]
+        && List.map (\t -> t.text) (lex "import A exposing (b)\nx = A.c").code == [ "x", "=", "A.c" ]
+        && List.map (\i -> i.malformed) (lex "import A exposing (b c)\nimport\nimport D as\n").imports == [ True, True, True ]
+        && kinds "'\"' x '\\'' y" == [ Punctuation, WordToken, Punctuation, WordToken ]
+        && kinds "a {- b {- c -} d -} e -- f\ng" == [ WordToken, WordToken, WordToken ]
+        && kinds "a - b" == [ WordToken, Punctuation, WordToken ]
         && not (lex "a b").broken
         && (lex "a 'bc' d").broken
-        && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) ""))
-        == Nothing
-        && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling ""))
-        /= Nothing
+        && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) "")) == Nothing
+        && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling "")) /= Nothing
 
 
 checks : Task.Task Error (List ( String, Bool ))

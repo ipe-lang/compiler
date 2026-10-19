@@ -12,7 +12,6 @@ import Lib.ReviewKey as ReviewKey
 -- callback a page's task settles through, and renders a fixed text of this
 -- tool's own, so no error's text reaches the model or the page.
 
-
 -- Why a read a page started (the queue, a History page, a source, a unit's
 -- standing) settled with nothing to show. `LoadContended`: a database the
 -- read used was busy. `LoadPastLimit`: the read passed one of the ceilings

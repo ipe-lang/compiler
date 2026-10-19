@@ -33,18 +33,12 @@ const fn false_marker() -> bool {
     std::hint::black_box(false)
 }
 
-/// Write `source` as a single-file `Main.ipe` under a fresh scratch dir keyed by
-/// `name`, returning the entry path (or `None` if scratch setup fails).
-fn write_single(name: &str, source: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("seal")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    std::fs::create_dir_all(&src).ok()?;
-    let entry = src.join("Main.ipe");
-    std::fs::write(&entry, source).ok()?;
-    Some(entry)
+/// Write `source` as the `Main` module of a fresh project fixture, failing the
+/// test loudly when the fixture cannot be written.
+#[track_caller]
+#[allow(clippy::expect_used)] // test setup: an unwritable fixture IS the failure
+fn write_single(source: &str) -> ipe::RootFixture {
+    ipe::RootFixture::main(source).expect("scratch fixture setup must succeed")
 }
 
 /// The scratch output dir for `name`, cleared.
@@ -61,10 +55,10 @@ fn out_dir(name: &str) -> PathBuf {
 /// the positive-SEAL companion to `negative_suite::assert_rejected`.
 #[track_caller]
 fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
+    let fixture = write_single(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    match ipe::build(&entry, &out, &runtime) {
+    match ipe::build_fixture(&fixture, &out, &runtime).map(drop) {
         Ok(()) => {}
         Err(CliError::Pipeline { diag, .. }) => {
             assert!(
@@ -112,10 +106,10 @@ fn assert_accepted(name: &str, source: &str, expected_stdout: &str) {
 /// binding is an Efficiency regression the SEAL's cargo-green gate would
 /// silently accept.
 fn emit_main_rs(name: &str, source: &str) -> String {
-    let entry = crate::support::expect_scratch_entry(name, write_single(name, source));
+    let fixture = write_single(source);
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = ipe::build_fixture(&fixture, &out, &runtime).map(drop);
     assert!(built.is_ok(), "{name}: build failed: {built:?}");
     let text = std::fs::read_to_string(out.join("src").join("main.rs"));
     assert!(
@@ -130,24 +124,25 @@ fn emit_main_rs(name: &str, source: &str) -> String {
 /// folding) can only be exercised through the sibling-discovery path.
 #[track_caller]
 fn assert_accepted_project(name: &str, files: &[(&str, &str)], expected_stdout: &str) {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("seal-proj")
-        .join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    let src = dir.join("src");
-    crate::support::expect_scratch_step(name, std::fs::create_dir_all(&src));
-    for (fname, contents) in files {
-        let path = src.join(fname);
-        if let Some(parent) = path.parent() {
-            crate::support::expect_scratch_step(name, std::fs::create_dir_all(parent));
-        }
-        crate::support::expect_scratch_step(name, std::fs::write(&path, contents));
-    }
+    let tree = files.iter().fold(
+        ipe::project_root::SourceTree::new(),
+        |tree, (fname, contents)| {
+            tree.module(&fname.trim_end_matches(".ipe").replace('/', "."), contents)
+        },
+    );
+    let fixture = ipe::RootFixture::from_tree(&tree);
+    assert!(
+        fixture.is_ok(),
+        "{name}: scratch fixture setup failed: {:?}",
+        fixture.as_ref().err()
+    );
+    let Ok(fixture) = fixture else {
+        return;
+    };
     let out = out_dir(name);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let entry = src.join("Main.ipe");
-    match ipe::build_loose_file(&entry, &out, &runtime) {
-        Ok(()) => {}
+    match ipe::build_fixture(&fixture, &out, &runtime) {
+        Ok(_) => {}
         Err(CliError::Pipeline { diag, .. }) => {
             assert!(
                 false_marker(),

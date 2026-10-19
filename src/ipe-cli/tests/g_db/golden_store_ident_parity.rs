@@ -17,10 +17,7 @@ const fn golden_name() -> &'static str {
 }
 
 fn entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(golden_name())
-        .join("Main.ipe")
+    root.join("tests").join("golden").join(golden_name())
 }
 
 // `<plain><dotted>` verdicts. Bare/underscore names pass both; a dotted
@@ -57,7 +54,7 @@ fn store_ident_parity_resolves_and_builds() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry(&root), &out, &runtime);
+    let built = crate::support::build_golden(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
         "store_ident_parity: `ipe dev build` must exit 0 (Store.validSqlIdent + \
@@ -80,7 +77,7 @@ fn store_ident_parity_end_to_end() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry(&root), &out, &runtime);
+    let built = crate::support::build_golden(&entry(&root), &out, &runtime);
     assert!(
         built.is_ok(),
         "store_ident_parity: `ipe dev build` must exit 0: {:?}",

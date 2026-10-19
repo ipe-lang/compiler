@@ -83,8 +83,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools bubblewrap util-linux
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -159,6 +160,17 @@ jobs:
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
 
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # ─── aarch64 static gate ───────────────────────────────────────────────────
   # Cross-compiles the emitted example crate for aarch64-unknown-linux-musl from
   # an x86_64 host. The emitted `.cargo/config.toml` pins the bundled `rust-lld`
@@ -195,8 +207,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools qemu-user-static
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -246,6 +259,17 @@ jobs:
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
 
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # ─── C-free build axis gate ────────────────────────────────────────────────
   # The `--cfree` axis models "link no C". Its ADT (`CProfile`) makes the
   # contradiction {c-free, C-requiring-allocator} unrepresentable, and the
@@ -270,8 +294,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -300,6 +325,17 @@ jobs:
           fi
           test ! -e out/cfree || {
             echo "::error::--cfree refusal must be artifact-free (no emitted crate)"; exit 1; }
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # ─── Windows static gate ───────────────────────────────────────────────────
   # `ipe dev build` on Windows emits a standard Cargo project; then `cargo build
@@ -341,8 +377,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -388,6 +425,17 @@ jobs:
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
 
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
   # ─── FreeBSD cross-compile gate ────────────────────────────────────────────
   # Cross-compiles the emitted example crate for `x86_64-unknown-freebsd` from
   # an ubuntu host. This is a BUILD-ONLY gate: GitHub has no native FreeBSD
@@ -423,8 +471,9 @@ jobs:
         with:
           targets: x86_64-unknown-freebsd
 
-      - name: Cache cargo target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -460,3 +509,14 @@ jobs:
           name: static-frozen-deps-freebsd-cross
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}

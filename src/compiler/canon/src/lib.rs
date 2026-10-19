@@ -35,7 +35,7 @@ pub use env::{
     const_str_eq, kernel_import_binds_last_segment, stdlib_canonical_qualifier,
 };
 pub use resolve::{
-    ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
+    DO_BIND_MODULE, ModuleOrigin, QualifierForm, builtin_empty_home_arity, import_qualifier_forms,
     import_qualifiers, is_reserved_builtin_type_name, is_stdlib_shared_carrier_type,
     is_user_type_declaration_forbidden, to_snake_case,
 };
@@ -200,7 +200,7 @@ mod tests {
     use ipe_diagnostics::{Diagnostic, NameError, Span, StdlibReach};
     use ipe_intern::Symbol;
 
-    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/Main.ipe");
+    const GOLDEN: &str = include_str!("../../../../tests/golden/basics/src/Main.ipe");
 
     /// Parse + canonicalise the golden module. Returns `None` (failing the
     /// caller's assertions) rather than panicking, per the no-panic gate.

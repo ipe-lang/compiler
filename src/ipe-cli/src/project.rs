@@ -36,6 +36,12 @@ use crate::text;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// The SQL driver of a build that declares none: a manifest without
+/// `build.database`, and every build without a manifest.
+///
+/// It is the documented default of `AGENTS.md`'s `package.ipe` schema table.
+pub const UNDECLARED_DB_DRIVER: ipe_backend_rust::DbDriver = ipe_backend_rust::DbDriver::Sqlite;
+
 /// The parsed, validated content of a `package.ipe` manifest.
 #[derive(Clone, Debug)]
 pub struct ProjectManifest {
@@ -56,9 +62,8 @@ pub struct ProjectManifest {
     /// `None` when the manifest declares no icon (the packager then omits the
     /// bundle icon rather than inventing one).
     pub icon: Option<PathBuf>,
-    /// The SQL driver the emitted project targets (from `build.database`).
-    /// Defaults to [`ipe_backend_rust::DbDriver::Sqlite`] when absent — the
-    /// documented default in `AGENTS.md`'s `package.ipe` schema table.
+    /// The SQL driver the emitted project targets (from `build.database`), or
+    /// [`UNDECLARED_DB_DRIVER`] when the field is absent.
     pub driver: ipe_backend_rust::DbDriver,
     /// The `[rust]` static-build request layer (`static` / `target` /
     /// `allocator` / `cFree`) — the lowest-precedence layer
@@ -67,9 +72,8 @@ pub struct ProjectManifest {
     /// Malformed values (a bad bool, an unknown allocator) are refused at
     /// parse time, never silently ignored.
     pub static_request: crate::build_plan::StaticRequestLayer,
-    /// The `[wasm]` section (M5: `mode`/`entry`/`mount`/`publicEnv`/
-    /// `optLevel`) — `WasmConfig::default()` (mode "off") when the section is
-    /// absent.
+    /// The `wasm` field (`mode`/`entry`/`mount`/`publicEnv`/`optLevel`) —
+    /// [`WasmConfig::Off`] when the field is absent.
     pub wasm: WasmConfig,
     /// The `[dependencies]` section: Ipê packages by name. Empty when the
     /// section is absent (back-compat). Resolution (fetch / download / lockfile)
@@ -398,24 +402,33 @@ fn has_drive_prefix(raw: &str) -> bool {
     )
 }
 
-/// `[wasm]` section of a `package.ipe` manifest (spec: `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q6
-/// "Opt-in mechanism").
+/// The `wasm` setting of a `package.ipe` manifest (spec: `docs/adr/0005-delivery-shapes-runtimes-hosts-targets.md` Q6
+/// "Opt-in mechanism"): `Off` (the default when the field is absent) or an
+/// `On` bundle.
 ///
-/// ```toml
-/// [wasm]
-/// mode      = "solo"             # solo (MVP) | hydrate (MVP+1) | off (default)
-/// entry     = "src/Client.ipe"   # client entry; its reachability closure is the bundle
-/// mount     = "#app"             # SPA mount node
-/// publicEnv = ["API_BASE_URL"]   # default-deny allowlist; see `PublicEnvName`
-/// optLevel  = "z"
+/// ```text
+/// wasm = On { mode = Solo, entry = "src/Client.ipe", mount = "#app",
+///             publicEnv = [ "API_BASE_URL" ], optLevel = "z" }
 /// ```
+///
+/// `--target wasm` still works with `Off`; the setting is metadata for the
+/// SSR+hydration/SPA-shell split, not a gate on `ipe dev build --target wasm`
+/// itself. A bundle always names its [`WasmMode`], so a wasm configuration
+/// without a mode has no representation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WasmConfig {
-    /// `"solo"` / `"hydrate"` / `"off"` (default when the key or section is
-    /// absent — `--target wasm` still works without a `[wasm]` section; this
-    /// field is metadata for the eventual SSR+hydration/SPA-shell split, not
-    /// a gate on `ipe dev build --target wasm` itself).
-    pub mode: Option<String>,
+pub enum WasmConfig {
+    /// No wasm bundle declared.
+    #[default]
+    Off,
+    /// A wasm bundle with its rendering mode and options.
+    On(WasmBundle),
+}
+
+/// The options of an active wasm bundle (`wasm = On { … }`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WasmBundle {
+    /// How the bundle renders.
+    pub mode: WasmMode,
     /// The client entry module's file, relative to the project root
     /// (defaults to the build's own entry file when absent — see M6).
     pub entry: Option<String>,
@@ -430,19 +443,36 @@ pub struct WasmConfig {
     pub opt_level: Option<String>,
 }
 
-impl WasmConfig {
-    /// Whether this config's `mode` implies the `WasmClient` compilation
-    /// target.
-    ///
-    /// `true` for any active mode (`"solo"`, `"hydrate"`, or any future on-value).
-    /// `false` for the explicit opt-out (`"off"`) and for the absent default
-    /// (no `[wasm]` section / no `mode` key — both leave `mode` as `None`).
+impl WasmBundle {
+    /// A bundle in `mode` with no entry, mount, public env or optimisation
+    /// level.
     #[must_use]
-    pub fn implies_wasm_target(&self) -> bool {
-        match self.mode.as_deref() {
-            None | Some("off") => false,
-            Some(_) => true,
+    pub fn new(mode: WasmMode) -> Self {
+        Self {
+            mode,
+            entry: None,
+            mount: None,
+            public_env: PublicEnvAllowlist::default(),
+            opt_level: None,
         }
+    }
+}
+
+/// How a wasm bundle renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasmMode {
+    /// A single-page app: the client renders everything.
+    Solo,
+    /// The server renders first and the client hydrates the markup.
+    Hydrate,
+}
+
+impl WasmConfig {
+    /// Whether this config implies the `WasmClient` compilation target: any
+    /// active bundle does, `Off` does not.
+    #[must_use]
+    pub const fn implies_wasm_target(&self) -> bool {
+        matches!(self, Self::On(_))
     }
 }
 
@@ -2209,37 +2239,23 @@ import String
 
     #[test]
     fn implies_wasm_target_solo_and_hydrate_are_on() {
-        assert!(
-            WasmConfig {
-                mode: Some("solo".to_owned()),
-                ..Default::default()
-            }
-            .implies_wasm_target(),
-            "mode=solo must imply wasm target"
-        );
-        assert!(
-            WasmConfig {
-                mode: Some("hydrate".to_owned()),
-                ..Default::default()
-            }
-            .implies_wasm_target(),
-            "mode=hydrate must imply wasm target"
-        );
+        for mode in [WasmMode::Solo, WasmMode::Hydrate] {
+            assert!(
+                WasmConfig::On(WasmBundle::new(mode)).implies_wasm_target(),
+                "{mode:?} must imply wasm target"
+            );
+        }
     }
 
     #[test]
-    fn implies_wasm_target_off_and_absent_are_native() {
+    fn implies_wasm_target_off_is_native() {
         assert!(
-            !WasmConfig {
-                mode: Some("off".to_owned()),
-                ..Default::default()
-            }
-            .implies_wasm_target(),
-            "mode=off must not imply wasm target"
+            !WasmConfig::Off.implies_wasm_target(),
+            "Off must not imply wasm target"
         );
         assert!(
             !WasmConfig::default().implies_wasm_target(),
-            "absent mode (None) must not imply wasm target"
+            "the default config must not imply wasm target"
         );
     }
 

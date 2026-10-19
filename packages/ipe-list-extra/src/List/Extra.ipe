@@ -152,7 +152,6 @@ findIndexFold pred i list =
 -- functions bypass this check). They are omitted until the compiler gains
 -- an Equatable constraint syntax.
 
-
 -- ---------------------------------------------------------------------------
 -- Counting
 -- ---------------------------------------------------------------------------
@@ -166,7 +165,8 @@ count pred list =
                 acc + 1
 
             else
-                acc)
+                acc
+        )
         0
         list
 
@@ -174,7 +174,6 @@ count pred list =
 -- ---------------------------------------------------------------------------
 -- Deduplication
 -- ---------------------------------------------------------------------------
-
 
 -- ---------------------------------------------------------------------------
 -- Grouping
@@ -200,26 +199,33 @@ groupWhile pred list =
                     List.foldl
                         (\x state ->
                             let
-                                current = Tuple.first state
-                                done = Tuple.second state
+                                current =
+                                    Tuple.first state
+
+                                done =
+                                    Tuple.second state
                             in
-                                case current of
-                                    [] ->
-                                        ( [ x ], done )
+                            case current of
+                                [] ->
+                                    ( [ x ], done )
 
-                                    pivot :: _ ->
-                                        if pred pivot x then
-                                            ( x :: current, done )
+                                pivot :: _ ->
+                                    if pred pivot x then
+                                        ( x :: current, done )
 
-                                        else
-                                            ( [ x ], List.reverse current :: done ))
+                                    else
+                                        ( [ x ], List.reverse current :: done )
+                        )
                         ( [ first_ ], [] )
                         rest
 
-                lastGroup = Tuple.first finalState
-                finishedGroups = Tuple.second finalState
+                lastGroup =
+                    Tuple.first finalState
+
+                finishedGroups =
+                    Tuple.second finalState
             in
-                List.reverse (List.reverse lastGroup :: finishedGroups)
+            List.reverse (List.reverse lastGroup :: finishedGroups)
 
 
 -- ---------------------------------------------------------------------------
@@ -323,24 +329,31 @@ span pred list =
             List.foldl
                 (\x st ->
                     let
-                        done = Tuple.first st
-                        acc = Tuple.second st
+                        done =
+                            Tuple.first st
+
+                        acc =
+                            Tuple.second st
                     in
-                        if done then
-                            st
+                    if done then
+                        st
 
-                        else if pred x then
-                            ( False, List.append acc [ x ] )
+                    else if pred x then
+                        ( False, List.append acc [ x ] )
 
-                        else
-                            ( True, acc ))
+                    else
+                        ( True, acc )
+                )
                 ( False, [] )
                 list
 
-        prefix = Tuple.second state
-        prefixLen = List.length prefix
+        prefix =
+            Tuple.second state
+
+        prefixLen =
+            List.length prefix
     in
-        ( prefix, List.drop prefixLen list )
+    ( prefix, List.drop prefixLen list )
 
 
 -- ---------------------------------------------------------------------------
@@ -381,9 +394,10 @@ scanlAcc fn acc rest out =
 
         x :: remaining ->
             let
-                next = fn acc x
+                next =
+                    fn acc x
             in
-                scanlAcc fn next remaining (next :: out)
+            scanlAcc fn next remaining (next :: out)
 
 
 -- ---------------------------------------------------------------------------
@@ -406,9 +420,11 @@ maximumBy keyFn list =
                             y
 
                         else
-                            best)
+                            best
+                    )
                     x
-                    rest)
+                    rest
+                )
 
 
 -- | `minimumBy keyFn list` — the element with the smallest key, or `Nothing`
@@ -427,6 +443,8 @@ minimumBy keyFn list =
                             y
 
                         else
-                            best)
+                            best
+                    )
                     x
-                    rest)
+                    rest
+                )

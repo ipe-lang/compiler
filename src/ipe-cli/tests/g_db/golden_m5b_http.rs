@@ -52,18 +52,17 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe` through ipe, build the emitted Rust
+/// Compile `tests/golden/<name>/src/Main.ipe` through ipe, build the emitted Rust
 /// project with the shared cargo target, run the binary, and return the golden
 /// directory plus the run outcome. Gated on `IPE_E2E=1`.
 fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -154,13 +153,13 @@ fn http_response_fields() {
 #[test]
 fn http_default_request_emits_without_signature_consumer() {
     let root = repo_root();
-    let entry = golden_dir(&root, "http_response_fields").join("Main.ipe");
+    let golden_project = golden_dir(&root, "http_response_fields");
     let out = crate::support::scratch_root().join("ipec_m5b_http_default_request_no_sig_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for a HttpRequest built via \

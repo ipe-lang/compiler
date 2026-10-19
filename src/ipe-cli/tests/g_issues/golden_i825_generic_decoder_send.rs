@@ -21,11 +21,8 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "generic_decoder_send";
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("Main.ipe")
+fn fixture_dir(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Accept + emit gate (always): the generic decoder combinator must be accepted
@@ -34,17 +31,13 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn generic_decoder_send_emits_byte_identical() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("main.rs");
+    let golden_dir = fixture_dir(&root);
+    let golden_project = root.join("tests").join("golden").join(GOLDEN);
     let out = crate::support::scratch_root().join("ipec_i825_generic_decoder_send_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "a generic decoder combinator (`withDefault : a -> Decoder a -> Decoder a`) \
@@ -53,10 +46,7 @@ fn generic_decoder_send_emits_byte_identical() {
          got: {built:?}"
     );
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// THE SEAL: under `IPE_E2E=1`, actually `cargo build` and run the emitted
@@ -65,12 +55,12 @@ fn generic_decoder_send_emits_byte_identical() {
 #[test]
 fn generic_decoder_send_builds_and_runs() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let golden_dir = fixture_dir(&root);
     let out = crate::support::scratch_root().join("ipec_i825_generic_decoder_send_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&golden_dir, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {

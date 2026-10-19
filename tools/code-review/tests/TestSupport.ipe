@@ -66,6 +66,10 @@ module TestSupport exposing
     , noHazard
     , rendered
     , renderedForeign
+    , labelOf
+    , labelText
+    , quotedLabelOf
+    , piecesShown
     , describeText
     , refusedFor
     , migratedReviewAt
@@ -139,6 +143,7 @@ import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
@@ -286,7 +291,7 @@ viewTag view =
             "unverifiable"
 
         Unreadable failure ->
-            "unreadable: " ++ SafeText.toString (Index.readFailureText failure)
+            "unreadable: " ++ piecesShown (Index.readFailureText failure)
 
         TooLarge (SpanLines o) ->
             "too large lines " ++ String.fromInt o.lines
@@ -658,7 +663,6 @@ decideShownNow db shown decision =
             )
 
 
-
 -- `Queue.decideRefusal` approving refusal `label`, bound to `digest`, under
 -- the environment's signing key; a server with no signing key fails the
 -- run, since it acknowledges nothing.
@@ -674,6 +678,7 @@ decidedRefusalNow db label digest =
                     ReadOnly ->
                         Task.fail (Error.conflict "the test environment has no signing key")
             )
+
 
 -- `task`'s value when it is not refused; a refusal fails the run, naming
 -- `what`.
@@ -1219,31 +1224,18 @@ isUnitA entry =
         u =
             entry.unit
     in
-    u.uid
-        == uid "u-a"
+    u.uid == uid "u-a"
         && isNew entry.change
-        && SafeText.toString u.path
-        == "ipe:src/Lib.rs"
-        && SafeText.toString u.name
-        == "answer"
-        && SafeText.toString u.qualified
-        == "Lib.answer"
-        && SafeText.toString u.kind
-        == "fn"
-        && u.lineStart
-        == 3
-        && u.lineEnd
-        == 6
-        && SafeText.toString u.facing
-        == "internal"
-        && Maybe.map SafeText.toString u.purpose
-        == Just "purpose-A"
-        && Index.storedHash u.attested
-        == Index.attest viewA
-        && u.updatedSha
-        == "shaA"
-        && shownTextOf entry.view
-        == Just viewA
+        && labelText u.path == "ipe:src/Lib.rs"
+        && labelText u.name == "answer"
+        && labelText u.qualified == "Lib.answer"
+        && labelText u.kind == "fn"
+        && u.lineStart == 3
+        && u.lineEnd == 6
+        && labelText u.facing == "internal"
+        && Maybe.map labelText u.purpose == Just "purpose-A"
+        && Index.storedHash u.attested == Index.attest viewA
+        && shownTextOf entry.view == Just viewA
 
 
 isUnitB : PageEntry -> Bool
@@ -1252,20 +1244,13 @@ isUnitB entry =
         u =
             entry.unit
     in
-    u.uid
-        == uid "u-b"
-        && modifiedFrom entry.change
-        == Just "oldB"
-        && SafeText.toString u.path
-        == "ipe:src/Main.ipe"
-        && SafeText.toString u.kind
-        == "module"
-        && SafeText.toString u.facing
-        == "user"
-        && Maybe.map SafeText.toString u.purpose
-        == Nothing
-        && shownTextOf entry.view
-        == Just viewB
+    u.uid == uid "u-b"
+        && modifiedFrom entry.change == Just "oldB"
+        && labelText u.path == "ipe:src/Main.ipe"
+        && labelText u.kind == "module"
+        && labelText u.facing == "user"
+        && Maybe.map labelText u.purpose == Nothing
+        && shownTextOf entry.view == Just viewB
 
 
 cleanupIndex : String -> String -> Task.Task Error ()
@@ -1309,9 +1294,57 @@ renderedForeign raw =
     SafeText.toString (SafeText.renderForeign raw)
 
 
+-- Text the app holds whole, parsed as an index column of a unit's label.
+labelOf : String -> Label
+labelOf raw =
+    Label.fromText Label.labelCap raw
+
+
+-- A label's parts joined as the page draws them, its marker included.
+labelText : Label -> String
+labelText shown =
+    String.concat (List.map labelPartText (Label.parts shown))
+
+
+labelPartText : LabelPart -> String
+labelPartText part =
+    case part of
+        LabelText s ->
+            s
+
+        LabelEscapes s ->
+            s
+
+        LabelCut dropped hash ->
+            Label.markerText dropped hash
+
+
+-- Text the app holds whole, parsed as a stored path a refusal quotes.
+quotedLabelOf : String -> Label
+quotedLabelOf raw =
+    Label.fromQuotedText Label.labelCap raw
+
+
+-- A line's pieces joined as the page draws them: each label as `labelText`
+-- joins it, the tool's text flattened.
+piecesShown : List LabelPiece -> String
+piecesShown pieces =
+    String.concat (List.map pieceShown pieces)
+
+
+pieceShown : LabelPiece -> String
+pieceShown piece =
+    case piece of
+        IndexedLabel label ->
+            labelText label
+
+        ToolText text ->
+            SafeText.toString text
+
+
 describeText : PathError -> String
 describeText err =
-    SafeText.toString (RepoPath.describe err)
+    piecesShown (RepoPath.describe err)
 
 
 -- A parse that failed, and failed for `reason` rather than an unrelated one.

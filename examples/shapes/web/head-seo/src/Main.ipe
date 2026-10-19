@@ -9,15 +9,14 @@ module Main exposing (main)
 -- SEO tags so the strings are HTML-escaped and the URLs are validated `Ipe.Url`
 -- values, not bare strings that could smuggle a `javascript:` href.
 
-
-import Ipe.Tea.Web as Web
-import Ipe.Web.Head as Head
 import Ipe.Html as Html exposing (Html)
-import Ipe.Ui as Ui
+import Ipe.Result exposing (Result(..))
+import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
 import Ipe.Url as Url
-import Ipe.Result exposing (Result(..))
+import Ipe.Web.Head as Head
 
 
 type Msg
@@ -77,7 +76,8 @@ head model =
 
 view : Model -> Element Msg
 view model =
-    Ui.column []
+    Ui.column
+        []
         [ Ui.text ("page: " ++ model.pageTitle) ]
 
 

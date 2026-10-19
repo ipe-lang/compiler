@@ -707,6 +707,8 @@ messages! {
     publish_single_path = "publish-single-path";
     /// `ipe dev watch`/`ipe dev build` given a directory with no manifest inside it.
     watch_dir_no_manifest = "watch-dir-no-manifest";
+    /// A `web desktop` build of an entry file with no `package.ipe`.
+    webview_needs_manifest = "webview-needs-manifest";
     /// `ipe diff` misuse.
     diff_usage = "diff-usage";
     /// `ipe init --shape` without its value.
@@ -953,6 +955,12 @@ messages! {
     cli_target_dir_crate_local = "cli-target-dir-crate-local";
     /// An unlinkable per-user build cache directory.
     cli_target_dir_user_cache = "cli-target-dir-user-cache";
+    /// An unlinkable shared test build directory in the per-user cache.
+    cli_target_dir_scratch_cache = "cli-target-dir-scratch-cache";
+    /// Another `ipe test` held the shared test build directory past the wall.
+    cli_test_target_busy(path: &crate::style::TerminalSafe, wall) = "cli-test-target-busy";
+    /// The embedded runtime manifest could not be prepared for bundling.
+    cli_bundled_manifest(detail) = "cli-bundled-manifest";
     /// An unlinkable toolchain sysroot.
     cli_target_dir_sysroot = "cli-target-dir-sysroot";
     /// A host linker that opens only ASCII paths.

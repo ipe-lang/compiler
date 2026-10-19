@@ -898,6 +898,29 @@ fn claim_in(parent: &held::HeldDir, name: &std::ffi::OsStr) -> Result<held::Held
     Ok(dir)
 }
 
+/// The one mtime every scratch runtime bundle file carries.
+///
+/// Its freshness is then its content alone: cargo's mtime check never sees a
+/// newer file, and the bundle's content digest, stamped into its version, is
+/// the unit's identity. Non-zero, since zero is a sentinel to some tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleMtime(std::time::Duration);
+
+/// The pinned mtime of a scratch runtime bundle file: one billion seconds after the epoch.
+pub const BUNDLE_MTIME: BundleMtime = BundleMtime(std::time::Duration::from_secs(1_000_000_000));
+
+impl BundleMtime {
+    /// The instant.
+    ///
+    /// # Errors
+    /// An I/O error when the host clock cannot represent it.
+    pub fn at(self) -> std::io::Result<std::time::SystemTime> {
+        std::time::UNIX_EPOCH
+            .checked_add(self.0)
+            .ok_or_else(|| std::io::Error::other("the pinned bundle mtime is not representable"))
+    }
+}
+
 /// A path under an [`OwnedDir`] with no symlink at any level.
 ///
 /// Built only by [`OwnedDir::path_to`]. Every operation re-walks the levels
@@ -930,6 +953,20 @@ impl OwnedPath {
     /// filesystem failure.
     pub fn write(&self, contents: &[u8]) -> Result<(), CliError> {
         self.replace_with(None, |file| file.write_all(contents))
+    }
+
+    /// Replace the file with `contents`, atomically, its mtime set to `mtime`.
+    ///
+    /// The mtime is set on the exclusive temp file before the rename, so the
+    /// entry never shows the contents under another mtime.
+    ///
+    /// # Errors
+    /// As [`OwnedPath::write`].
+    pub fn write_pinned(&self, contents: &[u8], mtime: BundleMtime) -> Result<(), CliError> {
+        self.replace_with(None, |file| {
+            file.write_all(contents)?;
+            file.set_modified(mtime.at()?)
+        })
     }
 
     /// Replace the file with a copy of `source`, carrying its permission bits.
@@ -1503,6 +1540,14 @@ impl AreaClaim {
     }
 }
 
+/// The root of a private scratch directory, as an [`EmitTarget`].
+///
+/// Built only by [`EmitTarget::in_scratch`] from a borrowed
+/// [`crate::scratch::ScratchDir`], the proof the directory was created
+/// exclusively, unpredictably named, owner-only, and fresh.
+#[derive(Debug, Clone)]
+pub struct ScratchArea(AreaClaim);
+
 /// Where an emitted project is written: an area still to claim, or a directory already claimed.
 ///
 /// Every variant carries a disjointness proof; a bare path cannot name a
@@ -1513,6 +1558,8 @@ pub enum EmitTarget {
     Area(AreaClaim),
     /// A directory claimed earlier, proven still the same when written.
     Claimed(OwnedDir),
+    /// The root of a private scratch directory.
+    Scratch(ScratchArea),
 }
 
 impl EmitTarget {
@@ -1528,13 +1575,38 @@ impl EmitTarget {
         Ok(Self::Area(OutputRoot::at(out_dir, project)?.area(&[])))
     }
 
+    /// The root of `scratch` as a target, proven disjoint from `project`.
+    ///
+    /// # Errors
+    /// As [`OutputRoot::resolve`].
+    pub fn in_scratch(
+        scratch: &crate::scratch::ScratchDir,
+        project: &ProjectPaths,
+    ) -> Result<Self, CliError> {
+        Ok(Self::Scratch(ScratchArea(
+            OutputRoot::at(scratch.path(), project)?.area(&[]),
+        )))
+    }
+
+    /// The role of the runtime bundle written under this target.
+    ///
+    /// Only a scratch target bundles the scratch role, so no other emission
+    /// can stamp, or pin the mtimes of, a scratch bundle.
+    #[must_use]
+    pub const fn bundle_role(&self) -> crate::runtime_embed::BundleRole {
+        match self {
+            Self::Area(_) | Self::Claimed(_) => crate::runtime_embed::BundleRole::Out,
+            Self::Scratch(_) => crate::runtime_embed::BundleRole::Scratch,
+        }
+    }
+
     /// The target directory's absolute path.
     ///
     /// # Errors
     /// As [`OutputRoot::area_path`].
     pub fn path(&self) -> Result<PathBuf, CliError> {
         match self {
-            Self::Area(area) => area.path(),
+            Self::Area(area) | Self::Scratch(ScratchArea(area)) => area.path(),
             Self::Claimed(dir) => Ok(dir.path().to_path_buf()),
         }
     }
@@ -1545,7 +1617,7 @@ impl EmitTarget {
     /// As [`AreaClaim::claim`] and [`OwnedDir::verify`].
     pub fn claim(&self) -> Result<OwnedDir, CliError> {
         match self {
-            Self::Area(area) => area.claim(),
+            Self::Area(area) | Self::Scratch(ScratchArea(area)) => area.claim(),
             Self::Claimed(dir) => {
                 dir.verify()?;
                 Ok(dir.clone())
@@ -3026,6 +3098,39 @@ mod tests {
             .remove()
             .expect("remove tree");
         assert!(!out.path().join("a").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A pinned write leaves the pinned mtime, and still refuses a planted link.
+    #[test]
+    fn write_pinned_sets_the_bundle_mtime_and_refuses_a_link() {
+        let base = scratch("pinned");
+        let out = OwnedDir::claim(&base.join("out")).expect("claim out");
+        let file = out.path_to("dep/src/lib.rs").expect("path");
+        file.write_pinned(b"pub fn a() {}", BUNDLE_MTIME)
+            .expect("pinned write");
+        let modified = std::fs::metadata(out.path().join("dep/src/lib.rs"))
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        assert_eq!(modified, BUNDLE_MTIME.at().expect("representable"));
+        assert_ne!(modified, std::time::UNIX_EPOCH);
+
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, "keep").expect("victim file");
+        let late = out.path_to("late.rs").expect("late path");
+        plant_link(&victim, &out.path().join("late.rs"));
+        let wrote = late.write_pinned(b"payload", BUNDLE_MTIME);
+        assert!(
+            matches!(
+                wrote,
+                Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+            ),
+            "a pinned write refuses the planted link, got {wrote:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).ok().as_deref(),
+            Some("keep")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

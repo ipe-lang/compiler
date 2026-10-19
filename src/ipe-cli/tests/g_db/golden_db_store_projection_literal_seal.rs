@@ -14,11 +14,8 @@ use crate::support::repo_root;
 
 const GOLDEN: &str = "db_store_projection_literal_seal";
 
-fn fixture_entry(root: &Path) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("Main.ipe")
+fn fixture_project(root: &Path) -> PathBuf {
+    root.join("tests").join("golden").join(GOLDEN)
 }
 
 /// Emit gate: the frontend must accept the `Store.select` body that contains a
@@ -27,12 +24,12 @@ fn fixture_entry(root: &Path) -> PathBuf {
 #[test]
 fn db_store_projection_literal_emits() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_projection_literal_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "a `Store.literal` mixed-projection must be accepted and emitted, got: {built:?}"
@@ -46,12 +43,12 @@ fn db_store_projection_literal_emits() {
 #[test]
 fn db_store_projection_literal_seal_builds() {
     let root = repo_root();
-    let entry = fixture_entry(&root);
+    let entry = fixture_project(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_projection_literal_seal_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = ipe::build(&entry, &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(built.is_ok(), "{GOLDEN} must be accepted, got: {built:?}");
 
     crate::support::assert_seal_builds(GOLDEN, &out);

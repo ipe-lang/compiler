@@ -208,11 +208,17 @@ impl<T: RetainedBytes> RetainedBytes for [T] {
 
 impl<T: RetainedBytes> RetainedBytes for VecDeque<T> {
     fn retained_bytes(&self) -> Option<Bytes> {
-        let spare = self.capacity().checked_sub(self.len())?;
-        Bytes::inline::<Self>()?
-            .checked_add(Bytes::slots::<T>(spare)?)?
-            .plus_all(self)
+        deque_frame(self)?.plus_all(self)
     }
+}
+
+/// The bytes a deque keeps besides its items: its inline size and its spare slots.
+///
+/// The one formula every deque-backed measure charges its frame with.
+#[must_use]
+pub(crate) fn deque_frame<T>(deque: &VecDeque<T>) -> Option<Bytes> {
+    let spare = deque.capacity().checked_sub(deque.len())?;
+    Bytes::inline::<VecDeque<T>>()?.checked_add(Bytes::slots::<T>(spare)?)
 }
 
 // ─── Maps and sets ───────────────────────────────────────────────────────────

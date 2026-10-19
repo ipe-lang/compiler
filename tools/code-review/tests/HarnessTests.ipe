@@ -68,8 +68,7 @@ erroringCheckReportedTo out =
         line <- Task.fromResult (Path.fromString out) |> Task.andThen File.readFile
         removeFileIfAny out
         Task.succeed
-            (results
-                == [ ( "the erroring probe", False ), ( "the probe after it", True ) ]
+            (results == [ ( "the erroring probe", False ), ( "the probe after it", True ) ]
                 && String.contains "the erroring probe" line
                 && String.contains "probe-boom" line
                 && not (String.contains (codeText 27) line)

@@ -131,9 +131,9 @@ fn cold_state_parity(label: &str, user: &UserSources) -> (usize, usize) {
 }
 
 /// Load a golden fixture directory into an in-memory source map (every
-/// `*.ipe` under it). `None` when the directory holds no `Main` module.
+/// `*.ipe` under its `src/`). `None` when the directory holds no `Main` module.
 fn fixture_user_sources(dir: &Path) -> Option<UserSources> {
-    let discovered = project::discover_modules(dir).ok()?;
+    let discovered = project::discover_modules(dir.join("src").as_path()).ok()?;
     if !discovered.iter().any(|m| m.module_path() == entry_path()) {
         return None;
     }

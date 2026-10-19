@@ -90,7 +90,7 @@ fn wrap_program(i: &mut Interner) -> DResult<Program> {
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
-        params: vec![(
+        params: vec![ipe_ir::Param::owned(
             w,
             IrType::Enum {
                 home: ModPath(vec![]),

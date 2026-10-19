@@ -9,7 +9,7 @@
 //! The `RadioOption` opaque type was also absent from the IR (`UiCtor` enum)
 //! and from the type-routing in `ir_type_from_canon` / `ir_type_from_ty`.
 //!
-//! This test asserts that `ipe::build` succeeds on the fixture — no pipeline
+//! This test asserts that `support::build_golden` succeeds on the fixture — no pipeline
 //! diagnostic, no panic.  It does NOT run cargo or the emitted binary (no
 //! `IPE_E2E` required).
 
@@ -20,21 +20,17 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Compile `tests/golden/input_radio_row/Main.ipe` and assert it succeeds.
+/// Compile `tests/golden/input_radio_row/src/Main.ipe` and assert it succeeds.
 /// Skips silently when the runtime cannot be resolved (CI without runtime dir).
 #[test]
 fn input_radio_row_typechecks_and_lowers() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("input_radio_row")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("input_radio_row");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i155_input_radio_row_emit");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let result = ipe::build(&entry, &out, &runtime);
+    let result = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         result.is_ok(),
         "Input.radio / Input.radioRow / Input.option must compile without diagnostic; got: {:?}",

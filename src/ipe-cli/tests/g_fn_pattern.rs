@@ -4,6 +4,9 @@
 
 mod support;
 
+#[path = "g_fn_pattern/root_fixture.rs"]
+mod root_fixture;
+
 #[path = "g_fn_pattern/golden_asymmetric_arms_cloneok.rs"]
 mod golden_asymmetric_arms_cloneok;
 #[path = "g_fn_pattern/golden_aud04_emit_expr_ir_capture.rs"]
