@@ -434,12 +434,11 @@ carryAfter g carry line toks carried =
 
 closesHeredoc : String -> Bool -> String -> Bool
 closesHeredoc delimiter stripTabs line =
-    line
-        == delimiter
+    line == delimiter
         || (stripTabs
-            && String.endsWith delimiter line
-            && String.all (\c -> c == tabChar) (String.dropRight (String.length delimiter) line)
-        )
+                && String.endsWith delimiter line
+                && String.all (\c -> c == tabChar) (String.dropRight (String.length delimiter) line)
+           )
 
 
 -- Where the scan of a shell line for a heredoc operator is: before one,

@@ -121,8 +121,8 @@ fixtureRows indexDb =
     Task.sequence
         (List.map (insertFixtureUnit indexDb) fixtureUnits
             ++ [ execIndex indexDb "INSERT INTO files (path, lang) VALUES (?, ?), (?, ?)" [ SqlString "ipe:src/links.rs", SqlString "rs", SqlString "ipe:src/Feature.ipe", SqlString "ipe" ]
-            , execIndex indexDb "INSERT INTO callgraph (caller_uid, callee_uid) VALUES (?, ?), (?, ?)" [ Uid.toSql (uid "u-src"), Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-src"), Uid.toSql (uid "u-src") ]
-            ]
+               , execIndex indexDb "INSERT INTO callgraph (caller_uid, callee_uid) VALUES (?, ?), (?, ?)" [ Uid.toSql (uid "u-src"), Uid.toSql (uid "u-edge"), Uid.toSql (uid "u-src"), Uid.toSql (uid "u-src") ]
+               ]
         )
         |> Task.map (\_ -> ())
 
@@ -237,30 +237,24 @@ fixtureChecks got =
     , ( "a bare reference links to its own module's unit", List.member (internalKey "u-helper") got.rust )
     , ( "a bare reference never links to another module's unit of the same name", not (List.member (internalKey "u-shared") got.rust) )
     , ( "a duplicate qualified name links the same-path unit, then the lowest uid"
-    , List.member (internalKey "u-twin-z") got.rust
-        && not (List.member (internalKey "u-twin-a") got.rust)
-        && List.member (internalKey "u-pair-a") got.rust
-        && not (List.member (internalKey "u-pair-b") got.rust)
-    )
+      , List.member (internalKey "u-twin-z") got.rust
+            && not (List.member (internalKey "u-twin-a") got.rust)
+            && List.member (internalKey "u-pair-a") got.rust
+            && not (List.member (internalKey "u-pair-b") got.rust)
+      )
     , ( "a unit never links to itself", not (List.member (internalKey "u-src") got.rust) )
     , ( "links are edges first, then references in first-occurrence order, nothing hidden"
-    , got.rust
-        == [ internalKey "u-edge", internalKey "u-helper", internalKey "u-exact", internalKey "u-twin-z", internalKey "u-pair-a" ]
-        && got.rustHidden
-        == Just NoneHidden
-    )
+      , got.rust == [ internalKey "u-edge", internalKey "u-helper", internalKey "u-exact", internalKey "u-twin-z", internalKey "u-pair-a" ]
+            && got.rustHidden == Just NoneHidden
+      )
     , ( "a call written as `Foo.bar(x)` links `Foo.bar`", got.ipe == [ internalKey "u-foo" ] )
     , ( "the candidate query uses i_units_qual", List.any (String.contains "i_units_qual") got.plan )
     , ( "a callee whose stored qualified name is a mebibyte links under a label cut at the read, its marker counting the dropped bytes"
-      , List.length got.hugeEdge
-            == 1
+      , List.length got.hugeEdge == 1
             && List.all
                 (\l ->
-                    Label.byteCount l
-                        <= Label.capBytes Label.labelCap
-                        + Label.markerByteCeiling
-                        && droppedOf l
-                        == Just (hugeQualifiedBytes - Label.capBytes Label.labelCap)
+                    Label.byteCount l <= Label.capBytes Label.labelCap + Label.markerByteCeiling
+                        && droppedOf l == Just (hugeQualifiedBytes - Label.capBytes Label.labelCap)
                 )
                 got.hugeEdge
       )
@@ -304,19 +298,12 @@ candidateCeiling =
                 ( _, params ) ->
                     List.length params
     in
-    List.length over.names
-        == Links.linkCandidateCeiling
-        && over.reach
-        == Capped
-        && bound
-        == Links.linkCandidateCeiling
-        + 2
-        && (Links.assemble { edges = Complete, candidates = over.reach } [] [] []).hidden
-        == AtLeast 0
-        && List.length atCeiling.names
-        == Links.linkCandidateCeiling
-        && atCeiling.reach
-        == Complete
+    List.length over.names == Links.linkCandidateCeiling
+        && over.reach == Capped
+        && bound == Links.linkCandidateCeiling + 2
+        && (Links.assemble { edges = Complete, candidates = over.reach } [] [] []).hidden == AtLeast 0
+        && List.length atCeiling.names == Links.linkCandidateCeiling
+        && atCeiling.reach == Complete
 
 
 internalLinks : Int -> List Link
@@ -342,21 +329,13 @@ linkCeilingCut =
         note hidden =
             Maybe.map SafeText.toString (Links.hiddenNote hidden)
     in
-    List.length over.links
-        == Links.linkCeiling
-        && over.hidden
-        == Exactly 3
-        && note over.hidden
-        == Just "+3 more"
-        && full.hidden
-        == NoneHidden
-        && note full.hidden
-        == Nothing
-        && edgesCut.hidden
-        == AtLeast 1
-        && note edgesCut.hidden
-        == Just "+1 or more"
-
+    List.length over.links == Links.linkCeiling
+        && over.hidden == Exactly 3
+        && note over.hidden == Just "+3 more"
+        && full.hidden == NoneHidden
+        && note full.hidden == Nothing
+        && edgesCut.hidden == AtLeast 1
+        && note edgesCut.hidden == Just "+1 or more"
 
 
 -- A unit's stored identity as the index read returns it: each column through
@@ -378,12 +357,9 @@ firstOccurrence =
         assembled =
             Links.assemble { edges = Complete, candidates = Complete } [ Links.internal (Label.fromText Label.labelCap "a") (Uid.toString (uid "u-a")) ] resolved (Links.sourceUrls "see https://x.io (https://x.io),")
     in
-    wanted.names
-        == [ "b", "a", "c" ]
-        && List.map Links.linkKey resolved
-        == [ internalKey "u-b", internalKey "u-a", internalKey "u-c" ]
-        && List.map Links.linkKey assembled.links
-        == [ internalKey "u-a", internalKey "u-b", internalKey "u-c", "e:https://x.io" ]
+    wanted.names == [ "b", "a", "c" ]
+        && List.map Links.linkKey resolved == [ internalKey "u-b", internalKey "u-a", internalKey "u-c" ]
+        && List.map Links.linkKey assembled.links == [ internalKey "u-a", internalKey "u-b", internalKey "u-c", "e:https://x.io" ]
 
 
 candidateRule : Bool
@@ -392,22 +368,14 @@ candidateRule =
         namesFor lang unit refs =
             (Links.candidates lang unit refs).names
     in
-    namesFor Highlight.Rust (unitNamed "fn" "caller" "app::links::caller#2") [ Bare "helper" ]
-        == [ "helper", "app::links::helper" ]
-        && namesFor Highlight.Ipe (unitNamed "fn" "run" "Feature.run") [ Bare "go", Path "Foo.bar" ]
-        == [ "go", "Feature.go", "Foo.bar" ]
-        && namesFor Highlight.Rust (unitNamed "file" "FILE" "app::links::FILE") [ Bare "helper" ]
-        == [ "helper" ]
-        && namesFor Highlight.Rust (unitNamed "fn" "other" "app::links::caller") [ Bare "helper" ]
-        == [ "helper" ]
-        && namesFor Highlight.Rust (unitNamed "fn" "f" "mycrate::m::f") [ Path "crate::util::g" ]
-        == [ "mycrate::util::g" ]
-        && namesFor Highlight.Ipe (unitNamed "fn" "f" "M.f") [ Path "crate.util.g" ]
-        == [ "crate.util.g" ]
-        && namesFor Highlight.Shell (unitNamed "fn" "f" "m::f") [ Bare "g", Path "crate::x" ]
-        == [ "g", "crate::x" ]
-        && namesFor Highlight.Unknown (unitNamed "fn" "f" "m::f") [ Bare "g" ]
-        == [ "g" ]
+    namesFor Highlight.Rust (unitNamed "fn" "caller" "app::links::caller#2") [ Bare "helper" ] == [ "helper", "app::links::helper" ]
+        && namesFor Highlight.Ipe (unitNamed "fn" "run" "Feature.run") [ Bare "go", Path "Foo.bar" ] == [ "go", "Feature.go", "Foo.bar" ]
+        && namesFor Highlight.Rust (unitNamed "file" "FILE" "app::links::FILE") [ Bare "helper" ] == [ "helper" ]
+        && namesFor Highlight.Rust (unitNamed "fn" "other" "app::links::caller") [ Bare "helper" ] == [ "helper" ]
+        && namesFor Highlight.Rust (unitNamed "fn" "f" "mycrate::m::f") [ Path "crate::util::g" ] == [ "mycrate::util::g" ]
+        && namesFor Highlight.Ipe (unitNamed "fn" "f" "M.f") [ Path "crate.util.g" ] == [ "crate.util.g" ]
+        && namesFor Highlight.Shell (unitNamed "fn" "f" "m::f") [ Bare "g", Path "crate::x" ] == [ "g", "crate::x" ]
+        && namesFor Highlight.Unknown (unitNamed "fn" "f" "m::f") [ Bare "g" ] == [ "g" ]
 
 
 -- A unit whose kind, name or qualified name is longer than the index read's
@@ -436,10 +404,8 @@ cutNameBuildsNoCandidate =
         shown =
             Links.candidates Highlight.Rust atWindow refs
     in
-    shown.names
-        == [ "helper", "app::helper" ]
-        && shown.reach
-        == Complete
+    shown.names == [ "helper", "app::helper" ]
+        && shown.reach == Complete
         && refused (unitNamed "fn" (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 4)))
         && refused (unitNamed "fn" (nameAt (Label.windowChars + 1)) ("app::" ++ nameAt (Label.windowChars - 5)))
         && refused (unitNamed (String.repeat (Label.windowChars + 1) "f") (nameAt (Label.windowChars - 5)) ("app::" ++ nameAt (Label.windowChars - 5)))
@@ -450,10 +416,8 @@ cutNameBuildsNoCandidate =
 -- unit can hold. A `..` range starts no member, so its end still names.
 referencesFollowTokens : Bool
 referencesFollowTokens =
-    Links.references Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b"
-        == [ Bare "a", Bare "x", Bare "T", Path "crate::m::f", Path "Foo::bar", Bare "a", Bare "b" ]
-        && Links.references Highlight.Ipe "Foo.bar(x) model.count"
-        == [ Path "Foo.bar", Bare "x", Path "model.count" ]
+    Links.references Highlight.Rust "a.b.c x::<T>::new() self.go ::std::io crate::m::f fn Foo::bar.baz a..b" == [ Bare "a", Bare "x", Bare "T", Path "crate::m::f", Path "Foo::bar", Bare "a", Bare "b" ]
+        && Links.references Highlight.Ipe "Foo.bar(x) model.count" == [ Path "Foo.bar", Bare "x", Path "model.count" ]
         && List.isEmpty (Links.references Highlight.Shell "Foo.bar x")
         && List.isEmpty (Links.references Highlight.Unknown "Foo.bar x")
 
@@ -464,12 +428,9 @@ candidateSqlBound =
         ( sql, params ) ->
             not (String.contains "evil" sql)
                 && String.contains "IN (?, ?)" sql
-                && params
-                == [ SqlString "ipe:p", SqlString "evil'); DROP TABLE units; --", SqlString "b", Uid.toSql (uid "u-self") ]
-                && Index.placeholders 3
-                == "?, ?, ?"
-                && Index.placeholders 0
-                == ""
+                && params == [ SqlString "ipe:p", SqlString "evil'); DROP TABLE units; --", SqlString "b", Uid.toSql (uid "u-self") ]
+                && Index.placeholders 3 == "?, ?, ?"
+                && Index.placeholders 0 == ""
 
 
 -- One row of ipe-index's `tests/callee_vectors.json`: a caller unit's stored
@@ -504,8 +465,7 @@ calleeVectorDecoder : Decode.Decoder CalleeVector
 calleeVectorDecoder =
     Decode.map3
         (\unit callee wanted -> { unit = unit, callee = callee, candidates = wanted })
-        (Decode.map3
-            unitNamed
+        (Decode.map3 unitNamed
             (Decode.field "kind" Decode.string)
             (Decode.field "name" Decode.string)
             (Decode.field "qualified" Decode.string)
