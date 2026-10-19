@@ -736,7 +736,7 @@ fn a_postgres_project_test_cannot_open_an_sqlite_location() -> TestResult {
     std::fs::copy(fixture("clean.ipe"), dir.join("src").join("Main.ipe"))?;
     std::fs::write(dir.join("tests").join("Main.ipe"), MEMORY_OPEN_TEST)?;
 
-    let (ok, stdout, stderr) = run_ipe(&["test", &dir.join("package.ipe").to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["test", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !ok,
