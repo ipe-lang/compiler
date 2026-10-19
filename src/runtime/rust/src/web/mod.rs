@@ -677,6 +677,32 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 pub struct QueuedEvent<Msg> {
     msg: Msg,
     charge: budget::Charge,
+    origin: Origin,
+}
+
+/// What caused one commit of a session's render.
+///
+/// The driver commits once per input it takes, so a commit's origin is that
+/// one input's: the event a tab posted with its id and per-tab seq, or
+/// [`Origin::None`] for every input no tab's event caused (a Cmd result, a
+/// subscription delivery, a route entry, a debugger step, a resync, an event
+/// posted without a tab or a seq).
+#[cfg(feature = "web")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Origin {
+    /// The event `seq` the tab `tab` posted.
+    Tab { tab: TabId, seq: u64 },
+    /// No tab's event.
+    None,
+}
+
+#[cfg(feature = "web")]
+impl Origin {
+    /// The origin of an event posted with `tab` and `seq`: a tab only when both are present.
+    fn of_event(tab: Option<TabId>, seq: Option<u64>) -> Self {
+        tab.zip(seq)
+            .map_or(Self::None, |(tab, seq)| Self::Tab { tab, seq })
+    }
 }
 
 /// How many browser events one session's driver queue holds.
@@ -1505,6 +1531,9 @@ const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing 
 ///
 /// `from` / `to` are the epochs the commit moved between: the client applies
 /// the patches only onto the DOM of `from`, then adopts `to`.
+///
+/// A commit a tab's event caused names that tab and the event's seq
+/// (`tab`, `tabSeq`); any other commit's frame carries neither.
 #[derive(serde::Serialize)]
 #[cfg(feature = "web")]
 struct PatchEnvelope<'a> {
@@ -1513,6 +1542,31 @@ struct PatchEnvelope<'a> {
     from: String,
     to: String,
     patches: &'a [crate::web::diff::Patch],
+    #[serde(flatten)]
+    cause: Option<FrameCause>,
+}
+
+/// The tab event a frame's commit answers.
+#[derive(serde::Serialize)]
+#[cfg(feature = "web")]
+struct FrameCause {
+    tab: String,
+    #[serde(rename = "tabSeq")]
+    seq: u64,
+}
+
+#[cfg(feature = "web")]
+impl FrameCause {
+    /// The cause a frame names for a commit of `origin`; `None` when no tab's event caused it.
+    fn of(origin: Origin) -> Option<Self> {
+        match origin {
+            Origin::Tab { tab, seq } => Some(Self {
+                tab: tab.to_token(),
+                seq,
+            }),
+            Origin::None => None,
+        }
+    }
 }
 
 /// Push one commit's `patches` frame, empty patches included, so the client's
@@ -1523,6 +1577,7 @@ async fn send_patches_frame(
     global_seq: u64,
     step: EpochStep,
     patches: &[crate::web::diff::Patch],
+    origin: Origin,
 ) {
     let Some(sse) = sse else {
         return;
@@ -1532,6 +1587,7 @@ async fn send_patches_frame(
         from: step.from.to_token(),
         to: step.to.to_token(),
         patches,
+        cause: FrameCause::of(origin),
     };
     if let Ok(json) = serde_json::to_string(&env) {
         let _ = sse.send(SsePatch(sse::frame("patches", &json))).await;
@@ -1560,6 +1616,12 @@ impl TabId {
             return None;
         }
         u128::from_str_radix(token, 16).ok().map(Self)
+    }
+
+    /// The 32 lowercase hex characters [`TabId::parse`] reads back.
+    #[must_use]
+    pub fn to_token(self) -> String {
+        format!("{:032x}", self.0)
     }
 }
 
@@ -2872,13 +2934,15 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
         // Each input is taken with its turn, held until the Cmds it produced
         // hold their own units: dropped at the end of the iteration, after
         // `run_cmd`, or on the way out.
-        let (msg, queued, _turn) = tokio::select! {
+        let (msg, queued, origin, _turn) = tokio::select! {
             taken = take_input(&entry, &cmds, &mut msg_rx) => match taken {
-                Taken::Input(m, turn) => (m, None, turn),
+                Taken::Input(m, turn) => (m, None, Origin::None, turn),
                 Taken::Closed | Taken::Gone => break,
             },
             taken = take_input(&entry, &cmds, &mut event_rx), if events_open => match taken {
-                Taken::Input(QueuedEvent { msg, charge }, turn) => (msg, Some(charge), turn),
+                Taken::Input(QueuedEvent { msg, charge, origin }, turn) => {
+                    (msg, Some(charge), origin, turn)
+                }
                 Taken::Closed => {
                     events_open = false;
                     continue;
@@ -3050,7 +3114,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
             1,
         );
 
-        send_patches_frame(sse, seq, step, &patches).await;
+        send_patches_frame(sse, seq, step, &patches, origin).await;
 
         // Write-through: checkpoint the committed model to the store (a touch
         // for memory; a re-serialize for persistent backends) on every commit.
@@ -3775,7 +3839,7 @@ async fn apply_literal_patch_to_web_sessions<Model, Msg, FView>(
             close_session(store, scope.sid(), Some(&handle), CloseReason::OverCeiling).await;
             continue;
         }
-        send_patches_frame(sse, seq, step, &patches).await;
+        send_patches_frame(sse, seq, step, &patches, Origin::None).await;
     }
 }
 
@@ -5597,7 +5661,11 @@ mod handlers {
                     .ok_or(budget::OverBudget::Session)
                     .and_then(|bytes| e.charge.budget().try_charge(bytes));
                 match charged {
-                    Ok(charge) => Some(QueuedEvent { msg, charge }),
+                    Ok(charge) => Some(QueuedEvent {
+                        msg,
+                        charge,
+                        origin: Origin::of_event(tab, parsed.seq),
+                    }),
                     Err(why) => return refused_charge(why),
                 }
             }
@@ -13332,6 +13400,74 @@ mod emitted_router_behavior_tests {
         });
     }
 
+    /// An event posted with a tab and a seq is queued as that tab's event;
+    /// one posted without a tab names no tab.
+    #[test]
+    #[allow(clippy::expect_used)] // the page and the tab token are fixtures
+    fn a_queued_event_carries_the_tab_event_that_posted_it() {
+        with_csrf_off(|| async {
+            let store = Arc::new(Store::new(Duration::from_secs(60)));
+            let (sid, body) = get(make_router(store.clone()), "/", None).await;
+            let plus = hid_near_text(&body, "+").expect("data-ipe-hid near >+<");
+            let first = epoch_of(&body).expect("the page carries its render epoch");
+            let (tx, mut rx) = mpsc::channel::<QueuedEvent<Msg>>(4);
+            capture_dispatches(&store, &sid, tx).await;
+            let tab = TabId::parse(TAB).expect("TAB is a tab token");
+
+            let tabbed = click_body(&plus, Some(&first), Some((TAB, 7)));
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &tabbed).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                rx.try_recv().map(|queued| queued.origin).ok(),
+                Some(Origin::Tab { tab, seq: 7 }),
+                "an event posted with a tab and a seq is that tab's event"
+            );
+
+            let untabbed = click_body(&plus, Some(&first), None);
+            let (status, _, _) = post_event_full(make_router(store.clone()), &sid, &untabbed).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                rx.try_recv().map(|queued| queued.origin).ok(),
+                Some(Origin::None),
+                "an event posted without a tab names no tab"
+            );
+        });
+    }
+
+    /// A frame names its tab event only for a commit one caused, and the tab
+    /// token it names is the one the tab posted.
+    #[test]
+    #[allow(clippy::expect_used)] // serializing a fixture envelope cannot fail
+    fn a_frame_names_the_tab_event_only_for_a_commit_one_caused() {
+        let tab = TabId::parse(TAB).expect("TAB is a tab token");
+        let frame = |origin| {
+            serde_json::to_value(PatchEnvelope {
+                global_seq: 1,
+                from: String::new(),
+                to: String::new(),
+                patches: &[],
+                cause: FrameCause::of(origin),
+            })
+            .expect("an envelope serializes")
+        };
+        let caused = frame(Origin::Tab { tab, seq: 3 });
+        assert_eq!(
+            caused.get("tab").and_then(serde_json::Value::as_str),
+            Some(TAB)
+        );
+        assert_eq!(
+            caused.get("tabSeq").and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        let uncaused = frame(Origin::None);
+        assert!(
+            uncaused.get("tab").is_none() && uncaused.get("tabSeq").is_none(),
+            "a commit no tab caused names no tab: {uncaused}"
+        );
+        assert_eq!(Origin::of_event(Some(tab), None), Origin::None);
+        assert_eq!(Origin::of_event(None, Some(3)), Origin::None);
+    }
+
     /// A queued event holds its Msg's bytes against its own session's budget.
     #[test]
     #[allow(clippy::expect_used)] // the page is a fixture
@@ -13902,6 +14038,7 @@ mod emitted_router_behavior_tests {
             tx.try_send(QueuedEvent {
                 msg: Msg::Decrement,
                 charge,
+                origin: Origin::None,
             })
             .map_err(|_| ())
             .expect("the one slot is free");
