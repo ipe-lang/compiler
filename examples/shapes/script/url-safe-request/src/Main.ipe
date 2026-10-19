@@ -1,11 +1,11 @@
 module Main exposing (main)
 
-import Ipe.Url as Url
-import Ipe.Task as Task
+import Ipe.Io as Io
+import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.String as String
-import Ipe.List as List
-import Ipe.Io as Io
+import Ipe.Task as Task
+import Ipe.Url as Url
 
 
 -- Parse, narrow, and build with `Ipe.Url`, exercising the three ideas the module
@@ -20,7 +20,6 @@ import Ipe.Io as Io
 --     protocol-relative `//host` or a `..`-traversal that escapes the origin.
 --   • `Url.buildQuery` percent-encodes every key AND value, so a metacharacter in
 --     a value (`&`, `=`, space, `#`) cannot split off a new parameter.
-
 
 -- The schemes THIS surface admits. The allowlist is the SSOT the surface owns —
 -- `checkScheme` is called with it, never a scatter of inline scheme comparisons.

@@ -9,7 +9,6 @@ package =
     , version = "0.1.0"
     , capabilities =
         { declares = []
-
         -- The `Ipe.Browser.Speech` import discloses `js-port:speech`;
         -- the `:raw` floor is also disclosed because the module reaches
         -- `Js.send`/`Js.subscribe` under the hood. Both must be accepted here

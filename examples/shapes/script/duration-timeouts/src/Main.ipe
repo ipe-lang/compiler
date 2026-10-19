@@ -1,10 +1,10 @@
 module Main exposing (main)
 
 import Ipe.Duration as Duration
-import Ipe.Task as Task
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.String as String
-import Ipe.Io as Io
+import Ipe.Task as Task
 
 
 -- Build a timeout schedule from unit-explicit spans, exercising the three ideas
@@ -19,7 +19,6 @@ import Ipe.Io as Io
 --     `toMillis`, only at the boundary — not scattered through the program as
 --     nameless integers.
 
-
 -- A named span keeps its unit visible where a caller reads it. `seconds 30` says
 -- what it means; a bare `30000` would not.
 type alias Stage =
@@ -33,7 +32,8 @@ schedule =
     [ { label = "connect", budget = Duration.seconds 5 }
     , { label = "handshake", budget = Duration.millis 750 }
     , { label = "download", budget = Duration.minutes 2 }
-    , { label = "cleanup", budget = Duration.seconds (0 - 3) } -- clamps to zero
+    , { label = "cleanup", budget = Duration.seconds (0 - 3) }
+    -- clamps to zero
     ]
 
 

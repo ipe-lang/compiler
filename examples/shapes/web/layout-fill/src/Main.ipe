@@ -10,11 +10,10 @@ module Main exposing (main)
 --
 -- Co-located, no capabilities, no JS ports.
 
-
+import Ipe.String as String
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.String as String
 import Ipe.Ui as Ui
 
 

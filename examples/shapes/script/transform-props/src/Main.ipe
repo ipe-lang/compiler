@@ -1,7 +1,7 @@
 module Main exposing (main)
 
-import Ipe.Ui.Transform as Transform exposing (Prop)
 import Ipe.Io as Io
+import Ipe.Ui.Transform as Transform exposing (Prop)
 
 
 -- `Ipe.Ui.Transform` describes a CSS transform as a list of typed VALUES, then
@@ -14,7 +14,6 @@ import Ipe.Io as Io
 --   • `propsToCss` joins a whole list into a single CSS `transform` declaration,
 --     in the order given. Composition is a list, so the order is explicit and the
 --     pieces cannot run together malformed.
-
 
 -- A card lift: nudge up, shrink slightly, and tilt.
 lift : List Prop

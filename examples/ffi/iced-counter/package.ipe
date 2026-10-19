@@ -7,6 +7,5 @@ package : Package
 package =
     { name = "iced-counter"
     , version = "0.1.0"
-    , rustDependencies =
-        [ rustDep "iced" "=0.12.1" ]
+    , rustDependencies = [ rustDep "iced" "=0.12.1" ]
     }

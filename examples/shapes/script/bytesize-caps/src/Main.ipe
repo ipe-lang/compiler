@@ -1,10 +1,10 @@
 module Main exposing (main)
 
 import Ipe.ByteSize as ByteSize
-import Ipe.Task as Task
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.String as String
-import Ipe.Io as Io
+import Ipe.Task as Task
 
 
 -- Build resource caps from unit-explicit byte quantities, exercising the three
@@ -31,7 +31,8 @@ caps =
     [ { resource = "upload", limit = ByteSize.mib 10 }
     , { resource = "avatar", limit = ByteSize.kib 256 }
     , { resource = "token", limit = ByteSize.bytes 512 }
-    , { resource = "unset", limit = ByteSize.bytes (0 - 1) } -- clamps to zero
+    , { resource = "unset", limit = ByteSize.bytes (0 - 1) }
+    -- clamps to zero
     ]
 
 

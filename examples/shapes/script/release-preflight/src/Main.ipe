@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.Task as Task
 import Ipe.Error as Error exposing (Error)
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task
 
 
 -- A release-preflight script in the non-TEA `Program` shape: a plain `main`
@@ -22,14 +22,19 @@ import Ipe.Io as Io
 --
 -- The `do` block below IS that chain — read top-to-bottom instead of nested.
 main =
-    let version = "1.4.0" in
+    let
+        version =
+            "1.4.0"
+    in
     do
-        Io.println ("Preflight for v" ++ version)   -- bare : run for its effect, discard the ()
-        results <- Task.parallel                    -- `<-` : run all three at once, bind the List
-            [ checkBuild
-            , checkChangelog
-            , checkGitClean
-            ]
+        Io.println ("Preflight for v" ++ version)
+        -- bare : run for its effect, discard the ()
+        results <- Task.parallel
+                    -- `<-` : run all three at once, bind the List
+                    [ checkBuild
+                    , checkChangelog
+                    , checkGitClean
+                    ]
         Io.println (report version results)
 
 

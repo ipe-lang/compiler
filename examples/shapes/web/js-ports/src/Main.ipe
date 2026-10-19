@@ -15,14 +15,13 @@ module Main exposing (main)
 --     every inbound value runs through the total, bounded seal decoder; a
 --     malformed or mismatched message is DROPPED whole, never a partial value.
 
-
+import Ipe.Ffi.Js as Js
+import Ipe.Json.Decode as Decode
+import Ipe.String as String
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Ffi.Js as Js
-import Ipe.Json.Decode as Decode
-import Ipe.String as String
 
 
 -- The ONE outbound published type — the whole outbound surface as a single
@@ -69,7 +68,8 @@ subscriptions _model =
 view : Model -> Element Msg
 view model =
     Ui.column []
-        [ Ui.button []
+        [ Ui.button
+            []
             { onPress = Just Ring, label = Ui.text "Chime" }
         , Ui.text ("last tick: " ++ String.fromInt model.lastTick)
         ]

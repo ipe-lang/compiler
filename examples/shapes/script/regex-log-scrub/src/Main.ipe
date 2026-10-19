@@ -1,10 +1,10 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
+import Ipe.List as List
 import Ipe.Regex as Regex
 import Ipe.Result as Result exposing (Result(..))
-import Ipe.List as List
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- Scrub sensitive values out of log lines before they are stored. A pattern is
@@ -13,7 +13,6 @@ import Ipe.Io as Io
 -- `replace` (redact emails), `findAll` (collect leaked tokens for an audit), and
 -- `match` (flag lines that still look risky). RE2 syntax: linear-time matching,
 -- no catastrophic backtracking on adversarial input.
-
 
 -- The raw log the scrubber runs over.
 logLines : List String
@@ -73,7 +72,6 @@ leakedTokens tokenRule line =
 
 main =
     case rules of
-
         Err _ ->
             Io.eprintln "a scrub pattern failed to compile"
 
@@ -98,7 +96,6 @@ printScrubbed ruleList =
 printAudit : List Rule -> Task Error ()
 printAudit ruleList =
     case List.drop 1 ruleList of
-
         tokenRule :: _ ->
             do
                 Io.println "Leaked tokens (pre-scrub):"

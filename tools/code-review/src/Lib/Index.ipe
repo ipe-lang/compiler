@@ -2397,13 +2397,10 @@ queueElementCeiling =
         rows =
             PageSize.toInt PageSize.queue
     in
-    rows
-        * (railRowChrome + railLabels * labelElements)
-        + rows
-        * (refusalRowChrome + labelElements)
+    rows * (railRowChrome + railLabels * labelElements)
+        + rows * (refusalRowChrome + labelElements)
         + queuePageChrome
-        + cardLabels
-        * labelElements
+        + cardLabels * labelElements
 
 
 -- The most bytes the labels of one queue page hold: each unit's five labels

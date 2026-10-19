@@ -1,11 +1,11 @@
 module Main exposing (main)
 
 import Ipe.Csv as Csv exposing (Csv)
-import Ipe.Result as Result exposing (Result(..))
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
-import Ipe.Io as Io
 
 
 -- Parse a CSV export, keep only the shipped orders, and re-encode. The shape to
@@ -51,7 +51,6 @@ elementAt n xs =
 
 main =
     case Csv.parse export of
-
         Err _ ->
             Io.eprintln "the CSV export was malformed"
 

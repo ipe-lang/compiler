@@ -1,11 +1,11 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
+import Ipe.List as List
 import Ipe.Net as Net
 import Ipe.Result as Result
-import Ipe.Task as Task
-import Ipe.List as List
 import Ipe.String as String
-import Ipe.Io as Io
+import Ipe.Task as Task
 
 
 -- Validate candidate port numbers at the boundary, exercising the three ideas
@@ -19,7 +19,6 @@ import Ipe.Io as Io
 --   • `Net.min` and `Net.max` are TOTAL known-valid ports — handy as the seed for
 --     `Result.withDefault` when falling back to a compile-time-safe default.
 
-
 -- Candidate ports from, say, a config file: some valid, some not. `fromInt` is the
 -- single gate — each becomes `Ok Port` or a typed `Err`.
 candidates : List Int
@@ -32,7 +31,6 @@ candidates =
 describe : Int -> String
 describe n =
     case Net.fromInt n of
-
         Ok port ->
             String.fromInt n ++ "  ->  ok (Port " ++ String.fromInt (Net.toInt port) ++ ")"
 

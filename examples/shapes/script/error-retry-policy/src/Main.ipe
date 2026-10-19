@@ -1,9 +1,9 @@
 module Main exposing (main)
 
 import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- Classify failures and decide a retry, exercising the ideas `Ipe.Error` turns on:
@@ -13,7 +13,6 @@ import Ipe.Io as Io
 --     query on the type, not a fragile substring match on a message.
 --   • `toString` renders "<Kind>: <message>" for a log line without leaking the
 --     structured details.
-
 
 -- A few representative failures a client might see.
 samples : List Error

@@ -23,13 +23,12 @@ module Main exposing (main)
 -- directly. This example uses the top-level Task form on purpose, to show it
 -- composing through `Cmd.perform`.
 
-
-import Ipe.Tea.Web as Web
 import Ipe.PubSub as PubSub
-import Ipe.Ui as Ui
+import Ipe.String as String
+import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.String as String
+import Ipe.Ui as Ui
 
 
 type Msg
@@ -86,7 +85,8 @@ subscriptions _model =
 view : Model -> Element Msg
 view model =
     Ui.column []
-        [ Ui.button []
+        [ Ui.button
+            []
             { onPress = Just Publish, label = Ui.text "Broadcast" }
         , Ui.text ("last subscriber count: " ++ String.fromInt model.lastCount)
         ]

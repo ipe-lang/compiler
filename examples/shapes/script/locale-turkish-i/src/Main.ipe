@@ -1,10 +1,10 @@
 module Main exposing (main)
 
-import Ipe.Locale as Locale
-import Ipe.String as String
-import Ipe.Maybe as Maybe
-import Ipe.Task as Task
 import Ipe.Io as Io
+import Ipe.Locale as Locale
+import Ipe.Maybe as Maybe
+import Ipe.String as String
+import Ipe.Task as Task
 
 
 -- `Ipe.Locale` is the explicit-locale surface for case mapping.  The default
@@ -19,13 +19,11 @@ import Ipe.Io as Io
 -- tag is therefore a typed absence — it can never silently become a default
 -- locale.
 
-
 -- Parse two locales at the single boundary, then compare their upper-casing.
 -- `showCase` folds the `Maybe Locale` to describe the result.
 showCase : String -> String -> String
 showCase tag word =
     case Locale.fromTag tag of
-
         Just locale ->
             tag
                 ++ ": toUpperIn \""
@@ -41,7 +39,6 @@ showCase tag word =
 showLower : String -> String -> String
 showLower tag word =
     case Locale.fromTag tag of
-
         Just locale ->
             tag
                 ++ ": toLowerIn \""
@@ -59,7 +56,6 @@ showLower tag word =
 showInvalid : String -> String
 showInvalid tag =
     case Locale.fromTag tag of
-
         Just _ ->
             tag ++ ": (unexpectedly parsed)"
 

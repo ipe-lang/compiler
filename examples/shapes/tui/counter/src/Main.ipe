@@ -63,7 +63,8 @@ update msg model =
 
 view : Model -> Screen Msg
 view model =
-    Ui.column [ Ui.spacing 1, Ui.padding 2 ]
+    Ui.column
+        [ Ui.spacing 1, Ui.padding 2 ]
         [ Ui.el [ Ui.bold ] (Ui.text "Ipê tui counter")
         , Ui.el [ Ui.reverse ] (Ui.text ("count = " ++ String.fromInt model.count))
         , Ui.el [ Ui.dim ] (Ui.text "(Up/k +, Down/j -, r reset, q quit)")

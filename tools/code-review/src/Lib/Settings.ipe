@@ -119,9 +119,9 @@ parseIndexSettings rawDb rawRoot rawRepos =
         root <- RepoPath.parseRoot rawRoot
         extra <- parseRepoRoots rawRepos
         roots <- ipeTag
-            |> Result.andThen (\tag -> RepoPath.rootMap (( tag, root ) :: extra))
-            |> Result.mapError rootsRefusal
-            |> Task.fromResult
+                    |> Result.andThen (\tag -> RepoPath.rootMap (( tag, root ) :: extra))
+                    |> Result.mapError rootsRefusal
+                    |> Task.fromResult
         Task.succeed { db = db, roots = roots }
 
 

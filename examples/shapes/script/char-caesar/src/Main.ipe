@@ -1,8 +1,8 @@
 module Main exposing (main)
 
 import Ipe.Char as Char
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.String as String
 
 
 -- A Caesar-shift cipher — rotate each letter by N places — exercising the three
@@ -15,7 +15,6 @@ import Ipe.Io as Io
 --     shift; digits, spaces, and punctuation pass through untouched.
 --   • Case matters to the arithmetic: upper- and lower-case letters live in
 --     different code-point ranges, so each is shifted relative to its own base.
-
 
 -- Shift one character by `n` places within its case's 26-letter range, wrapping
 -- around with `modBy`. A non-letter is returned unchanged. The whole operation is
@@ -55,7 +54,6 @@ main =
 
         secret =
             encipher 3 message
-
         -- Deciphering is the inverse shift: 26 - 3 brings each letter back.
         recovered =
             encipher (26 - 3) secret

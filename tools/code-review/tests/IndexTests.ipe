@@ -186,11 +186,8 @@ pathPastWindowRefused =
         Task.succeed
             (case ( Maybe.map .view past, Maybe.map .view within ) of
                 ( Just (Unreadable (PathPastWindow stored)), Just (Unreadable failure) ) ->
-                    Label.byteCount stored
-                        <= Label.capBytes Label.labelCap
-                        + Label.markerByteCeiling
-                        && List.length (Label.parts stored)
-                        <= Label.elementCeiling
+                    Label.byteCount stored <= Label.capBytes Label.labelCap + Label.markerByteCeiling
+                        && List.length (Label.parts stored) <= Label.elementCeiling
                         && not (windowFailure failure)
 
                 _ ->
@@ -214,9 +211,7 @@ pathCutAtNulRefused =
         Task.succeed
             (case Maybe.map .view cut of
                 Just (Unreadable (PathHoldsNul stored)) ->
-                    Label.byteCount stored
-                        <= Label.capBytes Label.labelCap
-                        + Label.markerByteCeiling
+                    Label.byteCount stored <= Label.capBytes Label.labelCap + Label.markerByteCeiling
                         && List.any isCut (Label.parts stored)
                         && String.contains "holds a NUL byte" (piecesShown (Index.readFailureText (PathHoldsNul stored)))
 
@@ -241,8 +236,7 @@ bodyHashPastWindowFailsRead =
         failed <- probeMessage (loadUnitNow (uid "u-b") |> Task.map (\_ -> ()))
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (failed
-                /= Nothing
+            (failed /= Nothing
                 && not (maybeContains (String.repeat 64 "a") failed)
             )
 
@@ -297,8 +291,7 @@ actedColumnsPastWindowFailRead =
             (past "old_hash" oldHash
                 && past "body_hash" pair
                 && past "head" stamp
-                && tag
-                /= Nothing
+                && tag /= Nothing
                 && not (maybeContains (String.repeat 64 "a") tag)
             )
 
@@ -570,10 +563,8 @@ spanPreCheckNoOverflow =
         huge <- oversizeTag False fixtureLibRs 1 9223372036854775807 (Index.attest viewA)
         invalid <- oversizeTag False fixtureLibRs (0 - 9223372036854775807) 9223372036854775807 (Index.attest viewA)
         Task.succeed
-            (huge
-                == "too large lines 9223372036854775807"
-                && invalid
-                == "range 10"
+            (huge == "too large lines 9223372036854775807"
+                && invalid == "range 10"
                 && notJudged 0 Index.viewLineCeiling
                 && notJudged 2 (0 - 9223372036854775807)
             )
@@ -686,10 +677,8 @@ viewPastNodeCeilingWithheld =
         line =
             escapeLine (Index.viewNodeCeiling - 3)
     in
-    nodesOver (classifyLine line)
-        == Just (Index.viewNodeCeiling + 1)
-        && String.length line
-        < ByteSize.toBytes Index.viewByteCeiling
+    nodesOver (classifyLine line) == Just (Index.viewNodeCeiling + 1)
+        && String.length line < ByteSize.toBytes Index.viewByteCeiling
 
 
 -- A line of 7000 keywords takes more elements coloured than the ceiling and
@@ -701,12 +690,9 @@ plainFallbackWhenColorsTooMany =
         keywords =
             String.repeat 7000 "fn "
     in
-    Drawn.elements (Drawn.highlighted Rust [ Numbered 1 keywords ])
-        > Index.viewNodeCeiling
-        && drawnShape (classifyLine keywords)
-        == Just ( 4, Unhighlighted )
-        && Maybe.map (\( _, drawnMode ) -> drawnMode) (drawnShape (classifyLine "fn x() {}"))
-        == Just Highlighted
+    Drawn.elements (Drawn.highlighted Rust [ Numbered 1 keywords ]) > Index.viewNodeCeiling
+        && drawnShape (classifyLine keywords) == Just ( 4, Unhighlighted )
+        && Maybe.map (\( _, drawnMode ) -> drawnMode) (drawnShape (classifyLine "fn x() {}")) == Just Highlighted
 
 
 -- A 14 KB line of one token per byte, and a 129 KiB one, are shown plain
@@ -731,11 +717,8 @@ longTokenLinesNeverHighlighted =
     in
     withinCeiling (classifyLine (String.repeat 7000 "1 "))
         && withinCeiling (classifyLine (String.repeat 66048 "1 "))
-        && nodesOver (classifyLine escapes)
-        == Just 33028
-        && 4
-        * 33024
-        < ByteSize.toBytes Index.viewByteCeiling
+        && nodesOver (classifyLine escapes) == Just 33028
+        && 4 * 33024 < ByteSize.toBytes Index.viewByteCeiling
 
 
 -- A view past the element ceiling under a wrong hash is too large, not
@@ -757,19 +740,9 @@ nodeOversizeRanksBeforeDrift =
 -- without the other.
 nodeCeilingFitsSessionCeiling : Bool
 nodeCeilingFitsSessionCeiling =
-    0
-        < Index.viewNodeCeiling
-        && Index.viewNodeCeiling
-        * ByteSize.toBytes Index.elementResidentBytes
-        + ByteSize.toBytes Index.viewReserve
-        <= ByteSize.toBytes Index.runtimeSessionCeiling
-        // 4
-        * 3
-        && 16
-        * ByteSize.toBytes Index.viewByteCeiling
-        + 128
-        * Index.viewLineCeiling
-        <= ByteSize.toBytes Index.viewReserve
+    0 < Index.viewNodeCeiling
+        && Index.viewNodeCeiling * ByteSize.toBytes Index.elementResidentBytes + ByteSize.toBytes Index.viewReserve <= ByteSize.toBytes Index.runtimeSessionCeiling // 4 * 3
+        && 16 * ByteSize.toBytes Index.viewByteCeiling + 128 * Index.viewLineCeiling <= ByteSize.toBytes Index.viewReserve
 
 
 -- The relation the queue page is sized by: a full page's elements at the
@@ -779,15 +752,8 @@ nodeCeilingFitsSessionCeiling =
 -- Red if the page size, a label cap or a cost moves without the other.
 queueCeilingFitsQuarter : Bool
 queueCeilingFitsQuarter =
-    0
-        < Index.queueElementCeiling
-        && Index.queueElementCeiling
-        * ByteSize.toBytes Index.elementResidentBytes
-        + 2
-        * Index.queueLabelByteCeiling
-        + ByteSize.toBytes Index.runtimeEntryOverhead
-        <= ByteSize.toBytes Index.runtimeSessionCeiling
-        // 4
+    0 < Index.queueElementCeiling
+        && Index.queueElementCeiling * ByteSize.toBytes Index.elementResidentBytes + 2 * Index.queueLabelByteCeiling + ByteSize.toBytes Index.runtimeEntryOverhead <= ByteSize.toBytes Index.runtimeSessionCeiling // 4
 
 
 -- A unit whose stored purpose is a mebibyte reaches the queue page and the
@@ -803,11 +769,8 @@ purposeOfOneMibIsBounded =
         bounded purpose =
             case purpose of
                 Just label ->
-                    Label.byteCount label
-                        <= Label.capBytes Label.purposeCap
-                        + Label.markerByteCeiling
-                        && droppedOf label
-                        == Just (stored - Label.capBytes Label.purposeCap)
+                    Label.byteCount label <= Label.capBytes Label.purposeCap + Label.markerByteCeiling
+                        && droppedOf label == Just (stored - Label.capBytes Label.purposeCap)
 
                 Nothing ->
                     False
@@ -823,8 +786,7 @@ purposeOfOneMibIsBounded =
         cleanupIndex at.indexDb at.repo
         Task.succeed
             (List.any (\row -> row.unit.uid == uid "u-a" && bounded row.unit.purpose) rows
-                && Maybe.map (\view -> bounded view.unit.purpose) loaded
-                == Just True
+                && Maybe.map (\view -> bounded view.unit.purpose) loaded == Just True
             )
 
 
@@ -859,8 +821,7 @@ entryOverheadMirrorsRuntime =
     in
     Task.map
         (\source ->
-            modBy kib overhead
-                == 0
+            modBy kib overhead == 0
                 && String.contains ("\npub const ENTRY_OVERHEAD: Bytes = Bytes::new(" ++ String.fromInt (overhead // kib) ++ " * 1024);\n") source
         )
         runtimeBudgetSource
@@ -880,8 +841,7 @@ sessionCeilingMirrorsRuntime =
     in
     Task.map
         (\source ->
-            modBy mib ceiling
-                == 0
+            modBy mib ceiling == 0
                 && String.contains ("\npub const SESSION_CEILING: Bytes = Bytes::mib(" ++ String.fromInt (ceiling // mib) ++ ");\n") source
         )
         runtimeBudgetSource
@@ -921,12 +881,9 @@ runtimeBudgetSource =
 -- the read ceiling.
 viewCeilingsWellFormed : Bool
 viewCeilingsWellFormed =
-    0
-        < Index.viewLineCeiling
-        && 0
-        < ByteSize.toBytes Index.viewByteCeiling
-        && ByteSize.toBytes Index.viewByteCeiling
-        <= ByteSize.toBytes Index.sourceCeiling
+    0 < Index.viewLineCeiling
+        && 0 < ByteSize.toBytes Index.viewByteCeiling
+        && ByteSize.toBytes Index.viewByteCeiling <= ByteSize.toBytes Index.sourceCeiling
 
 
 -- The drawn lines are the attested lines: a `\r` is kept, and a trailing
@@ -948,14 +905,10 @@ shownLinesAreAttestedLines =
         drawn text first last =
             Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-x") Rust (Index.attest text) (LineRange first last) file))
     in
-    span
-        == [ "a\r", "b", "", "" ]
-        && drawn crView 1 4
-        == Just [ Numbered 1 "a\r", Numbered 2 "b", Numbered 3 "", Numbered 4 "" ]
-        && drawn "b\n" 2 3
-        == Just [ Numbered 2 "b", Numbered 3 "" ]
-        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") Rust (Index.attest viewB) (LineRange 1 2) fixtureMainIpe))
-        == Just [ Numbered 1 "module Main exposing (main)", Numbered 2 "" ]
+    span == [ "a\r", "b", "", "" ]
+        && drawn crView 1 4 == Just [ Numbered 1 "a\r", Numbered 2 "b", Numbered 3 "", Numbered 4 "" ]
+        && drawn "b\n" 2 3 == Just [ Numbered 2 "b", Numbered 3 "" ]
+        && Maybe.map Index.shownRows (shownOf (Index.classifyView (uid "u-b") Rust (Index.attest viewB) (LineRange 1 2) fixtureMainIpe)) == Just [ Numbered 1 "module Main exposing (main)", Numbered 2 "" ]
 
 
 -- The unit page's data path: a uid that exists loads with its source and
@@ -992,13 +945,10 @@ unitPageLoadIn base =
                             case mb of
                                 Just loaded ->
                                     Task.succeed
-                                        (labelText loaded.unit.qualified
-                                            == "Lib.answer"
-                                            && shownTextOf loaded.view
-                                            == Just viewA
+                                        (labelText loaded.unit.qualified == "Lib.answer"
+                                            && shownTextOf loaded.view == Just viewA
                                             && List.isEmpty loaded.links.links
-                                            && loaded.links.hidden
-                                            == Links.NoneHidden
+                                            && loaded.links.hidden == Links.NoneHidden
                                         )
 
                                 Nothing ->
@@ -1155,15 +1105,11 @@ residualVectorHolds v =
         spans =
             List.filterMap spanPair v.spans
     in
-    List.length spans
-        == List.length v.spans
-        && Index.residualText spans v.src
-        == v.residual
+    List.length spans == List.length v.spans
+        && Index.residualText spans v.src == v.residual
         && (String.isEmpty v.residual || String.startsWith "\n" v.residual)
-        && Index.attestResidual v.residual
-        == v.hash
-        && shownTextOf (Index.classifyView (uid "u-file") Rust v.hash (Residual spans) v.src)
-        == Just v.residual
+        && Index.attestResidual v.residual == v.hash
+        && shownTextOf (Index.classifyView (uid "u-file") Rust v.hash (Residual spans) v.src) == Just v.residual
 
 
 spanPair : List Int -> Maybe ( Int, Int )
@@ -1224,14 +1170,10 @@ fileUnitShowsResidual =
                 Maybe.map Index.shownRows (Maybe.andThen shownOf residual)
         in
         Task.succeed
-            (rows
-                == Just [ Numbered 1 "// fixture library", Covered, Numbered 8 "pub fn other() -> i32 {", Numbered 9 "    7", Numbered 10 "}" ]
-                && Maybe.andThen shownTextOf residual
-                == Just libResidual
-                && Maybe.map viewTag whole
-                == Just "drifted"
-                && Maybe.map viewTag viewScheme
-                == Just "drifted"
+            (rows == Just [ Numbered 1 "// fixture library", Covered, Numbered 8 "pub fn other() -> i32 {", Numbered 9 "    7", Numbered 10 "}" ]
+                && Maybe.andThen shownTextOf residual == Just libResidual
+                && Maybe.map viewTag whole == Just "drifted"
+                && Maybe.map viewTag viewScheme == Just "drifted"
             )
 
 
@@ -1244,10 +1186,8 @@ fileUnitPastChildSpanCeiling =
         past <- fileUnitView "ipe-index-file-spans-past" (Index.attestResidual libResidual) (childUnits Index.childSpanCeiling)
         at <- fileUnitView "ipe-index-file-spans-at" (Index.attestResidual libResidual) (childUnits (Index.childSpanCeiling - 1))
         Task.succeed
-            (Maybe.map viewTag past
-                == Just ("too large spans " ++ String.fromInt (Index.childSpanCeiling + 1))
-                && Maybe.map viewTag at
-                == Just "shown"
+            (Maybe.map viewTag past == Just ("too large spans " ++ String.fromInt (Index.childSpanCeiling + 1))
+                && Maybe.map viewTag at == Just "shown"
             )
 
 
@@ -1271,10 +1211,10 @@ everySharedVectorsFileRead =
         names <- Task.fromResult (Path.fromString (String.dropRight 1 (ipeIndexTestFile cwd ""))) |> Task.andThen File.readDir
         suiteNames <- Task.fromResult (Path.fromString (cwd ++ "/tests")) |> Task.andThen File.readDir
         sources <- Task.sequence
-            (List.map
-                (\file -> Task.fromResult (Path.fromString (cwd ++ "/tests/" ++ file)) |> Task.andThen (\p -> File.readFileLimit p (ByteSize.kib 256)))
-                (List.filter (String.endsWith ".ipe") suiteNames)
-            )
+                    (List.map
+                        (\file -> Task.fromResult (Path.fromString (cwd ++ "/tests/" ++ file)) |> Task.andThen (\p -> File.readFileLimit p (ByteSize.kib 256)))
+                        (List.filter (String.endsWith ".ipe") suiteNames)
+                    )
         let
             code =
                 String.join "\n" (List.map codeLines sources)
@@ -1324,8 +1264,7 @@ pageReadsNoSource =
         found <- Index.loadView conn settings.roots (uid "u-b")
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (List.map (\r -> r.unit.uid) rows
-                == [ uid "u-a", uid "u-b" ]
+            (List.map (\r -> r.unit.uid) rows == [ uid "u-a", uid "u-b" ]
                 && String.startsWith "unreadable: " (loadedViewTag found)
             )
 
@@ -1441,8 +1380,8 @@ refusalReadFailsWith name reason size digest =
             [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin", SqlString reason, size, digest ]
         conn <- indexConn
         failed <- snapshotOn conn
-            |> Task.map (\_ -> False)
-            |> Task.onError (\_ -> Task.succeed True)
+                    |> Task.map (\_ -> False)
+                    |> Task.onError (\_ -> Task.succeed True)
         cleanupIndex at.indexDb at.repo
         Task.succeed failed
 
@@ -1468,8 +1407,7 @@ refusalReasonsMatchSchema =
         statements <- indexSchemaStatements cwd
         Task.succeed
             (List.any (\s -> String.contains allReasons s && String.contains blocking s) statements
-                && List.length (List.filter Index.ackable Index.refusalReasons)
-                == 5
+                && List.length (List.filter Index.ackable Index.refusalReasons) == 5
             )
 
 
@@ -1487,10 +1425,8 @@ unrecordedUnitListed =
         r <- loadFirstPage
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (r.total
-                == 2
-                && List.map (\e -> e.uid) r.units
-                == [ uid "u-a", uid "u-b" ]
+            (r.total == 2
+                && List.map (\e -> e.uid) r.units == [ uid "u-a", uid "u-b" ]
                 && List.all (\e -> e.uid /= uid "u-a" || isUnrecorded e.change) r.units
                 && List.all (\e -> e.uid /= uid "u-b" || modifiedFrom e.change == Just "oldB") r.units
             )
@@ -1601,8 +1537,8 @@ pageReadFailsAfter name sql =
         execIndexScript at.indexDb sql
         conn <- indexConn
         failed <- pendingRows conn
-            |> Task.map (\_ -> False)
-            |> Task.onError (\_ -> Task.succeed True)
+                    |> Task.map (\_ -> False)
+                    |> Task.onError (\_ -> Task.succeed True)
         cleanupIndex at.indexDb at.repo
         Task.succeed failed
 
@@ -1845,24 +1781,19 @@ unboundUnitsExcluded =
         view <- Index.loadView conn settings.roots (uid "u-ext")
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (before.unbound
-                == 0
-                && after.unbound
-                == 1
-                && after.units
-                == before.units
-                && after.open
-                == before.open
-                && List.length after.rows
-                == List.length before.rows
+            (before.unbound == 0
+                && after.unbound == 1
+                && after.units == before.units
+                && after.open == before.open
+                && List.length after.rows == List.length before.rows
                 && not (List.any (\row -> Uid.toString row.unit.uid == Uid.toString (uid "u-ext")) after.rows)
                 && (case view of
-                    Just _ ->
-                        False
+                        Just _ ->
+                            False
 
-                    Nothing ->
-                        True
-                )
+                        Nothing ->
+                            True
+                   )
             )
 
 

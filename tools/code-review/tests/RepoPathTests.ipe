@@ -263,14 +263,11 @@ relativeRootAccepted =
         System.setenv "IPE_INDEX_ROOT" rel
         settings <- envSettings
         Task.succeed
-            (Path.toString (RepoPath.rootPath root)
-                == Path.toString cwdPath
-                && Path.toString (RepoPath.rootPath dotRoot)
-                == Path.toString cwdPath
+            (Path.toString (RepoPath.rootPath root) == Path.toString cwdPath
+                && Path.toString (RepoPath.rootPath dotRoot) == Path.toString cwdPath
                 && resolvesTo (Path.toString cwdPath ++ "/package.ipe") (RepoPath.resolve settings.roots "ipe:package.ipe")
                 && refusedAs "unknown-tag" (RepoPath.resolve settings.roots "other:package.ipe")
-                && Result.map RepoPath.tagName Settings.ipeTag
-                == Ok "ipe"
+                && Result.map RepoPath.tagName Settings.ipeTag == Ok "ipe"
             )
 
 
@@ -314,10 +311,8 @@ pathRefusalPageTextFixed =
                         False
 
                     Err err ->
-                        refusalName err
-                            == refusalName expected
-                            && pageText err
-                            == describeText expected
+                        refusalName err == refusalName expected
+                            && pageText err == describeText expected
                             && String.contains (SafeText.toString (SafeText.quoted stored)) (pageText err)
                             && not (String.contains rootText (pageText err))
                             && not (String.contains base (pageText err))
@@ -611,8 +606,7 @@ diagnosticsNeverRaw =
         tree <- freshNested
         nestedRoots <- mapOf [ ( "out", tree.outer ), ( "in", tree.inner ) ]
         Task.succeed
-            (List.length allPathErrors
-                == 9
+            (List.length allPathErrors == 9
                 && List.all (\err -> clean (withForeign hazards err)) allPathErrors
                 && List.all
                     (resolvedClean roots)
@@ -892,10 +886,8 @@ tooManyRootsRefused =
         limit <- maxReposVector
         roots <- distinctRoots (limit + 1)
         Task.succeed
-            (limit
-                >= 1
-                && RepoPath.maxRoots
-                == limit
+            (limit >= 1
+                && RepoPath.maxRoots == limit
                 && mapRefusedAs "too-many-roots" (mapResult roots)
                 && not (mapRefused (mapResult (List.take limit roots)))
             )
@@ -1012,14 +1004,12 @@ reposRefusedAs raw expected position =
                             text =
                                 SafeText.toString (RepoPath.describeRepos raw err)
                         in
-                        reposErrorName err
-                            == expected
+                        reposErrorName err == expected
                             && String.startsWith "IPE_INDEX_REPOS " text
                             && noHazard text
-                            && (position
-                                == 0
-                                || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
-                            )
+                            && (position == 0
+                                    || String.contains ("IPE_INDEX_REPOS entry " ++ String.fromInt position ++ " (") text
+                               )
             )
 
 
@@ -1046,8 +1036,7 @@ reposUnsetBindsIpeOnly =
         base <- freshDir "ipe-repos-unset"
         settings <- Settings.parseIndexSettings (base ++ "/index.db") base Settings.EnvUnset
         Task.succeed
-            (List.map (\( tag, _ ) -> RepoPath.tagName tag) (RepoPath.boundRoots settings.roots)
-                == [ "ipe" ]
+            (List.map (\( tag, _ ) -> RepoPath.tagName tag) (RepoPath.boundRoots settings.roots) == [ "ipe" ]
                 && not (refused (RepoPath.resolve settings.roots "ipe:src/x"))
                 && refusedAs "unknown-tag" (RepoPath.resolve settings.roots "ext:src/x")
             )
@@ -1132,8 +1121,7 @@ reposRootsNameTheirEntry =
             (List.member ( "ipe", "IPE_INDEX_ROOT" ) origins
                 && List.any (\( name, origin ) -> name == "ext" && String.startsWith "IPE_INDEX_REPOS entry 1 (" origin) origins
                 && List.any (\( name, origin ) -> name == "docs" && String.startsWith "IPE_INDEX_REPOS entry 2 (" origin) origins
-                && List.length origins
-                == 3
+                && List.length origins == 3
             )
 
 
@@ -1187,10 +1175,8 @@ reposCeilingCountsIpe =
         atCeiling <- reposSettingsRefusal base (numberedEntries base (limit - 1))
         overCeiling <- reposSettingsRefusal base (numberedEntries base limit)
         Task.succeed
-            (RepoPath.maxRoots
-                == limit
-                && atCeiling
-                == Nothing
+            (RepoPath.maxRoots == limit
+                && atCeiling == Nothing
                 && maybeContains "repository roots are configured" overCeiling
             )
 

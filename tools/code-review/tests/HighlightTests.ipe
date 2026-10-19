@@ -74,26 +74,19 @@ twoLines lang first second =
 -- `/* */` and `#` are punctuation; `->` opens nothing.
 ipeLineComments : Bool
 ipeLineComments =
-    Highlight.tokenize Ipe "x -- c // d"
-        == [ Ident "x", Plain " ", Comment "-- c // d" ]
-        && Highlight.tokenize Ipe "a // b"
-        == [ Ident "a", Plain " ", Plain "/", Plain "/", Plain " ", Ident "b" ]
-        && Highlight.tokenize Ipe "/* b */"
-        == [ Plain "/", Plain "*", Plain " ", Ident "b", Plain " ", Plain "*", Plain "/" ]
-        && Highlight.tokenize Ipe "a # b"
-        == [ Ident "a", Plain " ", Plain "#", Plain " ", Ident "b" ]
-        && Highlight.tokenize Ipe "a -> b"
-        == [ Ident "a", Plain " ", Plain "-", Plain ">", Plain " ", Ident "b" ]
+    Highlight.tokenize Ipe "x -- c // d" == [ Ident "x", Plain " ", Comment "-- c // d" ]
+        && Highlight.tokenize Ipe "a // b" == [ Ident "a", Plain " ", Plain "/", Plain "/", Plain " ", Ident "b" ]
+        && Highlight.tokenize Ipe "/* b */" == [ Plain "/", Plain "*", Plain " ", Ident "b", Plain " ", Plain "*", Plain "/" ]
+        && Highlight.tokenize Ipe "a # b" == [ Ident "a", Plain " ", Plain "#", Plain " ", Ident "b" ]
+        && Highlight.tokenize Ipe "a -> b" == [ Ident "a", Plain " ", Plain "-", Plain ">", Plain " ", Ident "b" ]
 
 
 -- Ipê: a nested `{- -}` block comment carries its depth across lines; a
 -- `{-|` doc comment does not nest, so it closes at its first `-}`.
 ipeBlockComments : Bool
 ipeBlockComments =
-    twoLines Ipe "{- a {- b" "-} c -} x"
-        == ( [ Comment "{- a {- b" ], [ Comment "-} c -}", Plain " ", Ident "x" ] )
-        && Highlight.tokenize Ipe "{-| a {- b -} c"
-        == [ Comment "{-| a {- b -}", Plain " ", Ident "c" ]
+    twoLines Ipe "{- a {- b" "-} c -} x" == ( [ Comment "{- a {- b" ], [ Comment "-} c -}", Plain " ", Ident "x" ] )
+        && Highlight.tokenize Ipe "{-| a {- b -} c" == [ Comment "{-| a {- b -}", Plain " ", Ident "c" ]
 
 
 -- Ipê: `--` inside a string or after a `'"'` char literal is code, and an
@@ -101,12 +94,9 @@ ipeBlockComments =
 -- `--` is a comment.
 ipeStrings : Bool
 ipeStrings =
-    Highlight.tokenize Ipe "\"a -- b\" c"
-        == [ Str "\"a -- b\"", Plain " ", Ident "c" ]
-        && Highlight.tokenize Ipe "'\"' -- q"
-        == [ Str "'\"'", Plain " ", Comment "-- q" ]
-        && twoLines Ipe "\"a" "-- c"
-        == ( [ Plain "\"a" ], [ Comment "-- c" ] )
+    Highlight.tokenize Ipe "\"a -- b\" c" == [ Str "\"a -- b\"", Plain " ", Ident "c" ]
+        && Highlight.tokenize Ipe "'\"' -- q" == [ Str "'\"'", Plain " ", Comment "-- q" ]
+        && twoLines Ipe "\"a" "-- c" == ( [ Plain "\"a" ], [ Comment "-- c" ] )
 
 
 -- Shell: a `#` at a word start is a comment and swallows a `/*` after it;
@@ -114,16 +104,11 @@ ipeStrings =
 -- nothing.
 shellComments : Bool
 shellComments =
-    Highlight.tokenize Shell "echo x # c /* d */"
-        == [ Keyword "echo", Plain " ", Ident "x", Plain " ", Comment "# c /* d */" ]
-        && Highlight.tokenize Shell "/* x */"
-        == [ Plain "/", Plain "*", Plain " ", Ident "x", Plain " ", Plain "*", Plain "/" ]
-        && twoLines Shell "/* a" "b */ # c"
-        == ( [ Plain "/", Plain "*", Plain " ", Ident "a" ], [ Ident "b", Plain " ", Plain "*", Plain "/", Plain " ", Comment "# c" ] )
-        && Highlight.tokenize Shell "ls --all"
-        == [ Ident "ls", Plain " ", Plain "-", Plain "-", Ident "all" ]
-        && Highlight.tokenize Shell "echo $#"
-        == [ Keyword "echo", Plain " ", Plain "$", Plain "#" ]
+    Highlight.tokenize Shell "echo x # c /* d */" == [ Keyword "echo", Plain " ", Ident "x", Plain " ", Comment "# c /* d */" ]
+        && Highlight.tokenize Shell "/* x */" == [ Plain "/", Plain "*", Plain " ", Ident "x", Plain " ", Plain "*", Plain "/" ]
+        && twoLines Shell "/* a" "b */ # c" == ( [ Plain "/", Plain "*", Plain " ", Ident "a" ], [ Ident "b", Plain " ", Plain "*", Plain "/", Plain " ", Comment "# c" ] )
+        && Highlight.tokenize Shell "ls --all" == [ Ident "ls", Plain " ", Plain "-", Plain "-", Ident "all" ]
+        && Highlight.tokenize Shell "echo $#" == [ Keyword "echo", Plain " ", Plain "$", Plain "#" ]
 
 
 -- Shell: a `'…'` string spans lines, so a `#` inside it is no comment and
@@ -146,12 +131,9 @@ secondLine lines =
 -- verbatim `'…'` string.
 shellDollarStrings : Bool
 shellDollarStrings =
-    Highlight.tokenize Shell "echo $'it\\'s' # c"
-        == [ Keyword "echo", Plain " ", Str "$'it\\'s'", Plain " ", Comment "# c" ]
-        && twoLines Shell "x=$'a\\'" "b' # c"
-        == ( [ Ident "x", Plain "=", Str "$'a\\'" ], [ Str "b'", Plain " ", Comment "# c" ] )
-        && Highlight.tokenize Shell "echo \\$'a\\'"
-        == [ Keyword "echo", Plain " ", Plain "\\$", Str "'a\\'" ]
+    Highlight.tokenize Shell "echo $'it\\'s' # c" == [ Keyword "echo", Plain " ", Str "$'it\\'s'", Plain " ", Comment "# c" ]
+        && twoLines Shell "x=$'a\\'" "b' # c" == ( [ Ident "x", Plain "=", Str "$'a\\'" ], [ Str "b'", Plain " ", Comment "# c" ] )
+        && Highlight.tokenize Shell "echo \\$'a\\'" == [ Keyword "echo", Plain " ", Plain "\\$", Str "'a\\'" ]
 
 
 -- Shell: a `<<` inside `((…))` or `$((…))` is a shift, so the line after it
@@ -159,12 +141,9 @@ shellDollarStrings =
 -- whose body line opens no string past itself.
 shellArithmeticShift : Bool
 shellArithmeticShift =
-    twoLines Shell "x=$((1 << 2)); echo 'a" "b' # c"
-        == ( [ Ident "x", Plain "=", Plain "$", Plain "(", Plain "(", Num "1", Plain " ", Plain "<", Plain "<", Plain " ", Num "2", Plain ")", Plain ")", Plain ";", Plain " ", Keyword "echo", Plain " ", Str "'a" ], [ Str "b'", Plain " ", Comment "# c" ] )
-        && secondLine (twoLines Shell "((n <<= (1))); echo 'a" "b' # c")
-        == [ Str "b'", Plain " ", Comment "# c" ]
-        && secondLine (twoLines Shell "cat $((1)) <<EOF" "don't")
-        == [ Ident "don", Str "'t" ]
+    twoLines Shell "x=$((1 << 2)); echo 'a" "b' # c" == ( [ Ident "x", Plain "=", Plain "$", Plain "(", Plain "(", Num "1", Plain " ", Plain "<", Plain "<", Plain " ", Num "2", Plain ")", Plain ")", Plain ";", Plain " ", Keyword "echo", Plain " ", Str "'a" ], [ Str "b'", Plain " ", Comment "# c" ] )
+        && secondLine (twoLines Shell "((n <<= (1))); echo 'a" "b' # c") == [ Str "b'", Plain " ", Comment "# c" ]
+        && secondLine (twoLines Shell "cat $((1)) <<EOF" "don't") == [ Ident "don", Str "'t" ]
 
 
 -- Rust: a `'"'` char literal opens no string, so the `//` after it is a
@@ -172,18 +151,12 @@ shellArithmeticShift =
 -- a lifetime's `'` is punctuation; block comments nest.
 rustComments : Bool
 rustComments =
-    Highlight.tokenize Rust "let q = '\"'; // c"
-        == [ Keyword "let", Plain " ", Ident "q", Plain " ", Plain "=", Plain " ", Str "'\"'", Plain ";", Plain " ", Comment "// c" ]
-        && Highlight.tokenize Rust "\"a // b\" c"
-        == [ Str "\"a // b\"", Plain " ", Ident "c" ]
-        && Highlight.tokenize Rust "x -- y"
-        == [ Ident "x", Plain " ", Plain "-", Plain "-", Plain " ", Ident "y" ]
-        && Highlight.tokenize Rust "#[test]"
-        == [ Plain "#", Plain "[", Ident "test", Plain "]" ]
-        && Highlight.tokenize Rust "&'a str"
-        == [ Plain "&", Plain "'", Ident "a", Plain " ", Ident "str" ]
-        && Highlight.tokenize Rust "/* a /* b */ c */ x"
-        == [ Comment "/* a /* b */ c */", Plain " ", Ident "x" ]
+    Highlight.tokenize Rust "let q = '\"'; // c" == [ Keyword "let", Plain " ", Ident "q", Plain " ", Plain "=", Plain " ", Str "'\"'", Plain ";", Plain " ", Comment "// c" ]
+        && Highlight.tokenize Rust "\"a // b\" c" == [ Str "\"a // b\"", Plain " ", Ident "c" ]
+        && Highlight.tokenize Rust "x -- y" == [ Ident "x", Plain " ", Plain "-", Plain "-", Plain " ", Ident "y" ]
+        && Highlight.tokenize Rust "#[test]" == [ Plain "#", Plain "[", Ident "test", Plain "]" ]
+        && Highlight.tokenize Rust "&'a str" == [ Plain "&", Plain "'", Ident "a", Plain " ", Ident "str" ]
+        && Highlight.tokenize Rust "/* a /* b */ c */ x" == [ Comment "/* a /* b */ c */", Plain " ", Ident "x" ]
 
 
 -- Rust: a `r#"…"#` raw string closes only at `"#`, on its line or a later
@@ -191,21 +164,16 @@ rustComments =
 -- the string's.
 rustStrings : Bool
 rustStrings =
-    Highlight.tokenize Rust "r#\"a \" // b\"# c"
-        == [ Str "r#\"a \" // b\"#", Plain " ", Ident "c" ]
-        && twoLines Rust "let s = r#\"a" "// b\"# + 1"
-        == ( [ Keyword "let", Plain " ", Ident "s", Plain " ", Plain "=", Plain " ", Str "r#\"a" ], [ Str "// b\"#", Plain " ", Plain "+", Plain " ", Num "1" ] )
-        && twoLines Rust "let s = \"a" "// b\";"
-        == ( [ Keyword "let", Plain " ", Ident "s", Plain " ", Plain "=", Plain " ", Str "\"a" ], [ Str "// b\"", Plain ";" ] )
+    Highlight.tokenize Rust "r#\"a \" // b\"# c" == [ Str "r#\"a \" // b\"#", Plain " ", Ident "c" ]
+        && twoLines Rust "let s = r#\"a" "// b\"# + 1" == ( [ Keyword "let", Plain " ", Ident "s", Plain " ", Plain "=", Plain " ", Str "r#\"a" ], [ Str "// b\"#", Plain " ", Plain "+", Plain " ", Num "1" ] )
+        && twoLines Rust "let s = \"a" "// b\";" == ( [ Keyword "let", Plain " ", Ident "s", Plain " ", Plain "=", Plain " ", Str "\"a" ], [ Str "// b\"", Plain ";" ] )
 
 
 -- A language with no grammar is one Plain token, whole or per line.
 unknownIsPlain : Bool
 unknownIsPlain =
-    Highlight.tokenize Unknown "// a # b -- c {- d"
-        == [ Plain "// a # b -- c {- d" ]
-        && twoLines Unknown "/* a" "b */"
-        == ( [ Plain "/* a" ], [ Plain "b */" ] )
+    Highlight.tokenize Unknown "// a # b -- c {- d" == [ Plain "// a # b -- c {- d" ]
+        && twoLines Unknown "/* a" "b */" == ( [ Plain "/* a" ], [ Plain "b */" ] )
 
 
 -- Lexemes left open at the end of the input close as Plain, in one pass:
@@ -227,12 +195,9 @@ unterminatedAtEof =
         rawToks =
             Highlight.tokenize Rust raw
     in
-    Highlight.tokenize Rust block
-        == [ Plain block ]
-        && Highlight.tokenize Ipe nested
-        == [ Plain nested ]
-        && List.length rawToks
-        == 131072
+    Highlight.tokenize Rust block == [ Plain block ]
+        && Highlight.tokenize Ipe nested == [ Plain nested ]
+        && List.length rawToks == 131072
         && not (List.any isComment rawToks)
         && reassembles Rust raw
 
@@ -248,8 +213,7 @@ longLines =
     reassembles Ipe (String.repeat 32768 "a -> {b} ")
         && reassembles Shell (String.repeat 32768 "a 'b' \\c ")
         && reassembles Rust (String.repeat 32768 "r\"a\" '\"' ")
-        && Highlight.tokenize Ipe comment
-        == [ Comment comment ]
+        && Highlight.tokenize Ipe comment == [ Comment comment ]
 
 
 -- Each language's layout and path facts are its grammar row's: a CRLF is
