@@ -139,7 +139,7 @@ fn run_ipe(args: &[&str]) -> Result<(bool, String), Box<dyn Error>> {
 
 #[test]
 fn reports_network_for_an_http_program() -> TestResult {
-    let project = fixture_project("uses_http.ipe")?;
+    let project = fixture_project("http_project/src/Main.ipe")?;
     let (ok, stdout) = run_ipe_in(project.root().path(), &["capabilities", "--plain"])?;
     assert!(ok, "capabilities must exit 0");
     assert_eq!(stdout.trim(), "network");
@@ -186,7 +186,7 @@ fn capabilities_help_page_lists_the_command() -> TestResult {
 #[test]
 fn verify_accepts_the_exact_declared_set() -> TestResult {
     let declared = BTreeSet::from([Capability::Network]);
-    let project = fixture_project("uses_http.ipe")?;
+    let project = fixture_project("http_project/src/Main.ipe")?;
     let r = verify_capabilities(project.root(), &declared);
     assert!(r.is_ok(), "an exact declaration verifies: {r:?}");
     Ok(())
@@ -196,7 +196,7 @@ fn verify_accepts_the_exact_declared_set() -> TestResult {
 fn verify_rejects_underdeclared() -> TestResult {
     // The program uses `network` but declares nothing.
     let declared = BTreeSet::new();
-    let project = fixture_project("uses_http.ipe")?;
+    let project = fixture_project("http_project/src/Main.ipe")?;
     let r = verify_capabilities(project.root(), &declared);
     assert!(r.is_err(), "an empty declaration must be rejected");
     Ok(())

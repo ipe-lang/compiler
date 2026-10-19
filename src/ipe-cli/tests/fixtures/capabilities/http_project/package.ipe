@@ -1,0 +1,5 @@
+module Package exposing (package)
+
+
+package =
+    { name = "httpfixture", version = "0.1.0" }
