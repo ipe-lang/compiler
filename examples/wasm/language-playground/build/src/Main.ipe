@@ -16,6 +16,7 @@ import Ipe.Task as Task
 -- Every observable step is a `Task Error a`; a missing tool exits non-zero
 -- with a styled install hint instead of a raw OS error.
 
+
 main : Task Error ()
 main =
     build
@@ -74,10 +75,13 @@ buildCrate root =
         Io.println "Building ipe-wasm for wasm32-unknown-unknown (release)…"
         Process.run "cargo"
             [ "build"
-            , "-p", "ipe-wasm"
-            , "--target", "wasm32-unknown-unknown"
+            , "-p"
+            , "ipe-wasm"
+            , "--target"
+            , "wasm32-unknown-unknown"
             , "--release"
-            , "--manifest-path", root ++ "/Cargo.toml"
+            , "--manifest-path"
+            , root ++ "/Cargo.toml"
             ]
             |> Task.map (\_ -> root)
 
@@ -89,8 +93,11 @@ buildCrate root =
 wasmPath : String -> Task Error String
 wasmPath root =
     Process.run "cargo"
-        [ "metadata", "--format-version", "1"
-        , "--manifest-path", root ++ "/Cargo.toml"
+        [ "metadata"
+        , "--format-version"
+        , "1"
+        , "--manifest-path"
+        , root ++ "/Cargo.toml"
         ]
         |> Task.andThen
             (\out ->
@@ -99,7 +106,8 @@ wasmPath root =
                         Task.succeed (dir ++ "/wasm32-unknown-unknown/release/ipe_wasm.wasm")
 
                     Err err ->
-                        Task.fail (Error.unexpected ("could not read cargo metadata: " ++ Error.toString err)))
+                        Task.fail (Error.unexpected ("could not read cargo metadata: " ++ Error.toString err))
+            )
 
 
 bindGen : String -> Task Error String
@@ -110,13 +118,17 @@ bindGen root =
                 do
                     Io.println "Generating JS bindings with wasm-bindgen…"
                     Process.run "wasm-bindgen"
-                        [ "--target", "web"
+                        [ "--target"
+                        , "web"
                         , "--no-typescript"
-                        , "--out-dir", playgroundDir root ++ "/pkg"
-                        , "--out-name", "ipe_wasm"
+                        , "--out-dir"
+                        , playgroundDir root ++ "/pkg"
+                        , "--out-name"
+                        , "ipe_wasm"
                         , wasm
                         ]
-                        |> Task.map (\_ -> root))
+                        |> Task.map (\_ -> root)
+            )
 
 
 done : String -> Task Error ()

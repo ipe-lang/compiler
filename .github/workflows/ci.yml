@@ -202,6 +202,8 @@ jobs:
         run: python3 .github/ci/test_claims_table.py -v
       - name: Prove the live-ruleset merge-queue pin refusals (unit tests)
         run: python3 .github/ci/test_check_required_set.py -v
+      - name: Prove the in-repo ipe-fmt check refusals (unit tests)
+        run: python3 .github/ci/test_ipe_fmt_check.py -v
       - name: The derived required-set is in sync with the manifest
         run: python3 .github/ci/check_required_set.py
 
@@ -1100,6 +1102,13 @@ jobs:
         env:
           IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
         run: bash tools/scripts/first-party-check-floor.sh
+      # Every tracked Ipê project (a directory holding a tracked `package.ipe`,
+      # test inputs under a `tests` directory aside) must be `ipe fmt --check`
+      # clean; the set is discovered from git, so a new project is held at once.
+      - name: Every in-repo Ipê project is ipe-fmt clean
+        env:
+          IPE_BIN: ${{ runner.temp }}/ipe-release/ipe
+        run: python3 tools/scripts/ipe-fmt-check.py
 
   # `ipe-runtime-rust`'s `default = []` leaves `compression`/`csv`/`config`/
   # `tokio` (and every other optional feature) OFF, so the `test` job above

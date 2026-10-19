@@ -10,10 +10,10 @@ import Ipe.Browser.Connectivity as Connectivity
 import Ipe.Browser.MediaQuery as MediaQuery
 import Ipe.Browser.Visibility as Visibility exposing (State(..))
 import Ipe.String as String
+import Ipe.Task as Task
 import Ipe.Tea.Web as Web exposing (tea)
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Ipe.Ui.Font as Font
 
@@ -171,7 +171,8 @@ view model =
 
 row : String -> String -> Element Msg
 row label value =
-    Ui.row [ Ui.spacing 12 ]
+    Ui.row
+        [ Ui.spacing 12 ]
         [ Ui.el [ Font.bold ] (Ui.text label)
         , Ui.text value
         ]

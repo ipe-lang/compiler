@@ -48,6 +48,11 @@ pub enum CliError {
     /// Command-line or manifest misuse; carries the catalog message saying what
     /// was wrong and how to fix it.
     Usage(text::Message),
+    /// A check ran correctly and its verdict on the user's input is "failed"
+    /// (e.g. `ipe fmt --check` found unformatted files). Carries the catalog
+    /// message with the findings. A verdict is not command misuse, so it exits
+    /// non-zero with the message alone and never the command's `--help` page.
+    CheckFailed(text::Message),
     /// No command, or an unrecognised one: the top-level help is shown and the
     /// process exits non-zero. Distinct from [`Self::Usage`] because it renders
     /// the full sectioned screen (coloured for a terminal) rather than a hint.
@@ -750,6 +755,7 @@ impl CliError {
     pub const fn machine_kind(&self) -> &'static str {
         match self {
             Self::Usage(_) | Self::FfiPrep(_) => "usage",
+            Self::CheckFailed(_) => "check-failed",
             Self::UnknownCommand { .. } => "unknown-command",
             Self::Io { .. } => "io",
             Self::ScratchUnavailable { .. } => "scratch-unavailable",
@@ -853,6 +859,7 @@ impl CliError {
             Self::RuntimeVersionMismatch { .. } | Self::BundledManifest { .. } => Internal,
             Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
             Self::Usage(_)
+            | Self::CheckFailed(_)
             | Self::UnknownCommand { .. }
             | Self::Io { .. }
             | Self::ScratchUnavailable { .. }
@@ -982,7 +989,7 @@ impl std::fmt::Display for CliError {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(hint) => f.write_str(hint),
+            Self::Usage(hint) | Self::CheckFailed(hint) => f.write_str(hint),
             Self::UnknownCommand { attempted } => fmt_unknown_command(attempted, f),
             Self::Io { path, source } => fmt_io_error(path, source, f),
             Self::ScratchUnavailable { source } => {

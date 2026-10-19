@@ -9,7 +9,6 @@ package =
     , version = "0.1.0"
     , capabilities =
         { declares = []
-
         -- The `Ipe.Browser.WebAuthn` import discloses `js-port:web-authn`; the
         -- `:raw` floor is also disclosed because the module reaches
         -- `Js.send`/`Js.subscribe`/`Js.request` under the hood. Both must be

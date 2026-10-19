@@ -1,8 +1,8 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
 import Ipe.Path as Path exposing (Path)
 import Ipe.String as String
-import Ipe.Io as Io
 
 
 -- Parse, don't validate, for filesystem paths. `Path` is opaque: the only way to
@@ -11,14 +11,12 @@ import Ipe.Io as Io
 -- it is a clean, in-root path — so every `Ipe.File` entry point takes a `Path`,
 -- never a raw `String`, and an unvalidated string can never reach a syscall.
 
-
 -- On a parsed `Path`, the accessors are total: `base`, `dir`, `ext`, and
 -- `isAbsolute` each read a component with no re-checking, because the value is
 -- already known clean. A traversal attack or NUL byte fails at `fromString`.
 describe : String -> String
 describe raw =
     case Path.fromString raw of
-
         Ok path ->
             String.join "  "
                 [ Path.toString path
@@ -34,7 +32,6 @@ describe raw =
 ext : Path -> String
 ext path =
     case Path.ext path of
-
         "" ->
             "(none)"
 

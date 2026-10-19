@@ -23,12 +23,14 @@ import Ipe.Tea.Cli.Sub as Sub
 import Ipe.Ui.Cli as Ui
 import Ipe.Ui.Cli exposing (Lines)
 
+
 type Msg
     = Increment
     | Decrement
     | Reset
     | Quit
     | NoOp
+
 
 type alias Model =
     { count : Int }
@@ -42,7 +44,6 @@ init _ =
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-
         Increment ->
             ( { model | count = model.count + 1 }, Cmd.none )
 
@@ -72,7 +73,6 @@ subscriptions _ =
 onLine : String -> Msg
 onLine line =
     case String.trim line of
-
         "+" ->
             Increment
 

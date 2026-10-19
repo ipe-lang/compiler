@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.Random.Generator as Gen
-import Ipe.List as List
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Random.Generator as Gen
+import Ipe.String as String
 
 
 -- Roll a reproducible character sheet, exercising the three ideas most
@@ -44,7 +44,8 @@ rollSheet : Gen.Seed -> Sheet
 rollSheet seed0 =
     let
         ( abilities, seed1 ) =
-            Gen.map3 (\s d w -> { strength = s, dexterity = d, wisdom = w })
+            Gen.map3
+                (\s d w -> { strength = s, dexterity = d, wisdom = w })
                 ability
                 ability
                 ability

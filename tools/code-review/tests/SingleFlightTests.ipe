@@ -160,18 +160,12 @@ unitEntriesDuringReadCoalesce settings a b =
         returned =
             after settings [ SelectedViewLoaded ua settings.epoch (Ok (Just a)) ] entered
     in
-    inFlight first
-        == Just ( ua, Nothing )
-        && startedDuring
-        == Nothing
-        && inFlight entered
-        == Just ( ua, Just uc )
-        && pageTag entered
-        == "loading"
-        && inFlight returned
-        == Just ( uc, Nothing )
-        && pageTag returned
-        == "loading"
+    inFlight first == Just ( ua, Nothing )
+        && startedDuring == Nothing
+        && inFlight entered == Just ( ua, Just uc )
+        && pageTag entered == "loading"
+        && inFlight returned == Just ( uc, Nothing )
+        && pageTag returned == "loading"
 
 
 -- The queue card and the unit page read through one slot: a unit page entered
@@ -206,18 +200,12 @@ oneReadSlotAcrossPages settings a b =
         queueLoaded =
             after settings [ PendingLoaded backOnQueue.queueLoad (Ok (queuePageOf [ a, b ])) ] backOnQueue
     in
-    inFlight onUnitPage
-        == Just ( ua, Just ub )
-        && inFlight keysOnUnitPage
-        == Just ( ua, Just ub )
-        && keysOnUnitPage.selected
-        == 0
-        && keysOnUnitPage.decision
-        == DecisionIdle
-        && inFlight unitReading
-        == Just ( ub, Nothing )
-        && inFlight queueLoaded
-        == Just ( ub, Just ua )
+    inFlight onUnitPage == Just ( ua, Just ub )
+        && inFlight keysOnUnitPage == Just ( ua, Just ub )
+        && keysOnUnitPage.selected == 0
+        && keysOnUnitPage.decision == DecisionIdle
+        && inFlight unitReading == Just ( ub, Nothing )
+        && inFlight queueLoaded == Just ( ub, Just ua )
 
 
 -- The unit page shows only a read settled for its own unit: another unit's
@@ -260,22 +248,14 @@ unitPageSettlesOnItsOwnRead settings a b =
         refused =
             after settings [ Navigated (UnitPage "not-a-unit-id") ] ownReturned
     in
-    pageTag waiting
-        == "loading"
-        && pageTag otherReturned
-        == "loading"
-        && inFlight queueLoaded
-        == Just ( ub, Nothing )
-        && pageTag ownReturned
-        == ("loaded " ++ Uid.toString ub)
-        && pageTag lateOther
-        == ("loaded " ++ Uid.toString ub)
-        && pageTag shownElsewhere
-        == "loading"
-        && pageTag missing
-        == "not found"
-        && pageTag refused
-        == "refused"
+    pageTag waiting == "loading"
+        && pageTag otherReturned == "loading"
+        && inFlight queueLoaded == Just ( ub, Nothing )
+        && pageTag ownReturned == ("loaded " ++ Uid.toString ub)
+        && pageTag lateOther == ("loaded " ++ Uid.toString ub)
+        && pageTag shownElsewhere == "loading"
+        && pageTag missing == "not found"
+        && pageTag refused == "refused"
 
 
 -- One decision is in flight per session: a decision asked, by button or key,
@@ -310,26 +290,16 @@ decisionsSingleFlight settings a b =
         lateOther =
             after settings [ App.decisionSaved b.unit.uid settings.epoch (Err (Error.conflict "boom")) ] next
     in
-    Queue.startDecision settings.epoch ua (DecisionSaving ua settings.epoch)
-        == Nothing
-        && saving.decision
-        == DecisionSaving ua settings.epoch
-        && pressedAgain.decision
-        == DecisionSaving ua settings.epoch
-        && refusing.decision
-        == DecisionSaving ua settings.epoch
-        && refusing.refuseError
-        == Just DraftWhileSaving
-        && refusing.refusingUid
-        == Just ua
-        && refusing.refuseDraft
-        == "needs a test"
-        && Queue.notSavedOf settled.decision
-        == Just SaveFailed
-        && next.decision
-        == DecisionSaving ua settings.epoch
-        && lateOther.decision
-        == DecisionSaving ua settings.epoch
+    Queue.startDecision settings.epoch ua (DecisionSaving ua settings.epoch) == Nothing
+        && saving.decision == DecisionSaving ua settings.epoch
+        && pressedAgain.decision == DecisionSaving ua settings.epoch
+        && refusing.decision == DecisionSaving ua settings.epoch
+        && refusing.refuseError == Just DraftWhileSaving
+        && refusing.refusingUid == Just ua
+        && refusing.refuseDraft == "needs a test"
+        && Queue.notSavedOf settled.decision == Just SaveFailed
+        && next.decision == DecisionSaving ua settings.epoch
+        && lateOther.decision == DecisionSaving ua settings.epoch
 
 
 -- A slot left taken by another process, whose completion died with it, is
@@ -374,28 +344,17 @@ foreignDecisionIsIdle settings otherEpoch a b =
         ownEntered =
             after settings [ Navigated QueuePage ] { shown | decision = DecisionRefreshing ub settings.epoch }
     in
-    Queue.startDecision settings.epoch ua (DecisionSaving ub otherEpoch)
-        == Just (DecisionSaving ua settings.epoch)
-        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub otherEpoch)
-        == Just (DecisionSaving ua settings.epoch)
-        && Queue.startDecision settings.epoch ua (DecisionSaving ub settings.epoch)
-        == Nothing
-        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub settings.epoch)
-        == Nothing
-        && entered.decision
-        == DecisionIdle
-        && ownEntered.decision
-        == DecisionRefreshing ub settings.epoch
-        && approved.decision
-        == DecisionSaving ua settings.epoch
-        && refused.decision
-        == DecisionSaving ua settings.epoch
-        && refused.refuseError
-        == Nothing
-        && foreignResult.decision
-        == DecisionSaving ua settings.epoch
-        && Queue.notSavedOf ownResult.decision
-        == Just SaveFailed
+    Queue.startDecision settings.epoch ua (DecisionSaving ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
+        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub otherEpoch) == Just (DecisionSaving ua settings.epoch)
+        && Queue.startDecision settings.epoch ua (DecisionSaving ub settings.epoch) == Nothing
+        && Queue.startDecision settings.epoch ua (DecisionRefreshing ub settings.epoch) == Nothing
+        && entered.decision == DecisionIdle
+        && ownEntered.decision == DecisionRefreshing ub settings.epoch
+        && approved.decision == DecisionSaving ua settings.epoch
+        && refused.decision == DecisionSaving ua settings.epoch
+        && refused.refuseError == Nothing
+        && foreignResult.decision == DecisionSaving ua settings.epoch
+        && Queue.notSavedOf ownResult.decision == Just SaveFailed
 
 
 -- A source read left in flight by another process is `NoneSelected`: a
@@ -440,22 +399,14 @@ foreignReadIsIdle settings otherEpoch a b =
         ownResult =
             after settings [ SelectedViewLoaded ub settings.epoch (Ok (Just b)) ] foreignResult
     in
-    inFlight unitEntered
-        == Just ( ub, Nothing )
-        && inFlight selected
-        == Just ( ub, Nothing )
-        && inFlight queueLoaded
-        == Just ( ua, Nothing )
-        && inFlight historyEntered
-        == Nothing
-        && inFlight ownSelected
-        == Just ( ua, Just ub )
-        && inFlight foreignResult
-        == Just ( ub, Nothing )
-        && inFlight ownResult
-        == Nothing
-        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ub ownResult.selectedView)
-        == Nothing
+    inFlight unitEntered == Just ( ub, Nothing )
+        && inFlight selected == Just ( ub, Nothing )
+        && inFlight queueLoaded == Just ( ua, Nothing )
+        && inFlight historyEntered == Nothing
+        && inFlight ownSelected == Just ( ua, Just ub )
+        && inFlight foreignResult == Just ( ub, Nothing )
+        && inFlight ownResult == Nothing
+        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ub ownResult.selectedView) == Nothing
 
 
 -- A decision asked off the queue page is refused before it takes the slot:
@@ -486,16 +437,11 @@ decisionOffQueueHoldsNoSlot settings a b =
         savingThenOff =
             after settings [ ApproveUnit ua ] { onQueue | page = HistoryPage }
     in
-    Queue.notSavedOf onUnitPage.decision
-        == Just SaveOffQueue
-        && Queue.notSavedOf onHistory.decision
-        == Just SaveOffQueue
-        && onQueue.decision
-        == DecisionSaving ua settings.epoch
-        && backOnQueue.decision
-        == DecisionSaving ua settings.epoch
-        && savingThenOff.decision
-        == DecisionSaving ua settings.epoch
+    Queue.notSavedOf onUnitPage.decision == Just SaveOffQueue
+        && Queue.notSavedOf onHistory.decision == Just SaveOffQueue
+        && onQueue.decision == DecisionSaving ua settings.epoch
+        && backOnQueue.decision == DecisionSaving ua settings.epoch
+        && savingThenOff.decision == DecisionSaving ua settings.epoch
 
 
 -- ── rendered ────────────────────────────────────────────────────────────
@@ -585,23 +531,19 @@ saveFailureRendered settings a b =
         changed =
             after settings [ App.decisionSaved ua settings.epoch (Ok (Err SourceChanged)) ] saving
     in
-    Queue.notSavedOf busy.decision
-        == Just SaveContended
+    Queue.notSavedOf busy.decision == Just SaveContended
         && String.contains "the index or review database is busy; try again" busyPage
         && not (String.contains "Unexpected" busyPage)
         && not (String.contains "[5]" busyPage)
         && not (String.contains (Html.escapeHtml busyText) busyPage)
-        && Queue.notSavedOf other.decision
-        == Just SaveFailed
+        && Queue.notSavedOf other.decision == Just SaveFailed
         && String.contains (Html.escapeHtml (Failure.saveFailureText SaveFailed)) otherPage
         && not (String.contains "Unexpected" otherPage)
         && not (String.contains (Html.escapeHtml otherText) otherPage)
-        && Queue.notSavedOf moved.decision
-        == Just SaveFailed
+        && Queue.notSavedOf moved.decision == Just SaveFailed
         && String.contains (Html.escapeHtml (Failure.saveFailureText SaveFailed)) movedPage
         && not (String.contains (Html.escapeHtml (Error.message LibDb.headMoved)) movedPage)
-        && Queue.notSavedOf changed.decision
-        == Just (SaveRefused SourceChanged)
+        && Queue.notSavedOf changed.decision == Just (SaveRefused SourceChanged)
         && String.contains (Html.escapeHtml (Failure.saveFailureText (SaveRefused SourceChanged))) (page changed)
 
 
@@ -614,8 +556,7 @@ readOnlySaveRefused settings a b =
         refused =
             after { settings | key = ReadOnly } [ ApproveUnit a.unit.uid ] (queueModel [ a, b ] (ViewShown a))
     in
-    Queue.notSavedOf refused.decision
-        == Just SaveReadOnly
+    Queue.notSavedOf refused.decision == Just SaveReadOnly
         && String.contains ReviewKey.readOnlyText (page refused)
 
 
@@ -768,19 +709,14 @@ queueLoadFailureTyped settings a =
         lead =
             "Queue failed to load: "
     in
-    queueFailure busy.queueState
-        == Just LoadContended
+    queueFailure busy.queueState == Just LoadContended
         && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
-        && queueFailure plain.queueState
-        == Just LoadFailed
+        && queueFailure plain.queueState == Just LoadFailed
         && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
-        && queueFailure limit.queueState
-        == Just LoadPastLimit
+        && queueFailure limit.queueState == Just LoadPastLimit
         && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
-        && queueFailure succeeded.queueState
-        == Nothing
-        && Maybe.map SafeText.toString (Queue.queueStatusText succeeded.queueState)
-        == Nothing
+        && queueFailure succeeded.queueState == Nothing
+        && Maybe.map SafeText.toString (Queue.queueStatusText succeeded.queueState) == Nothing
 
 
 -- A History load's failure is a typed case alike, its page the case's fixed
@@ -806,16 +742,12 @@ historyLoadFailureTyped settings =
         lead =
             "History load failed: "
     in
-    historyFailure limit.history
-        == Just LoadPastLimit
+    historyFailure limit.history == Just LoadPastLimit
         && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
-        && historyFailure plain.history
-        == Just LoadFailed
+        && historyFailure plain.history == Just LoadFailed
         && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
-        && historyFailure succeeded.history
-        == Nothing
-        && Maybe.map SafeText.toString (Queue.historyStatusText succeeded.history)
-        == Just "No reviews yet."
+        && historyFailure succeeded.history == Nothing
+        && Maybe.map SafeText.toString (Queue.historyStatusText succeeded.history) == Just "No reviews yet."
 
 
 -- The queue card's source read that fails settles the slot as a typed case,
@@ -845,16 +777,12 @@ viewLoadFailureTyped settings a b =
         lead =
             "Source load failed: "
     in
-    viewFailure plain.selectedView
-        == Just LoadFailed
+    viewFailure plain.selectedView == Just LoadFailed
         && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
-        && viewFailure busy.selectedView
-        == Just LoadContended
+        && viewFailure busy.selectedView == Just LoadContended
         && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
-        && viewFailure succeeded.selectedView
-        == Nothing
-        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ua succeeded.selectedView)
-        == Nothing
+        && viewFailure succeeded.selectedView == Nothing
+        && Maybe.map SafeText.toString (Queue.selectedViewStatusText ua succeeded.selectedView) == Nothing
 
 
 -- The unit page's read that fails shows the case's fixed text. Red if the
@@ -883,16 +811,12 @@ unitLoadFailureTyped settings a =
         lead =
             "Unit load failed: "
     in
-    unitFailure busy
-        == Just LoadContended
+    unitFailure busy == Just LoadContended
         && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
-        && unitFailure limit
-        == Just LoadPastLimit
+        && unitFailure limit == Just LoadPastLimit
         && showsOnly (lead ++ Failure.loadFailureText LoadPastLimit) limit
-        && unitFailure succeeded
-        == Nothing
-        && pageTag succeeded
-        == ("loaded " ++ Uid.toString ua)
+        && unitFailure succeeded == Nothing
+        && pageTag succeeded == ("loaded " ++ Uid.toString ua)
 
 
 -- The unit page's standing read that fails shows the case's fixed text in
@@ -924,14 +848,11 @@ standingLoadFailureTyped settings a =
         lead =
             "Review status read failed: "
     in
-    standingFailure busy.standing
-        == Just LoadContended
+    standingFailure busy.standing == Just LoadContended
         && showsOnly (lead ++ Failure.loadFailureText LoadContended) busy
-        && standingFailure plain.standing
-        == Just LoadFailed
+        && standingFailure plain.standing == Just LoadFailed
         && showsOnly (lead ++ Failure.loadFailureText LoadFailed) plain
-        && standingFailure succeeded.standing
-        == Nothing
+        && standingFailure succeeded.standing == Nothing
         && not (String.contains lead (page succeeded))
 
 
@@ -965,20 +886,14 @@ refuseDraftTyped settings a b =
         kept =
             submit "needs a test"
     in
-    blank.refuseError
-        == Just (DraftRefused ReasonBlank)
-        && blank.decision
-        == DecisionIdle
+    blank.refuseError == Just (DraftRefused ReasonBlank)
+        && blank.decision == DecisionIdle
         && String.contains (Failure.refuseFailureText (DraftRefused ReasonBlank)) (page blank)
-        && overlong.refuseError
-        == Just overlongCase
-        && overlong.decision
-        == DecisionIdle
+        && overlong.refuseError == Just overlongCase
+        && overlong.decision == DecisionIdle
         && String.contains (Failure.refuseFailureText overlongCase) (page overlong)
-        && kept.refuseError
-        == Nothing
-        && kept.decision
-        == DecisionSaving ua settings.epoch
+        && kept.refuseError == Nothing
+        && kept.decision == DecisionSaving ua settings.epoch
 
 
 -- A decision on a unit off the shown queue page is refused as `NotQueued`,
@@ -1004,22 +919,14 @@ decisionRefusedBeforeReading =
         fileBlocking <- App.decisionTask settings macKey (withRefusal blockingRow (queueModel [ a, b ] (ViewShown a))) OnRefusal (uid "r-blocking") LibDb.Approved
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (refusalOf offList
-                == Just NotQueued
-                && refusalOf notShown
-                == Just SourceNotShown
-                && refusalOf fileOffList
-                == Just FileNotQueued
-                && refusalOf fileBlocking
-                == Just FileNotAcknowledgeable
-                && savedRefusal (Failure.saved (Ok fileBlocking))
-                == Just FileNotAcknowledgeable
-                && savedRefusal (Failure.saved (Ok offList))
-                == Just NotQueued
-                && savedRefusal (Failure.saved (Ok notShown))
-                == Just SourceNotShown
+            (refusalOf offList == Just NotQueued
+                && refusalOf notShown == Just SourceNotShown
+                && refusalOf fileOffList == Just FileNotQueued
+                && refusalOf fileBlocking == Just FileNotAcknowledgeable
+                && savedRefusal (Failure.saved (Ok fileBlocking)) == Just FileNotAcknowledgeable
+                && savedRefusal (Failure.saved (Ok offList)) == Just NotQueued
+                && savedRefusal (Failure.saved (Ok notShown)) == Just SourceNotShown
             )
-
 
 
 -- A file the index refuses for a blocking reason, so it carries no digest.
@@ -1046,6 +953,7 @@ withRefusal row model =
 
         Failed _ ->
             model
+
 
 -- The refusal a settled save carries, if it was refused.
 savedRefusal : Result SaveFailure a -> Maybe DecideRefusal
@@ -1135,22 +1043,15 @@ writtenStaysPending settings a b pair =
         writtenPage =
             page written
     in
-    written.decision
-        == DecisionRefreshing ua settings.epoch
-        && pressed.decision
-        == DecisionRefreshing ua settings.epoch
+    written.decision == DecisionRefreshing ua settings.epoch
+        && pressed.decision == DecisionRefreshing ua settings.epoch
         && String.contains "Decision saved; refreshing the queue…" writtenPage
         && not (String.contains ">Approve<" writtenPage)
-        && olderLoad.decision
-        == DecisionRefreshing ua settings.epoch
-        && reloaded.decision
-        == DecisionIdle
-        && reloadFailed.decision
-        == DecisionIdle
-        && superseding.decision
-        == DecisionRefreshing ua settings.epoch
-        && superseded.decision
-        == DecisionIdle
+        && olderLoad.decision == DecisionRefreshing ua settings.epoch
+        && reloaded.decision == DecisionIdle
+        && reloadFailed.decision == DecisionIdle
+        && superseding.decision == DecisionRefreshing ua settings.epoch
+        && superseded.decision == DecisionIdle
 
 
 -- The notice of a decision that was not saved advises a reload, and the
@@ -1178,16 +1079,12 @@ notSavedClearedByReload settings a b =
         banner =
             Html.escapeHtml ("Decision save failed: " ++ Failure.saveFailureText SaveFailed)
     in
-    Queue.notSavedOf failed.decision
-        == Just SaveFailed
+    Queue.notSavedOf failed.decision == Just SaveFailed
         && String.contains banner (page failed)
-        && Queue.notSavedOf reloading.decision
-        == Just SaveFailed
-        && reloaded.decision
-        == DecisionIdle
+        && Queue.notSavedOf reloading.decision == Just SaveFailed
+        && reloaded.decision == DecisionIdle
         && not (String.contains banner (page reloaded))
-        && Queue.notSavedOf reloadFailed.decision
-        == Just SaveFailed
+        && Queue.notSavedOf reloadFailed.decision == Just SaveFailed
 
 
 -- Only a reload started after the failure clears its notice: a queue load
@@ -1220,13 +1117,10 @@ notSavedOutlivesOlderLoad settings a b =
         banner =
             Html.escapeHtml ("Decision save failed: " ++ Failure.saveFailureText SaveFailed)
     in
-    Queue.notSavedOf failed.decision
-        == Just SaveFailed
-        && Queue.notSavedOf olderLoaded.decision
-        == Just SaveFailed
+    Queue.notSavedOf failed.decision == Just SaveFailed
+        && Queue.notSavedOf olderLoaded.decision == Just SaveFailed
         && String.contains banner (page olderLoaded)
-        && reloaded.decision
-        == DecisionIdle
+        && reloaded.decision == DecisionIdle
         && not (String.contains banner (page reloaded))
 
 
@@ -1252,7 +1146,8 @@ writtenChecks =
 
 checks : Task.Task Error (List ( String, Bool ))
 checks =
-    Task.map2 (\seeded refused -> seeded ++ [ refused ])
+    Task.map2
+        (\seeded refused -> seeded ++ [ refused ])
         seededChecks
         (check "a decision off the shown list or source is refused before any read" decisionRefusedBeforeReading)
 

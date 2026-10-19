@@ -26,7 +26,6 @@ import TestSupport exposing (check)
 -- so `refuseError` is not `Error`. Each returns its violations; none is a
 -- pass.
 
-
 -- The modules of `src`, each by its path relative to `src` with its text.
 -- A file past `fileCeiling`, a module past `moduleByteCeiling`, or one that
 -- cannot be read fails the read.
@@ -107,9 +106,7 @@ leadsWith test text =
             False
 
 
-
 -- ── conversion sites ────────────────────────────────────────────────────
-
 
 -- The `Ipe.Error` calls that turn an error into text.
 conversionFunctions : List String
@@ -247,9 +244,7 @@ conversionViolations admitted modules =
         ++ List.map (\site -> "the admitted site " ++ site ++ " holds no conversion") (List.filter (\site -> not (List.member site found)) admitted)
 
 
-
 -- ── the types a page holds ──────────────────────────────────────────────
-
 
 -- The stdlib types that hold no `Error` unless given one as a parameter,
 -- which the token check sees.
@@ -719,7 +714,6 @@ scanViolations modules =
     conversionViolations admittedConversions modules ++ reachViolationsOf modules ++ viewImportViolations modules
 
 
-
 -- ── the real tree ───────────────────────────────────────────────────────
 --
 -- The tree holds no violation, and each way around a scan is one: a new
@@ -790,7 +784,6 @@ prependTo rel extra sources =
         sources
 
 
-
 -- ── scanner self-tests ──────────────────────────────────────────────────
 
 
@@ -851,16 +844,11 @@ chainedModel depth =
 -- substrings or a site's name.
 conversionScanRefuses : Bool
 conversionScanRefuses =
-    conversionSitesIn "Lib/Queue.ipe" "show e =\n    Error.toString e\n\n\nlabel =\n    errorToStringLabel refuseError\n"
-        == [ "Lib/Queue.ipe:show" ]
-        && conversionViolations [ "Lib/Queue.ipe:show" ] [ indexModule ( "Lib/Queue.ipe", "show e =\n    Error.toString e\n" ) ]
-        == []
-        && List.length (conversionViolations [ "Lib/Queue.ipe:show" ] [ indexModule ( "Lib/Queue.ipe", "other e =\n    Error.toString e\n" ) ])
-        == 2
-        && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) ""))
-        == Nothing
-        && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling ""))
-        /= Nothing
+    conversionSitesIn "Lib/Queue.ipe" "show e =\n    Error.toString e\n\n\nlabel =\n    errorToStringLabel refuseError\n" == [ "Lib/Queue.ipe:show" ]
+        && conversionViolations [ "Lib/Queue.ipe:show" ] [ indexModule ( "Lib/Queue.ipe", "show e =\n    Error.toString e\n" ) ] == []
+        && List.length (conversionViolations [ "Lib/Queue.ipe:show" ] [ indexModule ( "Lib/Queue.ipe", "other e =\n    Error.toString e\n" ) ]) == 2
+        && Result.toMaybe (withinFileCeiling (List.repeat (fileCeiling + 1) "")) == Nothing
+        && Result.toMaybe (withinFileCeiling (List.repeat fileCeiling "")) /= Nothing
 
 
 checks : Task.Task Error (List ( String, Bool ))
