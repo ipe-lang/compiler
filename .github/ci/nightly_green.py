@@ -128,7 +128,20 @@ PRODUCERS: tuple[Producer, ...] = (
                 "linux-arm64-tier2 (fifth platform — fail-closed refuse-to-certify proof)",
             }
         ),
-        non_blocking=frozenset({"cancel-on-cheap-red"}),
+        non_blocking=frozenset(
+            {
+                "cancel-on-cheap-red",
+                "cancel-on-test-red-windows-test",
+                "cancel-on-test-red-wasi-run",
+                "cancel-on-test-red-test-run",
+                "cancel-on-test-red-e2e",
+                "cancel-on-test-red-runtime-full-features-run",
+                "cancel-on-test-red-runtime-feature-combos-run",
+                "cancel-on-test-red-seal-modset-vendored",
+                "cancel-on-test-red-linux-x64-tier2",
+                "cancel-on-test-red-release-targets-run",
+            }
+        ),
     ),
     Producer(
         workflow="ruleset-admin-read.yml",

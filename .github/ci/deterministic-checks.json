@@ -11,7 +11,25 @@
     "input, same result, every attempt.",
     "Consumer: ci.yml `cancel-on-cheap-red` (its `needs:` is exactly these jobs;",
     "it cancels only on a matched pair). ci/verify-manifest.py validates shape,",
-    "the needs: set, and every step name against ci.yml."
+    "the needs: set, and every step name against ci.yml.",
+    "test_watchers = the heavy tests-phase producers (ci.yml job ids) a",
+    "merge-group fail-fast watcher follows: one `cancel-on-test-red-<id>` job",
+    "per producer, which cancels a merge-group run only when",
+    "`rerun_policy.py --proven-test-red` proves a failed leg of that producer",
+    "is a test that ran and failed with no infrastructure signature.",
+    "ci/verify-manifest.py generates each watcher's exact job from this list",
+    "and refuses any watcher job that differs or is not listed."
+  ],
+  "test_watchers": [
+    "windows-test",
+    "wasi-run",
+    "test-run",
+    "e2e",
+    "runtime-full-features-run",
+    "runtime-feature-combos-run",
+    "seal-modset-vendored",
+    "linux-x64-tier2",
+    "release-targets-run"
   ],
   "checks": [
     {"context": "artifact-guard", "step": "Reject committed build artifacts"},

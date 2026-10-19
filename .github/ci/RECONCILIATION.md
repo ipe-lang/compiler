@@ -28,9 +28,11 @@ The live ruleset is `main-protection` (`RULESET_ID` in
 key the API returns is examined and pinned or named as display metadata, and
 any other key, rule type, or rule parameter is refused. It must be an active
 branch ruleset on `~DEFAULT_BRANCH` with no exclusions, carrying `deletion`,
-`non_fast_forward`, `pull_request`, `merge_queue` (grouping `ALLGREEN`), and
-`required_status_checks` once each,
-the last with pairs equal to the derived set in both directions.
+`non_fast_forward`, `pull_request`, `merge_queue`, and
+`required_status_checks` once each: the pull-request rule and the queue with
+every setting equal to `PULL_REQUEST` and `MERGE_QUEUE` in
+`check_required_set.py`, the last with pairs equal to the
+derived set in both directions.
 `current_user_can_bypass`, when returned, must be `never`.
 
 GitHub returns `bypass_actors` only to a ruleset admin, and the workflow token
@@ -101,6 +103,53 @@ policy stays off because the `ALLGREEN` merge queue already runs the required
 checks on the combined tree of each queued change, which is the property the
 strict policy would buy; the queue's grouping is pinned for that reason.
 
+## The pull-request and merge-queue settings
+
+`MERGE_QUEUE` in `check_required_set.py` pins all seven parameters of the
+ruleset's `merge_queue` rule, each with its reason. The parse refuses a live
+queue with a parameter missing, an unknown one, a different JSON type, or a
+different value, so `--fetch`, `--fetch-admin` and `--live` all turn red on a
+queue setting changed by hand. The rule's `parameters` in the PUT body are
+exactly this block (`test_check_required_set.py` proves it equals
+`MERGE_QUEUE`):
+
+```json
+{
+  "merge_method": "SQUASH",
+  "max_entries_to_build": 2,
+  "min_entries_to_merge": 1,
+  "max_entries_to_merge": 2,
+  "min_entries_to_merge_wait_minutes": 5,
+  "grouping_strategy": "ALLGREEN",
+  "check_response_timeout_minutes": 120
+}
+```
+
+`PULL_REQUEST` pins the `pull_request` rule's nine parameters the same way, so
+a review protection switched off by hand (thread resolution, stale-review
+dismissal) is refused rather than passing typed. Its `parameters` in the PUT
+body are exactly this block:
+
+```json
+{
+  "required_approving_review_count": 0,
+  "dismiss_stale_reviews_on_push": true,
+  "required_reviewers": [],
+  "require_code_owner_review": false,
+  "dismissal_restriction": {"enabled": false, "allowed_actors": []},
+  "require_last_push_approval": false,
+  "required_review_thread_resolution": true,
+  "require_extra_approval_for_unattributed_changes": true,
+  "allowed_merge_methods": ["merge", "squash", "rebase"]
+}
+```
+
+To change a setting, edit its table (`PINNED_RULES` names both) and its block
+in one change; once it merges, the owner applies it with the `PUT` of step 3
+below, whose `--render-put` sets each pinned rule's parameters to its table as
+it sets the required pairs to `required-set.json`. Until the `PUT`,
+`ruleset-drift` is red.
+
 ## Changing the required set
 
 1. Change the entry's disposition in `ci/check-manifest.yml`.
@@ -118,8 +167,9 @@ strict policy would buy; the queue's grouping is pinned for that reason.
    python3 .github/ci/check_required_set.py --live <(gh api "repos/$repo/rulesets/$id")
    ```
 
-   `--render-put` refuses a live body the closed `Ruleset` parse refuses (an
-   unexamined key, rule or parameter, a bypass actor) and a
+   `--render-put` sets the pinned rules' settings to `PINNED_RULES`, then
+   refuses a live body the closed `Ruleset` parse refuses (an unexamined key,
+   rule or parameter, a bypass actor) and a
    `required-set.json` that differs from the manifest, printing nothing; it
    prints the body only once that body, re-parsed, requires exactly
    `required-set.json`. Review `/tmp/rs-new.json` before the `PUT`: it

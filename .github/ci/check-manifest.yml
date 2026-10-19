@@ -142,6 +142,7 @@ checks:
         - python3 .github/ci/test_local_gate.py -v
         - python3 .github/ci/test_cargo_invocation.py -v
         - python3 .github/ci/test_claims_table.py -v
+        - python3 .github/ci/test_check_required_set.py -v
         - python3 .github/ci/check_required_set.py
   - context: manifest-lock-consistency
     disposition: gate
@@ -341,6 +342,75 @@ checks:
       PR-only watcher that cancels a run once a deterministic cheap gate is
       red at its check step, so the heavy tier stops consuming runners; see the comment above
       the job in ci.yml.
+
+  # ── Merge-group test watchers — informational (never a merge gate) ────────
+  # One per `test_watchers` producer in `ci/deterministic-checks.json`;
+  # SKIPPED unless a need is red on a merge-group run, so none may be a
+  # `gate`. `ci/verify-manifest.py` generates each job's exact shape from that
+  # list and refuses a missing, unlisted or reshaped one.
+  - context: cancel-on-test-red-windows-test
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed windows-test leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-wasi-run
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed wasi-run leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-test-run
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed test-run leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-e2e
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed e2e leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-runtime-full-features-run
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed runtime-full-features-run leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-runtime-feature-combos-run
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed runtime-feature-combos-run leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-seal-modset-vendored
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed seal-modset-vendored leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-linux-x64-tier2
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed linux-x64-tier2 leg
+      is proven a test red; see the comment above the watchers in ci.yml.
+  - context: cancel-on-test-red-release-targets-run
+    disposition: informational
+    producer: ci.yml
+    owner: ci
+    note: >-
+      Merge-group-only watcher that cancels the run once a failed release-targets-run leg
+      is proven a test red; see the comment above the watchers in ci.yml.
 
   # ── Trust-root diff (code-owner review of trust-root changes) ─────────────
   - context: trust-root-diff
