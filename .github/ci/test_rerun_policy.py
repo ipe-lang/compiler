@@ -318,6 +318,21 @@ class ProvenTestRedTest(unittest.TestCase):
     def test_marker_tables_pass_and_each_proof_is_a_veto(self) -> None:
         self.assertEqual(rp.proven_marker_errors(rp.PROVEN_TEST_RED_MARKERS, rp.TEST_FAILURE_MARKERS), [])
 
+    def test_a_proven_red_is_never_rerun_even_off_the_veto_table(self) -> None:
+        # A cancel must fall only on a red the rerun policy would never retry:
+        # `scan` makes a proof line a test failure itself, so the pairing
+        # holds even if the proof table outgrows the veto table.
+        saved = rp._PROVEN_RES
+        rp._PROVEN_RES = (*saved, rp.re.compile(r"PROVEN-ONLY"))
+        try:
+            ev = rp.scan([TS + "PROVEN-ONLY x", *ENOSPC_LOG])
+        finally:
+            rp._PROVEN_RES = saved
+        self.assertTrue(ev.test_red)
+        self.assertTrue(ev.test_failure)
+        self.assertFalse(ev.infra_only)
+        self.assertFalse(rp.decide([ev]))
+
     def test_fail_open_proven_tables_refused(self) -> None:
         for table, want in (
             ((), "is empty"),
