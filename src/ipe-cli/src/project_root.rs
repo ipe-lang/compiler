@@ -333,6 +333,12 @@ impl ProjectRoot {
         self.tests.as_ref()
     }
 
+    /// The path of the project's test source directory, whether or not it exists.
+    #[must_use]
+    pub fn test_sources_path(&self) -> PathBuf {
+        self.path().join(TESTS_DIR)
+    }
+
     /// Judge a file argument against this project.
     ///
     /// The project's `package.ipe` names the whole project; a module file

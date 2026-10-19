@@ -4,7 +4,7 @@ use crate::loose_file::LooseFileError;
 #[cfg(not(unix))]
 use crate::output_dir::OutputRefusal;
 use crate::output_dir::{EmitTarget, OwnedDir, OwnedPath, ProjectPaths};
-use crate::project_root::{ProjectRoot, SourceDir};
+use crate::project_root::ProjectRoot;
 use crate::source_snapshot::TestView;
 use crate::{
     BTreeMap, BTreeSet, Diagnostic, Interner, Path, PathBuf, build_plan, cache, contained_path, fs,
@@ -634,9 +634,9 @@ pub fn build_test_into(
     runtime_dir: &Path,
 ) -> Result<EmittedCrate, CliError> {
     let manifest_path = root.path().join(crate::package_manifest::PACKAGE_IPE);
-    let tests_dir = root.path().join(SourceDir::Tests.name());
+    let test_sources = root.test_sources_path();
     let target =
-        out.prove(&ProjectPaths::from_manifest(root.manifest()).with_sources(&tests_dir))?;
+        out.prove(&ProjectPaths::from_manifest(root.manifest()).with_sources(&test_sources))?;
     let options = BuildOptions {
         intent: ipe_backend_rust::BuildIntent::Development,
         ..BuildOptions::from_env()

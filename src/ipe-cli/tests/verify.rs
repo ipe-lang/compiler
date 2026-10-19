@@ -72,7 +72,15 @@ fn unformatted_project_stops_at_the_format_stage() -> TestResult {
 /// and never reaches the build stage.
 #[test]
 fn type_error_project_stops_at_the_type_check_stage() -> TestResult {
-    let (ok, stdout, stderr) = run_ipe(&["verify", &fixture("type_error.ipe").to_string_lossy()])?;
+    let dir = crate::support::scratch_root()
+        .join(format!("ipe_verify_type_error_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("package.ipe"), PACKAGE_IPE)?;
+    std::fs::copy(fixture("type_error.ipe"), dir.join("src").join("Main.ipe"))?;
+
+    let (ok, stdout, stderr) = run_ipe(&["verify", &dir.to_string_lossy()])?;
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(!ok, "a type-erroring project must exit non-zero");
     assert!(
         stdout.contains("format passed") && stdout.contains("type-check failed"),
@@ -133,9 +141,8 @@ fn clean_project_passes_every_stage() -> TestResult {
         crate::support::scratch_root().join(format!("ipe_verify_clean_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     write_project(&dir)?;
-    let src = dir.join("src").join("Main.ipe");
 
-    let (ok, stdout, stderr) = run_ipe(&["verify", &src.to_string_lossy()])?;
+    let (ok, stdout, stderr) = run_ipe(&["verify", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         ok,
@@ -171,10 +178,7 @@ fn project_with_passing_tests_clears_the_test_stage() -> TestResult {
         dir.join("tests").join("Main.ipe"),
     )?;
 
-    let (ok, stdout, stderr) = run_ipe(&[
-        "verify",
-        &dir.join("src").join("Main.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = run_ipe(&["verify", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         ok,
@@ -221,10 +225,7 @@ fn test_stage_resolves_src_modules_from_a_sibling_tests_dir() -> TestResult {
         "module Main exposing (main)\n\nimport Ipe.Test as Test exposing (Test)\nimport Lib.Foo as Foo\n\n\ntests : List Test\ntests =\n    [ Test.test \"library answer\" (\\_ -> Test.equal 42 Foo.answer)\n    ]\n\n\nmain =\n    Test.runMain tests\n",
     )?;
 
-    let (ok, stdout, stderr) = run_ipe(&[
-        "verify",
-        &dir.join("src").join("Main.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = run_ipe(&["verify", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !stderr.contains("IPE-N0020"),
@@ -260,10 +261,7 @@ fn project_with_failing_tests_fails_the_test_stage() -> TestResult {
         dir.join("tests").join("Main.ipe"),
     )?;
 
-    let (ok, stdout, stderr) = run_ipe(&[
-        "verify",
-        &dir.join("src").join("Main.ipe").to_string_lossy(),
-    ])?;
+    let (ok, stdout, stderr) = run_ipe(&["verify", &dir.to_string_lossy()])?;
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !ok,
