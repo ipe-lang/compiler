@@ -12,7 +12,10 @@
  * focus that sits outside the swapped container.
  *
  * The first mount focuses the root's `autofocus` only while the load's own
- * autofocus is still due; a later frame only puts lost focus back. A form's
+ * autofocus is still due. A later frame moves focus only to the `autofocus`
+ * element its render newly shows, and only when it answers this tab's own
+ * event with focus where it was when the event was sent; every other frame
+ * only puts lost focus back. A form's
  * named controls shadow its members, so every member read on a node that may
  * be a form goes through the element prototypes: one test per read proves it.
  *
@@ -20,8 +23,9 @@
  * key press. A key reaches the root's handler only while focus is below the
  * root, so a `keys: j` line proves focus survived the patch. A read no
  * fixture event reaches (the namespace the form's content is parsed in, a
- * script revived inside the form, a full re-render) is driven by calling the
- * client's own function from the page.
+ * script revived inside the form, a full re-render, a frame behind the render
+ * on screen or of another tab) is driven by calling the client's own function
+ * from the page.
  *
  * Runs against the focus-across-patch example. Prerequisites and local run:
  * see geo-clipboard.spec.mjs.
@@ -427,4 +431,180 @@ test("focus-across-patch: a backward selection keeps its direction across a patc
   expect(
     await field.evaluate((el) => [el.selectionStart, el.selectionEnd, el.selectionDirection]),
   ).toEqual([3, 5, "backward"]);
+});
+
+// ── autofocus on appearance ──────────────────────────────────────────────────
+//
+// `F2` opens a panel whose `reason` field carries `autofocus`; the frame that
+// answers the key names the field, so the field takes focus. Every refusal
+// below starts from the same panel: only a render that answers this tab's own
+// event, with focus where it was when the event was sent, moves focus.
+
+/** Put focus on the root by a click on its non-focusable `keys` line. */
+async function focusRoot(page) {
+  await page.click("#keys");
+  await expect.poll(() => focusedId(page)).toBe("root");
+}
+
+/**
+ * Feed the client one patches frame that answers an event this tab records as
+ * sent just now, naming the stamped id of `target` (or the raw `focus`). The
+ * frame steps the render on screen to the next one (`step: "next"`) or
+ * reaches the current render from the one before it (`step: "behind"`); it
+ * names this tab unless `tab` is `"other"`.
+ */
+function feedFrame(page, { step, target, focus, tab, relayed }) {
+  return page.evaluate(
+    ({ step, target, focus, tab, relayed }) => {
+      const parts = __ipeEpochParts(__ipeEpoch);
+      const at = (n) => `${parts.inc}.${n}`;
+      const n = Number(parts.n);
+      const [from, to] = step === "next" ? [__ipeEpoch, at(n + 1)] : [at(n - 1), __ipeEpoch];
+      const tabSeq = __ipeClientSeq + 1000;
+      __ipeNoteSent(tabSeq);
+      const frame = {
+        globalSeq: 0,
+        from,
+        to,
+        patches: [],
+        tab: tab === "other" ? "0".repeat(32) : __ipeTabId,
+        tabSeq,
+        focus: focus ?? document.querySelector(target).getAttribute("ipe-id"),
+      };
+      __ipeLiveFrames.patches(JSON.stringify(frame), relayed === true);
+    },
+    { step, target, focus, tab, relayed },
+  );
+}
+
+/** Move the render on screen one past the first so a frame can be behind it. */
+async function stepOnce(page) {
+  await focusRoot(page);
+  await page.keyboard.press("j");
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+}
+
+test("focus-across-patch: a panel the user's key opens focuses its autofocus field", async ({ page }) => {
+  await open(page);
+  await focusRoot(page);
+  await page.keyboard.press("F2");
+  const field = page.locator("input#reason");
+  await expect(field).toHaveCount(1);
+  await expect(field).toBeFocused();
+  await page.keyboard.type("abc");
+  await expect(field).toHaveValue("abc");
+});
+
+test("focus-across-patch: a reopened panel focuses its autofocus field again", async ({ page }) => {
+  await open(page);
+  await focusRoot(page);
+  await page.keyboard.press("F2");
+  await expect(page.locator("input#reason")).toBeFocused();
+  // The key reaches the root's handler from the field: the panel closes.
+  await page.keyboard.press("F2");
+  await expect(page.locator("input#reason")).toHaveCount(0);
+  await expect.poll(() => focusedId(page)).toBe("root");
+  await page.keyboard.press("F2");
+  await expect(page.locator("input#reason")).toBeFocused();
+});
+
+test("focus-across-patch: typing into an autofocus field never refocuses it", async ({ page }) => {
+  await open(page);
+  await focusRoot(page);
+  await page.keyboard.press("F2");
+  const field = page.locator("input#reason");
+  await expect(field).toBeFocused();
+  await page.keyboard.type("abc");
+  // Let each debounced input event's render land.
+  await page.waitForTimeout(500);
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.type("X");
+  await page.waitForTimeout(500);
+  await expect(field).toBeFocused();
+  await expect(field).toHaveValue("abXc");
+  expect(await field.evaluate((el) => [el.selectionStart, el.selectionEnd])).toEqual([3, 3]);
+});
+
+test("focus-across-patch: a panel another tab opens never moves this tab's focus", async ({ browser }) => {
+  test.setTimeout(60_000);
+  const ctx = await browser.newContext();
+  const here = await ctx.newPage();
+  await open(here);
+  const there = await ctx.newPage();
+  await open(there);
+  await focusRoot(here);
+  await focusRoot(there);
+  await there.keyboard.press("F2");
+  await expect(there.locator("input#reason")).toBeFocused();
+  // The same session renders the panel in both tabs.
+  await expect(here.locator("input#reason")).toHaveCount(1);
+  expect(await focusedId(here)).toBe("root");
+  await ctx.close();
+});
+
+test("focus-across-patch: a field a subscription renders never takes focus", async ({ page }) => {
+  await open(page);
+  await focusRoot(page);
+  // `F4` starts the subscription; its tick, not the key, renders the field.
+  await page.keyboard.press("F4");
+  await expect(page.locator("input#ticked")).toHaveCount(1);
+  await page.waitForTimeout(300);
+  expect(await focusedId(page)).toBe("root");
+});
+
+test("focus-across-patch: focus moved after the key was sent stays where the user put it", async ({ page }) => {
+  await open(page);
+  await focusRoot(page);
+  // Hold the key's event until the user has clicked into another field.
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  let seen;
+  const posted = new Promise((resolve) => {
+    seen = resolve;
+  });
+  await page.route("**/_ipe/event", async (route) => {
+    seen();
+    await held;
+    await route.continue();
+  });
+  await page.keyboard.press("F2");
+  await posted;
+  await page.click("input#note");
+  release();
+  await expect(page.locator("input#reason")).toHaveCount(1);
+  await page.waitForTimeout(300);
+  expect(await focusedId(page)).toBe("note");
+});
+
+test("focus-across-patch: a frame's focus applies only to a next frame of this tab", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await open(page);
+  await stepOnce(page);
+  // A frame behind the render on screen resyncs; it never moves focus.
+  await feedFrame(page, { step: "behind", target: "input#note" });
+  await page.waitForTimeout(300);
+  expect(await focusedId(page)).toBe("root");
+  // A next frame of another tab, relayed or not, never moves focus.
+  await feedFrame(page, { step: "next", target: "input#note", tab: "other" });
+  await feedFrame(page, { step: "next", target: "input#note", tab: "other", relayed: true });
+  expect(await focusedId(page)).toBe("root");
+  // A next frame of this tab names a target that is on screen: it takes focus.
+  await feedFrame(page, { step: "next", target: "input#note" });
+  expect(await focusedId(page)).toBe("note");
+  expect(errors).toEqual([]);
+});
+
+test("focus-across-patch: a focus target no longer on screen is ignored", async ({ page }) => {
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e));
+  await open(page);
+  await focusRoot(page);
+  await feedFrame(page, { step: "next", focus: "r_absent" });
+  // An id outside the stamper alphabet is never looked up.
+  await feedFrame(page, { step: "next", focus: 'r"] , *[x="' });
+  expect(await focusedId(page)).toBe("root");
+  expect(errors).toEqual([]);
 });

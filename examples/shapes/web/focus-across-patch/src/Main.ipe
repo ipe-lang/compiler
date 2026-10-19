@@ -19,6 +19,10 @@ module Main exposing (main)
 -- field whose `name` holds a backslash and a newline; `Escape` puts a row ahead
 -- of it, so the swap finds it again by name. `m` puts a row beside the
 -- focusable MathML element `mfocus`.
+-- `F2` toggles a panel whose `reason` field carries `autofocus`, so the field
+-- takes focus each time the panel opens in answer to the key. `F4` starts a
+-- subscription whose first tick shows a `ticked` field that carries
+-- `autofocus` too, in a render no user action caused.
 -- Clicking `xdeep` replaces its keyed chain with one whose keys absorb the
 -- next id segment, so a node at the same depth carries the same id under a
 -- different chain. `tbutton` (a `button` named `x`) is replaced by an element
@@ -48,6 +52,10 @@ type alias Model =
     , hostRow : Bool
     , formDrop : Bool
     , mathRow : Bool
+    , panel : Bool
+    , reason : String
+    , ticking : Bool
+    , ticked : Bool
     }
 
 
@@ -62,12 +70,14 @@ type Msg
     | TagSwap
     | Grow
     | FormDrop
+    | Reason String
+    | Tick
     | NoOp
 
 
 init : WebReq -> ( Model, Cmd.Cmd Msg )
 init _req =
-    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False }, Cmd.none )
+    ( { keys = "", row = False, drop = True, note = "", swapped = False, pressed = False, deep = False, tagSwapped = False, hostRow = False, formDrop = True, mathRow = False, panel = False, reason = "", ticking = False, ticked = False }, Cmd.none )
 
 
 update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
@@ -79,6 +89,12 @@ update msg model =
 
             else if key == "m" then
                 ( { model | keys = key, mathRow = not model.mathRow }, Cmd.none )
+
+            else if key == "F2" then
+                ( { model | keys = key, panel = not model.panel }, Cmd.none )
+
+            else if key == "F4" then
+                ( { model | keys = key, ticking = True }, Cmd.none )
 
             else
                 ( { model | keys = key }, Cmd.none )
@@ -110,13 +126,23 @@ update msg model =
         FormDrop ->
             ( { model | formDrop = False }, Cmd.none )
 
+        Reason text ->
+            ( { model | reason = text }, Cmd.none )
+
+        Tick ->
+            ( { model | ticking = False, ticked = True }, Cmd.none )
+
         NoOp ->
             ( model, Cmd.none )
 
 
 subscriptions : Model -> Sub.Sub Msg
-subscriptions _model =
-    Sub.none
+subscriptions model =
+    if model.ticking then
+        Sub.every 300 Tick
+
+    else
+        Sub.none
 
 
 panelRow : Model -> List (Ui.Element Msg)
@@ -321,6 +347,38 @@ mathRow model =
         []
 
 
+reasonPanel : Model -> List (Ui.Element Msg)
+reasonPanel model =
+    if model.panel then
+        [ Input.text
+            [ Ui.id "reason", Ui.htmlAttribute "autofocus" "" ]
+            { label = Input.labelHidden "Reason"
+            , text = model.reason
+            , onChange = Reason
+            , placeholder = Nothing
+            }
+        ]
+
+    else
+        []
+
+
+tickedField : Model -> List (Ui.Element Msg)
+tickedField model =
+    if model.ticked then
+        [ Input.text
+            [ Ui.id "ticked", Ui.htmlAttribute "autofocus" "" ]
+            { label = Input.labelHidden "Ticked"
+            , text = ""
+            , onChange = \_ -> NoOp
+            , placeholder = Nothing
+            }
+        ]
+
+    else
+        []
+
+
 view : Model -> Ui.Element Msg
 view model =
     Ui.column
@@ -377,6 +435,7 @@ view model =
                 )
                 :: mathRow model
             )
+        , Ui.column [ Ui.id "reasonhost" ] (reasonPanel model ++ tickedField model)
         ]
 
 
