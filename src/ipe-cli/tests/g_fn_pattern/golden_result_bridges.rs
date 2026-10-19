@@ -1,7 +1,7 @@
 //! The `Result.toMaybe` / `Result.fromMaybe` bridges are CALLABLE from user
 //! code and produce Elm-matching results.
 //!
-//! Exercises both in one program (`tests/golden/result_bridges/Main.ipe`),
+//! Exercises both in one program (`tests/golden/result_bridges/src/Main.ipe`),
 //! building and running the emitted binary and asserting the stdout line — the
 //! SEAL guarantee plus behaviour parity with `elm/core`'s `Result`.
 //!

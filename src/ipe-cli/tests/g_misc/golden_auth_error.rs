@@ -33,8 +33,7 @@ fn auth_error_matches_oracle() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let fixture = crate::src_golden::fixture_of(&dir);
-    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "build failed for {GOLDEN}: {:?}",

@@ -37,11 +37,10 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn entry_path(root: &Path) -> PathBuf {
+fn project_path(root: &Path) -> PathBuf {
     root.join("tests")
         .join("golden")
         .join("db_get_iperow_bound")
-        .join("Main.ipe")
 }
 
 /// ipe-0: the compiler must accept the program AND emit `+ IpeRow` on the
@@ -51,13 +50,13 @@ fn entry_path(root: &Path) -> PathBuf {
 #[test]
 fn i177_ipec_accepts_and_bounds_fn_not_struct() {
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("i177_db_get_iperow_bound_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for db_get_iperow_bound: {:?}",
@@ -105,13 +104,13 @@ fn i177_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let entry = entry_path(&root);
+    let entry = project_path(&root);
     let out = crate::support::scratch_root().join("ipec_i177_db_get_iperow_bound_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for db_get_iperow_bound: {:?}",

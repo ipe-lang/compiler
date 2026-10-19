@@ -28,11 +28,8 @@ fn golden_dir(root: &Path) -> PathBuf {
 #[test]
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join(golden_name())
-        .join("main.rs");
+    let golden_project = root.join("tests").join("golden").join(golden_name());
+    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("money_parse_currency_maybe_emit");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -41,10 +38,7 @@ fn emits_byte_identical_main_rs() {
     let built = crate::support::build_golden(&golden_dir(&root), &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// Full spine: compile → cargo build → run → assert output.

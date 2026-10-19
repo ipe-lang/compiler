@@ -45,17 +45,16 @@ fn move_closure_lines(src: &str) -> String {
 #[test]
 fn server_handler_lambda_boxes_with_arc_not_box() {
     let root = repo_root();
-    let entry = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("server_request_accessors")
-        .join("Main.ipe");
+        .join("server_request_accessors");
     let out = crate::support::scratch_root().join("ipec_l0114_server_handler_arc");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for the server-handler fixture: {:?}",
@@ -96,17 +95,13 @@ fn ws_onerror_lines(src: &str) -> String {
 #[test]
 fn ws_on_error_callback_boxes_with_arc_not_box() {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join("ws_onerror")
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join("ws_onerror");
     let out = crate::support::scratch_root().join("ipec_l0114_ws_onerror_arc");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for the WS onError fixture: {:?}",

@@ -26,12 +26,12 @@ fn golden_dir(root: &Path) -> PathBuf {
 #[test]
 fn db_store_select_pipe_builds() {
     let root = repo_root();
-    let entry = golden_dir(&root).join("Main.ipe");
+    let golden_project = golden_dir(&root);
     let out = crate::support::scratch_root().join("ipec_db_store_select_pipe_build");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "every call form of `Store.selectToList` / `Store.selectToMaybe` with a \
@@ -50,12 +50,11 @@ fn db_store_select_pipe_runs() {
     }
     let root = repo_root();
     let dir = golden_dir(&root);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_db_store_select_pipe_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "build failed for {GOLDEN}: {:?}",

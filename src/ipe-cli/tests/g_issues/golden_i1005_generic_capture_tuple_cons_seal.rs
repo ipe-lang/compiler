@@ -32,11 +32,8 @@ fn fixture_dir(root: &Path) -> PathBuf {
 fn generic_capture_tuple_cons_emits_byte_identical() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("main.rs");
+    let golden_project = root.join("tests").join("golden").join(GOLDEN);
+    let golden = golden_project.join("main.rs");
     let out = crate::support::scratch_root().join("ipec_i1005_generic_capture_tuple_cons_emit");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -49,10 +46,7 @@ fn generic_capture_tuple_cons_emits_byte_identical() {
          got: {built:?}"
     );
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// THE SEAL: under `IPE_E2E=1`, actually `cargo build` the emitted crate.

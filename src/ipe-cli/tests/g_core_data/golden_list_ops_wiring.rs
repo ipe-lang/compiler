@@ -35,18 +35,18 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe` into an emitted Rust project and
+/// Compile `tests/golden/<name>/src/Main.ipe` into an emitted Rust project and
 /// return its directory. Fails the test loudly on a compile error (so the
 /// IPE-L0108/N0005 regression, were it to return, fails here rather than
 /// silently skipping).
 fn compile_golden(name: &str) -> PathBuf {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
+    let golden_project = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
     out
 }

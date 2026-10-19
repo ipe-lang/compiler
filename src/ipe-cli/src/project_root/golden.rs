@@ -7,20 +7,17 @@
 use std::path::Path;
 
 use crate::package_manifest::PACKAGE_IPE;
-use crate::project::IPE_TOML;
-use crate::{BuildOptions, CliError, build_project_with_options, build_with_options};
-
-/// The module a golden without a manifest builds.
-const SINGLE_FILE_ENTRY: &str = "Main.ipe";
+use crate::{BuildOptions, CliError, build_project_with_options};
 
 /// Build the golden directory `dir` into `out`, vendoring the runtime from `runtime`.
 ///
-/// A golden with a `package.ipe` or `ipe.toml` is a project; any other golden
-/// is the single file `Main.ipe`.
+/// A golden is a project: `dir` holds a `package.ipe` and its modules under
+/// `src/`. A directory without a `package.ipe` is refused, never built from
+/// whatever sources sit beside it.
 ///
 /// # Errors
-/// As [`crate::build_project_with_options`] for a project and
-/// [`crate::build_with_options`] for a single file.
+/// [`CliError::NoManifest`] when `dir` holds no `package.ipe`; otherwise as
+/// [`crate::build_project_with_options`].
 pub fn build_golden_dir(
     dir: &Path,
     out: &Path,
@@ -28,14 +25,12 @@ pub fn build_golden_dir(
     options: &BuildOptions,
 ) -> Result<(), CliError> {
     let package_ipe = dir.join(PACKAGE_IPE);
-    let ipe_toml = dir.join(IPE_TOML);
-    if package_ipe.is_file() {
-        build_project_with_options(&package_ipe, out, runtime, options)
-    } else if ipe_toml.is_file() {
-        build_project_with_options(&ipe_toml, out, runtime, options)
-    } else {
-        build_with_options(&dir.join(SINGLE_FILE_ENTRY), out, runtime, options.clone())
+    if !package_ipe.is_file() {
+        return Err(CliError::NoManifest {
+            dir: dir.to_path_buf(),
+        });
     }
+    build_project_with_options(&package_ipe, out, runtime, options)
 }
 
 #[cfg(test)]
@@ -50,55 +45,50 @@ mod tests {
     const TEST_SUPPORT: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/mod.rs"));
 
+    const MODULE: &str = "module Main exposing (main)\n\nmain =\n    1\n";
+
+    /// A directory holding only `Main.ipe` is no golden: it is refused with the
+    /// no-manifest text and nothing is emitted. The same sources as a project
+    /// build.
     #[test]
-    fn a_directory_with_no_entry_is_refused() {
-        let scratch =
-            RootFixture::main("module Main exposing (main)\n\nmain =\n    1\n").expect("fixture");
-        let empty = scratch.path().join("empty");
-        std::fs::create_dir_all(&empty).expect("dir");
-        let out = scratch.path().join("out");
-        let result = build_golden_dir(&empty, &out, scratch.path(), &BuildOptions::default());
-        assert!(result.is_err());
-        assert!(!out.join("src").join("main.rs").exists());
+    fn a_directory_without_package_ipe_is_refused_and_emits_nothing() {
+        let scratch = RootFixture::main(MODULE).expect("fixture");
+        let runtime = e2e_support::require_runtime().into_path_buf();
+
+        let loose = scratch.path().join("loose");
+        std::fs::create_dir_all(&loose).expect("dir");
+        std::fs::write(loose.join("Main.ipe"), MODULE).expect("Main.ipe");
+        let out = scratch.path().join("out-loose");
+        let err = build_golden_dir(&loose, &out, &runtime, &BuildOptions::default())
+            .expect_err("a manifestless directory is not a golden");
+        assert!(matches!(&err, CliError::NoManifest { dir } if *dir == loose));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "error[IPE-E0004]: no package.ipe at {}; run `ipe init` there",
+                loose.display()
+            )
+        );
+        assert!(!out.exists(), "a refused golden must emit nothing");
+
+        let project = scratch.path().join("project");
+        std::fs::create_dir_all(project.join("src")).expect("dir");
+        std::fs::write(project.join("src").join("Main.ipe"), MODULE).expect("Main.ipe");
+        std::fs::write(
+            project.join(PACKAGE_IPE),
+            "module Package exposing (package)\n\nimport Ipe.Package exposing (..)\n\n\npackage : Package\npackage =\n    { name = \"loose-neighbour\"\n    }\n",
+        )
+        .expect("package.ipe");
+        let built = scratch.path().join("out-project");
+        build_golden_dir(&project, &built, &runtime, &BuildOptions::default())
+            .expect("the same sources as a project build");
+        assert!(built.join("src").join("main.rs").is_file());
     }
 
-    /// Every checked-in golden that carries an emitted `main.rs` is a project.
+    /// Every checked-in golden directory is a project: a regular `package.ipe`
+    /// and a `src/` directory.
     #[test]
-    fn every_emitted_golden_directory_has_a_manifest() {
-        let goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("tests")
-            .join("golden");
-        let entries = std::fs::read_dir(&goldens).expect("read tests/golden");
-        let mut emitted = 0_usize;
-        let mut offenders = Vec::new();
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.join("main.rs").is_file() {
-                continue;
-            }
-            emitted += 1;
-            if !dir.join(PACKAGE_IPE).is_file() && !dir.join(IPE_TOML).is_file() {
-                offenders.push(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-        assert!(
-            emitted > 100,
-            "found only {emitted} emitted golden directories under {}: the scan is not reading the golden tree",
-            goldens.display()
-        );
-        offenders.sort();
-        assert!(
-            offenders.is_empty(),
-            "emitted golden directories with no manifest: {offenders:?}"
-        );
-    }
-
-    /// A golden with a `package.ipe` is built from its `src/` root; one without
-    /// that root is refused by the build, so no checked-in golden may be one.
-    #[test]
-    fn every_golden_manifest_has_a_source_root() {
+    fn every_golden_directory_is_a_project() {
         let goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -113,19 +103,21 @@ mod tests {
                 continue;
             }
             scanned += 1;
-            if dir.join(PACKAGE_IPE).is_file() && !dir.join("src").is_dir() {
+            let manifest = std::fs::symlink_metadata(dir.join(PACKAGE_IPE));
+            let sources = std::fs::symlink_metadata(dir.join("src"));
+            if !manifest.is_ok_and(|m| m.is_file()) || !sources.is_ok_and(|m| m.is_dir()) {
                 offenders.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
         assert!(
-            scanned > 100,
+            scanned > 700,
             "scanned only {scanned} golden directories under {}: the scan is not reading the golden tree",
             goldens.display()
         );
         offenders.sort();
         assert!(
             offenders.is_empty(),
-            "golden directories with a `package.ipe` and no `src/` root: {offenders:?}"
+            "golden directories that are not a project (a regular `package.ipe` and a `src/` directory): {offenders:?}"
         );
     }
 

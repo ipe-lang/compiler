@@ -116,7 +116,7 @@ fn golden_dir(dir: &str) -> PathBuf {
 }
 
 fn golden_entry(dir: &str) -> PathBuf {
-    golden_dir(dir).join("Main.ipe")
+    golden_dir(dir).join("src").join("Main.ipe")
 }
 
 /// Lower the frontier fixture into `out`, asserting `ipe` accepts it.

@@ -4,9 +4,6 @@
 
 mod support;
 
-#[path = "g_misc/src_golden.rs"]
-mod src_golden;
-
 #[path = "g_http_live/golden_http_builders_redirects.rs"]
 mod golden_http_builders_redirects;
 #[path = "g_http_live/golden_http_request_name_only_fold_seal.rs"]

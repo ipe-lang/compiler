@@ -195,16 +195,12 @@ fn repo_root() -> PathBuf {
 /// Returns
 fn run_ipec(fixture: &str, out_suffix: &str) -> Result<(), CliError> {
     let root = repo_root();
-    let entry = root
-        .join("tests")
-        .join("golden")
-        .join(fixture)
-        .join("Main.ipe");
+    let golden_project = root.join("tests").join("golden").join(fixture);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_suffix);
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime)
+    crate::support::build_golden(&golden_project, &out, &runtime)
 }
 
 /// R1: Routed Model (`page : Page`), `routes = []`, `notFound = 5` (Int).
@@ -356,17 +352,15 @@ fn non_routed_live_app_compiles() {
 /// constructor has no route), never an app whose pages have no address.
 #[test]
 fn routed_empty_routes_is_refused() {
-    let entry = repo_root()
+    let golden_project = repo_root()
         .join("tests")
         .join("golden")
-        .join("live_routed_empty_routes_refused")
-        .join("Main.ipe");
+        .join("live_routed_empty_routes_refused");
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m7_live_routed_empty_routes_refused");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let result =
-        crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let result = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         matches!(&result, Err(CliError::Pipeline { diag, .. }) if diag.code().as_str() == "IPE-L0159"),
         "a routed app with an empty table must be refused with IPE-L0159, got: {result:?}",

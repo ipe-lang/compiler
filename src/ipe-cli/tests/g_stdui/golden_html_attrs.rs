@@ -1,6 +1,6 @@
 //! Ipe.Html.Attributes family end-to-end golden.
 //!
-//! Compiles `tests/golden/html_attrs/Main.ipe` through `ipe`, builds the
+//! Compiles `tests/golden/html_attrs/src/Main.ipe` through `ipe`, builds the
 //! emitted Rust project with the shared cargo target, runs the binary, and
 //! asserts on the rendered HTML. Gated on `IPE_E2E=1`.
 //!
@@ -33,12 +33,11 @@ fn html_attributes_family_renders_and_escapes() {
 
     let root = repo_root();
     let dir = root.join("tests").join("golden").join("html_attrs");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_m7_html_attrs_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for html_attrs: {:?}",

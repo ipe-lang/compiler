@@ -26,23 +26,16 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn golden_entry(root: &Path, name: &str) -> PathBuf {
-    root.join("tests")
-        .join("golden")
-        .join(name)
-        .join("Main.ipe")
+fn golden_project_dir(root: &Path, name: &str) -> PathBuf {
+    root.join("tests").join("golden").join(name)
 }
 
 fn try_build(entry: &Path) -> Result<PathBuf, ipe::CliError> {
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(
-        entry
-            .parent()
-            .and_then(|p| p.file_name())
-            .unwrap_or_default(),
-    );
+    let out =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(entry.file_name().unwrap_or_default());
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    crate::support::build_golden(crate::support::golden_dir_of(entry), &out, &runtime)?;
+    crate::support::build_golden(entry, &out, &runtime)?;
     Ok(out)
 }
 
@@ -54,11 +47,11 @@ fn try_build(entry: &Path) -> Result<PathBuf, ipe::CliError> {
 #[test]
 fn errortostring_polymorphic_compiles() {
     let root = repo_root();
-    let entry = golden_entry(&root, "m_ipe_test_stringify");
+    let entry = golden_project_dir(&root, "m_ipe_test_stringify");
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m_ipe_test_stringify");
     let _ = std::fs::remove_dir_all(&out);
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "errorToString polymorphic / Eq+Stringify multi-bound must compile: {:?}",
@@ -73,11 +66,11 @@ fn errortostring_polymorphic_e2e() {
         return;
     }
     let root = repo_root();
-    let entry = golden_entry(&root, "m_ipe_test_stringify");
+    let entry = golden_project_dir(&root, "m_ipe_test_stringify");
     let out = crate::support::scratch_root().join("ipec_m_ipe_test_stringify_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(built.is_ok(), "must compile: {:?}", built.err());
     let outcome = crate::support::build_and_run_emitted("m_ipe_test_stringify", &out);
     assert_eq!(outcome.exit_code, Some(0));
@@ -88,11 +81,11 @@ fn errortostring_polymorphic_e2e() {
 #[test]
 fn eqshow_eq_plus_stringify_compiles() {
     let root = repo_root();
-    let entry = golden_entry(&root, "m_errortostring_eqshow");
+    let entry = golden_project_dir(&root, "m_errortostring_eqshow");
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("m_errortostring_eqshow");
     let _ = std::fs::remove_dir_all(&out);
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(
         built.is_ok(),
         "Eq+Stringify multi-bound on annotation var must compile: {:?}",
@@ -107,11 +100,11 @@ fn eqshow_e2e() {
         return;
     }
     let root = repo_root();
-    let entry = golden_entry(&root, "m_errortostring_eqshow");
+    let entry = golden_project_dir(&root, "m_errortostring_eqshow");
     let out = crate::support::scratch_root().join("ipec_m_errortostring_eqshow_e2e");
     let _ = std::fs::remove_dir_all(&out);
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&entry, &out, &runtime);
     assert!(built.is_ok(), "must compile: {:?}", built.err());
     let outcome = crate::support::build_and_run_emitted("m_errortostring_eqshow", &out);
     assert_eq!(outcome.exit_code, Some(0));
@@ -126,7 +119,7 @@ fn eqshow_e2e() {
 #[test]
 fn errortostring_on_function_rejected_at_typecheck() {
     let root = repo_root();
-    let entry = golden_entry(&root, "m_errortostring_fn_gate");
+    let entry = golden_project_dir(&root, "m_errortostring_fn_gate");
     let res = try_build(&entry);
     assert!(
         res.is_err(),
@@ -144,7 +137,7 @@ fn annotation_rigid_plus_literal_still_fails() {
     // (Number-bound) at Bool → T0014; the annotation-rigid+literal case
     // (`f : a -> a; f x = x + 1` → T0001) is separately exercised via a
     // transient fixture here.
-    let entry = golden_entry(&root, "gate_unsatisfied");
+    let entry = golden_project_dir(&root, "gate_unsatisfied");
     let res = try_build(&entry);
     assert!(
         res.is_err(),

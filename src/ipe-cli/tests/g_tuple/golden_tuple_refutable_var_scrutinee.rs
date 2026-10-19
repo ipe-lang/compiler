@@ -38,12 +38,11 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-fn fixture_entry() -> PathBuf {
+fn fixture_project() -> PathBuf {
     repo_root()
         .join("tests")
         .join("golden")
         .join("i_tuple_refutable_var_scrutinee")
-        .join("Main.ipe")
 }
 
 /// Fast gate: a non-literal tuple scrutinee with list / cons columns builds
@@ -54,11 +53,7 @@ fn refutable_var_scrutinee_builds() {
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(
-        crate::support::golden_dir_of(&fixture_entry()),
-        &out,
-        &runtime,
-    );
+    let built = crate::support::build_golden(&fixture_project(), &out, &runtime);
     assert!(
         built.is_ok(),
         "non-literal-scrutinee tuple `case` with list column must build (IPE-L0115 close); \
@@ -81,11 +76,7 @@ fn refutable_var_scrutinee_cargo_builds_and_runs() {
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(
-        crate::support::golden_dir_of(&fixture_entry()),
-        &out,
-        &runtime,
-    );
+    let built = crate::support::build_golden(&fixture_project(), &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for i_tuple_refutable_var_scrutinee: {:?}",

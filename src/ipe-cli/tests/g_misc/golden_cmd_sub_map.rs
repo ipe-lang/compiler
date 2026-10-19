@@ -2,7 +2,7 @@
 //!
 //! A child sub-component's `Cmd ChildMsg` / `Sub ChildMsg` are folded into a
 //! parent `Cli.tea` via `Cmd.map` / `Sub.map`, retagging them into the
-//! parent's `Msg` (`tests/golden/cmd_sub_map/Main.ipe`). This pins ipe-0 ∧
+//! parent's `Msg` (`tests/golden/cmd_sub_map/src/Main.ipe`). This pins ipe-0 ∧
 //! cargo-0 ∧ run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs) and
 //! that the emitted main routes through the Cli runtime entry. The runtime
 //! unit tests (`ipe_runtime::tea::map_tests`) cover the retagging semantics.

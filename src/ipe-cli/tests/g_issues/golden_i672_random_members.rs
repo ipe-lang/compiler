@@ -6,7 +6,7 @@
 //! `Ffi.kernel "Random_*"` aliases to the registered `Random*` kernels, and the
 //! seeded tier (`seed`/`seededInt`/`seededFloat`/`seededChoice` over the opaque
 //! `Seed`) is pure Ipê over the seeded raw kernels
-//! (`tests/golden/random_members/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧ run-0
+//! (`tests/golden/random_members/src/Main.ipe`). This pins ipe-0 ∧ cargo-0 ∧ run-0
 //! (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs): the entropy tier is
 //! drawn through `Cmd.perform` and the seeded tier is asserted reproducible
 //! (two draws from one `Seed` agree), so the rendered line is stable.

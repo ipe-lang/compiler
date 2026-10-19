@@ -46,7 +46,7 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Compile / build / run `tests/golden/stdui_oninput_closure/Main.ipe` and
+/// Compile / build / run `tests/golden/stdui_oninput_closure/src/Main.ipe` and
 /// return the golden directory together with the run outcome.  Gated on `IPE_E2E=1`.
 fn build_run_oninput_closure() -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
@@ -54,12 +54,11 @@ fn build_run_oninput_closure() -> (PathBuf, crate::support::RunOutcome) {
         .join("tests")
         .join("golden")
         .join("stdui_oninput_closure");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_m7_stdui_oninput_closure_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for stdui_oninput_closure: {:?}",

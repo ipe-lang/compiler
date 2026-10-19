@@ -35,11 +35,11 @@ fn example_dir(root: &Path) -> PathBuf {
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
     let dir = example_dir(&root);
-    let golden = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("body_local_generic_record")
-        .join("main.rs");
+        .join("body_local_generic_record");
+    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("body_local_generic_record_emit");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -48,10 +48,7 @@ fn emits_byte_identical_main_rs() {
     let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed: {:?}", built.err());
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// Full spine: compile, build the emitted Cargo project, run it, and assert the

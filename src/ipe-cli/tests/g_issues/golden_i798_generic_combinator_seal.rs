@@ -45,11 +45,8 @@ fn fixture_dir(root: &Path) -> PathBuf {
 fn generic_combinator_emits_byte_identical() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join(GOLDEN)
-        .join("main.rs");
+    let golden_project = root.join("tests").join("golden").join(GOLDEN);
+    let golden = golden_project.join("main.rs");
     let out = crate::support::scratch_root().join("ipec_i798_generic_combinator_emit");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -63,10 +60,7 @@ fn generic_combinator_emits_byte_identical() {
          read is demoted onto the `Box<dyn Fn>` carrier), got: {built:?}"
     );
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// THE SEAL: under `IPE_E2E=1`, actually `cargo build` and run the emitted crate,

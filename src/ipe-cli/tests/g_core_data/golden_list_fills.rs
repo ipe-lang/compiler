@@ -4,7 +4,7 @@
 //! Exercises `List.sum` / `product` / `maximum` / `minimum` / `singleton` /
 //! `repeat` / `intersperse` / `partition` / `unzip` / `sort` / `sortWith` /
 //! `sortBy` / `filterMap` / `unique` in
-//! one program (`tests/golden/list_fills/Main.ipe`), building and running the
+//! one program (`tests/golden/list_fills/src/Main.ipe`), building and running the
 //! emitted binary and asserting the stdout line — the SEAL guarantee (ipe exit
 //! 0 ⇒ emitted Rust builds and runs) plus behaviour parity with `elm/core`.
 //!
@@ -22,16 +22,16 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe` into an emitted Rust project and
+/// Compile `tests/golden/<name>/src/Main.ipe` into an emitted Rust project and
 /// return its directory. Fails the test loudly on a compile error.
 fn compile_golden(name: &str) -> PathBuf {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
+    let golden_project = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
     out
 }

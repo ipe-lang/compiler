@@ -84,19 +84,17 @@ fn repo_root() -> PathBuf {
 #[test]
 fn db_wrapper_empty_params_165_ipec_accepts_and_emits_sql_param_bound() {
     let root = repo_root();
-    let fixture = crate::src_golden::fixture_of(
-        &root
-            .join("tests")
-            .join("golden")
-            .join("db_wrapper_empty_params_165"),
-    );
+    let golden_project = root
+        .join("tests")
+        .join("golden")
+        .join("db_wrapper_empty_params_165");
     let out =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_wrapper_empty_params_165_ipec_out");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for db_wrapper_empty_params_165: {:?}",
@@ -148,18 +146,16 @@ fn db_wrapper_empty_params_165_cargo_builds_and_runs() {
     }
 
     let root = repo_root();
-    let fixture = crate::src_golden::fixture_of(
-        &root
-            .join("tests")
-            .join("golden")
-            .join("db_wrapper_empty_params_165"),
-    );
+    let golden_project = root
+        .join("tests")
+        .join("golden")
+        .join("db_wrapper_empty_params_165");
     let out = crate::support::scratch_root().join("ipec_db_wrapper_empty_params_165_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for db_wrapper_empty_params_165: {:?}",

@@ -99,18 +99,17 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe`, build the emitted Cargo project, run
+/// Compile `tests/golden/<name>/src/Main.ipe`, build the emitted Cargo project, run
 /// it, and return the golden directory plus the run outcome. The caller gates on
 /// `IPE_E2E`. Fails the test on any build/runtime error.
 fn build_run(name: &str) -> (PathBuf, crate::support::RunOutcome) {
     let root = repo_root();
     let dir = golden_dir(&root, name);
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join(format!("ipec_{name}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
@@ -595,13 +594,12 @@ fn db_sql_decimal_money() {
 fn db_sql_decimal_accepts_decimal() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_sql_decimal_money");
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_accepts");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "`SqlDecimal (Decimal.fromMinor 5 314159)` must type-check and emit; got: {:?}",
@@ -617,13 +615,12 @@ fn db_sql_decimal_accepts_decimal() {
 fn db_sql_decimal_rejects_raw_string() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_sql_decimal_rejects_string");
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_sql_decimal_rejects");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let err = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime)
+    let err = crate::support::build_golden(&dir, &out, &runtime)
         .map_err(|e| e.to_string())
         .expect_err(
             "`SqlDecimal \"1.5\"` must be rejected: the ctor takes a native `Decimal`, not a `String`",
@@ -655,14 +652,13 @@ fn db_sql_decimal_rejects_raw_string() {
 fn db_poly_params_compiles() {
     let root = repo_root();
     let dir = golden_dir(&root, "db_poly_params");
-    let entry = dir.join("Main.ipe");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("db_poly_params");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
     // Core assertion: `ipe::build` succeeds — no IPE-T0001 for any param-list shape.
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "IPE-T0001 regression: `Db.exec` with `List Int` / `List String` / mixed \

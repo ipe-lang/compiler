@@ -46,17 +46,16 @@ fn server_request_accessor_emit_inserts_clone() {
     }
 
     let root = repo_root();
-    let entry = root
+    let golden_project = root
         .join("tests")
         .join("golden")
-        .join("server_request_accessors")
-        .join("Main.ipe");
+        .join("server_request_accessors");
     let out = crate::support::scratch_root().join("ipec_m6_server_request_accessors");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
 
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe::build failed for server_request_accessors: {:?}",

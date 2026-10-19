@@ -3,7 +3,7 @@
 //!
 //! A JSON document is decoded through `map2` + `oneOf` + `index` (a record),
 //! `maybe` + `keyValuePairs`, and `dict`
-//! (`tests/golden/config_decoder_combinators/Main.ipe`). This pins ipe-0 ∧
+//! (`tests/golden/config_decoder_combinators/src/Main.ipe`). This pins ipe-0 ∧
 //! cargo-0 ∧ run-0 (THE SEAL: ipe exit 0 ⇒ emitted Rust builds and runs) and the
 //! decoded values are rendered (`server: alpha:5432 tags=1 limits=1`), proving
 //! each combinator routes to its runtime `decode_*` / `config_*`.

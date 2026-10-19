@@ -34,11 +34,8 @@ fn fixture_dir(root: &Path) -> PathBuf {
 fn record_fn_literal_emits_byte_identical() {
     let root = repo_root();
     let golden_dir = fixture_dir(&root);
-    let golden = root
-        .join("tests")
-        .join("golden")
-        .join("fcf_record_fn")
-        .join("main.rs");
+    let golden_project = root.join("tests").join("golden").join("fcf_record_fn");
+    let golden = golden_project.join("main.rs");
     let out = crate::support::scratch_root().join("ipec_i789_fcf_record_fn_emit");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -51,10 +48,7 @@ fn record_fn_literal_emits_byte_identical() {
          `Arc` carrier), got: {built:?}"
     );
 
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// THE SEAL: under `IPE_E2E=1`, actually `cargo build` and run the emitted crate.

@@ -27,7 +27,7 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe` into an emitted Rust project and return
+/// Compile `tests/golden/<name>/src/Main.ipe` into an emitted Rust project and return
 /// its directory. Fails the test loudly on a compile error.
 ///
 /// `scratch` names a per-CALLER scratch directory: several tests exercise the same
@@ -36,12 +36,12 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
 /// nextest's parallelism. A distinct `scratch` per test keeps each emit isolated.
 fn compile_golden(name: &str, scratch: &str) -> PathBuf {
     let root = repo_root();
-    let entry = golden_dir(&root, name).join("Main.ipe");
+    let golden_project = golden_dir(&root, name);
     let out = crate::support::scratch_root().join(format!("ipec_{scratch}_e2e"));
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&golden_project, &out, &runtime);
     assert!(built.is_ok(), "build failed for {name}: {:?}", built.err());
     out
 }

@@ -49,7 +49,7 @@ fn golden_dir(root: &Path, name: &str) -> PathBuf {
     root.join("tests").join("golden").join(name)
 }
 
-/// Compile `tests/golden/<name>/Main.ipe`, build the emitted Cargo project,
+/// Compile `tests/golden/<name>/src/Main.ipe`, build the emitted Cargo project,
 /// run it, and assert its stdout matches the cached oracle.  Gated on
 /// `IPE_E2E=1`.
 fn assert_runs_and_matches_oracle(name: &str) {

@@ -42,7 +42,8 @@ fn fixture_dir(root: &Path) -> PathBuf {
 fn emits_byte_identical_main_rs() {
     let root = repo_root();
     let dir = fixture_dir(&root);
-    let golden = fixture_dir(&root).join("main.rs");
+    let golden_project = fixture_dir(&root);
+    let golden = golden_project.join("main.rs");
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("l0105_alias_move_seal_emit");
     let _ = std::fs::remove_dir_all(&out);
 
@@ -55,10 +56,7 @@ fn emits_byte_identical_main_rs() {
     // the emitted `src/main.rs` against the golden `main.rs`). Replaces the
     // former hand-rolled `read_to_string` + `assert_eq!` pair with the shared
     // harness helper.
-    crate::support::assert_emitted_project_matches_golden_dir(
-        &out,
-        crate::support::golden_dir_of(&golden),
-    );
+    crate::support::assert_emitted_project_matches_golden_dir(&out, &golden_project);
 }
 
 /// The seal invariant asserted independently of the byte lock: NO by-value

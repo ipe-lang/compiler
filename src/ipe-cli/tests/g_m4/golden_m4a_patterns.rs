@@ -84,7 +84,7 @@ fn assert_runs_and_matches_oracle(name: &str) {
     assert_eq!(outcome.exit_code, Some(0), "exit 0");
 }
 
-/// Compile `tests/golden/<fixture>/Main.ipe` and assert it is rejected with the
+/// Compile `tests/golden/<fixture>/src/Main.ipe` and assert it is rejected with the
 /// expected diagnostic code (a gate golden — no program output).
 fn assert_gate(fixture: &str, expected: ipe_diagnostics::Code) {
     let root = repo_root();

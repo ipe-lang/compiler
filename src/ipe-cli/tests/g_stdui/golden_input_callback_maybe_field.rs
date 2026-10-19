@@ -43,7 +43,7 @@ fn repo_root() -> PathBuf {
     std::fs::canonicalize(&joined).unwrap_or(joined)
 }
 
-/// Compile / build / run `tests/golden/input_callback_maybe_field/Main.ipe`.
+/// Compile / build / run `tests/golden/input_callback_maybe_field/src/Main.ipe`.
 /// Gated on `IPE_E2E=1`. The `cargo build` step is where the seal is enforced:
 /// a `Box`-vs-`Arc` callback mismatch fails the build (E0308), failing this
 /// test hard.
@@ -53,12 +53,11 @@ fn build_run_input_callback() -> crate::support::RunOutcome {
         .join("tests")
         .join("golden")
         .join("input_callback_maybe_field");
-    let entry = dir.join("Main.ipe");
     let out = crate::support::scratch_root().join("ipec_m7_input_callback_maybe_field_e2e");
     let _ = std::fs::remove_dir_all(&out);
 
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let built = crate::support::build_golden(crate::support::golden_dir_of(&entry), &out, &runtime);
+    let built = crate::support::build_golden(&dir, &out, &runtime);
     assert!(
         built.is_ok(),
         "ipe dev build must succeed for input_callback_maybe_field: {:?}",
