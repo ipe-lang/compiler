@@ -3093,7 +3093,8 @@ fn extract_module_imports(src: &str) -> Vec<String> {
 
 /// Synthesize a minimal compilable module wrapping `body`.
 ///
-/// If `body` already starts with `module ` it is returned as-is. Otherwise a
+/// If `body` already starts with `module ` it is returned as-is; it is checked
+/// as its project's `Main` module, so its header must name `Main`. Otherwise a
 /// `module Main exposing (..)` header is prepended. The module that the
 /// doc-string belongs to (`source_module`, e.g. `Ipe.Maybe`) is imported with
 /// `exposing (..)` so unqualified names from it resolve, and that module's own
@@ -3279,15 +3280,16 @@ fn child_shared_target_dir() -> Option<std::ffi::OsString> {
     })
 }
 
-/// Run the compiled example at `snippet_path` and assert its output matches the
-/// `-->` annotated results (one per line, in order).
+/// Run the example project `root` and assert its output matches the `-->`
+/// annotated results (one per line, in order).
 ///
-/// Runs the current binary as `ipe dev run <snippet_path>`, held to
+/// Runs the current binary as `ipe dev run <root>` from the project's own
+/// directory, held to
 /// [`crate::remote_ingest::SELF_RUN_LIMITS`], and compares stdout against the
 /// expected output. Returns `Err(description)` on a mismatch or
 /// subprocess failure; `Ok(())` when the output matches.
 fn run_example_and_check(
-    snippet_path: &Path,
+    root: &crate::project_root::ProjectRoot,
     label: &str,
     expected: &[String],
 ) -> Result<(), String> {
@@ -3299,22 +3301,19 @@ fn run_example_and_check(
 
     let mut cmd = Command::new(&ipe_bin);
     cmd.args(crate::verb::Verb::DEV_RUN.argv())
-        .arg(snippet_path);
+        .arg(root.path())
+        .current_dir(root.path());
     // Forward the warm shared target into the `ipe dev run` child's CARGO_TARGET_DIR.
     // CI's e2e/seal jobs export ONLY IPE_ORACLE_SHARED_TARGET, which production
     // `ipe dev run` never reads; without this translation the child cold-builds the
     // whole runtime tree per example. Absent it (a bare local run) the child
     // inherits the ambient env unchanged.
+    //
+    // THE SEAL: sharing ONE warm target is sound because each example is its own
+    // project, whose emitted crate is named by its manifest and its own private
+    // directory, so no example's app crate is ever reused for another's.
     if let Some(target) = child_shared_target_dir() {
         cmd.env("CARGO_TARGET_DIR", target);
-        // THE SEAL: every example emits under the default `ipe-app` name, so
-        // sharing ONE warm target risks cargo reusing a prior example's compiled
-        // `ipe-app` crate and greening a broken emit. Give each example a UNIQUE
-        // package name (honoured by the single-file emit) so its app crate owns
-        // its own fingerprint — a genuinely broken emit still fails to build even
-        // against the warm target. Only set alongside the shared target, so an
-        // ordinary local run keeps the plain `ipe-app` default.
-        cmd.env("IPE_EMIT_PACKAGE_NAME", format!("ipe-doc-example-{label}"));
     }
     let out = crate::remote_ingest::run_local(
         cmd,
@@ -3379,17 +3378,6 @@ fn check_examples() -> Result<(), CliError> {
     let mut passed = 0usize;
     let mut failed: Vec<String> = Vec::new();
 
-    // Write examples to a temp dir; RAII cleanup on exit.
-    let tmp_dir =
-        crate::scratch::ScratchDir::new("ipe-doc-examples").map_err(|e| CliError::Io {
-            path: std::path::PathBuf::from("ipe-doc-examples"),
-            source: e,
-        })?;
-    let snippet_leaf = crate::scratch::LeafName::new("Main.ipe").map_err(|e| CliError::Io {
-        path: std::path::PathBuf::from("Main.ipe"),
-        source: e.into(),
-    })?;
-
     for (module_name, src) in &all_sources {
         let examples = extract_doc_examples(module_name, src);
         let module_imports = extract_module_imports(src);
@@ -3397,13 +3385,14 @@ fn check_examples() -> Result<(), CliError> {
             total += 1;
             let module_src = synthesize_module(&ex.body, module_name, &module_imports);
 
-            // Write to a temp file.
-            let snippet_path = tmp_dir.child(&snippet_leaf);
-            std::fs::write(&snippet_path, &module_src)
-                .map_err(|e| crate::io_err(&snippet_path, e))?;
+            // The example is the `Main` module of its own scratch project, so
+            // no file outside it is a module of the check; removed on drop.
+            let scratch = crate::project_root::ProjectRoot::scratch(&module_src)?;
 
             // Tier 1: type-check the example (always).
-            match crate::typecheck_entry_via_graph(&snippet_path) {
+            match crate::driver::typecheck_target(&crate::project_root::AnalysisTarget::Project(
+                scratch.root(),
+            )) {
                 Ok(()) => {
                     crate::screen::chatter(
                         crate::screen::Stream::Stderr,
@@ -3429,7 +3418,7 @@ fn check_examples() -> Result<(), CliError> {
             if !ex.expected_results.is_empty()
                 && ipe_env::var_os("IPE_E2E").is_some_and(|v| v == "1")
             {
-                match run_example_and_check(&snippet_path, &ex.label, &ex.expected_results) {
+                match run_example_and_check(scratch.root(), &ex.label, &ex.expected_results) {
                     Ok(()) => {}
                     Err(msg) => {
                         crate::screen::chatter(

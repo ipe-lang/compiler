@@ -326,7 +326,7 @@ pub use driver::{
     RuntimeContext, UPGRADE_TAG_FILE_ENV, UPGRADE_WRAPPED_ENV, apply_fixes, bluegreen_enabled,
     build, build_loose_file, build_loose_file_with_options, build_project,
     build_project_with_options, build_with_options, code_index, compile_prepared,
-    create_source_root, emit_ir_text, explain_lookup, front_check_entry, hot_appearance_enabled,
+    create_source_root, emit_ir_text, explain_lookup, front_check, hot_appearance_enabled,
     infer_package_capabilities, infer_package_capabilities_in, resolve_runtime, run_cli,
     run_upgrade, runtime_dep_from_env, select_non_overlapping, verify_capabilities,
     watch_banner_enabled,
@@ -344,9 +344,8 @@ pub use project_root::golden::build_golden_dir;
 // to public API; the block above re-exports the genuine public surface as `pub`.
 pub(crate) use driver::{
     DevMarkedCrate, RewriteKind, build_source_graph, capabilities_including_served_widgets,
-    find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err, lower_entry_via_graph,
-    read_progress_chunk, read_yes_no, read_yes_no_default, resolve_vendored_runtime_dir,
-    rewrite_user_file, rewrite_walked_file, run_capabilities, run_fix, run_installer, run_package,
-    run_test, run_type_check, run_verify, run_version, typecheck_entry_via_graph,
-    write_emitted_project,
+    find_manifest_for_ipe_file, force_cargo_terminal_ui, io_err, read_progress_chunk, read_yes_no,
+    read_yes_no_default, resolve_vendored_runtime_dir, rewrite_user_file, rewrite_walked_file,
+    run_capabilities, run_fix, run_installer, run_package, run_test, run_type_check, run_verify,
+    run_version, write_emitted_project,
 };

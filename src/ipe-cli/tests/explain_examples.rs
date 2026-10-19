@@ -4,9 +4,9 @@
 //! The explain pages are the registry's own: every code in `ALL_CODES` whose
 //! `explain_page` exists is scanned, so a new code's page is checked the moment
 //! it exists. The doc pages are every `docs/constructs` and `docs/topics` page.
-//! Each block is judged in-process through the build front end
-//! (`ipe::front_check_entry`: type-check, decoder gate, lowering, emit; no
-//! cargo):
+//! Each block is the one module of a scratch project, judged in-process through
+//! the build front end (`ipe::front_check`: type-check, decoder gate, lowering,
+//! emit; no cargo):
 //!
 //! - a check block (` ```ipe `) must be accepted;
 //! - an error block must be refused with its expected code: the page's own code
@@ -15,7 +15,9 @@
 //! - a skip block (` ```ipe ipe:skip <reason> `) is not compiled.
 //!
 //! No import is ever injected; a block with no module header is only wrapped in
-//! `module Main exposing (..)`. Every mismatch is reported at once.
+//! `module Main exposing (..)`. A block with a header lies at the file its
+//! header names: `Main` is the project's entry, any other module its one
+//! exposed module. Every mismatch is reported at once.
 //!
 //! `explain_examples/known_rot.txt` lists the `page:line` blocks still failing:
 //! a listed block must still mismatch, so the ledger can only shrink.
@@ -27,6 +29,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use fence::{Block, Kind, Page};
+use ipe::project_root::SourceTree;
 use ipe_diagnostics::{ALL_CODES, Code, explain_page};
 
 /// The blocks known to fail, one `page:line` per line.
@@ -65,16 +68,45 @@ fn program_source(body: &str) -> String {
     }
 }
 
-/// Judge one program source in its own directory under `dir`.
+/// The module a program's header names, when its first line is a header
+/// naming a dotted module path.
+fn header_module(source: &str) -> Option<&str> {
+    let header = source.lines().find(|l| !l.trim().is_empty())?;
+    let name = header
+        .trim_start()
+        .strip_prefix("module ")?
+        .split_whitespace()
+        .next()?;
+    name.split('.')
+        .all(|segment| {
+            segment
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .then_some(name)
+}
+
+/// The one-module project holding `source`, at the file its header names.
+fn snippet_tree(source: &str) -> SourceTree {
+    match header_module(source) {
+        Some(module) if module != "Main" => SourceTree::new()
+            .module(module, source)
+            .field(&format!("exposedModules = [ \"{module}\" ]")),
+        _ => SourceTree::main(source),
+    }
+}
+
+/// Judge one program source as a scratch project under `dir`.
 fn front_check(dir: &Path, source: &str) -> Outcome {
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        return Outcome::Failed(format!("create {}: {e}", dir.display()));
-    }
-    let entry = dir.join("Main.ipe");
-    if let Err(e) = std::fs::write(&entry, source) {
-        return Outcome::Failed(format!("write {}: {e}", entry.display()));
-    }
-    match ipe::front_check_entry(&entry) {
+    let scratch = match snippet_tree(source).resolve_under(dir) {
+        Ok(scratch) => scratch,
+        Err(e) => return Outcome::Failed(format!("scratch project under {}: {e}", dir.display())),
+    };
+    match ipe::front_check(scratch.root()) {
         Ok(()) => Outcome::Accepted,
         Err(ipe::CliError::Pipeline { diag, .. }) => Outcome::Refused(diag.code()),
         Err(other) => Outcome::Failed(other.to_string()),

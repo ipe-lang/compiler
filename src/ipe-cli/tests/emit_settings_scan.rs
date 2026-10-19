@@ -218,6 +218,14 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "release_pipeline",
         3,
     ),
+    // A front check writes no artifact and opens no window: it judges the
+    // served build.
+    (
+        "HostIntent::Served",
+        "src/ipe-cli/src/driver/commands.rs",
+        "front_check",
+        1,
+    ),
     (
         "HostIntent::Served",
         "src/ipe-cli/src/driver/commands_pkg.rs",

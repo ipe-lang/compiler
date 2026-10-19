@@ -211,33 +211,24 @@ impl AspectCheck<StdlibSymbol> for DocExampleColumn {
         let empty = Vec::new();
         let module_imports = self.module_imports.get(&dotted).unwrap_or(&empty);
 
-        // One scratch dir for this symbol's examples; RAII-cleaned on drop.
-        let scratch = match crate::scratch::ScratchDir::new("ipe-coverage-doc-example") {
-            Ok(dir) => dir,
-            Err(e) => {
-                return Cell::Hole(format!(
-                    "could not create a scratch dir to type-check {}.{}'s example: {e}",
-                    sym.module.join("."),
-                    sym.name
-                ));
-            }
-        };
-
-        let snippet = match crate::scratch::LeafName::new("Main.ipe") {
-            Ok(leaf) => scratch.child(&leaf),
-            Err(e) => return Cell::Hole(format!("scratch entry `Main.ipe` refused: {e}")),
-        };
+        // Each example is the `Main` module of its own scratch project, so no
+        // file outside it is a module of the check; RAII-cleaned on drop.
         for (index, body) in examples.iter().enumerate() {
             let module_src = synthesize_example_module(body, &dotted, module_imports);
-            if let Err(e) = std::fs::write(&snippet, &module_src) {
-                return Cell::Hole(format!(
-                    "could not write {}.{}'s example {} to type-check it: {e}",
-                    sym.module.join("."),
-                    sym.name,
-                    index + 1
-                ));
-            }
-            if let Err(err) = crate::typecheck_entry_via_graph(&snippet) {
+            let scratch = match crate::project_root::ProjectRoot::scratch(&module_src) {
+                Ok(scratch) => scratch,
+                Err(e) => {
+                    return Cell::Hole(format!(
+                        "could not write {}.{}'s example {} to type-check it: {e}",
+                        sym.module.join("."),
+                        sym.name,
+                        index + 1
+                    ));
+                }
+            };
+            if let Err(err) = crate::driver::typecheck_target(
+                &crate::project_root::AnalysisTarget::Project(scratch.root()),
+            ) {
                 return Cell::Hole(format!(
                     "{}.{} doc-string example {} does not type-check: {err}",
                     sym.module.join("."),
@@ -292,7 +283,8 @@ fn import_line_module(line: &str) -> Option<&str> {
 /// own imports (so a qualified alias it uses resolves), and adds a fixed fallback
 /// import for a common qualified prefix the example reaches that the documenting
 /// module does not itself import. An example already starting with `module ` is
-/// returned verbatim.
+/// returned verbatim; it is checked as its project's `Main` module, so its
+/// header must name `Main`.
 ///
 /// A line carrying `-->` is an expression/result annotation: the expression
 /// before the arrow becomes a fresh top-level binding (`docCheckN = <expr>`) so
