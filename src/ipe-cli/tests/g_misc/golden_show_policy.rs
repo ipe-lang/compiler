@@ -84,7 +84,10 @@ fn every_shown_leaf_renders_through_its_row() {
 #[allow(clippy::panic)] // a refused precondition is the test failure
 fn showing_a_rust_handle_is_refused_before_cargo() {
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let source = golden_project_dir(&repo_root(), "show_refused_foreign");
+    let source = crate::support::golden_source(
+        &golden_project_dir(&repo_root(), "show_refused_foreign"),
+        "Main",
+    );
     let main = std::fs::read_to_string(&source)
         .unwrap_or_else(|e| panic!("read {}: {e}", source.display()));
     let fixture = ffi_fixture(&main);

@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use e2e_support::normalize_runtime_dep_path;
 use ipe_backend::Backend;
 use ipe_backend_rust::{RuntimeDep, RustBackend};
 use ipe_diagnostics::{DResult, Diagnostic};
@@ -18,10 +19,10 @@ use ipe_ir::{
 const GOLDEN_MAIN: &str = include_str!("../../../../../tests/golden/basics/main.rs");
 const GOLDEN_CARGO: &str = include_str!("../../../../../tests/golden/basics/Cargo.toml");
 
-/// The placeholder the blessed golden `Cargo.toml` stores in place of the
-/// machine-specific dependency-model runtime path. Kept in sync with the CLI
-/// test support's `RUNTIME_PATH_PLACEHOLDER`.
-const RUNTIME_PATH_PLACEHOLDER: &str = "__IPE_RUNTIME_PATH__";
+/// The crate identity a project build gives `tests/golden/basics`: the package
+/// name from its `package.ipe` plus a fixed-width hash suffix, which
+/// `normalize_runtime_dep_path` replaces with the portable placeholder.
+const BASICS_PROJECT_NAME: &str = "basics_00000000";
 
 /// Locate the runtime crate root (`src/runtime/rust`) by walking up from the
 /// crate manifest dir — the same in-repo resolution the driver performs. Used
@@ -42,42 +43,14 @@ fn runtime_crate_root() -> PathBuf {
         .expect("runtime crate root canonicalizes")
 }
 
-/// Rewrite the dependency-model runtime `path = "<absolute root>"` in an emitted
-/// manifest to [`RUNTIME_PATH_PLACEHOLDER`] so the byte-compare against the
-/// portable blessed golden is machine-independent. The emit itself keeps the
-/// real resolvable path — only the golden text is normalized (SEAL stays
-/// honest).
-fn normalize_runtime_dep_path(manifest: &str) -> String {
-    manifest
-        .lines()
-        .map(|line| {
-            if line.contains("package = \"ipe-runtime-rust\"")
-                && let Some(start) = line.find("path = \"")
-            {
-                let val_start = start + "path = \"".len();
-                if let Some(rel_end) = line[val_start..].find('"') {
-                    let end = val_start + rel_end;
-                    return format!(
-                        "{}{}{}",
-                        &line[..val_start],
-                        RUNTIME_PATH_PLACEHOLDER,
-                        &line[end..]
-                    );
-                }
-            }
-            line.to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if manifest.ends_with('\n') { "\n" } else { "" }
-}
-
 /// The dependency-model backend the golden emit now exercises (the default
 /// native emit shape).
 fn dep_backend(interner: &Interner) -> RustBackend<'_> {
-    RustBackend::new(interner).with_runtime_dep(Some(RuntimeDep {
-        root: runtime_crate_root(),
-    }))
+    RustBackend::new(interner)
+        .with_project_name(BASICS_PROJECT_NAME)
+        .with_runtime_dep(Some(RuntimeDep {
+            root: runtime_crate_root(),
+        }))
 }
 
 /// Build the golden program:
