@@ -53,6 +53,11 @@ fn sample_entry() -> String {
     dir.to_string_lossy().into_owned()
 }
 
+/// The unformatted fixture module, as a loose file for the formatter tests.
+fn sample_source() -> PathBuf {
+    support::manifest_dir().join("tests/fixtures/capabilities/uses_http_and_clock.ipe")
+}
+
 /// Run `ipe <args>` in `dir` with `NO_COLOR=1`, as [`run`] does.
 fn run_in(dir: &Path, args: &[&str]) -> Run {
     match Command::new(support::ipe_bin())
@@ -905,7 +910,7 @@ fn fmt_check_json_emits_compact_verdict() {
     let file = dir.join("Main.ipe");
 
     // Format a copy in place first, so the subsequent --check is a clean scan.
-    std::fs::copy(sample_entry(), &file).expect("seed the fixture");
+    std::fs::copy(sample_source(), &file).expect("seed the fixture");
     let fmt = run(&["fmt", file.to_str().expect("utf8")]);
     assert!(fmt.ok, "seeding format must succeed, got:\n{}", fmt.stderr);
 
@@ -919,7 +924,7 @@ fn fmt_check_json_emits_compact_verdict() {
 
     // Now restore the raw (unformatted) fixture and confirm the verdict lists
     // the file, compact, exit non-zero.
-    std::fs::copy(sample_entry(), &file).expect("restore the unformatted fixture");
+    std::fs::copy(sample_source(), &file).expect("restore the unformatted fixture");
     let dirty = run(&["fmt", "--check", "--json", file.to_str().expect("utf8")]);
     assert!(!dirty.ok, "an unformatted file fails --check");
     let line = dirty.stdout.trim();
