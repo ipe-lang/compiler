@@ -44,10 +44,8 @@ uidParseRefuses =
         , String.repeat 63 "a" ++ codeText 65345
         , String.repeat 63 "a" ++ codeText 1635
         ]
-        && Result.map Uid.toString (Uid.parse hex)
-        == Ok hex
-        && Result.map Uid.toString (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
-        == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        && Result.map Uid.toString (Uid.parse hex) == Ok hex
+        && Result.map Uid.toString (Uid.parse "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == Ok "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 
 -- True when `raw` is refused as invalid input.
@@ -71,8 +69,7 @@ routeUidRefusedNotQueried =
         && entryRefused ("../" ++ String.repeat 61 "a")
         && entryRefused (String.repeat 64 "F")
         && entryAccepted (uid "u-a")
-        && Maybe.map SafeText.toString (Queue.unitPageStatusText UnitIdRefused)
-        == Just "This address does not name a unit."
+        && Maybe.map SafeText.toString (Queue.unitPageStatusText UnitIdRefused) == Just "This address does not name a unit."
 
 
 entryRefused : String -> Bool
@@ -115,16 +112,11 @@ badLinkUidRendersText =
             Links.resolveCandidates [ [ "x" ] ] [ ( "x", Just "../evil" ) ]
     in
     isUnlinked edge
-        && Links.label edge
-        == name
-        && Label.parts name
-        == [ LabelText "app::x" ]
-        && Links.linkKey edge
-        == "t:"
-        ++ Label.key name
+        && Links.label edge == name
+        && Label.parts name == [ LabelText "app::x" ]
+        && Links.linkKey edge == "t:" ++ Label.key name
         && List.all isUnlinked resolved
-        && List.length resolved
-        == 1
+        && List.length resolved == 1
         && not (isUnlinked (Links.internal (Label.fromText Label.labelCap "app::y") (Uid.toString (uid "u-y"))))
 
 

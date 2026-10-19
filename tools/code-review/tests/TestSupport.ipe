@@ -142,8 +142,8 @@ import Lib.Failure as Failure exposing (DecideRefusal(..), RefuseFailure(..))
 import Lib.Format as Format
 import Lib.Highlight as Highlight exposing (Lang(..), Token(..))
 import Lib.Index as Index exposing (Change(..), Oversize(..), SourceView(..), StaleReason(..), Written(..))
-import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Keys as Keys exposing (KeyAction(..))
+import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
 import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), UnitPageState(..))
@@ -663,7 +663,6 @@ decideShownNow db shown decision =
             )
 
 
-
 -- `Queue.decideRefusal` approving refusal `label`, bound to `digest`, under
 -- the environment's signing key; a server with no signing key fails the
 -- run, since it acknowledges nothing.
@@ -679,6 +678,7 @@ decidedRefusalNow db label digest =
                     ReadOnly ->
                         Task.fail (Error.conflict "the test environment has no signing key")
             )
+
 
 -- `task`'s value when it is not refused; a refusal fails the run, naming
 -- `what`.
@@ -1224,29 +1224,18 @@ isUnitA entry =
         u =
             entry.unit
     in
-    u.uid
-        == uid "u-a"
+    u.uid == uid "u-a"
         && isNew entry.change
-        && labelText u.path
-        == "ipe:src/Lib.rs"
-        && labelText u.name
-        == "answer"
-        && labelText u.qualified
-        == "Lib.answer"
-        && labelText u.kind
-        == "fn"
-        && u.lineStart
-        == 3
-        && u.lineEnd
-        == 6
-        && labelText u.facing
-        == "internal"
-        && Maybe.map labelText u.purpose
-        == Just "purpose-A"
-        && Index.storedHash u.attested
-        == Index.attest viewA
-        && shownTextOf entry.view
-        == Just viewA
+        && labelText u.path == "ipe:src/Lib.rs"
+        && labelText u.name == "answer"
+        && labelText u.qualified == "Lib.answer"
+        && labelText u.kind == "fn"
+        && u.lineStart == 3
+        && u.lineEnd == 6
+        && labelText u.facing == "internal"
+        && Maybe.map labelText u.purpose == Just "purpose-A"
+        && Index.storedHash u.attested == Index.attest viewA
+        && shownTextOf entry.view == Just viewA
 
 
 isUnitB : PageEntry -> Bool
@@ -1255,20 +1244,13 @@ isUnitB entry =
         u =
             entry.unit
     in
-    u.uid
-        == uid "u-b"
-        && modifiedFrom entry.change
-        == Just "oldB"
-        && labelText u.path
-        == "ipe:src/Main.ipe"
-        && labelText u.kind
-        == "module"
-        && labelText u.facing
-        == "user"
-        && Maybe.map labelText u.purpose
-        == Nothing
-        && shownTextOf entry.view
-        == Just viewB
+    u.uid == uid "u-b"
+        && modifiedFrom entry.change == Just "oldB"
+        && labelText u.path == "ipe:src/Main.ipe"
+        && labelText u.kind == "module"
+        && labelText u.facing == "user"
+        && Maybe.map labelText u.purpose == Nothing
+        && shownTextOf entry.view == Just viewB
 
 
 cleanupIndex : String -> String -> Task.Task Error ()

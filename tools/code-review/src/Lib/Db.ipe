@@ -354,12 +354,12 @@ copyHolds : LogState -> Index.Snapshot -> Bool
 copyHolds state snap =
     copyCurrent state snap.stamp
         && (case snap.copy of
-            Just digest ->
-                SetDigest.same (verifiedPairs state) digest
+                Just digest ->
+                    SetDigest.same (verifiedPairs state) digest
 
-            Nothing ->
-                False
-        )
+                Nothing ->
+                    False
+           )
 
 
 verifiedPairs : LogState -> SetDigest
@@ -522,35 +522,38 @@ fromMaybeRecord found =
 reviewCodec : Codec ReviewRecord
 reviewCodec =
     Codec
-        { enc = \row ->
-            Encode.object
-                [ ( "uid", Encode.string row.uid )
-                , ( "body_hash", Encode.string row.bodyHash )
-                , ( "decision", Encode.string row.decision )
-                , ( "reason"
-                , case row.reason of
-                    Just r ->
-                        Encode.string r
+        { enc =
+            \row ->
+                Encode.object
+                    [ ( "uid", Encode.string row.uid )
+                    , ( "body_hash", Encode.string row.bodyHash )
+                    , ( "decision", Encode.string row.decision )
+                    , ( "reason"
+                      , case row.reason of
+                            Just r ->
+                                Encode.string r
 
-                    Nothing ->
-                        Encode.null
-                )
-                , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
+                            Nothing ->
+                                Encode.null
+                      )
+                    , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
+                    ]
+        , mkDec =
+            \_ ->
+                Config.map5 makeRecord
+                    (Config.field "uid" Config.string)
+                    (Config.field "body_hash" Config.string)
+                    (Config.field "decision" Config.string)
+                    (Config.field "reason" (Config.nullable Config.string))
+                    (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
+        , shp =
+            SRecord
+                [ ( "uid", CText )
+                , ( "body_hash", CText )
+                , ( "decision", CText )
+                , ( "reason", CNull CText )
+                , ( "reviewed_at", CTime )
                 ]
-        , mkDec = \_ ->
-            Config.map5 makeRecord
-                (Config.field "uid" Config.string)
-                (Config.field "body_hash" Config.string)
-                (Config.field "decision" Config.string)
-                (Config.field "reason" (Config.nullable Config.string))
-                (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
-        , shp = SRecord
-            [ ( "uid", CText )
-            , ( "body_hash", CText )
-            , ( "decision", CText )
-            , ( "reason", CNull CText )
-            , ( "reviewed_at", CTime )
-            ]
         }
 
 
@@ -634,8 +637,8 @@ adoptLog : MacKey -> Db -> Index.ChainHead -> Task.Task Error ()
 adoptLog key tx head =
     do
         bound <- Db.exec tx
-            "UPDATE review_log_head SET key_check = ? WHERE one = 1 AND key_check IS NULL AND log_id = ? AND seq = ? AND head = ?"
-            [ SqlString (keyCheckOf key (Index.chainLogId head)), SqlString (Index.chainLogId head), SqlInt (Index.chainSeq head), SqlString (Index.chainMac head) ]
+                    "UPDATE review_log_head SET key_check = ? WHERE one = 1 AND key_check IS NULL AND log_id = ? AND seq = ? AND head = ?"
+                    [ SqlString (keyCheckOf key (Index.chainLogId head)), SqlString (Index.chainLogId head), SqlInt (Index.chainSeq head), SqlString (Index.chainMac head) ]
         if bound == 1 then
             Task.succeed ()
 
@@ -833,8 +836,8 @@ advanceHead : Db -> Index.ChainHead -> Index.ChainHead -> Task.Task Error ()
 advanceHead db prev next =
     do
         moved <- Db.exec db
-            "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1 AND log_id = ? AND seq = ? AND head = ? AND key_check IS ?"
-            [ SqlInt (Index.chainSeq next), SqlString (Index.chainMac next), SqlString (Index.chainLogId prev), SqlInt (Index.chainSeq prev), SqlString (Index.chainMac prev), keyCheckValue prev ]
+                    "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1 AND log_id = ? AND seq = ? AND head = ? AND key_check IS ?"
+                    [ SqlInt (Index.chainSeq next), SqlString (Index.chainMac next), SqlString (Index.chainLogId prev), SqlInt (Index.chainSeq prev), SqlString (Index.chainMac prev), keyCheckValue prev ]
         if moved == 1 then
             Task.succeed ()
 
@@ -1185,9 +1188,9 @@ walkStep : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> ChainW
 walkStep key db size ceiling refusal head walk =
     do
         rows <- Db.queryDecode db
-            (logColumns ++ " WHERE seq >= ? AND seq <= ? ORDER BY seq LIMIT ?")
-            [ SqlInt walk.nextSeq, SqlInt (Index.chainSeq head), SqlInt (PageSize.toInt size) ]
-            walkRowDecoder
+                    (logColumns ++ " WHERE seq >= ? AND seq <= ? ORDER BY seq LIMIT ?")
+                    [ SqlInt walk.nextSeq, SqlInt (Index.chainSeq head), SqlInt (PageSize.toInt size) ]
+                    walkRowDecoder
         if List.isEmpty rows then
             Task.succeed (Task.Done (chainEnd head walk))
 
@@ -1391,8 +1394,8 @@ appendDecision key tx head attested decision at =
     in
     do
         inserted <- Db.exec tx
-            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (seq) DO NOTHING"
-            [ SqlInt seq, Uid.toSql uid, SqlString bodyHash, SqlString decisionText, reasonValue reason, SqlTime at, SqlString prev, SqlString mac ]
+                        "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (seq) DO NOTHING"
+                        [ SqlInt seq, Uid.toSql uid, SqlString bodyHash, SqlString decisionText, reasonValue reason, SqlTime at, SqlString prev, SqlString mac ]
         if inserted == 1 then
             advanceHead tx head next
                 |> Task.map (\_ -> Index.Inserted { prev = Index.signedStamp key head Intact, next = Index.signedStamp key next Intact })
@@ -1452,9 +1455,9 @@ findDecision : Verifier -> Db -> Uid -> String -> Task.Task Error (Maybe ReviewE
 findDecision verify db uid bodyHash =
     do
         rows <- Db.queryDecode db
-            (logColumns ++ " WHERE uid = ? AND body_hash = ?" ++ boundClause verify ++ " ORDER BY seq LIMIT ?")
-            ([ Uid.toSql uid, SqlString bodyHash ] ++ boundParams verify ++ [ SqlInt candidateCeiling ])
-            logRowDecoder
+                    (logColumns ++ " WHERE uid = ? AND body_hash = ?" ++ boundClause verify ++ " ORDER BY seq LIMIT ?")
+                    ([ Uid.toSql uid, SqlString bodyHash ] ++ boundParams verify ++ [ SqlInt candidateCeiling ])
+                    logRowDecoder
         case pickEntry (List.map (entryOf verify) rows) of
             Just entry ->
                 Task.succeed (Just entry)
