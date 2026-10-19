@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for `tools/scripts/ipe-fmt-check.py`: drift, an empty discovery and a missing binary all fail."""
+"""Tests for `tools/scripts/ipe-fmt-check.py`: drift, a timeout, an empty discovery, a missing binary and a non-Cargo `tests` exemption all fail."""
 
 from __future__ import annotations
 
@@ -83,6 +83,8 @@ class TestDiscovery(unittest.TestCase):
     def test_projects_are_the_tracked_manifest_dirs_outside_tests(self) -> None:
         got = ipe_fmt_check.projects(
             [
+                "Cargo.toml",
+                "src/ipe-cli/Cargo.toml",
                 "tools/code-review/package.ipe",
                 "tools/code-review/src/Main.ipe",
                 "tools/code-review/tests/Main.ipe",
@@ -95,6 +97,29 @@ class TestDiscovery(unittest.TestCase):
         )
         self.assertEqual(got, ["examples/shapes/web/a", "tools/code-review"])
 
+    def test_a_tests_dir_outside_a_cargo_test_tree_hides_no_project(self) -> None:
+        got = ipe_fmt_check.projects(
+            [
+                "examples/tests/app/package.ipe",
+                "tests/golden/x/package.ipe",
+                "tools/mytests/b/package.ipe",
+                "src/lib/tests/c/package.ipe",
+                "src/lib/Cargo.toml.bak",
+                "src/other/Cargo.toml",
+                "src/other/sub/tests/d/package.ipe",
+            ]
+        )
+        self.assertEqual(
+            got,
+            [
+                "examples/tests/app",
+                "src/lib/tests/c",
+                "src/other/sub/tests/d",
+                "tests/golden/x",
+                "tools/mytests/b",
+            ],
+        )
+
     def test_repo_discovery_matches_an_independent_walk(self) -> None:
         tracked = set(ipe_fmt_check.tracked_files(ipe_fmt_check.ROOT))
         walked = set()
@@ -102,7 +127,10 @@ class TestDiscovery(unittest.TestCase):
             dirnames[:] = [d for d in dirnames if d != ".git"]
             rel_dir = os.path.relpath(dirpath, ipe_fmt_check.ROOT).replace(os.sep, "/")
             parts = [] if rel_dir == "." else rel_dir.split("/")
-            if "package.ipe" in filenames and "tests" not in parts:
+            in_cargo_tests = any(
+                p == "tests" and "/".join([*parts[:i], "Cargo.toml"]) in tracked for i, p in enumerate(parts)
+            )
+            if "package.ipe" in filenames and not in_cargo_tests:
                 rel = "/".join([*parts, "package.ipe"])
                 if rel in tracked:
                     walked.add(rel_dir)
@@ -116,7 +144,7 @@ class TestDiscovery(unittest.TestCase):
 
 
 class TestVerdict(unittest.TestCase):
-    FILES = ("a/package.ipe", "a/src/Main.ipe", "b/c/package.ipe", "tests/golden/g/package.ipe")
+    FILES = ("Cargo.toml", "a/package.ipe", "a/src/Main.ipe", "b/c/package.ipe", "tests/golden/g/package.ipe")
 
     def setUp(self) -> None:
         self.repo = Repo(self.FILES)
@@ -152,12 +180,21 @@ class TestVerdict(unittest.TestCase):
         self.assertEqual(ipe_fmt_check.unformatted("ipe", ".", ["a"], killed), ["a"])
         self.assertEqual(ipe_fmt_check.run_ipe([os.path.join(self.repo.root, "nope")], self.repo.root), 1)
 
+    def test_a_timed_out_check_fails_the_project(self) -> None:
+        saved = ipe_fmt_check.TIMEOUT_SECS
+        ipe_fmt_check.TIMEOUT_SECS = 0.2
+        try:
+            got = ipe_fmt_check.run_ipe([sys.executable, "-c", "import time; time.sleep(30)"], self.repo.root)
+        finally:
+            ipe_fmt_check.TIMEOUT_SECS = saved
+        self.assertEqual(got, 1)
+
 
 class TestEmptyDiscovery(unittest.TestCase):
     def test_no_project_fails(self) -> None:
         for name, files in (
             ("no files", ()),
-            ("only test inputs", ("tests/golden/g/package.ipe", "x/tests/p/package.ipe")),
+            ("only test inputs", ("Cargo.toml", "x/Cargo.toml", "tests/golden/g/package.ipe", "x/tests/p/package.ipe")),
             ("untracked manifest only", ("README.md",)),
         ):
             with self.subTest(name):

@@ -3,9 +3,11 @@
 
 A project is a directory holding a git-tracked `package.ipe`; the set is
 discovered from `git ls-files`, never hand-kept, so a new project is held to
-the formatter the moment it is tracked. A project beneath a `tests` directory
-is a test input — its exact bytes, deliberately unparseable ones included, are
-what its test pins — so the formatter does not judge it.
+the formatter the moment it is tracked. A project beneath a Cargo test tree (a
+`tests` directory beside a tracked `Cargo.toml`) is a test input — its exact
+bytes, deliberately unparseable ones included, are what its test pins — so the
+formatter does not judge it. A `tests` directory that is not a Cargo test tree
+exempts nothing: the exemption is proven by the crate manifest, never by name.
 
 Each project is checked with `$IPE_BIN fmt --check --plain <dir>`, and the
 verdict is that command's exit status alone: any non-zero exit (drift, a parse
@@ -24,6 +26,7 @@ from collections.abc import Callable, Iterable, Sequence
 
 MANIFEST = "package.ipe"
 TEST_INPUT_COMPONENT = "tests"
+CRATE_MANIFEST = "Cargo.toml"
 TIMEOUT_SECS = 120
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,12 +34,21 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 Runner = Callable[[Sequence[str], str], int]
 
 
+def _is_test_input(parts: Sequence[str], tracked: frozenset[str]) -> bool:
+    """True when a `tests` component of `parts` is a Cargo test tree: its parent tracks a `Cargo.toml`."""
+    return any(
+        part == TEST_INPUT_COMPONENT and "/".join([*parts[:i], CRATE_MANIFEST]) in tracked
+        for i, part in enumerate(parts[:-1])
+    )
+
+
 def projects(tracked: Iterable[str]) -> list[str]:
     """The project directories among `tracked` (repo-relative, `/`-separated) paths, sorted."""
+    paths = frozenset(tracked)
     found = set()
-    for path in tracked:
+    for path in paths:
         parts = path.split("/")
-        if parts[-1] != MANIFEST or TEST_INPUT_COMPONENT in parts[:-1]:
+        if parts[-1] != MANIFEST or _is_test_input(parts, paths):
             continue
         found.add("/".join(parts[:-1]) or ".")
     return sorted(found)
