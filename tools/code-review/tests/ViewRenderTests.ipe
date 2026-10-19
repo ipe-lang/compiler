@@ -423,8 +423,7 @@ everyWithheldConstructorRendered =
             (List.member "Shown" views
                 && List.member "Stale" views
                 && List.member "TooLarge" views
-                && List.sort declared
-                == List.sort (List.filterMap (\entry -> withheldName entry.view) withheldCases)
+                && List.sort declared == List.sort (List.filterMap (\entry -> withheldName entry.view) withheldCases)
             )
 
 
@@ -717,8 +716,7 @@ escapeCutUrlIsUnlinked loaded =
         shown =
             page (unitPageModel (withLinks [ link ] loaded))
     in
-    Label.textBytes url
-        < Lib.Links.hrefByteCeiling
+    Label.textBytes url < Lib.Links.hrefByteCeiling
         && has "data-review-cut" shown
         && not (has "href=" shown)
         && String.startsWith "f:" (Lib.Links.linkKey link)
@@ -820,8 +818,7 @@ seededChecks a b =
         documented title html =
             has ("<title>" ++ title ++ " · Code review</title>") html
                 && has "lang=\"en\"" html
-                && List.length (String.split "<h1" html)
-                == 2
+                && List.length (String.split "<h1" html) == 2
 
         standingPage bodyHash standing =
             page { baseModel | page = UnitPage (Uid.toString a.unit.uid), selectedView = ViewShown a, standing = Queue.StandingShown a.unit.uid bodyHash standing }
@@ -862,43 +859,42 @@ seededChecks a b =
     , ( "a hostile unit name, unit path and history name each draw in byte order", hostileInByteOrder "" (page (cardModel hostileName)) && hostileInByteOrder "" (page (unitPageModel hostileName)) && hostileInByteOrder "" (page (cardModel hostilePath)) && hostileInByteOrder "" (page hostileHistory) )
     , ( "untrusted text draws in byte order, and text with no hazard draws no escape marker", has "unicode-bidi:bidi-override" View.displayOrderCss && has "direction:ltr" View.displayOrderCss && has "background-color:" View.escapeCss && has "border:" View.escapeCss && not (has "data-review-escape" shownCard) && has (byteOrderOpen ++ "Lib.answer") shownCard )
     , ( "two units sharing a kind and name each show their place, a unit alone shows its kind and no place"
-    , has (placeOf "ipe:src/twin.rs") twinCard
-        && has (placeOf (labelText unit.path)) twinCard
-        && has (labelText unit.kind) shownCard
-        && not (has (placeOf (labelText unit.path)) shownCard)
-    )
+      , has (placeOf "ipe:src/twin.rs") twinCard
+            && has (placeOf (labelText unit.path)) twinCard
+            && has (labelText unit.kind) shownCard
+            && not (has (placeOf (labelText unit.path)) shownCard)
+      )
     , ( "every page has a title naming it, a language and one h1, and each unit card or history entry opens an h2"
-    , documented "Queue" shownCard
-        && documented "Queue" (page baseModel)
-        && documented "History" historyPage
-        && documented "Unit" shownPage
-        && documented "Unit" (page (addressModel "not a uid"))
-        && has "<h2" shownCard
-        && has "<h2" shownPage
-        && has "<h2" historyPage
-        && not (has "<title></title>" shownCard)
-        && not (has "<h2" (page baseModel))
-    )
+      , documented "Queue" shownCard
+            && documented "Queue" (page baseModel)
+            && documented "History" historyPage
+            && documented "Unit" shownPage
+            && documented "Unit" (page (addressModel "not a uid"))
+            && has "<h2" shownCard
+            && has "<h2" shownPage
+            && has "<h2" historyPage
+            && not (has "<title></title>" shownCard)
+            && not (has "<h2" (page baseModel))
+      )
     , ( "the unit page of a decided unit names its decision, a reopened unit says why its row is not counted, and an undecided one says it is not reviewed"
-    , has "Approved" approvedPage
-        && not (has "Not reviewed" approvedPage)
-        && has "signature does not verify" tamperedPage
-        && not (has "Approved" tamperedPage)
-        && has "Not reviewed" undecidedPage
-        && not (has "Approved" undecidedPage)
-        && noDecisionButtons approvedPage
-    )
+      , has "Approved" approvedPage
+            && not (has "Not reviewed" approvedPage)
+            && has "signature does not verify" tamperedPage
+            && not (has "Approved" tamperedPage)
+            && has "Not reviewed" undecidedPage
+            && not (has "Approved" undecidedPage)
+            && noDecisionButtons approvedPage
+      )
     , ( "a standing read for another body of the unit shows no decision, only that the read is running"
-    , not (has "Approved" olderBodyPage)
-        && has "Reading review status" olderBodyPage
-        && has "Reading review status" shownPage
-    )
+      , not (has "Approved" olderBodyPage)
+            && has "Reading review status" olderBodyPage
+            && has "Reading review status" shownPage
+      )
     , ( "a queued unit whose row for the current body does not verify says so on its card and in the rail, never as an unreviewed unit"
-    , List.length (String.split "signature does not verify" tamperedCard)
-        == 3
-        && not (has "Not reviewed" tamperedCard)
-        && has "Not reviewed" shownCard
-    )
+      , List.length (String.split "signature does not verify" tamperedCard) == 3
+            && not (has "Not reviewed" tamperedCard)
+            && has "Not reviewed" shownCard
+      )
     , ( "each queue state renders its own text and no other state's", List.all showsOnly stateCases )
     , ( "a queue with open units renders none of the state texts and its header", showsNoStateText (page (cardModel a)) && has (showingLine (queuePage [ queued a ] 1 { reviewed = 0, total = 1 })) shownCard )
     , ( "the progress line and the showing header follow the model's counts", countsFollowModel a b )
@@ -912,24 +908,24 @@ seededChecks a b =
     , ( "a read-only server shows no decision control and says why, beside a signing server that shows them", not (button "Approve" readOnlyCard) && not (button "Refuse" readOnlyCard) && has "Read-only: IPE_REVIEW_MAC_KEY is not set, so no decision is recorded." readOnlyCard && button "Approve" shownCard && not (has "Read-only:" shownCard) )
     , ( "a broken chain shows its banner, naming the entry, on the queue and the History, and an intact one shows none", has banner brokenCard && has banner (page (unverifiedHistory (ShownBroken (BreaksAt 2)) ChainBroken)) && not (has "chain breaks" shownCard) && not (has "chain breaks" (page hostileHistory)) )
     , ( "a log with entries past its head and a log signed by another key each show their own banner"
-    , has "The review log holds 2 entries past its head: a decision was added outside this tool." pastHeadCard
-        && not (has "chain breaks" pastHeadCard)
-        && has "The review log was signed by a different IPE_REVIEW_MAC_KEY: no decision in it counts." keyMismatchCard
-        && not (has "chain breaks" keyMismatchCard)
-        && has "The review log holds 1 entry before its first: a decision was added outside this tool." beforeFirstCard
-        && not (has "past its head" beforeFirstCard)
-    )
+      , has "The review log holds 2 entries past its head: a decision was added outside this tool." pastHeadCard
+            && not (has "chain breaks" pastHeadCard)
+            && has "The review log was signed by a different IPE_REVIEW_MAC_KEY: no decision in it counts." keyMismatchCard
+            && not (has "chain breaks" keyMismatchCard)
+            && has "The review log holds 1 entry before its first: a decision was added outside this tool." beforeFirstCard
+            && not (has "past its head" beforeFirstCard)
+      )
     , ( "a log not proven under the server's key shows no decision control or shortcut and says why, beside a proven one that shows them"
-    , List.all noControl [ brokenCard, pastHeadCard, beforeFirstCard, keyMismatchCard ]
-        && has "The review log is not intact, so no decision is recorded until it is restored." brokenCard
-        && has "The review log is not intact, so no decision is recorded until it is restored." pastHeadCard
-        && has "The review log is not intact, so no decision is recorded until it is restored." beforeFirstCard
-        && has "The review log was signed by a different IPE_REVIEW_MAC_KEY, so no decision is recorded." keyMismatchCard
-        && not (has "Read-only:" brokenCard)
-        && not (has "Read-only:" keyMismatchCard)
-        && button "Approve" shownCard
-        && has "a approve" shownCard
-    )
+      , List.all noControl [ brokenCard, pastHeadCard, beforeFirstCard, keyMismatchCard ]
+            && has "The review log is not intact, so no decision is recorded until it is restored." brokenCard
+            && has "The review log is not intact, so no decision is recorded until it is restored." pastHeadCard
+            && has "The review log is not intact, so no decision is recorded until it is restored." beforeFirstCard
+            && has "The review log was signed by a different IPE_REVIEW_MAC_KEY, so no decision is recorded." keyMismatchCard
+            && not (has "Read-only:" brokenCard)
+            && not (has "Read-only:" keyMismatchCard)
+            && button "Approve" shownCard
+            && has "a approve" shownCard
+      )
     , ( "each reason an entry does not count shows its own text", List.all (\( why, text ) -> has text (page (unverifiedHistory ShownProven why))) unverifiedTexts )
     , ( "the review key never appears on any page", List.all (\html -> not (has testKeyHex html) && not (has (String.toUpper testKeyHex) html)) everyPage )
     ]
@@ -1053,10 +1049,8 @@ drawnDepthWithinBound html =
             deepestDrawnDepth html
     in
     List.any (has "data-review-escape") (codeBlocks html)
-        && 0
-        < deepest
-        && deepest
-        <= Index.drawnDepthCeiling
+        && 0 < deepest
+        && deepest <= Index.drawnDepthCeiling
 
 
 -- The fixture unit's four lines with a comment holding `hostileText`, then the
@@ -1196,8 +1190,7 @@ shortcutRootAutofocused =
             page baseModel
     in
     List.any (\tag -> has "tabindex=\"0\"" tag && has "autofocus" tag) (String.split "<" html)
-        && List.length (String.split "autofocus" html)
-        == 2
+        && List.length (String.split "autofocus" html) == 2
 
 
 -- ── unreviewable files ──────────────────────────────────────────────────
@@ -1221,12 +1214,12 @@ refusalChecks =
             [ Uid.toSql (uid "r-gone"), SqlString "ipe:src/replaced.txt" ]
         loaded <- loadPageNow Index.Start
         decided <- case Maybe.andThen (\row -> row.digest) (List.find (\row -> row.uid == uid "r-link") loaded.refusals) of
-            Just digest ->
-                accepted "the acknowledgement of r-link" (decidedRefusalNow db "r-link" digest)
-                    |> Task.map (\_ -> True)
+                    Just digest ->
+                        accepted "the acknowledgement of r-link" (decidedRefusalNow db "r-link" digest)
+                            |> Task.map (\_ -> True)
 
-            Nothing ->
-                Task.succeed False
+                    Nothing ->
+                        Task.succeed False
         history <- loadHistoryPageNow HistoryStart
         cleanupIndex at.indexDb at.repo
         removeFileIfAny at.reviewDb
@@ -1345,7 +1338,7 @@ untrustedSinkChecks loaded =
             page (cardModel (unreadable "ipe:gone.rs"))
 
         headerModel name =
-            { baseModel | queueState = Loaded (queuePage [] 0 { reviewed = 0, total = 0 } |> (\shown -> { shown | dbName = name })) }
+            { baseModel | queueState = Loaded (queuePage [] 0 { reviewed = 0, total = 0 } |> \shown -> { shown | dbName = name }) }
 
         unit =
             loaded.unit
@@ -1495,8 +1488,7 @@ queueBudgetChecks loaded =
             List.length (String.split plainPath (withPath plainPath)) - 1
     in
     [ ( "a full queue page of hostile labels draws no more elements than the queue element ceiling, and draws every unit cut with its marker"
-      , elementsOf full
-            <= Index.queueElementCeiling
+      , elementsOf full <= Index.queueElementCeiling
             && List.all (\id -> has (uidPlace id) full) (ids "u-budget-")
             && has "data-review-cut" full
             && has "data-review-escape" full
@@ -1505,8 +1497,7 @@ queueBudgetChecks loaded =
       , labelBytes <= Index.queueLabelByteCeiling && labelBytes > 0
       )
     , ( "two units whose columns share their read window and byte length share a label and are told apart by uid"
-      , Label.key (labelOf (twinColumn "x"))
-            == Label.key (labelOf (twinColumn "y"))
+      , Label.key (labelOf (twinColumn "x")) == Label.key (labelOf (twinColumn "y"))
             && has (uidPlace "u-twin-x") twinPage
             && has (uidPlace "u-twin-y") twinPage
       )

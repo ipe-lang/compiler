@@ -89,9 +89,9 @@ openDoesNotMigrateIn base =
     do
         db <- Settings.parseReviewDb dbPath |> Task.andThen LibDb.openAt
         readFailed <- countingVerifier db
-            |> Task.andThen (\verify -> LibDb.findDecision verify db (uid "u-a") "h")
-            |> Task.map (\_ -> False)
-            |> Task.onError (\_ -> Task.succeed True)
+                        |> Task.andThen (\verify -> LibDb.findDecision verify db (uid "u-a") "h")
+                        |> Task.map (\_ -> False)
+                        |> Task.onError (\_ -> Task.succeed True)
         created <- tableExists db "review"
         removeReviewFiles dbPath
         Task.succeed (readFailed && not created)
@@ -123,10 +123,8 @@ duplicateDecisionAlreadyDecided =
                 Task.succeed
                     (linksFrom genesis afterFirst first
                         && isAlreadyDecided second
-                        && afterSecond
-                        == afterFirst
-                        && n
-                        == 1
+                        && afterSecond == afterFirst
+                        && n == 1
                         && isApproved found
                     )
         )
@@ -190,34 +188,32 @@ reviewLogAppendOnly db =
         accepted "the decision" (LibDb.insertDecision key db attested Approved)
         head <- headTextOf db
         refusals <- Task.sequence
-            (List.map refused
-                [ "DELETE FROM review_log"
-                , "UPDATE review_log SET decision = 'refuse', reason = 'x'"
-                , "UPDATE review_log SET body_hash = 'other'"
-                , "DELETE FROM review_log_head"
-                , "UPDATE review_log_head SET log_id = '00000000000000000000000000000000'"
-                , "INSERT OR REPLACE INTO " ++ headColumns
-                , "INSERT INTO " ++ headColumns ++ " ON CONFLICT (one) DO UPDATE SET log_id = excluded.log_id, seq = excluded.seq, head = excluded.head"
-                ]
-            )
+                        (List.map refused
+                            [ "DELETE FROM review_log"
+                            , "UPDATE review_log SET decision = 'refuse', reason = 'x'"
+                            , "UPDATE review_log SET body_hash = 'other'"
+                            , "DELETE FROM review_log_head"
+                            , "UPDATE review_log_head SET log_id = '00000000000000000000000000000000'"
+                            , "INSERT OR REPLACE INTO " ++ headColumns
+                            , "INSERT INTO " ++ headColumns ++ " ON CONFLICT (one) DO UPDATE SET log_id = excluded.log_id, seq = excluded.seq, head = excluded.head"
+                            ]
+                        )
         rewrites <- Task.sequence
-            (List.map rewrite
-                [ "INSERT OR REPLACE INTO " ++ columns
-                , "REPLACE INTO " ++ columns
-                , "INSERT INTO " ++ columns ++ " ON CONFLICT (seq) DO UPDATE SET decision = excluded.decision, reason = excluded.reason, mac = excluded.mac"
-                ]
-            )
+                        (List.map rewrite
+                            [ "INSERT OR REPLACE INTO " ++ columns
+                            , "REPLACE INTO " ++ columns
+                            , "INSERT INTO " ++ columns ++ " ON CONFLICT (seq) DO UPDATE SET decision = excluded.decision, reason = excluded.reason, mac = excluded.mac"
+                            ]
+                        )
         n <- countReviewRows db (uid "u-a") (Index.attest viewA)
         verify <- countingVerifier db
         kept <- LibDb.findDecision verify db (uid "u-a") (Index.attest viewA)
         headAfter <- headTextOf db
         Task.succeed
             (List.all (\ok -> ok) (refusals ++ rewrites)
-                && n
-                == 1
+                && n == 1
                 && isApproved kept
-                && headAfter
-                == head
+                && headAfter == head
             )
 
 
@@ -279,10 +275,10 @@ probeRefusesReviewWithoutHeadIn base =
     do
         legacyMessage <- probeAfterEdits legacy [ "DROP TABLE review_head" ]
         logHeadMessage <- probeAfterEdits logHead
-            [ "DROP TRIGGER review_log_head_no_delete"
-            , "DELETE FROM review_log_head"
-            , "CREATE TRIGGER review_log_head_no_delete BEFORE DELETE ON review_log_head BEGIN SELECT RAISE(ABORT, 'review_log_head is permanent'); END"
-            ]
+                            [ "DROP TRIGGER review_log_head_no_delete"
+                            , "DELETE FROM review_log_head"
+                            , "CREATE TRIGGER review_log_head_no_delete BEFORE DELETE ON review_log_head BEGIN SELECT RAISE(ABORT, 'review_log_head is permanent'); END"
+                            ]
         Task.succeed
             (probeNames "IPE_REVIEW_DB" legacy legacyMessage
                 && probeNames "IPE_REVIEW_DB" logHead logHeadMessage
@@ -319,8 +315,7 @@ probeRefusesReviewWithoutGuardsIn base =
         droppedHeadMessage <- probeAfterEdits (base ++ "/dropped-head.db") [ "DROP TRIGGER review_log_head_no_insert" ]
         renamedMessage <- probeAfterEdits renamed [ "ALTER TABLE review RENAME TO review_old", "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" ]
         Task.succeed
-            (intact
-                == Nothing
+            (intact == Nothing
                 && probeNames "IPE_REVIEW_DB" dropped droppedMessage
                 && maybeContains "lost an append-only trigger" droppedLogMessage
                 && maybeContains "lost an append-only trigger" droppedHeadMessage
@@ -402,12 +397,12 @@ reasonBounded db =
                 && rejected (atBound ++ "x") (overlong (LibDb.reasonMaxChars + 1))
                 && rejected (atBound ++ atBound) (overlong (2 * LibDb.reasonMaxChars))
                 && (case LibDb.parseReason atBound of
-                    Ok r ->
-                        String.length (reasonShown r) == LibDb.reasonMaxChars
+                        Ok r ->
+                            String.length (reasonShown r) == LibDb.reasonMaxChars
 
-                    Err _ ->
-                        False
-                )
+                        Err _ ->
+                            False
+                   )
                 && storedRefused
             )
 
@@ -519,13 +514,9 @@ historyWalkMatchesOrder db =
         logged <- Db.queryDecode db "SELECT uid, body_hash FROM review_log ORDER BY reviewed_at DESC, seq DESC" [] keyDecoder
         legacyRows <- Db.queryDecode db "SELECT uid, body_hash FROM review ORDER BY reviewed_at DESC, uid, body_hash" [] keyDecoder
         Task.succeed
-            (walked.seen
-                == logged
-                ++ legacyRows
-                && walked.pages
-                > 4
-                && List.filter (\( unit, _ ) -> List.member unit walkUids) walked.seen
-                == List.map walkKey [ ( "walk-d", "h1" ), ( "walk-a", "h1" ), ( "walk-a", "h2" ), ( "walk-b", "h1" ), ( "walk-c", "h2" ), ( "walk-c", "h1" ), ( "walk-e", "h1" ), ( "walk-f", "h1" ), ( "walk-f", "h2" ), ( "walk-g", "h1" ) ]
+            (walked.seen == logged ++ legacyRows
+                && walked.pages > 4
+                && List.filter (\( unit, _ ) -> List.member unit walkUids) walked.seen == List.map walkKey [ ( "walk-d", "h1" ), ( "walk-a", "h1" ), ( "walk-a", "h2" ), ( "walk-b", "h1" ), ( "walk-c", "h2" ), ( "walk-c", "h1" ), ( "walk-e", "h1" ), ( "walk-f", "h1" ), ( "walk-f", "h2" ), ( "walk-g", "h1" ) ]
             )
 
 
@@ -611,8 +602,7 @@ historyPageSizeRefused db =
                 && refused (PageSize.maxRows + 1)
                 && accepted 1
                 && accepted PageSize.maxRows
-                && List.length onePage.rows
-                <= 1
+                && List.length onePage.rows <= 1
             )
 
 
@@ -788,8 +778,7 @@ historyRoundtripIn base =
                                     page.rows
                             in
                             isLastHistoryPage page.next
-                                && List.length rows
-                                == 2
+                                && List.length rows == 2
                                 && List.member ( uid "u-a", Nothing ) (List.map historyKey rows)
                                 && List.member ( uid "u-b", Just "too big" ) (List.map historyKey rows)
                         )
@@ -1094,9 +1083,9 @@ truncatedTailFailsClosed : Db -> Task.Task Error Bool
 truncatedTailFailsClosed db =
     do
         verdict <- chainAfter db
-            [ ( "DELETE FROM review_log WHERE seq = 3", [] )
-            , ( "UPDATE review_log_head SET seq = 2, head = (SELECT mac FROM review_log WHERE seq = 2) WHERE one = 1", [] )
-            ]
+                    [ ( "DELETE FROM review_log WHERE seq = 3", [] )
+                    , ( "UPDATE review_log_head SET seq = 2, head = (SELECT mac FROM review_log WHERE seq = 2) WHERE one = 1", [] )
+                    ]
         first <- lookUp db "chain-1" "h"
         second <- lookUp db "chain-2" "h"
         removed <- lookUp db "chain-3" "h"
@@ -1155,17 +1144,13 @@ headRolledBackBelowRowsIsPastHead db =
         refused <- refusedAs LogBroken (LibDb.insertDecision macKey db attested Approved)
         rows <- logRowCount db
         Task.succeed
-            (LibDb.stateVerdict state
-                == Broken (PastHead 3)
-                && LibDb.logShown state
-                == ShownBroken (PastHead 3)
+            (LibDb.stateVerdict state == Broken (PastHead 3)
+                && LibDb.logShown state == ShownBroken (PastHead 3)
                 && List.all (\entry -> whyOf entry == Just ChainBroken) found
-                && List.length page.rows
-                == 6
+                && List.length page.rows == 6
                 && countsNone page.rows
                 && refused
-                && rows
-                == 6
+                && rows == 6
             )
 
 
@@ -1381,25 +1366,16 @@ legacyHeadAdoptsOnlyOnProofIn base =
         otherKey <- legacyProbe (base ++ "/other-key.db") [] other
         pastHead <- legacyProbe (base ++ "/past-head.db") [ "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (3, 'x', 'hX', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')" ] key
         Task.succeed
-            (intact.unbound
-                == KeyMismatch
-                && intact.refusal
-                == Nothing
-                && intact.check
-                /= Nothing
+            (intact.unbound == KeyMismatch
+                && intact.refusal == Nothing
+                && intact.check /= Nothing
                 && isProven intact.after
-                && tampered.refusal
-                == Just (Error.message LibDb.keyMismatchRefusal)
-                && tampered.check
-                == Nothing
-                && otherKey.refusal
-                == Just (Error.message LibDb.keyMismatchRefusal)
-                && otherKey.check
-                == Nothing
-                && pastHead.refusal
-                == Just (Error.message LibDb.keyMismatchRefusal)
-                && pastHead.check
-                == Nothing
+                && tampered.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && tampered.check == Nothing
+                && otherKey.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && otherKey.check == Nothing
+                && pastHead.refusal == Just (Error.message LibDb.keyMismatchRefusal)
+                && pastHead.check == Nothing
             )
 
 
@@ -1496,8 +1472,8 @@ keyCheckMismatchMessageIsSecretFreeIn base =
         startup <- probeMessage (LibDb.probe (ReviewKey.Signing other) loc)
         attested <- attestedFor "ipe-review-secret-free-index" (uid "u-a")
         decision <- LibDb.insertDecision other db attested Approved
-            |> Task.map (\result -> Maybe.map (\refusal -> Failure.saveFailureText (SaveRefused refusal)) (refusalOf result))
-            |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
+                        |> Task.map (\result -> Maybe.map (\refusal -> Failure.saveFailureText (SaveRefused refusal)) (refusalOf result))
+                        |> Task.onError (\e -> Task.succeed (Just (Error.toString e)))
         removeReviewFiles dbPath
         let
             secrets =
@@ -1569,21 +1545,16 @@ storedRowChecks =
         , check "decision roundtrip" decisionRoundtrip
         , Task.succeed
             ( "history shows the digest, not the scheme"
-            , shortHashShown "sha256:0123456789abcdef"
-                == "01234567"
-                && shortHashShown "deadbeefcafe"
-                == "deadbeef"
-                && shortHashShown "sha256:"
-                == ""
+            , shortHashShown "sha256:0123456789abcdef" == "01234567"
+                && shortHashShown "deadbeefcafe" == "deadbeef"
+                && shortHashShown "sha256:" == ""
             )
         , Task.succeed
             -- A review row's hash is database text: a bidi override in it
             -- shows as an escape on the History page.
             ( "history hash renders hazards"
-            , shortHashShown ("sha256:" ++ codeText 8238 ++ "ab" ++ codeText 27 ++ "c")
-                == "\\u{202e}ab\\u{1b}c"
-                && shortHashShown ("dead" ++ codeText 8294 ++ "beef")
-                == "dead\\u{2066}bee"
+            , shortHashShown ("sha256:" ++ codeText 8238 ++ "ab" ++ codeText 27 ++ "c") == "\\u{202e}ab\\u{1b}c"
+                && shortHashShown ("dead" ++ codeText 8294 ++ "beef") == "dead\\u{2066}bee"
             )
         , check "review history roundtrip" historyRoundtrip
         , check "failed writes keep their error" failedWritesKeepTheirError

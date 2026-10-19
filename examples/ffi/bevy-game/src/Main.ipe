@@ -15,10 +15,10 @@ module Main exposing (main)
 -- (bevy's `World` is `!Clone`) cannot be duplicated, so a linear thread is the
 -- only shape the shim-free FFI can compile.
 
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
 import Ipe.Result as Result
 import Ipe.String as String
-import Ipe.Io as Io
-import Ipe.Error as Error exposing (Error)
 import Ipe.Task as Task
 import Rust.Bevy_ecs as Ecs
 

@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.Set as Set
-import Ipe.List as List
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Set as Set
+import Ipe.String as String
 
 
 -- A role-based access check built entirely on set algebra. Each role grants a
@@ -14,13 +14,11 @@ import Ipe.Io as Io
 -- granted. Sets make the "unique, unordered, membership-first" shape of a
 -- permission collection unrepresentable as anything else.
 
-
 -- The permissions a single role grants. `Set.fromList` de-duplicates as it
 -- builds, so a role listed with a repeat still holds each permission once.
 roleGrants : String -> Set String
 roleGrants role =
     case role of
-
         "viewer" ->
             Set.fromList [ "read" ]
 
@@ -97,7 +95,6 @@ main =
 
         deleteAction =
             Set.fromList [ "read", "delete" ]
-
         -- The permissions common to the viewer and admin roles, via
         -- `Set.intersect`: what every one of those roles can always do.
         sharedFloor =

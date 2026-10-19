@@ -1,9 +1,9 @@
 module Main exposing (main)
 
 import Ipe.Analytics as Analytics exposing (Config, ConsentState(..), PropValue(..))
+import Ipe.Io as Io
 import Ipe.Json.Encode as Encode
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- `Ipe.Analytics` is a consent-gated, PII-safe analytics surface. Three security
@@ -20,7 +20,6 @@ import Ipe.Io as Io
 -- The config is an explicit value threaded through the program — there is no
 -- mutable global. Build it with `defaultConfig` (which starts in the fail-closed
 -- `Pending` state) and set consent with `setConsent`.
-
 
 -- Show what one prop value serialises to. The PII branch never reveals the
 -- wrapped plaintext — it always renders the redacted sentinel.
@@ -40,7 +39,8 @@ configWith state =
 -- `Pending` / `Denied` the returned Task succeeds without emitting.
 trackOnce : ConsentState -> Task Error ()
 trackOnce state =
-    Analytics.track (configWith state)
+    Analytics.track
+        (configWith state)
         "checkout"
         (Analytics.props [ ( "plan", PText "pro" ) ])
 

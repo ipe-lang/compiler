@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.List as List
 import Ipe.Dict as Dict
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.String as String
 
 
 -- A word-frequency report in the non-TEA `Program` shape: a plain `main` that
@@ -60,7 +60,6 @@ bump word counts =
 increment : Maybe Int -> Maybe Int
 increment current =
     case current of
-
         Nothing ->
             Just 1
 
@@ -79,7 +78,6 @@ ranked counts =
 byCountThenWord : ( String, Int ) -> ( String, Int ) -> Order
 byCountThenWord ( wordA, countA ) ( wordB, countB ) =
     case compare countB countA of
-
         EQ ->
             compare wordA wordB
 

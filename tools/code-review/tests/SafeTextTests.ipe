@@ -62,8 +62,7 @@ safeTextHazardTable =
     List.all
         (\code ->
             SafeText.isHazard (Char.fromCode code)
-                && rendered (codeText code)
-                /= codeText code
+                && rendered (codeText code) /= codeText code
                 && noHazard (rendered (codeText code))
                 && noHazard (renderedForeign (codeText code))
         )
@@ -71,10 +70,8 @@ safeTextHazardTable =
         && List.all
             (\code ->
                 not (SafeText.isHazard (Char.fromCode code))
-                    && rendered (codeText code)
-                    == codeText code
-                    && renderedForeign (codeText code)
-                    == codeText code
+                    && rendered (codeText code) == codeText code
+                    && renderedForeign (codeText code) == codeText code
             )
             hazardNeighbours
         && List.all identity
@@ -121,8 +118,7 @@ logHazardsAreDisplayHazards =
         cwd <- System.cwd ()
         ranges <- readCodeRanges (repoFile cwd "src/runtime/rust/tests/log_hazard_ranges.json")
         Task.succeed
-            (List.length ranges
-                >= 20
+            (List.length ranges >= 20
                 && List.all
                     (\( lo, hi ) -> List.all (\code -> SafeText.isHazard (Char.fromCode code)) [ lo, (lo + hi) // 2, hi ])
                     ranges
@@ -158,12 +154,9 @@ invisibleCodepointsRendered : Bool
 invisibleCodepointsRendered =
     let
         escaped ( code, spelled ) =
-            rendered (codeText code)
-                == spelled
-                && renderedForeign (codeText code)
-                == spelled
-                && SafeText.toString (Highlight.tokenText (Plain (codeText code)))
-                == spelled
+            rendered (codeText code) == spelled
+                && renderedForeign (codeText code) == spelled
+                && SafeText.toString (Highlight.tokenText (Plain (codeText code))) == spelled
     in
     List.all escaped
         [ ( 173, "\\u{ad}" )
@@ -184,8 +177,7 @@ invisibleCodepointsRendered =
         , ( 160, "\\u{a0}" )
         , ( 12288, "\\u{3000}" )
         ]
-        && rendered "admin"
-        /= rendered ("admin" ++ codeText 8203)
+        && rendered "admin" /= rendered ("admin" ++ codeText 8203)
         && List.all (\code -> rendered (codeText code) == codeText code && SafeText.toString (Highlight.tokenText (Plain (codeText code))) == codeText code) [ 32, 233, 10003 ]
 
 
@@ -236,12 +228,9 @@ segmentsSpellRenderForeign =
                     SafeText.escapeSpelling c
     in
     List.all roleHolds segs
-        && List.length (List.filter isEscaped segs)
-        == List.length hazardMembers
-        && String.concat (List.map spell segs)
-        == renderedForeign mixed
-        && renderedForeign ("a" ++ codeText 8238 ++ "b\n\\" ++ codeText 9)
-        == "a\\u{202e}b\\n\\\\t"
+        && List.length (List.filter isEscaped segs) == List.length hazardMembers
+        && String.concat (List.map spell segs) == renderedForeign mixed
+        && renderedForeign ("a" ++ codeText 8238 ++ "b\n\\" ++ codeText 9) == "a\\u{202e}b\\n\\\\t"
 
 
 isEscaped : Segment -> Bool
@@ -321,8 +310,7 @@ indexUnitRendered : Index.Unit -> Bool
 indexUnitRendered u =
     List.all safeShown [ u.name, u.qualified, u.kind, u.facing ]
         && (Maybe.map safeShown u.purpose == Just True)
-        && labelText u.qualified
-        == "Lib.\\u{202e}answer"
+        && labelText u.qualified == "Lib.\\u{202e}answer"
 
 
 -- Rendered text holds no hazard and spells at least one as an escape.
@@ -353,8 +341,7 @@ sourceTokensRendered =
     List.all
         (\lang -> noHazard (shownIn lang) && String.contains "\\u{202e}" (shownIn lang) && String.contains "\\u{2066}" (shownIn lang))
         [ Highlight.Rust, Highlight.Shell, Highlight.Ipe, Highlight.Unknown ]
-        && label
-        == [ [ LabelText "Lib.", LabelEscapes "\\u{202e}", LabelText "x" ] ]
+        && label == [ [ LabelText "Lib.", LabelEscapes "\\u{202e}", LabelText "x" ] ]
 
 
 -- ── labels ──────────────────────────────────────────────────────────────
@@ -374,14 +361,10 @@ labelTruncationIsInjective =
         other =
             labelOf (prefix ++ "d" ++ String.repeat 3795 "c")
     in
-    Label.key one
-        /= Label.key other
-        && labelText one
-        /= labelText other
-        && droppedBytes one
-        == Just (4096 - Label.capBytes Label.labelCap)
-        && droppedBytes other
-        == droppedBytes one
+    Label.key one /= Label.key other
+        && labelText one /= labelText other
+        && droppedBytes one == Just (4096 - Label.capBytes Label.labelCap)
+        && droppedBytes other == droppedBytes one
 
 
 -- A hundred adjacent NULs are one escape run, cut at the cap with a marker
@@ -435,12 +418,9 @@ shortLabelUncut =
 -- either character, or the plain parse starts.
 quotedLabelEscapesQuotes : Bool
 quotedLabelEscapesQuotes =
-    Label.parts (quotedLabelOf "a\"b\\c")
-        == [ LabelText "a", LabelEscapes (SafeText.escapeSpelling '"'), LabelText "b", LabelEscapes (SafeText.escapeSpelling '\\'), LabelText "c" ]
-        && Label.parts (labelOf "a\"b\\c")
-        == [ LabelText "a\"b\\c" ]
-        && labelText (quotedLabelOf "x\" ok \"y")
-        == String.dropRight 1 (String.dropLeft 1 (SafeText.toString (SafeText.quoted "x\" ok \"y")))
+    Label.parts (quotedLabelOf "a\"b\\c") == [ LabelText "a", LabelEscapes (SafeText.escapeSpelling '"'), LabelText "b", LabelEscapes (SafeText.escapeSpelling '\\'), LabelText "c" ]
+        && Label.parts (labelOf "a\"b\\c") == [ LabelText "a\"b\\c" ]
+        && labelText (quotedLabelOf "x\" ok \"y") == String.dropRight 1 (String.dropLeft 1 (SafeText.toString (SafeText.quoted "x\" ok \"y")))
 
 
 -- A stored path dense with hazards, quoted, still draws at most
@@ -455,12 +435,9 @@ quotedLabelBounded =
         elements =
             List.length (List.filter isElement drawn)
     in
-    elements
-        <= Label.elementCeiling
-        && droppedBytes (quotedLabelOf (String.repeat 200 (codeText 27 ++ "\"a")))
-        /= Nothing
-        && List.length (List.filter isElement (Label.parts (quotedLabelOf "ipe:src/lib.rs")))
-        == 0
+    elements <= Label.elementCeiling
+        && droppedBytes (quotedLabelOf (String.repeat 200 (codeText 27 ++ "\"a"))) /= Nothing
+        && List.length (List.filter isElement (Label.parts (quotedLabelOf "ipe:src/lib.rs"))) == 0
 
 
 isElement : LabelPart -> Bool
@@ -493,18 +470,12 @@ wholeOnlyWithinWindow =
         hexOfCutBlob =
             String.repeat Label.windowChars "6c"
     in
-    Label.whole { shown = hexOfCutBlob, bytes = 2 * Label.windowChars, window = Nothing }
-        == Nothing
-        && Label.whole (Label.columnOf at)
-        == Just at
-        && Label.whole (Label.columnOf wide)
-        == Just wide
-        && Label.whole (Label.columnOf (at ++ "a"))
-        == Nothing
-        && Label.whole (Label.columnOf (wide ++ "é"))
-        == Nothing
-        && Label.whole { shown = "a", bytes = 2, window = Just 2 }
-        == Nothing
+    Label.whole { shown = hexOfCutBlob, bytes = 2 * Label.windowChars, window = Nothing } == Nothing
+        && Label.whole (Label.columnOf at) == Just at
+        && Label.whole (Label.columnOf wide) == Just wide
+        && Label.whole (Label.columnOf (at ++ "a")) == Nothing
+        && Label.whole (Label.columnOf (wide ++ "é")) == Nothing
+        && Label.whole { shown = "a", bytes = 2, window = Just 2 } == Nothing
 
 
 -- A column's extent names why its window falls short: a window of
@@ -521,7 +492,8 @@ extentNamesItsCause =
         at =
             String.repeat Label.windowChars "a"
     in
-    List.map (\column -> extentName (Label.extent column))
+    List.map
+        (\column -> extentName (Label.extent column))
         [ Label.columnOf "ipe:src/Main.ipe"
         , Label.columnOf (at ++ "a")
         , { shown = "ipe:src/Ma", bytes = 17, window = Just 10 }

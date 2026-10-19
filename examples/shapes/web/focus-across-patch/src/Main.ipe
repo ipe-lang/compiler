@@ -166,25 +166,25 @@ deepItems : Model -> List ( String, Ui.Element Msg )
 deepItems model =
     if model.deep then
         [ ( "a_0_div"
-        , Keyed.column
-            []
-            [ ( "b", Ui.el [] (Ui.el [ Ui.id "ydeep", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "y")) ) ]
-        )
+          , Keyed.column
+                []
+                [ ( "b", Ui.el [] (Ui.el [ Ui.id "ydeep", Ui.htmlAttribute "tabindex" "0" ] (Ui.text "y")) ) ]
+          )
         , ( "deeptail", Ui.el [ Ui.id "deeptail" ] (Ui.text "tail") )
         ]
 
     else
         [ ( "a"
-        , Ui.el []
-            (Keyed.column []
-                [ ( "b_0_div"
-                , Ui.el
-                    [ Ui.id "xdeep", Ui.htmlAttribute "tabindex" "0", Ui.onClick Deep ]
-                    (Ui.text "x")
+          , Ui.el []
+                (Keyed.column []
+                    [ ( "b_0_div"
+                      , Ui.el
+                            [ Ui.id "xdeep", Ui.htmlAttribute "tabindex" "0", Ui.onClick Deep ]
+                            (Ui.text "x")
+                      )
+                    ]
                 )
-                ]
-            )
-        )
+          )
         ]
 
 
@@ -267,38 +267,38 @@ shadowingForm model =
         , Ui.htmlAttribute "data-dropped" (dropMark (not model.formDrop) "yes")
         ]
         ([ shadow "appendChild"
-        , Ui.button
+         , Ui.button
             [ Ui.id "rc", Ui.htmlAttribute "name" "removeChild" ]
             { onPress = Nothing, label = Ui.text "named control" }
-        , Ui.button
+         , Ui.button
             [ Ui.id "pe", Ui.htmlAttribute "name" "parentElement" ]
             { onPress = Nothing, label = Ui.text "named walk" }
-        , Ui.el [] (shadow "firstChild")
-        , Ui.el [] (shadow "firstElementChild")
-        , shadow "querySelectorAll"
-        , shadow "contains"
-        , shadow "getAttribute"
-        , shadow "tagName"
-        , shadow "previousElementSibling"
-        , shadow "nextElementSibling"
-        , shadow "namespaceURI"
-        , shadow "replaceChild"
-        , shadow "focus"
-        , shadow "setAttribute"
-        , shadow "removeAttribute"
-        , shadow "closest"
-        , Ui.el [ Ui.id "formlabel" ] (Ui.text "form label")
-        , Ui.el
+         , Ui.el [] (shadow "firstChild")
+         , Ui.el [] (shadow "firstElementChild")
+         , shadow "querySelectorAll"
+         , shadow "contains"
+         , shadow "getAttribute"
+         , shadow "tagName"
+         , shadow "previousElementSibling"
+         , shadow "nextElementSibling"
+         , shadow "namespaceURI"
+         , shadow "replaceChild"
+         , shadow "focus"
+         , shadow "setAttribute"
+         , shadow "removeAttribute"
+         , shadow "closest"
+         , Ui.el [ Ui.id "formlabel" ] (Ui.text "form label")
+         , Ui.el
             [ Ui.id "fgrow", Ui.htmlAttribute "tabindex" "0", Ui.onClick Grow ]
             (Ui.text "grow")
-        ]
+         ]
             ++ formDrop model
             ++ [ Ui.input
-                [ Ui.id "typed"
-                , Ui.htmlAttribute "name" "typed"
-                , Ui.htmlAttribute "aria-label" "Form field"
-                ]
-            ]
+                    [ Ui.id "typed"
+                    , Ui.htmlAttribute "name" "typed"
+                    , Ui.htmlAttribute "aria-label" "Form field"
+                    ]
+               ]
             ++ formRow model
         )
 
@@ -333,14 +333,14 @@ view model =
         , Ui.column
             [ Ui.id "panel" ]
             ([ Ui.button [ Ui.id "add" ] { onPress = Just AddRow, label = Ui.text "add" }
-            , Input.text
+             , Input.text
                 [ Ui.id "note" ]
                 { label = Input.labelHidden "Note"
                 , text = model.note
                 , onChange = Note
                 , placeholder = Nothing
                 }
-            ]
+             ]
                 ++ panelRow model
                 ++ panelDrop model
             )
@@ -351,21 +351,21 @@ view model =
         , Ui.column
             [ Ui.id "formhost" ]
             ([ shadowingForm model
-            , Ui.el
+             , Ui.el
                 [ Ui.id "nfocus", Ui.htmlAttribute "tabindex" "0", Ui.onClick Grow ]
                 (Ui.text "after form")
-            ]
+             ]
                 ++ hostRow model
             )
         , Ui.column
             [ Ui.id "eschost" ]
             (escRow model
                 ++ [ Ui.input
-                    [ Ui.id "escname"
-                    , Ui.htmlAttribute "name" "a\\b\nc"
-                    , Ui.htmlAttribute "aria-label" "Escaped name"
-                    ]
-                ]
+                        [ Ui.id "escname"
+                        , Ui.htmlAttribute "name" "a\\b\nc"
+                        , Ui.htmlAttribute "aria-label" "Escaped name"
+                        ]
+                   ]
             )
         , Ui.column
             [ Ui.id "mathhost" ]

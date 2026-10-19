@@ -1,10 +1,10 @@
 module Main exposing (main)
 
-import Ipe.Palette as Palette exposing (Shade(..), Spacing(..))
+import Ipe.Io as Io
 import Ipe.List as List
+import Ipe.Palette as Palette exposing (Shade(..), Spacing(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- `Ipe.Palette` is a small closed-ADT design-token module. Two ideas:
@@ -15,7 +15,6 @@ import Ipe.Io as Io
 --   • `Spacing` wraps a raw pixel count in a NAMED type (`Sp Int`), so a spacing
 --     value can never be confused with a bare `Int` from somewhere else;
 --     `spacingPx` is the one place the raw number is recovered.
-
 
 -- Every `Shade` renders to its hex string. Because `Shade` is a closed union,
 -- listing its constructors here is exhaustive by construction.

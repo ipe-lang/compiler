@@ -88,7 +88,7 @@ report results =
             (if ok then
                 "PASS"
 
-            else
+             else
                 "FAIL"
             )
                 ++ " "

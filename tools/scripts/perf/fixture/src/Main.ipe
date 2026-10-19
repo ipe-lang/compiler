@@ -7,11 +7,10 @@ module Main exposing (main)
 -- `ipe dev watch` hot-swap path, and a logic value (the increment step) to exercise a
 -- full recompile.
 
-
+import Ipe.String as String
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.String as String
 import Ipe.Ui as Ui
 
 
@@ -50,7 +49,8 @@ subscriptions _model =
 
 view : Model -> Element Msg
 view model =
-    Ui.column [ Ui.style "background-color" "#ffffff" ]
+    Ui.column
+        [ Ui.style "background-color" "#ffffff" ]
         [ Ui.button [] { onPress = Just Increment, label = Ui.text "+" }
         , Ui.text (String.fromInt model.count)
         , Ui.button [] { onPress = Just Decrement, label = Ui.text "-" }
