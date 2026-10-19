@@ -30,8 +30,7 @@ fn lower_entry(entry: &Path) -> Option<(Interner, ipe_ir::Program)> {
     Some((interner, program))
 }
 
-/// Every golden corpus directory that carries both a `Main.ipe` source (at its
-/// root or under `src/`) and a checked-in `main.rs` emitted-Rust golden — the
+/// Every golden corpus directory that carries both a `src/Main.ipe` source and a checked-in `main.rs` emitted-Rust golden — the
 /// byte-exact reference the native path must reproduce — as `(directory name, source)`.
 fn corpus_entries() -> Vec<(String, PathBuf)> {
     let golden = repo_root().join("tests").join("golden");
@@ -44,10 +43,8 @@ fn corpus_entries() -> Vec<(String, PathBuf)> {
         if !path.join("main.rs").is_file() {
             continue;
         }
-        let source = [path.join("src").join("Main.ipe"), path.join("Main.ipe")]
-            .into_iter()
-            .find(|candidate| candidate.is_file());
-        if let Some(source) = source {
+        let source = path.join("src").join("Main.ipe");
+        if source.is_file() {
             entries.push((dir.file_name().to_string_lossy().into_owned(), source));
         }
     }

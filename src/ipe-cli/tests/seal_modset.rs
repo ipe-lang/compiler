@@ -200,7 +200,7 @@ const HTTP_STREAM_CHUNKS: &str = "module Main exposing (main)\n\
 /// with E0425 (`AuthConfig` not found) — the SEAL breach this test gates.
 const AUTHED_ROUTE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/authed_route_revocation_vendored_seal/Main.ipe"
+    "/../../tests/golden/authed_route_revocation_vendored_seal/src/Main.ipe"
 ));
 
 /// Authed-route + Db-store program using `Store.allAs` behind `Server.getAuthed`.
@@ -231,7 +231,7 @@ const AUTHED_STORE_QUERY: &str = include_str!(concat!(
 /// crate will not build.
 const REVOKE_SESSION_ARITY3: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/revoke_session_arity3_seal/Main.ipe"
+    "/../../tests/golden/revoke_session_arity3_seal/src/Main.ipe"
 ));
 
 /// Authed-route program that reads the principal's verified claims via
@@ -247,7 +247,7 @@ const REVOKE_SESSION_ARITY3: &str = include_str!(concat!(
 /// for the principal-read surface.
 const AUTHED_PRINCIPAL_CLAIMS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/golden/authed_principal_claims_seal/Main.ipe"
+    "/../../tests/golden/authed_principal_claims_seal/src/Main.ipe"
 ));
 
 // ── The gate: every shape emits AND cargo-builds ────────────────────────────

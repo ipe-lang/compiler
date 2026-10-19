@@ -258,7 +258,8 @@ fn a_misplaced_asserted_call_is_refused() {
 #[test]
 fn asserted_program_discloses_ffi_raw() {
     let fixture = ffi_fixture(MAIN_IPE);
-    let entry = fixture.path().join("src").join("Main.ipe");
+    let golden_project = fixture.path().join("src");
+    let entry = crate::support::golden_source(&golden_project, "Main");
 
     // The same front-end seam the build runs: stdlib injection → FFI
     // preparation (scan + interface injection) → lower → capability scan.
@@ -305,7 +306,8 @@ fn analysis_entrypoints_accept_an_asserted_program() {
             .field("version = \"0.1.0\""),
     );
 
-    let entry = fixture.path().join("src").join("Main.ipe");
+    let golden_project = fixture.path().join("src");
+    let entry = crate::support::golden_source(&golden_project, "Main");
     ipe::run_cli(&["type-check".to_owned(), entry.display().to_string()])
         .expect("`ipe type-check` must accept an asserted program");
 

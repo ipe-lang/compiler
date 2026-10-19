@@ -320,7 +320,7 @@ main =
 "#;
 
 /// Ipê server exercising `Middleware.withCsrf` end-to-end.  Mirrors
-/// `tests/golden/middleware_csrf/Main.ipe` but adds a `GET /action` route
+/// `tests/golden/middleware_csrf/src/Main.ipe` but adds a `GET /action` route
 /// (also wrapped in `Middleware.withCsrf`) so a real HTTP client can mint the
 /// double-submit cookie via a safe-method request before probing the
 /// CSRF-protected `POST /action`.

@@ -31,11 +31,11 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// unparseable file, or a parser regression that starts rejecting more, goes
 /// red here instead of silently widening the skip set.
 const KNOWN_PARSE_REFUSALS: &[&str] = &[
-    "tests/golden/blockcomment_unterminated/Main.ipe",
-    "tests/golden/gate_malformed_char_pattern/Main.ipe",
-    "tests/golden/gate_malformed_char_scrutinee/Main.ipe",
-    "tests/golden/neg_int_lambda/Main.ipe",
-    "tests/golden/neg_list_lambda/Main.ipe",
+    "tests/golden/blockcomment_unterminated/src/Main.ipe",
+    "tests/golden/gate_malformed_char_pattern/src/Main.ipe",
+    "tests/golden/gate_malformed_char_scrutinee/src/Main.ipe",
+    "tests/golden/neg_int_lambda/src/Main.ipe",
+    "tests/golden/neg_list_lambda/src/Main.ipe",
 ];
 
 /// The floor a healthy walk must clear.
