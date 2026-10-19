@@ -1173,7 +1173,7 @@ refusePanel controls submit =
     Ui.column
         [ Ui.width (Ui.px 240), Ui.spacing 6 ]
         [ Input.text
-            [ Ui.width Ui.fill ]
+            [ Ui.width Ui.fill, Ui.htmlAttribute "autofocus" "" ]
             { label = Input.labelAbove [ Font.size 11 ] (Ui.text "Reason")
             , text = controls.refuseDraft
             , onChange = RefuseDraft
