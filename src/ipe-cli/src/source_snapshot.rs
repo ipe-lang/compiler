@@ -273,6 +273,35 @@ impl SourceSnapshot {
         })
     }
 
+    /// The modules the `dir` module `module` is analysed over, when the snapshot holds a `tests/` one.
+    ///
+    /// A `src/` module is analysed over the build's modules
+    /// ([`SourceSnapshot::modules`]); a `tests/` module over its own
+    /// [`SourceSnapshot::test_view`], never merged into the build's. `None`
+    /// when `dir` is `tests/` and the snapshot holds no `tests/` module
+    /// `module`; whether a `src/` module is held is the caller's to check
+    /// against each module's [`SourceOrigin`].
+    ///
+    /// # Errors
+    /// Every refusal of [`SourceSnapshot::test_view`].
+    pub fn view<'s>(
+        &'s self,
+        dir: SourceDir,
+        module: &'s [String],
+    ) -> Result<Option<ModuleView<'s>>, CliError> {
+        match dir {
+            SourceDir::Src => Ok(Some(ModuleView::Build {
+                modules: &self.modules,
+                entry: module,
+            })),
+            SourceDir::Tests => self
+                .test_entry(module)
+                .map(Self::test_view)
+                .transpose()
+                .map(|view| view.map(|view| ModuleView::Test(Box::new(view)))),
+        }
+    }
+
     /// Every module the build sees, keyed by module path.
     #[must_use]
     pub const fn modules(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
@@ -391,6 +420,41 @@ impl TestView {
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
+    }
+}
+
+/// The modules one project module is analysed over, and the entry it names in them.
+///
+/// Minted by [`SourceSnapshot::view`].
+pub enum ModuleView<'s> {
+    /// A `src/` module over the build's modules.
+    Build {
+        /// Every module the build sees.
+        modules: &'s BTreeMap<ModulePath, SnapshotModule>,
+        /// The module analysed.
+        entry: &'s [String],
+    },
+    /// A `tests/` module over its own test universe.
+    Test(Box<TestView>),
+}
+
+impl ModuleView<'_> {
+    /// Every module the analysed module sees, keyed by module path.
+    #[must_use]
+    pub fn modules(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
+        match self {
+            Self::Build { modules, .. } => modules,
+            Self::Test(view) => view.modules(),
+        }
+    }
+
+    /// The analysed module.
+    #[must_use]
+    pub fn entry(&self) -> &[String] {
+        match self {
+            Self::Build { entry, .. } => entry,
+            Self::Test(view) => view.entry(),
+        }
     }
 }
 

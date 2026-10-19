@@ -3681,15 +3681,16 @@ pub struct SourceGraph {
     /// The entry module's dotted path — its `(file, src)` is the fallback frame
     /// for a homeless / dummy-span diagnostic.
     entry_module_path: Vec<String>,
+    /// The path the entry module's text was read from, taken from `sources`
+    /// when the graph is built: a graph whose entry has no source is not built.
+    entry_path: PathBuf,
 }
 
 impl SourceGraph {
     /// The path the entry module's text was read from, which its diagnostics blame.
     #[must_use]
     pub fn entry_path(&self) -> &Path {
-        self.sources
-            .get(&self.entry_module_path)
-            .map_or_else(|| Path::new(""), |(path, _)| path.as_path())
+        &self.entry_path
     }
 
     /// Run the per-module canonicalisation blame loop, then map a rejecting
@@ -3804,15 +3805,18 @@ fn build_source_graph_from(
 
     let db = ipe_db::IpeDatabase::new();
     let source_root = create_source_root(&db, &collected.sources, &injected, &ffi_injected);
-    let Some(entry_file) = source_root
-        .files(&db)
-        .get(&collected.entry_module_path)
-        .copied()
-    else {
+    let (Some(entry_file), Some((entry_path, _))) = (
+        source_root
+            .files(&db)
+            .get(&collected.entry_module_path)
+            .copied(),
+        collected.sources.get(&collected.entry_module_path),
+    ) else {
         return Err(CliError::Usage(
             text::msg::internal_entry_not_in_source_map(),
         ));
     };
+    let entry_path = entry_path.clone();
 
     Ok(SourceGraph {
         db,
@@ -3820,6 +3824,7 @@ fn build_source_graph_from(
         entry_file,
         sources: collected.sources,
         entry_module_path: collected.entry_module_path,
+        entry_path,
     })
 }
 
@@ -4217,35 +4222,12 @@ pub fn analysis_graphs(target: &AnalysisTarget<'_>) -> Result<Vec<SourceGraph>, 
                 .map(|module| graph_over(root, snapshot.modules(), SourceDir::Src, module))
                 .collect()
         }
-        AnalysisTarget::Module {
-            root,
-            dir: SourceDir::Src,
-            module,
-        } => {
+        AnalysisTarget::Module { root, dir, module } => {
             let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
-            Ok(vec![graph_over(
-                root,
-                snapshot.modules(),
-                SourceDir::Src,
-                module,
-            )?])
-        }
-        AnalysisTarget::Module {
-            root,
-            dir: SourceDir::Tests,
-            module,
-        } => {
-            let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
-            let Some(entry) = snapshot.test_entry(module) else {
-                return Err(module_missing(root, SourceDir::Tests, module));
+            let Some(view) = snapshot.view(*dir, module)? else {
+                return Err(module_missing(root, *dir, module));
             };
-            let view = SourceSnapshot::test_view(entry)?;
-            Ok(vec![graph_over(
-                root,
-                view.modules(),
-                SourceDir::Tests,
-                view.entry(),
-            )?])
+            Ok(vec![graph_over(root, view.modules(), *dir, view.entry())?])
         }
     }
 }
@@ -4260,14 +4242,10 @@ pub fn entry_modules(entries: &EntrySet) -> Vec<&[String]> {
 
 /// The refusal for a module the snapshot does not hold, naming the file it would lie at.
 pub fn module_missing(root: &ProjectRoot, dir: SourceDir, module: &[String]) -> CliError {
-    let dir_name = match dir {
-        SourceDir::Src => "src",
-        SourceDir::Tests => "tests",
-    };
     CliError::Io {
         path: root
             .path()
-            .join(dir_name)
+            .join(dir.name())
             .join(format!("{}.ipe", module.join("/"))),
         source: std::io::ErrorKind::NotFound.into(),
     }
@@ -4275,14 +4253,25 @@ pub fn module_missing(root: &ProjectRoot, dir: SourceDir, module: &[String]) -> 
 
 /// The source graph of `entry` over `modules`, each keeping the origin the snapshot gave it.
 ///
+/// The entry must be a module of the project's own `dir`: a stdlib or FFI
+/// module of its path, or one of the other directory, is never analysed in
+/// its place.
+///
 /// # Errors
-/// [`CliError::Io`] (`NotFound`) when `modules` holds no `entry`.
-fn graph_over(
+/// [`CliError::Io`] (`NotFound`) when `modules` holds no `dir` module `entry`.
+pub fn graph_over(
     root: &ProjectRoot,
     modules: &BTreeMap<ModulePath, SnapshotModule>,
     dir: SourceDir,
     entry: &[String],
 ) -> Result<SourceGraph, CliError> {
+    let Some(held_entry) = modules
+        .get(entry)
+        .filter(|held| held.origin() == SourceOrigin::Own(dir))
+    else {
+        return Err(module_missing(root, dir, entry));
+    };
+    let entry_path = held_entry.path().to_path_buf();
     let mut sources = BTreeMap::new();
     let mut stdlib = std::collections::BTreeSet::new();
     let mut ffi_injected = std::collections::BTreeSet::new();
@@ -4312,6 +4301,7 @@ fn graph_over(
         entry_file,
         sources,
         entry_module_path: entry.to_vec(),
+        entry_path,
     })
 }
 

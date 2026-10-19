@@ -3322,6 +3322,53 @@ fn a_tests_module_importing_a_src_module_type_checks_green() {
     assert!(checked.is_ok(), "{checked:?}");
 }
 
+/// A module the analysed directory does not own is refused, never analysed in
+/// its place: a stdlib module of the build, a `src/` module of a test view.
+#[test]
+fn graph_over_refuses_an_entry_its_directory_does_not_own() {
+    use crate::project_root::SourceDir;
+    use crate::source_snapshot::{Limits, SnapshotModule, SourceOrigin, SourceSnapshot};
+    let project = analysis_project(
+        &SourceTree::main(
+            "module Main exposing (main)\n\nimport Ipe.List as List\n\n\nmain : Int\nmain =\n    List.length [ 1 ]\n",
+        )
+        .test_module("Check", "module Check exposing (main)\nmain = 1\n"),
+    );
+    let root = project.root();
+    let snapshot = SourceSnapshot::read(root, Limits::DEFAULT).expect("snapshot");
+    let stdlib = vec!["Ipe".to_owned(), "List".to_owned()];
+    assert_eq!(
+        snapshot.module(&stdlib).map(SnapshotModule::origin),
+        Some(SourceOrigin::Stdlib),
+        "the build's modules hold the stdlib module"
+    );
+    let as_src = graph_over(root, snapshot.modules(), SourceDir::Src, &stdlib);
+    assert!(
+        matches!(&as_src, Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound),
+        "a stdlib module is no `src/` module: {:?}",
+        as_src.err()
+    );
+    let check = vec!["Check".to_owned()];
+    let view = snapshot
+        .view(SourceDir::Tests, &check)
+        .expect("the test view prepares")
+        .expect("the snapshot holds `tests/Check.ipe`");
+    let main = vec!["Main".to_owned()];
+    assert_eq!(
+        view.modules().get(&main).map(SnapshotModule::origin),
+        Some(SourceOrigin::Own(SourceDir::Src)),
+        "the test view holds the `src/` module"
+    );
+    let as_test = graph_over(root, view.modules(), SourceDir::Tests, &main);
+    assert!(
+        matches!(&as_test, Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound),
+        "a `src/` module is no `tests/` module: {:?}",
+        as_test.err()
+    );
+    let own = graph_over(root, view.modules(), SourceDir::Tests, view.entry());
+    assert!(own.is_ok(), "the view's own entry: {:?}", own.err());
+}
+
 /// A nested `src/` module importing a sibling by its full module path
 /// type-checks over the whole `src/` tree.
 #[test]
@@ -6195,6 +6242,88 @@ fn a_user_named_entry_symlink_is_followed() {
         shape.is_ok(),
         "a named entry link must be followed: {:?}",
         shape.err()
+    );
+}
+
+/// A project whose one program's entry is `entry`, with a clean `src/Main.ipe` and `extra` sources.
+fn declared_entry_project(tag: &str, entry: &str, extra: &[(&str, &str)]) -> PathBuf {
+    let dir = session_scratch(tag);
+    let src = dir.join("src");
+    assert!(fs::create_dir_all(&src).is_ok(), "make src/");
+    let manifest = format!(
+        "module Package exposing (package)\n\n\npackage =\n    {{ name = \"app\"\n    , programs = [ {{ name = \"app\", entry = \"{entry}\" }} ]\n    }}\n"
+    );
+    assert!(
+        fs::write(dir.join("package.ipe"), manifest).is_ok(),
+        "write package.ipe"
+    );
+    assert!(
+        fs::write(src.join("Main.ipe"), CLEAN_MAIN).is_ok(),
+        "write src/Main.ipe"
+    );
+    for (rel, body) in extra {
+        assert!(fs::write(src.join(rel), body).is_ok(), "write extra source");
+    }
+    dir
+}
+
+/// A program entry the build refuses (escaping `src/`, absolute, no `.ipe`, no
+/// module name) is refused by the shape read too, never read as the path it spells.
+#[test]
+fn classify_entry_shape_refuses_an_entry_the_build_refuses() {
+    for (tag, entry) in [
+        ("shape_entry_absolute", "/etc/passwd"),
+        ("shape_entry_absolute_module", "/etc/Main.ipe"),
+        ("shape_entry_parent", "../../secret.ipe"),
+        ("shape_entry_parent_module", "../../Secret.ipe"),
+        ("shape_entry_no_extension", "Main"),
+        ("shape_entry_other_extension", "Main.txt"),
+        ("shape_entry_lowercase", "main.ipe"),
+    ] {
+        let dir = declared_entry_project(
+            tag,
+            entry,
+            &[
+                ("Main.txt", "module Main exposing (main)\nmain = 1\n"),
+                ("main.ipe", "module Main exposing (main)\nmain = 1\n"),
+            ],
+        );
+        let shape = classify_entry_shape(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            matches!(shape, Err(CliError::Usage(_))),
+            "entry {entry:?} must be refused like the build: {shape:?}"
+        );
+    }
+}
+
+/// A well-formed entry module whose file links out of `src/` is refused, not read.
+#[cfg(unix)]
+#[test]
+fn classify_entry_shape_refuses_an_entry_linked_outside_the_source_root() {
+    let dir = declared_entry_project("shape_entry_link", "Main.ipe", &[]);
+    let outside = dir.join("Outside.ipe");
+    assert!(
+        fs::write(&outside, CLEAN_MAIN).is_ok(),
+        "write outside file"
+    );
+    let link = dir.join("src").join("Main.ipe");
+    assert!(fs::remove_file(&link).is_ok(), "drop src/Main.ipe");
+    assert!(
+        std::os::unix::fs::symlink(&outside, &link).is_ok(),
+        "link entry out of src/"
+    );
+    let shape = classify_entry_shape(&dir);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(
+            shape,
+            Err(CliError::SourceRefused {
+                reason: SourceRefusal::Symlink,
+                ..
+            })
+        ),
+        "an entry file linked outside src/ must be refused: {shape:?}"
     );
 }
 

@@ -124,6 +124,17 @@ pub enum SourceDir {
     Tests,
 }
 
+impl SourceDir {
+    /// The directory's name below the project root.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Src => SRC_DIR,
+            Self::Tests => TESTS_DIR,
+        }
+    }
+}
+
 /// What one analysis command looks at.
 #[derive(Debug)]
 pub enum AnalysisTarget<'r> {
