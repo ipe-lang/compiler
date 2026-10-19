@@ -142,6 +142,7 @@ checks:
         - python3 .github/ci/test_local_gate.py -v
         - python3 .github/ci/test_cargo_invocation.py -v
         - python3 .github/ci/test_claims_table.py -v
+        - python3 .github/ci/test_check_required_set.py -v
         - python3 .github/ci/check_required_set.py
   - context: manifest-lock-consistency
     disposition: gate
