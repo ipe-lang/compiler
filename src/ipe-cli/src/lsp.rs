@@ -133,6 +133,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::PackageAudit(_)
         | CliError::Publish(_)
         | CliError::VersionRefused { .. }
+        | CliError::CheckFailed(_)
         | CliError::DocCoverage(_)
         | CliError::DocExamplesFailed(_)
         | CliError::CommandUsage { .. }
