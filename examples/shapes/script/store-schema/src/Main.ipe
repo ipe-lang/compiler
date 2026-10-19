@@ -1,12 +1,12 @@
 module Main exposing (main)
 
-import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Codec as Codec exposing (Codec)
-import Ipe.Result as Result exposing (Result(..))
+import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Error exposing (Error)
-import Ipe.String as String
-import Ipe.List as List
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
 
 
 -- `Ipe.Db.Store` is a typed table whose schema, reads, and writes all derive

@@ -1,11 +1,11 @@
 module Main exposing (main)
 
-import Ipe.Io as Io
-import Ipe.Task as Task
 import Ipe.Error as Error exposing (Error)
-import Ipe.String as String
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
+import Ipe.String as String
+import Ipe.Task as Task
 import Ipe.Tuple as Tuple
 import List.Extra as Extra
 
@@ -22,6 +22,7 @@ check name ok failures =
 
 -- Typed helpers to give the HM solver concrete element types for tests that
 -- would otherwise leave a type variable ambiguous.
+
 
 emptyInts : List Int
 emptyInts =
@@ -54,104 +55,140 @@ spanSecond pred list =
 -- Test groups — each group is a small |> chain so HM stays tractable.
 -- ---------------------------------------------------------------------------
 
+
 checksAccess : List String
 checksAccess =
     []
-        |> check "last [1,2,3] == Just 3"
-               (Extra.last [ 1, 2, 3 ] == Just 3)
-        |> check "last [] == Nothing"
-               (Extra.last emptyInts == Nothing)
-        |> check "init [1,2,3] == Just [1,2]"
-               (Extra.init [ 1, 2, 3 ] == Just [ 1, 2 ])
-        |> check "init [] == Nothing"
-               (Extra.init emptyInts == Nothing)
-        |> check "getAt 1 [10,20,30] == Just 20"
-               (Extra.getAt 1 [ 10, 20, 30 ] == Just 20)
-        |> check "getAt 5 [1,2,3] == Nothing"
-               (Extra.getAt 5 [ 1, 2, 3 ] == Nothing)
-        |> check "getAt -1 [1,2,3] == Nothing"
-               (Extra.getAt (0 - 1) [ 1, 2, 3 ] == Nothing)
+        |> check
+            "last [1,2,3] == Just 3"
+            (Extra.last [ 1, 2, 3 ] == Just 3)
+        |> check
+            "last [] == Nothing"
+            (Extra.last emptyInts == Nothing)
+        |> check
+            "init [1,2,3] == Just [1,2]"
+            (Extra.init [ 1, 2, 3 ] == Just [ 1, 2 ])
+        |> check
+            "init [] == Nothing"
+            (Extra.init emptyInts == Nothing)
+        |> check
+            "getAt 1 [10,20,30] == Just 20"
+            (Extra.getAt 1 [ 10, 20, 30 ] == Just 20)
+        |> check
+            "getAt 5 [1,2,3] == Nothing"
+            (Extra.getAt 5 [ 1, 2, 3 ] == Nothing)
+        |> check
+            "getAt -1 [1,2,3] == Nothing"
+            (Extra.getAt (0 - 1) [ 1, 2, 3 ] == Nothing)
 
 
 checksSearch : List String
 checksSearch =
     []
-        |> check "findIndex even [1,2,3,4] == Just 1"
-               (Extra.findIndex (\x -> modBy 2 x == 0) [ 1, 2, 3, 4 ] == Just 1)
-        |> check "findIndex (>10) [1,2,3] == Nothing"
-               (Extra.findIndex (\x -> x > 10) [ 1, 2, 3 ] == Nothing)
-        |> check "count even [1,2,3,4,5,6] == 3"
-               (Extra.count (\x -> modBy 2 x == 0) [ 1, 2, 3, 4, 5, 6 ] == 3)
-        |> check "count (>10) [1,2,3] == 0"
-               (Extra.count (\x -> x > 10) [ 1, 2, 3 ] == 0)
+        |> check
+            "findIndex even [1,2,3,4] == Just 1"
+            (Extra.findIndex (\x -> modBy 2 x == 0) [ 1, 2, 3, 4 ] == Just 1)
+        |> check
+            "findIndex (>10) [1,2,3] == Nothing"
+            (Extra.findIndex (\x -> x > 10) [ 1, 2, 3 ] == Nothing)
+        |> check
+            "count even [1,2,3,4,5,6] == 3"
+            (Extra.count (\x -> modBy 2 x == 0) [ 1, 2, 3, 4, 5, 6 ] == 3)
+        |> check
+            "count (>10) [1,2,3] == 0"
+            (Extra.count (\x -> x > 10) [ 1, 2, 3 ] == 0)
 
 
 checksInterweave : List String
 checksInterweave =
     []
-        |> check "interweave non-empty is non-empty"
-               (not (List.isEmpty (Extra.interweave [ 1, 2, 3 ] [ 4, 5 ])))
-        |> check "interweave equal-length has double length"
-               (List.length (Extra.interweave [ 1, 2 ] [ 3, 4 ]) == 4)
-        |> check "interweave with empty right == left"
-               (List.length (Extra.interweave [ 1, 2, 3 ] emptyInts) == 3)
-        |> check "interweave with empty left == right"
-               (List.length (Extra.interweave emptyInts [ 4, 5 ]) == 2)
+        |> check
+            "interweave non-empty is non-empty"
+            (not (List.isEmpty (Extra.interweave [ 1, 2, 3 ] [ 4, 5 ])))
+        |> check
+            "interweave equal-length has double length"
+            (List.length (Extra.interweave [ 1, 2 ] [ 3, 4 ]) == 4)
+        |> check
+            "interweave with empty right == left"
+            (List.length (Extra.interweave [ 1, 2, 3 ] emptyInts) == 3)
+        |> check
+            "interweave with empty left == right"
+            (List.length (Extra.interweave emptyInts [ 4, 5 ]) == 2)
 
 
 checksSplit : List String
 checksSplit =
     []
-        |> check "splitAt 2 [1,2,3,4] first has length 2"
-               (List.length (splitAtFirst 2 [ 1, 2, 3, 4 ]) == 2)
-        |> check "splitAt 2 [1,2,3,4] second has length 2"
-               (List.length (splitAtSecond 2 [ 1, 2, 3, 4 ]) == 2)
-        |> check "splitAt 0 [1,2,3] first is empty"
-               (List.isEmpty (splitAtFirst 0 [ 1, 2, 3 ]))
-        |> check "splitAt 0 [1,2,3] second has length 3"
-               (List.length (splitAtSecond 0 [ 1, 2, 3 ]) == 3)
-        |> check "splitAt beyond length second is empty"
-               (List.isEmpty (splitAtSecond 10 [ 1, 2, 3 ]))
-        |> check "span (<3) [1,2,3,4] prefix length == 2"
-               (List.length (spanFirst (\x -> x < 3) [ 1, 2, 3, 4 ]) == 2)
-        |> check "span (<3) [1,2,3,4] suffix length == 2"
-               (List.length (spanSecond (\x -> x < 3) [ 1, 2, 3, 4 ]) == 2)
-        |> check "span all-true prefix length == 3"
-               (List.length (spanFirst (\x -> x < 10) [ 1, 2, 3 ]) == 3)
-        |> check "span all-true suffix is empty"
-               (List.isEmpty (spanSecond (\x -> x < 10) [ 1, 2, 3 ]))
-        |> check "span all-false prefix is empty"
-               (List.isEmpty (spanFirst (\x -> x > 10) [ 1, 2, 3 ]))
+        |> check
+            "splitAt 2 [1,2,3,4] first has length 2"
+            (List.length (splitAtFirst 2 [ 1, 2, 3, 4 ]) == 2)
+        |> check
+            "splitAt 2 [1,2,3,4] second has length 2"
+            (List.length (splitAtSecond 2 [ 1, 2, 3, 4 ]) == 2)
+        |> check
+            "splitAt 0 [1,2,3] first is empty"
+            (List.isEmpty (splitAtFirst 0 [ 1, 2, 3 ]))
+        |> check
+            "splitAt 0 [1,2,3] second has length 3"
+            (List.length (splitAtSecond 0 [ 1, 2, 3 ]) == 3)
+        |> check
+            "splitAt beyond length second is empty"
+            (List.isEmpty (splitAtSecond 10 [ 1, 2, 3 ]))
+        |> check
+            "span (<3) [1,2,3,4] prefix length == 2"
+            (List.length (spanFirst (\x -> x < 3) [ 1, 2, 3, 4 ]) == 2)
+        |> check
+            "span (<3) [1,2,3,4] suffix length == 2"
+            (List.length (spanSecond (\x -> x < 3) [ 1, 2, 3, 4 ]) == 2)
+        |> check
+            "span all-true prefix length == 3"
+            (List.length (spanFirst (\x -> x < 10) [ 1, 2, 3 ]) == 3)
+        |> check
+            "span all-true suffix is empty"
+            (List.isEmpty (spanSecond (\x -> x < 10) [ 1, 2, 3 ]))
+        |> check
+            "span all-false prefix is empty"
+            (List.isEmpty (spanFirst (\x -> x > 10) [ 1, 2, 3 ]))
 
 
 checksFold : List String
 checksFold =
     []
-        |> check "foldl1 (+) [1,2,3] == Just 6"
-               (Extra.foldl1 (\x acc -> x + acc) [ 1, 2, 3 ] == Just 6)
-        |> check "foldl1 (-) [10,3,2] == Just 5"
-               (Extra.foldl1 (\x acc -> x - acc) [ 10, 3, 2 ] == Just 5)
-        |> check "foldl1 [] == Nothing"
-               (Extra.foldl1 (\x acc -> x + acc) emptyInts == Nothing)
-        |> check "scanl1 (+) [1,2,3,4] == [1,3,6,10]"
-               (Extra.scanl1 (\x acc -> x + acc) [ 1, 2, 3, 4 ] == [ 1, 3, 6, 10 ])
-        |> check "scanl1 [] == []"
-               (Extra.scanl1 (\x acc -> x + acc) emptyInts == [])
+        |> check
+            "foldl1 (+) [1,2,3] == Just 6"
+            (Extra.foldl1 (\x acc -> x + acc) [ 1, 2, 3 ] == Just 6)
+        |> check
+            "foldl1 (-) [10,3,2] == Just 5"
+            (Extra.foldl1 (\x acc -> x - acc) [ 10, 3, 2 ] == Just 5)
+        |> check
+            "foldl1 [] == Nothing"
+            (Extra.foldl1 (\x acc -> x + acc) emptyInts == Nothing)
+        |> check
+            "scanl1 (+) [1,2,3,4] == [1,3,6,10]"
+            (Extra.scanl1 (\x acc -> x + acc) [ 1, 2, 3, 4 ] == [ 1, 3, 6, 10 ])
+        |> check
+            "scanl1 [] == []"
+            (Extra.scanl1 (\x acc -> x + acc) emptyInts == [])
 
 
 checksOrder : List String
 checksOrder =
     []
-        |> check "maximumBy identity [3,1,4,1,5,9] == Just 9"
-               (Extra.maximumBy identity [ 3, 1, 4, 1, 5, 9 ] == Just 9)
-        |> check "maximumBy identity [] == Nothing"
-               (Extra.maximumBy identity emptyInts == Nothing)
-        |> check "minimumBy identity [3,1,4,1,5,9] == Just 1"
-               (Extra.minimumBy identity [ 3, 1, 4, 1, 5, 9 ] == Just 1)
-        |> check "minimumBy identity [] == Nothing"
-               (Extra.minimumBy identity emptyInts == Nothing)
-        |> check "maximumBy negate picks smallest"
-               (Extra.maximumBy (\x -> negate x) [ 3, 1, 4 ] == Just 1)
+        |> check
+            "maximumBy identity [3,1,4,1,5,9] == Just 9"
+            (Extra.maximumBy identity [ 3, 1, 4, 1, 5, 9 ] == Just 9)
+        |> check
+            "maximumBy identity [] == Nothing"
+            (Extra.maximumBy identity emptyInts == Nothing)
+        |> check
+            "minimumBy identity [3,1,4,1,5,9] == Just 1"
+            (Extra.minimumBy identity [ 3, 1, 4, 1, 5, 9 ] == Just 1)
+        |> check
+            "minimumBy identity [] == Nothing"
+            (Extra.minimumBy identity emptyInts == Nothing)
+        |> check
+            "maximumBy negate picks smallest"
+            (Extra.maximumBy (\x -> negate x) [ 3, 1, 4 ] == Just 1)
 
 
 -- | All assertion groups concatenated.
@@ -170,13 +207,15 @@ runChecks =
 main : Task Error ()
 main =
     let
-        failures = runChecks
+        failures =
+            runChecks
     in
-        if List.isEmpty failures then
-            Io.println "PASS: all List.Extra checks passed"
+    if List.isEmpty failures then
+        Io.println "PASS: all List.Extra checks passed"
 
-        else
-            Io.println ("FAIL: " ++ String.fromInt (List.length failures) ++ " check(s) failed")
-                |> Task.andThen
-                    (\_ ->
-                        Io.println (String.join "\n" failures))
+    else
+        Io.println ("FAIL: " ++ String.fromInt (List.length failures) ++ " check(s) failed")
+            |> Task.andThen
+                (\_ ->
+                    Io.println (String.join "\n" failures)
+                )

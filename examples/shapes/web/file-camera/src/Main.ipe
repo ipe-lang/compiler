@@ -16,15 +16,14 @@ module Main exposing (main)
 -- a user cancellation is an ordinary `Err` the update folds, never a thrown
 -- error or a silently dropped frame.
 
-
+import Ipe.Browser.Camera as Camera
+import Ipe.Browser.FilePicker as FilePicker
+import Ipe.Error as Error exposing (Error)
+import Ipe.Task as Task
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Error as Error exposing (Error)
-import Ipe.Browser.FilePicker as FilePicker
-import Ipe.Browser.Camera as Camera
-import Ipe.Task as Task
 
 
 type alias Model =

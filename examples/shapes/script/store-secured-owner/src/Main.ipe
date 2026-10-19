@@ -92,7 +92,8 @@ securedNotes =
 -- `x <- task` line desugars to `Task.andThen`.
 handleAddNote : Request -> Auth.Principal -> Task Error Response
 handleAddNote _ principal =
-    Task.onError (\_ -> Task.succeed (Server.text "none"))
+    Task.onError
+        (\_ -> Task.succeed (Server.text "none"))
         (case securedNotes of
             Err _ ->
                 Task.succeed (Server.text "policy-error")
@@ -119,7 +120,8 @@ newNote =
 -- `author` equals the caller's subject.
 handleMyNotes : Request -> Auth.Principal -> Task Error Response
 handleMyNotes _ principal =
-    Task.onError (\_ -> Task.succeed (Server.text "none"))
+    Task.onError
+        (\_ -> Task.succeed (Server.text "none"))
         (case securedNotes of
             Err _ ->
                 Task.succeed (Server.text "policy-error")
@@ -144,8 +146,7 @@ main =
         (\_ -> Io.println "store-secured-owner")
         (Task.andThen
             (\_ -> Io.println "store-secured-owner")
-            (Server.listen
-                8000
+            (Server.listen 8000
                 [ Server.postAuthed "/notes" authCfg handleAddNote
                 , Server.getAuthed "/my/notes" authCfg handleMyNotes
                 ]

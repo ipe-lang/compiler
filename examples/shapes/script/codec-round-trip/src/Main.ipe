@@ -1,11 +1,11 @@
 module Main exposing (main)
 
 import Ipe.Codec as Codec exposing (Codec)
-import Ipe.Result as Result
+import Ipe.Io as Io
 import Ipe.List as List
+import Ipe.Result as Result
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- A `Codec a` bundles an encoder and a decoder in ONE value, so encode and decode

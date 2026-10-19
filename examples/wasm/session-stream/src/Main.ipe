@@ -17,16 +17,15 @@ module Main exposing (main)
 -- closed, monomorphic value types, decoded fail-closed on the way in. The handle
 -- is opaque and unforgeable: you can only address a session you opened.
 
-
+import Ipe.Error as Error exposing (Error)
+import Ipe.Ffi.Js as Js
+import Ipe.Json.Decode as Decode
+import Ipe.Maybe exposing (Maybe(..))
+import Ipe.String as String
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Ffi.Js as Js
-import Ipe.Json.Decode as Decode
-import Ipe.Error as Error exposing (Error)
-import Ipe.String as String
-import Ipe.Maybe exposing (Maybe(..))
 
 
 -- The closed outbound OPEN command — start a ticker session at a given interval.

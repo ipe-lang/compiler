@@ -1,12 +1,12 @@
 module Main exposing (main)
 
-import Ipe.Compression as Compression
 import Ipe.Bytes as Bytes exposing (Bytes)
+import Ipe.Compression as Compression
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- gzip round-trip, exercising the ideas `Ipe.Compression` turns on:
@@ -16,7 +16,6 @@ import Ipe.Io as Io
 --   • It operates on `Bytes` (arbitrary octets), not `String` — convert at the
 --     boundary with `Bytes.fromString` / `Bytes.toString`.
 --   • gunzip(gzip(x)) recovers x exactly — a lossless round-trip.
-
 
 -- A compressible payload: the same line repeated, so gzip has real redundancy to
 -- squeeze out.

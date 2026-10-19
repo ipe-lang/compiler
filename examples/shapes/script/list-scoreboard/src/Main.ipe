@@ -1,9 +1,9 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
 import Ipe.List as List
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- Turn a flat list of match results into a ranked standings table, exercising the
@@ -83,7 +83,6 @@ creditTeam team earned table =
             List.partition (\row -> row.team == team) table
     in
     case mine of
-
         row :: _ ->
             { row | points = row.points + earned, played = row.played + 1 } :: rest
 
@@ -96,7 +95,6 @@ creditTeam team earned table =
 byRank : Standing -> Standing -> Order
 byRank a b =
     case compare b.points a.points of
-
         EQ ->
             compare a.team b.team
 

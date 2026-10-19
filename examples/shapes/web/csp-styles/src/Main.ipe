@@ -106,12 +106,12 @@ view model =
     Ui.column
         [ Ui.id "root" ]
         ([ card
-        , Ui.breakpoint Ui.mobile
+         , Ui.breakpoint Ui.mobile
             [ Background.color (Ui.rgb 18 18 24) ]
             (Ui.el [ Ui.id "narrow" ] (Ui.text "narrow"))
-        , Ui.button [ Ui.id "show" ] { onPress = Just Show, label = Ui.text "show" }
-        , Ui.button [ Ui.id "recolor" ] { onPress = Just Recolor, label = Ui.text "recolor" }
-        ]
+         , Ui.button [ Ui.id "show" ] { onPress = Just Show, label = Ui.text "show" }
+         , Ui.button [ Ui.id "recolor" ] { onPress = Just Recolor, label = Ui.text "recolor" }
+         ]
             ++ styled model
         )
 

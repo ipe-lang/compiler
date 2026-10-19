@@ -1,8 +1,8 @@
 module Main exposing (main)
 
 import Ipe.Html as Html exposing (Html)
-import Ipe.Web.Head.Unsafe as HeadU
 import Ipe.Io as Io
+import Ipe.Web.Head.Unsafe as HeadU
 
 
 -- `Ipe.Web.Head.Unsafe` is the one home for the `<head>` member that emits a raw
@@ -14,7 +14,6 @@ import Ipe.Io as Io
 --     module discloses the `unsafe` capability program-wide.
 --   • Build the JSON from typed data you control, never from request input, so
 --     the string is structurally trusted before it reaches the verbatim sink.
-
 
 -- Structured data for a product page. In a real app this would come from a typed
 -- JSON encoder over your own record types; here it is a trusted constant.

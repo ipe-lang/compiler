@@ -1,10 +1,10 @@
 module Main exposing (main)
 
-import Ipe.Parser as Parser exposing (Parser)
-import Ipe.Task as Task
-import Ipe.List as List
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Parser as Parser exposing (Parser)
+import Ipe.String as String
+import Ipe.Task as Task
 
 
 -- Parse a parenthesised integer pair like `(3,4)` into a `Point`, then a small
@@ -37,7 +37,7 @@ point =
         |= Parser.map2 Point
             Parser.int
             (Parser.symbol "," |= Parser.int)
-        |. Parser.symbol ")"
+            |. Parser.symbol ")"
 
 
 -- `move (x,y)` or `ping` — a keyword chooses the branch, and a nested `andThen`
@@ -59,7 +59,6 @@ command =
 render : String -> String
 render raw =
     case Parser.run command raw of
-
         Ok (Move p) ->
             raw ++ "  ->  Move (" ++ String.fromInt p.x ++ "," ++ String.fromInt p.y ++ ")"
 

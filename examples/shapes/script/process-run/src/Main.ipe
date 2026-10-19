@@ -1,10 +1,10 @@
 module Main exposing (main)
 
+import Ipe.Io as Io
+import Ipe.Maybe exposing (Maybe(..))
 import Ipe.Process as Process
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
-import Ipe.Maybe exposing (Maybe(..))
 
 
 -- `Ipe.Process` runs a child process with NO shell. The command and its
@@ -25,15 +25,13 @@ main =
         -- The simple form: capture stdout of a successful command.
         greeting <- Process.run "echo" [ "hello", "from", "a", "child" ]
         Io.println ("run -> " ++ String.trim greeting)
-
         -- The rich form: an argument that LOOKS like a shell variable is passed
         -- literally, and a non-zero exit is a normal result, not a failure.
-        result <-
-            Process.runWith
-                { command = "printf"
-                , args = [ "%s\n", "$HOME is not expanded" ]
-                , cwd = Nothing
-                , env = []
-                }
+        result <- Process.runWith
+                    { command = "printf"
+                    , args = [ "%s\n", "$HOME is not expanded" ]
+                    , cwd = Nothing
+                    , env = []
+                    }
         Io.println ("exit=" ++ String.fromInt result.exitCode)
         Io.println ("stdout -> " ++ String.trim result.stdout)
