@@ -655,8 +655,9 @@ fn a_hand_edited_out_build_never_replaces_the_test_runtime_unit() -> TestResult 
 
     let out = project.join("out");
     let runtime = e2e_support::require_runtime().into_path_buf();
-    ipe::build(&project.join("src").join("Main.ipe"), &out, &runtime)
+    let out_project = ipe::RootFixture::main(&std::fs::read_to_string(fixture("clean.ipe"))?)
         .map_err(|e| format!("{e:?}"))?;
+    ipe::build_fixture(&out_project, &out, &runtime).map_err(|e| format!("{e:?}"))?;
     let mod_rs = out.join("ipe_runtime_dep").join("src").join("mod.rs");
     let mut source = std::fs::read_to_string(&mod_rs)?;
     source.push_str("\n// edited by hand\n");
