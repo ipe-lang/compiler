@@ -1,8 +1,11 @@
 use super::{
     BTreeMap, BTreeSet, Budget, Builder, Builtins, Content, DResult, Diagnostic, FlatType,
-    Generated, InferError, Interner, RefCell, RowTail, STAGE, SchemeKey, StdlibKernel, Symbol, Ty,
-    UnionFind, VarId, ZONK_NODE_LIMIT, tag_solver_var, unify_at,
+    Generated, InferError, Interner, RefCell, RowTail, STAGE, SchemeKey, Span, StdlibKernel,
+    Symbol, Ty, TypeError, UnionFind, VarId, ZONK_NODE_LIMIT, tag_solver_var, unify_at,
 };
+use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 
 // ===========================================================================
 // Boundary Scheme Promotion — untyped top-level binding generalization.
@@ -645,14 +648,17 @@ pub enum ZonkTask {
     /// of union-find representative `root`, so a later visit to any variable
     /// sharing that representative reuses the cached [`Ty`] instead of walking
     /// the sub-structure again. This is what keeps a shared solver DAG from
-    /// expanding as a tree.
-    Memoize { root: VarId },
+    /// expanding as a tree. `start` is the unfolded count the walk had reached
+    /// when `root` was first visited, so the cached subtree's own unfolded size
+    /// is the count now minus `start`.
+    Memoize { root: VarId, start: u64 },
 }
 
 /// Read back one union-find node during [`zonk`], driving the shared work
 /// stack. Resolves `v` to its representative; a representative already in `memo`
 /// is genuine sharing (the structure is acyclic), so its cached [`Ty`] is reused
-/// without re-walking or re-charging the node budget. A first visit charges one
+/// without re-walking or re-charging the node budget, but charged its unfolded
+/// size. A first visit charges one
 /// node, then either produces a leaf `Ty` (also cached) or pushes the rebuild
 /// task, a [`ZonkTask::Memoize`] to cache the assembled parent, and the
 /// children's visits.
@@ -668,16 +674,24 @@ fn zonk_visit(
         work,
         results,
         memo,
+        unfolded,
     } = walk;
     let root = uf.find(v)?;
-    if let Some(cached) = memo.get(&root) {
+    if let Some((cached, size)) = memo.get(&root) {
         // A representative already read back: reuse it. Sharing does not
-        // re-consume the node budget, so the limit now bounds the count of
-        // distinct nodes rather than an expanded tree.
+        // re-consume the node budget, so that limit bounds the count of
+        // distinct nodes. The clone is still an unfolded tree, so it is
+        // charged its unfolded size, against the size ceiling and the shared
+        // step budget alike.
+        charge_unfolded(unfolded, *size)?;
+        for _ in 1..*size {
+            budget.tick()?;
+        }
         results.push(cached.clone());
         return Ok(());
     }
     charge_node(nodes_left)?;
+    let start = *unfolded;
     // Borrow the descriptor: leaf arms need no owned copy, and the structural
     // arms clone only the field they genuinely move into a rebuild task (the
     // module path, the record field names) rather than the whole descriptor.
@@ -691,11 +705,13 @@ fn zonk_visit(
             // annotation-symbol raw if this zonked `Ty` is ever fed back
             // through instantiation.
             let ty = Ty::Var(tag_solver_var(root));
-            memo.insert(root, ty.clone());
+            charge_unfolded(unfolded, 1)?;
+            memo.insert(root, (ty.clone(), 1));
             results.push(ty);
         }
         Content::Structure(FlatType::Unit) => {
-            memo.insert(root, Ty::Unit);
+            charge_unfolded(unfolded, 1)?;
+            memo.insert(root, (Ty::Unit, 1));
             results.push(Ty::Unit);
         }
         Content::Structure(FlatType::Fun(a, b)) => {
@@ -703,14 +719,14 @@ fn zonk_visit(
             // the rebuild and children so that `a` is visited before `b` and
             // lands lower on `results`.
             let (a, b) = (*a, *b);
-            work.push(ZonkTask::Memoize { root });
+            work.push(ZonkTask::Memoize { root, start });
             work.push(ZonkTask::BuildFun);
             work.push(ZonkTask::Visit(b));
             work.push(ZonkTask::Visit(a));
         }
         Content::Structure(FlatType::Con { module, name, args }) => {
             let arity = args.len();
-            work.push(ZonkTask::Memoize { root });
+            work.push(ZonkTask::Memoize { root, start });
             work.push(ZonkTask::BuildCon {
                 module: module.clone(),
                 name: *name,
@@ -723,7 +739,7 @@ fn zonk_visit(
         }
         Content::Structure(FlatType::Tuple(elems)) => {
             let arity = elems.len();
-            work.push(ZonkTask::Memoize { root });
+            work.push(ZonkTask::Memoize { root, start });
             work.push(ZonkTask::BuildTuple { arity });
             // Reverse so elements land on `results` in source order.
             for e in elems.iter().rev() {
@@ -737,7 +753,7 @@ fn zonk_visit(
             let (mut fields, ext) = (fields.clone(), *ext);
             let tail = zonk_row(uf, budget, reading, nodes_left, &mut fields, ext)?;
             let names: Vec<Symbol> = fields.keys().copied().collect();
-            work.push(ZonkTask::Memoize { root });
+            work.push(ZonkTask::Memoize { root, start });
             work.push(ZonkTask::BuildRecord { names, tail });
             for v in fields.values().rev() {
                 work.push(ZonkTask::Visit(*v));
@@ -751,7 +767,8 @@ fn zonk_visit(
             // so the work stack stays balanced (this arm is reachable if zonk is
             // called directly on an extension var, which does not happen in
             // normal code, but must not panic).
-            memo.insert(root, Ty::Unit);
+            charge_unfolded(unfolded, 1)?;
+            memo.insert(root, (Ty::Unit, 1));
             results.push(Ty::Unit);
         }
     }
@@ -770,6 +787,28 @@ fn charge_node(nodes_left: &mut u32) -> DResult<()> {
             detail: "type exceeded read-back node limit".to_owned(),
         })?;
     Ok(())
+}
+
+/// Add `size` read-back nodes to the walk's unfolded count.
+///
+/// # Errors
+/// [`TypeError::TypeTooLarge`] once the count passes [`TYPE_SIZE_LIMIT`].
+const fn charge_unfolded(unfolded: &mut u64, size: u64) -> DResult<()> {
+    *unfolded = unfolded.saturating_add(size);
+    if *unfolded > TYPE_SIZE_LIMIT {
+        return Err(type_too_large(Span::DUMMY));
+    }
+    Ok(())
+}
+
+/// The refusal of a type that unfolds past [`TYPE_SIZE_LIMIT`], at `span`.
+const fn type_too_large(span: Span) -> Diagnostic {
+    Diagnostic::Type {
+        span,
+        msg: TypeError::TypeTooLarge {
+            limit: TYPE_SIZE_LIMIT,
+        },
+    }
 }
 
 /// How a read-back presents a record row that ends in a variable.
@@ -867,8 +906,9 @@ fn row_chain_bug(detail: &str) -> Diagnostic {
 ///
 /// # Errors
 /// [`Diagnostic::CompilerBug`] on a union-find invariant violation or if the
-/// structure has more than [`ZONK_NODE_LIMIT`] nodes; [`TypeError::StepBudgetExceeded`]
-/// if the shared budget is exhausted.
+/// structure has more than [`ZONK_NODE_LIMIT`] nodes; [`TypeError::TypeTooLarge`]
+/// (unspanned) if the type unfolds past [`TYPE_SIZE_LIMIT`] nodes;
+/// [`TypeError::StepBudgetExceeded`] if the shared budget is exhausted.
 pub fn zonk(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId) -> DResult<Ty> {
     read_back(uf, budget, RowReading::Faithful, var)
 }
@@ -887,12 +927,40 @@ pub fn zonk_emitted(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId
     read_back(uf, budget, RowReading::Emitted, var)
 }
 
+/// Read `var` back for a diagnostic reported at `span`.
+///
+/// An error raised before [`measure_type_depth`] runs reads back a type no
+/// ceiling has bounded yet, and renders it through the recursive `ty_to_doc`.
+/// The type is measured first: past either ceiling, the refusal is the
+/// diagnostic, sited at `span`, and the type is never read back or rendered.
+///
+/// # Errors
+/// [`TypeError::TypeTooDeep`] or [`TypeError::TypeTooLarge`] at `span` when
+/// the type passes a ceiling; otherwise as [`TypeMeasures::measure`] and
+/// [`zonk`].
+pub fn zonk_reported(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    var: VarId,
+    span: Span,
+) -> DResult<Ty> {
+    let measure = TypeMeasures::default().measure(uf, budget, var)?;
+    measure
+        .refusal(span)
+        .map_or_else(|| zonk(uf, budget, var), Err)
+}
+
 /// The stacks one [`read_back`] walk drives: pending tasks, assembled results,
 /// and the read-back cache keyed by union-find representative.
+///
+/// `memo` holds each cached [`Ty`] with its unfolded node count, and
+/// `unfolded` is the node count of every result assembled so far: a reused
+/// subtree is a full clone, so it is charged its whole unfolded size.
 struct ReadBackWalk {
     work: Vec<ZonkTask>,
     results: Vec<Ty>,
-    memo: std::collections::HashMap<VarId, Ty>,
+    memo: HashMap<VarId, (Ty, u64)>,
+    unfolded: u64,
 }
 
 /// The [`zonk`] / [`zonk_emitted`] work-stack walk under `reading`.
@@ -909,10 +977,13 @@ fn read_back(
     // and reusing its cached `Ty` reproduces the same type while visiting the
     // shared sub-structure only once. Without it a diamond of sharing (e.g.
     // `p = (q, q)` chained) doubles the walk per level and blows the node limit.
+    // The reused `Ty` is still a clone, so each reuse is charged its unfolded
+    // size against [`TYPE_SIZE_LIMIT`].
     let mut walk = ReadBackWalk {
         work: vec![ZonkTask::Visit(var)],
         results: Vec::new(),
-        memo: std::collections::HashMap::new(),
+        memo: HashMap::new(),
+        unfolded: 0,
     };
 
     while let Some(task) = walk.work.pop() {
@@ -921,18 +992,21 @@ fn read_back(
                 budget.tick()?;
                 zonk_visit(uf, budget, reading, v, &mut walk, &mut nodes_left)?;
             }
-            ZonkTask::Memoize { root } => {
+            ZonkTask::Memoize { root, start } => {
                 // The parent `Ty` was just assembled and sits on top of the
-                // result stack; cache it under its representative so later shared
-                // visits reuse it.
+                // result stack; cache it under its representative, with the
+                // nodes assembled since its first visit, so later shared visits
+                // reuse it and pay its unfolded size.
                 match walk.results.last() {
                     Some(ty) => {
-                        walk.memo.insert(root, ty.clone());
+                        let size = walk.unfolded.saturating_sub(start);
+                        walk.memo.insert(root, (ty.clone(), size));
                     }
                     None => return Err(zonk_underflow()),
                 }
             }
             ZonkTask::BuildFun => {
+                charge_unfolded(&mut walk.unfolded, 1)?;
                 let (Some(b), Some(a)) = (walk.results.pop(), walk.results.pop()) else {
                     return Err(zonk_underflow());
                 };
@@ -943,6 +1017,7 @@ fn read_back(
                 name,
                 arity,
             } => {
+                charge_unfolded(&mut walk.unfolded, 1)?;
                 let split = walk
                     .results
                     .len()
@@ -952,6 +1027,7 @@ fn read_back(
                 walk.results.push(Ty::Con { module, name, args });
             }
             ZonkTask::BuildTuple { arity } => {
+                charge_unfolded(&mut walk.unfolded, 1)?;
                 let split = walk
                     .results
                     .len()
@@ -961,6 +1037,7 @@ fn read_back(
                 walk.results.push(Ty::Tuple(elems));
             }
             ZonkTask::BuildRecord { names, tail } => {
+                charge_unfolded(&mut walk.unfolded, 1)?;
                 let split = walk
                     .results
                     .len()
@@ -989,6 +1066,261 @@ pub fn zonk_underflow() -> Diagnostic {
         detail: "zonk result stack underflow".to_owned(),
     }
 }
+
+// ===========================================================================
+// Type ceiling — depth and unfolded size of every checked type.
+// ===========================================================================
+
+/// Depth and unfolded size of one type, as [`measure_type_depth`] counts them.
+///
+/// A function arrow, a type application with arguments, a tuple and a record
+/// (its whole row chain) are one level each; a variable, `()` and a nullary
+/// type are leaves of depth 0. The size counts every node of the unfolded
+/// tree, each occurrence of a shared subtree included, so it is the node count
+/// [`zonk`] reads back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TypeMeasure {
+    /// Type-former levels, saturated at `u16::MAX`.
+    pub depth: u16,
+    /// Unfolded node count, saturated at `u64::MAX`.
+    pub size: u64,
+}
+
+impl TypeMeasure {
+    /// The measure of a leaf.
+    const LEAF: Self = Self { depth: 0, size: 1 };
+
+    /// The refusal this measure earns at `span`, if it passes a ceiling.
+    #[must_use]
+    pub const fn refusal(self, span: Span) -> Option<Diagnostic> {
+        if self.depth > TYPE_DEPTH_LIMIT {
+            Some(Diagnostic::Type {
+                span,
+                msg: TypeError::TypeTooDeep {
+                    depth: self.depth,
+                    limit: TYPE_DEPTH_LIMIT,
+                },
+            })
+        } else if self.size > TYPE_SIZE_LIMIT {
+            Some(type_too_large(span))
+        } else {
+            None
+        }
+    }
+}
+
+/// One step of the iterative [`TypeMeasures::measure`] walk.
+enum MeasureTask {
+    /// Measure one variable's representative.
+    Visit(VarId),
+    /// Combine the measured `children` (and the row chain's next record, if
+    /// any) into the measure of `root`.
+    Finish {
+        root: VarId,
+        children: Vec<VarId>,
+        row: Option<VarId>,
+    },
+}
+
+/// The memoized type measures of one module's solved union-find graph.
+///
+/// One memo keyed by representative is shared by every measured variable, so
+/// measuring every region costs one walk over the solved graph.
+#[derive(Default)]
+pub struct TypeMeasures {
+    memo: HashMap<VarId, TypeMeasure>,
+    in_progress: HashSet<VarId>,
+}
+
+impl TypeMeasures {
+    /// The measure of `var`'s solved type.
+    ///
+    /// Iterative (an explicit work stack), memoized by representative, and
+    /// ticked once per visit against the shared [`Budget`].
+    ///
+    /// # Errors
+    /// [`Diagnostic::CompilerBug`] on a union-find invariant violation or a
+    /// cycle (unification's occurs check rules one out);
+    /// [`TypeError::StepBudgetExceeded`] if the shared budget is exhausted.
+    pub fn measure(
+        &mut self,
+        uf: &mut UnionFind<Content>,
+        budget: &mut Budget,
+        var: VarId,
+    ) -> DResult<TypeMeasure> {
+        let mut work = vec![MeasureTask::Visit(var)];
+        while let Some(task) = work.pop() {
+            match task {
+                MeasureTask::Visit(v) => {
+                    budget.tick()?;
+                    self.visit(uf, v, &mut work)?;
+                }
+                MeasureTask::Finish {
+                    root,
+                    children,
+                    row,
+                } => self.finish(root, &children, row)?,
+            }
+        }
+        let root = uf.find(var)?;
+        self.memo.get(&root).copied().ok_or_else(measure_bug)
+    }
+
+    /// Read one node: memo hit, leaf, or a [`MeasureTask::Finish`] over its
+    /// children's visits.
+    fn visit(
+        &mut self,
+        uf: &mut UnionFind<Content>,
+        v: VarId,
+        work: &mut Vec<MeasureTask>,
+    ) -> DResult<()> {
+        let root = uf.find(v)?;
+        if self.memo.contains_key(&root) {
+            return Ok(());
+        }
+        if !self.in_progress.insert(root) {
+            return Err(Diagnostic::CompilerBug {
+                where_: STAGE,
+                detail: "a solved type reaches itself (cycle) while its depth is measured"
+                    .to_owned(),
+            });
+        }
+        let (children, ext) = match uf.root_content(root)? {
+            Content::Flex
+            | Content::Rigid
+            | Content::Super { .. }
+            | Content::Structure(FlatType::Unit | FlatType::EmptyRecord) => (Vec::new(), None),
+            Content::Structure(FlatType::Fun(a, b)) => (vec![*a, *b], None),
+            Content::Structure(FlatType::Con { args, .. }) => (args.clone(), None),
+            Content::Structure(FlatType::Tuple(elems)) => (elems.clone(), None),
+            Content::Structure(FlatType::Record(fields, ext)) => {
+                (fields.values().copied().collect(), Some(*ext))
+            }
+        };
+        let is_leaf = children.is_empty() && ext.is_none();
+        if is_leaf {
+            self.in_progress.remove(&root);
+            self.memo.insert(root, TypeMeasure::LEAF);
+            return Ok(());
+        }
+        // A record whose extension is itself a record continues one row:
+        // the chain reads back as a single record level.
+        let row = match ext {
+            Some(ext) => {
+                let ext_root = uf.find(ext)?;
+                matches!(
+                    uf.root_content(ext_root)?,
+                    Content::Structure(FlatType::Record(..))
+                )
+                .then_some(ext_root)
+            }
+            None => None,
+        };
+        let mut roots = Vec::with_capacity(children.len());
+        for child in children {
+            roots.push(uf.find(child)?);
+        }
+        // The finish runs beneath every child visit, so after all of them.
+        work.push(MeasureTask::Finish {
+            root,
+            children: roots.clone(),
+            row,
+        });
+        for child in roots.iter().rev() {
+            work.push(MeasureTask::Visit(*child));
+        }
+        if let Some(row) = row {
+            work.push(MeasureTask::Visit(row));
+        }
+        Ok(())
+    }
+
+    /// Combine the measured children of `root` into its measure.
+    fn finish(&mut self, root: VarId, children: &[VarId], row: Option<VarId>) -> DResult<()> {
+        let mut depth: u16 = 0;
+        let mut size: u64 = 1;
+        for child in children {
+            let m = self.memo.get(child).copied().ok_or_else(measure_bug)?;
+            depth = depth.max(m.depth);
+            size = size.saturating_add(m.size);
+        }
+        depth = depth.saturating_add(1);
+        if let Some(row) = row {
+            // The next record of the row chain shares this level: its depth
+            // and size each carry one record node this level already counts.
+            let m = self.memo.get(&row).copied().ok_or_else(measure_bug)?;
+            depth = depth.max(m.depth);
+            size = size.saturating_add(m.size.saturating_sub(1));
+        }
+        self.in_progress.remove(&root);
+        self.memo.insert(root, TypeMeasure { depth, size });
+        Ok(())
+    }
+}
+
+/// The measure walk's own invariant failed (a child finished unmeasured).
+fn measure_bug() -> Diagnostic {
+    Diagnostic::CompilerBug {
+        where_: STAGE,
+        detail: "a type's depth was read before it was measured".to_owned(),
+    }
+}
+
+/// Refuse a module whose solved types pass [`TYPE_DEPTH_LIMIT`] or [`TYPE_SIZE_LIMIT`].
+///
+/// Every region's, every expected type's and every untyped top-level binding's
+/// solved type is measured over one shared memo. A deep type is reported where
+/// it is first built: among the spans whose type passes a ceiling, the one
+/// that ends first (the innermost, for nested spans), so a `let` chain is
+/// refused at the binding whose value crossed the limit, not at the
+/// expression that encloses the chain. An untyped binding is reported at its
+/// name only when no region refuses first. Runs after solving and before any
+/// read-back, so no later walker meets a type past either ceiling.
+///
+/// # Errors
+/// [`InferError::Sited`] carrying [`TypeError::TypeTooDeep`] or
+/// [`TypeError::TypeTooLarge`]; [`InferError::Program`] for a union-find
+/// invariant violation or step-budget exhaustion.
+pub fn measure_type_depth(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    generated: &Generated,
+) -> Result<(), InferError> {
+    let mut measures = TypeMeasures::default();
+    let mut refused: Option<(RefusalRank<'_>, Diagnostic)> = None;
+    for ((home, span), var) in generated.regions.iter().chain(&generated.expected) {
+        let measure = measures
+            .measure(uf, budget, *var)
+            .map_err(InferError::unsited)?;
+        if let Some(diag) = measure.refusal(*span) {
+            let rank = (
+                *span == Span::DUMMY,
+                home.as_slice(),
+                span.hi,
+                Reverse(span.lo),
+            );
+            if refused.as_ref().is_none_or(|(best, _)| rank < *best) {
+                refused = Some((rank, diag));
+            }
+        }
+    }
+    if let Some(((_, home, _, _), diag)) = refused {
+        return Err(InferError::sited_at_path(diag, home));
+    }
+    for ((home, _), def) in &generated.untyped {
+        let measure = measures
+            .measure(uf, budget, def.var)
+            .map_err(InferError::unsited)?;
+        if let Some(diag) = measure.refusal(def.name_span) {
+            return Err(InferError::sited_at_path(diag, home));
+        }
+    }
+    Ok(())
+}
+
+/// The order a refused span is reported in: real spans before synthesized
+/// ones, then by module, then the span that ends first, the innermost first.
+type RefusalRank<'a> = (bool, &'a [Symbol], u32, Reverse<u32>);
 
 // ===========================================================================
 // Kernel-registry tripwires

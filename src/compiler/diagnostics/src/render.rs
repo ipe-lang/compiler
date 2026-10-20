@@ -725,6 +725,12 @@ fn type_prose(msg: &TypeError) -> String {
         TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             "Type checking this took longer than I'm allowed to spend on it.".to_string()
         }
+        TypeError::TypeTooDeep { depth, limit } => {
+            format!("The type of this value nests {depth} levels deep, past the limit of {limit}.")
+        }
+        TypeError::TypeTooLarge { limit } => {
+            format!("The type of this value is built from more than {limit} parts.")
+        }
     }
 }
 
@@ -740,6 +746,9 @@ fn lower_prose(msg: &LowerError) -> String {
         }
         LowerError::BackendNestingTooDeep { .. } => {
             "This expression nests deeper than I can compile.".to_string()
+        }
+        LowerError::BackendTypeTooDeep { .. } => {
+            "A type here nests deeper than I can compile.".to_string()
         }
         LowerError::DecodeSucceedArityTooHigh { .. } => {
             "This decoder builds a value with more fields than I can wire up at once.".to_string()
@@ -1952,6 +1961,13 @@ fn type_label(msg: &TypeError) -> Option<String> {
                 ty_to_string(found)
             ),
         }),
+        TypeError::TypeTooDeep { limit, .. } => Some(format!(
+            "this value's type nests more than {limit} levels deep, which the generated \
+             Rust cannot build"
+        )),
+        TypeError::TypeTooLarge { limit } => Some(format!(
+            "this value's type unfolds to more than {limit} parts"
+        )),
         TypeError::Mismatch | TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             None
         }
@@ -1973,6 +1989,15 @@ fn lower_label(msg: &LowerError) -> String {
             |site| {
                 format!(
                     "`{}` nests past the backend limit of {limit}",
+                    site.qualified()
+                )
+            },
+        ),
+        LowerError::BackendTypeTooDeep { limit, func } => func.as_ref().map_or_else(
+            || format!("a type nests past the backend limit of {limit}"),
+            |site| {
+                format!(
+                    "a type in `{}` nests past the backend limit of {limit}",
                     site.qualified()
                 )
             },

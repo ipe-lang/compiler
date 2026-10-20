@@ -26,6 +26,80 @@ use ipe_diagnostics::{DResult, Diagnostic};
 /// epilogue are exact substrings of this file.
 const GOLDEN: &str = include_str!("../templates/main.rs");
 
+/// The crate-root attribute that lifts rustc's recursion limit for the emitted crate.
+///
+/// The type ceiling [`ipe_diagnostics::nesting::TYPE_DEPTH_LIMIT`] is sized so
+/// every accepted type fits under this limit.
+const RECURSION_LIMIT_ATTR: &str = "#![recursion_limit = \"1024\"]";
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the emitted `#![recursion_limit]` drifts from `EMITTED_RECURSION_LIMIT` [ledger #boundary]
+const _: () = assert!(
+    attr_limit(RECURSION_LIMIT_ATTR.as_bytes())
+        == ipe_diagnostics::nesting::EMITTED_RECURSION_LIMIT as u64,
+    "RECURSION_LIMIT_ATTR must declare EMITTED_RECURSION_LIMIT",
+);
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the template stops declaring `RECURSION_LIMIT_ATTR` on its own line [ledger #boundary]
+const _: () = assert!(
+    has_own_line(GOLDEN.as_bytes(), RECURSION_LIMIT_ATTR.as_bytes()),
+    "templates/main.rs must declare RECURSION_LIMIT_ATTR on its own line",
+);
+
+/// The number spelled by the decimal digits of `attr`, other bytes skipped.
+///
+/// Saturates at `u64::MAX`, so an absurd literal still fails the equality check.
+const fn attr_limit(attr: &[u8]) -> u64 {
+    let mut value: u64 = 0;
+    let mut rest = attr;
+    while let [byte, tail @ ..] = rest {
+        if byte.is_ascii_digit() {
+            value = value
+                .saturating_mul(10)
+                .saturating_add(byte.saturating_sub(b'0') as u64);
+        }
+        rest = tail;
+    }
+    value
+}
+
+/// Whether `line` occurs in `text` as a whole line.
+const fn has_own_line(text: &[u8], line: &[u8]) -> bool {
+    let mut rest = text;
+    loop {
+        if starts_with_line(rest, line) {
+            return true;
+        }
+        // Advance past the next newline, to the start of the following line.
+        loop {
+            match rest {
+                [] => return false,
+                [b'\n', tail @ ..] => {
+                    rest = tail;
+                    break;
+                }
+                [_, tail @ ..] => rest = tail,
+            }
+        }
+    }
+}
+
+/// Whether `text` begins with `line` followed by a newline or the end of `text`.
+const fn starts_with_line(text: &[u8], line: &[u8]) -> bool {
+    let mut rest = text;
+    let mut want = line;
+    while let [w, want_tail @ ..] = want {
+        let [r, rest_tail @ ..] = rest else {
+            return false;
+        };
+        if *r != *w {
+            return false;
+        }
+        rest = rest_tail;
+        want = want_tail;
+    }
+    matches!(rest, [] | [b'\n', ..])
+}
+
 /// The `Diagnostic::CompilerBug` raised when a template anchor is absent — a
 /// drifted-template invariant violation, surfaced (IPE-I0203) instead of a
 /// silent empty slice.
@@ -113,20 +187,49 @@ pub fn epilogue() -> DResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{epilogue, preamble};
+    use super::{RECURSION_LIMIT_ATTR, attr_limit, epilogue, has_own_line, preamble};
     use ipe_diagnostics::DResult;
+    use ipe_diagnostics::nesting::EMITTED_RECURSION_LIMIT;
+
+    #[test]
+    fn preamble_declares_the_emitted_recursion_limit_at_the_crate_root() -> DResult<()> {
+        let second_line = preamble(false)?.lines().nth(1).map(str::to_owned);
+        assert_eq!(second_line.as_deref(), Some(RECURSION_LIMIT_ATTR));
+        assert_eq!(
+            attr_limit(RECURSION_LIMIT_ATTR.as_bytes()),
+            u64::from(EMITTED_RECURSION_LIMIT)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn own_line_search_refuses_a_partial_or_embedded_match() {
+        let attr = b"#![recursion_limit = \"1024\"]";
+        assert!(has_own_line(
+            b"// head\n#![recursion_limit = \"1024\"]\nfn f() {}",
+            attr
+        ));
+        assert!(has_own_line(b"#![recursion_limit = \"1024\"]", attr));
+        assert!(!has_own_line(b"// #![recursion_limit = \"1024\"]\n", attr));
+        assert!(!has_own_line(
+            b"#![recursion_limit = \"1024\"] // x\n",
+            attr
+        ));
+        assert!(!has_own_line(b"#![recursion_limit = \"102\"]\n", attr));
+        assert_ne!(attr_limit(b"#![recursion_limit = \"128\"]"), 1024);
+    }
 
     /// Independent copy of the template, reconstructed by 1-indexed line ranges
     /// so the assertions don't merely echo the implementation's anchor logic.
     const GOLDEN: &str = include_str!("../templates/main.rs");
 
     #[test]
-    fn preamble_matches_golden_lines_1_to_34() -> DResult<()> {
-        // Lines 1..=34: header (incl. the cfg-gated allocator arms) through the
-        // blank line closing the USER TYPES banner (the next line, 35, is the
+    fn preamble_matches_golden_lines_1_to_35() -> DResult<()> {
+        // Lines 1..=35: header (incl. the cfg-gated allocator arms) through the
+        // blank line closing the USER TYPES banner (the next line, 36, is the
         // first user type definition). The golden template is a JSON-using program,
         // so `keep_json` reproduces it verbatim (the `type Value` alias present).
-        let expected: String = GOLDEN.split_inclusive('\n').take(34).collect();
+        let expected: String = GOLDEN.split_inclusive('\n').take(35).collect();
         assert_eq!(preamble(true)?, expected);
         Ok(())
     }

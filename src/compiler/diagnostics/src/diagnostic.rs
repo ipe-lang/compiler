@@ -20,18 +20,19 @@ use crate::code::{
     IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144,
     IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152,
     IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160,
-    IPE_L0161, IPE_L0162, IPE_L0200, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005,
-    IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023,
-    IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031,
-    IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040,
-    IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048,
-    IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003,
-    IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017,
-    IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050,
-    IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067,
-    IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001,
-    IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014,
-    IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
+    IPE_L0161, IPE_L0162, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004,
+    IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022,
+    IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030,
+    IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039,
+    IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047,
+    IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002,
+    IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016,
+    IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041,
+    IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066,
+    IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004,
+    IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013,
+    IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021,
+    IPE_T0022, IPE_T0023, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -1205,6 +1206,17 @@ pub enum TypeError {
         parameter: usize,
         dependence: WildcardDependence,
     },
+    /// A type nests deeper than the checker's type ceiling. [IPE-T0022]
+    ///
+    /// `depth` is the measured depth, saturated at `u16::MAX`, and `limit` the
+    /// ceiling it passed. The type itself is never carried: printing a type
+    /// past the ceiling would walk that same depth.
+    TypeTooDeep { depth: u16, limit: u16 },
+    /// A type unfolds to more nodes than the checker's size ceiling. [IPE-T0023]
+    ///
+    /// `limit` is the node ceiling. The type itself is never carried: printing
+    /// it would unfold every one of those nodes.
+    TypeTooLarge { limit: u64 },
 }
 
 /// Why a wildcard `any` parameter has no independent lowering, under
@@ -1558,6 +1570,14 @@ pub enum LowerError {
     /// emitter fills it before the diagnostic leaves the backend, so the driver
     /// frames it against the function's own module.
     BackendNestingTooDeep { limit: u16, func: Option<EmitSite> },
+    /// A rendered Rust type nests past the backend's type-depth backstop. [IPE-L0201]
+    ///
+    /// The type checker's ceiling refuses every such type first; this is the
+    /// emitter's independent second boundary. `func` names the function whose
+    /// emission crossed the bound, filled in by the function emitter exactly as
+    /// for [`LowerError::BackendNestingTooDeep`]; it stays `None` for a type
+    /// rendered outside any function body.
+    BackendTypeTooDeep { limit: u16, func: Option<EmitSite> },
     /// `JsonDec.succeed` / `Db.Decode.succeed` constructor has more than 10
     /// parameters, which exceeds the `curry1`..`curry10` helpers in the runtime.
     /// [IPE-L0121]
@@ -2553,7 +2573,9 @@ impl Diagnostic {
                 | TypeError::OrPatternBindingMismatch { .. }
                 | TypeError::TaskArity { .. }
                 | TypeError::WebViewReturnsHtml
-                | TypeError::WildcardNotIndependent { .. } => Severity::Error,
+                | TypeError::WildcardNotIndependent { .. }
+                | TypeError::TypeTooDeep { .. }
+                | TypeError::TypeTooLarge { .. } => Severity::Error,
             },
             Self::CompilerBug { .. } => Severity::Bug,
         }
@@ -2805,6 +2827,8 @@ const fn type_code(msg: &TypeError) -> Code {
         TypeError::TaskArity { .. } => IPE_T0016,
         TypeError::WebViewReturnsHtml => IPE_T0020,
         TypeError::WildcardNotIndependent { .. } => IPE_T0021,
+        TypeError::TypeTooDeep { .. } => IPE_T0022,
+        TypeError::TypeTooLarge { .. } => IPE_T0023,
     })
 }
 
@@ -2816,6 +2840,7 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::SecretFromStringLiteral => IPE_L0150,
         LowerError::SecretFromStringUnapplied => IPE_L0151,
         LowerError::BackendNestingTooDeep { .. } => IPE_L0200,
+        LowerError::BackendTypeTooDeep { .. } => IPE_L0201,
         LowerError::DecodeSucceedArityTooHigh { .. } => IPE_L0121,
         LowerError::RouteParamCountMismatch { .. } => IPE_L0122,
         LowerError::RoutePatternMalformed { .. } => IPE_L0156,
@@ -3068,6 +3093,18 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
              the shape apply `Ui.layout` for you."
                 .into(),
         )],
+        TypeError::TypeTooDeep { .. } => vec![HelpLine::Note(
+            "each binding whose value wraps the one before it adds a level to its \
+             type. Give an intermediate level a named type (a `type alias` or a \
+             custom type), or restructure the chain so no value nests this deep."
+                .into(),
+        )],
+        TypeError::TypeTooLarge { .. } => vec![HelpLine::Note(
+            "a value that holds the same value twice doubles its type each time. \
+             Name the repeated part with its own custom type, or build the \
+             structure from a list instead of nested pairs."
+                .into(),
+        )],
         TypeError::WildcardNotIndependent { .. } => vec![HelpLine::Note(
             "each use of the signature gives every `any` its own independent \
              type, so an `any` the body ties to another type cannot be emitted \
@@ -3189,6 +3226,13 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             }
             lines.push(HelpLine::Hint(Hint::NestingBoundDeliberate));
             lines
+        }
+        LowerError::BackendTypeTooDeep { func, .. } => {
+            func.as_ref().map_or_else(Vec::new, |site| {
+                vec![HelpLine::Note(
+                    format!("in the emitted code of `{}`", site.qualified()).into_boxed_str(),
+                )]
+            })
         }
         LowerError::DecodeSucceedArityTooHigh { n } => vec![HelpLine::Note(
             format!(

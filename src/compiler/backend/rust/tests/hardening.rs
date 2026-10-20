@@ -16,9 +16,11 @@ use std::collections::BTreeMap;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::{FfiEmit, FfiWrapperGlue, RustBackend};
-use ipe_diagnostics::nesting::{COMPILE_STACK_BYTES, SOURCE_NESTING_LIMIT};
+use ipe_diagnostics::nesting::{
+    COMPILE_STACK_BYTES, IR_EXPANSION_SLACK, SOURCE_NESTING_LIMIT, TYPE_DEPTH_LIMIT,
+};
 use ipe_diagnostics::{
-    DResult, Diagnostic, EmitSite, IPE_I0201, IPE_L0200, IPE_N0012, LowerError, Span,
+    DResult, Diagnostic, EmitSite, IPE_I0201, IPE_L0200, IPE_L0201, IPE_N0012, LowerError, Span,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
@@ -256,6 +258,81 @@ fn nesting_at_the_bound_emits() -> DResult<()> {
     let prog = program(main_mod, vec![], vec![ok_fn]);
     assert!(emit(&interner, &prog).is_ok(), "in-bound nesting must emit");
     Ok(())
+}
+
+/// The deepest level the emitter's type backstop renders.
+const TYPE_RENDER_LIMIT: u16 = TYPE_DEPTH_LIMIT + IR_EXPANSION_SLACK;
+
+/// `inner` wrapped in `levels` `List`s.
+fn nested_lists(levels: u16, inner: IrType) -> IrType {
+    (0..levels).fold(inner, |ty, _| IrType::List(Box::new(ty)))
+}
+
+/// Emit a one-function `Main` program whose `deepType` returns `ret`.
+fn emit_returning(ret: IrType) -> DResult<String> {
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let func = interner.intern("deepType")?;
+    let deep_fn = Func {
+        id: FuncId::from_raw(0),
+        name: func,
+        home: ModPath(vec![main_mod]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![],
+        ret,
+        body: Expr::Int(0),
+    };
+    emit(&interner, &program(main_mod, vec![], vec![deep_fn]))
+}
+
+/// The backstop refusal naming `Main.deepType`.
+fn type_too_deep_in_deep_type() -> Diagnostic {
+    Diagnostic::Lower {
+        span: Span::DUMMY,
+        msg: LowerError::BackendTypeTooDeep {
+            limit: TYPE_RENDER_LIMIT,
+            func: Some(EmitSite {
+                home: Box::new(["Main".into()]),
+                name: "deepType".into(),
+            }),
+        },
+    }
+}
+
+/// A rendered type one level past the emitter's backstop is refused at ipe
+/// time with IPE-L0201 naming the function, never handed to rustc; the type
+/// that reaches the backstop exactly still emits.
+#[test]
+fn rendered_type_past_the_backstop_is_refused_naming_the_function() {
+    // `levels` lists put the `Int` leaf at render depth `levels + 1`.
+    let at_limit = emit_returning(nested_lists(TYPE_RENDER_LIMIT - 1, IrType::Int));
+    assert!(
+        at_limit.is_ok(),
+        "a type at the backstop must emit, got {at_limit:?}"
+    );
+    let past = emit_returning(nested_lists(TYPE_RENDER_LIMIT, IrType::Int));
+    assert!(past.is_err(), "a type past the backstop must be refused");
+    if let Err(err) = past {
+        assert_eq!(err.code(), IPE_L0201, "wrong code for an over-deep type");
+        assert_eq!(err, type_too_deep_in_deep_type());
+    }
+}
+
+/// A curried `FnOnce` chain charges two levels per parameter (the box and
+/// the trait object), where a flat function type charges one.
+#[test]
+fn fn_once_chain_charges_two_levels_per_parameter() {
+    let levels = TYPE_RENDER_LIMIT - 3;
+    let flat = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
+    let chain = IrType::FnOnceChain(vec![IrType::Int], Box::new(IrType::Int));
+    let flat_res = emit_returning(nested_lists(levels, flat));
+    assert!(
+        flat_res.is_ok(),
+        "the flat function type fits under the backstop, got {flat_res:?}"
+    );
+    let chain_res = emit_returning(nested_lists(levels, chain));
+    assert_eq!(chain_res, Err(type_too_deep_in_deep_type()));
 }
 
 /// A param symbol that resolves to the empty string is a dangling-symbol

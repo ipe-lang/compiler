@@ -504,6 +504,10 @@ code! {
     IPE_T0020 = "IPE-T0020", "this is `Html` where an `Element` is required", "IPE-T0020";
     /// a wildcard `any` parameter the body ties to another type (name it with a type variable)
     IPE_T0021 = "IPE-T0021", "this `any` is tied to another type, so it cannot stay a wildcard", "IPE-T0021";
+    /// a type nests deeper than the type depth ceiling
+    IPE_T0022 = "IPE-T0022", "this type nests too deeply", "IPE-T0022";
+    /// a type unfolds to more nodes than the type size ceiling
+    IPE_T0023 = "IPE-T0023", "this type is too large", "IPE-T0023";
 
     // -----------------------------------------------------------------------
     // Lower / not-yet-supported (IPE-L####)
@@ -700,6 +704,8 @@ code! {
     IPE_L0162 = "IPE-L0162", "`onNavigate` is set but the Model has no `page` field", "IPE-L0162";
     /// expression nests too deeply for the backend
     IPE_L0200 = "IPE-L0200", "expression nests too deeply for the backend", "IPE-L0200";
+    /// a type nests too deeply for the backend
+    IPE_L0201 = "IPE-L0201", "a type nests too deeply for the backend", "IPE-L0201";
 
     // -----------------------------------------------------------------------
     // FFI (IPE-F####)
