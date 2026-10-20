@@ -3968,7 +3968,7 @@ fn the_shape_and_the_build_share_one_read_of_the_entry() {
     assert_eq!(
         held.snapshot()
             .module(&["Main".to_owned()])
-            .map(|module| module.text()),
+            .map(crate::source_snapshot::SnapshotModule::text),
         Some(TUI_MAIN),
         "the emit compiles the text the shape was read from"
     );
@@ -6128,32 +6128,6 @@ fn vendored_debugger_build_is_refused_before_compiling() {
     );
     let _ = fs::remove_dir_all(&out);
 }
-
-/// A project whose one program's entry is `entry`, with a clean `src/Main.ipe` and `extra` sources.
-fn declared_entry_project(tag: &str, entry: &str, extra: &[(&str, &str)]) -> PathBuf {
-    let dir = session_scratch(tag);
-    let src = dir.join("src");
-    assert!(fs::create_dir_all(&src).is_ok(), "make src/");
-    let manifest = format!(
-        "module Package exposing (package)\n\n\npackage =\n    {{ name = \"app\"\n    , programs = [ {{ name = \"app\", entry = \"{entry}\" }} ]\n    }}\n"
-    );
-    assert!(
-        fs::write(dir.join("package.ipe"), manifest).is_ok(),
-        "write package.ipe"
-    );
-    assert!(
-        fs::write(src.join("Main.ipe"), CLEAN_MAIN).is_ok(),
-        "write src/Main.ipe"
-    );
-    for (rel, body) in extra {
-        assert!(fs::write(src.join(rel), body).is_ok(), "write extra source");
-    }
-    dir
-}
-
-/// A Tui entry: `Tui.tea`'s callee is never resolved by the parse-only shape read.
-const TUI_PROGRAM: &str =
-    "module Term exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
 
 // A `src/` module `ipe fix` is pointed at through a link is refused, never read through it.
 #[cfg(unix)]
