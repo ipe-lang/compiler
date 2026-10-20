@@ -3828,14 +3828,15 @@ impl<'a> EmitCtx<'a> {
     /// parameter; the pinned type for a [`UserPin::Instance`] parameter no
     /// emitted parameter of the callee names (the arguments cannot let rustc
     /// infer it); `_` for every other one. A pin rendering only `_` renders
-    /// nothing. The pin on a non-[`Callee::Func`] callee, or a
-    /// [`UserPin::Unlowered`] parameter that must render, is a lowering bug,
-    /// never a silent drop.
+    /// nothing. A [`UserPin::Unlowered`] parameter that must render returns
+    /// the refusal its lowering produced; the pin on a non-[`Callee::Func`]
+    /// callee is a lowering bug, never a silent drop.
     ///
     /// # Errors
     ///
-    /// [`Diagnostic::CompilerBug`] on either lowering bug above; any error of
-    /// [`crate::emit_types::render_type`].
+    /// The lowering refusal a must-render [`UserPin::Unlowered`] holds;
+    /// [`Diagnostic::CompilerBug`] on a pin over a non-user callee; any error
+    /// of [`crate::emit_types::render_type`].
     pub(crate) fn call_pin_turbofish(
         &self,
         callee: &Callee,
@@ -3883,14 +3884,10 @@ impl<'a> EmitCtx<'a> {
                 Some(UserPin::Instance(ty)) if !inferable => {
                     Some(emit_types::render_type(self, ty, generics)?)
                 }
-                Some(UserPin::Unlowered) if !inferable => {
-                    return Err(Diagnostic::CompilerBug {
-                        where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
-                        detail: "an uninferable type parameter pinned to an unlowered type"
-                            .to_owned(),
-                    });
+                Some(UserPin::Unlowered(refusal)) if !inferable => {
+                    return Err(Diagnostic::clone(refusal));
                 }
-                Some(UserPin::Instance(_) | UserPin::Unlowered) | None => None,
+                Some(UserPin::Instance(_) | UserPin::Unlowered(_)) | None => None,
             };
             any_pinned |= entry.is_some();
             entries.push(entry.unwrap_or_else(|| "_".to_owned()));

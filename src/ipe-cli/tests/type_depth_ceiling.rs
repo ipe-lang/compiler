@@ -22,16 +22,17 @@
 //! arrangement its constructors reach, together, and is refused at the
 //! constructor that permutes them. A parameter no field uses is accepted and
 //! erased from the emitted enum, and a generic its erasure leaves no argument
-//! to infer from is pinned at each call. A custom type whose instantiations grow past
-//! the size ceiling is refused with IPE-T0023 at the constructor applying the
-//! one that crosses it.
+//! to infer from is pinned at each call; a bounded generic only an erased
+//! parameter names is refused with IPE-L0102 where its body reads it. A custom
+//! type whose instantiations grow past the size ceiling is refused with
+//! IPE-T0023 at the constructor applying the one that crosses it.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ipe::CliError;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
-use ipe_diagnostics::{Diagnostic, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError};
+use ipe_diagnostics::{Diagnostic, IPE_L0102, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError};
 
 /// Where the chain one binding past the deepest is refused.
 #[derive(Clone, Copy)]
@@ -539,8 +540,8 @@ fn a_custom_type_parameter_no_field_uses_builds_with_cargo() {
 /// generic over the erased parameter, and an unannotated caller.
 const ERASED_INFERENCE_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\ncount : Tag Int -> Int\ncount t =\n    List.length (empties t)\n\n\ncountAny : Tag b -> Int\ncountAny t =\n    List.length (empties t)\n\n\ncountUnannotated t =\n    List.length (empties t)\n\n\nmain =\n    Io.println (if count Tag + countAny Tag + countUnannotated Tag == 0 then \"zero\" else \"other\")\n";
 
-/// Every emitted Rust line under `dir` that calls `callee` with a turbofish.
-fn turbofish_calls(dir: &Path, callee: &str) -> Vec<String> {
+/// Every emitted Rust source file under `dir`.
+fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(next) = pending.pop() {
@@ -552,17 +553,26 @@ fn turbofish_calls(dir: &Path, callee: &str) -> Vec<String> {
             if path.is_dir() {
                 pending.push(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                let needle = format!("{callee}::<");
-                found.extend(
-                    text.lines()
-                        .filter(|line| line.contains(&needle))
-                        .map(str::to_owned),
-                );
+                found.push(path);
             }
         }
     }
     found
+}
+
+/// Every emitted Rust line under `dir` that calls `callee` with a turbofish.
+fn turbofish_calls(dir: &Path, callee: &str) -> Vec<String> {
+    let needle = format!("{callee}::<");
+    rust_sources(dir)
+        .iter()
+        .flat_map(|path| {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            text.lines()
+                .filter(|line| line.contains(&needle))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// A generic whose only naming argument a parameter erasure removed is pinned
@@ -602,6 +612,49 @@ fn a_generic_named_only_by_an_erased_argument_is_pinned_at_each_call() {
         );
     }
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// `doubledCount` is generic over a bounded `number` that only the erased
+/// parameter of `Tag` names, so its emitted signature names no generic its
+/// body's arithmetic could read.
+const BOUNDED_ERASED_GENERIC: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\ndoubledCount : Tag number -> Int\ndoubledCount t =\n    List.length (List.map (\\x -> x + x) (empties t))\n\n\nmain =\n    Io.println (if doubledCount Tag == 0 then \"zero\" else \"other\")\n";
+
+/// A bounded generic the emitted signature does not name has no reading in
+/// its body: the build is refused with IPE-L0102 inside the body that reads
+/// it, never a compiler bug, and no Rust is emitted. Read in the CI
+/// `test-run` job.
+#[test]
+fn a_bounded_generic_only_an_erased_parameter_names_is_refused_where_it_is_read() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_bounded_erased_{}",
+        std::process::id()
+    ));
+    let built = ipe::RootFixture::main(BOUNDED_ERASED_GENERIC)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    let diag = refusal(&built);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_L0102), "{built:?}");
+    let src = BOUNDED_ERASED_GENERIC;
+    let body = span_of(src, "doubledCount t =", 0);
+    let main_at = span_of(src, "main =", offset_of(body));
+    let span = diag.map(Diagnostic::primary_span);
+    assert!(
+        span.is_some_and(|s| s != Span::DUMMY
+            && body.lo <= s.lo
+            && s.lo < s.hi
+            && s.hi <= main_at.lo),
+        "refused at {span:?}, not inside doubledCount's body {}..{}: {built:?}",
+        body.lo,
+        main_at.lo
+    );
+    let emitted = rust_sources(&scratch);
+    assert!(emitted.is_empty(), "no Rust may be emitted: {emitted:?}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// The byte offset `span` starts at.
+fn offset_of(span: Span) -> usize {
+    usize::try_from(span.lo).unwrap_or(usize::MAX)
 }
 
 /// `p0 = 0` and `pK = ( p{K-1}, p{K-1} )` through `p{n}`, compared with

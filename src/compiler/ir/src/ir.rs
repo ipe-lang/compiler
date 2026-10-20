@@ -3322,8 +3322,14 @@ pub enum UserPin {
     /// argument lowering erased it), so its return alone cannot leave rustc
     /// without the type.
     Instance(IrType),
-    /// An instantiation the use could not lower; refused if it must render.
-    Unlowered,
+    /// An instantiation the use could not lower, holding the lowering's own
+    /// refusal: the backend returns it when the parameter must render, so the
+    /// reason is never replaced by a compiler bug.
+    ///
+    /// Never serialized: a program holding one does not enter the IR cache,
+    /// and a cached program never deserializes into one.
+    #[serde(skip)]
+    Unlowered(Box<Diagnostic>),
 }
 
 impl CallPin {
@@ -3364,7 +3370,7 @@ impl CallPin {
         };
         pins.into_iter().flatten().filter_map(|pin| match pin {
             UserPin::Instance(ty) => Some(ty),
-            UserPin::Unit | UserPin::Unlowered => None,
+            UserPin::Unit | UserPin::Unlowered(_) => None,
         })
     }
 }

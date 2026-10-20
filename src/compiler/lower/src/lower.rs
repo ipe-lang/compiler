@@ -11770,9 +11770,9 @@ pub struct Lowerer<'a> {
     /// Installed and restored together with `current_poly_tvars` by
     /// [`Self::with_poly_tvars`], so the two can never describe different defs.
     current_row_params: std::cell::RefCell<BTreeSet<Symbol>>,
-    /// The current def's generics its emitted signature does not name, read
-    /// as `()` in its body ([`Self::with_erased_tvars`]).
-    current_unit_tvars: std::cell::RefCell<BTreeSet<ipe_types::SolverVar>>,
+    /// The current def's generics its emitted signature does not name, each
+    /// with how its body reads it ([`Self::with_erased_tvars`]).
+    current_erased_tvars: std::cell::RefCell<BTreeMap<ipe_types::SolverVar, ErasedTvar>>,
     /// Whether the function (def or lambda) currently being lowered has a Task
     /// return type. Set to `true` when `lower_def` / `lower_lambda` detects that
     /// the inferred return type is `IrType::Task(_)`; reset to `false` on entry to
@@ -13736,6 +13736,18 @@ enum ReadSite {
     Body,
 }
 
+/// How the current def's body reads a generic its emitted signature does not
+/// name ([`Lowerer::with_erased_tvars`]): the emitted function declares no
+/// Rust generic for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErasedTvar {
+    /// No obligation: read as `()`, sound by parametricity.
+    Unit,
+    /// An obligation `()` may not meet, and no Rust generic carries the bound:
+    /// a body type naming it is refused (IPE-L0102).
+    Bounded,
+}
+
 /// The one symbol that stands for the wildcard `any` in lowered types.
 ///
 /// Minted fresh per lowering through [`Interner::fresh_symbols`], so no
@@ -14139,7 +14151,7 @@ impl<'a> Lowerer<'a> {
             ),
             current_poly_tvars: std::cell::RefCell::new(BTreeMap::new()),
             current_row_params: std::cell::RefCell::new(BTreeSet::new()),
-            current_unit_tvars: std::cell::RefCell::new(BTreeSet::new()),
+            current_erased_tvars: std::cell::RefCell::new(BTreeMap::new()),
             fn_is_async: Cell::new(false),
             promotable_fn_binders: std::cell::RefCell::new(BTreeSet::new()),
             deferred_fun_captures: std::cell::RefCell::new(BTreeMap::new()),
@@ -20449,16 +20461,17 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Run `f` with every generic of the current def that its lowered `params`
-    /// and `ret` do not name, and that carries no obligation in `bounds`, read
-    /// as `()`.
+    /// and `ret` do not name read by its [`ErasedTvar`]: `()` for one carrying
+    /// no obligation in `bounds`, a refusal for a bounded one.
     ///
     /// An argument lowering may erase a generic (`Tag b` lowers to `Tag` when
     /// `Tag` never uses its parameter); the emitted function then has no Rust
     /// generic for it, so a body type naming it would be out of scope. No value
     /// of the def's type is observable through it, so by parametricity `()`
-    /// is a sound instantiation. A bounded one keeps its generic reading,
-    /// refused at emit as out of scope rather than given a type that may not
-    /// meet the bound. Restored once `f` returns.
+    /// is a sound instantiation. A bounded one has no type that surely meets
+    /// the bound and no generic to carry it, so a body type naming it is
+    /// refused at the read (IPE-L0102) rather than emitted out of scope.
+    /// Restored once `f` returns.
     fn with_erased_tvars<T>(
         &self,
         params: &[(Symbol, IrType)],
@@ -20471,20 +20484,23 @@ impl<'a> Lowerer<'a> {
             collect_ir_generic_syms(ty, &mut named);
         }
         collect_ir_generic_syms(ret, &mut named);
-        let erased: BTreeSet<ipe_types::SolverVar> = {
+        let erased: BTreeMap<ipe_types::SolverVar, ErasedTvar> = {
             let rows = self.current_row_params.borrow();
             self.current_poly_tvars
                 .borrow()
                 .iter()
                 .filter(|(_, sym)| {
-                    !named.contains(*sym)
-                        && **sym != self.wildcard_marker
-                        && !rows.contains(*sym)
-                        && bounds
-                            .and_then(|m| m.get(*sym))
-                            .is_none_or(|b| b.is_empty())
+                    !named.contains(*sym) && **sym != self.wildcard_marker && !rows.contains(*sym)
                 })
-                .map(|(var, _)| *var)
+                .map(|(var, sym)| {
+                    let unbounded = bounds.and_then(|m| m.get(sym)).is_none_or(|b| b.is_empty());
+                    let read = if unbounded {
+                        ErasedTvar::Unit
+                    } else {
+                        ErasedTvar::Bounded
+                    };
+                    (*var, read)
+                })
                 .collect()
         };
         if erased.is_empty() {
@@ -20493,11 +20509,11 @@ impl<'a> Lowerer<'a> {
         let saved_poly = self.current_poly_tvars.borrow().clone();
         self.current_poly_tvars
             .borrow_mut()
-            .retain(|var, _| !erased.contains(var));
-        let saved_unit = self.current_unit_tvars.replace(erased);
+            .retain(|var, _| erased.get(var) != Some(&ErasedTvar::Unit));
+        let saved_erased = self.current_erased_tvars.replace(erased);
         let out = f();
         self.current_poly_tvars.replace(saved_poly);
-        self.current_unit_tvars.replace(saved_unit);
+        self.current_erased_tvars.replace(saved_erased);
         out
     }
 
@@ -21060,21 +21076,23 @@ impl<'a> Lowerer<'a> {
         out
     }
 
-    /// Lower the type variable `raw` by its owner: `()` for a generic the
-    /// current def's signature erased ([`Self::with_erased_tvars`]), the
-    /// current def's generic, a refusal for another binding's generic read in
-    /// the current def's signature, or `lenient` for a free one or a body read
-    /// (see [`ReadSite`]).
+    /// Lower the type variable `raw` by its owner: a generic the current def's
+    /// signature erased by its [`ErasedTvar`] ([`Self::with_erased_tvars`]),
+    /// the current def's generic, a refusal for another binding's generic read
+    /// in the current def's signature, or `lenient` for a free one or a body
+    /// read (see [`ReadSite`]).
     fn ir_type_from_owned_var(
         &self,
         raw: u32,
         span: Span,
         lenient: impl FnOnce() -> DResult<IrType>,
     ) -> DResult<IrType> {
-        if ipe_types::SolverVar::from_raw(raw)
-            .is_some_and(|var| self.current_unit_tvars.borrow().contains(&var))
-        {
-            return Ok(IrType::Unit);
+        let erased = ipe_types::SolverVar::from_raw(raw)
+            .and_then(|var| self.current_erased_tvars.borrow().get(&var).copied());
+        match erased {
+            Some(ErasedTvar::Unit) => return Ok(IrType::Unit),
+            Some(ErasedTvar::Bounded) => return Err(unsupported(span, Feature::Polymorphism)),
+            None => {}
         }
         match (self.var_owner(raw), self.read_site.get()) {
             (VarOwner::Here(sym), ReadSite::Signature | ReadSite::Body) => Ok(IrType::Generic(sym)),
@@ -24570,9 +24588,10 @@ impl<'a> Lowerer<'a> {
             let (Some(sym), Some(ty)) = (name_of(*raw), subst.get(raw)) else {
                 continue;
             };
-            let pin = self
-                .ir_type_from_ty_ui_msg(ty, callee.span)
-                .map_or(UserPin::Unlowered, UserPin::Instance);
+            let pin = match self.ir_type_from_ty_ui_msg(ty, callee.span) {
+                Ok(lowered) => UserPin::Instance(lowered),
+                Err(refusal) => UserPin::Unlowered(Box::new(refusal)),
+            };
             pins.insert(sym, pin);
         }
         let free_msg = msg_only

@@ -2455,6 +2455,32 @@ mod tests {
         );
     }
 
+    /// An imported union over-applied through the bare name its import's
+    /// clause exposes.
+    const EXPOSED_UNION_OVER_APPLIED: &str = "module Main exposing (f)\n\
+         import Dep exposing (Box)\n\n\
+         f : Box Int Int -> Int\n\
+         f b =\n    0\n";
+
+    #[test]
+    fn exposed_union_over_applied_is_a_type_arity_error() {
+        let err = canon_main_with_dep(
+            "module Dep exposing (Box)\n\
+             type Box a = Box a\n",
+            EXPOSED_UNION_OVER_APPLIED,
+        );
+        assert!(
+            is_type_arity_at(
+                err.as_ref(),
+                EXPOSED_UNION_OVER_APPLIED,
+                "Box",
+                (1, 2),
+                "Box Int Int"
+            ),
+            "expected TypeArity(Box, 1, 2) at the signature, got {err:?}"
+        );
+    }
+
     #[test]
     fn union_applied_to_its_declared_parameters_is_accepted() {
         let local = canon_err(
