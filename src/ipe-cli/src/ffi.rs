@@ -512,6 +512,13 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
 /// wrapper is proven to be the directory reached through the root's own
 /// handle.
 ///
+/// This is a check-then-cargo window, not a hold: cargo later resolves the
+/// emitted `path = ...` by name. A co-tenant able to write a level of the
+/// wrapper's path can rename the wrapper directory and plant another tree
+/// after this check and before cargo resolves the path, and that tree is
+/// built. The structural close copies the wrapper through a held handle into
+/// the output directory and binds the copy, a separate design.
+///
 /// # Errors
 /// [`CliError::TrustRefused`] naming the first wrapper that is not;
 /// [`CliError::Io`] when a level cannot be opened or stat'd.
