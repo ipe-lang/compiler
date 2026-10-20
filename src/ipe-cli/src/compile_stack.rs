@@ -6,7 +6,14 @@
 //! depth the parser admits, on the one compile door the commands use
 //! ([`crate::threads::run_compile`], a thread of exactly
 //! [`crate::threads::COMPILE_STACK_BYTES`]); one level deeper is refused by the
-//! parser with `NestingTooDeep`, never by a later stage or a stack overflow.
+//! parser with `NestingTooDeep` inside its innermost level, never by a later
+//! stage or a stack overflow. Under `IPE_E2E=1` the at-ceiling program of each
+//! shape is also built with cargo.
+//!
+//! The deepest count of each shape is pinned. A body's expression opens at
+//! depth 0; an application adds one frame, its head or argument a postfix and
+//! an atom frame, a construct the atom opens one more, and that construct's
+//! inner expression one more, so a nesting construct costs five levels.
 
 #![cfg(test)]
 
@@ -24,56 +31,255 @@ use crate::driver::{
 /// The imports every shape's module opens with.
 const HEADER: &str = "module Main exposing (main)\n\n\
                       import Ipe.Io as Io\n\
+                      import Ipe.List as List\n\
                       import Ipe.String as String\n\
                       import Ipe.Task as Task\n\n\n";
+
+/// A `main` that prints `deep 1`, then the head of `deep : Int -> Int`.
+const DEEP_HEAD: &str = "main =\n    Io.println (String.fromInt (deep 1))\n\n\n\
+                         deep : Int -> Int\ndeep x =\n";
+
+/// A shape's source and the byte range its refusal one level past the ceiling
+/// must lie in: the innermost nesting level, or a sequence's last element
+/// through the end.
+struct Shaped {
+    src: String,
+    tail: (u32, u32),
+}
+
+/// A source generator of one nesting shape, by depth.
+type Shape = fn(usize) -> Shaped;
 
 /// The ceiling as a count.
 fn ceiling() -> usize {
     usize::try_from(SOURCE_NESTING_LIMIT).unwrap_or(usize::MAX)
 }
 
-/// A `do` block of `n` binds.
-fn do_binds(n: usize) -> String {
-    let mut src = format!("{HEADER}main =\n    do\n");
-    for _ in 0..n {
-        src.push_str("        _ <- Io.println \"s\"\n");
-    }
-    src.push_str("        Io.println \"e\"\n");
-    src
+/// A byte offset as a span bound.
+fn offset(at: usize) -> u32 {
+    u32::try_from(at).unwrap_or(u32::MAX)
 }
 
-/// A `let` block of `n` bindings, each reading the one before it.
-fn let_block(n: usize) -> String {
-    let bindings: String = (1..=n)
-        .map(|i| format!("        x{i} = x{} + 1\n", i - 1))
-        .collect();
-    format!(
-        "{HEADER}main =\n    let\n        x0 = 0\n{bindings}    in\n    Io.println (String.fromInt x{n})\n"
+/// `before`, `n` nested copies of `open`, `core`, `n` copies of `close`, then
+/// `after`; the tail is the innermost level.
+fn nested(n: usize, before: &str, open: &str, core: &str, close: &str, after: &str) -> Shaped {
+    let mut src = String::from(HEADER);
+    src.push_str(before);
+    let mut lo = src.len();
+    for _ in 0..n {
+        lo = src.len();
+        src.push_str(open);
+    }
+    src.push_str(core);
+    let mut hi = src.len();
+    for level in 0..n {
+        src.push_str(close);
+        if level == 0 {
+            hi = src.len();
+        }
+    }
+    src.push_str(after);
+    Shaped {
+        src,
+        tail: (offset(lo), offset(hi)),
+    }
+}
+
+/// `before`, `n` steps, then `after`; the tail runs from the last step to the end.
+fn sequence(n: usize, before: &str, step: impl Fn(usize) -> String, after: &str) -> Shaped {
+    let mut src = String::from(HEADER);
+    src.push_str(before);
+    let mut lo = src.len();
+    for i in 0..n {
+        lo = src.len();
+        src.push_str(&step(i));
+    }
+    src.push_str(after);
+    let tail = (offset(lo), offset(src.len()));
+    Shaped { src, tail }
+}
+
+/// A `do` block of `n` binds.
+fn do_binds(n: usize) -> Shaped {
+    sequence(
+        n,
+        "main =\n    do\n",
+        |_| "        _ <- Io.println \"s\"\n".to_owned(),
+        "        Io.println \"e\"\n",
+    )
+}
+
+/// A `let` block of `n` bindings after `x0`, each reading the one before it.
+fn let_block(n: usize) -> Shaped {
+    let body = format!("    in\n    Io.println (String.fromInt x{n})\n");
+    sequence(
+        n,
+        "main =\n    let\n        x0 = 0\n",
+        |i| format!("        x{} = x{i} + 1\n", i + 1),
+        &body,
     )
 }
 
 /// A chain of `n` `+` operators.
-fn binop_chain(n: usize) -> String {
-    let terms = vec!["1"; n + 1].join(" + ");
-    format!("{HEADER}main =\n    Io.println (String.fromInt ({terms}))\n")
+fn binop_chain(n: usize) -> Shaped {
+    sequence(
+        n,
+        "main =\n    Io.println (String.fromInt (1",
+        |_| " + 1".to_owned(),
+        "))\n",
+    )
 }
 
 /// A pipeline of `n` `Task.andThen` continuations.
-fn pipeline(n: usize) -> String {
-    let mut body = String::from("Io.println \"s\"");
-    for _ in 0..n {
-        body.push_str(" |> Task.andThen (\\_ -> Io.println \"s\")");
-    }
-    format!("{HEADER}main =\n    {body}\n")
+fn pipeline(n: usize) -> Shaped {
+    sequence(
+        n,
+        "main =\n    Io.println \"s\"",
+        |_| " |> Task.andThen (\\_ -> Io.println \"s\")".to_owned(),
+        "\n",
+    )
 }
 
 /// `n` continuation lambdas, each nested inside the last.
-fn nested_lambda(n: usize) -> String {
-    let mut body = String::from("Io.println \"end\"");
-    for _ in 0..n {
-        body = format!("Io.println \"s\" |> Task.andThen (\\_ -> {body})");
+fn nested_lambda(n: usize) -> Shaped {
+    nested(
+        n,
+        "main =\n    ",
+        "Io.println \"s\" |> Task.andThen (\\_ -> ",
+        "Io.println \"end\"",
+        ")",
+        "\n",
+    )
+}
+
+/// `n` nested applications `inc (inc (… 0))`.
+fn nested_application(n: usize) -> Shaped {
+    nested(
+        n,
+        "main =\n    Io.println (String.fromInt (",
+        "inc (",
+        "0",
+        ")",
+        "))\n\n\ninc : Int -> Int\ninc x =\n    x + 1\n",
+    )
+}
+
+/// `n` nested parentheses.
+fn nested_parens(n: usize) -> Shaped {
+    nested(
+        n,
+        "main =\n    Io.println (String.fromInt (",
+        "(",
+        "1",
+        ")",
+        "))\n",
+    )
+}
+
+/// `n` nested `case` expressions, each in the last one's fallback arm.
+fn nested_case(n: usize) -> Shaped {
+    let mut src = String::from(HEADER);
+    src.push_str(DEEP_HEAD);
+    let mut lo = src.len();
+    for level in 0..n {
+        let indent = " ".repeat(4 + 8 * level);
+        lo = src.len();
+        for line in ["case x of\n", "    0 ->\n", "        0\n\n", "    _ ->\n"] {
+            src.push_str(&indent);
+            src.push_str(line);
+        }
     }
-    format!("{HEADER}main =\n    {body}\n")
+    src.push_str(&" ".repeat(4 + 8 * n));
+    src.push_str("x\n");
+    let tail = (offset(lo), offset(src.len()));
+    Shaped { src, tail }
+}
+
+/// `n` nested `if` expressions, each in the last one's `then` branch.
+fn nested_if(n: usize) -> Shaped {
+    let before = format!("{DEEP_HEAD}    ");
+    nested(n, &before, "if x > 0 then ", "x", " else 0", "\n")
+}
+
+/// An `if` with `n` `else if` arms.
+fn else_if_chain(n: usize) -> Shaped {
+    let before = format!("{DEEP_HEAD}    if x > 0 then 1");
+    sequence(
+        n,
+        &before,
+        |_| " else if x > 1 then 1".to_owned(),
+        " else 0\n",
+    )
+}
+
+/// `n` nested records `{ a = { a = … } }`, read back through `n` accesses.
+fn nested_record(n: usize) -> Shaped {
+    let after = format!(
+        "\n    in\n    Io.println (String.fromInt r{})\n",
+        ".a".repeat(n)
+    );
+    nested(
+        n,
+        "main =\n    let\n        r =\n            ",
+        "{ a = ",
+        "1",
+        " }",
+        &after,
+    )
+}
+
+/// `n` nested list literals, measured by `List.length`.
+fn nested_list(n: usize) -> Shaped {
+    nested(
+        n,
+        "main =\n    Io.println (String.fromInt (List.length ",
+        "[",
+        "1",
+        "]",
+        "))\n",
+    )
+}
+
+/// A chain of `n` one-parameter lambdas `\_ -> \_ -> … -> 7`, applied to `n` zeros.
+fn lambda_chain(n: usize) -> Shaped {
+    let before = format!(
+        "main =\n    Io.println (String.fromInt (chain{}))\n\n\nchain : {}Int\nchain =\n    ",
+        " 0".repeat(n),
+        "Int -> ".repeat(n)
+    );
+    nested(n, &before, "\\_ -> ", "7", "", "\n")
+}
+
+/// Every nesting shape, by name, with the deepest count the parser admits.
+///
+/// `L` is the ceiling. A shape's deepest count is the largest `n` whose
+/// deepest atom (named per entry) still sits at depth `L` or less.
+fn shapes() -> [(&'static str, Shape, usize); 13] {
+    let limit = ceiling();
+    [
+        // Bind `k`'s operand atom at depth `9 + 2k`, the final run's at `10 + 2n`.
+        ("do_bind", do_binds, (limit - 10) / 2),
+        // The body's `String.fromInt` atom at depth `14 + n`.
+        ("let_block", let_block, limit - 14),
+        // The chain's expression at depth 10, each operator one level more.
+        ("binop_chain", binop_chain, limit - 10),
+        // The chain's expression at depth 0, each operator one level more.
+        ("pipeline", pipeline, limit),
+        // Ten levels per continuation; the innermost atom at depth `10n + 3`.
+        ("nested_lambda", nested_lambda, (limit - 3) / 10),
+        // The innermost atom at depth `13 + 5n` inside `String.fromInt (…)`.
+        ("nested_application", nested_application, (limit - 13) / 5),
+        ("nested_parens", nested_parens, (limit - 13) / 5),
+        ("nested_list", nested_list, (limit - 13) / 5),
+        // The innermost atom at depth `10 + 5n` inside a `let` binding.
+        ("nested_record", nested_record, (limit - 10) / 5),
+        // The innermost atom at depth `3 + 5n` in a declaration body.
+        ("nested_case", nested_case, (limit - 3) / 5),
+        ("nested_if", nested_if, (limit - 3) / 5),
+        ("lambda_chain", lambda_chain, (limit - 3) / 5),
+        // Arm `k`'s condition atom at depth `8 + k`.
+        ("else_if_chain", else_if_chain, limit - 8),
+    ]
 }
 
 /// A multiline string of `n` interpolations.
@@ -85,11 +291,11 @@ fn interpolation(n: usize) -> String {
     )
 }
 
-/// The deepest `n` whose `source(n)` the parser admits, searched up to twice its ceiling.
-fn parser_ceiling(source: fn(usize) -> String) -> Option<usize> {
+/// The deepest `n` whose `shape(n)` the parser admits, searched up to twice its ceiling.
+fn parser_ceiling(shape: Shape) -> Option<usize> {
     (0..=2 * ceiling())
         .take_while(|n| {
-            ipe_parse::parse_module(&source(*n), &mut ipe_intern::Interner::new()).is_ok()
+            ipe_parse::parse_module(&shape(*n).src, &mut ipe_intern::Interner::new()).is_ok()
         })
         .last()
 }
@@ -123,53 +329,93 @@ fn compile_here(src: String) -> Result<(), CliError> {
     compile_prepared(&db, root, &sources, &main, blame, config).map(|_| ())
 }
 
-/// Whether `result` is the parser's `NestingTooDeep` refusal.
-fn refused_by_parser(result: &Result<(), CliError>) -> bool {
-    matches!(
-        result,
-        Err(CliError::Pipeline { diag, .. })
-            if matches!(
-                **diag,
-                Diagnostic::Parse {
-                    msg: ParseError::NestingTooDeep { .. },
-                    ..
-                }
-            )
-    )
+/// The span of `result` when it is the parser's `NestingTooDeep` refusal.
+fn parser_refusal_span(result: &Result<(), CliError>) -> Option<(u32, u32)> {
+    let Err(CliError::Pipeline { diag, .. }) = result else {
+        return None;
+    };
+    let Diagnostic::Parse {
+        span,
+        msg: ParseError::NestingTooDeep { .. },
+        ..
+    } = &**diag
+    else {
+        return None;
+    };
+    Some((span.lo, span.hi))
+}
+
+/// Assert `result` is the parser's `NestingTooDeep` refusal inside `tail`.
+fn assert_refused_in(result: &Result<(), CliError>, (lo, hi): (u32, u32), name: &str) {
+    let span = parser_refusal_span(result);
+    assert!(
+        span.is_some(),
+        "{name}: one level past the ceiling must be refused by the parser, got {result:?}"
+    );
+    let Some((at_lo, at_hi)) = span else {
+        return;
+    };
+    assert!(
+        at_lo >= lo && at_hi <= hi,
+        "{name}: the refusal at {at_lo}..{at_hi} lies in the innermost level {lo}..{hi}"
+    );
 }
 
 /// Every nesting shape compiles at the parser's ceiling on the declared stack,
-/// and one level deeper is refused by the parser.
+/// and one level deeper is refused by the parser inside its innermost level.
 #[test]
 fn at_ceiling_shapes_fit_declared_stack() {
-    type Shape = fn(usize) -> String;
-    let shapes: [(&str, Shape); 5] = [
-        ("do-bind", do_binds),
-        ("let-block", let_block),
-        ("binop chain", binop_chain),
-        ("pipeline", pipeline),
-        ("nested lambda", nested_lambda),
-    ];
-    for (name, source) in shapes {
-        let found = parser_ceiling(source);
-        assert!(
-            found.is_some_and(|n| n > 0 && n < 2 * ceiling()),
-            "{name}: the parser must admit some depth and refuse a deeper one: {found:?}"
+    for (name, shape, deepest) in shapes() {
+        let found = parser_ceiling(shape);
+        assert_eq!(
+            found,
+            Some(deepest),
+            "{name}: the deepest count the parser admits"
         );
-        let Some(deepest) = found else {
-            continue;
-        };
-        let admitted = compile_on_compile_door(source(deepest));
+        let admitted = compile_on_compile_door(shape(deepest).src);
         assert!(
             admitted.is_ok(),
             "{name}: depth {deepest} must compile through emit: {admitted:?}"
         );
-        let refused = compile_on_compile_door(source(deepest + 1));
-        assert!(
-            refused_by_parser(&refused),
-            "{name}: depth {} must be refused by the parser, got {refused:?}",
-            deepest + 1
-        );
+        let past = shape(deepest + 1);
+        let refused = compile_on_compile_door(past.src);
+        assert_refused_in(&refused, past.tail, name);
+    }
+}
+
+/// Build the project whose `Main` module is `src` into `out`.
+fn build_shape(src: &str, out: &Path, runtime: &Path) -> Result<(), CliError> {
+    let fixture = crate::RootFixture::main(src)?;
+    crate::build_fixture(&fixture, out, runtime).map(|_| ())
+}
+
+/// Every nesting shape's at-ceiling program builds with cargo, and one level
+/// deeper is refused at ipe time by the parser. Gated on `IPE_E2E=1` (the CI
+/// `e2e` job): the seal cargo-builds each emitted crate.
+#[test]
+fn at_ceiling_shapes_build_with_cargo() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch =
+            ipe_test_temp::temp_root().join(format!("ipe_nesting_ceiling_{}", std::process::id()));
+        for (name, shape, deepest) in shapes() {
+            let out = scratch.join(name);
+            let emitted = build_shape(&shape(deepest).src, &out, &runtime);
+            assert!(
+                emitted.is_ok(),
+                "{name}: depth {deepest} must emit: {emitted:?}"
+            );
+            let built = e2e_support::build_rust_binary(&format!("nesting_ceiling_{name}"), &out);
+            assert!(
+                built.is_ok(),
+                "{name}: the emitted crate at depth {deepest} must build with cargo: {}",
+                built.err().unwrap_or_default()
+            );
+            let past = shape(deepest + 1);
+            let refused = build_shape(&past.src, &scratch.join(format!("{name}_past")), &runtime);
+            assert_refused_in(&refused, past.tail, name);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
 

@@ -1,12 +1,13 @@
 //! The one expression-nesting ceiling every compiler stage derives its bound from.
 //!
-//! The parser refuses source nested past [`SOURCE_NESTING_LIMIT`]. Every later
-//! walker recurses at most [`LOWER_FRAMES_PER_LEVEL`] times per source level, so
-//! the IR walkers and the emitter bound their recursion by [`IR_NESTING_LIMIT`].
-//! A program the parser admits therefore never meets a later depth guard; that
-//! guard stays as defence in depth against a lowering step that manufactures
-//! nesting. [`COMPILE_STACK_BYTES`] is the native stack every compile thread is
-//! spawned with, sized so the at-ceiling shapes fit it.
+//! The parser refuses source nested past [`SOURCE_NESTING_LIMIT`]. The IR
+//! walkers and the emitter bound their recursion by [`IR_NESTING_LIMIT`], the
+//! source ceiling times [`LOWER_FRAMES_PER_LEVEL`]. The parser's charge keeps
+//! `do`/`let` blocks, operator chains, pipelines, lambdas and `else if` chains
+//! under that IR ceiling. The clone `let`s a capture rewrite adds and an
+//! interpolation's `++` spine are not charged at the parser, so the emitter's
+//! guard may still refuse them. [`COMPILE_STACK_BYTES`] is the native stack
+//! every compile thread is spawned with, sized so the at-ceiling shapes fit it.
 
 /// Deepest source nesting the parser admits.
 ///

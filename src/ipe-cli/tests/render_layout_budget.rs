@@ -11,8 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ipe::threads::COMPILE_STACK_BYTES;
-use ipe_db::Db;
+use ipe_db::{Db, PipelineError};
 use ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT;
+use ipe_diagnostics::{Diagnostic, ParseError};
 
 /// The fixtures whose bodies once ran the fuel out; each must lower and be measured.
 const NAMED_FIXTURES: [&str; 2] = ["db_store_rename_column", "analytics_store_gate"];
@@ -50,9 +51,57 @@ fn fixture_name(entry: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Why no body of a source was measured.
+#[derive(Debug)]
+enum Unmeasured {
+    /// The entry could not be read.
+    Read(std::io::Error),
+    /// The OS refused the measuring thread.
+    Spawn(std::io::Error),
+    /// The measuring thread panicked.
+    Panicked,
+    /// The source root holds no `Main` module.
+    AbsentEntry,
+    /// The pipeline refused the program before or during lowering.
+    Lower(Box<PipelineError>),
+    /// The backend refused the lowered program.
+    Emit(Box<Diagnostic>),
+}
+
+impl std::fmt::Display for Unmeasured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "read: {e}"),
+            Self::Spawn(e) => write!(f, "spawn: {e}"),
+            Self::Panicked => f.write_str("the compile thread panicked"),
+            Self::AbsentEntry => f.write_str("the entry module is absent from the source root"),
+            Self::Lower(refusal) => write!(f, "lower: {refusal:?}"),
+            Self::Emit(refusal) => write!(f, "emit: {refusal:?}"),
+        }
+    }
+}
+
+impl Unmeasured {
+    /// Whether this is the parser's nesting refusal, as opposed to any later
+    /// stage's bound.
+    fn is_parser_nesting_refusal(&self) -> bool {
+        let Self::Lower(err) = self else {
+            return false;
+        };
+        let (diag, _) = <(Diagnostic, Vec<ipe_intern::Symbol>)>::from((**err).clone());
+        matches!(
+            diag,
+            Diagnostic::Parse {
+                msg: ParseError::NestingTooDeep { .. },
+                ..
+            }
+        )
+    }
+}
+
 /// The layout budget of every body in `entry`, or the reason none was measured.
-fn measure(entry: &Path) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, String> {
-    let src = std::fs::read_to_string(entry).map_err(|e| format!("read: {e}"))?;
+fn measure(entry: &Path) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, Unmeasured> {
+    let src = std::fs::read_to_string(entry).map_err(Unmeasured::Read)?;
     measure_source(entry, src)
 }
 
@@ -60,7 +109,7 @@ fn measure(entry: &Path) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, Stri
 fn measure_source(
     entry: &Path,
     src: String,
-) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, String> {
+) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, Unmeasured> {
     measure_source_on(entry, src, None)
 }
 
@@ -70,7 +119,7 @@ fn measure_source_on(
     entry: &Path,
     src: String,
     stack: Option<usize>,
-) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, String> {
+) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, Unmeasured> {
     let Some(stack) = stack else {
         return measure_here(entry, src);
     };
@@ -78,9 +127,9 @@ fn measure_source_on(
         std::thread::Builder::new()
             .stack_size(stack)
             .spawn_scoped(scope, move || measure_here(entry, src))
-            .map_err(|e| format!("spawn: {e}"))?
+            .map_err(Unmeasured::Spawn)?
             .join()
-            .map_err(|_| "the compile thread panicked".to_owned())?
+            .map_err(|_| Unmeasured::Panicked)?
     })
 }
 
@@ -88,7 +137,7 @@ fn measure_source_on(
 fn measure_here(
     entry: &Path,
     src: String,
-) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, String> {
+) -> Result<Vec<ipe_backend_rust::BodyLayoutBudget>, Unmeasured> {
     let main = vec!["Main".to_owned()];
     let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
     sources.insert(main.clone(), (entry.to_path_buf(), src));
@@ -100,12 +149,12 @@ fn measure_here(
         .files(&db)
         .get(&main)
         .copied()
-        .ok_or_else(|| "the entry module is absent from the source root".to_owned())?;
+        .ok_or(Unmeasured::AbsentEntry)?;
     let program = ipe_db::lower_program(&db, root, entry_file)
         .clone()
-        .map_err(|refusal| format!("lower: {refusal:?}"))?;
+        .map_err(|refusal| Unmeasured::Lower(Box::new(refusal)))?;
     ipe_backend_rust::body_layout_budgets(&db.interner().lock(), &program)
-        .map_err(|e| format!("emit: {e:?}"))
+        .map_err(|refusal| Unmeasured::Emit(Box::new(refusal)))
 }
 
 #[test]
@@ -270,9 +319,7 @@ fn deepest_admitted_body_lays_out_on_compile_stack() {
         assert!(
             refused
                 .as_ref()
-                .is_err_and(|reason| reason.starts_with("lower:")
-                    && reason.contains("NestingTooDeep")
-                    && !reason.contains("BackendNestingTooDeep")),
+                .is_err_and(Unmeasured::is_parser_nesting_refusal),
             "{name}: depth {} must be refused by the parser's NestingTooDeep, got {refused:?}",
             deepest + 1
         );

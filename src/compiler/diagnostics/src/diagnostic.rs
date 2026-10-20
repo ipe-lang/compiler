@@ -630,14 +630,15 @@ pub enum NameError {
     ///
     /// * [`AliasExpansionKind::Depth`] — a long straight chain of distinct
     ///   aliases (`type alias A1 = A0`, `type alias A2 = A1`, …) grows the
-    ///   native call stack by one frame per expansion. The depth cap (256)
-    ///   mirrors the parser's `MAX_DEPTH` to stay safely below the thread
-    ///   stack limit in every build profile.
+    ///   native call stack by one frame per expansion. The resolver's
+    ///   `TYPE_EXPANSION_DEPTH_LIMIT` caps it below the thread stack limit in
+    ///   every build profile.
     ///
     /// * [`AliasExpansionKind::Nodes`] — a diamond of aliases (`type alias
     ///   A1 = (A0, A0)`, …) is acyclic so the path-based cycle guard never
-    ///   fires, but the total nodes produced double at every level. The node
-    ///   budget (100 000) bounds this regardless of tree shape.
+    ///   fires, but the total nodes produced double at every level. The
+    ///   resolver's `TYPE_EXPANSION_NODE_LIMIT` bounds this regardless of tree
+    ///   shape.
     ///
     /// [IPE-N0032]
     TypeExpansionTooDeep {
