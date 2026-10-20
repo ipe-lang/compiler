@@ -306,8 +306,8 @@ static HAND_TABLE: &[EnvVar] = &[
                   mirror + advisory index). `ipe add` and `ipe package audit` read it as \
                   a fast-path, falling back to the `IPE_INDEX_DIR` git checkout on any \
                   network failure or malformed response. The URL must be `https://`, \
-                  redirects included: a plain `http://` URL is never fetched, so the \
-                  fast-path is skipped and the checkout is read. Set to empty to disable \
+                  redirects included: any other value is refused with an error naming \
+                  this variable, never fetched or silently replaced. Set to empty to disable \
                   the HTTP fast-path (air-gapped): resolution then reads the checkout directly. \
                   The pinned rev + sha256 stay the trust root either way.",
         subsystem: Subsystem::Build,

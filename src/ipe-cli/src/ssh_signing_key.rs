@@ -351,7 +351,7 @@ pub(crate) enum RegistrationError {
     /// GitHub answered with a status other than `201 Created`.
     Refused { status: u16, message: String },
     /// The request never got an HTTP answer.
-    Transport(ureq::Error),
+    Transport(crate::net::Error),
 }
 
 impl RegistrationError {
@@ -810,15 +810,15 @@ fn post_signing_key(
 
 /// The registration verdict of one `POST` answer: only `201 Created` counts.
 fn registration_outcome(
-    result: Result<crate::net::Answer, ureq::Error>,
+    result: Result<crate::net::Answer, crate::net::Error>,
 ) -> Result<(), RegistrationError> {
     match result {
-        Ok(answer) if answer.status_code().as_u16() == 201 => Ok(()),
+        Ok(answer) if answer.status_code() == 201 => Ok(()),
         Ok(answer) => Err(RegistrationError::Refused {
-            status: answer.status_code().as_u16(),
+            status: answer.status_code(),
             message: github_message(&answer),
         }),
-        Err(ureq::Error::StatusCode(status)) => Err(RegistrationError::Refused {
+        Err(crate::net::Error::Status(status)) => Err(RegistrationError::Refused {
             status,
             message: echoed_message(""),
         }),
@@ -1747,7 +1747,7 @@ mod tests {
         let forged = "offline\nipe login: forged success\u{1b}[2K";
         for error in [
             RegistrationError::Authorization(forged.to_owned()),
-            RegistrationError::Transport(ureq::Error::BadUri(forged.to_owned())),
+            RegistrationError::Transport(crate::net::Error::BadRequest),
             RegistrationError::Refused {
                 status: 500,
                 message: forged.to_owned(),
@@ -1781,12 +1781,9 @@ mod tests {
 
     /// An HTTP answer with `status` and `body`, as the agent hands it back.
     fn answer(status: u16, body: &str) -> crate::net::Answer {
-        let response = ureq::http::Response::builder()
-            .status(status)
-            .body(ureq::Body::builder().data(body.as_bytes().to_vec()))
-            .expect("a well-formed response");
-        crate::net::Answer::read(
-            response,
+        crate::net::testing::answer(
+            status,
+            body.as_bytes(),
             crate::remote_ingest::JSON_RESPONSE_MAX_BYTES,
             crate::remote_ingest::IngestSource::GithubApi,
         )
@@ -1811,15 +1808,15 @@ mod tests {
     #[test]
     fn status_and_transport_errors_are_refusals() {
         assert!(matches!(
-            registration_outcome(Err(ureq::Error::StatusCode(401))),
+            registration_outcome(Err(crate::net::Error::Status(401))),
             Err(RegistrationError::Refused { status: 401, .. })
         ));
         assert!(matches!(
-            registration_outcome(Err(ureq::Error::Timeout(ureq::Timeout::Global))),
+            registration_outcome(Err(crate::net::Error::Timeout)),
             Err(RegistrationError::Transport(_))
         ));
         assert!(matches!(
-            registration_outcome(Err(ureq::Error::TooManyRedirects)),
+            registration_outcome(Err(crate::net::Error::Redirect)),
             Err(RegistrationError::Transport(_))
         ));
     }

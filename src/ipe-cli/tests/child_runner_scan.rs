@@ -50,8 +50,15 @@
 //! cannot stand for another value. A ceiling parameter or a helper's ceiling
 //! parameter must be bound once in its fn and not `mut`, a fn a renaming `use`
 //! imports has no provable callers, and a fn key two items share proves
-//! nothing. A `ureq` body read is held to
+//! nothing. An HTTP body read is held to
 //! `remote_ingest::read_capped` by a whitespace-free text match.
+//!
+//! The HTTP client crate is named only in `src/net.rs`, whose policy every
+//! call takes: any other source of this crate naming it as a token — a path,
+//! an import, a rename, a raw identifier, a comment — is refused, as is an
+//! exported `net` item whose surface carries a client type, a `package =`
+//! rename of it in `Cargo.toml`, and any other workspace package depending on
+//! it in `Cargo.lock`.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -1858,9 +1865,9 @@ fn proofs(scans: &Scans, inventory: &Inventory<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Unbounded `ureq` body reads, whitespace removed, refused in every file
-/// whether or not it names `ureq`: a body reaches a file through a value, not
-/// through an import.
+/// Unbounded HTTP client body reads, whitespace removed, refused in every file
+/// whether or not it names the client: a body reaches a file through a value,
+/// not through an import.
 const UNBOUNDED_BODY_READS: &[&str] = &[
     ".read_to_string()",
     ".read_to_vec()",
@@ -1894,7 +1901,7 @@ fn reader_is_capped(before: &str) -> bool {
     receiver.len() < before.len() && receiver.ends_with(CAPPED_CALL)
 }
 
-/// Every unbounded `ureq` body read in one flattened source.
+/// Every unbounded HTTP client body read in one flattened source.
 fn violations(flat: &str) -> Vec<String> {
     let mut found: Vec<String> = UNBOUNDED_BODY_READS
         .iter()
@@ -1907,6 +1914,174 @@ fn violations(flat: &str) -> Vec<String> {
             .map(|_| READER.to_owned()),
     );
     found
+}
+
+/// The HTTP client crate's name, spelled in two pieces so this file never
+/// names it: only [`CLIENT_OWNER`] may.
+const HTTP_CLIENT: &str = concat!("ur", "eq");
+
+/// The one source, relative to the crate directory, that names [`HTTP_CLIENT`].
+const CLIENT_OWNER: &str = "src/net.rs";
+
+/// The one workspace package that depends on [`HTTP_CLIENT`].
+const CLIENT_PACKAGE: &str = "ipe";
+
+/// Whether `source` names [`HTTP_CLIENT`] as a whole token, not as a piece of
+/// a longer identifier.
+fn names_client(source: &str) -> bool {
+    let ident_char = |ch: char| ch.is_alphanumeric() || ch == '_';
+    source.match_indices(HTTP_CLIENT).any(|(at, _)| {
+        let before = source.get(..at).and_then(|head| head.chars().next_back());
+        let after = source
+            .get(at..)
+            .and_then(|tail| tail.strip_prefix(HTTP_CLIENT))
+            .and_then(|tail| tail.chars().next());
+        !before.is_some_and(ident_char) && !after.is_some_and(ident_char)
+    })
+}
+
+/// Whether an item with `vis` is visible outside its module.
+const fn exported(vis: &syn::Visibility) -> bool {
+    !matches!(vis, syn::Visibility::Inherited)
+}
+
+/// Whether the identifiers a visit reaches include [`HTTP_CLIENT`].
+#[derive(Default)]
+struct ClientNamed(bool);
+
+impl<'ast> Visit<'ast> for ClientNamed {
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        if name_of(ident) == HTTP_CLIENT {
+            self.0 = true;
+        }
+    }
+}
+
+/// Whether `visit` reaches [`HTTP_CLIENT`].
+fn reaches_client(visit: impl FnOnce(&mut ClientNamed)) -> bool {
+    let mut named = ClientNamed::default();
+    visit(&mut named);
+    named.0
+}
+
+/// Whether one item of an impl block carries a client type out: an exported
+/// fn's signature of an inherent impl, the return type of a trait impl's fn,
+/// and any associated type or const. A trait impl's fn inputs only take a
+/// client value in, which no other file can produce.
+fn impl_item_exports_client(item: &ImplItem, trait_impl: bool) -> bool {
+    match item {
+        ImplItem::Fn(f) if trait_impl => reaches_client(|n| n.visit_return_type(&f.sig.output)),
+        ImplItem::Fn(f) => exported(&f.vis) && reaches_client(|n| n.visit_signature(&f.sig)),
+        ImplItem::Const(c) => reaches_client(|n| n.visit_type(&c.ty)),
+        ImplItem::Type(t) => reaches_client(|n| n.visit_type(&t.ty)),
+        ImplItem::Macro(m) => names_client(&m.mac.tokens.to_string()),
+        ImplItem::Verbatim(tokens) => names_client(&tokens.to_string()),
+        // `ImplItem` is non-exhaustive: an item kind this scan cannot read is
+        // refused, never admitted unread.
+        _ => true,
+    }
+}
+
+/// Whether `item`'s surface outside its module carries a client type. A
+/// module is judged item by item, by [`leaked_client`].
+fn exports_client(item: &Item) -> bool {
+    match item {
+        Item::Const(c) => exported(&c.vis) && reaches_client(|n| n.visit_type(&c.ty)),
+        Item::Enum(e) => exported(&e.vis) && reaches_client(|n| n.visit_item_enum(e)),
+        Item::ExternCrate(e) => {
+            exported(&e.vis) && reaches_client(|n| n.visit_item_extern_crate(e))
+        }
+        Item::Fn(f) => exported(&f.vis) && reaches_client(|n| n.visit_signature(&f.sig)),
+        Item::ForeignMod(f) => reaches_client(|n| n.visit_item_foreign_mod(f)),
+        Item::Impl(i) => {
+            reaches_client(|n| n.visit_type(&i.self_ty))
+                || i.items
+                    .iter()
+                    .any(|member| impl_item_exports_client(member, i.trait_.is_some()))
+        }
+        Item::Macro(m) => names_client(&m.mac.tokens.to_string()),
+        Item::Mod(_) => false,
+        Item::Static(st) => exported(&st.vis) && reaches_client(|n| n.visit_type(&st.ty)),
+        Item::Struct(st) => {
+            exported(&st.vis)
+                && reaches_client(|n| {
+                    n.visit_generics(&st.generics);
+                    st.fields
+                        .iter()
+                        .filter(|field| exported(&field.vis))
+                        .for_each(|field| n.visit_type(&field.ty));
+                })
+        }
+        Item::Trait(t) => exported(&t.vis) && reaches_client(|n| n.visit_item_trait(t)),
+        Item::TraitAlias(t) => exported(&t.vis) && reaches_client(|n| n.visit_item_trait_alias(t)),
+        Item::Type(t) => exported(&t.vis) && reaches_client(|n| n.visit_item_type(t)),
+        Item::Union(u) => exported(&u.vis) && reaches_client(|n| n.visit_item_union(u)),
+        Item::Use(u) => exported(&u.vis) && reaches_client(|n| n.visit_item_use(u)),
+        Item::Verbatim(tokens) => names_client(&tokens.to_string()),
+        // `Item` is non-exhaustive: an item kind this scan cannot read is
+        // refused, never admitted unread.
+        _ => true,
+    }
+}
+
+/// Every item of `items`, nested modules included, whose surface outside its
+/// module carries a client type, by its position in its module.
+fn leaked_client(items: &[Item], module: &str, out: &mut Vec<String>) {
+    for (at, item) in items.iter().enumerate() {
+        if let Item::Mod(inner) = item
+            && let Some((_, nested)) = &inner.content
+        {
+            leaked_client(nested, &format!("{module}::{}", name_of(&inner.ident)), out);
+        } else if exports_client(item) {
+            out.push(format!("item {at} of `{module}`"));
+        }
+    }
+}
+
+/// Every line of a crate manifest naming [`HTTP_CLIENT`] other than its plain
+/// dependency entry: a `package =` key would let another name stand for it.
+fn manifest_renames(manifest: &str) -> Vec<String> {
+    manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && names_client(line))
+        .filter(|line| {
+            line.contains("package")
+                || !line
+                    .strip_prefix(HTTP_CLIENT)
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether one `dependencies` line of a lockfile names [`HTTP_CLIENT`], with
+/// or without a version.
+fn lock_dependency_is_client(line: &str) -> bool {
+    line.trim()
+        .trim_end_matches(',')
+        .strip_prefix('"')
+        .and_then(|dep| dep.strip_suffix('"'))
+        .is_some_and(|dep| dep.split(' ').next() == Some(HTTP_CLIENT))
+}
+
+/// The workspace packages of a lockfile — those with no `source` — that
+/// depend on [`HTTP_CLIENT`]. The lockfile records the real crate name, so a
+/// renaming dependency key cannot hide one.
+fn client_dependents(lock: &str) -> Vec<String> {
+    lock.split("[[package]]")
+        .filter(|block| !block.lines().any(|line| line.starts_with("source =")))
+        .filter(|block| block.lines().any(lock_dependency_is_client))
+        .map(|block| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix("name = "))
+                .map_or_else(
+                    || "<unnamed>".to_owned(),
+                    |name| name.trim_matches('"').to_owned(),
+                )
+        })
+        .collect()
 }
 
 #[test]
@@ -1961,7 +2136,7 @@ fn each_row_is_proved_by_its_runner_call() {
 }
 
 #[test]
-fn no_ureq_body_read_is_unbounded() {
+fn no_http_body_read_is_unbounded() {
     let root = src_root();
     let mut paths = Vec::new();
     rust_files(&root, 0, &mut paths).expect("source tree listable");
@@ -1988,19 +2163,101 @@ fn no_ureq_body_read_is_unbounded() {
 }
 
 #[test]
+fn only_net_names_the_http_client() {
+    let crate_dir = e2e_support::manifest_dir!();
+    let mut paths = Vec::new();
+    rust_files(&crate_dir, 0, &mut paths).expect("crate tree listable");
+    let owner = crate_dir.join(CLIENT_OWNER);
+    assert!(
+        paths.contains(&owner),
+        "the scan must see {CLIENT_OWNER}, or it is scanning the wrong tree"
+    );
+    let mut found: Vec<String> = paths
+        .iter()
+        .filter(|path| **path != owner)
+        .filter(|path| {
+            let bytes = std::fs::read(path).expect("source readable");
+            names_client(&String::from_utf8_lossy(&bytes))
+        })
+        .map(|path| format!("{}: names the HTTP client", path.display()))
+        .collect();
+    let net = std::fs::read_to_string(&owner).expect("net source readable");
+    assert!(
+        names_client(&net),
+        "{CLIENT_OWNER} must name the HTTP client, or the token matcher matches nothing"
+    );
+    let mut leaked = Vec::new();
+    leaked_client(
+        &syn::parse_file(&net).expect("net source parses").items,
+        "net",
+        &mut leaked,
+    );
+    found.extend(
+        leaked
+            .into_iter()
+            .map(|item| format!("{CLIENT_OWNER}: {item} exports a client type")),
+    );
+    let manifest =
+        std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest readable");
+    assert!(
+        names_client(&manifest),
+        "Cargo.toml must name the HTTP client, or the rename check matches nothing"
+    );
+    found.extend(
+        manifest_renames(&manifest)
+            .into_iter()
+            .map(|line| format!("Cargo.toml: `{line}` is not the plain client entry")),
+    );
+    let root = crate_dir
+        .ancestors()
+        .nth(2)
+        .expect("crate sits two levels under the workspace");
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("lockfile readable");
+    let dependents = client_dependents(&lock);
+    assert!(
+        dependents.iter().any(|name| name == CLIENT_PACKAGE),
+        "Cargo.lock must show `{CLIENT_PACKAGE}` depending on the HTTP client, or the \
+         dependents check matches nothing"
+    );
+    found.extend(
+        dependents
+            .into_iter()
+            .filter(|name| name != CLIENT_PACKAGE)
+            .map(|name| format!("Cargo.lock: workspace package `{name}` depends on the client")),
+    );
+    assert!(
+        found.is_empty(),
+        "the HTTP client is named only in {CLIENT_OWNER}, whose policy every call takes:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
 fn matcher_refuses_each_bypass() {
+    let named = [
+        "CLIENT::get(url).call()",
+        "use CLIENT::Body as B;",
+        "::CLIENT::agent()",
+        "extern crate CLIENT as http;",
+        "let a = r#CLIENT::agent();",
+        "// the CLIENT agent",
+    ];
+    for sample in named {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        assert!(names_client(&sample), "matcher must refuse: {sample}");
+    }
     let refused = [
-        "use ureq; let s = resp.body_mut().read_to_string()?;",
-        "use ureq; let v = resp.body_mut().read_to_vec()?;",
-        "use ureq; let v: Value = resp.body_mut().read_json()?;",
-        "use ureq; let r = resp.body_mut().as_reader();",
-        "use ureq; let r = resp.body_mut().with_config().reader();",
-        "use ureq; let r = resp.into_body().into_with_config().reader();",
+        "use http; let s = resp.body_mut().read_to_string()?;",
+        "use http; let v = resp.body_mut().read_to_vec()?;",
+        "use http; let v: Value = resp.body_mut().read_json()?;",
+        "use http; let r = resp.body_mut().as_reader();",
+        "use http; let r = resp.body_mut().with_config().reader();",
+        "use http; let r = resp.into_body().into_with_config().reader();",
         "let r = response.into_body().as_reader();",
         "let b = response.into_body().into_with_config().limit(u64::MAX).read_to_vec();",
         "let v: Value = response.body_mut().read_json()?;",
         "let v = response.body_mut().read_to_vec()?;",
-        "read_capped(ureq::Body::into_reader(body), MAX)",
+        "read_capped(http::Body::into_reader(body), MAX)",
         "read_capped(Body::into_reader(body), MAX)",
         "let r = body.map(Body::into_reader);",
         "let c = Body::into_with_config(body);",
@@ -2021,7 +2278,7 @@ fn matcher_refuses_each_bypass() {
 fn matcher_admits_the_bounded_forms() {
     let admitted = [
         "remote_ingest::read_capped(\n    response.into_reader(),\n    MAX,\n)",
-        "use ureq; let body = response.into_body(); read_capped(body.into_reader(), MAX)",
+        "use http; let body = response.into_body(); read_capped(body.into_reader(), MAX)",
         "Git::isolated(dir).args([\"fetch\"])",
         "use std::process::Command;",
         "let s = value.into_string();",
@@ -2035,6 +2292,93 @@ fn matcher_admits_the_bounded_forms() {
             "matcher must admit: {sample}"
         );
     }
+    for sample in [
+        "pCLIENT::get()",
+        "CLIENT_proto::parse()",
+        "let CLIENTs = 1;",
+    ] {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        assert!(!names_client(&sample), "matcher must admit: {sample}");
+    }
+}
+
+#[test]
+fn surface_checks_refuse_each_export() {
+    let exported_samples = [
+        "pub fn agent() -> CLIENT::Agent { x() }",
+        "pub use CLIENT::Agent as A;",
+        "pub use ::CLIENT;",
+        "pub struct S { pub body: CLIENT::Body }",
+        "pub struct S<B: Into<CLIENT::Body>>(B);",
+        "pub(crate) mod m { pub fn f(x: CLIENT::Body) {} }",
+        "pub struct A; impl A { pub fn f(&self) -> ::CLIENT::Body { x() } }",
+        "pub fn with<F: FnOnce(CLIENT::Body)>(f: F) {}",
+        "impl From<Answer> for CLIENT::Body { fn from(a: Answer) -> Self { x() } }",
+        "impl Deref for A { type Target = CLIENT::Body; fn deref(&self) -> &Self::Target { x() } }",
+        "impl Tr for A { fn get(&self) -> CLIENT::Agent { x() } }",
+        "pub type B = CLIENT::Body;",
+        "pub const C: Option<CLIENT::Agent> = None;",
+        "pub enum E { Body(CLIENT::Body) }",
+        "macro_rules! m { () => { CLIENT::agent() } }",
+    ];
+    for sample in exported_samples {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        let mut leaked = Vec::new();
+        leaked_client(
+            &syn::parse_file(&sample).expect("sample parses").items,
+            "net",
+            &mut leaked,
+        );
+        assert!(!leaked.is_empty(), "surface check must refuse: {sample}");
+    }
+    for sample in [
+        "http = { package = \"CLIENT\", version = \"3\" }",
+        "CLIENT = { package = \"other\" }",
+        "package = \"CLIENT\"",
+        "[dependencies.CLIENT]",
+    ] {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        assert!(
+            !manifest_renames(&sample).is_empty(),
+            "manifest check must refuse: {sample}"
+        );
+    }
+    let lock = "[[package]]\nname = \"ipe-lsp\"\ndependencies = [\n \"CLIENT 3.4.2\",\n]\n"
+        .replace("CLIENT", HTTP_CLIENT);
+    assert_eq!(client_dependents(&lock), ["ipe-lsp"]);
+}
+
+#[test]
+fn surface_checks_admit_the_private_forms() {
+    for sample in [
+        "fn agent() -> CLIENT::Agent { x() }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "pub struct S { body: CLIENT::Body }",
+        "pub fn post(url: &str) -> Result<Answer, Error> { CLIENT::get(url); x() }",
+        "mod tests { fn response() -> CLIENT::Body { x() } }",
+        "pub(crate) mod testing { pub fn answer(status: u16) -> Answer { super::response(status) } }",
+    ] {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        let mut leaked = Vec::new();
+        leaked_client(
+            &syn::parse_file(&sample).expect("sample parses").items,
+            "net",
+            &mut leaked,
+        );
+        assert!(
+            leaked.is_empty(),
+            "surface check must admit: {sample}: {leaked:?}"
+        );
+    }
+    let entry = "CLIENT = { version = \"3\", default-features = false, features = [\"rustls\"] }"
+        .replace("CLIENT", HTTP_CLIENT);
+    assert!(
+        manifest_renames(&entry).is_empty(),
+        "manifest check must admit: {entry}"
+    );
+    let lock = "[[package]]\nname = \"tls\"\nsource = \"registry+https://x\"\ndependencies = [\n \"CLIENT\",\n]\n\n[[package]]\nname = \"ipe\"\ndependencies = [\n \"CLIENT-proto\",\n \"CLIENT\",\n]\n"
+        .replace("CLIENT", HTTP_CLIENT);
+    assert_eq!(client_dependents(&lock), ["ipe"]);
 }
 
 /// The ceilings of the sample crate: one named ceiling and one const of another type.
