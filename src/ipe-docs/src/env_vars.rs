@@ -305,8 +305,10 @@ static HAND_TABLE: &[EnvVar] = &[
         purpose: "Base URL of the registry's static Pages read API (per-package JSON \
                   mirror + advisory index). `ipe add` and `ipe package audit` read it as \
                   a fast-path, falling back to the `IPE_INDEX_DIR` git checkout on any \
-                  network failure or malformed response. Set to empty to disable the HTTP \
-                  fast-path (air-gapped): resolution then reads the checkout directly. \
+                  network failure or malformed response. The URL must be `https://`, \
+                  redirects included: a plain `http://` URL is never fetched, so the \
+                  fast-path is skipped and the checkout is read. Set to empty to disable \
+                  the HTTP fast-path (air-gapped): resolution then reads the checkout directly. \
                   The pinned rev + sha256 stay the trust root either way.",
         subsystem: Subsystem::Build,
         class: Class::Tunable,

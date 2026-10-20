@@ -320,12 +320,8 @@ const RUNNER_BODIES: &[NameRow] = &[
 /// its rendered receiver and name: a non-child receiver (an HTTP response's
 /// `status()`) or a runner's own method.
 const METHODS: &[NameRow] = &[
-    (
-        "ssh_signing_key.rs",
-        "post_signing_key",
-        "response.status",
-        2,
-    ),
+    ("net.rs", "Answer::read", "response.status", 1),
+    ("net.rs", "success_body", "response.status", 1),
     ("watch.rs", "spawn_cargo_build", "build.spawn", 1),
 ];
 
@@ -1862,7 +1858,9 @@ fn proofs(scans: &Scans, inventory: &Inventory<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Unbounded `ureq` body reads, whitespace removed.
+/// Unbounded `ureq` body reads, whitespace removed, refused in every file
+/// whether or not it names `ureq`: a body reaches a file through a value, not
+/// through an import.
 const UNBOUNDED_BODY_READS: &[&str] = &[
     ".read_to_string()",
     ".read_to_vec()",
@@ -1870,6 +1868,13 @@ const UNBOUNDED_BODY_READS: &[&str] = &[
     ".as_reader()",
     ".with_config()",
     ".into_with_config()",
+    "::into_reader",
+    "::into_with_config",
+    "::as_reader",
+    "::read_to_vec",
+    "::read_json",
+    "Body::with_config",
+    "Body::read_to_string",
 ];
 
 /// The one bounded body read: a response reader handed straight to `read_capped`.
@@ -1891,15 +1896,11 @@ fn reader_is_capped(before: &str) -> bool {
 
 /// Every unbounded `ureq` body read in one flattened source.
 fn violations(flat: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    if flat.contains("ureq") {
-        found.extend(
-            UNBOUNDED_BODY_READS
-                .iter()
-                .filter(|needle| flat.contains(*needle))
-                .map(|needle| (*needle).to_owned()),
-        );
-    }
+    let mut found: Vec<String> = UNBOUNDED_BODY_READS
+        .iter()
+        .filter(|needle| flat.contains(*needle))
+        .map(|needle| (*needle).to_owned())
+        .collect();
     found.extend(
         flat.match_indices(READER)
             .filter(|(at, _)| !flat.get(..*at).is_some_and(reader_is_capped))
@@ -1995,6 +1996,14 @@ fn matcher_refuses_each_bypass() {
         "use ureq; let r = resp.body_mut().as_reader();",
         "use ureq; let r = resp.body_mut().with_config().reader();",
         "use ureq; let r = resp.into_body().into_with_config().reader();",
+        "let r = response.into_body().as_reader();",
+        "let b = response.into_body().into_with_config().limit(u64::MAX).read_to_vec();",
+        "let v: Value = response.body_mut().read_json()?;",
+        "let v = response.body_mut().read_to_vec()?;",
+        "read_capped(ureq::Body::into_reader(body), MAX)",
+        "read_capped(Body::into_reader(body), MAX)",
+        "let r = body.map(Body::into_reader);",
+        "let c = Body::into_with_config(body);",
         "read_capped(resp.into_body().into_reader(), MAX)",
         "let r = resp.into_reader();",
         "read_capped(std::io::empty()).and(resp.into_reader())",
@@ -2016,6 +2025,9 @@ fn matcher_admits_the_bounded_forms() {
         "Git::isolated(dir).args([\"fetch\"])",
         "use std::process::Command;",
         "let s = value.into_string();",
+        "let s = std::fs::read_to_string(path)?;",
+        "let s = std::io::read_to_string(reader)?;",
+        "let r = file.into_reader(one_past);",
     ];
     for sample in admitted {
         assert!(
