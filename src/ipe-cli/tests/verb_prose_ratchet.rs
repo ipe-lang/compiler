@@ -470,7 +470,7 @@ fn a_grouped_verb_is_not_reported() {
         "ipe builder",
         "ipe release",
         "ipe.exe dev build",
-        "\"$ipe_bin\" dev run src/Main.ipe",
+        "\"$ipe_bin\" dev run .",
         "$IPE release build",
         "${IPEC_BIN} release run dist/app",
         "ipe  dev  build",
