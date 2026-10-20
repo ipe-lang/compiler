@@ -139,7 +139,7 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     (
         "RustBackend::configured",
         "src/ipe-cli/src/driver/build_pipeline.rs",
-        "compile_source_set_observed",
+        "compile_source_set_here",
         1,
     ),
     (
@@ -275,7 +275,7 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     (
         SETTINGS_LITERAL,
         "src/ipe-cli/src/driver/build_pipeline.rs",
-        "compile_source_set_observed",
+        "compile_source_set_here",
         1,
     ),
     (SETTINGS_LITERAL, "src/ipe-cli/src/watch.rs", "run_inner", 1),
@@ -1015,7 +1015,7 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
             pipeline,
             "fn manifest_emit_settings() { match h { HostIntent::Served => EmitHost::Served, \
              HostIntent::WebView(_) => EmitHost::WebView(w) }; }\n\
-             fn compile_source_set_observed() { RustBackend::configured(&g, &s); }\n\
+             fn compile_source_set_here() { RustBackend::configured(&g, &s); }\n\
              fn build_project_with_options() { go(HostIntent::Served); }\n\
              fn build_from_sources() { go(HostIntent::Served); }\n\
              fn manifest_emit_settings() { let e = m.wasm.public_env.to_names(); \
@@ -1024,7 +1024,7 @@ fn an_admitted_site_is_not_refused() -> Result<(), String> {
              Manifest { .. } => manifest_emit_settings(m, p, o, h, r) } }\n\
              fn loose_emit_settings() { EmitSettings { db_driver: d }; }\n\
              fn manifest_emit_settings() { EmitSettings { db_driver: d }; }\n\
-             fn compile_source_set_observed() { EmitSettings { ffi, ..settings }; }\n",
+             fn compile_source_set_here() { EmitSettings { ffi, ..settings }; }\n",
         ),
         (
             "src/ipe-cli/src/package_manifest.rs",
