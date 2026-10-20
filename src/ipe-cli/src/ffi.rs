@@ -324,17 +324,6 @@ pub fn find_cache_root(start: &Path) -> Result<Option<TrustedCache>, CliError> {
     Ok(None)
 }
 
-/// Load the installed-crate catalog for a build rooted at (or blamed on)
-/// `blame_path`. Absent cache ⇒ empty catalog.
-///
-/// # Errors
-/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
-/// tampered or half-written cache is refused, never silently skipped), or
-/// refusing a cache entry that fails the owner rule.
-pub fn load_catalog_for(blame_path: &Path) -> Result<Vec<InstalledCrate>, CliError> {
-    load_located_catalog(blame_path).map(|catalog| catalog.crates)
-}
-
 /// Whether a build can link Rust FFI: an installed crate catalog makes its
 /// `Rust.*` interfaces reachable from the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,24 +334,14 @@ pub enum FfiPresence {
     Present,
 }
 
-/// The [`FfiPresence`] of the build rooted at (or blamed on) `blame_path`.
-///
-/// # Errors
-/// As [`load_catalog_for`].
-pub fn project_ffi_presence(blame_path: &Path) -> Result<FfiPresence, CliError> {
-    Ok(if load_catalog_for(blame_path)?.is_empty() {
-        FfiPresence::Absent
-    } else {
-        FfiPresence::Present
-    })
-}
-
 /// The catalog of the cache one discovery walk up from `blame_path` finds.
 ///
 /// Empty when no cache exists.
 ///
 /// # Errors
-/// As [`load_catalog_for`].
+/// [`CliError::TrustRefused`] relaying the catalog loader's diagnostic (a
+/// tampered or half-written cache is refused, never silently skipped), or
+/// refusing a cache entry that fails the owner rule.
 fn load_located_catalog(blame_path: &Path) -> Result<Catalog, CliError> {
     load_catalog(find_cache_root(blame_path)?.as_ref())
 }
@@ -1044,7 +1023,7 @@ pub struct FfiPrep {
 /// walks up from it looking for `.ipe/cache/ffi/rust`.
 ///
 /// # Errors
-/// As [`load_catalog_for`] and [`prepare`].
+/// As [`load_located_catalog`] and [`prepare`].
 pub fn prepare_ffi(
     sources: &mut BTreeMap<Vec<String>, (PathBuf, String)>,
     blame_path: &Path,

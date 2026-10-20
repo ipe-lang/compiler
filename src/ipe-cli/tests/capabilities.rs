@@ -551,34 +551,41 @@ fn a_handle_constructed_in_an_imported_module_discloses_custom_element() -> Test
     Ok(())
 }
 
-/// The manifest-less single-file audit path (the `entry` alone, no `package.ipe`
-/// up-tree) must disclose `custom-element` for a constructed-but-unmounted
-/// `customElement` handle. This is the seam the run-jail resolver consumes via
-/// [`ipe::run_sandbox::resolve_for_run`]; routing it through the
-/// served-widget-aware inference keeps it consistent with `ipe capabilities` /
-/// `package audit`. The `customElement "js/counter.js"` literal
-/// resolves against the lone entry's own directory, so the JS sits beside it.
+/// The run-jail resolver discloses `custom-element` for a constructed-but-unmounted `customElement` handle.
+///
+/// [`ipe::run_sandbox::resolve_for_run`] infers over the package source set
+/// the build compiles, through the served-widget-aware inference, so it agrees
+/// with `ipe capabilities` / `package audit`; the declared set is the
+/// manifest's own `[capabilities]`.
 #[test]
-fn a_manifest_less_single_file_handle_discloses_custom_element() -> TestResult {
+fn the_run_resolver_discloses_an_unmounted_handle() -> TestResult {
     let dir = crate::support::scratch_root().join(format!(
-        "ipe-ce-singlefile-{}-{:?}",
+        "ipe-ce-run-resolver-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("js"))?;
-    std::fs::write(dir.join("Main.ipe"), UNMOUNTED_WIDGET_APP)?;
-    std::fs::write(dir.join("js/counter.js"), COUNTER_JS)?;
+    create_project_dir(&dir)?;
+    std::fs::create_dir_all(dir.join("src/js"))?;
+    std::fs::write(dir.join("src/Main.ipe"), UNMOUNTED_WIDGET_APP)?;
+    std::fs::write(dir.join("src/js/counter.js"), COUNTER_JS)?;
 
-    let entry = dir.join("Main.ipe");
-    let resolved = ipe::run_sandbox::resolve_for_run(None, None, &entry)?;
+    let manifest_path = dir.join("package.ipe");
+    let manifest = ipe::project::parse_manifest(&manifest_path)?;
+    let package = ipe::PackageSourceSet::read(&manifest_path)?;
+    let resolved = ipe::run_sandbox::resolve_for_run(&manifest, &package)?;
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         resolved.inferred.contains(&Capability::CustomElement),
-        "a manifest-less single file that constructs a served widget handle must \
-         disclose `custom-element` from the single-file audit path, got: {:?}",
+        "a project that constructs a served widget handle must disclose \
+         `custom-element` to the run resolver, got: {:?}",
         resolved.inferred
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        resolved.declared.is_empty(),
+        "the declared set is the manifest's, which declares none: {:?}",
+        resolved.declared
+    );
     Ok(())
 }
 

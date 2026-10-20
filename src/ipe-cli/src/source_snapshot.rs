@@ -322,29 +322,21 @@ impl SourceSnapshot {
     }
 
     /// The module `module`, when the snapshot holds it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the build reads its module set through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub fn module(&self, module: &[String]) -> Option<&SnapshotModule> {
         self.modules.get(module)
     }
 
     /// The FFI preparation made over this snapshot's text.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the build prepares FFI through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub const fn ffi(&self) -> &FfiPrep {
         &self.ffi
+    }
+
+    /// The FFI catalog read once through the root's held cache directory.
+    #[must_use]
+    pub const fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
 }
 
