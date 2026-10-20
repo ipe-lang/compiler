@@ -385,7 +385,7 @@ shownColumn source alias =
         window =
             "substr(" ++ source ++ ", 1, " ++ String.fromInt Label.windowChars ++ ")"
     in
-    window ++ " AS " ++ alias ++ "_shown, length(CAST(" ++ source ++ " AS BLOB)) AS " ++ alias ++ "_bytes, CASE WHEN typeof(" ++ source ++ ") = 'text' THEN length(CAST(" ++ window ++ " AS BLOB)) END AS " ++ alias ++ "_window"
+    window ++ " AS " ++ alias ++ "_shown, octet_length(" ++ source ++ ") AS " ++ alias ++ "_bytes, CASE WHEN typeof(" ++ source ++ ") = 'text' THEN octet_length(" ++ window ++ ") END AS " ++ alias ++ "_window"
 
 
 -- The names `shownColumn` gives the display columns, for a query that
