@@ -13467,6 +13467,191 @@ fn mapper_wrap_eta_demand(body: &canon::Expr, home: &[Symbol], types: &SolvedTyp
     total
 }
 
+/// The eta symbols a def's type-derived arrow blocks can draw, widest def.
+///
+/// Every function binder lowers to the flattened IR arrow of its solved type,
+/// so the eta blocks the lowering draws from a solved type (a lambda's
+/// flatten pad, a function-typed binder's block and its parameter shims, a
+/// top-level function value adapted to its flattened arity, a function
+/// argument expanded to its arrow) are each no wider than `block`: the widest
+/// curried arrow chain in any solved type of the module. The checker refuses
+/// a type deeper than `ipe_diagnostics::nesting::TYPE_DEPTH_LIMIT`, every
+/// arrow one level, so `block` never exceeds it. [`arrow_block_sites`]
+/// charges one block per syntactic node, binding and pattern node, so the
+/// reservation grows with the type-derived demand rather than with a fixed
+/// per-site constant the demand can outrun. A module with no arrow in any
+/// solved type reserves nothing.
+#[must_use]
+pub fn max_arrow_eta_demand(m: &canon::Module, types: &SolvedTypes) -> usize {
+    let homes: BTreeSet<&[Symbol]> = m.defs.iter().map(canon::Def::home).collect();
+    let block = types
+        .regions
+        .iter()
+        .filter(|((home, _), _)| homes.contains(home.as_slice()))
+        .map(|(_, ty)| ty)
+        .chain(
+            types
+                .env
+                .iter()
+                .filter(|((home, _), _)| homes.contains(home.as_slice()))
+                .map(|(_, ty)| ty),
+        )
+        .map(widest_arrow)
+        .max()
+        .unwrap_or(0);
+    if block == 0 {
+        return 0;
+    }
+    m.defs
+        .iter()
+        .map(|d| {
+            let (patterns, body) = match d {
+                canon::Def::Typed { patterns, body, .. }
+                | canon::Def::Untyped { patterns, body, .. } => (patterns, body),
+            };
+            arrow_block_sites(patterns, body).saturating_mul(block)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The longest curried arrow chain anywhere inside `ty`.
+///
+/// A chain `a -> b -> c` counts its arrows once as one flattened block; each
+/// argument and the chain's result are walked as their own roots. The walk is
+/// an explicit work stack over the solved type, whose size the checker's type
+/// ceilings already bound.
+fn widest_arrow(ty: &Ty) -> usize {
+    let mut widest: usize = 0;
+    let mut work: Vec<&Ty> = vec![ty];
+    while let Some(node) = work.pop() {
+        match node {
+            Ty::Fun(..) => {
+                let mut width: usize = 0;
+                let mut cur = node;
+                while let Ty::Fun(arg, rest) = cur {
+                    width = width.saturating_add(1);
+                    work.push(arg.as_ref());
+                    cur = rest.as_ref();
+                }
+                widest = widest.max(width);
+                work.push(cur);
+            }
+            Ty::Con { args, .. } | Ty::Tuple(args) => work.extend(args.iter()),
+            Ty::Record(fields, _) => work.extend(fields.values()),
+            Ty::Var(_) | Ty::Wildcard | Ty::Unit => {}
+        }
+    }
+    widest
+}
+
+/// The arrow blocks a def can draw: one per expression node, one per
+/// pattern node, record-pattern field and alias name (def head, lambda
+/// parameters, `let` and `case` patterns), and one per `let` binding.
+///
+/// A node or binder draws at most one type-derived block of its own, so the
+/// count, times the module's widest arrow, bounds the def's type-derived eta
+/// demand. The walk is an explicit work stack over the canonical tree, whose
+/// size the parser's limits already bound.
+fn arrow_block_sites(patterns: &[canon::Pattern], body: &canon::Expr) -> usize {
+    let mut sites: usize = pattern_nodes(patterns);
+    let mut work: Vec<&canon::Expr> = vec![body];
+    while let Some(e) = work.pop() {
+        sites = sites.saturating_add(1);
+        match &e.value {
+            canon::Expr_::Lambda(params, inner) => {
+                sites = sites.saturating_add(pattern_nodes(params));
+                work.push(inner);
+            }
+            canon::Expr_::Access(inner, _) => work.push(inner),
+            canon::Expr_::Call(callee, args) => {
+                work.extend(args.iter().rev());
+                work.push(callee);
+            }
+            canon::Expr_::ForeignCall { args, .. }
+            | canon::Expr_::Tuple(args)
+            | canon::Expr_::List(args) => work.extend(args.iter().rev()),
+            canon::Expr_::Binop { lhs, rhs, .. } | canon::Expr_::Cons(lhs, rhs) => {
+                work.push(rhs);
+                work.push(lhs);
+            }
+            canon::Expr_::Case(scrutinee, branches) => {
+                for b in branches {
+                    sites = sites.saturating_add(pattern_nodes(std::slice::from_ref(&b.pat)));
+                }
+                work.extend(branches.iter().rev().map(|b| &b.body));
+                work.push(scrutinee);
+            }
+            canon::Expr_::Let(bindings, inner) => {
+                for b in bindings {
+                    sites = sites
+                        .saturating_add(1)
+                        .saturating_add(pattern_nodes(std::slice::from_ref(&b.pat)));
+                }
+                work.push(inner);
+                work.extend(bindings.iter().rev().map(|b| &b.body));
+            }
+            canon::Expr_::If(branches, else_expr) => {
+                work.push(else_expr);
+                for (cond, then) in branches.iter().rev() {
+                    work.push(then);
+                    work.push(cond);
+                }
+            }
+            canon::Expr_::Record(fields) => work.extend(fields.iter().rev().map(|(_, v)| v)),
+            canon::Expr_::Update(base, fields) => {
+                work.extend(fields.iter().rev().map(|(_, v)| v));
+                work.push(base);
+            }
+            canon::Expr_::VarKernel { .. }
+            | canon::Expr_::VarLocal(_)
+            | canon::Expr_::VarTopLevel { .. }
+            | canon::Expr_::VarCtor { .. }
+            | canon::Expr_::Int(_)
+            | canon::Expr_::Float(_)
+            | canon::Expr_::Str(_)
+            | canon::Expr_::CustomElementCtor(_)
+            | canon::Expr_::Char(_)
+            | canon::Expr_::Unit => {}
+        }
+    }
+    sites
+}
+
+/// Every pattern node in `patterns`, plus one per record-pattern field and
+/// alias name (each binds a name of its own).
+fn pattern_nodes(patterns: &[canon::Pattern]) -> usize {
+    let mut nodes: usize = 0;
+    let mut work: Vec<&canon::Pattern> = patterns.iter().collect();
+    while let Some(p) = work.pop() {
+        nodes = nodes.saturating_add(1);
+        match &p.value {
+            canon::Pattern_::PRecord(fields) => nodes = nodes.saturating_add(fields.len()),
+            canon::Pattern_::PAlias(inner, _) => {
+                nodes = nodes.saturating_add(1);
+                work.push(inner);
+            }
+            canon::Pattern_::PCtor { args, .. }
+            | canon::Pattern_::PTuple(args)
+            | canon::Pattern_::PList(args)
+            | canon::Pattern_::POr(args) => work.extend(args.iter()),
+            canon::Pattern_::PCons(head, tail) => {
+                work.push(tail);
+                work.push(head);
+            }
+            canon::Pattern_::PAnything
+            | canon::Pattern_::PDebugAnything
+            | canon::Pattern_::PUnit
+            | canon::Pattern_::PVar(_)
+            | canon::Pattern_::PInt(_)
+            | canon::Pattern_::PBool(_)
+            | canon::Pattern_::PChar(_)
+            | canon::Pattern_::PStr(_) => {}
+        }
+    }
+    nodes
+}
+
 /// Who emits a type variable as a Rust generic, seen from the def being lowered.
 ///
 /// Three distinct states, never folded into an `Option`: a lenient lowering
@@ -26513,11 +26698,13 @@ impl<'a> Lowerer<'a> {
         site: EtaDemand,
         span: Span,
     ) -> DResult<(Vec<(Symbol, IrType)>, &'t Ty)> {
-        let (pad, tail) = self.flatten_pad(ret_ty, span)?;
-        if !pad.is_empty() && site.charge(missing.saturating_add(pad.len())).is_none() {
+        // Charge before drawing: an over-wide residual is refused here, never
+        // left to overrun the eta pool.
+        let width = arrow_params(ret_ty).len();
+        if width > 0 && site.charge(missing.saturating_add(width)).is_none() {
             return Err(unsupported(span, Feature::EtaSiteLimit));
         }
-        Ok((pad, tail))
+        self.flatten_pad(ret_ty, span)
     }
 
     /// The fresh binder and IR type of each missing argument slot
@@ -39058,6 +39245,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A `let` chain `x0 = 0`, `x(k+1) = \_ -> xk`, `k` bindings deep,
+    /// applied to all `k` arguments: binding `xk` has a `k`-wide flattened arrow.
+    fn lambda_chain_source(k: usize) -> String {
+        let mut src = String::from("module Main exposing (v)\n\nv =\n    let\n        x0 = 0\n");
+        for n in 1..=k {
+            src.push_str(&format!("        x{n} = \\_ -> x{}\n", n - 1));
+        }
+        src.push_str(&format!("    in\n    x{k}"));
+        for _ in 0..k {
+            src.push_str(" 0");
+        }
+        src.push('\n');
+        src
+    }
+
+    /// The deepest lambda chain the type ceiling admits lowers: its flatten
+    /// pads and binder blocks grow with the arrow width, so the eta pool must
+    /// be sized from the solved types, not from a per-site constant.
+    #[test]
+    fn lambda_chain_at_type_depth_ceiling_lowers() {
+        let depth = usize::from(ipe_diagnostics::nesting::TYPE_DEPTH_LIMIT);
+        let src = lambda_chain_source(depth);
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(&src, &mut i).expect("source must parse");
+        let m = ipe_canon::canonicalise(&parsed, &mut i).expect("source must resolve");
+        let types = ipe_types::infer(&m, &mut i).expect("the ceiling-deep chain must type-check");
+        let lowered = crate::lower(&m, &types, &mut i, "", "");
+        assert!(
+            lowered.is_ok(),
+            "a lambda chain at the type depth ceiling must lower, got {:?}",
+            lowered.err()
+        );
+    }
+
+    /// One binding past the ceiling is refused by the checker, so the widest
+    /// arrow the eta pool reserves for never exceeds `TYPE_DEPTH_LIMIT`.
+    #[test]
+    fn lambda_chain_past_type_depth_ceiling_is_refused() {
+        let depth = usize::from(ipe_diagnostics::nesting::TYPE_DEPTH_LIMIT) + 1;
+        let src = lambda_chain_source(depth);
+        let mut i = Interner::new();
+        let parsed = ipe_parse::parse_module(&src, &mut i).expect("source must parse");
+        let m = ipe_canon::canonicalise(&parsed, &mut i).expect("source must resolve");
+        let refused = ipe_types::infer(&m, &mut i);
+        assert!(
+            matches!(
+                refused,
+                Err(ipe_diagnostics::Diagnostic::Type {
+                    msg: ipe_diagnostics::TypeError::TypeTooDeep { .. },
+                    ..
+                })
+            ),
+            "a chain one past the type depth ceiling must be refused as too deep, got {:?}",
+            refused.err()
+        );
+    }
+
+    /// The type-derived reservation reads the widest arrow, per node.
+    #[test]
+    fn widest_arrow_counts_each_chain_once() {
+        let unit = || Box::new(Ty::Unit);
+        let two = Ty::Fun(unit(), Box::new(Ty::Fun(unit(), unit())));
+        let three_inside = Ty::Tuple(vec![
+            Ty::Unit,
+            Ty::Fun(
+                Box::new(two.clone()),
+                Box::new(Ty::Fun(unit(), Box::new(Ty::Fun(unit(), unit())))),
+            ),
+        ]);
+        assert_eq!(super::widest_arrow(&Ty::Unit), 0);
+        assert_eq!(super::widest_arrow(&two), 2);
+        assert_eq!(super::widest_arrow(&three_inside), 3);
     }
 
     /// The fused [`module_symbol_pool_counts`] must return, field for field,
