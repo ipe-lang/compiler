@@ -164,15 +164,8 @@ const SITES: &[SiteRow] = &[
     ),
     (
         "coverage/probe.rs",
-        "build_and_run",
-        "&ipe_bin",
-        Runner::Local("SELF_RUN_LIMITS"),
-        1,
-    ),
-    (
-        "doc.rs",
-        "run_example_and_check",
-        "&ipe_bin",
+        "dev_run_project",
+        "ipe_bin",
         Runner::Local("SELF_RUN_LIMITS"),
         1,
     ),
