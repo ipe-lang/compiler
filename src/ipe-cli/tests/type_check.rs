@@ -340,15 +340,15 @@ fn location_and_caret(report: &str) -> Option<(String, String)> {
     Some((loc.trim().to_owned(), caret.to_owned()))
 }
 
-/// Run `ipe dev build` on a fixture entry, returning its combined stderr. Skips the
+/// Run `ipe dev build` on a fixture project directory, returning its combined stderr. Skips the
 /// caller's assertions (returns `None`) when no runtime tree is resolvable in
 /// this environment — the diagnostic under test fires at compile time, before
 /// any runtime is read, so a resolvable runtime is only needed to get `build`
 /// as far as the compiler.
-fn build_stderr(entry: &Path) -> Option<String> {
+fn build_stderr(project: &Path) -> Option<String> {
     let runtime = e2e_support::require_runtime().into_path_buf();
     let out = Command::new(support::ipe_bin())
-        .args(["dev", "build", &entry.to_string_lossy()])
+        .args(["dev", "build", &project.to_string_lossy()])
         .arg("--out")
         .arg(crate::support::scratch_root().join(format!("ipe_caret_build_{}", std::process::id())))
         .env("IPE_RUNTIME_DIR", &runtime)
@@ -366,7 +366,6 @@ fn build_stderr(entry: &Path) -> Option<String> {
 fn check_caret_matches_build_for_unresolved_import_in_dependency() -> TestResult {
     let project = fixture_project("multi_unresolved_import")?;
     let dir = project_dir(&project)?;
-    let entry = dir.join("src").join("Main.ipe");
     let (ok, _, check_err) = type_check_in(&dir)?;
     assert!(!ok, "an unresolved import must exit non-zero");
     assert!(
@@ -384,7 +383,7 @@ fn check_caret_matches_build_for_unresolved_import_in_dependency() -> TestResult
         "the caret must underline `Rust.Firestore`, got:\n{caret}"
     );
 
-    if let Some(build_err) = build_stderr(&entry) {
+    if let Some(build_err) = build_stderr(&dir) {
         let build_lc = location_and_caret(&build_err)
             .ok_or_else(|| format!("build report has no snippet band:\n{build_err}"))?;
         assert_eq!(
@@ -404,7 +403,6 @@ fn check_caret_matches_build_for_unresolved_import_in_dependency() -> TestResult
 fn check_caret_matches_build_for_missing_qualifier_in_dependency() -> TestResult {
     let project = fixture_project("multi_missing_qualifier")?;
     let dir = project_dir(&project)?;
-    let entry = dir.join("src").join("Main.ipe");
     let (ok, _, check_err) = type_check_in(&dir)?;
     assert!(!ok, "an unimported stdlib qualifier must exit non-zero");
     assert!(
@@ -422,7 +420,7 @@ fn check_caret_matches_build_for_missing_qualifier_in_dependency() -> TestResult
         "the caret must underline `Crypto`, got:\n{caret}"
     );
 
-    if let Some(build_err) = build_stderr(&entry) {
+    if let Some(build_err) = build_stderr(&dir) {
         let build_lc = location_and_caret(&build_err)
             .ok_or_else(|| format!("build report has no snippet band:\n{build_err}"))?;
         assert_eq!(
@@ -455,7 +453,7 @@ fn closed_union_catch_all_fails_check_nonzero() -> TestResult {
 
 /// FAIL-CLOSED, no artifact: the same closed-union catch-all through `ipe dev build`
 /// must exit non-zero and write NO emitted crate. The entry is copied into a
-/// fresh directory so any `out/` emission would be unmistakable. This proves the
+/// fresh project so any `out/` emission would be unmistakable. This proves the
 /// error stops the pipeline before code generation, not merely at print time.
 #[test]
 fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
@@ -465,13 +463,19 @@ fn closed_union_catch_all_build_emits_no_crate() -> TestResult {
         std::process::id(),
         "closed_union"
     ));
-    std::fs::create_dir_all(&dir)?;
-    let src = dir.join("Main.ipe");
-    std::fs::copy(fixture("closed_union_catch_all.ipe"), &src)?;
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(
+        dir.join("package.ipe"),
+        support::package_ipe("closed-union"),
+    )?;
+    std::fs::copy(
+        fixture("closed_union_catch_all.ipe"),
+        dir.join("src").join("Main.ipe"),
+    )?;
     let out_dir = dir.join("out");
 
     let output = Command::new(support::ipe_bin())
-        .args(["dev", "build", &src.to_string_lossy()])
+        .args(["dev", "build", &dir.to_string_lossy()])
         .arg("--out")
         .arg(&out_dir)
         .env("IPE_RUNTIME_DIR", &runtime)

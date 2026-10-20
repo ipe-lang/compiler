@@ -1305,7 +1305,7 @@ fn copy_native_artifact(
     Ok(dest)
 }
 
-/// `ipe release eject [<path>] --out <dir>` — emit a self-contained Rust Cargo project a
+/// `ipe release eject [<dir>] --out <dir>` — emit a self-contained Rust Cargo project a
 /// user can `cargo build` with no `ipe` toolchain installed.
 ///
 /// The escape hatch from the dependency-crate model: where `ipe dev build` emits a
@@ -1438,7 +1438,7 @@ pub(super) fn eject_options() -> BuildOptions {
     }
 }
 
-/// `ipe release build [<path>] [--out <dir>] [--target wasm|<triple>] [--embed]` —
+/// `ipe release build [<dir>] [--out <dir>] [--target wasm|<triple>] [--embed]` —
 /// build the production artifact for every app kind.
 ///
 /// The artifact kind is determined by the app and the `--target` flag:
@@ -2847,7 +2847,7 @@ pub fn show_session_trace(trace: &TraceFile) -> Result<(), CliError> {
         })
 }
 
-/// `ipe dev run [<path>]` — compile a program and run the resulting binary.
+/// `ipe dev run [<dir>]` — compile a program and run the resulting binary.
 ///
 /// One-shot build + run: compiles the entry to `out_dir` (same routing as
 /// [`run_build`]), then invokes `cargo build` on the emitted project and
@@ -3173,13 +3173,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     }
 }
 
-/// `ipe release run [<path>] [--out] [--runtime] [--target] [-- <args>...]`
+/// `ipe release run [<dir>|<artifact-dir>] [--out] [--runtime] [--target] [-- <args>...]`
 /// — produce the release artifact, then run exactly the artifact the pipeline
 /// returned, jailed.
 ///
 /// Every run is confined: the embed-mode wrapper jails itself by
 /// construction, and a bundle or a pure-native binary runs through
-/// [`run_sandbox::exec_jailed`], which has no unconfined fallback. A `<path>`
+/// [`run_sandbox::exec_jailed`], which has no unconfined fallback. An argument
 /// naming a built artifact directory (one holding `ipe-wrapper`) runs that
 /// artifact as built: a bundle's profile is strictly parsed and verified
 /// against the floor embedded in its app before the jailed exec.
@@ -5444,6 +5444,40 @@ mod parsed_manifest_tests {
         assert!(
             !out.join("crate").join("Cargo.toml").exists(),
             "no Cargo.toml binds the replaced path"
+        );
+    }
+
+    /// Eject judges the catalog the held read took, not the cache path as it stands later.
+    ///
+    /// The FFI cache of a project with one installed wrapper is moved away
+    /// after the read: the held build still reports the foreign crate eject
+    /// refuses, while a fresh read of the moved tree finds none.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn eject_judges_the_held_catalog_after_a_cache_swap() {
+        let base = crate::scratch::ScratchDir::new("ipe-eject-cache-swap").expect("scratch base");
+        let project = wrapper_project(&base.path().join("app"));
+        let read = || {
+            HeldBuild::read(
+                ProjectRoot::resolve(RootArg::at(&project)).expect("the root resolves"),
+                false,
+            )
+            .expect("the project reads")
+        };
+        let held = read();
+        let cache = ipe_ffi::driver::FfiCache::at_project_root(&project);
+        std::fs::rename(cache.root(), base.path().join("cache-away")).expect("move the cache");
+
+        assert_eq!(
+            held.ffi_presence(),
+            crate::ffi::FfiPresence::Present,
+            "the held catalog keeps the crate the read saw"
+        );
+        assert_eq!(
+            read().ffi_presence(),
+            crate::ffi::FfiPresence::Absent,
+            "a read after the move sees no crate, so a by-path judge would admit the eject"
         );
     }
 }

@@ -6,7 +6,7 @@ ipe lint [<path>]
 
 ## Arguments
 
-A module file under `src/` or `tests/` of the current directory's project, whose findings alone are reported and fixed, or a project directory. Defaults to the current directory's project, every module.
+A module file of this project, whose findings alone are reported and fixed, or a project directory. Defaults to the current directory's project, every module.
 
 ## Options
 

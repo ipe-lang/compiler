@@ -8,7 +8,7 @@
 //! `Main.ipe` to stdout `10\n`, exit 0:
 //!
 //! ```text
-//! $ ipe dev run tests/golden/if_expr/src/Main.ipe
+//! $ ipe dev run
 //! 10
 //! ```
 //!

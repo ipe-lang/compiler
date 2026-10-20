@@ -20,7 +20,7 @@
 //! `Main.ipe` to stdout `6\n33\n103\n`, exit 0:
 //!
 //! ```text
-//! $ ipe dev run tests/golden/partial_app/src/Main.ipe
+//! $ ipe dev run
 //! 6
 //! 33
 //! 103

@@ -271,7 +271,7 @@ fn emitted_build_failure_reports_missing_feature() {
     assert!(rendered.contains("/tmp/rt"), "{rendered}");
     assert!(rendered.contains("out of date"), "{rendered}");
     assert!(
-        !rendered.contains("ipe dev run [<path>]"),
+        !rendered.contains("ipe dev run [<dir>]"),
         "the build failure must not print the run help page: {rendered}"
     );
 }
@@ -298,7 +298,7 @@ fn emitted_build_failure_reports_unattributed_as_compiler_bug() {
     assert!(rendered.contains("cannot find value"), "{rendered}");
     assert!(rendered.contains("E0425"), "{rendered}");
     // Neither a help page nor the old plain-header user-error framing.
-    assert!(!rendered.contains("ipe dev run [<path>]"), "{rendered}");
+    assert!(!rendered.contains("ipe dev run [<dir>]"), "{rendered}");
     assert!(
         !rendered.contains("building the emitted program failed (cargo exited"),
         "{rendered}"
@@ -5833,9 +5833,9 @@ fn release_eject_gates_debug() {
     .expect("write package.ipe");
     fs::write(tmp.join("src").join("Main.ipe"), DEBUG_LOG_MAIN).expect("write Main.ipe");
     let out = tmp.join("ejected");
-    let package = tmp.join("package.ipe").to_string_lossy().into_owned();
+    let project = tmp.to_string_lossy().into_owned();
     let out_arg = out.to_string_lossy().into_owned();
-    let result = run_argv(&["release", "eject", &package, "--out", &out_arg]);
+    let result = run_argv(&["release", "eject", &project, "--out", &out_arg]);
     let written = out.join("Cargo.toml").exists() || out.join("src").join("main.rs").exists();
     let _ = fs::remove_dir_all(&tmp);
     assert!(

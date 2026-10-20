@@ -1211,15 +1211,15 @@ ipe init [name]                    # new project
 # — there is no `watch` under release, so hot-reloading a shipping build is
 # not expressible. A `build` / `run` with no group in front is refused: the
 # group names the posture.
-ipe dev build src/Main.ipe         # compile → out/app
-ipe dev build src/Main.ipe --target wasm   # browser-WASM project (cdylib + www/ shell)
-ipe dev run src/Main.ipe           # build + run
-ipe release build src/Main.ipe     # PRODUCTION build; rejects any Debug.* use
+ipe dev build                      # compile the project here → out/app
+ipe dev build --target wasm        # browser-WASM project (cdylib + www/ shell)
+ipe dev run                        # build + run
+ipe release build                  # PRODUCTION build; rejects any Debug.* use
                                    #  (IPE-L0140)
 ipe dev build|run … --static       # fully-static musl single binary (dlmalloc
                                    #  default; --target <triple> --allocator
                                    #  <auto|system|dlmalloc|talc|mimalloc>)
-ipe dev watch src/Main.ipe         # file-watch rebuild + restart
+ipe dev watch                      # file-watch rebuild + restart
 ipe type-check src/Main.ipe        # type-check only — no build, no run, no emit
 ipe fmt src/Main.ipe               # opinionated formatter (run after editing .ipe/.ipei)
                                    # test runner: place tests/Main.ipe in the

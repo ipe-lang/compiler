@@ -547,8 +547,8 @@ pub fn build_with_options_into(
 /// Build a loose `.ipe` entry file plus the sibling modules it imports.
 ///
 /// When no manifest is present, an import `A.B` resolves to `A/B.ipe` under
-/// the entry file's directory, so a multi-file program builds via the
-/// file-path shorthand (`ipe dev build src/Main.ipe`).
+/// the entry file's directory, so a multi-file program builds from its entry
+/// file alone.
 ///
 /// The module set is the entry plus the sibling modules its imports reach,
 /// resolved by [`crate::loose_file::resolve_loose_file`] (see

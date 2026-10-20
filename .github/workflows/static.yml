@@ -110,7 +110,7 @@ jobs:
           ALLOCATOR: ${{ matrix.allocator }}
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out \
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out \
             --static --allocator "$ALLOCATOR"
           cd out/rust
           cargo build --release --target "$STATIC_TRIPLE"
@@ -224,7 +224,7 @@ jobs:
       - name: ipe dev build --static --target aarch64-unknown-linux-musl
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out \
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out \
             --static --target aarch64-unknown-linux-musl --allocator dlmalloc
           cd out/rust
           cargo build --release --target "$STATIC_TRIPLE"
@@ -318,7 +318,7 @@ jobs:
       - name: ipe dev build --static --cfree is refused
         run: |
           cd examples/shapes/non-tea/hello-world
-          if "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out/cfree \
+          if "$CARGO_TARGET_DIR/release/ipe" dev build --out out/cfree \
                --static --cfree; then
             echo "::error::--cfree must be refused until the pure-Rust dep swaps land"
             exit 1
@@ -394,7 +394,7 @@ jobs:
       - name: ipe dev build (emit Rust for 01-hello-world)
         run: |
           cd "$REPO/examples/shapes/non-tea/hello-world"
-          "$CARGO_TARGET_DIR/release/ipe.exe" dev build package.ipe --out out
+          "$CARGO_TARGET_DIR/release/ipe.exe" dev build --out out
 
       - name: cargo build --release (MSVC +crt-static, dlmalloc)
         run: |
@@ -493,7 +493,7 @@ jobs:
       - name: ipe dev build (emit Rust for 01-hello-world)
         run: |
           cd examples/shapes/non-tea/hello-world
-          "$CARGO_TARGET_DIR/release/ipe" dev build package.ipe --out out
+          "$CARGO_TARGET_DIR/release/ipe" dev build --out out
 
       # Build-only: cross compiles the emitted crate for FreeBSD. Running
       # the resulting ELF on an ubuntu host is not possible (wrong ABI).
