@@ -2897,6 +2897,40 @@ pub fn build_parsed_project_into(
     )
 }
 
+/// Build the project `held` holds into `out`, for the host `host` asks for.
+///
+/// The program is compiled exactly as `held` read it: its modules, the stdlib
+/// closure and the FFI preparation came from one read of the tree its root
+/// holds, and its shape is the one that read pinned, so nothing is discovered
+/// or read again here and a file swapped after the read is never compiled.
+///
+/// # Errors
+/// [`CliError::Usage`] for a debugger request with no runtime dependency, or
+/// for a webview request whose held shape is not a web program; otherwise as
+/// [`build_from_sources`].
+pub fn build_root_into(
+    held: &super::HeldBuild,
+    out: OutTarget<'_>,
+    runtime_dir: &Path,
+    options: &BuildOptions,
+    host: crate::delivery::HostIntent,
+) -> Result<EmittedCrate, CliError> {
+    refuse_debugger_without_runtime_dep(options)?;
+    if let crate::delivery::HostIntent::WebView(_) = host {
+        crate::pack::desktop::require_webview(super::desktop_app_shape(held.shape()))
+            .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
+    }
+    build_from_sources_for(
+        held.root().manifest(),
+        held.manifest_path(),
+        super::PackageSourceSet::from_build_snapshot(held.snapshot()),
+        out,
+        runtime_dir,
+        options,
+        host,
+    )
+}
+
 /// Refuse a webview request whose entry `main` is not a web program.
 ///
 /// The CLI's delivery resolution already pins the shape; this re-checks it

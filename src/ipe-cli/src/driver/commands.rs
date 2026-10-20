@@ -1,11 +1,10 @@
 use super::{
     BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget, RuntimeContext,
     SettingsSource, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
-    bluegreen_enabled, build_loose_file_into, build_parsed_project_into, bundle_delivery,
-    collect_entry_and_siblings, compile_prepared, create_source_root, emit_machine_error,
-    emit_permissions, emit_settings, find_manifest_for_ipe_file, frame_infer_error,
-    gate_decoder_pipelines, home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version,
-    runtime_dep_from_env,
+    bluegreen_enabled, build_root_into, bundle_delivery, collect_entry_and_siblings,
+    compile_prepared, create_source_root, emit_machine_error, emit_permissions, emit_settings,
+    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
+    io_err, resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -16,7 +15,6 @@ use crate::cargo_step::{
     CargoBuild, CargoCrate, CargoOutput, CargoProfile, CargoTarget, EmbeddedApp, Verbosity,
 };
 use crate::delivery::HostIntent;
-use crate::loose_file::LooseFileError;
 use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths};
 use crate::project_root::{
     AnalysisTarget, EntrySet, FileArg, ProjectRoot, ResolvedEntry, RootArg, SourceDir,
@@ -330,51 +328,160 @@ pub fn with_help_on_misuse(
     }
 }
 
-/// Project-aware default entry for `build`, `run`, or `watch` without a positional.
+/// A project build held from one read: its root, its modules and the shape its `main` pins.
 ///
-/// Resolution order:
-/// 1. `./package.ipe` exists — entry `"."` (project mode; `discover_manifest`
-///    reads the directory's `package.ipe`).
-/// 2. `./src/Main.ipe` exists — entry `"src/Main.ipe"` (single-file
-///    shorthand without a manifest).
-/// 3. A bare `./ipe.toml` with no `package.ipe` — a clear legacy-toml error, so
-///    the legacy manifest never silently governs a build.
-/// 4. Neither — usage error: nothing to build here.
-pub fn default_entry() -> Result<String, CliError> {
-    if std::path::Path::new(package_manifest::PACKAGE_IPE).exists() {
-        return Ok(".".to_owned());
-    }
-    if std::path::Path::new("src/Main.ipe").exists() {
-        return Ok("src/Main.ipe".to_owned());
-    }
-    if project::has_only_legacy_toml(std::path::Path::new(".")) {
-        return Err(CliError::Usage(text::msg::legacy_toml_hint()));
-    }
-    Err(CliError::Usage(text::msg::no_entry()))
+/// Every `build`, `run`, `watch`, `release` and `eject` arm reads its project
+/// once into this value ([`HeldBuild::read`]). The shape the delivery grammar is
+/// checked against, the sources the consent gates scan, the FFI catalog the
+/// gates consult and the modules the emit compiles are one read of one tree,
+/// so a file swapped on disk after the read is seen by none of them.
+pub struct HeldBuild {
+    root: ProjectRoot,
+    snapshot: SourceSnapshot,
+    shape: delivery::Shape,
+    manifest_path: PathBuf,
 }
 
-/// `ipe dev watch [<path>]` — rebuild and re-run on every source change
+impl HeldBuild {
+    /// Read the project `root` once, after applying its machine fixes when `fix` is set.
+    ///
+    /// # Errors
+    /// The refusals of [`apply_fixes_cmd`] and [`SourceSnapshot::read`];
+    /// [`CliError::EntryMissing`] when the program the build selects is not
+    /// among the root's entries or not a `src/` module of the read.
+    pub fn read(root: ProjectRoot, fix: bool) -> Result<Self, CliError> {
+        if fix {
+            apply_fixes_cmd(&root, None, true, &mut std::io::stdout())?;
+        }
+        let snapshot = SourceSnapshot::read(&root, Limits::DEFAULT)?;
+        let shape = built_shape(&root, &snapshot)?;
+        let manifest_path = root.path().join(package_manifest::PACKAGE_IPE);
+        Ok(Self {
+            root,
+            snapshot,
+            shape,
+            manifest_path,
+        })
+    }
+
+    /// The resolved project root.
+    #[must_use]
+    pub const fn root(&self) -> &ProjectRoot {
+        &self.root
+    }
+
+    /// The one read of the project's modules.
+    #[must_use]
+    pub const fn snapshot(&self) -> &SourceSnapshot {
+        &self.snapshot
+    }
+
+    /// The shape the built program's `main` pins in the held text.
+    #[must_use]
+    pub const fn shape(&self) -> delivery::Shape {
+        self.shape
+    }
+
+    /// The `package.ipe` path: the blame location and crate-identity seed.
+    #[must_use]
+    pub fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    /// Whether the catalog the held read took links any foreign crate.
+    #[must_use]
+    pub fn ffi_presence(&self) -> ffi::FfiPresence {
+        if self.snapshot.catalog().crates().is_empty() {
+            ffi::FfiPresence::Absent
+        } else {
+            ffi::FfiPresence::Present
+        }
+    }
+
+    /// The source set the held modules compile and infer as.
+    #[must_use]
+    pub fn sources(&self) -> super::PackageSourceSet {
+        super::PackageSourceSet::from_build_snapshot(&self.snapshot)
+    }
+
+    /// Emit the held program into `target` for `host`, returning the claimed crate directory.
+    ///
+    /// # Errors
+    /// As [`build_root_into`].
+    pub fn emit(
+        &self,
+        target: &EmitTarget,
+        runtime_dir: &Path,
+        options: &BuildOptions,
+        host: HostIntent,
+    ) -> Result<EmittedCrate, CliError> {
+        build_root_into(self, OutTarget::Proven(target), runtime_dir, options, host)
+    }
+}
+
+/// The shape of the program the build of `root` selects, read from `snapshot`'s text.
+///
+/// A library has no `main` to pin a shape and is a [`delivery::Shape::Script`];
+/// a program root classifies the program the build selects
+/// ([`project::ProjectManifest::resolved_entry`]) on its held text
+/// ([`EntryMain::of`]), the text the emit compiles.
+///
+/// # Errors
+/// [`CliError::EntryMissing`] when the selected program is not among the
+/// root's entries or not a `src/` module of `snapshot`.
+fn built_shape(root: &ProjectRoot, snapshot: &SourceSnapshot) -> Result<delivery::Shape, CliError> {
+    let EntrySet::Programs(programs) = root.entries() else {
+        return Ok(delivery::Shape::from_main(
+            ipe_canon::shape_source::MainShape::Script,
+        ));
+    };
+    let built = root.manifest().resolved_entry()?;
+    let missing = || CliError::EntryMissing {
+        entry: format!("{}.ipe", built.join("/")),
+    };
+    if !programs
+        .iter()
+        .any(|entry| entry.module() == built.as_slice())
+    {
+        return Err(missing());
+    }
+    let held = snapshot
+        .module(&built)
+        .filter(|held| held.origin() == SourceOrigin::Own(SourceDir::Src))
+        .ok_or_else(missing)?;
+    Ok(EntryMain::of(held.text()).delivery_shape())
+}
+
+/// Resolve the project a `build` / `run` / `watch` / `release` / `eject` of `arg` builds.
+///
+/// `arg` is the project directory, or the current directory when absent; a
+/// file is refused ([`RootArg::dir_only`]).
+///
+/// # Errors
+/// [`CliError::DirectoryExpected`] for a file argument; every refusal of
+/// [`ProjectRoot::resolve`].
+pub fn build_root(arg: Option<&str>, verb: Verb) -> Result<ProjectRoot, CliError> {
+    ProjectRoot::resolve(RootArg::dir_only(
+        &working_dir()?,
+        arg.map(Path::new),
+        verb,
+    )?)
+}
+
+/// `ipe dev watch [<dir>]` — rebuild and re-run on every source change
 /// (`crate::watch`). Never returns
 /// `Err` for a build failure (INV-3: a red build is logged, not fatal);
 /// only misuse / setup failures propagate.
 pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_watch(rest)?;
-    let entry = match args.entry {
-        Some(e) => e,
-        None => default_entry()?,
-    };
+    let held = HeldBuild::read(build_root(args.entry.as_deref(), Verb::DEV_WATCH)?, false)?;
 
     // Validate the delivery grammar against the shape `main` pins: the `[shape]`
     // cross-check and the `[runtime] [host]` tail. `ipe dev watch` is a dev
     // build-run-reload loop that serves the served runtime; it takes no `--static`.
     // A grammar refusal (e.g. `web solo ios`, which cannot be watched — see the
     // spec's mobile-watch note) is caught here before the loop starts.
-    let delivery = resolve_delivery(
-        Path::new(&entry),
-        &args.delivery,
-        false,
-        Verb::DEV_WATCH.name(),
-    )?;
+    let delivery = resolve_delivery(held.shape(), &args.delivery, false, Verb::DEV_WATCH.name())?;
 
     // A Tui app with no interactive terminal is refused right here — before
     // any compile or cargo work — same as `ipe dev run`.
@@ -394,11 +501,11 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     // its root cause — not as a per-rebuild opaque spawn error.
     let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Watch)?;
 
-    let output = resolve_output_root(args.out.as_deref(), Path::new(&entry), None)?;
+    let output = resolve_output_root(args.out.as_deref(), held.root().manifest())?;
     let rust_area = output.area(&[OutputArea::Rust]);
     let out_dir = rust_area.path()?;
 
-    let mut opts = watch::WatchOptions::new(PathBuf::from(entry), out_dir, runtime_dir);
+    let mut opts = watch::WatchOptions::new(held.root().path().to_path_buf(), out_dir, runtime_dir);
     opts.out_target = Some(EmitTarget::Area(rust_area));
     opts.port = args.port;
     opts.cargo_path = cargo_bin.path().to_path_buf();
@@ -416,30 +523,24 @@ pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     watch::run(&opts)
 }
 
-/// Resolve the output root for a build of `entry`.
+/// Resolve the output root for a build of the project `manifest` governs.
 ///
 /// `--out <dir>` or `<project>/out`, proven claimable by ipe and disjoint from
 /// the project's sources.
 ///
 /// # Errors
 /// [`CliError::OutputRefused`] when the location overlaps the project or holds
-/// files ipe did not create; manifest discovery errors when `manifest` is absent
-/// and the entry's project must be discovered.
+/// files ipe did not create.
 pub fn resolve_output_root(
     out: Option<&str>,
-    entry: &Path,
-    manifest: Option<&project::ProjectManifest>,
+    manifest: &project::ProjectManifest,
 ) -> Result<OutputRoot, CliError> {
-    let paths = match manifest {
-        Some(m) => ProjectPaths::from_manifest(m),
-        None => ProjectPaths::discover(entry)?,
-    };
-    OutputRoot::resolve(out, &paths)
+    OutputRoot::resolve(out, &ProjectPaths::from_manifest(manifest))
 }
 
 /// What an entry source's `main` pins.
 ///
-/// The one reading of an entry that the delivery shape ([`classify_entry_shape`])
+/// The one reading of an entry that the delivery shape ([`HeldBuild::shape`])
 /// and the audit's control-model disclosure both project, so the two can never
 /// judge the same source differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,90 +588,8 @@ impl EntryMain {
     }
 }
 
-/// The source text of `entry`, read beneath `root`'s held `src/` directory.
-///
-/// Every level is opened through the handle on the level above, never
-/// following a link.
-///
-/// # Errors
-/// [`CliError::EntryMissing`] when a directory on the way is absent; an
-/// output refusal for a linked or non-directory level; the
-/// `read_file_capped` refusals for the file itself.
-pub fn read_entry_source(root: &ProjectRoot, entry: &ResolvedEntry) -> Result<String, CliError> {
-    let missing = || CliError::EntryMissing {
-        entry: format!("{}.ipe", entry.module().join("/")),
-    };
-    let (leaf, parents) = entry.module().split_last().ok_or_else(missing)?;
-    let mut walked = None;
-    for segment in parents {
-        let here = walked.as_ref().unwrap_or_else(|| root.src());
-        walked = Some(
-            here.child(std::ffi::OsStr::new(segment))?
-                .ok_or_else(missing)?,
-        );
-    }
-    let here = walked.as_ref().unwrap_or_else(|| root.src());
-    let name = here.entry(std::ffi::OsStr::new(&format!("{leaf}.ipe")))?;
-    here.read_file_capped(&name, io_bounded::SOURCE_CAP)
-}
-
-/// Classify the shape `main` pins for one program of a resolved project.
-///
-/// The shape is the single source of truth for delivery: it is derived from
-/// code, never from config or the CLI. Each program of a root is classified on
-/// its own entry ([`EntryMain::of`]), so a root's second program is never given
-/// its first program's shape.
-///
-/// # Errors
-/// The [`read_entry_source`] refusals.
-pub fn classify_entry_shape(
-    root: &ProjectRoot,
-    entry: &ResolvedEntry,
-) -> Result<delivery::Shape, CliError> {
-    Ok(EntryMain::of(&read_entry_source(root, entry)?).delivery_shape())
-}
-
-/// The shape of the program a `build` / `run` / `watch` of `entry_arg` builds.
-///
-/// `entry_arg` is the raw positional (a `.ipe` file, a project directory, or a
-/// bare `.`). A file no manifest governs is read as the user named it,
-/// following a link. A governed project is resolved as a [`ProjectRoot`]: a
-/// library has no `main` to pin a shape and is a [`delivery::Shape::Script`];
-/// a program root classifies the program the build selects
-/// ([`project::ProjectManifest::resolved_entry`]) among its resolved entries.
-///
-/// # Errors
-/// [`CliError::Io`] when a loose entry cannot be read; the
-/// [`ProjectRoot::resolve`] refusals; [`CliError::EntryMissing`] when the
-/// selected program is not among the root's entries; the
-/// [`classify_entry_shape`] refusals.
-pub fn built_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliError> {
-    let Some(manifest) = discover_manifest(entry_arg)? else {
-        let source = io_bounded::read_user_named(entry_arg, io_bounded::SOURCE_CAP)?;
-        return Ok(EntryMain::of(&source).delivery_shape());
-    };
-    let dir = manifest
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let root = ProjectRoot::resolve(RootArg::at(dir))?;
-    let EntrySet::Programs(programs) = root.entries() else {
-        return Ok(delivery::Shape::from_main(
-            ipe_canon::shape_source::MainShape::Script,
-        ));
-    };
-    let built = root.manifest().resolved_entry()?;
-    let entry = programs
-        .iter()
-        .find(|entry| entry.module() == built.as_slice())
-        .ok_or_else(|| CliError::EntryMissing {
-            entry: format!("{}.ipe", built.join("/")),
-        })?;
-    classify_entry_shape(&root, entry)
-}
-
-/// Resolve the delivery for a `build` / `run` / `watch` invocation: classify the
-/// shape `main` pins, cross-check the optional `[shape]` positional against it,
+/// Resolve the delivery for a `build` / `run` / `watch` invocation: cross-check
+/// the optional `[shape]` positional against `pinned`, the shape `main` pins,
 /// resolve the `[runtime] [host]` tail, and gate `--static`.
 ///
 /// This is the one place the CLI turns the delivery grammar into a validated
@@ -581,14 +600,13 @@ pub fn built_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliError> 
 /// # Errors
 /// [`CliError::Usage`] carrying the delivery lesson on a shape mismatch, an
 /// invalid runtime/host combination, or a `--static` request the delivery
-/// cannot honour; the refusals of [`built_entry_shape`].
+/// cannot honour.
 pub fn resolve_delivery(
-    entry_arg: &Path,
+    pinned: delivery::Shape,
     positionals: &cli_args::DeliveryPositionals,
     wants_static: bool,
     command: &str,
 ) -> Result<delivery::Delivery, CliError> {
-    let pinned = built_entry_shape(entry_arg)?;
     delivery::Delivery::resolve_checked(
         pinned,
         positionals.stated_shape,
@@ -630,13 +648,10 @@ pub fn discover_manifest(entry_path: &Path) -> Result<Option<PathBuf>, CliError>
 /// [`build_plan::resolve`].
 pub fn resolve_static_plan(
     cli_layer: build_plan::StaticRequestLayer,
-    manifest: Option<&Path>,
+    manifest: &project::ProjectManifest,
     output_format: cli_args::OutputFormat,
 ) -> Result<Option<ipe_backend_rust::static_build::StaticPlan>, CliError> {
-    let toml_layer = match manifest {
-        Some(m) => project::parse_manifest(m)?.static_request,
-        None => build_plan::StaticRequestLayer::default(),
-    };
+    let toml_layer = manifest.static_request.clone();
     let mut env = build_plan::env_layer()?;
     if matches!(env.target.as_deref(), Some("wasm" | "wasi")) {
         env.target = None;
@@ -748,7 +763,7 @@ pub fn resolve_compile_target(
     CompileTarget::Native
 }
 
-/// `ipe dev build [<path>]` — compile a program to a native or WebAssembly artifact.
+/// `ipe dev build [<dir>]` — compile a program to a native or WebAssembly artifact.
 // A linear pipeline (parse → discover manifest → acknowledge unsafe → resolve
 // target → emit → cargo build); the steps share enough locals that splitting
 // reads worse than the whole.
@@ -823,43 +838,27 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
             static_layer,
         } => (out, wasm, static_layer),
     };
-    let entry = match args.entry {
-        Some(e) => e,
-        None => default_entry()?,
-    };
-    let entry_path = PathBuf::from(&entry);
-
-    // Route the build:
-    //   1. Directory → expect package.ipe inside it.
-    //   2. .ipe file → walk up looking for package.ipe (project-mode); fall back
-    //      to sibling discovery when no manifest exists, so a multi-file project
-    //      built via the file-path shorthand still compiles the whole module
-    //      graph rather than the single entry file.
-    let manifest = discover_manifest(&entry_path)?;
-
-    // The manifest is parsed once: its `[wasm].mode` picks the compile target
-    // and the same value is the one the emit and the artifact name read.
-    let manifest_parsed = manifest
-        .as_deref()
-        .map(project::parse_manifest)
-        .transpose()?;
-    let manifest_wasm: Option<project::WasmConfig> =
-        manifest_parsed.as_ref().map(|m| m.wasm.clone());
+    let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
+    let root = build_root(args.entry.as_deref(), Verb::DEV_BUILD)?;
 
     // Static-flag contradictions (--cfree + C-requiring allocator,
     // --target without --static, talc-without-arena) are pure over the CLI +
-    // env + manifest layers and touch no source. Resolving here — before
-    // resolve_delivery reads the entry file — ensures a refused build produces
-    // no artifact and touches nothing, even when the entry path does not exist.
-    let static_plan = resolve_static_plan(cli_layer, manifest.as_deref(), args.format)?;
+    // env + manifest layers and touch no source. Resolving here — before any
+    // module is read — ensures a refused build produces no artifact and
+    // touches nothing.
+    let static_plan = resolve_static_plan(cli_layer, root.manifest(), args.format)?;
+
+    // `--fix` carries durable authorization: machine-applicable fixes are
+    // applied non-interactively, then the project is read once, so the build
+    // sees the rewritten bytes.
+    let held = HeldBuild::read(root, args.fix)?;
+    let manifest = held.root().manifest();
 
     // Resolve the delivery grammar against the shape `main` pins: the optional
     // `[shape]` cross-check, the `[runtime] [host]` tail, and the `--static`
-    // gate. Runs after the static-plan check so a flag contradiction fires
-    // before the entry file is read. A webview-native `web desktop` drives
-    // the emit host below.
+    // gate. A webview-native `web desktop` drives the emit host below.
     let delivery = resolve_delivery(
-        &entry_path,
+        held.shape(),
         &args.delivery,
         wants_static,
         Verb::DEV_BUILD.name(),
@@ -892,15 +891,8 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     // bundle for `build`).
     let bundle_host = BundleHost::from_delivery_host(delivery.host())?;
 
-    // `--fix` carries durable authorization: apply machine-applicable fixes
-    // non-interactively before the build sees the source.
-    if bundle_host.is_none() && args.fix {
-        let (root, file) = analysis_root(&working_dir()?, Some(&entry_path))?;
-        apply_fixes_cmd(&root, file.as_ref(), true, &mut std::io::stdout())?;
-    }
-
     if let Some(host) = bundle_host {
-        bundle_delivery(host, NativeFinish::Dev, Some(entry.as_str()))?;
+        bundle_delivery(host, NativeFinish::Dev, &held)?;
         return Ok(BuildSuccess {
             entry,
             out_dir: PathBuf::new(),
@@ -908,7 +900,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     }
 
     // Precedence: CLI --target wasm|wasi > IPE_TARGET=wasm|wasi > [wasm].mode.
-    let compile_target = resolve_compile_target(wasm_target, manifest_wasm.as_ref());
+    let compile_target = resolve_compile_target(wasm_target, Some(&manifest.wasm));
 
     // The delivery runtime and the compile target are derived independently; fail
     // closed unless they agree — the `(engine, triple)` validity matrix is the
@@ -944,7 +936,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
 
     // Resolved only now, after every refusal above; nothing is created until the
     // emit writes its crate.
-    let output = resolve_output_root(out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
+    let output = resolve_output_root(out.as_deref(), manifest)?;
     let rust_area = output.area(&[OutputArea::Rust]);
     let out_dir = rust_area.path()?;
 
@@ -965,17 +957,12 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         hot_appearance: false,
     };
 
-    // No manifest found: compile entry + all sibling .ipe files in the same
-    // directory. Byte-identical to `build` when the directory holds only the
-    // entry file (regression-covered by the golden suite).
     // A webview-native `web desktop` delivery links the system webview and
     // selects the webview executor; every other delivery is served.
-    let crate_dir = emit_into(
-        &entry_path,
-        manifest_parsed.as_ref().zip(manifest.as_deref()),
+    let crate_dir = held.emit(
         &EmitTarget::Area(rust_area),
         &runtime_dir,
-        options,
+        &options,
         delivery.host_intent(),
     )?;
 
@@ -997,7 +984,7 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
                 runtime_dep,
                 quiet: args.quiet,
             },
-            manifest_parsed.as_ref(),
+            Some(manifest),
         )?),
     };
 
@@ -1019,36 +1006,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         );
     }
     Ok(BuildSuccess { entry, out_dir })
-}
-
-/// Emit the program at `entry_path` into `target`, returning the claimed crate directory.
-///
-/// The manifest project is emitted for `host` from the manifest the caller parsed,
-/// never read again, when one was found; else the
-/// entry with its sibling files for the served host. A loose file has no
-/// manifest window, so a webview request for one is refused, never served.
-///
-/// # Errors
-/// [`CliError::Usage`] for a webview `host` with no manifest; otherwise as
-/// [`build_parsed_project_into`] and [`build_loose_file_into`].
-fn emit_into(
-    entry_path: &Path,
-    manifest: Option<(&project::ProjectManifest, &Path)>,
-    target: &EmitTarget,
-    runtime_dir: &Path,
-    options: BuildOptions,
-    host: HostIntent,
-) -> Result<EmittedCrate, CliError> {
-    let out = OutTarget::Proven(target);
-    match manifest {
-        Some((parsed, path)) => {
-            build_parsed_project_into(parsed, path, out, runtime_dir, &options, host)
-        }
-        None => match host {
-            HostIntent::Served => build_loose_file_into(entry_path, out, runtime_dir, options),
-            HostIntent::WebView(_) => Err(CliError::Usage(text::msg::webview_needs_manifest())),
-        },
-    }
 }
 
 /// How [`compile_and_finalize_native_build`] runs `cargo build`.
@@ -1373,19 +1330,21 @@ fn copy_native_artifact(
 /// pipeline / filesystem / runtime-resolution errors as [`build_project`].
 pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_eject(rest)?;
-    let entry = match args.entry {
-        Some(e) => e,
-        None => default_entry()?,
-    };
-    let entry_path = PathBuf::from(&entry);
+    let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
+    let held = HeldBuild::read(
+        build_root(args.entry.as_deref(), Verb::RELEASE_EJECT)?,
+        false,
+    )?;
+    let manifest = held.root().manifest();
 
     // Fail closed on an FFI-bearing project BEFORE any emit: eject vendors only
     // the embedded runtime SOURCE, so a program binding a foreign Rust crate
     // cannot be made self-contained (its external crates would be a registry
-    // fetch at the ejected project's `cargo build`). Detecting it from the
-    // installed FFI catalog is the same trusted signal the build pipeline reads;
-    // a non-empty catalog means at least one `Rust.` binding is in scope.
-    if !ffi::load_catalog_for(&entry_path)?.is_empty() {
+    // fetch at the ejected project's `cargo build`). The catalog judged is the
+    // one the held read took through the root's cache directory, the catalog
+    // the emit binds; a non-empty catalog means at least one `Rust.` binding is
+    // in scope.
+    if held.ffi_presence() == ffi::FfiPresence::Present {
         return Err(CliError::EjectUnsupported {
             reason: TerminalSafe::sanitize(
                 "this program binds a foreign Rust crate (FFI). Eject vendors only the \
@@ -1395,20 +1354,13 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
         });
     }
 
-    let manifest = discover_manifest(&entry_path)?;
-
     // Eject targets a plain native `cargo build`; a wasm target has its own
     // bundling step and a distinct closed vendoring template. Refuse a wasm
     // request from ANY tier — the `IPE_TARGET=wasm|wasi` env OR a project's
     // `[wasm].mode` — rather than silently emit a native tree for a wasm app.
     // (`parse_eject` has no `--target` flag, so the CLI tier cannot select wasm
     // here; `WasmKind::None` for the CLI axis is exact.)
-    let manifest_parsed = manifest
-        .as_deref()
-        .map(project::parse_manifest)
-        .transpose()?;
-    let manifest_wasm: Option<&project::WasmConfig> = manifest_parsed.as_ref().map(|m| &m.wasm);
-    if resolve_compile_target(cli_args::WasmKind::None, manifest_wasm).is_wasm() {
+    if resolve_compile_target(cli_args::WasmKind::None, Some(&manifest.wasm)).is_wasm() {
         return Err(CliError::EjectUnsupported {
             reason: TerminalSafe::sanitize(
                 "eject produces a native Cargo project; a wasm target has a separate \
@@ -1424,11 +1376,7 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     // directory clear of the sources and of every tree ipe owns — never over
     // anything already there. It is claimed before the build, so the emit
     // adopts it and no ancestor is ever marked ipe-owned.
-    let paths = match manifest_parsed.as_ref() {
-        Some(m) => ProjectPaths::from_manifest(m),
-        None => ProjectPaths::discover(&entry_path)?,
-    };
-    let target = OutputRoot::fresh(&args.out, &paths)?.claim()?;
+    let target = OutputRoot::fresh(&args.out, &ProjectPaths::from_manifest(manifest))?.claim()?;
 
     let options = eject_options();
 
@@ -1447,12 +1395,10 @@ pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
         );
     }
 
-    emit_into(
-        &entry_path,
-        manifest_parsed.as_ref().zip(manifest.as_deref()),
+    held.emit(
         &EmitTarget::Claimed(target.owned().clone()),
         &runtime_dir,
-        options,
+        &options,
         // An ejected tree is the served program.
         HostIntent::Served,
     )
@@ -1601,11 +1547,8 @@ pub fn run_release_body(rest: &[String]) -> Result<(), CliError> {
     // `--emit-permissions <platform>`: a read-only inspection — print the
     // OS-permission derivation and stop, before any compile.
     if let Some(platform) = args.emit_permissions.as_deref() {
-        let entry = match args.entry.as_deref() {
-            Some(e) => e.to_owned(),
-            None => default_entry()?,
-        };
-        return emit_permissions(platform, Some(entry.as_str()), Verb::RELEASE_BUILD.name());
+        let root = build_root(args.entry.as_deref(), Verb::RELEASE_BUILD)?;
+        return emit_permissions(platform, &root, Verb::RELEASE_BUILD.name());
     }
 
     release_pipeline(&args, ReleasePurpose::Build)?;
@@ -1664,19 +1607,9 @@ pub fn release_pipeline(
     purpose: ReleasePurpose,
 ) -> Result<ReleaseOutput, CliError> {
     let verb = purpose.verb();
-    let entry = match args.entry.clone() {
-        Some(e) => e,
-        None => default_entry()?,
-    };
-    let entry_path = PathBuf::from(&entry);
-
-    // Discover the manifest (same logic as build/eject).
-    let manifest = discover_manifest(&entry_path)?;
-
-    let manifest_parsed = match manifest.as_deref() {
-        Some(m) => Some(project::parse_manifest(m)?),
-        None => None,
-    };
+    let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
+    let held = HeldBuild::read(build_root(args.entry.as_deref(), verb)?, false)?;
+    let manifest = held.root().manifest();
 
     // The trust-boundary consent gates, applied BEFORE any emit, cargo build,
     // OR bundle — hoisted above the bundle
@@ -1688,8 +1621,7 @@ pub fn release_pipeline(
     // carries no `--accept-risks` and never prompts, so an ungranted disclosure
     // fails closed here, and the durable manifest `[capabilities]` grant is the
     // only way through (a CI release must not block on a TTY prompt).
-    let consented =
-        consent_to_capabilities(manifest_parsed.as_ref(), manifest.as_deref(), &entry_path)?;
+    let consented = consent_to_capabilities(&held)?;
 
     // A `desktop`/`ios`/`android` host is a production distributable bundle:
     // route it through the delivery-grammar bundler (the `release` production
@@ -1697,7 +1629,7 @@ pub fn release_pipeline(
     // artifact below. The delivery grammar is the one vocabulary for every bundle
     // target.
     let bundle_delivery_resolved =
-        resolve_delivery(&entry_path, &args.delivery, false, verb.name())?;
+        resolve_delivery(held.shape(), &args.delivery, false, verb.name())?;
     if let (ReleasePurpose::Run, Some(target)) = (
         purpose,
         cli_args::NoRunTarget::from_host(bundle_delivery_resolved.host()),
@@ -1706,11 +1638,9 @@ pub fn release_pipeline(
     }
     // The database driver a release profile's socket allowances follow: the
     // one the emit links, read from the same build shape.
-    let driver = SettingsSource::discovered(
-        manifest_parsed.as_ref().zip(manifest.as_deref()),
-        HostIntent::Served,
-    )
-    .db_driver();
+    let driver =
+        SettingsSource::discovered(Some((manifest, held.manifest_path())), HostIntent::Served)
+            .db_driver();
     if let Some(host) = BundleHost::from_delivery_host(bundle_delivery_resolved.host())? {
         bundle_delivery(
             host,
@@ -1718,13 +1648,10 @@ pub fn release_pipeline(
                 consented: &consented,
                 driver,
             },
-            Some(entry.as_str()),
+            &held,
         )?;
         return Ok(ReleaseOutput::Distributable);
     }
-
-    let manifest_wasm: Option<project::WasmConfig> =
-        manifest_parsed.as_ref().map(|m| m.wasm.clone());
 
     // Route on the typed artifact: the browser bundle or a static native
     // binary. A native `--target` still yields to `IPE_TARGET` and the
@@ -1732,7 +1659,7 @@ pub fn release_pipeline(
     // refuses.
     let artifact = release_artifact(
         args.target.clone(),
-        resolve_compile_target(cli_args::WasmKind::None, manifest_wasm.as_ref()),
+        resolve_compile_target(cli_args::WasmKind::None, Some(&manifest.wasm)),
     )?;
     let compile_target = artifact.compile_target();
 
@@ -1758,8 +1685,7 @@ pub fn release_pipeline(
         }
         ReleaseArtifact::Browser => {
             // Browser/wasm production path.
-            let output =
-                resolve_output_root(args.out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
+            let output = resolve_output_root(args.out.as_deref(), manifest)?;
             let rust_area = output.area(&[OutputArea::Release, OutputArea::Rust]);
             let out_dir = rust_area.path()?;
             let runtime_dep = runtime_dep_from_env();
@@ -1792,12 +1718,10 @@ pub fn release_pipeline(
                 // A release build never carries appearance hot-swap scaffolding.
                 hot_appearance: false,
             };
-            let crate_dir = emit_into(
-                &entry_path,
-                manifest_parsed.as_ref().zip(manifest.as_deref()),
+            let crate_dir = held.emit(
                 &EmitTarget::Area(rust_area),
                 &runtime_dir,
-                options,
+                &options,
                 bundle_delivery_resolved.host_intent(),
             )?;
             bundle_wasm(crate_dir.dir())?;
@@ -1829,8 +1753,7 @@ pub fn release_pipeline(
 
     if !run_sandbox::is_native_bearing(&resolved.union()) {
         // Pure-native path: emit and build a plain release binary.
-        let output =
-            resolve_output_root(args.out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
+        let output = resolve_output_root(args.out.as_deref(), manifest)?;
         let rust_area = output.area(&[OutputArea::Release, OutputArea::Rust]);
         let out_dir = rust_area.path()?;
 
@@ -1864,12 +1787,10 @@ pub fn release_pipeline(
         };
         // A desktop host returned through the bundler above, so this static
         // artifact is the served program.
-        let crate_dir = emit_into(
-            &entry_path,
-            manifest_parsed.as_ref().zip(manifest.as_deref()),
+        let crate_dir = held.emit(
             &EmitTarget::Area(rust_area),
             &runtime_dir,
-            options,
+            &options,
             HostIntent::Served,
         )?;
 
@@ -1908,7 +1829,7 @@ pub fn release_pipeline(
         // artifact lands at a predictable path regardless of CARGO_TARGET_DIR.
         let dest = output
             .claim_area(&[OutputArea::Release])?
-            .path_to(friendly_artifact_filename(manifest_parsed.as_ref()))?;
+            .path_to(friendly_artifact_filename(Some(manifest)))?;
         dest.copy_from(&bin_path)?;
         let dest = dest.path();
         #[cfg(unix)]
@@ -1936,7 +1857,7 @@ pub fn release_pipeline(
     // tree the current directory leads to; verified before anything is built.
     let wrapper_source = crate::wrapper_source::WrapperSource::resolve()
         .map_err(|r| CliError::WrapperSourceRefused(Box::new(r)))?;
-    let output = resolve_output_root(args.out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
+    let output = resolve_output_root(args.out.as_deref(), manifest)?;
 
     if show_progress {
         crate::screen::chatter(
@@ -1970,12 +1891,10 @@ pub fn release_pipeline(
     };
     // A desktop host returned through the bundler above, so this static
     // artifact is the served program.
-    let app_dir = emit_into(
-        &entry_path,
-        manifest_parsed.as_ref().zip(manifest.as_deref()),
+    let app_dir = held.emit(
         &EmitTarget::Area(app_area),
         &runtime_dir,
-        options,
+        &options,
         HostIntent::Served,
     )?;
 
@@ -2985,39 +2904,28 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // module the embedded wasmtime path runs; `--target wasm` was refused at
     // parse). Manifest `[wasm].mode` still selects only the browser client.
     let cli_wasm = args.wasm;
-    let entry = match args.entry {
-        Some(e) => e,
-        None => default_entry()?,
-    };
-
-    let entry_path = PathBuf::from(&entry);
+    let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
 
     // --- Step 1: ipe compile → emit the Rust project ---
-    let manifest = discover_manifest(&entry_path)?;
-
-    // Parse the manifest early to read [wasm].mode for target inference.
-    let manifest_parsed = manifest
-        .as_deref()
-        .map(project::parse_manifest)
-        .transpose()?;
-    let manifest_wasm: Option<project::WasmConfig> =
-        manifest_parsed.as_ref().map(|m| m.wasm.clone());
+    let root = build_root(args.entry.as_deref(), Verb::DEV_RUN)?;
 
     let wants_static = cli_layer.static_build == Some(true);
 
     // Static-flag contradictions (--cfree + C-requiring allocator,
     // --target without --static, talc-without-arena) are pure over the CLI +
-    // env + manifest layers and touch no source. Resolving here — before
-    // resolve_delivery reads the entry file — ensures a refused run produces
-    // no artifact and touches nothing, even when the entry path does not exist.
-    let static_plan = resolve_static_plan(cli_layer, manifest.as_deref(), output_format)?;
+    // env + manifest layers and touch no source. Resolving here — before any
+    // module is read — ensures a refused run produces no artifact and touches
+    // nothing.
+    let static_plan = resolve_static_plan(cli_layer, root.manifest(), output_format)?;
+
+    let held = HeldBuild::read(root, false)?;
+    let manifest = held.root().manifest();
 
     // Resolve the delivery grammar (shape cross-check, runtime/host, `--static`
     // gate) against the shape `main` pins — same as `ipe dev build`. A webview-native
-    // `web desktop` drives the emit host below. Runs after the static-plan check
-    // so a flag contradiction fires before the entry file is read.
+    // `web desktop` drives the emit host below.
     let delivery = resolve_delivery(
-        &entry_path,
+        held.shape(),
         &args.delivery,
         wants_static,
         Verb::DEV_RUN.name(),
@@ -3057,7 +2965,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // dev run` EXECUTES under embedded wasmtime. A plain `ipe dev run` in a non-wasm
     // project stays native. (`--target wasm` was refused at parse: the browser
     // bundle has no executable form.)
-    let compile_target = resolve_compile_target(cli_wasm, manifest_wasm.as_ref());
+    let compile_target = resolve_compile_target(cli_wasm, Some(&manifest.wasm));
     let wasm_target = compile_target.is_wasm();
 
     // A session over a shape or target with no recordable update loop is
@@ -3087,14 +2995,13 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     }
 
     if let Some(flag) = session.flag() {
-        let blame = manifest.as_deref().unwrap_or(&entry_path);
-        gate_session_ffi(flag, ffi::project_ffi_presence(blame)?)?;
+        gate_session_ffi(flag, held.ffi_presence())?;
     }
 
     // Resolved after every program refusal above. The session log lands in the
     // ipe-owned output root, never beside sources; a shown trace ends the run
     // here, before any toolchain check or build — nothing re-runs.
-    let output = resolve_output_root(args.out.as_deref(), &entry_path, manifest_parsed.as_ref())?;
+    let output = resolve_output_root(args.out.as_deref(), manifest)?;
     let session_env = match resolve_session_plan(&session, &output)? {
         SessionPlan::Run(env) => env,
         SessionPlan::ShowTrace(trace) => return show_session_trace(&trace),
@@ -3139,12 +3046,10 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
 
     // A webview-native `web desktop` delivery links the system webview and
     // selects the webview executor; every other delivery is served.
-    let crate_dir = emit_into(
-        &entry_path,
-        manifest_parsed.as_ref().zip(manifest.as_deref()),
+    let crate_dir = held.emit(
         &EmitTarget::Area(rust_area),
         &runtime_dir,
-        options,
+        &options,
         delivery.host_intent(),
     )?;
 
@@ -3888,60 +3793,6 @@ fn build_source_graph_from(
     })
 }
 
-/// Collect the USER `.ipe` source texts a build sees, for the `.Unsafe`-import
-/// scan. A manifest project reads every discovered module under its source root
-/// (the same whole-tree posture package-capability inference takes); a
-/// single-file entry reads the entry plus its imported siblings.
-///
-/// Fail-closed: a discovery failure or any unreadable module causes an
-/// immediate `Err` so the acknowledgment gate never operates on a partial
-/// source set.
-///
-/// # Errors
-/// Every [`project::discover_modules`] error, and [`CliError::Io`] when any
-/// discovered module cannot be read; for a single file, every
-/// [`loose_file_scan_sources`] error.
-pub fn user_sources_for_unsafe_scan(
-    manifest: Option<&Path>,
-    entry: &Path,
-) -> Result<Vec<String>, CliError> {
-    if let Some(mpath) = manifest
-        && let Ok(m) = project::parse_manifest(mpath)
-    {
-        return project::discover_modules(&m.src_root)?
-            .iter()
-            .map(|d| crate::io_bounded::read_walked_source(d.path()))
-            .collect::<Result<Vec<_>, _>>();
-    }
-    // Single file (or a manifest that failed to parse — the build will surface
-    // that error itself): the entry and its siblings.
-    loose_file_scan_sources(entry).map(|named| named.into_iter().map(|(_, src)| src).collect())
-}
-
-/// The loose-file closure's `(dotted-module-name, source)` pairs for a consent scan.
-///
-/// An entry that does not parse has no import closure to follow, so the scan
-/// sees the entry's own text, keyed by its path; the build reports the parse
-/// error itself. Every other failure — an unreadable entry or module, a file
-/// or closure past its limit — propagates, so no gate judges a partial
-/// source set.
-///
-/// # Errors
-/// Every [`LooseFileError::Refused`] error [`collect_entry_and_siblings`] returns.
-fn loose_file_scan_sources(entry: &Path) -> Result<Vec<(String, String)>, CliError> {
-    match collect_entry_and_siblings(entry) {
-        Ok(collected) => Ok(collected
-            .sources
-            .into_iter()
-            .map(|(path, (_, src))| (path.join("."), src))
-            .collect()),
-        Err(LooseFileError::EntryParse(failure)) => {
-            Ok(vec![(entry.display().to_string(), failure.into_src())])
-        }
-        Err(LooseFileError::Refused(other)) => Err(other),
-    }
-}
-
 /// The program's resolved capability sets, admitted by every trust-boundary
 /// consent gate.
 ///
@@ -3975,18 +3826,18 @@ impl ConsentedCapabilities {
 /// consent, then the app-boundary native-crossing consent. All three judge the
 /// SAME resolved value, and the value is released only once all three admit it.
 ///
+/// Inference and every scan run over the modules `held` read, the ones the
+/// emit compiles.
+///
 /// # Errors
 /// The first gate refusal (`IPE-S0001` / `IPE-S0002` / `IPE-S0003`); the
 /// capability-resolution errors it composes.
-pub fn consent_to_capabilities(
-    manifest_parsed: Option<&project::ProjectManifest>,
-    manifest_path: Option<&Path>,
-    entry: &Path,
-) -> Result<ConsentedCapabilities, CliError> {
-    let resolved = run_sandbox::resolve_for_run(manifest_parsed, manifest_path, entry)?;
-    acknowledge_unsafe_imports(&resolved, manifest_parsed, manifest_path, entry)?;
-    gate_web_consent(&resolved, manifest_parsed, manifest_path, entry)?;
-    gate_native_ffi_consent(&resolved, manifest_parsed, manifest_path, entry)?;
+pub fn consent_to_capabilities(held: &HeldBuild) -> Result<ConsentedCapabilities, CliError> {
+    let manifest = held.root().manifest();
+    let resolved = run_sandbox::resolve_for_run(manifest, &held.sources())?;
+    acknowledge_unsafe_imports(&resolved, manifest, held)?;
+    gate_web_consent(&resolved, manifest, held)?;
+    gate_native_ffi_consent(&resolved, manifest, held)?;
     Ok(ConsentedCapabilities { resolved })
 }
 
@@ -3999,29 +3850,25 @@ pub fn consent_to_capabilities(
 /// (`IPE-S0001`); it never blocks on a prompt. A program with no `.Unsafe` import is untouched.
 ///
 /// # Errors
-/// [`CliError::Usage`] (`IPE-S0001`) when consent is required but absent;
-/// the source-read errors of the provenance scan.
+/// [`CliError::Usage`] (`IPE-S0001`) when consent is required but absent.
 fn acknowledge_unsafe_imports(
     resolved: &run_sandbox::ResolvedCapabilities,
-    manifest_parsed: Option<&project::ProjectManifest>,
-    manifest_path: Option<&Path>,
-    entry: &Path,
+    manifest: &project::ProjectManifest,
+    held: &HeldBuild,
 ) -> Result<(), CliError> {
-    // Short-circuit before any source read when the disclosed capability is
-    // absent — the safe path does no work at all.
+    // Short-circuit before any scan when the disclosed capability is absent —
+    // the safe path does no work at all.
     if !resolved.inferred.contains(&ipe_ir::Capability::Unsafe) {
         return Ok(());
     }
-    let sources = user_sources_for_unsafe_scan(manifest_path, entry)?;
-    let via = unsafe_ack::unsafe_modules_in_sources(sources.iter().map(String::as_str));
-    let manifest_accept = manifest_parsed
-        .map(|m| m.capabilities_accept.clone())
-        .unwrap_or_default();
+    let via =
+        unsafe_ack::unsafe_modules_in_sources(own_sources(held).into_iter().map(|(_, src)| src));
+    let manifest_accept = &manifest.capabilities_accept;
     let mut stdin = std::io::stdin().lock();
     let mut stderr = std::io::stderr().lock();
     unsafe_ack::gate(
         &resolved.inferred,
-        &manifest_accept,
+        manifest_accept,
         &via,
         unsafe_ack::is_interactive(),
         &mut stdin,
@@ -4040,13 +3887,11 @@ fn acknowledge_unsafe_imports(
 /// program that reaches no web capability is untouched.
 ///
 /// # Errors
-/// [`CliError::Pipeline`] (`IPE-S0002`) when a disclosed web axis is ungranted;
-/// the source-read errors of the provenance scan.
+/// [`CliError::Pipeline`] (`IPE-S0002`) when a disclosed web axis is ungranted.
 fn gate_web_consent(
     resolved: &run_sandbox::ResolvedCapabilities,
-    manifest_parsed: Option<&project::ProjectManifest>,
-    manifest_path: Option<&Path>,
-    entry: &Path,
+    manifest: &project::ProjectManifest,
+    held: &HeldBuild,
 ) -> Result<(), CliError> {
     // Short-circuit before any source read when no web axis is disclosed.
     if !resolved
@@ -4056,20 +3901,21 @@ fn gate_web_consent(
     {
         return Ok(());
     }
-    // Provenance over the whole module set (app + siblings + any dep modules the
-    // infer path reads), keyed on the module path so the refusal names the
-    // disclosing module. Total by construction: an inferred axis that no source
-    // attributes is refused as un-attributable, never dropped.
-    let named_sources = named_sources_for_web_scan(manifest_path, entry)?;
+    // Provenance over the project's held `src/` modules, keyed on the module
+    // path so the refusal names the disclosing module. Total by construction:
+    // an inferred axis that no source attributes is refused as
+    // un-attributable, never dropped.
+    let named_sources = own_sources(held);
     let provenance = web_consent::WebAxisProvenance::from_sources(
         named_sources
             .iter()
-            .map(|(name, src)| (name.as_str(), src.as_str())),
+            .map(|(name, src)| (name.as_str(), *src)),
     );
-    let granted = manifest_parsed
-        .map(|m| m.capabilities_accept.clone())
-        .unwrap_or_default();
-    web_consent::gate(&resolved.inferred, &granted, &provenance)
+    web_consent::gate(
+        &resolved.inferred,
+        &manifest.capabilities_accept,
+        &provenance,
+    )
 }
 
 /// The app-boundary native-crossing consent gate, invoked right after the
@@ -4092,53 +3938,41 @@ fn gate_web_consent(
 ///
 /// # Errors
 /// [`CliError::Pipeline`] (`IPE-S0003`) when the disclosed native crossing is
-/// ungranted; the source-read errors of the provenance scan.
+/// ungranted.
 fn gate_native_ffi_consent(
     resolved: &run_sandbox::ResolvedCapabilities,
-    manifest_parsed: Option<&project::ProjectManifest>,
-    manifest_path: Option<&Path>,
-    entry: &Path,
+    manifest: &project::ProjectManifest,
+    held: &HeldBuild,
 ) -> Result<(), CliError> {
     // Short-circuit before any source read when no native crossing is disclosed.
     if !resolved.inferred.contains(&ipe_ir::Capability::NativeFfi) {
         return Ok(());
     }
-    // Provenance over the whole module set (app + siblings + any dep modules the
-    // infer path reads), keyed on the crate so the refusal names the disclosing
-    // `Rust.<Crate>` import. Total by construction: an inferred crossing that no
-    // source attributes is refused as un-attributable, never dropped.
-    let named_sources = named_sources_for_web_scan(manifest_path, entry)?;
+    // Provenance over the project's held `src/` modules, keyed on the crate so
+    // the refusal names the disclosing `Rust.<Crate>` import. Total by
+    // construction: an inferred crossing that no source attributes is refused
+    // as un-attributable, never dropped.
+    let named_sources = own_sources(held);
     let provenance = native_ffi_consent::NativeCrossingProvenance::from_sources(
         named_sources
             .iter()
-            .map(|(name, src)| (name.as_str(), src.as_str())),
+            .map(|(name, src)| (name.as_str(), *src)),
     );
-    let granted = manifest_parsed
-        .map(|m| m.capabilities.clone())
-        .unwrap_or_default();
-    native_ffi_consent::gate(&resolved.inferred, &granted, &provenance)
+    native_ffi_consent::gate(&resolved.inferred, &manifest.capabilities, &provenance)
 }
 
-/// Collect `(dotted-module-name, source)` pairs spanning the app entry and its
-/// siblings (and, when a manifest is present, every discovered package module),
-/// for the web-axis provenance scan. Discovery failures propagate, exactly as
-/// in the `.Unsafe` scan; see [`loose_file_scan_sources`].
-pub fn named_sources_for_web_scan(
-    manifest_path: Option<&Path>,
-    entry: &Path,
-) -> Result<Vec<(String, String)>, CliError> {
-    if let Some(mpath) = manifest_path
-        && let Ok(manifest) = project::parse_manifest(mpath)
-    {
-        let discovered = project::discover_modules(&manifest.src_root)?;
-        let mut out = Vec::with_capacity(discovered.len());
-        for m in &discovered {
-            let src = crate::io_bounded::read_walked_source(m.path())?;
-            out.push((m.module_path().join("."), src));
-        }
-        return Ok(out);
-    }
-    loose_file_scan_sources(entry)
+/// The `src/` modules `held` read, each named by its dotted module path, for a consent gate's provenance scan.
+///
+/// The scan judges the text the build compiles: the held read, never a second
+/// read of the tree, so a module swapped after the read is neither scanned nor
+/// built.
+pub fn own_sources(held: &HeldBuild) -> Vec<(String, &str)> {
+    held.snapshot()
+        .modules()
+        .iter()
+        .filter(|(_, module)| module.origin() == SourceOrigin::Own(SourceDir::Src))
+        .map(|(path, module)| (path.join("."), module.text()))
+        .collect()
 }
 
 /// The type-check every analysis surface demands of a source graph: link, HM
@@ -5483,68 +5317,19 @@ mod progress_chunk_tests {
 }
 
 #[cfg(test)]
-mod loose_host_tests {
-    //! A loose entry file has no manifest window, so a webview request for one
-    //! is refused before anything is read or written, never emitted served.
-
-    use super::emit_into;
-    use crate::delivery::Delivery;
-    use crate::output_dir::{EmitTarget, OwnedDir};
-    use crate::{BuildOptions, CliError, text};
-
-    /// A `web desktop` request for an entry with no manifest is the typed
-    /// usage refusal, and the claimed crate directory stays empty.
-    #[test]
-    fn webview_loose_entry_refused() {
-        let base =
-            ipe_test_temp::temp_root().join(format!("ipe-loose-webview-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).expect("scratch base");
-        let entry = base.join("Main.ipe");
-        std::fs::write(&entry, "module Main exposing (main)\n\nmain =\n    1\n")
-            .expect("write entry");
-        let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
-        let crate_path = crate_dir.path().to_path_buf();
-        let names = || -> Vec<std::ffi::OsString> {
-            let mut names: Vec<_> = std::fs::read_dir(&crate_path)
-                .expect("list crate")
-                .map(|entry| entry.expect("crate entry").file_name())
-                .collect();
-            names.sort();
-            names
-        };
-        let claimed = names();
-        let result = emit_into(
-            &entry,
-            None,
-            &EmitTarget::Claimed(crate_dir),
-            &base,
-            BuildOptions::default(),
-            Delivery::web_desktop().host_intent(),
-        );
-        let after = names();
-        let _ = std::fs::remove_dir_all(&base);
-        assert!(
-            matches!(&result, Err(CliError::Usage(m)) if *m == text::msg::webview_needs_manifest()),
-            "a loose webview request was not refused"
-        );
-        assert_eq!(after, claimed, "the refused request wrote into the crate");
-    }
-}
-
-#[cfg(test)]
 mod parsed_manifest_tests {
-    //! A manifest build emits from the manifest its caller parsed, so the
-    //! settings the caller judged (the release profile's driver, the compile
-    //! target) are the ones the emitted crate links.
+    //! A build emits from the manifest its root resolved with, so the settings
+    //! the caller judged (the release profile's driver, the compile target) are
+    //! the ones the emitted crate links.
 
-    use super::emit_into;
+    use super::HeldBuild;
+    use crate::BuildOptions;
     use crate::delivery::HostIntent;
     use crate::output_dir::{EmitTarget, OwnedDir};
-    use crate::{BuildOptions, project};
+    use crate::project_root::{ProjectRoot, RootArg};
 
-    /// An edit to `package.ipe` after the caller parsed it never reaches the
-    /// emitted crate: the crate links the parsed manifest's driver.
+    /// An edit to `package.ipe` after the root resolved never reaches the
+    /// emitted crate: the crate links the resolved manifest's driver.
     #[test]
     #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
     fn an_edit_after_the_parse_is_not_emitted() {
@@ -5557,7 +5342,11 @@ mod parsed_manifest_tests {
         .field("build = { database = Sqlite }");
         let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
         let manifest_path = fixture.manifest_path();
-        let parsed = project::parse_manifest(&manifest_path).expect("manifest parses");
+        let held = HeldBuild::read(
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("the root resolves"),
+            false,
+        )
+        .expect("the project reads");
         let text = std::fs::read_to_string(&manifest_path).expect("read package.ipe");
         let edited = text.replace("database = Sqlite", "database = Postgres");
         assert_ne!(edited, text, "the fixture declares `database = Sqlite`");
@@ -5569,18 +5358,17 @@ mod parsed_manifest_tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("scratch base");
         let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
-        let emitted = emit_into(
-            &fixture.path().join("src").join("Main.ipe"),
-            Some((&parsed, &manifest_path)),
-            &EmitTarget::Claimed(crate_dir),
-            &runtime,
-            BuildOptions {
-                runtime_dep: true,
-                ..BuildOptions::default()
-            },
-            HostIntent::Served,
-        )
-        .expect("the project emits");
+        let emitted = held
+            .emit(
+                &EmitTarget::Claimed(crate_dir),
+                &runtime,
+                &BuildOptions {
+                    runtime_dep: true,
+                    ..BuildOptions::default()
+                },
+                HostIntent::Served,
+            )
+            .expect("the project emits");
         let cargo_toml =
             std::fs::read_to_string(emitted.path().join("Cargo.toml")).expect("emitted Cargo.toml");
         let _ = std::fs::remove_dir_all(&base);

@@ -22,7 +22,7 @@ use crate::output_dir::OutputRefusal;
 use crate::output_dir::held::{EntryKind, HeldDir};
 use crate::owner_trust::{self, TrustedCache};
 use crate::package_manifest::{PACKAGE_IPE, parse_package_manifest_source};
-use crate::project::{IPE_TOML, ProjectManifest, parse_entry};
+use crate::project::{IPE_TOML, ProjectManifest, WasmConfig, parse_entry};
 use crate::text;
 use crate::verb::Verb;
 
@@ -529,6 +529,11 @@ pub fn entry_set(
     for name in &manifest.exposed_modules {
         library.push(exposed_module(&locate, name)?);
     }
+    if let WasmConfig::On(bundle) = &manifest.wasm
+        && let Some(raw) = &bundle.entry
+    {
+        wasm_entry(raw, root)?;
+    }
     let mut programs = Vec::with_capacity(manifest.programs.len());
     for program in &manifest.programs {
         let module = parse_entry(&program.entry)
@@ -573,6 +578,27 @@ pub fn entry_set(
         .ok_or_else(|| CliError::NoDefaultEntry {
             root: root.to_path_buf(),
         })
+}
+
+/// The module the `[wasm] entry` spelling `raw` names below `src/`.
+///
+/// The spelling is relative to the project root `root`. One that is absolute,
+/// climbs with `..` or names a file outside `src/` escapes the source root and
+/// is refused as [`CliError::EntryEscapes`]; a spelling below `src/` that names
+/// no module is refused as the program entry would be.
+fn wasm_entry(raw: &str, root: &Path) -> Result<ModulePath, CliError> {
+    let escapes = || CliError::EntryEscapes {
+        entry: raw.to_owned(),
+        path: root.join(raw),
+    };
+    let climbs = Path::new(raw)
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)));
+    let below_src = raw
+        .strip_prefix("src/")
+        .filter(|_| !climbs)
+        .ok_or_else(escapes)?;
+    parse_entry(below_src).map_err(|refusal| CliError::manifest_entry_refused(raw, &refusal))
 }
 
 /// The module path of the exposed module `name`, its file present where `locate` looks.
@@ -885,6 +911,61 @@ mod tests {
                 if entry == "Cli/Main.ipe" && *path == s.path().join("src/Cli")
         ));
         assert!(err.to_string().contains("IPE-E0008"));
+    }
+
+    /// A `[wasm] entry` that leaves `src/` escapes the source root; one below it resolves.
+    #[test]
+    fn a_wasm_entry_outside_src_escapes() {
+        for raw in [
+            "../Client.ipe",
+            "src/../../Client.ipe",
+            "/etc/Client.ipe",
+            "Client.ipe",
+            "tests/Client.ipe",
+            "./src/Client.ipe",
+        ] {
+            let s = app("wasm-entry-escape");
+            s.write(
+                PACKAGE_IPE,
+                &manifest_with(&format!(", wasm = On {{ mode = Solo, entry = {raw:?} }}")),
+            );
+            let err = resolve_err(s.path());
+            assert!(
+                matches!(
+                    &err,
+                    CliError::EntryEscapes { entry, path }
+                        if entry == raw && *path == s.path().join(raw)
+                ),
+                "`{raw}` must escape: {err:?}"
+            );
+            assert!(err.to_string().contains("IPE-E0008"), "{err}");
+        }
+        let s = app("wasm-entry-below-src");
+        s.write(
+            PACKAGE_IPE,
+            &manifest_with(", wasm = On { mode = Solo, entry = \"src/Client.ipe\" }"),
+        );
+        let root = resolve(s.path());
+        assert!(
+            root.is_ok(),
+            "an entry below `src/` resolves: {:?}",
+            root.err()
+        );
+    }
+
+    /// A `[wasm] entry` below `src/` that names no module is refused like a program entry.
+    #[test]
+    fn a_wasm_entry_naming_no_module_is_refused() {
+        let s = app("wasm-entry-no-module");
+        s.write(
+            PACKAGE_IPE,
+            &manifest_with(", wasm = On { mode = Solo, entry = \"src/client.ipe\" }"),
+        );
+        let err = resolve_err(s.path());
+        assert!(
+            matches!(&err, CliError::Usage(_)),
+            "a lowercase module file is not a module: {err:?}"
+        );
     }
 
     #[test]
