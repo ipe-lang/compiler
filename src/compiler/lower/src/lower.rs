@@ -39250,11 +39250,12 @@ mod tests {
     /// A `let` chain `x0 = 0`, `x(k+1) = \_ -> xk`, `k` bindings deep,
     /// applied to all `k` arguments: binding `xk` has a `k`-wide flattened arrow.
     fn lambda_chain_source(k: usize) -> String {
+        use std::fmt::Write as _;
         let mut src = String::from("module Main exposing (v)\n\nv =\n    let\n        x0 = 0\n");
         for n in 1..=k {
-            src.push_str(&format!("        x{n} = \\_ -> x{}\n", n - 1));
+            let _ = writeln!(src, "        x{n} = \\_ -> x{}", n - 1);
         }
-        src.push_str(&format!("    in\n    x{k}"));
+        let _ = write!(src, "    in\n    x{k}");
         for _ in 0..k {
             src.push_str(" 0");
         }

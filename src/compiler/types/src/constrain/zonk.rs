@@ -945,10 +945,9 @@ pub fn zonk_reported(
     span: Span,
 ) -> DResult<Ty> {
     let measure = TypeMeasures::default().measure(uf, budget, var)?;
-    match measure.refusal(span) {
-        Some(refusal) => Err(refusal),
-        None => zonk(uf, budget, var),
-    }
+    measure
+        .refusal(span)
+        .map_or_else(|| zonk(uf, budget, var), Err)
 }
 
 /// The stacks one [`read_back`] walk drives: pending tasks, assembled results,
