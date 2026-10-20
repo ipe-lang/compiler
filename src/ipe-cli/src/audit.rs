@@ -61,7 +61,7 @@ use crate::CliError;
 use crate::cli_args::OutputFormat;
 use crate::index::Sha256Hex;
 use crate::project::{ModuleSources, PackageSnapshot, ProjectManifest};
-use crate::project_root::NonEmpty;
+use crate::project_root::{EntrySet, Located, NonEmpty, entry_set};
 use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
 use crate::remote_ingest::{
@@ -1430,66 +1430,42 @@ struct CapturedProgram<'s> {
 
 /// Every program the captured package builds, or `None` for a library.
 ///
-/// The same set [`crate::project_root::ProjectRoot`] resolves, read from the
-/// capture instead of the disk, with the same refusals in the same order: every
-/// exposed module must be held; then the declared programs in manifest order,
-/// else `src/Main.ipe` under the package's name, else no program when the
-/// manifest exposes a module, else the refusal of a package that builds
-/// nothing.
+/// [`crate::project_root::entry_set`] over the capture: the one derivation
+/// [`crate::project_root::ProjectRoot`] reads over the disk, so the audit and
+/// the build can never resolve one manifest to different programs.
 ///
 /// # Errors
-/// [`CliError::ExposedModuleMissing`] when an exposed module is not in the
-/// capture; the manifest-entry refusal of a declared entry that names no
-/// module; [`CliError::EntryMissing`] when a declared program's entry is not
-/// in the capture; [`CliError::NoDefaultEntry`] when the package declares no
-/// program, holds no `src/Main.ipe` and exposes no module.
+/// Every refusal of [`crate::project_root::entry_set`];
+/// [`CliError::EntryMissing`] when a resolved entry is not in the capture.
 fn captured_programs<'s>(
     manifest: &ProjectManifest,
     sources: &'s ModuleSources,
 ) -> Result<Option<NonEmpty<CapturedProgram<'s>>>, CliError> {
-    for name in &manifest.exposed_modules {
-        let held = crate::project::parse_entry(&format!("{}.ipe", name.replace('.', "/")))
-            .is_ok_and(|module| sources.contains_key(&module));
-        if !held {
-            return Err(CliError::ExposedModuleMissing {
-                module: name.clone(),
-            });
-        }
-    }
-    let mut programs = Vec::with_capacity(manifest.programs.len());
-    for program in &manifest.programs {
-        let module = crate::project::parse_entry(&program.entry)
-            .map_err(|refusal| CliError::manifest_entry_refused(&program.entry, &refusal))?;
-        let Some((path, source)) = sources.get(&module) else {
+    let held = |module: &Vec<String>| {
+        Ok(if sources.contains_key(module) {
+            Located::Found
+        } else {
+            Located::Missing
+        })
+    };
+    let EntrySet::Programs(entries) = entry_set(manifest, &manifest.root, held)? else {
+        return Ok(None);
+    };
+    let mut programs = Vec::with_capacity(entries.iter().count());
+    for entry in entries.iter() {
+        let Some((path, source)) = sources.get(entry.module()) else {
             return Err(CliError::EntryMissing {
-                entry: program.entry.clone(),
+                entry: format!("{}.ipe", entry.module().join("/")),
             });
         };
         programs.push(CapturedProgram {
-            name: program.name.clone(),
-            module,
+            name: entry.name().as_str().to_owned(),
+            module: entry.module().to_vec(),
             path,
             source,
         });
     }
-    if programs.is_empty() {
-        let main = vec!["Main".to_owned()];
-        if let Some((path, source)) = sources.get(&main) {
-            programs.push(CapturedProgram {
-                name: manifest.name.clone(),
-                module: main,
-                path,
-                source,
-            });
-        }
-    }
-    let programs = NonEmpty::from_vec(programs);
-    if programs.is_none() && manifest.exposed_modules.is_empty() {
-        return Err(CliError::NoDefaultEntry {
-            root: manifest.root.clone(),
-        });
-    }
-    Ok(programs)
+    Ok(NonEmpty::from_vec(programs))
 }
 
 /// Run the control-model consent gate for every disclosed program.

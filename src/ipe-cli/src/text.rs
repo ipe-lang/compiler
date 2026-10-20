@@ -1021,6 +1021,8 @@ messages! {
     project_symlink_in_source(path) = "project-symlink-in-source";
     /// A file argument lies outside the project's `src/` and `tests/`.
     project_file_outside_root(arg, root) = "project-file-outside-root";
+    /// A build command was given a file where it takes a project directory.
+    project_directory_expected(arg, verb, parent) = "project-directory-expected";
     /// A locked dependency falls within an advisory's affected range.
     cli_advisory_vulnerable(package, version, severity, id, description, fixed_in) =
         "cli-advisory-vulnerable";
