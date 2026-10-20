@@ -2267,8 +2267,7 @@ malformedUidRowUnnamed =
         cleanupProgressScratch at
         Task.succeed
             (List.length history.rows == 2
-                && List.map (\row -> ( whyOf row.entry, Queue.entryUid row.entry, describeLabel row.label )) (List.filter (\row -> Queue.entryUid row.entry == Nothing) history.rows)
-                == [ ( Just Tampered, Nothing, describeLabel Unnamed ) ]
+                && List.map (\row -> ( whyOf row.entry, Queue.entryUid row.entry, describeLabel row.label )) (List.filter (\row -> Queue.entryUid row.entry == Nothing) history.rows) == [ ( Just Tampered, Nothing, describeLabel Unnamed ) ]
             )
 
 
