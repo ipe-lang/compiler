@@ -89,7 +89,9 @@ unitRowSelect =
 
 -- The units among `uids` the index holds under a bound tag, read as
 -- `loadView` reads one: the names History draws for a decision whose row
--- carries no verified name. Every uid and tag is a bound parameter.
+-- carries no verified name. Every uid and tag is a bound parameter. One row
+-- per uid, at most one per uid asked, so a uid the index holds more than
+-- once neither sets the read's size nor crowds another uid out.
 liveUnits : Db.Db -> RootMap -> List Uid -> Task.Task Error (List Unit)
 liveUnits conn roots uids =
     let
@@ -101,14 +103,14 @@ liveUnits conn roots uids =
 
     else
         Db.queryDecode conn
-            (unitRowSelect ++ " WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql ++ " ORDER BY u.uid COLLATE BINARY LIMIT ?")
+            (unitRowSelect ++ " WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql ++ " GROUP BY u.uid COLLATE BINARY ORDER BY u.uid COLLATE BINARY LIMIT ?")
             (List.map Uid.toSql uids ++ bound.params ++ [ SqlInt (List.length uids) ])
             (Db.Decode.map2 withRow coreDecoder shownDecoder)
 
 
 -- The unreviewable files among `uids` the index holds under a bound tag,
 -- each with the label of its stored path, read under `Label.labelCap` as a
--- queue card reads it.
+-- queue card reads it; one row per uid, as `liveUnits` reads.
 liveFiles : Db.Db -> RootMap -> List Uid -> Task.Task Error (List ( Uid, Label ))
 liveFiles conn roots uids =
     let
@@ -120,7 +122,7 @@ liveFiles conn roots uids =
 
     else
         Db.queryDecode conn
-            ("SELECT " ++ shownColumn "u.uid" "uid" ++ ", " ++ shownColumn "u.path" "path" ++ " FROM refusals u WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql ++ " ORDER BY u.uid COLLATE BINARY LIMIT ?")
+            ("SELECT " ++ shownColumn "u.uid" "uid" ++ ", " ++ shownColumn "u.path" "path" ++ " FROM refusals u WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql ++ " GROUP BY u.uid COLLATE BINARY ORDER BY u.uid COLLATE BINARY LIMIT ?")
             (List.map Uid.toSql uids ++ bound.params ++ [ SqlInt (List.length uids) ])
             (Db.Decode.map2 (\fileUid path -> ( fileUid, Label.parse Label.labelCap path )) (wholeUidDecoder "uid") (columnDecoder "path"))
 

@@ -1836,8 +1836,10 @@ unjudgedRefusalFailsSnapshot =
 
 -- An index whose `units` and `refusals` tables were rebuilt without their
 -- primary key holds three rows under one uid: History's live name reads
--- and the unit page read return no more rows than uids asked. Red if a
--- read's row count is set by the index rather than by its own bound.
+-- return one row per uid asked. Asked beside a uid the index holds once,
+-- the repeated uid does not crowd it out of the read. Red if a read's row
+-- count is set by the index rather than by its own bound, or if a repeated
+-- uid takes another uid's row.
 liveReadsBoundedByUids : Task.Task Error Bool
 liveReadsBoundedByUids =
     do
@@ -1847,6 +1849,9 @@ liveReadsBoundedByUids =
         execIndex at.indexDb
             "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
             [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin" ]
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-y"), SqlString "ipe:src/y.bin" ]
         execIndexScript at.indexDb
             ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; "
                 ++ "INSERT INTO units SELECT * FROM units WHERE uid = '"
@@ -1862,8 +1867,18 @@ liveReadsBoundedByUids =
         held <- Db.queryDecode conn "SELECT (SELECT COUNT(*) FROM units WHERE uid = ?) AS units, (SELECT COUNT(*) FROM refusals WHERE uid = ?) AS refusals" [ Uid.toSql (uid "u-a"), Uid.toSql (uid "r-x") ] heldDecoder
         units <- Index.liveUnits conn settings.roots [ uid "u-a" ]
         files <- Index.liveFiles conn settings.roots [ uid "r-x" ]
+        bothUnits <- Index.liveUnits conn settings.roots [ uid "u-a", uid "u-b" ]
+        bothFiles <- Index.liveFiles conn settings.roots [ uid "r-x", uid "r-y" ]
         cleanupIndex at.indexDb at.repo
-        Task.succeed (held == [ ( 3, 3 ) ] && List.length units == 1 && List.length files == 1)
+        Task.succeed
+            (held == [ ( 3, 3 ) ]
+                && List.length units == 1
+                && List.length files == 1
+                && List.length bothUnits == 2
+                && List.any (\unit -> unit.uid == uid "u-b") bothUnits
+                && List.length bothFiles == 2
+                && List.any (\( fileUid, _ ) -> fileUid == uid "r-y") bothFiles
+            )
 
 
 heldDecoder : Db.Decode.Decoder ( Int, Int )
