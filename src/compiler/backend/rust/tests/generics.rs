@@ -472,7 +472,7 @@ fn end_to_end_builds_and_prints_forty_two() -> DResult<()> {
 
 /// The refusal a lowering produced for the instantiation of `empties`'s
 /// generic at the call in [`build_unlowered_pin_program`].
-fn unlowered_pin_refusal() -> Diagnostic {
+const fn unlowered_pin_refusal() -> Diagnostic {
     Diagnostic::Lower {
         span: Span::new(3, 9),
         msg: LowerError::Unsupported(Feature::Polymorphism),
