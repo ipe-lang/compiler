@@ -33,7 +33,7 @@ fn run_no_args_returns_usage_error() {
     );
 }
 
-/// `ipe dev run <entry> --bogus` (unrecognised flag after the entry) must return a
+/// `ipe dev run <dir> --bogus` (unrecognised flag after the directory) must return a
 /// command-usage error for `run` — carrying a reason naming the offending flag,
 /// so the caller shows `run`'s help page — not panic.
 #[test]
@@ -41,7 +41,7 @@ fn run_unknown_flag_returns_usage_error() {
     let args: Vec<String> = vec![
         "dev".to_owned(),
         "run".to_owned(),
-        "Main.ipe".to_owned(),
+        ".".to_owned(),
         "--bogus-flag".to_owned(),
     ];
     let result = ipe::run_cli(&args);
@@ -59,7 +59,7 @@ fn run_unknown_flag_returns_usage_error() {
 // E2E test — only active when IPE_E2E=1 (requires cargo + runtime)
 // ---------------------------------------------------------------------------
 
-/// `ipe dev run <entry.ipe>` must:
+/// `ipe dev run <project-dir>` must:
 ///   1. Compile the Ipê program (exit 0 from ipe pipeline).
 ///   2. Invoke `cargo build` on the emitted project (SEAL check).
 ///   3. Exec the resulting binary; its stdout must equal `"hello from run\n"`.
@@ -249,7 +249,7 @@ fn emitted_cargo_toml_name_matches_binary_ipe_run_will_exec() {
 // Toolchain-absence tests (unconditional — the whole point is NO cargo)
 // ---------------------------------------------------------------------------
 
-/// `ipe dev run <entry.ipe>` under a `PATH` with no `cargo`, and with `CARGO_HOME`
+/// `ipe dev run <project-dir>` under a `PATH` with no `cargo`, and with `CARGO_HOME`
 /// and `HOME` pointed at empty directories so no install location is found,
 /// must fail with the friendly root-cause message — naming Rust/Cargo, why Ipê
 /// needs it, and the rustup fix — rather than the opaque OS spawn error.
@@ -266,19 +266,22 @@ fn run_without_cargo_reports_the_missing_toolchain() {
     // emit). Skip when the repo tree is unavailable (CI without checkout).
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
 
+    let fixture = RootFixture::main(SRC);
+    let Ok(fixture) = fixture else {
+        panic!("write project: {fixture:?}")
+    };
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_run_no_cargo_e2e");
     let _ = fs::remove_dir_all(&dir);
-    let entry = dir.join("Main.ipe");
     let empty_home = dir.join("empty-home");
-    let created = fs::create_dir_all(&empty_home).and_then(|()| fs::write(&entry, SRC));
-    assert!(created.is_ok(), "write source + empty home: {created:?}");
+    let created = fs::create_dir_all(&empty_home);
+    assert!(created.is_ok(), "write empty home: {created:?}");
 
     let ipe_bin = e2e_support::cargo_bin!("ipe");
     // A minimal PATH with no cargo. `/nonexistent-ipe-cargo-probe` cannot hold
     // any executable, so cargo is unresolvable on the PATH.
     let cargoless_path = "/nonexistent-ipe-cargo-probe";
     let out = std::process::Command::new(ipe_bin)
-        .args(["dev", "run", &entry.to_string_lossy(), "--out"])
+        .args(["dev", "run", &fixture.path().to_string_lossy(), "--out"])
         .arg(dir.join("out"))
         .env("PATH", cargoless_path)
         .env("HOME", &empty_home)
@@ -319,4 +322,141 @@ fn run_without_cargo_reports_the_missing_toolchain() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// The build verbs take a project directory, never a file
+// ---------------------------------------------------------------------------
+
+/// The six build verbs, as `ipe` spells them on the command line.
+const BUILD_VERBS: [[&str; 2]; 6] = [
+    ["dev", "build"],
+    ["dev", "run"],
+    ["dev", "watch"],
+    ["release", "build"],
+    ["release", "run"],
+    ["release", "eject"],
+];
+
+/// `ipe <group> <verb> <args…> --out <out>` run from `cwd`, never reaching cargo.
+#[allow(clippy::panic)] // a failed spawn is the test failure
+fn run_verb(
+    cwd: &std::path::Path,
+    verb: [&str; 2],
+    arg: &str,
+    out: &std::path::Path,
+) -> std::process::Output {
+    let ran = std::process::Command::new(e2e_support::cargo_bin!("ipe"))
+        .args(verb)
+        .arg(arg)
+        .arg("--out")
+        .arg(out)
+        .current_dir(cwd)
+        .env("PATH", "/nonexistent-ipe-cargo-probe")
+        .env("HOME", cwd.join("no-home"))
+        .env("CARGO_HOME", cwd.join("no-home/no-cargo"))
+        .env("NO_COLOR", "1")
+        .output();
+    let Ok(ran) = ran else {
+        panic!("failed to spawn ipe: {ran:?}")
+    };
+    ran
+}
+
+/// Each build verb refuses a module file and a `package.ipe` with the exact text, and writes nothing.
+///
+/// Run from the project root, `src/Main.ipe` is refused with the current
+/// directory as the hint and `package.ipe` with its own directory; a nested
+/// `app/package.ipe` names `app`. No output directory is created, so no build
+/// started. A directory with no `package.ipe` is refused as no manifest.
+#[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
+fn the_build_verbs_refuse_a_file_argument() {
+    const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
+    let fixture = RootFixture::main(SRC);
+    let Ok(fixture) = fixture else {
+        panic!("write project: {fixture:?}")
+    };
+    let root = fixture.path();
+    let parent = root.parent().unwrap_or(root);
+    let app = root
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let nested = format!("{app}/package.ipe");
+    for verb in BUILD_VERBS {
+        let spelled = verb.join(" ");
+        for (cwd, arg, hint) in [
+            (root, "src/Main.ipe", "."),
+            (root, "package.ipe", "."),
+            (parent, nested.as_str(), app.as_str()),
+        ] {
+            let out = root.join(format!("out-{}-{}", verb[0], verb[1]));
+            let ran = run_verb(cwd, verb, arg, &out);
+            let stderr = String::from_utf8_lossy(&ran.stderr);
+            assert!(
+                !ran.status.success(),
+                "`ipe {spelled} {arg}` must be refused"
+            );
+            let expected = format!(
+                "error[IPE-E0012]: `{arg}` is a file; `ipe {spelled}` takes a project directory. \
+                 Pass the directory instead: `ipe {spelled} {hint}`"
+            );
+            assert!(
+                stderr.contains(&expected),
+                "`ipe {spelled} {arg}` must say:\n{expected}\ngot:\n{stderr}"
+            );
+            assert!(
+                !out.exists(),
+                "`ipe {spelled} {arg}` must write no output directory"
+            );
+        }
+
+        let bare = root.join("not-a-project");
+        let made = fs::create_dir_all(&bare);
+        assert!(made.is_ok(), "make the bare directory: {made:?}");
+        let out = root.join("out-bare");
+        let ran = run_verb(root, verb, "not-a-project", &out);
+        let stderr = String::from_utf8_lossy(&ran.stderr);
+        let expected = format!(
+            "error[IPE-E0004]: no package.ipe at {}; run `ipe init` there",
+            bare.display()
+        );
+        assert!(
+            stderr.contains(&expected),
+            "`ipe {spelled} not-a-project` must say:\n{expected}\ngot:\n{stderr}"
+        );
+        assert!(
+            !out.exists(),
+            "`ipe {spelled} not-a-project` must write no output directory"
+        );
+    }
+}
+
+/// The neighbour of the refusal: `.` and the root's own path are taken as the project.
+///
+/// Each verb gets past the argument to the build, which then stops at the
+/// missing cargo; neither spelling is refused as a file or as no manifest.
+#[test]
+#[allow(clippy::panic)] // a refused precondition is the test failure
+fn the_build_verbs_take_a_directory_argument() {
+    const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
+    let fixture = RootFixture::main(SRC);
+    let Ok(fixture) = fixture else {
+        panic!("write project: {fixture:?}")
+    };
+    let root = fixture.path();
+    let spelled_root = root.to_string_lossy().into_owned();
+    for verb in BUILD_VERBS {
+        for arg in [".", spelled_root.as_str()] {
+            let out = root.join(format!("out-{}-{}", verb[0], verb[1]));
+            let ran = run_verb(root, verb, arg, &out);
+            let stderr = String::from_utf8_lossy(&ran.stderr);
+            assert!(
+                !stderr.contains("IPE-E0012") && !stderr.contains("IPE-E0004"),
+                "`ipe {} {arg}` must take the directory, got:\n{stderr}",
+                verb.join(" ")
+            );
+            let _ = fs::remove_dir_all(&out);
+        }
+    }
 }

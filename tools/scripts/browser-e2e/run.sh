@@ -47,7 +47,7 @@ serve() {
 
   echo "==> Compiling $name example..."
   rm -rf "$out"
-  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name/package.ipe" --out "$out"
+  "$IPE" dev build "$REPO_ROOT/examples/shapes/web/$name" --out "$out"
 
   echo "==> Cargo-building emitted $name project..."
   cargo build --release --manifest-path "$out/rust/Cargo.toml"

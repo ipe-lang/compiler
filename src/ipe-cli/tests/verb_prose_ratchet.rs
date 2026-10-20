@@ -7,7 +7,10 @@
 //! fails, so this scan walks the tracked tree (`git ls-files`, minus the
 //! trees that carry a reader-facing spelling) and fails on each line that
 //! names the `ipe` binary followed by a bare `build`, `run`, `exec`, `watch`,
-//! or `eject`, or by `release` and anything but one of its verbs.
+//! or `eject`, or by `release` and anything but one of its verbs. The six
+//! grouped build verbs take a project directory, never a file, so one of them
+//! followed by an argument naming an `.ipe` file is refused too; the analysis
+//! verbs (`type-check`, `lint`, ...) still take a module file.
 //!
 //! The scan reads only the trees it lists. A tracked tree it neither lists nor
 //! sets aside is refused, so a new tree cannot slip past unscanned; the files
@@ -92,6 +95,12 @@ const BARE_VERBS: &[&str] = &["build", "run", "exec", "watch", "eject"];
 
 /// The words that may follow `ipe release`.
 const RELEASE_MEMBERS: &[&str] = &["build", "run", "eject", "--help"];
+
+/// The grouped verbs that take a project directory, never a file, by group.
+const DIRECTORY_VERBS: &[(&str, &[&str])] = &[
+    ("dev", &["build", "run", "watch"]),
+    ("release", &["build", "run", "eject"]),
+];
 
 /// Ceiling on the number of tracked files the scan reads.
 const MAX_FILES: usize = 20_000;
@@ -185,7 +194,31 @@ fn refused(line: &str) -> bool {
         let Some(rest) = line.get(inv.end..).and_then(after_blanks) else {
             return false;
         };
-        (!inv.ticked || argued(rest)) && (bare_verb(rest) || foreign_release_word(rest))
+        (!inv.ticked || argued(rest))
+            && (bare_verb(rest) || foreign_release_word(rest) || file_argued_build_verb(rest))
+    })
+}
+
+/// Whether `rest` is a grouped build verb whose first argument names an `.ipe` file.
+///
+/// The argument is the next blank-separated word, without a closing quote,
+/// backtick or trailing punctuation.
+fn file_argued_build_verb(rest: &str) -> bool {
+    DIRECTORY_VERBS.iter().any(|(group, verbs)| {
+        let Some(tail) = rest.strip_prefix(group).and_then(after_blanks) else {
+            return false;
+        };
+        verbs.iter().any(|verb| {
+            tail.strip_prefix(verb)
+                .and_then(after_blanks)
+                .is_some_and(|args| {
+                    let token = args.split_whitespace().next().unwrap_or_default();
+                    let token = token.trim_end_matches(['`', '"', '\'', ',', '.', ';', ':', ')']);
+                    Path::new(token)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("ipe"))
+                })
+        })
     })
 }
 
@@ -390,6 +423,28 @@ fn a_bare_verb_in_prose_is_reported() {
         "`ipe` build --target wasm",
         "`ipe` exec",
         "$IPE release  src/Main.ipe",
+        "ipe dev run src/Main.ipe",
+        "ipe release build src/Main.ipe",
+    ] {
+        assert!(refused(line), "{line:?} must be reported");
+    }
+}
+
+/// A grouped build verb given a module file or a `package.ipe` is reported, each of the six.
+#[test]
+fn a_build_verb_given_a_file_is_reported() {
+    assert_eq!(
+        hits("fixture.md", "ok\nipe dev build src/Main.ipe"),
+        vec!["fixture.md:2: ipe dev build src/Main.ipe".to_owned()]
+    );
+    for line in [
+        "ipe dev build package.ipe",
+        "ipe dev watch Main.ipe --port 8000",
+        "run `ipe release eject src/Main.ipe` once",
+        "ipe release run src/Main.ipe.",
+        "\"$IPE\" dev build \"$dir/package.ipe\" --out out",
+        "${IPEC_BIN} release build tests/golden/x/src/Main.ipe",
+        "ipe.exe dev  run  SRC/MAIN.IPE",
     ] {
         assert!(refused(line), "{line:?} must be reported");
     }
@@ -399,8 +454,14 @@ fn a_bare_verb_in_prose_is_reported() {
 fn a_grouped_verb_is_not_reported() {
     for line in [
         "run `ipe dev build` now",
-        "ipe dev run src/Main.ipe",
-        "ipe release build src/Main.ipe",
+        "ipe dev run",
+        "ipe dev build . --out out",
+        "ipe release build examples/app",
+        "ipe type-check src/Main.ipe",
+        "ipe dev lint src/Helper.ipe",
+        "ipe fmt src/Main.ipe",
+        "ipe dev build --target wasm",
+        "ipe dev build web solo",
         "ipe release run dist/app",
         "ipe release eject out/",
         "ipe release --help",

@@ -1,12 +1,12 @@
 Compile a program as a development build and run the resulting binary.
 
 ```
-ipe dev run [<path>]
+ipe dev run [<dir>]
 ```
 
 ## Arguments
 
-A source file, a project directory, or a package.ipe. Defaults to the current project.
+A project directory (default: the current directory).
 
 ## Options
 

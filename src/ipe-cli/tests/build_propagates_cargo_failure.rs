@@ -53,10 +53,13 @@ fn build_propagates_a_failed_emitted_cargo_build() {
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipe_build_cargo_fail_e2e");
     let _ = fs::remove_dir_all(&dir);
     let bin_dir = dir.join("fakebin");
-    let entry = dir.join("Main.ipe");
     let out_dir = dir.join("out");
-    let setup = fs::create_dir_all(&bin_dir).and_then(|()| fs::write(&entry, SRC));
-    assert!(setup.is_ok(), "write source + fake-bin dir: {setup:?}");
+    let setup = fs::create_dir_all(&bin_dir);
+    assert!(setup.is_ok(), "make the fake-bin dir: {setup:?}");
+    let fixture = ipe::RootFixture::main(SRC);
+    let Ok(fixture) = fixture else {
+        panic!("write project: {fixture:?}")
+    };
 
     let fake_cargo = write_failing_cargo(&bin_dir);
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
@@ -65,7 +68,7 @@ fn build_propagates_a_failed_emitted_cargo_build() {
     // and no real cargo can be reached. `sh` is invoked by the fake cargo via
     // its shebang, which the kernel resolves without consulting PATH.
     let out = std::process::Command::new(ipe_bin)
-        .args(["dev", "build", &entry.to_string_lossy(), "--out"])
+        .args(["dev", "build", &fixture.path().to_string_lossy(), "--out"])
         .arg(&out_dir)
         .env("PATH", &bin_dir)
         .env("IPE_RUNTIME_DIR", &runtime_dir)

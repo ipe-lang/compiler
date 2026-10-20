@@ -2149,8 +2149,8 @@ mod tests {
         );
     }
 
-    /// A bare `package.ipe` filename (as `ipe dev build package.ipe` passes it from
-    /// inside the project dir) has an EMPTY parent, not an absolute one. The
+    /// A bare `package.ipe` filename (as a caller passes it from inside the
+    /// project dir) has an EMPTY parent, not an absolute one. The
     /// path-containment root must resolve to the current directory, so a
     /// legitimate in-tree `src/` is accepted rather than refused as an escape.
     #[test]
@@ -2164,7 +2164,7 @@ mod tests {
             format!("{HEADER}package =\n    {{ name = \"bare\" }}\n"),
         )
         .expect("write package.ipe");
-        // `ipe dev build package.ipe` runs with cwd == project root and a bare path.
+        // The caller runs with cwd == project root and a bare path.
         let _guard = CWD_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
