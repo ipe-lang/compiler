@@ -725,6 +725,12 @@ fn type_prose(msg: &TypeError) -> String {
         TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             "Type checking this took longer than I'm allowed to spend on it.".to_string()
         }
+        TypeError::TypeTooDeep { depth, limit } => {
+            format!("The type of this value nests {depth} levels deep, past the limit of {limit}.")
+        }
+        TypeError::TypeTooLarge { limit } => {
+            format!("The type of this value is built from more than {limit} parts.")
+        }
     }
 }
 
@@ -1952,6 +1958,13 @@ fn type_label(msg: &TypeError) -> Option<String> {
                 ty_to_string(found)
             ),
         }),
+        TypeError::TypeTooDeep { limit, .. } => Some(format!(
+            "this value's type nests more than {limit} levels deep, which the generated \
+             Rust cannot build"
+        )),
+        TypeError::TypeTooLarge { limit } => Some(format!(
+            "this value's type unfolds to more than {limit} parts"
+        )),
         TypeError::Mismatch | TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             None
         }

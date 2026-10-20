@@ -31,7 +31,8 @@ use crate::code::{
     IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067,
     IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001,
     IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014,
-    IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, Severity,
+    IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022,
+    IPE_T0023, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -1205,6 +1206,17 @@ pub enum TypeError {
         parameter: usize,
         dependence: WildcardDependence,
     },
+    /// A type nests deeper than the checker's type ceiling. [IPE-T0022]
+    ///
+    /// `depth` is the measured depth, saturated at `u16::MAX`, and `limit` the
+    /// ceiling it passed. The type itself is never carried: printing a type
+    /// past the ceiling would walk that same depth.
+    TypeTooDeep { depth: u16, limit: u16 },
+    /// A type unfolds to more nodes than the checker's size ceiling. [IPE-T0023]
+    ///
+    /// `limit` is the node ceiling. The type itself is never carried: printing
+    /// it would unfold every one of those nodes.
+    TypeTooLarge { limit: u64 },
 }
 
 /// Why a wildcard `any` parameter has no independent lowering, under
@@ -2553,7 +2565,9 @@ impl Diagnostic {
                 | TypeError::OrPatternBindingMismatch { .. }
                 | TypeError::TaskArity { .. }
                 | TypeError::WebViewReturnsHtml
-                | TypeError::WildcardNotIndependent { .. } => Severity::Error,
+                | TypeError::WildcardNotIndependent { .. }
+                | TypeError::TypeTooDeep { .. }
+                | TypeError::TypeTooLarge { .. } => Severity::Error,
             },
             Self::CompilerBug { .. } => Severity::Bug,
         }
@@ -2805,6 +2819,8 @@ const fn type_code(msg: &TypeError) -> Code {
         TypeError::TaskArity { .. } => IPE_T0016,
         TypeError::WebViewReturnsHtml => IPE_T0020,
         TypeError::WildcardNotIndependent { .. } => IPE_T0021,
+        TypeError::TypeTooDeep { .. } => IPE_T0022,
+        TypeError::TypeTooLarge { .. } => IPE_T0023,
     })
 }
 
@@ -3066,6 +3082,18 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
              `Web.tea` `view`, prefer returning the inner \
              `Element` directly (annotate `view : Model -> Element Msg`) and let \
              the shape apply `Ui.layout` for you."
+                .into(),
+        )],
+        TypeError::TypeTooDeep { .. } => vec![HelpLine::Note(
+            "each binding whose value wraps the one before it adds a level to its \
+             type. Give an intermediate level a named type (a `type alias` or a \
+             custom type), or restructure the chain so no value nests this deep."
+                .into(),
+        )],
+        TypeError::TypeTooLarge { .. } => vec![HelpLine::Note(
+            "a value that holds the same value twice doubles its type each time. \
+             Name the repeated part with its own custom type, or build the \
+             structure from a list instead of nested pairs."
                 .into(),
         )],
         TypeError::WildcardNotIndependent { .. } => vec![HelpLine::Note(
