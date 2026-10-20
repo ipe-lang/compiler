@@ -792,30 +792,32 @@ fn post_signing_key(
 ) -> Result<(), RegistrationError> {
     let body = serde_json::json!({ "title": title, "key": public_key.as_str() }).to_string();
     let authorization = Zeroizing::new(format!("Bearer {}", token.as_str()));
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .build();
-    let result = agent
+    let result = crate::net::agent(Duration::from_secs(30))
         .post(SIGNING_KEYS_API)
-        .set("User-Agent", "ipe-cli")
-        .set("Accept", "application/vnd.github+json")
-        .set("X-GitHub-Api-Version", "2022-11-28")
-        .set("Content-Type", "application/json")
-        .set("Authorization", &authorization)
-        .send_string(&body);
+        .header("User-Agent", "ipe-cli")
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("Content-Type", "application/json")
+        .header("Authorization", authorization.as_str())
+        .send(body.as_str());
+    registration_outcome(result)
+}
+
+/// The registration verdict of one `POST` answer: only `201 Created` counts.
+fn registration_outcome(
+    result: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<(), RegistrationError> {
     match result {
-        Ok(response) if response.status() == 201 => Ok(()),
+        Ok(response) if response.status().as_u16() == 201 => Ok(()),
         Ok(response) => Err(RegistrationError::Refused {
-            status: response.status(),
+            status: response.status().as_u16(),
             message: github_message(response),
         }),
-        Err(ureq::Error::Status(status, response)) => Err(RegistrationError::Refused {
+        Err(ureq::Error::StatusCode(status)) => Err(RegistrationError::Refused {
             status,
-            message: github_message(response),
+            message: echoed_message(""),
         }),
-        Err(ureq::Error::Transport(transport)) => {
-            Err(RegistrationError::Transport(transport.to_string()))
-        }
+        Err(transport) => Err(RegistrationError::Transport(transport.to_string())),
     }
 }
 
@@ -825,9 +827,10 @@ fn post_signing_key(
 /// The body is read through [`crate::remote_ingest::read_capped`] at
 /// [`crate::remote_ingest::JSON_RESPONSE_MAX_BYTES`]; an over-budget body
 /// carries no message.
-fn github_message(response: ureq::Response) -> String {
+fn github_message(response: ureq::http::Response<ureq::Body>) -> String {
+    let body = response.into_body();
     let message = crate::remote_ingest::read_capped(
-        response.into_reader(),
+        body.into_reader(),
         crate::remote_ingest::JSON_RESPONSE_MAX_BYTES,
         crate::remote_ingest::IngestSource::GithubApi,
     )
@@ -1774,5 +1777,45 @@ mod tests {
         let missing = status_line(None, Some(dir.as_path()));
         assert!(missing.contains("ipe login --signing-key"), "{missing:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An HTTP answer with `status` and `body`, as the agent hands it back.
+    fn answer(status: u16, body: &str) -> ureq::http::Response<ureq::Body> {
+        ureq::http::Response::builder()
+            .status(status)
+            .body(ureq::Body::builder().data(body.as_bytes().to_vec()))
+            .unwrap()
+    }
+
+    #[test]
+    fn only_created_counts_as_registered() {
+        assert!(registration_outcome(Ok(answer(201, ""))).is_ok());
+        for status in [200, 204, 302, 422, 500] {
+            let outcome = registration_outcome(Ok(answer(status, r#"{"message":"no"}"#)));
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(RegistrationError::Refused { status: s, message })
+                        if *s == status && message == "no"
+                ),
+                "status {status} must be refused with its message: {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_and_transport_errors_are_refusals() {
+        assert!(matches!(
+            registration_outcome(Err(ureq::Error::StatusCode(401))),
+            Err(RegistrationError::Refused { status: 401, .. })
+        ));
+        assert!(matches!(
+            registration_outcome(Err(ureq::Error::Timeout(ureq::Timeout::Global))),
+            Err(RegistrationError::Transport(_))
+        ));
+        assert!(matches!(
+            registration_outcome(Err(ureq::Error::TooManyRedirects)),
+            Err(RegistrationError::Transport(_))
+        ));
     }
 }

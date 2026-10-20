@@ -1863,7 +1863,14 @@ fn proofs(scans: &Scans, inventory: &Inventory<'_>) -> Vec<String> {
 }
 
 /// Unbounded `ureq` body reads, whitespace removed.
-const UNBOUNDED_BODY_READS: &[&str] = &[".into_json(", ".into_string()"];
+const UNBOUNDED_BODY_READS: &[&str] = &[
+    ".read_to_string()",
+    ".read_to_vec()",
+    ".read_json(",
+    ".as_reader()",
+    ".with_config()",
+    ".into_with_config()",
+];
 
 /// The one bounded body read: a response reader handed straight to `read_capped`.
 const READER: &str = ".into_reader()";
@@ -1982,8 +1989,13 @@ fn no_ureq_body_read_is_unbounded() {
 #[test]
 fn matcher_refuses_each_bypass() {
     let refused = [
-        "use ureq; let v: Value = resp.into_json()?;",
-        "use ureq; let s = resp.into_string()?;",
+        "use ureq; let s = resp.body_mut().read_to_string()?;",
+        "use ureq; let v = resp.body_mut().read_to_vec()?;",
+        "use ureq; let v: Value = resp.body_mut().read_json()?;",
+        "use ureq; let r = resp.body_mut().as_reader();",
+        "use ureq; let r = resp.body_mut().with_config().reader();",
+        "use ureq; let r = resp.into_body().into_with_config().reader();",
+        "read_capped(resp.into_body().into_reader(), MAX)",
         "let r = resp.into_reader();",
         "read_capped(std::io::empty()).and(resp.into_reader())",
         "read_capped(\n  (resp).into_reader(), 4)",
@@ -2000,6 +2012,7 @@ fn matcher_refuses_each_bypass() {
 fn matcher_admits_the_bounded_forms() {
     let admitted = [
         "remote_ingest::read_capped(\n    response.into_reader(),\n    MAX,\n)",
+        "use ureq; let body = response.into_body(); read_capped(body.into_reader(), MAX)",
         "Git::isolated(dir).args([\"fetch\"])",
         "use std::process::Command;",
         "let s = value.into_string();",
