@@ -1964,16 +1964,112 @@ fn reaches_client(visit: impl FnOnce(&mut ClientNamed)) -> bool {
     named.0
 }
 
-/// Whether one item of an impl block carries a client type out: an exported
-/// fn's signature of an inherent impl, the return type of a trait impl's fn,
-/// and any associated type or const. A trait impl's fn inputs only take a
-/// client value in, which no other file can produce.
+/// Whether `path` is exactly `names`, segment by segment, with no generic
+/// arguments, a leading `::` or not.
+fn plain_path(path: &syn::Path, names: &[&str]) -> bool {
+    path.segments.len() == names.len()
+        && path
+            .segments
+            .iter()
+            .zip(names)
+            .all(|(segment, name)| segment.arguments.is_none() && name_of(&segment.ident) == *name)
+}
+
+/// Whether `ty` is the plain path `names`.
+fn is_plain_type(ty: &Type, names: &[&str]) -> bool {
+    matches!(ty, Type::Path(p) if p.qself.is_none() && plain_path(&p.path, names))
+}
+
+/// Whether `ty` is the client's error type.
+fn is_client_error(ty: &Type) -> bool {
+    is_plain_type(ty, &[HTTP_CLIENT, "Error"])
+}
+
+/// Whether `path` is `From<CLIENT::Error>`.
+fn is_from_client_error(path: &syn::Path) -> bool {
+    path.segments.len() == 1
+        && path.segments.first().is_some_and(|segment| {
+            name_of(&segment.ident) == "From" && match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.len() == 1
+                    && args.args.first().is_some_and(
+                        |arg| matches!(arg, syn::GenericArgument::Type(ty) if is_client_error(ty)),
+                    ),
+                syn::PathArguments::None | syn::PathArguments::Parenthesized(_) => false,
+            }
+        })
+}
+
+/// Whether `sig` is `fn from(_: CLIENT::Error) -> Self`.
+fn is_conversion_fn(sig: &Signature) -> bool {
+    name_of(&sig.ident) == "from"
+        && sig.generics.params.is_empty()
+        && sig.generics.where_clause.is_none()
+        && sig.variadic.is_none()
+        && sig.inputs.len() == 1
+        && sig
+            .inputs
+            .first()
+            .is_some_and(|input| matches!(input, FnArg::Typed(arg) if is_client_error(&arg.ty)))
+        && matches!(&sig.output, ReturnType::Type(_, ty) if is_plain_type(ty, &["Self"]))
+}
+
+/// Whether `i` is `impl From<CLIENT::Error> for Error`, the conversion of a
+/// client failure into `net`'s typed error: the one trait impl whose surface
+/// may name the client, as it only takes a client value in, by value.
+fn is_error_conversion(i: &ItemImpl) -> bool {
+    i.trait_
+        .as_ref()
+        .is_some_and(|(path, _)| is_from_client_error(path))
+        && i.unsafety.is_none()
+        && i.modifiers.defaultness.is_none()
+        && i.modifiers.polarity.is_none()
+        && i.generics.params.is_empty()
+        && i.generics.where_clause.is_none()
+        && is_plain_type(&i.self_ty, &["Error"])
+        && i.items.len() == 1
+        && i.items
+            .first()
+            .is_some_and(|item| matches!(item, ImplItem::Fn(f) if is_conversion_fn(&f.sig)))
+}
+
+/// Whether an impl block's surface carries a client type: its generics, its
+/// self type, its trait path, and each item by [`impl_item_exports_client`].
+/// A trait impl is reachable wherever its trait and self type are, so it is
+/// read whole, save the one [`is_error_conversion`] shape.
+fn impl_exports_client(i: &ItemImpl) -> bool {
+    if is_error_conversion(i) {
+        return false;
+    }
+    let trait_impl = i.trait_.is_some();
+    reaches_client(|n| {
+        n.visit_generics(&i.generics);
+        n.visit_type(&i.self_ty);
+        if let Some((path, _)) = &i.trait_ {
+            n.visit_path(path);
+        }
+    }) || i
+        .items
+        .iter()
+        .any(|member| impl_item_exports_client(member, trait_impl))
+}
+
+/// Whether one item of an impl block carries a client type: the whole
+/// signature of every fn of a trait impl — a callback input hands a client
+/// value out as surely as a return type does — and of an exported fn of an
+/// inherent impl, and any associated type or const.
 fn impl_item_exports_client(item: &ImplItem, trait_impl: bool) -> bool {
     match item {
-        ImplItem::Fn(f) if trait_impl => reaches_client(|n| n.visit_return_type(&f.sig.output)),
-        ImplItem::Fn(f) => exported(&f.vis) && reaches_client(|n| n.visit_signature(&f.sig)),
-        ImplItem::Const(c) => reaches_client(|n| n.visit_type(&c.ty)),
-        ImplItem::Type(t) => reaches_client(|n| n.visit_type(&t.ty)),
+        ImplItem::Fn(f) => {
+            (trait_impl || exported(&f.vis)) && reaches_client(|n| n.visit_signature(&f.sig))
+        }
+        ImplItem::Const(c) => reaches_client(|n| {
+            n.visit_generics(&c.generics);
+            n.visit_type(&c.ty);
+        }),
+        ImplItem::Type(t) => reaches_client(|n| {
+            n.visit_generics(&t.generics);
+            n.visit_type(&t.ty);
+        }),
         ImplItem::Macro(m) => names_client(&m.mac.tokens.to_string()),
         ImplItem::Verbatim(tokens) => names_client(&tokens.to_string()),
         // `ImplItem` is non-exhaustive: an item kind this scan cannot read is
@@ -1993,12 +2089,7 @@ fn exports_client(item: &Item) -> bool {
         }
         Item::Fn(f) => exported(&f.vis) && reaches_client(|n| n.visit_signature(&f.sig)),
         Item::ForeignMod(f) => reaches_client(|n| n.visit_item_foreign_mod(f)),
-        Item::Impl(i) => {
-            reaches_client(|n| n.visit_type(&i.self_ty))
-                || i.items
-                    .iter()
-                    .any(|member| impl_item_exports_client(member, i.trait_.is_some()))
-        }
+        Item::Impl(i) => impl_exports_client(i),
         Item::Macro(m) => names_client(&m.mac.tokens.to_string()),
         Item::Mod(_) => false,
         Item::Static(st) => exported(&st.vis) && reaches_client(|n| n.visit_type(&st.ty)),
@@ -2320,6 +2411,13 @@ fn surface_checks_refuse_each_export() {
         "pub const C: Option<CLIENT::Agent> = None;",
         "pub enum E { Body(CLIENT::Body) }",
         "macro_rules! m { () => { CLIENT::agent() } }",
+        "impl crate::x::WithBody<CLIENT::Body> for Answer { fn with(&self, f: &mut dyn FnMut(CLIENT::Body)) {} }",
+        "impl crate::x::WithBody for Answer { fn with(&self, f: &mut dyn FnMut(CLIENT::Body)) {} }",
+        "impl crate::x::Tr<CLIENT::Body> for Answer {}",
+        "impl<F: FnOnce(CLIENT::Body)> Tr for A<F> {}",
+        "impl<F> Tr for A<F> where F: FnOnce(CLIENT::Body) {}",
+        "impl<F: FnOnce(CLIENT::Body)> A<F> { pub fn run(self) {} }",
+        "mod tests { impl Tr for A { fn with(&self, f: impl FnOnce(CLIENT::Body)) {} } }",
     ];
     for sample in exported_samples {
         let sample = sample.replace("CLIENT", HTTP_CLIENT);
@@ -2346,6 +2444,45 @@ fn surface_checks_refuse_each_export() {
     let lock = "[[package]]\nname = \"ipe-lsp\"\ndependencies = [\n \"CLIENT 3.4.2\",\n]\n"
         .replace("CLIENT", HTTP_CLIENT);
     assert_eq!(client_dependents(&lock), ["ipe-lsp"]);
+}
+
+#[test]
+fn surface_checks_admit_only_the_error_conversion() {
+    let leaks = |sample: &str| {
+        let sample = sample.replace("CLIENT", HTTP_CLIENT);
+        let mut leaked = Vec::new();
+        leaked_client(
+            &syn::parse_file(&sample).expect("sample parses").items,
+            "net",
+            &mut leaked,
+        );
+        !leaked.is_empty()
+    };
+    let conversion =
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }";
+    assert!(!leaks(conversion), "the error conversion must be admitted");
+    for mutated in [
+        "impl From<CLIENT::Body> for Error { fn from(e: CLIENT::Body) -> Self { x(e) } }",
+        "impl Into<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Other { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error<T> { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl<T> From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error where CLIENT::Body: Sized { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error { fn from(e: &mut dyn FnMut(CLIENT::Error)) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> CLIENT::Error { e } }",
+        "impl From<CLIENT::Error> for Error { fn from<F: FnOnce(CLIENT::Body)>(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } fn body(&self, f: impl FnOnce(CLIENT::Body)) {} }",
+        "impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } type Body = CLIENT::Body; }",
+        "impl From<CLIENT::Error<CLIENT::Body>> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl From<CLIENT::Error, CLIENT::Body> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "impl x::From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+        "unsafe impl From<CLIENT::Error> for Error { fn from(e: CLIENT::Error) -> Self { x(e) } }",
+    ] {
+        assert!(
+            leaks(mutated),
+            "only the exact error conversion is admitted: {mutated}"
+        );
+    }
 }
 
 #[test]
