@@ -1190,24 +1190,20 @@ storedPure loaded long ok yes =
             && has "ipe:src/b.rs" goneHistory
             && has ":9" goneHistory
             && has "no longer indexed" goneHistory
-            && longestHexRun goneHistory
-            < 64
+            && longestHexRun goneHistory < 64
             && has "crate::FILE" indexedHistory
             && not (has "no longer indexed" indexedHistory)
-            && longestHexRun (Uid.toString (LibDb.verifiedUid yes))
-            >= 64
+            && longestHexRun (Uid.toString (LibDb.verifiedUid yes)) >= 64
       )
     , ( "a History entry of a file gone from the index shows its path and says it is no longer indexed, with no uid"
       , has "ipe:src/blob.bin" goneFileHistory
             && has "no longer indexed" goneFileHistory
-            && longestHexRun goneFileHistory
-            < 64
+            && longestHexRun goneFileHistory < 64
       )
     , ( "an unnamed History entry shows its fixed text and its short body hash, and no uid"
       , has "unit no longer indexed (no verified record of its name)" unnamedHistory
             && has "h-yes" unnamedHistory
-            && longestHexRun unnamedHistory
-            < 64
+            && longestHexRun unnamedHistory < 64
             && not (has "no verified record of its name" goneHistory)
       )
     ]

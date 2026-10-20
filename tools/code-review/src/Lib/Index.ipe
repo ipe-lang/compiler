@@ -75,7 +75,7 @@ unitByUid roots uid =
         bound =
             boundTags roots
     in
-    ( unitRowSelect ++ " WHERE u.uid = ? AND" ++ bound.sql
+    ( unitRowSelect ++ " WHERE u.uid = ? AND" ++ bound.sql ++ " LIMIT 1"
     , Uid.toSql uid :: bound.params
     )
 
@@ -101,8 +101,8 @@ liveUnits conn roots uids =
 
     else
         Db.queryDecode conn
-            (unitRowSelect ++ " WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql)
-            (List.map Uid.toSql uids ++ bound.params)
+            (unitRowSelect ++ " WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql ++ " ORDER BY u.uid COLLATE BINARY LIMIT ?")
+            (List.map Uid.toSql uids ++ bound.params ++ [ SqlInt (List.length uids) ])
             (Db.Decode.map2 withRow coreDecoder shownDecoder)
 
 
@@ -120,8 +120,8 @@ liveFiles conn roots uids =
 
     else
         Db.queryDecode conn
-            ("SELECT " ++ shownColumn "u.uid" "uid" ++ ", " ++ shownColumn "u.path" "path" ++ " FROM refusals u WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql)
-            (List.map Uid.toSql uids ++ bound.params)
+            ("SELECT " ++ shownColumn "u.uid" "uid" ++ ", " ++ shownColumn "u.path" "path" ++ " FROM refusals u WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql ++ " ORDER BY u.uid COLLATE BINARY LIMIT ?")
+            (List.map Uid.toSql uids ++ bound.params ++ [ SqlInt (List.length uids) ])
             (Db.Decode.map2 (\fileUid path -> ( fileUid, Label.parse Label.labelCap path )) (wholeUidDecoder "uid") (columnDecoder "path"))
 
 

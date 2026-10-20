@@ -31,7 +31,7 @@ import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Label as Label
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Presence(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
@@ -2874,6 +2874,10 @@ checks =
                     , check "a legacy row of a deleted unit is unnamed" historyLegacyRowOfDeletedUnitUnnamed
                     , check "an acknowledged file keeps its signed path on History after its refusal row is gone" historyNamesFileDecision
                     , check "a decision on a unit whose name is past the ceiling is refused and writes nothing" decideRefusedWhenNamePastCeiling
+                    , check "a decision on a unit whose qualified name is empty is refused and writes nothing" (decideRefusedWhenNameUnreadable "empty" "UPDATE units SET qualified = '' WHERE uid = ?")
+                    , check "a decision on a unit whose qualified name holds a NUL is refused and writes nothing" (decideRefusedWhenNameUnreadable "nul" "UPDATE units SET qualified = 'Lib.' || char(0) || 'answer' WHERE uid = ?")
+                    , check "a decision on a file unit that starts at a negative line is refused and writes nothing, and lands at line 0" decideRefusedWhenLineNegative
+                    , check "an acknowledgement of a file whose path is past the ceiling is refused and writes nothing" refusalDecisionRefusedWhenPathPastCeiling
                     ]
         Task.succeed (first ++ rest ++ named)
 
@@ -2898,13 +2902,13 @@ describeLabel label =
 describePlace : Queue.Place -> String
 describePlace place =
     case place of
-        Queue.Named ->
+        Named ->
             ""
 
-        Queue.At path line ->
+        At path line ->
             " at " ++ labelText path ++ ":" ++ String.fromInt line
 
-        Queue.AtUnit path line _ ->
+        AtUnit path line _ ->
             " at unit " ++ labelText path ++ ":" ++ String.fromInt line
 
 
@@ -2964,10 +2968,8 @@ historyNamesDeletedUnit =
         after <- loadHistoryPageNow HistoryStart
         cleanupProgressScratch at
         Task.succeed
-            (labelsFor "u-a" before
-                == [ answerLabel ]
-                && labelsFor "u-a" after
-                == [ answerLabel ++ " (no longer indexed)" ]
+            (labelsFor "u-a" before == [ answerLabel ]
+                && labelsFor "u-a" after == [ answerLabel ++ " (no longer indexed)" ]
                 && List.all (\row -> isVerifiedEntry row.entry) after.rows
             )
 
@@ -3017,21 +3019,14 @@ historyLabelsTellApart =
         page <- loadHistoryPageNow HistoryStart
         cleanupProgressScratch at
         Task.succeed
-            (List.length page.rows
-                == 7
+            (List.length page.rows == 7
                 && List.all (\row -> isVerifiedEntry row.entry) page.rows
-                && labelsFor "h-file-a" page
-                == [ "unit const crate::FILE at ipe:src/a.rs:1" ++ gone ]
-                && labelsFor "h-file-b1" page
-                == [ "unit const crate::FILE at ipe:src/b.rs:1" ++ gone ]
-                && labelsFor "h-file-b9" page
-                == [ "unit const crate::FILE at ipe:src/b.rs:9" ++ gone ]
-                && labelsFor "h-struct" page
-                == [ "unit struct StaticRegex" ++ gone ]
-                && labelsFor "h-impl" page
-                == [ "unit impl StaticRegex" ++ gone ]
-                && labelsFor "h-twice" page
-                == [ "unit fn Lib.twice" ++ gone, "unit fn Lib.twice" ++ gone ]
+                && labelsFor "h-file-a" page == [ "unit const crate::FILE at ipe:src/a.rs:1" ++ gone ]
+                && labelsFor "h-file-b1" page == [ "unit const crate::FILE at ipe:src/b.rs:1" ++ gone ]
+                && labelsFor "h-file-b9" page == [ "unit const crate::FILE at ipe:src/b.rs:9" ++ gone ]
+                && labelsFor "h-struct" page == [ "unit struct StaticRegex" ++ gone ]
+                && labelsFor "h-impl" page == [ "unit impl StaticRegex" ++ gone ]
+                && labelsFor "h-twice" page == [ "unit fn Lib.twice" ++ gone, "unit fn Lib.twice" ++ gone ]
             )
 
 
@@ -3054,12 +3049,9 @@ historyNeverDrawsUnverifiedName =
         tampered <- loadHistoryPageNow HistoryStart
         cleanupProgressScratch at
         Task.succeed
-            (labelsFor "h-gone" verified
-                == [ "unit fn Lib.gone (no longer indexed)" ]
-                && labelsFor "h-gone" tampered
-                == [ "unnamed" ]
-                && List.map (\r -> whyOf r.entry) tampered.rows
-                == [ Just Tampered ]
+            (labelsFor "h-gone" verified == [ "unit fn Lib.gone (no longer indexed)" ]
+                && labelsFor "h-gone" tampered == [ "unnamed" ]
+                && List.map (\r -> whyOf r.entry) tampered.rows == [ Just Tampered ]
             )
 
 
@@ -3083,12 +3075,9 @@ historyUnverifiedRowNamedLive =
         gone <- loadHistoryPageNow HistoryStart
         cleanupProgressScratch at
         Task.succeed
-            (labelsFor "u-a" live
-                == [ answerLabel ]
-                && labelsFor "u-a" gone
-                == [ "unnamed" ]
-                && List.map (\r -> whyOf r.entry) live.rows
-                == [ Just Tampered ]
+            (labelsFor "u-a" live == [ answerLabel ]
+                && labelsFor "u-a" gone == [ "unnamed" ]
+                && List.map (\r -> whyOf r.entry) live.rows == [ Just Tampered ]
             )
 
 
@@ -3106,12 +3095,9 @@ historyLegacyRowOfDeletedUnitUnnamed =
         gone <- loadHistoryPageNow HistoryStart
         cleanupProgressScratch at
         Task.succeed
-            (labelsFor "u-a" live
-                == [ answerLabel ]
-                && labelsFor "u-a" gone
-                == [ "unnamed" ]
-                && List.map (\r -> whyOf r.entry) gone.rows
-                == [ Just Legacy ]
+            (labelsFor "u-a" live == [ answerLabel ]
+                && labelsFor "u-a" gone == [ "unnamed" ]
+                && List.map (\r -> whyOf r.entry) gone.rows == [ Just Legacy ]
             )
 
 
@@ -3133,10 +3119,8 @@ historyNamesFileDecision =
         after <- loadHistoryPageNow HistoryStart
         cleanupProgressScratch at
         Task.succeed
-            (labelsFor "r-big" before
-                == [ "file ipe:src/big.txt" ]
-                && labelsFor "r-big" after
-                == [ "file ipe:src/big.txt (no longer indexed)" ]
+            (labelsFor "r-big" before == [ "file ipe:src/big.txt" ]
+                && labelsFor "r-big" after == [ "file ipe:src/big.txt (no longer indexed)" ]
                 && List.all (\row -> isVerifiedEntry row.entry) after.rows
             )
 
@@ -3164,12 +3148,67 @@ decideRefusedWhenNamePastCeiling =
         cleanupProgressScratch at
         Task.succeed
             (refused
-                && rowsAfterRefusal
-                == 0
-                && headAfter
-                == headBefore
-                && rows
-                == 1
-                && labelsFor "u-a" history
-                == [ "unit fn " ++ labelText (labelOf (String.repeat 2048 "q")) ++ " (no longer indexed)" ]
+                && rowsAfterRefusal == 0
+                && headAfter == headBefore
+                && rows == 1
+                && labelsFor "u-a" history == [ "unit fn " ++ labelText (labelOf (String.repeat 2048 "q")) ++ " (no longer indexed)" ]
             )
+
+
+-- A unit whose re-read name cannot be recorded whole (here after `edit` on
+-- its index row) is refused as `NameUnreadable` before the write: no row is
+-- added and the head stays. Red if such a name is recorded, or refused
+-- only by the database.
+decideRefusedWhenNameUnreadable : String -> String -> Task.Task Error Bool
+decideRefusedWhenNameUnreadable label edit =
+    do
+        at <- freshScratch ("ipe-history-name-unreadable-" ++ label)
+        db <- seedProgressScratch at
+        headBefore <- headTextOf db
+        execIndex at.indexDb edit [ Uid.toSql (uid "u-a") ]
+        refused <- refusedAs NameUnreadable (decidedNow db (uid "u-a") Approved)
+        rows <- logRowCount db
+        headAfter <- headTextOf db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0 && headAfter == headBefore)
+
+
+-- A file unit attests its residual, so its start line does not reach its
+-- view: at line -1 the view still verifies and the decision is refused as
+-- `NameUnreadable`, writing nothing; the same unit at line 0 lands. Red if
+-- a negative line is recorded, or if the refusal comes from the view.
+decideRefusedWhenLineNegative : Task.Task Error Bool
+decideRefusedWhenLineNegative =
+    do
+        at <- freshScratch "ipe-history-name-line-negative"
+        db <- seedProgressScratch at
+        execIndex at.indexDb
+            "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?, 'ipe:src/Lib.rs', 'file', 'Lib.rs', 'crate::FILE', -1, 0, 'internal', NULL, ?, 'shaF')"
+            [ Uid.toSql (uid "u-file"), SqlString (Index.attestResidual (Index.residualText [ ( 3, 6 ) ] fixtureLibRs)) ]
+        headBefore <- headTextOf db
+        refused <- refusedAs NameUnreadable (decidedNow db (uid "u-file") Approved)
+        rows <- logRowCount db
+        headAfter <- headTextOf db
+        execIndex at.indexDb "UPDATE units SET line_start = 0 WHERE uid = ?" [ Uid.toSql (uid "u-file") ]
+        decideNow db (uid "u-file") Approved
+        landed <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0 && headAfter == headBefore && landed == 1)
+
+
+-- An acknowledgement of a file whose stored path is 2049 code points is
+-- refused as `NamePastCeiling` before the write: no row is added and the
+-- head stays. Red if a file's path past the ceiling is recorded or cut.
+refusalDecisionRefusedWhenPathPastCeiling : Task.Task Error Bool
+refusalDecisionRefusedWhenPathPastCeiling =
+    do
+        at <- freshScratch "ipe-history-file-name-ceiling"
+        db <- seedProgressScratch at
+        insertRefusal at.indexDb "r-long" ("ipe:" ++ String.repeat 2045 "p") "symlink-entry" (SqlNull (SqlInt 0)) (refusalDigestOf "a")
+        digest <- shownRefusalDigest "r-long"
+        headBefore <- headTextOf db
+        refused <- refusedAs NamePastCeiling (decidedRefusalNow db "r-long" digest)
+        rows <- logRowCount db
+        headAfter <- headTextOf db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0 && headAfter == headBefore)

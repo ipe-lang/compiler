@@ -721,7 +721,6 @@ scanViolations modules =
 -- and enclosing top-level name. `Lib/Uid.ipe` defines it and is not
 -- scanned.
 
-
 -- The names `Uid.toString` goes by in a module: under `Uid`, under
 -- `Lib.Uid`, under every name the module imports `Lib.Uid` as, and bare when
 -- an import of it exposes `toString` or everything.
@@ -819,7 +818,6 @@ uidTextScanRefuses =
 uidCaught : List ScanModule -> Bool
 uidCaught sources =
     not (List.isEmpty (uidTextViolations admittedUidTexts sources))
-
 
 
 -- ── the real tree ───────────────────────────────────────────────────────

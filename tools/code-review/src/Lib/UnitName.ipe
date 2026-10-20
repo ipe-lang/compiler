@@ -11,6 +11,7 @@ module Lib.UnitName exposing (NameRefusal(..), RecordedName, SignedName(..), Uni
 -- `Index.unitName`) or from a recorded name (`fromRecorded`), so a uid or
 -- any other text never stands in for a name.
 
+import Ipe.Char as Char
 import Ipe.List as List
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
@@ -132,6 +133,9 @@ partRefusal part =
 
     else if chars > nameMaxChars then
         Just PartPastCeiling
+
+    else if String.any (\c -> Char.toCode c == 0) part then
+        Just PartNotText
 
     else
         Nothing

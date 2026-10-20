@@ -1834,6 +1834,45 @@ unjudgedRefusalFailsSnapshot =
         Task.succeed (intact && maybeContains "the index's refusal counts do not add up" message)
 
 
+-- An index whose `units` and `refusals` tables were rebuilt without their
+-- primary key holds three rows under one uid: History's live name reads
+-- and the unit page read return no more rows than uids asked. Red if a
+-- read's row count is set by the index rather than by its own bound.
+liveReadsBoundedByUids : Task.Task Error Bool
+liveReadsBoundedByUids =
+    do
+        at <- freshScratch "ipe-index-live-reads-bounded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin" ]
+        execIndexScript at.indexDb
+            ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; "
+                ++ "INSERT INTO units SELECT * FROM units WHERE uid = '"
+                ++ Uid.toString (uid "u-a")
+                ++ "'; INSERT INTO units SELECT * FROM units WHERE uid = '"
+                ++ Uid.toString (uid "u-a")
+                ++ "' LIMIT 1; "
+                ++ "CREATE TABLE refusals_copy AS SELECT * FROM refusals; DROP TABLE refusals; CREATE TABLE refusals AS SELECT * FROM refusals_copy; DROP TABLE refusals_copy; "
+                ++ "INSERT INTO refusals SELECT * FROM refusals; INSERT INTO refusals SELECT * FROM refusals LIMIT 1"
+            )
+        conn <- indexConn
+        settings <- envSettings
+        held <- Db.queryDecode conn "SELECT (SELECT COUNT(*) FROM units WHERE uid = ?) AS units, (SELECT COUNT(*) FROM refusals WHERE uid = ?) AS refusals" [ Uid.toSql (uid "u-a"), Uid.toSql (uid "r-x") ] heldDecoder
+        units <- Index.liveUnits conn settings.roots [ uid "u-a" ]
+        files <- Index.liveFiles conn settings.roots [ uid "r-x" ]
+        cleanupIndex at.indexDb at.repo
+        Task.succeed (held == [ ( 3, 3 ) ] && List.length units == 1 && List.length files == 1)
+
+
+heldDecoder : Db.Decode.Decoder ( Int, Int )
+heldDecoder =
+    Db.Decode.succeed (\units refusals -> ( units, refusals ))
+        |> Db.Decode.required "units" (Db.Decode.int "units")
+        |> Db.Decode.required "refusals" (Db.Decode.int "refusals")
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -1898,4 +1937,5 @@ checks =
         , check "a unit under an unbound tag is counted, never shown" unboundUnitsExcluded
         , check "a unit neither bound nor unbound fails the snapshot" unjudgedUnitFailsSnapshot
         , check "a refusal neither bound nor unbound fails the snapshot" unjudgedRefusalFailsSnapshot
+        , check "History's live name reads return at most one row per uid asked, however many the index holds" liveReadsBoundedByUids
         ]

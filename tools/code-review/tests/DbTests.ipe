@@ -1540,6 +1540,7 @@ unitNameChecks =
     Task.sequence
         [ check "an edit of any name column of a signed row, or its name cleared or cut to a path, reads tampered and breaks the chain" nameEditsTampered
         , check "a row inserted with no name or part of a unit's name is refused" (onFreshReview "ipe-review-partialNameInsertRefused" partialNameInsertRefused)
+        , check "a name column that is not text or an integer line, is empty, past the ceiling or holds a NUL is refused" (onFreshReview "ipe-review-nameColumnChecksRefuse" nameColumnChecksRefuse)
         , check "a review file without its whole-name guard fails the probe" probeRefusesReviewWithoutNameGuard
         , check "a review file holding decisions recorded before names were kept fails the probe" probeRefusesUnnamedRows
         , Task.succeed ( "a row's name columns decode whole within the ceiling or malformed", rowNameWholeOrMalformed )
@@ -1583,14 +1584,10 @@ namedEditTampers db sql =
         control <- lookUp db "edit-control" "h1"
         verdict <- logVerdictOf db
         Task.succeed
-            (recordedFieldsOf before
-                == Just [ "unit", "fn", "Lib.answer", "ipe:src/Lib.rs", "3" ]
-                && whyOf after
-                == Just Tampered
-                && whyOf control
-                == Just ChainBroken
-                && verdict
-                == Broken (BreaksAt 2)
+            (recordedFieldsOf before == Just [ "unit", "fn", "Lib.answer", "ipe:src/Lib.rs", "3" ]
+                && whyOf after == Just Tampered
+                && whyOf control == Just ChainBroken
+                && verdict == Broken (BreaksAt 2)
             )
 
 
@@ -1641,6 +1638,42 @@ partialNameInsertRefused db =
         Task.succeed (none && one && lineOnly && two && noLine && noKind && noPath && empty == 0 && unit == 1 && file == 2)
 
 
+-- Each name column's `CHECK` refuses a whole name holding one bad part: a
+-- qualified name of 2049 code points, one whose NUL hides 3000 more from
+-- `length`, an empty kind, a kind stored as a blob, a negative line, and a
+-- line stored as text or a real. The same name at 2048 code points lands.
+-- Red if a column admits text past the ceiling, a NUL, or a value of
+-- another type.
+nameColumnChecksRefuse : Db -> Task.Task Error Bool
+nameColumnChecksRefuse db =
+    let
+        insert seq kind qualified line =
+            Db.exec db
+                ("INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (" ++ String.fromInt seq ++ ", ?, 'h', 'approve', NULL, 0, 'genesis', ?, " ++ kind ++ ", " ++ qualified ++ ", 'ipe:src/Lib.rs', " ++ line ++ ")")
+                [ Uid.toSql (uid "checked-name"), SqlString (String.repeat 64 "e") ]
+
+        refused kind qualified line =
+            insert 1 kind qualified line
+                |> Task.map (\_ -> False)
+                |> Task.onError (\e -> Task.succeed (carriesFailure Db.CheckViolation e))
+
+        qs n =
+            "replace(hex(zeroblob(" ++ String.fromInt n ++ ")), '00', 'q')"
+    in
+    do
+        longName <- refused "'fn'" (qs 2049) "3"
+        hiddenPastNul <- refused "'fn'" ("'a' || char(0) || " ++ qs 3000) "3"
+        emptyKind <- refused "''" "'Lib.answer'" "3"
+        blobKind <- refused "X'666e'" "'Lib.answer'" "3"
+        negativeLine <- refused "'fn'" "'Lib.answer'" "-1"
+        textLine <- refused "'fn'" "'Lib.answer'" "'x'"
+        realLine <- refused "'fn'" "'Lib.answer'" "3.5"
+        none <- logRowCount db
+        insert 1 "'fn'" (qs 2048) "3"
+        landed <- logRowCount db
+        Task.succeed (longName && hiddenPastNul && emptyKind && blobKind && negativeLine && textLine && realLine && none == 0 && landed == 1)
+
+
 -- A review file whose `review_log_name_whole` trigger was dropped is refused
 -- by the probe, beside an intact file that passes. Red if the trigger is
 -- not among the guards the probe requires.
@@ -1654,22 +1687,37 @@ probeRefusesReviewWithoutNameGuard =
 
 
 -- A review file migrated before names were kept, holding a decision, is
--- refused by the probe once the names migration adds its columns: the row
--- has no name to verify, so the log is never read as proven. The same file
--- with no decision passes. Red if the probe admits a row with no name.
+-- refused by the probe before any migration runs, and is left without the
+-- name columns: the row has no name to verify, so the log is never read as
+-- proven. The same file with no decision passes. A file already past the
+-- names migration that holds a row with no name (written while its name
+-- trigger was gone, the trigger since put back) is refused too. Red if the
+-- probe admits a row with no name, or migrates a file it refuses.
 probeRefusesUnnamedRows : Task.Task Error Bool
 probeRefusesUnnamedRows =
     do
         base <- freshDir "ipe-review-probe-unnamed-rows"
         held <- probeBeforeNames (base ++ "/held.db") [ "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, 'x', 'h', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')" ]
         empty <- probeBeforeNames (base ++ "/empty.db") []
-        Task.succeed (maybeContains "recorded before unit names were kept" held && empty == Nothing)
+        unnamedAfter <- probeAfterEdits
+                            (base ++ "/after.db")
+                            [ "DROP TRIGGER review_log_name_whole"
+                            , "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, 'x', 'h', 'approve', NULL, 0, 'genesis', '" ++ String.repeat 64 "e" ++ "')"
+                            , "CREATE TRIGGER review_log_name_whole BEFORE INSERT ON review_log BEGIN SELECT 1; END"
+                            ]
+        Task.succeed
+            (maybeContains "recorded before unit names were kept" held.message
+                && not held.migrated
+                && empty.message == Nothing
+                && empty.migrated
+                && maybeContains "recorded before unit names were kept" unnamedAfter
+            )
 
 
 -- The probe's refusal message on a review file at `dbPath` migrated up to,
--- not through, the names migration, after `edits` ran on it; Nothing when
--- the probe passes.
-probeBeforeNames : String -> List String -> Task.Task Error (Maybe String)
+-- not through, the names migration, after `edits` ran on it (Nothing when
+-- the probe passes), and whether the file then has the name columns.
+probeBeforeNames : String -> List String -> Task.Task Error { message : Maybe String, migrated : Bool }
 probeBeforeNames dbPath edits =
     do
         db <- openFileAt CreateIfMissing dbPath
@@ -1678,8 +1726,15 @@ probeBeforeNames dbPath edits =
         loc <- Settings.parseReviewDb dbPath
         key <- testReviewKey
         message <- probeMessage (LibDb.probe key loc)
+        columns <- Db.queryDecode db "SELECT COUNT(*) AS total FROM pragma_table_info('review_log') WHERE name = 'unit_path'" [] nameColumnDecoder
         removeReviewFiles dbPath
-        Task.succeed message
+        Task.succeed { message = message, migrated = columns == [ 1 ] }
+
+
+nameColumnDecoder : Db.Decode.Decoder Int
+nameColumnDecoder =
+    Db.Decode.succeed (\total -> total)
+        |> Db.Decode.required "total" (Db.Decode.int "total")
 
 
 -- A path with the kind, qualified name and line all set is a unit's name,
@@ -1715,12 +1770,11 @@ rowNameWholeOrMalformed =
         && malformed (LibDb.rowNameOf (Just "fn") (Just "Lib.answer") (Just "ipe:src/Lib.rs") (Just (0 - 1)))
         && malformed (LibDb.rowNameOf Nothing Nothing (Just "") Nothing)
         && malformed (LibDb.rowNameOf Nothing Nothing (Just (chars 2049)) Nothing)
-        && fieldsOf (LibDb.rowNameOf (Just "fn") (Just (chars 2048)) (Just "ipe:src/Lib.rs") (Just 0))
-        == Just [ "unit", "fn", chars 2048, "ipe:src/Lib.rs", "0" ]
-        && fieldsOf (LibDb.rowNameOf (Just (chars 2048)) (Just "Lib.answer") (Just (chars 2048)) (Just 3))
-        == Just [ "unit", chars 2048, "Lib.answer", chars 2048, "3" ]
-        && fieldsOf (LibDb.rowNameOf Nothing Nothing (Just (chars 2048)) Nothing)
-        == Just [ "file", chars 2048 ]
+        && malformed (LibDb.rowNameOf (Just "fn") (Just ("a" ++ String.fromChar (Char.fromCode 0) ++ "b")) (Just "ipe:src/Lib.rs") (Just 3))
+        && malformed (LibDb.rowNameOf Nothing Nothing (Just ("ipe:a" ++ String.fromChar (Char.fromCode 0))) Nothing)
+        && fieldsOf (LibDb.rowNameOf (Just "fn") (Just (chars 2048)) (Just "ipe:src/Lib.rs") (Just 0)) == Just [ "unit", "fn", chars 2048, "ipe:src/Lib.rs", "0" ]
+        && fieldsOf (LibDb.rowNameOf (Just (chars 2048)) (Just "Lib.answer") (Just (chars 2048)) (Just 3)) == Just [ "unit", chars 2048, "Lib.answer", chars 2048, "3" ]
+        && fieldsOf (LibDb.rowNameOf Nothing Nothing (Just (chars 2048)) Nothing) == Just [ "file", chars 2048 ]
 
 
 -- The tool's mac input for one row, naming a unit and naming a file,
@@ -1752,16 +1806,11 @@ macInputVectorsPinned =
     in
     case ( UnitName.recordUnit { kind = "fn", qualified = "Lib.answer", path = "ipe:src/Lib.rs", line = 3 }, UnitName.recordFile "ipe:src/Lib.rs" ) of
         ( Ok unit, Ok file ) ->
-            tool unit
-                == unitVector
-                && rawMacInput logId 2 "prevhead" unitRow
-                == unitVector
-                && tool file
-                == fileVector
-                && rawMacInput logId 2 "prevhead" fileRow
-                == fileVector
-                && String.length (Uid.toString unitRow.uid)
-                == 64
+            tool unit == unitVector
+                && rawMacInput logId 2 "prevhead" unitRow == unitVector
+                && tool file == fileVector
+                && rawMacInput logId 2 "prevhead" fileRow == fileVector
+                && String.length (Uid.toString unitRow.uid) == 64
 
         _ ->
             False

@@ -703,11 +703,22 @@ keyMismatchRefusal =
     Error.invalidInput ("the review log was signed by a different " ++ ReviewKey.keyVar ++ ", so this key can neither verify nor record its decisions.\n  fix: start with the key that signed it.")
 
 
+-- The review file opened and migrated, once it is known to hold no decision
+-- recorded before names were kept.
 openMigrated : ReviewFile -> Task.Task Error Db
 openMigrated loc =
     openAt loc
-        |> Task.andThen (\db -> Task.map (\_ -> db) (migrate db))
         |> Task.onError (Settings.openFailure ReviewDb loc.path)
+        |> Task.andThen
+            (\db ->
+                requireNamedBeforeMigration loc db
+                    |> Task.andThen
+                        (\_ ->
+                            migrate db
+                                |> Task.map (\_ -> db)
+                                |> Task.onError (Settings.openFailure ReviewDb loc.path)
+                        )
+            )
 
 
 headAt : ReviewFile -> Db -> Task.Task Error Index.ChainHead
@@ -761,7 +772,7 @@ requireGuards loc db =
 
 -- A log holding a row with no subject name was recorded before names were
 -- kept: no such row's mac covers a name, so this reviewer can neither
--- verify it nor name its subject, and the file is refused, never migrated.
+-- verify it nor name its subject, and the file is refused.
 requireNamedRows : ReviewFile -> Db -> Task.Task Error ()
 requireNamedRows loc db =
     do
@@ -773,6 +784,29 @@ requireNamedRows loc db =
 
             _ ->
                 Task.fail (Settings.brokenLog loc.path unnamedRowsReason)
+
+
+-- A log whose table predates the name columns and holds a decision is
+-- refused before any migration runs, so the refused file is left as found.
+requireNamedBeforeMigration : ReviewFile -> Db -> Task.Task Error ()
+requireNamedBeforeMigration loc db =
+    do
+        rows <- Db.queryDecode db "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_log') AND NOT EXISTS (SELECT 1 FROM pragma_table_info('review_log') WHERE name = 'unit_path') AS unnamed" [] unnamedDecoder
+                    |> Task.onError (Settings.openFailure ReviewDb loc.path)
+        case rows of
+            [ False ] ->
+                Task.succeed ()
+
+            _ ->
+                do
+                    held <- Db.queryDecode db "SELECT EXISTS (SELECT 1 FROM review_log) AS unnamed" [] unnamedDecoder
+                                |> Task.onError (Settings.openFailure ReviewDb loc.path)
+                    case held of
+                        [ False ] ->
+                            Task.succeed ()
+
+                        _ ->
+                            Task.fail (Settings.brokenLog loc.path unnamedRowsReason)
 
 
 -- Why a log holding rows recorded before names were kept is refused.
@@ -991,15 +1025,37 @@ rowNameDecoder =
 
 rowNameOf : Maybe String -> Maybe String -> Maybe String -> Maybe Int -> RowName
 rowNameOf kindColumn qualifiedColumn pathColumn lineColumn =
-    case ( pathColumn, kindColumn, ( qualifiedColumn, lineColumn ) ) of
-        ( Just path, Just kind, ( Just qualified, Just line ) ) ->
-            namedOf (UnitName.recordUnit { kind = kind, qualified = qualified, path = path, line = line })
-
-        ( Just path, Nothing, ( Nothing, Nothing ) ) ->
-            namedOf (UnitName.recordFile path)
-
-        _ ->
+    case pathColumn of
+        Nothing ->
             NameMalformed
+
+        Just path ->
+            case kindColumn of
+                Nothing ->
+                    case qualifiedColumn of
+                        Nothing ->
+                            case lineColumn of
+                                Nothing ->
+                                    namedOf (UnitName.recordFile path)
+
+                                Just _ ->
+                                    NameMalformed
+
+                        Just _ ->
+                            NameMalformed
+
+                Just kind ->
+                    case qualifiedColumn of
+                        Nothing ->
+                            NameMalformed
+
+                        Just qualified ->
+                            case lineColumn of
+                                Nothing ->
+                                    NameMalformed
+
+                                Just line ->
+                                    namedOf (UnitName.recordUnit { kind = kind, qualified = qualified, path = path, line = line })
 
 
 namedOf : Result UnitName.NameRefusal RecordedName -> RowName

@@ -113,9 +113,9 @@ END;"""
       , sql = """ALTER TABLE review_log_head ADD COLUMN key_check TEXT CHECK (key_check IS NULL OR length(key_check) = 64);"""
       }
     , { name = "0009_review_log_unit_name"
-      , sql = """ALTER TABLE review_log ADD COLUMN unit_kind TEXT CHECK (unit_kind IS NULL OR (typeof(unit_kind) = 'text' AND length(unit_kind) BETWEEN 1 AND 2048));
-ALTER TABLE review_log ADD COLUMN unit_qualified TEXT CHECK (unit_qualified IS NULL OR (typeof(unit_qualified) = 'text' AND length(unit_qualified) BETWEEN 1 AND 2048));
-ALTER TABLE review_log ADD COLUMN unit_path TEXT CHECK (unit_path IS NULL OR (typeof(unit_path) = 'text' AND length(unit_path) BETWEEN 1 AND 2048));
+      , sql = """ALTER TABLE review_log ADD COLUMN unit_kind TEXT CHECK (unit_kind IS NULL OR (typeof(unit_kind) = 'text' AND length(unit_kind) BETWEEN 1 AND 2048 AND length(CAST(unit_kind AS BLOB)) <= 8192 AND instr(CAST(unit_kind AS BLOB), X'00') = 0));
+ALTER TABLE review_log ADD COLUMN unit_qualified TEXT CHECK (unit_qualified IS NULL OR (typeof(unit_qualified) = 'text' AND length(unit_qualified) BETWEEN 1 AND 2048 AND length(CAST(unit_qualified AS BLOB)) <= 8192 AND instr(CAST(unit_qualified AS BLOB), X'00') = 0));
+ALTER TABLE review_log ADD COLUMN unit_path TEXT CHECK (unit_path IS NULL OR (typeof(unit_path) = 'text' AND length(unit_path) BETWEEN 1 AND 2048 AND length(CAST(unit_path AS BLOB)) <= 8192 AND instr(CAST(unit_path AS BLOB), X'00') = 0));
 ALTER TABLE review_log ADD COLUMN unit_line INTEGER CHECK (unit_line IS NULL OR (typeof(unit_line) = 'integer' AND unit_line >= 0));
 CREATE TRIGGER review_log_name_whole BEFORE INSERT ON review_log
 WHEN NOT (NEW.unit_path IS NOT NULL
