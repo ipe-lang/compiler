@@ -6389,6 +6389,104 @@ fn classify_entry_shape_reads_each_program_of_a_root() {
     );
 }
 
+/// An entry read through a resolved root refuses a linked entry file, a linked parent
+/// directory and an absent parent directory, whatever the tree held when it resolved.
+#[cfg(unix)]
+#[test]
+fn classify_entry_shape_refuses_a_tree_changed_after_resolve() {
+    use crate::project_root::{EntrySet, ProjectRoot, RootArg};
+    let dir = session_scratch("shape_changed_tree");
+    let src = dir.join("src");
+    assert!(
+        fs::create_dir_all(src.join("Tools")).is_ok(),
+        "make src/Tools/"
+    );
+    let manifest = "module Package exposing (package)\n\n\npackage =\n    { name = \"app\"\n    , programs =\n        [ { name = \"term\", entry = \"Term.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n";
+    assert!(
+        fs::write(dir.join("package.ipe"), manifest).is_ok(),
+        "write package.ipe"
+    );
+    assert!(
+        fs::write(src.join("Term.ipe"), TUI_PROGRAM).is_ok(),
+        "write src/Term.ipe"
+    );
+    assert!(
+        fs::write(
+            src.join("Tools").join("Sync.ipe"),
+            "module Tools.Sync exposing (main)\n\nmain = 1\n"
+        )
+        .is_ok(),
+        "write src/Tools/Sync.ipe"
+    );
+    let outside = dir.join("Outside.ipe");
+    assert!(
+        fs::write(&outside, TUI_PROGRAM).is_ok(),
+        "write the outside file"
+    );
+    let root = ProjectRoot::resolve(RootArg::at(&dir)).expect("resolve the root");
+    let programs: Vec<_> = match root.entries() {
+        EntrySet::Programs(programs) => programs.iter().collect(),
+        EntrySet::Library(_) => Vec::new(),
+    };
+    let entry = |name: &str| {
+        programs
+            .iter()
+            .copied()
+            .find(|entry| entry.name().as_str() == name)
+            .expect("the named program")
+    };
+
+    assert!(
+        fs::remove_file(src.join("Term.ipe")).is_ok(),
+        "drop src/Term.ipe"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&outside, src.join("Term.ipe")).is_ok(),
+        "link src/Term.ipe out of src/"
+    );
+    let linked_file = classify_entry_shape(&root, entry("term"));
+
+    let moved = dir.join("MovedTools");
+    assert!(
+        fs::rename(src.join("Tools"), &moved).is_ok(),
+        "move src/Tools away"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&moved, src.join("Tools")).is_ok(),
+        "link src/Tools to the moved directory"
+    );
+    let linked_parent = classify_entry_shape(&root, entry("sync"));
+
+    assert!(
+        fs::remove_file(src.join("Tools")).is_ok(),
+        "drop the src/Tools link"
+    );
+    let absent_parent = classify_entry_shape(&root, entry("sync"));
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(
+            linked_file,
+            Err(CliError::SourceRefused {
+                reason: SourceRefusal::Symlink,
+                ..
+            })
+        ),
+        "a linked entry file is refused as a link: {linked_file:?}"
+    );
+    assert!(
+        matches!(
+            linked_parent,
+            Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+        ),
+        "a linked parent directory is refused as a link: {linked_parent:?}"
+    );
+    assert!(
+        matches!(absent_parent, Err(CliError::EntryMissing { .. })),
+        "an absent parent directory is a missing entry: {absent_parent:?}"
+    );
+}
+
 // A `src/` module `ipe fix` is pointed at through a link is refused, never read through it.
 #[cfg(unix)]
 #[test]

@@ -731,13 +731,14 @@ fn passing_summary(
     disclosure: &Disclosure,
 ) -> String {
     use crate::audit_native::Tier2Outcome;
+    let shown = shown_name(name);
     let tier_line = match tier2 {
         Tier2Outcome::SkippedPureIpe => format!(
-            "package audit: {name} {version} — all Tier-1 checks passed. (Pure Ipê package: \
+            "package audit: {shown} {version} — all Tier-1 checks passed. (Pure Ipê package: \
              native Tier-2 does not apply.)"
         ),
         Tier2Outcome::Certified { platform } => format!(
-            "package audit: {name} {version} — all Tier-1 checks passed; native Tier-2 capability \
+            "package audit: {shown} {version} — all Tier-1 checks passed; native Tier-2 capability \
              enforcement (build+link reachability of the package's FFI bindings under a \
              declared-scoped jail) passed on: {platform}. A Tier-2 certification is per-host — it \
              vouches only for the platform whose jail actually ran; running the audit on another \
@@ -1286,7 +1287,7 @@ fn capability_consistency(
                     &format!(
                         "package audit: note — `{}` exercises the `native-ffi` capability; its \
                      native effects cannot be inferred from Ipê alone.",
-                        manifest.name
+                        shown_name(&manifest.name)
                     ),
                 )
                 .emit();
@@ -1408,7 +1409,7 @@ fn unparsed(program: &CapturedProgram<'_>) -> CliError {
             "program `{}`'s entry source (`{}`) does not parse, so its control model cannot be \
              derived. A program whose self-driving model the audit cannot state is refused \
              rather than certified with an assumed model.",
-            program.name,
+            shown_name(&program.name),
             program.path.display()
         ),
     )
@@ -1431,12 +1432,15 @@ struct CapturedProgram<'s> {
 ///
 /// The same set [`crate::project_root::ProjectRoot`] resolves, read from the
 /// capture instead of the disk: the declared programs in manifest order, else
-/// `src/Main.ipe` under the package's name, else no program.
+/// `src/Main.ipe` under the package's name, else no program when the manifest
+/// exposes a module, else the refusal of a package that builds nothing.
 ///
 /// # Errors
-/// The manifest-entry refusal of a declared entry that names no module, and
+/// The manifest-entry refusal of a declared entry that names no module;
 /// [`CliError::PackageAudit`] with [`Check::Capability`] when a declared
-/// program's entry is not in the capture.
+/// program's entry is not in the capture; [`CliError::NoDefaultEntry`] when
+/// the package declares no program, holds no `src/Main.ipe` and exposes no
+/// module.
 fn captured_programs<'s>(
     manifest: &ProjectManifest,
     sources: &'s ModuleSources,
@@ -1450,7 +1454,8 @@ fn captured_programs<'s>(
                 Check::Capability,
                 format!(
                     "program `{}` names the entry `{}`, which the captured package does not hold.",
-                    program.name, program.entry
+                    shown_name(&program.name),
+                    shown_name(&program.entry)
                 ),
             ));
         };
@@ -1472,7 +1477,13 @@ fn captured_programs<'s>(
             });
         }
     }
-    Ok(NonEmpty::from_vec(programs))
+    let programs = NonEmpty::from_vec(programs);
+    if programs.is_none() && manifest.exposed_modules.is_empty() {
+        return Err(CliError::NoDefaultEntry {
+            root: manifest.root.clone(),
+        });
+    }
+    Ok(programs)
 }
 
 /// Run the control-model consent gate for every disclosed program.
@@ -1514,7 +1525,8 @@ fn consent_every_program(
 ///
 /// # Errors
 /// [`CliError`] when the manifest cannot be located or parsed, the capability
-/// inference fails, or the entry source cannot be read or parsed (fail-closed).
+/// inference fails, the entry source cannot be read or parsed (fail-closed), or
+/// the package builds nothing ([`CliError::NoDefaultEntry`]).
 pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
     // A working-tree reader, not a capture: `ipe doc` certifies nothing, and a
     // capture would walk the build output under the project root. The modules
@@ -1533,6 +1545,7 @@ pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
 /// (possibly empty) capability set the package can exercise.
 ///
 /// A package of more than one program also names each program's own model.
+/// Every name is shown through [`shown_name`].
 fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
     let caps: Vec<&'static str> = disclosure.capabilities.iter().map(|c| c.as_str()).collect();
     let caps_line = if caps.is_empty() {
@@ -1543,7 +1556,13 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
     let programs: Vec<String> = disclosure
         .control_model
         .programs()
-        .map(|program| format!("`{}`: {}", program.program, program.model.word()))
+        .map(|program| {
+            format!(
+                "`{}`: {}",
+                shown_name(&program.program),
+                program.model.word()
+            )
+        })
         .collect();
     let per_program = if programs.len() > 1 {
         format!(" ({})", programs.join(", "))
@@ -1551,9 +1570,21 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
         String::new()
     };
     format!(
-        "package audit: `{name}` control model: {}{per_program}; capabilities: {caps_line}.",
+        "package audit: `{}` control model: {}{per_program}; capabilities: {caps_line}.",
+        shown_name(name),
         disclosure.control_model.word()
     )
+}
+
+/// A manifest-supplied name (the package's or a program's) as one inert token
+/// of a single report line: control characters and line breaks escaped as in
+/// [`str::escape_debug`], a backtick escaped so the name cannot close the code
+/// span it is shown in, and the result proven a [`crate::style::TerminalLine`].
+fn shown_name(raw: &str) -> String {
+    let escaped = raw.escape_debug().to_string().replace('`', "\\`");
+    crate::style::TerminalLine::sanitize(&escaped)
+        .as_str()
+        .to_owned()
 }
 
 // ===========================================================================
@@ -1618,7 +1649,7 @@ fn enforced_semver(
                     "package audit: `{}` {new_version} is a prerelease — exempt from the \
                  enforced-semver API-compatibility bump (semver §9: a prerelease is unstable \
                  and is not resolved by a stable version requirement).",
-                    manifest.name
+                    shown_name(&manifest.name)
                 ),
             )
             .emit();
@@ -1639,7 +1670,7 @@ fn enforced_semver(
                 &format!(
                     "package audit: `{}` has no previously published version in the index — \
                  skipping the enforced-semver check (first version).",
-                    manifest.name
+                    shown_name(&manifest.name)
                 ),
             )
             .emit();
@@ -1654,7 +1685,7 @@ fn enforced_semver(
                     "package audit: `{}` has no published stable version below {new_version} — \
                  skipping the enforced-semver check (first stable version; a prerelease \
                  carries no compatibility promise to diff against).",
-                    manifest.name
+                    shown_name(&manifest.name)
                 ),
             )
             .emit();
@@ -2981,6 +3012,43 @@ mod tests {
         );
     }
 
+    /// A program or package name holding a line break and a backtick is shown escaped on one
+    /// line, so it cannot forge a second disclosure line or close its code span.
+    #[test]
+    fn disclosure_summary_shows_hostile_names_escaped_on_one_line() {
+        let (mut manifest, sources) = two_program_package();
+        let hostile = "sync\n`forged`: tea";
+        if let Some(program) = manifest.programs.get_mut(1) {
+            hostile.clone_into(&mut program.name);
+        }
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives both");
+        let summary = disclosure_summary("two\r\n`pkg`", &disclosure);
+        assert!(
+            !summary.contains('\n') && !summary.contains('\r'),
+            "no name breaks the line: {summary:?}"
+        );
+        assert!(
+            summary.contains(r"`sync\n\`forged\`: tea`: direct"),
+            "the program name is shown escaped: {summary}"
+        );
+        assert!(
+            summary.contains(r"package audit: `two\r\n\`pkg\`` control model"),
+            "the package name is shown escaped: {summary}"
+        );
+        let passing = passing_summary(
+            "two\n`pkg`",
+            "0.1.0",
+            &crate::audit_native::Tier2Outcome::SkippedPureIpe,
+            &disclosure,
+        );
+        assert_eq!(
+            passing.lines().count(),
+            2,
+            "the tier line and the disclosure line only: {passing:?}"
+        );
+    }
+
     /// A package whose second program alone runs a model `acceptsControl` omits is refused.
     #[test]
     fn consent_refuses_a_second_program_the_accept_set_does_not_cover() {
@@ -3059,13 +3127,22 @@ mod tests {
         );
     }
 
-    /// The programs the audit reads from a capture are the programs the project root resolves.
+    /// The programs the audit reads from a capture are the programs the project root resolves,
+    /// and a package the root refuses is refused by the audit with the same refusal.
     #[test]
     fn captured_programs_are_the_project_roots_programs() {
         use crate::project_root::{EntrySet, ProjectRoot, RootArg};
         /// A capture case: its tag, its manifest, and its `src/` files.
         type Case<'a> = (&'a str, &'a str, &'a [(&'a str, String)]);
-        let cases: [Case<'_>; 3] = [
+        /// Each program's name and entry module, `None` for a library, or the refusal's kind.
+        type Outcome = Result<Option<Vec<(String, Vec<String>)>>, String>;
+        fn refusal(err: &CliError) -> String {
+            match err {
+                CliError::NoDefaultEntry { .. } => "no-default-entry".to_owned(),
+                other => format!("{other:?}"),
+            }
+        }
+        let cases: [Case<'_>; 6] = [
             (
                 "agree-two-programs",
                 "module Package exposing (package)\n\n\npackage =\n    { name = \"two\"\n    , programs =\n        [ { name = \"board\", entry = \"Main.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n",
@@ -3082,6 +3159,33 @@ mod tests {
             (
                 "agree-library",
                 "module Package exposing (package)\n\n\npackage =\n    { name = \"lib\", exposedModules = [ \"Lib\" ] }\n",
+                &[(
+                    "Lib.ipe",
+                    "module Lib exposing (one)\n\none = 1\n".to_owned(),
+                )],
+            ),
+            (
+                "agree-declared-over-stray-main",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"tools\"\n    , programs = [ { name = \"sync\", entry = \"Tools/Sync.ipe\" } ]\n    }\n",
+                &[
+                    ("Main.ipe", tea_entry("Main")),
+                    ("Tools/Sync.ipe", direct_entry("Tools.Sync")),
+                ],
+            ),
+            (
+                "agree-main-over-exposed",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"both\", exposedModules = [ \"Lib\" ] }\n",
+                &[
+                    ("Main.ipe", direct_entry("Main")),
+                    (
+                        "Lib.ipe",
+                        "module Lib exposing (one)\n\none = 1\n".to_owned(),
+                    ),
+                ],
+            ),
+            (
+                "agree-no-default-entry",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"none\" }\n",
                 &[(
                     "Lib.ipe",
                     "module Lib exposing (one)\n\none = 1\n".to_owned(),
@@ -3105,27 +3209,44 @@ mod tests {
                 );
             }
             let snapshot = capture_package(&dir).expect("capture");
-            let audited: Option<Vec<(String, Vec<String>)>> =
-                captured_programs(snapshot.manifest(), snapshot.sources())
-                    .expect("captured programs")
-                    .map(|programs| {
+            let audited: Outcome = captured_programs(snapshot.manifest(), snapshot.sources())
+                .map(|programs| {
+                    programs.map(|programs| {
                         programs
                             .iter()
                             .map(|program| (program.name.clone(), program.module.clone()))
                             .collect()
-                    });
+                    })
+                })
+                .map_err(|err| refusal(&err));
             let root = ProjectRoot::resolve(RootArg::at(&dir));
             let _ = std::fs::remove_dir_all(&dir);
-            let resolved = match root.expect("resolve").entries() {
-                EntrySet::Programs(programs) => Some(
-                    programs
-                        .iter()
-                        .map(|entry| (entry.name().as_str().to_owned(), entry.module().to_vec()))
-                        .collect(),
-                ),
-                EntrySet::Library(_) => None,
-            };
+            let resolved: Outcome = root
+                .map(|root| match root.entries() {
+                    EntrySet::Programs(programs) => Some(
+                        programs
+                            .iter()
+                            .map(|entry| {
+                                (entry.name().as_str().to_owned(), entry.module().to_vec())
+                            })
+                            .collect(),
+                    ),
+                    EntrySet::Library(_) => None,
+                })
+                .map_err(|err| refusal(&err));
             assert_eq!(audited, resolved, "{tag}: the audit and the root agree");
+            let expected: Outcome = match tag {
+                "agree-declared-over-stray-main" => Ok(Some(vec![(
+                    "sync".to_owned(),
+                    vec!["Tools".to_owned(), "Sync".to_owned()],
+                )])),
+                "agree-main-over-exposed" => {
+                    Ok(Some(vec![("both".to_owned(), vec!["Main".to_owned()])]))
+                }
+                "agree-no-default-entry" => Err("no-default-entry".to_owned()),
+                _ => continue,
+            };
+            assert_eq!(audited, expected, "{tag}: the expected entry set");
         }
     }
 
