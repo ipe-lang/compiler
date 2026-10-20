@@ -40,7 +40,8 @@
 //! A renaming `use` of, or to, `Command`, `CommandExt`, `Child`,
 //! `LocalCeiling`, `InheritedRole` or a runner fn, a type alias naming
 //! `Command`, `CommandExt` or `Child`, a `Command::new` not called in place,
-//! and an `include!` by any path are refused.
+//! and an `include!` by any path, by a renaming `use`, or inside a
+//! token-matched macro body are refused.
 //!
 //! A ceiling is named only by the top-level `LocalCeiling` consts of
 //! `remote_ingest.rs`: a `LocalCeiling` const elsewhere, any const, static,
@@ -525,6 +526,7 @@ fn rename_refused(name: &str) -> bool {
         || listed(SINK_FNS, name)
         || name == CEILING_TYPE
         || name == ROLE_TYPE
+        || name == INCLUDE_MACRO
 }
 
 /// Whether the `cfg` predicate `meta` holds only under `cfg(test)`.
@@ -1057,6 +1059,10 @@ impl Scanner<'_> {
         let key = self.key();
         self.out.macro_idents.push((key, name.clone()));
         self.out.values.push(name.clone());
+        if name == INCLUDE_MACRO && next.is_some_and(|tree| is_punct(tree, '!')) {
+            self.refuse("an `include!`");
+            return;
+        }
         if let [rest @ .., dollar] = before
             && is_punct(dollar, '$')
         {
@@ -2653,6 +2659,32 @@ fn a_hidden_or_renamed_child_start_is_refused() {
             "the scan must refuse: {sample}"
         );
     }
+}
+
+#[test]
+fn an_include_of_any_file_by_any_spelling_is_refused() {
+    let refused = [
+        "fn f() { let _ = include!(\"generated.txt\"); }",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/spawn.in\"));",
+        "use std::include as splice;",
+        "use core::{include as splice};",
+        "macro_rules! splice { ($f:literal) => { include!($f) }; }",
+        "fn f() { m!(a b include!(\"x.txt\")); }",
+        "fn f() { m!(a b std::include!(\"x.txt\")); }",
+    ];
+    for sample in refused {
+        assert!(
+            refused_for(&sample_verdict(sample), "include"),
+            "the scan must refuse: {sample}"
+        );
+    }
+    assert!(
+        !refused_for(
+            &sample_verdict("const PAGE: &str = \"include\";"),
+            "include"
+        ),
+        "a string naming include is not an `include!`"
+    );
 }
 
 #[test]
