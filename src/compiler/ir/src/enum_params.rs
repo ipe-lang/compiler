@@ -175,6 +175,13 @@ impl EnumParamUse {
             .is_none_or(|used| *used)
     }
 
+    /// How many type parameters enum `(home, name)` declares, when the table
+    /// holds it.
+    #[must_use]
+    pub fn declared_arity(&self, home: &ModPath, name: Symbol) -> Option<usize> {
+        self.live.get(&(home.clone(), name)).map(Vec::len)
+    }
+
     /// `args` of an application of enum `(home, name)` without those its
     /// declaration erases.
     #[must_use]
@@ -612,6 +619,30 @@ mod tests {
         assert!(uses.is_used(&home, passes, 0));
         assert!(uses.is_used(&home, open, 0));
         assert!(uses.refuse_unused().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn the_declared_arity_is_the_parameter_count_of_a_held_enum_only() -> DResult<()> {
+        let mut i = Interner::new();
+        let home = ModPath(vec![i.intern("Main")?]);
+        let (pair, other, pa, pb) = (
+            i.intern("Pair")?,
+            i.intern("Other")?,
+            i.intern("a")?,
+            i.intern("b")?,
+        );
+        let defs = [def(
+            &home,
+            pair,
+            vec![pa, pb],
+            &[pair],
+            vec![vec![IrType::Generic(pa), IrType::Generic(pb)]],
+        )];
+        let uses = EnumParamUse::of(&defs);
+        assert_eq!(uses.declared_arity(&home, pair), Some(2));
+        assert_eq!(uses.declared_arity(&home, other), None);
+        assert_eq!(uses.declared_arity(&ModPath(vec![]), pair), None);
         Ok(())
     }
 }

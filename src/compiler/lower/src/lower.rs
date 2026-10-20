@@ -19200,7 +19200,7 @@ impl<'a> Lowerer<'a> {
         generics: &[Symbol],
     ) -> DResult<IrType> {
         let mut ir_args = Vec::with_capacity(args.len());
-        for a in self.emitted_type_args(home, name, args) {
+        for a in self.emitted_type_args(home, name, args)? {
             // A type argument filling a generic payload slot that
             // instantiates to a function takes the same `Arc<dyn Fn>`
             // carrier the decl-side flip
@@ -19235,21 +19235,39 @@ impl<'a> Lowerer<'a> {
     /// Kept, a phantom argument would leave the emitted enum's generic
     /// uninferrable (E0283/E0392). An erased argument is never lowered, so
     /// nothing it names can refuse a type the emitted Rust never spells.
+    ///
+    /// # Errors
+    ///
+    /// A [`Diagnostic::CompilerBug`] when `args` does not fill exactly the
+    /// parameters the declaration holds: the erasure is positional, so a
+    /// mismatched count would keep or drop the wrong arguments.
     fn emitted_type_args<'args, A>(
         &self,
         home: &[Symbol],
         name: Symbol,
         args: &'args [A],
-    ) -> impl Iterator<Item = &'args A> {
+    ) -> DResult<impl Iterator<Item = &'args A>> {
         let erase_all =
             self.is_cache_handle_con(home, name) || self.is_store_row_phantom_con(home, name);
         let path = ModPath(home.to_vec());
-        args.iter()
+        if let Some(declared) = self.enum_param_use.declared_arity(&path, name)
+            && declared != args.len()
+        {
+            return Err(bug(
+                "ipe_lower::emitted_type_args",
+                format!(
+                    "an application of an enum declaring {declared} type parameters holds {} arguments",
+                    args.len()
+                ),
+            ));
+        }
+        Ok(args
+            .iter()
             .enumerate()
             .filter(move |(position, _)| {
                 !erase_all && self.enum_param_use.is_used(&path, name, *position)
             })
-            .map(|(_, a)| a)
+            .map(|(_, a)| a))
     }
 
     /// Lower a solved program-union application to its `IrType::Enum`.
@@ -19268,7 +19286,7 @@ impl<'a> Lowerer<'a> {
         //
         // The arguments the emitted enum keeps ([`Self::emitted_type_args`]).
         let mut ir_args = Vec::with_capacity(args.len());
-        for a in self.emitted_type_args(module, name, args) {
+        for a in self.emitted_type_args(module, name, args)? {
             // A generic payload slot instantiated to a function takes
             // the `Arc<dyn Fn>` carrier, matching the decl-side flip
             // ([`normalize_enum_payload_fun_carrier`]) and the
@@ -34471,6 +34489,78 @@ mod tests {
             "",
         );
         check(&lowerer, &syms);
+    }
+
+    /// An application whose argument count differs from the declaration's
+    /// parameter count is a compiler bug, never a positional erasure.
+    #[test]
+    fn an_enum_application_not_filling_its_declared_parameters_is_refused() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let (main, pair, pa, pb) = (
+            interner.intern("Main").unwrap(),
+            interner.intern("Pair").unwrap(),
+            interner.intern("a").unwrap(),
+            interner.intern("b").unwrap(),
+        );
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![],
+        };
+        let types = empty_solved_types();
+        let mut lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let def = ipe_ir::EnumDef {
+            name: pair,
+            home: ipe_ir::ModPath(vec![main]),
+            type_params: vec![pa, pb],
+            variants: vec![ipe_ir::Variant {
+                name: pair,
+                fields: vec![ipe_ir::IrType::Generic(pa), ipe_ir::IrType::Generic(pb)],
+            }],
+        };
+        lowerer.enum_param_use = ipe_ir::EnumParamUse::of([&def]);
+        let kept = lowerer
+            .emitted_type_args(&[main], pair, &[1u8, 2][..])
+            .map(|args| args.copied().collect::<Vec<u8>>());
+        assert_eq!(kept, Ok(vec![1, 2]));
+        let short: &[u8] = &[1];
+        let long: &[u8] = &[1, 2, 3];
+        for args in [short, long] {
+            let refused = lowerer.emitted_type_args(&[main], pair, args).map(|_| ());
+            assert!(
+                matches!(
+                    refused,
+                    Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                        where_: "ipe_lower::emitted_type_args",
+                        ..
+                    })
+                ),
+                "{} arguments must be refused: {refused:?}",
+                args.len()
+            );
+        }
     }
 
     /// A nullary built-in `Ty::Con` named `name`.
