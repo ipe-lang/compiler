@@ -304,7 +304,7 @@ fn type_too_deep_in_deep_type() -> Diagnostic {
 /// time with IPE-L0201 naming the function, never handed to rustc; the type
 /// that reaches the backstop exactly still emits.
 #[test]
-fn rendered_type_past_the_backstop_is_refused_naming_the_function() -> DResult<()> {
+fn rendered_type_past_the_backstop_is_refused_naming_the_function() {
     // `levels` lists put the `Int` leaf at render depth `levels + 1`.
     let at_limit = emit_returning(nested_lists(TYPE_RENDER_LIMIT - 1, IrType::Int));
     assert!(
@@ -317,13 +317,12 @@ fn rendered_type_past_the_backstop_is_refused_naming_the_function() -> DResult<(
         assert_eq!(err.code(), IPE_L0201, "wrong code for an over-deep type");
         assert_eq!(err, type_too_deep_in_deep_type());
     }
-    Ok(())
 }
 
 /// A curried `FnOnce` chain charges two levels per parameter (the box and
 /// the trait object), where a flat function type charges one.
 #[test]
-fn fn_once_chain_charges_two_levels_per_parameter() -> DResult<()> {
+fn fn_once_chain_charges_two_levels_per_parameter() {
     let levels = TYPE_RENDER_LIMIT - 3;
     let flat = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
     let chain = IrType::FnOnceChain(vec![IrType::Int], Box::new(IrType::Int));
@@ -334,7 +333,6 @@ fn fn_once_chain_charges_two_levels_per_parameter() -> DResult<()> {
     );
     let chain_res = emit_returning(nested_lists(levels, chain));
     assert_eq!(chain_res, Err(type_too_deep_in_deep_type()));
-    Ok(())
 }
 
 /// A param symbol that resolves to the empty string is a dangling-symbol
