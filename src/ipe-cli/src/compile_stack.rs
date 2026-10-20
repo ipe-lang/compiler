@@ -10,6 +10,11 @@
 //! stage or a stack overflow. Under `IPE_E2E=1` the at-ceiling program of each
 //! shape is also built with cargo.
 //!
+//! A source ceiling and a type ceiling bound different things: an access chain
+//! as long as the source ceiling admits reads through more record levels than
+//! the type ceiling lets one record have, so at its source ceiling it is
+//! refused by the type checker, and its type ceiling is pinned on its own.
+//!
 //! The deepest count of each shape is pinned. A body's expression opens at
 //! depth 0; an application adds one frame, its head or argument a postfix and
 //! an atom frame, a construct the atom opens one more, and that construct's
@@ -21,8 +26,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use ipe_diagnostics::nesting::{COMPOSE_NESTING, SOURCE_NESTING_LIMIT};
-use ipe_diagnostics::{Diagnostic, ParseError};
+use ipe_diagnostics::nesting::{
+    COMPOSE_NESTING, LAMBDA_CHAIN_TYPE_DEPTH_AT_SOURCE_CEILING, SOURCE_NESTING_LIMIT,
+    TYPE_DEPTH_LIMIT,
+};
+use ipe_diagnostics::{Diagnostic, IPE_T0022, ParseError};
 
 use crate::CliError;
 use crate::driver::{
@@ -50,6 +58,16 @@ struct Shaped {
 
 /// A source generator of one nesting shape, by depth.
 type Shape = fn(usize) -> Shaped;
+
+/// What compiling a shape at its source ceiling yields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtCeiling {
+    /// The program compiles through emit and builds with cargo.
+    Builds,
+    /// The type checker refuses the program, after every earlier stage ran
+    /// on the declared stack.
+    TypeRefused,
+}
 
 /// The ceiling as a count.
 fn ceiling() -> usize {
@@ -153,13 +171,27 @@ fn record_wraps(name: &str, n: usize) -> String {
 
 /// `n` field accesses `r.a.a.….a` in one dotted identifier, over a record
 /// nested `n` deep.
-///
-/// The record is built by two top-level `let` blocks of about `n / 2`
-/// bindings each, so building it stays far under the ceiling while the access
-/// chain reaches it.
 fn access_chain(n: usize) -> Shaped {
-    let inner = n / 2;
-    let outer = n - inner;
+    access_over(n, n)
+}
+
+/// `n` field accesses `r.a.a.….a` in one dotted identifier, over a record
+/// nested exactly as deep as the type ceiling admits.
+///
+/// Past that many accesses the chain reads a field of an `Int`, so the type
+/// checker refuses the program once the parser has admitted it.
+fn ceiling_record_access_chain(n: usize) -> Shaped {
+    access_over(usize::from(TYPE_DEPTH_LIMIT), n)
+}
+
+/// `n` field accesses `r.a.a.….a` in one dotted identifier, over a record
+/// nested `depth` deep.
+///
+/// The record is built by two top-level `let` blocks of about `depth / 2`
+/// bindings each, so building it stays far under the source ceiling.
+fn access_over(depth: usize, n: usize) -> Shaped {
+    let inner = depth / 2;
+    let outer = depth - inner;
     let after = format!(
         ")\n\n\ninner =\n    let\n        x0 = 1\n{}    in\n    x{inner}\n\n\n\
          r =\n    let\n        y0 = inner\n{}    in\n    y{outer}\n",
@@ -298,36 +330,53 @@ fn lambda_chain(n: usize) -> Shaped {
 ///
 /// `L` is the ceiling. A shape's deepest count is the largest `n` whose
 /// deepest atom (named per entry) still sits at depth `L` or less.
-fn shapes() -> [(&'static str, Shape, usize); 15] {
+fn shapes() -> [(&'static str, Shape, usize, AtCeiling); 15] {
+    use AtCeiling::{Builds, TypeRefused};
     let limit = ceiling();
     let compose = usize::try_from(COMPOSE_NESTING).unwrap_or(usize::MAX);
+    let lambdas = usize::try_from(LAMBDA_CHAIN_TYPE_DEPTH_AT_SOURCE_CEILING).unwrap_or(usize::MAX);
     [
         // Bind `k`'s operand atom at depth `9 + 2k`, the final run's at `10 + 2n`.
-        ("do_bind", do_binds, (limit - 10) / 2),
+        ("do_bind", do_binds, (limit - 10) / 2, Builds),
         // The body's `String.fromInt` atom at depth `14 + n`.
-        ("let_block", let_block, limit - 14),
+        ("let_block", let_block, limit - 14, Builds),
         // The chain's expression at depth 10, each operator one level more.
-        ("binop_chain", binop_chain, limit - 10),
+        ("binop_chain", binop_chain, limit - 10, Builds),
         // The chain's expression at depth 15, each `>>` charged its desugar's levels.
-        ("compose_chain", compose_chain, (limit - 15) / compose),
+        (
+            "compose_chain",
+            compose_chain,
+            (limit - 15) / compose,
+            Builds,
+        ),
         // The dotted identifier's atom at depth 8, each segment one level more.
-        ("access_chain", access_chain, limit - 8),
+        (
+            "access_chain",
+            ceiling_record_access_chain,
+            limit - 8,
+            TypeRefused,
+        ),
         // The chain's expression at depth 0, each operator one level more.
-        ("pipeline", pipeline, limit),
+        ("pipeline", pipeline, limit, Builds),
         // Ten levels per continuation; the innermost atom at depth `10n + 3`.
-        ("nested_lambda", nested_lambda, (limit - 3) / 10),
+        ("nested_lambda", nested_lambda, (limit - 3) / 10, Builds),
         // The innermost atom at depth `13 + 5n` inside `String.fromInt (…)`.
-        ("nested_application", nested_application, (limit - 13) / 5),
-        ("nested_parens", nested_parens, (limit - 13) / 5),
-        ("nested_list", nested_list, (limit - 13) / 5),
+        (
+            "nested_application",
+            nested_application,
+            (limit - 13) / 5,
+            Builds,
+        ),
+        ("nested_parens", nested_parens, (limit - 13) / 5, Builds),
+        ("nested_list", nested_list, (limit - 13) / 5, Builds),
         // The innermost atom at depth `10 + 5n` inside a `let` binding.
-        ("nested_record", nested_record, (limit - 10) / 5),
+        ("nested_record", nested_record, (limit - 10) / 5, Builds),
         // The innermost atom at depth `3 + 5n` in a declaration body.
-        ("nested_case", nested_case, (limit - 3) / 5),
-        ("nested_if", nested_if, (limit - 3) / 5),
-        ("lambda_chain", lambda_chain, (limit - 3) / 5),
+        ("nested_case", nested_case, (limit - 3) / 5, Builds),
+        ("nested_if", nested_if, (limit - 3) / 5, Builds),
+        ("lambda_chain", lambda_chain, lambdas, Builds),
         // Arm `k`'s condition atom at depth `8 + k`.
-        ("else_if_chain", else_if_chain, limit - 8),
+        ("else_if_chain", else_if_chain, limit - 8, Builds),
     ]
 }
 
@@ -410,11 +459,32 @@ fn assert_refused_in(result: &Result<(), CliError>, (lo, hi): (u32, u32), name: 
     );
 }
 
+/// Whether `result` is a type checker refusal.
+fn is_type_refusal(result: &Result<(), CliError>) -> bool {
+    matches!(result, Err(CliError::Pipeline { diag, .. }) if matches!(**diag, Diagnostic::Type { .. }))
+}
+
+/// Assert `result` is what `expected` says a shape at its ceiling yields.
+fn assert_at_ceiling(result: &Result<(), CliError>, expected: AtCeiling, name: &str, n: usize) {
+    match expected {
+        AtCeiling::Builds => assert!(
+            result.is_ok(),
+            "{name}: depth {n} must compile through emit: {result:?}"
+        ),
+        AtCeiling::TypeRefused => assert!(
+            is_type_refusal(result),
+            "{name}: depth {n} must be refused by the type checker: {result:?}"
+        ),
+    }
+}
+
 /// Every nesting shape compiles at the parser's ceiling on the declared stack,
-/// and one level deeper is refused by the parser inside its innermost level.
+/// or is refused there by the type checker when the shape's types pass the
+/// type ceiling first, and one level deeper is refused by the parser inside
+/// its innermost level.
 #[test]
 fn at_ceiling_shapes_fit_declared_stack() {
-    for (name, shape, deepest) in shapes() {
+    for (name, shape, deepest, expected) in shapes() {
         let found = parser_ceiling(shape);
         assert_eq!(
             found,
@@ -422,10 +492,7 @@ fn at_ceiling_shapes_fit_declared_stack() {
             "{name}: the deepest count the parser admits"
         );
         let admitted = compile_on_compile_door(shape(deepest).src);
-        assert!(
-            admitted.is_ok(),
-            "{name}: depth {deepest} must compile through emit: {admitted:?}"
-        );
+        assert_at_ceiling(&admitted, expected, name, deepest);
         let past = shape(deepest + 1);
         let refused = compile_on_compile_door(past.src);
         assert_refused_in(&refused, past.tail, name);
@@ -438,47 +505,90 @@ fn build_shape(src: &str, out: &Path, runtime: &Path) -> Result<(), CliError> {
     crate::build_fixture(&fixture, out, runtime).map(|_| ())
 }
 
-/// The deepest `name` that the cargo build covers. `access_chain` builds a
-/// record type as deep as the chain, and the depth of a type is bounded by
-/// rustc's recursion limit (128), not by the source-nesting ceiling; until
-/// type depth has a ceiling of its own, the cargo build stops under that limit.
-fn cargo_depth(name: &str, deepest: usize) -> usize {
-    const RUSTC_TYPE_DEPTH_SAFE: usize = 64;
-    if name == "access_chain" {
-        deepest.min(RUSTC_TYPE_DEPTH_SAFE)
-    } else {
-        deepest
-    }
+/// Emit `src` into `out` and build the emitted crate with cargo as `bin`.
+fn assert_builds_with_cargo(src: &str, out: &Path, runtime: &Path, bin: &str) {
+    let emitted = build_shape(src, out, runtime);
+    assert!(emitted.is_ok(), "{bin}: must emit: {emitted:?}");
+    let built = e2e_support::build_rust_binary(bin, out);
+    assert!(
+        built.is_ok(),
+        "{bin}: the emitted crate must build with cargo: {}",
+        built.err().unwrap_or_default()
+    );
 }
 
-/// Every nesting shape's at-ceiling program builds with cargo, and one level
-/// deeper is refused at ipe time by the parser. Gated on `IPE_E2E=1` (the CI
-/// `e2e` job): the seal cargo-builds each emitted crate.
+/// Every nesting shape's at-ceiling program builds with cargo (or, for a
+/// shape whose types pass the type ceiling first, is refused by the type
+/// checker), and one level deeper is refused at ipe time by the parser. Gated
+/// on `IPE_E2E=1` (the CI `e2e` job): the seal cargo-builds each emitted crate.
 #[test]
 fn at_ceiling_shapes_build_with_cargo() {
     if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
         let runtime = e2e_support::require_runtime().into_path_buf();
         let scratch =
             ipe_test_temp::temp_root().join(format!("ipe_nesting_ceiling_{}", std::process::id()));
-        for (name, shape, deepest) in shapes() {
+        for (name, shape, deepest, expected) in shapes() {
             let out = scratch.join(name);
-            let built_at = cargo_depth(name, deepest);
-            let emitted = build_shape(&shape(built_at).src, &out, &runtime);
-            assert!(
-                emitted.is_ok(),
-                "{name}: depth {built_at} must emit: {emitted:?}"
-            );
-            let built = e2e_support::build_rust_binary(&format!("nesting_ceiling_{name}"), &out);
-            assert!(
-                built.is_ok(),
-                "{name}: the emitted crate at depth {built_at} must build with cargo: {}",
-                built.err().unwrap_or_default()
-            );
+            let at = shape(deepest).src;
+            match expected {
+                AtCeiling::Builds => {
+                    assert_builds_with_cargo(
+                        &at,
+                        &out,
+                        &runtime,
+                        &format!("nesting_ceiling_{name}"),
+                    );
+                }
+                AtCeiling::TypeRefused => {
+                    assert_at_ceiling(&build_shape(&at, &out, &runtime), expected, name, deepest);
+                }
+            }
             let past = shape(deepest + 1);
             let refused = build_shape(&past.src, &scratch.join(format!("{name}_past")), &runtime);
             assert_refused_in(&refused, past.tail, name);
         }
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// The code of `result`'s pipeline diagnostic, if it is one.
+fn refusal_code(result: &Result<(), CliError>) -> Option<ipe_diagnostics::Code> {
+    match result {
+        Err(CliError::Pipeline { diag, .. }) => Some(diag.code()),
+        _ => None,
+    }
+}
+
+/// An access chain over a record exactly as deep as the type ceiling admits
+/// compiles through emit on the declared stack; over a record one level
+/// deeper it is refused by the type checker with IPE-T0022.
+#[test]
+fn access_chain_at_the_type_ceiling_compiles_and_one_level_deeper_is_refused() {
+    let limit = usize::from(TYPE_DEPTH_LIMIT);
+    let admitted = compile_on_compile_door(access_chain(limit).src);
+    assert!(
+        admitted.is_ok(),
+        "a record {limit} levels deep must compile through emit: {admitted:?}"
+    );
+    let refused = compile_on_compile_door(access_chain(limit + 1).src);
+    assert_eq!(
+        refusal_code(&refused),
+        Some(IPE_T0022),
+        "a record one level past the type ceiling: {refused:?}"
+    );
+}
+
+/// The access chain at the type ceiling builds with cargo. Gated on
+/// `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn access_chain_at_the_type_ceiling_builds_with_cargo() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let out = ipe_test_temp::temp_root()
+            .join(format!("ipe_type_ceiling_access_{}", std::process::id()));
+        let src = access_chain(usize::from(TYPE_DEPTH_LIMIT)).src;
+        assert_builds_with_cargo(&src, &out, &runtime, "type_ceiling_access_chain");
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
 
