@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
 use ipe_intern::Interner;
 
-use crate::constrain::zonk;
+use crate::constrain::zonk_reported;
 use crate::doc::{VarNamer, ty_to_doc};
 use crate::homed::{InferError, ModuleHome};
 use crate::solve::Budget;
@@ -269,7 +269,7 @@ fn unify_step(
                 // An interpolation hole names the capability the value lacks
                 // (IPE-T0014), not a bare shape mismatch against no written type.
                 let structure_var = if a_is_structure { ra } else { rb };
-                let ty = zonk(uf, budget, structure_var)?;
+                let ty = zonk_reported(uf, budget, structure_var, span)?;
                 Err(crate::super_unsatisfied(interner, bounds, &ty, span))
             } else {
                 Err(mismatch(uf, budget, interner, span, ra, rb))
@@ -930,11 +930,11 @@ fn mismatch(
     expected: VarId,
 ) -> Diagnostic {
     let mut namer = VarNamer::new();
-    let expected_ty = match zonk(uf, budget, expected) {
+    let expected_ty = match zonk_reported(uf, budget, expected, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
-    let found_ty = match zonk(uf, budget, found) {
+    let found_ty = match zonk_reported(uf, budget, found, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
@@ -1015,7 +1015,7 @@ fn infinite_type(
     let mut namer = VarNamer::new();
     // Name the variable first so it reads as `a` and any same var inside the
     // structure renders consistently.
-    let var_ty = match zonk(uf, budget, var) {
+    let var_ty = match zonk_reported(uf, budget, var, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
@@ -1026,7 +1026,7 @@ fn infinite_type(
         Ok(_) => Box::from("?"),
         Err(bug) => return bug,
     };
-    let structure_ty = match zonk(uf, budget, structure) {
+    let structure_ty = match zonk_reported(uf, budget, structure, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };

@@ -59,6 +59,7 @@ pub use ty::{
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
     measure_type_depth, promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
+    zonk_reported,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
@@ -3829,7 +3830,7 @@ fn no_such_field(
             };
         }
     };
-    let record_ty = match zonk(uf, budget, record) {
+    let record_ty = match zonk_reported(uf, budget, record, span) {
         Ok(t) => t,
         Err(bug) => return bug,
     };
