@@ -5376,7 +5376,7 @@ mod parsed_manifest_tests {
         .expect("package.ipe");
         std::fs::write(
             project.join("src/Main.ipe"),
-            "module Main exposing (main)\n\n\nmain : Int\nmain =\n    1\n",
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Rust.Engine_wrap as Engine\n\n\nmain =\n    case Engine.shift 1 of\n        Ok _ -> Io.println \"app\"\n        Err _ -> Io.println \"err\"\n",
         )
         .expect("src/Main.ipe");
         write_wrapper(&project.join("wrappers/engine"));

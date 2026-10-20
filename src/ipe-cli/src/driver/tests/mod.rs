@@ -3119,7 +3119,7 @@ fn eject_refuses_a_wasm_mode_project_from_the_manifest_tier() {
 
     let out = tmp.join("out");
     let args = [
-        tmp.join("package.ipe").to_string_lossy().into_owned(),
+        tmp.to_string_lossy().into_owned(),
         "--out".to_owned(),
         out.to_string_lossy().into_owned(),
     ];
@@ -3886,7 +3886,7 @@ fn the_held_read_fails_closed_on_an_unreadable_module() {
 #[test]
 fn consent_scans_read_the_held_modules_never_the_tree() {
     const UNSAFE_MAIN: &str =
-        "module Main exposing (main)\n\nimport Ipe.Unsafe\n\n\nmain : Int\nmain =\n    1\n";
+        "module Main exposing (main)\n\nimport Ipe.Db.Unsafe\n\n\nmain : Int\nmain =\n    1\n";
     for (tag, held_text, swapped, scanned_unsafe) in [
         ("held-unsafe", UNSAFE_MAIN, CLEAN_MAIN, true),
         ("held-clean", CLEAN_MAIN, UNSAFE_MAIN, false),

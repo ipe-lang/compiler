@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(arg.dir, s.path().join("nowhere"));
         assert!(matches!(
             ProjectRoot::resolve(arg),
-            Err(CliError::NoManifest { .. })
+            Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
         ));
     }
 
