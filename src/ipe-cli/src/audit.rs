@@ -3127,22 +3127,73 @@ mod tests {
         );
     }
 
+    /// A capture case: its tag, its manifest, and its `src/` files.
+    type CaptureCase<'a> = (&'a str, &'a str, &'a [(&'a str, String)]);
+    /// Each program's name and entry module, `None` for a library, or the refusal's kind.
+    type CaptureOutcome = Result<Option<Vec<(String, Vec<String>)>>, String>;
+
+    fn capture_refusal(err: &CliError) -> String {
+        match err {
+            CliError::NoDefaultEntry { .. } => "no-default-entry".to_owned(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// The outcome of the audit's capture reading and of the project root's resolution over the
+    /// package `manifest` with `files` under `src/`.
+    fn audited_and_resolved(
+        tag: &str,
+        manifest: &str,
+        files: &[(&str, String)],
+    ) -> (CaptureOutcome, CaptureOutcome) {
+        use crate::project_root::{EntrySet, ProjectRoot, RootArg};
+        let dir = make_test_dir(tag);
+        assert!(
+            std::fs::create_dir_all(dir.join("src/Tools")).is_ok(),
+            "create src/"
+        );
+        assert!(
+            std::fs::write(dir.join("package.ipe"), manifest).is_ok(),
+            "write package.ipe"
+        );
+        for (rel, text) in files {
+            assert!(
+                std::fs::write(dir.join("src").join(rel), text).is_ok(),
+                "write {rel}"
+            );
+        }
+        let snapshot = capture_package(&dir).expect("capture");
+        let audited: CaptureOutcome = captured_programs(snapshot.manifest(), snapshot.sources())
+            .map(|programs| {
+                programs.map(|programs| {
+                    programs
+                        .iter()
+                        .map(|program| (program.name.clone(), program.module.clone()))
+                        .collect()
+                })
+            })
+            .map_err(|err| capture_refusal(&err));
+        let root = ProjectRoot::resolve(RootArg::at(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        let resolved: CaptureOutcome = root
+            .map(|root| match root.entries() {
+                EntrySet::Programs(programs) => Some(
+                    programs
+                        .iter()
+                        .map(|entry| (entry.name().as_str().to_owned(), entry.module().to_vec()))
+                        .collect(),
+                ),
+                EntrySet::Library(_) => None,
+            })
+            .map_err(|err| capture_refusal(&err));
+        (audited, resolved)
+    }
+
     /// The programs the audit reads from a capture are the programs the project root resolves,
     /// and a package the root refuses is refused by the audit with the same refusal.
     #[test]
     fn captured_programs_are_the_project_roots_programs() {
-        use crate::project_root::{EntrySet, ProjectRoot, RootArg};
-        /// A capture case: its tag, its manifest, and its `src/` files.
-        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, String)]);
-        /// Each program's name and entry module, `None` for a library, or the refusal's kind.
-        type Outcome = Result<Option<Vec<(String, Vec<String>)>>, String>;
-        fn refusal(err: &CliError) -> String {
-            match err {
-                CliError::NoDefaultEntry { .. } => "no-default-entry".to_owned(),
-                other => format!("{other:?}"),
-            }
-        }
-        let cases: [Case<'_>; 6] = [
+        let cases: [CaptureCase<'_>; 6] = [
             (
                 "agree-two-programs",
                 "module Package exposing (package)\n\n\npackage =\n    { name = \"two\"\n    , programs =\n        [ { name = \"board\", entry = \"Main.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n",
@@ -3193,49 +3244,9 @@ mod tests {
             ),
         ];
         for (tag, manifest, files) in cases {
-            let dir = make_test_dir(tag);
-            assert!(
-                std::fs::create_dir_all(dir.join("src/Tools")).is_ok(),
-                "create src/"
-            );
-            assert!(
-                std::fs::write(dir.join("package.ipe"), manifest).is_ok(),
-                "write package.ipe"
-            );
-            for (rel, text) in files {
-                assert!(
-                    std::fs::write(dir.join("src").join(rel), text).is_ok(),
-                    "write {rel}"
-                );
-            }
-            let snapshot = capture_package(&dir).expect("capture");
-            let audited: Outcome = captured_programs(snapshot.manifest(), snapshot.sources())
-                .map(|programs| {
-                    programs.map(|programs| {
-                        programs
-                            .iter()
-                            .map(|program| (program.name.clone(), program.module.clone()))
-                            .collect()
-                    })
-                })
-                .map_err(|err| refusal(&err));
-            let root = ProjectRoot::resolve(RootArg::at(&dir));
-            let _ = std::fs::remove_dir_all(&dir);
-            let resolved: Outcome = root
-                .map(|root| match root.entries() {
-                    EntrySet::Programs(programs) => Some(
-                        programs
-                            .iter()
-                            .map(|entry| {
-                                (entry.name().as_str().to_owned(), entry.module().to_vec())
-                            })
-                            .collect(),
-                    ),
-                    EntrySet::Library(_) => None,
-                })
-                .map_err(|err| refusal(&err));
+            let (audited, resolved) = audited_and_resolved(tag, manifest, files);
             assert_eq!(audited, resolved, "{tag}: the audit and the root agree");
-            let expected: Outcome = match tag {
+            let expected: CaptureOutcome = match tag {
                 "agree-declared-over-stray-main" => Ok(Some(vec![(
                     "sync".to_owned(),
                     vec!["Tools".to_owned(), "Sync".to_owned()],
