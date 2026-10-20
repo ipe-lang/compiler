@@ -1,10 +1,10 @@
 use super::{
-    BuildOptions, BundleHost, CliError, CollectedSources, EmittedCrate, OutTarget, RuntimeContext,
-    SettingsSource, apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error,
-    bluegreen_enabled, build_root_into, bundle_delivery, collect_entry_and_siblings,
-    compile_prepared, create_source_root, emit_machine_error, emit_permissions, emit_settings,
-    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
-    io_err, resolve_vendored_runtime_dir, run_version, runtime_dep_from_env,
+    BuildOptions, BundleHost, CliError, EmittedCrate, OutTarget, RuntimeContext, SettingsSource,
+    apply_fixes_cmd, attribute_canon_errors, attribute_post_link_error, bluegreen_enabled,
+    build_root_into, bundle_delivery, compile_prepared, create_source_root, emit_machine_error,
+    emit_permissions, emit_settings, find_manifest_for_ipe_file, frame_infer_error,
+    gate_decoder_pipelines, home_to_source_map, io_err, resolve_vendored_runtime_dir, run_version,
+    runtime_dep_from_env,
 };
 use std::num::NonZeroU8;
 
@@ -3736,61 +3736,6 @@ impl SourceGraph {
             }
         })
     }
-}
-
-/// Build the injection-aware whole-program source graph for a single `.ipe`
-/// entry: discover its siblings, inject the compiled-source stdlib closure, and
-/// create the salsa source root, so a compiled-source stdlib import (e.g.
-/// `Ipe.Test`) resolves as the build resolves it.
-///
-/// # Errors
-/// [`CliError::Pipeline`] when the entry does not parse; [`CliError::Io`] on any
-/// filesystem failure; [`CliError::Usage`] if the entry is not in the built map.
-pub fn build_source_graph(entry: &Path) -> Result<SourceGraph, CliError> {
-    build_source_graph_from(collect_entry_and_siblings(entry)?, entry)
-}
-
-/// The [`build_source_graph`] core: inject the compiled-source stdlib closure and the FFI seam into an already
-/// collected module set, then create the salsa source root.
-///
-/// # Errors
-/// [`CliError::Pipeline`] when a module does not parse; [`CliError::Io`] on any
-/// filesystem failure; [`CliError::Usage`] if the entry is not in the built map.
-fn build_source_graph_from(
-    mut collected: CollectedSources,
-    blame_path: &Path,
-) -> Result<SourceGraph, CliError> {
-    let injected =
-        project::inject_compiled_std_closure(&mut collected.sources, &mut collected.discovered);
-    // The SAME FFI seam the build runs: without it, a project with installed
-    // crates (or asserted `Rust.Ffi.call` definitions) has no `Rust.*`
-    // interface modules here, so `ipe type-check` / `ipe capabilities` /
-    // `--emit-ir` would refuse a program the build accepts.
-    let ffi_injected = ffi::prepare_ffi(&mut collected.sources, blame_path)?.injected;
-
-    let db = ipe_db::IpeDatabase::new();
-    let source_root = create_source_root(&db, &collected.sources, &injected, &ffi_injected);
-    let (Some(entry_file), Some((entry_path, _))) = (
-        source_root
-            .files(&db)
-            .get(&collected.entry_module_path)
-            .copied(),
-        collected.sources.get(&collected.entry_module_path),
-    ) else {
-        return Err(CliError::Usage(
-            text::msg::internal_entry_not_in_source_map(),
-        ));
-    };
-    let entry_path = entry_path.clone();
-
-    Ok(SourceGraph {
-        db,
-        source_root,
-        entry_file,
-        sources: collected.sources,
-        entry_module_path: collected.entry_module_path,
-        entry_path,
-    })
 }
 
 /// The program's resolved capability sets, admitted by every trust-boundary

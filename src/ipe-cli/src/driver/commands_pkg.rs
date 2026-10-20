@@ -217,10 +217,10 @@ pub fn classify_mobile_spa_cap(
     built: delivery::Shape,
     wasm: &project::WasmConfig,
 ) -> pack::mobile::WebSpaCapability {
-    let shape_is_web = match declared {
-        Some(s) => s == project::EntryShape::Web,
-        None => built == delivery::Shape::Web,
-    };
+    let shape_is_web = declared.map_or_else(
+        || built == delivery::Shape::Web,
+        |s| s == project::EntryShape::Web,
+    );
     pack::mobile::WebSpaCapability {
         shape_is_web,
         wasm_enabled: wasm.implies_wasm_target(),
@@ -324,7 +324,7 @@ impl<'a> BundleAssembler<'a> {
     }
 
     /// The manifest of the held build.
-    fn manifest(&self) -> &'a project::ProjectManifest {
+    const fn manifest(&self) -> &'a project::ProjectManifest {
         self.held.root().manifest()
     }
 

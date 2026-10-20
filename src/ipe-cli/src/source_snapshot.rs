@@ -309,13 +309,6 @@ impl SourceSnapshot {
     }
 
     /// Every `tests/` module, keyed by module path, including one whose path a `src/` module has.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the test runner reads its programs through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub const fn tests(&self) -> &BTreeMap<ModulePath, SnapshotModule> {
         &self.tests
@@ -353,13 +346,6 @@ pub struct TestEntry<'s> {
 
 impl TestEntry<'_> {
     /// The entry's module path.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the test runner names its programs through this snapshot once it is wired in"
-        )
-    )]
     #[must_use]
     pub const fn module(&self) -> &ModulePath {
         self.module

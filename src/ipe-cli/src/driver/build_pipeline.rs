@@ -676,8 +676,7 @@ pub struct CollectedSources {
 /// Collect a loose entry plus the transitive closure of sibling modules it imports.
 ///
 /// This is the file-path shorthand's source-collection step, shared by the
-/// build path ([`build_loose_file_with_options`]) and
-/// [`crate::build_source_graph`] so both see the SAME module set. It
+/// build path ([`build_loose_file_with_options`]). It
 /// delegates to
 /// [`crate::loose_file::resolve_loose_file`] — the one loose-file resolver
 /// `ipe dev watch` and `ipe lsp` also use — so every surface compiles the same
@@ -685,7 +684,7 @@ pub struct CollectedSources {
 /// the entry's directory only, within
 /// [`crate::loose_file::LooseFileLimits::DEFAULT`], and no directory
 /// listing. The compiled-source stdlib closure is injected downstream (in
-/// [`compile_modules_observed`] / [`crate::build_source_graph`]), not here, so
+/// [`compile_modules_observed`]), not here, so
 /// the injection routine stays single-sourced.
 ///
 /// # Errors
