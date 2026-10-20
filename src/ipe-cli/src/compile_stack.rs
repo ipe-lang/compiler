@@ -18,9 +18,10 @@
 #![cfg(test)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT;
+use ipe_diagnostics::nesting::{COMPOSE_NESTING, SOURCE_NESTING_LIMIT};
 use ipe_diagnostics::{Diagnostic, ParseError};
 
 use crate::CliError;
@@ -127,6 +128,49 @@ fn binop_chain(n: usize) -> Shaped {
         "main =\n    Io.println (String.fromInt (1",
         |_| " + 1".to_owned(),
         "))\n",
+    )
+}
+
+/// A composition of `n + 1` `inc`s by `>>`, applied to `1`.
+fn compose_chain(n: usize) -> Shaped {
+    sequence(
+        n,
+        "main =\n    Io.println (String.fromInt ((inc",
+        |_| " >> inc".to_owned(),
+        ") 1))\n\n\ninc : Int -> Int\ninc x =\n    x + 1\n",
+    )
+}
+
+/// The bindings `{name}1 = { a = {name}0 }` through `{name}{n}` of a `let`
+/// block, each wrapping the one before it in a record.
+fn record_wraps(name: &str, n: usize) -> String {
+    let mut bindings = String::new();
+    for i in 0..n {
+        let _ = writeln!(bindings, "        {name}{} = {{ a = {name}{i} }}", i + 1);
+    }
+    bindings
+}
+
+/// `n` field accesses `r.a.a.….a` in one dotted identifier, over a record
+/// nested `n` deep.
+///
+/// The record is built by two top-level `let` blocks of about `n / 2`
+/// bindings each, so building it stays far under the ceiling while the access
+/// chain reaches it.
+fn access_chain(n: usize) -> Shaped {
+    let inner = n / 2;
+    let outer = n - inner;
+    let after = format!(
+        ")\n\n\ninner =\n    let\n        x0 = 1\n{}    in\n    x{inner}\n\n\n\
+         r =\n    let\n        y0 = inner\n{}    in\n    y{outer}\n",
+        record_wraps("x", inner),
+        record_wraps("y", outer)
+    );
+    sequence(
+        n,
+        "main =\n    Io.println (String.fromInt r",
+        |_| ".a".to_owned(),
+        &after,
     )
 }
 
@@ -254,8 +298,9 @@ fn lambda_chain(n: usize) -> Shaped {
 ///
 /// `L` is the ceiling. A shape's deepest count is the largest `n` whose
 /// deepest atom (named per entry) still sits at depth `L` or less.
-fn shapes() -> [(&'static str, Shape, usize); 13] {
+fn shapes() -> [(&'static str, Shape, usize); 15] {
     let limit = ceiling();
+    let compose = usize::try_from(COMPOSE_NESTING).unwrap_or(usize::MAX);
     [
         // Bind `k`'s operand atom at depth `9 + 2k`, the final run's at `10 + 2n`.
         ("do_bind", do_binds, (limit - 10) / 2),
@@ -263,6 +308,10 @@ fn shapes() -> [(&'static str, Shape, usize); 13] {
         ("let_block", let_block, limit - 14),
         // The chain's expression at depth 10, each operator one level more.
         ("binop_chain", binop_chain, limit - 10),
+        // The chain's expression at depth 15, each `>>` charged its desugar's levels.
+        ("compose_chain", compose_chain, (limit - 15) / compose),
+        // The dotted identifier's atom at depth 8, each segment one level more.
+        ("access_chain", access_chain, limit - 8),
         // The chain's expression at depth 0, each operator one level more.
         ("pipeline", pipeline, limit),
         // Ten levels per continuation; the innermost atom at depth `10n + 3`.

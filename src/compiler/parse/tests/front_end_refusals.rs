@@ -5,7 +5,9 @@
 //! access on a qualified value). A rejection no test drives is one edit from
 //! silently vanishing.
 
-use ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT;
+use std::fmt::Write as _;
+
+use ipe_diagnostics::nesting::{COMPOSE_NESTING, SOURCE_NESTING_LIMIT};
 use ipe_diagnostics::{Diagnostic, ParseError};
 use ipe_intern::Interner;
 use ipe_parse::parse_module;
@@ -478,5 +480,151 @@ fn else_if_chain_is_refused_at_the_ceiling() {
         boundary,
         ceiling() + 1 - arm_atom,
         "each `else if` charges one level"
+    );
+}
+
+/// A composition desugars to a lambda over two calls, so each `>>` charges
+/// `COMPOSE_NESTING` levels from its expression's depth: a declaration body's
+/// expression is at depth 0, so the first `>>` whose cumulative charge passes
+/// the ceiling is refused at that operator.
+#[test]
+fn composition_chain_is_refused_at_its_charged_ceiling() {
+    let build = |n: usize| {
+        let mut src = String::from("module Main exposing (main)\n\nmain =\n    f");
+        let mut last = src.len();
+        for _ in 0..n {
+            last = src.len();
+            src.push_str(" >> f");
+        }
+        src.push('\n');
+        let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+        let tail = (offset(last), offset(src.len()));
+        (src, tail)
+    };
+    let boundary = assert_block_boundary(build, "composition chain");
+    let charge = usize::try_from(COMPOSE_NESTING).unwrap_or(usize::MAX);
+    assert_eq!(
+        boundary,
+        ceiling() / charge + 1,
+        "each `>>` charges its desugar's levels"
+    );
+}
+
+// ── Field-access chains charge the ceiling from where they sit ──────────────
+//
+// A dotted run `r.a.….a` is one token but builds one nested `Access` per
+// segment, so each segment costs one level over the depth of the atom it
+// wraps; the segment past the ceiling is refused at its own sub-span.
+
+/// Depth a declaration body's atom is parsed at: below the body's expression,
+/// application and postfix frames.
+const BODY_ATOM_DEPTH: usize = 3;
+
+/// A module whose `main` is `before` followed by `n` `.a` segments.
+fn access_module(before: &str, n: usize) -> Block {
+    let mut src = format!("module Main exposing (main)\n\nmain =\n{before}");
+    let mut last = src.len();
+    for _ in 0..n {
+        last = src.len();
+        src.push_str(".a");
+    }
+    src.push('\n');
+    let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+    let tail = (offset(last), offset(src.len()));
+    (src, tail)
+}
+
+/// `r.a.….a` in a declaration body: the identifier's atom sits at depth 3,
+/// so the ceiling admits that many fewer segments.
+#[test]
+fn access_chain_is_refused_at_the_ceiling() {
+    let boundary = assert_block_boundary(|n| access_module("    r", n), "access chain");
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - BODY_ATOM_DEPTH,
+        "each segment charges one level"
+    );
+}
+
+/// `(r).a.….a` charges from the parenthesised atom's depth, the same depth a
+/// bare dotted identifier sits at.
+#[test]
+fn postfix_access_chain_is_refused_at_the_ceiling() {
+    let boundary = assert_block_boundary(|n| access_module("    (r)", n), "postfix access");
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - BODY_ATOM_DEPTH,
+        "each segment charges one level"
+    );
+}
+
+/// The accessor `.a.….a` reads its chain inside the getter lambda it
+/// desugars to, one level below the atom.
+#[test]
+fn accessor_chain_is_refused_at_the_ceiling() {
+    let boundary = assert_block_boundary(|n| access_module("    ", n), "accessor chain");
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - (BODY_ATOM_DEPTH + 1),
+        "the getter's chain sits one level below the atom"
+    );
+}
+
+/// Binds in the `do` block a mixed chain closes.
+const MIXED_BINDS: usize = 120;
+
+/// A `do` block of `MIXED_BINDS` binds whose final statement is `r` and `n`
+/// segments.
+fn do_then_access(n: usize) -> Block {
+    let mut block = String::from("    do\n");
+    for i in 0..MIXED_BINDS {
+        let _ = writeln!(block, "        x{i} <- t");
+    }
+    block.push_str("        r");
+    access_module(&block, n)
+}
+
+/// A chain closing a `do` block charges from the block's charged depth, so a
+/// chain a declaration body admits on its own is refused at parse when it
+/// ends a long block, instead of reaching the emitter's IR ceiling.
+#[test]
+fn access_chain_after_do_block_is_refused_at_parse() {
+    let boundary = assert_block_boundary(do_then_access, "do block then access chain");
+    // The final run is charged one level past the binds' `2 * MIXED_BINDS`,
+    // and its operand atom sits `STATEMENT_TO_ATOM` frames below that.
+    let final_atom = FIRST_STATEMENT_DEPTH + 2 * MIXED_BINDS + 1 + STATEMENT_TO_ATOM;
+    assert_eq!(
+        boundary,
+        ceiling() + 1 - final_atom,
+        "the chain charges from the block's charged depth"
+    );
+
+    let long = ceiling() - BODY_ATOM_DEPTH;
+    let (alone, _) = access_module("    r", long);
+    let admitted = parse_module(&alone, &mut Interner::new());
+    assert!(
+        admitted.is_ok(),
+        "{long} segments in a declaration body must parse: {admitted:?}"
+    );
+    let (mixed, (lo, hi)) = do_then_access(long);
+    let refused = parse_module(&mixed, &mut Interner::new());
+    assert!(
+        matches!(
+            refused,
+            Err(Diagnostic::Parse {
+                msg: ParseError::NestingTooDeep { .. },
+                ..
+            })
+        ),
+        "{long} segments closing the block: expected NestingTooDeep, got {refused:?}"
+    );
+    let Err(Diagnostic::Parse { span, .. }) = refused else {
+        return;
+    };
+    assert!(
+        span.lo >= lo && span.hi <= hi,
+        "the refusal at {}..{} lies in the chain {lo}..{hi}",
+        span.lo,
+        span.hi
     );
 }

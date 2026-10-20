@@ -22,7 +22,7 @@
 //! parser fails fast instead of silently dropping the qualifier (which the
 //! canonicaliser would then resolve against the wrong name).
 
-use ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT;
+use ipe_diagnostics::nesting::{COMPOSE_NESTING, SOURCE_NESTING_LIMIT};
 use ipe_diagnostics::{
     CaseDefect, Construct, DResult, Diagnostic, Expected, ExpectedSet, ExposingDefect,
     HeaderDefect, IfDefect, LetDefect, Located, ParseError, Span, TokenKind, TypeDeclDefect,
@@ -241,6 +241,41 @@ fn int_value(magnitude: IntMagnitude, sign: Sign, span: Span) -> DResult<i64> {
     }
 }
 
+/// The source nesting levels one operator of a chain is charged.
+///
+/// A composition desugars to a lambda over two calls, so it is charged
+/// [`COMPOSE_NESTING`]; every other operator builds one node and is charged
+/// one level.
+const fn op_nesting(op: BinOp) -> u32 {
+    match op {
+        BinOp::ComposeLeft | BinOp::ComposeRight => COMPOSE_NESTING,
+        BinOp::Mul
+        | BinOp::FloatDiv
+        | BinOp::IntDiv
+        | BinOp::Add
+        | BinOp::Sub
+        | BinOp::ParserIgnorer
+        | BinOp::Append
+        | BinOp::Cons
+        | BinOp::ParserKeeper
+        | BinOp::Eq
+        | BinOp::Neq
+        | BinOp::Lt
+        | BinOp::Gt
+        | BinOp::Le
+        | BinOp::Ge
+        | BinOp::And
+        | BinOp::Or
+        | BinOp::PipeRight
+        | BinOp::PipeLeft => 1,
+    }
+}
+
+/// The number of `Access` levels a dotted field text builds: one per segment.
+fn segment_count(text: &str) -> u32 {
+    u32::try_from(text.split('.').count()).unwrap_or(u32::MAX)
+}
+
 impl<'a> Parser<'a> {
     pub const fn new(toks: Vec<Token>, interner: &'a mut Interner) -> Self {
         Self {
@@ -296,8 +331,14 @@ impl<'a> Parser<'a> {
     }
 
     fn too_deep(&self, construct: Construct) -> Diagnostic {
+        Self::too_deep_at(self.err_here_span(), construct)
+    }
+
+    /// The `NestingTooDeep` refusal at `span`, for a level carved out of a
+    /// token already consumed.
+    const fn too_deep_at(span: Span, construct: Construct) -> Diagnostic {
         Diagnostic::Parse {
-            span: self.err_here_span(),
+            span,
             msg: ParseError::NestingTooDeep {
                 construct,
                 limit: NESTING_LIMIT_U16,
@@ -1405,16 +1446,14 @@ impl<'a> Parser<'a> {
         let first = self.parse_app(threshold, depth + 1)?;
         let mut ops: Vec<(Expr, Located<Symbol>)> = Vec::new();
         let mut operand = first;
+        // A flat operator chain re-associates into a nesting-deep tree
+        // downstream, so each operator is charged the levels its desugar nests
+        // ([`op_nesting`]), cumulatively, or the chain escapes `MAX_DEPTH` and
+        // overflows the recursive walkers (and Drop) that traverse the tree.
+        let mut charged: u32 = 0;
         while let Some((op, op_span)) = self.peek_binop(threshold) {
-            // A flat operator chain re-associates into a nesting-deep Binop/Cons
-            // tree downstream, so each operator must cost one depth level here or
-            // the chain escapes `MAX_DEPTH` and overflows the recursive walkers
-            // (and Drop) that traverse the canonical tree.
-            let op_depth = depth.saturating_add(
-                u32::try_from(ops.len())
-                    .unwrap_or(u32::MAX)
-                    .saturating_add(1),
-            );
+            charged = charged.saturating_add(op_nesting(op));
+            let op_depth = depth.saturating_add(charged);
             if op_depth > MAX_DEPTH {
                 return Err(self.too_deep(Construct::Expression));
             }
@@ -1534,7 +1573,11 @@ impl<'a> Parser<'a> {
     /// different program the type system cannot yet express; it is rejected with a
     /// teaching diagnostic rather than silently parsed as field access.
     fn parse_atom_postfix(&mut self, threshold: u32, depth: u32) -> DResult<Expr> {
-        let mut expr = self.parse_atom(threshold, depth + 1)?;
+        let atom_depth = depth + 1;
+        let mut expr = self.parse_atom(threshold, atom_depth)?;
+        // Every `Access` this postfix run wraps around the atom nests one level
+        // over the last, across every dotted token the run consumes.
+        let mut chained: u32 = 0;
         while self.peek_kind() == Some(&Tok::Dot) {
             let dot_span = self.err_here_span();
             if dot_span.lo != expr.span.hi {
@@ -1559,7 +1602,9 @@ impl<'a> Parser<'a> {
             };
             // `a.b.c` after a dot lexes as one dotted identifier; each segment
             // becomes a separate Access node with a distinct carved sub-span.
-            expr = self.build_access_chain(expr, tok_span, &text)?;
+            let chain_depth = atom_depth.saturating_add(chained);
+            expr = self.build_access_chain(expr, tok_span, &text, chain_depth)?;
+            chained = chained.saturating_add(segment_count(&text));
         }
         Ok(expr)
     }
@@ -1605,7 +1650,7 @@ impl<'a> Parser<'a> {
             Tok::Char(c) => Ok(Located::new(span, Expr_::Char(c))),
             Tok::Minus => self.parse_negative_literal(span, threshold, depth),
             Tok::Ident(text) => {
-                let expr = self.ident_expr(&text, span)?;
+                let expr = self.ident_expr(&text, span, depth)?;
                 Ok(Located::new(span, expr))
             }
             // A leading `.field` in atom position is the first-class accessor — a
@@ -1660,7 +1705,7 @@ impl<'a> Parser<'a> {
         // Each field of a dotted accessor `.a.b` gets a distinct sub-span via
         // the shared helper, so no two Access nodes share a `(module, span)`
         // type-region key.
-        body = self.build_access_chain(body, tok_span, &text)?;
+        body = self.build_access_chain(body, tok_span, &text, depth.saturating_add(1))?;
         let span = Self::span_merge(dot_span, tok_span);
         Ok(Located::new(
             span,
@@ -1676,22 +1721,30 @@ impl<'a> Parser<'a> {
     /// offset at the end of the last-written segment; `.` separators each
     /// advance it by one byte.
     ///
+    /// `depth` is the depth of `base`. The `k`-th `Access` nests `k` levels
+    /// over it, so the segment that would sit past [`MAX_DEPTH`] is refused
+    /// with `NestingTooDeep` at its own sub-span.
+    ///
     /// Called from three sites that all produce an `Access` chain from a single
     /// dotted identifier token: `parse_atom_postfix`, `parse_field_accessor`,
     /// and `ident_expr`.
-    fn build_access_chain(&mut self, mut base: Expr, tok_span: Span, text: &str) -> DResult<Expr> {
+    fn build_access_chain(
+        &mut self,
+        mut base: Expr,
+        tok_span: Span,
+        text: &str,
+        depth: u32,
+    ) -> DResult<Expr> {
         let mut cursor = tok_span.lo;
-        for (seg_count, seg) in (0_u32..).zip(text.split('.')) {
-            if seg_count > MAX_DEPTH {
-                return Err(self.too_deep(Construct::Expression));
-            }
+        for (seg_count, seg) in (1_u32..).zip(text.split('.')) {
             let seg_len = u32::try_from(seg.len()).unwrap_or(0);
             let field_lo = cursor;
+            let field_span = Span::from_start_width(field_lo, seg_len);
+            if depth.saturating_add(seg_count) > MAX_DEPTH {
+                return Err(Self::too_deep_at(field_span, Construct::Expression));
+            }
             cursor = field_lo.saturating_add(seg_len);
-            let field = Located::new(
-                Span::from_start_width(field_lo, seg_len),
-                self.interner.intern(seg)?,
-            );
+            let field = Located::new(field_span, self.interner.intern(seg)?);
             let span = Span::new(base.span.lo, cursor);
             base = Located::new(span, Expr_::Access(Box::new(base), field));
             cursor = cursor.saturating_add(1); // step past the '.' before the next segment
@@ -1926,7 +1979,7 @@ impl<'a> Parser<'a> {
     /// the end of its own field segment. Distinct sub-spans keep every node's
     /// `(module, span)` key unique, which the type-region map relies on — a shared
     /// key lets a field's result type overwrite the record type at the same key.
-    fn ident_expr(&mut self, text: &str, span: Span) -> DResult<Expr_> {
+    fn ident_expr(&mut self, text: &str, span: Span, depth: u32) -> DResult<Expr_> {
         let first = text.split('.').next().unwrap_or("");
         if !text.contains('.') {
             return Ok(Expr_::VarLocal(self.interner.intern(first)?));
@@ -1982,7 +2035,7 @@ impl<'a> Parser<'a> {
             let access_start = qual_len.saturating_add(value_len).saturating_add(1);
             let access_text = text.get(access_start..).unwrap_or_default();
             let access_span = Span::new(access_lo, span.hi);
-            let expr = self.build_access_chain(var_qual, access_span, access_text)?;
+            let expr = self.build_access_chain(var_qual, access_span, access_text, depth)?;
             return Ok(expr.value);
         }
         // Lower-case head: a local var with a chain of field accesses. Build the
@@ -1998,7 +2051,7 @@ impl<'a> Parser<'a> {
         let rest_lo = span.lo.saturating_add(base_len).saturating_add(1);
         let rest_text = text.get(first.len() + 1..).unwrap_or_default();
         let tok_span = Span::new(rest_lo, span.hi);
-        let expr = self.build_access_chain(base, tok_span, rest_text)?;
+        let expr = self.build_access_chain(base, tok_span, rest_text, depth)?;
         Ok(expr.value)
     }
 
