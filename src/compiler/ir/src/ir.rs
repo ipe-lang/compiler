@@ -3305,19 +3305,32 @@ pub enum CallPin {
     /// error type — `::<IpeError>`. Used by `decimal_from_string<E: From<String>>`
     /// when the `Err` channel is discarded.
     ErrIpeError,
-    /// A USER generic function's type parameters, named by the callee
-    /// [`Func::type_params`] symbol, that occur only as UI message slots of its
-    /// signature and that this use leaves unconstrained — each pinned to `()`,
-    /// the type the use's own node type lowered that slot to. Every other
-    /// parameter renders `_`. Only a [`Callee::Func`] call carries it.
-    MsgUnit(BTreeSet<Symbol>),
+    /// A USER generic function's type parameters this use pins, keyed by the
+    /// callee [`Func::type_params`] symbol; every other parameter renders `_`.
+    /// Only a [`Callee::Func`] call carries it.
+    User(BTreeMap<Symbol, UserPin>),
+}
+
+/// How a use pins one type parameter of a user generic callee.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum UserPin {
+    /// `()`: a message slot or `any` return this use leaves unconstrained,
+    /// the type the use's own node type lowered it to.
+    Unit,
+    /// The use's solved instantiation of a parameter its declared arguments
+    /// name, rendered when no emitted parameter of the callee names it (an
+    /// argument lowering erased it), so its return alone cannot leave rustc
+    /// without the type.
+    Instance(IrType),
+    /// An instantiation the use could not lower; refused if it must render.
+    Unlowered,
 }
 
 impl CallPin {
     /// The turbofish suffix this pin renders immediately after a kernel's name
     /// (before its `(` argument list): `dict_empty::<String, i64>(…)`, etc.
     /// [`Self::None`] renders the empty string, so an unpinned call emits no
-    /// turbofish. [`Self::MsgUnit`] has no fixed suffix — its rendering needs
+    /// turbofish. [`Self::User`] has no fixed suffix — its rendering needs
     /// the callee's generic layout — so it is `None`.
     ///
     /// The concrete default types (`i64` / `String` / `IpeError`) mirror the
@@ -3334,8 +3347,25 @@ impl CallPin {
             Self::DefaultDict => Some("::<String, i64>"),
             Self::DefaultResultMapErr => Some("::<_, _, i64>"),
             Self::ErrIpeError => Some("::<IpeError>"),
-            Self::MsgUnit(_) => None,
+            Self::User(_) => None,
         }
+    }
+
+    /// Every type this pin may render, the one source the type-mention walkers
+    /// read so a pinned type keeps its definitions and features alive.
+    pub fn pinned_types(&self) -> impl Iterator<Item = &IrType> {
+        let pins = match self {
+            Self::User(pins) => Some(pins.values()),
+            Self::None
+            | Self::DefaultI64
+            | Self::DefaultDict
+            | Self::DefaultResultMapErr
+            | Self::ErrIpeError => None,
+        };
+        pins.into_iter().flatten().filter_map(|pin| match pin {
+            UserPin::Instance(ty) => Some(ty),
+            UserPin::Unit | UserPin::Unlowered => None,
+        })
     }
 }
 

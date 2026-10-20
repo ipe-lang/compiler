@@ -21,7 +21,8 @@
 //! A custom type passing its parameters on permuted is as deep as every
 //! arrangement its constructors reach, together, and is refused at the
 //! constructor that permutes them. A parameter no field uses is accepted and
-//! erased from the emitted enum. A custom type whose instantiations grow past
+//! erased from the emitted enum, and a generic its erasure leaves no argument
+//! to infer from is pinned at each call. A custom type whose instantiations grow past
 //! the size ceiling is refused with IPE-T0023 at the constructor applying the
 //! one that crosses it.
 
@@ -531,6 +532,76 @@ fn a_custom_type_parameter_no_field_uses_builds_with_cargo() {
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }
+}
+
+/// `Tag a` whose parameter no constructor holds, so its erasure removes the
+/// only argument naming `empties`'s generic: a caller at `Tag Int`, a caller
+/// generic over the erased parameter, and an unannotated caller.
+const ERASED_INFERENCE_PIN: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\ncount : Tag Int -> Int\ncount t =\n    List.length (empties t)\n\n\ncountAny : Tag b -> Int\ncountAny t =\n    List.length (empties t)\n\n\ncountUnannotated t =\n    List.length (empties t)\n\n\nmain =\n    Io.println (if count Tag + countAny Tag + countUnannotated Tag == 0 then \"zero\" else \"other\")\n";
+
+/// Every emitted Rust line under `dir` that calls `callee` with a turbofish.
+fn turbofish_calls(dir: &Path, callee: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let needle = format!("{callee}::<");
+                found.extend(
+                    text.lines()
+                        .filter(|line| line.contains(&needle))
+                        .map(str::to_owned),
+                );
+            }
+        }
+    }
+    found
+}
+
+/// A generic whose only naming argument a parameter erasure removed is pinned
+/// at each call by its instantiation: `i64` at `Tag Int`, `()` where the
+/// caller's own generic was erased too. The emitted calls are read in the CI
+/// `test-run` job; the crate builds with cargo under `IPE_E2E=1` (the CI `e2e`
+/// job).
+#[test]
+fn a_generic_named_only_by_an_erased_argument_is_pinned_at_each_call() {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "ipe_type_ceiling_erased_pin_{}",
+        std::process::id()
+    ));
+    let emitted = ipe::RootFixture::main(ERASED_INFERENCE_PIN)
+        .and_then(|fixture| ipe::build_fixture(&fixture, &scratch, &runtime).map(|_| ()));
+    assert!(emitted.is_ok(), "must emit: {emitted:?}");
+    let calls = turbofish_calls(&scratch, "empties");
+    assert!(
+        calls.iter().any(|line| line.contains("empties::<i64>(")),
+        "the `Tag Int` call must pin `i64`: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .filter(|line| line.contains("empties::<()>("))
+            .count()
+            >= 2,
+        "the calls over an erased caller generic must pin `()`: {calls:?}"
+    );
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let built = e2e_support::build_rust_binary("type_ceiling_erased_pin", &scratch);
+        assert!(
+            built.is_ok(),
+            "the emitted crate must build with cargo: {}",
+            built.err().unwrap_or_default()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// `p0 = 0` and `pK = ( p{K-1}, p{K-1} )` through `p{n}`, compared with

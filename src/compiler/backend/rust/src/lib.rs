@@ -78,7 +78,7 @@ use ipe_diagnostics::{DResult, Diagnostic, NameError, RustNameFoldKind, Span};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
     CallPin, Callee, EnumTraits, Expr, FuncId, IrType, KernelFn, ModPath, Program,
-    RuntimeBridgedEnum, TypeDef,
+    RuntimeBridgedEnum, TypeDef, UserPin,
 };
 
 pub use emit_doc::{SweepDivergence, native_vs_legacy_sweep};
@@ -1468,7 +1468,7 @@ pub(crate) struct EmitCtx<'a> {
     passes: ipe_ir::borrow::PassTable,
     /// Function id → the order of its explicit Rust generics, for a function
     /// that declares any ([`GenericLayout`]). Read to render a use-site
-    /// [`ipe_ir::CallPin::MsgUnit`] turbofish against the callee's own clause.
+    /// [`ipe_ir::CallPin::User`] turbofish against the callee's own clause.
     generic_layouts: BTreeMap<FuncId, GenericLayout>,
     /// Every distinct record shape synthesised for the program, in emission
     /// order (sorted by field-name set).
@@ -1907,8 +1907,13 @@ impl<'a> EmitCtx<'a> {
                 // ONCE here (from the same `Func`) so signature and call site can
                 // never disagree on the carrier.
                 let idxs = crate::emit_expr::impl_fn_param_indices(func);
+                let mut named_by_params: Vec<Symbol> = Vec::new();
+                for param in &func.params {
+                    collect_generics(&param.ty, &mut named_by_params);
+                }
                 let layout = GenericLayout {
                     type_params: func.type_params.iter().map(|(sym, _)| *sym).collect(),
+                    named_by_params: named_by_params.into_iter().collect(),
                     inferred_tail: idxs.len().saturating_add(func.row_params.len()),
                 };
                 if !layout.type_params.is_empty() {
@@ -3816,17 +3821,29 @@ impl<'a> EmitCtx<'a> {
     }
 
     /// The turbofish a call to `callee` carrying `pin` renders between the
-    /// callee's name and its `(`.
+    /// callee's name and its `(`, inside the caller's generic scope `generics`.
     ///
-    /// A [`CallPin::MsgUnit`] renders one entry per explicit generic of the
-    /// callee, in [`GenericLayout`] order: `()` for a type parameter the pin
-    /// names, `_` for every other one. A pin naming none of the callee's type
-    /// parameters (a message slot the callee already defaulted to `()`)
-    /// renders nothing. The pin on a non-[`Callee::Func`] callee is a lowering
-    /// bug, never a silent drop.
-    pub(crate) fn call_pin_turbofish(&self, callee: &Callee, pin: &CallPin) -> DResult<String> {
-        let syms = match pin {
-            CallPin::MsgUnit(syms) => syms,
+    /// A [`CallPin::User`] renders one entry per explicit generic of the
+    /// callee, in [`GenericLayout`] order: `()` for a [`UserPin::Unit`]
+    /// parameter; the pinned type for a [`UserPin::Instance`] parameter no
+    /// emitted parameter of the callee names (the arguments cannot let rustc
+    /// infer it); `_` for every other one. A pin rendering only `_` renders
+    /// nothing. The pin on a non-[`Callee::Func`] callee, or a
+    /// [`UserPin::Unlowered`] parameter that must render, is a lowering bug,
+    /// never a silent drop.
+    ///
+    /// # Errors
+    ///
+    /// [`Diagnostic::CompilerBug`] on either lowering bug above; any error of
+    /// [`crate::emit_types::render_type`].
+    pub(crate) fn call_pin_turbofish(
+        &self,
+        callee: &Callee,
+        pin: &CallPin,
+        generics: emit_types::GenericScope,
+    ) -> DResult<String> {
+        let pins = match pin {
+            CallPin::User(pins) => pins,
             CallPin::None
             | CallPin::DefaultI64
             | CallPin::DefaultDict
@@ -3845,22 +3862,43 @@ impl<'a> EmitCtx<'a> {
             Callee::Kernel(_) | Callee::Ffi { .. } => {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
-                    detail: "a message-slot pin on a non-user callee".to_owned(),
+                    detail: "a user-generic pin on a non-user callee".to_owned(),
                 });
             }
         };
         let Some(layout) = self.generic_layouts.get(&id) else {
             return Ok(String::new());
         };
-        if !layout.type_params.iter().any(|sym| syms.contains(sym)) {
+        let mut entries: Vec<String> = Vec::with_capacity(
+            layout
+                .type_params
+                .len()
+                .saturating_add(layout.inferred_tail),
+        );
+        let mut any_pinned = false;
+        for sym in &layout.type_params {
+            let inferable = layout.named_by_params.contains(sym);
+            let entry = match pins.get(sym) {
+                Some(UserPin::Unit) => Some("()".to_owned()),
+                Some(UserPin::Instance(ty)) if !inferable => {
+                    Some(emit_types::render_type(self, ty, generics)?)
+                }
+                Some(UserPin::Unlowered) if !inferable => {
+                    return Err(Diagnostic::CompilerBug {
+                        where_: "ipe_backend_rust::EmitCtx::call_pin_turbofish",
+                        detail: "an uninferable type parameter pinned to an unlowered type"
+                            .to_owned(),
+                    });
+                }
+                Some(UserPin::Instance(_) | UserPin::Unlowered) | None => None,
+            };
+            any_pinned |= entry.is_some();
+            entries.push(entry.unwrap_or_else(|| "_".to_owned()));
+        }
+        if !any_pinned {
             return Ok(String::new());
         }
-        let entries: Vec<&str> = layout
-            .type_params
-            .iter()
-            .map(|sym| if syms.contains(sym) { "()" } else { "_" })
-            .chain(std::iter::repeat_n("_", layout.inferred_tail))
-            .collect();
+        entries.extend(std::iter::repeat_n("_".to_owned(), layout.inferred_tail));
         Ok(format!("::<{}>", entries.join(", ")))
     }
 }
@@ -3871,6 +3909,9 @@ impl<'a> EmitCtx<'a> {
 /// always leaves to inference.
 struct GenericLayout {
     type_params: Vec<Symbol>,
+    /// The type parameters some emitted parameter type names, which a call's
+    /// arguments let rustc infer.
+    named_by_params: BTreeSet<Symbol>,
     inferred_tail: usize,
 }
 

@@ -1047,7 +1047,7 @@ fn build_generic_call(
     // substitutes when the pin is empty (`csv_parse::<IpeError>(…)`). Every
     // kernel here returns `IpeResult<E, _>` generic over the error channel, so a
     // call whose result flows into a polymorphic context needs `E` pinned.
-    let pin_turbofish = ctx.call_pin_turbofish(callee, pin)?;
+    let pin_turbofish = ctx.call_pin_turbofish(callee, pin, generics)?;
     let turbofish: &str = if pin_turbofish.is_empty()
         && matches!(
             callee,

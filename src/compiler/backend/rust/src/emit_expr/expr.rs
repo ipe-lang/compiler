@@ -497,10 +497,10 @@ pub fn emit_expr_at(
             // the turbofish the lowerer pinned because the solver left one of
             // this call's type parameters genuinely unconstrained (a discarded /
             // empty / phantom position): a polymorphic kernel's default, or a
-            // user generic's message slot pinned to `()`. Empty for an unpinned
+            // user generic's parameter its arguments cannot infer. Empty for an unpinned
             // call. The suffix goes between the callee name and its `(`
             // argument list: `dict_empty::<String, i64>(…)`.
-            let pin_turbofish = ctx.call_pin_turbofish(callee, pin)?;
+            let pin_turbofish = ctx.call_pin_turbofish(callee, pin, generics)?;
             // `Ipe.Csv` parse kernels are generic over the error channel
             // (`csv_parse<E: From<String>>(...) -> IpeResult<E, CsvDoc>`); a
             // `Result`-returning call whose `Err` arm is often discarded leaves
