@@ -95,7 +95,8 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
         | CliError::ExposedModuleMissing { .. }
         | CliError::SourceTree(_)
         | CliError::SymlinkInSource { .. }
-        | CliError::FileOutsideRoot { .. } => LoadError::Refused(detail),
+        | CliError::FileOutsideRoot { .. }
+        | CliError::DirectoryExpected { .. } => LoadError::Refused(detail),
         CliError::FileTooLarge { .. }
         | CliError::FmtOutputTooLarge { .. }
         | CliError::DiscoveryLimitReached { .. }

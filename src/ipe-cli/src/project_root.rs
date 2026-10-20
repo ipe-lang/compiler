@@ -1081,9 +1081,11 @@ mod tests {
         assert!(made.success(), "mkfifo failed");
         let cwd = s.path().to_path_buf();
         let (send, recv) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = send.send(dir_only(&cwd, "pipe").map(|_| ()));
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = send.send(dir_only(&cwd, "pipe").map(|_| ()));
+            })
+            .expect("spawn the judging thread");
         let judged = recv
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the argument is judged without opening the FIFO");
