@@ -1216,15 +1216,26 @@ pub enum TypeError {
     TypeTooDeep { depth: u16, limit: u16 },
     /// A type unfolds to more nodes than the checker's size ceiling. [IPE-T0023]
     ///
-    /// `limit` is the node ceiling. The type itself is never carried: printing
-    /// it would unfold every one of those nodes.
-    TypeTooLarge { limit: u64 },
+    /// `limit` is the node ceiling and `origin` what built the type. The type
+    /// itself is never carried: printing it would unfold every one of those
+    /// nodes.
+    TypeTooLarge { limit: u64, origin: TypeSizeOrigin },
     /// A custom type reaches itself with one of its parameters wrapped in a
     /// larger type, so its uses nest without bound. [IPE-T0024]
     ///
     /// `union` names the custom type refused and `param` the parameter that
     /// grows on the way around the cycle.
     ExpansiveRecursion { union: Box<str>, param: Box<str> },
+}
+
+/// What built a type past the size ceiling, under [`TypeError::TypeTooLarge`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TypeSizeOrigin {
+    /// A value's inferred type.
+    Value,
+    /// A custom type's constructor instantiating a type of its own recursive
+    /// group with larger arguments.
+    Declaration,
 }
 
 /// Why a wildcard `any` parameter has no independent lowering, under
@@ -3118,10 +3129,23 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
              level down."
                 .into(),
         )],
-        TypeError::TypeTooLarge { .. } => vec![HelpLine::Note(
+        TypeError::TypeTooLarge {
+            origin: TypeSizeOrigin::Value,
+            ..
+        } => vec![HelpLine::Note(
             "a value that holds the same value twice doubles its type each time. \
              Name the repeated part with its own custom type, or build the \
              structure from a list instead of nested pairs."
+                .into(),
+        )],
+        TypeError::TypeTooLarge {
+            origin: TypeSizeOrigin::Declaration,
+            ..
+        } => vec![HelpLine::Note(
+            "a custom type that refers to itself with larger arguments builds a \
+             larger type at each level, however shallow. Pass its parameters on \
+             as they are, or hold the growing part in a field of its own type, \
+             such as a `List`."
                 .into(),
         )],
         TypeError::WildcardNotIndependent { .. } => vec![HelpLine::Note(

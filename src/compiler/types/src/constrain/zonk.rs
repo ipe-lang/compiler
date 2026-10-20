@@ -3,6 +3,7 @@ use super::{
     Generated, InferError, Interner, RefCell, RowTail, STAGE, SchemeKey, Span, StdlibKernel,
     Symbol, Ty, TypeError, UnionFind, VarId, ZONK_NODE_LIMIT, tag_solver_var, unify_at,
 };
+use ipe_diagnostics::TypeSizeOrigin;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW, TYPE_SIZE_LIMIT};
 
 use crate::expansive::NominalLevels;
@@ -809,6 +810,7 @@ const fn type_too_large(span: Span) -> Diagnostic {
         span,
         msg: TypeError::TypeTooLarge {
             limit: TYPE_SIZE_LIMIT,
+            origin: TypeSizeOrigin::Value,
         },
     }
 }

@@ -33,7 +33,10 @@ use std::path::{Path, PathBuf};
 
 use ipe::CliError;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
-use ipe_diagnostics::{Diagnostic, IPE_L0102, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError};
+use ipe_diagnostics::{
+    Diagnostic, HelpLine, IPE_L0102, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError,
+    TypeSizeOrigin,
+};
 
 /// Where the chain one binding past the deepest is refused.
 #[derive(Clone, Copy)]
@@ -728,6 +731,16 @@ fn doubling_chain(n: usize) -> Chain {
     }
 }
 
+/// The help under a value's type past the size ceiling.
+const VALUE_SIZE_HELP: &str = "a value that holds the same value twice doubles its type each time. \
+     Name the repeated part with its own custom type, or build the structure from a list \
+     instead of nested pairs.";
+
+/// The help under a declared type built past the size ceiling.
+const DECLARATION_SIZE_HELP: &str = "a custom type that refers to itself with larger arguments \
+     builds a larger type at each level, however shallow. Pass its parameters on as they are, \
+     or hold the growing part in a field of its own type, such as a `List`.";
+
 /// A type that is shallow but unfolds to more than [`TYPE_SIZE_LIMIT`] nodes is
 /// refused with IPE-T0023 at the binding that doubled past it; one doubling
 /// less fits. `pK`'s type unfolds to `2^(K + 1) - 1` nodes.
@@ -748,8 +761,13 @@ fn a_type_doubling_past_the_size_ceiling_is_refused() {
             span: past.refused_at,
             msg: TypeError::TypeTooLarge {
                 limit: TYPE_SIZE_LIMIT,
+                origin: TypeSizeOrigin::Value,
             },
         })
+    );
+    assert_eq!(
+        diag.map(Diagnostic::help),
+        Some(vec![HelpLine::Note(VALUE_SIZE_HELP.into())])
     );
 }
 
@@ -795,9 +813,15 @@ fn a_type_whose_instantiations_widen_past_the_size_ceiling_is_refused() {
                 span: past.refused_at,
                 msg: TypeError::TypeTooLarge {
                     limit: TYPE_SIZE_LIMIT,
+                    origin: TypeSizeOrigin::Declaration,
                 },
             }),
             "a widening of {k} must be refused: {refused:?}"
+        );
+        assert_eq!(
+            refusal(&refused).map(Diagnostic::help),
+            Some(vec![HelpLine::Note(DECLARATION_SIZE_HELP.into())]),
+            "a widening of {k} must name its declaration: {refused:?}"
         );
     }
 }

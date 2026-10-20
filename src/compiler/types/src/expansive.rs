@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW, TYPE_SIZE_LIMIT};
-use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError};
+use ipe_diagnostics::{DResult, Diagnostic, Span, TypeError, TypeSizeOrigin};
 use ipe_intern::{Interner, Symbol};
 
 use crate::{Budget, InferError};
@@ -879,6 +879,7 @@ const fn too_large(span: Span) -> Diagnostic {
         span,
         msg: TypeError::TypeTooLarge {
             limit: TYPE_SIZE_LIMIT,
+            origin: TypeSizeOrigin::Declaration,
         },
     }
 }
