@@ -714,6 +714,114 @@ scanViolations modules =
     conversionViolations admittedConversions modules ++ reachViolationsOf modules ++ viewImportViolations modules
 
 
+-- ── a uid as text ───────────────────────────────────────────────────────
+--
+-- A page names a unit through its label, never its uid: `Uid.toString`
+-- appears under `src/Lib` only at the admitted sites, each keyed by its file
+-- and enclosing top-level name. `Lib/Uid.ipe` defines it and is not
+-- scanned.
+
+
+-- The names `Uid.toString` goes by in a module: under `Uid`, under
+-- `Lib.Uid`, under every name the module imports `Lib.Uid` as, and bare when
+-- an import of it exposes `toString` or everything.
+uidTextNames : List Import -> List String
+uidTextNames imports =
+    let
+        uidImports =
+            List.filter (\imp -> imp.moduleName == "Lib.Uid") imports
+
+        qualifiers =
+            List.unique ("Uid" :: "Lib.Uid" :: List.map (\imp -> imp.qualifier) uidImports)
+
+        bare =
+            if List.any (\imp -> List.member "toString" imp.exposed || List.member ".." imp.exposed) uidImports then
+                [ "toString" ]
+
+            else
+                []
+    in
+    bare ++ List.map (\q -> q ++ ".toString") qualifiers
+
+
+-- Every site a uid becomes text: the unit place a page shows beside its
+-- path, the internal link target and key, the stored key and its lookup
+-- bind, and the store's refusal of a row it cannot read.
+admittedUidTexts : List String
+admittedUidTexts =
+    [ "Lib/Db.ipe:findLegacy"
+    , "Lib/Db.ipe:storedDecision"
+    , "Lib/Db.ipe:storedUid"
+    , "Lib/Links.ipe:linkKey"
+    , "Lib/View.ipe:linkEl"
+    , "Lib/View.ipe:placeEls"
+    ]
+
+
+-- Each `Uid.toString` token of a module, keyed `rel:name` by the last
+-- column-0 lowercase line above it.
+uidTextSitesIn : ScanModule -> List String
+uidTextSitesIn scanned =
+    (List.foldl (uidTextStep (uidTextNames scanned.imports) scanned.rel) { name = "", sites = [] } (String.lines scanned.text)).sites
+
+
+uidTextStep : List String -> String -> String -> SiteScan -> SiteScan
+uidTextStep names rel line scan =
+    let
+        name =
+            if leadsWith Char.isLower line then
+                Maybe.withDefault scan.name (List.head (tokens line))
+
+            else
+                scan.name
+
+        found =
+            List.filter (\token -> List.member token names) (tokens line)
+    in
+    { name = name, sites = List.map (\_ -> rel ++ ":" ++ name) found ++ scan.sites }
+
+
+-- A uid-text site `admitted` does not list, and an admitted site no source
+-- holds, over the modules under `Lib/` but `Lib/Uid.ipe`.
+uidTextViolations : List String -> List ScanModule -> List String
+uidTextViolations admitted modules =
+    let
+        found =
+            List.unique (List.concatMap uidTextSitesIn (List.filter (\scanned -> String.startsWith "Lib/" scanned.rel && scanned.rel /= "Lib/Uid.ipe") modules))
+    in
+    List.map (\site -> "a uid becomes text at " ++ site ++ ", which is not admitted") (List.filter (\site -> not (List.member site admitted)) found)
+        ++ List.map (\site -> "the admitted site " ++ site ++ " holds no uid text") (List.filter (\site -> not (List.member site found)) admitted)
+
+
+-- The tree shows a uid only at the admitted sites, and each way around the
+-- scan is a violation: a uid in a heading, under an import alias, exposed
+-- bare, an admitted site removed from the source. A token that only
+-- contains the name is no site. Red if a page can draw a uid in a unit's
+-- place, or the scan stops seeing it.
+uidTextScanRefuses : Task.Task Error Bool
+uidTextScanRefuses =
+    srcSources
+        |> Task.map (List.map indexModule)
+        |> Task.map
+            (\sources ->
+                List.isEmpty (uidTextViolations admittedUidTexts sources)
+                    && uidCaught (appendTo "Lib/View.ipe" "heading uid =\n    Uid.toString uid" sources)
+                    && uidCaught (appendTo "Lib/Queue.ipe" "labelOf uid =\n    Lib.Uid.toString uid" sources)
+                    && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid as U" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    U.toString uid" sources))
+                    && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid exposing (toString)" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    toString uid" sources))
+                    && uidCaught (appendTo "Lib/UnitName.ipe" "shown name =\n    Uid.toString (uid name)" sources)
+                    && uidCaught (List.filter (\scanned -> scanned.rel /= "Lib/Links.ipe") sources)
+                    && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Queue.ipe" "labelOf uid =\n    myUid.toStringLabel uid" sources))
+                    && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Uid.ipe" "shown uid =\n    Uid.toString uid" sources))
+            )
+
+
+uidCaught : List ScanModule -> Bool
+uidCaught sources =
+    not (List.isEmpty (uidTextViolations admittedUidTexts sources))
+
+
+
 -- ── the real tree ───────────────────────────────────────────────────────
 --
 -- The tree holds no violation, and each way around a scan is one: a new
@@ -858,4 +966,5 @@ checks =
         , check "each way around the source scans is a violation" scansRefuseEvasions
         , Task.succeed ( "the type walk refuses every path an error reaches a page by", typeWalkRefuses )
         , Task.succeed ( "the conversion scan admits only the listed sites, by token", conversionScanRefuses )
+        , check "a uid becomes text only at the admitted sites, and a uid in a heading is a violation" uidTextScanRefuses
         ]

@@ -20,7 +20,7 @@ import Lib.Format as Format
 import Lib.Index as Index exposing (Change(..), SourceView(..))
 import Lib.Label as Label exposing (Label, LabelPart(..), LabelPiece(..))
 import Lib.Links as Links exposing (Link(..))
-import Lib.Queue as Queue exposing (HistoryState(..), Place(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), Standing(..), UnitLabel, UnitPageState(..))
 import Lib.ReviewKey as ReviewKey
 import Lib.SafeText as SafeText exposing (SafeText, Segment(..))
 import Lib.Uid exposing (Uid)
@@ -535,7 +535,7 @@ historyHeading row badge bodyHash reviewedAt =
     Ui.row
         [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
         [ badge
-        , Ui.el [ Ui.describe (Ui.descHeading 2), Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (shownLabel (nameOf row))
+        , sectionHeading (historyName row.label)
         , Ui.el
             [ Font.size 12, Font.family Font.monospace, Font.color (Ui.rgb 150 150 165) ]
             (safeText (Index.shortHash bodyHash))
@@ -568,14 +568,30 @@ unverifiedText why =
             "Not counted: the log's chain breaks before this row"
 
 
-nameOf : Queue.HistoryRow -> List LabelPiece
-nameOf row =
-    case row.name of
-        Just n ->
-            [ IndexedLabel n ]
+-- What a History row is called: a unit's label or a file's path, each
+-- marked when the index no longer holds it. A row with no name says so in
+-- fixed text, never in any text the row carries.
+historyName : Queue.HistoryLabel -> Ui.Element Msg
+historyName label =
+    case label of
+        Labelled unit presence ->
+            Ui.row [ Ui.spacing 6, Ui.centerY ] (labelEl 14 unit :: presenceEls presence)
 
-        Nothing ->
-            [ ToolText (SafeText.renderForeign (Uid.toString (Queue.entryUid row.entry))) ]
+        FileLabelled path presence ->
+            Ui.row [ Ui.spacing 6, Ui.centerY ] (Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (shownLabel [ IndexedLabel path ]) :: presenceEls presence)
+
+        Unnamed ->
+            Ui.el [ Font.size 14, Font.bold, Font.color (Ui.rgb 235 235 240) ] (safeText (SafeText.literal "unit no longer indexed (no verified record of its name)"))
+
+
+presenceEls : Queue.Presence -> List (Ui.Element Msg)
+presenceEls presence =
+    case presence of
+        Indexed ->
+            []
+
+        NoLongerIndexed ->
+            [ chipColored (SafeText.literal "no longer indexed") (Ui.rgb 70 70 85) ]
 
 
 -- The unit page shows the source of one unit with its resolved links —
@@ -629,7 +645,7 @@ unitPageCard standing loaded =
         ]
         [ Ui.row
             [ Ui.width Ui.fill, Ui.spacing 10, Ui.centerY ]
-            [ sectionHeading (labelEl 14 (Queue.unitLabel Named unit))
+            [ sectionHeading (labelEl 14 (Queue.unitLabel Named (Index.unitName unit)))
             , labelChip unit.facing
             ]
         , unitStanding (Queue.standingFor unit standing)

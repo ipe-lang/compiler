@@ -135,7 +135,7 @@ historyModel rows =
 
 historyRowOf : LibDb.VerifiedRow -> Queue.HistoryRow
 historyRowOf row =
-    { entry = Verified row, name = Nothing }
+    { entry = Verified row, label = Queue.Unnamed }
 
 
 -- The queue card of `loaded` on a server whose review log reads `log`.
@@ -157,7 +157,7 @@ unverifiedHistory : LogShown -> Unverified -> Model
 unverifiedHistory log why =
     { baseModel
         | page = HistoryPage
-        , history = HistoryLoaded { rows = [ { entry = Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why }, name = Nothing } ], at = HistoryStart, next = Nothing, log = log }
+        , history = HistoryLoaded { rows = [ { entry = Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why }, label = Queue.Unnamed } ], at = HistoryStart, next = Nothing, log = log }
     }
 
 
@@ -590,6 +590,8 @@ decisionErrorFixedText loaded =
         , SaveRefused SourceGone
         , SaveRefused SourceChanged
         , SaveRefused SourcePastCeiling
+        , SaveRefused NamePastCeiling
+        , SaveRefused NameUnreadable
         , SaveRefused NotQueued
         , SaveRefused SourceNotShown
         , SaveRefused LogBroken
@@ -783,7 +785,7 @@ seededChecks a b =
             page (refusingModel a)
 
         hostileHistory =
-            historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, name = Just (labelOf hostileText) } ]
+            historyModel [ { entry = Unverified { uid = a.unit.uid, bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.FileLabelled (labelOf hostileText) Queue.Indexed } ]
 
         readOnlyCard =
             page (cardModelUnder ShownUnkeyed a)
@@ -1160,6 +1162,21 @@ storedPure loaded long ok yes =
 
         refusedInHistory =
             page (historyModel [ historyRowOf ok ])
+
+        goneLabel =
+            { kind = labelOf "const", name = labelOf "crate::FILE", place = Queue.At (labelOf "ipe:src/b.rs") 9 }
+
+        goneHistory =
+            page (historyModel [ { entry = Verified yes, label = Queue.Labelled goneLabel Queue.NoLongerIndexed } ])
+
+        indexedHistory =
+            page (historyModel [ { entry = Verified yes, label = Queue.Labelled goneLabel Queue.Indexed } ])
+
+        goneFileHistory =
+            page (historyModel [ { entry = Verified yes, label = Queue.FileLabelled (labelOf "ipe:src/blob.bin") Queue.NoLongerIndexed } ])
+
+        unnamedHistory =
+            page (historyModel [ { entry = Verified yes, label = Queue.Unnamed } ])
     in
     [ ( "an over-long stored reason shows its length and none of its text, in the History and on a changed card", has lengthNote hiddenInHistory && has lengthNote hiddenOnCard && not (has (String.repeat 20 "Q") hiddenInHistory) && not (has (String.repeat 20 "Q") hiddenOnCard) )
     , ( "a valid stored reason is shown in the History and on a changed card", has "needs a test" okInHistory && has "needs a test" okOnCard && not (has "reason not shown" okInHistory) )
@@ -1167,7 +1184,49 @@ storedPure loaded long ok yes =
     , ( "a stored refusal shows its badge and no approval", has "✗ Refused" refusedInHistory && not (has "✓ Approved" refusedInHistory) )
     , ( "a changed card names a previous approval", has "Previously Approved" (page (changedModel loaded yes)) )
     , ( "a changed card names a previous refusal with its reason", has "Previously Refused (needs a test)" okOnCard )
+    , ( "a History entry of a unit gone from the index shows its kind, name and place, says it is no longer indexed, and holds no run of 64 hex characters, beside one still indexed"
+      , has "const" goneHistory
+            && has "crate::FILE" goneHistory
+            && has "ipe:src/b.rs" goneHistory
+            && has ":9" goneHistory
+            && has "no longer indexed" goneHistory
+            && longestHexRun goneHistory
+            < 64
+            && has "crate::FILE" indexedHistory
+            && not (has "no longer indexed" indexedHistory)
+            && longestHexRun (Uid.toString (LibDb.verifiedUid yes))
+            >= 64
+      )
+    , ( "a History entry of a file gone from the index shows its path and says it is no longer indexed, with no uid"
+      , has "ipe:src/blob.bin" goneFileHistory
+            && has "no longer indexed" goneFileHistory
+            && longestHexRun goneFileHistory
+            < 64
+      )
+    , ( "an unnamed History entry shows its fixed text and its short body hash, and no uid"
+      , has "unit no longer indexed (no verified record of its name)" unnamedHistory
+            && has "h-yes" unnamedHistory
+            && longestHexRun unnamedHistory
+            < 64
+            && not (has "no verified record of its name" goneHistory)
+      )
     ]
+
+
+-- The longest run of hex digits in `text`: a uid is 64 of them.
+longestHexRun : String -> Int
+longestHexRun text =
+    String.foldl
+        (\c run ->
+            if String.contains (String.fromChar c) "0123456789abcdefABCDEF" then
+                { current = run.current + 1, longest = max run.longest (run.current + 1) }
+
+            else
+                { current = 0, longest = run.longest }
+        )
+        { current = 0, longest = 0 }
+        text
+        |> .longest
 
 
 -- ── harness ─────────────────────────────────────────────────────────────

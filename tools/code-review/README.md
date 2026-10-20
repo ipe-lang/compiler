@@ -126,6 +126,16 @@ length, never its text.
 History shows 100 reviews per page, newest first; each page reads only its own
 rows, through an index in that order.
 
+Each History entry names its unit by kind, qualified name, path and line, or
+an unreviewable file by its path. A decision records that name in its signed
+row, so an entry still names a unit or file the index no longer holds,
+marked "no longer indexed"; a name is drawn only from a row whose signature
+verifies, never from an unverified one. A row that does not verify, or a
+legacy row, is named from the index while it holds the unit and otherwise
+reads "unit no longer indexed (no verified record of its name)"; a uid never
+stands in for a name. A unit whose kind, qualified name or path is longer
+than 2048 characters cannot be decided.
+
 The queue lists the index's current units minus the `(uid, body_hash)` pairs
 in its `reviewed` table, the app's copy of the review DB's decisions. A unit
 is listed because its current body has no decision, not because a change
@@ -187,7 +197,7 @@ A row counts as a decision only when its signature verifies under the key and
 the log's chain is unbroken. The signature covers the log's random id, the
 row's sequence number, the previous row's signature, the unit's `uid` and
 `body_hash`, the decision, the reason (an absent reason and an empty one
-differ) and the review time, so an edit to any of them outside the tool, a
+differ), the review time and the recorded name of the unit or file, so an edit to any of them outside the tool, a
 forged row, or a row copied from another review DB does not verify. Such a row
 is shown in the history as not counted, with the reason, and its unit stays
 in the queue.
@@ -208,7 +218,10 @@ first entry, "The review log holds N entries past its head" or "before its
 first", then ": a decision was added outside this tool."), the queue page
 offers no Approve or Refuse, and every new decision is refused until the log
 is repaired, so nothing is appended to a broken chain. Startup refuses a
-review DB whose append-only triggers are missing.
+review DB whose append-only triggers, or the trigger that keeps each row's
+name whole, are missing. It also refuses a review DB holding decisions
+recorded before names were kept, which this reviewer cannot verify: start a
+fresh review database.
 
 Removing the last rows and rewriting the head to match, or restoring an older
 copy of the whole file under the same key, cannot be told apart from a log

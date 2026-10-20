@@ -239,7 +239,7 @@ uncheckedReview name rows =
         db <- openFileAt CreateIfMissing (base ++ "/review.db")
         Db.exec db "CREATE TABLE review (uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, PRIMARY KEY (uid, body_hash))" []
         Task.sequence (List.map (Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)") rows)
-        Db.exec db "CREATE TABLE review_log (seq INTEGER PRIMARY KEY, uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, prev TEXT NOT NULL, mac TEXT NOT NULL)" []
+        Db.exec db "CREATE TABLE review_log (seq INTEGER PRIMARY KEY, uid TEXT NOT NULL, body_hash TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT, reviewed_at INTEGER NOT NULL, prev TEXT NOT NULL, mac TEXT NOT NULL, unit_kind TEXT, unit_qualified TEXT, unit_path TEXT, unit_line INTEGER)" []
         Db.exec db "CREATE TABLE review_log_head (one INTEGER PRIMARY KEY, log_id TEXT NOT NULL, seq INTEGER NOT NULL, head TEXT NOT NULL, key_check TEXT)" []
         Db.exec db "INSERT INTO review_log_head (one, log_id, seq, head, key_check) VALUES (1, ?, 0, 'genesis', ?)" [ SqlString uncheckedLogId, SqlString (rawKeyCheckFor uncheckedLogId) ]
         Task.succeed db

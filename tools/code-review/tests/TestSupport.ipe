@@ -91,7 +91,9 @@ module TestSupport exposing
     , testMacKey
     , testReviewKey
     , RawRow
+    , RawName(..)
     , rawRow
+    , rawMacInput
     , appendSigned
     , appendSignedAs
     , appendSignedClaiming
@@ -1006,12 +1008,46 @@ type alias RawRow =
     , decision : String
     , reason : Maybe String
     , reviewedAt : Int
+    , name : RawName
     }
 
 
+-- The name of a row's subject as its four name columns hold it: a unit's
+-- kind, qualified name, path and line, or a file's path alone.
+type RawName
+    = RawUnit { kind : String, qualified : String, path : String, line : Int }
+    | RawFile String
+
+
+-- A row naming the fixture unit `Lib.answer`; a test that needs another
+-- name sets `name`.
 rawRow : String -> String -> String -> Maybe String -> RawRow
 rawRow label bodyHash decision reason =
-    { uid = uid label, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = 0 }
+    { uid = uid label, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = 0, name = RawUnit { kind = "fn", qualified = "Lib.answer", path = "ipe:src/Lib.rs", line = 3 } }
+
+
+-- A row's name columns as bound parameters, in the order
+-- `unit_kind, unit_qualified, unit_path, unit_line`.
+rawNameValues : RawName -> List SqlValue
+rawNameValues name =
+    case name of
+        RawUnit parts ->
+            [ SqlString parts.kind, SqlString parts.qualified, SqlString parts.path, SqlInt parts.line ]
+
+        RawFile path ->
+            [ SqlNull (SqlString ""), SqlNull (SqlString ""), SqlString path, SqlNull (SqlInt 0) ]
+
+
+-- The name fields the mac covers after the row's own, spelled
+-- independently of the tool.
+rawNameFields : RawName -> List String
+rawNameFields name =
+    case name of
+        RawUnit parts ->
+            [ "unit", parts.kind, parts.qualified, parts.path, String.fromInt parts.line ]
+
+        RawFile path ->
+            [ "file", path ]
 
 
 -- The head row read as raw columns.
@@ -1095,8 +1131,8 @@ appendSignedWithUidText db uidText row =
         head <- rawHead db
         mac <- Task.succeed (rawMac (rawMacInputWith head.logId (head.seq + 1) head.head uidText row))
         Db.exec db
-            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            [ SqlInt (head.seq + 1), SqlString uidText, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac ]
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ([ SqlInt (head.seq + 1), SqlString uidText, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString mac ] ++ rawNameValues row.name)
         Db.exec db "UPDATE review_log_head SET seq = ?, head = ? WHERE one = 1" [ SqlInt (head.seq + 1), SqlString mac ]
 
 
@@ -1117,8 +1153,8 @@ appendClaimedAt db logId claimed head row =
 insertClaimed : Db -> String -> RawHead -> RawHead -> RawRow -> Task.Task Error Int
 insertClaimed db logId claimed head row =
     Db.exec db
-        "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        [ SqlInt (head.seq + 1), Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString (claimedMac logId claimed row) ]
+        "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ([ SqlInt (head.seq + 1), Uid.toSql row.uid, SqlString row.bodyHash, SqlString row.decision, rawReason row.reason, SqlInt row.reviewedAt, SqlString head.head, SqlString (claimedMac logId claimed row) ] ++ rawNameValues row.name)
 
 
 claimedMac : String -> RawHead -> RawRow -> String
@@ -1162,7 +1198,7 @@ rawReason reason =
 
 -- The review-row mac input of the log format, spelled independently of the
 -- tool: each field length-prefixed in order, the reason marked present or
--- absent.
+-- absent, then the row's name.
 rawMacInput : String -> Int -> String -> RawRow -> String
 rawMacInput logId seq prev row =
     rawMacInputWith logId seq prev (Uid.toString row.uid) row
@@ -1180,7 +1216,7 @@ rawMacInputWith logId seq prev uidText row =
                 Nothing ->
                     "-"
     in
-    [ "ipe-code-review/review-row/v1", logId, String.fromInt seq, prev, uidText, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ]
+    ([ "ipe-code-review/review-row/v2", logId, String.fromInt seq, prev, uidText, row.bodyHash, row.decision, reasonPart, String.fromInt row.reviewedAt ] ++ rawNameFields row.name)
         |> List.map (\part -> String.fromInt (String.length part) ++ ":" ++ part)
         |> String.concat
 

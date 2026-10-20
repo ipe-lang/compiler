@@ -25,16 +25,21 @@ type LoadFailure
 
 -- A decision this tool refuses itself, decided before anything is written:
 -- the shown unit is gone from the index, its source changed or passed the
--- line ceiling since it was shown, it is not on the shown queue page or its
+-- line ceiling since it was shown, its kind, name or path is past the
+-- recorded-name ceiling or not whole text in the index (so no decision
+-- signs a cut name), it is not on the shown queue page or its
 -- source is not shown, or the review log does not verify under the signing
 -- key (broken, or signed by another key). An unreviewable file's decision is
 -- refused when the file is no longer listed unreviewable, its digest changed,
 -- it is one no decision acknowledges, it could not be re-probed, it now reads
--- as text, or it is not on the shown queue page.
+-- as text, its path is past the recorded-name ceiling or not whole text,
+-- or it is not on the shown queue page.
 type DecideRefusal
     = SourceGone
     | SourceChanged
     | SourcePastCeiling
+    | NamePastCeiling
+    | NameUnreadable
     | NotQueued
     | SourceNotShown
     | LogBroken
@@ -274,6 +279,12 @@ decideRefusalText refusal =
 
         SourcePastCeiling ->
             "the unit's source is past the line ceiling, so it cannot be decided"
+
+        NamePastCeiling ->
+            "the name or path this decision would record is past the recorded-name ceiling, so it cannot be decided"
+
+        NameUnreadable ->
+            "the name or path this decision would record is not whole text in the index, so it cannot be decided"
 
         NotQueued ->
             "the unit is no longer in the queue"

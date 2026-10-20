@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, loadView, nameFor, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, liveFiles, liveUnits, loadView, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -28,6 +28,7 @@ import Lib.SafeText as SafeText exposing (SafeText)
 import Lib.SetDigest as SetDigest exposing (SetDigest)
 import Lib.Settings as Settings exposing (DbRole(..), IndexSettings)
 import Lib.Uid as Uid exposing (Uid)
+import Lib.UnitName as UnitName exposing (NameRefusal(..), RecordedName, UnitName)
 
 
 -- One ipe-index unit's metadata, never its source: a queue page lists these
@@ -74,9 +75,60 @@ unitByUid roots uid =
         bound =
             boundTags roots
     in
-    ( "SELECT " ++ shownColumn "u.uid" "uid" ++ ", u.line_start, u.line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ " FROM units u" ++ unitFiles ++ " WHERE u.uid = ? AND" ++ bound.sql
+    ( unitRowSelect ++ " WHERE u.uid = ? AND" ++ bound.sql
     , Uid.toSql uid :: bound.params
     )
+
+
+-- The columns of one unit row `u` that `coreDecoder` and `shownDecoder`
+-- read, joined with its file row.
+unitRowSelect : String
+unitRowSelect =
+    "SELECT " ++ shownColumn "u.uid" "uid" ++ ", u.line_start, u.line_end, " ++ shownColumn "u.body_hash" "body_hash" ++ ", " ++ shownColumn "f.lang" "lang" ++ ", " ++ unitShownColumns ++ " FROM units u" ++ unitFiles
+
+
+-- The units among `uids` the index holds under a bound tag, read as
+-- `loadView` reads one: the names History draws for a decision whose row
+-- carries no verified name. Every uid and tag is a bound parameter.
+liveUnits : Db.Db -> RootMap -> List Uid -> Task.Task Error (List Unit)
+liveUnits conn roots uids =
+    let
+        bound =
+            boundTags roots
+    in
+    if List.isEmpty uids then
+        Task.succeed []
+
+    else
+        Db.queryDecode conn
+            (unitRowSelect ++ " WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql)
+            (List.map Uid.toSql uids ++ bound.params)
+            (Db.Decode.map2 withRow coreDecoder shownDecoder)
+
+
+-- The unreviewable files among `uids` the index holds under a bound tag,
+-- each with the label of its stored path, read under `Label.labelCap` as a
+-- queue card reads it.
+liveFiles : Db.Db -> RootMap -> List Uid -> Task.Task Error (List ( Uid, Label ))
+liveFiles conn roots uids =
+    let
+        bound =
+            refusalCondition (refusalTags roots)
+    in
+    if List.isEmpty uids then
+        Task.succeed []
+
+    else
+        Db.queryDecode conn
+            ("SELECT " ++ shownColumn "u.uid" "uid" ++ ", " ++ shownColumn "u.path" "path" ++ " FROM refusals u WHERE u.uid COLLATE BINARY IN (" ++ placeholders (List.length uids) ++ ") AND" ++ bound.sql)
+            (List.map Uid.toSql uids ++ bound.params)
+            (Db.Decode.map2 (\fileUid path -> ( fileUid, Label.parse Label.labelCap path )) (wholeUidDecoder "uid") (columnDecoder "path"))
+
+
+-- A live unit's name, the one a queue card, the unit page and History draw.
+unitName : Unit -> UnitName
+unitName unit =
+    UnitName.live unit.uid { kind = unit.kind, qualified = unit.qualified, path = unit.path, line = unit.lineStart }
 
 
 -- The one bound-tag membership condition on a unit row `u`, with its bound
@@ -2051,31 +2103,6 @@ rebuildReviewed settings refill =
             )
 
 
--- The unit's qualified name from the units table, read through a bounded
--- window and parsed into a `Label`, if the unit still exists, or else the
--- label of the path of the unreviewable file the uid names (a decided unit
--- whose source was deleted leaves a review row but no name). The `uid` value
--- is always a bound parameter, never interpolated into SQL text.
-nameFor : Db.Db -> Uid -> Task.Task Error (Maybe Label)
-nameFor conn uid =
-    do
-        rows <- Db.queryDecode conn ("SELECT " ++ shownColumn "qualified" "qualified" ++ " FROM units WHERE uid = ? COLLATE BINARY LIMIT 1") [ Uid.toSql uid ] (nullableColumnDecoder "qualified")
-        case List.head rows of
-            Just qualified ->
-                Task.succeed (Maybe.map (Label.parse Label.labelCap) qualified)
-
-            Nothing ->
-                refusalPathFor conn uid
-
-
--- The label of an unreviewable file's path, the name of a decision on its
--- refusal row while the index holds the row.
-refusalPathFor : Db.Db -> Uid -> Task.Task Error (Maybe Label)
-refusalPathFor conn uid =
-    Db.queryDecode conn ("SELECT " ++ shownColumn "path" "path" ++ " FROM refusals WHERE uid = ? COLLATE BINARY LIMIT 1") [ Uid.toSql uid ] (columnDecoder "path")
-        |> Task.map (\rows -> Maybe.map (Label.parse Label.labelCap) (List.head rows))
-
-
 -- The one verification of a unit's source. The stored hash is parsed first,
 -- so an unknown scheme refuses before any read; then a stored path longer
 -- than its window, cut at a NUL byte or not stored as text is refused under
@@ -2691,10 +2718,11 @@ shownHash shown =
 
 
 -- The one hash a decision or drain may record: the hash of the bytes that
--- were shown, re-proved against the current index row and file. Opaque:
--- built only by `reverify`.
+-- were shown, re-proved against the current index row and file, with the
+-- name of its subject as that row holds it, the name the decision signs.
+-- Opaque: built only by `reverify` and `reverifyRefusal`.
 type Attested
-    = Attested { uid : Uid, hash : String }
+    = Attested { uid : Uid, hash : String, name : RecordedName }
 
 
 attestedUid : Attested -> Uid
@@ -2711,12 +2739,21 @@ attestedHash attested =
             a.hash
 
 
+attestedName : Attested -> RecordedName
+attestedName attested =
+    case attested of
+        Attested a ->
+            a.name
+
+
 -- Re-proves a shown source at decision time: the unit's row is re-read from
 -- the index and its file re-hashed through `viewOf`, and the fresh view must
 -- be shown under the same hash. A unit gone from the index, a source that
 -- changed or became unreadable since it was shown, or one now past a view
 -- ceiling is a `DecideRefusal` value, decided from reads alone, so no
--- decision is recorded against bytes the reviewer did not see. The index and
+-- decision is recorded against bytes the reviewer did not see. So is a unit
+-- whose kind, qualified name or path the re-read row does not hold whole
+-- within `UnitName.nameMaxChars`: no decision records a cut name. The index and
 -- root are the one `settings` value resolved at startup, the tree the page
 -- showed the unit from.
 reverify : IndexSettings -> ShownSource -> Task.Task Error (Result DecideRefusal Attested)
@@ -2729,7 +2766,7 @@ reverify settings shown =
                 case List.head rows of
                     Just ( row, columns ) ->
                         viewOf conn settings.roots row columns
-                            |> Task.map (confirmShown s.uid s.hash)
+                            |> Task.map (confirmShown s.uid s.hash (UnitName.unitFromColumns { kind = columns.kind, qualified = columns.qualified, path = columns.path, line = row.lineStart }))
 
                     Nothing ->
                         Task.succeed (Err SourceGone)
@@ -2737,12 +2774,13 @@ reverify settings shown =
 
 -- A shown unit that grew past a view ceiling before its decision is
 -- `SourcePastCeiling`; any other view but the one shown is `SourceChanged`.
-confirmShown : Uid -> String -> SourceView -> Result DecideRefusal Attested
-confirmShown uid hash fresh =
+-- The shown view then binds the unit's name, or the name's refusal.
+confirmShown : Uid -> String -> Result NameRefusal RecordedName -> SourceView -> Result DecideRefusal Attested
+confirmShown uid hash name fresh =
     case fresh of
         Shown now ->
             if shownHash now == hash then
-                Ok (Attested { uid = uid, hash = hash })
+                attestedWith uid hash name
 
             else
                 Err SourceChanged
@@ -2778,23 +2816,44 @@ reverifyRefusal settings uid digest =
         conn <- readConnection settings
         rows <- Db.queryDecode conn (refusalColumns ++ " u.uid = ? AND" ++ bound.sql ++ " LIMIT 1") ([ Uid.toSql uid ] ++ bound.params) refusalWithPathDecoder
         case List.head rows of
-            Just ( row, stored ) ->
-                confirmRefusal settings.roots digest row stored
+            Just ( row, column, stored ) ->
+                confirmRefusal settings.roots digest row column stored
 
             Nothing ->
                 Task.succeed (Err FileGone)
 
 
--- A refusal row with its stored path, the one form `RepoPath.resolve` reads:
--- the path's window when it holds the whole path, else `Nothing`, so no
--- prefix of a long path is ever joined.
-refusalWithPathDecoder : Db.Decode.Decoder ( RefusalRow, Maybe String )
+-- A decision's attestation once its source is re-proved: bound to the name
+-- of its subject, or refused when that name cannot be recorded whole.
+attestedWith : Uid -> String -> Result NameRefusal RecordedName -> Result DecideRefusal Attested
+attestedWith uid hash name =
+    case name of
+        Ok recorded ->
+            Ok (Attested { uid = uid, hash = hash, name = recorded })
+
+        Err PartPastCeiling ->
+            Err NamePastCeiling
+
+        Err PartEmpty ->
+            Err NameUnreadable
+
+        Err PartNotText ->
+            Err NameUnreadable
+
+        Err LineNegative ->
+            Err NameUnreadable
+
+
+-- A refusal row with its stored path column, and the path in the one form
+-- `RepoPath.resolve` reads: the path's window when it holds the whole path,
+-- else `Nothing`, so no prefix of a long path is ever joined.
+refusalWithPathDecoder : Db.Decode.Decoder ( RefusalRow, Label.Column, Maybe String )
 refusalWithPathDecoder =
-    Db.Decode.map2 (\row column -> ( row, Label.whole column )) refusalRowDecoder (columnDecoder "path")
+    Db.Decode.map2 (\row column -> ( row, column, Label.whole column )) refusalRowDecoder (columnDecoder "path")
 
 
-confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> Maybe String -> Task.Task Error (Result DecideRefusal Attested)
-confirmRefusal roots digest row stored =
+confirmRefusal : RootMap -> RefusalDigest -> RefusalRow -> Label.Column -> Maybe String -> Task.Task Error (Result DecideRefusal Attested)
+confirmRefusal roots digest row column stored =
     case row.digest of
         Nothing ->
             Task.succeed (Err FileNotAcknowledgeable)
@@ -2802,7 +2861,7 @@ confirmRefusal roots digest row stored =
         Just now ->
             if refusalDigestText now == refusalDigestText digest then
                 stillRefused roots row stored
-                    |> Task.map (Result.map (\_ -> Attested { uid = row.uid, hash = refusalDigestText now }))
+                    |> Task.map (Result.andThen (\_ -> attestedWith row.uid (refusalDigestText now) (UnitName.fileFromColumn column)))
 
             else
                 Task.succeed (Err FileChanged)
