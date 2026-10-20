@@ -621,13 +621,12 @@ fn access_chain_after_do_block_is_refused_at_parse() {
         ),
         "{long} segments closing the block: expected NestingTooDeep, got {refused:?}"
     );
-    let Err(Diagnostic::Parse { span, .. }) = refused else {
-        return;
+    let (at_lo, at_hi) = match refused {
+        Err(Diagnostic::Parse { span, .. }) => (span.lo, span.hi),
+        _ => (0, 0),
     };
     assert!(
-        span.lo >= lo && span.hi <= hi,
-        "the refusal at {}..{} lies in the chain {lo}..{hi}",
-        span.lo,
-        span.hi
+        at_lo >= lo && at_hi <= hi,
+        "the refusal at {at_lo}..{at_hi} lies in the chain {lo}..{hi}"
     );
 }
