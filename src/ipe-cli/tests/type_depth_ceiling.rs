@@ -614,10 +614,13 @@ fn a_generic_named_only_by_an_erased_argument_is_pinned_at_each_call() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// `doubledCount` is generic over a bounded `number` that only the erased
-/// parameter of `Tag` names, so its emitted signature names no generic its
-/// body's arithmetic could read.
-const BOUNDED_ERASED_GENERIC: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\ndoubledCount : Tag number -> Int\ndoubledCount t =\n    List.length (List.map (\\x -> x + x) (empties t))\n\n\nmain =\n    Io.println (if doubledCount Tag == 0 then \"zero\" else \"other\")\n";
+/// `doubledCount` is generic over a `number` its body's `x + x` bounds, and
+/// that only the erased parameter of `Tag` names, so its emitted signature
+/// names no generic the body could read. The checker accepts it: the body adds
+/// no literal to the annotated variable, and the one use pins it to `Int`
+/// through `intTag`, since a use leaving a bounded generic unpinned is refused
+/// with IPE-T0014.
+const BOUNDED_ERASED_GENERIC: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\nimport Ipe.List as List\n\n\ntype Tag a\n    = Tag\n\n\nempties : Tag a -> List a\nempties _ =\n    []\n\n\nintTag : Tag Int\nintTag =\n    Tag\n\n\ndoubledCount : Tag number -> Int\ndoubledCount t =\n    case List.head (empties t) of\n        Just x ->\n            List.length [ x + x ]\n\n        Nothing ->\n            0\n\n\nmain =\n    Io.println (if doubledCount intTag == 0 then \"zero\" else \"other\")\n";
 
 /// A bounded generic the emitted signature does not name has no reading in
 /// its body: the build is refused with IPE-L0102 inside the body that reads
