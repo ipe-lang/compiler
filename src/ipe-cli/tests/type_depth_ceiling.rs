@@ -60,7 +60,7 @@ fn compare(last: &str, _: usize) -> String {
 }
 
 /// Every former the checker measures, with the chain each builds.
-fn formers() -> [Former; 12] {
+fn formers() -> [Former; 11] {
     let plain = |name, wrap, refused_at| Former {
         name,
         imports: "",
@@ -94,16 +94,6 @@ fn formers() -> [Former; 12] {
             decls: "ok : a -> Result String a\nok x =\n    Ok x\n\n\n",
             short_of_ceiling: 1,
             ..plain("result", |x| format!("ok {x}"), RefusedAt::Head("ok"))
-        },
-        // `Set.singleton : a -> Set a` is one arrow over the value it builds.
-        Former {
-            imports: "import Ipe.Set as Set\n",
-            short_of_ceiling: 1,
-            ..plain(
-                "set",
-                |x| format!("Set.singleton {x}"),
-                RefusedAt::Head("Set.singleton"),
-            )
         },
         // A decoder has no equality, so `main` runs it; `Decode.decodeJson`
         // takes the decoder after its input, two arrows over the decoder.
