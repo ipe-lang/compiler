@@ -731,6 +731,10 @@ fn type_prose(msg: &TypeError) -> String {
         TypeError::TypeTooLarge { limit } => {
             format!("The type of this value is built from more than {limit} parts.")
         }
+        TypeError::ExpansiveRecursion { union, param } => format!(
+            "The type `{union}` refers to itself with its parameter `{param}` wrapped in a \
+             larger type, so every level of it is a bigger type than the last."
+        ),
     }
 }
 
@@ -1967,6 +1971,10 @@ fn type_label(msg: &TypeError) -> Option<String> {
         )),
         TypeError::TypeTooLarge { limit } => Some(format!(
             "this value's type unfolds to more than {limit} parts"
+        )),
+        TypeError::ExpansiveRecursion { param, .. } => Some(format!(
+            "`{param}` grows each time this type refers to itself, which the generated \
+             Rust cannot build"
         )),
         TypeError::Mismatch | TypeError::BudgetExceeded | TypeError::StepBudgetExceeded { .. } => {
             None

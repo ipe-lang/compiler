@@ -18,6 +18,7 @@ use ipe_backend::Backend;
 use ipe_backend_rust::{FfiEmit, FfiWrapperGlue, RustBackend};
 use ipe_diagnostics::nesting::{
     COMPILE_STACK_BYTES, IR_EXPANSION_SLACK, SOURCE_NESTING_LIMIT, TYPE_DEPTH_LIMIT,
+    TYPE_LEVELS_PER_ARROW,
 };
 use ipe_diagnostics::{
     DResult, Diagnostic, EmitSite, IPE_I0201, IPE_L0200, IPE_L0201, IPE_N0012, LowerError, Span,
@@ -305,13 +306,14 @@ fn type_too_deep_in_deep_type() -> Diagnostic {
 /// that reaches the backstop exactly still emits.
 #[test]
 fn rendered_type_past_the_backstop_is_refused_naming_the_function() {
-    // `levels` lists put the `Int` leaf at render depth `levels + 1`.
-    let at_limit = emit_returning(nested_lists(TYPE_RENDER_LIMIT - 1, IrType::Int));
+    // A leaf adds no level, so `levels` lists are `levels` deep, the
+    // checker's count for the same type.
+    let at_limit = emit_returning(nested_lists(TYPE_RENDER_LIMIT, IrType::Int));
     assert!(
         at_limit.is_ok(),
         "a type at the backstop must emit, got {at_limit:?}"
     );
-    let past = emit_returning(nested_lists(TYPE_RENDER_LIMIT, IrType::Int));
+    let past = emit_returning(nested_lists(TYPE_RENDER_LIMIT + 1, IrType::Int));
     assert!(past.is_err(), "a type past the backstop must be refused");
     if let Err(err) = past {
         assert_eq!(err.code(), IPE_L0201, "wrong code for an over-deep type");
@@ -319,20 +321,25 @@ fn rendered_type_past_the_backstop_is_refused_naming_the_function() {
     }
 }
 
-/// A curried `FnOnce` chain charges two levels per parameter (the box and
-/// the trait object), where a flat function type charges one.
+/// A curried `FnOnce` chain charges [`TYPE_LEVELS_PER_ARROW`] per parameter,
+/// the unit the checker charges each arrow.
 #[test]
-fn fn_once_chain_charges_two_levels_per_parameter() {
-    let levels = TYPE_RENDER_LIMIT - 3;
-    let flat = IrType::Fun(vec![IrType::Int], Box::new(IrType::Int));
-    let chain = IrType::FnOnceChain(vec![IrType::Int], Box::new(IrType::Int));
-    let flat_res = emit_returning(nested_lists(levels, flat));
+fn fn_once_chain_charges_one_arrow_unit_per_parameter() {
+    let params = 3;
+    let chain = || {
+        IrType::FnOnceChain(
+            vec![IrType::Int; usize::from(params)],
+            Box::new(IrType::Int),
+        )
+    };
+    let lists = TYPE_RENDER_LIMIT - params * TYPE_LEVELS_PER_ARROW;
+    let at_limit = emit_returning(nested_lists(lists, chain()));
     assert!(
-        flat_res.is_ok(),
-        "the flat function type fits under the backstop, got {flat_res:?}"
+        at_limit.is_ok(),
+        "a chain reaching the backstop exactly must emit, got {at_limit:?}"
     );
-    let chain_res = emit_returning(nested_lists(levels, chain));
-    assert_eq!(chain_res, Err(type_too_deep_in_deep_type()));
+    let past = emit_returning(nested_lists(lists + 1, chain()));
+    assert_eq!(past, Err(type_too_deep_in_deep_type()));
 }
 
 /// A param symbol that resolves to the empty string is a dangling-symbol

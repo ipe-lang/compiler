@@ -12,13 +12,19 @@
 //! the growing value has a type one arrow deeper than the value it returns, so
 //! a former written as an application reaches the ceiling one binding earlier,
 //! and a use whose callee takes the value reaches it one binding earlier again.
+//!
+//! Declared types are measured where they are written, used or not: a chain of
+//! custom types each holding the one before is as deep as it is long, so the
+//! one declaration past the ceiling is refused at the constructor that crosses
+//! it, a top-level annotation past the ceiling at its name, and a custom type
+//! that refers to itself with a growing parameter with IPE-T0024 at its name.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ipe::CliError;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_SIZE_LIMIT};
-use ipe_diagnostics::{Diagnostic, IPE_T0022, IPE_T0023, Span, TypeError};
+use ipe_diagnostics::{Diagnostic, IPE_T0022, IPE_T0023, IPE_T0024, Span, TypeError};
 
 /// Where the chain one binding past the deepest is refused.
 #[derive(Clone, Copy)]
@@ -54,7 +60,7 @@ fn compare(last: &str, _: usize) -> String {
 }
 
 /// Every former the checker measures, with the chain each builds.
-fn formers() -> [Former; 9] {
+fn formers() -> [Former; 12] {
     let plain = |name, wrap, refused_at| Former {
         name,
         imports: "",
@@ -82,6 +88,33 @@ fn formers() -> [Former; 9] {
                 |x| format!("Wrap {x}"),
                 RefusedAt::Head("Wrap"),
             )
+        },
+        // `ok : a -> Result String a` is one arrow over the value it builds.
+        Former {
+            decls: "ok : a -> Result String a\nok x =\n    Ok x\n\n\n",
+            short_of_ceiling: 1,
+            ..plain("result", |x| format!("ok {x}"), RefusedAt::Head("ok"))
+        },
+        // `Set.singleton : a -> Set a` is one arrow over the value it builds.
+        Former {
+            imports: "import Ipe.Set as Set\n",
+            short_of_ceiling: 1,
+            ..plain(
+                "set",
+                |x| format!("Set.singleton {x}"),
+                RefusedAt::Head("Set.singleton"),
+            )
+        },
+        // A decoder has no equality, so `main` runs it; `Decode.decodeJson`
+        // takes the decoder after its input, two arrows over the decoder.
+        Former {
+            name: "decoder",
+            imports: "import Ipe.Config as Decode\n",
+            decls: "report : Result e a -> String\nreport result =\n    case result of\n        Ok _ ->\n            \"ok\"\n\n        Err _ ->\n            \"err\"\n\n\n",
+            wrap: |x| format!("Decode.succeed {x}"),
+            body: |last, _| format!("Io.println (report (Decode.decodeJson \"0\" {last}))"),
+            short_of_ceiling: 2,
+            refused_at: RefusedAt::Use("Decode.decodeJson"),
         },
         // `Dict.singleton : k -> v -> Dict k v` is two arrows over its value.
         Former {
@@ -245,6 +278,163 @@ fn deepest_accepted_chain_of_every_former_builds_with_cargo() {
             let src = chain(&former, deepest(&former)).src;
             let bin = format!("type_ceiling_{}", former.name);
             assert_builds_with_cargo(&src, &scratch.join(former.name), &runtime, &bin);
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// A module whose `main` prints a constant after `decls`.
+fn with_decls(decls: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\n{decls}main =\n    Io.println \"ok\"\n"
+    )
+}
+
+/// The span of the first `needle` in `src` at or after byte `from`.
+fn span_of(src: &str, needle: &str, from: usize) -> Span {
+    let lo = src
+        .get(from..)
+        .and_then(|rest| rest.find(needle))
+        .map_or(src.len(), |at| from + at);
+    Span {
+        lo: offset(lo),
+        hi: offset(lo + needle.len()),
+    }
+}
+
+/// `type U0 = U0` and `type U{k} = U{k} U{k-1}` through `U{n}`, `U{k}` declared
+/// `k` levels deep, and the span of `U{n}`'s constructor.
+fn union_chain(n: usize) -> Chain {
+    let mut decls = String::from("type U0\n    = U0\n\n\n");
+    for k in 1..=n {
+        let _ = write!(decls, "type U{k}\n    = U{k} U{}\n\n\n", k - 1);
+    }
+    let src = with_decls(&decls);
+    let ctor = format!("= U{n} ");
+    let at = span_of(&src, &ctor, 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 2,
+            hi: at.hi - 1,
+        },
+        src,
+    }
+}
+
+/// `deep : List (List … Int)` with `n` lists, unused, and the span of the name
+/// its definition binds.
+fn annotation_chain(n: usize) -> Chain {
+    let src = with_decls(&format!(
+        "deep : {}Int{}\ndeep =\n    []\n\n\n",
+        "List (".repeat(n - 1) + "List ",
+        ")".repeat(n - 1)
+    ));
+    let at = span_of(&src, "\ndeep =", 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 1,
+            hi: at.lo + 1 + offset("deep".len()),
+        },
+        src,
+    }
+}
+
+/// `Nested` refers to itself at `inner`, given over its parameter `a`.
+fn nested(inner: &str) -> String {
+    with_decls(&format!(
+        "type Nested a\n    = Leaf a\n    | Nest {inner}\n\n\n"
+    ))
+}
+
+/// A refusal of `src` with IPE-T0022 at `span`, `depth` levels deep.
+fn assert_too_deep(src: &str, span: Span, depth: u16) {
+    let refused = front_check(src);
+    assert_eq!(
+        refusal(&refused),
+        Some(&Diagnostic::Type {
+            span,
+            msg: TypeError::TypeTooDeep {
+                depth,
+                limit: TYPE_DEPTH_LIMIT,
+            },
+        }),
+        "refused at {span:?} ({:?}): {refused:?}",
+        src.get(span.lo as usize..span.hi as usize)
+    );
+}
+
+/// The custom type chain as deep as the ceiling is accepted, and the one
+/// declaration more is refused at its constructor, used or not.
+#[test]
+fn a_custom_type_chain_one_past_the_ceiling_is_refused_at_its_constructor() {
+    let n = usize::from(TYPE_DEPTH_LIMIT);
+    let accepted = front_check(&union_chain(n).src);
+    assert!(
+        accepted.is_ok(),
+        "the chain of {n} must be accepted: {accepted:?}"
+    );
+    let past = union_chain(n + 1);
+    assert_too_deep(&past.src, past.refused_at, TYPE_DEPTH_LIMIT + 1);
+}
+
+/// An annotation as deep as the ceiling is accepted, and one level more is
+/// refused at the name it annotates, used or not.
+#[test]
+fn an_annotation_one_past_the_ceiling_is_refused_at_its_name() {
+    let n = usize::from(TYPE_DEPTH_LIMIT);
+    let accepted = front_check(&annotation_chain(n).src);
+    assert!(
+        accepted.is_ok(),
+        "the annotation of {n} must be accepted: {accepted:?}"
+    );
+    let past = annotation_chain(n + 1);
+    assert_too_deep(&past.src, past.refused_at, TYPE_DEPTH_LIMIT + 1);
+}
+
+/// A custom type that refers to itself with its parameter inside a larger type
+/// is refused with IPE-T0024 at its name; the same type holding a list of
+/// itself is accepted.
+#[test]
+fn a_custom_type_growing_at_each_self_reference_is_refused_at_its_name() {
+    let accepted = front_check(&nested("(List (Nested a))"));
+    assert!(
+        accepted.is_ok(),
+        "a list of itself must be accepted: {accepted:?}"
+    );
+    let src = nested("(Nested (List a))");
+    let refused = front_check(&src);
+    let diag = refusal(&refused);
+    assert_eq!(diag.map(Diagnostic::code), Some(IPE_T0024), "{refused:?}");
+    assert_eq!(
+        diag,
+        Some(&Diagnostic::Type {
+            span: span_of(&src, "Nested", 0),
+            msg: TypeError::ExpansiveRecursion {
+                union: "Nested".into(),
+                param: "a".into(),
+            },
+        }),
+        "{refused:?}"
+    );
+}
+
+/// The deepest accepted declarations build with cargo. Gated on `IPE_E2E=1`
+/// (the CI `e2e` job).
+#[test]
+fn deepest_accepted_declarations_build_with_cargo() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("ipe_type_ceiling_decls_{}", std::process::id()));
+        let n = usize::from(TYPE_DEPTH_LIMIT);
+        let cases = [
+            ("union_chain", union_chain(n).src),
+            ("annotation", annotation_chain(n).src),
+            ("regular_nested", nested("(List (Nested a))")),
+        ];
+        for (name, src) in cases {
+            let bin = format!("type_ceiling_{name}");
+            assert_builds_with_cargo(&src, &scratch.join(name), &runtime, &bin);
         }
         let _ = std::fs::remove_dir_all(&scratch);
     }

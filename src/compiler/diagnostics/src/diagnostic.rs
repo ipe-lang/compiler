@@ -32,7 +32,7 @@ use crate::code::{
     IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004,
     IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013,
     IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021,
-    IPE_T0022, IPE_T0023, Severity,
+    IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -1217,6 +1217,12 @@ pub enum TypeError {
     /// `limit` is the node ceiling. The type itself is never carried: printing
     /// it would unfold every one of those nodes.
     TypeTooLarge { limit: u64 },
+    /// A custom type reaches itself with one of its parameters wrapped in a
+    /// larger type, so its uses nest without bound. [IPE-T0024]
+    ///
+    /// `union` names the custom type refused and `param` the parameter that
+    /// grows on the way around the cycle.
+    ExpansiveRecursion { union: Box<str>, param: Box<str> },
 }
 
 /// Why a wildcard `any` parameter has no independent lowering, under
@@ -2575,7 +2581,8 @@ impl Diagnostic {
                 | TypeError::WebViewReturnsHtml
                 | TypeError::WildcardNotIndependent { .. }
                 | TypeError::TypeTooDeep { .. }
-                | TypeError::TypeTooLarge { .. } => Severity::Error,
+                | TypeError::TypeTooLarge { .. }
+                | TypeError::ExpansiveRecursion { .. } => Severity::Error,
             },
             Self::CompilerBug { .. } => Severity::Bug,
         }
@@ -2829,6 +2836,7 @@ const fn type_code(msg: &TypeError) -> Code {
         TypeError::WildcardNotIndependent { .. } => IPE_T0021,
         TypeError::TypeTooDeep { .. } => IPE_T0022,
         TypeError::TypeTooLarge { .. } => IPE_T0023,
+        TypeError::ExpansiveRecursion { .. } => IPE_T0024,
     })
 }
 
@@ -3095,8 +3103,17 @@ fn type_help(msg: &TypeError) -> Vec<HelpLine> {
         )],
         TypeError::TypeTooDeep { .. } => vec![HelpLine::Note(
             "each binding whose value wraps the one before it adds a level to its \
-             type. Give an intermediate level a named type (a `type alias` or a \
-             custom type), or restructure the chain so no value nests this deep."
+             type, and each custom type adds a level over the types its \
+             constructors hold. Keep a long sequence in a `List` or a recursive \
+             custom type, whose depth does not grow with its length, or \
+             restructure the chain so no value nests this deep."
+                .into(),
+        )],
+        TypeError::ExpansiveRecursion { .. } => vec![HelpLine::Note(
+            "a custom type may refer to itself only with its parameters as they \
+             are (`List a` inside `type List a`). Hold the growing part in a \
+             field of its own type instead, such as a `List` of the values one \
+             level down."
                 .into(),
         )],
         TypeError::TypeTooLarge { .. } => vec![HelpLine::Note(

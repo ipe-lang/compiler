@@ -52,9 +52,18 @@ pub const COMPILE_STACK_BYTES: usize = 64 << 20;
 
 /// Deepest type the checker accepts, in type-former levels.
 ///
-/// Every function arrow, type application, tuple and record is one level;
-/// variables, `()` and nullary types are leaves.
+/// Every type application, tuple and record is one level, and every function
+/// arrow is [`TYPE_LEVELS_PER_ARROW`]. A user type costs at least its declared
+/// nesting: the levels its constructors' payloads render to, so a nullary user
+/// type over a chain of declarations is that chain deep. Variables, `()` and
+/// builtin nullary types are leaves.
 pub const TYPE_DEPTH_LIMIT: u16 = 64;
+
+/// Type levels one function arrow costs.
+///
+/// The checker charges it per arrow and the emitter per parameter of a curried
+/// `Box<dyn FnOnce>` chain, so both count one unit.
+pub const TYPE_LEVELS_PER_ARROW: u16 = 1;
 
 /// Most Rust type levels one Ipê type level renders to.
 ///
@@ -102,5 +111,7 @@ const _: () = assert!(
 );
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the type ceiling refuses a lambda chain the source ceiling admits [ledger #boundary]
 const _: () = assert!(TYPE_DEPTH_LIMIT as u32 > LAMBDA_CHAIN_TYPE_DEPTH_AT_SOURCE_CEILING);
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an arrow is charged no type level, so a function spine could pass the ceiling at any length [ledger #boundary]
+const _: () = assert!(TYPE_LEVELS_PER_ARROW >= 1);
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the size ceiling refuses the fourteen-deep shared type the read-back certifies, which unfolds to 2^15 - 1 nodes [ledger #boundary]
 const _: () = assert!(TYPE_SIZE_LIMIT > 1 << 15);

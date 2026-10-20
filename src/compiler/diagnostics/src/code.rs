@@ -508,6 +508,8 @@ code! {
     IPE_T0022 = "IPE-T0022", "this type nests too deeply", "IPE-T0022";
     /// a type unfolds to more nodes than the type size ceiling
     IPE_T0023 = "IPE-T0023", "this type is too large", "IPE-T0023";
+    /// a custom type refers to itself with a parameter wrapped in a larger type
+    IPE_T0024 = "IPE-T0024", "this type grows every time it refers to itself", "IPE-T0024";
 
     // -----------------------------------------------------------------------
     // Lower / not-yet-supported (IPE-L####)
