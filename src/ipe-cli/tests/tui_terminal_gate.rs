@@ -3,9 +3,9 @@
 //! wired end-to-end through `ipe::run_cli`, exactly the boundary a real
 //! invocation crosses.
 //!
-//! `classify_entry_shape` only parses the entry file (no canon/infer/lower,
-//! no cargo), and the terminal gate fires immediately after — before
-//! `discover_manifest`'s emit step or any cargo work — so these two tests are
+//! `built_entry_shape` only parses the entry file (no canon/infer/lower,
+//! no cargo), and the terminal gate fires immediately after — before any
+//! emit step or cargo work — so these two tests are
 //! unconditional: no `IPE_E2E`, no build, no process replacement. Calling
 //! `ipe::run_cli` in process is safe here specifically because the refusal
 //! returns an `Err` before `run_run` / the watch loop ever reaches the point
@@ -28,7 +28,7 @@
 use std::fs;
 
 /// A minimal entry whose `main` pins the `Tui` shape — enough for
-/// `classify_entry_shape`'s parse-only check. `Tui.tea`'s callee is never
+/// `built_entry_shape`'s parse-only check. `Tui.tea`'s callee is never
 /// resolved, so `cfg` need not exist.
 const TUI_ENTRY: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
 

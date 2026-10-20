@@ -61,6 +61,7 @@ use crate::CliError;
 use crate::cli_args::OutputFormat;
 use crate::index::Sha256Hex;
 use crate::project::{ModuleSources, PackageSnapshot, ProjectManifest};
+use crate::project_root::NonEmpty;
 use crate::published_version::PublishedVersion;
 use crate::publisher::{BlessedPublisher, BlessingRefusal, SelfDeclaredPublisher};
 use crate::remote_ingest::{
@@ -151,22 +152,22 @@ impl std::fmt::Display for Rejection {
     }
 }
 
-/// The compiler-derived facts a consumer needs to consent to a package: how its
-/// entry program drives itself (the control model) and the effect axes it can
+/// The compiler-derived facts a consumer needs to consent to a package: how each
+/// of its programs drives itself (the control model) and the effect axes it can
 /// exercise (the capability set). Both are read from the compiler's own
 /// derivation, never a second source — the control model projects the shape the
 /// compiler pinned for `main`, and the capability set is the whole-tree inferred
 /// union the capability-consistency check already computes.
 ///
-/// A closed value: a package either exposes a runnable entry (whose control model
-/// is one of the closed [`crate::delivery::ControlModel`] variants) or is a
-/// library with no self-driving entry ([`ControlModelDisclosure::NotApplicable`]).
+/// A closed value: a package either builds programs (each disclosing one of the
+/// closed [`crate::delivery::ControlModel`] variants) or is a library with no
+/// self-driving entry ([`ControlModelDisclosure::NotApplicable`]).
 /// An entry that exists but cannot be classified is never represented here — it is
 /// a fail-closed rejection before a [`Disclosure`] is ever built, so no permissive
 /// default can be disclosed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Disclosure {
-    /// The entry program's control model, or the library marker.
+    /// Every program's control model, or the library marker.
     control_model: ControlModelDisclosure,
     /// The capability axes the whole package can exercise — the same inferred
     /// union the capability-consistency check reconciles against the manifest.
@@ -174,10 +175,11 @@ pub(crate) struct Disclosure {
 }
 
 impl Disclosure {
-    /// The disclosed control-model word — a closed-set model's own word, or
-    /// `"library"` for a package with no runnable entry. The exact vocabulary the
-    /// `ipe audit` JSON verdict discloses, so `ipe doc` speaks the same words.
-    pub(crate) const fn control_model_word(&self) -> &'static str {
+    /// The disclosed control-model word — the most elevated model any program
+    /// runs, or `"library"` for a package with no runnable entry. The exact
+    /// vocabulary the `ipe audit` JSON verdict discloses, so `ipe doc` speaks the
+    /// same words.
+    pub(crate) fn control_model_word(&self) -> &'static str {
         self.control_model.word()
     }
 
@@ -188,30 +190,69 @@ impl Disclosure {
     }
 }
 
-/// The control model disclosed for a package: the entry program's model, or the
+/// The control model disclosed for a package: every program's model, or the
 /// marker for a library that exposes modules but runs no entry of its own.
 ///
 /// There is deliberately no "unknown" variant. A runnable entry that cannot be
 /// classified fails the audit closed (a program whose self-driving model we
 /// cannot state must not be certified as safe), so the only representable states
-/// are a known model or a genuine absence of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// are a known model for every program or a genuine absence of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlModelDisclosure {
-    /// The entry program's compiler-pinned control model.
-    Entry(crate::delivery::ControlModel),
-    /// A library: it exposes modules but defines no runnable `main`, so it has no
+    /// Each program the package builds, in manifest order, with its compiler-pinned control model.
+    Programs(NonEmpty<ProgramModel>),
+    /// A library: it exposes modules but builds no program, so it has no
     /// control model of its own. Honest absence, not a permissive default.
     NotApplicable,
 }
 
+/// One program of a package and the control model its `main` runs under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgramModel {
+    /// The program's name.
+    program: String,
+    /// The program's entry module.
+    module: Vec<String>,
+    /// The control model the program's `main` pins.
+    model: crate::delivery::ControlModel,
+}
+
 impl ControlModelDisclosure {
-    /// The word disclosed for this control model — a closed-set model's own word,
-    /// or `"library"` for a package with no runnable entry.
-    const fn word(self) -> &'static str {
+    /// The word disclosed for the package — the most elevated model any of its
+    /// programs runs, or `"library"` for a package with no runnable entry.
+    ///
+    /// A package with one `direct` program among `tea` ones reads `direct`, so
+    /// a one-word surface never understates what the package can run.
+    fn word(&self) -> &'static str {
         match self {
-            Self::Entry(model) => model.word(),
+            Self::Programs(programs) => programs
+                .iter()
+                .map(|program| program.model)
+                .fold(programs.first().model, most_elevated)
+                .word(),
             Self::NotApplicable => "library",
         }
+    }
+
+    /// The programs disclosed, in manifest order; none for a library.
+    fn programs(&self) -> impl Iterator<Item = &ProgramModel> {
+        let programs = match self {
+            Self::Programs(programs) => Some(programs.iter()),
+            Self::NotApplicable => None,
+        };
+        programs.into_iter().flatten()
+    }
+}
+
+/// The more elevated of two control models: `Direct` drives itself, `Tea` runs a managed loop.
+const fn most_elevated(
+    a: crate::delivery::ControlModel,
+    b: crate::delivery::ControlModel,
+) -> crate::delivery::ControlModel {
+    use crate::delivery::ControlModel;
+    match (a, b) {
+        (ControlModel::Direct, _) | (_, ControlModel::Direct) => ControlModel::Direct,
+        (ControlModel::Tea, ControlModel::Tea) => ControlModel::Tea,
     }
 }
 
@@ -538,16 +579,13 @@ fn audit_gate(
     })?;
 
     // Control-model consent (defence-in-depth boundary, sibling of the build-time
-    // gate): a package whose runnable entry runs an elevated (`Direct`) control
-    // model its own manifest does not accept is a fail-closed audit rejection. A
-    // managed model or a library (`NotApplicable`) needs no accept and passes
-    // silently. It runs LAST — after the native-bearing fail-closed checks
+    // gate): a package any of whose programs runs a control model its own
+    // manifest does not accept is a fail-closed audit rejection. A library
+    // (`NotApplicable`) has no program to gate and passes silently. It runs LAST — after the native-bearing fail-closed checks
     // (binding regeneration, provenance, Tier-2) — so the consent decision is the
     // final gate on an otherwise-certifiable package and never preempts a
     // native-surface refusal.
-    if let ControlModelDisclosure::Entry(model) = disclosure.control_model {
-        crate::control_model_consent::gate(model, &manifest.control_models_accept, &manifest.name)?;
-    }
+    consent_every_program(&disclosure, manifest)?;
 
     Ok(AuditedPackage {
         digest: reprove_tree(&prepared.snapshot)?,
@@ -629,6 +667,7 @@ fn audit_verdict_json(
                 "controlModel",
                 json::string(disclosure.control_model.word()),
             ),
+            ("programs", disclosure_programs_json(disclosure)),
             ("capabilities", disclosure_capabilities_json(disclosure)),
             ("certified", "true".to_owned()),
         ]),
@@ -642,6 +681,7 @@ fn audit_verdict_json(
                 "controlModel",
                 json::string(disclosure.control_model.word()),
             ),
+            ("programs", disclosure_programs_json(disclosure)),
             ("capabilities", disclosure_capabilities_json(disclosure)),
             ("certified", "true".to_owned()),
         ]),
@@ -652,6 +692,23 @@ fn audit_verdict_json(
             ("reason", json::string(&err.to_string())),
         ]),
     }
+}
+
+/// Every disclosed program as a compact JSON array of `{name, controlModel}`
+/// objects, in manifest order; empty for a library.
+fn disclosure_programs_json(disclosure: &Disclosure) -> String {
+    use crate::cli_args::json;
+    let programs: Vec<String> = disclosure
+        .control_model
+        .programs()
+        .map(|program| {
+            json::object(&[
+                ("name", json::string(&program.program)),
+                ("controlModel", json::string(program.model.word())),
+            ])
+        })
+        .collect();
+    json::array(&programs)
 }
 
 /// The capability set as a compact JSON array of the axes' canonical words, in
@@ -1282,99 +1339,162 @@ fn capability_verdict(
 // Compiler-derived disclosure (control model + capability set)
 // ===========================================================================
 
-/// Derive the consumer-facing disclosure — the entry program's control model and
+/// Derive the consumer-facing disclosure — every program's control model and
 /// the package's capability set — reusing the compiler's own derivations.
 ///
 /// The capability set is the whole-tree inferred union the caller already
 /// computed (the SSOT the capability-consistency check reconciles), so the
 /// disclosed effects and the reconciled effects are the same value.
 ///
-/// The control model is a projection of the shape the compiler pins for `main`
-/// ([`ipe_canon::shape_source::classify_main_shape`] → [`crate::delivery::Shape`]
-/// → [`crate::delivery::ControlModel`]), never a second inspection of `main`.
-/// It is derived **fail-closed**:
+/// Each program's control model is a projection of the shape the compiler pins
+/// for its `main` ([`crate::driver::EntryMain`], the reading the build's shape
+/// check also projects), never a second inspection of `main`. Every program the
+/// package builds ([`captured_programs`]) is disclosed, never one chosen among
+/// them. It is derived **fail-closed**:
 ///
-/// - A library that exposes modules but has no runnable entry file discloses
+/// - A library that builds no program discloses
 ///   [`ControlModelDisclosure::NotApplicable`] — an honest absence, not a
 ///   permissive default.
-/// - A runnable entry that cannot be read or parsed at disclosure time is a hard
-///   rejection: a program whose self-driving model we cannot state must never be
-///   certified as safe with a permissive-looking default. (The package already
-///   built in [`prepare`], so this is a defence-in-depth second boundary, not the
-///   only one.)
+/// - A program whose entry defines no `main` pins the `script` shape the build
+///   checks it as, and so discloses `direct`, the elevated model.
+/// - A program whose entry does not parse is a hard rejection: a program whose
+///   self-driving model we cannot state must never be certified as safe with a
+///   permissive-looking default. (The package already built in [`prepare`], so
+///   this is a defence-in-depth second boundary, not the only one.)
 ///
 /// # Errors
-/// [`CliError::PackageAudit`] with [`Check::Capability`] when a runnable entry
-/// exists but its control model cannot be derived.
+/// [`CliError::PackageAudit`] with [`Check::Capability`] when a program's
+/// entry does not parse; the [`captured_programs`] refusals.
 fn derive_disclosure(
     manifest: &ProjectManifest,
     sources: &ModuleSources,
     inferred: BTreeSet<Capability>,
 ) -> Result<Disclosure, CliError> {
-    // A library ships no runnable `Main`; the entry is then the first exposed
-    // module (or the absent default). Only an ABSENT entry is an honest
-    // absence. A source the capture could not hold (a link, a FIFO, an
-    // oversized file) already refused the package, so every present entry is
-    // classified from the captured text.
-    let Some((entry, source)) = sources.get(&entry_module_of(manifest, sources)?) else {
+    let Some(programs) = captured_programs(manifest, sources)? else {
         return Ok(Disclosure {
             control_model: ControlModelDisclosure::NotApplicable,
             capabilities: inferred,
         });
     };
-    let mut interner = ipe_intern::Interner::new();
-    let module = ipe_parse::parse_module(source, &mut interner).map_err(|_| {
-        reject(
-            Check::Capability,
-            format!(
-                "the package's entry source (`{}`) does not parse, so its control model cannot be \
-                 derived. A program whose self-driving model the audit cannot state is refused \
-                 rather than certified with an assumed model.",
-                entry.display()
-            ),
-        )
-    })?;
-
-    // A module that defines no `main` is not a runnable program — it is a library
-    // module the package exposes. It drives nothing of its own, so the control
-    // model is a genuine absence, distinct from a plain-`Task` Direct `main`.
-    let defines_main = interner
-        .lookup("main")
-        .is_some_and(|main_sym| module.values.iter().any(|v| v.value.name.value == main_sym));
-    if !defines_main {
-        return Ok(Disclosure {
-            control_model: ControlModelDisclosure::NotApplicable,
-            capabilities: inferred,
+    let mut models = Vec::new();
+    for program in programs.iter() {
+        let model = match crate::driver::EntryMain::of(program.source) {
+            crate::driver::EntryMain::Unparsed => return Err(unparsed(program)),
+            entry => entry.delivery_shape().control_model(),
+        };
+        models.push(ProgramModel {
+            program: program.name.clone(),
+            module: program.module.clone(),
+            model,
         });
     }
-
-    let shape = crate::delivery::Shape::from_main(ipe_canon::shape_source::classify_main_shape(
-        &module, &interner,
-    ));
+    let Some(models) = NonEmpty::from_vec(models) else {
+        return Err(reject(
+            Check::Capability,
+            "the package's program list disclosed no program".to_owned(),
+        ));
+    };
     Ok(Disclosure {
-        control_model: ControlModelDisclosure::Entry(shape.control_model()),
+        control_model: ControlModelDisclosure::Programs(models),
         capabilities: inferred,
     })
 }
 
-/// The module path of a package's entry: the declared program's entry, else `Main`, else the first exposed module.
+/// The fail-closed refusal of a program whose entry does not parse.
+fn unparsed(program: &CapturedProgram<'_>) -> CliError {
+    reject(
+        Check::Capability,
+        format!(
+            "program `{}`'s entry source (`{}`) does not parse, so its control model cannot be \
+             derived. A program whose self-driving model the audit cannot state is refused \
+             rather than certified with an assumed model.",
+            program.name,
+            program.path.display()
+        ),
+    )
+}
+
+/// One program of the captured package: its name, entry module and entry text.
+#[derive(Debug)]
+struct CapturedProgram<'s> {
+    /// The program's name.
+    name: String,
+    /// The program's entry module.
+    module: Vec<String>,
+    /// The entry file's path, for a refusal to name.
+    path: &'s Path,
+    /// The entry file's captured text.
+    source: &'s str,
+}
+
+/// Every program the captured package builds, or `None` for a library.
+///
+/// The same set [`crate::project_root::ProjectRoot`] resolves, read from the
+/// capture instead of the disk: the declared programs in manifest order, else
+/// `src/Main.ipe` under the package's name, else no program.
 ///
 /// # Errors
-/// [`CliError::Manifest`]-family errors when a declared program's entry is refused.
-fn entry_module_of(
+/// The manifest-entry refusal of a declared entry that names no module, and
+/// [`CliError::PackageAudit`] with [`Check::Capability`] when a declared
+/// program's entry is not in the capture.
+fn captured_programs<'s>(
     manifest: &ProjectManifest,
-    sources: &ModuleSources,
-) -> Result<Vec<String>, CliError> {
-    if manifest.default_program().is_some() {
-        return manifest.resolved_entry();
+    sources: &'s ModuleSources,
+) -> Result<Option<NonEmpty<CapturedProgram<'s>>>, CliError> {
+    let mut programs = Vec::with_capacity(manifest.programs.len());
+    for program in &manifest.programs {
+        let module = crate::project::parse_entry(&program.entry)
+            .map_err(|refusal| CliError::manifest_entry_refused(&program.entry, &refusal))?;
+        let Some((path, source)) = sources.get(&module) else {
+            return Err(reject(
+                Check::Capability,
+                format!(
+                    "program `{}` names the entry `{}`, which the captured package does not hold.",
+                    program.name, program.entry
+                ),
+            ));
+        };
+        programs.push(CapturedProgram {
+            name: program.name.clone(),
+            module,
+            path,
+            source,
+        });
     }
-    let main = vec!["Main".to_owned()];
-    if sources.contains_key(&main) {
-        return Ok(main);
+    if programs.is_empty() {
+        let main = vec!["Main".to_owned()];
+        if let Some((path, source)) = sources.get(&main) {
+            programs.push(CapturedProgram {
+                name: manifest.name.clone(),
+                module: main,
+                path,
+                source,
+            });
+        }
     }
-    Ok(manifest.exposed_modules.first().map_or(main, |module| {
-        module.split('.').map(str::to_owned).collect()
-    }))
+    Ok(NonEmpty::from_vec(programs))
+}
+
+/// Run the control-model consent gate for every disclosed program.
+///
+/// Each program is gated on its own model, so a package whose second program
+/// alone runs an uncovered model is refused like one whose first program does.
+///
+/// # Errors
+/// The [`crate::control_model_consent::gate`] refusal of the first program whose
+/// model the manifest's `acceptsControl` does not cover.
+fn consent_every_program(
+    disclosure: &Disclosure,
+    manifest: &ProjectManifest,
+) -> Result<(), CliError> {
+    for program in disclosure.control_model.programs() {
+        crate::control_model_consent::gate(
+            program.model,
+            &manifest.control_models_accept,
+            &program.module.join("."),
+        )?;
+    }
+    Ok(())
 }
 
 /// The package disclosure a non-audit surface (`ipe doc`) reads — the SAME
@@ -1383,14 +1503,14 @@ fn entry_module_of(
 /// [`crate::infer_package_capabilities`] rather than a second derivation that
 /// could disagree with the audit's answer.
 ///
-/// Fail-closed identically to the audit: a runnable entry whose source cannot be
-/// read or parsed is a hard rejection ([`Check::Capability`]), never a permissive
-/// default; a package with no runnable `main` discloses an honest
+/// Fail-closed identically to the audit: a program whose entry cannot be read
+/// or parsed is a hard rejection ([`Check::Capability`]), never a permissive
+/// default; a library that builds no program discloses an honest
 /// [`ControlModelDisclosure::NotApplicable`] ("library").
 ///
 /// This does NOT build the package (no emit): the disclosure needs only the
-/// manifest (for the capability union) and the entry source (for the control
-/// model), so `ipe doc` stays a read-only documentation surface.
+/// manifest (for the capability union) and each program's entry source (for
+/// the control models), so `ipe doc` stays a read-only documentation surface.
 ///
 /// # Errors
 /// [`CliError`] when the manifest cannot be located or parsed, the capability
@@ -1411,6 +1531,8 @@ pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
 
 /// Render the disclosure as a human-readable frame — the control model and the
 /// (possibly empty) capability set the package can exercise.
+///
+/// A package of more than one program also names each program's own model.
 fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
     let caps: Vec<&'static str> = disclosure.capabilities.iter().map(|c| c.as_str()).collect();
     let caps_line = if caps.is_empty() {
@@ -1418,8 +1540,18 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
     } else {
         caps.join(", ")
     };
+    let programs: Vec<String> = disclosure
+        .control_model
+        .programs()
+        .map(|program| format!("`{}`: {}", program.program, program.model.word()))
+        .collect();
+    let per_program = if programs.len() > 1 {
+        format!(" ({})", programs.join(", "))
+    } else {
+        String::new()
+    };
     format!(
-        "package audit: `{name}` control model: {}; capabilities: {caps_line}.",
+        "package audit: `{name}` control model: {}{per_program}; capabilities: {caps_line}.",
         disclosure.control_model.word()
     )
 }
@@ -2377,7 +2509,7 @@ mod tests {
         use crate::audit_native::Tier2Outcome;
 
         let disclosure = Disclosure {
-            control_model: ControlModelDisclosure::Entry(crate::delivery::ControlModel::Tea),
+            control_model: single(crate::delivery::ControlModel::Tea),
             capabilities: BTreeSet::from([Capability::Clock, Capability::Network]),
         };
         let pass = audit_verdict_json(
@@ -2426,12 +2558,9 @@ mod tests {
 
     #[test]
     fn control_model_disclosure_word_is_the_models_word_or_library() {
+        assert_eq!(single(crate::delivery::ControlModel::Tea).word(), "tea");
         assert_eq!(
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Tea).word(),
-            "tea"
-        );
-        assert_eq!(
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct).word(),
+            single(crate::delivery::ControlModel::Direct).word(),
             "direct"
         );
         assert_eq!(ControlModelDisclosure::NotApplicable.word(), "library");
@@ -2440,7 +2569,7 @@ mod tests {
     #[test]
     fn disclosure_summary_lists_capabilities_or_none() {
         let with_caps = Disclosure {
-            control_model: ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            control_model: single(crate::delivery::ControlModel::Direct),
             capabilities: BTreeSet::from([Capability::Clock]),
         };
         let s = disclosure_summary("pkg", &with_caps);
@@ -2751,6 +2880,253 @@ mod tests {
 
     // ── Disclosure derivation (control model + capabilities) ────────────────
 
+    /// The disclosure of a package whose one program `test-pkg` (entry `Main`) runs `model`.
+    fn single(model: crate::delivery::ControlModel) -> ControlModelDisclosure {
+        ControlModelDisclosure::Programs(
+            NonEmpty::from_vec(vec![ProgramModel {
+                program: "test-pkg".to_owned(),
+                module: vec!["Main".to_owned()],
+                model,
+            }])
+            .expect("one program"),
+        )
+    }
+
+    /// A TEA web entry module `module`.
+    fn tea_entry(module: &str) -> String {
+        format!(
+            "module {module} exposing (main)\nimport Ipe.Tea.Web as Web\n\nmain = Web.tea config\n"
+        )
+    }
+
+    /// A plain-`Task` entry module `module` that writes to standard output.
+    fn direct_entry(module: &str) -> String {
+        format!(
+            "module {module} exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain : Task ()\nmain =\n    Io.println \"hi\"\n"
+        )
+    }
+
+    /// A manifest of two programs, `board` (a TEA `Main`) then `sync` (a Direct `Sync`), and their sources.
+    fn two_program_package() -> (ProjectManifest, ModuleSources) {
+        let mut manifest = test_manifest(Path::new("/nonexistent/disclosure-two-programs"));
+        manifest.programs = vec![
+            crate::project::Program {
+                name: "board".to_owned(),
+                entry: "Main.ipe".to_owned(),
+                shape: None,
+            },
+            crate::project::Program {
+                name: "sync".to_owned(),
+                entry: "Sync.ipe".to_owned(),
+                shape: None,
+            },
+        ];
+        let sources = ModuleSources::from([
+            (
+                vec!["Main".to_owned()],
+                (manifest.src_root.join("Main.ipe"), tea_entry("Main")),
+            ),
+            (
+                vec!["Sync".to_owned()],
+                (manifest.src_root.join("Sync.ipe"), direct_entry("Sync")),
+            ),
+        ]);
+        (manifest, sources)
+    }
+
+    /// Every program of a two-program package is disclosed, the second's Direct model included.
+    #[test]
+    fn disclosure_names_every_program_of_a_two_program_package() {
+        let (manifest, sources) = two_program_package();
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives both");
+        let models: Vec<(&str, crate::delivery::ControlModel)> = disclosure
+            .control_model
+            .programs()
+            .map(|program| (program.program.as_str(), program.model))
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                ("board", crate::delivery::ControlModel::Tea),
+                ("sync", crate::delivery::ControlModel::Direct),
+            ],
+            "each program discloses its own model, in manifest order"
+        );
+        assert_eq!(
+            disclosure.control_model_word(),
+            "direct",
+            "the one-word model is the most elevated any program runs"
+        );
+        let summary = disclosure_summary("two", &disclosure);
+        assert!(
+            summary.contains("control model: direct (`board`: tea, `sync`: direct)"),
+            "the summary names both programs' models: {summary}"
+        );
+        let json = audit_verdict_json(
+            "two",
+            "0.1.0",
+            &Ok(AuditedPackage {
+                digest: test_digest(),
+                disclosure,
+                tier2: crate::audit_native::Tier2Outcome::SkippedPureIpe,
+            }),
+        );
+        assert!(
+            json.contains(
+                "\"programs\":[{\"name\":\"board\",\"controlModel\":\"tea\"},\
+                 {\"name\":\"sync\",\"controlModel\":\"direct\"}]"
+            ),
+            "the verdict lists both programs: {json}"
+        );
+    }
+
+    /// A package whose second program alone runs a model `acceptsControl` omits is refused.
+    #[test]
+    fn consent_refuses_a_second_program_the_accept_set_does_not_cover() {
+        let (mut manifest, sources) = two_program_package();
+        manifest.control_models_accept =
+            std::iter::once(crate::delivery::ControlModel::Tea).collect();
+        let disclosure =
+            derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives both");
+        let err = consent_every_program(&disclosure, &manifest)
+            .expect_err("the second program's Direct model is not accepted");
+        let text = err.to_string();
+        assert!(text.contains("IPE-S0004"), "carries the code: {text}");
+        assert!(
+            text.contains("`Sync`"),
+            "names the second program's entry: {text}"
+        );
+
+        manifest.control_models_accept = [
+            crate::delivery::ControlModel::Tea,
+            crate::delivery::ControlModel::Direct,
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            consent_every_program(&disclosure, &manifest).is_ok(),
+            "an accept set covering both programs passes"
+        );
+    }
+
+    /// A second program whose entry does not parse fails the disclosure closed.
+    #[test]
+    fn disclosure_fails_closed_when_a_second_program_does_not_parse() {
+        let (manifest, mut sources) = two_program_package();
+        sources.insert(
+            vec!["Sync".to_owned()],
+            (
+                manifest.src_root.join("Sync.ipe"),
+                "module Sync exposing (main)\n\nmain = = = broken (((\n".to_owned(),
+            ),
+        );
+        let err = derive_disclosure(&manifest, &sources, BTreeSet::new())
+            .expect_err("an unparseable second program must fail closed");
+        assert!(
+            matches!(err, CliError::PackageAudit(ref r) if r.check == Check::Capability),
+            "a Capability rejection: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("`sync`"),
+            "names the program: {err}"
+        );
+    }
+
+    /// A declared program whose entry the capture does not hold fails the disclosure closed.
+    #[test]
+    fn disclosure_fails_closed_when_a_declared_program_is_not_captured() {
+        let (manifest, mut sources) = two_program_package();
+        sources.remove(["Sync".to_owned()].as_slice());
+        let err = derive_disclosure(&manifest, &sources, BTreeSet::new())
+            .expect_err("a missing second program must fail closed");
+        assert!(
+            matches!(err, CliError::PackageAudit(ref r) if r.check == Check::Capability),
+            "a Capability rejection: {err:?}"
+        );
+    }
+
+    /// An entry that defines no `main` discloses the `direct` model the build's script shape runs.
+    #[test]
+    fn disclosure_of_an_entry_without_main_is_the_script_model() {
+        let (manifest, sources) =
+            manifest_with_main("module Main exposing (helper)\n\nhelper = 1\n");
+        let disclosure = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
+        assert_eq!(
+            disclosure.control_model,
+            single(crate::delivery::ControlModel::Direct),
+            "no `main` is the script shape, never a library"
+        );
+    }
+
+    /// The programs the audit reads from a capture are the programs the project root resolves.
+    #[test]
+    fn captured_programs_are_the_project_roots_programs() {
+        use crate::project_root::{EntrySet, ProjectRoot, RootArg};
+        let cases: [(&str, &str, &[(&str, String)]); 3] = [
+            (
+                "agree-two-programs",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"two\"\n    , programs =\n        [ { name = \"board\", entry = \"Main.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n",
+                &[
+                    ("Main.ipe", tea_entry("Main")),
+                    ("Tools/Sync.ipe", direct_entry("Tools.Sync")),
+                ],
+            ),
+            (
+                "agree-default-main",
+                SNAPSHOT_MANIFEST,
+                &[("Main.ipe", direct_entry("Main"))],
+            ),
+            (
+                "agree-library",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"lib\", exposedModules = [ \"Lib\" ] }\n",
+                &[(
+                    "Lib.ipe",
+                    "module Lib exposing (one)\n\none = 1\n".to_owned(),
+                )],
+            ),
+        ];
+        for (tag, manifest, files) in cases {
+            let dir = make_test_dir(tag);
+            assert!(
+                std::fs::create_dir_all(dir.join("src/Tools")).is_ok(),
+                "create src/"
+            );
+            assert!(
+                std::fs::write(dir.join("package.ipe"), manifest).is_ok(),
+                "write package.ipe"
+            );
+            for (rel, text) in files {
+                assert!(
+                    std::fs::write(dir.join("src").join(rel), text).is_ok(),
+                    "write {rel}"
+                );
+            }
+            let snapshot = capture_package(&dir).expect("capture");
+            let audited: Option<Vec<(String, Vec<String>)>> =
+                captured_programs(snapshot.manifest(), snapshot.sources())
+                    .expect("captured programs")
+                    .map(|programs| {
+                        programs
+                            .iter()
+                            .map(|program| (program.name.clone(), program.module.clone()))
+                            .collect()
+                    });
+            let root = ProjectRoot::resolve(RootArg::at(&dir));
+            let _ = std::fs::remove_dir_all(&dir);
+            let resolved = match root.expect("resolve").entries() {
+                EntrySet::Programs(programs) => Some(
+                    programs
+                        .iter()
+                        .map(|entry| (entry.name().as_str().to_owned(), entry.module().to_vec()))
+                        .collect(),
+                ),
+                EntrySet::Library(_) => None,
+            };
+            assert_eq!(audited, resolved, "{tag}: the audit and the root agree");
+        }
+    }
+
     /// A manifest and captured sources holding a single `Main` module of `main_src`.
     ///
     /// Only the manifest's `programs` and `exposed_modules` matter to [`derive_disclosure`].
@@ -2773,7 +3149,7 @@ mod tests {
         let d = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
         assert_eq!(
             d.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Tea),
+            single(crate::delivery::ControlModel::Tea),
             "a `Web.tea` entry discloses the TEA control model"
         );
     }
@@ -2787,7 +3163,7 @@ mod tests {
         let d = derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives");
         assert_eq!(
             d.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
             "a plain-`Task` `main` discloses the Direct control model"
         );
     }
@@ -2884,7 +3260,7 @@ mod tests {
             derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
             "a plain-Task entry discloses the Direct model"
         );
         let err = crate::control_model_consent::gate(
@@ -2906,7 +3282,7 @@ mod tests {
             derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
         );
         crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
@@ -2927,7 +3303,7 @@ mod tests {
             derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives Direct");
         assert_eq!(
             disclosure.control_model,
-            ControlModelDisclosure::Entry(crate::delivery::ControlModel::Direct),
+            single(crate::delivery::ControlModel::Direct),
         );
         assert!(
             manifest.control_models_accept.is_empty(),

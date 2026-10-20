@@ -437,49 +437,136 @@ pub fn resolve_output_root(
     OutputRoot::resolve(out, &paths)
 }
 
-/// Classify the shape `main` pins for the entry the user named, reading the
-/// entry `.ipe` source and inspecting `main`'s head (spec § 0, § 1).
+/// What an entry source's `main` pins.
 ///
-/// The shape is the single source of truth for delivery: it is derived from
-/// code, never from config or the CLI. `entry_arg` is the raw positional (a
-/// `.ipe` file, a project directory, or a bare `.`): a file no manifest governs
-/// is read as the user named it, following a link; a governed project's entry
-/// is the build's entry module below its source root, never followed. A library
-/// (no program, no `src/Main.ipe`, some `exposedModules`) has no `main` to pin
-/// a shape and classifies as [`delivery::Shape::Script`], as does a source that
-/// does not parse — the cross-check then does not fire and the build pipeline
-/// reports the real refusal with a blamed span.
+/// The one reading of an entry that the delivery shape ([`classify_entry_shape`])
+/// and the audit's control-model disclosure both project, so the two can never
+/// judge the same source differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryMain {
+    /// The source does not parse.
+    Unparsed,
+    /// The source parses and defines no `main`.
+    Absent,
+    /// The shape the compiler pins for the source's `main`.
+    Pins(delivery::Shape),
+}
+
+impl EntryMain {
+    /// Read `source`'s `main` through the compiler's own classifier.
+    #[must_use]
+    pub fn of(source: &str) -> Self {
+        let mut interner = Interner::new();
+        let Ok(module) = ipe_parse::parse_module(source, &mut interner) else {
+            return Self::Unparsed;
+        };
+        let defines_main = interner
+            .lookup("main")
+            .is_some_and(|main| module.values.iter().any(|v| v.value.name.value == main));
+        if !defines_main {
+            return Self::Absent;
+        }
+        Self::Pins(delivery::Shape::from_main(
+            ipe_canon::shape_source::classify_main_shape(&module, &interner),
+        ))
+    }
+
+    /// The shape the delivery grammar is checked against.
+    ///
+    /// A source that does not parse, or defines no `main`, pins no shape and
+    /// reads as [`delivery::Shape::Script`]: the cross-check then does not fire
+    /// and the build pipeline reports the real refusal with a blamed span.
+    #[must_use]
+    pub const fn delivery_shape(self) -> delivery::Shape {
+        match self {
+            Self::Pins(shape) => shape,
+            Self::Unparsed | Self::Absent => {
+                delivery::Shape::from_main(ipe_canon::shape_source::MainShape::Script)
+            }
+        }
+    }
+}
+
+/// The source text of `entry`, read beneath `root`'s held `src/` directory.
+///
+/// Every level is opened through the handle on the level above, never
+/// following a link.
 ///
 /// # Errors
-/// [`CliError::Io`] when the entry source cannot be read, or the manifest /
-/// entry-resolution errors of [`project::ProjectManifest::resolved_entry`].
-pub fn classify_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliError> {
-    let source = match discover_manifest(entry_arg)? {
-        None => io_bounded::read_user_named(entry_arg, io_bounded::SOURCE_CAP)?,
-        Some(manifest) => {
-            let parsed = project::parse_manifest(&manifest)?;
-            let main = parsed.src_root.join("Main.ipe");
-            if parsed.default_program().is_none()
-                && !parsed.exposed_modules.is_empty()
-                && !main.is_file()
-            {
-                return Ok(delivery::Shape::from_main(
-                    ipe_canon::shape_source::MainShape::Script,
-                ));
-            }
-            let module = parsed.resolved_entry()?;
-            let entry = parsed.src_root.join(format!("{}.ipe", module.join("/")));
-            io_bounded::read_beneath(&parsed.src_root, &entry, io_bounded::SOURCE_CAP)?
-        }
+/// [`CliError::EntryMissing`] when a directory on the way is absent; an
+/// output refusal for a linked or non-directory level; the
+/// `read_file_capped` refusals for the file itself.
+pub fn read_entry_source(root: &ProjectRoot, entry: &ResolvedEntry) -> Result<String, CliError> {
+    let missing = || CliError::EntryMissing {
+        entry: format!("{}.ipe", entry.module().join("/")),
     };
-    let mut interner = Interner::new();
-    // A parse failure is the compile pipeline's to report (with a blamed span);
-    // the shape cross-check simply does not fire, so classify as a script.
-    let shape = ipe_parse::parse_module(&source, &mut interner)
-        .map_or(ipe_canon::shape_source::MainShape::Script, |module| {
-            ipe_canon::shape_source::classify_main_shape(&module, &interner)
-        });
-    Ok(delivery::Shape::from_main(shape))
+    let (leaf, parents) = entry.module().split_last().ok_or_else(missing)?;
+    let mut walked = None;
+    for segment in parents {
+        let here = walked.as_ref().unwrap_or(root.src());
+        walked = Some(
+            here.child(std::ffi::OsStr::new(segment))?
+                .ok_or_else(missing)?,
+        );
+    }
+    let here = walked.as_ref().unwrap_or(root.src());
+    let name = here.entry(std::ffi::OsStr::new(&format!("{leaf}.ipe")))?;
+    here.read_file_capped(&name, io_bounded::SOURCE_CAP)
+}
+
+/// Classify the shape `main` pins for one program of a resolved project.
+///
+/// The shape is the single source of truth for delivery: it is derived from
+/// code, never from config or the CLI. Each program of a root is classified on
+/// its own entry ([`EntryMain::of`]), so a root's second program is never given
+/// its first program's shape.
+///
+/// # Errors
+/// The [`read_entry_source`] refusals.
+pub fn classify_entry_shape(
+    root: &ProjectRoot,
+    entry: &ResolvedEntry,
+) -> Result<delivery::Shape, CliError> {
+    Ok(EntryMain::of(&read_entry_source(root, entry)?).delivery_shape())
+}
+
+/// The shape of the program a `build` / `run` / `watch` of `entry_arg` builds.
+///
+/// `entry_arg` is the raw positional (a `.ipe` file, a project directory, or a
+/// bare `.`). A file no manifest governs is read as the user named it,
+/// following a link. A governed project is resolved as a [`ProjectRoot`]: a
+/// library has no `main` to pin a shape and is a [`delivery::Shape::Script`];
+/// a program root classifies the program the build selects
+/// ([`project::ProjectManifest::resolved_entry`]) among its resolved entries.
+///
+/// # Errors
+/// [`CliError::Io`] when a loose entry cannot be read; the
+/// [`ProjectRoot::resolve`] refusals; [`CliError::EntryMissing`] when the
+/// selected program is not among the root's entries; the
+/// [`classify_entry_shape`] refusals.
+pub fn built_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliError> {
+    let Some(manifest) = discover_manifest(entry_arg)? else {
+        let source = io_bounded::read_user_named(entry_arg, io_bounded::SOURCE_CAP)?;
+        return Ok(EntryMain::of(&source).delivery_shape());
+    };
+    let dir = manifest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root = ProjectRoot::resolve(RootArg::at(dir))?;
+    let EntrySet::Programs(programs) = root.entries() else {
+        return Ok(delivery::Shape::from_main(
+            ipe_canon::shape_source::MainShape::Script,
+        ));
+    };
+    let built = root.manifest().resolved_entry()?;
+    let entry = programs
+        .iter()
+        .find(|entry| entry.module() == built.as_slice())
+        .ok_or_else(|| CliError::EntryMissing {
+            entry: format!("{}.ipe", built.join("/")),
+        })?;
+    classify_entry_shape(&root, entry)
 }
 
 /// Resolve the delivery for a `build` / `run` / `watch` invocation: classify the
@@ -494,14 +581,14 @@ pub fn classify_entry_shape(entry_arg: &Path) -> Result<delivery::Shape, CliErro
 /// # Errors
 /// [`CliError::Usage`] carrying the delivery lesson on a shape mismatch, an
 /// invalid runtime/host combination, or a `--static` request the delivery
-/// cannot honour; the I/O errors of [`classify_entry_shape`].
+/// cannot honour; the refusals of [`built_entry_shape`].
 pub fn resolve_delivery(
     entry_arg: &Path,
     positionals: &cli_args::DeliveryPositionals,
     wants_static: bool,
     command: &str,
 ) -> Result<delivery::Delivery, CliError> {
-    let pinned = classify_entry_shape(entry_arg)?;
+    let pinned = built_entry_shape(entry_arg)?;
     delivery::Delivery::resolve_checked(
         pinned,
         positionals.stated_shape,

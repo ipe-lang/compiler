@@ -1,10 +1,10 @@
 use super::{
     BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
     analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
-    attribute_post_link_error, build_project_into, build_test_into,
-    capabilities_including_served_widgets, classify_entry_shape, create_source_root,
-    discover_manifest, emit_machine_error, emitted_bin_filename, entry_modules, frame_infer_error,
-    home_to_source_map, lowering_check_query, program_constructs_a_widget, resolve_runtime,
+    attribute_post_link_error, build_project_into, build_test_into, built_entry_shape,
+    capabilities_including_served_widgets, create_source_root, discover_manifest,
+    emit_machine_error, emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
+    lowering_check_query, program_constructs_a_widget, resolve_runtime,
     resolve_vendored_runtime_dir, run_build, runtime_context_for_message, typecheck_target,
     working_dir,
 };
@@ -163,12 +163,12 @@ pub fn bundle_delivery(
 /// shape (when present) or by inspecting the entry source (when absent).
 ///
 /// The shape classification is a pure function of its inputs: no build, no I/O
-/// beyond the entry-source read that `classify_entry_shape` performs when no
-/// declared shape is available.
+/// beyond the read of the built program's entry that [`built_entry_shape`]
+/// performs when no declared shape is available.
 ///
 /// # Errors
-/// [`CliError`] forwarded from [`classify_entry_shape`] when entry-source
-/// classification is needed and the source cannot be read or parsed.
+/// [`CliError`] forwarded from [`built_entry_shape`] when entry-source
+/// classification is needed and the project or its entry is refused.
 pub fn classify_desktop_shape(
     declared: Option<project::EntryShape>,
     root: &Path,
@@ -178,7 +178,7 @@ pub fn classify_desktop_shape(
         Some(project::EntryShape::WebView) => Ok(pack::desktop::AppShape::WebView),
         Some(project::EntryShape::Terminal) => Ok(pack::desktop::AppShape::Terminal),
         Some(project::EntryShape::Program) => Ok(pack::desktop::AppShape::Program),
-        None => Ok(desktop_app_shape(classify_entry_shape(root)?)),
+        None => Ok(desktop_app_shape(built_entry_shape(root)?)),
     }
 }
 
@@ -218,8 +218,8 @@ pub fn validate_desktop_shape(
 /// shape (when present) or by classifying the entry source.
 ///
 /// # Errors
-/// [`CliError`] forwarded from [`classify_entry_shape`] when entry-source
-/// classification is needed and the source cannot be read or parsed.
+/// [`CliError`] forwarded from [`built_entry_shape`] when entry-source
+/// classification is needed and the project or its entry is refused.
 pub fn classify_mobile_spa_cap(
     declared: Option<project::EntryShape>,
     root: &Path,
@@ -227,7 +227,7 @@ pub fn classify_mobile_spa_cap(
 ) -> Result<pack::mobile::WebSpaCapability, CliError> {
     let shape_is_web = match declared {
         Some(s) => s == project::EntryShape::Web,
-        None => classify_entry_shape(root)? == delivery::Shape::Web,
+        None => built_entry_shape(root)? == delivery::Shape::Web,
     };
     Ok(pack::mobile::WebSpaCapability {
         shape_is_web,
@@ -3832,7 +3832,7 @@ pub const fn diag_span(d: &Diagnostic) -> ipe_diagnostics::Span {
 // ── Refusal gate unit tests ───────────────────────────────────────────────────
 //
 // These tests drive the fail-closed shape/permission gates WITHOUT a real
-// project on disk: they pass `Some(declared)` so `classify_entry_shape` (which
+// project on disk: they pass `Some(declared)` so `built_entry_shape` (which
 // reads source files) is bypassed. Any rejected path that no test drives is one
 // edit away from silently passing — pin them here.
 
