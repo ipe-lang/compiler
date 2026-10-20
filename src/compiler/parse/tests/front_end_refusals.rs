@@ -5,7 +5,8 @@
 //! access on a qualified value). A rejection no test drives is one edit from
 //! silently vanishing.
 
-use ipe_diagnostics::Diagnostic;
+use ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT;
+use ipe_diagnostics::{Diagnostic, ParseError};
 use ipe_intern::Interner;
 use ipe_parse::parse_module;
 use ipe_syntax::{Expr_, Pattern_};
@@ -265,4 +266,153 @@ fn deep_record_expr_is_p0003() {
 
     let mut i = Interner::new();
     assert_nesting_too_deep(parse_module(&src, &mut i), "deep record expr");
+}
+
+// ── Manufactured nesting: `do` and `let` blocks charge the ceiling ──────────
+//
+// A flat block of N statements lowers to N nested binders, so the block, not
+// the source indentation, decides the depth every later stage walks. The
+// boundary is found by search (the enclosing frames' cost is the parser's
+// business), then pinned: the block one statement shorter parses, and the
+// block at the boundary is refused with `NestingTooDeep` in the tail the last
+// statement pushed past the ceiling: that statement or the block's result.
+
+/// A block module's source plus the byte range from its last statement to the end.
+type Block = (String, (u32, u32));
+
+/// A module whose `main` is a block of `n` statements framed by `open` / `close`.
+fn block_module(n: usize, open: &str, stmt: impl Fn(usize) -> String, close: &str) -> Block {
+    let mut src = String::from("module Main exposing (main)\n\nmain =\n");
+    src.push_str(open);
+    let mut last = 0;
+    for i in 0..n {
+        last = src.len();
+        src.push_str(&stmt(i));
+        src.push('\n');
+    }
+    src.push_str(close);
+    let offset = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+    let tail = (offset(last), offset(src.len()));
+    (src, tail)
+}
+
+/// The ceiling as a statement count.
+fn ceiling() -> usize {
+    usize::try_from(SOURCE_NESTING_LIMIT).unwrap_or(usize::MAX)
+}
+
+/// The first statement count `build` refuses, searched up to twice the ceiling.
+fn first_refused(build: impl Fn(usize) -> Block) -> Option<usize> {
+    (1..=2 * ceiling()).find(|n| {
+        let (src, _) = build(*n);
+        parse_module(&src, &mut Interner::new()).is_err()
+    })
+}
+
+/// Assert the block of `boundary - 1` statements parses and the block of
+/// `boundary` is refused as `NestingTooDeep` in the tail statement `boundary`
+/// starts.
+///
+/// Returns the boundary.
+fn assert_block_boundary(build: impl Fn(usize) -> Block, label: &str) -> usize {
+    let found = first_refused(&build);
+    assert!(
+        found.is_some(),
+        "{label}: no statement count up to twice the ceiling is refused"
+    );
+    let Some(boundary) = found else {
+        return 0;
+    };
+    assert!(boundary > 1, "{label}: a one-statement block is refused");
+
+    let (below, _) = build(boundary - 1);
+    let ok = parse_module(&below, &mut Interner::new());
+    assert!(
+        ok.is_ok(),
+        "{label}: {} statements must parse: {ok:?}",
+        boundary - 1
+    );
+
+    let (at, (lo, hi)) = build(boundary);
+    let refused = parse_module(&at, &mut Interner::new());
+    assert!(
+        matches!(
+            refused,
+            Err(Diagnostic::Parse {
+                msg: ParseError::NestingTooDeep { .. },
+                ..
+            })
+        ),
+        "{label}: {boundary} statements: expected NestingTooDeep, got {refused:?}"
+    );
+    let Err(Diagnostic::Parse {
+        span,
+        msg: ParseError::NestingTooDeep { limit, .. },
+    }) = refused
+    else {
+        return boundary;
+    };
+    assert_eq!(
+        u32::from(limit),
+        SOURCE_NESTING_LIMIT,
+        "{label}: the refusal names the ceiling"
+    );
+    assert!(
+        span.lo >= lo && span.hi <= hi,
+        "{label}: span {}..{} lies in the crossing tail {lo}..{hi}",
+        span.lo,
+        span.hi
+    );
+    boundary
+}
+
+/// A `do` block of binds charges two levels per bind (the `Task.andThen` call
+/// and its continuation lambda), so the ceiling stops it within half the limit.
+#[test]
+fn do_block_of_binds_is_refused_at_the_ceiling() {
+    let build = |n: usize| {
+        block_module(
+            n,
+            "    do\n",
+            |i| format!("        x{i} <- t"),
+            "        t\n",
+        )
+    };
+    let boundary = assert_block_boundary(build, "do binds");
+    assert!(
+        boundary <= ceiling() / 2,
+        "each bind charges two levels: refused at {boundary}, past half of {}",
+        ceiling()
+    );
+}
+
+/// A `do` block of bare runs charges one level per run.
+#[test]
+fn do_block_of_runs_is_refused_at_the_ceiling() {
+    let build = |n: usize| block_module(n, "    do\n", |i| format!("        t{i}"), "        t\n");
+    let boundary = assert_block_boundary(build, "do runs");
+    assert!(
+        boundary <= ceiling(),
+        "each run charges one level: refused at {boundary}, past {}",
+        ceiling()
+    );
+}
+
+/// A `let` block charges one level per binding.
+#[test]
+fn let_block_is_refused_at_the_ceiling() {
+    let build = |n: usize| {
+        block_module(
+            n,
+            "    let\n",
+            |i| format!("        x{i} = 1"),
+            "    in\n    1\n",
+        )
+    };
+    let boundary = assert_block_boundary(build, "let bindings");
+    assert!(
+        boundary <= ceiling(),
+        "each binding charges one level: refused at {boundary}, past {}",
+        ceiling()
+    );
 }

@@ -1330,8 +1330,7 @@ fn capability_verdict(
     manifest: &ProjectManifest,
     sources: &crate::driver::PackageSourceSet,
 ) -> Result<BTreeSet<Capability>, CliError> {
-    let inferred =
-        crate::driver::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), sources)?;
+    let inferred = crate::driver::infer_package_capabilities_of(sources)?;
     capability_consistency(manifest, &inferred)?;
     Ok(inferred)
 }
@@ -1542,8 +1541,7 @@ pub(crate) fn disclose_package(path: &Path) -> Result<Disclosure, CliError> {
     let (sources, entries) = crate::driver::read_package_modules(&manifest)?;
     let source_set =
         crate::driver::PackageSourceSet::assemble(sources.clone(), entries, &manifest_path)?;
-    let inferred =
-        crate::driver::infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &source_set)?;
+    let inferred = crate::driver::infer_package_capabilities_of(&source_set)?;
     derive_disclosure(&manifest, &sources, inferred)
 }
 

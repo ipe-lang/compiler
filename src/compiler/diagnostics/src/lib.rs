@@ -6,6 +6,7 @@
 mod code;
 mod diagnostic;
 pub mod json;
+pub mod nesting;
 pub mod path_check;
 mod render;
 mod span;
@@ -22,13 +23,14 @@ pub use code::*;
 pub use diagnostic::{
     AliasExpansionKind, AliasRowFault, AppShape, Applicability, Candidates, CaseDefect,
     CmdSubShapeMismatch, CodecAutoRejection, ConsentError, Construct, DResult, Diagnostic,
-    EditTarget, Expected, ExpectedSet, ExposingDefect, Feature, FfiError, GenericAppEntryReach,
-    HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint, INTERPOLABLE_CLASS, INTERPOLABLE_TYPES,
-    IfDefect, ImportedAs, InterceptContext, LetDefect, LowerError, MainRetName, ModelLeaf,
-    ModulePlacementReason, ModulePlacementRejection, MountPrefixFault, NameError, ParseError,
-    RoutePatternDefect, RustNameFoldKind, SandboxError, SealRejection, SortedNames, SpanRole,
-    StdlibReach, StoreEqAccessorDefect, StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc,
-    TypeDeclDefect, TypeError, WildcardDependence,
+    EditTarget, EmitSite, Expected, ExpectedSet, ExposingDefect, Feature, FfiError,
+    GenericAppEntryReach, HOF_KERNEL_RESULT_CLASS, HeaderDefect, HelpLine, Hint,
+    INTERPOLABLE_CLASS, INTERPOLABLE_TYPES, IfDefect, ImportedAs, InterceptContext, LetDefect,
+    LowerError, MainRetName, ModelLeaf, ModulePlacementReason, ModulePlacementRejection,
+    MountPrefixFault, NameError, ParseError, RoutePatternDefect, RustNameFoldKind, SandboxError,
+    SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
+    StoreSelectProjectionDefect, Suggestion, TokenKind, TyDoc, TypeDeclDefect, TypeError,
+    WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
 pub use span::{Located, Span};

@@ -22,6 +22,7 @@
 //! parser fails fast instead of silently dropping the qualifier (which the
 //! canonicaliser would then resolve against the wrong name).
 
+use ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT;
 use ipe_diagnostics::{
     CaseDefect, Construct, DResult, Diagnostic, Expected, ExpectedSet, ExposingDefect,
     HeaderDefect, IfDefect, LetDefect, Located, ParseError, Span, TokenKind, TypeDeclDefect,
@@ -37,7 +38,18 @@ use crate::lexer::{IntMagnitude, Tok, Token};
 
 /// Maximum recursion depth before the parser bails with
 /// [`ParseError::NestingTooDeep`].
-pub const MAX_DEPTH: u32 = 256;
+///
+/// It is the compiler-wide [`SOURCE_NESTING_LIMIT`]; every later stage derives
+/// its own bound from the same constant.
+pub const MAX_DEPTH: u32 = SOURCE_NESTING_LIMIT;
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the parser ceiling stops fitting the `u16` its refusal reports [ledger #boundary]
+const _: () = assert!(MAX_DEPTH <= u16::MAX as u32);
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the const assert above proves `MAX_DEPTH` fits a `u16`"
+)]
+const NESTING_LIMIT_U16: u16 = MAX_DEPTH as u16;
 
 pub struct Parser<'a> {
     toks: Vec<Token>,
@@ -154,6 +166,30 @@ pub const fn tok_kind(t: &Tok) -> TokenKind {
     }
 }
 
+/// Which statement a `do`-block line opens, read from its first two tokens.
+#[derive(Clone, Copy)]
+enum DoHead {
+    /// `p <- e`.
+    Bind,
+    /// `p = e`.
+    Let,
+    /// `e`.
+    Run,
+}
+
+impl DoHead {
+    /// Nesting levels the statement's desugar manufactures.
+    ///
+    /// A bind becomes a `Task.andThen` call around its continuation lambda (2);
+    /// a let or a non-final run becomes one `Let` around the rest (1).
+    const fn nesting(self) -> u32 {
+        match self {
+            Self::Bind => 2,
+            Self::Let | Self::Run => 1,
+        }
+    }
+}
+
 /// One statement inside a `do` block, before desugaring to `Task.andThen`.
 ///
 /// `Bind` and `Let` carry the span of their `<-` / `=` operator token: the
@@ -264,7 +300,7 @@ impl<'a> Parser<'a> {
             span: self.err_here_span(),
             msg: ParseError::NestingTooDeep {
                 construct,
-                limit: u16::try_from(MAX_DEPTH).unwrap_or(u16::MAX),
+                limit: NESTING_LIMIT_U16,
             },
         }
     }
@@ -2203,9 +2239,19 @@ impl<'a> Parser<'a> {
             }
         };
 
+        // Each binding lowers to one more nested `Let` around everything after
+        // it, so the block charges one level per binding, cumulatively. A
+        // binding that crosses the ceiling is refused at its own head token;
+        // the charge ends with the block.
+        let mut charged: u32 = 0;
         let mut bindings = Vec::new();
         loop {
-            bindings.push(self.parse_let_binding(binding_col, depth + 1)?);
+            charged = charged.saturating_add(1);
+            let binding_depth = depth.saturating_add(1).saturating_add(charged);
+            if binding_depth > MAX_DEPTH {
+                return Err(self.too_deep(Construct::Let));
+            }
+            bindings.push(self.parse_let_binding(binding_col, binding_depth)?);
             // Another binding continues only when the next token is an
             // identifier aligned at the binding column. `in` is its own token
             // (never an `Ident`), so it always ends the binding list.
@@ -2235,7 +2281,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        let body = self.parse_expr(threshold, depth + 1)?;
+        let body = self.parse_expr(threshold, depth.saturating_add(1).saturating_add(charged))?;
         let span = Self::span_merge(let_tok.span, body.span);
         Ok(Located::new(span, Expr_::Let(bindings, Box::new(body))))
     }
@@ -2477,7 +2523,7 @@ impl<'a> Parser<'a> {
     /// Desugaring, bottom-up over the tail `rest`:
     /// - `⟦(p <- e); rest⟧ = Task.andThen (\p -> ⟦rest⟧) e`
     /// - `⟦(p =  e); rest⟧ = let p = e in ⟦rest⟧`
-    /// - `⟦e ; rest⟧       = Task.andThen (\_ -> ⟦rest⟧) e`
+    /// - `⟦e ; rest⟧       = let _ = e in ⟦rest⟧`
     /// - `⟦e⟧              = e`
     ///
     /// `Task.andThen` here is the [`Expr_::TaskAndThen`] identity node, not a
@@ -2507,9 +2553,21 @@ impl<'a> Parser<'a> {
                 msg: ParseError::Unexpected,
             });
         }
+        // The desugar nests the rest of the block inside each statement, so
+        // the block charges each statement's manufactured nesting
+        // ([`DoHead::nesting`]), cumulatively, and parses the statement at the
+        // charged depth. A statement that crosses the ceiling is refused at its
+        // own head token; the charge ends with the block.
+        let mut charged: u32 = 0;
         let mut stmts = Vec::new();
         loop {
-            stmts.push(self.parse_do_statement(block_col, depth + 1)?);
+            let head = self.do_statement_head();
+            charged = charged.saturating_add(head.nesting());
+            let stmt_depth = depth.saturating_add(1).saturating_add(charged);
+            if stmt_depth > MAX_DEPTH {
+                return Err(self.too_deep(Construct::Expression));
+            }
+            stmts.push(self.parse_do_statement(head, block_col, stmt_depth)?);
             if !self
                 .peek()
                 .is_some_and(|t| layout::aligned_at(t, block_col))
@@ -2520,14 +2578,23 @@ impl<'a> Parser<'a> {
         Self::desugar_do(do_tok.span, stmts)
     }
 
-    /// Parse one `do`-block statement. A leading lowercase name (or `_`) directly
-    /// followed by `<-` or `=` is a bind / let; anything else is a bare run.
-    fn parse_do_statement(&mut self, block_col: u32, depth: u32) -> DResult<DoStmt> {
+    /// Classify the `do`-block statement at the cursor.
+    ///
+    /// A leading lowercase name (or `_`) directly followed by `<-` or `=` is a
+    /// bind / let; anything else is a bare run.
+    fn do_statement_head(&self) -> DoHead {
         let head_is_binder = matches!(self.peek_kind(), Some(Tok::Ident(_) | Tok::Underscore));
-        let next = self.toks.get(self.pos + 1).map(|t| &t.kind);
-        let is_bind = next == Some(&Tok::LeftArrow);
-        let is_let = next == Some(&Tok::Equals);
-        if head_is_binder && (is_bind || is_let) {
+        match self.toks.get(self.pos + 1).map(|t| &t.kind) {
+            Some(Tok::LeftArrow) if head_is_binder => DoHead::Bind,
+            Some(Tok::Equals) if head_is_binder => DoHead::Let,
+            _ => DoHead::Run,
+        }
+    }
+
+    /// Parse one `do`-block statement whose kind `head` has already classified.
+    fn parse_do_statement(&mut self, head: DoHead, block_col: u32, depth: u32) -> DResult<DoStmt> {
+        let is_bind = matches!(head, DoHead::Bind);
+        if matches!(head, DoHead::Bind | DoHead::Let) {
             let head = self.bump(Construct::Expression)?;
             let pat = match &head.kind {
                 Tok::Underscore => Located::new(head.span, Pattern_::PAnything),

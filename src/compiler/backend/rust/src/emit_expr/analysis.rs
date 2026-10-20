@@ -1,4 +1,6 @@
-use super::{Expr, Func, IrType, MAX_IR_RENDER_DEPTH, Symbol, wants_arc_ctor};
+use super::{
+    Diagnostic, Expr, Func, IrType, LowerError, MAX_IR_RENDER_DEPTH, Span, Symbol, wants_arc_ctor,
+};
 
 pub use ipe_ir::free_vars::{collect_free_vars, free_vars};
 pub use ipe_ir::let_inline::inlined_let_body;
@@ -8,19 +10,30 @@ pub use ipe_ir::seq_clone::clone_targets_in_expr;
 /// The deepest expression nesting the backend will descend before failing fast.
 ///
 /// `emit_expr` recurses one Rust stack frame per IR-expression level (`BinOp`
-/// operands, call arguments, match scrutinee/arm bodies). An adversarially or
-/// buggily deep IR spine would otherwise overflow the native stack with no
-/// diagnostic. The parser already caps *source* nesting at 256 (IPE-P0003);
-/// this matching bound is defence-in-depth against an IR produced past that —
-/// well below the native stack ceiling (≤ 2 MB default thread stack), so the
-/// guard fires first. Sized conservatively to leave headroom for the frame size
-/// of `emit_expr_at` in debug builds.
-///
-/// Shares [`ipe_ir::MAX_IR_RENDER_DEPTH`] rather than a separately-declared
-/// copy of the same value — a `--emit-ir` dev-flag dump and the real emitter
-/// must refuse a program at the identical depth, not two independently
-/// tuned bounds that can drift apart.
+/// operands, call arguments, match scrutinee/arm bodies). It is
+/// [`ipe_ir::MAX_IR_RENDER_DEPTH`], the compiler-wide
+/// `ipe_diagnostics::nesting::IR_NESTING_LIMIT` the parser's source ceiling
+/// derives, so a program the parser admits is never refused here. The guard is
+/// defence in depth against a lowering step that manufactures nesting; the
+/// declared compile stack is sized for this depth.
 pub const MAX_EMIT_DEPTH: u16 = MAX_IR_RENDER_DEPTH;
+
+/// The refusal a body nested past [`MAX_EMIT_DEPTH`] gets.
+///
+/// It leaves the expression walk without its function; [`emit_func_vis`]
+/// names the function before the diagnostic leaves the backend.
+///
+/// [`emit_func_vis`]: super::emit_func_vis
+#[must_use]
+pub const fn nesting_refusal() -> Diagnostic {
+    Diagnostic::Lower {
+        span: Span::DUMMY,
+        msg: LowerError::BackendNestingTooDeep {
+            limit: MAX_EMIT_DEPTH,
+            func: None,
+        },
+    }
+}
 
 /// One indentation level: four spaces, matching the golden's formatting.
 pub fn indent_of(level: usize) -> String {
