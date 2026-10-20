@@ -1369,6 +1369,8 @@ messages! {
     ffi_reserved_module_claimed(krate, module) = "ffi-reserved-module-claimed";
     /// An FFI wrapper uses the reserved asserted-shim prefix.
     ffi_reserved_wrapper_prefix(krate, wrapper, prefix) = "ffi-reserved-wrapper-prefix";
+    /// A wrapper crate the catalog bound by path is no longer the directory below the project root.
+    ffi_wrapper_moved(package, path) = "ffi-wrapper-moved";
     /// A project module takes the reserved asserted-call module name.
     ffi_reserved_module_exists(module) = "ffi-reserved-module-exists";
     /// Asserted calls were validated against an empty FFI catalog (an internal invariant).

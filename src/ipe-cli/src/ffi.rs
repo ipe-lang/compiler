@@ -503,6 +503,37 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
     Ok(Some(AssembledEmit { emit, merged }))
 }
 
+/// Refuse a wrapper crate `catalog` binds by path that is no longer the directory below `root`.
+///
+/// A wrapper's `path` dependency is proven inside the project when the
+/// catalog is read. Between that read and the emit, a wrapper level swapped
+/// for a link, or the project renamed away and replaced, would make the path
+/// the emitted `Cargo.toml` binds name another tree; so at the emit each
+/// wrapper is proven to be the directory reached through the root's own
+/// handle.
+///
+/// # Errors
+/// [`CliError::TrustRefused`] naming the first wrapper that is not;
+/// [`CliError::Io`] when a level cannot be opened or stat'd.
+pub fn hold_wrapper_deps(
+    root: &crate::project_root::ProjectRoot,
+    catalog: &[InstalledCrate],
+) -> Result<(), CliError> {
+    for dep in catalog.iter().flat_map(|c| &c.cargo_deps) {
+        if let CargoDep::Wrapper { dir, .. } = dep
+            && !root.holds_wrapper(Path::new(dir.as_str()))?
+        {
+            return Err(CliError::TrustRefused(
+                owner_trust::TrustRefusal::FfiWrapperMoved {
+                    package: dir.package().as_str().to_owned(),
+                    path: PathBuf::from(dir.as_str()),
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Every refusal FFI prep returns, one variant per cause.
 ///
 /// It reaches [`CliError`] only as [`CliError::FfiPrep`], so a consumer (the

@@ -352,6 +352,44 @@ impl ProjectRoot {
         owner_trust::open_cache_beneath(self.fs_root.handle(), self.path())
     }
 
+    /// Whether the directory `wrapper` opens now is the one below this root's handle.
+    ///
+    /// `wrapper` is the path a wrapper crate's `path` dependency binds. Its
+    /// spelling below the root's canonical path is walked from the handle
+    /// [`ProjectRoot::resolve`] proved is the root, never following a link,
+    /// and the directory reached must be the one `wrapper` opens. A root
+    /// renamed away and replaced, a wrapper level swapped for a link, and a
+    /// wrapper outside the root are not this root's wrapper.
+    ///
+    /// # Errors
+    /// [`CliError::Io`] when a level cannot be opened or stat'd.
+    pub(crate) fn holds_wrapper(&self, wrapper: &Path) -> Result<bool, CliError> {
+        let (Ok(root), Ok(canonical)) = (
+            std::fs::canonicalize(self.path()),
+            std::fs::canonicalize(wrapper),
+        ) else {
+            return Ok(false);
+        };
+        let Ok(below) = canonical.strip_prefix(&root) else {
+            return Ok(false);
+        };
+        let mut level: Option<HeldDir> = None;
+        for component in below.components() {
+            let Component::Normal(name) = component else {
+                return Ok(false);
+            };
+            level = match level.as_ref().unwrap_or(&self.dir).child(name) {
+                Ok(Some(child)) => Some(child),
+                Ok(None)
+                | Err(CliError::OutputRefused(
+                    OutputRefusal::Symlink(_) | OutputRefusal::NotADirectory(_),
+                )) => return Ok(false),
+                Err(other) => return Err(other),
+            };
+        }
+        level.as_ref().unwrap_or(&self.dir).is_at(wrapper)
+    }
+
     /// The parsed `package.ipe`.
     #[must_use]
     pub const fn manifest(&self) -> &ProjectManifest {
