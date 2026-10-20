@@ -748,7 +748,7 @@ rootSampleOf conn ( tag, root ) =
         prefix =
             RepoPath.tagName tag ++ ":"
     in
-    Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample ] (columnDecoder "path")
+    Db.queryDecode conn taggedPathsSql [ SqlString prefix, SqlString prefix, SqlInt rootSample, SqlInt rootSample ] (columnDecoder "path")
         |> Task.map (\stored -> { tag = tag, rootDir = RepoPath.rootPath root, origin = RepoPath.rootOrigin tag root, fix = RepoPath.rootFixFor root, stored = stored })
 
 
@@ -779,12 +779,13 @@ rootSample =
     16
 
 
--- The distinct paths under one tag, each as its window and byte length:
--- the stored path starts with `tag:`, compared by `substr`, so no character
--- of the tag is a pattern.
+-- The distinct paths under one tag, each as its window and byte length,
+-- at most `rootSample` of them, bounded by the outer read as well as the
+-- inner: the stored path starts with `tag:`, compared by `substr`, so no
+-- character of the tag is a pattern.
 taggedPathsSql : String
 taggedPathsSql =
-    "SELECT " ++ shownColumn "path" "path" ++ " FROM (SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?) ORDER BY path"
+    "SELECT " ++ shownColumn "path" "path" ++ " FROM (SELECT DISTINCT path FROM units WHERE substr(path, 1, length(?)) = ? ORDER BY path LIMIT ?) ORDER BY path LIMIT ?"
 
 
 -- Whether the index holds any unit, read without any of its columns.
@@ -2041,12 +2042,24 @@ type DecidedPair
     = DecidedPair { uid : Uid, hash : String }
 
 
--- The one constructor of a `DecidedPair`: a row's `uid` and `body_hash`.
-decidedPairDecoder : Db.Decode.Decoder DecidedPair
+-- The one constructor of a `DecidedPair`: a row's `uid` and `body_hash`,
+-- the uid parsed once here. A uid that is not a unit id decodes as Nothing,
+-- a row with no pair, never a failed read.
+decidedPairDecoder : Db.Decode.Decoder (Maybe DecidedPair)
 decidedPairDecoder =
-    Db.Decode.succeed (\uid hash -> DecidedPair { uid = uid, hash = hash })
-        |> Db.Decode.required "uid" (Uid.decoder "uid")
+    Db.Decode.succeed decidedPairOf
+        |> Db.Decode.required "uid" (Db.Decode.string "uid")
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
+
+
+decidedPairOf : String -> String -> Maybe DecidedPair
+decidedPairOf stored hash =
+    case Uid.parse stored of
+        Ok uid ->
+            Just (DecidedPair { uid = uid, hash = hash })
+
+        Err _ ->
+            Nothing
 
 
 -- A decided pair's key, read-only: the (uid, body_hash) it was decoded from.

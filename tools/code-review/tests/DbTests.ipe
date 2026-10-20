@@ -345,8 +345,9 @@ probeAfterEdits dbPath edits =
 
 -- A review file whose head table is rebuilt without its key and checks
 -- fails the startup probe when it holds two head rows, and when its one row
--- holds a cell past its ceiling, a 33-digit log id: the head is read at most
--- two rows deep and cell by cell under `headCellCeilings`, never as two
+-- holds a cell past its ceiling, a 33-digit log id or a 1 MiB blob in its
+-- integer seq: the head is read at most two rows deep and cell by cell
+-- under `headCellCeilings`, its seq windowed to an integer, never as two
 -- heads or a whole cell. The same rebuild with its one row intact passes.
 -- Red if the head read takes the first of several rows, or reads a cell
 -- whole.
@@ -361,7 +362,8 @@ headRowsBoundedIn base =
         intact <- probeAfterEdits (base ++ "/intact.db") (rebuiltHead [ "one, log_id, seq, head, key_check" ])
         doubled <- probeAfterEdits (base ++ "/doubled.db") (rebuiltHead [ "one, log_id, seq, head, key_check", "one, log_id, seq, head, key_check" ])
         wide <- probeAfterEdits (base ++ "/wide.db") (rebuiltHead [ "one, log_id || 'a', seq, head, key_check" ])
-        Task.succeed (intact == Nothing && maybeContains "no single head row" doubled && maybeContains "no single head row" wide)
+        blob <- probeAfterEdits (base ++ "/blob.db") (rebuiltHead [ "one, log_id, zeroblob(1048576), head, key_check" ])
+        Task.succeed (intact == Nothing && maybeContains "no single head row" doubled && maybeContains "no single head row" wide && maybeContains "no single head row" blob)
 
 
 -- The edits rebuilding `review_log_head` with no key or check, one row
@@ -496,10 +498,10 @@ storedOverlongReasonDecodes : Db -> Task.Task Error Bool
 storedOverlongReasonDecodes db =
     let
         expected =
-            "reason not shown: 1500 characters, over the 500-character limit"
+            "reason not shown: 5000 characters, over the 500-character limit"
     in
     do
-        appendSigned db (rawRow "huge-uid" "hH" "refuse" (Just (String.repeat 1500 "y")))
+        appendSigned db (rawRow "huge-uid" "hH" "refuse" (Just (String.repeat 5000 "y")))
         verify <- countingVerifier db
         byPair <- LibDb.findDecision verify db (uid "huge-uid") "hH"
         byUid <- LibDb.findLatestForUid verify db (uid "huge-uid")
@@ -518,14 +520,14 @@ storedBlankReasonDecodes db =
 
 
 -- A signed review-log cell past its ceiling is never read: a reason of
--- exactly `reasonMaxChars * 4` bytes is held and counts, while a 1 MiB
+-- exactly `storedReasonMaxBytes` bytes is held and counts, while a 1 MiB
 -- reason, correctly signed, reads as `Tampered`, breaks the walk at its
 -- entry, and the History page still loads, the row shown as tampered. Red
 -- if the log reads a cell whole, since the signed row would then verify.
 logCellPastCeilingRefused : Db -> Task.Task Error Bool
 logCellPastCeilingRefused db =
     do
-        appendSigned db (rawRow "edge-uid" "hE" "refuse" (Just (String.repeat (LibDb.reasonMaxChars * 4) "r")))
+        appendSigned db (rawRow "edge-uid" "hE" "refuse" (Just (String.repeat LibDb.storedReasonMaxBytes "r")))
         edge <- lookUp db "edge-uid" "hE"
         appendSigned db (rawRow "vast-uid" "hV" "refuse" (Just (String.repeat 1048576 "r")))
         verdict <- logVerdictOf db
@@ -540,10 +542,76 @@ logCellPastCeilingRefused db =
             )
 
 
+-- A signed review-log row whose review time is replaced outside the tool by
+-- a 1 MiB blob is never read whole: SQLite windows the integer cell, the
+-- row reads as `Tampered`, the walk breaks at its entry, and the History
+-- page still loads, the row shown as tampered; a page of one row, which
+-- ends on that row, fails as having no place to continue from. Red if an
+-- integer cell is read whole or its type is taken on trust from the
+-- schema, or if a page continues from a key the row does not hold.
+integerCellPastTypeRefused : Db -> Task.Task Error Bool
+integerCellPastTypeRefused db =
+    do
+        appendSigned db (rawRow "int-a" "hA" "approve" Nothing)
+        appendSigned db (rawRow "int-b" "hB" "approve" Nothing)
+        tamperLog db "UPDATE review_log SET reviewed_at = zeroblob(1048576) WHERE seq = 2" []
+        verdict <- logVerdictOf db
+        vast <- lookUp db "int-b" "hB"
+        verify <- countingVerifier db
+        page <- LibDb.historyPage verify db PageSize.history HistoryStart
+        one <- pageOf 1
+        cut <- failureOf (LibDb.historyPage verify db one HistoryStart)
+        Task.succeed
+            (verdict == Broken (BreaksAt 2)
+                && whyOf vast == Just Tampered
+                && List.map (\entry -> whyOf (Just entry)) page.rows == [ Just Tampered, Just ChainBroken ]
+                && maybeContains "no place to start" cut
+            )
+
+
+-- A legacy review row whose review time is a 1 MiB blob is never read
+-- whole: the History page that reaches it fails, naming a cell past its
+-- ceiling. Red if a legacy integer cell is read whole or its type is taken
+-- on trust from the schema.
+legacyIntegerCellPastTypeRefused : Db -> Task.Task Error Bool
+legacyIntegerCellPastTypeRefused db =
+    do
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?, ?, 'refuse', 'r', zeroblob(1048576))" [ Uid.toSql (uid "legacy-blob"), SqlString "hL" ]
+        verify <- countingVerifier db
+        refused <- failureOf (LibDb.historyPage verify db PageSize.history HistoryStart)
+        Task.succeed (maybeContains "past its ceiling" refused)
+
+
+-- A History row whose uid column holds text that is no unit id, signed so
+-- its own mac and link verify, reads as `Tampered` and names no unit id,
+-- while the History page still loads with the row before it. Red if a
+-- stored uid is taken for a unit id without parsing it, or if one such row
+-- fails the whole page.
+storedUidNotAUnitIdTampered : Db -> Task.Task Error Bool
+storedUidNotAUnitIdTampered db =
+    do
+        appendSigned db (rawRow "first-1" "h" "approve" Nothing)
+        appendSignedWithUidText db "not-a-unit-id" (rawRow "second-2" "h2" "approve" Nothing)
+        verify <- countingVerifier db
+        page <- LibDb.historyPage verify db PageSize.history HistoryStart
+        Task.succeed
+            (List.map (\entry -> whyOf (Just entry)) page.rows == [ Just Tampered, Just ChainBroken ]
+                && List.map Queue.entryUid page.rows == [ Nothing, Just (uid "first-1") ]
+            )
+
+
+-- The message a task fails with; Nothing when it succeeds.
+failureOf : Task.Task Error a -> Task.Task Error (Maybe String)
+failureOf task =
+    task
+        |> Task.map (\_ -> Nothing)
+        |> Task.onError (\e -> Task.succeed (Just (Error.message e)))
+
+
 -- Each review-log and head cell ceiling is the bound the schema or the app
 -- holds that column to: a name column's byte CHECK, a mac's and a head's
--- length CHECK, a unit id's length, four bytes for each character of a
--- `Reason`, the longest decision word, and an attestation's length. Red if
+-- length CHECK, a unit id's length, a stored reason's ceiling at or past
+-- four bytes for each character of a `Reason`, the longest decision word, and an attestation's length. Red if
 -- a ceiling drifts from the bound it mirrors.
 cellCeilingsMatchSchema : Bool
 cellCeilingsMatchSchema =
@@ -576,7 +644,8 @@ cellCeilingsMatchSchema =
         && logBytes "prev" == logBytes "mac"
         && List.all (lengthChecked LibDb.headCellCeilings) [ "log_id", "head", "key_check" ]
         && logBytes "uid" == Just Uid.uidLength
-        && logBytes "reason" == Just (LibDb.reasonMaxChars * 4)
+        && logBytes "reason" == Just LibDb.storedReasonMaxBytes
+        && LibDb.storedReasonMaxBytes >= LibDb.reasonMaxChars * 4
         && logBytes "decision" == Just (max (String.length "approve") (String.length "refuse"))
         && logBytes "body_hash" == Just Index.attestedHashMaxBytes
         && String.length (Index.attest viewA) <= Index.attestedHashMaxBytes
@@ -637,7 +706,7 @@ entryKey entry =
             ( Uid.toString (LibDb.verifiedUid row), LibDb.verifiedHash row )
 
         Unverified row ->
-            ( Uid.toString row.uid, row.bodyHash )
+            ( Maybe.withDefault "" (Maybe.map Uid.toString row.uid), row.bodyHash )
 
 
 -- The state one History walk step carries: where the next page starts, the
@@ -728,7 +797,7 @@ historyStateTextsDistinct : Bool
 historyStateTextsDistinct =
     let
         row =
-            { entry = Unverified { uid = uid "u-h", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.Unnamed }
+            { entry = Unverified { uid = Just (uid "u-h"), bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = Legacy }, label = Queue.Unnamed }
 
         later =
             HistoryAfter (Timestamp.fromUnixMillis 0) 1
@@ -888,8 +957,8 @@ historyRoundtripIn base =
                             in
                             isLastHistoryPage page.next
                                 && List.length rows == 2
-                                && List.member ( uid "u-a", Nothing ) (List.map historyKey rows)
-                                && List.member ( uid "u-b", Just "too big" ) (List.map historyKey rows)
+                                && List.member ( Just (uid "u-a"), Nothing ) (List.map historyKey rows)
+                                && List.member ( Just (uid "u-b"), Just "too big" ) (List.map historyKey rows)
                         )
             )
         |> Task.andThen
@@ -903,16 +972,16 @@ historyRoundtripIn base =
 
 -- A History entry's uid and, for a counted refusal, its shown reason; an
 -- entry that does not count shows no decision at all.
-historyKey : ReviewEntry -> ( Uid, Maybe String )
+historyKey : ReviewEntry -> ( Maybe Uid, Maybe String )
 historyKey entry =
     case entry of
         Verified row ->
             case LibDb.verifiedDecision row of
                 StoredApproved ->
-                    ( LibDb.verifiedUid row, Nothing )
+                    ( Just (LibDb.verifiedUid row), Nothing )
 
                 StoredRefused reason ->
-                    ( LibDb.verifiedUid row, Just (SafeText.toString (LibDb.storedReasonText reason)) )
+                    ( Just (LibDb.verifiedUid row), Just (SafeText.toString (LibDb.storedReasonText reason)) )
 
         Unverified row ->
             ( row.uid, Just "not counted" )
@@ -1930,6 +1999,9 @@ storedRowChecks =
         , check "a stored over-long reason decodes and shows its length" (onFreshReview "ipe-review-storedOverlongReasonDecodes" storedOverlongReasonDecodes)
         , check "a stored blank reason decodes as blank" (onFreshReview "ipe-review-storedBlankReasonDecodes" storedBlankReasonDecodes)
         , check "a signed review-log cell past its ceiling reads as tampered and the History still loads" (onFreshReview "ipe-review-logCellPastCeilingRefused" logCellPastCeilingRefused)
+        , check "a review-log integer cell holding a blob reads as tampered and a page cannot continue from it" (onFreshReview "ipe-review-integerCellPastTypeRefused" integerCellPastTypeRefused)
+        , check "a legacy integer cell holding a blob fails the History page" (onFreshReview "ipe-review-legacyIntegerCellPastTypeRefused" legacyIntegerCellPastTypeRefused)
+        , check "a stored uid that is no unit id reads as tampered and the History still loads" (onFreshReview "ipe-review-storedUidNotAUnitIdTampered" storedUidNotAUnitIdTampered)
         , Task.succeed ( "each review-log cell ceiling is the bound its column is held to", cellCeilingsMatchSchema )
         , check "history pages walk every row once in order" (onFreshReview "ipe-review-historyWalkMatchesOrder" historyWalkMatchesOrder)
         , check "a history page below one row is refused" (onFreshReview "ipe-review-historyPageSizeRefused" historyPageSizeRefused)

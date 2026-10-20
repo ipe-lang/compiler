@@ -1,13 +1,9 @@
-module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
+module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
 
-import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
-import Ipe.Config as Config
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
 import Ipe.Db.Decode
-import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Error as Error
-import Ipe.Json.Encode as Encode
 import Ipe.List as List
 import Ipe.Maybe as Maybe
 import Ipe.Result as Result exposing (Result(..))
@@ -44,6 +40,15 @@ type Reason
 reasonMaxChars : Int
 reasonMaxChars =
     500
+
+
+-- The most bytes a stored reason is read with. A signed or legacy row may
+-- hold a reason longer than a `Reason`, read whole so its mac verifies and
+-- shown by its length only; the window is a margin past the longest
+-- `Reason` (four UTF-8 bytes a character), and a reason past it is unheld.
+storedReasonMaxBytes : Int
+storedReasonMaxBytes =
+    16384
 
 
 -- The reviewer's text as a `Reason`, or why it is not one.
@@ -146,9 +151,10 @@ type Unverified
     | ChainBroken
 
 
--- A row that is not counted: what it names and when, never a decision.
+-- A row that is not counted: what it names and when, never a decision. Its
+-- uid is Nothing when the row's uid column holds no unit id.
 type alias UnverifiedRow =
-    { uid : Uid
+    { uid : Maybe Uid
     , bodyHash : String
     , reviewedAt : Timestamp
     , why : Unverified
@@ -465,42 +471,49 @@ type alias LegacyRow =
 
 
 -- One row of the legacy `review` table, recorded before rows were signed,
--- as its columns hold it: the store's codec shape, read only through
--- `fromRecord`.
+-- as its columns hold it, each read under `legacyCellCeilings`: read only
+-- through `fromRecord`. `held` is False when any cell was past its ceiling.
 type alias ReviewRecord =
     { uid : String
     , bodyHash : String
     , decision : String
     , reason : Maybe String
     , reviewedAt : Timestamp
+    , held : Bool
     }
 
 
-makeRecord : String -> String -> String -> Maybe String -> Timestamp -> ReviewRecord
-makeRecord uid bodyHash decision reason reviewedAt =
+makeRecord : String -> String -> String -> Maybe String -> Timestamp -> Bool -> ReviewRecord
+makeRecord uid bodyHash decision reason reviewedAt held =
     { uid = uid
     , bodyHash = bodyHash
     , decision = decision
     , reason = reason
     , reviewedAt = reviewedAt
+    , held = held
     }
 
 
--- The one parser of a stored row. The uid must be a unit id and the
--- decision `approve` or `refuse`; any other row fails, naming the row by its
--- uid and never echoing the column text. A refusal's reason is classified by
--- `storedReason`, a NULL one as blank, so a row breaking the reason bound
--- still reads; an approval's reason column is never read.
+-- The one parser of a stored row. Every cell must be held, the uid a unit
+-- id and the decision `approve` or `refuse`; any other row fails, naming the
+-- row by its uid only once it is a unit id and never echoing the column
+-- text. A refusal's reason is classified by `storedReason`, a NULL one as
+-- blank, so a row breaking the reason bound still reads; an approval's
+-- reason column is never read.
 fromRecord : ReviewRecord -> Result Error LegacyRow
 fromRecord record =
-    case Uid.parse record.uid of
-        Err _ ->
-            Err (Error.unexpected "a review row holds a uid that is not a unit id")
+    if not record.held then
+        Err (Error.unexpected "a review row holds a cell past its ceiling")
 
-        Ok uid ->
-            Result.map
-                (\decision -> { uid = uid, bodyHash = record.bodyHash, decision = decision, reviewedAt = record.reviewedAt })
-                (storedDecision uid record)
+    else
+        case Uid.parse record.uid of
+            Err _ ->
+                Err (Error.unexpected "a review row holds a uid that is not a unit id")
+
+            Ok uid ->
+                Result.map
+                    (\decision -> { uid = uid, bodyHash = record.bodyHash, decision = decision, reviewedAt = record.reviewedAt })
+                    (storedDecision uid record)
 
 
 storedDecision : Uid -> ReviewRecord -> Result Error StoredDecision
@@ -515,7 +528,7 @@ storedDecision uid record =
         Err (Error.unexpected ("review row " ++ Uid.toString uid ++ " holds a decision this reviewer does not know"))
 
 
--- A store read's row, parsed.
+-- A one-row read's row, parsed.
 fromMaybeRecord : Maybe ReviewRecord -> Task.Task Error (Maybe LegacyRow)
 fromMaybeRecord found =
     case found of
@@ -526,62 +539,10 @@ fromMaybeRecord found =
             Task.fromResult (Result.map Just (fromRecord record))
 
 
--- Codec for ReviewRecord. Keys in `SRecord` and JSON object match the DB
--- column names so `Store.fromCodec` derives the correct column list from the
--- shape.
-reviewCodec : Codec ReviewRecord
-reviewCodec =
-    Codec
-        { enc =
-            \row ->
-                Encode.object
-                    [ ( "uid", Encode.string row.uid )
-                    , ( "body_hash", Encode.string row.bodyHash )
-                    , ( "decision", Encode.string row.decision )
-                    , ( "reason"
-                      , case row.reason of
-                            Just r ->
-                                Encode.string r
-
-                            Nothing ->
-                                Encode.null
-                      )
-                    , ( "reviewed_at", Codec.toValue Codec.timestamp row.reviewedAt )
-                    ]
-        , mkDec =
-            \_ ->
-                Config.map5 makeRecord
-                    (Config.field "uid" Config.string)
-                    (Config.field "body_hash" Config.string)
-                    (Config.field "decision" Config.string)
-                    (Config.field "reason" (Config.nullable Config.string))
-                    (Config.field "reviewed_at" (Config.map Timestamp.fromUnixMillis Config.int))
-        , shp =
-            SRecord
-                [ ( "uid", CText )
-                , ( "body_hash", CText )
-                , ( "decision", CText )
-                , ( "reason", CNull CText )
-                , ( "reviewed_at", CTime )
-                ]
-        }
-
-
--- The typed store for the legacy `review` table. `fromCodec` validates every column
--- identifier; the composite key records `PRIMARY KEY (uid, body_hash)`, so the
--- by-key operations fail closed and every access names both key columns. The
--- table itself comes from the hand-written migration, since `createSql` does
--- not render a composite key.
-reviewStore : Result Error (Store ReviewRecord)
-reviewStore =
-    Store.fromCodec "review" reviewCodec
-        |> Result.map (\draft -> Store.public (Store.compositePrimaryKey2 .uid .bodyHash draft))
-
-
 -- A legacy row as every reader shows it: uncounted, with no decision.
 legacyEntry : LegacyRow -> ReviewEntry
 legacyEntry row =
-    Unverified { uid = row.uid, bodyHash = row.bodyHash, reviewedAt = row.reviewedAt, why = Legacy }
+    Unverified { uid = Just row.uid, bodyHash = row.bodyHash, reviewedAt = row.reviewedAt, why = Legacy }
 
 
 -- The startup check of `IPE_REVIEW_DB`: the review database is opened
@@ -870,11 +831,12 @@ type HeadRead
 
 
 -- At most two head rows, enough to see a second whatever key the file's
--- table declares, each cell read under `headCellCeilings`.
+-- table declares, each text cell read under `headCellCeilings` and each
+-- integer cell of `headIntegerCells` only when it holds an integer.
 headRows : Db -> Task.Task Error (List HeadRead)
 headRows db =
     Db.queryDecode db
-        ("SELECT seq, " ++ heldCells headCellCeilings ++ ", " ++ anyUnheld headCellCeilings ++ " AS unheld FROM review_log_head WHERE one = 1 LIMIT 2")
+        ("SELECT " ++ heldIntegers headIntegerCells ++ ", " ++ heldCells headCellCeilings ++ ", " ++ anyUnheld headCellCeilings headIntegerCells ++ " AS unheld FROM review_log_head WHERE one = 1 LIMIT 2")
         []
         (Db.Decode.map2 headReadOf Index.chainHeadDecoder unheldDecoder)
 
@@ -1106,10 +1068,12 @@ reasonField reason =
 
 
 -- One review-log row as its columns hold it, every column read and none
--- trusted: classified only by `entryOf`. Its pair is read through
--- `Index.decidedPairDecoder`, so a uid that is not a unit id fails the read.
+-- trusted: classified only by `entryOf`. Its uid is read as stored; `pair`
+-- is the uid and body hash decoded through `Index.decidedPairDecoder`,
+-- Nothing when the uid is not a unit id. `keyed` is True when its seq and
+-- review time are integers, the page order's key.
 type LogRow
-    = LogRow { seq : Int, pair : DecidedPair, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, name : RowName, held : Bool }
+    = LogRow { seq : Int, uid : StoredUid, bodyHash : String, pair : Maybe DecidedPair, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, name : RowName, held : Bool, keyed : Bool }
 
 
 logRowDecoder : Db.Decode.Decoder LogRow
@@ -1117,38 +1081,62 @@ logRowDecoder =
     Db.Decode.map3 logRowOf Index.decidedPairDecoder logColumnsDecoder rowNameDecoder
 
 
-logColumnsDecoder : Db.Decode.Decoder { seq : Int, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, unheld : Int }
+-- A log row's columns before its pair and name, decoded apart from them
+-- since `Db.Decode.succeed` lifts at most 10 parameters.
+type alias LogColumns =
+    { seq : Int
+    , uid : StoredUid
+    , bodyHash : String
+    , decision : String
+    , reason : Maybe String
+    , reviewedAt : Int
+    , prev : String
+    , mac : String
+    , held : Bool
+    , keyed : Bool
+    }
+
+
+logColumnsDecoder : Db.Decode.Decoder LogColumns
 logColumnsDecoder =
-    Db.Decode.succeed (\seq decision reason reviewedAt prev mac unheld -> { seq = seq, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac, unheld = unheld })
+    Db.Decode.succeed (\seq uid bodyHash decision reason reviewedAt prev mac unheld keyed -> { seq = seq, uid = StoredUid uid, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac, held = unheld == 0, keyed = keyed /= 0 })
         |> Db.Decode.required "seq" (Db.Decode.int "seq")
+        |> Db.Decode.required "uid" (Db.Decode.string "uid")
+        |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
         |> Db.Decode.required "decision" (Db.Decode.string "decision")
         |> Db.Decode.required "reason" (Db.Decode.nullable (Db.Decode.string "reason"))
         |> Db.Decode.required "reviewed_at" (Db.Decode.int "reviewed_at")
         |> Db.Decode.required "prev" (Db.Decode.string "prev")
         |> Db.Decode.required "mac" (Db.Decode.string "mac")
         |> Db.Decode.required "unheld" (Db.Decode.int "unheld")
+        |> Db.Decode.required "keyed" (Db.Decode.int "keyed")
 
 
-logRowOf : DecidedPair -> { seq : Int, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, unheld : Int } -> RowName -> LogRow
+logRowOf : Maybe DecidedPair -> LogColumns -> RowName -> LogRow
 logRowOf pair cols name =
-    LogRow { seq = cols.seq, pair = pair, decision = cols.decision, reason = cols.reason, reviewedAt = cols.reviewedAt, prev = cols.prev, mac = cols.mac, name = name, held = cols.unheld == 0 }
+    LogRow { seq = cols.seq, uid = cols.uid, bodyHash = cols.bodyHash, pair = pair, decision = cols.decision, reason = cols.reason, reviewedAt = cols.reviewedAt, prev = cols.prev, mac = cols.mac, name = name, held = cols.held, keyed = cols.keyed }
 
 
 -- The columns every review-log reader selects: each one a row's mac covers,
--- each text cell read under `logCellCeilings`, and whether any is unheld.
+-- each text cell read under `logCellCeilings` and each integer cell of
+-- `logIntegerCells` only when it holds an integer, whether any is unheld,
+-- and whether the row's page-order key is held. Their aliases are the
+-- columns' own names, so a reader's ORDER BY names its columns qualified
+-- (`review_log.seq`): an unqualified name would sort by the window.
 logColumns : String
 logColumns =
-    "SELECT seq, " ++ heldCells logCellCeilings ++ ", reviewed_at, unit_line, " ++ anyUnheld logCellCeilings ++ " AS unheld FROM review_log"
+    "SELECT " ++ heldIntegers logIntegerCells ++ ", " ++ heldCells logCellCeilings ++ ", " ++ anyUnheld logCellCeilings logIntegerCells ++ " AS unheld, (" ++ integerHeld "seq" ++ " AND " ++ integerHeld "reviewed_at" ++ ") AS keyed FROM review_log"
 
 
 -- ── cell windows ────────────────────────────────────────────────────────
 --
--- A review-database text cell is read only under its byte ceiling, judged
--- database-side: a text cell of at most `bytes` bytes is read whole, a
--- NULL as NULL, and any other cell (past the ceiling, or not text) as the
--- empty string beside an `unheld` flag, so no cell past its ceiling is ever
--- allocated, whatever the file's schema admits. An unheld review-log row
--- never verifies; an unheld head row is no head.
+-- A review-database cell is read only under its ceiling, judged
+-- database-side: a text cell of at most `bytes` bytes is read whole, an
+-- integer cell only when it holds an integer, a NULL as NULL, and any other
+-- cell (past the ceiling, or of another type: a blob in an integer column
+-- included) as the empty string or 0 beside an `unheld` flag, so no cell
+-- past its ceiling is ever allocated, whatever the file's schema admits. An
+-- unheld review-log row never verifies; an unheld head row is no head.
 
 -- A column and the most bytes a cell of it is read with.
 type alias CellCeiling =
@@ -1156,21 +1144,27 @@ type alias CellCeiling =
 
 
 -- Each review-log text column a row's mac covers, under the most bytes the
--- app writes there: a unit id, an attestation, a decision's word, a
--- `Reason` (at most four UTF-8 bytes a character), a mac (or `genesis`),
--- and a name part under the name columns' own CHECK.
+-- app reads there: a unit id, an attestation, a decision's word, a stored
+-- reason (`storedReasonMaxBytes`), a mac (or `genesis`), and a name part
+-- under the name columns' own CHECK.
 logCellCeilings : List CellCeiling
 logCellCeilings =
     [ { column = "uid", bytes = Uid.uidLength }
     , { column = "body_hash", bytes = Index.attestedHashMaxBytes }
     , { column = "decision", bytes = String.length "approve" }
-    , { column = "reason", bytes = reasonMaxChars * 4 }
+    , { column = "reason", bytes = storedReasonMaxBytes }
     , { column = "prev", bytes = macHexBytes }
     , { column = "mac", bytes = macHexBytes }
     , { column = "unit_kind", bytes = nameCellBytes }
     , { column = "unit_qualified", bytes = nameCellBytes }
     , { column = "unit_path", bytes = nameCellBytes }
     ]
+
+
+-- Each review-log integer column a row's mac covers.
+logIntegerCells : List String
+logIntegerCells =
+    [ "seq", "reviewed_at", "unit_line" ]
 
 
 -- Each `review_log_head` text column under its CHECK's length.
@@ -1180,6 +1174,25 @@ headCellCeilings =
     , { column = "head", bytes = macHexBytes }
     , { column = "key_check", bytes = macHexBytes }
     ]
+
+
+-- Each `review_log_head` integer column.
+headIntegerCells : List String
+headIntegerCells =
+    [ "seq" ]
+
+
+-- Each legacy `review` text column, under the review log's ceiling for the
+-- same column.
+legacyCellCeilings : List CellCeiling
+legacyCellCeilings =
+    List.filter (\cell -> List.member cell.column [ "uid", "body_hash", "decision", "reason" ]) logCellCeilings
+
+
+-- Each legacy `review` integer column.
+legacyIntegerCells : List String
+legacyIntegerCells =
+    [ "reviewed_at" ]
 
 
 -- A mac's length in hex digits, the review log's `mac` CHECK.
@@ -1205,9 +1218,24 @@ heldCells cells =
     String.join ", " (List.map (\cell -> "CASE WHEN " ++ cellHeld cell ++ " THEN " ++ cell.column ++ " WHEN " ++ cell.column ++ " IS NULL THEN NULL ELSE '' END AS " ++ cell.column) cells)
 
 
-anyUnheld : List CellCeiling -> String
-anyUnheld cells =
-    "(" ++ String.join " OR " (List.map (\cell -> "(" ++ cell.column ++ " IS NOT NULL AND NOT " ++ cellHeld cell ++ ")") cells) ++ ")"
+integerHeld : String -> String
+integerHeld column =
+    "(typeof(" ++ column ++ ") = 'integer')"
+
+
+heldIntegers : List String -> String
+heldIntegers columns =
+    String.join ", " (List.map (\column -> "CASE WHEN " ++ integerHeld column ++ " THEN " ++ column ++ " WHEN " ++ column ++ " IS NULL THEN NULL ELSE 0 END AS " ++ column) columns)
+
+
+anyUnheld : List CellCeiling -> List String -> String
+anyUnheld cells integers =
+    "(" ++ String.join " OR " (List.map (\cell -> unheldWhen cell.column (cellHeld cell)) cells ++ List.map (\column -> unheldWhen column (integerHeld column)) integers) ++ ")"
+
+
+unheldWhen : String -> String -> String
+unheldWhen column held =
+    "(" ++ column ++ " IS NOT NULL AND NOT " ++ held ++ ")"
 
 
 unheldDecoder : Db.Decode.Decoder Bool
@@ -1223,11 +1251,7 @@ rowVerifies : MacKey -> String -> LogRow -> Bool
 rowVerifies key logId row =
     case row of
         LogRow r ->
-            let
-                ( uid, bodyHash ) =
-                    Index.decidedPairKey r.pair
-            in
-            r.held && rowSignedBy key logId r.seq r.prev (storedUid uid) bodyHash r.decision r.reason r.reviewedAt r.name r.mac
+            r.held && rowSignedBy key logId r.seq r.prev r.uid r.bodyHash r.decision r.reason r.reviewedAt r.name r.mac
 
 
 -- A row's decision column parsed: Nothing for any text but `approve` or
@@ -1246,12 +1270,30 @@ logDecision row =
                 Nothing
 
 
--- The one classifier of a review-log row: `Verified` only under a counting
--- verifier, for a row at or below the proven head whose mac verifies and
--- whose decision parses; otherwise why it is not counted. A row past the
--- proven head is one the walk did not prove, so it never counts.
+-- The one classifier of a review-log row: `Tampered` under any verifier
+-- for a row no signer writes, one whose uid is not a unit id or whose cells
+-- are unheld; `Verified` only under a counting verifier, for a row at or
+-- below the proven head whose mac verifies and whose decision parses;
+-- otherwise why it is not counted. A row past the proven head is one the
+-- walk did not prove, so it never counts.
 entryOf : Verifier -> LogRow -> ReviewEntry
 entryOf verify row =
+    case row of
+        LogRow r ->
+            case r.pair of
+                Nothing ->
+                    unverifiedOf Tampered row
+
+                Just pair ->
+                    if r.held then
+                        pairEntryOf verify pair row
+
+                    else
+                        unverifiedOf Tampered row
+
+
+pairEntryOf : Verifier -> DecidedPair -> LogRow -> ReviewEntry
+pairEntryOf verify pair row =
     case verify of
         Keyless ->
             unverifiedOf NoKey row
@@ -1268,37 +1310,47 @@ entryOf verify row =
                 unverifiedOf ChainBroken row
 
             else if rowVerifies key (Index.chainLogId (provenChain proven)) row then
-                case ( logDecision row, logName row ) of
-                    ( Just decision, Named name ) ->
-                        Verified (verifiedOf decision name row)
+                case logDecision row of
+                    Just decision ->
+                        case logName row of
+                            Named name ->
+                                Verified (verifiedOf pair decision name row)
 
-                    _ ->
+                            NameMalformed ->
+                                unverifiedOf Tampered row
+
+                    Nothing ->
                         unverifiedOf Tampered row
 
             else
                 unverifiedOf Tampered row
 
 
-verifiedOf : StoredDecision -> RecordedName -> LogRow -> VerifiedRow
-verifiedOf decision name row =
+verifiedOf : DecidedPair -> StoredDecision -> RecordedName -> LogRow -> VerifiedRow
+verifiedOf pair decision name row =
     case row of
         LogRow r ->
             let
                 ( uid, bodyHash ) =
-                    Index.decidedPairKey r.pair
+                    Index.decidedPairKey pair
             in
-            VerifiedRow { seq = r.seq, pair = r.pair, uid = uid, bodyHash = bodyHash, decision = decision, reviewedAt = Timestamp.fromUnixMillis r.reviewedAt, name = name }
+            VerifiedRow { seq = r.seq, pair = pair, uid = uid, bodyHash = bodyHash, decision = decision, reviewedAt = Timestamp.fromUnixMillis r.reviewedAt, name = name }
 
 
 unverifiedOf : Unverified -> LogRow -> ReviewEntry
 unverifiedOf why row =
     case row of
         LogRow r ->
-            let
-                ( uid, bodyHash ) =
-                    Index.decidedPairKey r.pair
-            in
-            Unverified { uid = uid, bodyHash = bodyHash, reviewedAt = Timestamp.fromUnixMillis r.reviewedAt, why = why }
+            Unverified { uid = Maybe.map pairUid r.pair, bodyHash = r.bodyHash, reviewedAt = Timestamp.fromUnixMillis r.reviewedAt, why = why }
+
+
+pairUid : DecidedPair -> Uid
+pairUid pair =
+    let
+        ( uid, _ ) =
+            Index.decidedPairKey pair
+    in
+    uid
 
 
 logSeq : LogRow -> Int
@@ -1489,7 +1541,7 @@ walkStep : MacKey -> Db -> PageSize -> Int -> Error -> Index.ChainHead -> ChainW
 walkStep key db size ceiling refusal head walk =
     do
         rows <- Db.queryDecode db
-                    (logColumns ++ " WHERE seq >= ? AND seq <= ? ORDER BY seq LIMIT ?")
+                    (logColumns ++ " WHERE seq >= ? AND seq <= ? ORDER BY review_log.seq LIMIT ?")
                     [ SqlInt walk.nextSeq, SqlInt (Index.chainSeq head), SqlInt (PageSize.toInt size) ]
                     walkRowDecoder
         if List.isEmpty rows then
@@ -1659,7 +1711,7 @@ recordDecision key tx attested decision at =
 pairVerifies : MacKey -> Db -> ProvenHead -> Uid -> String -> Task.Task Error Bool
 pairVerifies key db proven uid bodyHash =
     Db.queryDecode db
-        (logColumns ++ " WHERE uid = ? AND body_hash = ? AND seq <= ? ORDER BY seq LIMIT ?")
+        (logColumns ++ " WHERE uid = ? AND body_hash = ? AND seq <= ? ORDER BY review_log.seq LIMIT ?")
         [ Uid.toSql uid, SqlString bodyHash, SqlInt (provenSeq proven), SqlInt candidateCeiling ]
         logRowDecoder
         |> Task.map (List.any (rowVerifies key (Index.chainLogId (provenChain proven))))
@@ -1739,7 +1791,7 @@ reasonValue reason =
 logRowsAfter : Db -> PageSize -> ProvenHead -> Int -> Task.Task Error (List LogRow)
 logRowsAfter db size proven after =
     Db.queryDecode db
-        (logColumns ++ " WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?")
+        (logColumns ++ " WHERE seq > ? AND seq <= ? ORDER BY review_log.seq LIMIT ?")
         [ SqlInt after, SqlInt (provenSeq proven), SqlInt (PageSize.toInt size) ]
         logRowDecoder
 
@@ -1774,7 +1826,7 @@ findDecision : Verifier -> Db -> Uid -> String -> Task.Task Error (Maybe ReviewE
 findDecision verify db uid bodyHash =
     do
         rows <- Db.queryDecode db
-                    (logColumns ++ " WHERE uid = ? AND body_hash = ?" ++ boundClause verify ++ " ORDER BY seq LIMIT ?")
+                    (logColumns ++ " WHERE uid = ? AND body_hash = ?" ++ boundClause verify ++ " ORDER BY review_log.seq LIMIT ?")
                     ([ Uid.toSql uid, SqlString bodyHash ] ++ boundParams verify ++ [ SqlInt candidateCeiling ])
                     logRowDecoder
         case pickEntry (List.map (entryOf verify) rows) of
@@ -1806,19 +1858,14 @@ isVerified entry =
 
 
 -- The legacy row for a pair: the read takes one row, whatever key the
--- file's table declares.
+-- file's table declares, each cell under its window.
 findLegacy : Db -> Uid -> String -> Task.Task Error (Maybe LegacyRow)
 findLegacy db uid bodyHash =
-    case reviewStore of
-        Err e ->
-            Task.fail e
-
-        Ok store ->
-            Store.query store
-                |> Store.where (Store.and [ Store.eq .uid (Uid.toString uid), Store.eq .bodyHash bodyHash ])
-                |> Store.limit 1
-                |> Store.toMaybe db
-                |> Task.andThen fromMaybeRecord
+    Db.queryDecode db
+        (legacyColumns ++ " WHERE uid = ? AND body_hash = ? LIMIT 1")
+        [ Uid.toSql uid, SqlString bodyHash ]
+        historyRowDecoder
+        |> Task.andThen (\records -> fromMaybeRecord (List.head records))
 
 
 -- The most recent counted row for a uid across all hashes, if any: of its
@@ -1830,7 +1877,7 @@ findLatestForUid verify db uid =
     case verify of
         Counting proven _ ->
             Db.queryDecode db
-                (logColumns ++ " WHERE uid = ? AND seq <= ? ORDER BY reviewed_at DESC, seq DESC LIMIT ?")
+                (logColumns ++ " WHERE uid = ? AND seq <= ? ORDER BY review_log.reviewed_at DESC, review_log.seq DESC LIMIT ?")
                 [ Uid.toSql uid, SqlInt (provenSeq proven), SqlInt candidateCeiling ]
                 logRowDecoder
                 |> Task.map (\rows -> List.head (countedRows verify rows))
@@ -1889,7 +1936,10 @@ logHistoryPage verify db limit cursor =
 
 
 -- A full page of log rows ends at its last row; a short one is filled with
--- legacy rows from the newest.
+-- legacy rows from the newest. A full page whose last row's seq or review
+-- time is not an integer has no position in the page order to continue
+-- from, so it fails, never skipping or repeating a row; such rows sort
+-- before every integer key, so only the first pages can end on one.
 logPageOf : Verifier -> Db -> Int -> List ReviewEntry -> List LogRow -> Task.Task Error HistoryRows
 logPageOf verify db limit entries rows =
     if List.length rows < limit then
@@ -1897,7 +1947,29 @@ logPageOf verify db limit entries rows =
             |> Task.map (\legacy -> { rows = entries ++ legacy.rows, next = legacy.next })
 
     else
-        Task.succeed { rows = entries, next = Maybe.map (\last -> HistoryAfter (logAt last) (logSeq last)) (List.head (List.reverse rows)) }
+        case List.head (List.reverse rows) of
+            Nothing ->
+                Task.succeed { rows = entries, next = Nothing }
+
+            Just last ->
+                if logKeyed last then
+                    Task.succeed { rows = entries, next = Just (HistoryAfter (logAt last) (logSeq last)) }
+
+                else
+                    Task.fail unkeyedPageEnd
+
+
+-- Why a History page ending on a row with no page-order key fails.
+unkeyedPageEnd : Error
+unkeyedPageEnd =
+    Error.unexpected "a review-log row holds a seq or review time that is not an integer, so the History page after it has no place to start"
+
+
+logKeyed : LogRow -> Bool
+logKeyed row =
+    case row of
+        LogRow r ->
+            r.keyed
 
 
 logAt : LogRow -> Timestamp
@@ -2037,7 +2109,7 @@ historyParams bound limit cursor =
 
 historyOrder : String
 historyOrder =
-    " ORDER BY reviewed_at DESC, seq DESC LIMIT ?"
+    " ORDER BY review_log.reviewed_at DESC, review_log.seq DESC LIMIT ?"
 
 
 legacySql : HistoryCursor -> String
@@ -2066,14 +2138,18 @@ legacyParams limit cursor =
             [ SqlInt limit ]
 
 
+-- The columns every legacy reader selects, each text cell read under
+-- `legacyCellCeilings` and the review time only when it is an integer, and
+-- whether any is unheld. Their aliases are the columns' own names, so the
+-- page order names its columns qualified (`review.uid`).
 legacyColumns : String
 legacyColumns =
-    "SELECT uid, body_hash, decision, reason, reviewed_at FROM review"
+    "SELECT " ++ heldCells legacyCellCeilings ++ ", " ++ heldIntegers legacyIntegerCells ++ ", " ++ anyUnheld legacyCellCeilings legacyIntegerCells ++ " AS unheld FROM review"
 
 
 legacyOrder : String
 legacyOrder =
-    " ORDER BY reviewed_at DESC, uid, body_hash LIMIT ?"
+    " ORDER BY review.reviewed_at DESC, review.uid, review.body_hash LIMIT ?"
 
 
 -- The cursor after a legacy page: the last row's key when the page is full.
@@ -2094,8 +2170,9 @@ historyRowDecoder =
         |> Db.Decode.required "decision" (Db.Decode.string "decision")
         |> Db.Decode.required "reason" (Db.Decode.nullable (Db.Decode.string "reason"))
         |> Db.Decode.required "reviewed_at" (Db.Decode.int "reviewed_at")
+        |> Db.Decode.required "unheld" (Db.Decode.int "unheld")
 
 
-historyRecord : String -> String -> String -> Maybe String -> Int -> ReviewRecord
-historyRecord uid bodyHash decision reason reviewedAt =
-    makeRecord uid bodyHash decision reason (Timestamp.fromUnixMillis reviewedAt)
+historyRecord : String -> String -> String -> Maybe String -> Int -> Int -> ReviewRecord
+historyRecord uid bodyHash decision reason reviewedAt unheld =
+    makeRecord uid bodyHash decision reason (Timestamp.fromUnixMillis reviewedAt) (unheld == 0)
