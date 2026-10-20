@@ -4329,12 +4329,12 @@ pub(crate) enum StartupRefusal {
     SessionStore(store::StoreConfigError),
     /// The base path (`IPE_WEB_BASE_PATH` / the mount prefix) does not decode.
     BasePath {
-        base: String,
+        base: crate::system::RefusedText,
         refusal: crate::encoding::DecodeRefusal,
     },
     /// The base path is outside the mount-base grammar every shell URL uses.
     MountBase {
-        base: String,
+        base: crate::system::RefusedText,
         refusal: crate::encoding::MountBaseRefusal,
     },
     /// An environment ceiling the app applies is present but malformed.
@@ -4352,21 +4352,13 @@ impl std::fmt::Display for StartupRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RouteTable(refusal) => write!(f, "{refusal}"),
-            Self::SessionStore(e) => write!(
-                f,
-                "session store misconfigured: {}",
-                crate::system::scrub_log_controls(&e.to_string())
-            ),
-            Self::BasePath { base, refusal } => write!(
-                f,
-                "web base path `{}` is malformed: {refusal}",
-                crate::system::scrub_log_controls(base)
-            ),
-            Self::MountBase { base, refusal } => write!(
-                f,
-                "web base path `{}` is not a mount base: {refusal}",
-                crate::system::scrub_log_controls(base)
-            ),
+            Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
+            Self::BasePath { base, refusal } => {
+                write!(f, "web base path `{base}` is malformed: {refusal}")
+            }
+            Self::MountBase { base, refusal } => {
+                write!(f, "web base path `{base}` is not a mount base: {refusal}")
+            }
             Self::Ceiling(refusal) => write!(f, "{refusal}"),
             Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
             Self::Bind(refusal) => write!(f, "{refusal}"),
@@ -4399,7 +4391,7 @@ pub(crate) const FAIL_CLOSED_BODY: &str =
 #[cfg(feature = "web")]
 fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
     route::DecodedPath::parse(base).map_err(|refusal| StartupRefusal::BasePath {
-        base: base.to_string(),
+        base: crate::system::RefusedText::new(base),
         refusal,
     })
 }
@@ -4413,7 +4405,7 @@ fn parse_route_base(base: &str) -> Result<route::DecodedPath, StartupRefusal> {
 #[cfg(feature = "web")]
 fn parse_mount_base(base: &str) -> Result<crate::encoding::MountBase, StartupRefusal> {
     crate::encoding::MountBase::parse(base).map_err(|refusal| StartupRefusal::MountBase {
-        base: base.to_string(),
+        base: crate::system::RefusedText::new(base),
         refusal,
     })
 }
@@ -10005,13 +9997,34 @@ mod sse_reconnect_reconcile_tests {
             assert!(
                 matches!(
                     parse_mount_base(bad),
-                    Err(StartupRefusal::MountBase { ref base, .. }) if base == bad
+                    Err(StartupRefusal::MountBase { ref base, .. }) if base.as_str() == bad
                 ),
                 "base {bad} must be refused"
             );
         }
         assert_eq!(parse_mount_base(""), Ok(crate::encoding::MountBase::root()));
         assert!(parse_mount_base("/_ipe/console").is_ok_and(|b| b.prefix() == "/_ipe/console"));
+    }
+
+    /// A refused base path is scrubbed once, where the refusal is built: a
+    /// `\` in it renders as `\\`, never re-escaped to `\\\\` by the `Display`.
+    #[test]
+    fn startup_refusal_scrubs_the_base_once() {
+        let refusals = [
+            parse_route_base("/%zz\\").err(),
+            parse_mount_base("/a\\b").err(),
+        ];
+        let expected = [
+            "web base path `/%zz\\\\` is malformed",
+            "web base path `/a\\\\b` is not a mount base",
+        ];
+        for (refusal, expected) in refusals.into_iter().zip(expected) {
+            let rendered = refusal.map(|r| r.to_string()).unwrap_or_default();
+            assert!(
+                rendered.starts_with(expected) && !rendered.contains("\\\\\\\\"),
+                "{rendered:?} must start with {expected:?}"
+            );
+        }
     }
 
     /// A refused base path renders bidi overrides and control characters as
@@ -10028,7 +10041,7 @@ mod sse_reconnect_reconcile_tests {
                 matches!(
                     &refusal,
                     Some(StartupRefusal::BasePath { base, .. } | StartupRefusal::MountBase { base, .. })
-                        if base == hostile
+                        if *base == crate::system::RefusedText::new(hostile)
                 ),
                 "{refusal:?}"
             );
@@ -10051,7 +10064,7 @@ mod sse_reconnect_reconcile_tests {
             assert!(
                 matches!(
                     parse_route_base(bad),
-                    Err(StartupRefusal::BasePath { ref base, .. }) if base == bad
+                    Err(StartupRefusal::BasePath { ref base, .. }) if base.as_str() == bad
                 ),
                 "base {bad} must be refused"
             );
@@ -12718,7 +12731,7 @@ mod emitted_router_behavior_tests {
         .err();
         crate::system::locked_remove_var("IPE_WEB_BASE_PATH");
         assert!(
-            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base == "/app/x%41"),
+            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base.as_str() == "/app/x%41"),
             "a non-mount base must refuse the router, got {refused:?}"
         );
     }
@@ -14608,15 +14621,33 @@ mod emitted_router_behavior_tests {
     /// reaches the startup error or the log.
     #[test]
     fn store_refusal_display_is_scrubbed() {
-        let cause = StartupRefusal::SessionStore(store::StoreConfigError(
-            "bad\n[ipe.live] forged\u{1b}[31m\u{202e}".to_string(),
-        ));
+        let cause = StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+            backend: "postgres",
+            cause: crate::system::RefusedText::new("bad\n[ipe.live] forged\u{1b}[31m\u{202e}"),
+        });
         let shown = cause.to_string();
         assert!(
             !shown.chars().any(crate::system::is_log_hazard),
             "a raw control survived: {shown:?}"
         );
         assert_eq!(shown.lines().count(), 1, "{shown:?}");
+    }
+
+    /// A store refusal's cause is scrubbed once, where the refusal is built: a
+    /// `\` in it renders as `\\`, never re-escaped to `\\\\` on its way to the
+    /// startup error.
+    #[test]
+    fn store_refusal_scrubs_the_cause_once() {
+        let cause = StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+            backend: "postgres",
+            cause: crate::system::RefusedText::new("host a\\b"),
+        });
+        assert_eq!(
+            cause.to_string(),
+            "session store misconfigured: IPE_WEB_STORE=postgres refused at connect \
+             (host a\\\\b); fix the connection URL or the server, or set \
+             IPE_WEB_STORE=file|memory"
+        );
     }
 
     /// A mounted routed app whose table holds a malformed pattern answers every
@@ -14721,10 +14752,10 @@ mod emitted_router_behavior_tests {
                 crate::web::route::check_route_table(&malformed_routes())
                     .expect_err("the table is malformed"),
             ),
-            StartupRefusal::SessionStore(store::StoreConfigError(
-                "IPE_WEB_STORE=postgres refused at connect (postgres://user:hunter2@db.internal/app)"
-                    .to_string(),
-            )),
+            StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+                backend: "postgres",
+                cause: crate::system::RefusedText::new("postgres://user:hunter2@db.internal/app"),
+            }),
             parse_route_base("/%zz").expect_err("the base is malformed"),
             StartupRefusal::FrameAncestors(
                 crate::telemetry::FrameAncestors::parse("https://a.example\r\n")

@@ -7,6 +7,5 @@ package : Package
 package =
     { name = "wasm-websocket"
     , version = "0.1.0"
-    , wasm =
-        On { mode = Solo }
+    , wasm = On { mode = Solo }
     }

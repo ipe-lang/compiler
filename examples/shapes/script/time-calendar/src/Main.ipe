@@ -1,10 +1,10 @@
 module Main exposing (main)
 
+import Ipe.Duration as Duration
+import Ipe.Io as Io
+import Ipe.String as String
 import Ipe.Time as Time
 import Ipe.Time.Timestamp as Timestamp
-import Ipe.Duration as Duration
-import Ipe.String as String
-import Ipe.Io as Io
 
 
 -- `Ipe.Time` separates the effect of reading the clock from the pure work of
@@ -18,7 +18,6 @@ import Ipe.Io as Io
 --   • The calendar helpers (`isLeapYear`, `daysInMonth`) are pure `Int` maths,
 --     and the UTC formatters (`formatISO8601`, `formatRFC3339`) render an instant
 --     the same way everywhere, independent of the local timezone.
-
 
 -- A fixed instant pinned in milliseconds since the Unix epoch, so the output is
 -- reproducible: it falls on the leap day of a leap year, at noon UTC.

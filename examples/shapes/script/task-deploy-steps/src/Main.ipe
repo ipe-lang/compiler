@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.Task as Task
 import Ipe.Error as Error exposing (Error)
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Task as Task
 
 
 -- A tiny deploy runner that chains dependent steps, exercising the three ideas
@@ -16,7 +16,6 @@ import Ipe.Io as Io
 --   • The error channel is a typed, matchable `Error`. `onError` catches a failed
 --     task and decides what to do, so recovery is ordinary composition, not a
 --     separate exception mechanism.
-
 
 -- Each step is a Task that can fail on the typed Error channel. `check` succeeds
 -- with a log line when the predicate holds, and fails with a classified Error when
@@ -53,9 +52,8 @@ attempt : String -> Bool -> Task Error ()
 attempt name migrationsOk =
     do
         _ <- Io.println (name ++ ":")
-        outcome <-
-            deploy migrationsOk
-                |> Task.onError rollback
+        outcome <- deploy migrationsOk
+                    |> Task.onError rollback
         Io.println ("  => " ++ outcome)
 
 

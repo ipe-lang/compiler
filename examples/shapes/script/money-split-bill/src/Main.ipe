@@ -1,12 +1,12 @@
 module Main exposing (main)
 
-import Ipe.Money as Money exposing (Money, Currency(..))
 import Ipe.Decimal as Decimal
-import Ipe.Result as Result
+import Ipe.Io as Io
 import Ipe.List as List
+import Ipe.Money as Money exposing (Money, Currency(..))
+import Ipe.Result as Result
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- Split a restaurant bill three ways, exercising the ideas `Ipe.Money` turns on:
@@ -15,7 +15,6 @@ import Ipe.Io as Io
 --   • `Money.allocate n` splits a value into n parts that sum back to the input
 --     EXACTLY — no lost or invented cent — with the residue distributed fairly.
 --   • Percentages (`addPercent`) are exact decimal arithmetic, not float drift.
-
 
 -- A $100.00 bill, plus an 18% tip, split three ways.
 bill : Money
@@ -49,7 +48,6 @@ main =
 
         resummed =
             Money.sumOf USD shares
-
         -- Adding a Money in a DIFFERENT currency is a typed error, not a bad sum.
         crossCurrency =
             Money.add bill (Money.fromMajor EUR 50)

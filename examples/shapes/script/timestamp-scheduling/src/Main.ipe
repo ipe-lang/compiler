@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
 import Ipe.Duration as Duration
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.String as String
+import Ipe.Time.Timestamp as Timestamp exposing (Timestamp)
 
 
 -- A `Timestamp` is an opaque instant — whole milliseconds since the Unix epoch,
@@ -18,7 +18,6 @@ import Ipe.Io as Io
 --   • The constructor is not exported, so a bare `Int` can never be mistaken for
 --     an instant: an epoch millisecond count and a real timestamp are different
 --     types.
-
 
 -- A fixed reference instant (milliseconds since the epoch), so the run is
 -- deterministic without reading the wall clock.

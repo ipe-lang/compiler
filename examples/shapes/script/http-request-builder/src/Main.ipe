@@ -1,13 +1,13 @@
 module Main exposing (main)
 
-import Ipe.Http as Http
-import Ipe.Error exposing (Error)
-import Ipe.Result as Result exposing (Result(..))
-import Ipe.Maybe as Maybe exposing (Maybe(..))
 import Ipe.Dict as Dict
-import Ipe.List as List
-import Ipe.Task as Task
+import Ipe.Error exposing (Error)
+import Ipe.Http as Http
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.Task as Task
 
 
 -- Assemble and inspect outbound HTTP requests without sending one, exercising the
@@ -23,7 +23,6 @@ import Ipe.Io as Io
 --     each key and value and keeping the first of any duplicate key — the result
 --     is a typed map, not a re-splittable string. A malformed escape refuses the
 --     whole query as an `Err`, never a half-decoded map.
-
 
 -- Build a request from a raw string target. `defaultRequestFromString` is the
 -- MARKED boundary: it parses the URL once and narrows the scheme, returning a
@@ -41,7 +40,6 @@ buildRequest raw =
 describe : String -> String
 describe raw =
     case buildRequest raw of
-
         Ok req ->
             raw ++ "  ->  " ++ Http.methodToString req.method ++ " " ++ req.url
 
@@ -64,7 +62,6 @@ targets =
 queryParam : String -> String -> String
 queryParam key raw =
     case Http.parseQuery raw of
-
         Ok params ->
             Maybe.withDefault "?" (Dict.get key params)
 
@@ -76,7 +73,6 @@ queryParam key raw =
 methodLabel : String -> String
 methodLabel raw =
     case Http.methodFromString raw of
-
         Just m ->
             raw ++ " -> " ++ Http.methodToString m
 

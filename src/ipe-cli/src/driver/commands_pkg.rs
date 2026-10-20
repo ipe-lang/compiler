@@ -1,8 +1,8 @@
 use super::{
-    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SettingsSource,
-    SourceGraph, analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
+    BuildOptions, CliError, EmittedCrate, FlooredBuild, NativeFinish, OutTarget, SourceGraph,
+    analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
     attribute_post_link_error, build_project_into, build_test_into,
-    capabilities_including_served_widgets, classify_entry_shape, create_source_root, default_entry,
+    capabilities_including_served_widgets, classify_entry_shape, create_source_root,
     discover_manifest, emit_machine_error, emitted_bin_filename, entry_modules, frame_infer_error,
     home_to_source_map, lowering_check_query, program_constructs_a_widget, resolve_runtime,
     resolve_vendored_runtime_dir, run_build, runtime_context_for_message, typecheck_target,
@@ -13,6 +13,7 @@ use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPat
 use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
+use crate::source_snapshot::{Limits, SourceOrigin, SourceSnapshot, TestView};
 use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
@@ -1228,10 +1229,6 @@ pub fn parse_audit_entry_args(rest: &[String]) -> Result<AuditEntryArgs, CliErro
     })
 }
 
-/// The directory name a governing manifest's test tree lives under, relative
-/// to the project root — the one spelling [`run_project_tests_with`] keys off.
-const TESTS_DIR_NAME: &str = "tests";
-
 /// `ipe type-check [<path>]` — type-check a program and stop. Runs the same
 /// injection-aware source graph `ipe dev build` uses, but demands only the
 /// `typecheck` query: no IR lowering, no Rust emission, nothing written. Exits
@@ -1378,84 +1375,57 @@ pub enum TestStdio {
 /// Build and run a project's `tests/Main.ipe`, the single test runner shared by
 /// `ipe test` and `ipe verify`'s final stage.
 ///
-/// The test entry is the file at `<project-root>/tests/Main.ipe`. The project
-/// root is the directory holding `package.ipe`; with no manifest it is the parent
-/// of the entry's `src/` directory (the conventional layout), or the entry's
-/// own directory for a flat single-directory project. The test entry is built
-/// against the project's `src/` tree AND its `tests/` siblings, so a test that
-/// imports the code under test resolves. When the test entry is absent the
-/// runner returns [`TestOutcome::NoTestEntry`] — a project with no test entry is
-/// not an error. When it exists, the test runner is compiled to a temporary
-/// output directory, the emitted Rust project is built with `cargo build`, and
-/// the resulting `ipe-app` binary is executed. The binary itself prints the
-/// per-test failures and the `N passed, M failed` summary (from
-/// `Ipe.Test.runMain`) to stdout; this function only classifies its exit code.
+/// The test entry is the module `tests/Main.ipe` of the project `path` names:
+/// a project directory, its `package.ipe`, or a module under its `src/` or
+/// `tests/`; with no `path`, the current directory. The project is resolved
+/// exactly as `ipe dev build` resolves it ([`ProjectRoot::resolve`]): the
+/// directory must hold `package.ipe` itself, and no parent directory is ever
+/// searched. The test program is the snapshot's own test universe
+/// ([`SourceSnapshot::test_view`]) — the entry, the project's `src/` tree, its
+/// other `tests/` modules, and the stdlib closure and FFI preparation over the
+/// one catalog the snapshot read — built with the manifest's settings, so the
+/// program under test is the program the project build ships. When the test
+/// entry is absent the runner returns [`TestOutcome::NoTestEntry`] — a project
+/// with no test entry is not an error. When it exists, the test runner is
+/// compiled to a temporary output directory, the emitted Rust project is built
+/// with `cargo build`, and the resulting `ipe-app` binary is executed. The
+/// binary itself prints the per-test failures and the `N passed, M failed`
+/// summary (from `Ipe.Test.runMain`) to stdout; this function only classifies
+/// its exit code.
 ///
 /// # Errors
 /// [`CliError::TestFailed`] when the test binary exits non-zero (one or more
-/// cases failed) — the binary's own output is the report. Otherwise any build
-/// or toolchain error encountered while compiling the runner.
+/// cases failed) — the binary's own output is the report. Otherwise every
+/// refusal of [`ProjectRoot::resolve`], [`ProjectRoot::target`],
+/// [`SourceSnapshot::read`] and [`SourceSnapshot::test_view`], or any build or
+/// toolchain error encountered while compiling the runner.
 pub fn run_project_tests(path: Option<&str>) -> Result<TestOutcome, CliError> {
-    run_project_tests_with(path, TestStdio::Inherit)
+    run_project_tests_with(&working_dir()?, path, TestStdio::Inherit)
 }
 
-/// The shared test runner, parameterised by where the test binary's own summary
-/// goes ([`TestStdio`]). See [`run_project_tests`] for the resolution rules.
+/// The shared test runner over the project `path` names from `cwd`,
+/// parameterised by where the test binary's own summary goes ([`TestStdio`]).
+///
+/// See [`run_project_tests`] for the resolution rules.
 ///
 /// # Errors
 /// As [`run_project_tests`].
 pub fn run_project_tests_with(
+    cwd: &Path,
     path: Option<&str>,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
-    // Resolve the project root from the supplied path (or cwd defaults).
-    let entry_path = match path {
-        Some(p) => PathBuf::from(p),
-        None => PathBuf::from(default_entry()?),
-    };
-
-    // Resolve the project root and the source root (the `src/` tree the code
-    // under test lives in). With a manifest, both come from it — the manifest's
-    // directory and its declared `src_root` (honouring a `srcDir` override).
-    // Without a manifest, the entry's own directory is the source root, and the
-    // project root is the source root's parent when the entry lives under a
-    // conventional `src/` directory (so `src/Main.ipe`'s sibling `tests/` tree
-    // is at `<project-root>/tests`, not `src/tests`); otherwise the entry's
-    // directory is itself the project root (a flat single-directory project).
-    // The manifest is parsed once: its settings are the test build's settings,
-    // its database driver included, so the program under test is the program
-    // the project build ships.
-    let manifest_path = discover_manifest(&entry_path)?;
-    let manifest = match manifest_path.as_deref() {
-        Some(m) => Some(project::parse_manifest(m)?),
-        None => None,
-    };
-    let found = manifest.as_ref().zip(manifest_path.as_deref());
-    let (project_root, project_src_root): (PathBuf, PathBuf) = if let Some((parsed, m)) = found {
-        let root = m
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        (root, parsed.src_root.clone())
-    } else {
-        let src_root = entry_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let root = if src_root.file_name().and_then(|n| n.to_str()) == Some("src") {
-            src_root
-                .parent()
-                .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-        } else {
-            src_root.clone()
-        };
-        (root, src_root)
-    };
-
-    let tests_root = project_root.join(TESTS_DIR_NAME);
-    let test_entry = tests_root.join("Main.ipe");
-    if !test_entry.is_file() {
-        // No test entry — there is nothing to run.
+    let (root, file) = analysis_root(cwd, path.map(Path::new))?;
+    // A named file selects its project and nothing more; it must still lie
+    // under the project's `src/` or `tests/`.
+    analysis_target(&root, file.as_ref())?;
+    let snapshot = SourceSnapshot::read(&root, Limits::DEFAULT)?;
+    let Some(entry) = snapshot.test_entry(&[TEST_ENTRY_MODULE.to_owned()]) else {
         return Ok(TestOutcome::NoTestEntry);
-    }
+    };
+    // The test universe is judged, its FFI calls included, before any
+    // toolchain is asked for.
+    let view = SourceSnapshot::test_view(entry)?;
 
     // Fail closed before emitting: the test stage shells out to cargo to build
     // the test runner, so a missing toolchain is reported with its root cause
@@ -1472,23 +1442,11 @@ pub fn run_project_tests_with(
         source: e,
     })?;
 
-    // Build the test entry. When the project has a `src/` tree, the test entry
-    // is built against BOTH it (the code under test) and the `tests/` tree (its
-    // test-only siblings), so a `tests/Main.ipe` importing `Lib.Foo` from
-    // `src/Lib/Foo.ipe` resolves. A `tests/`-only project with no `src/` (a
-    // standalone test) falls back to sibling discovery rooted at `tests/`. On
-    // any compile failure the stage propagates that error directly — the error
-    // is already a well-formed `CliError`.
-    // Build, then run, the test entry. Everything after the temp output is
-    // created runs inside this closure so a single cleanup below removes the
-    // temp directory on EVERY exit — a compile failure, a cargo failure, a
-    // spawn error, or a normal run — not only the success path.
     let outcome = build_and_run_test_entry(
-        &SettingsSource::discovered(found, crate::delivery::HostIntent::Served),
-        TestLayout {
-            src_root: &project_src_root,
-            tests_root: &tests_root,
-            entry: &test_entry,
+        &TestProgram {
+            root: &root,
+            view: &view,
+            host: crate::delivery::HostIntent::Served,
         },
         &out_scratch,
         &runtime_dir,
@@ -1502,16 +1460,18 @@ pub fn run_project_tests_with(
     outcome
 }
 
-/// Where a project's tests live: the code under test, the `tests/` tree, and
-/// the tree's entry.
-#[derive(Clone, Copy, Debug)]
-pub struct TestLayout<'a> {
-    /// The project's source root (`src/`, or the project root when flat).
-    pub src_root: &'a Path,
-    /// The `tests/` tree.
-    pub tests_root: &'a Path,
-    /// The test entry, `tests/Main.ipe`.
-    pub entry: &'a Path,
+/// The module every project's test program is entered at: `tests/Main.ipe`.
+const TEST_ENTRY_MODULE: &str = "Main";
+
+/// One test program: the project it belongs to, its universe, and the host it is built for.
+#[derive(Clone, Copy)]
+pub struct TestProgram<'a> {
+    /// The resolved project, the source of the build's settings.
+    pub root: &'a ProjectRoot,
+    /// The program's modules and FFI preparation.
+    pub view: &'a TestView,
+    /// The host the program is built for.
+    pub host: crate::delivery::HostIntent,
 }
 
 /// Compile the test entry into `out_scratch`, build the emitted Rust project, and
@@ -1536,18 +1496,16 @@ pub struct TestLayout<'a> {
 /// [`CliError::TestFailed`] when the binary exits non-zero (a failing case, or
 /// a crash/signal with no exit code).
 pub fn build_and_run_test_entry(
-    source: &SettingsSource<'_>,
-    layout: TestLayout<'_>,
+    program: &TestProgram<'_>,
     out_scratch: &scratch::ScratchDir,
     runtime_dir: &Path,
     cargo_bin: &crate::toolchain::CargoBin,
     stdio: TestStdio,
 ) -> Result<TestOutcome, CliError> {
     let crate_dir = build_test_into(
-        source,
-        layout.src_root,
-        layout.tests_root,
-        layout.entry,
+        program.root,
+        program.view,
+        program.host,
         OutTarget::Scratch(out_scratch),
         runtime_dir,
     )?;
@@ -1788,7 +1746,7 @@ pub fn run_test_json(path: Option<&str>) -> Result<(), CliError> {
     use cli_args::json;
 
     let verdict = |result: &str| json::object(&[("result", json::string(result))]);
-    match run_project_tests_with(path, TestStdio::Quiet) {
+    match run_project_tests_with(&working_dir()?, path, TestStdio::Quiet) {
         Ok(TestOutcome::AllPassed) => {
             json_line(&verdict("passed"));
             Ok(())
@@ -1918,7 +1876,7 @@ pub fn typecheck_in(cwd: &Path, arg: Option<&str>) -> Result<(), CliError> {
 /// The test stage in machine-quiet form: the shared runner with the test
 /// binary's own summary routed to stderr, so stdout stays the JSON verdict alone.
 pub fn verify_test_quiet(path: Option<&str>) -> Result<(), CliError> {
-    run_project_tests_with(path, TestStdio::Quiet).map(|_| ())
+    run_project_tests_with(&working_dir()?, path, TestStdio::Quiet).map(|_| ())
 }
 
 pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
@@ -2750,6 +2708,40 @@ impl PackageSourceSet {
             snapshot.modules().to_vec(),
             &snapshot_manifest_path(snapshot),
         )
+    }
+
+    /// The source set of the test program `view`: its universe as the snapshot holds it, never re-read.
+    ///
+    /// Nothing is injected or prepared again: the stdlib closure and the FFI
+    /// preparation are the ones the view was minted with, so the test build
+    /// binds the one catalog the snapshot read.
+    #[must_use]
+    pub fn from_test_view(view: &TestView) -> Self {
+        let mut sources = BTreeMap::new();
+        let mut injected = std::collections::BTreeSet::new();
+        let mut entries = Vec::new();
+        for (module, held) in view.modules() {
+            if held.origin() == SourceOrigin::Stdlib {
+                injected.insert(module.clone());
+            }
+            if module == view.entry() {
+                entries.push(project::DiscoveredModule::user(
+                    held.path().to_path_buf(),
+                    module.clone(),
+                ));
+            }
+            sources.insert(
+                module.clone(),
+                (held.path().to_path_buf(), held.text().to_owned()),
+            );
+        }
+        Self {
+            sources,
+            entries,
+            injected,
+            ffi_injected: view.ffi().injected.clone(),
+            ffi_emit: view.ffi().emit.clone(),
+        }
     }
 
     /// Inject the compiled-source stdlib closure and the FFI interface modules into `sources`.

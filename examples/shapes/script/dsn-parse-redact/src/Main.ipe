@@ -1,12 +1,12 @@
 module Main exposing (main)
 
 import Ipe.Db.Dsn as Dsn exposing (Dsn, Driver(..))
-import Ipe.Net as Net
+import Ipe.Io as Io
 import Ipe.Maybe exposing (Maybe(..))
+import Ipe.Net as Net
 import Ipe.Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- A `Dsn` is a typed, opaque database connection descriptor. Three ideas:
@@ -18,7 +18,6 @@ import Ipe.Io as Io
 --     its credential into a log line.
 --   • Connecting (`open`) is a separate, separately-disclosed capability; a
 --     `Dsn` on its own does no I/O, so parsing one is pure and safe.
-
 
 -- Describe a parse result: either the redacted descriptor and its parts, or the
 -- typed rejection. `redacted` is the ONLY way to render a `Dsn`.

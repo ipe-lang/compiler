@@ -9,16 +9,16 @@ module Main exposing (main)
 -- doc for the fixed bug).
 
 import Ipe.String as String
-import Ipe.Url as Url
-import Ipe.WebSocket as WS exposing (WebSocketMessage(..))
+import Ipe.Task as Task
 import Ipe.Tea.Web exposing (tea)
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
-import Ipe.Task as Task
 import Ipe.Ui as Ui
 import Ipe.Ui.Background as Background
 import Ipe.Ui.Border as Border
 import Ipe.Ui.Font as Font
+import Ipe.Url as Url
+import Ipe.WebSocket as WS exposing (WebSocketMessage(..))
 
 
 type Page
@@ -154,16 +154,19 @@ view model =
     Ui.column
         [ Ui.spacing 14, Ui.padding 32 ]
         [ Ui.el [ Font.size 20, Font.bold ] (Ui.text "M4 Ipe.WebSocket client substitute")
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ actionButton Connect "Connect"
             , actionButton SendHello "Send \"hello-from-browser\""
             , actionButton Disconnect "Disconnect"
             ]
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ Ui.el [ Font.bold ] (Ui.text "status:")
             , Ui.el [ Ui.htmlAttribute "id" "ws-status" ] (Ui.text model.status)
             ]
-        , Ui.row [ Ui.spacing 12 ]
+        , Ui.row
+            [ Ui.spacing 12 ]
             [ Ui.el [ Font.bold ] (Ui.text "last frame:")
             , Ui.el [ Ui.htmlAttribute "id" "ws-last-frame" ] (Ui.text model.lastFrame)
             ]

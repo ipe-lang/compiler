@@ -13,12 +13,11 @@ module Main exposing (main)
 -- A missing BroadcastChannel API arrives as `ChannelUnavailable` — a typed
 -- variant, never a thrown error or a silently dropped frame.
 
-
+import Ipe.Browser.Channel as Channel exposing (ChannelEvent(..))
 import Ipe.Tea.Web as Web
 import Ipe.Tea.Web.Cmd as Cmd
 import Ipe.Tea.Web.Sub as Sub
 import Ipe.Ui as Ui
-import Ipe.Browser.Channel as Channel exposing (ChannelEvent(..))
 
 
 channelName : String

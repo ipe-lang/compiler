@@ -9,7 +9,6 @@ package =
     , version = "0.1.0"
     , capabilities =
         { declares = []
-
         -- The two first-party web capabilities this app's reachable code
         -- discloses by importing `Ipe.Browser.FilePicker` and
         -- `Ipe.Browser.Camera`. The `:raw` floor is disclosed too (both

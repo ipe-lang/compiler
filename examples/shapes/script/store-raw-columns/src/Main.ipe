@@ -2,10 +2,10 @@ module Main exposing (main)
 
 import Ipe.Db.Store as Store exposing (Store)
 import Ipe.Db.Store.Unsafe as StoreU
-import Ipe.Result as Result exposing (Result(..))
 import Ipe.Error exposing (Error)
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
 
 
 -- The safe `Ipe.Db.Store` surface names a column by an accessor literal
@@ -24,7 +24,6 @@ import Ipe.Io as Io
 --     is ever interpolated.
 --   • Importing the module discloses the `unsafe` capability program-wide, so the
 --     narrower guarantee is visible in an audit before the program runs.
-
 
 -- A raw-column table: the columns are declared as data (no record type), so the
 -- primary key is named by the string "id" through the unsafe surface.

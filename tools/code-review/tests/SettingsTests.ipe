@@ -50,12 +50,12 @@ dbRefusalNamesOnlyVariable =
                 && not (refusedFor "]0;pwn" refusal)
                 && not (refusedFor "postgres://" refusal)
                 && (case refusal of
-                    Just message ->
-                        noHazard message
+                        Just message ->
+                            noHazard message
 
-                    Nothing ->
-                        False
-                )
+                        Nothing ->
+                            False
+                   )
             )
 
 
@@ -121,17 +121,11 @@ dbSettingParsesOnce =
         relative <- Settings.parseIndexDb "rel.db"
         review <- Settings.parseReviewDb "/abs/review.db"
         Task.succeed
-            (Path.toString absolute.path
-                == "/abs/x.db"
-                && Path.toString plus.path
-                == "/t/a+b.db"
-                && Path.toString relative.path
-                == cwd
-                ++ "/rel.db"
-                && Path.toString review.path
-                == "/abs/review.db"
-                && Settings.dbFileName plus.path
-                == "a+b.db"
+            (Path.toString absolute.path == "/abs/x.db"
+                && Path.toString plus.path == "/t/a+b.db"
+                && Path.toString relative.path == cwd ++ "/rel.db"
+                && Path.toString review.path == "/abs/review.db"
+                && Settings.dbFileName plus.path == "a+b.db"
             )
 
 
@@ -144,11 +138,11 @@ urlMetacharactersNameLiteralFiles =
     do
         dir <- freshDir "ipe-settings-literal-db"
         opened <- [ "index.db?mode=ro", "index.db#x", "index%2e.db", "a&b.db" ]
-            |> List.map (literalFileOpened dir)
-            |> Task.sequence
+                    |> List.map (literalFileOpened dir)
+                    |> Task.sequence
         strays <- [ "index.db", "index..db", "index.db?mode=rwc" ]
-            |> List.map (\name -> Task.fromResult (Path.fromString (dir ++ "/" ++ name)) |> Task.andThen File.exists)
-            |> Task.sequence
+                    |> List.map (\name -> Task.fromResult (Path.fromString (dir ++ "/" ++ name)) |> Task.andThen File.exists)
+                    |> Task.sequence
         Task.succeed (List.all (\ok -> ok) opened && List.all not strays)
 
 
@@ -211,12 +205,9 @@ rootProbeJoinsIndexedPath =
         System.setenv "IPE_INDEX_ROOT" at.repo
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (good
-                == Nothing
-                && oneGone
-                == Nothing
-                && Maybe.map (String.startsWith "IPE_INDEX_ROOT ") wrong
-                == Just True
+            (good == Nothing
+                && oneGone == Nothing
+                && Maybe.map (String.startsWith "IPE_INDEX_ROOT ") wrong == Just True
                 && maybeContains "ipe:src/" wrong
                 && maybeContains empty wrong
                 && maybeContains " is not found under " wrong
@@ -239,12 +230,10 @@ rootProbeBoundsLongPath =
         long <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (Maybe.map (String.startsWith "IPE_INDEX_ROOT ") long
-                == Just True
+            (Maybe.map (String.startsWith "IPE_INDEX_ROOT ") long == Just True
                 && maybeContains " is not found under " long
                 && maybeContains " bytes, #" long
-                && Maybe.map (\message -> String.length message < 2048) long
-                == Just True
+                && Maybe.map (\message -> String.length message < 2048) long == Just True
             )
 
 
@@ -264,12 +253,10 @@ rootProbeRefusesUntaggedIndex =
         emptied <- probeMessage (envSettings |> Task.andThen Index.probeRoot)
         cleanupIndex at.indexDb at.repo
         Task.succeed
-            (Maybe.map (String.startsWith "IPE_INDEX_DB ") untagged
-                == Just True
+            (Maybe.map (String.startsWith "IPE_INDEX_DB ") untagged == Just True
                 && maybeContains "no index path starts with a configured repo tag" untagged
                 && maybeContains "\"ipe:\"" untagged
-                && emptied
-                == Nothing
+                && emptied == Nothing
             )
 
 
@@ -389,20 +376,13 @@ classifiedAs ( present, failure, expected ) =
 -- narrower case.
 dbRefusalIgnoresMessage : Bool
 dbRefusalIgnoresMessage =
-    Settings.dbRefusalOf True (Error.unexpected "db: database error [5]")
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.unexpected "db: database error [14]")
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.unexpected "pool timed out")
-        == Settings.Unusable
-        && Settings.dbRefusalOf False (Error.unexpected "pool timed out")
-        == Settings.NoDatabaseFile
-        && Settings.dbRefusalOf True (Error.withDetails (Custom "Busy") (Error.unexpected "db failed"))
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.withDetails (Database Db.OtherFailure) (Error.unexpected "db: database error [5]"))
-        == Settings.Unusable
-        && Settings.dbRefusalOf True (Error.withDetails (Database Db.CannotOpen) (Error.unexpected "pool timed out"))
-        == Settings.NotPermitted
+    Settings.dbRefusalOf True (Error.unexpected "db: database error [5]") == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "db: database error [14]") == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.unexpected "pool timed out") == Settings.Unusable
+        && Settings.dbRefusalOf False (Error.unexpected "pool timed out") == Settings.NoDatabaseFile
+        && Settings.dbRefusalOf True (Error.withDetails (Custom "Busy") (Error.unexpected "db failed")) == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.OtherFailure) (Error.unexpected "db: database error [5]")) == Settings.Unusable
+        && Settings.dbRefusalOf True (Error.withDetails (Database Db.CannotOpen) (Error.unexpected "pool timed out")) == Settings.NotPermitted
 
 
 -- A file that is not a SQLite database is refused as one, at either
@@ -437,14 +417,14 @@ dbRefusalsStateOneFix =
         cwd <- System.cwd ()
         System.setenv "IPE_INDEX_ROOT" cwd
         refusals <- [ ""
-        , "postgres://localhost/index"
-        , "sqlite:index.db"
-        , "sqlite:///tmp/index.db?mode=rwc"
-        , "/tmp/a:b.db"
-        , "/"
-        ]
-            |> List.map settingsRefusal
-            |> Task.sequence
+                    , "postgres://localhost/index"
+                    , "sqlite:index.db"
+                    , "sqlite:///tmp/index.db?mode=rwc"
+                    , "/tmp/a:b.db"
+                    , "/"
+                    ]
+                        |> List.map settingsRefusal
+                        |> Task.sequence
         Task.succeed
             (List.all
                 (\refusal ->
@@ -481,16 +461,15 @@ startupReadsAdmittedOnly =
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
         sources <- Task.sequence
-            (List.map
-                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                (moduleFiles topNames libNames)
-            )
+                    (List.map
+                        (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                        (moduleFiles topNames libNames)
+                    )
         settings <- readLibSource (cwd ++ "/src/Lib/Settings.ipe")
         mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
         Task.succeed
             (layoutAdmits topNames libNames
-                && List.length sources
-                >= 12
+                && List.length sources >= 12
                 && sitesAdmitted sources
                 && mainAdmits mainSource
                 && settingsExports settings
@@ -630,10 +609,10 @@ startupScanRefusesEvasions =
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
         sources <- Task.sequence
-            (List.map
-                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                (moduleFiles topNames libNames)
-            )
+                    (List.map
+                        (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                        (moduleFiles topNames libNames)
+                    )
         Task.succeed
             (sitesAdmitted sources
                 && evaded sources "Lib/Queue.ipe" "import Ipe.System as Sys\nroot = Sys.getcwd ()"
@@ -720,36 +699,22 @@ mainAdmits text =
         envLines =
             List.filter (String.contains "getenv") (String.lines text)
     in
-    List.length envLines
-        == 2
+    List.length envLines == 2
         && List.any (String.contains "(System.getenv key)") envLines
         && List.any (String.contains "(System.getenv key |> Task.map Settings.EnvSet)") envLines
-        && occurrences "getenv" text
-        == 2
-        && occurrences "requireEnv \"" text
-        == 2
-        && occurrences "requireEnv" text
-        == 4
-        && occurrences "optionalEnv \"" text
-        == 3
-        && occurrences "optionalEnv" text
-        == 5
-        && occurrences "requireLoopbackBind" text
-        == 3
-        && occurrences "Server.listen" text
-        == 1
-        && occurrences mountsDefinition text
-        == 1
-        && occurrences "mounts" text
-        == 3
-        && occurrences "mountApp" text
-        == 1
-        && occurrences "requireSettings" text
-        == 3
-        && occurrences "parseIndexSettings" text
-        == 1
-        && occurrences "parseReviewDb" text
-        == 1
+        && occurrences "getenv" text == 2
+        && occurrences "requireEnv \"" text == 2
+        && occurrences "requireEnv" text == 4
+        && occurrences "optionalEnv \"" text == 3
+        && occurrences "optionalEnv" text == 5
+        && occurrences "requireLoopbackBind" text == 3
+        && occurrences "Server.listen" text == 1
+        && occurrences mountsDefinition text == 1
+        && occurrences "mounts" text == 3
+        && occurrences "mountApp" text == 1
+        && occurrences "requireSettings" text == 3
+        && occurrences "parseIndexSettings" text == 1
+        && occurrences "parseReviewDb" text == 1
         && List.all (\needle -> occurrences needle text == 0) [ "parseDbFile", "parseRoot", "absolutize", "isDir", "System.cwd" ]
         && mainPinned text
 
@@ -767,22 +732,15 @@ mainPinned text =
             case List.take 9 (String.lines body) of
                 [ rawBindLine, bindLine, dbLine, rootLine, reposLine, reviewLine, keyLine, settingsLine, listenLine ] ->
                     endsBlock (List.drop 9 (String.lines body))
-                        && rawBindLine
-                        == "        rawBind <- optionalEnv \"IPE_HTTP_BIND\""
-                        && bindLine
-                        == "        bind <- requireLoopbackBind rawBind"
+                        && rawBindLine == "        rawBind <- optionalEnv \"IPE_HTTP_BIND\""
+                        && bindLine == "        bind <- requireLoopbackBind rawBind"
                         && String.startsWith "        rawDb <- requireEnv \"IPE_INDEX_DB\" \"" dbLine
                         && String.startsWith "        rawRoot <- requireEnv \"IPE_INDEX_ROOT\" \"" rootLine
-                        && reposLine
-                        == "        rawRepos <- optionalEnv \"IPE_INDEX_REPOS\""
-                        && reviewLine
-                        == "        rawReview <- optionalEnv \"IPE_REVIEW_DB\""
-                        && keyLine
-                        == "        key <- requireReviewKey"
-                        && settingsLine
-                        == "        settings <- requireSettings key rawDb rawRoot rawRepos rawReview"
-                        && listenLine
-                        == mainTail
+                        && reposLine == "        rawRepos <- optionalEnv \"IPE_INDEX_REPOS\""
+                        && reviewLine == "        rawReview <- optionalEnv \"IPE_REVIEW_DB\""
+                        && keyLine == "        key <- requireReviewKey"
+                        && settingsLine == "        settings <- requireSettings key rawDb rawRoot rawRepos rawReview"
+                        && listenLine == mainTail
 
                 _ ->
                     False
@@ -851,10 +809,10 @@ settingsNeverInSessionState =
         topNames <- readDirAt (cwd ++ "/src")
         libNames <- readDirAt (cwd ++ "/src/Lib")
         sources <- Task.sequence
-            (List.map
-                (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
-                (moduleFiles topNames libNames)
-            )
+                    (List.map
+                        (\rel -> readLibSource (cwd ++ "/src/" ++ rel) |> Task.map (\text -> ( rel, withoutCommentLines text )))
+                        (moduleFiles topNames libNames)
+                    )
         Task.succeed
             (layoutAdmits topNames libNames
                 && stateAdmitted sources
@@ -892,12 +850,9 @@ statePinned sources =
             mainCode sources
     in
     List.all (\( rel, line ) -> List.member line (String.lines (moduleCode rel sources))) stateAnnotations
-        && occurrences stateWiring code
-        == 1
-        && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources)
-        == 1
-        && List.sum (List.map (\( _, text ) -> occurrences "mountApp" text) sources)
-        == 1
+        && occurrences stateWiring code == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "embed" text) sources) == 1
+        && List.sum (List.map (\( _, text ) -> occurrences "mountApp" text) sources) == 1
 
 
 stateAnnotations : List ( String, String )
@@ -1132,10 +1087,8 @@ macKeyParseRefuses =
                     False
 
                 Err e ->
-                    Error.message e
-                        == expected
-                        && Error.kind e
-                        == Error.kind (Error.invalidInput "")
+                    Error.message e == expected
+                        && Error.kind e == Error.kind (Error.invalidInput "")
                         && (String.trim raw == "" || not (String.contains raw (Error.toString e)))
 
         signs raw =
@@ -1149,15 +1102,14 @@ macKeyParseRefuses =
         , String.repeat 64 " "
         , " " ++ String.dropRight 1 valid
         ]
-        && signs (String.toUpper valid)
-        == signs valid
+        && signs (String.toUpper valid) == signs valid
         && (case signs valid of
-            Ok _ ->
-                True
+                Ok _ ->
+                    True
 
-            Err _ ->
-                False
-        )
+                Err _ ->
+                    False
+           )
 
 
 -- Only a `NotFound` failure reads as read-only, decided by the error's kind
@@ -1262,8 +1214,7 @@ reposUnreadableRefused =
         unset <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnset |> Task.map (\_ -> ()))
         unreadable <- probeMessage (Settings.parseIndexSettings (base ++ "/index.db") cwd Settings.EnvUnreadable |> Task.map (\_ -> ()))
         Task.succeed
-            (unset
-                == Nothing
+            (unset == Nothing
                 && maybeContains "IPE_INDEX_REPOS" unreadable
                 && maybeContains "not valid Unicode" unreadable
             )
@@ -1279,10 +1230,8 @@ reviewDbUnreadableRefused =
         given <- Settings.valueOr "IPE_REVIEW_DB" "review.db" (Settings.EnvSet "/abs/review.db")
         unreadable <- probeMessage (Settings.valueOr "IPE_REVIEW_DB" "review.db" Settings.EnvUnreadable |> Task.map (\_ -> ()))
         Task.succeed
-            (unset
-                == "review.db"
-                && given
-                == "/abs/review.db"
+            (unset == "review.db"
+                && given == "/abs/review.db"
                 && maybeContains "IPE_REVIEW_DB" unreadable
                 && maybeContains "not valid Unicode" unreadable
             )
@@ -1300,8 +1249,7 @@ readmeEnvTableMatchesReads =
         mainSource <- readLibSource (cwd ++ "/src/Main.ipe") |> Task.map withoutCommentLines
         Task.succeed
             (envTableAgrees readme mainSource
-                && List.length (readmeEnvRows readme)
-                == 6
+                && List.length (readmeEnvRows readme) == 6
                 && not (envTableAgrees (String.replace "| `IPE_INDEX_REPOS`" "| `UNLISTED`" readme) mainSource)
                 && not (envTableAgrees readme (mainSource ++ "\nextra = optionalEnv \"IPE_EXTRA\""))
                 && not (envTableAgrees (readme ++ "\n| `IPE_INDEX_DB` | again |") mainSource)
@@ -1351,12 +1299,9 @@ bindParsed value =
 -- is the runtime's own default, `127.0.0.1`.
 bindAcceptsLoopback : Bool
 bindAcceptsLoopback =
-    bindParsed Settings.EnvUnset
-        == Ok "127.0.0.1"
-        && bindParsed (Settings.EnvSet "127.0.0.1")
-        == Ok "127.0.0.1"
-        && bindParsed (Settings.EnvSet "::1")
-        == Ok "::1"
+    bindParsed Settings.EnvUnset == Ok "127.0.0.1"
+        && bindParsed (Settings.EnvSet "127.0.0.1") == Ok "127.0.0.1"
+        && bindParsed (Settings.EnvSet "::1") == Ok "::1"
 
 
 -- Every value outside the accepted set, each refused as `NotLoopback` with
@@ -1404,8 +1349,7 @@ refusedBinds =
 
 bindRefusesOtherValues : Bool
 bindRefusesOtherValues =
-    List.length refusedBinds
-        == 34
+    List.length refusedBinds == 34
         && List.all (\raw -> bindParsed (Settings.EnvSet raw) == Err (NotLoopback raw)) refusedBinds
 
 
@@ -1413,10 +1357,8 @@ bindRefusesOtherValues =
 -- cannot be read is refused as unreadable.
 bindRefusesEmptyAndUnreadable : Bool
 bindRefusesEmptyAndUnreadable =
-    bindParsed (Settings.EnvSet "")
-        == Err EmptyBind
-        && bindParsed Settings.EnvUnreadable
-        == Err UnreadableBind
+    bindParsed (Settings.EnvSet "") == Err EmptyBind
+        && bindParsed Settings.EnvUnreadable == Err UnreadableBind
 
 
 -- The refusal's text names the variable, both accepted values and the SSH
@@ -1452,8 +1394,7 @@ bindRefusalNamesRemedy =
         && String.contains "\"0.0.0.0\"" (bindRefusalShown (NotLoopback "0.0.0.0"))
         && not (String.contains "\"" (bindRefusalShown UnreadableBind))
         && not (String.contains "\"" (bindRefusalShown EmptyBind))
-        && String.length long
-        < 1000
+        && String.length long < 1000
         && String.contains ("\"" ++ String.repeat 64 "a" ++ "\"…") long
         && not (String.contains (String.repeat 65 "a") long)
         && not (String.contains "…" (bindRefusalShown (NotLoopback (String.repeat 64 "a"))))
@@ -1496,8 +1437,7 @@ bindRefusalListsAcceptedSpellings =
         shown =
             bindRefusalShown (NotLoopback "0.0.0.0")
     in
-    Bind.acceptedSpellings
-        == [ "127.0.0.1", "::1" ]
+    Bind.acceptedSpellings == [ "127.0.0.1", "::1" ]
         && List.all (\spelling -> bindParsed (Settings.EnvSet spelling) == Ok spelling) Bind.acceptedSpellings
         && List.all (\spelling -> String.contains spelling shown) Bind.acceptedSpellings
         && String.contains ("(" ++ String.join ", " Bind.acceptedSpellings ++ ")") shown

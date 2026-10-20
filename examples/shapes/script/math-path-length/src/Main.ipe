@@ -1,9 +1,9 @@
 module Main exposing (main)
 
-import Ipe.Math as Math
-import Ipe.List as List
-import Ipe.String as String
 import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Math as Math
+import Ipe.String as String
 
 
 -- Measure the total length of a 2-D path and report it, exercising the two
@@ -45,7 +45,6 @@ distance a b =
 totalLength : List Point -> Float
 totalLength points =
     case points of
-
         _ :: rest ->
             List.map2 distance points rest
                 |> List.sum

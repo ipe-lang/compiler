@@ -56,7 +56,7 @@ navButton active label msg =
         , if active then
             Background.color (Ui.rgb 55 55 70)
 
-        else
+          else
             Background.color (Ui.rgb 24 24 32)
         , Font.color (Ui.rgb 200 200 210)
         ]
@@ -392,21 +392,22 @@ railItem selected i ( q, label ) =
         , if isSelected then
             Border.color (Ui.rgb 130 170 240)
 
-        else
+          else
             Border.color (Ui.rgb 40 40 52)
         , if isSelected then
             Background.color (Ui.rgb 34 34 46)
 
-        else
+          else
             Background.color (Ui.rgb 24 24 32)
         ]
         { onPress = Just (SelectUnit i)
-        , label = Ui.row
-            [ Ui.width Ui.fill, Ui.spacing 6, Ui.centerY ]
-            [ labelEl 12 label
-            , changeBadge q.change
-            , railStanding q.standing
-            ]
+        , label =
+            Ui.row
+                [ Ui.width Ui.fill, Ui.spacing 6, Ui.centerY ]
+                [ labelEl 12 label
+                , changeBadge q.change
+                , railStanding q.standing
+                ]
         }
 
 
@@ -417,7 +418,7 @@ hintLine records =
         (if records then
             Ui.text "a approve · r refuse · j/k move · g top · 1-5 jump · Enter confirm"
 
-        else
+         else
             Ui.text "j/k move · g top · 1-5 jump"
         )
 
@@ -877,8 +878,8 @@ labelEl size label =
     Ui.row
         [ Ui.spacing 6, Ui.centerY ]
         ([ Ui.el [ Font.size size, Font.color (Ui.rgb 150 150 165) ] (shownLabel [ IndexedLabel label.kind ])
-        , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (shownLabel [ IndexedLabel label.name ])
-        ]
+         , Ui.el [ Font.size size, Font.bold, Font.color (Ui.rgb 235 235 240) ] (shownLabel [ IndexedLabel label.name ])
+         ]
             ++ placeEls size label.place
         )
 

@@ -1,10 +1,10 @@
 module Main exposing (main)
 
-import Ipe.Markdown as Markdown exposing (Block(..), HeadingLevel(..))
+import Ipe.Io as Io
 import Ipe.List as List
+import Ipe.Markdown as Markdown exposing (Block(..), HeadingLevel(..))
 import Ipe.String as String
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- Parse markdown into its typed block tree, exercising the ideas `Ipe.Markdown`

@@ -1,9 +1,9 @@
 module Main exposing (main)
 
 import Ipe.Decimal as Decimal exposing (Decimal)
+import Ipe.Io as Io
 import Ipe.Result as Result
 import Ipe.Task as Task
-import Ipe.Io as Io
 
 
 -- Arbitrary-precision decimal arithmetic, exercising the three ideas `Ipe.Decimal`
@@ -15,7 +15,6 @@ import Ipe.Io as Io
 --   • Rounding is EXPLICIT: banker's rounding (`round`, half-to-even) and
 --     half-away-from-zero (`roundHalfUp`) are separate functions, because which one
 --     you want is a real decision, not a default.
-
 
 -- Parse a decimal or fall back to zero. `fromString` returns `Result`, so a
 -- malformed literal is a typed failure at the boundary, not a silent NaN.
@@ -50,8 +49,10 @@ roundingContrast =
         half =
             dec "2.5"
     in
-    "banker's " ++ Decimal.toString (Decimal.round 0 half)
-        ++ ", half-up " ++ Decimal.toString (Decimal.roundHalfUp 0 half)
+    "banker's "
+        ++ Decimal.toString (Decimal.round 0 half)
+        ++ ", half-up "
+        ++ Decimal.toString (Decimal.roundHalfUp 0 half)
 
 
 main =
