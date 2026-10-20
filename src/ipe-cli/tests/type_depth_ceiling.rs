@@ -13,6 +13,7 @@
 //! a former written as an application reaches the ceiling one binding earlier,
 //! and a use whose callee takes the value reaches it one binding earlier again.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use ipe::CliError;
@@ -136,7 +137,7 @@ fn chain(former: &Former, n: usize) -> Chain {
     let mut last_body = (0, String::new());
     for i in 1..=n {
         let body = (former.wrap)(&format!("x{}", i - 1));
-        src.push_str(&format!("        x{i} = "));
+        let _ = write!(src, "        x{i} = ");
         last_body = (src.len(), body.clone());
         src.push_str(&body);
         src.push('\n');
@@ -257,15 +258,16 @@ fn doubling_chain(n: usize) -> Chain {
     );
     let mut last_body = (0, 0);
     for i in 1..=n {
-        src.push_str(&format!("        p{i} = "));
+        let _ = write!(src, "        p{i} = ");
         let lo = src.len();
-        src.push_str(&format!("( p{0}, p{0} )", i - 1));
+        let _ = write!(src, "( p{0}, p{0} )", i - 1);
         last_body = (lo, src.len());
         src.push('\n');
     }
-    src.push_str(&format!(
+    let _ = write!(
+        src,
         "    in\n    Io.println (if p{n} == p{n} then \"same\" else \"differs\")\n"
-    ));
+    );
     Chain {
         src,
         refused_at: Span {

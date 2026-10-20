@@ -300,7 +300,7 @@ impl TypeDepth {
     /// # Errors
     ///
     /// [`LowerError::BackendTypeTooDeep`] past [`TypeDepth::LIMIT`].
-    pub fn descend(self) -> DResult<Self> {
+    pub const fn descend(self) -> DResult<Self> {
         self.descend_by(1)
     }
 
@@ -309,7 +309,7 @@ impl TypeDepth {
     /// # Errors
     ///
     /// [`LowerError::BackendTypeTooDeep`] past [`TypeDepth::LIMIT`].
-    pub fn descend_by(self, levels: u16) -> DResult<Self> {
+    pub const fn descend_by(self, levels: u16) -> DResult<Self> {
         let next = self.0.saturating_add(levels);
         if next > Self::LIMIT {
             return Err(Diagnostic::Lower {
