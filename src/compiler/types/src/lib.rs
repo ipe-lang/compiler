@@ -58,7 +58,7 @@ pub use ty::{
 
 use constrain::{
     Builder, FieldAccess, RecordUpdate, RouteWitnessCheck, RoutedWebCheck, SchemeApp, SuperVar,
-    promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
+    measure_type_depth, promote_untyped_boundaries, reify_scheme, zonk, zonk_emitted,
 };
 use solve::solve_attributed;
 use ty::{Content, FlatType};
@@ -837,6 +837,11 @@ fn infer_core(
     // sound for that use. The map consumed by downstream tooling (`SolvedTypes`)
     // is built separately AFTER defaulting, so emit still sees fully-defaulted
     // region types. Iterated by reference to leave `generated.regions` intact.
+    //
+    // Every solved type is measured first: a type past the depth or size
+    // ceiling is refused at the span that built it, so no read-back below, no
+    // downstream walker and no rustc build meets it.
+    measure_type_depth(&mut uf, budget, &generated)?;
     let mut regions_for_exhaust: BTreeMap<(Vec<Symbol>, Span), Ty> = BTreeMap::new();
     for ((home, span), var) in &generated.regions {
         regions_for_exhaust.insert((home.clone(), *span), lift!(zonk(&mut uf, budget, *var)));
