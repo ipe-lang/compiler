@@ -1931,19 +1931,21 @@ pub fn capabilities_in(
 fn target_capabilities(
     target: &AnalysisTarget<'_>,
 ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
-    let mut caps = std::collections::BTreeSet::new();
-    for graph in analysis_graphs(target)? {
-        let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
-            ipe_db::lower_program(db, root, file).clone()
-        })?;
-        caps.extend(capabilities_including_served_widgets(
-            &graph.db,
-            graph.source_root,
-            graph.entry_file,
-            &program,
-        ));
-    }
-    Ok(caps)
+    crate::threads::run_compile(|| {
+        let mut caps = std::collections::BTreeSet::new();
+        for graph in analysis_graphs(target)? {
+            let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
+                ipe_db::lower_program(db, root, file).clone()
+            })?;
+            caps.extend(capabilities_including_served_widgets(
+                &graph.db,
+                graph.source_root,
+                graph.entry_file,
+                &program,
+            ));
+        }
+        Ok(caps)
+    })?
 }
 
 /// Render a program's inferred capability set in the requested [`OutputFormat`].
@@ -2646,7 +2648,20 @@ pub fn infer_package_capabilities(
     manifest_path: &Path,
 ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
     let package = PackageSourceSet::read(manifest_path)?;
-    infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), &package)
+    infer_package_capabilities_of(&package)
+}
+
+/// [`infer_package_capabilities_in`] over a fresh database, on a compile thread.
+///
+/// # Errors
+/// [`CliError::ThreadRefused`] when the OS refused the compile thread; every
+/// refusal of [`infer_package_capabilities_in`].
+pub fn infer_package_capabilities_of(
+    package: &PackageSourceSet,
+) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
+    crate::threads::run_compile(|| {
+        infer_package_capabilities_in(&ipe_db::IpeDatabase::new(), package)
+    })?
 }
 
 /// Every source a package's build and capability inference see, plus its entry modules.
@@ -3351,23 +3366,27 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// replaces the file ([`judge_patch`]), and the file is replaced only while it
 /// still holds the bytes that were diagnosed.
 ///
-/// Writes go through a temp file + atomic rename.
+/// Writes go through a temp file + atomic rename. Every diagnosis and re-check
+/// parses author source, so the whole flow runs on the compile door.
 ///
 /// # Errors
 /// The refusal of a project context that cannot be built (an unreadable or
 /// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
-/// filesystem failure.
-pub fn apply_fixes_cmd<W: Write>(
+/// filesystem failure; [`CliError::ThreadRefused`] when the OS refuses the
+/// compile thread.
+pub fn apply_fixes_cmd<W: Write + Send>(
     root: &ProjectRoot,
     file: Option<&FileArg>,
     auto: bool,
     w: &mut W,
 ) -> Result<(), CliError> {
     let target = analysis_target(root, file)?;
-    for graph in analysis_graphs(&target)? {
-        fix_entry(graph, auto, w)?;
-    }
-    Ok(())
+    crate::threads::run_compile(|| {
+        for graph in analysis_graphs(&target)? {
+            fix_entry(graph, auto, w)?;
+        }
+        Ok(())
+    })?
 }
 
 /// Fix the entry of one source graph; every report names the entry's file.

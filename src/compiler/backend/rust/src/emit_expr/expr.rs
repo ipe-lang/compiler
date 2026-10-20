@@ -1,14 +1,14 @@
 use super::{
     BinOp, Callee, DResult, Diagnostic, Expr, GenericScope, IrType, KernelClass, KernelFn,
-    LowerError, MAX_EMIT_DEPTH, Match, ModPath, Span, Symbol, callee_name, clone_targets_in_expr,
-    combine_guards, elem_clone_proof, emit_apply, emit_arm_head, emit_binding_stmts,
-    emit_config_ctor_call, emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value,
-    emit_html_template, emit_http_builder_call, emit_http_call, emit_json_decoder_call,
-    emit_lambda, emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
+    MAX_EMIT_DEPTH, Match, ModPath, Symbol, callee_name, clone_targets_in_expr, combine_guards,
+    elem_clone_proof, emit_apply, emit_arm_head, emit_binding_stmts, emit_config_ctor_call,
+    emit_css_value_call, emit_db_call, emit_ffi_glued_call, emit_func_value, emit_html_template,
+    emit_http_builder_call, emit_http_call, emit_json_decoder_call, emit_lambda,
+    emit_lambda_unboxed, emit_match_scrutinee, emit_process_run_in_pty_call,
     emit_process_run_with_call, emit_record, emit_server_call, emit_shared_lambda,
     emit_task_loop_call, emit_task_retry_call, emit_tea_call, emit_ui_call, emit_ui_template,
     emit_update, float_literal, free_vars, indent_of, infix, inlined_let_body, int_literal,
-    ir_type_is_definitely_copy, once_closure_bug, render_type, rust_str_lit,
+    ir_type_is_definitely_copy, nesting_refusal, once_closure_bug, render_type, rust_str_lit,
     swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
@@ -30,12 +30,7 @@ pub fn emit_expr_at(
     generics: GenericScope,
 ) -> DResult<String> {
     if depth > MAX_EMIT_DEPTH {
-        return Err(Diagnostic::Lower {
-            span: Span::DUMMY,
-            msg: LowerError::BackendNestingTooDeep {
-                limit: MAX_EMIT_DEPTH,
-            },
-        });
+        return Err(nesting_refusal());
     }
     let child = depth + 1;
     match expr {

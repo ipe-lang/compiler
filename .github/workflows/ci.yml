@@ -865,7 +865,9 @@ jobs:
   # `remote_ingest` tests of `ipe` there. The build directory handed to a
   # Windows linker and the classification of a link step that cannot open an
   # input are host-dependent too, so their `target_dir` and
-  # `driver_error::link_failure` tests run here as well.
+  # `driver_error::link_failure` tests run here as well. The compile stack is
+  # declared rather than inherited from a 1 MiB Windows main thread, so the
+  # `compile_stack` proof that every at-ceiling shape fits it runs here too.
   windows-test:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -880,7 +882,7 @@ jobs:
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
       - name: Test the transfer containment and linkable build directory on Windows
         shell: bash
-        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::) | test(target_dir::) | test(driver_error::link_failure)'
+        run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::) | test(target_dir::) | test(driver_error::link_failure) | test(compile_stack::)'
 
   # Required aggregation gate for `test`: green only when every shard, the
   # doctest job (in test-prep), the feature job `wasi-run` and the Windows job

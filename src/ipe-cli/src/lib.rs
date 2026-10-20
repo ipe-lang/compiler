@@ -27,6 +27,7 @@ pub mod clean;
 pub mod cli_args;
 pub mod cli_docs;
 pub mod cli_transcript;
+mod compile_stack;
 pub mod contained_path;
 pub mod control_model_consent;
 pub mod coverage;

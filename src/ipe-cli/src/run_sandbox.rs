@@ -637,16 +637,18 @@ pub fn resolve_for_run(
         // capability-audit surface uses, so a constructed `customElement` handle
         // (whose JS the emitter serves) discloses `custom-element` here too,
         // whether or not a `CustomElement.node` mounts it.
-        let graph = crate::build_source_graph(entry)?;
-        let program = graph.run_attributed(entry, |db, root, file| {
-            ipe_db::lower_program(db, root, file).clone()
-        })?;
-        let inferred = crate::capabilities_including_served_widgets(
-            &graph.db,
-            graph.source_root,
-            graph.entry_file,
-            &program,
-        );
+        let inferred = crate::threads::run_compile(|| {
+            let graph = crate::build_source_graph(entry)?;
+            let program = graph.run_attributed(entry, |db, root, file| {
+                ipe_db::lower_program(db, root, file).clone()
+            })?;
+            Ok::<_, CliError>(crate::capabilities_including_served_widgets(
+                &graph.db,
+                graph.source_root,
+                graph.entry_file,
+                &program,
+            ))
+        })??;
         Ok(ResolvedCapabilities {
             inferred,
             declared: BTreeSet::new(),

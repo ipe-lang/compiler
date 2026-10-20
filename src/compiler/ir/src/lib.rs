@@ -56,6 +56,23 @@ pub use show_policy::{
 /// backend/db consumers reach it through the IR crate like `KernelFn`.
 pub use ipe_kernels::Target;
 
+/// Run `body` on a thread of exactly the declared compile stack.
+///
+/// Tests that walk IR nested to [`ipe_diagnostics::nesting::IR_NESTING_LIMIT`]
+/// run here, on the stack every production compile thread is spawned with.
+/// `None` when the thread could not be started or did not finish.
+#[cfg(test)]
+fn on_compile_stack<T: Send>(body: impl FnOnce() -> T + Send) -> Option<T> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(ipe_diagnostics::nesting::COMPILE_STACK_BYTES)
+            .spawn_scoped(scope, body)
+            .ok()?
+            .join()
+            .ok()
+    })
+}
+
 /// The app surface a program's entry pins.
 ///
 /// Re-exported so the lowerer and backend key shape-owned kernels on it through

@@ -4205,21 +4205,23 @@ pub fn front_check(root: &ProjectRoot) -> Result<(), CliError> {
         intent: ipe_backend_rust::BuildIntent::Development,
         ..BuildOptions::from_env()
     };
-    for graph in analysis_graphs(&AnalysisTarget::Project(root))? {
-        let config = ipe_db::BuildConfig::new(
-            &graph.db,
-            emit_settings(&source, &options, runtime_embed::BundleRole::Out),
-        );
-        compile_prepared(
-            &graph.db,
-            graph.source_root,
-            &graph.sources,
-            &graph.entry_module_path,
-            graph.entry_path(),
-            config,
-        )?;
-    }
-    Ok(())
+    crate::threads::run_compile(|| {
+        for graph in analysis_graphs(&AnalysisTarget::Project(root))? {
+            let config = ipe_db::BuildConfig::new(
+                &graph.db,
+                emit_settings(&source, &options, runtime_embed::BundleRole::Out),
+            );
+            compile_prepared(
+                &graph.db,
+                graph.source_root,
+                &graph.sources,
+                &graph.entry_module_path,
+                graph.entry_path(),
+                config,
+            )?;
+        }
+        Ok(())
+    })?
 }
 
 /// The process's current directory: the root every analysis command resolves.
@@ -4366,10 +4368,12 @@ pub fn graph_over(
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic; every
 /// refusal of [`analysis_graphs`].
 pub fn typecheck_target(target: &AnalysisTarget<'_>) -> Result<(), CliError> {
-    for graph in analysis_graphs(target)? {
-        graph.run_attributed(graph.entry_path(), typecheck_query)?;
-    }
-    Ok(())
+    crate::threads::run_compile(|| {
+        for graph in analysis_graphs(target)? {
+            graph.run_attributed(graph.entry_path(), typecheck_query)?;
+        }
+        Ok(())
+    })?
 }
 
 /// Lower a program to IR and pretty-print it, stopping before codegen.
@@ -4382,15 +4386,17 @@ pub fn typecheck_target(target: &AnalysisTarget<'_>) -> Result<(), CliError> {
 /// refusal of [`ProjectRoot::target`] and [`analysis_graphs`].
 pub fn emit_ir_text(root: &ProjectRoot, file: Option<&FileArg>) -> Result<String, CliError> {
     let target = analysis_target(root, file)?;
-    let mut trees = Vec::new();
-    for graph in analysis_graphs(&target)? {
-        let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
-            ipe_db::lower_program(db, root, file).clone()
-        })?;
-        let interner = ipe_db::Db::interner(&graph.db).lock();
-        trees.push(ipe_ir::pretty(&program, &interner));
-    }
-    Ok(trees.join("\n"))
+    crate::threads::run_compile(|| {
+        let mut trees = Vec::new();
+        for graph in analysis_graphs(&target)? {
+            let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
+                ipe_db::lower_program(db, root, file).clone()
+            })?;
+            let interner = ipe_db::Db::interner(&graph.db).lock();
+            trees.push(ipe_ir::pretty(&program, &interner));
+        }
+        Ok(trees.join("\n"))
+    })?
 }
 
 #[cfg(test)]

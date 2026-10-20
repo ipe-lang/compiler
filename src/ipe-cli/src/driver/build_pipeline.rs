@@ -1018,8 +1018,38 @@ const fn refuse_debugger_without_runtime_dep(options: &BuildOptions) -> Result<(
 /// config read; this core fills its `ffi` and `runtime_dep` once resolved.
 /// `options` contributes only the write-time knobs (static plan, tree shaking)
 /// and the dependency-model selector.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+///
+/// The compile runs on a [`crate::threads::ThreadRole::Compile`] thread, so
+/// the program admitted is bounded by the declared compile stack on every OS.
+#[allow(clippy::too_many_arguments)]
 fn compile_source_set_observed(
+    source_set: super::PackageSourceSet,
+    entry_path: &[String],
+    target: &EmitTarget,
+    runtime_dir: &Path,
+    blame_path: &Path,
+    settings: ipe_backend_rust::EmitSettings,
+    cache_site: Option<&cache::CacheSite>,
+    options: &BuildOptions,
+) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
+    crate::threads::run_compile(|| {
+        compile_source_set_here(
+            source_set,
+            entry_path,
+            target,
+            runtime_dir,
+            blame_path,
+            settings,
+            cache_site,
+            options,
+        )
+    })
+    .unwrap_or_else(|refused| (Err(refused), CacheOutcome::Miss))
+}
+
+/// [`compile_source_set_observed`] on the calling thread.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn compile_source_set_here(
     source_set: super::PackageSourceSet,
     entry_path: &[String],
     target: &EmitTarget,
@@ -1355,6 +1385,32 @@ pub fn source_for_span_in_linked(
     best.and_then(|(_, _, home)| home_to_source.get(home))
         .cloned()
         .unwrap_or_else(|| entry.clone())
+}
+
+/// The source of the module a backend refusal's function lives in.
+///
+/// `None` for every diagnostic that names no function, and for a function
+/// whose module has no source in `sources`.
+fn emit_site_source<'s>(
+    diag: &Diagnostic,
+    sources: &'s BTreeMap<Vec<String>, (PathBuf, String)>,
+) -> Option<&'s (PathBuf, String)> {
+    let Diagnostic::Lower {
+        msg:
+            ipe_diagnostics::LowerError::BackendNestingTooDeep {
+                func: Some(site), ..
+            },
+        ..
+    } = diag
+    else {
+        return None;
+    };
+    let home: Vec<String> = site
+        .home
+        .iter()
+        .map(|segment| String::from(&**segment))
+        .collect();
+    sources.get(&home)
 }
 
 /// Attribute a post-link pipeline error to the source file that OWNS it.
@@ -1896,8 +1952,18 @@ pub fn compile_prepared(
     let span_attributed_err = |err: ipe_db::PipelineError| {
         attribute_post_link_error(linked, &home_to_source, &entry, err)
     };
-    let homed_err = |(diag, home): (Diagnostic, Vec<ipe_intern::Symbol>)| {
-        span_attributed_err(ipe_db::PipelineError::Lower(diag, home))
+    // A backend refusal raised while emitting a body names its function's
+    // module, so it frames against that module's file even though the emit
+    // query hands it over without a home.
+    let homed_err = |(diag, home): (Diagnostic, Vec<ipe_intern::Symbol>)| match emit_site_source(
+        &diag, sources,
+    ) {
+        Some((file, src)) if home.is_empty() => CliError::Pipeline {
+            file: file.clone(),
+            src: src.clone(),
+            diag: Box::new(diag),
+        },
+        _ => span_attributed_err(ipe_db::PipelineError::Lower(diag, home)),
     };
 
     // Decoder-pipeline direction gate (IPE-N0040): reject the hand-nested

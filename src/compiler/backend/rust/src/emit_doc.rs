@@ -47,7 +47,7 @@
 //! [`emit_expr_at`] survives as the leaf builder the structured arms delegate to
 //! (and as the SEAL / byte-golden test oracle), not as the body formatter.
 
-use ipe_diagnostics::{DResult, Diagnostic, LowerError, Span};
+use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::{Interner, Symbol, rust_str_lit};
 use ipe_ir::{BinOp, Callee, Expr, IrType, KernelFn, MAX_IR_RENDER_DEPTH, ModPath};
 
@@ -56,8 +56,8 @@ use crate::doc::{ChainOperand, Doc, Leaf};
 use crate::emit_expr::{
     call_has_kernel_special_case, callee_name, clone_targets_in_expr, combine_guards,
     emit_arm_head, emit_binding_stmts, emit_expr_at, emit_match_scrutinee, free_vars, infix,
-    inlined_let_body, once_closure_bug, record_struct_name, swapped_container_clone_rewrite,
-    wants_arc_ctor,
+    inlined_let_body, nesting_refusal, once_closure_bug, record_struct_name,
+    swapped_container_clone_rewrite, wants_arc_ctor,
 };
 use crate::emit_types::{GenericScope, render_type};
 use ipe_ir::once_closure::{ClosureParts, ClosureSite, admitted_once_parts};
@@ -83,12 +83,7 @@ pub fn build_doc(
     // can overflow the native stack. Shared with the string path via
     // [`MAX_IR_RENDER_DEPTH`] so the two never drift to different ceilings.
     if depth > MAX_IR_RENDER_DEPTH {
-        return Err(Diagnostic::Lower {
-            span: Span::DUMMY,
-            msg: LowerError::BackendNestingTooDeep {
-                limit: MAX_IR_RENDER_DEPTH,
-            },
-        });
+        return Err(nesting_refusal());
     }
     let child = depth + 1;
     match expr {
@@ -631,12 +626,7 @@ fn build_binop_chain(
     // the same `Lower` diagnostic ([`emit_expr_at`]'s IPE-L0200) instead of
     // building a pathologically large `Doc::Chain`.
     if depth.saturating_add(u16::try_from(depth_count).unwrap_or(u16::MAX)) > MAX_IR_RENDER_DEPTH {
-        return Err(Diagnostic::Lower {
-            span: Span::DUMMY,
-            msg: LowerError::BackendNestingTooDeep {
-                limit: MAX_IR_RENDER_DEPTH,
-            },
-        });
+        return Err(nesting_refusal());
     }
 
     let mut operands: Vec<ChainOperand> = Vec::with_capacity(depth_count + 1);

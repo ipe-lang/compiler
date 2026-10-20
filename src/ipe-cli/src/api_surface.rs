@@ -474,17 +474,35 @@ pub fn extract_walked(tree: &WalkedTree) -> Result<PublicApi, DiffError> {
 /// # Errors
 /// [`DiffError`] on a typecheck failure or an open interface.
 pub fn extract_sources(sources: &project::ModuleSources) -> Result<PublicApi, DiffError> {
-    let db = ipe_db::IpeDatabase::new();
-    let mut prepared: BTreeMap<Vec<String>, (PathBuf, String)> = sources.clone();
-    let mut discovered: Vec<project::DiscoveredModule> = sources
+    let discovered: Vec<project::DiscoveredModule> = sources
         .iter()
         .map(|(p, (path, _))| project::DiscoveredModule::user(path.clone(), p.clone()))
         .collect();
-    let injected = project::inject_compiled_std_closure(&mut prepared, &mut discovered);
-    let source_root = crate::create_source_root(&db, &prepared, &injected, &BTreeSet::new());
-
     let user_modules: BTreeSet<Vec<String>> = sources.keys().cloned().collect();
-    extract_from_db(&db, source_root, &user_modules)
+    extract_on_compile_stack(sources.clone(), discovered, &user_modules)
+}
+
+/// Inject `prepared`'s stdlib closure, then project the public API of
+/// `targets`, on the compile door.
+///
+/// Extraction parses and typechecks author source, so it runs on a
+/// [`crate::threads::run_compile`] thread, whose stack holds every nesting the
+/// parser admits, never on the caller's.
+///
+/// # Errors
+/// [`DiffError::Source`] when the OS refuses the compile thread; otherwise as
+/// [`extract_from_db`].
+fn extract_on_compile_stack(
+    mut prepared: BTreeMap<Vec<String>, (PathBuf, String)>,
+    mut discovered: Vec<project::DiscoveredModule>,
+    targets: &BTreeSet<Vec<String>>,
+) -> Result<PublicApi, DiffError> {
+    crate::threads::run_compile(move || {
+        let injected = project::inject_compiled_std_closure(&mut prepared, &mut discovered);
+        let db = ipe_db::IpeDatabase::new();
+        let source_root = crate::create_source_root(&db, &prepared, &injected, &BTreeSet::new());
+        extract_from_db(&db, source_root, targets)
+    })?
 }
 
 /// Extract the public API surface of one compiled-source stdlib module.
@@ -502,28 +520,22 @@ pub fn extract_sources(sources: &project::ModuleSources) -> Result<PublicApi, Di
 /// # Errors
 /// [`DiffError`] on a typecheck failure or open interface.
 pub fn extract_stdlib_module(segments: &[String], source: &str) -> Result<PublicApi, DiffError> {
-    let db = ipe_db::IpeDatabase::new();
-
     let mut prepared: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
     let synth_path = PathBuf::from("<embedded-stdlib>").join(segments.join("."));
     prepared.insert(segments.to_vec(), (synth_path.clone(), source.to_owned()));
 
-    let mut discovered = vec![project::DiscoveredModule::embedded_stdlib(
+    // The target's own `embedded_stdlib` record makes it trusted alongside the
+    // dependencies its compiled-source import closure injects, so it may
+    // declare into the reserved namespace.
+    let discovered = vec![project::DiscoveredModule::embedded_stdlib(
         synth_path,
         segments.to_vec(),
     )];
 
-    // Inject the module's compiled-source import closure. The target's own
-    // `embedded_stdlib` record makes it trusted alongside its dependencies, so it
-    // may declare into the reserved namespace.
-    let injected = project::inject_compiled_std_closure(&mut prepared, &mut discovered);
-
-    let source_root = crate::create_source_root(&db, &prepared, &injected, &BTreeSet::new());
-
     // Project only the target module — its injected dependencies are not part of
     // the surface being documented.
     let target: BTreeSet<Vec<String>> = std::iter::once(segments.to_vec()).collect();
-    extract_from_db(&db, source_root, &target)
+    extract_on_compile_stack(prepared, discovered, &target)
 }
 
 /// Project the public API of `user_modules` out of an already-populated database.
@@ -637,6 +649,75 @@ fn closed_interface_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caller stack far smaller than the compile stack: one extraction run
+    /// on it, rather than on the compile door, overflows.
+    const SMALL_CALLER_STACK: usize = 128 << 10;
+
+    /// A module `Deep` whose value is a `let` block of `n` bindings after `x0`.
+    fn deep_let(n: usize) -> project::ModuleSources {
+        let mut src = String::from(
+            "module Deep exposing (deep)\n\n\ndeep : Int\ndeep =\n    let\n        x0 = 0\n",
+        );
+        for i in 1..=n {
+            src.push_str("        x");
+            src.push_str(&i.to_string());
+            src.push_str(" = x");
+            src.push_str(&(i - 1).to_string());
+            src.push_str(" + 1\n");
+        }
+        src.push_str("    in\n    x");
+        src.push_str(&n.to_string());
+        src.push('\n');
+        std::iter::once((vec!["Deep".to_owned()], (PathBuf::from("Deep.ipe"), src))).collect()
+    }
+
+    /// A package nested to the parser's ceiling extracts from a small caller
+    /// stack, and one binding deeper is the parser's typed refusal: the
+    /// extraction runs on the compile door, never on the caller's stack.
+    #[test]
+    fn extraction_at_the_ceiling_runs_on_the_compile_stack() {
+        let limit =
+            usize::try_from(ipe_diagnostics::nesting::SOURCE_NESTING_LIMIT).unwrap_or(usize::MAX);
+        let parses = |n: &usize| {
+            deep_let(*n).values().all(|(_, src)| {
+                ipe_parse::parse_module(src, &mut ipe_intern::Interner::new()).is_ok()
+            })
+        };
+        let deepest = (0..=2 * limit).take_while(parses).last();
+        assert!(
+            deepest.is_some_and(|n| n > 0 && n < 2 * limit),
+            "the parser must admit some depth and refuse a deeper one: {deepest:?}"
+        );
+        let Some(n) = deepest else {
+            return;
+        };
+        let (at, past) = (deep_let(n), deep_let(n + 1));
+        let caller = std::thread::Builder::new()
+            .stack_size(SMALL_CALLER_STACK)
+            .spawn(move || (extract_sources(&at), extract_sources(&past)))
+            .expect("spawn the small caller");
+        let (admitted, refused) = caller.join().expect("the small caller returns");
+        assert!(
+            admitted.is_ok(),
+            "{n} bindings must extract from a small caller stack: {admitted:?}"
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(DiffError::Typecheck { diag, .. })
+                    if matches!(
+                        **diag,
+                        Diagnostic::Parse {
+                            msg: ipe_diagnostics::ParseError::NestingTooDeep { .. },
+                            ..
+                        }
+                    )
+            ),
+            "{} bindings must be the parser's refusal: {refused:?}",
+            n + 1
+        );
+    }
 
     /// A discovery refusal keeps its typed cause: it never reads as an empty
     /// tree, and it reaches the CLI as the refusal itself.

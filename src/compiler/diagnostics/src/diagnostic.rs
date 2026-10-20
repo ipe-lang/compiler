@@ -220,6 +220,32 @@ pub enum Construct {
     Lambda,
 }
 
+/// The function a post-lowering refusal fired in.
+///
+/// The IR carries no source spans, so a refusal raised while emitting a body
+/// names its function instead: `home` routes it to the defining module's file
+/// and the rendered message names the function.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct EmitSite {
+    /// The defining module's path, one segment per dotted name part.
+    pub home: Box<[Box<str>]>,
+    /// The function's source name.
+    pub name: Box<str>,
+}
+
+impl EmitSite {
+    /// The function's module-qualified name, as source code spells it.
+    #[must_use]
+    pub fn qualified(&self) -> String {
+        let mut out = self.home.join(".");
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&self.name);
+        out
+    }
+}
+
 /// Which part of a module header is malformed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum HeaderDefect {
@@ -604,14 +630,15 @@ pub enum NameError {
     ///
     /// * [`AliasExpansionKind::Depth`] — a long straight chain of distinct
     ///   aliases (`type alias A1 = A0`, `type alias A2 = A1`, …) grows the
-    ///   native call stack by one frame per expansion. The depth cap (256)
-    ///   mirrors the parser's `MAX_DEPTH` to stay safely below the thread
-    ///   stack limit in every build profile.
+    ///   native call stack by one frame per expansion. The resolver's
+    ///   `TYPE_EXPANSION_DEPTH_LIMIT` caps it below the thread stack limit in
+    ///   every build profile.
     ///
     /// * [`AliasExpansionKind::Nodes`] — a diamond of aliases (`type alias
     ///   A1 = (A0, A0)`, …) is acyclic so the path-based cycle guard never
-    ///   fires, but the total nodes produced double at every level. The node
-    ///   budget (100 000) bounds this regardless of tree shape.
+    ///   fires, but the total nodes produced double at every level. The
+    ///   resolver's `TYPE_EXPANSION_NODE_LIMIT` bounds this regardless of tree
+    ///   shape.
     ///
     /// [IPE-N0032]
     TypeExpansionTooDeep {
@@ -1525,7 +1552,12 @@ pub enum LowerError {
         leaf: ModelLeaf,
     },
     /// Expression nesting exceeded the backend's bounded emit depth. [IPE-L0200]
-    BackendNestingTooDeep { limit: u16 },
+    ///
+    /// `func` names the function whose body crossed the bound. It is `None`
+    /// only while the refusal is still inside the expression walk: the function
+    /// emitter fills it before the diagnostic leaves the backend, so the driver
+    /// frames it against the function's own module.
+    BackendNestingTooDeep { limit: u16, func: Option<EmitSite> },
     /// `JsonDec.succeed` / `Db.Decode.succeed` constructor has more than 10
     /// parameters, which exceeds the `curry1`..`curry10` helpers in the runtime.
     /// [IPE-L0121]
@@ -3147,8 +3179,16 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
         LowerError::InadmissibleAppMsg { app, field, leaf } => vec![HelpLine::Note(
             inadmissible_msg_message(*app, field, *leaf).into_boxed_str(),
         )],
-        LowerError::BackendNestingTooDeep { .. } => {
-            vec![HelpLine::Hint(Hint::NestingBoundDeliberate)]
+        LowerError::BackendNestingTooDeep { func, .. } => {
+            // The IR is span-free, so the function is named on a `note:` line.
+            let mut lines = Vec::with_capacity(2);
+            if let Some(site) = func {
+                lines.push(HelpLine::Note(
+                    format!("in the body of `{}`", site.qualified()).into_boxed_str(),
+                ));
+            }
+            lines.push(HelpLine::Hint(Hint::NestingBoundDeliberate));
+            lines
         }
         LowerError::DecodeSucceedArityTooHigh { n } => vec![HelpLine::Note(
             format!(
