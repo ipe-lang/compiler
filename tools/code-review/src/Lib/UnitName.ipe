@@ -1,0 +1,225 @@
+module Lib.UnitName exposing (NameRefusal(..), RecordedName, SignedName(..), UnitName, columnsOf, fieldsOf, fileFromColumn, fromRecorded, kind, line, live, nameMaxChars, path, qualified, recordFile, recordUnit, uid, unitFromColumns)
+
+-- What names a decided subject on screen. `RecordedName` is the raw form a
+-- review row signs at decision time: a unit's kind, qualified name, path
+-- and start line, or an unreviewable file's path, each text 1 to
+-- `nameMaxChars` code points and the line not negative. It is built only by
+-- `recordUnit` and `recordFile`, on the write side from the re-read index
+-- columns and on the read side from a stored row, so both sides hold the
+-- same bounds. `SignedName` is the rendered form a label is built from, and
+-- `UnitName` a unit's: built only from a live unit (`live`, through
+-- `Index.unitName`) or from a recorded name (`fromRecorded`), so a uid or
+-- any other text never stands in for a name.
+
+import Ipe.Char as Char
+import Ipe.List as List
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Lib.Label as Label exposing (ColumnExtent(..), Label)
+import Lib.Uid exposing (Uid)
+
+
+type RecordedName
+    = RecordedUnit { kind : String, qualified : String, path : String, line : Int }
+    | RecordedFile { path : String }
+
+
+-- A unit's name parts as a label draws them, each parsed under
+-- `Label.labelCap` exactly as the index read of the same column is.
+type UnitName
+    = UnitName { uid : Uid, kind : Label, qualified : Label, path : Label, line : Int }
+
+
+-- A recorded or live name, rendered: a unit's, or an unreviewable file's
+-- path.
+type SignedName
+    = UnitNamed UnitName
+    | FileNamed Label
+
+
+-- Why a name cannot be recorded: a text part is empty, passes
+-- `nameMaxChars`, or is not whole text as stored (cut at a NUL byte or not
+-- stored as text); or the line is negative.
+type NameRefusal
+    = PartEmpty
+    | PartPastCeiling
+    | PartNotText
+    | LineNegative
+
+
+-- The most code points one recorded text part holds; the migration's
+-- `CHECK` on each name column holds the same bound.
+nameMaxChars : Int
+nameMaxChars =
+    2048
+
+
+recordUnit : { kind : String, qualified : String, path : String, line : Int } -> Result NameRefusal RecordedName
+recordUnit parts =
+    case firstRefusal [ parts.kind, parts.qualified, parts.path ] of
+        Just refusal ->
+            Err refusal
+
+        Nothing ->
+            if parts.line < 0 then
+                Err LineNegative
+
+            else
+                Ok (RecordedUnit { kind = parts.kind, qualified = parts.qualified, path = parts.path, line = parts.line })
+
+
+recordFile : String -> Result NameRefusal RecordedName
+recordFile filePath =
+    case partRefusal filePath of
+        Just refusal ->
+            Err refusal
+
+        Nothing ->
+            Ok (RecordedFile { path = filePath })
+
+
+-- A unit's name from its index columns as read through their windows: a
+-- part whose window does not hold the whole column is refused, never
+-- recorded as a prefix.
+unitFromColumns : { kind : Label.Column, qualified : Label.Column, path : Label.Column, line : Int } -> Result NameRefusal RecordedName
+unitFromColumns columns =
+    columnText columns.kind
+        |> Result.andThen
+            (\k ->
+                columnText columns.qualified
+                    |> Result.andThen
+                        (\q ->
+                            columnText columns.path
+                                |> Result.andThen (\p -> recordUnit { kind = k, qualified = q, path = p, line = columns.line })
+                        )
+            )
+
+
+-- An unreviewable file's name from its stored path column.
+fileFromColumn : Label.Column -> Result NameRefusal RecordedName
+fileFromColumn column =
+    columnText column |> Result.andThen recordFile
+
+
+columnText : Label.Column -> Result NameRefusal String
+columnText column =
+    case Label.extent column of
+        WholeColumn text ->
+            Ok text
+
+        CutAtWindow ->
+            Err PartPastCeiling
+
+        CutAtNul ->
+            Err PartNotText
+
+        NotTextCell ->
+            Err PartNotText
+
+
+firstRefusal : List String -> Maybe NameRefusal
+firstRefusal parts =
+    List.head (List.filterMap partRefusal parts)
+
+
+partRefusal : String -> Maybe NameRefusal
+partRefusal part =
+    let
+        chars =
+            String.length part
+    in
+    if chars < 1 then
+        Just PartEmpty
+
+    else if chars > nameMaxChars then
+        Just PartPastCeiling
+
+    else if String.any (\c -> Char.toCode c == 0) part then
+        Just PartNotText
+
+    else
+        Nothing
+
+
+-- The fields a row's mac covers after its own: a unit's tag, kind,
+-- qualified name, path and line, or a file's tag and path.
+fieldsOf : RecordedName -> List String
+fieldsOf name =
+    case name of
+        RecordedUnit parts ->
+            [ "unit", parts.kind, parts.qualified, parts.path, String.fromInt parts.line ]
+
+        RecordedFile parts ->
+            [ "file", parts.path ]
+
+
+-- The name columns a row stores: every one for a unit, the path alone for
+-- a file.
+columnsOf : RecordedName -> { kind : Maybe String, qualified : Maybe String, path : String, line : Maybe Int }
+columnsOf name =
+    case name of
+        RecordedUnit parts ->
+            { kind = Just parts.kind, qualified = Just parts.qualified, path = parts.path, line = Just parts.line }
+
+        RecordedFile parts ->
+            { kind = Nothing, qualified = Nothing, path = parts.path, line = Nothing }
+
+
+-- The name a review row recorded for `subject`, rendered.
+fromRecorded : Uid -> RecordedName -> SignedName
+fromRecorded subject name =
+    case name of
+        RecordedUnit parts ->
+            UnitNamed
+                (UnitName
+                    { uid = subject
+                    , kind = Label.fromText Label.labelCap parts.kind
+                    , qualified = Label.fromText Label.labelCap parts.qualified
+                    , path = Label.fromText Label.labelCap parts.path
+                    , line = parts.line
+                    }
+                )
+
+        RecordedFile parts ->
+            FileNamed (Label.fromText Label.labelCap parts.path)
+
+
+-- A live unit's already parsed name parts.
+live : Uid -> { kind : Label, qualified : Label, path : Label, line : Int } -> UnitName
+live subject parts =
+    UnitName { uid = subject, kind = parts.kind, qualified = parts.qualified, path = parts.path, line = parts.line }
+
+
+uid : UnitName -> Uid
+uid name =
+    case name of
+        UnitName parts ->
+            parts.uid
+
+
+kind : UnitName -> Label
+kind name =
+    case name of
+        UnitName parts ->
+            parts.kind
+
+
+qualified : UnitName -> Label
+qualified name =
+    case name of
+        UnitName parts ->
+            parts.qualified
+
+
+path : UnitName -> Label
+path name =
+    case name of
+        UnitName parts ->
+            parts.path
+
+
+line : UnitName -> Int
+line name =
+    case name of
+        UnitName parts ->
+            parts.line

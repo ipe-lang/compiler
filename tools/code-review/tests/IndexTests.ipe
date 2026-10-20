@@ -1615,7 +1615,7 @@ indexExposingScanRefusesEvasions =
 -- Every name `Lib.Index` exposes, a type's constructors written bare.
 indexExposes : List String
 indexExposes =
-    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "loadView", "nameFor", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
+    [ "Attested", "AttestedHash", "Body", "ChainHead", "ChainVerdict", "Change", "Cursor", "DecidedPair", "LogStatus", "Oversize", "PendingRow", "ReadFailure", "RefusalDigest", "RefusalReason", "RefusalRow", "ShownSource", "Snapshot", "SourceView", "StaleReason", "Stamp", "Unit", "UnitView", "Written", "ackable", "attest", "attestResidual", "attestedHash", "attestedName", "attestedUid", "candidateQuery", "chainHeadDecoder", "chainHeadText", "chainKeyCheck", "chainLogId", "chainMac", "chainNext", "chainSeq", "childSpanCeiling", "classifyView", "decidedPairDecoder", "decidedPairKey", "digestPair", "drainDecided", "drainUnit", "drawnDepthCeiling", "elementResidentBytes", "lengthPrefixed", "linkElements", "liveFiles", "liveUnits", "loadView", "placeholders", "probe", "probeRepos", "probeRoot", "queueElementCeiling", "queueLabelByteCeiling", "readConnection", "readFailureText", "readSnapshot", "readStamp", "rebuildReviewed", "refusalDigestText", "refusalReasons", "refusalRowDecoder", "refusalTag", "residualText", "reverify", "reverifyRefusal", "runtimeEntryOverhead", "runtimeSessionCeiling", "shortHash", "shownDrawn", "shownHash", "shownRows", "shownText", "signedStamp", "sourceCeiling", "spanOversize", "stampStatus", "stampText", "storedHash", "unescapeShown", "unitName", "unsignedStamp", "viewByteCeiling", "viewLineCeiling", "viewLines", "viewNodeCeiling", "viewReserve", "viewText" ]
 
 
 -- The readers `Index.readSnapshot` runs in its transaction.
@@ -1834,6 +1834,60 @@ unjudgedRefusalFailsSnapshot =
         Task.succeed (intact && maybeContains "the index's refusal counts do not add up" message)
 
 
+-- An index whose `units` and `refusals` tables were rebuilt without their
+-- primary key holds three rows under one uid: History's live name reads
+-- return one row per uid asked. Asked beside a uid the index holds once,
+-- the repeated uid does not crowd it out of the read. Red if a read's row
+-- count is set by the index rather than by its own bound, or if a repeated
+-- uid takes another uid's row.
+liveReadsBoundedByUids : Task.Task Error Bool
+liveReadsBoundedByUids =
+    do
+        at <- freshScratch "ipe-index-live-reads-bounded"
+        removeFileIfAny at.indexDb
+        seedIndex at.indexDb at.repo
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-x"), SqlString "ipe:src/x.bin" ]
+        execIndex at.indexDb
+            "INSERT INTO refusals (uid, path, lang, reason, size, digest) VALUES (?, ?, 'other', 'replaced', NULL, NULL)"
+            [ Uid.toSql (uid "r-y"), SqlString "ipe:src/y.bin" ]
+        execIndexScript at.indexDb
+            ("CREATE TABLE units_copy AS SELECT * FROM units; DROP TABLE units; CREATE TABLE units AS SELECT * FROM units_copy; DROP TABLE units_copy; "
+                ++ "INSERT INTO units SELECT * FROM units WHERE uid = '"
+                ++ Uid.toString (uid "u-a")
+                ++ "'; INSERT INTO units SELECT * FROM units WHERE uid = '"
+                ++ Uid.toString (uid "u-a")
+                ++ "' LIMIT 1; "
+                ++ "CREATE TABLE refusals_copy AS SELECT * FROM refusals; DROP TABLE refusals; CREATE TABLE refusals AS SELECT * FROM refusals_copy; DROP TABLE refusals_copy; "
+                ++ "INSERT INTO refusals SELECT * FROM refusals; INSERT INTO refusals SELECT * FROM refusals LIMIT 1"
+            )
+        conn <- indexConn
+        settings <- envSettings
+        held <- Db.queryDecode conn "SELECT (SELECT COUNT(*) FROM units WHERE uid = ?) AS units, (SELECT COUNT(*) FROM refusals WHERE uid = ?) AS refusals" [ Uid.toSql (uid "u-a"), Uid.toSql (uid "r-x") ] heldDecoder
+        units <- Index.liveUnits conn settings.roots [ uid "u-a" ]
+        files <- Index.liveFiles conn settings.roots [ uid "r-x" ]
+        bothUnits <- Index.liveUnits conn settings.roots [ uid "u-a", uid "u-b" ]
+        bothFiles <- Index.liveFiles conn settings.roots [ uid "r-x", uid "r-y" ]
+        cleanupIndex at.indexDb at.repo
+        Task.succeed
+            (held == [ ( 3, 3 ) ]
+                && List.length units == 1
+                && List.length files == 1
+                && List.length bothUnits == 2
+                && List.any (\unit -> unit.uid == uid "u-b") bothUnits
+                && List.length bothFiles == 2
+                && List.any (\( fileUid, _ ) -> fileUid == uid "r-y") bothFiles
+            )
+
+
+heldDecoder : Db.Decode.Decoder ( Int, Int )
+heldDecoder =
+    Db.Decode.succeed (\units refusals -> ( units, refusals ))
+        |> Db.Decode.required "units" (Db.Decode.int "units")
+        |> Db.Decode.required "refusals" (Db.Decode.int "refusals")
+
+
 checks : Task.Task Error (List ( String, Bool ))
 checks =
     Task.sequence
@@ -1898,4 +1952,5 @@ checks =
         , check "a unit under an unbound tag is counted, never shown" unboundUnitsExcluded
         , check "a unit neither bound nor unbound fails the snapshot" unjudgedUnitFailsSnapshot
         , check "a refusal neither bound nor unbound fails the snapshot" unjudgedRefusalFailsSnapshot
+        , check "History's live name reads return at most one row per uid asked, however many the index holds" liveReadsBoundedByUids
         ]

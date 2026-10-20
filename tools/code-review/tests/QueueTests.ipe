@@ -31,12 +31,12 @@ import Lib.Keys as Keys exposing (KeyAction(..))
 import Lib.Label as Label
 import Lib.Links as Links exposing (Link(..))
 import Lib.PageSize as PageSize
-import Lib.Queue as Queue exposing (HistoryState(..), QueueState(..), SelectedView(..), UnitPageState(..))
+import Lib.Queue as Queue exposing (HistoryLabel(..), HistoryState(..), Place(..), Presence(..), QueueState(..), SelectedView(..), UnitPageState(..))
 import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit, labelOf, labelText)
+import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit, labelOf, labelText)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -1546,7 +1546,7 @@ reviewWritesGoThroughWriteTransaction : Task.Task Error Bool
 reviewWritesGoThroughWriteTransaction =
     let
         others =
-            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Label.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/View.ipe" ]
+            [ "src/Main.ipe", "src/Migrations.ipe", "src/Lib/App.ipe", "src/Lib/Bind.ipe", "src/Lib/Drawn.ipe", "src/Lib/EnvLookup.ipe", "src/Lib/Epoch.ipe", "src/Lib/Failure.ipe", "src/Lib/Format.ipe", "src/Lib/Highlight.ipe", "src/Lib/Keys.ipe", "src/Lib/Label.ipe", "src/Lib/Links.ipe", "src/Lib/PageSize.ipe", "src/Lib/Queue.ipe", "src/Lib/RepoPath.ipe", "src/Lib/ReviewKey.ipe", "src/Lib/SafeText.ipe", "src/Lib/ServerLog.ipe", "src/Lib/SetDigest.ipe", "src/Lib/Settings.ipe", "src/Lib/Uid.ipe", "src/Lib/UnitName.ipe", "src/Lib/View.ipe" ]
     in
     do
         cwd <- System.cwd ()
@@ -2206,7 +2206,7 @@ forgedEntryLeavesUnitQueued =
         at <- freshScratch "ipe-index-log-forged"
         db <- seedProgressScratch at
         Db.exec db
-            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, ?, 'approve', NULL, 0, 'genesis', ?)"
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (1, ?, ?, 'approve', NULL, 0, 'genesis', ?, 'fn', 'Lib.answer', 'ipe:src/Lib.rs', 3)"
             [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString forged ]
         Db.exec db "UPDATE review_log_head SET seq = 1, head = ? WHERE one = 1" [ SqlString forged ]
         page <- loadPageNow Index.Start
@@ -2310,7 +2310,7 @@ countingOnlyIntactIsGone =
         before <- loadPageNow Index.Start
         tamperLog db "DELETE FROM review_log WHERE seq = 1" []
         Db.exec db
-            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac) VALUES (1, ?, ?, 'approve', NULL, 0, 'genesis', ?)"
+            "INSERT INTO review_log (seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line) VALUES (1, ?, ?, 'approve', NULL, 0, 'genesis', ?, 'fn', 'Lib.answer', 'ipe:src/Lib.rs', 3)"
             [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString (String.repeat 64 "d") ]
         rows <- logRowCount db
         verdict <- logVerdictOf db
@@ -2437,7 +2437,7 @@ saveFailureTyped =
             "database is locked [5]"
 
         refusals =
-            [ SourceGone, SourceChanged, SourcePastCeiling, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch, FileGone, FileChanged, FileNotAcknowledgeable, FileNotReprobed, FileReadsAsText, FileNotQueued ]
+            [ SourceGone, SourceChanged, SourcePastCeiling, NamePastCeiling, NameUnreadable, NotQueued, SourceNotShown, LogBroken, LogKeyMismatch, FileGone, FileChanged, FileNotAcknowledgeable, FileNotReprobed, FileReadsAsText, FileNotQueued ]
 
         cases =
             [ SaveOffQueue, SaveReadOnly, SaveContended, SavePastLimit, SaveFailed ] ++ List.map SaveRefused refusals
@@ -2865,4 +2865,350 @@ checks =
                     , check "a refusal under an escaped bound tag is listed and acknowledged" escapedTagRefusalBound
                     , Task.succeed ( "a progress rebuild bound that wraps past Int.max has no representation", resyncRefusesMaxIntCeiling )
                     ]
-        Task.succeed (first ++ rest)
+        named <- Task.sequence
+                    [ check "a decided unit deleted from the index keeps its signed name on History, marked no longer indexed" historyNamesDeletedUnit
+                    , check "a verified History row is named by its signed name over the live unit's" historySignedNameOverLive
+                    , check "History labels tell apart units sharing a name by place, or by kind, and one unit decided twice stays named" historyLabelsTellApart
+                    , check "a signed name of a row that does not verify is never drawn" historyNeverDrawsUnverifiedName
+                    , check "a row that does not verify is named from the live unit, then unnamed once it is gone" historyUnverifiedRowNamedLive
+                    , check "a legacy row of a deleted unit is unnamed" historyLegacyRowOfDeletedUnitUnnamed
+                    , check "an acknowledged file keeps its signed path on History after its refusal row is gone" historyNamesFileDecision
+                    , check "a decision on a unit whose name is past the ceiling is refused and writes nothing" decideRefusedWhenNamePastCeiling
+                    , check "a decision on a unit whose qualified name is empty is refused and writes nothing" (decideRefusedWhenNameUnreadable "empty" "UPDATE units SET qualified = '' WHERE uid = ?")
+                    , check "a decision on a unit whose qualified name holds a NUL is refused and writes nothing" (decideRefusedWhenNameUnreadable "nul" "UPDATE units SET qualified = 'Lib.' || char(0) || 'answer' WHERE uid = ?")
+                    , check "a decision on a file unit that starts at a negative line is refused and writes nothing, and lands at line 0" decideRefusedWhenLineNegative
+                    , check "an acknowledgement of a file whose path is past the ceiling is refused and writes nothing" refusalDecisionRefusedWhenPathPastCeiling
+                    ]
+        Task.succeed (first ++ rest ++ named)
+
+
+-- ── History names ───────────────────────────────────────────────────────
+-- A History label as the page spells it: a unit's kind, name and place, or
+-- a file's path, then whether the index still holds it. A place's uid is
+-- left out.
+describeLabel : HistoryLabel -> String
+describeLabel label =
+    case label of
+        Labelled unit presence ->
+            "unit " ++ labelText unit.kind ++ " " ++ labelText unit.name ++ describePlace unit.place ++ describePresence presence
+
+        FileLabelled path presence ->
+            "file " ++ labelText path ++ describePresence presence
+
+        Unnamed ->
+            "unnamed"
+
+
+describePlace : Queue.Place -> String
+describePlace place =
+    case place of
+        Named ->
+            ""
+
+        At path line ->
+            " at " ++ labelText path ++ ":" ++ String.fromInt line
+
+        AtUnit path line _ ->
+            " at unit " ++ labelText path ++ ":" ++ String.fromInt line
+
+
+describePresence : Presence -> String
+describePresence presence =
+    case presence of
+        Indexed ->
+            ""
+
+        NoLongerIndexed ->
+            " (no longer indexed)"
+
+
+-- The described labels of the rows of `page` for `label`, in page order.
+labelsFor : String -> Queue.HistoryPage -> List String
+labelsFor label page =
+    List.filterMap
+        (\row ->
+            if Queue.entryUid row.entry == uid label then
+                Just (describeLabel row.label)
+
+            else
+                Nothing
+        )
+        page.rows
+
+
+isVerifiedEntry : ReviewEntry -> Bool
+isVerifiedEntry entry =
+    case entry of
+        Verified _ ->
+            True
+
+        Unverified _ ->
+            False
+
+
+-- The label of fixture unit `u-a`, alone on its page.
+answerLabel : String
+answerLabel =
+    "unit fn Lib.answer"
+
+
+-- A unit approved through the tool, then deleted from the index, keeps on
+-- History the kind and name its decision signed, marked no longer indexed;
+-- before the deletion the same row is labelled and indexed. Red if History
+-- names a row through the live index alone, or draws the uid in its place.
+historyNamesDeletedUnit : Task.Task Error Bool
+historyNamesDeletedUnit =
+    do
+        at <- freshScratch "ipe-history-deleted-unit"
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        decideNow db (uid "u-a") Approved
+        before <- loadHistoryPageNow HistoryStart
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        after <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "u-a" before == [ answerLabel ]
+                && labelsFor "u-a" after == [ answerLabel ++ " (no longer indexed)" ]
+                && List.all (\row -> isVerifiedEntry row.entry) after.rows
+            )
+
+
+-- A verified row is named by the name its decision signed, even while the
+-- index holds its unit under another: the unit renamed after the decision
+-- still shows the decided name. Red if a verified row is named from the
+-- live index first.
+historySignedNameOverLive : Task.Task Error Bool
+historySignedNameOverLive =
+    do
+        at <- freshScratch "ipe-history-signed-over-live"
+        db <- seedProgressScratch at
+        loadPageNow Index.Start
+        decideNow db (uid "u-a") Approved
+        execIndex at.indexDb "UPDATE units SET qualified = 'Lib.renamed' WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        page <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed (labelsFor "u-a" page == [ answerLabel ])
+
+
+-- Units gone from the index, each with a signed name: three
+-- `const crate::FILE` at `a.rs:1`, `b.rs:1` and `b.rs:9` are told apart by
+-- their place; a `struct` and an `impl` both `StaticRegex` at one place by
+-- their kind, with no place; one unit decided at two body hashes is one
+-- unit, so both its rows stay named with no place. Red if History labels
+-- are built row by row, or the tally counts rows instead of units.
+historyLabelsTellApart : Task.Task Error Bool
+historyLabelsTellApart =
+    let
+        approve label hash kind qualified path line =
+            { uid = uid label, bodyHash = hash, decision = "approve", reason = Nothing, reviewedAt = 0, name = RawUnit { kind = kind, qualified = qualified, path = path, line = line } }
+
+        gone =
+            " (no longer indexed)"
+    in
+    do
+        at <- freshScratch "ipe-history-shared-names"
+        db <- seedProgressScratch at
+        appendSigned db (approve "h-file-a" "h1" "const" "crate::FILE" "ipe:src/a.rs" 1)
+        appendSigned db (approve "h-file-b1" "h1" "const" "crate::FILE" "ipe:src/b.rs" 1)
+        appendSigned db (approve "h-file-b9" "h1" "const" "crate::FILE" "ipe:src/b.rs" 9)
+        appendSigned db (approve "h-struct" "h1" "struct" "StaticRegex" "ipe:src/r.rs" 3)
+        appendSigned db (approve "h-impl" "h1" "impl" "StaticRegex" "ipe:src/r.rs" 3)
+        appendSigned db (approve "h-twice" "h1" "fn" "Lib.twice" "ipe:src/t.rs" 5)
+        appendSigned db (approve "h-twice" "h2" "fn" "Lib.twice" "ipe:src/t.rs" 5)
+        page <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (List.length page.rows == 7
+                && List.all (\row -> isVerifiedEntry row.entry) page.rows
+                && labelsFor "h-file-a" page == [ "unit const crate::FILE at ipe:src/a.rs:1" ++ gone ]
+                && labelsFor "h-file-b1" page == [ "unit const crate::FILE at ipe:src/b.rs:1" ++ gone ]
+                && labelsFor "h-file-b9" page == [ "unit const crate::FILE at ipe:src/b.rs:9" ++ gone ]
+                && labelsFor "h-struct" page == [ "unit struct StaticRegex" ++ gone ]
+                && labelsFor "h-impl" page == [ "unit impl StaticRegex" ++ gone ]
+                && labelsFor "h-twice" page == [ "unit fn Lib.twice" ++ gone, "unit fn Lib.twice" ++ gone ]
+            )
+
+
+-- A row signed with a name, its unit gone from the index, is drawn by the
+-- name it signed while it verifies; once its review time is edited outside
+-- the tool it does not verify, and it is unnamed, its recorded text never
+-- drawn. Red if a name is read from a row whose mac does not hold.
+historyNeverDrawsUnverifiedName : Task.Task Error Bool
+historyNeverDrawsUnverifiedName =
+    let
+        row =
+            rawRow "h-gone" "h1" "approve" Nothing
+    in
+    do
+        at <- freshScratch "ipe-history-unverified-name"
+        db <- seedProgressScratch at
+        appendSigned db { row | name = RawUnit { kind = "fn", qualified = "Lib.gone", path = "ipe:src/gone.rs", line = 4 } }
+        verified <- loadHistoryPageNow HistoryStart
+        tamperLog db "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" []
+        tampered <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "h-gone" verified == [ "unit fn Lib.gone (no longer indexed)" ]
+                && labelsFor "h-gone" tampered == [ "unnamed" ]
+                && List.map (\r -> whyOf r.entry) tampered.rows == [ Just Tampered ]
+            )
+
+
+-- A row that does not verify is named only from the index: while its unit
+-- is indexed, by the live unit, whatever name the row carries; once the
+-- unit is gone, unnamed. Red if an unverified row's own name columns are
+-- drawn.
+historyUnverifiedRowNamedLive : Task.Task Error Bool
+historyUnverifiedRowNamedLive =
+    let
+        row =
+            rawRow "u-a" (Index.attest viewA) "approve" Nothing
+    in
+    do
+        at <- freshScratch "ipe-history-unverified-live"
+        db <- seedProgressScratch at
+        appendSigned db { row | name = RawUnit { kind = "fn", qualified = "Lib.forged", path = "ipe:src/Lib.rs", line = 3 } }
+        tamperLog db "UPDATE review_log SET reviewed_at = 99 WHERE seq = 1" []
+        live <- loadHistoryPageNow HistoryStart
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        gone <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "u-a" live == [ answerLabel ]
+                && labelsFor "u-a" gone == [ "unnamed" ]
+                && List.map (\r -> whyOf r.entry) live.rows == [ Just Tampered ]
+            )
+
+
+-- A row of the unsigned legacy table is labelled from the live unit while
+-- it is indexed, and unnamed once the unit is gone. Red if a legacy row is
+-- named by its uid.
+historyLegacyRowOfDeletedUnitUnnamed : Task.Task Error Bool
+historyLegacyRowOfDeletedUnitUnnamed =
+    do
+        at <- freshScratch "ipe-history-legacy-row"
+        db <- seedProgressScratch at
+        Db.exec db "INSERT INTO review (uid, body_hash, decision, reason, reviewed_at) VALUES (?,?,?,?,?)" [ Uid.toSql (uid "u-a"), SqlString (Index.attest viewA), SqlString "approve", SqlNull (SqlString ""), SqlInt 0 ]
+        live <- loadHistoryPageNow HistoryStart
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        gone <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "u-a" live == [ answerLabel ]
+                && labelsFor "u-a" gone == [ "unnamed" ]
+                && List.map (\r -> whyOf r.entry) gone.rows == [ Just Legacy ]
+            )
+
+
+-- An acknowledged unreviewable file is named on History by the path its
+-- decision signed: indexed while its refusal row is there, and marked no
+-- longer indexed once the row is gone. Red if a file decision is named from
+-- the index alone, or is unnamed.
+historyNamesFileDecision : Task.Task Error Bool
+historyNamesFileDecision =
+    do
+        at <- freshScratch "ipe-history-file-decision"
+        db <- seedProgressScratch at
+        writeFileText (at.repo ++ "/src/big.txt") "0123456789"
+        insertRefusal at.indexDb "r-big" "ipe:src/big.txt" "too-large" (SqlInt 10) (refusalDigestOf "a")
+        digest <- shownRefusalDigest "r-big"
+        decideRefusalNow db "r-big" digest
+        before <- loadHistoryPageNow HistoryStart
+        execIndex at.indexDb "DELETE FROM refusals WHERE uid = ?" [ Uid.toSql (uid "r-big") ]
+        after <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (labelsFor "r-big" before == [ "file ipe:src/big.txt" ]
+                && labelsFor "r-big" after == [ "file ipe:src/big.txt (no longer indexed)" ]
+                && List.all (\row -> isVerifiedEntry row.entry) after.rows
+            )
+
+
+-- A unit whose qualified name is 2049 code points is refused as
+-- `NamePastCeiling` before the write: no row is added and the head stays.
+-- At 2048 code points the decision lands and History draws the name it
+-- signed. Red if a name past the ceiling is truncated, recorded, or refused
+-- only by the database after the write began.
+decideRefusedWhenNamePastCeiling : Task.Task Error Bool
+decideRefusedWhenNamePastCeiling =
+    do
+        at <- freshScratch "ipe-history-name-ceiling"
+        db <- seedProgressScratch at
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat 2049 "q"), Uid.toSql (uid "u-a") ]
+        headBefore <- headTextOf db
+        refused <- refusedAs NamePastCeiling (decidedNow db (uid "u-a") Approved)
+        rowsAfterRefusal <- logRowCount db
+        headAfter <- headTextOf db
+        execIndex at.indexDb "UPDATE units SET qualified = ? WHERE uid = ?" [ SqlString (String.repeat 2048 "q"), Uid.toSql (uid "u-a") ]
+        decideNow db (uid "u-a") Approved
+        rows <- logRowCount db
+        execIndex at.indexDb "DELETE FROM units WHERE uid = ?" [ Uid.toSql (uid "u-a") ]
+        history <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (refused
+                && rowsAfterRefusal == 0
+                && headAfter == headBefore
+                && rows == 1
+                && labelsFor "u-a" history == [ "unit fn " ++ labelText (labelOf (String.repeat 2048 "q")) ++ " (no longer indexed)" ]
+            )
+
+
+-- A unit whose re-read name cannot be recorded whole (here after `edit` on
+-- its index row) is refused as `NameUnreadable` before the write: no row is
+-- added and the head stays. Red if such a name is recorded, or refused
+-- only by the database.
+decideRefusedWhenNameUnreadable : String -> String -> Task.Task Error Bool
+decideRefusedWhenNameUnreadable label edit =
+    do
+        at <- freshScratch ("ipe-history-name-unreadable-" ++ label)
+        db <- seedProgressScratch at
+        headBefore <- headTextOf db
+        execIndex at.indexDb edit [ Uid.toSql (uid "u-a") ]
+        refused <- refusedAs NameUnreadable (decidedNow db (uid "u-a") Approved)
+        rows <- logRowCount db
+        headAfter <- headTextOf db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0 && headAfter == headBefore)
+
+
+-- A file unit attests its residual, so its start line does not reach its
+-- view: at line -1 the view still verifies and the decision is refused as
+-- `NameUnreadable`, writing nothing; the same unit at line 0 lands. Red if
+-- a negative line is recorded, or if the refusal comes from the view.
+decideRefusedWhenLineNegative : Task.Task Error Bool
+decideRefusedWhenLineNegative =
+    do
+        at <- freshScratch "ipe-history-name-line-negative"
+        db <- seedProgressScratch at
+        execIndex at.indexDb
+            "INSERT INTO units (uid, path, kind, name, qualified, line_start, line_end, facing, purpose, body_hash, updated_sha) VALUES (?, 'ipe:src/Lib.rs', 'file', 'Lib.rs', 'crate::FILE', -1, 0, 'internal', NULL, ?, 'shaF')"
+            [ Uid.toSql (uid "u-file"), SqlString (Index.attestResidual (Index.residualText [ ( 3, 6 ) ] fixtureLibRs)) ]
+        headBefore <- headTextOf db
+        refused <- refusedAs NameUnreadable (decidedNow db (uid "u-file") Approved)
+        rows <- logRowCount db
+        headAfter <- headTextOf db
+        execIndex at.indexDb "UPDATE units SET line_start = 0 WHERE uid = ?" [ Uid.toSql (uid "u-file") ]
+        decideNow db (uid "u-file") Approved
+        landed <- logRowCount db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0 && headAfter == headBefore && landed == 1)
+
+
+-- An acknowledgement of a file whose stored path is 2049 code points is
+-- refused as `NamePastCeiling` before the write: no row is added and the
+-- head stays. Red if a file's path past the ceiling is recorded or cut.
+refusalDecisionRefusedWhenPathPastCeiling : Task.Task Error Bool
+refusalDecisionRefusedWhenPathPastCeiling =
+    do
+        at <- freshScratch "ipe-history-file-name-ceiling"
+        db <- seedProgressScratch at
+        insertRefusal at.indexDb "r-long" ("ipe:" ++ String.repeat 2045 "p") "symlink-entry" (SqlNull (SqlInt 0)) (refusalDigestOf "a")
+        digest <- shownRefusalDigest "r-long"
+        headBefore <- headTextOf db
+        refused <- refusedAs NamePastCeiling (decidedRefusalNow db "r-long" digest)
+        rows <- logRowCount db
+        headAfter <- headTextOf db
+        cleanupProgressScratch at
+        Task.succeed (refused && rows == 0 && headAfter == headBefore)
