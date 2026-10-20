@@ -483,7 +483,7 @@ fn name_prose(msg: &NameError) -> String {
         | NameError::DuplicateType { name, .. } => {
             format!("`{name}` is already defined, so I found two definitions with the same name.")
         }
-        NameError::AliasArity { name, .. } | NameError::BuiltinTypeArity { name, .. } => {
+        NameError::AliasArity { name, .. } | NameError::TypeArity { name, .. } => {
             format!("`{name}` is applied to the wrong number of type arguments.")
         }
         NameError::ModuleNotFound { name, .. } => {
@@ -1550,7 +1550,7 @@ fn name_label(msg: &NameError) -> Option<String> {
         } => Some(format!(
             "`{name}` takes {expected} type argument(s), but {found} were given"
         )),
-        NameError::BuiltinTypeArity {
+        NameError::TypeArity {
             name,
             expected,
             found,

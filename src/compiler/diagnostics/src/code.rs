@@ -397,9 +397,10 @@ code! {
     /// A wasm client-entry's reachability closure transitively reaches a
     /// server-classified module.
     IPE_N0030 = "IPE-N0030", "server module reachable from the wasm client entry", "IPE-N0030";
-    /// a built-in container type constructor (`List`/`Maybe`/`Set`/`Dict`/`Result`)
-    /// is applied to the wrong number of type arguments
-    IPE_N0031 = "IPE-N0031", "built-in container type applied to the wrong number of arguments", "IPE-N0031";
+    /// a type constructor with a fixed arity (a declared union, `List`/`Maybe`/
+    /// `Dict`/`Result`, `CustomElement`) is applied to the wrong number of type
+    /// arguments
+    IPE_N0031 = "IPE-N0031", "type applied to the wrong number of arguments", "IPE-N0031";
     /// type alias expansion exceeded the depth or node-count budget (cyclic or
     /// exponentially-fanning alias chain)
     IPE_N0032 = "IPE-N0032", "type alias expansion too deep or too large", "IPE-N0032";

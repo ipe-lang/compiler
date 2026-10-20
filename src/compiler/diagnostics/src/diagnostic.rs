@@ -616,9 +616,11 @@ pub enum NameError {
     /// 2); an under- or over-application is caught at name resolution, ahead of
     /// the lowerer's `ir_type_from_canon` — where a mis-arity builtin would
     /// otherwise reach the empty-home catch-all and ICE (IPE-I0001). The
-    /// sibling of `AliasArity` for the closed builtin-container table.
-    /// [IPE-N0031]
-    BuiltinTypeArity {
+    /// sibling of `AliasArity` for every non-alias type constructor with a
+    /// fixed arity: the closed builtin table, `CustomElement`, and each declared
+    /// union (`X Int Int` or a bare `X` for `type X a`, which no emitted Rust
+    /// type can spell). [IPE-N0031]
+    TypeArity {
         name: Box<str>,
         expected: usize,
         found: usize,
@@ -2792,7 +2794,7 @@ const fn name_code(msg: &NameError) -> Code {
         NameError::UnknownKernelAlias { .. } => IPE_N0028,
         NameError::ServerOnlyKernelForWasm { .. } => IPE_N0029,
         NameError::ServerModuleReachableFromWasmClient { .. } => IPE_N0030,
-        NameError::BuiltinTypeArity { .. } => IPE_N0031,
+        NameError::TypeArity { .. } => IPE_N0031,
         NameError::TypeExpansionTooDeep { .. } => IPE_N0032,
         NameError::ProgramImportsTeaShape { .. } => IPE_N0033,
         NameError::WrongShapeCmdSub(..) | NameError::TwoShapeImports { .. } => IPE_N0035,
@@ -3024,7 +3026,7 @@ fn name_help(msg: &NameError) -> Vec<HelpLine> {
         )],
         NameError::Unknown
         | NameError::AliasArity { .. }
-        | NameError::BuiltinTypeArity { .. }
+        | NameError::TypeArity { .. }
         | NameError::ImportCycle { .. }
         | NameError::ModulePathMismatch { .. }
         | NameError::AmbiguousImport { .. }
