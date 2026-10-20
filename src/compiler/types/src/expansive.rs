@@ -15,14 +15,17 @@
 //!   nullary type is a leaf in the solved graph, yet it costs rustc the levels
 //!   of every payload it holds, so a chain of declarations nests like a chain
 //!   of applications. A recursive group of declarations is boxed, yet the Rust
-//!   build walks through every member of the group before it meets the cycle,
-//!   so the group costs each member's level and payload, summed.
+//!   build walks through every distinct instantiation of the group's members
+//!   before it meets the cycle, so the group costs each instantiation's level
+//!   and payload, summed. A group that passes its parameters on permuted
+//!   (`type P a b = E a b | S (P b a)`) instantiates a member once per
+//!   arrangement its references reach, and each is charged.
 //!
 //! [`check_declarations`] runs both before inference, and also measures every
 //! top-level annotation, so a declared type past [`TYPE_DEPTH_LIMIT`] is
 //! refused where it is written even when nothing uses it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW};
@@ -301,7 +304,10 @@ pub fn expansive_cycle<'u>(
                 let Some(target) = table.find(home, *name) else {
                     continue;
                 };
-                for (j, arg) in args.iter().enumerate() {
+                // An argument past the target's parameters is passed to no
+                // parameter, so it adds no edge.
+                let arity = table.union(target)?.vars.len();
+                for (j, arg) in args.iter().enumerate().take(arity) {
                     let to = node_of(target, j)?;
                     if let canon::Type::Var(p) = arg {
                         if let Some(i) = params(*p) {
@@ -422,15 +428,181 @@ struct DeclaredTooDeep<'u> {
     depth: u16,
 }
 
+/// `t` with each of `vars` replaced by the type at its position in `vals`,
+/// ticking `budget` once per node of `t`.
+///
+/// A variable with no value (an application given too few arguments) is left
+/// as written. Iterative: one explicit stack.
+fn substitute(
+    t: &canon::Type,
+    vars: &[Symbol],
+    vals: &[canon::Type],
+    budget: &mut Budget,
+) -> DResult<canon::Type> {
+    let mut work: Vec<(&canon::Type, bool)> = vec![(t, false)];
+    let mut done: Vec<canon::Type> = Vec::new();
+    let mut children = Vec::new();
+    while let Some((node, expanded)) = work.pop() {
+        children.clear();
+        push_children(node, &mut children);
+        if !expanded {
+            budget.tick()?;
+            work.push((node, true));
+            work.extend(children.iter().rev().map(|c| (*c, false)));
+            continue;
+        }
+        let at = done
+            .len()
+            .checked_sub(children.len())
+            .ok_or_else(walk_bug)?;
+        let mut kids = done.split_off(at).into_iter();
+        let mut next = || kids.next().ok_or_else(walk_bug);
+        let rebuilt = match node {
+            canon::Type::Var(v) => vars
+                .iter()
+                .position(|p| p == v)
+                .and_then(|i| vals.get(i))
+                .cloned()
+                .unwrap_or(canon::Type::Var(*v)),
+            canon::Type::Wildcard => canon::Type::Wildcard,
+            canon::Type::Unit => canon::Type::Unit,
+            canon::Type::Lambda(..) => {
+                let from = next()?;
+                canon::Type::Lambda(Box::new(from), Box::new(next()?))
+            }
+            canon::Type::Con { home, name, args } => canon::Type::Con {
+                home: home.clone(),
+                name: *name,
+                args: args.iter().map(|_| next()).collect::<DResult<_>>()?,
+            },
+            canon::Type::Tuple(elems) => {
+                canon::Type::Tuple(elems.iter().map(|_| next()).collect::<DResult<_>>()?)
+            }
+            canon::Type::Record(fields) => canon::Type::Record(
+                fields
+                    .iter()
+                    .map(|(f, _)| Ok((*f, next()?)))
+                    .collect::<DResult<_>>()?,
+            ),
+            canon::Type::RecordOpen(row, fields) => canon::Type::RecordOpen(
+                *row,
+                fields
+                    .iter()
+                    .map(|(f, _)| Ok((*f, next()?)))
+                    .collect::<DResult<_>>()?,
+            ),
+        };
+        done.push(rebuilt);
+    }
+    done.pop().ok_or_else(walk_bug)
+}
+
+/// One instantiation of a member of a recursive group.
+struct Instance<'u> {
+    member: usize,
+    /// The member's arguments, written over the parameters of the member the
+    /// walk started from.
+    args: Vec<canon::Type>,
+    /// The declaration and constructor whose payload applied the member.
+    applied_by: Option<(&'u canon::Union, Span)>,
+}
+
+/// The constructor that applied a member of a group a second time, with other
+/// arguments.
+type Reapplied<'u> = Option<(&'u canon::Union, Span)>;
+
+/// The level of the recursive group `costs` holds, walked from `root`, and the
+/// constructor that first applied a member a second time with other arguments.
+///
+/// rustc builds every distinct instantiation of the group that `root` reaches,
+/// each holding its member's payload over its own arguments, before it meets
+/// the cycle. A group that passes its parameters on in another order (`type P a
+/// b = E a b | S (P b a)`) instantiates one member several times, so the level
+/// is the sum, over the distinct instantiations, of the member's cost plus its
+/// deepest argument. The walk stops as soon as the sum passes
+/// [`TYPE_DEPTH_LIMIT`]: every member of a recursive group costs at least one
+/// level, so at most `TYPE_DEPTH_LIMIT + 1` instantiations are built however
+/// many the group has.
+fn orbit_level<'u>(
+    table: &Table<'u>,
+    costs: &BTreeMap<usize, u16>,
+    root: usize,
+    budget: &mut Budget,
+    named: &dyn Fn(&[Symbol], Symbol) -> Named,
+) -> DResult<(u16, Reapplied<'u>)> {
+    let start = table.union(root)?;
+    let mut pending = VecDeque::from([Instance {
+        member: root,
+        args: start.vars.iter().map(|v| canon::Type::Var(*v)).collect(),
+        applied_by: None,
+    }]);
+    let mut built: Vec<(usize, Vec<canon::Type>)> = Vec::new();
+    let mut level = 0u16;
+    let mut reapplied = None;
+    while let Some(instance) = pending.pop_front() {
+        let mut member_seen = false;
+        let mut instance_seen = false;
+        for (member, args) in &built {
+            budget.tick()?;
+            if *member == instance.member {
+                member_seen = true;
+                if *args == instance.args {
+                    instance_seen = true;
+                    break;
+                }
+            }
+        }
+        if instance_seen {
+            continue;
+        }
+        if member_seen && reapplied.is_none() {
+            reapplied = instance.applied_by;
+        }
+        let cost = costs.get(&instance.member).copied().ok_or_else(walk_bug)?;
+        let mut widest = 0u16;
+        for arg in &instance.args {
+            widest = widest.max(declared_depth(arg, budget, named)?);
+        }
+        level = level.saturating_add(cost.saturating_add(widest));
+        if level > TYPE_DEPTH_LIMIT {
+            break;
+        }
+        let union = table.union(instance.member)?;
+        for ctor in &union.ctors {
+            for field in &ctor.args {
+                for node in nodes(field, budget)? {
+                    if let canon::Type::Con { home, name, args } = node
+                        && let Some(target) = table.find(home, *name)
+                        && costs.contains_key(&target)
+                    {
+                        let args = args
+                            .iter()
+                            .map(|arg| substitute(arg, &union.vars, &instance.args, budget))
+                            .collect::<DResult<Vec<_>>>()?;
+                        pending.push_back(Instance {
+                            member: target,
+                            args,
+                            applied_by: Some((union, ctor.span)),
+                        });
+                    }
+                }
+            }
+        }
+        built.push((instance.member, instance.args));
+    }
+    Ok((level, reapplied))
+}
+
 /// The levels of every declaration in the table, plus the shallowest of the
 /// module's own declarations past [`TYPE_DEPTH_LIMIT`].
 ///
 /// A member's cost is one level plus its deepest payload, where a member of its
 /// own group is charged only as an application (the recursion is boxed) and any
 /// other type its own level; a member with no payload costs nothing. A group's
-/// level is the sum of its members' costs: rustc walks a path through every
-/// member of the group, and each member's payload, before it meets the cycle,
-/// so the deepest member alone does not bound it.
+/// level is the deepest [`orbit_level`] from any of its members: rustc walks a
+/// path through every distinct instantiation of the group, and each one's
+/// payload, before it meets the cycle, so the deepest member alone does not
+/// bound it.
 fn nominal_levels<'u>(
     table: &Table<'u>,
     budget: &mut Budget,
@@ -459,7 +631,7 @@ fn nominal_levels<'u>(
             Some(i) => Named::Level(by_index.get(i).copied().unwrap_or(0)),
             None => Named::Level(0),
         };
-        let mut level = 0u16;
+        let mut costs = BTreeMap::new();
         let mut fields_by_member = Vec::with_capacity(group.len());
         for &u in group {
             let union = table.union(u)?;
@@ -473,8 +645,17 @@ fn nominal_levels<'u>(
                 per_ctor.push(deepest);
             }
             let cost = payload.map_or(0, |deepest| deepest.saturating_add(1));
-            level = level.saturating_add(cost);
+            costs.insert(u, cost);
             fields_by_member.push((u, union, per_ctor, cost));
+        }
+        let mut level = 0u16;
+        let mut reapplied = None;
+        for &root in group {
+            let (from_root, again) = orbit_level(table, &costs, root, budget, &named)?;
+            if from_root > level {
+                level = from_root;
+                reapplied = again;
+            }
         }
         for (u, union, per_ctor, cost) in fields_by_member {
             *by_index.get_mut(u).ok_or_else(walk_bug)? = level;
@@ -486,21 +667,33 @@ fn nominal_levels<'u>(
                 // The constructor whose payload, over what the rest of the
                 // group costs, crosses the ceiling, else the declaration, when
                 // the depth comes from the other members.
-                let rest = level.saturating_sub(cost);
-                let span = union
-                    .ctors
-                    .iter()
-                    .zip(&per_ctor)
-                    .find(|(ctor, deepest)| {
-                        !ctor.args.is_empty()
-                            && rest.saturating_add(1).saturating_add(**deepest) > TYPE_DEPTH_LIMIT
-                    })
-                    .map_or(union.name_span, |(ctor, _)| ctor.span);
-                refused = Some(DeclaredTooDeep {
-                    union,
-                    span,
-                    depth: level,
-                });
+                let crossing = || {
+                    let rest = level.saturating_sub(cost);
+                    let span = union
+                        .ctors
+                        .iter()
+                        .zip(&per_ctor)
+                        .find(|(ctor, deepest)| {
+                            !ctor.args.is_empty()
+                                && rest.saturating_add(1).saturating_add(**deepest)
+                                    > TYPE_DEPTH_LIMIT
+                        })
+                        .map_or(union.name_span, |(ctor, _)| ctor.span);
+                    DeclaredTooDeep {
+                        union,
+                        span,
+                        depth: level,
+                    }
+                };
+                // Else the constructor that instantiated a member again, with
+                // its parameters passed on in another shape.
+                refused = Some(
+                    reapplied.map_or_else(crossing, |(by, span)| DeclaredTooDeep {
+                        union: by,
+                        span,
+                        depth: level,
+                    }),
+                );
             }
         }
     }
@@ -677,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_to_its_own_group_nests_its_arguments() -> DResult<()> {
+    fn a_reference_to_its_own_group_charges_each_instantiation() -> DResult<()> {
         let mut i = Interner::new();
         let home = [i.intern("Main")?];
         let (w, leaf, node, a, int) = (
@@ -688,7 +881,9 @@ mod tests {
             i.intern("Int")?,
         );
         // `Node (W (W (W Int)))`: each application of `W` is one level of the
-        // field the Rust enum holds, though `W` itself is boxed.
+        // field the Rust enum holds, though `W` itself is boxed, so `W a` costs
+        // 4. The field instantiates `W` at `W (W Int)`, `W Int` and `Int`, each
+        // 4 over its argument's depth: 4 + 6 + 5 + 4.
         let field = (0..3).fold(con(&[], int, vec![]), |t, _| con(&home, w, vec![t]));
         let unions = [union(
             &home,
@@ -696,7 +891,7 @@ mod tests {
             vec![a],
             vec![(leaf, vec![canon::Type::Var(a)]), (node, vec![field])],
         )];
-        assert_eq!(levels_of(&unions)?.level(&home, w), 4);
+        assert_eq!(levels_of(&unions)?.level(&home, w), 19);
         Ok(())
     }
 
@@ -895,6 +1090,116 @@ mod tests {
             ],
         )];
         assert_eq!(expansive_cycle(&regular, &[], &mut budget())?, None);
+        Ok(())
+    }
+
+    /// `name` over `vars` with a nullary `Z`, an `E` holding every parameter,
+    /// and a `Rot` holding `name` applied to `applied`, `Rot` at span `2..3`.
+    fn passing_on(
+        home: &[Symbol],
+        name: Symbol,
+        ctors: [Symbol; 3],
+        vars: &[Symbol],
+        applied: Vec<canon::Type>,
+    ) -> canon::Union {
+        let [z, e, rot] = ctors;
+        let mut u = union(
+            home,
+            name,
+            vars.to_vec(),
+            vec![
+                (z, vec![]),
+                (e, vars.iter().map(|v| canon::Type::Var(*v)).collect()),
+                (rot, vec![con(home, name, applied)]),
+            ],
+        );
+        if let Some(ctor) = u.ctors.get_mut(2) {
+            ctor.span = Span::new(2, 3);
+        }
+        u
+    }
+
+    #[test]
+    fn a_group_passing_its_parameters_on_permuted_costs_each_arrangement() -> DResult<()> {
+        let mut i = Interner::new();
+        let home = [i.intern("Main")?];
+        let ctors = [i.intern("Z")?, i.intern("E")?, i.intern("Rot")?];
+        let (p, a, b) = (i.intern("P")?, i.intern("a")?, i.intern("b")?);
+        let (va, vb) = (canon::Type::Var(a), canon::Type::Var(b));
+        // `Rot (P a b)` passes the parameters on as they came: one
+        // instantiation, costing one level over its deepest payload, `P a b`.
+        let same = [passing_on(
+            &home,
+            p,
+            ctors,
+            &[a, b],
+            vec![va.clone(), vb.clone()],
+        )];
+        assert_eq!(levels_of(&same)?.level(&home, p), 2);
+        // `Rot (P b a)` swaps them: `P a b` and `P b a` are two instantiations.
+        let swapped = [passing_on(&home, p, ctors, &[a, b], vec![vb, va])];
+        assert_eq!(levels_of(&swapped)?.level(&home, p), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rotation_one_past_the_ceiling_is_refused_at_the_rotating_constructor() -> DResult<()> {
+        let mut i = Interner::new();
+        let home = [i.intern("Main")?];
+        let ctors = [i.intern("Z")?, i.intern("E")?, i.intern("Rot")?];
+        let r = i.intern("R")?;
+        // `Rot (R a2 … ak a1)` reaches all `k` rotations, each costing 2.
+        let half = usize::from(TYPE_DEPTH_LIMIT) / 2;
+        let rotation = |names: &mut Interner, k: usize| -> DResult<canon::Union> {
+            let vars = (1..=k)
+                .map(|n| names.intern(&format!("a{n}")))
+                .collect::<DResult<Vec<Symbol>>>()?;
+            let applied = vars
+                .iter()
+                .cycle()
+                .skip(1)
+                .take(k)
+                .map(|v| canon::Type::Var(*v))
+                .collect();
+            Ok(passing_on(&home, r, ctors, &vars, applied))
+        };
+        let fits = [rotation(&mut i, half)?];
+        let table = Table::new(&fits, &[]);
+        let (levels, refused) = nominal_levels(&table, &mut budget())?;
+        assert_eq!(levels.level(&home, r), TYPE_DEPTH_LIMIT);
+        assert!(refused.is_none(), "{refused:?}");
+        let past = [rotation(&mut i, half + 1)?];
+        let table = Table::new(&past, &[]);
+        let (_, refused) = nominal_levels(&table, &mut budget())?;
+        assert_eq!(
+            refused.map(|found| (found.union.name, found.span, found.depth)),
+            Some((r, Span::new(2, 3), TYPE_DEPTH_LIMIT + 2)),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_application_past_its_parameters_adds_no_edge() -> DResult<()> {
+        let mut i = Interner::new();
+        let home = [i.intern("Main")?];
+        let (t, x, a) = (i.intern("A")?, i.intern("X")?, i.intern("a")?);
+        // `X (A a a)`: the second `a` is passed to no parameter of `A`.
+        let unions = [union(
+            &home,
+            t,
+            vec![a],
+            vec![(
+                x,
+                vec![con(
+                    &home,
+                    t,
+                    vec![canon::Type::Var(a), canon::Type::Var(a)],
+                )],
+            )],
+        )];
+        assert_eq!(expansive_cycle(&unions, &[], &mut budget())?, None);
+        // `A a` and `A a a` are two instantiations, each costing 2.
+        assert_eq!(levels_of(&unions)?.level(&home, t), 4);
         Ok(())
     }
 }

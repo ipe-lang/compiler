@@ -18,6 +18,10 @@
 //! one declaration past the ceiling is refused at the constructor that crosses
 //! it, a top-level annotation past the ceiling at its name, and a custom type
 //! that refers to itself with a growing parameter with IPE-T0024 at its name.
+//! A custom type passing its parameters on permuted is as deep as every
+//! arrangement its constructors reach, together, and is refused at the
+//! constructor that permutes them. A parameter no field uses is accepted and
+//! erased from the emitted enum.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -426,6 +430,103 @@ fn deepest_accepted_declarations_build_with_cargo() {
             let bin = format!("type_ceiling_{name}");
             assert_builds_with_cargo(&src, &scratch.join(name), &runtime, &bin);
         }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// `type R a1 … ak = Z | E a1 … ak | Rot (R a2 … ak a1)`, `k` nullary types
+/// `K0 … K{k-1}`, a value `v : R K0 … K{k-1}` compared with itself, and the
+/// span of `Rot`'s name.
+///
+/// `Rot` passes the parameters on rotated, so rustc builds all `k` rotations
+/// of `R`, each one level over its payload: the declaration is `2 * k` deep.
+fn rotation(k: usize) -> Chain {
+    let params: Vec<String> = (1..=k).map(|n| format!("a{n}")).collect();
+    let rotated: Vec<&str> = params
+        .iter()
+        .cycle()
+        .skip(1)
+        .take(k)
+        .map(String::as_str)
+        .collect();
+    let mut decls = format!(
+        "type R {params}\n    = Z\n    | E {params}\n    | Rot (R {rotated})\n\n\n",
+        params = params.join(" "),
+        rotated = rotated.join(" "),
+    );
+    for n in 0..k {
+        let _ = write!(decls, "type K{n}\n    = K{n}\n\n\n");
+    }
+    let args: Vec<String> = (0..k).map(|n| format!("K{n}")).collect();
+    let _ = write!(decls, "v : R {}\nv =\n    Z\n\n\n", args.join(" "));
+    let src = format!(
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\n{decls}main =\n    {}\n",
+        compare("v", 0)
+    );
+    let at = span_of(&src, "| Rot (", 0);
+    Chain {
+        refused_at: Span {
+            lo: at.lo + 2,
+            hi: at.lo + 2 + offset("Rot".len()),
+        },
+        src,
+    }
+}
+
+/// A custom type passing its parameters on rotated is as deep as its rotations
+/// together: the rotation reaching the ceiling is accepted, and the one
+/// parameter more is refused at the constructor that rotates them.
+#[test]
+fn a_permuting_type_one_past_the_ceiling_is_refused_at_its_rotating_constructor() {
+    let k = usize::from(TYPE_DEPTH_LIMIT) / 2;
+    let accepted = front_check(&rotation(k).src);
+    assert!(
+        accepted.is_ok(),
+        "the rotation of {k} must be accepted: {accepted:?}"
+    );
+    let past = rotation(k + 1);
+    assert_too_deep(&past.src, past.refused_at, TYPE_DEPTH_LIMIT + 2);
+}
+
+/// The deepest accepted rotation builds with cargo: every rotation rustc
+/// instantiates is charged, so none overflows its drop-check walk. Gated on
+/// `IPE_E2E=1` (the CI `e2e` job).
+#[test]
+fn deepest_accepted_rotation_builds_with_cargo() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("ipe_type_ceiling_rotation_{}", std::process::id()));
+        let src = rotation(usize::from(TYPE_DEPTH_LIMIT) / 2).src;
+        assert_builds_with_cargo(&src, &scratch, &runtime, "type_ceiling_rotation");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// `T a` whose parameter no constructor holds except through `T a` itself, and
+/// a polymorphic function over it applied at two arguments.
+const UNUSED_PARAMETER: &str = "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\ntype T a\n    = L\n    | N (T a)\n\n\nsize : T a -> Int\nsize t =\n    case t of\n        L ->\n            0\n\n        N inner ->\n            1 + size inner\n\n\nints : T Int\nints =\n    N (N L)\n\n\nstrings : T String\nstrings =\n    N L\n\n\nmain =\n    Io.println (if size ints == 2 then \"two\" else if size strings == 1 then \"one\" else \"other\")\n";
+
+/// A custom type parameter no field uses is accepted and builds with cargo:
+/// the emitted enum carries no parameter rustc would refuse as unused. The
+/// acceptance runs in the CI `test-run` job, the build under `IPE_E2E=1` (the
+/// CI `e2e` job).
+#[test]
+fn a_custom_type_parameter_no_field_uses_builds_with_cargo() {
+    let accepted = front_check(UNUSED_PARAMETER);
+    assert!(accepted.is_ok(), "must be accepted: {accepted:?}");
+    if e2e_support::e2e_tier() == e2e_support::Tier::E2e {
+        let runtime = e2e_support::require_runtime().into_path_buf();
+        let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "ipe_type_ceiling_unused_param_{}",
+            std::process::id()
+        ));
+        assert_builds_with_cargo(
+            UNUSED_PARAMETER,
+            &scratch,
+            &runtime,
+            "type_ceiling_unused_param",
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

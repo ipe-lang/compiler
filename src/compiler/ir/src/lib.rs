@@ -14,6 +14,7 @@
 pub mod borrow;
 mod carrier;
 mod enum_facts;
+mod enum_params;
 pub mod free_vars;
 mod held;
 mod ir;
@@ -31,6 +32,7 @@ pub use enum_facts::{
     EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS, home_is_ffi_interface,
     is_store_row_phantom_union, payload_leaf_is_clone,
 };
+pub use enum_params::EnumParamUse;
 pub use held::{
     EnumPayloadTable, MAX_HELD_WALK_DEPTH, Reach, enum_payload_holds, enum_payload_table,
     ir_type_holds, ir_type_reaches,

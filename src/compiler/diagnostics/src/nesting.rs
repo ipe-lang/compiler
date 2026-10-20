@@ -55,8 +55,11 @@ pub const COMPILE_STACK_BYTES: usize = 64 << 20;
 /// Every type application, tuple and record is one level, and every function
 /// arrow is [`TYPE_LEVELS_PER_ARROW`]. A user type costs at least its declared
 /// nesting: the levels its constructors' payloads render to, so a nullary user
-/// type over a chain of declarations is that chain deep. Variables, `()` and
-/// builtin nullary types are leaves.
+/// type over a chain of declarations is that chain deep. A recursive group of
+/// user types costs the sum, over every distinct instantiation of its members
+/// it reaches, of that member's payload over its arguments, so the ceiling
+/// also bounds how many instantiations one group may build: each costs at
+/// least one level. Variables, `()` and builtin nullary types are leaves.
 pub const TYPE_DEPTH_LIMIT: u16 = 64;
 
 /// Type levels one function arrow costs.

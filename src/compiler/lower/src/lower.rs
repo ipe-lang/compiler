@@ -11549,6 +11549,12 @@ pub struct Lowerer<'a> {
     /// enum holds — the same table shape the backend's enum-`Clone` fixpoint
     /// reads, so both stages agree on which enums are `Clone`.
     enum_payloads: EnumPayloadTable,
+    /// Which type parameters of the program's enums a field uses.
+    ///
+    /// Filled once every union is lowered, before any def body: an unused
+    /// parameter is erased from the declaration and from every application,
+    /// so no emitted enum declares a parameter rustc refuses (E0392).
+    enum_param_use: ipe_ir::EnumParamUse,
     /// The constructors of those transparent unions, keyed `(home, ctor)` —
     /// the one `Rust.*` constructor set a user program may legitimately
     /// construct and match.
@@ -14076,6 +14082,7 @@ impl<'a> Lowerer<'a> {
             ctor_arity,
             transparent_ffi_unions,
             enum_payloads: EnumPayloadTable::new(),
+            enum_param_use: ipe_ir::EnumParamUse::default(),
             transparent_ffi_ctors,
             eta_params,
             eta_base: Cell::new(0),
@@ -16492,6 +16499,22 @@ impl<'a> Lowerer<'a> {
             types_ir.push(TypeDef::Enum(def));
         }
         let prelude_enums = self.synthetic_prelude_enums();
+        // A parameter no field uses, directly or through a used parameter of
+        // another enum, carries nothing: erase it from every declaration here
+        // and, through `enum_param_use`, from every application lowered after.
+        self.enum_param_use = ipe_ir::EnumParamUse::of(
+            types_ir
+                .iter()
+                .map(|td| {
+                    let TypeDef::Enum(def) = td;
+                    def
+                })
+                .chain(prelude_enums.iter()),
+        );
+        let mut types_ir: Vec<TypeDef> = types_ir
+            .into_iter()
+            .map(|TypeDef::Enum(def)| TypeDef::Enum(self.enum_param_use.erase_in_def(def)))
+            .collect();
         self.enum_payloads = ipe_ir::enum_payload_table(
             types_ir
                 .iter()
@@ -19172,11 +19195,9 @@ impl<'a> Lowerer<'a> {
                 }
                 v
             };
-        Ok(IrType::Enum {
-            home: ModPath(home.to_vec()),
-            name,
-            args: ir_args,
-        })
+        let home = ModPath(home.to_vec());
+        let args = self.enum_param_use.used_args(&home, name, ir_args);
+        Ok(IrType::Enum { home, name, args })
     }
 
     /// Lower a solved program-union application to its `IrType::Enum`.
@@ -19220,11 +19241,9 @@ impl<'a> Lowerer<'a> {
             }
             v
         };
-        Ok(IrType::Enum {
-            home: ModPath(module.to_vec()),
-            name,
-            args: ir_args,
-        })
+        let home = ModPath(module.to_vec());
+        let args = self.enum_param_use.used_args(&home, name, ir_args);
+        Ok(IrType::Enum { home, name, args })
     }
 
     #[allow(clippy::too_many_lines)] // declarative type-constructor dispatch — each builtin listed explicitly for safety

@@ -1935,6 +1935,17 @@ impl<'a> EmitCtx<'a> {
         // parametric signature) and concrete instantiations (`{ value : Int }`):
         // [`canonicalise_shape`] reconciles them into a single struct.
         let mut shapes: BTreeMap<Vec<String>, ShapeOccurrences> = BTreeMap::new();
+        // seal: rustc refuses an enum type parameter no field uses (E0392).
+        // The lowerer erases every such parameter through the same table, so
+        // one surviving here is a lowering bug, refused before any emission.
+        ipe_ir::EnumParamUse::of(
+            program
+                .modules
+                .iter()
+                .flat_map(|module| module.types.iter())
+                .map(|TypeDef::Enum(def)| def),
+        )
+        .refuse_unused()?;
         for module in &program.modules {
             for func in &module.funcs {
                 for ipe_ir::Param { ty, .. } in &func.params {
