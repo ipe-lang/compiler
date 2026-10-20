@@ -44,12 +44,12 @@ fn do_binds(n: usize) -> String {
 
 /// A `let` block of `n` bindings, each reading the one before it.
 fn let_block(n: usize) -> String {
-    let mut src = format!("{HEADER}main =\n    let\n        x0 = 0\n");
-    for i in 1..=n {
-        src.push_str(&format!("        x{i} = x{} + 1\n", i - 1));
-    }
-    src.push_str(&format!("    in\n    Io.println (String.fromInt x{n})\n"));
-    src
+    let bindings: String = (1..=n)
+        .map(|i| format!("        x{i} = x{} + 1\n", i - 1))
+        .collect();
+    format!(
+        "{HEADER}main =\n    let\n        x0 = 0\n{bindings}    in\n    Io.println (String.fromInt x{n})\n"
+    )
 }
 
 /// A chain of `n` `+` operators.
@@ -142,7 +142,8 @@ fn refused_by_parser(result: &Result<(), CliError>) -> bool {
 /// and one level deeper is refused by the parser.
 #[test]
 fn at_ceiling_shapes_fit_declared_stack() {
-    let shapes: [(&str, fn(usize) -> String); 5] = [
+    type Shape = fn(usize) -> String;
+    let shapes: [(&str, Shape); 5] = [
         ("do-bind", do_binds),
         ("let-block", let_block),
         ("binop chain", binop_chain),
