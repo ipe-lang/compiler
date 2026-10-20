@@ -934,6 +934,10 @@ watch dependency-resolve retry
 
 watch compile worker
 
+## thread-role-compile
+
+compile worker
+
 ## thread-role-watch-cargo-waiter
 
 watch cargo-build waiter

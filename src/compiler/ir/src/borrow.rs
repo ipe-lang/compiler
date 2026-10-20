@@ -1209,11 +1209,24 @@ mod tests {
 
     #[test]
     fn a_body_past_the_depth_ceiling_is_owned() -> DResult<()> {
-        let mut interner = Interner::new();
-        let depth = usize::from(MAX_IR_RENDER_DEPTH) + 4;
-        let v = verdict_of(&mut interner, |p, x| deep(p, x, depth))?;
+        let v = deep_walk(|| {
+            let mut interner = Interner::new();
+            let depth = usize::from(MAX_IR_RENDER_DEPTH) + 4;
+            verdict_of(&mut interner, |p, x| deep(p, x, depth))
+        })?;
         assert_eq!(v, Some(ParamPass::Owned));
         Ok(())
+    }
+
+    /// Run a walk over a body nested to the IR ceiling on the declared compile
+    /// stack, which every production compile thread is spawned with.
+    fn deep_walk<T: Send>(body: impl FnOnce() -> DResult<T> + Send) -> DResult<T> {
+        crate::on_compile_stack(body).unwrap_or_else(|| {
+            Err(Diagnostic::CompilerBug {
+                where_: "borrow.tests.deep_walk",
+                detail: "the compile-stack thread did not finish".to_owned(),
+            })
+        })
     }
 
     #[test]
@@ -1297,9 +1310,11 @@ mod tests {
 
     #[test]
     fn verify_rejects_a_body_past_the_depth_ceiling() -> DResult<()> {
-        let mut interner = Interner::new();
-        let depth = usize::from(MAX_IR_RENDER_DEPTH) + 4;
-        let out = verify_one(&mut interner, |p, x| deep(p, x, depth))?;
+        let out = deep_walk(|| {
+            let mut interner = Interner::new();
+            let depth = usize::from(MAX_IR_RENDER_DEPTH) + 4;
+            verify_one(&mut interner, |p, x| deep(p, x, depth))
+        })?;
         assert!(matches!(out, Err(BorrowViolation::TooDeep { .. })));
         Ok(())
     }
@@ -1342,6 +1357,10 @@ mod tests {
 
     #[test]
     fn a_too_deep_body_demotes_every_function() -> DResult<()> {
+        deep_walk(a_too_deep_body_demotes_every_function_body)
+    }
+
+    fn a_too_deep_body_demotes_every_function_body() -> DResult<()> {
         let mut interner = Interner::new();
         let (fname, gname) = (interner.intern("f")?, interner.intern("g")?);
         let (p, q, x) = (
@@ -1364,6 +1383,10 @@ mod tests {
 
     #[test]
     fn verify_accepts_a_deep_all_owned_program() -> DResult<()> {
+        deep_walk(verify_accepts_a_deep_all_owned_program_body)
+    }
+
+    fn verify_accepts_a_deep_all_owned_program_body() -> DResult<()> {
         let mut interner = Interner::new();
         let (name, p, x) = (
             interner.intern("f")?,

@@ -1,13 +1,14 @@
 use super::{
     BoundSet, Callee, DResult, Diagnostic, Doc, Expr, Func, GenericScope, IrType, KernelFn,
-    RenderConfig, Symbol, callee_name, combine_guards, emit_arm_head, emit_binding_stmts,
-    emit_expr_at, emit_init_datum, emit_match_scrutinee, impl_fn_param_indices, indent_of,
-    render_type, tail_arm_prelude_lines,
+    LowerError, RenderConfig, Symbol, callee_name, combine_guards, emit_arm_head,
+    emit_binding_stmts, emit_expr_at, emit_init_datum, emit_match_scrutinee, impl_fn_param_indices,
+    indent_of, render_type, tail_arm_prelude_lines,
 };
 use crate::EmitCtx;
 use crate::render::{LayoutSpend, render_code};
 use core::cell::RefCell;
 use core::fmt::Write as _;
+use ipe_diagnostics::EmitSite;
 use ipe_intern::rust_str_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
@@ -810,6 +811,49 @@ pub fn emit_init_hot_for_func(
 /// measures against the prefix the emitted line actually carries — the
 /// `pub(crate)` form is seven columns wider than `pub`, so a borderline signature
 /// breaks under one and not the other.
+///
+/// A nesting refusal raised anywhere in the body leaves here naming this
+/// function ([`LowerError::BackendNestingTooDeep`]'s `func`).
+pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<String> {
+    emit_func_item(ctx, func, vis_prefix).map_err(|diag| name_nesting_site(ctx, func, diag))
+}
+
+/// Name `func` on a nesting refusal its body raised, so the driver frames it
+/// against the function's own module and the message names the function.
+///
+/// Every other diagnostic passes through unchanged. A refusal that already
+/// names a function keeps it: the innermost function is the one that crossed
+/// the bound.
+fn name_nesting_site(ctx: &EmitCtx, func: &Func, diag: Diagnostic) -> Diagnostic {
+    match diag {
+        Diagnostic::Lower {
+            span,
+            msg: LowerError::BackendNestingTooDeep { limit, func: None },
+        } => Diagnostic::Lower {
+            span,
+            msg: LowerError::BackendNestingTooDeep {
+                limit,
+                func: emit_site(ctx, func),
+            },
+        },
+        other => other,
+    }
+}
+
+/// The source-level name and home of `func`, or `None` when a symbol does not
+/// resolve through the build's interner.
+fn emit_site(ctx: &EmitCtx, func: &Func) -> Option<EmitSite> {
+    let home = func
+        .home
+        .0
+        .iter()
+        .map(|segment| ctx.interner.resolve(*segment).map(Box::<str>::from))
+        .collect::<Option<Box<[Box<str>]>>>()?;
+    let name = ctx.interner.resolve(func.name)?.into();
+    Some(EmitSite { home, name })
+}
+
+/// [`emit_func_vis`] before the function is named on a nesting refusal.
 #[allow(
     clippy::too_many_lines,
     reason = "one linear emit pipeline (elision, wraps, per-function literal + transition + \
@@ -818,7 +862,7 @@ pub fn emit_init_hot_for_func(
               `ipe_main_wrap_decision`), and splitting the rest would thread a dozen locals \
               through helpers without clarifying the single straight-line flow"
 )]
-pub fn emit_func_vis(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<String> {
+fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<String> {
     ctx.verify_borrows(func)?;
     let name = ctx.func_name(func.id)?.to_owned();
 

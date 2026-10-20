@@ -1060,6 +1060,8 @@ messages! {
     thread_role_watch_resolve_retry = "thread-role-watch-resolve-retry";
     /// The thread that runs an `ipe dev watch` compile.
     thread_role_watch_compile = "thread-role-watch-compile";
+    /// The thread that runs a one-shot command's compile.
+    thread_role_compile = "thread-role-compile";
     /// The thread that waits on an `ipe dev watch` cargo build.
     thread_role_watch_cargo_waiter = "thread-role-watch-cargo-waiter";
     /// The thread that enforces a WASI run's wall-clock ceiling.
