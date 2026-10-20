@@ -1176,23 +1176,43 @@ importOneViolations rel imp =
                     []
 
 
--- A module of `src`: its path relative to `src`, its text, and its tokens.
+-- A module of `src`: its path relative to `src`, its text, and its
+-- findings.
 type alias Source =
-    ( String, String, Lexed )
+    ( String, String, Findings )
+
+
+-- What the scan finds in one module, read from its tokens once when it is
+-- lexed: the violations at its tokens and at its imports, and its sites of
+-- each rule counted over the whole tree. A scan of the tree reads the
+-- findings, never the tokens; a changed text is lexed anew, so a scan of a
+-- changed tree reads every other module's findings as they stand.
+type alias Findings =
+    { atTokens : List Violation, atImports : List Violation, htmlTexts : List String, flattenings : List String, markupSinks : List String }
+
+
+findingsOf : String -> Lexed -> Findings
+findingsOf rel lexed =
+    { atTokens = tokenViolations rel lexed
+    , atImports = importViolations rel lexed.imports
+    , htmlTexts = sitesOf htmlTextNames rel lexed
+    , flattenings = sitesOf flattenNames rel lexed
+    , markupSinks = markupSites rel lexed
+    }
 
 
 lexSource : ( String, String ) -> Source
 lexSource ( rel, text ) =
-    ( rel, text, lex text )
+    ( rel, text, findingsOf rel (lex text) )
 
 
 scanViolations : List Source -> List Violation
-scanViolations lexedSources =
-    List.concatMap (\( rel, _, lexed ) -> tokenViolations rel lexed) lexedSources
-        ++ multisetViolations StrayHtmlText "Html.text" sanctionedHtmlText (List.concatMap (\( rel, _, lexed ) -> sitesOf htmlTextNames rel lexed) lexedSources)
-        ++ multisetViolations FlattenedText "SafeText.toString" admittedFlattening (List.concatMap (\( rel, _, lexed ) -> sitesOf flattenNames rel lexed) lexedSources)
-        ++ multisetViolations ComputedMarkup "markup sink of computed text" admittedMarkup (List.concatMap (\( rel, _, lexed ) -> markupSites rel lexed) lexedSources)
-        ++ List.concatMap (\( rel, _, lexed ) -> importViolations rel lexed.imports) lexedSources
+scanViolations sources =
+    List.concatMap (\( _, _, found ) -> found.atTokens) sources
+        ++ multisetViolations StrayHtmlText "Html.text" sanctionedHtmlText (List.concatMap (\( _, _, found ) -> found.htmlTexts) sources)
+        ++ multisetViolations FlattenedText "SafeText.toString" admittedFlattening (List.concatMap (\( _, _, found ) -> found.flattenings) sources)
+        ++ multisetViolations ComputedMarkup "markup sink of computed text" admittedMarkup (List.concatMap (\( _, _, found ) -> found.markupSinks) sources)
+        ++ List.concatMap (\( _, _, found ) -> found.atImports) sources
 
 
 -- ── the real tree ───────────────────────────────────────────────────────
@@ -1315,12 +1335,12 @@ scanRefusesEvasions =
 appendTo : String -> String -> List Source -> List Source
 appendTo rel extra sources =
     List.map
-        (\( name, text, tokens ) ->
+        (\( name, text, found ) ->
             if name == rel then
                 lexSource ( name, text ++ "\n\n" ++ extra ++ "\n" )
 
             else
-                ( name, text, tokens )
+                ( name, text, found )
         )
         sources
 
@@ -1330,12 +1350,12 @@ appendTo rel extra sources =
 editIn : String -> String -> String -> List Source -> List Source
 editIn rel from to sources =
     List.map
-        (\( name, text, tokens ) ->
+        (\( name, text, found ) ->
             if name == rel then
                 lexSource ( name, String.replace from to text )
 
             else
-                ( name, text, tokens )
+                ( name, text, found )
         )
         sources
 
@@ -1343,12 +1363,12 @@ editIn rel from to sources =
 prependTo : String -> String -> List Source -> List Source
 prependTo rel extra sources =
     List.map
-        (\( name, text, tokens ) ->
+        (\( name, text, found ) ->
             if name == rel then
                 lexSource ( name, extra ++ "\n" ++ text )
 
             else
-                ( name, text, tokens )
+                ( name, text, found )
         )
         sources
 
