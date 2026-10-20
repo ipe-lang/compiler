@@ -33,6 +33,7 @@ use ipe::RootFixture;
 const TUI_ENTRY: &str = "module Main exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
 
 /// A project whose `src/Main.ipe` is [`TUI_ENTRY`].
+#[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
 fn tui_project() -> RootFixture {
     RootFixture::main(TUI_ENTRY).expect("the TUI project resolves")
 }
