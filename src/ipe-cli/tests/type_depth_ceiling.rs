@@ -643,9 +643,9 @@ fn a_bounded_generic_only_an_erased_parameter_names_is_refused_where_it_is_read(
     let span = diag.map(Diagnostic::primary_span);
     assert!(
         span.is_some_and(|s| s != Span::DUMMY
-            && body.lo <= s.lo
             && s.lo < s.hi
-            && s.hi <= main_at.lo),
+            && (body.lo..=main_at.lo).contains(&s.lo)
+            && (body.lo..=main_at.lo).contains(&s.hi)),
         "refused at {span:?}, not inside doubledCount's body {}..{}: {built:?}",
         body.lo,
         main_at.lo

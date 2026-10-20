@@ -162,20 +162,17 @@ impl Budget {
     /// [`TypeError::StepBudgetExceeded`] when fewer than `steps` remain,
     /// carrying the configured `limit`.
     pub const fn charge(&mut self, steps: u64) -> DResult<()> {
-        match self.remaining.checked_sub(steps) {
-            Some(next) => {
-                self.remaining = next;
-                Ok(())
-            }
-            None => {
-                self.remaining = 0;
-                Err(Diagnostic::Type {
-                    span: Span::DUMMY,
-                    msg: TypeError::StepBudgetExceeded {
-                        budget: self.limit.get(),
-                    },
-                })
-            }
+        if let Some(next) = self.remaining.checked_sub(steps) {
+            self.remaining = next;
+            Ok(())
+        } else {
+            self.remaining = 0;
+            Err(Diagnostic::Type {
+                span: Span::DUMMY,
+                msg: TypeError::StepBudgetExceeded {
+                    budget: self.limit.get(),
+                },
+            })
         }
     }
 

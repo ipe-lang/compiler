@@ -466,7 +466,7 @@ impl Counted {
     }
 }
 
-/// `t` with each of `vars` replaced by the value at its position in `vals`,
+/// `t` with each of `vars` replaced by the value at its position in `actuals`,
 /// or `None` when the result would hold more than `room` nodes.
 ///
 /// The result's size is counted, one budget tick per node of `t`, and charged
@@ -476,11 +476,15 @@ impl Counted {
 fn substitute(
     t: &canon::Type,
     vars: &[Symbol],
-    vals: &[Counted],
+    actuals: &[Counted],
     room: u64,
     budget: &mut Budget,
 ) -> DResult<Option<Counted>> {
-    let value = |v: &Symbol| vars.iter().position(|p| p == v).and_then(|i| vals.get(i));
+    let value = |v: &Symbol| {
+        vars.iter()
+            .position(|p| p == v)
+            .and_then(|i| actuals.get(i))
+    };
     let mut size = 0u64;
     let mut work = vec![t];
     while let Some(node) = work.pop() {
@@ -656,9 +660,9 @@ fn orbit_level<'u>(
                         let mut applied = Vec::with_capacity(args.len());
                         let mut size = 0u64;
                         for arg in args {
-                            let room = TYPE_SIZE_LIMIT.saturating_sub(size);
+                            let headroom = TYPE_SIZE_LIMIT.saturating_sub(size);
                             let Some(value) =
-                                substitute(arg, &union.vars, &instance.args, room, budget)?
+                                substitute(arg, &union.vars, &instance.args, headroom, budget)?
                             else {
                                 return Ok(Orbit::TooLarge(union, ctor.span));
                             };
@@ -1327,8 +1331,8 @@ mod tests {
     /// (B b … b) (B c … c))`, `X` spanned at byte 7.
     fn widening(names: &mut Interner, k: usize) -> DResult<[canon::Union; 2]> {
         let home = [names.intern("Main")?];
-        let (b, t, int) = (names.intern("B")?, names.intern("T")?, names.intern("Int")?);
-        let (z, x) = (names.intern("Z")?, names.intern("X")?);
+        let (boxed, grower, int) = (names.intern("B")?, names.intern("T")?, names.intern("Int")?);
+        let (leaf, widen) = (names.intern("Z")?, names.intern("X")?);
         let params = (1..=k)
             .map(|n| names.intern(&format!("p{n}")))
             .collect::<DResult<Vec<Symbol>>>()?;
@@ -1336,21 +1340,21 @@ mod tests {
             .iter()
             .map(|v| names.intern(v))
             .collect::<DResult<Vec<Symbol>>>()?;
-        let over = |v: Symbol| con(&home, b, vec![canon::Type::Var(v); k]);
+        let over = |v: Symbol| con(&home, boxed, vec![canon::Type::Var(v); k]);
         let applied = std::iter::once(con(&home, int, vec![]))
             .chain(vars.iter().take(3).copied().map(over))
             .collect();
         let held = params.iter().map(|p| canon::Type::Var(*p)).collect();
         let mut grows = union(
             &home,
-            t,
+            grower,
             vars,
-            vec![(z, vec![]), (x, vec![con(&home, t, applied)])],
+            vec![(leaf, vec![]), (widen, vec![con(&home, grower, applied)])],
         );
         if let Some(ctor) = grows.ctors.get_mut(1) {
             ctor.span = Span::new(7, 8);
         }
-        Ok([union(&home, b, params, vec![(b, held)]), grows])
+        Ok([union(&home, boxed, params, vec![(boxed, held)]), grows])
     }
 
     #[test]
