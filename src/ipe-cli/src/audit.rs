@@ -3063,7 +3063,9 @@ mod tests {
     #[test]
     fn captured_programs_are_the_project_roots_programs() {
         use crate::project_root::{EntrySet, ProjectRoot, RootArg};
-        let cases: [(&str, &str, &[(&str, String)]); 3] = [
+        /// A capture case: its tag, its manifest, and its `src/` files.
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, String)]);
+        let cases: [Case<'_>; 3] = [
             (
                 "agree-two-programs",
                 "module Package exposing (package)\n\n\npackage =\n    { name = \"two\"\n    , programs =\n        [ { name = \"board\", entry = \"Main.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n",

@@ -503,13 +503,13 @@ pub fn read_entry_source(root: &ProjectRoot, entry: &ResolvedEntry) -> Result<St
     let (leaf, parents) = entry.module().split_last().ok_or_else(missing)?;
     let mut walked = None;
     for segment in parents {
-        let here = walked.as_ref().unwrap_or(root.src());
+        let here = walked.as_ref().unwrap_or_else(|| root.src());
         walked = Some(
             here.child(std::ffi::OsStr::new(segment))?
                 .ok_or_else(missing)?,
         );
     }
-    let here = walked.as_ref().unwrap_or(root.src());
+    let here = walked.as_ref().unwrap_or_else(|| root.src());
     let name = here.entry(std::ffi::OsStr::new(&format!("{leaf}.ipe")))?;
     here.read_file_capped(&name, io_bounded::SOURCE_CAP)
 }
