@@ -14,14 +14,15 @@
 //! * [`NominalLevels`] — the type levels each declared type renders to. A
 //!   nullary type is a leaf in the solved graph, yet it costs rustc the levels
 //!   of every payload it holds, so a chain of declarations nests like a chain
-//!   of applications. A recursive group of declarations is boxed and costs its
-//!   size plus what its payloads add.
+//!   of applications. A recursive group of declarations is boxed, yet the Rust
+//!   build walks through every member of the group before it meets the cycle,
+//!   so the group costs each member's level and payload, summed.
 //!
 //! [`check_declarations`] runs both before inference, and also measures every
 //! top-level annotation, so a declared type past [`TYPE_DEPTH_LIMIT`] is
 //! refused where it is written even when nothing uses it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::nesting::{TYPE_DEPTH_LIMIT, TYPE_LEVELS_PER_ARROW};
@@ -393,7 +394,7 @@ fn own_levels(t: &canon::Type, named: &dyn Fn(&[Symbol], Symbol) -> Named) -> u1
         canon::Type::Tuple(_) | canon::Type::RecordOpen(..) => 1,
         canon::Type::Record(fields) => u16::from(!fields.is_empty()),
         canon::Type::Con { home, name, args } => match named(home, *name) {
-            Named::InGroup => 0,
+            Named::InGroup => u16::from(!args.is_empty()),
             Named::Level(level) => level.max(u16::from(!args.is_empty())),
         },
     }
@@ -424,45 +425,46 @@ struct DeclaredTooDeep<'u> {
 /// The levels of every declaration in the table, plus the shallowest of the
 /// module's own declarations past [`TYPE_DEPTH_LIMIT`].
 ///
-/// A group of mutually recursive declarations with no payload is level 0;
-/// otherwise its level is its member count plus its deepest payload, a member
-/// of the group charged nothing (the recursion is boxed) and any other type
-/// its own level.
+/// A member's cost is one level plus its deepest payload, where a member of its
+/// own group is charged only as an application (the recursion is boxed) and any
+/// other type its own level; a member with no payload costs nothing. A group's
+/// level is the sum of its members' costs: rustc walks a path through every
+/// member of the group, and each member's payload, before it meets the cycle,
+/// so the deepest member alone does not bound it.
 fn nominal_levels<'u>(
     table: &Table<'u>,
     budget: &mut Budget,
 ) -> DResult<(NominalLevels, Option<DeclaredTooDeep<'u>>)> {
     let mut succ: Vec<Vec<usize>> = Vec::with_capacity(table.unions.len());
     for union in &table.unions {
-        let mut targets = Vec::new();
+        let mut targets = BTreeSet::new();
         for field in union.ctors.iter().flat_map(|c| c.args.iter()) {
             for node in nodes(field, budget)? {
                 if let canon::Type::Con { home, name, .. } = node
                     && let Some(target) = table.find(home, *name)
-                    && !targets.contains(&target)
                 {
-                    targets.push(target);
+                    targets.insert(target);
                 }
             }
         }
-        succ.push(targets);
+        succ.push(targets.into_iter().collect());
     }
     let components = components(&succ, budget)?;
     let mut by_index: Vec<u16> = vec![0; table.unions.len()];
     let mut levels = NominalLevels::default();
     let mut refused: Option<DeclaredTooDeep<'u>> = None;
     for (id, group) in components.members.iter().enumerate() {
-        let size = u16::try_from(group.len()).unwrap_or(u16::MAX);
         let named = |home: &[Symbol], name: Symbol| match table.find(home, name) {
             Some(i) if components.of.get(i) == Some(&id) => Named::InGroup,
             Some(i) => Named::Level(by_index.get(i).copied().unwrap_or(0)),
             None => Named::Level(0),
         };
-        let mut payload = None::<u16>;
+        let mut level = 0u16;
         let mut fields_by_member = Vec::with_capacity(group.len());
         for &u in group {
             let union = table.union(u)?;
             let mut per_ctor = Vec::with_capacity(union.ctors.len());
+            let mut payload = None::<u16>;
             for ctor in &union.ctors {
                 let deepest = deepest_field(ctor, budget, &named)?;
                 if !ctor.args.is_empty() {
@@ -470,24 +472,28 @@ fn nominal_levels<'u>(
                 }
                 per_ctor.push(deepest);
             }
-            fields_by_member.push((u, union, per_ctor));
+            let cost = payload.map_or(0, |deepest| deepest.saturating_add(1));
+            level = level.saturating_add(cost);
+            fields_by_member.push((u, union, per_ctor, cost));
         }
-        let level = payload.map_or(0, |deepest| size.saturating_add(deepest));
-        for (u, union, per_ctor) in fields_by_member {
+        for (u, union, per_ctor, cost) in fields_by_member {
             *by_index.get_mut(u).ok_or_else(walk_bug)? = level;
             levels.insert(&union.home, union.name, level);
             if u < table.own
                 && level > TYPE_DEPTH_LIMIT
                 && refused.is_none_or(|best| level < best.depth)
             {
-                // The constructor whose own payload crosses the ceiling, else
-                // the declaration, when the depth comes from another member.
+                // The constructor whose payload, over what the rest of the
+                // group costs, crosses the ceiling, else the declaration, when
+                // the depth comes from the other members.
+                let rest = level.saturating_sub(cost);
                 let span = union
                     .ctors
                     .iter()
                     .zip(&per_ctor)
                     .find(|(ctor, deepest)| {
-                        !ctor.args.is_empty() && size.saturating_add(**deepest) > TYPE_DEPTH_LIMIT
+                        !ctor.args.is_empty()
+                            && rest.saturating_add(1).saturating_add(**deepest) > TYPE_DEPTH_LIMIT
                     })
                     .map_or(union.name_span, |(ctor, _)| ctor.span);
                 refused = Some(DeclaredTooDeep {
@@ -636,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn a_self_recursive_type_is_its_group_size() -> DResult<()> {
+    fn a_self_recursive_type_is_one_level_over_its_payload() -> DResult<()> {
         let mut i = Interner::new();
         let home = [i.intern("Main")?];
         let (list, nil, cons, a) = (
@@ -660,7 +666,92 @@ mod tests {
                 ),
             ],
         )];
-        assert_eq!(levels_of(&unions)?.level(&home, list), 1);
+        // The `List a` field is one application over `a`.
+        assert_eq!(levels_of(&unions)?.level(&home, list), 2);
+        Ok(())
+    }
+
+    /// `n` applications of the builtin `Maybe` around `inner`.
+    fn maybes(maybe: Symbol, n: usize, inner: canon::Type) -> canon::Type {
+        (0..n).fold(inner, |t, _| con(&[], maybe, vec![t]))
+    }
+
+    #[test]
+    fn a_reference_to_its_own_group_nests_its_arguments() -> DResult<()> {
+        let mut i = Interner::new();
+        let home = [i.intern("Main")?];
+        let (w, leaf, node, a, int) = (
+            i.intern("W")?,
+            i.intern("Leaf")?,
+            i.intern("Node")?,
+            i.intern("a")?,
+            i.intern("Int")?,
+        );
+        // `Node (W (W (W Int)))`: each application of `W` is one level of the
+        // field the Rust enum holds, though `W` itself is boxed.
+        let field = (0..3).fold(con(&[], int, vec![]), |t, _| con(&home, w, vec![t]));
+        let unions = [union(
+            &home,
+            w,
+            vec![a],
+            vec![(leaf, vec![canon::Type::Var(a)]), (node, vec![field])],
+        )];
+        assert_eq!(levels_of(&unions)?.level(&home, w), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_recursive_group_costs_every_member_payload() -> DResult<()> {
+        let mut i = Interner::new();
+        let home = [i.intern("Main")?];
+        let (ta, tb, to_b, to_a, end, maybe) = (
+            i.intern("A")?,
+            i.intern("B")?,
+            i.intern("ToB")?,
+            i.intern("ToA")?,
+            i.intern("End")?,
+            i.intern("Maybe")?,
+        );
+        // Each member holds the other under `k` `Maybe`s. Neither payload
+        // alone nears the ceiling, but rustc walks `A`, `k` levels, `B`, `k`
+        // levels before it meets the cycle: `2 (k + 1)` deep.
+        let k = usize::from(TYPE_DEPTH_LIMIT) / 2;
+        let mut unions = [
+            union(
+                &home,
+                ta,
+                vec![],
+                vec![
+                    (end, vec![]),
+                    (to_b, vec![maybes(maybe, k, con(&home, tb, vec![]))]),
+                ],
+            ),
+            union(
+                &home,
+                tb,
+                vec![],
+                vec![(to_a, vec![maybes(maybe, k, con(&home, ta, vec![]))])],
+            ),
+        ];
+        let mut payload_spans = Vec::new();
+        for (n, u) in unions.iter_mut().enumerate() {
+            let lo = u32::try_from(n).unwrap_or(u32::MAX);
+            if let Some(ctor) = u.ctors.iter_mut().find(|c| !c.args.is_empty()) {
+                ctor.span = Span::new(lo, lo.saturating_add(1));
+                payload_spans.push(ctor.span);
+            }
+        }
+        let deep = TYPE_DEPTH_LIMIT + 2;
+        let table = Table::new(&unions, &[]);
+        let (levels, refused) = nominal_levels(&table, &mut budget())?;
+        assert_eq!(levels.level(&home, ta), deep);
+        assert_eq!(levels.level(&home, tb), deep);
+        // Refused at a member's payload constructor, over the other's cost.
+        let refused = refused.map(|r| (r.span, r.depth));
+        assert!(
+            refused.is_some_and(|(span, depth)| depth == deep && payload_spans.contains(&span)),
+            "{refused:?}",
+        );
         Ok(())
     }
 
