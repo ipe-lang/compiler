@@ -1,4 +1,4 @@
-module Lib.Db exposing (BreakAt(..), Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
+module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
 
 import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
 import Ipe.Config as Config
@@ -821,9 +821,15 @@ unnamedDecoder =
         |> Db.Decode.required "unnamed" (Db.Decode.int "unnamed")
 
 
+-- The guards of `appendOnlyGuards` the file holds. A trigger name is unique
+-- in `sqlite_master`, so each guard is at most one row and the read takes
+-- at most one per guard, however many other triggers the file holds.
 presentGuards : ReviewFile -> Db -> Task.Task Error (List String)
 presentGuards loc db =
-    Db.queryDecode db "SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger'" [] guardDecoder
+    Db.queryDecode db
+        ("SELECT guard FROM (SELECT name || ' on ' || tbl_name AS guard FROM sqlite_master WHERE type = 'trigger') WHERE guard IN (" ++ Index.placeholders (List.length appendOnlyGuards) ++ ") LIMIT ?")
+        (List.map SqlString appendOnlyGuards ++ [ SqlInt (List.length appendOnlyGuards) ])
+        guardDecoder
         |> Task.onError (Settings.openFailure ReviewDb loc.path)
 
 
@@ -850,25 +856,46 @@ logPageCeiling =
 
 
 -- The review log's head: the one `review_log_head` row. A missing or extra
--- row is a failed read, never a default head.
+-- row, or one holding a cell past its ceiling, is a failed read, never a
+-- default head.
 currentHead : Db -> Task.Task Error Index.ChainHead
 currentHead db =
     headRows db |> Task.andThen oneHead
 
 
-headRows : Db -> Task.Task Error (List Index.ChainHead)
+-- A head row as read: held when every cell is within its ceiling.
+type HeadRead
+    = HeadHeld Index.ChainHead
+    | HeadUnheld
+
+
+-- At most two head rows, enough to see a second whatever key the file's
+-- table declares, each cell read under `headCellCeilings`.
+headRows : Db -> Task.Task Error (List HeadRead)
 headRows db =
-    Db.queryDecode db "SELECT log_id, seq, head, key_check FROM review_log_head WHERE one = 1" [] Index.chainHeadDecoder
+    Db.queryDecode db
+        ("SELECT seq, " ++ heldCells headCellCeilings ++ ", " ++ anyUnheld headCellCeilings ++ " AS unheld FROM review_log_head WHERE one = 1 LIMIT 2")
+        []
+        (Db.Decode.map2 headReadOf Index.chainHeadDecoder unheldDecoder)
 
 
-oneHead : List Index.ChainHead -> Task.Task Error Index.ChainHead
+headReadOf : Index.ChainHead -> Bool -> HeadRead
+headReadOf head unheld =
+    if unheld then
+        HeadUnheld
+
+    else
+        HeadHeld head
+
+
+oneHead : List HeadRead -> Task.Task Error Index.ChainHead
 oneHead rows =
     case rows of
-        [ head ] ->
+        [ HeadHeld head ] ->
             Task.succeed head
 
         _ ->
-            Task.fail (Error.unexpected "review_log_head did not return exactly one row")
+            Task.fail (Error.unexpected "review_log_head did not return exactly one readable row")
 
 
 -- How many entries the log holds past the head's seq.
@@ -1082,7 +1109,7 @@ reasonField reason =
 -- trusted: classified only by `entryOf`. Its pair is read through
 -- `Index.decidedPairDecoder`, so a uid that is not a unit id fails the read.
 type LogRow
-    = LogRow { seq : Int, pair : DecidedPair, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, name : RowName }
+    = LogRow { seq : Int, pair : DecidedPair, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, name : RowName, held : Bool }
 
 
 logRowDecoder : Db.Decode.Decoder LogRow
@@ -1090,30 +1117,108 @@ logRowDecoder =
     Db.Decode.map3 logRowOf Index.decidedPairDecoder logColumnsDecoder rowNameDecoder
 
 
-logColumnsDecoder : Db.Decode.Decoder { seq : Int, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String }
+logColumnsDecoder : Db.Decode.Decoder { seq : Int, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, unheld : Int }
 logColumnsDecoder =
-    Db.Decode.succeed (\seq decision reason reviewedAt prev mac -> { seq = seq, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac })
+    Db.Decode.succeed (\seq decision reason reviewedAt prev mac unheld -> { seq = seq, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac, unheld = unheld })
         |> Db.Decode.required "seq" (Db.Decode.int "seq")
         |> Db.Decode.required "decision" (Db.Decode.string "decision")
         |> Db.Decode.required "reason" (Db.Decode.nullable (Db.Decode.string "reason"))
         |> Db.Decode.required "reviewed_at" (Db.Decode.int "reviewed_at")
         |> Db.Decode.required "prev" (Db.Decode.string "prev")
         |> Db.Decode.required "mac" (Db.Decode.string "mac")
+        |> Db.Decode.required "unheld" (Db.Decode.int "unheld")
 
 
-logRowOf : DecidedPair -> { seq : Int, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String } -> RowName -> LogRow
+logRowOf : DecidedPair -> { seq : Int, decision : String, reason : Maybe String, reviewedAt : Int, prev : String, mac : String, unheld : Int } -> RowName -> LogRow
 logRowOf pair cols name =
-    LogRow { seq = cols.seq, pair = pair, decision = cols.decision, reason = cols.reason, reviewedAt = cols.reviewedAt, prev = cols.prev, mac = cols.mac, name = name }
+    LogRow { seq = cols.seq, pair = pair, decision = cols.decision, reason = cols.reason, reviewedAt = cols.reviewedAt, prev = cols.prev, mac = cols.mac, name = name, held = cols.unheld == 0 }
 
 
--- The columns every review-log reader selects: each one a row's mac covers.
+-- The columns every review-log reader selects: each one a row's mac covers,
+-- each text cell read under `logCellCeilings`, and whether any is unheld.
 logColumns : String
 logColumns =
-    "SELECT seq, uid, body_hash, decision, reason, reviewed_at, prev, mac, unit_kind, unit_qualified, unit_path, unit_line FROM review_log"
+    "SELECT seq, " ++ heldCells logCellCeilings ++ ", reviewed_at, unit_line, " ++ anyUnheld logCellCeilings ++ " AS unheld FROM review_log"
 
 
--- True exactly when the row's mac, parsed once, is the tag of its columns
--- under `key` in the log `logId`. An unparsable mac never verifies.
+-- ── cell windows ────────────────────────────────────────────────────────
+--
+-- A review-database text cell is read only under its byte ceiling, judged
+-- database-side: a text cell of at most `bytes` bytes is read whole, a
+-- NULL as NULL, and any other cell (past the ceiling, or not text) as the
+-- empty string beside an `unheld` flag, so no cell past its ceiling is ever
+-- allocated, whatever the file's schema admits. An unheld review-log row
+-- never verifies; an unheld head row is no head.
+
+-- A column and the most bytes a cell of it is read with.
+type alias CellCeiling =
+    { column : String, bytes : Int }
+
+
+-- Each review-log text column a row's mac covers, under the most bytes the
+-- app writes there: a unit id, an attestation, a decision's word, a
+-- `Reason` (at most four UTF-8 bytes a character), a mac (or `genesis`),
+-- and a name part under the name columns' own CHECK.
+logCellCeilings : List CellCeiling
+logCellCeilings =
+    [ { column = "uid", bytes = Uid.uidLength }
+    , { column = "body_hash", bytes = Index.attestedHashMaxBytes }
+    , { column = "decision", bytes = String.length "approve" }
+    , { column = "reason", bytes = reasonMaxChars * 4 }
+    , { column = "prev", bytes = macHexBytes }
+    , { column = "mac", bytes = macHexBytes }
+    , { column = "unit_kind", bytes = nameCellBytes }
+    , { column = "unit_qualified", bytes = nameCellBytes }
+    , { column = "unit_path", bytes = nameCellBytes }
+    ]
+
+
+-- Each `review_log_head` text column under its CHECK's length.
+headCellCeilings : List CellCeiling
+headCellCeilings =
+    [ { column = "log_id", bytes = 32 }
+    , { column = "head", bytes = macHexBytes }
+    , { column = "key_check", bytes = macHexBytes }
+    ]
+
+
+-- A mac's length in hex digits, the review log's `mac` CHECK.
+macHexBytes : Int
+macHexBytes =
+    64
+
+
+-- The most bytes a name column's CHECK admits: four UTF-8 bytes for each
+-- of `UnitName.nameMaxChars` characters.
+nameCellBytes : Int
+nameCellBytes =
+    UnitName.nameMaxChars * 4
+
+
+cellHeld : CellCeiling -> String
+cellHeld cell =
+    "(typeof(" ++ cell.column ++ ") = 'text' AND length(CAST(" ++ cell.column ++ " AS BLOB)) <= " ++ String.fromInt cell.bytes ++ ")"
+
+
+heldCells : List CellCeiling -> String
+heldCells cells =
+    String.join ", " (List.map (\cell -> "CASE WHEN " ++ cellHeld cell ++ " THEN " ++ cell.column ++ " WHEN " ++ cell.column ++ " IS NULL THEN NULL ELSE '' END AS " ++ cell.column) cells)
+
+
+anyUnheld : List CellCeiling -> String
+anyUnheld cells =
+    "(" ++ String.join " OR " (List.map (\cell -> "(" ++ cell.column ++ " IS NOT NULL AND NOT " ++ cellHeld cell ++ ")") cells) ++ ")"
+
+
+unheldDecoder : Db.Decode.Decoder Bool
+unheldDecoder =
+    Db.Decode.succeed (\unheld -> unheld /= 0)
+        |> Db.Decode.required "unheld" (Db.Decode.int "unheld")
+
+
+-- True exactly when every cell of the row was held and its mac, parsed
+-- once, is the tag of its columns under `key` in the log `logId`. An
+-- unparsable mac never verifies.
 rowVerifies : MacKey -> String -> LogRow -> Bool
 rowVerifies key logId row =
     case row of
@@ -1122,7 +1227,7 @@ rowVerifies key logId row =
                 ( uid, bodyHash ) =
                     Index.decidedPairKey r.pair
             in
-            rowSignedBy key logId r.seq r.prev (storedUid uid) bodyHash r.decision r.reason r.reviewedAt r.name r.mac
+            r.held && rowSignedBy key logId r.seq r.prev (storedUid uid) bodyHash r.decision r.reason r.reviewedAt r.name r.mac
 
 
 -- A row's decision column parsed: Nothing for any text but `approve` or
@@ -1253,8 +1358,8 @@ verdictOf key tx size ceiling refusal head =
 
 -- One review-log row as the walk reads it: every column its mac covers, the
 -- uid as stored and the name as decoded, so a row whose uid is not a unit
--- id, or whose name is malformed, breaks the chain at its seq rather than
--- failing the walk.
+-- id, whose name is malformed, or whose cells are unheld, breaks the chain
+-- at its seq rather than failing the walk.
 type alias WalkRow =
     { seq : Int
     , uid : StoredUid
@@ -1265,6 +1370,7 @@ type alias WalkRow =
     , prev : String
     , mac : String
     , name : RowName
+    , held : Bool
     }
 
 
@@ -1279,6 +1385,7 @@ type alias WalkColumns =
     , reviewedAt : Int
     , prev : String
     , mac : String
+    , held : Bool
     }
 
 
@@ -1289,12 +1396,12 @@ walkRowDecoder =
 
 walkRowOf : WalkColumns -> RowName -> WalkRow
 walkRowOf c name =
-    { seq = c.seq, uid = c.uid, bodyHash = c.bodyHash, decision = c.decision, reason = c.reason, reviewedAt = c.reviewedAt, prev = c.prev, mac = c.mac, name = name }
+    { seq = c.seq, uid = c.uid, bodyHash = c.bodyHash, decision = c.decision, reason = c.reason, reviewedAt = c.reviewedAt, prev = c.prev, mac = c.mac, name = name, held = c.held }
 
 
 walkColumnsDecoder : Db.Decode.Decoder WalkColumns
 walkColumnsDecoder =
-    Db.Decode.succeed (\seq uid bodyHash decision reason reviewedAt prev mac -> { seq = seq, uid = StoredUid uid, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac })
+    Db.Decode.succeed (\seq uid bodyHash decision reason reviewedAt prev mac unheld -> { seq = seq, uid = StoredUid uid, bodyHash = bodyHash, decision = decision, reason = reason, reviewedAt = reviewedAt, prev = prev, mac = mac, held = unheld == 0 })
         |> Db.Decode.required "seq" (Db.Decode.int "seq")
         |> Db.Decode.required "uid" (Db.Decode.string "uid")
         |> Db.Decode.required "body_hash" (Db.Decode.string "body_hash")
@@ -1303,6 +1410,7 @@ walkColumnsDecoder =
         |> Db.Decode.required "reviewed_at" (Db.Decode.int "reviewed_at")
         |> Db.Decode.required "prev" (Db.Decode.string "prev")
         |> Db.Decode.required "mac" (Db.Decode.string "mac")
+        |> Db.Decode.required "unheld" (Db.Decode.int "unheld")
 
 
 -- The state one walk step carries: pages read, the seq the next entry must
@@ -1405,9 +1513,10 @@ walkStep key db size ceiling refusal head walk =
 
 -- One page of rows followed from the walk's expected seq and mac: the walk
 -- after the page, each row's pair added to its digest, or the first entry
--- the chain breaks at. A missing entry breaks at its seq; an entry linking
--- another mac, holding a uid that is not a unit id or a malformed name, or
--- whose own mac does not verify under the key, breaks at its own.
+-- the chain breaks at. A missing entry breaks at its seq; an entry holding
+-- a cell past its ceiling, linking another mac, holding a uid that is not a
+-- unit id or a malformed name, or whose own mac does not verify under the
+-- key, breaks at its own.
 followRows : MacKey -> String -> ChainWalk -> List WalkRow -> Result Int ChainWalk
 followRows key logId walk rows =
     List.foldl
@@ -1420,7 +1529,7 @@ followRows key logId walk rows =
                     if row.seq /= at.nextSeq then
                         Err at.nextSeq
 
-                    else if Crypto.constantTimeEqual row.prev at.prev && storedIsUnitId row.uid && rowSignedBy key logId row.seq row.prev row.uid row.bodyHash row.decision row.reason row.reviewedAt row.name row.mac then
+                    else if row.held && Crypto.constantTimeEqual row.prev at.prev && storedIsUnitId row.uid && rowSignedBy key logId row.seq row.prev row.uid row.bodyHash row.decision row.reason row.reviewedAt row.name row.mac then
                         Ok { pagesRead = at.pagesRead, nextSeq = at.nextSeq + 1, prev = row.mac, pairs = Index.digestPair (Signing key) (storedUidText row.uid) row.bodyHash at.pairs }
 
                     else
@@ -1696,6 +1805,8 @@ isVerified entry =
             False
 
 
+-- The legacy row for a pair: the read takes one row, whatever key the
+-- file's table declares.
 findLegacy : Db -> Uid -> String -> Task.Task Error (Maybe LegacyRow)
 findLegacy db uid bodyHash =
     case reviewStore of
@@ -1705,6 +1816,7 @@ findLegacy db uid bodyHash =
         Ok store ->
             Store.query store
                 |> Store.where (Store.and [ Store.eq .uid (Uid.toString uid), Store.eq .bodyHash bodyHash ])
+                |> Store.limit 1
                 |> Store.toMaybe db
                 |> Task.andThen fromMaybeRecord
 
