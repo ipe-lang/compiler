@@ -927,6 +927,30 @@ pub fn zonk_emitted(uf: &mut UnionFind<Content>, budget: &mut Budget, var: VarId
     read_back(uf, budget, RowReading::Emitted, var)
 }
 
+/// Read `var` back for a diagnostic reported at `span`.
+///
+/// An error raised before [`measure_type_depth`] runs reads back a type no
+/// ceiling has bounded yet, and renders it through the recursive `ty_to_doc`.
+/// The type is measured first: past either ceiling, the refusal is the
+/// diagnostic, sited at `span`, and the type is never read back or rendered.
+///
+/// # Errors
+/// [`TypeError::TypeTooDeep`] or [`TypeError::TypeTooLarge`] at `span` when
+/// the type passes a ceiling; otherwise as [`TypeMeasures::measure`] and
+/// [`zonk`].
+pub fn zonk_reported(
+    uf: &mut UnionFind<Content>,
+    budget: &mut Budget,
+    var: VarId,
+    span: Span,
+) -> DResult<Ty> {
+    let measure = TypeMeasures::default().measure(uf, budget, var)?;
+    match measure.refusal(span) {
+        Some(refusal) => Err(refusal),
+        None => zonk(uf, budget, var),
+    }
+}
+
 /// The stacks one [`read_back`] walk drives: pending tasks, assembled results,
 /// and the read-back cache keyed by union-find representative.
 ///

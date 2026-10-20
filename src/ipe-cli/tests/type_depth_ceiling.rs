@@ -301,3 +301,63 @@ fn a_type_doubling_past_the_size_ceiling_is_refused() {
         })
     );
 }
+
+/// `main`'s body comparing the last binding with `0`, a type mismatch for
+/// every chain whose value is not a number.
+fn compare_with_zero(last: &str, _: usize) -> String {
+    format!("Io.println (if {last} == 0 then \"zero\" else \"other\")")
+}
+
+/// The byte range of `src`'s last line, `main`'s body in every chain.
+fn body_range(src: &str) -> (u32, u32) {
+    let body = src.trim_end_matches('\n');
+    let lo = body.rfind('\n').map_or(0, |at| at + 1);
+    (offset(lo), offset(body.len()))
+}
+
+/// Assert `result` is refused with `code` at a span inside `main`'s body.
+fn assert_refused_in_body(result: &Result<(), CliError>, src: &str, code: ipe_diagnostics::Code) {
+    let diag = refusal(result);
+    assert_eq!(diag.map(Diagnostic::code), Some(code), "{result:?}");
+    let (lo, hi) = body_range(src);
+    let span = match diag {
+        Some(Diagnostic::Type { span, .. }) => Some(*span),
+        _ => None,
+    };
+    assert!(
+        span.is_some_and(|s| s != Span::DUMMY && lo <= s.lo && s.lo < s.hi && s.hi <= hi),
+        "refused at {span:?}, not inside main's body {lo}..{hi}: {result:?}"
+    );
+}
+
+/// A mismatch raised while solving, before every type is measured, over a
+/// type past the depth ceiling is refused with IPE-T0022 at the mismatch; the
+/// type is never read back or rendered for the mismatch's message.
+#[test]
+fn a_mismatch_over_a_type_past_the_depth_ceiling_is_refused_at_the_mismatch() {
+    let former = Former {
+        name: "record",
+        imports: "",
+        decls: "",
+        wrap: |x| format!("{{ a = {x} }}"),
+        body: compare_with_zero,
+        short_of_ceiling: 0,
+        refused_at: RefusedAt::Body,
+    };
+    let past = chain(&former, usize::from(TYPE_DEPTH_LIMIT) + 1);
+    assert_refused_in_body(&front_check(&past.src), &past.src, IPE_T0022);
+}
+
+/// A mismatch raised while solving, before every type is measured, over a
+/// type that unfolds past the size ceiling is refused with IPE-T0023 at the
+/// mismatch, never at an unknown place.
+#[test]
+fn a_mismatch_over_a_type_past_the_size_ceiling_is_refused_at_the_mismatch() {
+    let doubled = doubling_chain(16).src;
+    let src = doubled.replace(
+        "Io.println (if p16 == p16 then \"same\" else \"differs\")",
+        &compare_with_zero("p16", 16),
+    );
+    assert_ne!(src, doubled, "the chain's body must be replaced");
+    assert_refused_in_body(&front_check(&src), &src, IPE_T0023);
+}
