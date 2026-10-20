@@ -5316,4 +5316,128 @@ mod parsed_manifest_tests {
             "the emit re-read the edited manifest:\n{cargo_toml}"
         );
     }
+
+    /// A project at `base` with the wrapper crate `engine_wrap` installed from `wrappers/engine`.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn wrapper_project(base: &std::path::Path) -> std::path::PathBuf {
+        let project = base.to_path_buf();
+        std::fs::create_dir_all(project.join("src")).expect("project src/");
+        std::fs::write(
+            project.join("package.ipe"),
+            "module Package exposing (package)\n\npackage =\n    { name = \"app\" }\n",
+        )
+        .expect("package.ipe");
+        std::fs::write(
+            project.join("src/Main.ipe"),
+            "module Main exposing (main)\n\n\nmain : Int\nmain =\n    1\n",
+        )
+        .expect("src/Main.ipe");
+        write_wrapper(&project.join("wrappers/engine"));
+        let cache = ipe_ffi::driver::FfiCache::at_project_root(&project);
+        let inspection = r#"{"pkg":"engine_wrap","name":"engine_wrap","version":"0.1.0","wrapperPath":"wrappers/engine","functions":[{"name":"shift","params":[{"name":"n","type":"i64"}],"results":[{"name":"","type":"i64"}],"effect":"pure"}],"constants":[],"errors":[]}"#;
+        let installed = ipe_ffi::driver::install_from_inspection(&cache, inspection);
+        assert!(installed.is_ok(), "install the wrapper: {installed:?}");
+        project
+    }
+
+    /// A wrapper crate directory named `engine_wrap` at `dir`.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn write_wrapper(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("src")).expect("wrapper dir");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"engine_wrap\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("wrapper manifest");
+        std::fs::write(dir.join("src/lib.rs"), "").expect("wrapper lib");
+    }
+
+    /// Emit `held` into a claimed crate under `base`.
+    #[cfg(unix)]
+    fn emit_under(
+        held: &HeldBuild,
+        base: &std::path::Path,
+    ) -> Result<super::EmittedCrate, crate::CliError> {
+        let runtime = super::super::resolve_runtime()?;
+        std::fs::create_dir_all(base).map_err(|e| crate::io_err(base, e))?;
+        let crate_dir = OwnedDir::claim(&base.join("crate"))?;
+        held.emit(
+            &EmitTarget::Claimed(crate_dir),
+            &runtime,
+            &BuildOptions {
+                runtime_dep: true,
+                ..BuildOptions::default()
+            },
+            HostIntent::Served,
+        )
+    }
+
+    /// A wrapper swapped for a link to an outside tree after the read is never bound.
+    ///
+    /// The catalog read proved `wrappers/engine` inside the root. A swap of
+    /// that directory for a link to a crate outside the root, and a rename of
+    /// the whole project replaced by a copy, both leave the emit refused
+    /// before any `Cargo.toml` binds the path. The control emits the path.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn a_wrapper_swapped_after_the_read_is_never_bound() {
+        let base = crate::scratch::ScratchDir::new("ipe-wrapper-swap").expect("scratch base");
+        let held_at = |project: &std::path::Path| {
+            HeldBuild::read(
+                ProjectRoot::resolve(RootArg::at(project)).expect("the root resolves"),
+                false,
+            )
+            .expect("the project reads")
+        };
+        let moved = |err: &crate::CliError| {
+            matches!(
+                err,
+                crate::CliError::TrustRefused(
+                    crate::owner_trust::TrustRefusal::FfiWrapperMoved { package, .. }
+                ) if package == "engine_wrap"
+            )
+        };
+
+        let control = wrapper_project(&base.path().join("control"));
+        let wrapper = std::fs::canonicalize(control.join("wrappers/engine")).expect("canonical");
+        let emitted = emit_under(&held_at(&control), &base.path().join("control-out"))
+            .expect("the unswapped project emits");
+        let cargo_toml =
+            std::fs::read_to_string(emitted.path().join("Cargo.toml")).expect("emitted Cargo.toml");
+        assert!(
+            cargo_toml.contains(&format!("path = \"{}\"", wrapper.display())),
+            "the control binds the wrapper path:\n{cargo_toml}"
+        );
+
+        let linked = wrapper_project(&base.path().join("linked"));
+        let held = held_at(&linked);
+        let outside = base.path().join("outside-engine");
+        write_wrapper(&outside);
+        let engine = linked.join("wrappers/engine");
+        std::fs::rename(&engine, base.path().join("linked-engine-away")).expect("move away");
+        std::os::unix::fs::symlink(&outside, &engine).expect("plant the link");
+        let out = base.path().join("linked-out");
+        let err = emit_under(&held, &out).expect_err("a linked wrapper is refused");
+        assert!(moved(&err), "{err:?}");
+        assert!(
+            !out.join("crate").join("Cargo.toml").exists(),
+            "no Cargo.toml binds the linked path"
+        );
+
+        let renamed = wrapper_project(&base.path().join("renamed"));
+        let held = held_at(&renamed);
+        std::fs::rename(&renamed, base.path().join("renamed-away")).expect("rename away");
+        let planted = wrapper_project(&base.path().join("renamed"));
+        assert_eq!(planted, renamed, "the copy takes the old path");
+        let out = base.path().join("renamed-out");
+        let err = emit_under(&held, &out).expect_err("a replaced project's wrapper is refused");
+        assert!(moved(&err), "{err:?}");
+        assert!(
+            !out.join("crate").join("Cargo.toml").exists(),
+            "no Cargo.toml binds the replaced path"
+        );
+    }
 }

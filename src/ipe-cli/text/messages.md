@@ -1672,6 +1672,10 @@ installed FFI crate `{krate}` claims the module `{module}`, which is reserved fo
 
 installed FFI crate `{krate}` declares wrapper `{wrapper}`, which uses the reserved asserted-shim prefix `{prefix}` — refusing to load the cache
 
+## ffi-wrapper-moved
+
+refusing to emit: the wrapper crate `{package}` at `{path}` is no longer the directory the project's FFI catalog was read from, so the emitted `Cargo.toml` would bind another tree. Replace any link there with the wrapper directory itself and build again
+
 ## ffi-reserved-module-exists
 
 module `{module}` already exists — it is reserved for the asserted-call surface (`Rust.Ffi.call`)

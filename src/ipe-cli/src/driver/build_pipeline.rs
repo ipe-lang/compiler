@@ -2839,8 +2839,10 @@ pub fn build_parsed_project_into(
 ///
 /// # Errors
 /// [`CliError::Usage`] for a debugger request with no runtime dependency, or
-/// for a webview request whose held shape is not a web program; otherwise as
-/// [`build_from_sources`].
+/// for a webview request whose held shape is not a web program;
+/// [`CliError::TrustRefused`] for a wrapper crate the held catalog binds by
+/// path that is no longer below the held root
+/// ([`crate::ffi::hold_wrapper_deps`]); otherwise as [`build_from_sources`].
 pub fn build_root_into(
     held: &super::HeldBuild,
     out: OutTarget<'_>,
@@ -2853,6 +2855,7 @@ pub fn build_root_into(
         crate::pack::desktop::require_webview(super::desktop_app_shape(held.shape()))
             .map_err(|refusal| CliError::Usage(text::Message::relay(&refusal)))?;
     }
+    crate::ffi::hold_wrapper_deps(held.root(), &held.snapshot().ffi().catalog)?;
     build_from_sources_for(
         held.root().manifest(),
         held.manifest_path(),
