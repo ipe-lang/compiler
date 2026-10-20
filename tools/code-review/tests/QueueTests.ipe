@@ -36,7 +36,7 @@ import Lib.RepoPath as RepoPath exposing (PathError(..), Root, RootMap)
 import Lib.ReviewKey as ReviewKey exposing (ReviewKey(..))
 import Lib.SafeText as SafeText
 import Lib.Uid as Uid exposing (Uid)
-import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, insertUnboundUnit, labelOf, labelText)
+import TestSupport exposing (openFileAt, piecesShown, quotedLabelOf, tableExists, countReviewRows, expectErr, refuse, seedIndex, writeFileText, fixtureLibRs, fixtureMainIpe, viewA, viewB, viewTag, shownTextOf, unitViewTag, execIndex, execIndexUnchecked, Scratch, freshScratch, freshDir, check, indexSchemaStatements, execIndexSchema, seedIndexDb, insertUnitRows, setIndexEnv, loadFirstPage, indexConn, loadUnitNow, decideNow, envSettings, envReview, envAppSettings, loadPageNow, drainThenLoadNow, loadUnitViewNow, drainUnitNow, decideShownNow, decidedRefusalNow, accepted, refusalOf, refusedAs, decidedNow, resyncReviewedNow, resyncReviewedWithinNow, shownOf, PageEntry, checkUnits, listSecond, isUnitA, isUnitB, cleanupIndex, removeFileIfAny, codeText, noHazard, rendered, renderedForeign, describeText, refusedFor, migratedReviewAt, tableRowCounts, openReadOnlyAt, vectorsPath, ipeIndexTestFile, repoFile, probeMessage, probeNames, maybeContains, isNew, isUnrecorded, mirroredCount, stampOf, reviewHeadOf, uid, resyncBoundOf, appendSigned, RawName(..), rawRow, tamperLog, logIdOf, headTextOf, logRowCount, loadHistoryPageNow, carriesFailure, logVerdictOf, appendSignedWithUidText, insertUnboundUnit, labelOf, labelText)
 
 
 -- ── decisions on attested bytes ─────────────────────────────────────────
@@ -1077,7 +1077,7 @@ standingNotCounted : Bool
 standingNotCounted =
     let
         row why =
-            Just (Unverified { uid = uid "u-a", bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
+            Just (Unverified { uid = Just (uid "u-a"), bodyHash = "h", reviewedAt = Timestamp.fromUnixMillis 0, why = why })
     in
     Queue.standingOf (row Tampered) == Queue.NotCounted Tampered
         && Queue.standingOf (row ChainBroken) == Queue.NotCounted ChainBroken
@@ -2251,6 +2251,26 @@ brokenChainCountsNothing =
             )
 
 
+-- A History row whose uid column holds text that is no unit id, signed so
+-- its own mac and link verify, reads as `Tampered`, names no unit id and is
+-- `Unnamed`, and the History page still loads with the row before it. Red
+-- if a stored uid is taken for a unit id without parsing it, failing the
+-- whole page, or if such a row is given a name.
+malformedUidRowUnnamed : Task.Task Error Bool
+malformedUidRowUnnamed =
+    do
+        at <- freshScratch "ipe-index-log-malformed-uid"
+        db <- seedProgressScratch at
+        insertReviewRow db "u-a" (Index.attest viewA)
+        appendSignedWithUidText db "not-a-unit-id" (rawRow "u-b" "h-b" "approve" Nothing)
+        history <- loadHistoryPageNow HistoryStart
+        cleanupProgressScratch at
+        Task.succeed
+            (List.length history.rows == 2
+                && List.map (\row -> ( whyOf row.entry, Queue.entryUid row.entry, describeLabel row.label )) (List.filter (\row -> Queue.entryUid row.entry == Nothing) history.rows) == [ ( Just Tampered, Nothing, describeLabel Unnamed ) ]
+            )
+
+
 -- An entry removed below an unmoved head is seen on the next page load, with
 -- no rebuild asked for: two units decided and drained through the tool, so
 -- the copy's stamp is current for an intact chain, then the first entry
@@ -2840,6 +2860,7 @@ checks =
                     , check "a decided refusal flipped to an approval is back in the queue" flippedRefusalBackInQueue
                     , check "a forged log entry leaves its unit queued" forgedEntryLeavesUnitQueued
                     , check "a broken chain counts nothing, shows its banner and refuses a decision" brokenChainCountsNothing
+                    , check "a History row whose stored uid is no unit id reads as tampered and unnamed" malformedUidRowUnnamed
                     , check "an entry removed below an unmoved head is seen on the next page load" removedEntryBelowHeadSeenOnLoad
                     , check "an entry edited below an unmoved head breaks the chain on the next page load" editedRowBelowHeadBreaksPerLoad
                     , check "an equal entry count never reads as an intact log" countingOnlyIntactIsGone
@@ -2927,7 +2948,7 @@ labelsFor : String -> Queue.HistoryPage -> List String
 labelsFor label page =
     List.filterMap
         (\row ->
-            if Queue.entryUid row.entry == uid label then
+            if Queue.entryUid row.entry == Just (uid label) then
                 Just (describeLabel row.label)
 
             else

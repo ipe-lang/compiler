@@ -744,12 +744,11 @@ uidTextNames imports =
 
 
 -- Every site a uid becomes text: the unit place a page shows beside its
--- path, the internal link target and key, the stored key and its lookup
--- bind, and the store's refusal of a row it cannot read.
+-- path, the internal link target and key, the stored key, and the store's
+-- refusal of a row it cannot read.
 admittedUidTexts : List String
 admittedUidTexts =
-    [ "Lib/Db.ipe:findLegacy"
-    , "Lib/Db.ipe:storedDecision"
+    [ "Lib/Db.ipe:storedDecision"
     , "Lib/Db.ipe:storedUid"
     , "Lib/Links.ipe:linkKey"
     , "Lib/View.ipe:linkEl"
@@ -809,6 +808,7 @@ uidTextScanRefuses =
                     && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid as U" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    U.toString uid" sources))
                     && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid exposing (toString)" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    toString uid" sources))
                     && uidCaught (appendTo "Lib/UnitName.ipe" "shown name =\n    Uid.toString (uid name)" sources)
+                    && uidCaught (appendTo "Lib/Db.ipe" "legacyKey uid =\n    Uid.toString uid" sources)
                     && uidCaught (List.filter (\scanned -> scanned.rel /= "Lib/Links.ipe") sources)
                     && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Queue.ipe" "labelOf uid =\n    myUid.toStringLabel uid" sources))
                     && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Uid.ipe" "shown uid =\n    Uid.toString uid" sources))
@@ -818,6 +818,437 @@ uidTextScanRefuses =
 uidCaught : List ScanModule -> Bool
 uidCaught sources =
     not (List.isEmpty (uidTextViolations admittedUidTexts sources))
+
+
+-- ── reads carry their bound ─────────────────────────────────────────────
+--
+-- Every read under `src/Lib` is bounded by the code that issues it, never by
+-- the size the schema or the database holds. A read is a `queryDecode` call
+-- or a `Store` run that returns rows. Its seed is its own statement, the
+-- read's line (or the head of the pipeline it ends) and the deeper lines
+-- after it, and the bindings of the names that statement uses: the `let`
+-- binding above it, or the scrutinee of the `case` arm binding them. A
+-- `queryDecode` read is bounded when a `LIMIT` sits outside every
+-- parenthesis of the SQL text written in its seed, or in a same-module
+-- definition the seed names, up to `readReachDepth` deep. A `Store` run is
+-- never bounded: `Store.limit` bounds no runner that takes no query, and
+-- every run decodes its cells whole, past any per-cell window. A read not
+-- bounded is one aggregate row by construction: it is admitted, keyed
+-- `rel:name` with the count of such reads the definition issues, holds an
+-- aggregate token in its seed and reaches no `GROUP`.
+
+-- A top-level definition: its name, the first token of its column-0
+-- lowercase lines, and the code of each of its lines.
+type alias TopDef =
+    { name : String, lines : List String }
+
+
+-- The top-level definitions of `text` in order. Consecutive column-0 lines
+-- of one name, a type annotation and its definition, are one definition;
+-- every other line belongs to the definition above it.
+topDefsOf : String -> List TopDef
+topDefsOf text =
+    List.reverse (List.foldl topDefStep [] (String.lines text))
+
+
+topDefStep : String -> List TopDef -> List TopDef
+topDefStep line defs =
+    let
+        code =
+            codeOf line
+
+        opened =
+            if leadsWith Char.isLower line then
+                List.head (tokens line)
+
+            else
+                Nothing
+    in
+    case defs of
+        current :: rest ->
+            case opened of
+                Just name ->
+                    if name == current.name then
+                        { current | lines = current.lines ++ [ code ] } :: rest
+
+                    else
+                        { name = name, lines = [ code ] } :: defs
+
+                Nothing ->
+                    { current | lines = current.lines ++ [ code ] } :: rest
+
+        [] ->
+            case opened of
+                Just name ->
+                    [ { name = name, lines = [ code ] } ]
+
+                Nothing ->
+                    []
+
+
+defTokens : TopDef -> List String
+defTokens def =
+    List.concatMap tokens def.lines
+
+
+-- A read's seed: the read calls on its line, its statement, and the lines
+-- binding the names its statement uses.
+type alias ReadSeed =
+    { calls : List String, statement : List String, bindings : List String }
+
+
+-- The seed of each read `def` issues, one per line holding a read call.
+readSeedsOf : TopDef -> List ReadSeed
+readSeedsOf def =
+    List.concat
+        (List.indexedMap
+            (\at line ->
+                case List.filter isReadCall (tokens line) of
+                    [] ->
+                        []
+
+                    calls ->
+                        [ readSeedAt def.lines at calls ]
+            )
+            def.lines
+        )
+
+
+readSeedAt : List String -> Int -> List String -> ReadSeed
+readSeedAt lines at calls =
+    let
+        from =
+            statementStart lines at
+
+        statement =
+            statementFrom lines from
+    in
+    { calls = calls
+    , statement = statement
+    , bindings = List.concatMap (bindingOf lines from) (List.unique (List.concatMap tokens statement))
+    }
+
+
+-- The line the statement holding line `at` opens on: that line, or for a
+-- pipeline step, the nearest line above it indented less.
+statementStart : List String -> Int -> Int
+statementStart lines at =
+    let
+        line =
+            Maybe.withDefault "" (List.head (List.drop at lines))
+    in
+    if String.startsWith "|>" (String.trim line) then
+        List.foldl
+            (\( index, above ) found ->
+                if not (isBlank above) && indentOf above < indentOf line then
+                    index
+
+                else
+                    found
+            )
+            at
+            (List.indexedMap (\index above -> ( index, above )) (List.take at lines))
+
+    else
+        at
+
+
+-- The statement opening at line `from`: that line and the deeper lines
+-- after it, up to the first blank line or one indented no deeper.
+statementFrom : List String -> Int -> List String
+statementFrom lines from =
+    case List.drop from lines of
+        first :: rest ->
+            first :: deeperRun (indentOf first) rest
+
+        [] ->
+            []
+
+
+deeperRun : Int -> List String -> List String
+deeperRun depth lines =
+    List.reverse
+        (Tuple.first
+            (List.foldl
+                (\line ( kept, open ) ->
+                    if open && not (isBlank line) && indentOf line > depth then
+                        ( line :: kept, True )
+
+                    else
+                        ( kept, False )
+                )
+                ( [], True )
+                lines
+            )
+        )
+
+
+-- The lines binding `name` above line `from`, the nearest binding first:
+-- a `let` binding naming it, with its deeper lines, or the scrutinee line
+-- of the `case` whose arm names it. A definition's own head, at column 0,
+-- binds only parameters and is no binding.
+bindingOf : List String -> Int -> String -> List String
+bindingOf lines from name =
+    let
+        numbered =
+            List.reverse (List.indexedMap (\index line -> ( index, line )) (List.take from lines))
+
+        binds entry =
+            indentOf (Tuple.second entry) > 0 && opensBinding (Tuple.second entry) && List.member name (tokens (Tuple.second entry))
+    in
+    if leadsWith Char.isLower name then
+        case List.find binds numbered of
+            Just ( index, line ) ->
+                if String.endsWith "=" (String.trimEnd line) then
+                    statementFrom lines index
+
+                else
+                    scrutineeOf numbered index (indentOf line)
+
+            Nothing ->
+                []
+
+    else
+        []
+
+
+-- A line ending in `=` or `->`: a binding's or a `case` arm's head.
+opensBinding : String -> Bool
+opensBinding line =
+    String.endsWith "=" (String.trimEnd line) || String.endsWith "->" (String.trimEnd line)
+
+
+-- The nearest `case` line above line `index` indented less than `depth`,
+-- from `numbered`, the lines above nearest first.
+scrutineeOf : List ( Int, String ) -> Int -> Int -> List String
+scrutineeOf numbered index depth =
+    List.find (\entry -> Tuple.first entry < index && indentOf (Tuple.second entry) < depth && List.member "case" (tokens (Tuple.second entry))) numbered
+        |> Maybe.map (\entry -> [ Tuple.second entry ])
+        |> Maybe.withDefault []
+
+
+indentOf : String -> Int
+indentOf line =
+    String.length line - String.length (String.trimStart line)
+
+
+isBlank : String -> Bool
+isBlank line =
+    String.isEmpty (String.trim line)
+
+
+-- A call that runs a read: `queryDecode` under any qualifier, and the
+-- `Store` runs that return rows.
+isReadCall : String -> Bool
+isReadCall token =
+    token == "queryDecode" || String.endsWith ".queryDecode" token || isStoreRun token
+
+
+isStoreRun : String -> Bool
+isStoreRun token =
+    List.any (\run -> token == "Store." ++ run || String.endsWith (".Store." ++ run) token) storeRuns
+
+
+-- Every `Ipe.Db.Store` function that runs a query and returns its rows.
+storeRuns : List String
+storeRuns =
+    [ "all", "allAs", "allOn", "findBy", "findWhere", "findWhereOn", "get", "getAs", "getOn", "joinToList", "joinToMaybe", "selectToList", "selectToMaybe", "toList", "toMaybe" ]
+
+
+-- The text of the string literals in `lines`, in order, escaped quotes and
+-- backslashes dropped.
+literalsOf : List String -> String
+literalsOf lines =
+    String.join "\n" lines
+        |> String.replace "\\\\" ""
+        |> String.replace "\\\"" ""
+        |> String.split "\""
+        |> List.indexedMap
+            (\index piece ->
+                if modBy 2 index == 1 then
+                    piece
+
+                else
+                    ""
+            )
+        |> String.join " "
+
+
+-- True when `sql` holds a `LIMIT` outside every parenthesis, so it bounds
+-- the statement itself rather than a subquery.
+limitAtTop : String -> Bool
+limitAtTop sql =
+    case String.split "LIMIT" sql of
+        first :: rest ->
+            Tuple.second (List.foldl (\piece ( depth, found ) -> ( depth + parenDepth piece, found || depth == 0 )) ( parenDepth first, False ) rest)
+
+        [] ->
+            False
+
+
+parenDepth : String -> Int
+parenDepth text =
+    List.length (String.indexes "(" text) - List.length (String.indexes ")" text)
+
+
+readReachDepth : Int
+readReachDepth =
+    3
+
+
+-- The definitions in `defs` that `toks` name and `seen` does not hold,
+-- followed `depth` more steps through the tokens of each.
+reachedDefs : List TopDef -> Int -> List String -> List String -> List TopDef
+reachedDefs defs depth seen toks =
+    let
+        named =
+            List.filter (\def -> List.member def.name toks && not (List.member def.name seen)) defs
+
+        found =
+            List.unique (List.map (\def -> def.name) named)
+    in
+    if depth <= 0 || List.isEmpty named then
+        []
+
+    else
+        named ++ reachedDefs defs (depth - 1) (seen ++ found) (List.concatMap defTokens named)
+
+
+-- A single-row aggregate read holds one of these in its seed.
+aggregateTokens : List String
+aggregateTokens =
+    [ "COUNT", "count", "EXISTS", "MIN", "MAX", "pragma_page_count" ]
+
+
+-- Each read that carries no bound: its key and whether it is one aggregate
+-- row.
+unboundedReadsIn : ScanModule -> List ( String, Bool )
+unboundedReadsIn scanned =
+    let
+        defs =
+            topDefsOf scanned.text
+
+        judged def seed =
+            let
+                seedLines =
+                    seed.statement ++ seed.bindings
+
+                seedTokens =
+                    List.concatMap tokens seedLines
+
+                reached =
+                    reachedDefs defs readReachDepth [ def.name ] seedTokens
+
+                bounded =
+                    if List.any isStoreRun seed.calls then
+                        False
+
+                    else
+                        limitAtTop (literalsOf seedLines) || List.any (\named -> limitAtTop (literalsOf named.lines)) reached
+            in
+            if bounded then
+                []
+
+            else
+                [ ( scanned.rel ++ ":" ++ def.name, List.any (\token -> List.member token seedTokens) aggregateTokens && not (List.member "GROUP" (seedTokens ++ List.concatMap defTokens reached)) ) ]
+    in
+    List.concatMap (\def -> List.concatMap (judged def) (readSeedsOf def)) defs
+
+
+-- The reads admitted without a `LIMIT`, each a single aggregate row, by
+-- `rel:name` and the count of them the definition issues.
+admittedAggregates : List ( String, Int )
+admittedAggregates =
+    [ ( "Lib/Db.ipe:entriesBefore", 1 )
+    , ( "Lib/Db.ipe:entriesPast", 1 )
+    , ( "Lib/Db.ipe:firstRepeat", 1 )
+    , ( "Lib/Db.ipe:requireNamedBeforeMigration", 2 )
+    , ( "Lib/Db.ipe:requireNamedRows", 1 )
+    , ( "Lib/Index.ipe:countAll", 1 )
+    , ( "Lib/Index.ipe:countAllRefusals", 1 )
+    , ( "Lib/Index.ipe:countOpenRefusals", 1 )
+    , ( "Lib/Index.ipe:countPending", 1 )
+    , ( "Lib/Index.ipe:countRefusals", 1 )
+    , ( "Lib/Index.ipe:countUnbound", 1 )
+    , ( "Lib/Index.ipe:countUnboundRefusals", 1 )
+    , ( "Lib/Index.ipe:countUnits", 1 )
+    , ( "Lib/Index.ipe:dbBytes", 1 )
+    ]
+
+
+-- A read under `Lib/` that reaches no bound and is not admitted, an
+-- admitted read that is not one aggregate row, and an admitted definition
+-- issuing another count of unbounded reads than listed.
+readViolations : List ( String, Int ) -> List ScanModule -> List String
+readViolations admitted modules =
+    let
+        found =
+            List.concatMap unboundedReadsIn (List.filter (\scanned -> String.startsWith "Lib/" scanned.rel) modules)
+
+        admittedKeys =
+            List.map Tuple.first admitted
+
+        countOf key =
+            List.length (List.filter (\read -> Tuple.first read == key) found)
+    in
+    List.map (\read -> "the read at " ++ Tuple.first read ++ " carries no LIMIT and is not admitted") (List.filter (\read -> not (List.member (Tuple.first read) admittedKeys)) found)
+        ++ List.map (\read -> "the admitted read at " ++ Tuple.first read ++ " is not one aggregate row") (List.filter (\read -> not (Tuple.second read)) found)
+        ++ List.map (\entry -> "the admitted definition " ++ Tuple.first entry ++ " issues another count of unbounded reads") (List.filter (\entry -> countOf (Tuple.first entry) /= Tuple.second entry) admitted)
+
+
+-- The tree's reads are bounded, and each way around the scan is a
+-- violation: a new read with no `LIMIT`, a second unbounded read in an
+-- admitted definition, an admitted aggregate given a `GROUP BY` or turned
+-- into a row read, a bounded read losing its `LIMIT`, any `Store` run, even
+-- one piped through `Store.limit`, a `LIMIT` only inside a subquery, a
+-- `LIMIT` on a line of the definition outside the read's statement, an
+-- admitted entry no source holds. A `LIMIT` in a definition the read names
+-- counts.
+-- Red if a read can take its size from the database, or the scan stops
+-- seeing one.
+readsCarryLimit : Task.Task Error Bool
+readsCarryLimit =
+    srcSources
+        |> Task.map (List.map indexModule)
+        |> Task.map
+            (\sources ->
+                List.isEmpty (readViolations admittedAggregates sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    Db.queryDecode conn \"SELECT seq FROM review_log\" [] leakedDecoder" sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "entriesBefore db =\n    Db.queryDecode db \"SELECT seq AS entries FROM review_log\" [] entriesDecoder" sources)
+                    && readCaught (replaceIn "Lib/Db.ipe" "count(*) AS entries FROM review_log WHERE seq < 1" "seq AS entries FROM review_log WHERE seq < 1" sources)
+                    && readCaught (replaceIn "Lib/Db.ipe" "count(*) AS entries FROM review_log WHERE seq > ?" "count(*) AS entries FROM review_log WHERE seq > ? GROUP BY uid" sources)
+                    && readCaught (replaceIn "Lib/Db.ipe" "review_log_head WHERE one = 1 LIMIT 2" "review_log_head WHERE one = 1" sources)
+                    && readCaught (replaceIn "Lib/Index.ipe" "reviewed_stamp WHERE one = 1 LIMIT 2" "reviewed_stamp WHERE one = 1" sources)
+                    && readCaught (replaceIn "Lib/Index.ipe" "(sql ++ \" LIMIT 2\")" "sql" sources)
+                    && readCaught (replaceIn "Lib/Db.ipe" "\" WHERE uid = ? AND body_hash = ? LIMIT 1\"" "\" WHERE uid = ? AND body_hash = ?\"" sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "leakedRows db =\n    Store.all db reviews" sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "leakedFind db =\n    Store.findBy db reviews \"uid\" (SqlString \"u\")" sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    Db.queryDecode conn \"SELECT seq FROM review_log WHERE seq IN (SELECT seq FROM review_log LIMIT 1)\" [] leakedDecoder" sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    do\n        rows <- Db.queryDecode conn \"SELECT seq FROM review_log\" [] leakedDecoder\n        Task.succeed (List.take 1 rows ++ [ \"LIMIT 1\" ])" sources)
+                    && not (List.isEmpty (readViolations (( "Lib/Db.ipe:gone", 1 ) :: admittedAggregates) sources))
+                    && List.isEmpty (readViolations admittedAggregates (appendTo "Lib/Db.ipe" "boundedRead conn =\n    Db.queryDecode conn boundedSql [] boundedDecoder\n\n\nboundedSql =\n    \"SELECT seq FROM review_log LIMIT 1\"" sources))
+                    && readCaught (appendTo "Lib/Db.ipe" "boundedRows db =\n    Store.all reviews\n        |> Store.limit 1\n        |> Store.toList db" sources)
+            )
+
+
+readCaught : List ScanModule -> Bool
+readCaught sources =
+    not (List.isEmpty (readViolations admittedAggregates sources))
+
+
+-- `sources` with every `from` in the text of `rel` replaced by `to`, that
+-- module indexed anew.
+replaceIn : String -> String -> String -> List ScanModule -> List ScanModule
+replaceIn rel from to sources =
+    List.map
+        (\scanned ->
+            if scanned.rel == rel then
+                indexModule ( rel, String.replace from to scanned.text )
+
+            else
+                scanned
+        )
+        sources
 
 
 -- ── the real tree ───────────────────────────────────────────────────────
@@ -965,4 +1396,5 @@ checks =
         , Task.succeed ( "the type walk refuses every path an error reaches a page by", typeWalkRefuses )
         , Task.succeed ( "the conversion scan admits only the listed sites, by token", conversionScanRefuses )
         , check "a uid becomes text only at the admitted sites, and a uid in a heading is a violation" uidTextScanRefuses
+        , check "every read under src/Lib carries a LIMIT or is an admitted aggregate row" readsCarryLimit
         ]

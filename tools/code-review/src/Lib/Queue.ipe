@@ -599,15 +599,15 @@ loadHistoryPage settings cursor =
 distinctUids : List LibDb.ReviewEntry -> List Uid
 distinctUids entries =
     List.foldr
-        (\entry uids ->
-            if List.member (entryUid entry) uids then
+        (\subject uids ->
+            if List.member subject uids then
                 uids
 
             else
-                entryUid entry :: uids
+                subject :: uids
         )
         []
-        entries
+        (List.filterMap entryUid entries)
 
 
 -- A History row's subject before its label: a unit's name or a file's path,
@@ -651,7 +651,12 @@ subjectOf units files entry =
                     FileSubject path presence
 
         Unverified row ->
-            liveSubject units files row.uid
+            case row.uid of
+                Just subject ->
+                    liveSubject units files subject
+
+                Nothing ->
+                    NoSubject
 
 
 -- The subject the index holds under `subject`: its unit, else its
@@ -706,11 +711,13 @@ labelOf tallies subject =
             Unnamed
 
 
-entryUid : LibDb.ReviewEntry -> Uid
+-- The unit id an entry names: Nothing for a row whose uid column holds no
+-- unit id, which names no subject.
+entryUid : LibDb.ReviewEntry -> Maybe Uid
 entryUid entry =
     case entry of
         Verified row ->
-            LibDb.verifiedUid row
+            Just (LibDb.verifiedUid row)
 
         Unverified row ->
             row.uid
