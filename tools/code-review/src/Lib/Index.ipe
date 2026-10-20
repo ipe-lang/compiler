@@ -1,4 +1,4 @@
-module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, liveFiles, liveUnits, loadView, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
+module Lib.Index exposing (Attested, AttestedHash(..), Body(..), ChainHead, ChainVerdict(..), Change(..), Cursor(..), DecidedPair, LogStatus(..), Oversize(..), PendingRow, ReadFailure(..), RefusalDigest, RefusalReason(..), RefusalRow, ShownSource, Snapshot, SourceView(..), StaleReason(..), Stamp, Unit, UnitView, Written(..), ackable, attest, attestResidual, attestedHash, attestedHashMaxBytes, attestedName, attestedUid, candidateQuery, chainHeadDecoder, chainHeadText, chainKeyCheck, chainLogId, chainMac, chainNext, chainSeq, childSpanCeiling, classifyView, decidedPairDecoder, decidedPairKey, digestPair, drainDecided, drainUnit, drawnDepthCeiling, elementResidentBytes, lengthPrefixed, linkElements, liveFiles, liveUnits, loadView, placeholders, probe, probeRepos, probeRoot, queueElementCeiling, queueLabelByteCeiling, readConnection, readFailureText, readSnapshot, readStamp, rebuildReviewed, refusalDigestText, refusalReasons, refusalRowDecoder, refusalTag, residualText, reverify, reverifyRefusal, runtimeEntryOverhead, runtimeSessionCeiling, shortHash, shownDrawn, shownHash, shownRows, shownText, signedStamp, sourceCeiling, spanOversize, stampStatus, stampText, storedHash, unescapeShown, unitName, unsignedStamp, viewByteCeiling, viewLineCeiling, viewLines, viewNodeCeiling, viewReserve, viewText)
 
 import Ipe.ByteSize as ByteSize exposing (ByteSize)
 import Ipe.Bytes as Bytes
@@ -309,12 +309,13 @@ candidateRows conn path uid names =
 
 -- One statement for every candidate name, on `i_units_qual`: at most one row
 -- per name, the unit in `path` first, then the lowest uid — ipe-index's own
--- `uid_for_qualified` tie-break. Every name is bound; only placeholders enter
--- the SQL text. A row's qualified name and uid are each read as a bounded
--- window, whatever collation the file declares on them.
+-- `uid_for_qualified` tie-break, the read bounded by the count of names.
+-- Every name is bound; only placeholders and that count enter the SQL
+-- text. A row's qualified name and uid are each read as a bounded window,
+-- whatever collation the file declares on them.
 candidateQuery : String -> Uid -> List String -> ( String, List SqlValue )
 candidateQuery path uid names =
-    ( "SELECT " ++ shownColumn "qualified" "qualified" ++ ", " ++ shownColumn "uid" "uid" ++ " FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1"
+    ( "SELECT " ++ shownColumn "qualified" "qualified" ++ ", " ++ shownColumn "uid" "uid" ++ " FROM (SELECT qualified, uid, ROW_NUMBER() OVER (PARTITION BY qualified ORDER BY (path = ?) DESC, uid) AS rn FROM units WHERE qualified IN (" ++ placeholders (List.length names) ++ ") AND uid != ?) WHERE rn = 1 LIMIT " ++ String.fromInt (List.length names)
     , List.concat [ [ SqlString path ], List.map SqlString names, [ Uid.toSql uid ] ]
     )
 
@@ -528,7 +529,7 @@ probe settings =
         Db.queryDecode conn (openColumns (boundTags settings.roots) ++ " LIMIT 0") (boundTags settings.roots).params pendingRowDecoder
         Db.queryDecode conn ("SELECT " ++ reviewedPairColumns ++ " FROM reviewed LIMIT 0") [] reviewedPairDecoder
         Db.queryDecode conn ("SELECT " ++ shownColumn "head" "head" ++ " FROM reviewed_stamp LIMIT 0") [] stampDecoder
-        Db.queryDecode conn (refusalColumns ++ " 0 = 1") [] refusalRowDecoder
+        Db.queryDecode conn (refusalColumns ++ " 0 = 1 LIMIT 0") [] refusalRowDecoder
         Task.succeed ()
     )
         |> Task.onError (Settings.openFailure IndexDb settings.db.path)
@@ -1674,10 +1675,11 @@ reviewedRepeatSql =
     "SELECT COUNT(*) AS total FROM (SELECT 1 FROM reviewed GROUP BY uid, body_hash HAVING COUNT(*) > 1)"
 
 
+-- A count is one row: the read takes two, enough to see a second.
 countOf : Db.Db -> String -> String -> Task.Task Error Int
 countOf conn what sql =
     do
-        rows <- Db.queryDecode conn sql [] countDecoder
+        rows <- Db.queryDecode conn (sql ++ " LIMIT 2") [] countDecoder
         singleInt what rows
 
 
@@ -1760,12 +1762,12 @@ stampDecoder =
 
 
 -- The head stamped on the `reviewed` copy: Nothing when no stamp row
--- exists. The table's key admits at most one row, so more than one is a
--- failed read.
+-- exists. More than one row is a failed read, whatever key the file's
+-- table declares: the read takes at most two rows, enough to see a second.
 readStamp : Db.Db -> Task.Task Error (Maybe String)
 readStamp conn =
     do
-        rows <- Db.queryDecode conn ("SELECT " ++ shownColumn "head" "head" ++ " FROM reviewed_stamp WHERE one = 1") [] stampDecoder
+        rows <- Db.queryDecode conn ("SELECT " ++ shownColumn "head" "head" ++ " FROM reviewed_stamp WHERE one = 1 LIMIT 2") [] stampDecoder
         case rows of
             [] ->
                 Task.succeed Nothing
@@ -3207,6 +3209,14 @@ attestScheme =
 residualScheme : String
 residualScheme =
     "sha256-residual:"
+
+
+-- The longest `body_hash` a decision records, in bytes: the longest scheme
+-- prefix and a 64-digit hex digest. Every attestation the app records is
+-- ASCII and fits it; a review-log cell past it is read as unheld.
+attestedHashMaxBytes : Int
+attestedHashMaxBytes =
+    List.foldl (\scheme longest -> max longest (String.length scheme)) 0 [ attestScheme, residualScheme, refusalScheme ] + 64
 
 
 -- The attestation of a line range's view: the scheme prefix and the view's

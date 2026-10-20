@@ -343,6 +343,46 @@ probeAfterEdits dbPath edits =
         Task.succeed message
 
 
+-- A review file whose head table is rebuilt without its key and checks
+-- fails the startup probe when it holds two head rows, and when its one row
+-- holds a cell past its ceiling, a 33-digit log id: the head is read at most
+-- two rows deep and cell by cell under `headCellCeilings`, never as two
+-- heads or a whole cell. The same rebuild with its one row intact passes.
+-- Red if the head read takes the first of several rows, or reads a cell
+-- whole.
+headRowsBounded : Task.Task Error Bool
+headRowsBounded =
+    freshDir "ipe-review-head-rows-bounded" |> Task.andThen headRowsBoundedIn
+
+
+headRowsBoundedIn : String -> Task.Task Error Bool
+headRowsBoundedIn base =
+    do
+        intact <- probeAfterEdits (base ++ "/intact.db") (rebuiltHead [ "one, log_id, seq, head, key_check" ])
+        doubled <- probeAfterEdits (base ++ "/doubled.db") (rebuiltHead [ "one, log_id, seq, head, key_check", "one, log_id, seq, head, key_check" ])
+        wide <- probeAfterEdits (base ++ "/wide.db") (rebuiltHead [ "one, log_id || 'a', seq, head, key_check" ])
+        Task.succeed (intact == Nothing && maybeContains "no single head row" doubled && maybeContains "no single head row" wide)
+
+
+-- The edits rebuilding `review_log_head` with no key or check, one row
+-- copied from the old head per entry of `copies` (its select list), and its
+-- guards recreated on the new table so the guard check passes.
+rebuiltHead : List String -> List String
+rebuiltHead copies =
+    [ "DROP TRIGGER review_log_head_no_delete"
+    , "DROP TRIGGER review_log_head_no_insert"
+    , "DROP TRIGGER review_log_head_id_fixed"
+    , "ALTER TABLE review_log_head RENAME TO review_log_head_old"
+    , "CREATE TABLE review_log_head (one INTEGER, log_id TEXT, seq INTEGER, head TEXT, key_check TEXT)"
+    ]
+        ++ List.map (\columns -> "INSERT INTO review_log_head SELECT " ++ columns ++ " FROM review_log_head_old") copies
+        ++ [ "DROP TABLE review_log_head_old"
+           , "CREATE TRIGGER review_log_head_no_delete BEFORE DELETE ON review_log_head BEGIN SELECT RAISE(ABORT, 'review_log_head is permanent'); END"
+           , "CREATE TRIGGER review_log_head_no_insert BEFORE INSERT ON review_log_head BEGIN SELECT RAISE(ABORT, 'review_log_head is permanent'); END"
+           , "CREATE TRIGGER review_log_head_id_fixed BEFORE UPDATE OF log_id ON review_log_head BEGIN SELECT RAISE(ABORT, 'review_log_head.log_id is fixed'); END"
+           ]
+
+
 -- Re-reviewing the same pair must succeed (any Err here fails
 -- the check loudly) and must keep the first decision.
 isApproved : Maybe ReviewEntry -> Bool
@@ -456,10 +496,10 @@ storedOverlongReasonDecodes : Db -> Task.Task Error Bool
 storedOverlongReasonDecodes db =
     let
         expected =
-            "reason not shown: 5000 characters, over the 500-character limit"
+            "reason not shown: 1500 characters, over the 500-character limit"
     in
     do
-        appendSigned db (rawRow "huge-uid" "hH" "refuse" (Just (String.repeat 5000 "y")))
+        appendSigned db (rawRow "huge-uid" "hH" "refuse" (Just (String.repeat 1500 "y")))
         verify <- countingVerifier db
         byPair <- LibDb.findDecision verify db (uid "huge-uid") "hH"
         byUid <- LibDb.findLatestForUid verify db (uid "huge-uid")
@@ -475,6 +515,72 @@ storedBlankReasonDecodes db =
         verify <- countingVerifier db
         found <- LibDb.findDecision verify db (uid "blank-uid") "hB"
         Task.succeed (storedReasonShown "reason not shown: it is blank" found)
+
+
+-- A signed review-log cell past its ceiling is never read: a reason of
+-- exactly `reasonMaxChars * 4` bytes is held and counts, while a 1 MiB
+-- reason, correctly signed, reads as `Tampered`, breaks the walk at its
+-- entry, and the History page still loads, the row shown as tampered. Red
+-- if the log reads a cell whole, since the signed row would then verify.
+logCellPastCeilingRefused : Db -> Task.Task Error Bool
+logCellPastCeilingRefused db =
+    do
+        appendSigned db (rawRow "edge-uid" "hE" "refuse" (Just (String.repeat (LibDb.reasonMaxChars * 4) "r")))
+        edge <- lookUp db "edge-uid" "hE"
+        appendSigned db (rawRow "vast-uid" "hV" "refuse" (Just (String.repeat 1048576 "r")))
+        verdict <- logVerdictOf db
+        vast <- lookUp db "vast-uid" "hV"
+        verify <- countingVerifier db
+        page <- LibDb.historyPage verify db PageSize.history HistoryStart
+        Task.succeed
+            (isCounted edge
+                && verdict == Broken (BreaksAt 2)
+                && whyOf vast == Just Tampered
+                && List.map (\entry -> whyOf (Just entry)) page.rows == [ Just Tampered, Just ChainBroken ]
+            )
+
+
+-- Each review-log and head cell ceiling is the bound the schema or the app
+-- holds that column to: a name column's byte CHECK, a mac's and a head's
+-- length CHECK, a unit id's length, four bytes for each character of a
+-- `Reason`, the longest decision word, and an attestation's length. Red if
+-- a ceiling drifts from the bound it mirrors.
+cellCeilingsMatchSchema : Bool
+cellCeilingsMatchSchema =
+    let
+        schema =
+            String.join "\n" (List.map (\migration -> migration.sql) Migrations.all)
+
+        bytesOf cells column =
+            Maybe.map (\cell -> cell.bytes) (List.find (\cell -> cell.column == column) cells)
+
+        logBytes column =
+            bytesOf LibDb.logCellCeilings column
+
+        checked cells column spelled =
+            case bytesOf cells column of
+                Just bytes ->
+                    String.contains (spelled bytes) schema
+
+                Nothing ->
+                    False
+
+        nameChecked column =
+            checked LibDb.logCellCeilings column (\bytes -> "length(CAST(" ++ column ++ " AS BLOB)) <= " ++ String.fromInt bytes)
+
+        lengthChecked cells column =
+            checked cells column (\bytes -> "length(" ++ column ++ ") = " ++ String.fromInt bytes)
+    in
+    List.all nameChecked [ "unit_kind", "unit_qualified", "unit_path" ]
+        && lengthChecked LibDb.logCellCeilings "mac"
+        && logBytes "prev" == logBytes "mac"
+        && List.all (lengthChecked LibDb.headCellCeilings) [ "log_id", "head", "key_check" ]
+        && logBytes "uid" == Just Uid.uidLength
+        && logBytes "reason" == Just (LibDb.reasonMaxChars * 4)
+        && logBytes "decision" == Just (max (String.length "approve") (String.length "refuse"))
+        && logBytes "body_hash" == Just Index.attestedHashMaxBytes
+        && String.length (Index.attest viewA) <= Index.attestedHashMaxBytes
+        && List.length LibDb.logCellCeilings == 9
 
 
 -- History pages walked two rows at a time from the start return every
@@ -1513,6 +1619,7 @@ reviewLogChecks =
         , check "a legacy row reads legacy and can be decided again" (onFreshReview "ipe-review-legacyRowRedecidable" legacyRowRedecidable)
         , check "a review file without its log head fails the probe" probeRefusesReviewWithoutHead
         , check "a review file without its append-only guards fails the probe" probeRefusesReviewWithoutGuards
+        , check "a rebuilt head table with two rows or a cell past its ceiling fails the probe" headRowsBounded
         , check "a head rolled back below its rows is broken past the head" (onFreshReview "ipe-review-headRolledBackBelowRowsIsPastHead" headRolledBackBelowRowsIsPastHead)
         , check "a head reset to the genesis with rows is broken past the head" (onFreshReview "ipe-review-headResetToGenesisWithRowsIsPastHead" headResetToGenesisWithRowsIsPastHead)
         , check "a signed row appended past the head never counts" (onFreshReview "ipe-review-rowAppendedPastHeadNeverVerified" rowAppendedPastHeadNeverVerified)
@@ -1822,6 +1929,8 @@ storedRowChecks =
         [ check "refusal reason is non-blank and bounded" (onFreshReview "ipe-review-reasonBounded" reasonBounded)
         , check "a stored over-long reason decodes and shows its length" (onFreshReview "ipe-review-storedOverlongReasonDecodes" storedOverlongReasonDecodes)
         , check "a stored blank reason decodes as blank" (onFreshReview "ipe-review-storedBlankReasonDecodes" storedBlankReasonDecodes)
+        , check "a signed review-log cell past its ceiling reads as tampered and the History still loads" (onFreshReview "ipe-review-logCellPastCeilingRefused" logCellPastCeilingRefused)
+        , Task.succeed ( "each review-log cell ceiling is the bound its column is held to", cellCeilingsMatchSchema )
         , check "history pages walk every row once in order" (onFreshReview "ipe-review-historyWalkMatchesOrder" historyWalkMatchesOrder)
         , check "a history page below one row is refused" (onFreshReview "ipe-review-historyPageSizeRefused" historyPageSizeRefused)
         , check "history pages read in index order" (onFreshReview "ipe-review-historyPagesUseIndex" historyPagesUseIndex)
