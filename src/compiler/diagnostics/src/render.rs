@@ -1968,13 +1968,15 @@ fn lower_label(msg: &LowerError) -> String {
         LowerError::InadmissibleAppMsg { app, field, leaf } => {
             crate::diagnostic::inadmissible_msg_message(*app, field, *leaf)
         }
-        LowerError::BackendNestingTooDeep { limit, func } => match func {
-            Some(site) => format!(
-                "`{}` nests past the backend limit of {limit}",
-                site.qualified()
-            ),
-            None => format!("nested past the backend limit of {limit}"),
-        },
+        LowerError::BackendNestingTooDeep { limit, func } => func.as_ref().map_or_else(
+            || format!("nested past the backend limit of {limit}"),
+            |site| {
+                format!(
+                    "`{}` nests past the backend limit of {limit}",
+                    site.qualified()
+                )
+            },
+        ),
         LowerError::DecodeSucceedArityTooHigh { n } => {
             format!("`succeed` constructor has {n} parameters; the `curry1`..`curry10` cap is 10")
         }
