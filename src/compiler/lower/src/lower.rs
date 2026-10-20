@@ -19237,12 +19237,12 @@ impl<'a> Lowerer<'a> {
     /// Kept, a phantom argument would leave the emitted enum's generic
     /// uninferrable (E0283/E0392). An erased argument is never lowered, so
     /// nothing it names can refuse a type the emitted Rust never spells.
-    fn emitted_type_args<'a, A>(
+    fn emitted_type_args<'args, A>(
         &self,
         home: &[Symbol],
         name: Symbol,
-        args: &'a [A],
-    ) -> impl Iterator<Item = &'a A> {
+        args: &'args [A],
+    ) -> impl Iterator<Item = &'args A> {
         let erase_all =
             self.is_cache_handle_con(home, name) || self.is_store_row_phantom_con(home, name);
         let path = ModPath(home.to_vec());

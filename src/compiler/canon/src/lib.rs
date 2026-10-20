@@ -2405,14 +2405,8 @@ mod tests {
     fn union_over_applied_in_a_union_field_is_a_type_arity_error() {
         let err = canon_err(UNION_OVER_APPLIED_FIELD);
         assert!(
-            is_type_arity_at(
-                err.as_ref(),
-                UNION_OVER_APPLIED_FIELD,
-                "X",
-                (1, 2),
-                "X Int Int"
-            ),
-            "expected TypeArity(X, 1, 2) at the field, got {err:?}"
+            is_type_arity_at(err.as_ref(), UNION_OVER_APPLIED_FIELD, "X", (1, 2), "Y"),
+            "expected TypeArity(X, 1, 2) at the field's constructor, got {err:?}"
         );
     }
 
@@ -2429,7 +2423,7 @@ mod tests {
                 UNION_UNDER_APPLIED_SELF_FIELD,
                 "T",
                 (1, 0),
-                "Node a T"
+                "Node"
             ),
             "expected TypeArity(T, 1, 0) at the field, got {err:?}"
         );
