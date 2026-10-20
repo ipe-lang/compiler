@@ -18,18 +18,15 @@ use ipe::{RootFixture, build_fixture};
 // CLI-parsing tests (unconditional — no network, no build)
 // ---------------------------------------------------------------------------
 
-/// `ipe dev run` (no arguments, nothing to build here) must return a command-usage
-/// error naming `run` — so the caller shows `run`'s help page — not panic.
+/// `ipe dev run` (no arguments, no `package.ipe` in the working directory) is
+/// refused as `NoManifest`, not a panic.
 #[test]
-fn run_no_args_returns_usage_error() {
+fn run_no_args_is_refused_as_no_manifest() {
     let args: Vec<String> = vec!["dev".to_owned(), "run".to_owned()];
     let result = ipe::run_cli(&args);
     assert!(
-        matches!(
-            &result,
-            Err(ipe::CliError::CommandUsage { command, .. }) if *command == "dev run"
-        ),
-        "expected a `run` command-usage error for bare `ipe dev run`, got: {result:?}"
+        matches!(&result, Err(ipe::CliError::NoManifest { .. })),
+        "expected NoManifest for bare `ipe dev run`, got: {result:?}"
     );
 }
 
