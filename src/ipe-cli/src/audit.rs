@@ -1431,33 +1431,39 @@ struct CapturedProgram<'s> {
 /// Every program the captured package builds, or `None` for a library.
 ///
 /// The same set [`crate::project_root::ProjectRoot`] resolves, read from the
-/// capture instead of the disk: the declared programs in manifest order, else
-/// `src/Main.ipe` under the package's name, else no program when the manifest
-/// exposes a module, else the refusal of a package that builds nothing.
+/// capture instead of the disk, with the same refusals in the same order: every
+/// exposed module must be held; then the declared programs in manifest order,
+/// else `src/Main.ipe` under the package's name, else no program when the
+/// manifest exposes a module, else the refusal of a package that builds
+/// nothing.
 ///
 /// # Errors
-/// The manifest-entry refusal of a declared entry that names no module;
-/// [`CliError::PackageAudit`] with [`Check::Capability`] when a declared
-/// program's entry is not in the capture; [`CliError::NoDefaultEntry`] when
-/// the package declares no program, holds no `src/Main.ipe` and exposes no
-/// module.
+/// [`CliError::ExposedModuleMissing`] when an exposed module is not in the
+/// capture; the manifest-entry refusal of a declared entry that names no
+/// module; [`CliError::EntryMissing`] when a declared program's entry is not
+/// in the capture; [`CliError::NoDefaultEntry`] when the package declares no
+/// program, holds no `src/Main.ipe` and exposes no module.
 fn captured_programs<'s>(
     manifest: &ProjectManifest,
     sources: &'s ModuleSources,
 ) -> Result<Option<NonEmpty<CapturedProgram<'s>>>, CliError> {
+    for name in &manifest.exposed_modules {
+        let held = crate::project::parse_entry(&format!("{}.ipe", name.replace('.', "/")))
+            .is_ok_and(|module| sources.contains_key(&module));
+        if !held {
+            return Err(CliError::ExposedModuleMissing {
+                module: name.clone(),
+            });
+        }
+    }
     let mut programs = Vec::with_capacity(manifest.programs.len());
     for program in &manifest.programs {
         let module = crate::project::parse_entry(&program.entry)
             .map_err(|refusal| CliError::manifest_entry_refused(&program.entry, &refusal))?;
         let Some((path, source)) = sources.get(&module) else {
-            return Err(reject(
-                Check::Capability,
-                format!(
-                    "program `{}` names the entry `{}`, which the captured package does not hold.",
-                    shown_name(&program.name),
-                    shown_name(&program.entry)
-                ),
-            ));
+            return Err(CliError::EntryMissing {
+                entry: program.entry.clone(),
+            });
         };
         programs.push(CapturedProgram {
             name: program.name.clone(),
@@ -3109,8 +3115,8 @@ mod tests {
         let err = derive_disclosure(&manifest, &sources, BTreeSet::new())
             .expect_err("a missing second program must fail closed");
         assert!(
-            matches!(err, CliError::PackageAudit(ref r) if r.check == Check::Capability),
-            "a Capability rejection: {err:?}"
+            matches!(&err, CliError::EntryMissing { entry } if entry == "Sync.ipe"),
+            "the project root's missing-entry refusal: {err:?}"
         );
     }
 
@@ -3258,6 +3264,53 @@ mod tests {
                 _ => continue,
             };
             assert_eq!(audited, expected, "{tag}: the expected entry set");
+        }
+    }
+
+    /// A package the project root refuses for an absent exposed module or an absent declared
+    /// entry is refused by the audit with that same refusal, never read as a library or as the
+    /// programs that are present.
+    #[test]
+    fn captured_programs_refuse_what_the_project_root_refuses() {
+        let lib = || "module Lib exposing (one)\n\none = 1\n".to_owned();
+        let cases: [CaptureCase<'_>; 3] = [
+            (
+                "refuse-exposed-missing-library",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"lib\", exposedModules = [ \"Absent\" ] }\n",
+                &[("Lib.ipe", lib())],
+            ),
+            (
+                "refuse-exposed-missing-beside-main",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"both\", exposedModules = [ \"Absent\" ] }\n",
+                &[("Main.ipe", direct_entry("Main")), ("Lib.ipe", lib())],
+            ),
+            (
+                "refuse-declared-entry-missing",
+                "module Package exposing (package)\n\n\npackage =\n    { name = \"tools\"\n    , programs = [ { name = \"sync\", entry = \"Tools/Sync.ipe\" } ]\n    }\n",
+                &[("Main.ipe", tea_entry("Main"))],
+            ),
+        ];
+        for (tag, manifest, files) in cases {
+            let (audited, resolved) = audited_and_resolved(tag, manifest, files);
+            assert_eq!(audited, resolved, "{tag}: the audit and the root agree");
+            assert_eq!(
+                audited,
+                Err(capture_refusal(&expected_refusal(tag))),
+                "{tag}: refused, never a library or a partial program set"
+            );
+        }
+    }
+
+    /// The refusal [`captured_programs_refuse_what_the_project_root_refuses`] expects for `tag`.
+    fn expected_refusal(tag: &str) -> CliError {
+        if tag == "refuse-declared-entry-missing" {
+            CliError::EntryMissing {
+                entry: "Tools/Sync.ipe".to_owned(),
+            }
+        } else {
+            CliError::ExposedModuleMissing {
+                module: "Absent".to_owned(),
+            }
         }
     }
 
