@@ -13,7 +13,7 @@ use crate::output_dir::{EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPat
 use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
-use crate::source_snapshot::{Limits, SourceOrigin, SourceSnapshot, TestView};
+use crate::source_snapshot::{BuildRole, Limits, SourceOrigin, SourceSnapshot, TestView};
 use crate::verb::Verb;
 use crate::{
     Applicability, BTreeMap, Diagnostic, HelpLine, Interner, Path, PathBuf, Suggestion, Write,
@@ -2733,19 +2733,19 @@ impl PackageSourceSet {
         let mut entries = Vec::new();
         let mut stdlib = Vec::new();
         for (module, held) in snapshot.modules() {
-            match held.origin() {
-                SourceOrigin::Own(SourceDir::Src) => entries.push(project::DiscoveredModule::user(
+            match held.origin().build_role() {
+                BuildRole::Entry => entries.push(project::DiscoveredModule::user(
                     held.path().to_path_buf(),
                     module.clone(),
                 )),
-                SourceOrigin::Stdlib => {
+                BuildRole::Stdlib => {
                     injected.insert(module.clone());
                     stdlib.push(project::DiscoveredModule::embedded_stdlib(
                         held.path().to_path_buf(),
                         module.clone(),
                     ));
                 }
-                SourceOrigin::Own(SourceDir::Tests) | SourceOrigin::FfiInterface => {}
+                BuildRole::Unbuilt => {}
             }
             sources.insert(
                 module.clone(),
