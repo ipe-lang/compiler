@@ -6255,7 +6255,7 @@ fn a_user_named_entry_symlink_is_followed() {
         std::os::unix::fs::symlink(&target, &link).is_ok(),
         "make link"
     );
-    let shape = classify_entry_shape(&link);
+    let shape = built_entry_shape(&link);
     let _ = fs::remove_dir_all(&dir);
     assert!(
         shape.is_ok(),
@@ -6289,7 +6289,7 @@ fn declared_entry_project(tag: &str, entry: &str, extra: &[(&str, &str)]) -> Pat
 /// A program entry the build refuses (escaping `src/`, absolute, no `.ipe`, no
 /// module name) is refused by the shape read too, never read as the path it spells.
 #[test]
-fn classify_entry_shape_refuses_an_entry_the_build_refuses() {
+fn built_entry_shape_refuses_an_entry_the_build_refuses() {
     for (tag, entry) in [
         ("shape_entry_absolute", "/etc/passwd"),
         ("shape_entry_absolute_module", "/etc/Main.ipe"),
@@ -6307,7 +6307,7 @@ fn classify_entry_shape_refuses_an_entry_the_build_refuses() {
                 ("main.ipe", "module Main exposing (main)\nmain = 1\n"),
             ],
         );
-        let shape = classify_entry_shape(&dir);
+        let shape = built_entry_shape(&dir);
         let _ = fs::remove_dir_all(&dir);
         assert!(
             matches!(shape, Err(CliError::Usage(_))),
@@ -6319,7 +6319,7 @@ fn classify_entry_shape_refuses_an_entry_the_build_refuses() {
 /// A well-formed entry module whose file links out of `src/` is refused, not read.
 #[cfg(unix)]
 #[test]
-fn classify_entry_shape_refuses_an_entry_linked_outside_the_source_root() {
+fn built_entry_shape_refuses_an_entry_linked_outside_the_source_root() {
     let dir = declared_entry_project("shape_entry_link", "Main.ipe", &[]);
     let outside = dir.join("Outside.ipe");
     assert!(
@@ -6332,17 +6332,158 @@ fn classify_entry_shape_refuses_an_entry_linked_outside_the_source_root() {
         std::os::unix::fs::symlink(&outside, &link).is_ok(),
         "link entry out of src/"
     );
-    let shape = classify_entry_shape(&dir);
+    let shape = built_entry_shape(&dir);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(shape, Err(CliError::EntryEscapes { .. })),
+        "an entry file linked outside src/ must be refused: {shape:?}"
+    );
+}
+
+/// A Tui entry: `Tui.tea`'s callee is never resolved by the parse-only shape read.
+const TUI_PROGRAM: &str =
+    "module Term exposing (main)\n\nimport Ipe.Tea.Tui\n\nmain = Tui.tea cfg\n";
+
+/// A root's second program alone being a Tui program gets the Tui shape, never the first program's.
+#[test]
+fn classify_entry_shape_reads_each_program_of_a_root() {
+    use crate::delivery;
+    use crate::project_root::{EntrySet, ProjectRoot, RootArg};
+    let dir = session_scratch("shape_each_program");
+    let src = dir.join("src");
+    assert!(fs::create_dir_all(&src).is_ok(), "make src/");
+    let manifest = "module Package exposing (package)\n\n\npackage =\n    { name = \"app\"\n    , programs =\n        [ { name = \"tool\", entry = \"Main.ipe\" }\n        , { name = \"term\", entry = \"Term.ipe\" }\n        ]\n    }\n";
+    assert!(
+        fs::write(dir.join("package.ipe"), manifest).is_ok(),
+        "write package.ipe"
+    );
+    assert!(
+        fs::write(src.join("Main.ipe"), CLEAN_MAIN).is_ok(),
+        "write src/Main.ipe"
+    );
+    assert!(
+        fs::write(src.join("Term.ipe"), TUI_PROGRAM).is_ok(),
+        "write src/Term.ipe"
+    );
+    let root = ProjectRoot::resolve(RootArg::at(&dir));
+    let shapes: Result<Vec<(String, delivery::Shape)>, CliError> = root.and_then(|root| {
+        let EntrySet::Programs(programs) = root.entries() else {
+            return Ok(Vec::new());
+        };
+        programs
+            .iter()
+            .map(|entry| {
+                classify_entry_shape(&root, entry)
+                    .map(|shape| (entry.name().as_str().to_owned(), shape))
+            })
+            .collect()
+    });
     let _ = fs::remove_dir_all(&dir);
     assert!(
         matches!(
-            shape,
+            shapes.as_deref(),
+            Ok([(tool, delivery::Shape::Script), (term, delivery::Shape::Tui)])
+                if tool == "tool" && term == "term"
+        ),
+        "each program is classified on its own entry: {shapes:?}"
+    );
+}
+
+/// An entry read through a resolved root refuses a linked entry file, a linked parent
+/// directory and an absent parent directory, whatever the tree held when it resolved.
+#[cfg(unix)]
+#[test]
+fn classify_entry_shape_refuses_a_tree_changed_after_resolve() {
+    use crate::project_root::{EntrySet, ProjectRoot, RootArg};
+    let dir = session_scratch("shape_changed_tree");
+    let src = dir.join("src");
+    assert!(
+        fs::create_dir_all(src.join("Tools")).is_ok(),
+        "make src/Tools/"
+    );
+    let manifest = "module Package exposing (package)\n\n\npackage =\n    { name = \"app\"\n    , programs =\n        [ { name = \"term\", entry = \"Term.ipe\" }\n        , { name = \"sync\", entry = \"Tools/Sync.ipe\" }\n        ]\n    }\n";
+    assert!(
+        fs::write(dir.join("package.ipe"), manifest).is_ok(),
+        "write package.ipe"
+    );
+    assert!(
+        fs::write(src.join("Term.ipe"), TUI_PROGRAM).is_ok(),
+        "write src/Term.ipe"
+    );
+    assert!(
+        fs::write(
+            src.join("Tools").join("Sync.ipe"),
+            "module Tools.Sync exposing (main)\n\nmain = 1\n"
+        )
+        .is_ok(),
+        "write src/Tools/Sync.ipe"
+    );
+    let outside = dir.join("Outside.ipe");
+    assert!(
+        fs::write(&outside, TUI_PROGRAM).is_ok(),
+        "write the outside file"
+    );
+    let root = ProjectRoot::resolve(RootArg::at(&dir)).expect("resolve the root");
+    let programs: Vec<_> = match root.entries() {
+        EntrySet::Programs(programs) => programs.iter().collect(),
+        EntrySet::Library(_) => Vec::new(),
+    };
+    let entry = |name: &str| {
+        programs
+            .iter()
+            .copied()
+            .find(|entry| entry.name().as_str() == name)
+            .expect("the named program")
+    };
+
+    assert!(
+        fs::remove_file(src.join("Term.ipe")).is_ok(),
+        "drop src/Term.ipe"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&outside, src.join("Term.ipe")).is_ok(),
+        "link src/Term.ipe out of src/"
+    );
+    let linked_file = classify_entry_shape(&root, entry("term"));
+
+    let moved = dir.join("MovedTools");
+    assert!(
+        fs::rename(src.join("Tools"), &moved).is_ok(),
+        "move src/Tools away"
+    );
+    assert!(
+        std::os::unix::fs::symlink(&moved, src.join("Tools")).is_ok(),
+        "link src/Tools to the moved directory"
+    );
+    let linked_parent = classify_entry_shape(&root, entry("sync"));
+
+    assert!(
+        fs::remove_file(src.join("Tools")).is_ok(),
+        "drop the src/Tools link"
+    );
+    let absent_parent = classify_entry_shape(&root, entry("sync"));
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(
+            linked_file,
             Err(CliError::SourceRefused {
                 reason: SourceRefusal::Symlink,
                 ..
             })
         ),
-        "an entry file linked outside src/ must be refused: {shape:?}"
+        "a linked entry file is refused as a link: {linked_file:?}"
+    );
+    assert!(
+        matches!(
+            linked_parent,
+            Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))
+        ),
+        "a linked parent directory is refused as a link: {linked_parent:?}"
+    );
+    assert!(
+        matches!(absent_parent, Err(CliError::EntryMissing { .. })),
+        "an absent parent directory is a missing entry: {absent_parent:?}"
     );
 }
 
