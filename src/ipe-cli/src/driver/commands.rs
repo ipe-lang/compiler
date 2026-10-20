@@ -343,16 +343,13 @@ pub struct HeldBuild {
 }
 
 impl HeldBuild {
-    /// Read the project `root` once, after applying its machine fixes when `fix` is set.
+    /// Read the project `root` once, writing nothing.
     ///
     /// # Errors
-    /// The refusals of [`apply_fixes_cmd`] and [`SourceSnapshot::read`];
-    /// [`CliError::EntryMissing`] when the program the build selects is not
-    /// among the root's entries or not a `src/` module of the read.
-    pub fn read(root: ProjectRoot, fix: bool) -> Result<Self, CliError> {
-        if fix {
-            apply_fixes_cmd(&root, None, true, &mut std::io::stdout())?;
-        }
+    /// The refusals of [`SourceSnapshot::read`]; [`CliError::EntryMissing`]
+    /// when the program the build selects is not among the root's entries or
+    /// not a `src/` module of the read.
+    pub fn read(root: ProjectRoot) -> Result<Self, CliError> {
         let snapshot = SourceSnapshot::read(&root, Limits::DEFAULT)?;
         let shape = built_shape(&root, &snapshot)?;
         let manifest_path = root.path().join(package_manifest::PACKAGE_IPE);
@@ -362,6 +359,19 @@ impl HeldBuild {
             shape,
             manifest_path,
         })
+    }
+
+    /// Apply the project's machine fixes and read the rewritten project once more.
+    ///
+    /// Fixing consumes a held read, so the files are rewritten only for a
+    /// project a caller has already read and judged; the returned read holds
+    /// the rewritten bytes and is the one to judge again and build.
+    ///
+    /// # Errors
+    /// The refusals of [`apply_fixes_cmd`] and [`HeldBuild::read`].
+    pub fn fixed(self) -> Result<Self, CliError> {
+        apply_fixes_cmd(&self.root, None, true, &mut std::io::stdout())?;
+        Self::read(self.root)
     }
 
     /// The resolved project root.
@@ -474,7 +484,7 @@ pub fn build_root(arg: Option<&str>, verb: Verb) -> Result<ProjectRoot, CliError
 /// only misuse / setup failures propagate.
 pub fn run_watch(rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_watch(rest)?;
-    let held = HeldBuild::read(build_root(args.entry.as_deref(), Verb::DEV_WATCH)?, false)?;
+    let held = HeldBuild::read(build_root(args.entry.as_deref(), Verb::DEV_WATCH)?)?;
 
     // Validate the delivery grammar against the shape `main` pins: the `[shape]`
     // cross-check and the `[runtime] [host]` tail. `ipe dev watch` is a dev
@@ -763,6 +773,58 @@ pub fn resolve_compile_target(
     CompileTarget::Native
 }
 
+/// What an `ipe dev build` of one held read is admitted to produce.
+struct DevAdmission {
+    delivery: delivery::Delivery,
+    bundle_host: Option<BundleHost>,
+    compile_target: CompileTarget,
+}
+
+/// Judge the delivery refusals of an `ipe dev build` of `held`.
+///
+/// The delivery grammar is resolved against the shape `main` pins (the
+/// optional `[shape]` cross-check, the `[runtime] [host]` tail, the `--static`
+/// gate). A `desktop`/`ios`/`android` host is an application bundle routed
+/// through the delivery-grammar bundler and is admitted as that bundle host.
+/// Every other delivery is admitted only when it agrees with the compile
+/// target (CLI `--target wasm|wasi` > `IPE_TARGET=wasm|wasi` > `[wasm].mode`)
+/// on the `(engine, triple)` validity matrix, the single live gate: a `spa`
+/// delivery compiles to the browser wasm engine and that engine carries only a
+/// `spa` delivery, a co-located native delivery resolves to the native engine,
+/// and the co-located WASI engine admits only the sealed `Direct`/`Script`
+/// floor, so the wasm-keyed native-deny backstops stay reachable for every
+/// sandboxed client.
+///
+/// # Errors
+/// [`CliError::Usage`] carrying the refusal of [`resolve_delivery`],
+/// [`BundleHost::from_delivery_host`] or the triple matrix.
+fn admit_dev_build(
+    held: &HeldBuild,
+    positionals: &cli_args::DeliveryPositionals,
+    wants_static: bool,
+    wasm_target: cli_args::WasmKind,
+) -> Result<DevAdmission, CliError> {
+    let delivery = resolve_delivery(
+        held.shape(),
+        positionals,
+        wants_static,
+        Verb::DEV_BUILD.name(),
+    )?;
+    let bundle_host = BundleHost::from_delivery_host(delivery.host())?;
+    let compile_target = resolve_compile_target(wasm_target, Some(&held.root().manifest().wasm));
+    if bundle_host.is_none() {
+        let (engine, triple) = compile_target.engine_triple();
+        delivery
+            .admit_triple(engine, triple)
+            .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_BUILD, &e)))?;
+    }
+    Ok(DevAdmission {
+        delivery,
+        bundle_host,
+        compile_target,
+    })
+}
+
 /// `ipe dev build [<dir>]` — compile a program to a native or WebAssembly artifact.
 // A linear pipeline (parse → discover manifest → acknowledge unsafe → resolve
 // target → emit → cargo build); the steps share enough locals that splitting
@@ -849,20 +911,25 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
     let static_plan = resolve_static_plan(cli_layer, root.manifest(), args.format)?;
 
     // `--fix` carries durable authorization: machine-applicable fixes are
-    // applied non-interactively, then the project is read once, so the build
-    // sees the rewritten bytes.
-    let held = HeldBuild::read(root, args.fix)?;
+    // applied non-interactively. They are written only for a build the
+    // delivery refusals admit on the unfixed read, so a refused project is left
+    // untouched; the rewritten project is then read and judged once more, and
+    // that read is the one built.
+    let unfixed = HeldBuild::read(root)?;
+    let admitted = admit_dev_build(&unfixed, &args.delivery, wants_static, wasm_target)?;
+    let (held, admitted) = if args.fix {
+        let held = unfixed.fixed()?;
+        let admitted = admit_dev_build(&held, &args.delivery, wants_static, wasm_target)?;
+        (held, admitted)
+    } else {
+        (unfixed, admitted)
+    };
+    let DevAdmission {
+        delivery,
+        bundle_host,
+        compile_target,
+    } = admitted;
     let manifest = held.root().manifest();
-
-    // Resolve the delivery grammar against the shape `main` pins: the optional
-    // `[shape]` cross-check, the `[runtime] [host]` tail, and the `--static`
-    // gate. A webview-native `web desktop` drives the emit host below.
-    let delivery = resolve_delivery(
-        held.shape(),
-        &args.delivery,
-        wants_static,
-        Verb::DEV_BUILD.name(),
-    )?;
 
     // Human-friendly progress: the compile+emit below is otherwise silent, so
     // the banner and a start line come first and a done line
@@ -886,11 +953,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
         );
     }
 
-    // A `desktop`/`ios`/`android` host is an application bundle, not a plain
-    // artifact: it is routed through the delivery-grammar bundler (a fast dev
-    // bundle for `build`).
-    let bundle_host = BundleHost::from_delivery_host(delivery.host())?;
-
     if let Some(host) = bundle_host {
         bundle_delivery(host, NativeFinish::Dev, &held)?;
         return Ok(BuildSuccess {
@@ -898,24 +960,6 @@ pub fn run_build_body(rest: &[String]) -> Result<BuildSuccess, CliError> {
             out_dir: PathBuf::new(),
         });
     }
-
-    // Precedence: CLI --target wasm|wasi > IPE_TARGET=wasm|wasi > [wasm].mode.
-    let compile_target = resolve_compile_target(wasm_target, Some(&manifest.wasm));
-
-    // The delivery runtime and the compile target are derived independently; fail
-    // closed unless they agree — the `(engine, triple)` validity matrix is the
-    // single live gate. A `spa` delivery MUST compile to the browser wasm engine,
-    // and the browser engine MUST carry a `spa` delivery; a co-located native
-    // delivery MUST resolve to the native engine; the co-located WASI engine
-    // admits ONLY the sealed `Direct`/`Script` floor (TEA/Server/Web refused
-    // fail-closed, so THE SEAL holds). This keeps the wasm-keyed native-deny
-    // backstops reachable for every sandboxed client, and is the structural
-    // successor to the `spa` IFF wasm biconditional (it subsumes it and adds the
-    // third — triple — axis).
-    let (engine, triple) = compile_target.engine_triple();
-    delivery
-        .admit_triple(engine, triple)
-        .map_err(|e| CliError::Usage(text::msg::command_refusal(&Verb::DEV_BUILD, &e)))?;
 
     // The dependency model (native OR wasm) needs no vendored tree — the runtime
     // is a path dependency. Only a dep-model-OFF build vendors the source subtree.
@@ -1331,10 +1375,7 @@ fn copy_native_artifact(
 pub fn run_eject(rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_eject(rest)?;
     let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
-    let held = HeldBuild::read(
-        build_root(args.entry.as_deref(), Verb::RELEASE_EJECT)?,
-        false,
-    )?;
+    let held = HeldBuild::read(build_root(args.entry.as_deref(), Verb::RELEASE_EJECT)?)?;
     let manifest = held.root().manifest();
 
     // Fail closed on an FFI-bearing project BEFORE any emit: eject vendors only
@@ -1608,7 +1649,7 @@ pub fn release_pipeline(
 ) -> Result<ReleaseOutput, CliError> {
     let verb = purpose.verb();
     let entry = args.entry.clone().unwrap_or_else(|| ".".to_owned());
-    let held = HeldBuild::read(build_root(args.entry.as_deref(), verb)?, false)?;
+    let held = HeldBuild::read(build_root(args.entry.as_deref(), verb)?)?;
     let manifest = held.root().manifest();
 
     // The trust-boundary consent gates, applied BEFORE any emit, cargo build,
@@ -2918,7 +2959,7 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     // nothing.
     let static_plan = resolve_static_plan(cli_layer, root.manifest(), output_format)?;
 
-    let held = HeldBuild::read(root, false)?;
+    let held = HeldBuild::read(root)?;
     let manifest = held.root().manifest();
 
     // Resolve the delivery grammar (shape cross-check, runtime/host, `--static`
@@ -5289,7 +5330,6 @@ mod parsed_manifest_tests {
         let manifest_path = fixture.manifest_path();
         let held = HeldBuild::read(
             ProjectRoot::resolve(RootArg::at(fixture.path())).expect("the root resolves"),
-            false,
         )
         .expect("the project reads");
         let text = std::fs::read_to_string(&manifest_path).expect("read package.ipe");
@@ -5392,11 +5432,8 @@ mod parsed_manifest_tests {
     fn a_wrapper_swapped_after_the_read_is_never_bound() {
         let base = crate::scratch::ScratchDir::new("ipe-wrapper-swap").expect("scratch base");
         let held_at = |project: &std::path::Path| {
-            HeldBuild::read(
-                ProjectRoot::resolve(RootArg::at(project)).expect("the root resolves"),
-                false,
-            )
-            .expect("the project reads")
+            HeldBuild::read(ProjectRoot::resolve(RootArg::at(project)).expect("the root resolves"))
+                .expect("the project reads")
         };
         let moved = |err: &crate::CliError| {
             matches!(
@@ -5459,11 +5496,8 @@ mod parsed_manifest_tests {
         let base = crate::scratch::ScratchDir::new("ipe-eject-cache-swap").expect("scratch base");
         let project = wrapper_project(&base.path().join("app"));
         let read = || {
-            HeldBuild::read(
-                ProjectRoot::resolve(RootArg::at(&project)).expect("the root resolves"),
-                false,
-            )
-            .expect("the project reads")
+            HeldBuild::read(ProjectRoot::resolve(RootArg::at(&project)).expect("the root resolves"))
+                .expect("the project reads")
         };
         let held = read();
         let cache = ipe_ffi::driver::FfiCache::at_project_root(&project);

@@ -3836,7 +3836,8 @@ fn audit_entry_rejects_on_hash_mismatch() {
 /// The project at `dir`, read once as the build arms read it.
 fn held_build(dir: &Path, fix: bool) -> Result<HeldBuild, CliError> {
     use crate::project_root::{ProjectRoot, RootArg};
-    HeldBuild::read(ProjectRoot::resolve(RootArg::at(dir))?, fix)
+    let held = HeldBuild::read(ProjectRoot::resolve(RootArg::at(dir))?)?;
+    if fix { held.fixed() } else { Ok(held) }
 }
 
 /// A project with an unreadable module is refused by the one read, naming that module.
@@ -3945,6 +3946,47 @@ fn a_fixed_build_reads_the_rewritten_module() {
             held.err()
         );
     }
+}
+
+/// `ipe dev build --fix` of a project its delivery refuses rewrites no file.
+///
+/// The `tui` cross-check word contradicts the `Script` shape the entry pins, so
+/// the build is refused on the unfixed read before any fix is written. The
+/// control fixes the same fixture through the held read, so the refused build
+/// left a fixable file untouched.
+#[test]
+fn a_build_refused_for_delivery_never_applies_its_fixes() {
+    let dir = fix_project(
+        "fix-refused-delivery",
+        FIX_MANIFEST,
+        &[("Main.ipe", MAIN_MISSPELLING_LENGTH)],
+    );
+    let main = dir.join("src").join("Main.ipe");
+    let built = super::run_build_body(&[
+        dir.to_string_lossy().into_owned(),
+        "tui".to_owned(),
+        "--fix".to_owned(),
+    ]);
+    let after_refusal = fs::read_to_string(&main).ok();
+    let fixed = held_build(&dir, true).map(|_| ());
+    let after_fix = fs::read_to_string(&main).ok();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        matches!(built, Err(CliError::Usage(_))),
+        "the stated `tui` shape is refused for a `Script` entry: {:?}",
+        built.err()
+    );
+    assert_eq!(
+        after_refusal.as_deref(),
+        Some(MAIN_MISSPELLING_LENGTH),
+        "a refused build rewrites no file"
+    );
+    assert!(fixed.is_ok(), "{:?}", fixed.err());
+    assert_eq!(
+        after_fix.as_deref(),
+        Some("module Main exposing (main)\n\nlength : Int\nlength = 2\n\nmain = length\n"),
+        "the fixture is fixable"
+    );
 }
 
 /// The shape is read from the held text: an entry swapped after the read keeps the shape it was read as.
