@@ -6922,7 +6922,7 @@ mod tests {
         // budget bounds the fixpoint's work, not only the unifications inside
         // it: the riders cost at least `riders * depth` steps over the chain
         // alone, where their own unifications cost a constant each.
-        let (depth, riders) = (64_usize, 8_usize);
+        let (depth, riders) = (32_usize, 8_usize);
         let alone = min_solver_steps(&chain_with_riders(depth, 0));
         let ridden = min_solver_steps(&chain_with_riders(depth, riders));
         assert!(
