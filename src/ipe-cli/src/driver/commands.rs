@@ -3641,31 +3641,6 @@ pub fn program_constructs_a_widget(
         })
 }
 
-/// Lower a single `.ipe` entry through the SAME injection-aware source-graph
-/// pipeline the build path uses, returning the owning database (its interner
-/// backs any downstream `ipe_ir::pretty`) and the lowered program.
-///
-/// This routes through sibling discovery + compiled-source stdlib injection +
-/// the salsa `lower_program` query rather than a bare single-module
-/// parse→canon→infer→lower. Without injection an entry importing a
-/// compiled-source stdlib module (e.g. `Ipe.Test`) fails name resolution with
-/// IPE-N0004 even though a real `ipe dev build` of the same program succeeds — the
-/// analysis surfaces (`ipe capabilities`, `ipe dev build --emit-ir`) must resolve
-/// such a module identically to the build.
-///
-/// # Errors
-/// [`CliError::Pipeline`] carrying the first compiler diagnostic;
-/// [`CliError::Io`] when a source file cannot be read.
-pub fn lower_entry_via_graph(
-    entry: &Path,
-) -> Result<(ipe_db::IpeDatabase, std::sync::Arc<ipe_ir::Program>), CliError> {
-    let graph = build_source_graph(entry)?;
-    let program = graph.run_attributed(entry, |db, root, file| {
-        ipe_db::lower_program(db, root, file).clone()
-    })?;
-    Ok((graph.db, program))
-}
-
 /// The salsa inputs one analysis needs: the owning database, the whole-program
 /// source root, and the entry module's [`ipe_db::SourceFile`] handle — the
 /// product of sibling discovery + compiled-source stdlib injection shared by
@@ -3773,10 +3748,8 @@ impl SourceGraph {
 
 /// Build the injection-aware whole-program source graph for a single `.ipe`
 /// entry: discover its siblings, inject the compiled-source stdlib closure, and
-/// create the salsa source root. Shared by [`lower_entry_via_graph`] and
-/// [`typecheck_entry_via_graph`] so the build, capabilities, `--emit-ir`, and
-/// `check` surfaces all resolve the same module set — a compiled-source stdlib
-/// import (e.g. `Ipe.Test`) resolves identically across every one.
+/// create the salsa source root, so a compiled-source stdlib import (e.g.
+/// `Ipe.Test`) resolves as the build resolves it.
 ///
 /// # Errors
 /// [`CliError::Pipeline`] when the entry does not parse; [`CliError::Io`] on any
@@ -4081,18 +4054,6 @@ pub fn named_sources_for_web_scan(
     loose_file_scan_sources(entry)
 }
 
-/// Type-check a single `.ipe` entry through the SAME injection-aware
-/// source-graph pipeline the build path uses, stopping at type-checking: it
-/// demands the `typecheck` query (parse → canon → link → HM infer) and never
-/// lowers to IR or emits Rust. This is what `ipe type-check` runs.
-///
-/// # Errors
-/// [`CliError::Pipeline`] carrying the first compiler diagnostic;
-/// [`CliError::Io`] when a source file cannot be read.
-pub fn typecheck_entry_via_graph(entry: &Path) -> Result<(), CliError> {
-    build_source_graph(entry)?.run_attributed(entry, typecheck_query)
-}
-
 /// The type-check every analysis surface demands of a source graph: link, HM
 /// type-check, then the IPE-N0040 decoder-direction gate the build path runs.
 ///
@@ -4129,41 +4090,48 @@ pub fn lowering_check_query(
     ipe_db::lower_program(db, root, file).clone().map(|_| ())
 }
 
-/// Judge one loose `.ipe` entry through the whole build front end, short of cargo.
+/// Judge every entry of `root` through the whole build front end, short of cargo.
 ///
-/// The entry's source graph is built as [`build_source_graph`] builds it, then
-/// run through [`compile_prepared`], the same canonicalise, link, target-gate,
-/// type-check, decoder-direction-gate, lower and emit pipeline `ipe dev build`
-/// runs, under a native development configuration. A refusal from any stage,
-/// lowering and emit included, surfaces as the first diagnostic, so a caller
-/// comparing its code sees the stage that actually refused the program. No
-/// project is written and cargo never runs.
+/// Each entry's source graph is the one [`analysis_graphs`] reads from the
+/// project's snapshot, run through [`compile_prepared`], the same canonicalise,
+/// link, target-gate, type-check, decoder-direction-gate, lower and emit
+/// pipeline `ipe dev build` runs, under the manifest's settings for a native
+/// development build of the served host. A refusal from any stage, lowering and
+/// emit included, surfaces as the first diagnostic, so a caller comparing its
+/// code sees the stage that actually refused the program. No project is written
+/// and cargo never runs.
 ///
 /// # Errors
-/// [`CliError::Pipeline`] carrying the first compiler diagnostic;
-/// [`CliError::Io`] when a source file cannot be read.
-pub fn front_check_entry(entry: &Path) -> Result<(), CliError> {
-    let graph = build_source_graph(entry)?;
-    let config = ipe_db::BuildConfig::new(
-        &graph.db,
-        emit_settings(
-            &SettingsSource::Loose,
-            &BuildOptions {
-                target: ipe_ir::Target::Native,
-                intent: ipe_backend_rust::BuildIntent::Development,
-                ..BuildOptions::from_env()
-            },
-            runtime_embed::BundleRole::Out,
-        ),
-    );
-    compile_prepared(
-        &graph.db,
-        graph.source_root,
-        &graph.sources,
-        &graph.entry_module_path,
-        entry,
-        config,
-    )?;
+/// [`CliError::Pipeline`] carrying the first compiler diagnostic; every
+/// refusal of [`analysis_graphs`].
+pub fn front_check(root: &ProjectRoot) -> Result<(), CliError> {
+    let manifest_path = root.path().join(package_manifest::PACKAGE_IPE);
+    let source = SettingsSource::Manifest {
+        manifest: root.manifest(),
+        manifest_path: &manifest_path,
+        // A front check writes no artifact and opens no window: it judges the
+        // program the served build compiles.
+        host: HostIntent::Served,
+    };
+    let options = BuildOptions {
+        target: ipe_ir::Target::Native,
+        intent: ipe_backend_rust::BuildIntent::Development,
+        ..BuildOptions::from_env()
+    };
+    for graph in analysis_graphs(&AnalysisTarget::Project(root))? {
+        let config = ipe_db::BuildConfig::new(
+            &graph.db,
+            emit_settings(&source, &options, runtime_embed::BundleRole::Out),
+        );
+        compile_prepared(
+            &graph.db,
+            graph.source_root,
+            &graph.sources,
+            &graph.entry_module_path,
+            graph.entry_path(),
+            config,
+        )?;
+    }
     Ok(())
 }
 

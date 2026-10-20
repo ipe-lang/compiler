@@ -465,12 +465,13 @@ fn emit_ir_resolves_compiled_source_stdlib_with_own_types() {
         "`Test.runMain` must resolve to the injected member:\n{tree}"
     );
 
-    // The same source-graph pipeline backs `ipe capabilities` via
-    // `lower_entry_via_graph`; it must resolve identically (a pure test
-    // program).
+    // The same program as a snippet's scratch project (the doc and coverage
+    // path) must resolve identically (a pure test program).
+    let source = std::fs::read_to_string(&entry).expect("read the golden entry");
+    let snippet = analysis_project(&SourceTree::main(&source));
     assert!(
-        lower_entry_via_graph(&entry).is_ok(),
-        "lower_entry_via_graph (capabilities path) must resolve `Ipe.Test` too"
+        emit_ir_text(snippet.root(), None).is_ok(),
+        "a snippet project must resolve `Ipe.Test` too"
     );
 }
 

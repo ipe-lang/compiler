@@ -134,13 +134,11 @@ pub fn runtime_dep_from_env() -> bool {
 ///
 /// A single-file build carries no `package.ipe`, so its emitted crate is
 /// otherwise always named `ipe-app`. When many single-file builds share ONE
-/// cargo target dir (the coverage harness driving a per-symbol emit into a warm
-/// shared dep target) that constant name makes their app-crate cargo
-/// fingerprints collide: cargo could reuse a prior probe's compiled `ipe-app`
-/// and mask a genuinely broken emit, defeating the seal the coverage sweep
-/// exists to hold. Setting a UNIQUE name per build gives each app crate its own
-/// fingerprint, so a broken emit still fails to build even against a warm
-/// target. This is the one read of the variable.
+/// cargo target dir that constant name makes their app-crate cargo
+/// fingerprints collide: cargo could reuse a prior build's compiled `ipe-app`
+/// and mask a genuinely broken emit. Setting a UNIQUE name per build gives
+/// each app crate its own fingerprint, so a broken emit still fails to build
+/// even against a warm target. This is the one read of the variable.
 fn single_file_crate_name() -> ipe_backend_rust::CrateName {
     ipe_env::var("IPE_EMIT_PACKAGE_NAME").ok().map_or(
         ipe_backend_rust::CrateName::SingleFile,
@@ -220,8 +218,7 @@ pub fn emit_settings(
     }
 }
 
-/// The emit settings of a no-manifest build (a single file, a loose file, a
-/// front check).
+/// The emit settings of a no-manifest build (a single file, a loose file).
 ///
 /// There is no manifest window, so the host is always served, and a loose file
 /// declares no browser delivery: the mount base is [`MountBase::root`], the
@@ -679,16 +676,16 @@ pub struct CollectedSources {
 /// Collect a loose entry plus the transitive closure of sibling modules it imports.
 ///
 /// This is the file-path shorthand's source-collection step, shared by the
-/// build path ([`build_loose_file_with_options`]) and the
-/// single-entry analysis path ([`lower_entry_via_graph`]) so both see the SAME
-/// module set. It delegates to
+/// build path ([`build_loose_file_with_options`]) and
+/// [`crate::build_source_graph`] so both see the SAME module set. It
+/// delegates to
 /// [`crate::loose_file::resolve_loose_file`] — the one loose-file resolver
 /// `ipe dev watch` and `ipe lsp` also use — so every surface compiles the same
 /// bounded closure: one probed path per import, regular files contained in
 /// the entry's directory only, within
 /// [`crate::loose_file::LooseFileLimits::DEFAULT`], and no directory
 /// listing. The compiled-source stdlib closure is injected downstream (in
-/// [`compile_modules_observed`] / [`lower_entry_via_graph`]), not here, so
+/// [`compile_modules_observed`] / [`crate::build_source_graph`]), not here, so
 /// the injection routine stays single-sourced.
 ///
 /// # Errors

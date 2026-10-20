@@ -122,14 +122,11 @@ impl AspectCheck<StdlibSymbol> for LowersColumn {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
         };
-        let snippet = match scratch_child(scratch, "Main.ipe") {
-            Ok(path) => path,
-            Err(cell) => return cell,
-        };
+        let base = scratch.path();
         // The seam is "type-checks but does not lower": a probe that does not
         // type-check is a point-free-reference limitation for this symbol, not a
         // lowering gap.
-        if let StageOutcome::Failed { .. } = probe::typechecks(&source, &snippet) {
+        if let StageOutcome::Failed { .. } = probe::typechecks(&source, base) {
             return Cell::not_applicable(format!(
                 "{}.{}: the point-free reference program does not type-check — a \
                  probe-form limitation for this symbol, not a lowering gap",
@@ -137,7 +134,7 @@ impl AspectCheck<StdlibSymbol> for LowersColumn {
                 sym.name
             ));
         }
-        let outcome = probe::lower(&source, &snippet);
+        let outcome = probe::lower(&source, base);
         classify_lower_outcome(sym, outcome, "type-checks but does not lower")
     }
 }
@@ -231,14 +228,11 @@ impl AspectCheck<StdlibSymbol> for ComposesColumn {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
         };
-        let snippet = match scratch_child(scratch, "Main.ipe") {
-            Ok(path) => path,
-            Err(cell) => return cell,
-        };
+        let base = scratch.path();
         // A nested probe that does not type-check is a generator limitation for
         // this symbol's shape, not a lowering gap: report it inapplicable so it
         // is not a false hole.
-        if let StageOutcome::Failed { .. } = probe::typechecks(&source, &snippet) {
+        if let StageOutcome::Failed { .. } = probe::typechecks(&source, base) {
             return Cell::not_applicable(format!(
                 "{}.{}: the nested reference program does not type-check — a generator \
                  limitation for this symbol's shape, not a lowering gap",
@@ -246,7 +240,7 @@ impl AspectCheck<StdlibSymbol> for ComposesColumn {
                 sym.name
             ));
         }
-        let outcome = probe::lower(&source, &snippet);
+        let outcome = probe::lower(&source, base);
         classify_lower_outcome(
             sym,
             outcome,
@@ -334,13 +328,11 @@ impl AspectCheck<StdlibSymbol> for BuildRunColumn {
             Ok(s) => s,
             Err(reason) => return unavailable_cell(&reason),
         };
-        // Each symbol writes its `Main.ipe` under its OWN subdirectory of the
+        // Each symbol's probe projects live under its OWN subdirectory of the
         // shared scratch, keyed on the dotted path, so a parallel sweep (distinct
-        // symbols on distinct threads) never clobbers a sibling's snippet. The
-        // module is `Main`, so the file must be named `Main.ipe`; the per-symbol
-        // parent is what keeps it unique.
-        let snippet = match scratch_child(scratch, &symbol_scratch_key(sym)) {
-            Ok(dir) => dir.join("Main.ipe"),
+        // symbols on distinct threads) keeps each symbol's projects apart.
+        let base = match scratch_child(scratch, &symbol_scratch_key(sym)) {
+            Ok(dir) => dir,
             Err(cell) => return cell,
         };
         // The point-free reference program can fail to compile for a reason that
@@ -349,7 +341,7 @@ impl AspectCheck<StdlibSymbol> for BuildRunColumn {
         // the probe reaches. Pre-check by lowering — build+run shells out and sees
         // only text, so it cannot classify — and defer to that verdict rather than
         // pay a full cargo build to reach a false hole.
-        let lowered = probe::lower(&source, &snippet);
+        let lowered = probe::lower(&source, &base);
         if probe::is_probe_form_limitation(&lowered) {
             return Cell::NotApplicable {
                 reason: format!(
@@ -390,7 +382,7 @@ impl AspectCheck<StdlibSymbol> for BuildRunColumn {
                 sym.name
             ));
         }
-        match probe::build_and_run(&source, &snippet) {
+        match probe::build_and_run(&source, &base) {
             StageOutcome::Ok => Cell::Ok,
             StageOutcome::Failed { message, .. } => Cell::Hole(format!(
                 "{}.{} emits but does not build+run: {message}",
