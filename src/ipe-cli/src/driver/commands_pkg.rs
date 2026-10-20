@@ -4615,7 +4615,7 @@ main =
         let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
         let root = ProjectRoot::resolve(crate::project_root::RootArg::at(fixture.path()))
             .expect("the fixture resolves");
-        let held = HeldBuild::read(root, false).expect("the fixture is read");
+        let held = HeldBuild::read(root).expect("the fixture is read");
         let gated = BundleAssembler::gate_desktop(&held, NativeFinish::Dev)
             .expect("a web app passes the desktop gate");
         let out = ipe_test_temp::temp_root()
