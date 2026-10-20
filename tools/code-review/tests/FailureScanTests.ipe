@@ -744,12 +744,11 @@ uidTextNames imports =
 
 
 -- Every site a uid becomes text: the unit place a page shows beside its
--- path, the internal link target and key, the stored key and its lookup
--- bind, and the store's refusal of a row it cannot read.
+-- path, the internal link target and key, the stored key, and the store's
+-- refusal of a row it cannot read.
 admittedUidTexts : List String
 admittedUidTexts =
-    [ "Lib/Db.ipe:findLegacy"
-    , "Lib/Db.ipe:storedDecision"
+    [ "Lib/Db.ipe:storedDecision"
     , "Lib/Db.ipe:storedUid"
     , "Lib/Links.ipe:linkKey"
     , "Lib/View.ipe:linkEl"
@@ -809,6 +808,7 @@ uidTextScanRefuses =
                     && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid as U" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    U.toString uid" sources))
                     && uidCaught (prependTo "Lib/Queue.ipe" "import Lib.Uid exposing (toString)" (appendTo "Lib/Queue.ipe" "labelOf uid =\n    toString uid" sources))
                     && uidCaught (appendTo "Lib/UnitName.ipe" "shown name =\n    Uid.toString (uid name)" sources)
+                    && uidCaught (appendTo "Lib/Db.ipe" "legacyKey uid =\n    Uid.toString uid" sources)
                     && uidCaught (List.filter (\scanned -> scanned.rel /= "Lib/Links.ipe") sources)
                     && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Queue.ipe" "labelOf uid =\n    myUid.toStringLabel uid" sources))
                     && List.isEmpty (uidTextViolations admittedUidTexts (appendTo "Lib/Uid.ipe" "shown uid =\n    Uid.toString uid" sources))
@@ -830,9 +830,10 @@ uidCaught sources =
 -- binding above it, or the scrutinee of the `case` arm binding them. A
 -- `queryDecode` read is bounded when a `LIMIT` sits outside every
 -- parenthesis of the SQL text written in its seed, or in a same-module
--- definition the seed names, up to `readReachDepth` deep; a `Store` run is
--- bounded when `Store.limit` is in its own statement. A read bounded by
--- neither is one aggregate row by construction: it is admitted, keyed
+-- definition the seed names, up to `readReachDepth` deep. A `Store` run is
+-- never bounded: `Store.limit` bounds no runner that takes no query, and
+-- every run decodes its cells whole, past any per-cell window. A read not
+-- bounded is one aggregate row by construction: it is admitted, keyed
 -- `rel:name` with the count of such reads the definition issues, holds an
 -- aggregate token in its seed and reaches no `GROUP`.
 
@@ -1140,7 +1141,7 @@ unboundedReadsIn scanned =
 
                 bounded =
                     if List.any isStoreRun seed.calls then
-                        List.member "Store.limit" (List.concatMap tokens seed.statement)
+                        False
 
                     else
                         limitAtTop (literalsOf seedLines) || List.any (\named -> limitAtTop (literalsOf named.lines)) reached
@@ -1198,11 +1199,11 @@ readViolations admitted modules =
 -- The tree's reads are bounded, and each way around the scan is a
 -- violation: a new read with no `LIMIT`, a second unbounded read in an
 -- admitted definition, an admitted aggregate given a `GROUP BY` or turned
--- into a row read, a bounded read losing its `LIMIT`, a `Store` run with no
--- `Store.limit`, a `LIMIT` only inside a subquery, a `LIMIT` on a line of
--- the definition outside the read's statement, an admitted entry no source
--- holds. A `LIMIT` in a definition the read names counts, and so does a
--- `Store.limit` in the run's own pipeline.
+-- into a row read, a bounded read losing its `LIMIT`, any `Store` run, even
+-- one piped through `Store.limit`, a `LIMIT` only inside a subquery, a
+-- `LIMIT` on a line of the definition outside the read's statement, an
+-- admitted entry no source holds. A `LIMIT` in a definition the read names
+-- counts.
 -- Red if a read can take its size from the database, or the scan stops
 -- seeing one.
 readsCarryLimit : Task.Task Error Bool
@@ -1220,12 +1221,13 @@ readsCarryLimit =
                     && readCaught (replaceIn "Lib/Index.ipe" "reviewed_stamp WHERE one = 1 LIMIT 2" "reviewed_stamp WHERE one = 1" sources)
                     && readCaught (replaceIn "Lib/Index.ipe" "(sql ++ \" LIMIT 2\")" "sql" sources)
                     && readCaught (replaceIn "Lib/Db.ipe" "\" WHERE uid = ? AND body_hash = ? LIMIT 1\"" "\" WHERE uid = ? AND body_hash = ?\"" sources)
-                    && readCaught (appendTo "Lib/Db.ipe" "leakedRows db =\n    Store.all reviews\n        |> Store.where (\\row -> row.seq > 0)\n        |> Store.toList db" sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "leakedRows db =\n    Store.all db reviews" sources)
+                    && readCaught (appendTo "Lib/Db.ipe" "leakedFind db =\n    Store.findBy db reviews \"uid\" (SqlString \"u\")" sources)
                     && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    Db.queryDecode conn \"SELECT seq FROM review_log WHERE seq IN (SELECT seq FROM review_log LIMIT 1)\" [] leakedDecoder" sources)
                     && readCaught (appendTo "Lib/Db.ipe" "leakedRead conn =\n    do\n        rows <- Db.queryDecode conn \"SELECT seq FROM review_log\" [] leakedDecoder\n        Task.succeed (List.take 1 rows ++ [ \"LIMIT 1\" ])" sources)
                     && not (List.isEmpty (readViolations (( "Lib/Db.ipe:gone", 1 ) :: admittedAggregates) sources))
                     && List.isEmpty (readViolations admittedAggregates (appendTo "Lib/Db.ipe" "boundedRead conn =\n    Db.queryDecode conn boundedSql [] boundedDecoder\n\n\nboundedSql =\n    \"SELECT seq FROM review_log LIMIT 1\"" sources))
-                    && List.isEmpty (readViolations admittedAggregates (appendTo "Lib/Db.ipe" "boundedRows db =\n    Store.all reviews\n        |> Store.limit 1\n        |> Store.toList db" sources))
+                    && readCaught (appendTo "Lib/Db.ipe" "boundedRows db =\n    Store.all reviews\n        |> Store.limit 1\n        |> Store.toList db" sources)
             )
 
 

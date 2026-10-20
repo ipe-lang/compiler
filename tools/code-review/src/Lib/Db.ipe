@@ -1,4 +1,4 @@
-module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
+module Lib.Db exposing (BreakAt(..), CellCeiling, Decision(..), HistoryCursor(..), HistoryRows, LogRow, LogShown(..), LogState, LogVerdict(..), ProvenHead, Reason, ReviewEntry(..), RowName(..), StoredDecision(..), StoredReason, Unverified(..), UnverifiedRow, VerifiedRow, Verifier, advanceHead, cellHeld, copyCurrent, copyHolds, copyStamp, countedRows, currentHead, findDecision, findLatestForUid, headMoved, headCellCeilings, historyPage, historyPlan, insertDecision, lastSeq, keyMismatchRefusal, logCellCeilings, logPageCeiling, logRowsAfter, logShown, logVerdict, logVerdictWithin, macInput, openAt, parseReason, probe, reasonMaxChars, reasonText, rowNameOf, stateHead, stateVerdict, storedReasonMaxBytes, storedReasonText, storedUid, verifiedAt, verifiedDecision, verifiedHash, verifiedName, verifiedPair, verifiedUid, verifier, writeTransaction)
 
 import Ipe.Crypto as Crypto
 import Ipe.Db as Db
@@ -1208,9 +1208,12 @@ nameCellBytes =
     UnitName.nameMaxChars * 4
 
 
+-- The condition that holds a text cell inside its ceiling. `octet_length`
+-- counts the stored bytes without loading the cell and without stopping at
+-- a NUL, so a tampered cell of any size is judged before SQLite reads it.
 cellHeld : CellCeiling -> String
 cellHeld cell =
-    "(typeof(" ++ cell.column ++ ") = 'text' AND length(CAST(" ++ cell.column ++ " AS BLOB)) <= " ++ String.fromInt cell.bytes ++ ")"
+    "(typeof(" ++ cell.column ++ ") = 'text' AND octet_length(" ++ cell.column ++ ") <= " ++ String.fromInt cell.bytes ++ ")"
 
 
 heldCells : List CellCeiling -> String
@@ -1936,10 +1939,9 @@ logHistoryPage verify db limit cursor =
 
 
 -- A full page of log rows ends at its last row; a short one is filled with
--- legacy rows from the newest. A full page whose last row's seq or review
--- time is not an integer has no position in the page order to continue
--- from, so it fails, never skipping or repeating a row; such rows sort
--- before every integer key, so only the first pages can end on one.
+-- legacy rows from the newest. A full page ending on a row whose seq or
+-- review time is not an integer has no position in the page order to
+-- continue from, so it fails, never skipping or repeating a row.
 logPageOf : Verifier -> Db -> Int -> List ReviewEntry -> List LogRow -> Task.Task Error HistoryRows
 logPageOf verify db limit entries rows =
     if List.length rows < limit then

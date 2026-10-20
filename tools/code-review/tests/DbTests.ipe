@@ -345,12 +345,13 @@ probeAfterEdits dbPath edits =
 
 -- A review file whose head table is rebuilt without its key and checks
 -- fails the startup probe when it holds two head rows, and when its one row
--- holds a cell past its ceiling, a 33-digit log id or a 1 MiB blob in its
--- integer seq: the head is read at most two rows deep and cell by cell
--- under `headCellCeilings`, its seq windowed to an integer, never as two
--- heads or a whole cell. The same rebuild with its one row intact passes.
--- Red if the head read takes the first of several rows, or reads a cell
--- whole.
+-- holds a cell past its ceiling, a 33-digit log id, a log id whose NUL hides
+-- two more bytes from `length`, or a 1 MiB blob in its integer seq: the
+-- head is read at most two rows deep and cell by cell under
+-- `headCellCeilings`, its seq windowed to an integer, never as two heads or
+-- a whole cell. The same rebuild with its one row intact passes. Red if the
+-- head read takes the first of several rows, reads a cell whole, or counts
+-- a cell's characters rather than its bytes.
 headRowsBounded : Task.Task Error Bool
 headRowsBounded =
     freshDir "ipe-review-head-rows-bounded" |> Task.andThen headRowsBoundedIn
@@ -363,7 +364,8 @@ headRowsBoundedIn base =
         doubled <- probeAfterEdits (base ++ "/doubled.db") (rebuiltHead [ "one, log_id, seq, head, key_check", "one, log_id, seq, head, key_check" ])
         wide <- probeAfterEdits (base ++ "/wide.db") (rebuiltHead [ "one, log_id || 'a', seq, head, key_check" ])
         blob <- probeAfterEdits (base ++ "/blob.db") (rebuiltHead [ "one, log_id, zeroblob(1048576), head, key_check" ])
-        Task.succeed (intact == Nothing && maybeContains "no single head row" doubled && maybeContains "no single head row" wide && maybeContains "no single head row" blob)
+        hidden <- probeAfterEdits (base ++ "/hidden.db") (rebuiltHead [ "one, log_id || char(0) || 'a', seq, head, key_check" ])
+        Task.succeed (intact == Nothing && maybeContains "no single head row" doubled && maybeContains "no single head row" wide && maybeContains "no single head row" blob && maybeContains "no single head row" hidden)
 
 
 -- The edits rebuilding `review_log_head` with no key or check, one row
@@ -650,6 +652,19 @@ cellCeilingsMatchSchema =
         && logBytes "body_hash" == Just Index.attestedHashMaxBytes
         && String.length (Index.attest viewA) <= Index.attestedHashMaxBytes
         && List.length LibDb.logCellCeilings == 9
+
+
+-- A cell window counts the cell's stored bytes with `octet_length`, which
+-- neither loads the cell nor stops at a NUL, and never casts the cell,
+-- since `CAST(c AS BLOB)` copies the whole cell inside SQLite before it is
+-- judged. Red if a window casts the cell or counts something else.
+cellWindowCountsBytes : Bool
+cellWindowCountsBytes =
+    let
+        window =
+            LibDb.cellHeld { column = "c", bytes = 7 }
+    in
+    String.contains "octet_length(c) <= 7" window && not (String.contains "CAST(" window)
 
 
 -- History pages walked two rows at a time from the start return every
@@ -2003,6 +2018,7 @@ storedRowChecks =
         , check "a legacy integer cell holding a blob fails the History page" (onFreshReview "ipe-review-legacyIntegerCellPastTypeRefused" legacyIntegerCellPastTypeRefused)
         , check "a stored uid that is no unit id reads as tampered and the History still loads" (onFreshReview "ipe-review-storedUidNotAUnitIdTampered" storedUidNotAUnitIdTampered)
         , Task.succeed ( "each review-log cell ceiling is the bound its column is held to", cellCeilingsMatchSchema )
+        , Task.succeed ( "a cell window counts the cell's stored bytes and never casts it", cellWindowCountsBytes )
         , check "history pages walk every row once in order" (onFreshReview "ipe-review-historyWalkMatchesOrder" historyWalkMatchesOrder)
         , check "a history page below one row is refused" (onFreshReview "ipe-review-historyPageSizeRefused" historyPageSizeRefused)
         , check "history pages read in index order" (onFreshReview "ipe-review-historyPagesUseIndex" historyPagesUseIndex)
